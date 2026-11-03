@@ -58,7 +58,7 @@ pub fn parse_ast(sql: &str) -> Result<Vec<ast::Statement>> {
         .spawn(move || {
             let (_, trees) = parse_on_this_thread(&sql)?;
             let mut transformer = transformer::Transformer::new(Grammar::duckdb());
-            trees.iter().map(|tree| transformer.statement(tree)).collect()
+            trees.iter().map(|tree| transformer.top_level_statement(tree)).collect()
         })
         .map_err(|e| Error::new(ErrorKind::Internal, format!("failed to start the parser thread: {e}")))?
         .join()

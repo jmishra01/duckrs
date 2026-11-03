@@ -176,8 +176,8 @@ fn transformer_errors_match_duckdb() {
         ),
         ("SELECT #0", "Parser Error: Positional reference node needs to be >= 1"),
         (
-            "MERGE INTO t USING s ON t.a = s.a WHEN MATCHED THEN DELETE",
-            "Not implemented Error: the transformer for MergeIntoStatement",
+            "SELECT * FROM t MATCH_RECOGNIZE (PATTERN (a) DEFINE a AS true)",
+            "Not implemented Error: the transformer for TableMatchRecognizeClause",
         ),
     ];
     for (sql, expected) in cases {
@@ -638,6 +638,93 @@ fn renders_utility_statements_like_duckdb() {
         (
             "CREATE PERSISTENT TABLE t (a INT)",
             "Parser Error: PERSISTENT is only supported for CREATE SECRET",
+        ),
+    ];
+    for (sql, expected) in errors {
+        let err = error(sql);
+        assert!(err.starts_with(expected), "{sql}: {err}");
+    }
+}
+
+#[test]
+fn renders_pivot_merge_and_nearest_like_duckdb() {
+    let cases = [
+        (
+            "PIVOT cities ON year IN (2000, 2010) USING sum(population) AS total GROUP BY country",
+            "SELECT * FROM cities PIVOT (sum(population) AS total FOR (\"year\") IN (2000, 2010) GROUP BY country)",
+        ),
+        (
+            "PIVOT cities ON country IN (NL, US)",
+            "SELECT * FROM cities PIVOT (count_star() FOR (country) IN ('NL', 'US'))",
+        ),
+        (
+            "PIVOT cities USING sum(population) GROUP BY country",
+            "SELECT country, sum(population) FROM cities GROUP BY country",
+        ),
+        (
+            "UNPIVOT monthly ON jan, feb INTO NAME month VALUE sales",
+            "SELECT * FROM monthly UNPIVOT (sales FOR \"month\" IN (jan, feb))",
+        ),
+        (
+            "SELECT * FROM cities PIVOT (sum(population) FOR year IN (2000, 2010) GROUP BY country) AS p",
+            "SELECT * FROM cities PIVOT (sum(population) FOR (\"year\") IN (2000, 2010) GROUP BY country) AS p",
+        ),
+        (
+            "SELECT * FROM monthly UNPIVOT INCLUDE NULLS (sales FOR month IN (jan, feb))",
+            "SELECT * FROM monthly UNPIVOT INCLUDE NULLS (sales FOR \"month\" IN (jan, feb))",
+        ),
+        (
+            "MERGE INTO t USING s ON t.id = s.id WHEN NOT MATCHED THEN INSERT VALUES (s.id) \
+             WHEN MATCHED AND s.x > 1 THEN UPDATE SET v = s.v WHEN MATCHED THEN DELETE",
+            "MERGE INTO t USING s ON (t.id = s.id) WHEN MATCHED  AND (s.x > 1) THEN UPDATE SET v = s.v \
+             WHEN MATCHED THEN DELETE WHEN NOT MATCHED THEN INSERT VALUES (s.id)",
+        ),
+        (
+            "MERGE INTO t AS x USING s USING (id) WHEN NOT MATCHED BY SOURCE THEN DO NOTHING \
+             WHEN NOT MATCHED THEN INSERT BY NAME RETURNING *",
+            "MERGE INTO t AS x USING s USING (id) WHEN NOT MATCHED BY SOURCE THEN DO NOTHING \
+             WHEN NOT MATCHED THEN INSERT BY NAME * RETURNING *",
+        ),
+        (
+            "SELECT * FROM a JOIN b NEAREST 3 BY DISTANCE a.v <-> b.v",
+            "SELECT * FROM (a INNER JOIN b EXACT NEAREST 3 BY DISTANCE (a.v <-> b.v))",
+        ),
+    ];
+    for (sql, expected) in cases {
+        assert_eq!(render(sql), expected, "{sql}");
+    }
+    // A pivot whose values come from the data first creates an ENUM of them.
+    let rendered = render("PIVOT cities ON year USING sum(population)");
+    assert!(
+        rendered.starts_with("CREATE OR REPLACE TEMP TYPE \"__pivot_enum_")
+            && rendered.contains("AS ENUM (SELECT DISTINCT CAST(\"year\" AS VARCHAR) FROM cities WHERE (\"year\" IS NOT NULL) ORDER BY 1 ASC);;SELECT * FROM cities PIVOT (sum(population) FOR (\"year\") IN \"__pivot_enum_"),
+        "{rendered}"
+    );
+    let errors = [
+        (
+            "PIVOT t",
+            "Parser Error: PIVOT requires an ON, USING or GROUP BY clause",
+        ),
+        ("PIVOT t ON 1", "Parser Error: Cannot pivot on constant value \"1\""),
+        (
+            "CREATE VIEW v AS PIVOT t ON a",
+            "Parser Error: PIVOT statements with pivot elements extracted from the data cannot be used in views",
+        ),
+        (
+            "PIVOT (SELECT ?) ON a",
+            "Parser Error: PIVOT statements with pivot elements extracted from the data cannot have parameters",
+        ),
+        (
+            "MERGE INTO t USING s USING (id) WHEN MATCHED THEN DELETE WHEN MATCHED THEN DELETE",
+            "Parser Error: Unconditional WHEN MATCHED clause was already defined",
+        ),
+        (
+            "SELECT * FROM a FULL JOIN b NEAREST BY DISTANCE x",
+            "Parser Error: NEAREST BY only supports INNER and LEFT OUTER joins, not FULL",
+        ),
+        (
+            "SELECT * FROM a JOIN b NEAREST 0 BY DISTANCE x",
+            "Parser Error: NEAREST expects a positive integer literal, got \"0\"",
         ),
     ];
     for (sql, expected) in errors {

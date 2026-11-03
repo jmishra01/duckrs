@@ -1198,6 +1198,8 @@ pub enum TableRefKind {
     ExpressionList(Vec<Vec<Expr>>),
     /// SHOW / DESCRIBE / SUMMARIZE.
     Show(ShowRef),
+    /// PIVOT or UNPIVOT of `source`.
+    Pivot(PivotRef),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1286,6 +1288,16 @@ impl Display for TableRef {
                 self.base_to_string(r, &self.column_name_alias)
             }
             TableRefKind::Show(show) => show.to_string(),
+            TableRefKind::Pivot(pivot) => {
+                let mut r = format!("{pivot}");
+                if !self.alias.is_empty() {
+                    r += &format!(" AS {}", sql_identifier(&self.alias));
+                    if !self.column_name_alias.is_empty() {
+                        r += &format!("({})", join(&self.column_name_alias, ", ", |c| sql_identifier(c)));
+                    }
+                }
+                r
+            }
             TableRefKind::ExpressionList(values) => {
                 let rows = join(values, ", ", |row| format!("({})", join(row, ", ", |e| e.to_string())));
                 self.base_to_string(format!("(VALUES {rows})"), &[])
@@ -1484,6 +1496,7 @@ pub enum QueryNodeKind {
     Insert(Box<InsertStatement>),
     Update(Box<UpdateStatement>),
     Delete(Box<DeleteStatement>),
+    Merge(Box<MergeStatement>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1646,6 +1659,7 @@ impl Display for QueryNode {
             QueryNodeKind::Insert(node) => write!(f, "{node}"),
             QueryNodeKind::Update(node) => write!(f, "{node}"),
             QueryNodeKind::Delete(node) => write!(f, "{node}"),
+            QueryNodeKind::Merge(node) => write!(f, "{node}"),
         }
     }
 }
@@ -2262,6 +2276,7 @@ pub enum Statement {
         columns: Vec<String>,
     },
     Load(Box<LoadInfo>),
+    Merge(Box<MergeStatement>),
     /// Statements one statement was rewritten into (`MultiStatement`).
     Multi(Vec<Statement>),
 }
@@ -2347,6 +2362,7 @@ impl Display for Statement {
                 f.write_str(";")
             }
             Statement::Load(info) => write!(f, "{info}"),
+            Statement::Merge(merge) => write!(f, "{merge}"),
             Statement::Multi(statements) => {
                 write!(f, "{};", join(statements, ";", |s| s.to_string()))
             }
@@ -3284,5 +3300,209 @@ impl Display for LoadInfo {
             write!(f, " AS {}", sql_identifier(&self.alias))?;
         }
         f.write_str(";")
+    }
+}
+
+/// An entry of a PIVOT IN list: constant values (from column names or a row of them), or an
+/// expression kept whole.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PivotColumnEntry {
+    pub values: Vec<Literal>,
+    pub expr: Option<Expr>,
+    pub alias: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PivotColumn {
+    pub pivot_expressions: Vec<Expr>,
+    pub unpivot_names: Vec<String>,
+    pub entries: Vec<PivotColumnEntry>,
+    /// The ENUM type that lists the values, when the IN list is not written out.
+    pub pivot_enum: String,
+    pub subquery: Option<Box<QueryNode>>,
+}
+
+impl Display for PivotColumn {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        if !self.unpivot_names.is_empty() {
+            if self.unpivot_names.len() == 1 {
+                f.write_str(&sql_identifier(&self.unpivot_names[0]))?;
+            } else {
+                write!(f, "({})", join(&self.unpivot_names, ", ", |n| sql_identifier(n)))?;
+            }
+        } else if !self.pivot_expressions.is_empty() {
+            write!(f, "({})", join(&self.pivot_expressions, ", ", |e| e.to_string()))?;
+        }
+        f.write_str(" IN ")?;
+        if !self.pivot_enum.is_empty() {
+            return f.write_str(&sql_identifier(&self.pivot_enum));
+        }
+        let entries = join(&self.entries, ", ", |entry| {
+            let mut r = match &entry.expr {
+                Some(e) => e.to_string(),
+                None if entry.values.len() == 1 => literal_to_sql(&entry.values[0]),
+                None => format!("({})", join(&entry.values, ", ", literal_to_sql)),
+            };
+            if !entry.alias.is_empty() {
+                r += &format!(" AS {}", sql_identifier(&entry.alias));
+            }
+            r
+        });
+        write!(f, "({entries})")
+    }
+}
+
+/// `PivotRef`: PIVOT when `aggregates` is non-empty, UNPIVOT otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PivotRef {
+    pub source: Box<TableRef>,
+    pub aggregates: Vec<Expr>,
+    pub unpivot_names: Vec<String>,
+    pub pivots: Vec<PivotColumn>,
+    pub groups: Vec<String>,
+    pub include_nulls: bool,
+}
+
+impl Display for PivotRef {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.source)?;
+        if !self.aggregates.is_empty() {
+            let aggregates = join(&self.aggregates, ", ", |a| {
+                if a.alias.is_empty() {
+                    a.to_string()
+                } else {
+                    format!("{a} AS {}", sql_identifier(&a.alias))
+                }
+            });
+            write!(f, " PIVOT ({aggregates}")?;
+        } else {
+            f.write_str(" UNPIVOT ")?;
+            if self.include_nulls {
+                f.write_str("INCLUDE NULLS ")?;
+            }
+            if self.unpivot_names.len() == 1 {
+                write!(f, "({}", sql_identifier(&self.unpivot_names[0]))?;
+            } else {
+                write!(f, "(({})", join(&self.unpivot_names, ", ", |n| sql_identifier(n)))?;
+            }
+        }
+        f.write_str(" FOR")?;
+        for pivot in &self.pivots {
+            write!(f, " {pivot}")?;
+        }
+        if !self.groups.is_empty() {
+            write!(f, " GROUP BY {}", join(&self.groups, ", ", |g| sql_identifier(g)))?;
+        }
+        f.write_str(")")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MergeCondition {
+    WhenMatched,
+    WhenNotMatchedBySource,
+    WhenNotMatchedByTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeActionType {
+    Update,
+    Delete,
+    Insert,
+    DoNothing,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeAction {
+    pub action_type: MergeActionType,
+    pub condition: Option<Box<Expr>>,
+    /// UPDATE SET ...; `None` for `UPDATE SET *` or a bare UPDATE.
+    pub update_info: Option<UpdateSetInfo>,
+    pub by_name: bool,
+    pub insert_columns: Vec<String>,
+    /// INSERT VALUES (...) or the ERROR message.
+    pub expressions: Vec<Expr>,
+    pub default_values: bool,
+}
+
+impl Display for MergeAction {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        if let Some(condition) = &self.condition {
+            write!(f, " AND {condition} ")?;
+        }
+        f.write_str("THEN ")?;
+        match self.action_type {
+            MergeActionType::Update => {
+                f.write_str("UPDATE ")?;
+                if self.by_name {
+                    f.write_str("BY NAME ")?;
+                }
+                if let Some(info) = &self.update_info {
+                    write!(f, "{info}")?;
+                }
+                Ok(())
+            }
+            MergeActionType::Delete => f.write_str("DELETE"),
+            MergeActionType::Insert => {
+                f.write_str("INSERT ")?;
+                if self.by_name {
+                    f.write_str("BY NAME ")?;
+                }
+                if !self.insert_columns.is_empty() {
+                    write!(f, "({}) ", join(&self.insert_columns, ", ", |c| sql_identifier(c)))?;
+                }
+                if self.expressions.is_empty() {
+                    f.write_str(if self.default_values { "DEFAULT VALUES" } else { "*" })
+                } else {
+                    write!(f, "VALUES ({})", join(&self.expressions, ", ", |e| e.to_string()))
+                }
+            }
+            MergeActionType::DoNothing => f.write_str("DO NOTHING"),
+            MergeActionType::Error => {
+                f.write_str("ERROR")?;
+                if let Some(e) = self.expressions.first() {
+                    write!(f, " {e}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeStatement {
+    pub cte_map: CteMap,
+    pub target: Box<TableRef>,
+    pub source: Box<TableRef>,
+    pub join_condition: Option<Box<Expr>>,
+    pub using_columns: Vec<String>,
+    /// Actions in the order written; rendered grouped by condition, as DuckDB stores them.
+    pub actions: Vec<(MergeCondition, MergeAction)>,
+    pub returning: Vec<Expr>,
+}
+
+impl Display for MergeStatement {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}MERGE INTO {} USING {}", self.cte_map, self.target, self.source)?;
+        match &self.join_condition {
+            Some(condition) => write!(f, " ON {condition}")?,
+            None => write!(f, " USING ({})", self.using_columns.join(", "))?,
+        }
+        for condition in [
+            MergeCondition::WhenMatched,
+            MergeCondition::WhenNotMatchedBySource,
+            MergeCondition::WhenNotMatchedByTarget,
+        ] {
+            let label = match condition {
+                MergeCondition::WhenMatched => "WHEN MATCHED",
+                MergeCondition::WhenNotMatchedByTarget => "WHEN NOT MATCHED",
+                MergeCondition::WhenNotMatchedBySource => "WHEN NOT MATCHED BY SOURCE",
+            };
+            for (_, action) in self.actions.iter().filter(|(c, _)| *c == condition) {
+                write!(f, " {label} {action}")?;
+            }
+        }
+        f.write_str(&returning_to_string(&self.returning))
     }
 }

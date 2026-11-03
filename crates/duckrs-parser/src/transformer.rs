@@ -163,6 +163,9 @@ pub struct Transformer<'g> {
     in_window_definition: bool,
     param_count: u64,
     named_params: HashMap<String, u64>,
+    pivot_entries: Vec<statements::PivotEntry>,
+    /// The WITH clauses in scope, outermost first.
+    cte_stack: Vec<CteMap>,
 }
 
 impl<'g> Transformer<'g> {
@@ -173,6 +176,8 @@ impl<'g> Transformer<'g> {
             in_window_definition: false,
             param_count: 0,
             named_params: HashMap::new(),
+            pivot_entries: Vec::new(),
+            cte_stack: Vec::new(),
         }
     }
 
@@ -1905,6 +1910,19 @@ impl<'g> Transformer<'g> {
             Some(with) => self.with_clause(with)?,
             None => CteMap::default(),
         };
+        let scoped = !cte_map.0.is_empty();
+        if scoped {
+            self.cte_stack.push(cte_map.clone());
+        }
+        let result = self.select_body(node, cte_map);
+        if scoped {
+            self.cte_stack.pop();
+        }
+        result
+    }
+
+    /// The set operations and result modifiers of a `SelectStatementInternal`.
+    fn select_body(&mut self, node: &ParseNode, cte_map: CteMap) -> Result<SelectStatement> {
         let mut statement = self.set_op_chain(self.req(node, "SelectSetOpChain")?)?;
         if !cte_map.0.is_empty() {
             statement.node.cte_map = cte_map;
@@ -2021,6 +2039,8 @@ impl<'g> Transformer<'g> {
             }
             "ValuesClause" => self.values_clause(kind),
             "DescribeStatement" => self.describe(kind),
+            "PivotStatement" => self.pivot_statement(kind),
+            "UnpivotStatement" => self.unpivot_statement(kind),
             "TableStatement" => {
                 let table = self.base_table_name(self.req(kind, "BaseTableName")?)?;
                 let node = SelectNode {
@@ -2405,13 +2425,22 @@ impl<'g> Transformer<'g> {
         let mut table = self.inner_table_ref(self.alt(self.req(node, "InnerTableRef")?)?)?;
         for join in self.subs(node, "JoinOrPivot") {
             let inner = self.alt(join)?;
+            if matches!(self.name(inner), "TablePivotClause" | "TableUnpivotClause") {
+                table = self.table_pivot(inner, table)?;
+                continue;
+            }
             if self.name(inner) != "JoinClause" {
                 return Err(not_implemented(format!(
                     "the transformer for {} is not yet ported",
                     self.name(inner)
                 )));
             }
-            let mut j = self.join_clause(self.alt(inner)?)?;
+            let clause = self.alt(inner)?;
+            let mut j = if self.name(clause) == "NearestJoinClause" {
+                self.nearest_join(clause)?
+            } else {
+                self.join_clause(clause)?
+            };
             j.left = Box::new(table);
             table = TableRefKind::Join(j).into();
         }

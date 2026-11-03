@@ -6,6 +6,8 @@
 //! Statement transformers other than SELECT.
 
 mod alter;
+mod pivot;
+pub(in crate::transformer) use pivot::PivotEntry;
 mod utility;
 
 use super::{Transformer, not_implemented, parser_error, to_recursive_cte, visit_expr_mut};
@@ -112,6 +114,7 @@ impl Transformer<'_> {
                     | Statement::Update(_)
                     | Statement::Delete(_)
                     | Statement::Copy(_) => None,
+                    Statement::Merge(_) => Some("MERGE_INTO_STATEMENT"),
                     Statement::CopyDatabase { .. } => Some("COPY_DATABASE_STATEMENT"),
                     Statement::Export { .. } => Some("EXPORT_STATEMENT"),
                     Statement::Attach(_) => Some("ATTACH_STATEMENT"),
@@ -143,6 +146,7 @@ impl Transformer<'_> {
             "ExecuteStatement" => self.execute(node),
             "AlterStatement" => self.alter(node),
             "CommentStatement" => self.comment(node),
+            "MergeIntoStatement" => Ok(Statement::Merge(Box::new(self.merge(node)?))),
             "CopyStatement" => self.copy(node),
             "ExportStatement" => self.export(node),
             "ImportStatement" => Ok(Statement::Pragma(PragmaInfo {
@@ -552,6 +556,7 @@ impl Transformer<'_> {
             Statement::Insert(s) => QueryNodeKind::Insert(s).into(),
             Statement::Update(s) => QueryNodeKind::Update(s).into(),
             Statement::Delete(s) => QueryNodeKind::Delete(s).into(),
+            Statement::Merge(s) => QueryNodeKind::Merge(s).into(),
             _ => {
                 return Err(parser_error(
                     "Trigger body must be an INSERT, UPDATE, or DELETE statement",
@@ -617,6 +622,7 @@ impl Transformer<'_> {
             }
         }
         let query = self.select_internal(self.req(node, "SelectStatementInternal")?)?;
+        self.pivot_entry_check("view")?;
         Ok(CreateKind::View {
             secure: self.sub(node, "CreateSecure").is_some(),
             aliases,
@@ -884,6 +890,7 @@ impl Transformer<'_> {
             });
         }
         let table_macro = matches!(macros[0].body, MacroBody::Table(_));
+        self.pivot_entry_check("macro")?;
         if macros
             .iter()
             .any(|m| matches!(m.body, MacroBody::Table(_)) != table_macro)
@@ -1698,6 +1705,7 @@ impl Transformer<'_> {
             if format.is_some() || explain_type == ExplainType::Analyze {
                 return Err(invalid_input("EXPLAIN (SQL) cannot be combined with ANALYZE or FORMAT"));
             }
+            self.pivot_entry_check("EXPLAIN (SQL) statement")?;
             explain_type = ExplainType::Sql;
         }
         let statement = self.statement_kind(self.alt(self.req(node, "ExplainableStatements")?)?)?;
