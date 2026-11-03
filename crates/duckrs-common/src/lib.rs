@@ -2,9 +2,12 @@
 //! the type system, `string_t`, validity masks, selection vectors, vectors, data chunks, the
 //! vectorized executors, and scalar values.
 
+pub mod column_data;
+pub mod comparison;
 mod error;
 pub mod executor;
 pub mod hash;
+pub mod row;
 pub mod string_cast;
 pub mod types;
 pub mod value;

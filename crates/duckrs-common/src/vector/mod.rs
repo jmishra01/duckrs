@@ -3,11 +3,13 @@
 
 mod buffer;
 mod chunk;
+mod copy;
 mod selection;
 mod validity;
 
 pub use buffer::StringBuffer;
 pub use chunk::DataChunk;
+pub use copy::StringCopy;
 pub use selection::SelectionVector;
 pub use validity::ValidityMask;
 
@@ -410,6 +412,12 @@ impl Vector {
         // SAFETY: `s` is inlined or points into this vector's own string buffer.
         unsafe { self.string_data_mut()[i] = s };
         self.validity_mut().set_valid(i);
+    }
+
+    /// Keeps `buffer` alive for as long as this vector's string buffer, so strings pointing into
+    /// it may be stored here (through `string_data_mut`).
+    pub(crate) fn keep_buffer_alive(&mut self, buffer: &Arc<StringBuffer>) {
+        self.string_buffer().add_reference(buffer);
     }
 
     /// The child of a flat LIST/MAP vector (`ListVector::GetEntry`).

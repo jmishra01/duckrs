@@ -236,3 +236,68 @@ fn prepare_flat_reuses_unshared_buffers() {
     v.data_mut::<i32>()[0] = 99;
     assert_eq!(shared.data::<i32>()[0], 1);
 }
+
+mod copy_props {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn strings(values: &[Option<String>]) -> Vector {
+        let mut v = Vector::new(LogicalType::VARCHAR, values.len().max(1));
+        for (i, x) in values.iter().enumerate() {
+            match x {
+                Some(s) => v.set_value(i, &Value::varchar(s.clone())).unwrap(),
+                None => v.set_null(i, true),
+            }
+        }
+        v
+    }
+
+    proptest! {
+        #[test]
+        fn copy_from_matches_row_by_row(
+            values in prop::collection::vec(prop::option::of("[a-z]{0,20}"), 1..200),
+            picks in prop::collection::vec(any::<prop::sample::Index>(), 0..200),
+            as_dictionary in any::<bool>(),
+            deep in any::<bool>(),
+            target_offset in 0usize..50,
+        ) {
+            let mut source = strings(&values);
+            if as_dictionary {
+                let n = values.len();
+                source.slice(&SelectionVector::from_vec((0..n as u32).rev().collect()), n);
+            }
+            let logical = |i: usize| if as_dictionary { values.len() - 1 - i } else { i };
+            let sel: Vec<u32> = picks.iter().map(|p| p.index(values.len()) as u32).collect();
+            let mut target = Vector::new(LogicalType::VARCHAR, 1);
+            let mode = if deep { StringCopy::Deep } else { StringCopy::Reference };
+            target.copy_from(&source, &SelectionVector::from_vec(sel.clone()), sel.len(), target_offset, mode);
+            drop(source);
+            for (i, &s) in sel.iter().enumerate() {
+                let expected = values[logical(s as usize)].clone();
+                let actual = target.get_value(target_offset + i);
+                prop_assert_eq!(actual, expected.map_or(Value::null(LogicalType::VARCHAR), Value::varchar));
+            }
+        }
+    }
+
+    #[test]
+    fn copies_lists_by_appending_children() {
+        let ty = LogicalType::list(LogicalType::INTEGER);
+        let a = Value::list(LogicalType::INTEGER, vec![Value::integer(1), Value::integer(2)]).unwrap();
+        let b = Value::list(LogicalType::INTEGER, vec![Value::integer(3)]).unwrap();
+        let mut source = Vector::new(ty.clone(), 2);
+        source.set_value(0, &a).unwrap();
+        source.set_value(1, &b).unwrap();
+        let mut target = Vector::new(ty, 1);
+        target.copy_from(
+            &source,
+            &SelectionVector::from_vec(vec![1, 0, 1]),
+            3,
+            0,
+            StringCopy::Deep,
+        );
+        target.copy_from(&source, &SelectionVector::Identity, 2, 3, StringCopy::Deep);
+        assert_eq!(collect(&target, 5), [b.clone(), a.clone(), b.clone(), a, b]);
+        assert_eq!(target.list_size(), 1 + 2 + 1 + 2 + 1);
+    }
+}
