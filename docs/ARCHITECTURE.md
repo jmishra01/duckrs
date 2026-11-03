@@ -66,7 +66,10 @@ deeper than a few hundred levels drop iteratively, so returning one to a small-s
 safe. Like DuckDB, the transformer limits expression depth (`ParserOptions::max_expression_depth`,
 default 1000): nested expressions, types and subqueries add one level each, every link of an
 operator chain one more. On the corpus (`--dump` it, then run the `bench` example) a statement
-takes about 54 µs to match, 61 µs through `parse` and 82 µs through `parse_ast`.
+takes about 54 µs to match and 75 µs to become an AST on one thread, against 24.5 µs for
+DuckDB's release-built `Parser::ParseQuery` on the same statements. Most of the gap is matching:
+C++ skips choice alternatives, optionals and repetitions whose FIRST set rules out the next
+token (`matcher_first_set.cpp`), which the Rust matcher does not do yet.
 
 The transformer (`transformer.rs`) turns parse trees into the AST (`ast.rs`). The C++ version
 has one function per rule plus ~20k lines of generated trampolines that unpack each rule's
