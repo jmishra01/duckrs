@@ -8,6 +8,8 @@ mod error;
 pub mod executor;
 pub mod hash;
 pub mod row;
+pub mod serializer;
+pub mod sort_key;
 pub mod string_cast;
 pub mod types;
 pub mod value;

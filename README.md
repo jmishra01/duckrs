@@ -18,15 +18,18 @@ An analytical SQL database engine: a port of [DuckDB](https://github.com/duckdb/
   - `Value` and the DuckDB-exact VARCHAR rendering of every scalar type;
   - vector copy, `ColumnDataCollection` (chunked columnar row buffer), and DuckDB's row format
     (`TupleDataLayout`, `TupleDataCollection`, `RowMatcher`) for hash tables and aggregation;
-  - DuckDB's comparison semantics (NaN ordering, NULL-aware `DISTINCT FROM`).
+  - DuckDB's comparison semantics (NaN ordering, NULL-aware `DISTINCT FROM`);
+  - the binary serializer (DuckDB's on-disk/WAL format) with `LogicalType` and `Value`
+    serialization, interval parsing, and byte-comparable sort keys (`create_sort_key`) with an
+    in-memory sort.
 - `crates/duckrs`: the public API surface (`Database`, `Connection`). Every query returns
   `Not implemented Error`.
 - `tools/sqllogictest`: a port of DuckDB's sqllogictest runner. It runs the DuckDB `.test` corpus
   against duckrs, or against the C++ DuckDB library as a reference.
 
-Still to do in Phase 1: sorting, the binary serializer, interval parsing, and LIST/ARRAY support
-in hashing and the row format. `ColumnDataCollection` and `TupleDataCollection` are in-memory;
-spilling to disk comes with the buffer manager (Phase 9).
+Still to do in Phase 1: LIST/ARRAY support in hashing and the row format. Sorting is in-memory
+(external merge sort comes with Phase 8), and `ColumnDataCollection` and `TupleDataCollection`
+are in-memory too (spilling comes with the buffer manager in Phase 9).
 
 The full roadmap is in [`../RUST_PORT_PLAN.md`](../RUST_PORT_PLAN.md).
 

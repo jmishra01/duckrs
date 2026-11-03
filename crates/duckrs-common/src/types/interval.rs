@@ -52,6 +52,240 @@ impl Interval {
     }
 }
 
+/// Why an interval string failed to parse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IntervalParseError {
+    /// Not an interval; the cast reports a generic conversion error.
+    Invalid,
+    /// A specific error, as DuckDB reports it.
+    Error(crate::ErrorKind, String),
+}
+
+fn out_of_range(message: &str) -> IntervalParseError {
+    IntervalParseError::Error(crate::ErrorKind::OutOfRange, message.into())
+}
+
+/// `IntervalTryAddition`: `target += input * multiplier`, then `round(fraction * multiplier)`.
+fn try_add<T>(target: &mut T, input: i64, multiplier: i64, fraction: f64) -> Result<(), IntervalParseError>
+where
+    T: TryFrom<i64> + Copy + std::ops::Add<Output = T> + num_like::CheckedAdd,
+{
+    let addition = input
+        .checked_mul(multiplier)
+        .ok_or_else(|| out_of_range("interval value is out of range"))?;
+    let cast = |v: i64| {
+        T::try_from(v).map_err(|_| {
+            IntervalParseError::Error(
+                crate::ErrorKind::InvalidInput,
+                format!("Type INT64 with value {v} can't be cast because the value is out of range for the destination type {}", T::NAME),
+            )
+        })
+    };
+    *target = target
+        .checked_add(cast(addition)?)
+        .ok_or_else(|| out_of_range("interval value is out of range"))?;
+    if fraction.abs() > 1e-10 {
+        let extra = (fraction * multiplier as f64).round() as i64;
+        *target = target
+            .checked_add(cast(extra)?)
+            .ok_or_else(|| out_of_range("interval fraction is out of range"))?;
+    }
+    Ok(())
+}
+
+mod num_like {
+    pub trait CheckedAdd: Sized {
+        const NAME: &'static str;
+        fn checked_add(self, other: Self) -> Option<Self>;
+    }
+    impl CheckedAdd for i32 {
+        const NAME: &'static str = "INT32";
+        fn checked_add(self, other: Self) -> Option<Self> {
+            i32::checked_add(self, other)
+        }
+    }
+    impl CheckedAdd for i64 {
+        const NAME: &'static str = "INT64";
+        fn checked_add(self, other: Self) -> Option<Self> {
+            i64::checked_add(self, other)
+        }
+    }
+}
+
+impl Interval {
+    pub const MONTHS_PER_YEAR: i64 = 12;
+
+    /// Parses an interval literal (`Interval::FromCString`): `[@]` followed by
+    /// `<number[.fraction]> <unit>` pairs, an optional `HH:MM[:SS[.ffffff]]` time, a bare
+    /// number of seconds, and an optional trailing `ago` that negates everything.
+    pub fn parse(s: &str) -> Result<Interval, IntervalParseError> {
+        use super::DatePart;
+        use super::time::{MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MINUTE, MICROS_PER_SEC};
+        let buf = s.as_bytes();
+        let len = buf.len();
+        let mut result = Interval::default();
+        if len == 0 {
+            return Err(IntervalParseError::Invalid);
+        }
+        let mut pos = 0;
+        match buf[0] {
+            b'@' => pos = 1,
+            b'P' | b'p' => return Err(IntervalParseError::Invalid),
+            _ => {}
+        }
+        let is_ws = |c: u8| c == b' ' || c == b'\t' || c == b'\n';
+        let mut found_any = false;
+        loop {
+            // standard_interval: skip spaces, then a number, "ago", or the end.
+            while pos < len && is_ws(buf[pos]) {
+                pos += 1;
+            }
+            if pos == len {
+                break;
+            }
+            let negative = match buf[pos] {
+                b'0'..=b'9' => false,
+                b'-' => {
+                    pos += 1;
+                    true
+                }
+                b'a' | b'A' => {
+                    // "ago" negates everything parsed so far.
+                    if len - pos < 3
+                        || !buf[pos + 1].eq_ignore_ascii_case(&b'g')
+                        || !buf[pos + 2].eq_ignore_ascii_case(&b'o')
+                    {
+                        return Err(IntervalParseError::Invalid);
+                    }
+                    if buf[pos + 3..].iter().any(|&c| !is_ws(c)) {
+                        return Err(IntervalParseError::Invalid);
+                    }
+                    if result.months == i32::MIN || result.days == i32::MIN || result.micros == i64::MIN {
+                        return Err(out_of_range("AGO interval value is out of range"));
+                    }
+                    result = Interval::new(-result.months, -result.days, -result.micros);
+                    break;
+                }
+                _ => return Err(IntervalParseError::Invalid),
+            };
+            // interval_parse_number
+            let start = pos;
+            while pos < len && buf[pos].is_ascii_digit() {
+                pos += 1;
+            }
+            if pos < len && buf[pos] == b':' {
+                // A time: parse the rest of the string as HH:MM[:SS[.ffffff]].
+                let (time, _) = super::Time::try_convert_interval(&buf[start..], false, None, negative)
+                    .ok_or(IntervalParseError::Invalid)?;
+                try_add(&mut result.micros, time.0, 1, 0.0)?;
+                found_any = true;
+                break;
+            }
+            if pos == start {
+                return Err(IntervalParseError::Invalid);
+            }
+            let digits = &s[start..pos];
+            let mut number: i64 = digits.parse().map_err(|_| {
+                IntervalParseError::Error(
+                    crate::ErrorKind::InvalidInput,
+                    format!("Could not convert string '{digits}' to INT64"),
+                )
+            })?;
+            let mut fraction = 0.0;
+            if pos < len && buf[pos] == b'.' {
+                pos += 1;
+                let frac_start = pos;
+                while pos < len && buf[pos].is_ascii_digit() {
+                    pos += 1;
+                }
+                if pos > frac_start {
+                    fraction = s[frac_start - 1..pos].parse().unwrap_or(0.0);
+                }
+            }
+            if negative {
+                number = -number;
+                fraction = -fraction;
+            }
+            // interval_parse_identifier
+            while pos < len && is_ws(buf[pos]) {
+                pos += 1;
+            }
+            let id_start = pos;
+            while pos < len && buf[pos].is_ascii_alphabetic() {
+                pos += 1;
+            }
+            let unit = &s[id_start..pos];
+            if unit.is_empty() && !found_any {
+                // A bare number is seconds.
+                try_add(&mut result.micros, number, MICROS_PER_SEC, 0.0)?;
+                try_add(&mut result.micros, 0, MICROS_PER_SEC, fraction)?;
+                if buf[pos..].iter().any(|&c| !is_ws(c)) {
+                    return Err(IntervalParseError::Invalid);
+                }
+                found_any = true;
+                break;
+            }
+            let Some(part) = DatePart::parse(unit) else {
+                return Err(IntervalParseError::Error(
+                    crate::ErrorKind::Conversion,
+                    format!("extract specifier \"{unit}\" not recognized"),
+                ));
+            };
+            let dpm = Self::DAYS_PER_MONTH;
+            match part {
+                DatePart::Millennium => try_add(&mut result.months, number, 12_000, fraction)?,
+                DatePart::Century => try_add(&mut result.months, number, 1200, fraction)?,
+                DatePart::Decade => try_add(&mut result.months, number, 120, fraction)?,
+                DatePart::Year => try_add(&mut result.months, number, 12, fraction)?,
+                DatePart::Quarter => {
+                    try_add(&mut result.months, number, 3, 0.0)?;
+                    let month = (fraction * 3.0) as i32;
+                    try_add(&mut result.months, i64::from(month), 1, 0.0)?;
+                    try_add(&mut result.days, 0, dpm, fraction * 3.0 - f64::from(month))?;
+                }
+                DatePart::Month => {
+                    try_add(&mut result.months, number, 1, 0.0)?;
+                    let day = (fraction * dpm as f64) as i32;
+                    try_add(&mut result.days, i64::from(day), 1, 0.0)?;
+                    try_add(
+                        &mut result.micros,
+                        0,
+                        MICROS_PER_DAY,
+                        fraction * dpm as f64 - f64::from(day),
+                    )?;
+                }
+                DatePart::Day => {
+                    try_add(&mut result.days, number, 1, 0.0)?;
+                    try_add(&mut result.micros, 0, MICROS_PER_DAY, fraction)?;
+                }
+                DatePart::Week => {
+                    try_add(&mut result.days, number, 7, 0.0)?;
+                    let day = (fraction * 7.0) as i32;
+                    try_add(&mut result.days, i64::from(day), 1, 0.0)?;
+                    try_add(&mut result.micros, 0, MICROS_PER_DAY, fraction * 7.0 - f64::from(day))?;
+                }
+                DatePart::Microseconds => try_add(&mut result.micros, number, 1, 0.0)?,
+                DatePart::Milliseconds => try_add(&mut result.micros, number, 1000, fraction)?,
+                DatePart::Second => try_add(&mut result.micros, number, MICROS_PER_SEC, fraction)?,
+                DatePart::Minute => try_add(&mut result.micros, number, MICROS_PER_MINUTE, fraction)?,
+                DatePart::Hour => try_add(&mut result.micros, number, MICROS_PER_HOUR, fraction)?,
+                _ => {
+                    return Err(IntervalParseError::Error(
+                        crate::ErrorKind::Conversion,
+                        format!("extract specifier \"{unit}\" not supported for interval"),
+                    ));
+                }
+            }
+            found_any = true;
+        }
+        if found_any {
+            Ok(result)
+        } else {
+            Err(IntervalParseError::Invalid)
+        }
+    }
+}
+
 impl std::fmt::Display for Interval {
     /// `IntervalToStringCast::Format`: `1 year 2 months 3 days 04:05:06.789`, or `00:00:00`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -145,6 +379,54 @@ mod tests {
         assert_eq!(Interval::new(13, 0, 0).to_string(), "1 year 1 month");
         assert_eq!(Interval::new(0, 0, hms(200, 0, 0, 0)).to_string(), "200:00:00");
         assert_eq!(Interval::new(-14, 0, 0).to_string(), "-1 year -2 months");
+    }
+
+    /// Expected values come from `SELECT INTERVAL '...'` in DuckDB.
+    #[test]
+    fn parsing_matches_duckdb() {
+        let p = |s: &str| Interval::parse(s).map(|i| i.to_string());
+        let cases = [
+            (
+                "1 year 2 months 3 days 04:05:06.789",
+                "1 year 2 months 3 days 04:05:06.789",
+            ),
+            ("2 hours 30 minutes", "02:30:00"),
+            ("1.5 years", "1 year 6 months"),
+            ("1.5 months", "1 month 15 days"),
+            ("1.25 days", "1 day 06:00:00"),
+            ("1.5 weeks", "10 days 12:00:00"),
+            ("1.5 quarters", "4 months 15 days"),
+            ("3 days ago", "-3 days"),
+            ("@ 1 day 2 hours", "1 day 02:00:00"),
+            ("-1 day 1 hour", "-1 day 01:00:00"),
+            ("90", "00:01:30"),
+            ("1.5", "00:00:01.5"),
+            ("-01:30", "-01:30:00"),
+            ("10:00:00", "10:00:00"),
+            ("1 century", "100 years"),
+            ("500 ms", "00:00:00.5"),
+            ("7 us", "00:00:00.000007"),
+            ("2 YEARS 1 Mon", "2 years 1 month"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(p(input).unwrap(), expected, "{input}");
+        }
+        assert_eq!(Interval::parse(""), Err(IntervalParseError::Invalid));
+        assert_eq!(Interval::parse("hello"), Err(IntervalParseError::Invalid));
+        assert_eq!(Interval::parse("P1D"), Err(IntervalParseError::Invalid));
+        assert_eq!(Interval::parse("3 days agox"), Err(IntervalParseError::Invalid));
+        assert!(matches!(
+            Interval::parse("1 fortnight"),
+            Err(IntervalParseError::Error(_, m)) if m == "extract specifier \"fortnight\" not recognized"
+        ));
+        assert!(matches!(
+            Interval::parse("1 dow"),
+            Err(IntervalParseError::Error(_, m)) if m == "extract specifier \"dow\" not supported for interval"
+        ));
+        assert!(matches!(
+            Interval::parse("3000000000 days"),
+            Err(IntervalParseError::Error(crate::ErrorKind::InvalidInput, _))
+        ));
     }
 
     #[test]

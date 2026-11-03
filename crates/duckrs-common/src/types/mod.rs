@@ -2,6 +2,7 @@
 // @ rust-port-baseline
 
 mod date;
+mod date_part;
 mod identifier;
 mod interval;
 mod native;
@@ -11,8 +12,9 @@ mod timestamp;
 mod uuid;
 
 pub use date::{Date, DateCastError, ParsedDate};
+pub use date_part::DatePart;
 pub use identifier::sql_identifier;
-pub use interval::Interval;
+pub use interval::{Interval, IntervalParseError};
 pub use native::{ListEntry, NativeType};
 pub use string_t::{StringHeap, StringT};
 pub use time::{
@@ -445,6 +447,12 @@ impl LogicalType {
             id: self.id,
             info: Some(Arc::new(info)),
         }
+    }
+
+    /// The same parameters under another id (e.g. a STRUCT's children as a TUPLE).
+    pub(crate) fn with_id(mut self, id: LogicalTypeId) -> Self {
+        self.id = id;
+        self
     }
 
     pub fn id(&self) -> LogicalTypeId {
