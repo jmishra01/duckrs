@@ -202,7 +202,7 @@ fn main() {
     let mut missing: Vec<_> = stats.not_ported_by_kind.iter().collect();
     missing.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
     println!("not yet ported:");
-    for (message, count) in missing.iter().take(12) {
+    for (message, count) in missing.iter().take(40) {
         println!("  {count:>6}  {message}");
     }
     // Group failures by their first word to show which statement kinds are missing.

@@ -176,8 +176,8 @@ fn transformer_errors_match_duckdb() {
         ),
         ("SELECT #0", "Parser Error: Positional reference node needs to be >= 1"),
         (
-            "CREATE VIEW v AS SELECT 1",
-            "Not implemented Error: the transformer for CreateViewStmt",
+            "ALTER TABLE t ADD COLUMN c INTEGER",
+            "Not implemented Error: the transformer for AlterStatement",
         ),
     ];
     for (sql, expected) in cases {
@@ -307,6 +307,118 @@ fn statement_errors_match_duckdb() {
         ),
     ];
     for (sql, expected) in cases {
+        let err = error(sql);
+        assert!(err.starts_with(expected), "{sql}: {err}");
+    }
+}
+
+#[test]
+fn renders_create_and_session_statements_like_duckdb() {
+    let cases = [
+        (
+            "CREATE VIEW v (a, b) AS SELECT 1, 2",
+            "CREATE VIEW v (a, b) AS SELECT 1, 2;",
+        ),
+        (
+            "CREATE OR REPLACE TEMP VIEW s.v WITH (defer_binding = true) AS SELECT 1",
+            "CREATE OR REPLACE TEMP VIEW s.v WITH (DEFER_BINDING) AS SELECT 1;",
+        ),
+        (
+            "CREATE RECURSIVE VIEW nums (n) AS SELECT 1 UNION ALL SELECT n + 1 FROM nums WHERE n < 5",
+            "CREATE VIEW nums (n) AS WITH RECURSIVE nums (n) AS ((SELECT 1) UNION ALL (SELECT (n + 1) FROM nums \
+             WHERE (n < 5))) SELECT n FROM nums;",
+        ),
+        ("CREATE SCHEMA IF NOT EXISTS db.s", "CREATE SCHEMA IF NOT EXISTS db.s;"),
+        (
+            "CREATE SEQUENCE seq INCREMENT BY -1 MINVALUE -10 CYCLE",
+            "CREATE SEQUENCE seq INCREMENT BY -1 MINVALUE -10 MAXVALUE -1 START -1 CYCLE;",
+        ),
+        (
+            "CREATE UNIQUE INDEX idx ON s.t (a, (b + 1)) WITH (x = 1)",
+            "CREATE UNIQUE INDEX idx ON s.t(a, ((b + 1))) WITH (x = 1 );",
+        ),
+        (
+            "CREATE INDEX i ON t USING HNSW (v)",
+            "CREATE INDEX i ON t USING HNSW (v);",
+        ),
+        (
+            "CREATE MACRO add(a, b := 1) AS a + b, (a INTEGER) AS a",
+            "CREATE MACRO \"add\" (a, b := 1) AS ((a + b)), (a INTEGER) AS (a);",
+        ),
+        (
+            "CREATE FUNCTION f(x) RETURNS INTEGER AS x * 2",
+            "CREATE MACRO f (x) RETURNS INTEGER AS ((x * 2));",
+        ),
+        (
+            "CREATE MACRO tm(n) AS TABLE SELECT * FROM range(n)",
+            "CREATE MACRO tm (n) AS TABLE (SELECT * FROM \"range\"(n));",
+        ),
+        (
+            "CREATE TYPE mood AS ENUM ('sad', 'happy')",
+            "CREATE TYPE mood AS ENUM ( 'sad', 'happy' );",
+        ),
+        (
+            "CREATE TYPE t2 AS STRUCT(a INT)",
+            "CREATE TYPE t2 AS STRUCT(a INTEGER);",
+        ),
+        ("USE db.s", "SET  schema TO 'db.s';"),
+        ("PREPARE p AS SELECT ?", "PREPARE p AS SELECT $1"),
+        ("EXECUTE p(1, 'x')", "EXECUTE p(\"1\" := 1, \"2\" := 'x');"),
+        ("DEALLOCATE p", "DEALLOCATE PREPARE p;"),
+        ("DETACH IF EXISTS db", "DETACH DATABASE IF EXISTS db;"),
+        (
+            "WITH ins AS (INSERT INTO t VALUES (1) RETURNING *) SELECT * FROM ins",
+            "WITH ins AS (INSERT INTO t (VALUES (1)) RETURNING *) SELECT * FROM ins",
+        ),
+        ("EXPLAIN (ANALYSE) SELECT 1", "EXPLAIN (ANALYZE) SELECT 1"),
+    ];
+    for (sql, expected) in cases {
+        assert_eq!(render(sql), expected, "{sql}");
+    }
+    let errors = [
+        (
+            "CREATE RECURSIVE VIEW v AS SELECT 1",
+            "Parser Error: CREATE RECURSIVE VIEW requires a column list",
+        ),
+        (
+            "CREATE SEQUENCE s INCREMENT 0",
+            "Parser Error: Increment must not be zero",
+        ),
+        (
+            "CREATE SEQUENCE s START 1 START 2",
+            "Parser Error: Start should be passed at most once",
+        ),
+        (
+            "CREATE SEQUENCE s MINVALUE 5 MAXVALUE 1",
+            "Parser Error: MINVALUE (5) must be less than MAXVALUE (1)",
+        ),
+        (
+            "CREATE INDEX ON t (a)",
+            "Not implemented Error: Please provide an index name",
+        ),
+        (
+            "CREATE TEMP INDEX i ON t (a)",
+            "Parser Error: Temporary indexes are not supported",
+        ),
+        (
+            "CREATE MACRO m(a := 1, b) AS a",
+            "Parser Error: Parameter without a default follows",
+        ),
+        (
+            "CREATE MACRO m(a, a) AS a",
+            "Parser Error: Duplicate parameter a in macro definition",
+        ),
+        (
+            "PREPARE p AS DROP TABLE t",
+            "Parser Error: DROP_STATEMENT is not a preparable statement",
+        ),
+        ("EXECUTE p(a)", "Invalid Input Error: Only scalar parameters"),
+        (
+            "WITH RECURSIVE x AS (DELETE FROM t) SELECT 1",
+            "Parser Error: Recursive CTEs with DML statements are not supported",
+        ),
+    ];
+    for (sql, expected) in errors {
         let err = error(sql);
         assert!(err.starts_with(expected), "{sql}: {err}");
     }

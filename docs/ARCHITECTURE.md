@@ -71,7 +71,8 @@ VALUES lists gain a subquery level, GROUPING SETS renumber, `UNNEST` is lowercas
 VARIABLE prints its name unquoted (so `"my var"` does not read back). The corpus
 tool therefore checks that every rendering parses again and reports identical renderings
 separately. Known deviation: STAR EXCLUDE/REPLACE/RENAME lists keep input order, where C++
-uses unordered sets, and CREATE TABLE WITH options keep input order. Statement transformers
+uses unordered sets, and WITH options and EXECUTE parameters keep input order. Arrays of
+ENUM types in CREATE TYPE are not supported yet. Statement transformers
 live in `transformer/statements.rs`; statements not yet ported return `Not implemented Error`.
 
 ## Testing

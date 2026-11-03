@@ -2163,10 +2163,24 @@ impl<'g> Transformer<'g> {
                 None => CteMaterialize::Default,
             };
             let body = self.alt(self.req(entry, "CTEBody")?)?;
-            if self.name(body) == "CTEDMLBody" {
-                return Err(not_implemented("DML statements in CTEs are not yet supported"));
-            }
-            let mut query = self.select_internal(self.req(body, "SelectStatementInternal")?)?.node;
+            let mut query = if self.name(body) == "CTEDMLBody" {
+                let kind = match self.statement(self.req(body, "Statement")?)? {
+                    Statement::Insert(s) => QueryNodeKind::Insert(s),
+                    Statement::Update(s) => QueryNodeKind::Update(s),
+                    Statement::Delete(s) => QueryNodeKind::Delete(s),
+                    _ => {
+                        return Err(parser_error(
+                            "A CTE body must be a SELECT, INSERT, UPDATE, DELETE, or COPY TO statement",
+                        ));
+                    }
+                };
+                if recursive {
+                    return Err(parser_error("Recursive CTEs with DML statements are not supported"));
+                }
+                kind.into()
+            } else {
+                self.select_internal(self.req(body, "SelectStatementInternal")?)?.node
+            };
             if recursive {
                 query = to_recursive_cte(query, &name, &aliases, &key_targets)?;
             }
@@ -2681,17 +2695,6 @@ impl<'g> Transformer<'g> {
                 seed: None,
                 repeatable: false,
             })
-        }
-    }
-}
-
-impl QualifiedName {
-    /// A name from its components, the last being the name itself.
-    pub fn from_parts(mut parts: Vec<String>) -> Self {
-        let name = parts.pop().unwrap_or_default();
-        Self {
-            qualification: parts,
-            name,
         }
     }
 }

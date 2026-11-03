@@ -5,7 +5,7 @@
 //
 //! Statement transformers other than SELECT.
 
-use super::{Transformer, not_implemented, parser_error, visit_expr_mut};
+use super::{Transformer, not_implemented, parser_error, to_recursive_cte, visit_expr_mut};
 use crate::ast::*;
 use crate::matcher::ParseNode;
 use duckrs_common::{Error, ErrorKind, Result};
@@ -94,6 +94,44 @@ impl Transformer<'_> {
             "ResetStatement" => self.reset(self.alt(self.req(node, "ResetTarget")?)?),
             "PragmaStatement" => self.pragma(self.alt(self.req(node, "PragmaAssignOrFunction")?)?),
             "ExplainStatement" => self.explain(node),
+            "UseStatement" => self.use_statement(self.alt(self.req(node, "UseTarget")?)?),
+            "PrepareStatement" => {
+                if self.sub(node, "TypeList").is_some() {
+                    return Err(not_implemented(
+                        "TypeList for prepared statement has not been implemented.",
+                    ));
+                }
+                let name = Self::text(self.req(node, "ColIdOrString")?);
+                let statement = self.statement(self.req(node, "Statement")?)?;
+                let kind = match &statement {
+                    Statement::Select(_) | Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => None,
+                    Statement::Explain { .. } => Some("EXPLAIN_STATEMENT"),
+                    Statement::CreateTable(_) | Statement::Create(_) => Some("CREATE_STATEMENT"),
+                    Statement::Drop(_) | Statement::Deallocate(_) => Some("DROP_STATEMENT"),
+                    Statement::Transaction { .. } => Some("TRANSACTION_STATEMENT"),
+                    Statement::Call(_) => Some("CALL_STATEMENT"),
+                    Statement::SetVariable { .. } | Statement::ResetVariable { .. } => Some("SET_STATEMENT"),
+                    Statement::Pragma(_) => Some("PRAGMA_STATEMENT"),
+                    Statement::Prepare { .. } => Some("PREPARE_STATEMENT"),
+                    Statement::Execute { .. } => Some("EXECUTE_STATEMENT"),
+                    Statement::Detach { .. } => Some("DETACH_STATEMENT"),
+                };
+                if let Some(kind) = kind {
+                    return Err(parser_error(format!("{kind} is not a preparable statement")));
+                }
+                self.param_count = 0;
+                self.named_params.clear();
+                Ok(Statement::Prepare {
+                    name,
+                    statement: Box::new(statement),
+                })
+            }
+            "ExecuteStatement" => self.execute(node),
+            "DeallocateStatement" => Ok(Statement::Deallocate(Self::text(self.req(node, "ColIdOrString")?))),
+            "DetachStatement" => Ok(Statement::Detach {
+                name: Self::text(self.req(node, "CatalogName")?),
+                if_exists: self.sub(node, "IfExists").is_some(),
+            }),
             other => Err(not_implemented(format!(
                 "the transformer for {other} is not yet ported"
             ))),
@@ -335,28 +373,474 @@ impl Transformer<'_> {
 
     fn create(&mut self, node: &ParseNode) -> Result<Statement> {
         let variation = self.alt(self.req(node, "CreateStatementVariation")?)?;
-        if self.name(variation) != "CreateTableStmt" {
+        if matches!(self.name(variation), "CreateSecretStmt" | "CreateTriggerStmt") {
             return Err(not_implemented(format!(
                 "the transformer for {} is not yet ported",
                 self.name(variation)
             )));
         }
-        let mut info = self.create_table(variation)?;
-        if self.sub(node, "OrReplace").is_some() {
-            if info.on_conflict == OnCreateConflict::Ignore {
-                return Err(parser_error(
-                    "Cannot specify both OR REPLACE and IF NOT EXISTS within single create statement",
-                ));
-            }
-            info.on_conflict = OnCreateConflict::Replace;
-        }
-        if let Some(temporary) = self.sub(node, "Temporary") {
-            if self.name(self.alt(temporary)?) == "Persistent" {
+        let or_replace = self.sub(node, "OrReplace").is_some();
+        let temporary = match self.sub(node, "Temporary") {
+            Some(t) if self.name(self.alt(t)?) == "Persistent" => {
                 return Err(parser_error("PERSISTENT is only supported for CREATE SECRET"));
             }
-            info.temporary = true;
+            Some(_) => true,
+            None => false,
+        };
+        let apply = |on_conflict: &mut OnCreateConflict| -> Result<()> {
+            if or_replace {
+                if *on_conflict == OnCreateConflict::Ignore {
+                    return Err(parser_error(
+                        "Cannot specify both OR REPLACE and IF NOT EXISTS within single create statement",
+                    ));
+                }
+                *on_conflict = OnCreateConflict::Replace;
+            }
+            Ok(())
+        };
+        if self.name(variation) == "CreateTableStmt" {
+            let mut info = self.create_table(variation)?;
+            apply(&mut info.on_conflict)?;
+            info.temporary = temporary;
+            return Ok(Statement::CreateTable(Box::new(info)));
         }
-        Ok(Statement::CreateTable(Box::new(info)))
+        let kind = match self.name(variation) {
+            "CreateViewStmt" => self.create_view(variation)?,
+            "CreateSchemaStmt" => self.create_schema(variation)?,
+            "CreateSequenceStmt" => self.create_sequence(variation)?,
+            "CreateIndexStmt" => {
+                if temporary {
+                    return Err(parser_error("Temporary indexes are not supported"));
+                }
+                self.create_index(variation)?
+            }
+            "CreateMacroStmt" => self.create_macro(variation)?,
+            "CreateTypeStmt" => self.create_type(variation)?,
+            other => {
+                return Err(not_implemented(format!(
+                    "the transformer for {other} is not yet ported"
+                )));
+            }
+        };
+        let name = match &kind {
+            CreateKind::Index { .. } => self.index_name(variation)?,
+            _ => self.qualified_name(self.req(variation, "QualifiedName")?)?,
+        };
+        let mut info = CreateInfo {
+            name,
+            on_conflict: if self.sub(variation, "IfNotExists").is_some() {
+                OnCreateConflict::Ignore
+            } else {
+                OnCreateConflict::Error
+            },
+            temporary,
+            kind,
+        };
+        apply(&mut info.on_conflict)?;
+        if let CreateKind::View { aliases, query, .. } = &mut info.kind
+            && self.sub(variation, "CreateRecursive").is_some()
+        {
+            let node = std::mem::replace(&mut query.node, SelectNode::default().into());
+            **query = recursive_view(&info.name, aliases, node)?;
+        }
+        Ok(Statement::Create(Box::new(info)))
+    }
+
+    /// `QualifiedName <- CatalogReservedSchemaIdentifier / SchemaReservedIdentifierOrStringLiteral / ...`.
+    fn qualified_name(&self, node: &ParseNode) -> Result<QualifiedName> {
+        Ok(QualifiedName::from_parts(self.rule_texts(self.alt(node)?)))
+    }
+
+    /// An index lives in the schema of its table.
+    fn index_name(&self, node: &ParseNode) -> Result<QualifiedName> {
+        let Some(name) = self.sub(node, "IndexName") else {
+            return Err(not_implemented(
+                "Please provide an index name, e.g., CREATE INDEX my_name ...",
+            ));
+        };
+        let table = self.table_name(self.req(node, "BaseTableName")?)?;
+        Ok(QualifiedName {
+            qualification: table.qualification,
+            name: Self::text(name),
+        })
+    }
+
+    fn create_view(&mut self, node: &ParseNode) -> Result<CreateKind> {
+        let recursive = self.sub(node, "CreateRecursive").is_some();
+        let aliases = match self.sub(node, "InsertColumnList") {
+            Some(list) => self.texts(self.req(list, "ColumnList")?, "ColId"),
+            None => Vec::new(),
+        };
+        if recursive && aliases.is_empty() {
+            return Err(parser_error("CREATE RECURSIVE VIEW requires a column list"));
+        }
+        let mut defer_binding = false;
+        if let Some(with) = self.sub(node, "WithList") {
+            for (name, value) in self.with_list(with)? {
+                if !name.eq_ignore_ascii_case("defer_binding") {
+                    return Err(parser_error(
+                        "Only DEFER_BINDING is currently supported as option for CREATE VIEW",
+                    ));
+                }
+                let ExprKind::Constant(literal) = value.kind else {
+                    return Err(invalid_input("Defer binding option must be a constant value"));
+                };
+                match literal.kind {
+                    LiteralKind::Null => defer_binding = true,
+                    LiteralKind::Boolean => defer_binding |= literal.text == "true",
+                    _ => return Err(invalid_input("Defer binding option must be a boolean")),
+                }
+            }
+        }
+        let query = self.select_internal(self.req(node, "SelectStatementInternal")?)?;
+        Ok(CreateKind::View {
+            secure: self.sub(node, "CreateSecure").is_some(),
+            aliases,
+            defer_binding,
+            query: Box::new(query),
+        })
+    }
+
+    fn create_schema(&mut self, node: &ParseNode) -> Result<CreateKind> {
+        let options = match self.sub(node, "WithOptionList") {
+            Some(with) => self.rel_options(self.req(with, "RelOptionList")?)?,
+            None => Vec::new(),
+        };
+        Ok(CreateKind::Schema { options })
+    }
+
+    /// A constant sequence option value; a negated constant is folded.
+    fn sequence_value(&mut self, node: &ParseNode, option: &str, integer: bool) -> Result<Literal> {
+        let mut expr = self.expr(self.req(node, "Expression")?)?;
+        if let ExprKind::Function(f) = &expr.kind
+            && integer
+        {
+            if f.name.name != "-" {
+                return Err(invalid_input(&format!(
+                    "Expected a minus function instead of {}",
+                    f.name.name
+                )));
+            }
+            match f.args.first().map(|a| &a.expr.kind) {
+                Some(ExprKind::Constant(literal)) if literal.is_numeric() => {
+                    expr = Expr::constant(literal.negate());
+                }
+                _ => return Err(invalid_input("Expected constant expression as child of minus function")),
+            }
+        }
+        let ExprKind::Constant(literal) = expr.kind else {
+            return Err(parser_error("Expected constant expression."));
+        };
+        if literal.kind != LiteralKind::Null && literal.kind != LiteralKind::Integer {
+            return Err(parser_error(format!(
+                "Expected an integer argument for {option}, got {literal}"
+            )));
+        }
+        Ok(literal)
+    }
+
+    fn create_sequence(&mut self, node: &ParseNode) -> Result<CreateKind> {
+        let mut options: Vec<(&'static str, Literal)> = Vec::new();
+        for option in self.subs(node, "SequenceOption") {
+            let option = self.alt(option)?;
+            let min_or_max = |s: &Self, n: &ParseNode| -> Result<&'static str> {
+                Ok(if s.name(s.alt(s.req(n, "SeqMinOrMax")?)?) == "MinValue" {
+                    "minvalue"
+                } else {
+                    "maxvalue"
+                })
+            };
+            let entry = match self.name(option) {
+                "SeqSetCycle" => ("cycle", Literal::boolean(self.name(self.alt(option)?) == "SeqCycle")),
+                "SeqSetIncrement" => ("increment", self.sequence_value(option, "INCREMENT", true)?),
+                "SeqSetMinMax" => {
+                    let which = min_or_max(self, option)?;
+                    let label = if which == "minvalue" { "MINVALUE" } else { "MAXVALUE" };
+                    (which, self.sequence_value(option, label, true)?)
+                }
+                "SeqNoMinMax" => {
+                    let which = min_or_max(self, option)?;
+                    (
+                        if which == "minvalue" {
+                            "nominvalue"
+                        } else {
+                            "nomaxvalue"
+                        },
+                        Literal::boolean(true),
+                    )
+                }
+                "SeqStartWith" => ("start", self.sequence_value(option, "START", false)?),
+                _ => ("owned", Literal::null()),
+            };
+            if options.iter().any(|(n, _)| *n == entry.0) {
+                let mut name = entry.0.to_string();
+                name[..1].make_ascii_uppercase();
+                return Err(parser_error(format!("{name} should be passed at most once")));
+            }
+            options.push(entry);
+        }
+        let no_min = options.iter().any(|(n, _)| *n == "nominvalue");
+        let no_max = options.iter().any(|(n, _)| *n == "nomaxvalue");
+        if no_min && options.iter().any(|(n, _)| *n == "minvalue") {
+            return Err(parser_error("Minvalue should be passed at most once"));
+        }
+        if no_max && options.iter().any(|(n, _)| *n == "maxvalue") {
+            return Err(parser_error("Maxvalue should be passed at most once"));
+        }
+        let int = |literal: &Literal, what: &str| -> Result<i64> {
+            if literal.kind == LiteralKind::Null {
+                return Err(parser_error(format!("{what} must not be NULL")));
+            }
+            literal
+                .try_get_i64()
+                .ok_or_else(|| Error::new(ErrorKind::Conversion, format!("Could not convert {literal} to INT64")))
+        };
+        let (mut increment, mut min_value, mut max_value) = (1i64, 1i64, i64::MAX);
+        let (mut start_value, mut cycle) = (None, false);
+        let (mut min_set, mut max_set) = (false, false);
+        for (name, literal) in &options {
+            match *name {
+                "increment" => {
+                    increment = int(literal, "INCREMENT")?;
+                    if increment == 0 {
+                        return Err(parser_error("Increment must not be zero"));
+                    }
+                    if increment < 0 {
+                        if !min_set {
+                            min_value = i64::MIN;
+                        }
+                        if !max_set {
+                            max_value = -1;
+                        }
+                    } else {
+                        if !max_set {
+                            max_value = i64::MAX;
+                        }
+                        if !min_set {
+                            min_value = 1;
+                        }
+                    }
+                }
+                "minvalue" => {
+                    min_value = int(literal, "MINVALUE")?;
+                    min_set = true;
+                }
+                "maxvalue" => {
+                    max_value = int(literal, "MAXVALUE")?;
+                    max_set = true;
+                }
+                "start" => start_value = Some(int(literal, "START value")?),
+                "cycle" => cycle = literal.text == "true",
+                "nominvalue" | "nomaxvalue" => {}
+                other => {
+                    return Err(parser_error(format!(
+                        "Unrecognized option \"{other}\" for CREATE SEQUENCE"
+                    )));
+                }
+            }
+        }
+        let start_value = start_value.unwrap_or(if increment < 0 { max_value } else { min_value });
+        if max_value <= min_value {
+            return Err(parser_error(format!(
+                "MINVALUE ({min_value}) must be less than MAXVALUE ({max_value})"
+            )));
+        }
+        if start_value < min_value {
+            return Err(parser_error(format!(
+                "START value ({start_value}) cannot be less than MINVALUE ({min_value})"
+            )));
+        }
+        if start_value > max_value {
+            return Err(parser_error(format!(
+                "START value ({start_value}) cannot be greater than MAXVALUE ({max_value})"
+            )));
+        }
+        Ok(CreateKind::Sequence {
+            increment,
+            min_value,
+            max_value,
+            start_value,
+            cycle,
+        })
+    }
+
+    fn create_index(&mut self, node: &ParseNode) -> Result<CreateKind> {
+        let table = self.table_name(self.req(node, "BaseTableName")?)?.name;
+        let index_type = self
+            .sub(node, "IndexType")
+            .map(|t| Self::text(self.req(t, "Identifier").unwrap_or(t)));
+        let mut expressions = Vec::new();
+        for element in self.subs(node, "IndexElement") {
+            let mut expr = self.expr(self.req(element, "Expression")?)?;
+            if index_type.is_none()
+                && let ExprKind::ColumnRef(names) = &mut expr.kind
+                && names.len() == 1
+            {
+                names.insert(0, table.clone());
+            }
+            if matches!(expr.kind, ExprKind::Collate { .. }) {
+                return Err(not_implemented("Index with collation not supported yet!"));
+            }
+            expressions.push(expr);
+        }
+        if self.sub(node, "WhereClause").is_some() {
+            return Err(not_implemented("Creating partial indexes is not supported currently"));
+        }
+        let mut options = Vec::new();
+        if let Some(with) = self.sub(node, "WithList") {
+            for (name, value) in self.with_list(with)? {
+                let ExprKind::Constant(literal) = value.kind else {
+                    return Err(invalid_input("Create index option must be a constant value"));
+                };
+                options.push((name, literal));
+            }
+        }
+        Ok(CreateKind::Index {
+            table,
+            unique: self.sub(node, "UniqueIndex").is_some(),
+            index_type: index_type.unwrap_or_else(|| "ART".into()),
+            expressions,
+            options,
+        })
+    }
+
+    fn create_macro(&mut self, node: &ParseNode) -> Result<CreateKind> {
+        let mut macros = Vec::new();
+        for definition in self.subs(node, "MacroDefinition") {
+            let body_node = self.alt(self.req(definition, "MacroDefinitionBody")?)?;
+            let body = if self.name(body_node) == "TableMacroDefinition" {
+                let query = self.select_internal(self.req(body_node, "SelectStatementInternal")?)?;
+                MacroBody::Table(Box::new(query.node))
+            } else {
+                MacroBody::Scalar(Box::new(self.expr(self.req(body_node, "Expression")?)?))
+            };
+            let return_type = match self.sub(definition, "ReturnsType") {
+                Some(r) => {
+                    if matches!(body, MacroBody::Table(_)) {
+                        return Err(parser_error("RETURNS types are not supported for table macros"));
+                    }
+                    Some(self.type_(self.req(r, "Type")?)?)
+                }
+                None => None,
+            };
+            let mut parameters: Vec<MacroParameter> = Vec::new();
+            if let Some(list) = self.sub(definition, "MacroParameters") {
+                for parameter in self.subs(list, "MacroParameter") {
+                    let parameter = self.alt(parameter)?;
+                    let name = Self::text(self.req(parameter, "TypeFuncName")?);
+                    if parameters.iter().any(|p| p.name.eq_ignore_ascii_case(&name)) {
+                        return Err(parser_error(format!("Duplicate parameter {name} in macro definition")));
+                    }
+                    let parameter_type = match self.sub(parameter, "Type") {
+                        Some(t) => Some(self.type_(t)?),
+                        None => None,
+                    };
+                    let default = match self.sub(parameter, "Expression") {
+                        Some(e) => Some(self.expr(e)?.with_alias(name.clone())),
+                        None => {
+                            if parameters.iter().any(|p| p.default.is_some()) {
+                                return Err(parser_error(
+                                    "Parameter without a default follows parameter with a default",
+                                ));
+                            }
+                            None
+                        }
+                    };
+                    parameters.push(MacroParameter {
+                        name,
+                        parameter_type,
+                        default,
+                    });
+                }
+            }
+            macros.push(MacroFunction {
+                parameters,
+                return_type,
+                body,
+            });
+        }
+        let table_macro = matches!(macros[0].body, MacroBody::Table(_));
+        if macros
+            .iter()
+            .any(|m| matches!(m.body, MacroBody::Table(_)) != table_macro)
+        {
+            return Err(parser_error("Cannot mix table and scalar macro function definitions"));
+        }
+        Ok(CreateKind::Macro { table_macro, macros })
+    }
+
+    fn create_type(&mut self, node: &ParseNode) -> Result<CreateKind> {
+        let ty = self.alt(self.req(node, "CreateType")?)?;
+        Ok(CreateKind::Type(match self.name(ty) {
+            "EnumSelectType" => CreateTypeKind::EnumQuery(Box::new(
+                self.select_internal(self.req(ty, "SelectStatementInternal")?)?,
+            )),
+            "EnumStringLiteralList" => {
+                if self.sub(ty, "ArrayBounds").is_some() {
+                    return Err(not_implemented(
+                        "arrays of ENUM types in CREATE TYPE are not yet supported",
+                    ));
+                }
+                CreateTypeKind::Enum(self.texts(ty, "StringLiteral"))
+            }
+            _ => CreateTypeKind::Alias(self.type_(self.req(ty, "Type")?)?),
+        }))
+    }
+
+    /// USE becomes `SET schema`.
+    fn use_statement(&self, node: &ParseNode) -> Result<Statement> {
+        let value = if self.name(node) == "UseTargetCatalogSchema" {
+            if self.sub(node, "DotIdentifier").is_some() {
+                return Err(parser_error("Expected \"USE database\" or \"USE database.schema\""));
+            }
+            format!(
+                "{}.{}",
+                sql_identifier(&Self::text(self.req(node, "CatalogName")?)),
+                sql_identifier(&Self::text(self.req(node, "ReservedSchemaName")?))
+            )
+        } else {
+            sql_identifier(&Self::text(node))
+        };
+        Ok(Statement::SetVariable {
+            name: "schema".into(),
+            value: Box::new(Expr::constant(Literal::string(value))),
+            scope: SetScope::Automatic,
+        })
+    }
+
+    fn execute(&mut self, node: &ParseNode) -> Result<Statement> {
+        let name = Self::text(self.req(node, "ColIdOrString")?);
+        let mut values: Vec<(String, Expr)> = Vec::new();
+        let mut positional = 0;
+        if let Some(args) = self.sub(node, "TableFunctionArguments") {
+            for (i, arg) in self.subs(args, "FunctionArgument").into_iter().enumerate() {
+                let arg = self.function_argument(arg)?;
+                if !is_scalar(&arg.expr) {
+                    return Err(invalid_input(
+                        "Only scalar parameters, named parameters or NULL supported for EXECUTE",
+                    ));
+                }
+                let mixing =
+                    || not_implemented("Mixing named parameters and positional parameters is not supported yet");
+                let key = if arg.name.is_empty() {
+                    if positional != i {
+                        return Err(mixing());
+                    }
+                    positional += 1;
+                    positional.to_string()
+                } else {
+                    if positional != 0 {
+                        return Err(mixing());
+                    }
+                    arg.name
+                };
+                let mut expr = arg.expr;
+                expr.alias.clear();
+                values.retain(|(k, _)| !k.eq_ignore_ascii_case(&key));
+                values.push((key, expr));
+            }
+        }
+        Ok(Statement::Execute { name, values })
     }
 
     fn create_table(&mut self, node: &ParseNode) -> Result<CreateTableInfo> {
@@ -475,6 +959,11 @@ impl Transformer<'_> {
         if self.name(options) == "Oids" {
             return Err(not_implemented("OIDS for index are not yet implemented."));
         }
+        self.rel_options(options)
+    }
+
+    /// `RelOptionList <- Parens(List(RelOption))`.
+    fn rel_options(&mut self, options: &ParseNode) -> Result<Vec<(String, Expr)>> {
         let mut result: Vec<(String, Expr)> = Vec::new();
         for option in self.subs(options, "RelOption") {
             let name_node = self.alt(self.req(option, "RelOptionName")?)?;
@@ -1041,7 +1530,12 @@ impl Transformer<'_> {
         let mut sql = false;
         if let Some(list) = self.sub(node, "ExplainOptionList") {
             for option in self.subs(list, "ExplainOption") {
-                let name = Self::text(self.req(option, "ExplainOptionName")?).to_lowercase();
+                let name_node = self.req(option, "ExplainOptionName")?;
+                let name = if self.sub(name_node, "AnalyzeKeyword").is_some() {
+                    "analyze".to_string()
+                } else {
+                    Self::text(name_node).to_lowercase()
+                };
                 let value = self.opt_expr(option, "Expression")?;
                 match name.as_str() {
                     "format" => {
@@ -1089,6 +1583,45 @@ impl Transformer<'_> {
             format: format.unwrap_or_else(|| "default".into()),
         })
     }
+}
+
+/// `ParsedExpression::IsScalar`: no column, positional or DEFAULT references and no subqueries.
+fn is_scalar(expr: &Expr) -> bool {
+    let mut scalar = true;
+    visit_expr_mut(&mut expr.clone(), &mut |e| {
+        scalar &= !matches!(
+            e.kind,
+            ExprKind::ColumnRef(_) | ExprKind::Positional(_) | ExprKind::Default | ExprKind::Subquery { .. }
+        );
+    });
+    scalar
+}
+
+/// `ConvertToRecursiveView`: the query becomes a recursive CTE named after the view, selected from.
+fn recursive_view(name: &QualifiedName, aliases: &[String], node: QueryNode) -> Result<SelectStatement> {
+    let query = to_recursive_cte(node, &name.name, aliases, &[])?;
+    let mut cte_map = CteMap::default();
+    cte_map.0.push((
+        name.name.clone(),
+        CteInfo {
+            aliases: aliases.to_vec(),
+            query: Box::new(query),
+            key_targets: Vec::new(),
+            materialized: CteMaterialize::Default,
+        },
+    ));
+    let select = SelectNode {
+        select_list: aliases.iter().map(|a| Expr::column(vec![a.clone()])).collect(),
+        from_table: TableRefKind::BaseTable {
+            name: name.clone(),
+            at_clause: None,
+        }
+        .into(),
+        ..SelectNode::default()
+    };
+    let mut node: QueryNode = select.into();
+    node.cte_map = cte_map;
+    Ok(SelectStatement { node })
 }
 
 /// DROP takes one object at a time.

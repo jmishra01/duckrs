@@ -30,9 +30,10 @@ An analytical SQL database engine: a port of [DuckDB](https://github.com/duckdb/
   below 99.9%. The transformer turns parse trees into the AST in `ast.rs`, which renders SQL
   exactly like DuckDB's `ToString`. It covers SELECT (every expression form, CTEs, set
   operations, joins, windows, grouping sets, samples), INSERT/UPDATE/DELETE/TRUNCATE, CREATE
-  TABLE (constraints, generated columns, CTAS), DROP, transactions, CHECKPOINT, CALL, SET/RESET,
-  PRAGMA and EXPLAIN: 87k corpus statements, all of whose renderings parse again (CI gate).
-  Next: the remaining statements (ALTER, CREATE VIEW/MACRO/INDEX/SEQUENCE/SCHEMA, PREPARE, ...).
+  TABLE (constraints, generated columns, CTAS), CREATE VIEW/SCHEMA/SEQUENCE/INDEX/MACRO/TYPE,
+  DROP, transactions, CHECKPOINT, CALL, SET/RESET/USE, PRAGMA, EXPLAIN, PREPARE/EXECUTE/DEALLOCATE,
+  DETACH and DML in CTEs: 92k corpus statements, all of whose renderings parse again (CI gate).
+  Next: ALTER, MATCH_RECOGNIZE, triggers, DESCRIBE, ATTACH, PIVOT, MERGE, COPY and the rest.
 - `crates/duckrs`: the public API surface (`Database`, `Connection`). Every query returns
   `Not implemented Error`.
 - `tools/sqllogictest`: a port of DuckDB's sqllogictest runner. It runs the DuckDB `.test` corpus

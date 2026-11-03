@@ -163,6 +163,15 @@ impl QualifiedName {
         out + &sql_identifier(&self.name)
     }
 
+    /// A name from its components, the last being the name itself.
+    pub fn from_parts(mut parts: Vec<String>) -> Self {
+        let name = parts.pop().unwrap_or_default();
+        Self {
+            qualification: parts,
+            name,
+        }
+    }
+
     pub fn qualification_to_string(&self) -> String {
         let mut out = String::new();
         for component in self.qualification.iter().filter(|c| !c.is_empty()) {
@@ -1468,6 +1477,10 @@ pub enum QueryNodeKind {
     Select(Box<SelectNode>),
     SetOperation(SetOperationNode),
     RecursiveCte(RecursiveCteNode),
+    /// INSERT, UPDATE or DELETE as the body of a CTE.
+    Insert(Box<InsertStatement>),
+    Update(Box<UpdateStatement>),
+    Delete(Box<DeleteStatement>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1624,6 +1637,9 @@ impl Display for QueryNode {
                 }
                 write!(f, "({})", node.right)
             }
+            QueryNodeKind::Insert(node) => write!(f, "{node}"),
+            QueryNodeKind::Update(node) => write!(f, "{node}"),
+            QueryNodeKind::Delete(node) => write!(f, "{node}"),
         }
     }
 }
@@ -2204,6 +2220,22 @@ pub enum Statement {
         /// The lowercase output format; "default" when not given.
         format: String,
     },
+    /// CREATE of a view, schema, sequence, index, macro or type.
+    Create(Box<CreateInfo>),
+    Prepare {
+        name: String,
+        statement: Box<Statement>,
+    },
+    Execute {
+        name: String,
+        /// Parameters by name (`1`, `2`, ... for positional ones).
+        values: Vec<(String, Expr)>,
+    },
+    Deallocate(String),
+    Detach {
+        name: String,
+        if_exists: bool,
+    },
 }
 
 impl Display for Statement {
@@ -2241,6 +2273,24 @@ impl Display for Statement {
                 }
                 f.write_str(";")
             }
+            Statement::Create(info) => write!(f, "{info}"),
+            Statement::Prepare { name, statement } => write!(f, "PREPARE {} AS {statement}", sql_identifier(name)),
+            Statement::Execute { name, values } => {
+                write!(f, "EXECUTE {}", sql_identifier(name))?;
+                if !values.is_empty() {
+                    let values = join(values, ", ", |(n, v)| format!("{} := {v}", sql_identifier(n)));
+                    write!(f, "({values})")?;
+                }
+                f.write_str(";")
+            }
+            Statement::Deallocate(name) => write!(f, "DEALLOCATE PREPARE {};", sql_identifier(name)),
+            Statement::Detach { name, if_exists } => {
+                f.write_str("DETACH DATABASE")?;
+                if *if_exists {
+                    f.write_str(" IF EXISTS")?;
+                }
+                write!(f, " {};", sql_identifier(name))
+            }
             Statement::Explain {
                 statement,
                 explain_type,
@@ -2268,6 +2318,263 @@ impl Display for Statement {
                     write!(f, " {options}")?;
                 }
                 write!(f, " {statement}")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacroParameter {
+    pub name: String,
+    pub parameter_type: Option<CastType>,
+    pub default: Option<Expr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MacroBody {
+    Scalar(Box<Expr>),
+    Table(Box<QueryNode>),
+}
+
+/// One overload of a macro (`MacroFunction`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacroFunction {
+    pub parameters: Vec<MacroParameter>,
+    pub return_type: Option<CastType>,
+    pub body: MacroBody,
+}
+
+impl Display for MacroFunction {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let params = join(&self.parameters, ", ", |p| {
+            let mut s = sql_identifier(&p.name);
+            if let Some(ty) = &p.parameter_type {
+                s += &format!(" {ty}");
+            }
+            if let Some(default) = &p.default {
+                s += &format!(" := {default}");
+            }
+            s
+        });
+        write!(f, "({params})")?;
+        if let Some(ty) = &self.return_type {
+            write!(f, " RETURNS {ty}")?;
+        }
+        f.write_str(" AS ")?;
+        match &self.body {
+            MacroBody::Scalar(expr) => write!(f, "({expr})"),
+            MacroBody::Table(query) => write!(f, "TABLE ({query})"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateTypeKind {
+    Enum(Vec<String>),
+    /// `ENUM (SELECT ...)`.
+    EnumQuery(Box<SelectStatement>),
+    Alias(CastType),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateKind {
+    View {
+        secure: bool,
+        aliases: Vec<String>,
+        defer_binding: bool,
+        query: Box<SelectStatement>,
+    },
+    /// The schema's full path is `name.qualification` followed by `name.name`.
+    Schema {
+        options: Vec<(String, Expr)>,
+    },
+    Sequence {
+        increment: i64,
+        min_value: i64,
+        max_value: i64,
+        start_value: i64,
+        cycle: bool,
+    },
+    /// `name` holds the table's qualification and the index name.
+    Index {
+        table: String,
+        unique: bool,
+        index_type: String,
+        expressions: Vec<Expr>,
+        options: Vec<(String, Literal)>,
+    },
+    Macro {
+        table_macro: bool,
+        macros: Vec<MacroFunction>,
+    },
+    Type(CreateTypeKind),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateInfo {
+    pub name: QualifiedName,
+    pub on_conflict: OnCreateConflict,
+    pub temporary: bool,
+    pub kind: CreateKind,
+}
+
+impl CreateInfo {
+    /// `CreateInfo::GetCreatePrefix`.
+    fn prefix(&self, entry: &str) -> String {
+        let mut r = String::from("CREATE");
+        if self.on_conflict == OnCreateConflict::Replace {
+            r += " OR REPLACE";
+        }
+        if self.temporary {
+            r += " TEMP";
+        }
+        r += &format!(" {entry} ");
+        if self.on_conflict == OnCreateConflict::Ignore {
+            r += " IF NOT EXISTS ";
+        }
+        r
+    }
+
+    /// `CreateInfo::QualifiedNameToString`: temporary entries leave out the catalog.
+    fn qualified_name(&self) -> String {
+        let mut name = self.name.clone();
+        if self.temporary && name.qualification.len() >= 2 {
+            name.qualification.remove(0);
+        }
+        name.to_string_hide_default_schema()
+    }
+}
+
+/// `CreateIndexInfo::ExpressionsToList`: drops the table qualification the transformer added.
+fn index_expression(expr: &Expr, table: &str) -> String {
+    match &expr.kind {
+        ExprKind::ColumnRef(names) if names.len() == 2 && names[0].eq_ignore_ascii_case(table) => {
+            sql_identifier(&names[1])
+        }
+        ExprKind::ColumnRef(names) if names.len() == 1 => expr.to_string(),
+        _ => format!("({expr})"),
+    }
+}
+
+impl Display for CreateInfo {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match &self.kind {
+            CreateKind::View {
+                secure,
+                aliases,
+                defer_binding,
+                query,
+            } => {
+                f.write_str(&self.prefix(if *secure { "SECURE VIEW" } else { "VIEW" }))?;
+                f.write_str(&self.qualified_name())?;
+                if !aliases.is_empty() {
+                    write!(f, " ({})", join(aliases, ", ", |a| sql_identifier(a)))?;
+                }
+                if *defer_binding {
+                    f.write_str(" WITH (DEFER_BINDING)")?;
+                }
+                write!(f, " AS {query};")
+            }
+            CreateKind::Schema { options } => {
+                let mut path = self.name.qualification.clone();
+                path.push(self.name.name.clone());
+                let mut qualified = QualifiedName::from_parts(path).to_string();
+                if !options.is_empty() {
+                    let opts = join(options, ", ", |(k, v)| format!("{}={v}", sql_string(k)));
+                    qualified += &format!(" WITH ({opts})");
+                }
+                let temp = if self.temporary { "TEMPORARY " } else { "" };
+                match self.on_conflict {
+                    OnCreateConflict::Ignore => write!(f, "CREATE {temp}SCHEMA IF NOT EXISTS {qualified};"),
+                    OnCreateConflict::Replace => write!(f, "CREATE OR REPLACE {temp}SCHEMA {qualified};"),
+                    OnCreateConflict::Error => write!(f, "CREATE {temp}SCHEMA {qualified};"),
+                }
+            }
+            CreateKind::Sequence {
+                increment,
+                min_value,
+                max_value,
+                start_value,
+                cycle,
+            } => {
+                f.write_str("CREATE")?;
+                if self.on_conflict == OnCreateConflict::Replace {
+                    f.write_str(" OR REPLACE")?;
+                }
+                if self.temporary {
+                    f.write_str(" TEMPORARY")?;
+                }
+                f.write_str(" SEQUENCE ")?;
+                if self.on_conflict == OnCreateConflict::Ignore {
+                    f.write_str(" IF NOT EXISTS ")?;
+                }
+                write!(
+                    f,
+                    "{} INCREMENT BY {increment} MINVALUE {min_value} MAXVALUE {max_value} START {start_value} {};",
+                    self.qualified_name(),
+                    if *cycle { "CYCLE" } else { "NO CYCLE" }
+                )
+            }
+            CreateKind::Index {
+                table,
+                unique,
+                index_type,
+                expressions,
+                options,
+            } => {
+                f.write_str("CREATE")?;
+                if *unique {
+                    f.write_str(" UNIQUE")?;
+                }
+                f.write_str(" INDEX ")?;
+                if self.on_conflict == OnCreateConflict::Ignore {
+                    f.write_str("IF NOT EXISTS ")?;
+                }
+                write!(f, "{} ON ", sql_identifier(&self.name.name))?;
+                let mut table_name = QualifiedName {
+                    qualification: self.name.qualification.clone(),
+                    name: table.clone(),
+                };
+                if self.temporary && table_name.qualification.len() >= 2 {
+                    table_name.qualification.remove(0);
+                }
+                f.write_str(&table_name.to_string_hide_default_schema())?;
+                if index_type != "ART" {
+                    write!(f, " USING {} ", sql_identifier(index_type))?;
+                }
+                write!(f, "({})", join(expressions, ", ", |e| index_expression(e, table)))?;
+                if !options.is_empty() {
+                    let opts = join(options, ", ", |(k, v)| {
+                        if v.kind == LiteralKind::Null {
+                            sql_identifier(k)
+                        } else {
+                            format!("{} = {v}", sql_identifier(k))
+                        }
+                    });
+                    write!(f, " WITH ({opts} )")?;
+                }
+                f.write_str(";")
+            }
+            CreateKind::Macro { macros, .. } => {
+                f.write_str(&self.prefix("MACRO"))?;
+                write!(
+                    f,
+                    "{} {};",
+                    self.qualified_name(),
+                    join(macros, ", ", |m| m.to_string())
+                )
+            }
+            CreateKind::Type(kind) => {
+                f.write_str(&self.prefix("TYPE"))?;
+                f.write_str(&self.qualified_name())?;
+                match kind {
+                    CreateTypeKind::Enum(values) => {
+                        write!(f, " AS ENUM ( {} )", join(values, ", ", |v| sql_string(v)))?
+                    }
+                    CreateTypeKind::EnumQuery(query) => write!(f, " AS ENUM ({query})")?,
+                    CreateTypeKind::Alias(ty) => write!(f, " AS {ty}")?,
+                }
+                f.write_str(";")
             }
         }
     }
