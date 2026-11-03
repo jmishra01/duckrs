@@ -28,14 +28,11 @@ An analytical SQL database engine: a port of [DuckDB](https://github.com/duckdb/
   99.99% of the statements the test corpus expects to parse (all except one extension's
   grammar); `cargo run --release -p duckrs-parser --example corpus` measures this, and CI fails
   below 99.9%. The transformer turns parse trees into the AST in `ast.rs`, which renders SQL
-  exactly like DuckDB's `ToString`. It covers SELECT (every expression form, CTEs, set
-  operations, joins, windows, grouping sets, samples), INSERT/UPDATE/DELETE/TRUNCATE, CREATE
-  TABLE (constraints, generated columns, CTAS), CREATE VIEW/SCHEMA/SEQUENCE/INDEX/MACRO/TYPE,
-  DROP, transactions, CHECKPOINT, CALL, SET/RESET/USE, PRAGMA, EXPLAIN, PREPARE/EXECUTE/DEALLOCATE,
-  DETACH, ALTER, COMMENT ON, SHOW/DESCRIBE/SUMMARIZE, COPY, EXPORT/IMPORT, ATTACH,
-  VACUUM/ANALYZE, LOAD/INSTALL, CREATE TRIGGER/SECRET, PIVOT/UNPIVOT, MERGE INTO, NEAREST
-  joins and DML in CTEs: 94.1k corpus statements, all of whose renderings parse again (CI
-  gate). Next: MATCH_RECOGNIZE, external resources and CONNECT/DISCONNECT.
+  exactly like DuckDB's `ToString`. It covers every statement in DuckDB's grammar (SELECT with
+  every expression form, DML, DDL, utility statements, PIVOT, MERGE, MATCH_RECOGNIZE, external
+  resources, ...): all 94.8k corpus statements that parse also transform, and their renderings
+  parse again (CI gate). Remaining Phase 2 work: parser speed and rejecting the invalid
+  statements DuckDB's transformer rejects (56.57% of the corpus's must-fail statements today).
 - `crates/duckrs`: the public API surface (`Database`, `Connection`). Every query returns
   `Not implemented Error`.
 - `tools/sqllogictest`: a port of DuckDB's sqllogictest runner. It runs the DuckDB `.test` corpus

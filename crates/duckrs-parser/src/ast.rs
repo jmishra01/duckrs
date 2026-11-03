@@ -537,6 +537,19 @@ pub enum ExprKind {
     Positional(u64),
     Default,
     Type(TypeExpr),
+    /// MATCH_RECOGNIZE patterns: parts matched in sequence.
+    Concatenation(Vec<Expr>),
+    /// A pattern part matched between `min` and `max` times; `excluded` for `{- ... -}`.
+    Quantified {
+        child: Box<Expr>,
+        min: Option<u64>,
+        max: Option<u64>,
+        excluded: bool,
+        reluctant: bool,
+    },
+    Alternation(Box<Expr>, Box<Expr>),
+    /// `^` (start) or `$` (end, `true`).
+    Anchor(bool),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -985,6 +998,37 @@ impl Display for Expr {
             ExprKind::Parameter(id) => write!(f, "${id}"),
             ExprKind::Positional(index) => write!(f, "#{index}"),
             ExprKind::Default => f.write_str("DEFAULT"),
+            ExprKind::Concatenation(parts) => write!(f, "({})", join(parts, " ", |p| p.to_string())),
+            ExprKind::Quantified {
+                child,
+                min,
+                max,
+                excluded,
+                reluctant,
+            } => {
+                let mut inner = child.to_string();
+                if matches!(child.kind, ExprKind::Quantified { .. }) {
+                    inner = format!("({inner})");
+                }
+                if *excluded {
+                    inner = format!("{{- {inner} -}}");
+                }
+                let suffix = if *reluctant { "?" } else { "" };
+                let quantifier = match (min, max) {
+                    (None, None) => String::new(),
+                    (Some(0), None) => format!("*{suffix}"),
+                    (Some(1), None) => format!("+{suffix}"),
+                    (Some(0), Some(1)) => format!("?{suffix}"),
+                    _ => format!(
+                        "{{{},{}}}{suffix}",
+                        min.map(|m| m.to_string()).unwrap_or_default(),
+                        max.map(|m| m.to_string()).unwrap_or_default()
+                    ),
+                };
+                write!(f, "{inner}{quantifier}")
+            }
+            ExprKind::Alternation(left, right) => write!(f, "({left} | {right})"),
+            ExprKind::Anchor(at_end) => f.write_str(if *at_end { "$" } else { "^" }),
             ExprKind::Type(ty) => write!(f, "{ty}"),
         }
     }
@@ -1200,6 +1244,8 @@ pub enum TableRefKind {
     Show(ShowRef),
     /// PIVOT or UNPIVOT of `source`.
     Pivot(PivotRef),
+    /// MATCH_RECOGNIZE over `input`.
+    MatchRecognize(MatchRecognizeRef),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1288,6 +1334,7 @@ impl Display for TableRef {
                 self.base_to_string(r, &self.column_name_alias)
             }
             TableRefKind::Show(show) => show.to_string(),
+            TableRefKind::MatchRecognize(mr) => self.base_to_string(mr.to_string(), &self.column_name_alias),
             TableRefKind::Pivot(pivot) => {
                 let mut r = format!("{pivot}");
                 if !self.alias.is_empty() {
@@ -1497,6 +1544,8 @@ pub enum QueryNodeKind {
     Update(Box<UpdateStatement>),
     Delete(Box<DeleteStatement>),
     Merge(Box<MergeStatement>),
+    /// COPY ... TO as the body of a CTE.
+    Copy(Box<CopyInfo>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1660,6 +1709,10 @@ impl Display for QueryNode {
             QueryNodeKind::Update(node) => write!(f, "{node}"),
             QueryNodeKind::Delete(node) => write!(f, "{node}"),
             QueryNodeKind::Merge(node) => write!(f, "{node}"),
+            QueryNodeKind::Copy(info) => {
+                let rendered = info.to_string();
+                f.write_str(rendered.strip_suffix(';').unwrap_or(&rendered))
+            }
         }
     }
 }
@@ -2277,6 +2330,10 @@ pub enum Statement {
     },
     Load(Box<LoadInfo>),
     Merge(Box<MergeStatement>),
+    ExternalResource(Box<ExternalResourceStatement>),
+    Connect(Box<ConnectInfo>),
+    Disconnect,
+    UpdateExtensions(Vec<String>),
     /// Statements one statement was rewritten into (`MultiStatement`).
     Multi(Vec<Statement>),
 }
@@ -2363,6 +2420,16 @@ impl Display for Statement {
             }
             Statement::Load(info) => write!(f, "{info}"),
             Statement::Merge(merge) => write!(f, "{merge}"),
+            Statement::ExternalResource(resource) => write!(f, "{resource}"),
+            Statement::Connect(info) => write!(f, "{info}"),
+            Statement::Disconnect => f.write_str("DISCONNECT;"),
+            Statement::UpdateExtensions(names) => {
+                f.write_str("UPDATE EXTENSIONS")?;
+                if !names.is_empty() {
+                    write!(f, "({})", names.join(", "))?;
+                }
+                Ok(())
+            }
             Statement::Multi(statements) => {
                 write!(f, "{};", join(statements, ";", |s| s.to_string()))
             }
@@ -3186,10 +3253,36 @@ pub struct AttachInfo {
     pub name: String,
     pub parsed_options: Vec<(String, Expr)>,
     pub options: Vec<(String, Literal)>,
+    /// ATTACH TO [NEW TEMPORARY] EXTERNAL RESOURCE.
+    pub external_resource: Option<ExternalResourceOptions>,
+}
+
+/// `RenderOptionList`.
+fn render_option_list(parsed: &[(String, Expr)], values: &[(String, Literal)]) -> String {
+    if parsed.is_empty() && values.is_empty() {
+        return String::new();
+    }
+    let mut parts: Vec<String> = parsed
+        .iter()
+        .map(|(n, e)| format!("{} {e}", sql_identifier(n)))
+        .collect();
+    parts.extend(
+        values
+            .iter()
+            .map(|(n, v)| format!("{} {}", sql_identifier(n), literal_to_sql(v))),
+    );
+    format!(" ({})", parts.join(", "))
 }
 
 impl Display for AttachInfo {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        if let Some(resource) = &self.external_resource {
+            write!(f, "ATTACH TO {resource}")?;
+            if !self.name.is_empty() {
+                write!(f, " AS {}", sql_identifier(&self.name))?;
+            }
+            return write!(f, "{};", render_option_list(&self.parsed_options, &self.options));
+        }
         f.write_str("ATTACH")?;
         match self.on_conflict {
             OnCreateConflict::Ignore => f.write_str(" IF NOT EXISTS")?,
@@ -3504,5 +3597,203 @@ impl Display for MergeStatement {
             }
         }
         f.write_str(&returning_to_string(&self.returning))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowsPerMatch {
+    Default,
+    One,
+    All,
+    AllOmitEmpty,
+    AllUnmatched,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterMatchSkip {
+    Default,
+    NextRow,
+    PastLastRow,
+    ToFirst,
+    ToLast,
+}
+
+/// `MatchRecognizeRef`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchRecognizeRef {
+    pub input: Box<TableRef>,
+    pub partitions: Vec<Expr>,
+    pub orders: Vec<OrderByNode>,
+    /// Aliased measure expressions.
+    pub measures: Vec<Expr>,
+    pub rows_per_match: RowsPerMatch,
+    pub after_match: AfterMatchSkip,
+    pub after_match_variable: String,
+    pub pattern: Box<Expr>,
+    pub subsets: Vec<(String, Vec<String>)>,
+    pub define_auto: bool,
+    /// Conditions aliased with their variable.
+    pub defines: Vec<Expr>,
+}
+
+impl Display for MatchRecognizeRef {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{} MATCH_RECOGNIZE(", self.input)?;
+        if !self.partitions.is_empty() {
+            write!(f, "PARTITION BY {} ", join(&self.partitions, ", ", |e| e.to_string()))?;
+        }
+        if !self.orders.is_empty() {
+            write!(f, "ORDER BY {} ", join(&self.orders, ", ", |o| o.to_string()))?;
+        }
+        if !self.measures.is_empty() {
+            let measures = join(&self.measures, ", ", |m| format!("{m} AS {}", sql_identifier(&m.alias)));
+            write!(f, "MEASURES {measures} ")?;
+        }
+        f.write_str(match self.rows_per_match {
+            RowsPerMatch::One => "ONE ROW PER MATCH ",
+            RowsPerMatch::All => "ALL ROWS PER MATCH ",
+            RowsPerMatch::AllOmitEmpty => "ALL ROWS PER MATCH OMIT EMPTY MATCHES ",
+            RowsPerMatch::AllUnmatched => "ALL ROWS PER MATCH WITH UNMATCHED ROWS ",
+            RowsPerMatch::Default => "",
+        })?;
+        match self.after_match {
+            AfterMatchSkip::NextRow => f.write_str("AFTER MATCH SKIP TO NEXT ROW ")?,
+            AfterMatchSkip::PastLastRow => f.write_str("AFTER MATCH SKIP PAST LAST ROW ")?,
+            AfterMatchSkip::ToFirst => write!(
+                f,
+                "AFTER MATCH SKIP TO FIRST {} ",
+                sql_identifier(&self.after_match_variable)
+            )?,
+            AfterMatchSkip::ToLast => write!(
+                f,
+                "AFTER MATCH SKIP TO LAST {} ",
+                sql_identifier(&self.after_match_variable)
+            )?,
+            AfterMatchSkip::Default => {}
+        }
+        write!(f, "PATTERN ({})", self.pattern)?;
+        if !self.subsets.is_empty() {
+            let subsets = join(&self.subsets, ", ", |(name, members)| {
+                format!(
+                    "{} = ({})",
+                    sql_identifier(name),
+                    join(members, ", ", |m| sql_identifier(m))
+                )
+            });
+            write!(f, " SUBSET {subsets}")?;
+        }
+        if self.define_auto {
+            f.write_str(" DEFINE AUTO")?;
+        } else if !self.defines.is_empty() {
+            let defines = join(&self.defines, ", ", |d| format!("{} AS {d}", sql_identifier(&d.alias)));
+            write!(f, " DEFINE {defines}")?;
+        }
+        f.write_str(")")
+    }
+}
+
+/// `ExternalResourceOptions`: a registered resource by name, or a new temporary one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalResourceOptions {
+    pub reference_name: String,
+    pub provider: String,
+    pub params: Vec<(String, Expr)>,
+}
+
+impl Display for ExternalResourceOptions {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        if !self.reference_name.is_empty() {
+            return write!(f, "EXTERNAL RESOURCE {}", sql_identifier(&self.reference_name));
+        }
+        write!(
+            f,
+            "NEW TEMPORARY EXTERNAL RESOURCE {}{}",
+            sql_string(&self.provider),
+            render_option_list(&self.params, &[])
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalResourceOperation {
+    Create,
+    Register,
+    Destroy,
+    Show,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalResourceStatement {
+    pub operation: ExternalResourceOperation,
+    pub resource_type: String,
+    pub name: String,
+    pub options: Vec<(String, Expr)>,
+    pub handle: Option<Box<Expr>>,
+    pub all: bool,
+}
+
+impl Display for ExternalResourceStatement {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self.operation {
+            ExternalResourceOperation::Create | ExternalResourceOperation::Register => {
+                let verb = if self.operation == ExternalResourceOperation::Create {
+                    "CREATE"
+                } else {
+                    "REGISTER"
+                };
+                write!(f, "{verb} EXTERNAL RESOURCE {}", sql_string(&self.resource_type))?;
+                if !self.name.is_empty() {
+                    write!(f, " AS {}", sql_identifier(&self.name))?;
+                }
+                if self.operation == ExternalResourceOperation::Create {
+                    if !self.options.is_empty() {
+                        let options = join(&self.options, ", ", |(n, e)| format!("{} {e}", sql_identifier(n)));
+                        write!(f, " ({options})")?;
+                    }
+                    Ok(())
+                } else {
+                    let handle = self.handle.as_ref().map(|h| h.to_string()).unwrap_or_default();
+                    write!(f, " FROM {handle}")
+                }
+            }
+            ExternalResourceOperation::Destroy => write!(f, "DESTROY EXTERNAL RESOURCE {}", sql_identifier(&self.name)),
+            ExternalResourceOperation::Show => f.write_str(if self.all {
+                "SHOW ALL EXTERNAL RESOURCES"
+            } else {
+                "SHOW EXTERNAL RESOURCES"
+            }),
+        }
+    }
+}
+
+/// `ConnectInfo`: CONNECT to a database, LOCAL, or an external resource.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConnectInfo {
+    pub external_resource: Option<ExternalResourceOptions>,
+    pub target_is_local: bool,
+    pub name: String,
+    pub name_is_string_literal: bool,
+    pub parsed_options: Vec<(String, Expr)>,
+    pub options: Vec<(String, Literal)>,
+}
+
+impl Display for ConnectInfo {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let options = render_option_list(&self.parsed_options, &self.options);
+        if let Some(resource) = &self.external_resource {
+            return write!(f, "CONNECT TO {resource}{options};");
+        }
+        if self.target_is_local {
+            return f.write_str("CONNECT LOCAL;");
+        }
+        if self.name.is_empty() {
+            return f.write_str("CONNECT;");
+        }
+        let name = if self.name_is_string_literal {
+            sql_string(&self.name)
+        } else {
+            sql_identifier(&self.name)
+        };
+        write!(f, "CONNECT {name}{options};")
     }
 }

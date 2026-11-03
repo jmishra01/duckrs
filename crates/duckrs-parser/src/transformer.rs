@@ -654,7 +654,15 @@ impl<'g> Transformer<'g> {
                 f.args = fields;
                 Ok(f.into())
             }
-            "MeasureSemanticsExpression" => Err(not_implemented("MATCH_RECOGNIZE is not yet supported")),
+            "MeasureSemanticsExpression" => {
+                let marker = if self.name(self.alt(self.req(node, "MeasureSemantics")?)?) == "FinalSemantics" {
+                    "__mr_final"
+                } else {
+                    "__mr_running"
+                };
+                let function = self.expr(self.req(node, "FunctionExpression")?)?;
+                Ok(FunctionExpr::new(marker, vec![function]).into())
+            }
             other => Err(Error::new(
                 ErrorKind::Internal,
                 format!("no expression transformer for rule {other}"),
@@ -1778,6 +1786,14 @@ impl<'g> Transformer<'g> {
         Ok(ty)
     }
 
+    /// Wraps `ty` in a LIST or ARRAY for one `ArrayBounds`.
+    fn wrap_array_bound(&mut self, ty: Expr, bound: &ParseNode) -> Result<Expr> {
+        Ok(match self.array_bound(bound)? {
+            None => type_expr("list", vec![ty]),
+            Some(n) => type_expr("array", vec![ty, Expr::constant(Literal::integer(n))]),
+        })
+    }
+
     fn array_bound(&mut self, node: &ParseNode) -> Result<Option<i64>> {
         let brackets = match self.name(node) {
             "ArrayKeyword" => return Ok(None),
@@ -2210,7 +2226,8 @@ impl<'g> Transformer<'g> {
                     Statement::Insert(s) => QueryNodeKind::Insert(s),
                     Statement::Update(s) => QueryNodeKind::Update(s),
                     Statement::Delete(s) => QueryNodeKind::Delete(s),
-                    Statement::Copy(_) => return Err(not_implemented("COPY TO in CTEs is not yet supported")),
+                    Statement::Copy(info) if !info.is_from => QueryNodeKind::Copy(info),
+                    Statement::Copy(_) => return Err(parser_error("COPY FROM cannot be used as a CTE body")),
                     _ => {
                         return Err(parser_error(
                             "A CTE body must be a SELECT, INSERT, UPDATE, DELETE, or COPY TO statement",
@@ -2218,6 +2235,9 @@ impl<'g> Transformer<'g> {
                     }
                 };
                 if recursive {
+                    if matches!(kind, QueryNodeKind::Copy(_)) {
+                        return Err(parser_error("Recursive CTEs with COPY statements are not supported"));
+                    }
                     return Err(parser_error("Recursive CTEs with DML statements are not supported"));
                 }
                 kind.into()
@@ -2425,6 +2445,10 @@ impl<'g> Transformer<'g> {
         let mut table = self.inner_table_ref(self.alt(self.req(node, "InnerTableRef")?)?)?;
         for join in self.subs(node, "JoinOrPivot") {
             let inner = self.alt(join)?;
+            if self.name(inner) == "TableMatchRecognizeClause" {
+                table = self.table_match_recognize(inner, table)?;
+                continue;
+            }
             if matches!(self.name(inner), "TablePivotClause" | "TableUnpivotClause") {
                 table = self.table_pivot(inner, table)?;
                 continue;
@@ -3257,6 +3281,12 @@ fn visit_expr_mut(expr: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
         ExprKind::Lambda { lhs, expr, .. } => {
             visit(lhs);
             visit(expr);
+        }
+        ExprKind::Concatenation(parts) => parts.iter_mut().for_each(visit),
+        ExprKind::Quantified { child, .. } => visit(child),
+        ExprKind::Alternation(left, right) => {
+            visit(left);
+            visit(right);
         }
         ExprKind::Star(star) => {
             star.replace_list.iter_mut().for_each(|(_, e)| visit(e));

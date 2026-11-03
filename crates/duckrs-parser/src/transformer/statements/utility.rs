@@ -475,6 +475,167 @@ impl Transformer<'_> {
         })
     }
 
+    /// `SplitGenericOptions`: options kept as expressions, and constant ones (a flag is `true`).
+    #[allow(clippy::type_complexity)]
+    fn split_options(
+        &mut self,
+        list: &ParseNode,
+        statement: &str,
+    ) -> Result<(Vec<(String, Expr)>, Vec<(String, Literal)>)> {
+        let (mut parsed, mut values): (Vec<(String, Expr)>, Vec<(String, Literal)>) = (Vec::new(), Vec::new());
+        for option in self.generic_option_list(list, true)? {
+            if let Some(e) = option.expression {
+                parsed.push((option.name, e));
+                continue;
+            }
+            let value = match option.children.len() {
+                0 => Literal::boolean(true),
+                1 => option.children.into_iter().next().unwrap(),
+                _ => {
+                    return Err(parser_error(format!(
+                        "Option {} can only have one argument",
+                        option.name
+                    )));
+                }
+            };
+            if value.kind == LiteralKind::Null {
+                return Err(binder_error(format!(
+                    "NULL is not supported as a valid option for {statement} option {}",
+                    option.name
+                )));
+            }
+            values.retain(|(n, _)| !n.eq_ignore_ascii_case(&option.name));
+            values.push((option.name, value));
+        }
+        Ok((parsed, values))
+    }
+
+    /// `CollectGenericOptions`: every option as an expression (a flag is `true`).
+    fn collect_options(&mut self, list: &ParseNode, statement: &str) -> Result<Vec<(String, Expr)>> {
+        let (mut parsed, values) = self.split_options(list, statement)?;
+        for (name, value) in values {
+            parsed.retain(|(n, _)| !n.eq_ignore_ascii_case(&name));
+            parsed.push((name, Expr::constant(value)));
+        }
+        Ok(parsed)
+    }
+
+    /// `ExternalResourceSource`: a new temporary resource, or a registered one by name.
+    fn external_resource_source(&mut self, node: &ParseNode) -> Result<ExternalResourceOptions> {
+        let source = self.alt(node)?;
+        if self.name(source) == "ExternalResourceReferenceClause" {
+            return Ok(ExternalResourceOptions {
+                reference_name: Self::text(self.req(source, "ColId")?),
+                provider: String::new(),
+                params: Vec::new(),
+            });
+        }
+        let params = match self.sub(source, "ExternalResourceCreationOptions") {
+            Some(o) => self.collect_options(self.req(o, "GenericCopyOptionList")?, "EXTERNAL RESOURCE")?,
+            None => Vec::new(),
+        };
+        Ok(ExternalResourceOptions {
+            reference_name: String::new(),
+            provider: Self::text(self.req(source, "StringLiteral")?),
+            params,
+        })
+    }
+
+    /// `ExternalResourceStatement`: CREATE/REGISTER/DESTROY/SHOW resources, ATTACH and CONNECT to one.
+    pub(in crate::transformer) fn external_resource(&mut self, node: &ParseNode) -> Result<Statement> {
+        let statement = self.alt(node)?;
+        let alias = |s: &Self| -> Result<String> {
+            Ok(match s.sub(statement, "AttachAlias") {
+                Some(a) => Self::text(s.req(a, "ColId")?),
+                None => String::new(),
+            })
+        };
+        let mut resource = ExternalResourceStatement {
+            operation: ExternalResourceOperation::Show,
+            resource_type: String::new(),
+            name: String::new(),
+            options: Vec::new(),
+            handle: None,
+            all: false,
+        };
+        match self.name(statement) {
+            "CreateExternalResourceStmt" => {
+                resource.operation = ExternalResourceOperation::Create;
+                resource.resource_type = Self::text(self.req(statement, "StringLiteral")?);
+                resource.name = alias(self)?;
+                if let Some(o) = self.sub(statement, "ExternalResourceCreationOptions") {
+                    resource.options =
+                        self.collect_options(self.req(o, "GenericCopyOptionList")?, "EXTERNAL RESOURCE")?;
+                }
+            }
+            "RegisterExternalResourceStmt" => {
+                resource.operation = ExternalResourceOperation::Register;
+                resource.resource_type = Self::text(self.req(statement, "StringLiteral")?);
+                resource.name = alias(self)?;
+                resource.handle = Some(Box::new(self.expr(self.req(statement, "Expression")?)?));
+            }
+            "DestroyExternalResourceStmt" => {
+                resource.operation = ExternalResourceOperation::Destroy;
+                resource.name = Self::text(self.req(statement, "ColId")?);
+            }
+            "ShowExternalResourcesStmt" => resource.all = self.sub(statement, "ShowAllModifier").is_some(),
+            "AttachToExternalResource" => {
+                let source = self.external_resource_source(self.req(statement, "ExternalResourceSource")?)?;
+                let mut info = AttachInfo {
+                    on_conflict: OnCreateConflict::Error,
+                    path: Box::new(Expr::constant(Literal::null())),
+                    name: alias(self)?,
+                    parsed_options: Vec::new(),
+                    options: Vec::new(),
+                    external_resource: Some(source),
+                };
+                if let Some(o) = self.sub(statement, "AttachOptions") {
+                    (info.parsed_options, info.options) =
+                        self.split_options(self.req(o, "GenericCopyOptionList")?, "ATTACH")?;
+                }
+                return Ok(Statement::Attach(Box::new(info)));
+            }
+            _ => {
+                let source = self.external_resource_source(self.req(statement, "ExternalResourceSource")?)?;
+                let mut info = ConnectInfo::default();
+                if let Some(o) = self.sub(statement, "AttachOptions") {
+                    if source.reference_name.is_empty() {
+                        return Err(parser_error(
+                            "CONNECT TO NEW TEMPORARY EXTERNAL RESOURCE: the option list belongs to the resource, so \
+                             the connection cannot take one of its own. Use `ATTACH TO NEW TEMPORARY EXTERNAL \
+                             RESOURCE ... AS <name> (options); CONNECT <name>;` instead",
+                        ));
+                    }
+                    (info.parsed_options, info.options) =
+                        self.split_options(self.req(o, "GenericCopyOptionList")?, "CONNECT")?;
+                }
+                info.external_resource = Some(source);
+                return Ok(Statement::Connect(Box::new(info)));
+            }
+        }
+        Ok(Statement::ExternalResource(Box::new(resource)))
+    }
+
+    /// `ConnectStatement <- 'CONNECT' SessionTarget?`.
+    pub(in crate::transformer) fn connect(&mut self, node: &ParseNode) -> Result<Statement> {
+        let mut info = ConnectInfo::default();
+        if let Some(target) = self.sub(node, "SessionTarget") {
+            let target = self.alt(target)?;
+            match self.name(target) {
+                "LocalSessionTarget" => info.target_is_local = true,
+                "StringSessionTarget" => {
+                    info.name = Self::text(self.req(target, "StringLiteral")?);
+                    info.name_is_string_literal = true;
+                    if let Some(list) = self.sub(target, "GenericCopyOptionList") {
+                        (info.parsed_options, info.options) = self.split_options(list, "CONNECT")?;
+                    }
+                }
+                _ => info.name = Self::text(self.req(target, "CatalogName")?),
+            }
+        }
+        Ok(Statement::Connect(Box::new(info)))
+    }
+
     pub(in crate::transformer) fn attach(&mut self, node: &ParseNode) -> Result<Statement> {
         let or_replace = self.sub(node, "OrReplace").is_some();
         let if_not_exists = self.sub(node, "IfNotExists").is_some();
@@ -498,32 +659,11 @@ impl Transformer<'_> {
             },
             parsed_options: Vec::new(),
             options: Vec::new(),
+            external_resource: None,
         };
         if let Some(options) = self.sub(node, "AttachOptions") {
-            for option in self.generic_option_list(self.req(options, "GenericCopyOptionList")?, true)? {
-                if let Some(e) = option.expression {
-                    info.parsed_options.push((option.name, e));
-                    continue;
-                }
-                let value = match option.children.len() {
-                    0 => Literal::boolean(true),
-                    1 => option.children.into_iter().next().unwrap(),
-                    _ => {
-                        return Err(parser_error(format!(
-                            "Option {} can only have one argument",
-                            option.name
-                        )));
-                    }
-                };
-                if value.kind == LiteralKind::Null {
-                    return Err(binder_error(format!(
-                        "NULL is not supported as a valid option for ATTACH option {}",
-                        option.name
-                    )));
-                }
-                info.options.retain(|(n, _)| !n.eq_ignore_ascii_case(&option.name));
-                info.options.push((option.name, value));
-            }
+            let list = self.req(options, "GenericCopyOptionList")?;
+            (info.parsed_options, info.options) = self.split_options(list, "ATTACH")?;
         }
         Ok(Statement::Attach(Box::new(info)))
     }

@@ -10,7 +10,7 @@
 //! DuckDB's own `ToString`, the second rendering is not always identical: VALUES lists nest one
 //! level deeper, GROUPING SETS renumber their expressions and `UNNEST` is lowercased, so identical
 //! renderings are reported separately. With `--min-transform PCT`, exits with an error if fewer
-//! covered statements than PCT percent transform and round trip.
+//! parsed statements than PCT percent transform and round trip.
 //!
 //! Statements DuckDB must accept (`statement ok`, `query`) should parse; statements whose
 //! expected error is a parser/syntax error should not. Loop bodies use their first iteration.
@@ -244,7 +244,8 @@ fn main() {
         .position(|a| a == "--min-transform")
         .and_then(|i| args.get(i + 1))
         .and_then(|n| n.parse().ok());
-    let covered = stats.transformed + stats.transform_failures.len();
+    // Every parsed statement must transform and round trip.
+    let covered = stats.parsed;
     if let Some(min) = min_transform
         && pct(stats.round_trips, covered) < min
     {

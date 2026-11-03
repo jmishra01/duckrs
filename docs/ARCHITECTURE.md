@@ -72,12 +72,12 @@ VARIABLE prints its name unquoted (so `"my var"` does not read back). The corpus
 tool therefore checks that every rendering parses again and reports identical renderings
 separately. Known deviation: STAR EXCLUDE/REPLACE/RENAME lists keep input order, where C++
 uses unordered sets, and WITH, ATTACH and CREATE SECRET options and EXECUTE parameters keep
-input order (COPY sorts its options, as DuckDB does). Arrays of
-ENUM types in CREATE TYPE are not supported yet. A PIVOT whose values come from the data is
+input order (COPY sorts its options, as DuckDB does). A PIVOT whose values come from the data is
 preceded by a `CREATE TYPE` of an ENUM; DuckDB names it with a random UUID, duckrs with a
 process-wide counter formatted as one, so renderings are reproducible. Statement transformers
 live in `transformer/statements.rs` (ALTER, COMMENT and SHOW in `statements/alter.rs`, COPY and the other option-driven statements
-in `statements/utility.rs`, PIVOT, MERGE and NEAREST in `statements/pivot.rs`); statements not yet ported return `Not implemented Error`.
+in `statements/utility.rs`, PIVOT, MERGE and NEAREST in `statements/pivot.rs`, MATCH_RECOGNIZE in
+`statements/match_recognize.rs`); every statement the grammar accepts is transformed.
 
 ## Testing
 

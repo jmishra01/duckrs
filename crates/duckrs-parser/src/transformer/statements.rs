@@ -6,6 +6,7 @@
 //! Statement transformers other than SELECT.
 
 mod alter;
+mod match_recognize;
 mod pivot;
 pub(in crate::transformer) use pivot::PivotEntry;
 mod utility;
@@ -115,6 +116,10 @@ impl Transformer<'_> {
                     | Statement::Delete(_)
                     | Statement::Copy(_) => None,
                     Statement::Merge(_) => Some("MERGE_INTO_STATEMENT"),
+                    Statement::ExternalResource(_) => Some("EXTERNAL_RESOURCE_STATEMENT"),
+                    Statement::Connect(_) => Some("CONNECT_STATEMENT"),
+                    Statement::Disconnect => Some("DISCONNECT_STATEMENT"),
+                    Statement::UpdateExtensions(_) => Some("UPDATE_EXTENSIONS_STATEMENT"),
                     Statement::CopyDatabase { .. } => Some("COPY_DATABASE_STATEMENT"),
                     Statement::Export { .. } => Some("EXPORT_STATEMENT"),
                     Statement::Attach(_) => Some("ATTACH_STATEMENT"),
@@ -146,6 +151,10 @@ impl Transformer<'_> {
             "ExecuteStatement" => self.execute(node),
             "AlterStatement" => self.alter(node),
             "CommentStatement" => self.comment(node),
+            "ExternalResourceStatement" => self.external_resource(node),
+            "ConnectStatement" => self.connect(node),
+            "DisconnectStatement" => Ok(Statement::Disconnect),
+            "UpdateExtensionsStatement" => Ok(Statement::UpdateExtensions(self.texts(node, "Identifier"))),
             "MergeIntoStatement" => Ok(Statement::Merge(Box::new(self.merge(node)?))),
             "CopyStatement" => self.copy(node),
             "ExportStatement" => self.export(node),
@@ -907,12 +916,22 @@ impl Transformer<'_> {
                 self.select_internal(self.req(ty, "SelectStatementInternal")?)?,
             )),
             "EnumStringLiteralList" => {
-                if self.sub(ty, "ArrayBounds").is_some() {
-                    return Err(not_implemented(
-                        "arrays of ENUM types in CREATE TYPE are not yet supported",
-                    ));
+                let values = self.texts(ty, "StringLiteral");
+                let bounds = self.subs(ty, "ArrayBounds");
+                if bounds.is_empty() {
+                    CreateTypeKind::Enum(values)
+                } else {
+                    // an array of the ENUM is a parsed type over the ENUM spelled as a type
+                    let mut enum_type: Expr = ExprKind::Type(TypeExpr {
+                        name: QualifiedName::new("ENUM"),
+                        children: values.into_iter().map(|v| Expr::constant(Literal::string(v))).collect(),
+                    })
+                    .into();
+                    for bound in bounds {
+                        enum_type = self.wrap_array_bound(enum_type, self.alt(bound)?)?;
+                    }
+                    CreateTypeKind::Alias(CastType::Parsed(Box::new(enum_type)))
                 }
-                CreateTypeKind::Enum(self.texts(ty, "StringLiteral"))
             }
             _ => CreateTypeKind::Alias(self.type_(self.req(ty, "Type")?)?),
         }))

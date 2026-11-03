@@ -175,10 +175,6 @@ fn transformer_errors_match_duckdb() {
             "Parser Error: DISTINCT requires at least one argument",
         ),
         ("SELECT #0", "Parser Error: Positional reference node needs to be >= 1"),
-        (
-            "SELECT * FROM t MATCH_RECOGNIZE (PATTERN (a) DEFINE a AS true)",
-            "Not implemented Error: the transformer for TableMatchRecognizeClause",
-        ),
     ];
     for (sql, expected) in cases {
         let err = error(sql);
@@ -725,6 +721,83 @@ fn renders_pivot_merge_and_nearest_like_duckdb() {
         (
             "SELECT * FROM a JOIN b NEAREST 0 BY DISTANCE x",
             "Parser Error: NEAREST expects a positive integer literal, got \"0\"",
+        ),
+    ];
+    for (sql, expected) in errors {
+        let err = error(sql);
+        assert!(err.starts_with(expected), "{sql}: {err}");
+    }
+}
+
+#[test]
+fn renders_match_recognize_and_remaining_statements_like_duckdb() {
+    let cases = [
+        (
+            "SELECT * FROM t MATCH_RECOGNIZE (PARTITION BY a ORDER BY ts MEASURES FINAL count(*) AS n \
+             ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW PATTERN (A B+? C{2,} (D | E)*) \
+             SUBSET U = (A, B) DEFINE A AS x > 1) AS m",
+            "SELECT * FROM t MATCH_RECOGNIZE(PARTITION BY a ORDER BY ts MEASURES __mr_final(count_star()) AS n \
+             ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW PATTERN ((A{1,1} B+? C{2,} (D{1,1} | E{1,1})*)) \
+             SUBSET U = (A, B) DEFINE A AS (x > 1)) AS m",
+        ),
+        (
+            "SELECT * FROM t MATCH_RECOGNIZE (PATTERN (PERMUTE(A, B) ^ ()) DEFINE AUTO)",
+            "SELECT * FROM t MATCH_RECOGNIZE(PATTERN ((((A{1,1} B{1,1}) | (B{1,1} A{1,1})){1,1} ^{1,1} (){1,1})) \
+             DEFINE AUTO)",
+        ),
+        (
+            "CREATE EXTERNAL RESOURCE 'kv' AS r (ttl 5)",
+            "CREATE EXTERNAL RESOURCE 'kv' AS r (ttl 5)",
+        ),
+        ("SHOW ALL EXTERNAL RESOURCES", "SHOW ALL EXTERNAL RESOURCES"),
+        (
+            "ATTACH TO EXTERNAL RESOURCE r AS db (READ_ONLY)",
+            "ATTACH TO EXTERNAL RESOURCE r AS db (read_only true);",
+        ),
+        ("CONNECT 'db.duckdb'", "CONNECT 'db.duckdb';"),
+        ("CONNECT LOCAL", "CONNECT LOCAL;"),
+        ("DISCONNECT", "DISCONNECT;"),
+        ("UPDATE EXTENSIONS (httpfs, json)", "UPDATE EXTENSIONS(httpfs, json)"),
+        (
+            "CREATE TYPE e AS ENUM ('a', 'b')[]",
+            "CREATE TYPE e AS ENUM('a', 'b')[];",
+        ),
+        (
+            "WITH c AS (COPY t TO 'x.csv') SELECT 1",
+            "WITH c AS (COPY t TO  'x.csv') SELECT 1",
+        ),
+    ];
+    for (sql, expected) in cases {
+        assert_eq!(render(sql), expected, "{sql}");
+    }
+    let errors = [
+        (
+            "SELECT * FROM t MATCH_RECOGNIZE (DEFINE A AS true)",
+            "Parser Error: MATCH_RECOGNIZE requires a PATTERN clause",
+        ),
+        (
+            "SELECT * FROM t MATCH_RECOGNIZE (PATTERN (A))",
+            "Parser Error: MATCH_RECOGNIZE requires a DEFINE clause",
+        ),
+        (
+            "SELECT * FROM t MATCH_RECOGNIZE (PATTERN (A) PATTERN (B) DEFINE A AS true)",
+            "Parser Error: MATCH_RECOGNIZE has more than one PATTERN clause",
+        ),
+        (
+            "SELECT * FROM t MATCH_RECOGNIZE (PATTERN (A{3,1}) DEFINE A AS true)",
+            "Parser Error: Min count cannot be larger than max count",
+        ),
+        (
+            "SELECT * FROM t MATCH_RECOGNIZE (PATTERN (A{0}) DEFINE A AS true)",
+            "Parser Error: A pattern quantifier's upper bound must be at least 1",
+        ),
+        (
+            "CONNECT TO NEW TEMPORARY EXTERNAL RESOURCE 'kv' (a 1) (b 2)",
+            "Parser Error: CONNECT TO NEW TEMPORARY EXTERNAL RESOURCE",
+        ),
+        (
+            "WITH c AS (COPY t FROM 'x.csv') SELECT 1",
+            "Parser Error: COPY FROM cannot be used as a CTE body",
         ),
     ];
     for (sql, expected) in errors {
