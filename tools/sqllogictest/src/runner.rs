@@ -459,7 +459,7 @@ fn conditions_hold(conditions: &[Condition], loops: &[ActiveLoop], location: &Lo
 }
 
 /// Expands `<integral>`, `<numeric>`, `!type` and friends in a `foreach` list (`ForEachTokenReplace`).
-fn expand_foreach(tokens: &[String]) -> Vec<String> {
+pub fn expand_foreach(tokens: &[String]) -> Vec<String> {
     const SIGNED: [&str; 5] = ["tinyint", "smallint", "integer", "bigint", "hugeint"];
     const UNSIGNED: [&str; 5] = ["utinyint", "usmallint", "uinteger", "ubigint", "uhugeint"];
     const COMPRESSION: [&str; 9] = [
@@ -472,6 +472,62 @@ fn expand_foreach(tokens: &[String]) -> Vec<String> {
         "dict_fsst",
         "alp",
         "alprd",
+    ];
+    // The columns of test_all_types().
+    const ALL_TYPES_COLUMNS: [&str; 53] = [
+        "bool",
+        "tinyint",
+        "smallint",
+        "int",
+        "bigint",
+        "hugeint",
+        "uhugeint",
+        "utinyint",
+        "usmallint",
+        "uint",
+        "ubigint",
+        "date",
+        "time",
+        "timestamp",
+        "timestamp_s",
+        "timestamp_ms",
+        "timestamp_ns",
+        "time_tz",
+        "timestamp_tz",
+        "float",
+        "double",
+        "dec_4_1",
+        "dec_9_4",
+        "dec_18_6",
+        "dec38_10",
+        "uuid",
+        "interval",
+        "varchar",
+        "blob",
+        "bit",
+        "small_enum",
+        "medium_enum",
+        "large_enum",
+        "int_array",
+        "double_array",
+        "date_array",
+        "timestamp_array",
+        "timestamptz_array",
+        "varchar_array",
+        "nested_int_array",
+        "struct",
+        "struct_of_arrays",
+        "array_of_structs",
+        "map",
+        "union",
+        "fixed_int_array",
+        "fixed_varchar_array",
+        "fixed_nested_int_array",
+        "fixed_nested_varchar_array",
+        "fixed_struct_array",
+        "struct_of_fixed_array",
+        "fixed_array_of_int_list",
+        "list_of_fixed_int_array",
     ];
     let mut result: Vec<String> = Vec::new();
     for token in tokens {
@@ -508,6 +564,9 @@ fn expand_foreach(tokens: &[String]) -> Vec<String> {
         }
         if name == "<compression>" {
             extend(&COMPRESSION);
+        }
+        if name == "<all_types_columns>" {
+            extend(&ALL_TYPES_COLUMNS);
         }
         if !collection {
             result.push(token.clone());

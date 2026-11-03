@@ -12,13 +12,13 @@ SQL ─► parser (PEG grammar) ─► AST ─► binder ─► logical plan ─
 
 ## Crates
 
-Today the workspace has three members. More crates are split out as each phase lands; the target
+Today the workspace has four members. More crates are split out as each phase lands; the target
 layout follows DuckDB's `src/` modules, so any C++ file has an obvious Rust home:
 
 | Crate (target) | C++ source | Phase |
 |---|---|---|
 | `duckrs-common` (exists) | `src/common` | 1 |
-| `duckrs-parser` | `src/parser` | 2 |
+| `duckrs-parser` (exists) | `src/parser` | 2 |
 | `duckrs-catalog` | `src/catalog` | 3 |
 | `duckrs-planner` | `src/planner` | 3, 6 |
 | `duckrs-execution` | `src/execution` | 3 |
@@ -50,6 +50,16 @@ storage), the lower crate defines a trait and the higher crate implements it.
   strings is `unsafe` (`string_data_mut`), so safe code cannot store a dangling pointer.
 - Executors take closures (`|a: i32, b: i32| a + b`) and handle vector representations and
   NULLs; the closures are monomorphized and vectorize.
+
+## Parser (`duckrs-parser`)
+
+The parser runs DuckDB's grammar unchanged: the `.gram` rules are vendored and interpreted at
+run time, so grammar changes upstream are picked up by re-syncing, not re-porting. The C++
+matcher is an explicit-stack machine; the Rust one is a recursive interpreter with the same
+semantics (ordered choice, greedy repetition, case-insensitive literals, packrat memoization).
+It runs on a thread with a 512 MB stack so deeply nested SQL cannot overflow. Known cost: a
+thread and a fresh memo table per parse (about 0.3 ms per statement); reusing threads and
+memoizing only the rules C++ memoizes are the obvious optimizations.
 
 ## Testing
 

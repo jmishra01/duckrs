@@ -2,8 +2,7 @@
 
 An analytical SQL database engine: a port of [DuckDB](https://github.com/duckdb/duckdb) to Rust.
 
-**Status: Phase 1 (common core) complete; Phase 2 (parser) is next.** The engine runs no queries yet.
-What exists today:
+**Status: Phase 2 (parser) in progress.** The engine runs no queries yet. What exists today:
 
 - `crates/duckrs-common`: the core building blocks every other crate uses:
   - the type system (`LogicalType`, `PhysicalType`, with DuckDB's ids and names), `string_t`
@@ -23,6 +22,12 @@ What exists today:
   - the binary serializer (DuckDB's on-disk/WAL format) with `LogicalType` and `Value`
     serialization, interval parsing, and byte-comparable sort keys (`create_sort_key`) with an
     in-memory sort.
+- `crates/duckrs-parser`: a port of DuckDB's PEG parser engine: the tokenizer, keyword tables,
+  grammar loader and a memoizing PEG matcher that runs DuckDB's own grammar (vendored from the
+  baseline in `grammar/`, re-synced with `sync_grammar.sh`) and produces parse trees. It accepts
+  99.99% of the statements the test corpus expects to parse (all except one extension's
+  grammar); `cargo run --release -p duckrs-parser --example corpus` measures this, and CI fails
+  below 99.9%. Next: the transformer from parse trees to the AST.
 - `crates/duckrs`: the public API surface (`Database`, `Connection`). Every query returns
   `Not implemented Error`.
 - `tools/sqllogictest`: a port of DuckDB's sqllogictest runner. It runs the DuckDB `.test` corpus
@@ -41,6 +46,7 @@ The full roadmap is in [`../RUST_PORT_PLAN.md`](../RUST_PORT_PLAN.md).
 duckrs/
 ├── crates/duckrs/          # public API (facade crate)
 ├── crates/duckrs-common/   # types, vectors, executors, values
+├── crates/duckrs-parser/   # tokenizer, PEG grammar engine (+ vendored grammar)
 ├── tools/sqllogictest/     # test runner + known_passing.txt
 └── docs/                   # ARCHITECTURE, PORTING_GUIDE, UPSTREAM_SYNC
 ```

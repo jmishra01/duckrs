@@ -61,6 +61,8 @@ jobs:
           ./target/release/sqllogictest --duckdb-root duckdb --allow-failures
           --known-passing tools/sqllogictest/known_passing.txt
           --status-out STATUS.md
+      - name: Parse every statement in the corpus (fails below 99.9%)
+        run: cargo run --release -q -p duckrs-parser --example corpus -- duckdb --min-parse 99.9
       - uses: actions/upload-artifact@v4
         with:
           name: sqllogictest-status

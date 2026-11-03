@@ -1,0 +1,3 @@
+The grammar files in this directory are copied from DuckDB (https://github.com/duckdb/duckdb),
+Copyright 2018-2025 Stichting DuckDB Foundation, licensed under the MIT License.
+Re-sync them with ../sync_grammar.sh.

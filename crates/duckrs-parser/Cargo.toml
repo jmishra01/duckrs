@@ -1,0 +1,17 @@
+[package]
+name = "duckrs-parser"
+description = "SQL parser for duckrs: a port of DuckDB's PEG grammar engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+duckrs-common.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+sqllogictest = { path = "../../tools/sqllogictest" }
+
+[lints]
+workspace = true

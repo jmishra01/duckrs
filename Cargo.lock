@@ -411,6 +411,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "duckrs-parser"
+version = "0.0.1"
+dependencies = [
+ "duckrs-common",
+ "proptest",
+ "sqllogictest",
+]
+
+[[package]]
 name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
