@@ -2,12 +2,24 @@
 
 An analytical SQL database engine: a port of [DuckDB](https://github.com/duckdb/duckdb) to Rust.
 
-**Status: Phase 0 (foundations).** The engine runs no queries yet. What exists today:
+**Status: Phase 1 (common core) in progress.** The engine runs no queries yet. What exists today:
 
-- `crates/duckrs`: the public API surface (`Database`, `Connection`, `Error`). Every query returns
+- `crates/duckrs-common`: the core building blocks every other crate uses:
+  - the type system (`LogicalType`, `PhysicalType`, with DuckDB's ids and names), `string_t`
+    (`StringT`, the 16-byte inline/prefix+pointer string) and its arena, `Interval`;
+  - `Vector` (flat, constant, dictionary and sequence representations, nested LIST/STRUCT/
+    ARRAY/MAP children, copy-on-write buffers), `ValidityMask`, `SelectionVector`,
+    `UnifiedFormat`, and `DataChunk`;
+  - the vectorized executors (unary/binary, nullable and fallible variants, string variants,
+    and selection for filters);
+  - `Value` and the DuckDB-exact VARCHAR rendering of numbers, decimals and blobs.
+- `crates/duckrs`: the public API surface (`Database`, `Connection`). Every query returns
   `Not implemented Error`.
 - `tools/sqllogictest`: a port of DuckDB's sqllogictest runner. It runs the DuckDB `.test` corpus
   against duckrs, or against the C++ DuckDB library as a reference.
+
+Still to do in Phase 1: date/time/timestamp types and their formatting, hashing, the row layout
+(`TupleDataCollection`), `ColumnDataCollection`, sorting, and the binary serializer.
 
 The full roadmap is in [`../RUST_PORT_PLAN.md`](../RUST_PORT_PLAN.md).
 
@@ -16,6 +28,7 @@ The full roadmap is in [`../RUST_PORT_PLAN.md`](../RUST_PORT_PLAN.md).
 ```
 duckrs/
 ├── crates/duckrs/          # public API (facade crate)
+├── crates/duckrs-common/   # types, vectors, executors, values
 ├── tools/sqllogictest/     # test runner + known_passing.txt
 └── docs/                   # ARCHITECTURE, PORTING_GUIDE, UPSTREAM_SYNC
 ```

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/duckrs", "tools/sqllogictest"]
+members = ["crates/duckrs", "crates/duckrs-common", "tools/sqllogictest"]
 
 [workspace.package]
 version = "0.0.1"
@@ -11,6 +11,10 @@ repository = "https://github.com/jmishra01/duckrs"
 
 [workspace.dependencies]
 duckrs = { path = "crates/duckrs" }
+duckrs-common = { path = "crates/duckrs-common" }
+parking_lot = "0.13"
+proptest = "1.12"
+criterion = "0.8"
 clap = { version = "4.6", features = ["derive"] }
 md-5 = "0.11"
 regex = "1.13"

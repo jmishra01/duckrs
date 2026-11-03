@@ -1,0 +1,21 @@
+[package]
+name = "duckrs-common"
+description = "Core types, vectors and data chunks for duckrs (port of duckdb/src/common)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+parking_lot.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "executor"
+harness = false
+
+[lints]
+workspace = true

@@ -30,6 +30,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
+  miri:
+    # Checks the unsafe code in duckrs-common (string_t, vector buffers) for undefined behavior.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - run: cargo miri test -p duckrs-common
+        env:
+          PROPTEST_CASES: "8"
+          MIRIFLAGS: -Zmiri-disable-isolation
+
   sqllogictest:
     runs-on: ubuntu-latest
     steps:

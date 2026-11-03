@@ -12,12 +12,12 @@ SQL ─► parser (PEG grammar) ─► AST ─► binder ─► logical plan ─
 
 ## Crates
 
-Today the workspace has two members. More crates are split out as each phase lands; the target
+Today the workspace has three members. More crates are split out as each phase lands; the target
 layout follows DuckDB's `src/` modules, so any C++ file has an obvious Rust home:
 
 | Crate (target) | C++ source | Phase |
 |---|---|---|
-| `duckrs-common` | `src/common` | 1 |
+| `duckrs-common` (exists) | `src/common` | 1 |
 | `duckrs-parser` | `src/parser` | 2 |
 | `duckrs-catalog` | `src/catalog` | 3 |
 | `duckrs-planner` | `src/planner` | 3, 6 |
@@ -37,6 +37,19 @@ Dependencies point downward only:
 `common → parser → catalog → function → planner → optimizer → storage/transaction → execution → parallel → main → duckrs`.
 Where the C++ modules reference each other (for example, a table catalog entry owning its
 storage), the lower crate defines a trait and the higher crate implements it.
+
+## Core data structures (`duckrs-common`)
+
+- `Vector` is a column of up to 2048 rows. It is flat (one value per row), constant (one value
+  for all rows), dictionary (a `SelectionVector` over a child vector) or sequence. Buffers are
+  shared through `Arc` and copied on write, so cloning a vector is cheap and clones never see
+  each other's writes.
+- `StringT` is DuckDB's 16-byte `string_t`. Reading a non-inlined string is `unsafe` because the
+  bytes live in a `StringBuffer` owned by a vector; the vector accessors (`str_at`,
+  `UnifiedFormat::str_at`) tie the bytes to the vector's lifetime and are safe. Writing raw
+  strings is `unsafe` (`string_data_mut`), so safe code cannot store a dangling pointer.
+- Executors take closures (`|a: i32, b: i32| a + b`) and handle vector representations and
+  NULLs; the closures are monomorphized and vectorize.
 
 ## Testing
 

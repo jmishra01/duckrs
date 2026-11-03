@@ -3,9 +3,7 @@
 //! Phase 0 only provides the public API surface; every query returns a
 //! `Not implemented` error until the engine lands in later phases.
 
-mod error;
-
-pub use error::{Error, ErrorKind, Result};
+pub use duckrs_common::{Error, ErrorKind, Result};
 
 use std::path::{Path, PathBuf};
 
