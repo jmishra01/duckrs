@@ -1,0 +1,4 @@
+/target
+/sqllogictest-results
+*.duckdb
+*.wal

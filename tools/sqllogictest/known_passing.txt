@@ -1,0 +1,21 @@
+# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
+# stop passing. Regenerate with:
+#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
+test/optimizer/joins/test_tpcds_pushdown.test
+test/sql/copy/csv/afl/fuzz_20250211_crash.test
+test/sql/copy/csv/afl/test_afl_ignore_errors.test
+test/sql/copy/csv/afl/test_afl_no_parameter.test
+test/sql/copy/csv/afl/test_afl_null_padding.test
+test/sql/copy/csv/afl/test_afl_skip.test
+test/sql/copy/csv/afl/test_fuzz_4172.test
+test/sql/copy/csv/test_afl.test
+test/sql/copy/csv/test_segfault.test
+test/sql/function/autocomplete/create_secret.test
+test/sql/sample/table_samples/basic_sample_tests.test
+test/sql/sample/table_samples/table_sample_converts_to_block_sample.test
+test/sql/sample/table_samples/test_sample_is_destroyed_on_updates.test
+test/sql/sample/table_samples/test_sample_types.test
+test/sql/storage/constraints/foreignkey/foreign_key_persistent_memory_limit.test
+test/sql/storage/test_empty_shutdown.test
+test/sql/types/enum/test_enum_constraints.test
+test/sql/types/nested/map/map_from_entries/invalid.test

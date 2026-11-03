@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = ["crates/duckrs", "tools/sqllogictest"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/jmishra01/duckrs"
+
+[workspace.dependencies]
+duckrs = { path = "crates/duckrs" }
+clap = { version = "4.6", features = ["derive"] }
+md-5 = "0.11"
+regex = "1.13"
+walkdir = "2.5"
+libduckdb-sys = { version = "1.20000.1", features = ["bundled", "parquet", "json"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+debug = 1

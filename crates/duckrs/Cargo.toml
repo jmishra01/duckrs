@@ -1,0 +1,10 @@
+[package]
+name = "duckrs"
+description = "An analytical SQL database engine, ported from DuckDB to Rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

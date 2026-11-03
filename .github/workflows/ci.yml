@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The DuckDB commit the port is pinned to (`rust-port-baseline` in the fork).
+  DUCKDB_BASELINE: 4d77d9c103baca29a62af61cba9ebdc40e5d2023
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  sqllogictest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out the DuckDB test corpus at the baseline
+        uses: actions/checkout@v4
+        with:
+          repository: jmishra01/duckdb
+          ref: ${{ env.DUCKDB_BASELINE }}
+          path: duckdb
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p sqllogictest
+      - name: Run the corpus against duckrs (fails only on regressions)
+        run: >
+          ./target/release/sqllogictest --duckdb-root duckdb --allow-failures
+          --known-passing tools/sqllogictest/known_passing.txt
+          --status-out STATUS.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sqllogictest-status
+          path: STATUS.md
