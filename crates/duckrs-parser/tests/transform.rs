@@ -176,8 +176,134 @@ fn transformer_errors_match_duckdb() {
         ),
         ("SELECT #0", "Parser Error: Positional reference node needs to be >= 1"),
         (
-            "CREATE TABLE t (i INTEGER)",
-            "Not implemented Error: the transformer for CreateStatement",
+            "CREATE VIEW v AS SELECT 1",
+            "Not implemented Error: the transformer for CreateViewStmt",
+        ),
+    ];
+    for (sql, expected) in cases {
+        let err = error(sql);
+        assert!(err.starts_with(expected), "{sql}: {err}");
+    }
+}
+
+#[test]
+fn renders_statements_like_duckdb() {
+    let cases = [
+        (
+            "INSERT INTO t VALUES (1, 'a'), (2, 'b')",
+            "INSERT INTO t (VALUES (1, 'a'), (2, 'b'))",
+        ),
+        (
+            "INSERT OR REPLACE INTO main.t AS x BY NAME (a, b) SELECT 1, 2 RETURNING a AS z",
+            "INSERT OR REPLACE INTO main.t AS x BY NAME (a, b) SELECT 1, 2 RETURNING a AS z",
+        ),
+        (
+            "INSERT INTO t AS x DEFAULT VALUES ON CONFLICT (A) WHERE a > 1 DO UPDATE SET B = 1 WHERE b < 2",
+            "INSERT INTO t AS x DEFAULT VALUES ON CONFLICT (a ) WHERE (a > 1) DO UPDATE SET b = 1 WHERE (b < 2)",
+        ),
+        (
+            "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING",
+            "INSERT INTO t (VALUES (1)) ON CONFLICT  DO NOTHING",
+        ),
+        (
+            "UPDATE t AS u SET a = 1, (b, c) = (2, 3) FROM s WHERE u.id = s.id RETURNING *",
+            "UPDATE t AS u SET a = 1, b = 2, c = 3 FROM s WHERE (u.id = s.id) RETURNING *",
+        ),
+        (
+            "DELETE FROM t AS x USING s, r WHERE x.a = s.a",
+            "DELETE FROM t AS x USING s, r WHERE (x.a = s.a)",
+        ),
+        ("TRUNCATE TABLE t", "DELETE FROM t"),
+        (
+            "CREATE TABLE t (i INTEGER PRIMARY KEY, s VARCHAR NOT NULL COLLATE nocase, d DECIMAL(10, 2) UNIQUE, \
+             g AS (i + 1), CHECK (i > 0), FOREIGN KEY (i) REFERENCES p(id), UNIQUE (s, d))",
+            "CREATE TABLE t(i INTEGER PRIMARY KEY, s VARCHAR('nocase') NOT NULL, d DECIMAL(10, 2) UNIQUE, \
+             g  GENERATED ALWAYS AS((i + 1)), CHECK((i > 0)), FOREIGN KEY (i) REFERENCES p(id), UNIQUE(s, d));",
+        ),
+        (
+            "CREATE OR REPLACE TEMP TABLE s.t AS SELECT 1 WITH NO DATA",
+            "CREATE OR REPLACE TEMP TABLE s.t AS SELECT 1 LIMIT 0",
+        ),
+        (
+            "CREATE TABLE IF NOT EXISTS t2 (a, b) AS SELECT 1",
+            "CREATE TABLE  IF NOT EXISTS t2(a , b ) AS SELECT 1",
+        ),
+        (
+            "CREATE TABLE t (i INT DEFAULT 3 USING COMPRESSION rle) WITH (foo = 1)",
+            "CREATE TABLE t(i INTEGER DEFAULT(3) USING COMPRESSION RLE) WITH ('foo'=1);",
+        ),
+        ("DROP TABLE IF EXISTS main.t CASCADE", "DROP TABLE IF EXISTS t CASCADE;"),
+        ("DROP FUNCTION m", "DROP MACRO m;"),
+        ("BEGIN TRANSACTION READ ONLY; END", "BEGIN READ ONLY;; COMMIT;"),
+        ("FORCE CHECKPOINT db", "CALL \"system\".main.force_checkpoint('db');"),
+        ("CALL range(1, 2)", "CALL \"range\"(1, 2);"),
+        ("SET threads = 4", "SET  threads TO 4;"),
+        ("SET GLOBAL x TO y", "SET GLOBAL x TO 'y';"),
+        ("SET threads = DEFAULT", "RESET  threads;"),
+        ("SET TIME ZONE 'UTC'", "SET  timezone TO 'UTC';"),
+        ("PRAGMA table_info('t')", "PRAGMA table_info('t');"),
+        ("PRAGMA threads = 4", "SET  threads TO 4;"),
+        ("EXPLAIN ANALYZE SELECT 1", "EXPLAIN (ANALYZE) SELECT 1"),
+        (
+            "EXPLAIN (FORMAT json) DELETE FROM t",
+            "EXPLAIN (FORMAT JSON) DELETE FROM t",
+        ),
+    ];
+    for (sql, expected) in cases {
+        assert_eq!(render(sql), expected, "{sql}");
+    }
+}
+
+#[test]
+fn statement_errors_match_duckdb() {
+    let cases = [
+        (
+            "CREATE TABLE t ()",
+            "Parser Error: Table must have at least one column!",
+        ),
+        (
+            "CREATE TABLE t (a)",
+            "Parser Error: Column a must have a type or be defined as a GENERATED column.",
+        ),
+        (
+            "CREATE TABLE t (a INT DEFAULT 1 DEFAULT 2)",
+            "Parser Error: Cannot define a default value twice",
+        ),
+        (
+            "CREATE TABLE t (a INT COLLATE x)",
+            "Parser Error: Only VARCHAR columns can have collations!",
+        ),
+        (
+            "CREATE TABLE t (a INT CHECK (a IN (SELECT 1)))",
+            "Parser Error: subqueries prohibited in CHECK constraints",
+        ),
+        (
+            "CREATE TABLE t AS INSERT INTO s VALUES (1)",
+            "Parser Error: CREATE TABLE AS requires a SELECT clause",
+        ),
+        (
+            "DROP TABLE a, b",
+            "Not implemented Error: Can only drop one object at a time",
+        ),
+        (
+            "INSERT INTO t (a) DEFAULT VALUES",
+            "Parser Error: You can not provide both a column list and DEFAULT VALUES",
+        ),
+        (
+            "UPDATE t SET (a, b) = (1, 2, 3)",
+            "Parser Error: Could not perform assignment, expected 2 values, got 3",
+        ),
+        (
+            "SET threads = 1, 2",
+            "Parser Error: SET can only contain a single value",
+        ),
+        (
+            "SET LOCAL threads = 1",
+            "Not implemented Error: SET LOCAL is not implemented.",
+        ),
+        (
+            "EXPLAIN (SQL, ANALYZE) SELECT 1",
+            "Invalid Input Error: EXPLAIN (SQL) cannot be combined with ANALYZE",
         ),
     ];
     for (sql, expected) in cases {

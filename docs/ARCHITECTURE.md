@@ -67,11 +67,12 @@ sequence by position; the Rust one handles each rule by name and finds its parts
 name (`sub`/`subs`), so it does not depend on how a rule's sequence nests. The AST is a set of
 enums (`ExprKind`, `TableRefKind`, `QueryNodeKind`) instead of a class hierarchy, and `Display`
 reproduces DuckDB's `ToString` byte for byte. Rendering is not idempotent in DuckDB either:
-VALUES lists gain a subquery level, GROUPING SETS renumber, `UNNEST` is lowercased. The corpus
+VALUES lists gain a subquery level, GROUPING SETS renumber, `UNNEST` is lowercased, and SET
+VARIABLE prints its name unquoted (so `"my var"` does not read back). The corpus
 tool therefore checks that every rendering parses again and reports identical renderings
 separately. Known deviation: STAR EXCLUDE/REPLACE/RENAME lists keep input order, where C++
-uses unordered sets. Only SELECT is transformed so far; other statements return
-`Not implemented Error`.
+uses unordered sets, and CREATE TABLE WITH options keep input order. Statement transformers
+live in `transformer/statements.rs`; statements not yet ported return `Not implemented Error`.
 
 ## Testing
 

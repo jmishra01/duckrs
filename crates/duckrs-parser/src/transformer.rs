@@ -6,14 +6,16 @@
 //! The C++ transformer has one function per grammar rule, with generated trampolines that unpack
 //! each rule's sequence positionally. Here each rule is handled by name and its parts are found
 //! by the names of the sub-rules it matched (`sub`, `subs`), which descends through sequences,
-//! choices, optionals and repetitions but not into other rules. Only SELECT statements (and the
-//! expressions they contain) are transformed so far; other statements report NotImplemented.
+//! choices, optionals and repetitions but not into other rules. Statements are in `statements`;
+//! those not yet ported report NotImplemented.
 
 use crate::ast::*;
 use crate::grammar::Grammar;
 use crate::matcher::{ParseNode, TerminalValue};
 use duckrs_common::{Error, ErrorKind, Result};
 use std::collections::{BTreeSet, HashMap};
+
+mod statements;
 
 fn parser_error(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::Parser, message)
@@ -296,16 +298,7 @@ impl<'g> Transformer<'g> {
 
     /// Transforms a `Statement` parse tree.
     pub fn statement(&mut self, node: &ParseNode) -> Result<Statement> {
-        let inner = self.alt(node)?;
-        match self.name(inner) {
-            "SelectStatement" => {
-                let select = self.select_internal(self.req(inner, "SelectStatementInternal")?)?;
-                Ok(Statement::Select(select))
-            }
-            other => Err(not_implemented(format!(
-                "the transformer for {other} is not yet ported"
-            ))),
-        }
+        self.statement_kind(self.alt(node)?)
     }
 
     // -----------------------------------------------------------------------------------------

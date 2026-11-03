@@ -148,6 +148,21 @@ impl QualifiedName {
             name: name.into(),
         }
     }
+    /// The name, leaving out a lone `main` schema (`QualifiedNameToStringMode::HIDE_DEFAULT_SCHEMA`).
+    pub fn to_string_hide_default_schema(&self) -> String {
+        let mut out = String::new();
+        for (i, component) in self.qualification.iter().enumerate() {
+            if component.is_empty()
+                || (out.is_empty() && i + 1 == self.qualification.len() && component.eq_ignore_ascii_case("main"))
+            {
+                continue;
+            }
+            out += &sql_identifier(component);
+            out.push('.');
+        }
+        out + &sql_identifier(&self.name)
+    }
+
     pub fn qualification_to_string(&self) -> String {
         let mut out = String::new();
         for component in self.qualification.iter().filter(|c| !c.is_empty()) {
@@ -786,6 +801,16 @@ impl Display for TypeExpr {
         }
         if unqualified && upper == "MAP" && params.len() == 2 {
             return write!(f, "MAP({}, {})", params[0], params[1]);
+        }
+        if unqualified
+            && upper == "VARCHAR"
+            && let Some(Expr {
+                kind: ExprKind::Constant(collation),
+                alias,
+            }) = params.last()
+            && alias == "collation"
+        {
+            return write!(f, "VARCHAR({})", sql_string(&collation.text));
         }
         if unqualified && upper == "INTERVAL" && !params.is_empty() {
             return f.write_str("INTERVAL");
@@ -1614,16 +1639,636 @@ impl Display for SelectStatement {
     }
 }
 
-/// A transformed SQL statement. Only SELECT is transformed so far.
+fn returning_to_string(list: &[Expr]) -> String {
+    if list.is_empty() {
+        return String::new();
+    }
+    let cols = join(list, ", ", |e| {
+        if e.alias.is_empty() {
+            e.to_string()
+        } else {
+            format!("{e} AS {}", sql_identifier(&e.alias))
+        }
+    });
+    format!(" RETURNING {cols}")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnConflictAction {
+    Nothing,
+    Update,
+    /// `INSERT OR REPLACE`.
+    Replace,
+}
+
+/// `SET col = expr, ...` with an optional WHERE (`UpdateSetInfo`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UpdateSetInfo {
+    pub columns: Vec<String>,
+    pub expressions: Vec<Expr>,
+    pub condition: Option<Box<Expr>>,
+}
+
+impl Display for UpdateSetInfo {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let sets: Vec<String> = self
+            .columns
+            .iter()
+            .zip(&self.expressions)
+            .map(|(c, e)| format!("{} = {e}", sql_identifier(c)))
+            .collect();
+        write!(f, "SET {}", sets.join(", "))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnConflictInfo {
+    pub action: OnConflictAction,
+    pub indexed_columns: Vec<String>,
+    pub condition: Option<Box<Expr>>,
+    pub set_info: Option<UpdateSetInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InsertValues {
+    Select(Box<SelectStatement>),
+    DefaultValues,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsertStatement {
+    pub cte_map: CteMap,
+    pub table: QualifiedName,
+    /// The target's alias; like DuckDB, only kept when there is a conflict clause.
+    pub table_alias: Option<String>,
+    pub by_name: bool,
+    pub columns: Vec<String>,
+    pub values: InsertValues,
+    pub on_conflict: Option<OnConflictInfo>,
+    pub returning: Vec<Expr>,
+}
+
+/// `InsertQueryNode::GetValuesList`: a plain `SELECT * FROM (VALUES ...)`.
+fn values_list(statement: &SelectStatement) -> Option<&Vec<Vec<Expr>>> {
+    let node = &statement.node;
+    let QueryNodeKind::Select(select) = &node.kind else {
+        return None;
+    };
+    if select.where_clause.is_some() || select.qualify.is_some() || select.having.is_some() {
+        return None;
+    }
+    if !node.cte_map.0.is_empty() || !select.groups.grouping_sets.is_empty() || select.force_aggregates {
+        return None;
+    }
+    if select.select_list.len() != 1 || !matches!(select.select_list[0].kind, ExprKind::Star(_)) {
+        return None;
+    }
+    match &select.from_table.kind {
+        TableRefKind::ExpressionList(values) => Some(values),
+        _ => None,
+    }
+}
+
+impl Display for InsertStatement {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let mut r = self.cte_map.to_string();
+        r += "INSERT";
+        let or_replace = matches!(&self.on_conflict, Some(c) if c.action == OnConflictAction::Replace);
+        if or_replace {
+            r += " OR REPLACE";
+        }
+        r += " INTO ";
+        r += &self.table.to_string();
+        if let Some(alias) = self.table_alias.as_ref().filter(|a| !a.is_empty()) {
+            r += &format!(" AS {}", sql_identifier(alias));
+        }
+        if self.by_name {
+            r += " BY NAME";
+        }
+        if !self.columns.is_empty() {
+            r += &format!(" ({})", join(&self.columns, ", ", |c| sql_identifier(c)));
+        }
+        r += " ";
+        match &self.values {
+            InsertValues::Select(select) => match values_list(select) {
+                Some(rows) => {
+                    let rows = join(rows, ", ", |row| format!("({})", join(row, ", ", |e| e.to_string())));
+                    r += &format!("(VALUES {rows})");
+                }
+                None => r += &select.to_string(),
+            },
+            InsertValues::DefaultValues => r += "DEFAULT VALUES",
+        }
+        if let Some(conflict) = self.on_conflict.as_ref().filter(|_| !or_replace) {
+            r += " ON CONFLICT ";
+            if !conflict.indexed_columns.is_empty() {
+                r += &format!("({} )", join(&conflict.indexed_columns, ", ", |c| c.to_lowercase()));
+            }
+            if let Some(condition) = &conflict.condition {
+                r += &format!(" WHERE {condition}");
+            }
+            r += match conflict.action {
+                OnConflictAction::Nothing => " DO NOTHING",
+                _ => " DO UPDATE",
+            };
+            if let Some(set) = &conflict.set_info {
+                let sets: Vec<String> = set
+                    .columns
+                    .iter()
+                    .zip(&set.expressions)
+                    .map(|(c, e)| format!("{} = {e}", c.to_lowercase()))
+                    .collect();
+                r += &format!(" SET {}", sets.join(", "));
+                if let Some(condition) = &set.condition {
+                    r += &format!(" WHERE {condition}");
+                }
+            }
+        }
+        r += &returning_to_string(&self.returning);
+        f.write_str(&r)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateStatement {
+    pub cte_map: CteMap,
+    pub table: TableRef,
+    pub set_info: UpdateSetInfo,
+    pub from_table: Option<TableRef>,
+    pub returning: Vec<Expr>,
+}
+
+impl Display for UpdateStatement {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}UPDATE {} {}", self.cte_map, self.table, self.set_info)?;
+        if let Some(from) = &self.from_table {
+            write!(f, " FROM {from}")?;
+        }
+        if let Some(condition) = &self.set_info.condition {
+            write!(f, " WHERE {condition}")?;
+        }
+        f.write_str(&returning_to_string(&self.returning))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteStatement {
+    pub cte_map: CteMap,
+    pub table: TableRef,
+    pub using: Vec<TableRef>,
+    pub condition: Option<Box<Expr>>,
+    pub returning: Vec<Expr>,
+}
+
+impl Display for DeleteStatement {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}DELETE FROM {}", self.cte_map, self.table)?;
+        if !self.using.is_empty() {
+            write!(f, " USING {}", join(&self.using, ", ", |t| t.to_string()))?;
+        }
+        if let Some(condition) = &self.condition {
+            write!(f, " WHERE {condition}")?;
+        }
+        f.write_str(&returning_to_string(&self.returning))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnCreateConflict {
+    Error,
+    Ignore,
+    Replace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintCheckMode {
+    Default,
+    Immediate,
+    Deferred,
+}
+
+impl ConstraintCheckMode {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Default => "",
+            Self::Immediate => " IMMEDIATE",
+            Self::Deferred => " DEFERRED",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Constraint {
+    /// NOT NULL on the column at this index.
+    NotNull(usize),
+    /// UNIQUE or PRIMARY KEY, on the column at `index` (a column constraint) or on `columns`.
+    Unique {
+        index: Option<usize>,
+        columns: Vec<String>,
+        primary_key: bool,
+        check_mode: ConstraintCheckMode,
+    },
+    Check(Box<Expr>),
+    ForeignKey {
+        fk_columns: Vec<String>,
+        pk_columns: Vec<String>,
+        schema: String,
+        table: String,
+    },
+}
+
+impl Display for Constraint {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Constraint::NotNull(_) => f.write_str("NOT NULL"),
+            Constraint::Unique {
+                columns,
+                primary_key,
+                check_mode,
+                ..
+            } => write!(
+                f,
+                "{}({}){}",
+                if *primary_key { "PRIMARY KEY" } else { "UNIQUE" },
+                join(columns, ", ", |c| sql_identifier(c)),
+                check_mode.suffix()
+            ),
+            Constraint::Check(expr) => write!(f, "CHECK({expr})"),
+            Constraint::ForeignKey {
+                fk_columns,
+                pk_columns,
+                schema,
+                table,
+            } => {
+                write!(
+                    f,
+                    "FOREIGN KEY ({}) REFERENCES ",
+                    join(fk_columns, ", ", |c| sql_identifier(c))
+                )?;
+                if !schema.is_empty() && !schema.eq_ignore_ascii_case("main") {
+                    write!(f, "{}.", sql_identifier(schema))?;
+                }
+                f.write_str(&sql_identifier(table))?;
+                if !pk_columns.is_empty() {
+                    write!(f, "({})", join(pk_columns, ", ", |c| sql_identifier(c)))?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnDefinition {
+    pub name: String,
+    /// `None` for a generated column without a type (`ANY`) or a CREATE TABLE AS column name.
+    pub column_type: Option<CastType>,
+    /// The expression of a generated column, cast to `column_type` when one is given.
+    pub generated: Option<Box<Expr>>,
+    pub default_value: Option<Box<Expr>>,
+    /// `CompressionTypeToString` of the chosen compression.
+    pub compression: Option<&'static str>,
+}
+
+impl Display for ColumnDefinition {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{} ", sql_identifier(&self.name))?;
+        if let Some(ty) = &self.column_type {
+            write!(f, "{ty}")?;
+        }
+        if let Some(generated) = &self.generated {
+            let expr = match (&self.column_type, &generated.kind) {
+                (Some(_), ExprKind::Cast { child, .. }) => child,
+                _ => generated,
+            };
+            write!(f, " GENERATED ALWAYS AS({expr})")?;
+        } else if let Some(default) = &self.default_value {
+            write!(f, " DEFAULT({default})")?;
+        }
+        if let Some(compression) = self.compression {
+            write!(f, " USING COMPRESSION {compression}")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTableInfo {
+    pub name: QualifiedName,
+    pub on_conflict: OnCreateConflict,
+    pub temporary: bool,
+    pub columns: Vec<ColumnDefinition>,
+    pub constraints: Vec<Constraint>,
+    /// CREATE TABLE ... AS query.
+    pub query: Option<Box<SelectStatement>>,
+    pub partition_keys: Vec<Expr>,
+    pub sort_keys: Vec<Expr>,
+    /// WITH (...) options, in input order.
+    pub options: Vec<(String, Expr)>,
+}
+
+impl CreateTableInfo {
+    /// `TableCatalogEntry::ColumnsToSQL`.
+    fn columns_to_sql(&self) -> String {
+        let mut not_null = BTreeSet::new();
+        let mut unique: Vec<(usize, ConstraintCheckMode)> = Vec::new();
+        let mut pk: Vec<(usize, ConstraintCheckMode)> = Vec::new();
+        let mut multi_key_pks: Vec<String> = Vec::new();
+        let mut extra = Vec::new();
+        for constraint in &self.constraints {
+            match constraint {
+                Constraint::NotNull(i) => {
+                    not_null.insert(*i);
+                }
+                Constraint::Unique {
+                    index: Some(i),
+                    primary_key,
+                    check_mode,
+                    ..
+                } => {
+                    if *primary_key {
+                        pk.push((*i, *check_mode));
+                    } else {
+                        unique.push((*i, *check_mode));
+                    }
+                }
+                Constraint::Unique {
+                    columns, primary_key, ..
+                } => {
+                    if *primary_key {
+                        multi_key_pks.extend(columns.iter().cloned());
+                    }
+                    extra.push(constraint.to_string());
+                }
+                _ => extra.push(constraint.to_string()),
+            }
+        }
+        let mut r = String::from("(");
+        for (i, column) in self.columns.iter().enumerate() {
+            if i > 0 {
+                r += ", ";
+            }
+            r += &column.to_string();
+            let is_single_pk = pk.iter().any(|(c, _)| *c == i);
+            let is_multi_pk = multi_key_pks.iter().any(|c| c.eq_ignore_ascii_case(&column.name));
+            if not_null.contains(&i) && !is_single_pk && !is_multi_pk {
+                r += " NOT NULL";
+            }
+            for (_, mode) in pk.iter().filter(|(c, _)| *c == i) {
+                r += " PRIMARY KEY";
+                r += mode.suffix();
+            }
+            for (_, mode) in unique.iter().filter(|(c, _)| *c == i) {
+                r += " UNIQUE";
+                r += mode.suffix();
+            }
+        }
+        for e in extra {
+            r += ", ";
+            r += &e;
+        }
+        r + ")"
+    }
+
+    fn extra_options_to_string(&self) -> String {
+        let mut r = String::new();
+        if !self.partition_keys.is_empty() {
+            r += &format!(
+                " PARTITIONED BY ({})",
+                join(&self.partition_keys, ",", |e| e.to_string())
+            );
+        }
+        if !self.sort_keys.is_empty() {
+            r += &format!(" SORTED BY ({})", join(&self.sort_keys, ",", |e| e.to_string()));
+        }
+        if !self.options.is_empty() {
+            r += &format!(
+                " WITH ({})",
+                join(&self.options, ",", |(k, v)| format!("{}={v}", sql_string(k)))
+            );
+        }
+        r
+    }
+}
+
+impl Display for CreateTableInfo {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let mut r = String::from("CREATE");
+        if self.on_conflict == OnCreateConflict::Replace {
+            r += " OR REPLACE";
+        }
+        if self.temporary {
+            r += " TEMP";
+        }
+        r += " TABLE ";
+        if self.on_conflict == OnCreateConflict::Ignore {
+            r += " IF NOT EXISTS ";
+        }
+        let mut name = self.name.clone();
+        if self.temporary && name.qualification.len() >= 2 {
+            name.qualification.remove(0);
+        }
+        r += &name.to_string_hide_default_schema();
+        match &self.query {
+            Some(query) => {
+                if !self.columns.is_empty() {
+                    r += "(";
+                    r += &join(&self.columns, ", ", |c| format!("{} ", sql_identifier(&c.name)));
+                    r += ")";
+                }
+                r += &self.extra_options_to_string();
+                r += &format!(" AS {query}");
+            }
+            None => {
+                r += &self.columns_to_sql();
+                r += &self.extra_options_to_string();
+                r += ";";
+            }
+        }
+        f.write_str(&r)
+    }
+}
+
+/// `DropInfo`; `entry_type` is `ParseInfo::TypeToString` of the dropped catalog entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropInfo {
+    pub entry_type: &'static str,
+    pub name: QualifiedName,
+    pub if_exists: bool,
+    pub cascade: bool,
+    /// DROP TRIGGER ... ON table.
+    pub trigger_table: Option<Box<TableRef>>,
+    /// DROP SECRET ... FROM storage.
+    pub secret_storage: String,
+    /// DROP [TEMPORARY | PERSISTENT] SECRET.
+    pub secret_persist: Option<&'static str>,
+}
+
+impl Display for DropInfo {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "DROP {}", self.entry_type)?;
+        if self.if_exists {
+            f.write_str(" IF EXISTS")?;
+        }
+        write!(f, " {}", self.name.to_string_hide_default_schema())?;
+        if let Some(table) = &self.trigger_table {
+            write!(f, " ON {table}")?;
+        }
+        if !self.secret_storage.is_empty() {
+            write!(f, " FROM {}", sql_identifier(&self.secret_storage))?;
+        }
+        if self.cascade {
+            f.write_str(" CASCADE")?;
+        }
+        f.write_str(";")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionType {
+    Begin,
+    Commit,
+    Rollback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionModifier {
+    Default,
+    ReadOnly,
+    ReadWrite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetScope {
+    Automatic,
+    Local,
+    Session,
+    Global,
+    Variable,
+}
+
+impl SetScope {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Automatic => "",
+            Self::Local => "LOCAL",
+            Self::Session => "SESSION",
+            Self::Global => "GLOBAL",
+            Self::Variable => "VARIABLE",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PragmaInfo {
+    pub name: String,
+    pub parameters: Vec<Expr>,
+    pub named_parameters: Vec<(String, Expr)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplainType {
+    Standard,
+    Analyze,
+    Sql,
+}
+
+/// A transformed SQL statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Statement {
     Select(SelectStatement),
+    Insert(Box<InsertStatement>),
+    Update(Box<UpdateStatement>),
+    Delete(Box<DeleteStatement>),
+    CreateTable(Box<CreateTableInfo>),
+    Drop(Box<DropInfo>),
+    Transaction {
+        transaction_type: TransactionType,
+        modifier: TransactionModifier,
+    },
+    /// CALL of a table function.
+    Call(Box<Expr>),
+    SetVariable {
+        name: String,
+        value: Box<Expr>,
+        scope: SetScope,
+    },
+    ResetVariable {
+        name: String,
+        scope: SetScope,
+    },
+    Pragma(PragmaInfo),
+    Explain {
+        statement: Box<Statement>,
+        explain_type: ExplainType,
+        /// The lowercase output format; "default" when not given.
+        format: String,
+    },
 }
 
 impl Display for Statement {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Statement::Select(s) => write!(f, "{s}"),
+            Statement::Insert(s) => write!(f, "{s}"),
+            Statement::Update(s) => write!(f, "{s}"),
+            Statement::Delete(s) => write!(f, "{s}"),
+            Statement::CreateTable(s) => write!(f, "{s}"),
+            Statement::Drop(s) => write!(f, "{s}"),
+            Statement::Transaction {
+                transaction_type,
+                modifier,
+            } => {
+                f.write_str(match transaction_type {
+                    TransactionType::Begin => "BEGIN",
+                    TransactionType::Commit => "COMMIT",
+                    TransactionType::Rollback => "ROLLBACK",
+                })?;
+                f.write_str(match modifier {
+                    TransactionModifier::Default => "",
+                    TransactionModifier::ReadOnly => " READ ONLY",
+                    TransactionModifier::ReadWrite => " READ WRITE",
+                })?;
+                f.write_str(";")
+            }
+            Statement::Call(function) => write!(f, "CALL {function};"),
+            Statement::SetVariable { name, value, scope } => write!(f, "SET {} {name} TO {value};", scope.name()),
+            Statement::ResetVariable { name, scope } => write!(f, "RESET {} {name};", scope.name()),
+            Statement::Pragma(info) => {
+                write!(f, "PRAGMA {}", sql_identifier(&info.name))?;
+                if !info.parameters.is_empty() {
+                    write!(f, "({})", join(&info.parameters, ", ", |p| p.to_string()))?;
+                }
+                f.write_str(";")
+            }
+            Statement::Explain {
+                statement,
+                explain_type,
+                format,
+            } => {
+                f.write_str("EXPLAIN")?;
+                let options = match explain_type {
+                    ExplainType::Sql => "(SQL)".to_string(),
+                    _ => {
+                        let mut parts = Vec::new();
+                        if *explain_type == ExplainType::Analyze {
+                            parts.push("ANALYZE".to_string());
+                        }
+                        if format != "default" {
+                            parts.push(format!("FORMAT {}", format.to_uppercase()));
+                        }
+                        if parts.is_empty() {
+                            String::new()
+                        } else {
+                            format!("({})", parts.join(", "))
+                        }
+                    }
+                };
+                if !options.is_empty() {
+                    write!(f, " {options}")?;
+                }
+                write!(f, " {statement}")
+            }
         }
     }
 }

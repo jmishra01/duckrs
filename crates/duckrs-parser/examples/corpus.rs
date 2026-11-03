@@ -31,6 +31,7 @@ struct Stats {
     wrongly_accepted: Vec<(String, String)>,
     transformed: usize,
     not_ported: usize,
+    not_ported_by_kind: BTreeMap<String, usize>,
     transform_failures: Vec<(String, String, String)>,
     round_trips: usize,
     identical: usize,
@@ -129,6 +130,7 @@ fn check_parses(sql: &str, file: &str, stats: &mut Stats) {
         Ok(statements) => statements.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(";\n"),
         Err(e) if e.kind == ErrorKind::NotImplemented => {
             stats.not_ported += 1;
+            *stats.not_ported_by_kind.entry(e.message.clone()).or_default() += 1;
             return;
         }
         Err(e) => {
@@ -197,6 +199,12 @@ fn main() {
         pct(stats.round_trips, stats.transformed),
         pct(stats.identical, stats.transformed)
     );
+    let mut missing: Vec<_> = stats.not_ported_by_kind.iter().collect();
+    missing.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+    println!("not yet ported:");
+    for (message, count) in missing.iter().take(12) {
+        println!("  {count:>6}  {message}");
+    }
     // Group failures by their first word to show which statement kinds are missing.
     let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
     for (_, sql, _) in &stats.failures {
