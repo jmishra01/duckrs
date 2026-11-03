@@ -8,6 +8,7 @@ pub mod ast;
 pub mod grammar;
 pub mod keywords;
 pub mod matcher;
+mod pool;
 pub mod tokenizer;
 pub mod transformer;
 pub mod unicode;
@@ -20,9 +21,6 @@ use matcher::Matcher;
 use std::sync::Arc;
 use tokenizer::{Token, TokenType};
 
-/// Stack for the recursive matcher; deeply nested SQL needs far more than a default thread.
-const PARSER_STACK_SIZE: usize = 512 * 1024 * 1024;
-
 /// One parsed statement: its parse tree and the tokens it refers to.
 #[derive(Debug, Clone)]
 pub struct ParsedStatement {
@@ -33,13 +31,7 @@ pub struct ParsedStatement {
 /// Parses SQL text into one parse tree per statement.
 pub fn parse(sql: &str) -> Result<Vec<ParsedStatement>> {
     let sql = sql.to_string();
-    let handle = std::thread::Builder::new()
-        .stack_size(PARSER_STACK_SIZE)
-        .spawn(move || parse_on_this_thread(&sql))
-        .map_err(|e| Error::new(ErrorKind::Internal, format!("failed to start the parser thread: {e}")))?;
-    let (tokens, trees) = handle
-        .join()
-        .map_err(|_| Error::new(ErrorKind::Internal, "the parser thread panicked"))??;
+    let (tokens, trees) = pool::run(move || parse_on_this_thread(&sql))??;
     let tokens = Arc::new(tokens);
     Ok(trees
         .into_iter()
@@ -74,17 +66,12 @@ impl Default for ParserOptions {
 pub fn parse_ast_with(sql: &str, options: &ParserOptions) -> Result<Vec<ast::Statement>> {
     let sql = sql.to_string();
     let options = options.clone();
-    std::thread::Builder::new()
-        .stack_size(PARSER_STACK_SIZE)
-        .spawn(move || {
-            let (_, trees) = parse_on_this_thread_with(&sql, &options)?;
-            let mut transformer = transformer::Transformer::new(Grammar::duckdb());
-            transformer.max_expression_depth = options.max_expression_depth;
-            trees.iter().map(|tree| transformer.top_level_statement(tree)).collect()
-        })
-        .map_err(|e| Error::new(ErrorKind::Internal, format!("failed to start the parser thread: {e}")))?
-        .join()
-        .map_err(|_| Error::new(ErrorKind::Internal, "the parser thread panicked"))?
+    pool::run(move || {
+        let (_, trees) = parse_on_this_thread_with(&sql, &options)?;
+        let mut transformer = transformer::Transformer::new(Grammar::duckdb());
+        transformer.max_expression_depth = options.max_expression_depth;
+        trees.iter().map(|tree| transformer.top_level_statement(tree)).collect()
+    })?
 }
 
 /// Parses on the current thread (which must have a large enough stack).

@@ -33,8 +33,9 @@ An analytical SQL database engine: a port of [DuckDB](https://github.com/duckdb/
   resources, ...): all 94.8k corpus statements that parse also transform, and their renderings
   parse again (CI gate). It rejects 88.57% of the statements the corpus expects a parser error
   for (CI gate); the rest are raised by DuckDB's binder or at run time, so they arrive with
-  later phases. Expression depth is limited like DuckDB (`max_expression_depth`). Remaining
-  Phase 2 work: parser speed.
+  later phases. Expression depth is limited like DuckDB (`max_expression_depth`). Parsing a
+  corpus statement into the AST takes about 82 µs (`bench` example), with packrat memoization of
+  the rules DuckDB memoizes and a pool of reused parser threads. Phase 2 is complete.
 - `crates/duckrs`: the public API surface (`Database`, `Connection`). Every query returns
   `Not implemented Error`.
 - `tools/sqllogictest`: a port of DuckDB's sqllogictest runner. It runs the DuckDB `.test` corpus

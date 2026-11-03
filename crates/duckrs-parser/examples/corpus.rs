@@ -1,7 +1,9 @@
 //! Measures how much of DuckDB's sqllogictest corpus the parser accepts.
 //!
 //! `cargo run --release -p duckrs-parser --example corpus -- [../duckdb] [--show N] [--min-parse PCT]
-//! [--min-transform PCT] [--min-reject PCT]`
+//! [--min-transform PCT] [--min-reject PCT] [--dump FILE]`
+//!
+//! `--dump FILE` writes every statement expected to parse, NUL-separated (the `bench` example's input).
 //!
 //! With `--min-parse`, exits with an error if fewer statements than PCT percent parse (CI uses it).
 //!
@@ -38,6 +40,8 @@ struct Stats {
     not_ported_by_kind: BTreeMap<String, usize>,
     transform_failures: Vec<(String, String, String)>,
     round_trips: usize,
+    /// Every statement expected to parse, for `--dump`.
+    statements: Vec<String>,
     /// The file's parser settings, following its `SET max_expression_depth`.
     options: duckrs_parser::ParserOptions,
     identical: usize,
@@ -144,6 +148,7 @@ fn track_settings(statements: &[Statement], options: &mut duckrs_parser::ParserO
 
 fn check_parses(sql: &str, file: &str, stats: &mut Stats) {
     stats.must_parse += 1;
+    stats.statements.push(sql.to_string());
     match duckrs_parser::parse(sql) {
         Ok(_) => stats.parsed += 1,
         Err(e) => {
@@ -267,6 +272,9 @@ fn main() {
     {
         eprintln!("error: parse rate below {min}%");
         std::process::exit(1);
+    }
+    if let Some(path) = args.iter().position(|a| a == "--dump").and_then(|i| args.get(i + 1)) {
+        std::fs::write(path, stats.statements.join("\0")).expect("dump file is writable");
     }
     let min_reject: Option<f64> = args
         .iter()

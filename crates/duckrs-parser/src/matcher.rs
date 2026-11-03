@@ -3,7 +3,8 @@
 //
 // The C++ matcher is an explicit-stack machine with packrat caching and autocomplete hooks.
 // This is a recursive interpreter with the same matching semantics: ordered choice, greedy
-// repetition, case-insensitive literals, and memoization of every rule at every position.
+// repetition, case-insensitive literals, and packrat memoization of the rules DuckDB memoizes
+// (`Grammar::memoized`), whose results are shared rather than copied.
 
 use crate::grammar::{Grammar, Node, RuleId, Terminal};
 use crate::keywords;
@@ -54,25 +55,41 @@ pub enum ParseNode {
     },
 }
 
-/// Moves a node's children into `out`, leaving it childless.
-fn take_children(node: &mut ParseNode, out: &mut Vec<ParseNode>) {
+thread_local! {
+    /// How deep the current thread is in dropping parse nodes.
+    static DROP_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Nesting up to which parse trees drop recursively; deeper subtrees drop iteratively, so
+/// dropping a deep tree on a small-stack thread cannot overflow it.
+const RECURSIVE_DROP_DEPTH: usize = 256;
+
+/// Moves a node's only child out (leaving an empty placeholder), so it drops in our frame.
+fn take_child(node: &mut ParseNode) -> Option<ParseNode> {
     match node {
-        ParseNode::Terminal { .. } => {}
-        ParseNode::List(items) | ParseNode::Repeat(items) => out.append(items),
-        ParseNode::Choice { child, .. } => out.push(std::mem::replace(child.as_mut(), ParseNode::List(Vec::new()))),
-        ParseNode::Optional(child) => out.extend(child.take().map(|c| *c)),
+        ParseNode::Terminal { .. } => None,
+        ParseNode::List(_) | ParseNode::Repeat(_) => None,
+        ParseNode::Choice { child, .. } => Some(std::mem::replace(child.as_mut(), ParseNode::List(Vec::new()))),
+        ParseNode::Optional(child) => child.take().map(|c| *c),
         ParseNode::Rule { child, .. } => {
             // a shared subtree is dropped by its last owner
-            if let Some(inner) = Arc::get_mut(child) {
-                out.push(std::mem::replace(inner, ParseNode::List(Vec::new())));
-            }
+            Arc::get_mut(child).map(|inner| std::mem::replace(inner, ParseNode::List(Vec::new())))
         }
     }
 }
 
-/// Deeply nested trees are dropped iteratively: recursion could overflow the caller's stack.
 impl Drop for ParseNode {
     fn drop(&mut self) {
+        let depth = DROP_DEPTH.with(|d| d.get());
+        if depth < RECURSIVE_DROP_DEPTH {
+            DROP_DEPTH.with(|d| d.set(depth + 1));
+            match self {
+                ParseNode::List(items) | ParseNode::Repeat(items) => drop(std::mem::take(items)),
+                _ => drop(take_child(self)),
+            }
+            DROP_DEPTH.with(|d| d.set(depth));
+            return;
+        }
         let mut pending = Vec::new();
         take_children(self, &mut pending);
         while let Some(mut node) = pending.pop() {
@@ -81,7 +98,40 @@ impl Drop for ParseNode {
     }
 }
 
-type Memo = HashMap<(RuleId, usize), Option<(usize, Arc<ParseNode>)>>;
+/// Moves all of a node's children into `out`, leaving it childless.
+fn take_children(node: &mut ParseNode, out: &mut Vec<ParseNode>) {
+    match node {
+        ParseNode::List(items) | ParseNode::Repeat(items) => out.append(items),
+        _ => out.extend(take_child(node)),
+    }
+}
+
+/// A fast hasher for the memo's (rule, position) keys; they are small integers, not attacker
+/// controlled in a way that matters for a per-parse table.
+#[derive(Default)]
+struct KeyHasher(u64);
+
+impl std::hash::Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(b as u64);
+        }
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.write_u64(n as u64);
+    }
+}
+
+type Memo = HashMap<(RuleId, usize), Option<(usize, Arc<ParseNode>)>, std::hash::BuildHasherDefault<KeyHasher>>;
 
 pub struct Matcher<'a> {
     grammar: &'a Grammar,
@@ -117,7 +167,7 @@ impl<'a> Matcher<'a> {
         Self {
             grammar,
             tokens,
-            memo: HashMap::new(),
+            memo: Memo::default(),
             max_position: 0,
             depth_exceeded: false,
             stack_base: stack_position(),
@@ -127,24 +177,27 @@ impl<'a> Matcher<'a> {
 
     /// Matches `rule` at token `pos`, returning the end position and the parse tree.
     pub fn match_rule(&mut self, rule: RuleId, pos: usize) -> Option<(usize, Arc<ParseNode>)> {
-        if let Some(cached) = self.memo.get(&(rule, pos)) {
+        self.match_rule_body(rule, pos)
+            .map(|(end, child)| (end, Arc::new(ParseNode::Rule { rule, child })))
+    }
+
+    /// Matches `rule`, returning its body's parse tree; memoized for the packrat rules.
+    fn match_rule_body(&mut self, rule: RuleId, pos: usize) -> Option<(usize, Arc<ParseNode>)> {
+        let grammar = self.grammar;
+        let memoized = grammar.memoized[rule];
+        if memoized && let Some(cached) = self.memo.get(&(rule, pos)) {
             return cached.clone();
         }
         if self.stack_base.abs_diff(stack_position()) > self.stack_budget {
             self.depth_exceeded = true;
             return None;
         }
-        let grammar = self.grammar;
-        let result = self.match_node(&grammar.rules[rule].node, pos).map(|(end, child)| {
-            (
-                end,
-                Arc::new(ParseNode::Rule {
-                    rule,
-                    child: Arc::new(child),
-                }),
-            )
-        });
-        self.memo.insert((rule, pos), result.clone());
+        let result = self
+            .match_node(&grammar.rules[rule].node, pos)
+            .map(|(end, child)| (end, Arc::new(child)));
+        if memoized {
+            self.memo.insert((rule, pos), result.clone());
+        }
         result
     }
 
@@ -154,9 +207,11 @@ impl<'a> Matcher<'a> {
             Node::LiteralSet(_, set) => {
                 self.match_literal(pos, |text| text.len() <= 64 && set.contains(&text.to_ascii_lowercase()))
             }
-            Node::Rule(id) => self.match_rule(*id, pos).map(|(end, n)| (end, Arc::unwrap_or_clone(n))),
+            Node::Rule(id) => self
+                .match_rule_body(*id, pos)
+                .map(|(end, child)| (end, ParseNode::Rule { rule: *id, child })),
             Node::Seq(items) => {
-                let mut children = Vec::with_capacity(items.len());
+                let mut children = Vec::new();
                 let mut cur = pos;
                 for item in items {
                     let (end, child) = self.match_node(item, cur)?;

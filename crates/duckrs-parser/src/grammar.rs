@@ -379,7 +379,21 @@ pub struct Rule {
 pub struct Grammar {
     pub rules: Vec<Rule>,
     pub by_name: HashMap<String, RuleId>,
+    /// Whether the matcher memoizes each rule (packrat parsing), by rule id.
+    pub memoized: Vec<bool>,
 }
+
+/// The rules DuckDB packrat-memoizes (`AddPackratMemoizedRule`); memoizing every rule costs more
+/// than the backtracking it saves.
+const MEMOIZED_RULES: &[&str] = &[
+    "Expression",
+    "TableRef",
+    "Identifier",
+    "ColId",
+    "CatalogQualification",
+    "SchemaQualification",
+    "ReservedSchemaQualification",
+];
 
 impl Grammar {
     /// The built-in DuckDB grammar, compiled once.
@@ -423,7 +437,15 @@ impl Grammar {
                 node,
             });
         }
-        let grammar = Grammar { rules, by_name };
+        let memoized = rules
+            .iter()
+            .map(|r| MEMOIZED_RULES.contains(&r.name.as_str()))
+            .collect();
+        let grammar = Grammar {
+            rules,
+            by_name,
+            memoized,
+        };
         grammar.check_reachable(&failures)?;
         Ok(grammar)
     }
