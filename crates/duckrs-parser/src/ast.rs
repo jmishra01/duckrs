@@ -1798,7 +1798,7 @@ pub struct InsertStatement {
 }
 
 /// `InsertQueryNode::GetValuesList`: a plain `SELECT * FROM (VALUES ...)`.
-fn values_list(statement: &SelectStatement) -> Option<&Vec<Vec<Expr>>> {
+pub fn values_list(statement: &SelectStatement) -> Option<&Vec<Vec<Expr>>> {
     let node = &statement.node;
     let QueryNodeKind::Select(select) = &node.kind else {
         return None;

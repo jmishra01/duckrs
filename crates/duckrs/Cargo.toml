@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 duckrs-common.workspace = true
+duckrs-core.workspace = true
 
 [lints]
 workspace = true

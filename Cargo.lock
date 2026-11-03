@@ -399,6 +399,7 @@ name = "duckrs"
 version = "0.0.1"
 dependencies = [
  "duckrs-common",
+ "duckrs-core",
 ]
 
 [[package]]
@@ -408,6 +409,15 @@ dependencies = [
  "criterion",
  "parking_lot",
  "proptest",
+]
+
+[[package]]
+name = "duckrs-core"
+version = "0.0.1"
+dependencies = [
+ "duckrs-common",
+ "duckrs-parser",
+ "parking_lot",
 ]
 
 [[package]]

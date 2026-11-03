@@ -11,6 +11,7 @@ pub mod row;
 pub mod serializer;
 pub mod sort_key;
 pub mod string_cast;
+pub mod string_util;
 pub mod types;
 pub mod value;
 pub mod vector;

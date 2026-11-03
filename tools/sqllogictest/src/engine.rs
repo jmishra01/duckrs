@@ -94,14 +94,46 @@ struct DuckrsConnection(duckrs::Connection);
 impl Connection for DuckrsConnection {
     fn query(&mut self, sql: &str) -> Result<QueryOutput, String> {
         let result = self.0.query(sql).map_err(|e| e.to_string())?;
+        let types = result.types.iter().map(column_type).collect();
+        let mut rows = Vec::with_capacity(result.row_count());
+        for row in 0..result.row_count() {
+            let mut cells = Vec::with_capacity(result.column_count());
+            for column in 0..result.column_count() {
+                let value = result.value(column, row);
+                cells.push(if value.is_null() {
+                    None
+                } else {
+                    Some(value.try_to_string().map_err(|e| e.to_string())?)
+                });
+            }
+            rows.push(cells);
+        }
         Ok(QueryOutput {
             names: result.names,
-            ..QueryOutput::default()
+            types,
+            rows,
         })
     }
 
     fn load_extension(&mut self, _name: &str) -> bool {
         false
+    }
+}
+
+/// The comparison category of a result column (as the reference engine maps C API types).
+fn column_type(ty: &duckrs::LogicalType) -> ColumnType {
+    use duckrs::LogicalTypeId::*;
+    match ty.id() {
+        Boolean => ColumnType::Boolean,
+        TinyInt | SmallInt | Integer | BigInt | HugeInt | UTinyInt | USmallInt | UInteger | UBigInt | UHugeInt => {
+            ColumnType::Integer
+        }
+        Float => ColumnType::Float,
+        Double => ColumnType::Double,
+        Decimal => ColumnType::Decimal {
+            scale: ty.decimal_properties().map_or(0, |(_, scale)| scale),
+        },
+        _ => ColumnType::Other,
     }
 }
 

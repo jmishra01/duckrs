@@ -12,26 +12,28 @@ SQL ─► parser (PEG grammar) ─► AST ─► binder ─► logical plan ─
 
 ## Crates
 
-Today the workspace has four members. More crates are split out as each phase lands; the target
-layout follows DuckDB's `src/` modules, so any C++ file has an obvious Rust home:
+Today the workspace has five members. Following the plan, the engine starts as one crate,
+`duckrs-core`, with a module per DuckDB `src/` directory; each module becomes its own crate
+once its boundaries settle. The target layout follows DuckDB's `src/` modules, so any C++ file
+has an obvious Rust home:
 
-| Crate (target) | C++ source | Phase |
-|---|---|---|
-| `duckrs-common` (exists) | `src/common` | 1 |
-| `duckrs-parser` (exists) | `src/parser` | 2 |
-| `duckrs-catalog` | `src/catalog` | 3 |
-| `duckrs-planner` | `src/planner` | 3, 6 |
-| `duckrs-execution` | `src/execution` | 3 |
-| `duckrs-parallel` | `src/parallel` | 3, 8 |
-| `duckrs-function` | `src/function`, `extension/core_functions` | 4–5 |
-| `duckrs-optimizer` | `src/optimizer` | 7 |
-| `duckrs-storage` | `src/storage` | 9 |
-| `duckrs-transaction` | `src/transaction` | 10 |
-| `duckrs-main` | `src/main` | 3, 12 |
-| `duckrs` (exists) | public API facade | 0 |
-| `duckrs-capi` | `src/main/capi`, `duckdb.h` | 12 |
-| `duckrs-cli` | `tools/shell` | 12 |
-| `sqllogictest` (exists) | `test/sqlite` | 0 |
+| Crate (target) | C++ source | Phase | Today |
+|---|---|---|---|
+| `duckrs-common` | `src/common` | 1 | crate |
+| `duckrs-parser` | `src/parser` | 2 | crate |
+| `duckrs-catalog` | `src/catalog` | 3 | `duckrs-core::catalog` |
+| `duckrs-planner` | `src/planner` | 3, 6 | `duckrs-core::planner` |
+| `duckrs-execution` | `src/execution` | 3 | `duckrs-core::execution` |
+| `duckrs-parallel` | `src/parallel` | 3, 8 | `duckrs-core::execution` (pipelines) |
+| `duckrs-function` | `src/function`, `extension/core_functions` | 4–5 | `duckrs-core::function` |
+| `duckrs-optimizer` | `src/optimizer` | 7 | |
+| `duckrs-storage` | `src/storage` | 9 | |
+| `duckrs-transaction` | `src/transaction` | 10 | |
+| `duckrs-main` | `src/main` | 3, 12 | `duckrs-core::client` |
+| `duckrs` | public API facade | 0 | crate |
+| `duckrs-capi` | `src/main/capi`, `duckdb.h` | 12 | |
+| `duckrs-cli` | `tools/shell` | 12 | |
+| `sqllogictest` | `test/sqlite` | 0 | crate |
 
 Dependencies point downward only:
 `common → parser → catalog → function → planner → optimizer → storage/transaction → execution → parallel → main → duckrs`.
@@ -88,6 +90,33 @@ process-wide counter formatted as one, so renderings are reproducible. Statement
 live in `transformer/statements.rs` (ALTER, COMMENT and SHOW in `statements/alter.rs`, COPY and the other option-driven statements
 in `statements/utility.rs`, PIVOT, MERGE and NEAREST in `statements/pivot.rs`, MATCH_RECOGNIZE in
 `statements/match_recognize.rs`); every statement the grammar accepts is transformed.
+
+## Engine (`duckrs-core`)
+
+A statement goes `parse_ast` → `Binder` (bound expressions, `LogicalOperator` tree) →
+`ColumnBindingResolver` (column references become input positions) → `create_plan`
+(physical operators) → pipelines → `MaterializedQueryResult`. The pieces mirror the C++ classes:
+
+- **Types while binding.** Constants bind with literal types (`INTEGER_LITERAL` carries its
+  value, `STRING_LITERAL`), so `tinyint_col + 1` stays TINYINT and `int_col = '5'` compares as
+  INTEGER. `cast_rules` is `CastRules::ImplicitCast` (the cost table), `combine_types` is
+  `TryGetMaxLogicalType`/`ForceMaxLogicalType` with the built-in combine rules, and the function
+  binder picks the cheapest overload, folds calls with a NULL argument into a NULL constant and
+  casts the arguments to the parameter types, like `FunctionBinder`.
+- **Bound expressions and logical operators** are enums (`BoundExprKind`,
+  `LogicalOperatorKind`); each operator reports its types and column bindings.
+- **Physical operators** implement a trait with DuckDB's source/operator/sink roles. Pipelines
+  are built from those roles as in `PhysicalOperator::BuildPipelines` and run in dependency order
+  on the calling thread; the task scheduler and parallelism arrive with Phase 8.
+- **The catalog** is in memory and has no transactions yet: tables hold their rows in a
+  `ColumnDataCollection` until storage (Phase 9) and MVCC (Phase 10) land.
+
+Deliberate gaps of this slice: no DECIMAL arithmetic (a DECIMAL meets a number in DOUBLE), no
+`/`, `//` or `%`, no constraints, defaults or table options, the expression executor evaluates a
+filter's condition to a BOOLEAN vector rather than using DuckDB's specialized `Select`, and
+casts to VARCHAR go row by row through `Value`. Errors for SQL beyond the slice say it `is not
+yet ported to duckrs`, wording DuckDB never uses, so that no test expecting an error passes
+because a feature is missing.
 
 ## Testing
 

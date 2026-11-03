@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/duckrs", "crates/duckrs-common", "crates/duckrs-parser", "tools/sqllogictest"]
+members = ["crates/duckrs", "crates/duckrs-common", "crates/duckrs-core", "crates/duckrs-parser", "tools/sqllogictest"]
 
 [workspace.package]
 version = "0.0.1"
@@ -12,6 +12,7 @@ repository = "https://github.com/jmishra01/duckrs"
 [workspace.dependencies]
 duckrs = { path = "crates/duckrs" }
 duckrs-common = { path = "crates/duckrs-common" }
+duckrs-core = { path = "crates/duckrs-core" }
 duckrs-parser = { path = "crates/duckrs-parser" }
 parking_lot = "0.13"
 proptest = "1.12"

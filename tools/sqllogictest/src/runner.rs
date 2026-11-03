@@ -10,6 +10,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+/// What duckrs says about SQL it does not run yet (`duckrs_core::unported`).
+const UNPORTED_MARKER: &str = "is not yet ported to duckrs";
+
 /// Settings shared by every file in a run.
 #[derive(Debug, Clone)]
 pub struct RunConfig {
@@ -227,6 +230,10 @@ impl Shared {
             (ExpectedResult::Error(_), None) => {
                 self.record_failure(Failure::new(location, "Query unexpectedly succeeded!"))
             }
+            // a feature duckrs lacks never stands in for the error a test expects
+            (ExpectedResult::Error(_), Some(error)) if error.contains(UNPORTED_MARKER) => self.record_failure(
+                Failure::new(location, format!("Query failed on a missing feature:\n{error}")),
+            ),
             (ExpectedResult::Error(expected) | ExpectedResult::Maybe(expected), Some(error)) => {
                 if expected.is_empty() || self.error_matches(expected, error) {
                     return Flow::Next;

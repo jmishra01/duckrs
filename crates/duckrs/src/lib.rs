@@ -1,15 +1,21 @@
 //! duckrs: an analytical SQL database engine, ported from DuckDB.
 //!
-//! Phase 0 only provides the public API surface; every query returns a
-//! `Not implemented` error until the engine lands in later phases.
+//! The engine runs in memory and covers CREATE TABLE, INSERT and single-table SELECT with
+//! WHERE so far; other statements return a `Not implemented` error until later phases.
 
+pub use duckrs_common::types::{LogicalType, LogicalTypeId};
+pub use duckrs_common::value::Value;
 pub use duckrs_common::{Error, ErrorKind, Result};
+pub use duckrs_core::client::MaterializedQueryResult as QueryResult;
 
+use duckrs_core::client::{ClientContext, DatabaseInstance};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// A database instance (`DuckDB` / `DatabaseInstance` in C++).
 #[derive(Debug)]
 pub struct Database {
+    instance: Arc<DatabaseInstance>,
     path: Option<PathBuf>,
     read_only: bool,
 }
@@ -17,13 +23,17 @@ pub struct Database {
 impl Database {
     pub fn open_in_memory() -> Result<Self> {
         Ok(Self {
+            instance: DatabaseInstance::new(),
             path: None,
             read_only: false,
         })
     }
 
+    /// Opens a database file. Storage arrives with Phase 9; until then the database lives in
+    /// memory and nothing is written to `path`.
     pub fn open(path: impl AsRef<Path>, read_only: bool) -> Result<Self> {
         Ok(Self {
+            instance: DatabaseInstance::new(),
             path: Some(path.as_ref().to_path_buf()),
             read_only,
         })
@@ -38,26 +48,23 @@ impl Database {
     }
 
     pub fn connect(&self) -> Result<Connection> {
-        Ok(Connection { _private: () })
+        Ok(Connection {
+            context: ClientContext::new(self.instance.clone()),
+        })
     }
 }
 
 /// A connection to a [`Database`].
 #[derive(Debug)]
 pub struct Connection {
-    _private: (),
+    context: ClientContext,
 }
 
 impl Connection {
-    pub fn query(&mut self, _sql: &str) -> Result<QueryResult> {
-        Err(Error::not_implemented("duckrs cannot execute queries yet"))
+    /// Runs one or more `;`-separated statements and returns the result of the last one.
+    pub fn query(&mut self, sql: &str) -> Result<QueryResult> {
+        self.context.query(sql)
     }
-}
-
-/// A fully materialized query result.
-#[derive(Debug, Default)]
-pub struct QueryResult {
-    pub names: Vec<String>,
 }
 
 #[cfg(test)]
@@ -65,11 +72,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn query_reports_not_implemented() {
+    fn queries_run() {
         let db = Database::open_in_memory().unwrap();
         let mut con = db.connect().unwrap();
-        let err = con.query("SELECT 42").unwrap_err();
+        let result = con.query("SELECT 42 AS answer").unwrap();
+        assert_eq!(result.names, vec!["answer"]);
+        assert_eq!(result.types, vec![LogicalType::INTEGER]);
+        assert_eq!(result.value(0, 0), Value::integer(42));
+        // connections share the database
+        con.query("CREATE TABLE t (i INTEGER); INSERT INTO t VALUES (1), (2)")
+            .unwrap();
+        let mut other = db.connect().unwrap();
+        assert_eq!(other.query("SELECT i FROM t").unwrap().row_count(), 2);
+        let err = con.query("SELECT * FROM t ORDER BY i").unwrap_err();
         assert_eq!(err.kind, ErrorKind::NotImplemented);
-        assert!(err.to_string().starts_with("Not implemented Error: "));
     }
 }

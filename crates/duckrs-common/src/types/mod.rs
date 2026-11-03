@@ -333,6 +333,13 @@ enum Params {
         size: u32,
     },
     Enum(Arc<[String]>),
+    /// INTEGER_LITERAL: the constant's own integral type and its value (`IntegerLiteralTypeInfo`).
+    /// A UHUGEINT above `i128::MAX` keeps `value == i128::MAX` with `beyond_i128` set.
+    IntegerLiteral {
+        ty: LogicalTypeId,
+        value: i128,
+        beyond_i128: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -413,6 +420,17 @@ impl LogicalType {
         Self::with_params(LogicalTypeId::Struct, Params::Struct(children))
     }
 
+    /// `TUPLE(children)`: a STRUCT whose members have no names.
+    pub fn tuple(children: Vec<LogicalType>) -> Self {
+        let children = children.into_iter().map(|c| (String::new(), c)).collect();
+        Self::struct_type(children).with_id(LogicalTypeId::Tuple)
+    }
+
+    /// `MAP(entry)` from its `STRUCT(key, value)` entry type.
+    pub fn map_from_entry(entry: LogicalType) -> Self {
+        Self::with_params(LogicalTypeId::Map, Params::List(entry))
+    }
+
     /// `MAP(key, value)`: physically a `LIST(STRUCT(key, value))`.
     pub fn map(key: LogicalType, value: LogicalType) -> Self {
         let entry = Self::struct_type(vec![("key".into(), key), ("value".into(), value)]);
@@ -433,6 +451,27 @@ impl LogicalType {
 
     pub fn enum_type(values: Vec<String>) -> Self {
         Self::with_params(LogicalTypeId::Enum, Params::Enum(values.into()))
+    }
+
+    /// `LogicalType::INTEGER_LITERAL(constant)`: the type of an integer constant while binding,
+    /// which casts cheaply to any integer type it fits in. `ty` must be integral.
+    pub fn integer_literal(ty: LogicalTypeId, value: i128, beyond_i128: bool) -> Self {
+        assert!(
+            LogicalType::new(ty).is_integral(),
+            "INTEGER_LITERAL of non-integral type {ty:?}"
+        );
+        Self::with_params(
+            LogicalTypeId::IntegerLiteral,
+            Params::IntegerLiteral { ty, value, beyond_i128 },
+        )
+    }
+
+    /// `IntegerLiteral::GetType` and the literal's value, for an INTEGER_LITERAL.
+    pub fn integer_literal_value(&self) -> Option<(LogicalType, i128, bool)> {
+        match self.params() {
+            Params::IntegerLiteral { ty, value, beyond_i128 } => Some((LogicalType::new(*ty), *value, *beyond_i128)),
+            _ => None,
+        }
     }
 
     /// Returns this type with a user-facing alias (e.g. `CREATE TYPE`). The alias replaces the
