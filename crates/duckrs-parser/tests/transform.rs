@@ -532,3 +532,116 @@ fn renders_alter_comment_and_describe_like_duckdb() {
         assert!(err.starts_with(expected), "{sql}: {err}");
     }
 }
+
+#[test]
+fn renders_utility_statements_like_duckdb() {
+    let cases = [
+        (
+            "COPY t TO 'out.csv' (HEADER, DELIMITER ',')",
+            "COPY t TO  'out.csv' (header, delimiter ',' );",
+        ),
+        (
+            "COPY t FROM 'in.parquet' (FORMAT parquet)",
+            "COPY t FROM 'in.parquet' ( FORMAT 'parquet' );",
+        ),
+        (
+            "COPY (SELECT 1) TO 'x.csv' WITH (FORMAT 'csv', PARTITION_BY (a, b), COMPRESSION zstd)",
+            "COPY (SELECT 1) TO  'x.csv' ( FORMAT 'csv', partition_by \"row\"(a, b), compression 'zstd' );",
+        ),
+        (
+            "COPY t (a, b) FROM stdin CSV HEADER DELIMITER '|' NULL 'NA'",
+            "COPY t (a, b ) FROM '/dev/stdin' ( FORMAT 'csv', header true, null 'NA', delimiter '|' );",
+        ),
+        (
+            "COPY t TO 'o.csv' (ORDER BY (a DESC, b))",
+            "COPY t TO  'o.csv' (order_by \"row\"('a DESC', 'b') );",
+        ),
+        ("COPY t TO $1", "COPY t TO ($1);"),
+        ("COPY FROM DATABASE a TO b", "PRAGMA copy_database('a', 'b');"),
+        (
+            "COPY FROM DATABASE a TO b (SCHEMA)",
+            "COPY FROM DATABASE a TO b (SCHEMA)",
+        ),
+        (
+            "EXPORT DATABASE 'dir' (FORMAT parquet, COMPRESSION 'zstd')",
+            "EXPORT DATABASE 'dir' ( FORMAT 'parquet', compression 'zstd' );",
+        ),
+        ("IMPORT DATABASE 'dir'", "PRAGMA import_database('dir');"),
+        (
+            "ATTACH 'file.db' AS f (READ_ONLY, TYPE sqlite)",
+            "ATTACH DATABASE 'file.db' AS f (read_only true, \"type\" 'sqlite');",
+        ),
+        (
+            "ATTACH IF NOT EXISTS ':memory:'",
+            "ATTACH IF NOT EXISTS DATABASE ':memory:';",
+        ),
+        ("ANALYZE t(a, b)", "VACUUM ANALYZE t(a, b);"),
+        ("VACUUM (ANALYZE) t", "VACUUM ANALYZE t;"),
+        ("INSTALL 'spatial' FROM community", "INSTALL 'spatial' FROM community;"),
+        (
+            "FORCE INSTALL AND LOAD x FROM 'https://r'",
+            "FORCE INSTALL AND LOAD 'x' FROM 'https://r';",
+        ),
+        ("LOAD x AS y", "LOAD 'x' AS y;"),
+        (
+            "CREATE EXTENSION REPOSITORY r WITH PREFIX 'http://x' USING PUBLIC KEY 'k'",
+            "CREATE EXTENSION REPOSITORY r WITH PREFIX 'http://x' USING PUBLIC KEY 'k';",
+        ),
+        (
+            "CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW INSERT INTO log VALUES (1)",
+            "CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW INSERT INTO log (VALUES (1));",
+        ),
+        (
+            "CREATE TRIGGER trg BEFORE UPDATE OF a ON t REFERENCING NEW TABLE AS n DELETE FROM x",
+            "CREATE TRIGGER trg BEFORE UPDATE OF a ON t REFERENCING NEW TABLE AS n FOR EACH STATEMENT DELETE FROM x;",
+        ),
+        (
+            "CREATE SECRET (TYPE s3, KEY_ID 'abc')",
+            "CREATE SECRET  __default_s3(TYPE 's3', key_id 'abc')",
+        ),
+        ("CREATE TEMP SECRET s2 (TYPE gcs)", "CREATE TEMP SECRET  s2(TYPE 'gcs')"),
+    ];
+    for (sql, expected) in cases {
+        assert_eq!(render(sql), expected, "{sql}");
+    }
+    let errors = [
+        (
+            "COPY t TO 'x' (A 1, a 2)",
+            "Parser Error: Unexpected duplicate option a",
+        ),
+        (
+            "COPY t TO 'x' (FORMAT)",
+            "Parser Error: Unsupported parameter type for FORMAT",
+        ),
+        (
+            "COPY t TO 'x' (DELIMITER (a DESC))",
+            "Parser Error: ORDER BY modifiers are only supported",
+        ),
+        (
+            "ATTACH OR REPLACE IF NOT EXISTS 'x'",
+            "Parser Error: Cannot specify both OR REPLACE and IF NOT EXISTS",
+        ),
+        (
+            "ATTACH 'x' (TYPE NULL)",
+            "Binder Error: NULL is not supported as a valid option for ATTACH option type",
+        ),
+        ("VACUUM FULL", "Not implemented Error: FULL is not yet implemented"),
+        ("VACUUM (FOO)", "Parser Error: unrecognized VACUUM option \"FOO\""),
+        (
+            "CREATE SECRET (KEY_ID 'a')",
+            "Parser Error: Failed to create secret - secret must have a type defined",
+        ),
+        (
+            "CREATE TEMP TRIGGER t AFTER INSERT ON x DELETE FROM y",
+            "Parser Error: Temporary triggers are not supported",
+        ),
+        (
+            "CREATE PERSISTENT TABLE t (a INT)",
+            "Parser Error: PERSISTENT is only supported for CREATE SECRET",
+        ),
+    ];
+    for (sql, expected) in errors {
+        let err = error(sql);
+        assert!(err.starts_with(expected), "{sql}: {err}");
+    }
+}

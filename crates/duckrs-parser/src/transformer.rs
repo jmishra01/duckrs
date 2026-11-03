@@ -2190,6 +2190,7 @@ impl<'g> Transformer<'g> {
                     Statement::Insert(s) => QueryNodeKind::Insert(s),
                     Statement::Update(s) => QueryNodeKind::Update(s),
                     Statement::Delete(s) => QueryNodeKind::Delete(s),
+                    Statement::Copy(_) => return Err(not_implemented("COPY TO in CTEs is not yet supported")),
                     _ => {
                         return Err(parser_error(
                             "A CTE body must be a SELECT, INSERT, UPDATE, DELETE, or COPY TO statement",

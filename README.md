@@ -32,9 +32,10 @@ An analytical SQL database engine: a port of [DuckDB](https://github.com/duckdb/
   operations, joins, windows, grouping sets, samples), INSERT/UPDATE/DELETE/TRUNCATE, CREATE
   TABLE (constraints, generated columns, CTAS), CREATE VIEW/SCHEMA/SEQUENCE/INDEX/MACRO/TYPE,
   DROP, transactions, CHECKPOINT, CALL, SET/RESET/USE, PRAGMA, EXPLAIN, PREPARE/EXECUTE/DEALLOCATE,
-  DETACH, ALTER, COMMENT ON, SHOW/DESCRIBE/SUMMARIZE and DML in CTEs: 93k corpus statements,
-  all of whose renderings parse again (CI gate). Next: MATCH_RECOGNIZE, triggers, ATTACH,
-  PIVOT, MERGE, COPY and the remaining small statements.
+  DETACH, ALTER, COMMENT ON, SHOW/DESCRIBE/SUMMARIZE, COPY, EXPORT/IMPORT, ATTACH,
+  VACUUM/ANALYZE, LOAD/INSTALL, CREATE TRIGGER/SECRET and DML in CTEs: 93.7k corpus
+  statements, all of whose renderings parse again (CI gate). Next: MATCH_RECOGNIZE, PIVOT,
+  MERGE, external resources and NEAREST joins.
 - `crates/duckrs`: the public API surface (`Database`, `Connection`). Every query returns
   `Not implemented Error`.
 - `tools/sqllogictest`: a port of DuckDB's sqllogictest runner. It runs the DuckDB `.test` corpus

@@ -6,6 +6,7 @@
 //! Statement transformers other than SELECT.
 
 mod alter;
+mod utility;
 
 use super::{Transformer, not_implemented, parser_error, to_recursive_cte, visit_expr_mut};
 use crate::ast::*;
@@ -106,7 +107,16 @@ impl Transformer<'_> {
                 let name = Self::text(self.req(node, "ColIdOrString")?);
                 let statement = self.statement(self.req(node, "Statement")?)?;
                 let kind = match &statement {
-                    Statement::Select(_) | Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => None,
+                    Statement::Select(_)
+                    | Statement::Insert(_)
+                    | Statement::Update(_)
+                    | Statement::Delete(_)
+                    | Statement::Copy(_) => None,
+                    Statement::CopyDatabase { .. } => Some("COPY_DATABASE_STATEMENT"),
+                    Statement::Export { .. } => Some("EXPORT_STATEMENT"),
+                    Statement::Attach(_) => Some("ATTACH_STATEMENT"),
+                    Statement::Vacuum { .. } => Some("VACUUM_STATEMENT"),
+                    Statement::Load(_) => Some("LOAD_STATEMENT"),
                     Statement::Explain { .. } => Some("EXPLAIN_STATEMENT"),
                     Statement::CreateTable(_) | Statement::Create(_) => Some("CREATE_STATEMENT"),
                     Statement::Drop(_) | Statement::Deallocate(_) => Some("DROP_STATEMENT"),
@@ -133,6 +143,21 @@ impl Transformer<'_> {
             "ExecuteStatement" => self.execute(node),
             "AlterStatement" => self.alter(node),
             "CommentStatement" => self.comment(node),
+            "CopyStatement" => self.copy(node),
+            "ExportStatement" => self.export(node),
+            "ImportStatement" => Ok(Statement::Pragma(PragmaInfo {
+                name: "import_database".into(),
+                parameters: vec![Expr::constant(Literal::string(Self::text(
+                    self.req(node, "StringLiteral")?,
+                )))],
+                named_parameters: Vec::new(),
+            })),
+            "AttachStatement" => self.attach(node),
+            "AnalyzeStatement" => self.analyze(node),
+            "VacuumStatement" => self.vacuum(node),
+            "LoadStatement" => self.load(node),
+            "InstallStatement" => self.install(node),
+            "ExtensionRepositoryStatement" => self.extension_repository(node),
             "DeallocateStatement" => Ok(Statement::Deallocate(Self::text(self.req(node, "ColIdOrString")?))),
             "DetachStatement" => Ok(Statement::Detach {
                 name: Self::text(self.req(node, "CatalogName")?),
@@ -379,20 +404,19 @@ impl Transformer<'_> {
 
     fn create(&mut self, node: &ParseNode) -> Result<Statement> {
         let variation = self.alt(self.req(node, "CreateStatementVariation")?)?;
-        if matches!(self.name(variation), "CreateSecretStmt" | "CreateTriggerStmt") {
-            return Err(not_implemented(format!(
-                "the transformer for {} is not yet ported",
-                self.name(variation)
-            )));
-        }
         let or_replace = self.sub(node, "OrReplace").is_some();
-        let temporary = match self.sub(node, "Temporary") {
-            Some(t) if self.name(self.alt(t)?) == "Persistent" => {
-                return Err(parser_error("PERSISTENT is only supported for CREATE SECRET"));
-            }
-            Some(_) => true,
+        let persistent = match self.sub(node, "Temporary") {
+            Some(t) => self.name(self.alt(t)?) == "Persistent",
             None => false,
         };
+        let temporary = self.sub(node, "Temporary").is_some() && !persistent;
+        if persistent && self.name(variation) != "CreateSecretStmt" {
+            if self.name(variation) == "CreateTriggerStmt" {
+                // the trigger body is transformed first in DuckDB, so its errors win
+                self.create_trigger(variation)?;
+            }
+            return Err(parser_error("PERSISTENT is only supported for CREATE SECRET"));
+        }
         let apply = |on_conflict: &mut OnCreateConflict| -> Result<()> {
             if or_replace {
                 if *on_conflict == OnCreateConflict::Ignore {
@@ -422,6 +446,13 @@ impl Transformer<'_> {
             }
             "CreateMacroStmt" => self.create_macro(variation)?,
             "CreateTypeStmt" => self.create_type(variation)?,
+            "CreateTriggerStmt" => {
+                if temporary {
+                    return Err(parser_error("Temporary triggers are not supported"));
+                }
+                self.create_trigger(variation)?
+            }
+            "CreateSecretStmt" => self.create_secret(variation, persistent)?,
             other => {
                 return Err(not_implemented(format!(
                     "the transformer for {other} is not yet ported"
@@ -430,6 +461,29 @@ impl Transformer<'_> {
         };
         let name = match &kind {
             CreateKind::Index { .. } => self.index_name(variation)?,
+            CreateKind::Trigger { .. } => QualifiedName::new(Self::text(self.req(variation, "TriggerName")?)),
+            CreateKind::Secret { secret_type, .. } => match self.sub(variation, "SecretName") {
+                Some(n) => QualifiedName::new(Self::text(n)),
+                None => {
+                    let Some(ty) = secret_type else {
+                        return Err(parser_error(
+                            "Failed to create secret - secret must have a type defined",
+                        ));
+                    };
+                    let value = match &ty.kind {
+                        ExprKind::Constant(l) if l.kind != LiteralKind::Null => l.text.clone(),
+                        ExprKind::ColumnRef(names) => names.last().cloned().unwrap_or_default(),
+                        _ => {
+                            return Err(invalid_input(
+                                "Can not combine a non-constant expression for the secret type with a default-named \
+                                 secret. Either provide an explicit secret name or use a constant expression for the \
+                                 secret type.",
+                            ));
+                        }
+                    };
+                    QualifiedName::new(format!("__default_{}", value.to_lowercase()))
+                }
+            },
             _ => self.qualified_name(self.req(variation, "QualifiedName")?)?,
         };
         let mut info = CreateInfo {
@@ -450,6 +504,70 @@ impl Transformer<'_> {
             **query = recursive_view(&info.name, aliases, node)?;
         }
         Ok(Statement::Create(Box::new(info)))
+    }
+
+    fn create_trigger(&mut self, node: &ParseNode) -> Result<CreateKind> {
+        let timing = match self.name(self.alt(self.req(node, "TriggerTiming")?)?) {
+            "TriggerBefore" => "BEFORE",
+            "TriggerInsteadOf" => "INSTEAD OF",
+            _ => "AFTER",
+        };
+        let event_node = self.alt(self.req(node, "TriggerEvent")?)?;
+        let (event, columns) = match self.name(event_node) {
+            "TriggerEventInsert" => ("INSERT", Vec::new()),
+            "TriggerEventDelete" => ("DELETE", Vec::new()),
+            "TriggerEventUpdateOf" => (
+                "UPDATE",
+                self.texts(self.req(event_node, "TriggerColumnList")?, "ColId"),
+            ),
+            _ => ("UPDATE", Vec::new()),
+        };
+        let table = self.base_table_name(self.req(node, "BaseTableName")?)?;
+        let (mut referencing_new, mut referencing_old) = (String::new(), String::new());
+        if let Some(clause) = self.sub(node, "ReferencingClause") {
+            for item in self.subs(clause, "ReferencingItem") {
+                let item = self.alt(item)?;
+                let alias = Self::text(self.req(item, "ColId")?);
+                let (slot, which) = if self.name(item) == "ReferencingNewTableAs" {
+                    (&mut referencing_new, "NEW")
+                } else {
+                    (&mut referencing_old, "OLD")
+                };
+                if !slot.is_empty() {
+                    return Err(parser_error(format!(
+                        "{which} TABLE cannot be specified multiple times in REFERENCING clause"
+                    )));
+                }
+                *slot = alias;
+            }
+            if !referencing_new.is_empty() && referencing_new.eq_ignore_ascii_case(&referencing_old) {
+                return Err(parser_error("REFERENCING aliases must be distinct"));
+            }
+        }
+        let for_each = match self.sub(node, "ForEachClause") {
+            Some(f) if self.name(self.alt(f)?) == "ForEachRow" => "ROW",
+            _ => "STATEMENT",
+        };
+        let action: QueryNode = match self.statement_kind(self.alt(self.req(node, "TriggerBody")?)?)? {
+            Statement::Insert(s) => QueryNodeKind::Insert(s).into(),
+            Statement::Update(s) => QueryNodeKind::Update(s).into(),
+            Statement::Delete(s) => QueryNodeKind::Delete(s).into(),
+            _ => {
+                return Err(parser_error(
+                    "Trigger body must be an INSERT, UPDATE, or DELETE statement",
+                ));
+            }
+        };
+        Ok(CreateKind::Trigger {
+            timing,
+            event,
+            columns,
+            table: Box::new(table),
+            referencing_new,
+            referencing_old,
+            for_each,
+            action: Box::new(action),
+        })
     }
 
     /// `QualifiedName <- CatalogReservedSchemaIdentifier / SchemaReservedIdentifierOrStringLiteral / ...`.

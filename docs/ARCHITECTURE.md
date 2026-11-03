@@ -71,9 +71,11 @@ VALUES lists gain a subquery level, GROUPING SETS renumber, `UNNEST` is lowercas
 VARIABLE prints its name unquoted (so `"my var"` does not read back). The corpus
 tool therefore checks that every rendering parses again and reports identical renderings
 separately. Known deviation: STAR EXCLUDE/REPLACE/RENAME lists keep input order, where C++
-uses unordered sets, and WITH options and EXECUTE parameters keep input order. Arrays of
+uses unordered sets, and WITH, ATTACH and CREATE SECRET options and EXECUTE parameters keep
+input order (COPY sorts its options, as DuckDB does). Arrays of
 ENUM types in CREATE TYPE are not supported yet. Statement transformers
-live in `transformer/statements.rs` (ALTER, COMMENT and SHOW in `statements/alter.rs`); statements not yet ported return `Not implemented Error`.
+live in `transformer/statements.rs` (ALTER, COMMENT and SHOW in `statements/alter.rs`, COPY and the other option-driven statements
+in `statements/utility.rs`); statements not yet ported return `Not implemented Error`.
 
 ## Testing
 

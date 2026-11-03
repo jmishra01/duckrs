@@ -2243,6 +2243,25 @@ pub enum Statement {
         if_exists: bool,
     },
     Alter(Box<AlterInfo>),
+    Copy(Box<CopyInfo>),
+    /// COPY FROM DATABASE a TO b (SCHEMA | DATA).
+    CopyDatabase {
+        from: String,
+        to: String,
+        schema_only: bool,
+    },
+    Export {
+        database: String,
+        info: Box<CopyInfo>,
+    },
+    Attach(Box<AttachInfo>),
+    /// VACUUM and ANALYZE.
+    Vacuum {
+        analyze: bool,
+        table: Option<Box<TableRef>>,
+        columns: Vec<String>,
+    },
+    Load(Box<LoadInfo>),
     /// Statements one statement was rewritten into (`MultiStatement`).
     Multi(Vec<Statement>),
 }
@@ -2294,6 +2313,40 @@ impl Display for Statement {
             }
             Statement::Deallocate(name) => write!(f, "DEALLOCATE PREPARE {};", sql_identifier(name)),
             Statement::Alter(info) => write!(f, "{info}"),
+            Statement::Copy(info) => write!(f, "{info}"),
+            Statement::CopyDatabase { from, to, schema_only } => write!(
+                f,
+                "COPY FROM DATABASE {} TO {} ({})",
+                sql_identifier(from),
+                sql_identifier(to),
+                if *schema_only { "SCHEMA" } else { "DATA" }
+            ),
+            Statement::Export { database, info } => {
+                f.write_str("EXPORT DATABASE")?;
+                if !database.is_empty() {
+                    write!(f, " {} TO", sql_identifier(database))?;
+                }
+                write!(f, " {}{};", sql_string(&info.file_path), info.options_to_string())
+            }
+            Statement::Attach(info) => write!(f, "{info}"),
+            Statement::Vacuum {
+                analyze,
+                table,
+                columns,
+            } => {
+                f.write_str("VACUUM")?;
+                if *analyze {
+                    f.write_str(" ANALYZE")?;
+                }
+                if let Some(table) = table {
+                    write!(f, " {table}")?;
+                    if !columns.is_empty() {
+                        write!(f, "({})", join(columns, ", ", |c| sql_identifier(c)))?;
+                    }
+                }
+                f.write_str(";")
+            }
+            Statement::Load(info) => write!(f, "{info}"),
             Statement::Multi(statements) => {
                 write!(f, "{};", join(statements, ";", |s| s.to_string()))
             }
@@ -2421,6 +2474,26 @@ pub enum CreateKind {
         macros: Vec<MacroFunction>,
     },
     Type(CreateTypeKind),
+    /// `name.name` is the trigger name.
+    Trigger {
+        timing: &'static str,
+        event: &'static str,
+        columns: Vec<String>,
+        table: Box<TableRef>,
+        referencing_new: String,
+        referencing_old: String,
+        for_each: &'static str,
+        action: Box<QueryNode>,
+    },
+    /// `name.name` is the secret name.
+    Secret {
+        persistent: bool,
+        storage: String,
+        provider: Option<Box<Expr>>,
+        secret_type: Option<Box<Expr>>,
+        scope: Option<Box<Expr>>,
+        options: Vec<(String, Expr)>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2576,6 +2649,71 @@ impl Display for CreateInfo {
                     self.qualified_name(),
                     join(macros, ", ", |m| m.to_string())
                 )
+            }
+            CreateKind::Trigger {
+                timing,
+                event,
+                columns,
+                table,
+                referencing_new,
+                referencing_old,
+                for_each,
+                action,
+            } => {
+                f.write_str("CREATE")?;
+                if self.on_conflict == OnCreateConflict::Replace {
+                    f.write_str(" OR REPLACE")?;
+                }
+                f.write_str(" TRIGGER ")?;
+                if self.on_conflict == OnCreateConflict::Ignore {
+                    f.write_str("IF NOT EXISTS ")?;
+                }
+                if let Some(schema) = self.name.qualification.last() {
+                    write!(f, "{}.", sql_identifier(schema))?;
+                }
+                write!(f, "{} {timing} {event}", sql_identifier(&self.name.name))?;
+                if *event == "UPDATE" && !columns.is_empty() {
+                    write!(f, " OF {}", join(columns, ", ", |c| sql_identifier(c)))?;
+                }
+                write!(f, " ON {table}")?;
+                if !referencing_new.is_empty() || !referencing_old.is_empty() {
+                    f.write_str(" REFERENCING")?;
+                    if !referencing_new.is_empty() {
+                        write!(f, " NEW TABLE AS {}", sql_identifier(referencing_new))?;
+                    }
+                    if !referencing_old.is_empty() {
+                        write!(f, " OLD TABLE AS {}", sql_identifier(referencing_old))?;
+                    }
+                }
+                write!(f, " FOR EACH {for_each} {action};")
+            }
+            CreateKind::Secret {
+                persistent,
+                storage,
+                provider,
+                secret_type,
+                scope,
+                options,
+            } => {
+                f.write_str(&self.prefix(if *persistent { "PERSISTENT SECRET" } else { "SECRET" }))?;
+                if !self.name.name.is_empty() {
+                    write!(f, " {}", sql_identifier(&self.name.name))?;
+                }
+                if !storage.is_empty() {
+                    write!(f, " IN{}", sql_identifier(storage))?;
+                }
+                let mut list = Vec::new();
+                if let Some(p) = provider {
+                    list.push(format!("PROVIDER {p}"));
+                }
+                if let Some(t) = secret_type {
+                    list.push(format!("TYPE {t}"));
+                }
+                if let Some(s) = scope {
+                    list.push(format!("SCOPE {s}"));
+                }
+                list.extend(options.iter().map(|(k, v)| format!("{k} {v}")));
+                write!(f, "({})", list.join(", "))
             }
             CreateKind::Type(kind) => {
                 f.write_str(&self.prefix("TYPE"))?;
@@ -2895,5 +3033,256 @@ impl Display for AlterInfo {
                 sql_identifier(column)
             ),
         }
+    }
+}
+
+/// `Value::ToSQLString` of a literal's value.
+pub fn literal_to_sql(literal: &Literal) -> String {
+    match literal.kind {
+        LiteralKind::Integer => {
+            let digits: String = literal.text.chars().filter(|&c| c != '_').collect();
+            match digits.parse::<i128>() {
+                Ok(v) => v.to_string(),
+                Err(_) => digits,
+            }
+        }
+        LiteralKind::Numeric => {
+            let digits: String = literal.text.chars().filter(|&c| c != '_').collect();
+            if digits.contains(['e', 'E']) {
+                return digits
+                    .parse::<f64>()
+                    .ok()
+                    .and_then(|v| duckrs_common::value::Value::double(v).try_to_string().ok())
+                    .unwrap_or(digits);
+            }
+            let (negative, unsigned) = match digits.strip_prefix('-') {
+                Some(rest) => (true, rest),
+                None => (false, digits.as_str()),
+            };
+            let (int, frac) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+            let int = int.trim_start_matches('0');
+            let mut out = String::new();
+            if negative {
+                out.push('-');
+            }
+            out += if int.is_empty() { "0" } else { int };
+            if !frac.is_empty() {
+                out.push('.');
+                out += frac;
+            }
+            out
+        }
+        LiteralKind::Hex => {
+            let bytes: String = literal
+                .text
+                .as_bytes()
+                .chunks(2)
+                .map(|pair| format!("\\x{}", String::from_utf8_lossy(pair).to_uppercase()))
+                .collect();
+            format!("'{bytes}'::BLOB")
+        }
+        LiteralKind::Bit => format!("'{}'::BIT", literal.text),
+        _ => literal.to_string(),
+    }
+}
+
+/// `CopyInfo`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CopyInfo {
+    pub table: QualifiedName,
+    pub select_list: Vec<String>,
+    /// COPY (query) TO ...
+    pub select: Option<Box<QueryNode>>,
+    pub is_from: bool,
+    pub file_path: String,
+    pub file_path_expression: Option<Box<Expr>>,
+    /// The format; rendered only when given explicitly.
+    pub format: String,
+    pub format_given: bool,
+    /// Options kept as expressions (`None` for a bare flag like HEADER).
+    pub parsed_options: Vec<(String, Option<Expr>)>,
+    pub options: Vec<(String, Vec<Literal>)>,
+}
+
+impl CopyInfo {
+    /// `CopyInfo::CopyOptionsToString`: options in sorted order.
+    pub fn options_to_string(&self) -> String {
+        if !self.format_given && self.options.is_empty() && self.parsed_options.is_empty() {
+            return String::new();
+        }
+        let mut parts = Vec::new();
+        if self.format_given && !self.format.is_empty() {
+            parts.push(format!(" FORMAT {}", sql_string(&self.format)));
+        }
+        let mut parsed: Vec<_> = self.parsed_options.iter().collect();
+        parsed.sort_by_key(|(name, _)| name.to_lowercase());
+        for (name, expr) in parsed {
+            match expr {
+                Some(e) => parts.push(format!("{name} {e}")),
+                None => parts.push(name.clone()),
+            }
+        }
+        let mut options: Vec<_> = self.options.iter().collect();
+        options.sort_by_key(|(name, _)| name.to_lowercase());
+        for (name, values) in options {
+            parts.push(match values.len() {
+                0 => format!("{name} "),
+                1 => format!("{name} {}", literal_to_sql(&values[0])),
+                _ => format!("{name} ( {} )", join(values, ", ", literal_to_sql)),
+            });
+        }
+        format!(" ({} )", parts.join(", "))
+    }
+
+    fn table_part(&self) -> String {
+        let mut r = self.table.to_string_hide_default_schema();
+        if !self.select_list.is_empty() {
+            r += &format!(" ({} )", join(&self.select_list, ", ", |c| sql_identifier(c)));
+        }
+        r
+    }
+}
+
+impl Display for CopyInfo {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("COPY ")?;
+        if self.is_from {
+            write!(f, "{} FROM", self.table_part())?;
+        } else {
+            match &self.select {
+                Some(query) => write!(f, "({query})")?,
+                None => f.write_str(&self.table_part())?,
+            }
+            f.write_str(" TO ")?;
+        }
+        match &self.file_path_expression {
+            Some(e) if self.file_path.is_empty() => write!(f, "({e})")?,
+            _ => write!(f, " {}", sql_string(&self.file_path))?,
+        }
+        write!(f, "{};", self.options_to_string())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachInfo {
+    pub on_conflict: OnCreateConflict,
+    pub path: Box<Expr>,
+    pub name: String,
+    pub parsed_options: Vec<(String, Expr)>,
+    pub options: Vec<(String, Literal)>,
+}
+
+impl Display for AttachInfo {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("ATTACH")?;
+        match self.on_conflict {
+            OnCreateConflict::Ignore => f.write_str(" IF NOT EXISTS")?,
+            OnCreateConflict::Replace => f.write_str(" OR REPLACE")?,
+            OnCreateConflict::Error => {}
+        }
+        write!(f, " DATABASE {}", self.path)?;
+        if !self.name.is_empty() {
+            write!(f, " AS {}", sql_identifier(&self.name))?;
+        }
+        if !self.parsed_options.is_empty() || !self.options.is_empty() {
+            let mut parts: Vec<String> = self
+                .parsed_options
+                .iter()
+                .map(|(n, e)| format!("{} {e}", sql_identifier(n)))
+                .collect();
+            parts.extend(
+                self.options
+                    .iter()
+                    .map(|(n, v)| format!("{} {}", sql_identifier(n), literal_to_sql(v))),
+            );
+            write!(f, " ({})", parts.join(", "))?;
+        }
+        f.write_str(";")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadType {
+    Load,
+    Install,
+    ForceInstall,
+    CreateRepository,
+    DropRepository,
+}
+
+/// `LoadInfo`: LOAD, INSTALL and extension repositories.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadInfo {
+    pub load_type: LoadType,
+    pub load_after_install: bool,
+    pub filename: String,
+    pub repository: String,
+    pub repo_is_alias: bool,
+    pub alias: String,
+    pub version: String,
+    pub repository_url: String,
+    pub public_keys: Vec<String>,
+    pub on_conflict: OnCreateConflict,
+    pub missing_ok: bool,
+}
+
+impl Display for LoadInfo {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self.load_type {
+            LoadType::CreateRepository => {
+                f.write_str("CREATE ")?;
+                if self.on_conflict == OnCreateConflict::Replace {
+                    f.write_str("OR REPLACE ")?;
+                }
+                f.write_str("EXTENSION REPOSITORY ")?;
+                if self.on_conflict == OnCreateConflict::Ignore {
+                    f.write_str("IF NOT EXISTS ")?;
+                }
+                write!(
+                    f,
+                    "{} WITH PREFIX {}",
+                    sql_identifier(&self.repository),
+                    sql_string(&self.repository_url)
+                )?;
+                if !self.public_keys.is_empty() {
+                    let keyword = if self.public_keys.len() > 1 { "KEYS" } else { "KEY" };
+                    write!(
+                        f,
+                        " USING PUBLIC {keyword} {}",
+                        join(&self.public_keys, ", ", |k| sql_string(k))
+                    )?;
+                }
+                return f.write_str(";");
+            }
+            LoadType::DropRepository => {
+                f.write_str("DROP EXTENSION REPOSITORY ")?;
+                if self.missing_ok {
+                    f.write_str("IF EXISTS ")?;
+                }
+                return write!(f, "{};", sql_identifier(&self.repository));
+            }
+            LoadType::Load => f.write_str("LOAD")?,
+            LoadType::Install | LoadType::ForceInstall => {
+                if self.load_type == LoadType::ForceInstall {
+                    f.write_str("FORCE ")?;
+                }
+                f.write_str("INSTALL")?;
+                if self.load_after_install {
+                    f.write_str(" AND LOAD")?;
+                }
+            }
+        }
+        write!(f, " {}", sql_string(&self.filename))?;
+        if !self.repository.is_empty() {
+            if self.repo_is_alias {
+                write!(f, " FROM {}", sql_identifier(&self.repository))?;
+            } else {
+                write!(f, " FROM {}", sql_string(&self.repository))?;
+            }
+        }
+        if !self.alias.is_empty() {
+            write!(f, " AS {}", sql_identifier(&self.alias))?;
+        }
+        f.write_str(";")
     }
 }
