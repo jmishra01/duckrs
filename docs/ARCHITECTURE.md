@@ -61,6 +61,18 @@ It runs on a thread with a 512 MB stack so deeply nested SQL cannot overflow. Kn
 thread and a fresh memo table per parse (about 0.3 ms per statement); reusing threads and
 memoizing only the rules C++ memoizes are the obvious optimizations.
 
+The transformer (`transformer.rs`) turns parse trees into the AST (`ast.rs`). The C++ version
+has one function per rule plus ~20k lines of generated trampolines that unpack each rule's
+sequence by position; the Rust one handles each rule by name and finds its parts by sub-rule
+name (`sub`/`subs`), so it does not depend on how a rule's sequence nests. The AST is a set of
+enums (`ExprKind`, `TableRefKind`, `QueryNodeKind`) instead of a class hierarchy, and `Display`
+reproduces DuckDB's `ToString` byte for byte. Rendering is not idempotent in DuckDB either:
+VALUES lists gain a subquery level, GROUPING SETS renumber, `UNNEST` is lowercased. The corpus
+tool therefore checks that every rendering parses again and reports identical renderings
+separately. Known deviation: STAR EXCLUDE/REPLACE/RENAME lists keep input order, where C++
+uses unordered sets. Only SELECT is transformed so far; other statements return
+`Not implemented Error`.
+
 ## Testing
 
 The DuckDB sqllogictest corpus is the acceptance oracle. `tools/sqllogictest` runs it against

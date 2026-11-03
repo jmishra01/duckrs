@@ -27,7 +27,10 @@ An analytical SQL database engine: a port of [DuckDB](https://github.com/duckdb/
   baseline in `grammar/`, re-synced with `sync_grammar.sh`) and produces parse trees. It accepts
   99.99% of the statements the test corpus expects to parse (all except one extension's
   grammar); `cargo run --release -p duckrs-parser --example corpus` measures this, and CI fails
-  below 99.9%. Next: the transformer from parse trees to the AST.
+  below 99.9%. The transformer turns parse trees of SELECT queries (with every expression form,
+  CTEs, set operations, joins, windows, grouping sets and samples) into the AST in `ast.rs`,
+  which renders SQL exactly like DuckDB's `ToString`; all 48k corpus SELECTs transform and their
+  renderings parse again (CI gate). Next: transforming the other statements (CREATE, INSERT, ...).
 - `crates/duckrs`: the public API surface (`Database`, `Connection`). Every query returns
   `Not implemented Error`.
 - `tools/sqllogictest`: a port of DuckDB's sqllogictest runner. It runs the DuckDB `.test` corpus
@@ -46,7 +49,7 @@ The full roadmap is in [`../RUST_PORT_PLAN.md`](../RUST_PORT_PLAN.md).
 duckrs/
 ├── crates/duckrs/          # public API (facade crate)
 ├── crates/duckrs-common/   # types, vectors, executors, values
-├── crates/duckrs-parser/   # tokenizer, PEG grammar engine (+ vendored grammar)
+├── crates/duckrs-parser/   # tokenizer, PEG grammar engine (+ vendored grammar), AST, transformer
 ├── tools/sqllogictest/     # test runner + known_passing.txt
 └── docs/                   # ARCHITECTURE, PORTING_GUIDE, UPSTREAM_SYNC
 ```

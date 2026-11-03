@@ -1,13 +1,15 @@
 //! The duckrs SQL parser: a port of DuckDB's PEG parser (`duckdb/src/parser/peg`).
 //!
 //! It tokenizes SQL, then matches DuckDB's own grammar (vendored from the baseline commit in
-//! `grammar/`) to produce a parse tree. The transformer that turns parse trees into an AST is
-//! the next part of Phase 2.
+//! `grammar/`) to produce a parse tree, which the transformer turns into the AST ([`ast`]).
+//! The transformer covers SELECT statements so far.
 
+pub mod ast;
 pub mod grammar;
 pub mod keywords;
 pub mod matcher;
 pub mod tokenizer;
+pub mod transformer;
 pub mod unicode;
 
 pub use grammar::Grammar;
@@ -46,6 +48,21 @@ pub fn parse(sql: &str) -> Result<Vec<ParsedStatement>> {
             tokens: tokens.clone(),
         })
         .collect())
+}
+
+/// Parses SQL text into one AST statement per statement.
+pub fn parse_ast(sql: &str) -> Result<Vec<ast::Statement>> {
+    let sql = sql.to_string();
+    std::thread::Builder::new()
+        .stack_size(PARSER_STACK_SIZE)
+        .spawn(move || {
+            let (_, trees) = parse_on_this_thread(&sql)?;
+            let mut transformer = transformer::Transformer::new(Grammar::duckdb());
+            trees.iter().map(|tree| transformer.statement(tree)).collect()
+        })
+        .map_err(|e| Error::new(ErrorKind::Internal, format!("failed to start the parser thread: {e}")))?
+        .join()
+        .map_err(|_| Error::new(ErrorKind::Internal, "the parser thread panicked"))?
 }
 
 /// Parses on the current thread (which must have a large enough stack).

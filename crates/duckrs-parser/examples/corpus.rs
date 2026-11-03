@@ -1,12 +1,21 @@
 //! Measures how much of DuckDB's sqllogictest corpus the parser accepts.
 //!
-//! `cargo run --release -p duckrs-parser --example corpus -- [../duckdb] [--show N] [--min-parse PCT]`
+//! `cargo run --release -p duckrs-parser --example corpus -- [../duckdb] [--show N] [--min-parse PCT]
+//! [--min-transform PCT]`
 //!
 //! With `--min-parse`, exits with an error if fewer statements than PCT percent parse (CI uses it).
+//!
+//! Statements that parse are also transformed into the AST. Those the transformer covers are
+//! rendered back to SQL, and the rendering must parse and transform again (round trip). Like
+//! DuckDB's own `ToString`, the second rendering is not always identical: VALUES lists nest one
+//! level deeper, GROUPING SETS renumber their expressions and `UNNEST` is lowercased, so identical
+//! renderings are reported separately. With `--min-transform PCT`, exits with an error if fewer
+//! covered statements than PCT percent transform and round trip.
 //!
 //! Statements DuckDB must accept (`statement ok`, `query`) should parse; statements whose
 //! expected error is a parser/syntax error should not. Loop bodies use their first iteration.
 
+use duckrs_common::ErrorKind;
 use sqllogictest::parser::{ExpectedResult, LoopKind, Record, parse_file};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -20,6 +29,12 @@ struct Stats {
     rejected: usize,
     failures: Vec<(String, String, String)>,
     wrongly_accepted: Vec<(String, String)>,
+    transformed: usize,
+    not_ported: usize,
+    transform_failures: Vec<(String, String, String)>,
+    round_trips: usize,
+    identical: usize,
+    round_trip_failures: Vec<(String, String, String)>,
 }
 
 fn substitute(sql: &str, vars: &[(String, String)]) -> String {
@@ -105,7 +120,37 @@ fn check_parses(sql: &str, file: &str, stats: &mut Stats) {
     stats.must_parse += 1;
     match duckrs_parser::parse(sql) {
         Ok(_) => stats.parsed += 1,
-        Err(e) => stats.failures.push((file.to_string(), sql.to_string(), e.to_string())),
+        Err(e) => {
+            stats.failures.push((file.to_string(), sql.to_string(), e.to_string()));
+            return;
+        }
+    }
+    let rendered = match duckrs_parser::parse_ast(sql) {
+        Ok(statements) => statements.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(";\n"),
+        Err(e) if e.kind == ErrorKind::NotImplemented => {
+            stats.not_ported += 1;
+            return;
+        }
+        Err(e) => {
+            stats
+                .transform_failures
+                .push((file.to_string(), sql.to_string(), e.to_string()));
+            return;
+        }
+    };
+    stats.transformed += 1;
+    let again = duckrs_parser::parse_ast(&rendered)
+        .map(|statements| statements.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(";\n"));
+    match again {
+        Ok(again) => {
+            stats.round_trips += 1;
+            if again == rendered {
+                stats.identical += 1;
+            }
+        }
+        Err(e) => stats
+            .round_trip_failures
+            .push((file.to_string(), rendered, e.to_string())),
     }
 }
 
@@ -142,6 +187,16 @@ fn main() {
         stats.must_fail,
         pct(stats.rejected, stats.must_fail)
     );
+    println!(
+        "transformed: {} (not yet ported: {}, failed: {})\nround trips: {}/{} ({:.2}%), identical renderings: {:.2}%",
+        stats.transformed,
+        stats.not_ported,
+        stats.transform_failures.len(),
+        stats.round_trips,
+        stats.transformed,
+        pct(stats.round_trips, stats.transformed),
+        pct(stats.identical, stats.transformed)
+    );
     // Group failures by their first word to show which statement kinds are missing.
     let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
     for (_, sql, _) in &stats.failures {
@@ -153,6 +208,12 @@ fn main() {
     println!("failures by first word: {:?}", &kinds[..kinds.len().min(15)]);
     for (file, sql, err) in stats.failures.iter().take(show) {
         println!("--- {file}\n{sql}\n=> {err}");
+    }
+    for (file, sql, err) in stats.transform_failures.iter().take(show) {
+        println!("--- TRANSFORM {file}\n{sql}\n=> {err}");
+    }
+    for (file, sql, err) in stats.round_trip_failures.iter().take(show) {
+        println!("--- ROUND TRIP {file}\n{sql}\n=> {err}");
     }
     if show > 0 {
         for (file, sql) in stats.wrongly_accepted.iter().take(show / 2) {
@@ -168,6 +229,18 @@ fn main() {
         && pct(stats.parsed, stats.must_parse) < min
     {
         eprintln!("error: parse rate below {min}%");
+        std::process::exit(1);
+    }
+    let min_transform: Option<f64> = args
+        .iter()
+        .position(|a| a == "--min-transform")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|n| n.parse().ok());
+    let covered = stats.transformed + stats.transform_failures.len();
+    if let Some(min) = min_transform
+        && pct(stats.round_trips, covered) < min
+    {
+        eprintln!("error: transform round-trip rate below {min}%");
         std::process::exit(1);
     }
 }
