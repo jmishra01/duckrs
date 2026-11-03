@@ -112,25 +112,25 @@ fn matcher_semantics() {
     let not_distinct = RowMatcher::new(&layout, vec![ComparisonType::NotDistinctFrom; 4]).unwrap();
     let (mut sel, mut misses) = (all(), Vec::new());
     // SAFETY: ptrs belong to the live collection `rows`.
-    unsafe { equal.match_rows(&layout, &chunk, &ptrs, &mut sel, Some(&mut misses)) };
+    unsafe { equal.match_rows(&rows, &chunk, &ptrs, &mut sel, Some(&mut misses)) };
     assert_eq!(sel, [0]);
     assert_eq!(misses, [1, 2]);
     let mut sel = all();
     // SAFETY: as above.
-    unsafe { not_distinct.match_rows(&layout, &chunk, &ptrs, &mut sel, None) };
+    unsafe { not_distinct.match_rows(&rows, &chunk, &ptrs, &mut sel, None) };
     assert_eq!(sel, [0, 1, 2], "NaN matches NaN, NULL matches NULL");
 
     // Row 0's key against every row.
     let shifted = vec![ptrs[0]; 3];
     let mut sel = all();
     // SAFETY: as above.
-    unsafe { not_distinct.match_rows(&layout, &chunk, &shifted, &mut sel, None) };
+    unsafe { not_distinct.match_rows(&rows, &chunk, &shifted, &mut sel, None) };
     assert_eq!(sel, [0]);
 
     let gt = RowMatcher::new(&layout, vec![ComparisonType::GreaterThan]).unwrap();
     let mut sel = all();
     // SAFETY: as above.
-    unsafe { gt.match_rows(&layout, &chunk, &shifted, &mut sel, None) };
+    unsafe { gt.match_rows(&rows, &chunk, &shifted, &mut sel, None) };
     assert_eq!(sel, [2], "3 > 1; NULL > 1 is not true");
     assert!(
         RowMatcher::new(
@@ -146,14 +146,121 @@ fn matcher_semantics() {
     );
 }
 
+fn int_list(v: &[Option<i32>]) -> Value {
+    Value::list(
+        LogicalType::INTEGER,
+        v.iter()
+            .map(|x| x.map_or(Value::null(LogicalType::INTEGER), Value::integer))
+            .collect(),
+    )
+    .unwrap()
+}
+
 #[test]
-fn lists_are_rejected() {
-    let layout = TupleDataLayout::new(
-        vec![LogicalType::list(LogicalType::INTEGER)],
-        vec![],
-        RowValidity::CanHaveNull,
-    );
-    assert!(TupleDataCollection::new(layout).is_err());
+fn lists_and_arrays_round_trip_and_match() {
+    let list_ty = LogicalType::list(LogicalType::INTEGER);
+    let arr_ty = LogicalType::array(LogicalType::VARCHAR, 2);
+    let nested_ty = LogicalType::struct_type(vec![("l".into(), LogicalType::list(LogicalType::VARCHAR))]);
+    let types = [list_ty.clone(), arr_ty.clone(), nested_ty.clone()];
+    let arr = |a: &str, b: &str| {
+        Value::new(
+            arr_ty.clone(),
+            crate::value::ValueData::List(vec![Value::varchar(a), Value::varchar(b)]),
+        )
+        .unwrap()
+    };
+    let nested = |v: &[&str]| {
+        Value::struct_value(vec![(
+            "l".into(),
+            Value::list(LogicalType::VARCHAR, v.iter().map(|s| Value::varchar(*s)).collect()).unwrap(),
+        )])
+    };
+    let rows_in = [
+        [
+            int_list(&[Some(1), None]),
+            arr("x", "a string long enough for the heap"),
+            nested(&["p", "q"]),
+        ],
+        [
+            Value::null(list_ty.clone()),
+            Value::null(arr_ty.clone()),
+            Value::null(nested_ty.clone()),
+        ],
+        [int_list(&[]), arr("", "y"), nested(&[])],
+    ];
+    let mut chunk = DataChunk::with_capacity(&types, 3);
+    for row in &rows_in {
+        chunk.append_row(row).unwrap();
+    }
+    let layout = TupleDataLayout::new(types.to_vec(), vec![], RowValidity::CanHaveNull);
+    let mut rows = TupleDataCollection::new(layout.clone()).unwrap();
+    let ptrs = rows.append(&chunk);
+    let ptrs2 = rows.append(&chunk);
+    drop(chunk);
+    let back: Vec<DataChunk> = rows.scan().collect();
+    for (r, row) in rows_in.iter().enumerate() {
+        for (c, v) in row.iter().enumerate() {
+            assert_eq!(&back[0].get_value(c, r), v, "row {r} column {c}");
+            assert_eq!(&back[0].get_value(c, r + 3), v, "second copy, row {r} column {c}");
+        }
+    }
+
+    // Each row against its copy: NOT DISTINCT FROM matches all; EQUAL rejects the NULL row.
+    let mut chunk = DataChunk::with_capacity(&types, 3);
+    for row in &rows_in {
+        chunk.append_row(row).unwrap();
+    }
+    let not_distinct = RowMatcher::new(&layout, vec![ComparisonType::NotDistinctFrom; 3]).unwrap();
+    let equal = RowMatcher::new(&layout, vec![ComparisonType::Equal; 2]).unwrap();
+    let mut sel = vec![0, 1, 2];
+    // SAFETY: ptrs2 belong to `rows`, which is alive.
+    unsafe { not_distinct.match_rows(&rows, &chunk, &ptrs2, &mut sel, None) };
+    assert_eq!(sel, [0, 1, 2]);
+    let mut sel = vec![0, 1, 2];
+    // SAFETY: as above.
+    unsafe { equal.match_rows(&rows, &chunk, &ptrs, &mut sel, None) };
+    assert_eq!(sel, [0, 2], "[1, NULL] = [1, NULL] is true; NULL = NULL is not");
+
+    // Ordering: every row against row 0's list [1, NULL]. [] < [1, NULL]; NULL never compares.
+    let lt = RowMatcher::new(&layout, vec![ComparisonType::LessThan]).unwrap();
+    let against_first = vec![ptrs[0]; 3];
+    let mut sel = vec![0, 1, 2];
+    // SAFETY: as above.
+    unsafe { lt.match_rows(&rows, &chunk, &against_first, &mut sel, None) };
+    assert_eq!(sel, [2]);
+}
+
+proptest! {
+    /// Matching lists through sort keys agrees with DuckDB's list order (`[1, NULL] > [1, 2]`,
+    /// shorter lists first), which is the order of Vec<Option<i32>> with None greatest.
+    #[test]
+    fn list_comparisons_follow_duckdb_order(
+        a in prop::collection::vec(prop::option::of(-3i32..3), 0..4),
+        b in prop::collection::vec(prop::option::of(-3i32..3), 0..4),
+    ) {
+        let types = [LogicalType::list(LogicalType::INTEGER)];
+        let layout = TupleDataLayout::new(types.to_vec(), vec![], RowValidity::CanHaveNull);
+        let mut rows = TupleDataCollection::new(layout.clone()).unwrap();
+        let mut stored = DataChunk::with_capacity(&types, 1);
+        stored.append_row(&[int_list(&b)]).unwrap();
+        let ptrs = rows.append(&stored);
+        let mut probe = DataChunk::with_capacity(&types, 1);
+        probe.append_row(&[int_list(&a)]).unwrap();
+        // None sorts after Some, like a NULL element.
+        let key = |v: &Vec<Option<i32>>| v.iter().map(|x| x.map_or((1, 0), |x| (0, x))).collect::<Vec<_>>();
+        let expected = key(&a).cmp(&key(&b));
+        for (predicate, holds) in [
+            (ComparisonType::Equal, expected.is_eq()),
+            (ComparisonType::LessThan, expected.is_lt()),
+            (ComparisonType::GreaterThanOrEqual, expected.is_ge()),
+        ] {
+            let matcher = RowMatcher::new(&layout, vec![predicate]).unwrap();
+            let mut sel = vec![0];
+            // SAFETY: ptrs belong to `rows`, which is alive.
+            unsafe { matcher.match_rows(&rows, &probe, &ptrs, &mut sel, None) };
+            prop_assert_eq!(!sel.is_empty(), holds, "{:?} {:?} {:?}", predicate, a, b);
+        }
+    }
 }
 
 #[test]

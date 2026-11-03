@@ -2,7 +2,8 @@
 
 An analytical SQL database engine: a port of [DuckDB](https://github.com/duckdb/duckdb) to Rust.
 
-**Status: Phase 1 (common core) in progress.** The engine runs no queries yet. What exists today:
+**Status: Phase 1 (common core) complete; Phase 2 (parser) is next.** The engine runs no queries yet.
+What exists today:
 
 - `crates/duckrs-common`: the core building blocks every other crate uses:
   - the type system (`LogicalType`, `PhysicalType`, with DuckDB's ids and names), `string_t`
@@ -27,9 +28,10 @@ An analytical SQL database engine: a port of [DuckDB](https://github.com/duckdb/
 - `tools/sqllogictest`: a port of DuckDB's sqllogictest runner. It runs the DuckDB `.test` corpus
   against duckrs, or against the C++ DuckDB library as a reference.
 
-Still to do in Phase 1: LIST/ARRAY support in hashing and the row format. Sorting is in-memory
-(external merge sort comes with Phase 8), and `ColumnDataCollection` and `TupleDataCollection`
-are in-memory too (spilling comes with the buffer manager in Phase 9).
+Deferred to later phases by design: sorting is in-memory (external merge sort comes with Phase
+8), and `ColumnDataCollection` and `TupleDataCollection` are in-memory (spilling comes with the
+buffer manager in Phase 9). The row format stores LIST/ARRAY values in a per-column side store
+rather than C++'s row heap; it is never persisted, so only its behavior has to match.
 
 The full roadmap is in [`../RUST_PORT_PLAN.md`](../RUST_PORT_PLAN.md).
 

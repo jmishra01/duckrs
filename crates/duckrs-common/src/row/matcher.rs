@@ -1,8 +1,9 @@
 // Ported from duckdb/src/common/row_operations/row_matcher.cpp @ rust-port-baseline
 
-use super::collection::{RowPtr, load, row_is_valid};
+use super::collection::{NestedStores, RowPtr, TupleDataCollection, load, row_is_valid};
 use super::layout::TupleDataLayout;
 use crate::comparison::{ComparisonType, DuckOrd};
+use crate::sort_key::{OrderModifiers, create_sort_keys};
 use crate::types::{Interval, PhysicalType, StringT};
 use crate::vector::{DataChunk, UnifiedFormat, Vector};
 use crate::{Error, Result};
@@ -37,16 +38,17 @@ impl RowMatcher {
     ///
     /// # Safety
     ///
-    /// `rows[i]` must be a live row laid out with `layout` for every `i` in `sel`, and its long
-    /// strings must still be alive (they are while their collection is).
+    /// `rows[i]` must be a row of `rows_from` for every `i` in `sel`.
     pub unsafe fn match_rows(
         &self,
-        layout: &TupleDataLayout,
+        rows_from: &TupleDataCollection,
         lhs: &DataChunk,
         rows: &[RowPtr],
         sel: &mut Vec<u32>,
         mut no_match: Option<&mut Vec<u32>>,
     ) {
+        let layout = rows_from.layout();
+        let nested = rows_from.nested();
         let columns: Vec<Prepared> = lhs.columns()[..self.predicates.len()]
             .iter()
             .map(|c| Prepared::new(c, lhs.len()))
@@ -55,11 +57,9 @@ impl RowMatcher {
         for &idx in sel.iter() {
             let i = idx as usize;
             // SAFETY: forwarded to the caller.
-            let ok = self
-                .predicates
-                .iter()
-                .enumerate()
-                .all(|(col, &predicate)| unsafe { match_value(layout, col, predicate, &columns[col], i, rows[i]) });
+            let ok = self.predicates.iter().enumerate().all(|(col, &predicate)| unsafe {
+                match_value(layout, nested, col, predicate, &columns[col], i, rows[i])
+            });
             if ok {
                 matched.push(idx);
             } else if let Some(no_match) = no_match.as_deref_mut() {
@@ -77,10 +77,23 @@ enum Prepared {
         validity: UnifiedFormat,
         children: Vec<Prepared>,
     },
+    /// LIST/ARRAY values compare through their sort keys (`ASC NULLS LAST`), whose byte order is
+    /// DuckDB's nested-value order: element-wise, NULL elements largest, shorter lists first.
+    Nested {
+        validity: UnifiedFormat,
+        keys: Vec<Vec<u8>>,
+    },
 }
 
 impl Prepared {
     fn new(column: &Vector, count: usize) -> Self {
+        if matches!(column.physical_type(), PhysicalType::List | PhysicalType::Array) {
+            return Self::Nested {
+                validity: column.to_unified(count),
+                keys: create_sort_keys(&[(column, OrderModifiers::ASC_NULLS_LAST)], count)
+                    .expect("every type has sort keys"),
+            };
+        }
         if column.physical_type() != PhysicalType::Struct {
             return Self::Value(column.to_unified(count));
         }
@@ -94,7 +107,7 @@ impl Prepared {
 
     fn is_null(&self, i: usize) -> bool {
         let u = match self {
-            Self::Value(u) | Self::Struct { validity: u, .. } => u,
+            Self::Value(u) | Self::Struct { validity: u, .. } | Self::Nested { validity: u, .. } => u,
         };
         !u.validity.is_valid(u.sel.get(i))
     }
@@ -107,6 +120,7 @@ impl Prepared {
 /// `row` must be a live row laid out with `layout`.
 unsafe fn match_value(
     layout: &TupleDataLayout,
+    nested: &NestedStores,
     col: usize,
     predicate: ComparisonType,
     lhs: &Prepared,
@@ -118,6 +132,14 @@ unsafe fn match_value(
     let rhs_null = layout.can_have_null() && !unsafe { row_is_valid(row.as_ptr(), col) };
     let lhs = match lhs {
         Prepared::Value(u) => u,
+        Prepared::Nested { keys, .. } => {
+            return predicate.evaluate(lhs_null, rhs_null, || {
+                // SAFETY: a valid row's slot holds an index written by scatter.
+                let index: u64 = unsafe { load(layout, row, col) };
+                let store = &nested.lists[&col];
+                keys[i].cmp(&store.keys[index as usize])
+            });
+        }
         Prepared::Struct { children, .. } => {
             // STRUCT equality: both structs non-NULL (or, for NOT DISTINCT FROM, both NULL), and
             // every field NOT DISTINCT FROM its counterpart.
@@ -129,7 +151,17 @@ unsafe fn match_value(
             let child_row = RowPtr::from_raw(unsafe { row.as_ptr().add(layout.offsets()[col]) });
             return children.iter().enumerate().all(|(c, child)| {
                 // SAFETY: nested row of child_layout, alive with its parent.
-                unsafe { match_value(child_layout, c, ComparisonType::NotDistinctFrom, child, i, child_row) }
+                unsafe {
+                    match_value(
+                        child_layout,
+                        nested.structs.get(&col).unwrap_or(&NestedStores::default()),
+                        c,
+                        ComparisonType::NotDistinctFrom,
+                        child,
+                        i,
+                        child_row,
+                    )
+                }
             });
         }
     };
@@ -165,6 +197,6 @@ unsafe fn match_value(
             let rhs = unsafe { rhs.as_bytes() };
             lhs.str_at(i).cmp(rhs)
         }),
-        other => unreachable!("{other} columns are rejected by TupleDataCollection::new"),
+        other => unreachable!("{other} vectors hold no values"),
     }
 }

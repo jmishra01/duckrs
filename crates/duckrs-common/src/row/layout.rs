@@ -88,7 +88,7 @@ impl TupleDataLayout {
             } else if physical == PhysicalType::Struct {
                 struct_layouts[&i].row_width
             } else {
-                // LIST/ARRAY: a pointer to the heap.
+                // LIST/ARRAY: 8 bytes (an index into the collection's side store; a heap pointer in C++).
                 8
             };
         }

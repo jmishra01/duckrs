@@ -3,13 +3,20 @@
 //
 // In-memory only for now: rows live in fixed blocks that never move, so row pointers stay valid
 // until the collection is reset or dropped. Spilling (pointer swizzling through the buffer
-// manager) comes with the storage engine. LIST/ARRAY columns are not supported yet.
+// manager) comes with the storage engine.
+//
+// Deviation from C++: DuckDB serializes LIST/ARRAY values into a per-row heap. Here each
+// LIST/ARRAY column keeps an append-only side store (a vector of the column's values, plus their
+// sort keys for matching), and the row's 8-byte slot holds the value's index in that store. The
+// row format is never persisted, so only the behavior has to match; spilling will revisit this.
 
 use super::layout::TupleDataLayout;
+use crate::Result;
 use crate::STANDARD_VECTOR_SIZE;
+use crate::sort_key::{OrderModifiers, create_sort_keys};
 use crate::types::{Interval, PhysicalType, StringT};
-use crate::vector::{DataChunk, StringBuffer, Vector};
-use crate::{Error, Result};
+use crate::vector::{DataChunk, SelectionVector, StringBuffer, StringCopy, Vector};
+use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
@@ -58,6 +65,20 @@ pub(crate) unsafe fn row_is_valid(row: *const u8, column: usize) -> bool {
     unsafe { *row.add(column / 8) & (1 << (column % 8)) != 0 }
 }
 
+/// The LIST/ARRAY values of one column, in insertion order (see the module comment).
+pub(crate) struct ListStore {
+    pub(crate) values: Vector,
+    /// `create_sort_key(value, 'ASC NULLS LAST')` of each value, for the row matcher.
+    pub(crate) keys: Vec<Vec<u8>>,
+}
+
+/// Side stores for the LIST/ARRAY columns of a layout and of its nested STRUCT layouts.
+#[derive(Default)]
+pub(crate) struct NestedStores {
+    pub(crate) lists: HashMap<usize, ListStore>,
+    pub(crate) structs: HashMap<usize, NestedStores>,
+}
+
 /// Rows stored in DuckDB's row format (`TupleDataCollection`): the input to hash tables,
 /// aggregation and sorting.
 pub struct TupleDataCollection {
@@ -67,6 +88,7 @@ pub struct TupleDataCollection {
     rows_per_block: usize,
     count: usize,
     strings: Arc<StringBuffer>,
+    nested: NestedStores,
 }
 
 impl std::fmt::Debug for TupleDataCollection {
@@ -80,27 +102,8 @@ impl std::fmt::Debug for TupleDataCollection {
     }
 }
 
-fn check_supported(layout: &TupleDataLayout) -> Result<()> {
-    for ty in layout.types() {
-        match ty.physical_type() {
-            PhysicalType::List | PhysicalType::Array => {
-                return Err(Error::not_implemented(format!(
-                    "{ty} columns in rows are not supported yet"
-                )));
-            }
-            PhysicalType::Struct => {
-                let children: Vec<_> = ty.struct_children().iter().map(|(_, t)| t.clone()).collect();
-                check_supported(&TupleDataLayout::new(children, vec![], super::RowValidity::CanHaveNull))?;
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
 impl TupleDataCollection {
     pub fn new(layout: TupleDataLayout) -> Result<Self> {
-        check_supported(&layout)?;
         let rows_per_block = (BLOCK_SIZE / layout.row_width().max(1)).max(1);
         Ok(Self {
             layout,
@@ -109,6 +112,7 @@ impl TupleDataCollection {
             rows_per_block,
             count: 0,
             strings: Arc::default(),
+            nested: NestedStores::default(),
         })
     }
 
@@ -152,7 +156,17 @@ impl TupleDataCollection {
         }
         for (column, vector) in chunk.columns().iter().enumerate() {
             // SAFETY: the rows were just allocated with this collection's layout.
-            unsafe { scatter(&self.layout, column, vector, &rows, chunk.len(), &strings) };
+            unsafe {
+                scatter(
+                    &self.layout,
+                    column,
+                    vector,
+                    &rows,
+                    chunk.len(),
+                    &strings,
+                    &mut self.nested,
+                )
+            };
         }
         rows
     }
@@ -186,7 +200,7 @@ impl TupleDataCollection {
     pub unsafe fn gather(&self, rows: &[RowPtr], column: usize, target: &mut Vector) {
         target.prepare_flat(rows.len());
         // SAFETY: forwarded to the caller.
-        unsafe { gather(&self.layout, column, rows, target, &self.strings) };
+        unsafe { gather(&self.layout, column, rows, target, &self.strings, &self.nested) };
     }
 
     /// Reads every row back as chunks of up to [`STANDARD_VECTOR_SIZE`] rows.
@@ -211,6 +225,11 @@ impl TupleDataCollection {
         self.rows_in_last = 0;
         self.count = 0;
         self.strings = Arc::default();
+        self.nested = NestedStores::default();
+    }
+
+    pub(crate) fn nested(&self) -> &NestedStores {
+        &self.nested
     }
 }
 
@@ -226,9 +245,46 @@ unsafe fn scatter(
     rows: &[RowPtr],
     count: usize,
     strings: &StringBuffer,
+    nested: &mut NestedStores,
 ) {
     let offset = layout.offsets()[column];
     let ty = &layout.types()[column];
+    if matches!(ty.physical_type(), PhysicalType::List | PhysicalType::Array) {
+        let mut flat = vector.clone();
+        flat.flatten(count);
+        let store = nested.lists.entry(column).or_insert_with(|| ListStore {
+            values: Vector::new(ty.clone(), 0),
+            keys: Vec::new(),
+        });
+        let mut keys = create_sort_keys(&[(&flat, OrderModifiers::ASC_NULLS_LAST)], count)
+            .expect("every type has sort keys")
+            .into_iter();
+        let mut valid_rows = Vec::new();
+        for (i, row) in rows.iter().enumerate() {
+            let key = keys.next().expect("one key per row");
+            // SAFETY: rows are alive (caller); the 8-byte slot lies within the row.
+            unsafe {
+                if flat.is_valid(i) {
+                    let index = store.keys.len() as u64;
+                    row.as_ptr().add(offset).cast::<u64>().write_unaligned(index);
+                    store.keys.push(key);
+                    valid_rows.push(i as u32);
+                } else {
+                    set_invalid(row.as_ptr(), column);
+                }
+            }
+        }
+        let start = store.keys.len() - valid_rows.len();
+        let n = valid_rows.len();
+        store.values.copy_from(
+            &flat,
+            &SelectionVector::from_vec(valid_rows),
+            n,
+            start,
+            StringCopy::Deep,
+        );
+        return;
+    }
     if ty.physical_type() == PhysicalType::Struct {
         let mut flat = vector.clone();
         flat.flatten(count);
@@ -246,7 +302,17 @@ unsafe fn scatter(
         }
         for (c, child) in flat.struct_children().iter().enumerate() {
             // SAFETY: child rows are nested rows of child_layout.
-            unsafe { scatter(child_layout, c, child, &child_rows, count, strings) };
+            unsafe {
+                scatter(
+                    child_layout,
+                    c,
+                    child,
+                    &child_rows,
+                    count,
+                    strings,
+                    nested.structs.entry(column).or_default(),
+                )
+            };
         }
         return;
     }
@@ -295,7 +361,7 @@ unsafe fn scatter(
                 }
             }
         }
-        other => unreachable!("{other} columns are rejected by check_supported"),
+        other => unreachable!("{other} vectors hold no values"),
     }
 }
 
@@ -332,9 +398,44 @@ unsafe fn gather(
     rows: &[RowPtr],
     target: &mut Vector,
     strings: &Arc<StringBuffer>,
+    nested: &NestedStores,
 ) {
     let offset = layout.offsets()[column];
     let ty = layout.types()[column].clone();
+    if matches!(ty.physical_type(), PhysicalType::List | PhysicalType::Array) {
+        // SAFETY: forwarded to the caller.
+        let valid: Vec<bool> = rows
+            .iter()
+            .map(|r| !layout.can_have_null() || unsafe { row_is_valid(r.as_ptr(), column) })
+            .collect();
+        if let Some(store) = nested.lists.get(&column) {
+            let sel: Vec<u32> = rows
+                .iter()
+                .zip(&valid)
+                .map(|(r, v)| {
+                    if *v {
+                        // SAFETY: the slot of a valid row holds an index written by scatter.
+                        unsafe { r.as_ptr().add(offset).cast::<u64>().read_unaligned() as u32 }
+                    } else {
+                        0
+                    }
+                })
+                .collect();
+            target.copy_from(
+                &store.values,
+                &SelectionVector::from_vec(sel),
+                rows.len(),
+                0,
+                StringCopy::Reference,
+            );
+        }
+        for (i, v) in valid.iter().enumerate() {
+            if !v {
+                target.set_null(i, true);
+            }
+        }
+        return;
+    }
     for (i, row) in rows.iter().enumerate() {
         // SAFETY: forwarded to the caller.
         let valid = !layout.can_have_null() || unsafe { row_is_valid(row.as_ptr(), column) };
@@ -349,7 +450,16 @@ unsafe fn gather(
         for (c, child) in target.struct_children_mut().iter_mut().enumerate() {
             child.prepare_flat(rows.len());
             // SAFETY: nested rows of child_layout.
-            unsafe { gather(child_layout, c, &child_rows, child, strings) };
+            unsafe {
+                gather(
+                    child_layout,
+                    c,
+                    &child_rows,
+                    child,
+                    strings,
+                    nested.structs.get(&column).unwrap_or(&NestedStores::default()),
+                )
+            };
         }
         return;
     }
@@ -386,7 +496,7 @@ unsafe fn gather(
                 out[i] = unsafe { row.as_ptr().add(offset).cast::<StringT>().read_unaligned() };
             }
         }
-        other => unreachable!("{other} columns are rejected by check_supported"),
+        other => unreachable!("{other} vectors hold no values"),
     }
 }
 

@@ -4,7 +4,7 @@
 // Hash values must match DuckDB bit for bit: they decide hash-table and partition placement,
 // and `hash()` exposes them to SQL.
 
-use crate::types::{Interval, LogicalType, PhysicalType, TimeTz};
+use crate::types::{Interval, ListEntry, LogicalType, PhysicalType, TimeTz};
 use crate::vector::{Vector, VectorType};
 use crate::{Error, Result};
 
@@ -151,6 +151,11 @@ impl HashValue for TimeTz {
 /// hash to [`NULL_HASH`]. A constant input gives a constant result.
 pub fn hash_vector(input: &Vector, count: usize) -> Result<Vector> {
     let mut hashes = Vector::new(LogicalType::UBIGINT, count.max(1));
+    if matches!(input.physical_type(), PhysicalType::List | PhysicalType::Array) {
+        let values = nested_hashes(input, count, None)?;
+        hashes.data_mut::<u64>()[..count].copy_from_slice(&values);
+        return Ok(hashes);
+    }
     if input.physical_type() == PhysicalType::Struct {
         let mut flat = input.clone();
         flat.flatten(count);
@@ -178,6 +183,13 @@ pub fn hash_vector(input: &Vector, count: usize) -> Result<Vector> {
 
 /// Mixes the hashes of `input` into `hashes` row by row (`VectorOperations::CombineHash`).
 pub fn combine_hash(hashes: &mut Vector, input: &Vector, count: usize) -> Result<()> {
+    if matches!(input.physical_type(), PhysicalType::List | PhysicalType::Array) {
+        hashes.flatten(count);
+        let current = hashes.data::<u64>()[..count].to_vec();
+        let values = nested_hashes(input, count, Some(&current))?;
+        hashes.data_mut::<u64>()[..count].copy_from_slice(&values);
+        return Ok(());
+    }
     if input.physical_type() == PhysicalType::Struct {
         let mut flat = input.clone();
         flat.flatten(count);
@@ -198,6 +210,58 @@ pub fn combine_hash(hashes: &mut Vector, input: &Vector, count: usize) -> Result
         *h = combine_hash_scalar(*h, o);
     }
     Ok(())
+}
+
+/// Hashes LIST/ARRAY rows (`ListLoopHash`, `ArrayLoopHash`). Without `existing` this is the first
+/// hash of the row; with it, the elements are combined into the existing hashes.
+///
+/// - LIST, first hash: NULL or empty gives [`NULL_HASH`]; otherwise the first element's hash,
+///   combined with each following element's.
+/// - LIST, combining: every element is combined in; NULL or empty lists change nothing.
+/// - ARRAY: elements are combined into 0 (first hash) or the existing hash; a NULL array gives
+///   [`NULL_HASH`] (first hash) or changes nothing (combining).
+fn nested_hashes(input: &Vector, count: usize, existing: Option<&[u64]>) -> Result<Vec<u64>> {
+    let mut flat = input.clone();
+    flat.flatten(count);
+    let is_list = flat.physical_type() == PhysicalType::List;
+    let (child, child_count) = if is_list {
+        (flat.list_child(), flat.list_size())
+    } else {
+        let size = flat.logical_type().array_size().expect("ARRAY has a size") as usize;
+        (flat.array_child(), count * size)
+    };
+    let child_hashes = if child_count > 0 {
+        let mut h = hash_vector(child, child_count)?;
+        h.flatten(child_count);
+        h.data::<u64>()[..child_count].to_vec()
+    } else {
+        Vec::new()
+    };
+    let array_size = flat.logical_type().array_size().unwrap_or(0) as usize;
+    let mut out = Vec::with_capacity(count);
+    for row in 0..count {
+        let valid = flat.is_valid(row);
+        let range = if is_list {
+            let e = flat.data::<ListEntry>()[row];
+            e.offset as usize..(e.offset + e.length) as usize
+        } else {
+            row * array_size..(row + 1) * array_size
+        };
+        let h = match existing {
+            None if !valid || (is_list && range.is_empty()) => NULL_HASH,
+            None if is_list => child_hashes[range.clone()]
+                .iter()
+                .skip(1)
+                .fold(child_hashes[range.start], |h, &c| combine_hash_scalar(h, c)),
+            None => child_hashes[range].iter().fold(0, |h, &c| combine_hash_scalar(h, c)),
+            Some(current) if !valid => current[row],
+            Some(current) => child_hashes[range]
+                .iter()
+                .fold(current[row], |h, &c| combine_hash_scalar(h, c)),
+        };
+        out.push(h);
+    }
+    Ok(out)
 }
 
 /// The hash of each of the first `rows` rows of a non-nested vector.
@@ -325,8 +389,65 @@ mod tests {
     }
 
     #[test]
-    fn lists_are_not_supported_yet() {
-        let v = Vector::new(LogicalType::list(LogicalType::INTEGER), 1);
-        assert!(hash_vector(&v, 1).is_err());
+    fn list_and_array_hashes_match_duckdb() {
+        let int_list = |v: &[Option<i32>]| {
+            Value::list(
+                LogicalType::INTEGER,
+                v.iter()
+                    .map(|x| x.map_or(Value::null(LogicalType::INTEGER), Value::integer))
+                    .collect(),
+            )
+            .unwrap()
+        };
+        let first = |v: &Value| hash_vector(&Vector::constant(v), 1).unwrap().get_value(0);
+        let h = |x: u64| Value::ubigint(x);
+        assert_eq!(
+            first(&int_list(&[Some(1), Some(2), Some(3)])),
+            h(12_722_334_483_198_565_868)
+        );
+        assert_eq!(first(&int_list(&[])), h(NULL_HASH));
+        assert_eq!(
+            first(&Value::null(LogicalType::list(LogicalType::INTEGER))),
+            h(NULL_HASH)
+        );
+        assert_eq!(first(&int_list(&[None])), h(NULL_HASH));
+        let strings = Value::list(LogicalType::VARCHAR, vec![Value::varchar("a"), Value::varchar("b")]).unwrap();
+        assert_eq!(first(&strings), h(9_526_344_952_663_840_354));
+        let nested = Value::list(
+            LogicalType::list(LogicalType::INTEGER),
+            vec![int_list(&[Some(1)]), int_list(&[Some(2), Some(3)])],
+        )
+        .unwrap();
+        assert_eq!(first(&nested), h(3_168_151_700_479_660_323));
+        let arr_ty = LogicalType::array(LogicalType::INTEGER, 2);
+        let arr = Value::new(
+            arr_ty.clone(),
+            crate::value::ValueData::List(vec![Value::integer(1), Value::integer(2)]),
+        )
+        .unwrap();
+        assert_eq!(first(&arr), h(6_530_802_887_144_669_425));
+        assert_eq!(first(&Value::null(arr_ty.clone())), h(NULL_HASH));
+        let map = Value::new(
+            LogicalType::map(LogicalType::VARCHAR, LogicalType::INTEGER),
+            crate::value::ValueData::List(vec![Value::struct_value(vec![
+                ("key".into(), Value::varchar("k")),
+                ("value".into(), Value::integer(1)),
+            ])]),
+        )
+        .unwrap();
+        assert_eq!(first(&map), h(18_278_746_375_224_283_290));
+        let s = Value::struct_value(vec![("a".into(), int_list(&[Some(1), Some(2)]))]);
+        assert_eq!(first(&s), h(6_530_802_887_144_669_425));
+
+        // hash(42, x): combining into an existing hash.
+        let combined = |v: &Value| {
+            let mut hashes = hash_vector(&Vector::constant(&Value::integer(42)), 1).unwrap();
+            combine_hash(&mut hashes, &Vector::constant(v), 1).unwrap();
+            hashes.get_value(0)
+        };
+        assert_eq!(combined(&int_list(&[Some(1), Some(2)])), h(2_330_544_478_907_178_959));
+        assert_eq!(combined(&int_list(&[])), h(7_199_933_130_570_745_587));
+        assert_eq!(combined(&arr), h(2_330_544_478_907_178_959));
+        assert_eq!(combined(&Value::null(arr_ty)), h(7_199_933_130_570_745_587));
     }
 }
