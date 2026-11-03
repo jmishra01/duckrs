@@ -1196,6 +1196,8 @@ pub enum TableRefKind {
         with_ordinality: bool,
     },
     ExpressionList(Vec<Vec<Expr>>),
+    /// SHOW / DESCRIBE / SUMMARIZE.
+    Show(ShowRef),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1283,6 +1285,7 @@ impl Display for TableRef {
                 }
                 self.base_to_string(r, &self.column_name_alias)
             }
+            TableRefKind::Show(show) => show.to_string(),
             TableRefKind::ExpressionList(values) => {
                 let rows = join(values, ", ", |row| format!("({})", join(row, ", ", |e| e.to_string())));
                 self.base_to_string(format!("(VALUES {rows})"), &[])
@@ -1538,6 +1541,9 @@ impl Display for QueryNode {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match &self.kind {
             QueryNodeKind::Select(node) => {
+                if let TableRefKind::Show(show) = &node.from_table.kind {
+                    return write!(f, "{show}");
+                }
                 let mut r = self.cte_map.to_string();
                 r += "SELECT ";
                 for modifier in &self.modifiers {
@@ -2236,6 +2242,9 @@ pub enum Statement {
         name: String,
         if_exists: bool,
     },
+    Alter(Box<AlterInfo>),
+    /// Statements one statement was rewritten into (`MultiStatement`).
+    Multi(Vec<Statement>),
 }
 
 impl Display for Statement {
@@ -2284,6 +2293,10 @@ impl Display for Statement {
                 f.write_str(";")
             }
             Statement::Deallocate(name) => write!(f, "DEALLOCATE PREPARE {};", sql_identifier(name)),
+            Statement::Alter(info) => write!(f, "{info}"),
+            Statement::Multi(statements) => {
+                write!(f, "{};", join(statements, ";", |s| s.to_string()))
+            }
             Statement::Detach { name, if_exists } => {
                 f.write_str("DETACH DATABASE")?;
                 if *if_exists {
@@ -2576,6 +2589,311 @@ impl Display for CreateInfo {
                 }
                 f.write_str(";")
             }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShowType {
+    Show,
+    Describe,
+    Summary,
+    ShowFrom,
+    /// A form the binder handles specially: all tables, or `"databases"` and the like.
+    ShowSpecial,
+}
+
+/// `ShowRef`: what SHOW, DESCRIBE or SUMMARIZE look at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShowRef {
+    pub show_type: ShowType,
+    /// The named table or setting; special forms keep their name pre-quoted (e.g. `"tables"`).
+    pub name: Option<QualifiedName>,
+    /// SHOW TABLES FROM [catalog.]schema.
+    pub catalog: String,
+    pub schema: String,
+    /// The query whose columns are described.
+    pub query: Option<Box<QueryNode>>,
+}
+
+impl Display for ShowRef {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let name = self.name.as_ref().filter(|n| !n.name.is_empty());
+        if self.show_type == ShowType::Show {
+            f.write_str("SHOW ")?;
+            if let Some(name) = name {
+                return write!(f, "{name}");
+            }
+            if let Some(query) = &self.query {
+                return write!(f, "({query})");
+            }
+            return Ok(());
+        }
+        match self.show_type {
+            ShowType::Summary => f.write_str("SUMMARIZE ")?,
+            ShowType::ShowFrom => {
+                f.write_str("SHOW TABLES FROM ")?;
+                if !self.catalog.is_empty() {
+                    f.write_str(&sql_identifier(&self.catalog))?;
+                    if !self.schema.is_empty() {
+                        f.write_str(".")?;
+                    }
+                }
+                f.write_str(&sql_identifier(&self.schema))?;
+            }
+            _ => f.write_str("DESCRIBE ")?,
+        }
+        if let Some(query) = &self.query {
+            write!(f, "({query})")
+        } else if self.show_type == ShowType::ShowSpecial {
+            match name {
+                Some(n) if n.name != "__show_tables_expanded" => f.write_str(&n.name),
+                _ => Ok(()),
+            }
+        } else if let Some(name) = name {
+            write!(f, "{name}")
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlterKind {
+    RenameTable(String),
+    RenameView(String),
+    /// RENAME COLUMN of a column or a nested field.
+    RenameColumn {
+        path: Vec<String>,
+        new_name: String,
+    },
+    AddColumn {
+        column: ColumnDefinition,
+        if_not_exists: bool,
+        not_null: bool,
+        unique: bool,
+    },
+    /// ADD COLUMN of a nested field below `parent`.
+    AddField {
+        parent: Vec<String>,
+        column: ColumnDefinition,
+        if_not_exists: bool,
+    },
+    RemoveColumn {
+        path: Vec<String>,
+        if_exists: bool,
+        cascade: bool,
+    },
+    ChangeColumnType {
+        path: Vec<String>,
+        target: Option<CastType>,
+        using: Option<Box<Expr>>,
+    },
+    /// SET DEFAULT, or DROP DEFAULT when `None`.
+    SetDefault {
+        path: Vec<String>,
+        expression: Option<Box<Expr>>,
+    },
+    SetNotNull(Vec<String>),
+    DropNotNull(Vec<String>),
+    AddConstraint(Constraint),
+    /// Empty to reset.
+    SetPartitionedBy(Vec<Expr>),
+    SetSortedBy(Vec<OrderByNode>),
+    SetTableOptions(Vec<(String, Expr)>),
+    ResetTableOptions(Vec<String>),
+    /// The schema path is `name.qualification` plus `name.name`.
+    SetSchemaOptions(Vec<(String, Expr)>),
+    ResetSchemaOptions(Vec<String>),
+    /// `name.name` is the catalog.
+    RenameDatabase(String),
+    /// ALTER SEQUENCE ... OWNED BY schema.name.
+    ChangeOwnership {
+        owner_schema: String,
+        owner_name: String,
+    },
+    /// COMMENT ON <entry_type> name IS value.
+    SetComment {
+        entry_type: &'static str,
+        value: Literal,
+    },
+    /// COMMENT ON COLUMN table.column IS value.
+    SetColumnComment {
+        column: String,
+        value: Literal,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterInfo {
+    pub name: QualifiedName,
+    pub if_exists: bool,
+    pub kind: AlterKind,
+}
+
+fn path_to_string(path: &[String]) -> String {
+    join(path, ".", |p| sql_identifier(p))
+}
+
+fn options_to_string(options: &[(String, Expr)]) -> String {
+    join(options, ", ", |(k, v)| format!("{}={v}", sql_string(k)))
+}
+
+impl Display for AlterInfo {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let if_exists = if self.if_exists { "IF EXISTS " } else { "" };
+        let table = format!("ALTER TABLE {if_exists}{}", self.name.to_string_hide_default_schema());
+        match &self.kind {
+            AlterKind::RenameTable(new_name) => write!(f, "{table} RENAME TO {};", sql_identifier(new_name)),
+            AlterKind::RenameView(new_name) => write!(
+                f,
+                "ALTER VIEW {if_exists}{} RENAME TO {};",
+                self.name.to_string_hide_default_schema(),
+                sql_identifier(new_name)
+            ),
+            AlterKind::RenameColumn { path, new_name } => write!(
+                f,
+                "{table} RENAME COLUMN {} TO {};",
+                path_to_string(path),
+                sql_identifier(new_name)
+            ),
+            AlterKind::AddColumn {
+                column,
+                if_not_exists,
+                not_null,
+                unique,
+            } => {
+                write!(f, "{table} ADD COLUMN")?;
+                if *if_not_exists {
+                    f.write_str(" IF NOT EXISTS")?;
+                }
+                write!(f, " {} ", sql_identifier(&column.name))?;
+                if let Some(ty) = &column.column_type {
+                    write!(f, "{ty}")?;
+                }
+                if *not_null {
+                    f.write_str(" NOT NULL")?;
+                }
+                if *unique {
+                    f.write_str(" UNIQUE")?;
+                }
+                if let Some(default) = &column.default_value {
+                    write!(f, " DEFAULT {default}")?;
+                }
+                if let Some(compression) = column.compression {
+                    write!(f, " USING COMPRESSION {compression}")?;
+                }
+                f.write_str(";")
+            }
+            AlterKind::AddField {
+                parent,
+                column,
+                if_not_exists,
+            } => {
+                write!(f, "{table} ADD COLUMN ")?;
+                if *if_not_exists {
+                    f.write_str("IF NOT EXISTS ")?;
+                }
+                for p in parent {
+                    write!(f, "{}.", sql_identifier(p))?;
+                }
+                write!(f, "{column};")
+            }
+            AlterKind::RemoveColumn {
+                path,
+                if_exists: column_if_exists,
+                cascade,
+            } => {
+                write!(f, "{table} DROP COLUMN ")?;
+                if *column_if_exists {
+                    f.write_str("IF EXISTS ")?;
+                }
+                f.write_str(&path_to_string(path))?;
+                if *cascade {
+                    f.write_str(" CASCADE")?;
+                }
+                f.write_str(";")
+            }
+            AlterKind::ChangeColumnType { path, target, using } => {
+                write!(f, "{table} ALTER COLUMN {} TYPE ", path_to_string(path))?;
+                if let Some(ty) = target {
+                    write!(f, "{ty}")?;
+                }
+                if let Some(using) = using {
+                    write!(f, " USING {using}")?;
+                }
+                f.write_str(";")
+            }
+            AlterKind::SetDefault { path, expression } => {
+                write!(f, "{table} ALTER COLUMN {}", path_to_string(path))?;
+                match expression {
+                    Some(e) => write!(f, " SET DEFAULT {e};"),
+                    None => f.write_str(" DROP DEFAULT;"),
+                }
+            }
+            AlterKind::SetNotNull(path) => write!(f, "{table} ALTER COLUMN {} SET NOT NULL;", path_to_string(path)),
+            AlterKind::DropNotNull(path) => write!(f, "{table} ALTER COLUMN {} DROP NOT NULL;", path_to_string(path)),
+            AlterKind::AddConstraint(constraint) => write!(f, "{table} ADD {constraint};"),
+            AlterKind::SetPartitionedBy(keys) if keys.is_empty() => write!(f, "{table} RESET PARTITIONED BY"),
+            AlterKind::SetPartitionedBy(keys) => {
+                write!(
+                    f,
+                    "{table} SET PARTITIONED BY ({})",
+                    join(keys, ", ", |k| k.to_string())
+                )
+            }
+            AlterKind::SetSortedBy(orders) if orders.is_empty() => write!(f, "{table} RESET SORTED BY"),
+            AlterKind::SetSortedBy(orders) => {
+                write!(f, "{table} SET SORTED BY ({})", join(orders, ", ", |o| o.to_string()))
+            }
+            AlterKind::SetTableOptions(options) => write!(f, "{table} SET ({})", options_to_string(options)),
+            AlterKind::ResetTableOptions(names) => {
+                write!(f, "{table} RESET ({})", join(names, ", ", |n| sql_string(n)))
+            }
+            AlterKind::SetSchemaOptions(_) | AlterKind::ResetSchemaOptions(_) => {
+                let mut path = self.name.qualification.clone();
+                path.push(self.name.name.clone());
+                write!(f, "ALTER SCHEMA {if_exists}{}", path_to_string(&path))?;
+                match &self.kind {
+                    AlterKind::SetSchemaOptions(options) => write!(f, " SET ({})", options_to_string(options)),
+                    AlterKind::ResetSchemaOptions(names) => {
+                        write!(f, " RESET ({})", join(names, ", ", |n| sql_string(n)))
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            AlterKind::RenameDatabase(new_name) => write!(
+                f,
+                "ALTER DATABASE {if_exists}{} SET ALIAS TO {}",
+                sql_identifier(&self.name.name),
+                sql_identifier(new_name)
+            ),
+            AlterKind::ChangeOwnership {
+                owner_schema,
+                owner_name,
+            } => {
+                let owner = QualifiedName {
+                    qualification: vec![owner_schema.clone()],
+                    name: owner_name.clone(),
+                };
+                write!(
+                    f,
+                    "ALTER SEQUENCE {if_exists}{} OWNED BY {};",
+                    self.name.to_string_hide_default_schema(),
+                    owner.to_string_hide_default_schema()
+                )
+            }
+            AlterKind::SetComment { entry_type, value } => write!(
+                f,
+                "COMMENT ON {entry_type} {} IS {value};",
+                self.name.to_string_hide_default_schema()
+            ),
+            AlterKind::SetColumnComment { column, value } => write!(
+                f,
+                "COMMENT ON COLUMN {}.{} IS {value};",
+                self.name.to_string_hide_default_schema(),
+                sql_identifier(column)
+            ),
         }
     }
 }

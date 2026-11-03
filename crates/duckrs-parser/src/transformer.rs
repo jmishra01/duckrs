@@ -1920,6 +1920,27 @@ impl<'g> Transformer<'g> {
                 statement.node.modifiers.push(m);
             }
         }
+        if let QueryNodeKind::Select(select) = &statement.node.kind
+            && let TableRefKind::Show(show) = &select.from_table.kind
+        {
+            let kind = match show.show_type {
+                ShowType::Show => "SHOW",
+                ShowType::Describe => "DESCRIBE",
+                ShowType::Summary => "SUMMARY",
+                ShowType::ShowFrom => "SHOW_FROM",
+                ShowType::ShowSpecial => "SHOW_SPECIAL",
+            };
+            if !statement.node.cte_map.0.is_empty() {
+                return Err(parser_error(format!(
+                    "{kind} with CTE not allowed - wrap the statement in a subquery instead"
+                )));
+            }
+            if !statement.node.modifiers.is_empty() {
+                return Err(parser_error(format!(
+                    "{kind} with ORDER BY not allowed - wrap the statement in a subquery instead"
+                )));
+            }
+        }
         Ok(statement)
     }
 
@@ -1999,6 +2020,7 @@ impl<'g> Transformer<'g> {
                 self.simple_select(simple)
             }
             "ValuesClause" => self.values_clause(kind),
+            "DescribeStatement" => self.describe(kind),
             "TableStatement" => {
                 let table = self.base_table_name(self.req(kind, "BaseTableName")?)?;
                 let node = SelectNode {

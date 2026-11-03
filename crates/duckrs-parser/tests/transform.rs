@@ -176,8 +176,8 @@ fn transformer_errors_match_duckdb() {
         ),
         ("SELECT #0", "Parser Error: Positional reference node needs to be >= 1"),
         (
-            "ALTER TABLE t ADD COLUMN c INTEGER",
-            "Not implemented Error: the transformer for AlterStatement",
+            "MERGE INTO t USING s ON t.a = s.a WHEN MATCHED THEN DELETE",
+            "Not implemented Error: the transformer for MergeIntoStatement",
         ),
     ];
     for (sql, expected) in cases {
@@ -416,6 +416,115 @@ fn renders_create_and_session_statements_like_duckdb() {
         (
             "WITH RECURSIVE x AS (DELETE FROM t) SELECT 1",
             "Parser Error: Recursive CTEs with DML statements are not supported",
+        ),
+    ];
+    for (sql, expected) in errors {
+        let err = error(sql);
+        assert!(err.starts_with(expected), "{sql}: {err}");
+    }
+}
+
+#[test]
+fn renders_alter_comment_and_describe_like_duckdb() {
+    let cases = [
+        (
+            "ALTER TABLE IF EXISTS main.t RENAME COLUMN a TO b",
+            "ALTER TABLE IF EXISTS t RENAME COLUMN a TO b;",
+        ),
+        (
+            "ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 1",
+            "ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 1;",
+        ),
+        (
+            "ALTER TABLE t ADD COLUMN c INTEGER NOT NULL UNIQUE",
+            "ALTER TABLE t ADD COLUMN c INTEGER;;ALTER TABLE t ALTER COLUMN c SET NOT NULL;;\
+             ALTER TABLE t ADD UNIQUE(c);;",
+        ),
+        (
+            "ALTER TABLE t ADD COLUMN ts TIMESTAMP DEFAULT now()",
+            "ALTER TABLE t ADD COLUMN ts TIMESTAMP DEFAULT NULL;;UPDATE t SET ts = now();\
+             ALTER TABLE t ALTER COLUMN ts SET DEFAULT now();;",
+        ),
+        (
+            "ALTER TABLE t ADD COLUMN s.f VARCHAR",
+            "ALTER TABLE t ADD COLUMN s.f VARCHAR;",
+        ),
+        (
+            "ALTER TABLE t DROP COLUMN IF EXISTS c CASCADE",
+            "ALTER TABLE t DROP COLUMN IF EXISTS c CASCADE;",
+        ),
+        (
+            "ALTER TABLE t ALTER c TYPE BIGINT USING c + 1",
+            "ALTER TABLE t ALTER COLUMN c TYPE BIGINT USING (c + 1);",
+        ),
+        (
+            "ALTER TABLE t ALTER c DROP DEFAULT",
+            "ALTER TABLE t ALTER COLUMN c DROP DEFAULT;",
+        ),
+        (
+            "ALTER TABLE t ALTER c SET NOT NULL",
+            "ALTER TABLE t ALTER COLUMN c SET NOT NULL;",
+        ),
+        (
+            "ALTER TABLE t ADD PRIMARY KEY (a, b)",
+            "ALTER TABLE t ADD PRIMARY KEY(a, b);",
+        ),
+        (
+            "ALTER TABLE t SET SORTED BY (a DESC)",
+            "ALTER TABLE t SET SORTED BY (a DESC)",
+        ),
+        ("ALTER TABLE t RESET (x)", "ALTER TABLE t RESET ('x')"),
+        ("ALTER VIEW v RENAME TO w", "ALTER VIEW v RENAME TO w;"),
+        ("ALTER SEQUENCE seq OWNED BY s.t", "ALTER SEQUENCE seq OWNED BY s.t;"),
+        (
+            "ALTER DATABASE db SET ALIAS TO db2",
+            "ALTER DATABASE db SET ALIAS TO db2",
+        ),
+        ("COMMENT ON TABLE t IS 'hello'", "COMMENT ON TABLE t IS 'hello';"),
+        ("COMMENT ON COLUMN t.c IS NULL", "COMMENT ON COLUMN t.c IS NULL;"),
+        ("DESCRIBE t", "DESCRIBE (SELECT * FROM t)"),
+        ("SHOW TABLES", "DESCRIBE \"tables\""),
+        ("SHOW ALL TABLES", "DESCRIBE "),
+        ("SHOW TABLES FROM db.s", "SHOW TABLES FROM db.s"),
+        ("SUMMARIZE SELECT 1", "SUMMARIZE (SELECT 1)"),
+        ("SHOW threads", "SHOW threads"),
+        (
+            "SELECT * FROM (DESCRIBE t)",
+            "SELECT * FROM (DESCRIBE (SELECT * FROM t))",
+        ),
+    ];
+    for (sql, expected) in cases {
+        assert_eq!(render(sql), expected, "{sql}");
+    }
+    let errors = [
+        (
+            "ALTER TABLE t RENAME TO a, RENAME TO b",
+            "Parser Error: Only one ALTER command per statement",
+        ),
+        (
+            "ALTER TABLE t ADD COLUMN c INT PRIMARY KEY",
+            "Parser Error: Adding columns with PRIMARY KEY",
+        ),
+        (
+            "ALTER TABLE t ADD COLUMN IF NOT EXISTS c INT NOT NULL",
+            "Not implemented Error: Adding a NOT NULL",
+        ),
+        (
+            "ALTER TABLE t ALTER c TYPE",
+            "Parser Error: Omitting the type is only possible in combination with USING",
+        ),
+        (
+            "ALTER TABLE t RESET (x = 1)",
+            "Parser Error: Reset option \"x\" cannot set any value",
+        ),
+        (
+            "COMMENT ON COLUMN c IS 'x'",
+            "Parser Error: Invalid column reference: c",
+        ),
+        ("SUMMARIZE", "Parser Error: Expected table name with SUMMARIZE"),
+        (
+            "DESCRIBE t ORDER BY 1",
+            "Parser Error: DESCRIBE with ORDER BY not allowed",
         ),
     ];
     for (sql, expected) in errors {

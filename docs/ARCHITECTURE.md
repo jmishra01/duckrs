@@ -73,7 +73,7 @@ tool therefore checks that every rendering parses again and reports identical re
 separately. Known deviation: STAR EXCLUDE/REPLACE/RENAME lists keep input order, where C++
 uses unordered sets, and WITH options and EXECUTE parameters keep input order. Arrays of
 ENUM types in CREATE TYPE are not supported yet. Statement transformers
-live in `transformer/statements.rs`; statements not yet ported return `Not implemented Error`.
+live in `transformer/statements.rs` (ALTER, COMMENT and SHOW in `statements/alter.rs`); statements not yet ported return `Not implemented Error`.
 
 ## Testing
 

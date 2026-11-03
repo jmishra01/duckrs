@@ -5,6 +5,8 @@
 //
 //! Statement transformers other than SELECT.
 
+mod alter;
+
 use super::{Transformer, not_implemented, parser_error, to_recursive_cte, visit_expr_mut};
 use crate::ast::*;
 use crate::matcher::ParseNode;
@@ -115,6 +117,8 @@ impl Transformer<'_> {
                     Statement::Prepare { .. } => Some("PREPARE_STATEMENT"),
                     Statement::Execute { .. } => Some("EXECUTE_STATEMENT"),
                     Statement::Detach { .. } => Some("DETACH_STATEMENT"),
+                    Statement::Alter(_) => Some("ALTER_STATEMENT"),
+                    Statement::Multi(_) => Some("MULTI_STATEMENT"),
                 };
                 if let Some(kind) = kind {
                     return Err(parser_error(format!("{kind} is not a preparable statement")));
@@ -127,6 +131,8 @@ impl Transformer<'_> {
                 })
             }
             "ExecuteStatement" => self.execute(node),
+            "AlterStatement" => self.alter(node),
+            "CommentStatement" => self.comment(node),
             "DeallocateStatement" => Ok(Statement::Deallocate(Self::text(self.req(node, "ColIdOrString")?))),
             "DetachStatement" => Ok(Statement::Detach {
                 name: Self::text(self.req(node, "CatalogName")?),
