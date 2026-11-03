@@ -805,3 +805,27 @@ fn renders_match_recognize_and_remaining_statements_like_duckdb() {
         assert!(err.starts_with(expected), "{sql}: {err}");
     }
 }
+
+#[test]
+fn expression_depth_is_limited_like_duckdb() {
+    let limit = "Parser Error: Max expression depth limit of 1000 exceeded";
+    let nots = format!("SELECT {}1", "NOT ".repeat(1001));
+    assert!(error(&nots).starts_with(limit), "{}", error(&nots));
+    let sums = format!("SELECT 1{}", " + 1".repeat(1000));
+    assert!(error(&sums).starts_with(limit));
+    let lists = format!("SELECT {}1{}", "[".repeat(1001), "]".repeat(1001));
+    assert!(error(&lists).starts_with(limit));
+    assert!(duckrs_parser::parse_ast(&format!("SELECT 1{}", " + 1".repeat(500))).is_ok());
+
+    let options = duckrs_parser::ParserOptions {
+        max_expression_depth: 100,
+    };
+    let casts = format!("SELECT 1{}", "::INTEGER".repeat(150));
+    let err = duckrs_parser::parse_ast_with(&casts, &options).unwrap_err().to_string();
+    assert!(
+        err.starts_with("Parser Error: Max expression depth limit of 100 exceeded"),
+        "{err}"
+    );
+    let subqueries = format!("SELECT {}1{}", "(SELECT ".repeat(101), ")".repeat(101));
+    assert!(duckrs_parser::parse_ast_with(&subqueries, &options).is_err());
+}

@@ -31,8 +31,10 @@ An analytical SQL database engine: a port of [DuckDB](https://github.com/duckdb/
   exactly like DuckDB's `ToString`. It covers every statement in DuckDB's grammar (SELECT with
   every expression form, DML, DDL, utility statements, PIVOT, MERGE, MATCH_RECOGNIZE, external
   resources, ...): all 94.8k corpus statements that parse also transform, and their renderings
-  parse again (CI gate). Remaining Phase 2 work: parser speed and rejecting the invalid
-  statements DuckDB's transformer rejects (56.57% of the corpus's must-fail statements today).
+  parse again (CI gate). It rejects 88.57% of the statements the corpus expects a parser error
+  for (CI gate); the rest are raised by DuckDB's binder or at run time, so they arrive with
+  later phases. Expression depth is limited like DuckDB (`max_expression_depth`). Remaining
+  Phase 2 work: parser speed.
 - `crates/duckrs`: the public API surface (`Database`, `Connection`). Every query returns
   `Not implemented Error`.
 - `tools/sqllogictest`: a port of DuckDB's sqllogictest runner. It runs the DuckDB `.test` corpus

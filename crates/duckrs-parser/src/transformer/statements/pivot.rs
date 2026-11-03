@@ -38,6 +38,8 @@ impl Transformer<'_> {
         self.pivot_entries.clear();
         self.cte_stack.clear();
         self.window_clauses.clear();
+        self.expression_depth = 0;
+        self.stack_base = crate::matcher::stack_position();
         let statement = self.statement(node)?;
         if self.pivot_entries.is_empty() {
             return Ok(statement);
@@ -560,8 +562,7 @@ impl Transformer<'_> {
         Ok(match self.name(node) {
             "NearestValuesRef" => TableRef::subquery(self.values_clause(self.req(node, "ValuesClause")?)?),
             "NearestTableSubquery" => {
-                let s =
-                    self.select_internal(self.req(self.req(node, "SubqueryReference")?, "SelectStatementInternal")?)?;
+                let s = self.subquery_reference(self.req(node, "SubqueryReference")?)?;
                 TableRef::subquery(s)
             }
             "NearestBaseTableRef" => {

@@ -52,12 +52,34 @@ pub fn parse(sql: &str) -> Result<Vec<ParsedStatement>> {
 
 /// Parses SQL text into one AST statement per statement.
 pub fn parse_ast(sql: &str) -> Result<Vec<ast::Statement>> {
+    parse_ast_with(sql, &ParserOptions::default())
+}
+
+/// Settings that change how SQL is parsed (`ParserOptions`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParserOptions {
+    /// `max_expression_depth`: how deep expression trees may nest.
+    pub max_expression_depth: usize,
+}
+
+impl Default for ParserOptions {
+    fn default() -> Self {
+        Self {
+            max_expression_depth: transformer::DEFAULT_MAX_EXPRESSION_DEPTH,
+        }
+    }
+}
+
+/// [`parse_ast`] with explicit options.
+pub fn parse_ast_with(sql: &str, options: &ParserOptions) -> Result<Vec<ast::Statement>> {
     let sql = sql.to_string();
+    let options = options.clone();
     std::thread::Builder::new()
         .stack_size(PARSER_STACK_SIZE)
         .spawn(move || {
-            let (_, trees) = parse_on_this_thread(&sql)?;
+            let (_, trees) = parse_on_this_thread_with(&sql, &options)?;
             let mut transformer = transformer::Transformer::new(Grammar::duckdb());
+            transformer.max_expression_depth = options.max_expression_depth;
             trees.iter().map(|tree| transformer.top_level_statement(tree)).collect()
         })
         .map_err(|e| Error::new(ErrorKind::Internal, format!("failed to start the parser thread: {e}")))?
@@ -67,6 +89,11 @@ pub fn parse_ast(sql: &str) -> Result<Vec<ast::Statement>> {
 
 /// Parses on the current thread (which must have a large enough stack).
 pub fn parse_on_this_thread(sql: &str) -> Result<(Vec<Token>, Vec<Arc<ParseNode>>)> {
+    parse_on_this_thread_with(sql, &ParserOptions::default())
+}
+
+/// [`parse_on_this_thread`] with explicit options.
+pub fn parse_on_this_thread_with(sql: &str, options: &ParserOptions) -> Result<(Vec<Token>, Vec<Arc<ParseNode>>)> {
     let stripped = unicode::strip_unicode_spaces(sql);
     let tokens = tokenizer::tokenize(stripped.as_deref().unwrap_or(sql))?;
     let grammar = Grammar::duckdb();
@@ -94,6 +121,16 @@ pub fn parse_on_this_thread(sql: &str) -> Result<(Vec<Token>, Vec<Arc<ParseNode>
                 }
             }
             TokenType::EndOfInput => break,
+            _ if matcher.depth_exceeded => {
+                return Err(Error::new(
+                    ErrorKind::Parser,
+                    format!(
+                        "Max expression depth limit of {} exceeded. Use \"SET max_expression_depth TO x\" to \
+                         increase the maximum expression depth.",
+                        options.max_expression_depth
+                    ),
+                ));
+            }
             _ => return Err(syntax_error(&tokens, matcher.max_position.max(end))),
         }
     }

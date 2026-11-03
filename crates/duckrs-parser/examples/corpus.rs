@@ -1,7 +1,7 @@
 //! Measures how much of DuckDB's sqllogictest corpus the parser accepts.
 //!
 //! `cargo run --release -p duckrs-parser --example corpus -- [../duckdb] [--show N] [--min-parse PCT]
-//! [--min-transform PCT]`
+//! [--min-transform PCT] [--min-reject PCT]`
 //!
 //! With `--min-parse`, exits with an error if fewer statements than PCT percent parse (CI uses it).
 //!
@@ -10,12 +10,16 @@
 //! DuckDB's own `ToString`, the second rendering is not always identical: VALUES lists nest one
 //! level deeper, GROUPING SETS renumber their expressions and `UNNEST` is lowercased, so identical
 //! renderings are reported separately. With `--min-transform PCT`, exits with an error if fewer
-//! parsed statements than PCT percent transform and round trip.
+//! parsed statements than PCT percent transform and round trip, and with `--min-reject PCT` if
+//! fewer of the statements expecting a parser error than PCT percent are rejected. Rejection
+//! goes through the transformer too, and follows a file's `SET max_expression_depth`; the
+//! statements still accepted fail in DuckDB's binder or at run time.
 //!
 //! Statements DuckDB must accept (`statement ok`, `query`) should parse; statements whose
 //! expected error is a parser/syntax error should not. Loop bodies use their first iteration.
 
 use duckrs_common::ErrorKind;
+use duckrs_parser::ast::{ExprKind, Statement};
 use sqllogictest::parser::{ExpectedResult, LoopKind, Record, parse_file};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -28,12 +32,14 @@ struct Stats {
     must_fail: usize,
     rejected: usize,
     failures: Vec<(String, String, String)>,
-    wrongly_accepted: Vec<(String, String)>,
+    wrongly_accepted: Vec<(String, String, String)>,
     transformed: usize,
     not_ported: usize,
     not_ported_by_kind: BTreeMap<String, usize>,
     transform_failures: Vec<(String, String, String)>,
     round_trips: usize,
+    /// The file's parser settings, following its `SET max_expression_depth`.
+    options: duckrs_parser::ParserOptions,
     identical: usize,
     round_trip_failures: Vec<(String, String, String)>,
 }
@@ -81,10 +87,10 @@ fn visit(records: &[Record], file: &str, vars: &mut Vec<(String, String)>, stats
                     ExpectedResult::Success => check_parses(&sql, file, stats),
                     ExpectedResult::Error(msg) if msg.contains("Parser Error") || msg.contains("syntax error") => {
                         stats.must_fail += 1;
-                        if duckrs_parser::parse(&sql).is_err() {
+                        if duckrs_parser::parse_ast_with(&sql, &stats.options).is_err() {
                             stats.rejected += 1;
                         } else {
-                            stats.wrongly_accepted.push((file.to_string(), sql));
+                            stats.wrongly_accepted.push((file.to_string(), sql, msg.clone()));
                         }
                     }
                     _ => {}
@@ -117,6 +123,25 @@ fn visit(records: &[Record], file: &str, vars: &mut Vec<(String, String)>, stats
     }
 }
 
+/// Follows `SET max_expression_depth` / `RESET max_expression_depth` within a test file.
+fn track_settings(statements: &[Statement], options: &mut duckrs_parser::ParserOptions) {
+    for statement in statements {
+        match statement {
+            Statement::SetVariable { name, value, .. } if name.eq_ignore_ascii_case("max_expression_depth") => {
+                if let ExprKind::Constant(literal) = &value.kind
+                    && let Some(depth) = literal.try_get_i64()
+                {
+                    options.max_expression_depth = depth.max(0) as usize;
+                }
+            }
+            Statement::ResetVariable { name, .. } if name.eq_ignore_ascii_case("max_expression_depth") => {
+                *options = duckrs_parser::ParserOptions::default();
+            }
+            _ => {}
+        }
+    }
+}
+
 fn check_parses(sql: &str, file: &str, stats: &mut Stats) {
     stats.must_parse += 1;
     match duckrs_parser::parse(sql) {
@@ -126,8 +151,11 @@ fn check_parses(sql: &str, file: &str, stats: &mut Stats) {
             return;
         }
     }
-    let rendered = match duckrs_parser::parse_ast(sql) {
-        Ok(statements) => statements.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(";\n"),
+    let rendered = match duckrs_parser::parse_ast_with(sql, &stats.options) {
+        Ok(statements) => {
+            track_settings(&statements, &mut stats.options);
+            statements.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(";\n")
+        }
         Err(e) if e.kind == ErrorKind::NotImplemented => {
             stats.not_ported += 1;
             *stats.not_ported_by_kind.entry(e.message.clone()).or_default() += 1;
@@ -141,7 +169,7 @@ fn check_parses(sql: &str, file: &str, stats: &mut Stats) {
         }
     };
     stats.transformed += 1;
-    let again = duckrs_parser::parse_ast(&rendered)
+    let again = duckrs_parser::parse_ast_with(&rendered, &stats.options)
         .map(|statements| statements.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(";\n"));
     match again {
         Ok(again) => {
@@ -175,6 +203,7 @@ fn main() {
     // Files under test/extension exercise grammar that loadable extensions add at run time.
     for file in files.iter().filter(|f| !f.starts_with("test/extension/")) {
         if let Ok(test) = parse_file(file, &root) {
+            stats.options = duckrs_parser::ParserOptions::default();
             visit(&test.records, file, &mut Vec::new(), &mut stats);
         }
     }
@@ -224,8 +253,8 @@ fn main() {
         println!("--- ROUND TRIP {file}\n{sql}\n=> {err}");
     }
     if show > 0 {
-        for (file, sql) in stats.wrongly_accepted.iter().take(show / 2) {
-            println!("--- ACCEPTED (should fail) {file}\n{sql}");
+        for (file, sql, expected) in stats.wrongly_accepted.iter().take(show / 2) {
+            println!("--- ACCEPTED (should fail) {file}\n{sql}\n=> expected {expected}");
         }
     }
     let min: Option<f64> = args
@@ -237,6 +266,17 @@ fn main() {
         && pct(stats.parsed, stats.must_parse) < min
     {
         eprintln!("error: parse rate below {min}%");
+        std::process::exit(1);
+    }
+    let min_reject: Option<f64> = args
+        .iter()
+        .position(|a| a == "--min-reject")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|n| n.parse().ok());
+    if let Some(min) = min_reject
+        && pct(stats.rejected, stats.must_fail) < min
+    {
+        eprintln!("error: parser-error rejection rate below {min}%");
         std::process::exit(1);
     }
     let min_transform: Option<f64> = args

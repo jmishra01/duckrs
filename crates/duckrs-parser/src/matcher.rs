@@ -54,6 +54,33 @@ pub enum ParseNode {
     },
 }
 
+/// Moves a node's children into `out`, leaving it childless.
+fn take_children(node: &mut ParseNode, out: &mut Vec<ParseNode>) {
+    match node {
+        ParseNode::Terminal { .. } => {}
+        ParseNode::List(items) | ParseNode::Repeat(items) => out.append(items),
+        ParseNode::Choice { child, .. } => out.push(std::mem::replace(child.as_mut(), ParseNode::List(Vec::new()))),
+        ParseNode::Optional(child) => out.extend(child.take().map(|c| *c)),
+        ParseNode::Rule { child, .. } => {
+            // a shared subtree is dropped by its last owner
+            if let Some(inner) = Arc::get_mut(child) {
+                out.push(std::mem::replace(inner, ParseNode::List(Vec::new())));
+            }
+        }
+    }
+}
+
+/// Deeply nested trees are dropped iteratively: recursion could overflow the caller's stack.
+impl Drop for ParseNode {
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        take_children(self, &mut pending);
+        while let Some(mut node) = pending.pop() {
+            take_children(&mut node, &mut pending);
+        }
+    }
+}
+
 type Memo = HashMap<(RuleId, usize), Option<(usize, Arc<ParseNode>)>>;
 
 pub struct Matcher<'a> {
@@ -62,20 +89,39 @@ pub struct Matcher<'a> {
     memo: Memo,
     /// The furthest token any terminal reached; syntax errors point there.
     pub max_position: usize,
-    depth: usize,
+    /// Set when the input nested deeper than the matcher's stack budget allows.
+    pub depth_exceeded: bool,
+    /// Where the stack was when matching started, and how much of it matching may use.
+    stack_base: usize,
+    stack_budget: usize,
 }
 
-/// Recursion limit, so pathological nesting fails cleanly instead of overflowing the stack.
-const MAX_DEPTH: usize = 20_000;
+/// The stack the matcher may use by default: deep nesting fails cleanly instead of overflowing.
+/// Input that deep (thousands of levels) is far past any expression depth limit.
+pub const DEFAULT_STACK_BUDGET: usize = 448 * 1024 * 1024;
+
+/// The address of a local on the current stack frame.
+#[inline(always)]
+pub(crate) fn stack_position() -> usize {
+    let marker = 0u8;
+    std::hint::black_box(&marker) as *const u8 as usize
+}
 
 impl<'a> Matcher<'a> {
     pub fn new(grammar: &'a Grammar, tokens: &'a [Token]) -> Self {
+        Self::with_stack_budget(grammar, tokens, DEFAULT_STACK_BUDGET)
+    }
+
+    /// A matcher that uses at most `stack_budget` bytes of the current thread's stack.
+    pub fn with_stack_budget(grammar: &'a Grammar, tokens: &'a [Token], stack_budget: usize) -> Self {
         Self {
             grammar,
             tokens,
             memo: HashMap::new(),
             max_position: 0,
-            depth: 0,
+            depth_exceeded: false,
+            stack_base: stack_position(),
+            stack_budget,
         }
     }
 
@@ -84,10 +130,10 @@ impl<'a> Matcher<'a> {
         if let Some(cached) = self.memo.get(&(rule, pos)) {
             return cached.clone();
         }
-        if self.depth >= MAX_DEPTH {
+        if self.stack_base.abs_diff(stack_position()) > self.stack_budget {
+            self.depth_exceeded = true;
             return None;
         }
-        self.depth += 1;
         let grammar = self.grammar;
         let result = self.match_node(&grammar.rules[rule].node, pos).map(|(end, child)| {
             (
@@ -98,7 +144,6 @@ impl<'a> Matcher<'a> {
                 }),
             )
         });
-        self.depth -= 1;
         self.memo.insert((rule, pos), result.clone());
         result
     }

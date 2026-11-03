@@ -57,7 +57,12 @@ The parser runs DuckDB's grammar unchanged: the `.gram` rules are vendored and i
 run time, so grammar changes upstream are picked up by re-syncing, not re-porting. The C++
 matcher is an explicit-stack machine; the Rust one is a recursive interpreter with the same
 semantics (ordered choice, greedy repetition, case-insensitive literals, packrat memoization).
-It runs on a thread with a 512 MB stack so deeply nested SQL cannot overflow. Known cost: a
+It runs on a thread with a 512 MB stack. Instead of a recursion count, the matcher and the
+transformer measure the stack they use and stop at a 448 MB budget, reporting DuckDB's
+`Max expression depth` error (input that deep is far past any depth limit); parse trees drop
+iteratively, so returning one to a small-stack thread is safe. Like DuckDB, the transformer
+limits expression depth (`ParserOptions::max_expression_depth`, default 1000): nested
+expressions, types and subqueries add one level each, every link of an operator chain one more. Known cost: a
 thread and a fresh memo table per parse (about 0.3 ms per statement); reusing threads and
 memoizing only the rules C++ memoizes are the obvious optimizations.
 

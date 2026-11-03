@@ -157,6 +157,44 @@ struct LimitValue {
 
 const MAX_GROUPING_SETS: usize = 65535;
 
+/// The default `max_expression_depth` (`ParserOptions::max_expression_depth`).
+pub const DEFAULT_MAX_EXPRESSION_DEPTH: usize = 1000;
+
+/// Rules whose transform nests one level deeper (`ExpressionDepthKind::NESTING`).
+const NESTING_RULES: &[&str] = &["SingleExpression", "CustomPrefixExpression"];
+
+/// Rules whose operator chains add one level per link (`ExpressionDepthKind::CHAIN`).
+const CHAIN_RULES: &[&str] = &[
+    "LambdaArrowExpression",
+    "IsDistinctFromExpression",
+    "ComparisonExpression",
+    "BetweenInLikeExpression",
+    "InfixOtherOperatorExpression",
+    "BitwiseExpression",
+    "TildeExpression",
+    "AdditiveExpression",
+    "MultiplicativeExpression",
+    "ExponentiationExpression",
+    "CollateExpression",
+    "AtTimeZoneExpression",
+    "PrefixExpression",
+];
+
+/// `CountChainLinks`: the repetitions in a rule's sequence.
+fn chain_links(node: &ParseNode) -> usize {
+    match node {
+        ParseNode::Repeat(items) => items.len(),
+        ParseNode::Optional(Some(inner)) => chain_links(inner),
+        ParseNode::List(items) => items
+            .iter()
+            .filter(|i| matches!(i, ParseNode::Repeat(_) | ParseNode::Optional(_)))
+            .map(chain_links)
+            .sum(),
+        ParseNode::Rule { child, .. } => chain_links(child),
+        _ => 0,
+    }
+}
+
 pub struct Transformer<'g> {
     grammar: &'g Grammar,
     window_clauses: Vec<HashMap<String, WindowExpr>>,
@@ -166,6 +204,13 @@ pub struct Transformer<'g> {
     pivot_entries: Vec<statements::PivotEntry>,
     /// The WITH clauses in scope, outermost first.
     cte_stack: Vec<CteMap>,
+    /// `max_expression_depth`: how deep expression trees may nest.
+    pub max_expression_depth: usize,
+    /// An upper bound of the depth of the expression being transformed (`expression_depth`).
+    expression_depth: usize,
+    /// Where the stack was when the statement's transform started; deep trees stop before
+    /// using more than `DEFAULT_STACK_BUDGET` of it.
+    stack_base: usize,
 }
 
 impl<'g> Transformer<'g> {
@@ -178,6 +223,9 @@ impl<'g> Transformer<'g> {
             named_params: HashMap::new(),
             pivot_entries: Vec::new(),
             cte_stack: Vec::new(),
+            max_expression_depth: DEFAULT_MAX_EXPRESSION_DEPTH,
+            expression_depth: 0,
+            stack_base: crate::matcher::stack_position(),
         }
     }
 
@@ -312,6 +360,62 @@ impl<'g> Transformer<'g> {
 
     pub fn expr(&mut self, node: &ParseNode) -> Result<Expr> {
         let name = self.name(node);
+        let weight = if NESTING_RULES.contains(&name) {
+            1
+        } else if CHAIN_RULES.contains(&name) {
+            let links = match node {
+                ParseNode::Rule { child, .. } => chain_links(child),
+                _ => 0,
+            };
+            self.stack_check(links)?;
+            links
+        } else {
+            0
+        };
+        self.enter_expression(weight)?;
+        let result = self.expr_inner(node);
+        self.expression_depth -= weight;
+        result
+    }
+
+    /// `EnterExpression`: reject expression trees deeper than `max_expression_depth`.
+    fn enter_expression(&mut self, weight: usize) -> Result<()> {
+        let stack_used = self.stack_base.abs_diff(crate::matcher::stack_position());
+        if self.expression_depth + weight > self.max_expression_depth
+            || stack_used > crate::matcher::DEFAULT_STACK_BUDGET
+        {
+            return Err(self.depth_error());
+        }
+        self.expression_depth += weight;
+        Ok(())
+    }
+
+    /// `StackCheck`: a single operator chain may not reach the limit either.
+    fn stack_check(&self, links: usize) -> Result<()> {
+        if links >= self.max_expression_depth {
+            return Err(self.depth_error());
+        }
+        Ok(())
+    }
+
+    fn depth_error(&self) -> Error {
+        parser_error(format!(
+            "Max expression depth limit of {} exceeded. Use \"SET max_expression_depth TO x\" to increase the \
+             maximum expression depth.",
+            self.max_expression_depth
+        ))
+    }
+
+    /// `SubqueryReference <- Parens(SelectStatementInternal)`, one nesting level deeper.
+    pub(crate) fn subquery_reference(&mut self, node: &ParseNode) -> Result<SelectStatement> {
+        self.enter_expression(1)?;
+        let result = self.select_internal(self.req(node, "SelectStatementInternal")?);
+        self.expression_depth -= 1;
+        result
+    }
+
+    fn expr_inner(&mut self, node: &ParseNode) -> Result<Expr> {
+        let name = self.name(node);
         match name {
             "Expression"
             | "SingleExpression"
@@ -368,11 +472,13 @@ impl<'g> Transformer<'g> {
                 let nots = self
                     .sub(node, "NotExpression")
                     .map_or(0, |n| self.subs(n, "NotKeyword").len());
+                self.check_not_chain(nots)?;
                 Ok(apply_nots(nots, expr))
             }
             "NotComparisonOperand" => {
                 let expr = self.expr(self.req(node, "IsExpression")?)?;
                 let nots = self.subs(self.req(node, "NotExpression")?, "NotKeyword").len();
+                self.check_not_chain(nots)?;
                 Ok(apply_nots(nots, expr))
             }
             "IsExpression" => self.is_expression(node),
@@ -496,8 +602,7 @@ impl<'g> Transformer<'g> {
             "DefaultExpression" => Ok(ExprKind::Default.into()),
             "ColumnReference" => Ok(Expr::column(self.rule_texts(self.alt(node)?))),
             "SubqueryExpression" => {
-                let statement =
-                    self.select_internal(self.req(self.req(node, "SubqueryReference")?, "SelectStatementInternal")?)?;
+                let statement = self.subquery_reference(self.req(node, "SubqueryReference")?)?;
                 let subquery_type = if self.sub(node, "SubqueryExists").is_some() {
                     SubqueryType::Exists
                 } else {
@@ -758,7 +863,25 @@ impl<'g> Transformer<'g> {
         })
     }
 
+    /// `NotExpression` is a chain of NOTs.
+    fn check_not_chain(&mut self, nots: usize) -> Result<()> {
+        self.stack_check(nots)?;
+        self.enter_expression(nots)?;
+        self.expression_depth -= nots;
+        Ok(())
+    }
+
     fn is_expression(&mut self, node: &ParseNode) -> Result<Expr> {
+        let links = self
+            .sub(node, "IsExpressionContinuation")
+            .map_or(0, |c| self.subs(c, "IsExpressionTail").len());
+        self.enter_expression(links)?;
+        let result = self.is_expression_inner(node);
+        self.expression_depth -= links;
+        result
+    }
+
+    fn is_expression_inner(&mut self, node: &ParseNode) -> Result<Expr> {
         let mut expr = self.expr(self.req(node, "IsDistinctFromExpression")?)?;
         let Some(continuation) = self.sub(node, "IsExpressionContinuation") else {
             return Ok(expr);
@@ -959,6 +1082,16 @@ impl<'g> Transformer<'g> {
     }
 
     fn base_expression(&mut self, node: &ParseNode) -> Result<Expr> {
+        let links = self
+            .sub(node, "IndirectionList")
+            .map_or(0, |l| self.subs(l, "Indirection").len());
+        self.enter_expression(links)?;
+        let result = self.base_expression_inner(node);
+        self.expression_depth -= links;
+        result
+    }
+
+    fn base_expression_inner(&mut self, node: &ParseNode) -> Result<Expr> {
         let mut expr = self.expr(self.req(node, "SingleExpression")?)?;
         let Some(list) = self.sub(node, "IndirectionList") else {
             return Ok(expr);
@@ -1774,7 +1907,15 @@ impl<'g> Transformer<'g> {
         Ok(CastType::Parsed(Box::new(self.nested_type(node)?)))
     }
 
+    /// `Type` and `NestedType` each nest one level deeper.
     fn nested_type(&mut self, node: &ParseNode) -> Result<Expr> {
+        self.enter_expression(1)?;
+        let result = self.nested_type_inner(node);
+        self.expression_depth -= 1;
+        result
+    }
+
+    fn nested_type_inner(&mut self, node: &ParseNode) -> Result<Expr> {
         let mut ty = self.type_variation(self.alt(self.req(node, "TypeVariations")?)?)?;
         for bound in self.subs(node, "ArrayBounds") {
             let size = self.array_bound(self.alt(bound)?)?;
@@ -2537,8 +2678,7 @@ impl<'g> Transformer<'g> {
                 if lateral && self.sub(node, "SampleClause").is_some() {
                     return Err(parser_error("TABLESAMPLE cannot be applied to a LATERAL subquery"));
                 }
-                let s =
-                    self.select_internal(self.req(self.req(node, "SubqueryReference")?, "SelectStatementInternal")?)?;
+                let s = self.subquery_reference(self.req(node, "SubqueryReference")?)?;
                 let table = TableRef::subquery(s);
                 let describe = format!("{table} ");
                 self.decorate(node, table, &describe)
