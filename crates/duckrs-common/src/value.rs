@@ -1,7 +1,10 @@
 // Ported from duckdb/src/common/types/value.cpp @ rust-port-baseline
 
 use crate::string_cast::{format_blob, format_decimal, format_double, format_float};
-use crate::types::{Interval, LogicalType, LogicalTypeId, PhysicalType};
+use crate::types::{
+    Date, Interval, LogicalType, LogicalTypeId, PhysicalType, Time, TimeTz, Timestamp, time_ns_to_string,
+    timestamp_ms_to_string, timestamp_ns_to_string, timestamp_sec_to_string, timestamp_to_string, uuid_to_string,
+};
 use crate::{Error, Result};
 
 /// A value's payload, stored by physical type. DATE is `Int32`, TIMESTAMP `Int64`, DECIMAL the
@@ -193,6 +196,49 @@ impl Value {
         }
     }
 
+    pub fn date(v: Date) -> Self {
+        Self {
+            ty: LogicalType::DATE,
+            data: ValueData::Int32(v.0),
+        }
+    }
+
+    pub fn time(v: Time) -> Self {
+        Self {
+            ty: LogicalType::TIME,
+            data: ValueData::Int64(v.0),
+        }
+    }
+
+    pub fn time_tz(v: TimeTz) -> Self {
+        Self {
+            ty: LogicalType::new(LogicalTypeId::TimeTz),
+            data: ValueData::Int64(v.0 as i64),
+        }
+    }
+
+    pub fn timestamp(v: Timestamp) -> Self {
+        Self {
+            ty: LogicalType::TIMESTAMP,
+            data: ValueData::Int64(v.0),
+        }
+    }
+
+    pub fn timestamp_tz(v: Timestamp) -> Self {
+        Self {
+            ty: LogicalType::new(LogicalTypeId::TimestampTz),
+            data: ValueData::Int64(v.0),
+        }
+    }
+
+    /// A UUID from its stored (top-bit-flipped) HUGEINT form; see [`crate::types::uuid_from_str`].
+    pub fn uuid(stored: i128) -> Self {
+        Self {
+            ty: LogicalType::UUID,
+            data: ValueData::Int128(stored),
+        }
+    }
+
     pub fn blob(v: impl Into<Vec<u8>>) -> Self {
         Self {
             ty: LogicalType::BLOB,
@@ -262,7 +308,7 @@ impl Value {
 
     /// The value rendered as `CAST(value AS VARCHAR)` would (`Value::ToString`).
     ///
-    /// Temporal, nested, UUID, ENUM and BIT values go through the cast functions that land in
+    /// Nested, ENUM, BIT, BIGNUM and GEOMETRY values go through the cast functions that land in
     /// Phase 4; until then they return `Not implemented`.
     pub fn try_to_string(&self) -> Result<String> {
         if self.is_null() {
@@ -292,6 +338,18 @@ impl Value {
                 | LogicalTypeId::UBigInt,
             ) => self.as_i128().expect("integral").to_string(),
             (ValueData::UInt128(v), LogicalTypeId::UHugeInt) => v.to_string(),
+            (ValueData::Int32(v), LogicalTypeId::Date) => Date(*v).to_string(),
+            (ValueData::Int64(v), LogicalTypeId::Time) => Time(*v).to_string(),
+            (ValueData::Int64(v), LogicalTypeId::TimeNs) => time_ns_to_string(*v),
+            (ValueData::Int64(v), LogicalTypeId::TimeTz) => TimeTz(*v as u64).to_string(),
+            (ValueData::Int64(v), LogicalTypeId::Timestamp) => timestamp_to_string(*v, false),
+            (ValueData::Int64(v), LogicalTypeId::TimestampTz) => timestamp_to_string(*v, true),
+            (ValueData::Int64(v), LogicalTypeId::TimestampNs) => timestamp_ns_to_string(*v, false),
+            (ValueData::Int64(v), LogicalTypeId::TimestampTzNs) => timestamp_ns_to_string(*v, true),
+            (ValueData::Int64(v), LogicalTypeId::TimestampMs) => timestamp_ms_to_string(*v),
+            (ValueData::Int64(v), LogicalTypeId::TimestampSec) => timestamp_sec_to_string(*v),
+            (ValueData::Interval(v), _) => v.to_string(),
+            (ValueData::Int128(v), LogicalTypeId::Uuid) => uuid_to_string(*v),
             _ => {
                 return Err(Error::not_implemented(format!(
                     "converting {} values to VARCHAR is not supported yet",
@@ -327,7 +385,36 @@ mod tests {
         );
         assert_eq!(Value::varchar("héllo").try_to_string().unwrap(), "héllo");
         assert_eq!(Value::null(LogicalType::INTEGER).try_to_string().unwrap(), "NULL");
-        assert!(Value::interval(Interval::new(1, 0, 0)).try_to_string().is_err());
+        assert_eq!(
+            Value::interval(Interval::new(1, 0, 0)).try_to_string().unwrap(),
+            "1 month"
+        );
+        assert_eq!(Value::date(Date(8035)).try_to_string().unwrap(), "1992-01-01");
+        assert_eq!(
+            Value::time(Time::from_hms(12, 30, 0, 500_000)).try_to_string().unwrap(),
+            "12:30:00.5"
+        );
+        assert_eq!(
+            Value::timestamp(Timestamp(-1)).try_to_string().unwrap(),
+            "1969-12-31 23:59:59.999999"
+        );
+        assert_eq!(
+            Value::timestamp_tz(Timestamp(1_577_873_472_500_000))
+                .try_to_string()
+                .unwrap(),
+            "2020-01-01 10:11:12.5+00"
+        );
+        let uuid = crate::types::uuid_from_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8", true).unwrap();
+        assert_eq!(
+            Value::uuid(uuid).try_to_string().unwrap(),
+            "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+        );
+        assert!(
+            Value::list(LogicalType::INTEGER, vec![])
+                .unwrap()
+                .try_to_string()
+                .is_err()
+        );
     }
 
     #[test]

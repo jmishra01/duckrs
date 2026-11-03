@@ -1,7 +1,7 @@
 // Ported from duckdb/src/include/duckdb/common/types.hpp (GetTypeId / list_entry_t)
 // @ rust-port-baseline
 
-use super::{Interval, PhysicalType, StringT};
+use super::{Date, Interval, PhysicalType, StringT, Time, TimeTz, Timestamp};
 
 /// `list_entry_t`: a list value is a slice `[offset, offset + length)` of the child vector.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -60,6 +60,10 @@ native! {
     Interval => Interval,
     ListEntry => List,
     StringT => Varchar,
+    Date => Int32,
+    Time => Int64,
+    Timestamp => Int64,
+    TimeTz => Int64,
 }
 
 #[cfg(test)]

@@ -4,6 +4,7 @@
 
 mod error;
 pub mod executor;
+pub mod hash;
 pub mod string_cast;
 pub mod types;
 pub mod value;

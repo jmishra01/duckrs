@@ -52,6 +52,54 @@ impl Interval {
     }
 }
 
+impl std::fmt::Display for Interval {
+    /// `IntervalToStringCast::Format`: `1 year 2 months 3 days 04:05:06.789`, or `00:00:00`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::fmt::Write;
+        let mut out = String::with_capacity(32);
+        let part = |out: &mut String, value: i64, name: &str| {
+            if value == 0 {
+                return;
+            }
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            let _ = write!(out, "{value} {name}");
+            if value != 1 && value != -1 {
+                out.push('s');
+            }
+        };
+        if self.months != 0 {
+            let years = self.months / 12;
+            part(&mut out, i64::from(years), "year");
+            part(&mut out, i64::from(self.months - years * 12), "month");
+        }
+        part(&mut out, i64::from(self.days), "day");
+        if self.micros != 0 {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            if self.micros < 0 {
+                out.push('-');
+            }
+            // unsigned_abs avoids overflow for i64::MIN.
+            let micros = self.micros.unsigned_abs();
+            let hours = micros / 3_600_000_000;
+            let minutes = micros / 60_000_000 % 60;
+            let seconds = micros / 1_000_000 % 60;
+            let fraction = micros % 1_000_000;
+            let _ = write!(out, "{hours:02}:{minutes:02}:{seconds:02}");
+            if fraction != 0 {
+                let digits = format!("{fraction:06}");
+                let _ = write!(out, ".{}", digits.trim_end_matches('0'));
+            }
+        } else if out.is_empty() {
+            out.push_str("00:00:00");
+        }
+        f.write_str(&out)
+    }
+}
+
 impl PartialEq for Interval {
     fn eq(&self, other: &Self) -> bool {
         self.equals(*other)
@@ -81,6 +129,23 @@ impl std::hash::Hash for Interval {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formatting_matches_duckdb() {
+        let hms = |h: i64, m: i64, s: i64, us: i64| ((h * 60 + m) * 60 + s) * 1_000_000 + us;
+        assert_eq!(
+            Interval::new(14, 3, hms(4, 5, 6, 789_000)).to_string(),
+            "1 year 2 months 3 days 04:05:06.789"
+        );
+        assert_eq!(Interval::new(-1, 0, 0).to_string(), "-1 month");
+        assert_eq!(Interval::new(0, 0, 0).to_string(), "00:00:00");
+        assert_eq!(Interval::new(0, -1, hms(1, 0, 0, 0)).to_string(), "-1 day 01:00:00");
+        assert_eq!(Interval::new(0, 0, -hms(1, 30, 0, 0)).to_string(), "-01:30:00");
+        assert_eq!(Interval::new(0, 0, 1).to_string(), "00:00:00.000001");
+        assert_eq!(Interval::new(13, 0, 0).to_string(), "1 year 1 month");
+        assert_eq!(Interval::new(0, 0, hms(200, 0, 0, 0)).to_string(), "200:00:00");
+        assert_eq!(Interval::new(-14, 0, 0).to_string(), "-1 year -2 months");
+    }
 
     #[test]
     fn normalized_equality() {

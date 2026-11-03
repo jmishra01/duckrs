@@ -12,14 +12,17 @@ An analytical SQL database engine: a port of [DuckDB](https://github.com/duckdb/
     `UnifiedFormat`, and `DataChunk`;
   - the vectorized executors (unary/binary, nullable and fallible variants, string variants,
     and selection for filters);
-  - `Value` and the DuckDB-exact VARCHAR rendering of numbers, decimals and blobs.
+  - temporal types (`Date`, `Time`, `TimeTz`, `Timestamp` and the `_S`/`_MS`/`_NS`/`TZ`
+    variants), with DuckDB's parsing and formatting, plus interval formatting and UUIDs;
+  - DuckDB's hash functions (bit-for-bit, checked against `hash()`), for scalars and vectors;
+  - `Value` and the DuckDB-exact VARCHAR rendering of every scalar type.
 - `crates/duckrs`: the public API surface (`Database`, `Connection`). Every query returns
   `Not implemented Error`.
 - `tools/sqllogictest`: a port of DuckDB's sqllogictest runner. It runs the DuckDB `.test` corpus
   against duckrs, or against the C++ DuckDB library as a reference.
 
-Still to do in Phase 1: date/time/timestamp types and their formatting, hashing, the row layout
-(`TupleDataCollection`), `ColumnDataCollection`, sorting, and the binary serializer.
+Still to do in Phase 1: the row layout (`TupleDataCollection`), `ColumnDataCollection`, sorting,
+the binary serializer, interval parsing, and hashing of LIST/ARRAY values.
 
 The full roadmap is in [`../RUST_PORT_PLAN.md`](../RUST_PORT_PLAN.md).
 
