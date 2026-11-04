@@ -7,7 +7,8 @@
 //! Binding SELECT (one table or VALUES, WHERE, a select list, ORDER BY, LIMIT/OFFSET and
 //! DISTINCT), INSERT and CREATE TABLE.
 
-use super::{Binder, Binding, BoundStatement, StatementReturnType, binder_error};
+use super::expression::without_aliases;
+use super::{AggregateBindState, Binder, Binding, BoundStatement, ColumnMode, StatementReturnType, binder_error};
 use crate::catalog::{ColumnDefinition, DEFAULT_CATALOG, OnCreateConflict};
 use crate::execution::expression_executor::evaluate_scalar;
 use crate::function::binder::expression_return_type;
@@ -19,9 +20,9 @@ use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast::{
-    CreateTableInfo, Expr, ExprKind, InsertStatement, InsertValues, LiteralKind, OnCreateConflict as AstConflict,
-    OrderByNode, QualifiedName, QueryNodeKind, ResultModifier, SelectNode, SelectStatement, TableRef, TableRefKind,
-    values_list,
+    CreateTableInfo, Expr, ExprKind, InsertStatement, InsertValues, Literal, LiteralKind,
+    OnCreateConflict as AstConflict, OrderByNode, QualifiedName, QueryNodeKind, ResultModifier, SelectNode,
+    SelectStatement, TableRef, TableRefKind, values_list,
 };
 use duckrs_parser::transformer::visit_expr_mut;
 
@@ -40,13 +41,6 @@ fn expression_name(expr: &Expr) -> String {
     }
 }
 
-/// An expression with all aliases removed: `ParsedExpression::Equals` ignores aliases.
-fn without_aliases(expr: &Expr) -> Expr {
-    let mut expr = expr.clone();
-    visit_expr_mut(&mut expr, &mut |e| e.alias.clear());
-    expr
-}
-
 /// What binding the select list needs to know about it (`SelectBindState`).
 #[derive(Default)]
 struct SelectBindState {
@@ -56,6 +50,61 @@ struct SelectBindState {
     projection_map: Vec<(Expr, usize)>,
     /// the select list as written (qualified)
     original_expressions: Vec<Expr>,
+}
+
+/// `GroupBinder::ReplaceSelectRef`: a group naming a select list entry (by alias or position)
+/// takes that entry's expression, and the entry becomes a reference to the group.
+fn replace_select_ref(
+    group: &mut Expr,
+    group_index: usize,
+    select_list: &mut [Expr],
+    state: &SelectBindState,
+    aggregates: &mut AggregateBindState,
+    used_select_entries: &mut Vec<usize>,
+) -> Result<()> {
+    let select_index = match &group.kind {
+        ExprKind::ColumnRef(names) if names.len() == 1 => {
+            let name = &names[0];
+            let Some((alias, index)) = state.alias_map.iter().find(|(a, _)| a.eq_ignore_ascii_case(name)) else {
+                return Ok(());
+            };
+            aggregates.group_alias_map.push((alias.clone(), group_index));
+            *index
+        }
+        ExprKind::Constant(literal) if literal.kind == LiteralKind::Integer => {
+            let Ok(position) = literal.text.replace('_', "").parse::<i64>() else {
+                return Ok(());
+            };
+            (position - 1) as usize
+        }
+        ExprKind::Parameter(_) => {
+            return Err(Error::new(
+                ErrorKind::ParameterNotAllowed,
+                "Parameter not supported in GROUP BY clause",
+            ));
+        }
+        _ => return Ok(()),
+    };
+    if used_select_entries.contains(&select_index) {
+        // grouping on the same entry twice: the second group has no effect
+        *group = Expr::from(ExprKind::Constant(Literal::integer(42)));
+        return Ok(());
+    }
+    if select_index >= select_list.len() {
+        return Err(binder_error(format!(
+            "GROUP BY term out of range - should be between 1 and {}",
+            select_list.len()
+        )));
+    }
+    // the entry becomes a reference to the group, named after its position
+    let position = select_index.to_string();
+    *group = std::mem::replace(
+        &mut select_list[select_index],
+        ExprKind::ColumnRef(vec![position.clone()]).into(),
+    );
+    aggregates.group_alias_map.push((position, group_index));
+    used_select_entries.push(select_index);
+    Ok(())
 }
 
 /// A result modifier with its targets resolved to select list indexes.
@@ -97,12 +146,15 @@ impl Binder<'_> {
 
     /// `Binder::BindNode(SelectNode)` + `CreatePlan(BoundSelectNode)` + `VisitQueryNode`.
     fn bind_select_node(&mut self, node: &SelectNode, modifiers: &[ResultModifier]) -> Result<BoundStatement> {
-        if !node.groups.group_expressions.is_empty()
-            || !node.groups.grouping_sets.is_empty()
-            || node.force_aggregates
-            || node.having.is_some()
-        {
-            return Err(not_implemented("GROUP BY"));
+        // a single grouping set of all groups is a plain GROUP BY
+        let groups = &node.groups;
+        let plain_grouping = match groups.grouping_sets.as_slice() {
+            [] => true,
+            [set] => set.len() == groups.group_expressions.len(),
+            _ => false,
+        };
+        if !plain_grouping {
+            return Err(not_implemented("GROUPING SETS, ROLLUP and CUBE"));
         }
         if node.qualify.is_some() {
             return Err(not_implemented("QUALIFY"));
@@ -128,6 +180,37 @@ impl Binder<'_> {
             state.original_expressions.push(expr.clone());
         }
         let column_count = select_list.len();
+        // qualify the groups, and swap the ones naming a select list entry with that entry
+        let group_index = self.generate_table_index();
+        let aggregate_index = self.generate_table_index();
+        let mut aggregates = AggregateBindState {
+            group_index,
+            aggregate_index,
+            group_map: Vec::new(),
+            group_alias_map: Vec::new(),
+            groups: Vec::new(),
+            aggregates: Vec::new(),
+            aggregate_keys: Vec::new(),
+            inside_aggregate: false,
+            mode: ColumnMode::SelectList,
+            bound_columns: Vec::new(),
+            bound_aggregate: false,
+            force_aggregates: node.force_aggregates,
+        };
+        let mut group_expressions = node.groups.group_expressions.clone();
+        let mut used_select_entries = Vec::new();
+        for (i, group) in group_expressions.iter_mut().enumerate() {
+            self.qualify_column_names(group);
+            replace_select_ref(
+                group,
+                i,
+                &mut select_list,
+                &state,
+                &mut aggregates,
+                &mut used_select_entries,
+            )?;
+            aggregates.group_map.push((without_aliases(group), i));
+        }
         // PrepareModifiers: ORDER BY and DISTINCT targets refer to select list entries,
         // appending the ones that are not there yet
         let mut prepared = Vec::new();
@@ -141,6 +224,7 @@ impl Binder<'_> {
                 .iter()
                 .map(|(alias, i)| (alias.clone(), select_list[*i].clone()))
                 .collect();
+            self.aggregate_error = "WHERE clause cannot contain aggregates!";
             let condition = self.bind_expression(condition);
             self.alias_fallback.clear();
             let condition = condition?.cast_to(&LogicalType::BOOLEAN, false);
@@ -151,8 +235,29 @@ impl Binder<'_> {
                 vec![plan],
             );
         }
+        self.aggregate_error = "GROUP BY clause cannot contain aggregates!";
+        for group in &group_expressions {
+            let mut alias_in_expression = None;
+            visit_expr_mut(&mut group.clone(), &mut |e| {
+                if let ExprKind::ColumnRef(names) = &e.kind
+                    && let [name] = names.as_slice()
+                    && state.alias_map.iter().any(|(a, _)| a.eq_ignore_ascii_case(name))
+                {
+                    alias_in_expression = Some(name.clone());
+                }
+            });
+            if let Some(alias) = alias_in_expression {
+                return Err(binder_error(format!(
+                    "Alias with name {alias} exists, but aliases cannot be used as part of an expression in the \
+                     GROUP BY"
+                )));
+            }
+            aggregates.groups.push(self.bind_expression(group)?);
+        }
+        self.aggregates = Some(aggregates);
         // a select list entry may refer to the aliases of the entries before it
         let mut expressions = Vec::with_capacity(select_list.len());
+        let mut group_by_all = Vec::new();
         for (i, expr) in select_list.iter().enumerate() {
             self.alias_fallback = state
                 .alias_map
@@ -163,6 +268,98 @@ impl Binder<'_> {
             let bound = self.bind_expression(expr);
             self.alias_fallback.clear();
             expressions.push(bound?);
+            let aggregates = self.aggregates.as_mut().expect("set above");
+            if node.force_aggregates && i < column_count {
+                // GROUP BY ALL: an entry with columns becomes a group
+                if !aggregates.bound_columns.is_empty() {
+                    if aggregates.bound_aggregate {
+                        return Err(binder_error("Cannot mix aggregates with non-aggregated columns!"));
+                    }
+                    group_by_all.push(i);
+                }
+                aggregates.bound_columns.clear();
+                aggregates.bound_aggregate = false;
+            }
+        }
+        {
+            let aggregates = self.aggregates.as_mut().expect("set above");
+            for i in group_by_all {
+                let ty = expressions[i].return_type.clone();
+                let group = aggregates.groups.len();
+                let reference = BoundExpr::column_ref(ColumnBinding::new(group_index, group), ty, names[i].clone());
+                aggregates
+                    .groups
+                    .push(std::mem::replace(&mut expressions[i], reference));
+                aggregates
+                    .group_map
+                    .push((without_aliases(&state.original_expressions[i]), group));
+            }
+        }
+        // the HAVING clause binds after the select list and its groups
+        let having = match &node.having {
+            Some(having) => {
+                let mut having = having.clone();
+                self.qualify_column_names(&mut having);
+                self.alias_fallback = state
+                    .alias_map
+                    .iter()
+                    .map(|(alias, i)| (alias.clone(), select_list[*i].clone()))
+                    .collect();
+                self.aggregates.as_mut().expect("set above").mode = ColumnMode::Having;
+                let bound = self.bind_expression(&having);
+                self.alias_fallback.clear();
+                Some(bound?.cast_to(&LogicalType::BOOLEAN, false))
+            }
+            None => None,
+        };
+        let aggregates = self.aggregates.take().expect("set above");
+        let has_groups = !aggregates.groups.is_empty();
+        let has_aggregates = !aggregates.aggregates.is_empty();
+        let has_grouping_sets = !node.groups.grouping_sets.is_empty();
+        if has_groups || has_aggregates || having.is_some() || has_grouping_sets {
+            // a column outside of the groups and aggregates has no single value per group
+            if let Some(column) = aggregates.bound_columns.first() {
+                let mut error = format!(
+                    "column {column} must appear in the GROUP BY clause or must be part of an aggregate function."
+                );
+                if node.force_aggregates {
+                    error += "\nGROUP BY ALL will only group entries in the SELECT list. Add it to the SELECT list or \
+                              GROUP BY this entry explicitly.";
+                } else {
+                    error += &format!(
+                        "\nEither add it to the GROUP BY list, or use ANY_VALUE({column}) if the exact value of \
+                         {column} is not important."
+                    );
+                }
+                return Err(binder_error(error));
+            }
+        }
+        if has_groups || has_aggregates || having.is_some() {
+            plan = LogicalOperator::new(
+                LogicalOperatorKind::Aggregate {
+                    group_index,
+                    aggregate_index,
+                    groups: aggregates.groups,
+                    aggregates: aggregates.aggregates,
+                },
+                vec![plan],
+            );
+        } else if has_grouping_sets {
+            // edge case: `SELECT 1 FROM t GROUP BY ()` has one group, and nothing to compute
+            plan = LogicalOperator::new(
+                LogicalOperatorKind::DummyScan {
+                    table_index: group_index,
+                },
+                vec![],
+            );
+        }
+        if let Some(having) = having {
+            plan = LogicalOperator::new(
+                LogicalOperatorKind::Filter {
+                    expressions: vec![having],
+                },
+                vec![plan],
+            );
         }
         let types: Vec<LogicalType> = expressions.iter().map(|e| e.return_type.clone()).collect();
         let projection_index = self.generate_table_index();
@@ -243,8 +440,11 @@ impl Binder<'_> {
     fn qualify_column_names(&self, expr: &mut Expr) {
         visit_expr_mut(expr, &mut |e| {
             if let ExprKind::ColumnRef(names) = &mut e.kind
-                && let [column] = names.as_slice()
-                && let Ok((binding, ..)) = self.bind_context.bind_column(column)
+                && let Ok((binding, ..)) = match names.as_slice() {
+                    [column] => self.bind_context.bind_column(column),
+                    [table, column] => self.bind_context.bind_qualified_column(table, column),
+                    _ => return,
+                }
                 && let Some(table) = self
                     .bind_context
                     .bindings

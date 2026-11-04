@@ -9,6 +9,7 @@
 use duckrs_common::executor;
 use duckrs_common::string_cast::{format_double, format_float};
 use duckrs_common::types::{LogicalType, LogicalTypeId, NativeType, PhysicalType};
+use duckrs_common::value::Value;
 use duckrs_common::vector::Vector;
 use duckrs_common::{Error, ErrorKind, Result};
 
@@ -162,12 +163,12 @@ fn huge_to_double(value: i128) -> f64 {
     }
 }
 
-fn uhuge_to_double(value: u128) -> f64 {
+pub(super) fn uhuge_to_double(value: u128) -> f64 {
     (value as u64) as f64 + ((value >> 64) as u64) as f64 * (u64::MAX as f64 + 1.0)
 }
 
 /// An integer as a double: 64-bit values convert directly, wider ones like `Hugeint::TryCast`.
-fn int_to_double(value: i128) -> f64 {
+pub(super) fn int_to_double(value: i128) -> f64 {
     match i64::try_from(value) {
         Ok(v) => v as f64,
         Err(_) => huge_to_double(value),
@@ -532,7 +533,7 @@ fn string_to_number<T: CastNumber>(
                 nulls.push(i);
                 continue;
             }
-            let bytes = u.str_at(idx);
+            let bytes = u.str_at(i);
             match parse(bytes).and_then(T::from_number) {
                 Some(v) => *slot = v,
                 None if mode == CastMode::Try => nulls.push(i),
@@ -559,7 +560,14 @@ fn string_to<T: CastNumber>(source: &Vector, result: &mut Vector, count: usize, 
         PhysicalType::Bool => string_to_number::<T>(source, result, count, mode, |s| {
             try_cast_string_to_bool(s).map(|b| Number::Int(b as i128))
         }),
-        PhysicalType::Float | PhysicalType::Double => string_to_number::<T>(source, result, count, mode, |s| {
+        // a FLOAT is parsed as a float, so a value beyond its range becomes infinite
+        PhysicalType::Float => string_to_number::<T>(source, result, count, mode, |s| {
+            try_cast_string_to_double(s)?;
+            let text = std::str::from_utf8(s).ok()?;
+            let text = text.trim_matches(|c: char| c.is_ascii() && is_space(c as u8));
+            text.parse::<f32>().ok().map(Number::Float)
+        }),
+        PhysicalType::Double => string_to_number::<T>(source, result, count, mode, |s| {
             try_cast_string_to_double(s).map(Number::Double)
         }),
         _ => string_to_number::<T>(source, result, count, mode, |s| {
@@ -587,6 +595,236 @@ fn to_varchar(source: &Vector, result: &mut Vector, count: usize) -> Result<()> 
     Ok(())
 }
 
+fn pow10(exponent: u8) -> i128 {
+    10i128.pow(exponent as u32)
+}
+
+/// `TryDecimalStringCast`: the unscaled value a string spells at `scale`, rounding further
+/// digits half away from zero; `None` if it is no number or exceeds the width.
+fn string_to_decimal(input: &[u8], width: u8, scale: u8) -> Option<i128> {
+    let text = std::str::from_utf8(input)
+        .ok()?
+        .trim_matches(|c: char| c.is_ascii() && is_space(c as u8));
+    let (negative, text) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (mantissa, exponent) = match text.find(['e', 'E']) {
+        Some(i) => (&text[..i], text[i + 1..].parse::<i32>().ok()?),
+        None => (text, 0),
+    };
+    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let valid = |part: &str| {
+        part.is_empty()
+            || (part.bytes().all(|c| c.is_ascii_digit() || c == b'_')
+                && !part.starts_with('_')
+                && !part.ends_with('_')
+                && !part.contains("__"))
+    };
+    if !valid(integer) || !valid(fraction) || (integer.is_empty() && fraction.is_empty()) {
+        return None;
+    }
+    let digits: Vec<u8> = integer
+        .bytes()
+        .chain(fraction.bytes())
+        .filter(|c| *c != b'_')
+        .map(|c| c - b'0')
+        .collect();
+    // the position of the decimal point in `digits`, after the exponent moved it
+    let integer_digits = integer.bytes().filter(|c| *c != b'_').count() as i64;
+    let point = integer_digits + exponent as i64;
+    let end = point + scale as i64;
+    let mut result: i128 = 0;
+    let mut significant = 0i64;
+    for position in 0..end.max(0) {
+        let digit = digits.get(position as usize).copied().unwrap_or(0);
+        if result != 0 || digit != 0 {
+            significant += 1;
+            if position < point && significant > (width - scale) as i64 {
+                return None;
+            }
+            if significant > 38 {
+                return None;
+            }
+        }
+        result = result * 10 + digit as i128;
+    }
+    if end >= 0 && digits.get(end as usize).is_some_and(|d| *d >= 5) {
+        result += 1;
+    }
+    (result < pow10(width)).then_some(if negative { -result } else { result })
+}
+
+/// A cast from or to DECIMAL of one row: its value, or the conversion error.
+fn cast_decimal_value(value: &Value, target: &LogicalType) -> Result<Value> {
+    let source = value.logical_type();
+    let fail = |message: String| Err(conversion_error(message));
+    if let Some((width, scale)) = source.decimal_properties() {
+        let input = value.as_i128().expect("a DECIMAL value");
+        if let Some((target_width, target_scale)) = target.decimal_properties() {
+            // `DecimalDecimalCastSwitch`
+            let out_of_range = || {
+                conversion_error(format!(
+                    "Casting value \"{}\" to type {target} failed: value is out of range!",
+                    value.try_to_string().unwrap_or_default()
+                ))
+            };
+            let unscaled = if target_scale >= scale {
+                let difference = target_scale - scale;
+                if target_width < difference {
+                    if input != 0 {
+                        return Err(out_of_range());
+                    }
+                    0
+                } else {
+                    let limit = pow10(target_width - difference);
+                    if input >= limit || input <= -limit {
+                        return Err(out_of_range());
+                    }
+                    input * pow10(difference)
+                }
+            } else {
+                let factor = pow10(scale - target_scale);
+                let limit = 10u128.pow(target_width as u32 + (scale - target_scale) as u32);
+                let rounded = input.unsigned_abs()
+                    + if (input % factor).unsigned_abs() >= (factor as u128) / 2 {
+                        factor as u128
+                    } else {
+                        0
+                    };
+                if rounded >= limit {
+                    return Err(out_of_range());
+                }
+                // round on the digit below the target scale, away from zero
+                let halved = input / (factor / 2);
+                (if input < 0 { halved - 1 } else { halved + 1 }) / 2
+            };
+            return Value::decimal(unscaled, target_width, target_scale);
+        }
+        return match target.physical_type() {
+            PhysicalType::Bool => Ok(Value::boolean(input != 0)),
+            PhysicalType::Float | PhysicalType::Double => {
+                // the exact decimal, correctly rounded
+                let text = duckrs_common::string_cast::format_decimal(input, width, scale);
+                let number = text.parse::<f64>().expect("a decimal rendering");
+                Ok(if target.physical_type() == PhysicalType::Float {
+                    Value::float(text.parse::<f32>().expect("a decimal rendering"))
+                } else {
+                    Value::double(number)
+                })
+            }
+            physical => {
+                let power = pow10(scale);
+                let rounding = if input < 0 { -power } else { power } / 2;
+                let rounded = (input + rounding) / power;
+                let (min, max) = super::cast_rules::integral_range(target.id());
+                if !(min..=max).contains(&rounded) {
+                    return fail(format!("Failed to cast decimal value {rounded} to type {physical}"));
+                }
+                integer_value(rounded, target)
+            }
+        };
+    }
+    let (width, scale) = target.decimal_properties().expect("a DECIMAL target");
+    let decimal_error = |text: String| format!("Could not cast value {text} to DECIMAL({width},{scale})");
+    let unscaled = match source.physical_type() {
+        PhysicalType::Varchar => {
+            let bytes = value.try_to_string()?;
+            match string_to_decimal(bytes.as_bytes(), width, scale) {
+                Some(unscaled) => unscaled,
+                None => {
+                    return fail(format!(
+                        "Could not convert string \"{bytes}\" to DECIMAL({width},{scale})"
+                    ));
+                }
+            }
+        }
+        PhysicalType::Bool => {
+            let input = *value == Value::boolean(true);
+            if input && width <= scale {
+                return fail(decimal_error("true".into()));
+            }
+            if input { pow10(scale) } else { 0 }
+        }
+        PhysicalType::Float | PhysicalType::Double => {
+            let input = match value.data() {
+                duckrs_common::value::ValueData::Float(v) => *v as f64,
+                duckrs_common::value::ValueData::Double(v) => *v,
+                _ => unreachable!("a floating point value"),
+            };
+            let rounded = (input * 10f64.powi(scale as i32)).round();
+            let limit = 10f64.powi(width as i32);
+            if !rounded.is_finite() || rounded <= -limit || rounded >= limit {
+                return fail(decimal_error(format!("{input:.6}")));
+            }
+            rounded as i128
+        }
+        _ => {
+            let text = value.try_to_string()?;
+            let input = match value.data() {
+                duckrs_common::value::ValueData::UInt128(v) => i128::try_from(*v).unwrap_or(i128::MAX),
+                _ => value.as_i128().expect("an integer value"),
+            };
+            let limit = pow10(width - scale);
+            if input >= limit || input <= -limit {
+                return fail(decimal_error(text));
+            }
+            input * pow10(scale)
+        }
+    };
+    Value::decimal(unscaled, width, scale)
+}
+
+/// An integer as a value of the integer type `target`.
+fn integer_value(input: i128, target: &LogicalType) -> Result<Value> {
+    use LogicalTypeId::*;
+    Ok(match target.id() {
+        TinyInt => Value::tinyint(input as i8),
+        SmallInt => Value::smallint(input as i16),
+        Integer => Value::integer(input as i32),
+        BigInt => Value::bigint(input as i64),
+        HugeInt => Value::hugeint(input),
+        UTinyInt => Value::utinyint(input as u8),
+        USmallInt => Value::usmallint(input as u16),
+        UInteger => Value::uinteger(input as u32),
+        UBigInt => Value::ubigint(input as u64),
+        UHugeInt => Value::uhugeint(input as u128),
+        other => unreachable!("{other:?} is not an integer type"),
+    })
+}
+
+/// Casts from or to DECIMAL, row by row.
+fn decimal_cast(source: &Vector, result: &mut Vector, count: usize, mode: CastMode) -> Result<()> {
+    let target = result.logical_type().clone();
+    let constant = source.vector_type() == duckrs_common::vector::VectorType::Constant;
+    let rows = if constant { 1 } else { count };
+    result.prepare_flat(rows.max(1));
+    for i in 0..rows {
+        let value = source.get_value(i);
+        if value.is_null() {
+            result.set_null(i, true);
+            continue;
+        }
+        match cast_decimal_value(&value, &target) {
+            Ok(cast) => result.set_value(i, &cast)?,
+            Err(_) if mode == CastMode::Try => result.set_null(i, true),
+            Err(error) => return Err(error),
+        }
+    }
+    if constant {
+        result.set_constant();
+    }
+    Ok(())
+}
+
+/// Whether [`decimal_cast`] covers a cast.
+fn is_decimal_cast(source: &LogicalType, target: &LogicalType) -> bool {
+    let plain = |ty: &LogicalType| {
+        is_numeric_or_bool(ty) || ty.id() == LogicalTypeId::Decimal || ty.id() == LogicalTypeId::Varchar
+    };
+    (source.id() == LogicalTypeId::Decimal || target.id() == LogicalTypeId::Decimal) && plain(source) && plain(target)
+}
+
 fn is_numeric_or_bool(ty: &LogicalType) -> bool {
     use LogicalTypeId::*;
     ty.id() == Boolean || (ty.is_numeric() && ty.id() != Decimal)
@@ -603,6 +841,7 @@ pub fn has_cast(source: &LogicalType, target: &LogicalType) -> bool {
         || target.id() == LogicalTypeId::Varchar
         || (is_numeric_or_bool(source) && is_numeric_or_bool(target))
         || (source.id() == LogicalTypeId::Varchar && is_numeric_or_bool(target))
+        || is_decimal_cast(source, target)
 }
 
 /// Casts `source` (of `count` rows) into `result`, whose type is the target type.
@@ -618,6 +857,9 @@ pub fn cast_vector(source: &Vector, result: &mut Vector, count: usize, mode: Cas
     }
     if to.id() == LogicalTypeId::Varchar {
         return to_varchar(source, result, count);
+    }
+    if is_decimal_cast(&from, &to) {
+        return decimal_cast(source, result, count, mode);
     }
     if is_numeric_or_bool(&from) && is_numeric_or_bool(&to) {
         return match from.physical_type() {
@@ -681,6 +923,44 @@ mod tests {
         assert_eq!(cast("abc"), None);
         assert_eq!(cast(""), None);
         assert_eq!(cast("- 1"), None);
+    }
+
+    #[test]
+    fn decimals_cast_like_duckdb() {
+        let cast = |value: Value, target: &LogicalType| {
+            cast_decimal_value(&value, target)
+                .map(|v| v.try_to_string().unwrap())
+                .map_err(|e| e.to_string())
+        };
+        let d = |unscaled, width, scale| Value::decimal(unscaled, width, scale).unwrap();
+        assert_eq!(cast(d(15, 2, 1), &LogicalType::DOUBLE).unwrap(), "1.5");
+        assert_eq!(cast(d(15, 2, 1), &LogicalType::INTEGER).unwrap(), "2");
+        assert_eq!(cast(d(-25, 2, 1), &LogicalType::INTEGER).unwrap(), "-3");
+        assert_eq!(cast(d(1234, 4, 2), &LogicalType::decimal(4, 1)).unwrap(), "12.3");
+        assert_eq!(cast(d(1235, 4, 2), &LogicalType::decimal(4, 1)).unwrap(), "12.4");
+        assert_eq!(cast(d(15, 2, 1), &LogicalType::decimal(5, 3)).unwrap(), "1.500");
+        assert_eq!(
+            cast(d(1234, 4, 1), &LogicalType::decimal(3, 1)).unwrap_err(),
+            "Conversion Error: Casting value \"123.4\" to type DECIMAL(3,1) failed: value is out of range!"
+        );
+        assert_eq!(cast(Value::integer(12), &LogicalType::decimal(4, 1)).unwrap(), "12.0");
+        assert_eq!(
+            cast(Value::integer(1000), &LogicalType::decimal(4, 1)).unwrap_err(),
+            "Conversion Error: Could not cast value 1000 to DECIMAL(4,1)"
+        );
+        assert_eq!(cast(Value::double(1.25), &LogicalType::decimal(4, 1)).unwrap(), "1.3");
+        assert_eq!(
+            cast(Value::varchar(" 1.25 "), &LogicalType::decimal(4, 1)).unwrap(),
+            "1.3"
+        );
+        assert_eq!(
+            cast(Value::varchar("-1.2e1"), &LogicalType::decimal(4, 1)).unwrap(),
+            "-12.0"
+        );
+        assert_eq!(
+            cast(Value::varchar("abc"), &LogicalType::decimal(4, 1)).unwrap_err(),
+            "Conversion Error: Could not convert string \"abc\" to DECIMAL(4,1)"
+        );
     }
 
     #[test]

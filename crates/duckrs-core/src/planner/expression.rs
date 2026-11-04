@@ -6,6 +6,7 @@
 //! an enum here.
 
 use crate::function::ScalarFunction;
+use crate::function::aggregates::AggregateFunction;
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
 use duckrs_parser::ast::ComparisonOp;
@@ -73,6 +74,18 @@ pub enum BoundExprKind {
         children: Vec<BoundExpr>,
         is_operator: bool,
     },
+}
+
+/// An aggregate of a query (`BoundAggregateExpression`); expressions refer to its result
+/// through a column of the aggregate's table index.
+#[derive(Debug, Clone)]
+pub struct BoundAggregate {
+    pub function: Arc<AggregateFunction>,
+    pub return_type: LogicalType,
+    pub children: Vec<BoundExpr>,
+    /// `FILTER (WHERE ...)`
+    pub filter: Option<BoundExpr>,
+    pub distinct: bool,
 }
 
 /// A bound expression (`Expression`).

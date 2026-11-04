@@ -3,6 +3,7 @@
 //! Functions: scalar function signatures and sets, the built-in functions, casts, the implicit
 //! cast and type unification rules, and overload resolution ([`binder`]).
 
+pub mod aggregates;
 pub mod binder;
 pub mod cast;
 pub mod cast_rules;
@@ -82,15 +83,22 @@ impl ScalarFunctionSet {
 /// catalog; they move there when the catalog grows function entries.
 pub struct BuiltinFunctions {
     scalar: HashMap<String, ScalarFunctionSet>,
+    aggregate: HashMap<String, aggregates::AggregateFunctionSet>,
 }
 
 impl BuiltinFunctions {
     pub fn get() -> &'static BuiltinFunctions {
         static FUNCTIONS: OnceLock<BuiltinFunctions> = OnceLock::new();
         FUNCTIONS.get_or_init(|| {
-            let mut functions = BuiltinFunctions { scalar: HashMap::new() };
+            let mut functions = BuiltinFunctions {
+                scalar: HashMap::new(),
+                aggregate: HashMap::new(),
+            };
             for set in operators::arithmetic_operators() {
                 functions.scalar.insert(set.name.clone(), set);
+            }
+            for set in aggregates::aggregate_functions() {
+                functions.aggregate.insert(set.name.clone(), set);
             }
             functions
         })
@@ -98,5 +106,9 @@ impl BuiltinFunctions {
 
     pub fn scalar(&self, name: &str) -> Option<&ScalarFunctionSet> {
         self.scalar.get(&name.to_ascii_lowercase())
+    }
+
+    pub fn aggregate(&self, name: &str) -> Option<&aggregates::AggregateFunctionSet> {
+        self.aggregate.get(&name.to_ascii_lowercase())
     }
 }

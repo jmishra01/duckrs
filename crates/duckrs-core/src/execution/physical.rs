@@ -11,7 +11,8 @@
 
 use super::expression_executor::{execute, select};
 use crate::catalog::{ColumnDefinition, OnCreateConflict, SchemaCatalogEntry, TableCatalogEntry};
-use crate::planner::expression::BoundExpr;
+use crate::function::aggregates::{AggregateState, value_keys};
+use crate::planner::expression::{BoundAggregate, BoundExpr};
 use crate::planner::logical::BoundOrderByNode;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::{NullOrder, OrderModifiers, OrderType, create_sort_keys, sort_collection};
@@ -410,6 +411,191 @@ impl PhysicalOperator for PhysicalDistinct {
     }
     fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
         Ok(scan_collection(&self.data, state))
+    }
+}
+
+/// `PhysicalHashAggregate` and `PhysicalUngroupedAggregate`: computes aggregates per group
+/// (sink) and emits a row per group (source). Groups are found by the sort key of their
+/// values, so NULLs group together and equal values compare like DuckDB's.
+#[derive(Debug)]
+pub struct PhysicalAggregate {
+    pub types: Vec<LogicalType>,
+    pub groups: Vec<BoundExpr>,
+    pub aggregates: Vec<BoundAggregate>,
+    pub children: Vec<Box<dyn PhysicalOperator>>,
+    pub state: Mutex<AggregateSinkState>,
+}
+
+/// The groups so far and their aggregate states.
+#[derive(Debug)]
+pub struct AggregateSinkState {
+    group_ids: std::collections::HashMap<Vec<u8>, usize>,
+    group_values: ColumnDataCollection,
+    group_count: usize,
+    /// per aggregate, the states of the groups
+    states: Vec<Vec<AggregateState>>,
+    /// per aggregate, per group, the values a DISTINCT aggregate has seen
+    distinct_seen: Vec<std::collections::HashSet<(usize, Vec<u8>)>>,
+    output: Vec<DataChunk>,
+}
+
+impl PhysicalAggregate {
+    pub fn new(
+        types: Vec<LogicalType>,
+        groups: Vec<BoundExpr>,
+        aggregates: Vec<BoundAggregate>,
+        children: Vec<Box<dyn PhysicalOperator>>,
+    ) -> Self {
+        let group_types: Vec<LogicalType> = groups.iter().map(|g| g.return_type.clone()).collect();
+        // an ungrouped aggregate has its one group from the start
+        let group_count = usize::from(groups.is_empty());
+        let state = AggregateSinkState {
+            group_ids: std::collections::HashMap::new(),
+            group_values: ColumnDataCollection::new(group_types),
+            group_count,
+            states: aggregates
+                .iter()
+                .map(|a| vec![a.function.kind.initial_state(); group_count])
+                .collect(),
+            distinct_seen: vec![std::collections::HashSet::new(); aggregates.len()],
+            output: Vec::new(),
+        };
+        Self {
+            types,
+            groups,
+            aggregates,
+            children,
+            state: Mutex::new(state),
+        }
+    }
+
+    /// The group of each row of `chunk`, creating groups as needed.
+    fn find_groups(&self, chunk: &DataChunk, state: &mut AggregateSinkState) -> Result<Vec<usize>> {
+        if self.groups.is_empty() {
+            return Ok(vec![0; chunk.len()]);
+        }
+        let vectors = self
+            .groups
+            .iter()
+            .map(|g| execute(g, chunk))
+            .collect::<Result<Vec<_>>>()?;
+        let modifiers = OrderModifiers {
+            order: OrderType::Ascending,
+            nulls: NullOrder::NullsLast,
+        };
+        let columns: Vec<(&Vector, OrderModifiers)> = vectors.iter().map(|v| (v, modifiers)).collect();
+        let keys = create_sort_keys(&columns, chunk.len())?;
+        let mut new_rows = Vec::new();
+        let mut ids = Vec::with_capacity(keys.len());
+        for (row, key) in keys.into_iter().enumerate() {
+            let next = state.group_count;
+            let id = *state.group_ids.entry(key).or_insert(next);
+            if id == next {
+                state.group_count += 1;
+                new_rows.push(row as u32);
+            }
+            ids.push(id);
+        }
+        if !new_rows.is_empty() {
+            let count = new_rows.len();
+            let mut values = DataChunk::from_columns(vectors, chunk.len());
+            values.slice(&SelectionVector::from_vec(new_rows), count);
+            state.group_values.append(&values);
+            for (states, aggregate) in state.states.iter_mut().zip(&self.aggregates) {
+                states.resize(state.group_count, aggregate.function.kind.initial_state());
+            }
+        }
+        Ok(ids)
+    }
+}
+
+impl PhysicalOperator for PhysicalAggregate {
+    fn name(&self) -> &'static str {
+        if self.groups.is_empty() {
+            "UNGROUPED_AGGREGATE"
+        } else {
+            "HASH_GROUP_BY"
+        }
+    }
+    fn types(&self) -> &[LogicalType] {
+        &self.types
+    }
+    fn children(&self) -> &[Box<dyn PhysicalOperator>] {
+        &self.children
+    }
+    fn is_sink(&self) -> bool {
+        true
+    }
+    fn sink(&self, chunk: &DataChunk) -> Result<()> {
+        let mut state = self.state.lock();
+        let state = &mut *state;
+        let ids = self.find_groups(chunk, state)?;
+        for (i, aggregate) in self.aggregates.iter().enumerate() {
+            let mut rows: Vec<(usize, usize)> = match &aggregate.filter {
+                Some(filter) => {
+                    let (sel, count) = select(filter, chunk)?;
+                    (0..count).map(|r| (sel.get(r), ids[sel.get(r)])).collect()
+                }
+                None => ids.iter().copied().enumerate().collect(),
+            };
+            let input = aggregate.children.first().map(|c| execute(c, chunk)).transpose()?;
+            if let (true, Some(input)) = (aggregate.distinct, &input) {
+                // each value counts once per group; NULLs are not values
+                let keys = value_keys(input, chunk.len())?;
+                let unified = input.to_unified(chunk.len());
+                let seen = &mut state.distinct_seen[i];
+                rows.retain(|&(row, group)| unified.is_valid(row) && seen.insert((group, keys[row].clone())));
+            }
+            aggregate
+                .function
+                .update(input.as_ref(), chunk.len(), &rows, &mut state.states[i])?;
+        }
+        Ok(())
+    }
+    fn finalize(&self) -> Result<()> {
+        let mut state = self.state.lock();
+        let state = &mut *state;
+        let finalize = |group: usize, count: usize| -> Result<Vec<Vector>> {
+            self.aggregates
+                .iter()
+                .zip(&state.states)
+                .map(|(aggregate, states)| {
+                    let mut column = Vector::new(aggregate.return_type.clone(), count);
+                    let input = aggregate.children.first().map(|c| &c.return_type);
+                    for (row, state) in states[group..group + count].iter().enumerate() {
+                        let value = aggregate.function.finalize(state, &aggregate.return_type, input)?;
+                        column.set_value(row, &value)?;
+                    }
+                    Ok(column)
+                })
+                .collect()
+        };
+        let mut output = Vec::new();
+        if self.groups.is_empty() {
+            output.push(DataChunk::from_columns(finalize(0, 1)?, 1));
+        } else {
+            let mut offset = 0;
+            for chunk in state.group_values.chunks() {
+                let mut columns = chunk.columns().to_vec();
+                columns.extend(finalize(offset, chunk.len())?);
+                output.push(DataChunk::from_columns(columns, chunk.len()));
+                offset += chunk.len();
+            }
+        }
+        state.output = output;
+        Ok(())
+    }
+    fn is_source(&self) -> bool {
+        true
+    }
+    fn source_state(&self) -> SourceState {
+        Box::new(0usize)
+    }
+    fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
+        let next = state.downcast_mut::<usize>().expect("aggregate scan state");
+        let chunk = self.state.lock().output.get(*next).cloned();
+        *next += 1;
+        Ok(chunk)
     }
 }
 

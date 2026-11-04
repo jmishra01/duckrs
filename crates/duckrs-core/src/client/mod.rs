@@ -317,6 +317,121 @@ mod tests {
     }
 
     #[test]
+    fn aggregates() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        run(
+            &mut context,
+            "CREATE TABLE t (g INTEGER, v INTEGER, s VARCHAR, d DOUBLE, m DECIMAL(4,1))",
+        );
+        run(
+            &mut context,
+            "INSERT INTO t VALUES (1, 10, 'a', 1.5, 1.5), (1, 20, 'b', 2.5, 2.5), (2, NULL, NULL, NULL, NULL), \
+             (2, 5, 'c', 0.5, 0.5), (1, 10, 'a', 1.5, 1.5)",
+        );
+        let rows = |context: &mut ClientContext, sql: &str| {
+            run(context, sql).into_iter().map(|r| r.join(",")).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            rows(
+                &mut context,
+                "SELECT count(*), count(v), sum(v), min(v), max(s), avg(v), sum(d), sum(m), avg(m) FROM t"
+            ),
+            ["5,4,45,5,c,11.25,6.0,6.0,1.5"]
+        );
+        assert_eq!(
+            rows(
+                &mut context,
+                "SELECT g, sum(v), count(DISTINCT v) FROM t GROUP BY g ORDER BY g"
+            ),
+            ["1,40,2", "2,5,1"]
+        );
+        // groups by position and alias, HAVING, an expression over groups and aggregates
+        assert_eq!(
+            rows(
+                &mut context,
+                "SELECT g + 1 AS x, sum(v) * 2 FROM t GROUP BY x HAVING sum(v) > 10"
+            ),
+            ["2,80"]
+        );
+        assert_eq!(
+            rows(&mut context, "SELECT g + 1, count(*) FROM t GROUP BY 1 ORDER BY 1"),
+            ["2,3", "3,2"]
+        );
+        assert_eq!(
+            rows(&mut context, "SELECT g, count(*) AS c FROM t GROUP BY ALL HAVING c > 2"),
+            ["1,3"]
+        );
+        // ORDER BY an aggregate that is not selected
+        assert_eq!(
+            rows(&mut context, "SELECT g FROM t GROUP BY g ORDER BY count(*)"),
+            ["2", "1"]
+        );
+        // FILTER, NULL groups, and aggregates over nothing
+        assert_eq!(
+            rows(&mut context, "SELECT count(*) FILTER (WHERE v > 5), first(s) FROM t"),
+            ["3,a"]
+        );
+        assert_eq!(
+            rows(&mut context, "SELECT s, count(*) FROM t GROUP BY s ORDER BY s"),
+            ["a,2", "b,1", "c,1", "NULL,1"]
+        );
+        assert_eq!(
+            rows(&mut context, "SELECT count(*), sum(v) FROM t WHERE g > 5"),
+            ["0,NULL"]
+        );
+        assert!(run(&mut context, "SELECT g, sum(v) FROM t WHERE g > 5 GROUP BY g").is_empty());
+        assert_eq!(rows(&mut context, "SELECT 1 FROM t GROUP BY ()"), ["1"]);
+        // names compare case-insensitively, however they are qualified
+        assert_eq!(
+            rows(
+                &mut context,
+                "SELECT t.g AS g, count(*) FROM t GROUP BY G ORDER BY \"T\".\"G\""
+            ),
+            ["1,3", "2,2"]
+        );
+        assert_eq!(rows(&mut context, "SELECT '1e308'::FLOAT"), ["inf"]);
+        let err = context
+            .query("CREATE TABLE c (s VARCHAR COLLATE nocase)")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not yet ported"), "{err}");
+        let err = |context: &mut ClientContext, sql: &str| context.query(sql).unwrap_err().to_string();
+        assert_eq!(
+            err(&mut context, "SELECT v, sum(v) FROM t"),
+            "Binder Error: column v must appear in the GROUP BY clause or must be part of an aggregate function.\n\
+             Either add it to the GROUP BY list, or use ANY_VALUE(v) if the exact value of v is not important."
+        );
+        assert_eq!(
+            err(&mut context, "SELECT g FROM t WHERE sum(v) > 1"),
+            "Binder Error: WHERE clause cannot contain aggregates!"
+        );
+        assert_eq!(
+            err(&mut context, "SELECT sum(sum(v)) FROM t"),
+            "Binder Error: aggregate function calls cannot be nested"
+        );
+        assert_eq!(
+            err(&mut context, "SELECT g FROM t GROUP BY g HAVING v > 1"),
+            "Binder Error: column v must appear in the GROUP BY clause or be used in an aggregate function"
+        );
+    }
+
+    #[test]
+    fn filtered_strings_read_the_right_rows() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        run(&mut context, "CREATE TABLE t (i INTEGER, s VARCHAR)");
+        run(&mut context, "INSERT INTO t VALUES (1, '10'), (2, '20'), (3, '30')");
+        // the filter leaves a dictionary vector, whose rows the cast has to follow
+        assert_eq!(
+            run(&mut context, "SELECT CAST(s AS INTEGER) FROM t WHERE i > 1"),
+            vec![vec!["20"], vec!["30"]]
+        );
+        assert_eq!(
+            run(&mut context, "SELECT s IS DISTINCT FROM '30' FROM t WHERE i > 1"),
+            vec![vec!["true"], vec!["false"]]
+        );
+    }
+
+    #[test]
     fn errors_match_duckdb() {
         let mut context = ClientContext::new(DatabaseInstance::new());
         let err = |context: &mut ClientContext, sql: &str| context.query(sql).unwrap_err().to_string();

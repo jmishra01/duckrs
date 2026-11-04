@@ -6,7 +6,7 @@
 mod expression;
 mod statements;
 
-use super::expression::{BoundExpr, ColumnBinding};
+use super::expression::{BoundAggregate, BoundExpr, ColumnBinding};
 use super::logical::LogicalOperator;
 use crate::catalog::Catalog;
 use duckrs_common::sort_key::{NullOrder, OrderModifiers, OrderType};
@@ -206,12 +206,47 @@ impl BindOptions {
     }
 }
 
+/// How column references bind while a select list or HAVING clause is being bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnMode {
+    /// Columns bind to the FROM clause, and are noted: with a grouping they are an error.
+    SelectList,
+    /// Columns that are not groups name aliases or are an error (`HavingBinder`).
+    Having,
+}
+
+/// The grouping side of `BaseSelectBinder` and `BoundSelectNode`.
+#[derive(Debug)]
+struct AggregateBindState {
+    group_index: usize,
+    aggregate_index: usize,
+    /// (qualified, alias-free) group expression -> group (`group_map`)
+    group_map: Vec<(ast::Expr, usize)>,
+    /// alias or select list position -> group (`group_alias_map`)
+    group_alias_map: Vec<(String, usize)>,
+    groups: Vec<BoundExpr>,
+    aggregates: Vec<BoundAggregate>,
+    /// identifies each entry of `aggregates`, so that equal aggregates are computed once
+    aggregate_keys: Vec<String>,
+    inside_aggregate: bool,
+    mode: ColumnMode,
+    /// the columns bound outside of aggregates (`bound_columns`)
+    bound_columns: Vec<String>,
+    bound_aggregate: bool,
+    /// `GROUP BY ALL`
+    force_aggregates: bool,
+}
+
 /// Binds statements (`Binder`).
 pub struct Binder<'a> {
     catalog: &'a Catalog,
     pub options: BindOptions,
     bind_context: BindContext,
     next_table_index: usize,
+    /// The grouping of the select node being bound; `None` where aggregates are not allowed.
+    aggregates: Option<AggregateBindState>,
+    /// The error for an aggregate where it is not allowed (`UnsupportedAggregateMessage`).
+    aggregate_error: &'static str,
     /// The select list aliases the expression being bound may refer to: all of them in WHERE,
     /// the earlier ones in the select list (`ColumnAliasBinder`, `SelectBinder`).
     alias_fallback: Vec<(String, duckrs_parser::ast::Expr)>,
@@ -228,6 +263,8 @@ impl<'a> Binder<'a> {
             options,
             bind_context: BindContext::default(),
             next_table_index: 0,
+            aggregates: None,
+            aggregate_error: "Aggregate functions are not supported here",
             alias_fallback: Vec::new(),
         }
     }

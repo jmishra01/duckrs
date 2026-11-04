@@ -84,7 +84,7 @@ mod tests {
             .unwrap();
         let mut other = db.connect().unwrap();
         assert_eq!(other.query("SELECT i FROM t").unwrap().row_count(), 2);
-        let err = con.query("SELECT i FROM t GROUP BY i").unwrap_err();
+        let err = con.query("SELECT * FROM t, t AS u").unwrap_err();
         assert_eq!(err.kind, ErrorKind::NotImplemented);
     }
 }

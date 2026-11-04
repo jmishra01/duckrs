@@ -5,9 +5,10 @@
 //! arguments by implicit cast is a match, and the cheapest match wins. Only positional
 //! arguments are supported so far; named arguments, varargs and templates come later.
 
+use super::aggregates::{AggregateFunction, AggregateFunctionSet};
 use super::cast_rules::implicit_cast;
 use super::{ScalarFunction, ScalarFunctionSet};
-use crate::planner::expression::{BoundExpr, BoundExprKind};
+use crate::planner::expression::{BoundAggregate, BoundExpr, BoundExprKind};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::{Error, ErrorKind, Result};
@@ -54,12 +55,12 @@ fn binder_error(message: String) -> Error {
 
 /// `FunctionBinder::MatchOverload` for positional arguments: the total implicit cast cost, or
 /// `None` if the overload cannot take the arguments.
-fn match_overload(function: &ScalarFunction, arguments: &[LogicalType]) -> Option<i64> {
-    if function.arguments.len() != arguments.len() {
+fn match_overload(parameters: &[LogicalType], arguments: &[LogicalType]) -> Option<i64> {
+    if parameters.len() != arguments.len() {
         return None;
     }
     let mut cost = 0;
-    for (argument, parameter) in arguments.iter().zip(&function.arguments) {
+    for (argument, parameter) in arguments.iter().zip(parameters) {
         if argument.id() == LogicalTypeId::Unknown {
             // with a parameter of an unknown type, the cost is 0
             return Some(0);
@@ -75,9 +76,19 @@ fn match_overload(function: &ScalarFunction, arguments: &[LogicalType]) -> Optio
 
 /// `FunctionBinder::SelectFunction`: the cheapest overload, or the error DuckDB reports.
 pub fn select_function(set: &ScalarFunctionSet, arguments: &[LogicalType]) -> Result<Arc<ScalarFunction>> {
-    let mut cheapest: Vec<(&Arc<ScalarFunction>, i64)> = Vec::new();
-    for function in &set.functions {
-        let Some(cost) = match_overload(function, arguments) else {
+    select_overload(&set.name, &set.functions, |f| &f.arguments, arguments)
+}
+
+/// [`select_function`] for any kind of function.
+fn select_overload<F: std::fmt::Display>(
+    name: &str,
+    functions: &[Arc<F>],
+    parameters: impl Fn(&F) -> &[LogicalType],
+    arguments: &[LogicalType],
+) -> Result<Arc<F>> {
+    let mut cheapest: Vec<(&Arc<F>, i64)> = Vec::new();
+    for function in functions {
+        let Some(cost) = match_overload(parameters(function), arguments) else {
             continue;
         };
         match cheapest.first() {
@@ -90,7 +101,7 @@ pub fn select_function(set: &ScalarFunctionSet, arguments: &[LogicalType]) -> Re
     match cheapest.len() {
         0 => Err(binder_error(format!(
             "No function matches the given name and argument types '{}'. You might need to add explicit type casts.",
-            call_to_string(&set.name, arguments)
+            call_to_string(name, arguments)
         ))),
         1 => Ok(cheapest[0].0.clone()),
         _ => {
@@ -103,7 +114,7 @@ pub fn select_function(set: &ScalarFunctionSet, arguments: &[LogicalType]) -> Re
             let mut message = format!(
                 "Could not choose a best candidate function for the function call \"{}\". In order to select one, \
                  please add explicit type casts.\nCandidates:",
-                call_to_string(&set.name, arguments)
+                call_to_string(name, arguments)
             );
             for (function, _) in &cheapest {
                 message += &format!("\n    {function}");
@@ -162,6 +173,39 @@ pub fn bind_scalar_function(
         },
         return_type,
     ))
+}
+
+/// `FunctionBinder::BindAggregateFunction`: selects the overload and casts the arguments. ANY
+/// and DECIMAL parameters take the argument as it is, and may decide the return type.
+pub fn bind_aggregate_function(
+    set: &AggregateFunctionSet,
+    children: Vec<BoundExpr>,
+    filter: Option<BoundExpr>,
+    distinct: bool,
+) -> Result<BoundAggregate> {
+    let arguments: Vec<LogicalType> = children.iter().map(expression_return_type).collect();
+    let function: Arc<AggregateFunction> = select_overload(&set.name, &set.functions, |f| &f.arguments, &arguments)?;
+    let children: Vec<BoundExpr> = children
+        .into_iter()
+        .zip(&function.arguments)
+        .map(|(child, parameter)| {
+            let takes_input_type = parameter.id() == LogicalTypeId::Any
+                || (parameter.id() == LogicalTypeId::Decimal && !parameter.has_params());
+            if takes_input_type {
+                child
+            } else {
+                child.cast_to(parameter, false)
+            }
+        })
+        .collect();
+    let return_type = function.resolve_return_type(children.first().map(|c| &c.return_type));
+    Ok(BoundAggregate {
+        function,
+        return_type,
+        children,
+        filter,
+        distinct,
+    })
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@
 //! Logical operators (`LogicalOperator` and its subclasses), as an enum. Each operator knows
 //! its output types and the column bindings its parents refer to.
 
-use super::expression::{BoundExpr, ColumnBinding};
+use super::expression::{BoundAggregate, BoundExpr, ColumnBinding};
 use crate::catalog::{ColumnDefinition, OnCreateConflict, SchemaCatalogEntry, TableCatalogEntry};
 use duckrs_common::sort_key::OrderModifiers;
 use duckrs_common::types::LogicalType;
@@ -28,6 +28,13 @@ pub enum LogicalOperatorKind {
     },
     /// `LogicalFilter`: keeps the rows for which all expressions are true.
     Filter { expressions: Vec<BoundExpr> },
+    /// `LogicalAggregate`: one row per distinct `groups`, with the `aggregates` of its rows.
+    Aggregate {
+        group_index: usize,
+        aggregate_index: usize,
+        groups: Vec<BoundExpr>,
+        aggregates: Vec<BoundAggregate>,
+    },
     /// `LogicalOrder`: sorts by the expressions, in order.
     Order { orders: Vec<BoundOrderByNode> },
     /// `LogicalLimit` with constant values: skips `offset` rows, then keeps `limit` rows (all
@@ -82,6 +89,11 @@ impl LogicalOperator {
             // the dummy scan's single column is never read
             LogicalOperatorKind::DummyScan { .. } => vec![LogicalType::INTEGER],
             LogicalOperatorKind::ExpressionGet { types, .. } => types.clone(),
+            LogicalOperatorKind::Aggregate { groups, aggregates, .. } => groups
+                .iter()
+                .map(|g| g.return_type.clone())
+                .chain(aggregates.iter().map(|a| a.return_type.clone()))
+                .collect(),
             LogicalOperatorKind::Filter { .. }
             | LogicalOperatorKind::Order { .. }
             | LogicalOperatorKind::Limit { .. }
@@ -108,6 +120,16 @@ impl LogicalOperator {
             } => numbered(*table_index, column_ids.len()),
             LogicalOperatorKind::DummyScan { table_index } => numbered(*table_index, 1),
             LogicalOperatorKind::ExpressionGet { table_index, types, .. } => numbered(*table_index, types.len()),
+            LogicalOperatorKind::Aggregate {
+                group_index,
+                aggregate_index,
+                groups,
+                aggregates,
+            } => {
+                let mut bindings = numbered(*group_index, groups.len());
+                bindings.extend(numbered(*aggregate_index, aggregates.len()));
+                bindings
+            }
             LogicalOperatorKind::Filter { .. }
             | LogicalOperatorKind::Order { .. }
             | LogicalOperatorKind::Limit { .. }
@@ -127,6 +149,14 @@ impl LogicalOperator {
             | LogicalOperatorKind::Projection { expressions, .. }
             | LogicalOperatorKind::Distinct { targets: expressions } => expressions.iter_mut().collect(),
             LogicalOperatorKind::Order { orders } => orders.iter_mut().map(|o| &mut o.expr).collect(),
+            LogicalOperatorKind::Aggregate { groups, aggregates, .. } => groups
+                .iter_mut()
+                .chain(
+                    aggregates
+                        .iter_mut()
+                        .flat_map(|a| a.children.iter_mut().chain(a.filter.iter_mut())),
+                )
+                .collect(),
             LogicalOperatorKind::ExpressionGet { expressions, .. } => expressions.iter_mut().flatten().collect(),
             _ => Vec::new(),
         }

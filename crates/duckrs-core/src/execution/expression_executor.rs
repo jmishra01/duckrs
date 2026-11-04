@@ -80,7 +80,7 @@ fn compare_strings(left: &Vector, right: &Vector, result: &mut Vector, count: us
     for (i, slot) in out.iter_mut().enumerate().take(rows) {
         let (li, ri) = (lu.sel.get(i), ru.sel.get(i));
         let (lnull, rnull) = (!lu.validity.is_valid(li), !ru.validity.is_valid(ri));
-        *slot = op.evaluate(lnull, rnull, || lu.str_at(li).cmp(ru.str_at(ri)));
+        *slot = op.evaluate(lnull, rnull, || lu.str_at(i).cmp(ru.str_at(i)));
     }
     if rows == 1 && count != 1 {
         result.set_constant();

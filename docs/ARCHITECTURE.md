@@ -118,6 +118,12 @@ A statement goes `parse_ast` → `Binder` (bound expressions, `LogicalOperator` 
   projection, and the modifiers apply in the order they were written. ORDER BY gathers and
   sorts with the byte-comparable sort keys of `duckrs-common`; DISTINCT keeps the first row
   per sort key. Select list entries and WHERE may use select list aliases.
+- **Aggregates** bind like `BaseSelectBinder`: groups naming a select list entry swap places with
+  it, expressions matching a group or an aggregate become column references of the aggregate
+  operator, equal aggregates are computed once, and a column outside of them is DuckDB's "must
+  appear in the GROUP BY clause" error. `PhysicalAggregate` finds groups by sort key and keeps a
+  state per group and aggregate (`function::aggregates`); min, max and DISTINCT compare sort
+  keys. This is simple rather than fast: DuckDB's vectorized hash table comes with Phase 8.
 - **Settings** are generated from DuckDB's `settings.json` (`tools/generate_settings.py`) with
   their aliases, types, scopes and defaults, and kept per database and per connection.
   Settings that only tune performance, storage, extensions or logging are stored; the
@@ -127,12 +133,14 @@ A statement goes `parse_ast` → `Binder` (bound expressions, `LogicalOperator` 
   Pragmas that only switch DuckDB's debug verification, profiling or progress output are
   no-ops.
 
-Deliberate gaps so far: no DECIMAL arithmetic (a DECIMAL meets a number in DOUBLE), no
-`/`, `//` or `%`, no constraints, defaults or table options, the expression executor evaluates a
-filter's condition to a BOOLEAN vector rather than using DuckDB's specialized `Select`, and
-casts to VARCHAR go row by row through `Value`. Errors for SQL beyond the slice say it `is not
-yet ported to duckrs`, wording DuckDB never uses, so that no test expecting an error passes
-because a feature is missing.
+Deliberate gaps so far: no DECIMAL arithmetic (a DECIMAL meets a number in DOUBLE), no `/`, `//`
+or `%`, no constraints, defaults or table options, no joins, no DISTINCT ON, LIMIT PERCENT or
+non-constant LIMIT, no GROUPING SETS/ROLLUP/CUBE, no ORDER BY in aggregates, no collations, no
+SET VARIABLE or settings of MAP and list types. The expression executor evaluates a filter's
+condition to a BOOLEAN vector rather than using DuckDB's specialized `Select`, and casts to
+VARCHAR and from or to DECIMAL go row by row through `Value`. Errors for SQL beyond the slice
+say it `is not yet ported to duckrs`, wording DuckDB never uses, so that no test expecting an
+error passes because a feature is missing.
 
 ## Testing
 

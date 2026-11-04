@@ -5,16 +5,19 @@
 //
 //! Binding parsed expressions into [`BoundExpr`]s.
 
-use super::{Binder, binder_error};
+use super::{Binder, ColumnMode, binder_error};
 use crate::execution::expression_executor::try_evaluate_scalar;
 use crate::function::BuiltinFunctions;
-use crate::function::binder::{bind_scalar_function, expression_return_type};
+use crate::function::binder::{bind_aggregate_function, bind_scalar_function, expression_return_type};
 use crate::function::combine_types::{force_max_logical_type, normalize_type, try_max_logical_type};
-use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator};
+use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, ColumnBinding};
 use duckrs_common::types::{LogicalType, LogicalTypeId, decimal};
 use duckrs_common::value::Value;
 use duckrs_common::{Error, ErrorKind, Result};
-use duckrs_parser::ast::{CastType, ComparisonOp, Expr, ExprKind, Literal, LiteralKind, OperatorType, TypeExpr};
+use duckrs_parser::ast::{
+    CastType, ComparisonOp, Expr, ExprKind, FunctionExpr, Literal, LiteralKind, OperatorType, TypeExpr,
+};
+use duckrs_parser::transformer::visit_expr_mut;
 
 /// `NumberToValue`: an integer literal is INTEGER, BIGINT, HUGEINT or UHUGEINT if it fits, a
 /// number with a fraction is a DECIMAL as wide as it is written, anything else a DOUBLE.
@@ -216,6 +219,14 @@ impl Binder<'_> {
                 }
                 Ok(LogicalType::decimal(width as u8, scale as u8))
             }
+            // a string parameter is a collation
+            LogicalTypeId::Varchar
+                if children
+                    .iter()
+                    .any(|c| matches!(&c.kind, ExprKind::Constant(l) if l.kind == LiteralKind::String)) =>
+            {
+                Err(crate::unported("COLLATE"))
+            }
             // the width of a VARCHAR is accepted and ignored
             LogicalTypeId::Varchar if children.len() <= 1 => Ok(LogicalType::VARCHAR),
             _ if !children.is_empty() => Err(crate::unported(format!("type parameters for {}", name.to_uppercase()))),
@@ -237,9 +248,20 @@ impl Binder<'_> {
 
     /// `ExpressionBinder::Bind`.
     pub(super) fn bind_expression(&mut self, expr: &Expr) -> Result<BoundExpr> {
+        if let Some(group) = self.try_bind_group(expr) {
+            return Ok(group);
+        }
         let bound = match &expr.kind {
             ExprKind::Constant(literal) => BoundExpr::constant(literal_to_value(literal)?),
             ExprKind::ColumnRef(names) => {
+                let mode = self
+                    .aggregates
+                    .as_ref()
+                    .filter(|state| !state.inside_aggregate)
+                    .map(|state| state.mode);
+                if mode == Some(ColumnMode::Having) {
+                    return self.bind_having_column(names);
+                }
                 let (binding, ty, name) = match names.as_slice() {
                     [column] => match self.bind_context.bind_column(column) {
                         Ok(bound) => bound,
@@ -262,6 +284,9 @@ impl Binder<'_> {
                     [table, column] => self.bind_context.bind_qualified_column(table, column)?,
                     _ => return Err(crate::unported("column references with schema qualification")),
                 };
+                if mode == Some(ColumnMode::SelectList) {
+                    self.aggregates.as_mut().unwrap().bound_columns.push(name.clone());
+                }
                 BoundExpr::column_ref(binding, ty, name)
             }
             ExprKind::Comparison { op, left, right } => {
@@ -314,6 +339,12 @@ impl Binder<'_> {
                     target,
                 )
             }
+            ExprKind::Function(function)
+                if function.name.qualification.is_empty()
+                    && BuiltinFunctions::get().aggregate(&function.name.name).is_some() =>
+            {
+                self.bind_aggregate(function)?
+            }
             ExprKind::Function(function) => {
                 if function.filter.is_some() || !function.order_by.is_empty() || function.distinct {
                     return Err(crate::unported("aggregate modifiers"));
@@ -346,6 +377,139 @@ impl Binder<'_> {
         };
         Ok(bound)
     }
+}
+
+impl Binder<'_> {
+    /// `BaseSelectBinder::TryBindGroup` + `BindGroup`: a reference to the group `expr` matches.
+    fn try_bind_group(&self, expr: &Expr) -> Option<BoundExpr> {
+        let state = self.aggregates.as_ref().filter(|s| !s.inside_aggregate)?;
+        if state.group_map.is_empty() && state.group_alias_map.is_empty() {
+            return None;
+        }
+        let aliased = match &expr.kind {
+            ExprKind::ColumnRef(names) if names.len() == 1 => state
+                .group_alias_map
+                .iter()
+                .find(|(alias, _)| alias.eq_ignore_ascii_case(&names[0]))
+                .map(|(_, group)| *group),
+            _ => None,
+        };
+        let group = aliased.or_else(|| {
+            let key = without_aliases(expr);
+            state.group_map.iter().find(|(e, _)| *e == key).map(|(_, group)| *group)
+        })?;
+        Some(BoundExpr::column_ref(
+            ColumnBinding::new(state.group_index, group),
+            state.groups[group].return_type.clone(),
+            expr.alias.clone(),
+        ))
+    }
+
+    /// `HavingBinder::BindColumnRef`: a column that is no group names a select list alias;
+    /// with GROUP BY ALL it becomes a group.
+    fn bind_having_column(&mut self, names: &[String]) -> Result<BoundExpr> {
+        let column = names.last().cloned().unwrap_or_default();
+        if let [name] = names
+            && let Some(position) = self
+                .alias_fallback
+                .iter()
+                .position(|(a, _)| a.eq_ignore_ascii_case(name))
+        {
+            let (alias, aliased) = self.alias_fallback.remove(position);
+            let bound = self.bind_expression(&aliased);
+            self.alias_fallback.insert(position, (alias, aliased));
+            return bound;
+        }
+        let state = self.aggregates.as_ref().expect("HAVING binds with a grouping");
+        if !state.force_aggregates {
+            return Err(binder_error(format!(
+                "column {column} must appear in the GROUP BY clause or be used in an aggregate function"
+            )));
+        }
+        let group_index = state.group_index;
+        let (binding, ty, name) = match names {
+            [column] => self.bind_context.bind_column(column)?,
+            [table, column] => self.bind_context.bind_qualified_column(table, column)?,
+            _ => return Err(crate::unported("column references with schema qualification")),
+        };
+        let state = self.aggregates.as_mut().expect("HAVING binds with a grouping");
+        let group = state.groups.len();
+        state
+            .groups
+            .push(BoundExpr::column_ref(binding, ty.clone(), name.clone()));
+        Ok(BoundExpr::column_ref(ColumnBinding::new(group_index, group), ty, name))
+    }
+
+    /// `BaseSelectBinder::BindAggregate`.
+    fn bind_aggregate(&mut self, function: &FunctionExpr) -> Result<BoundExpr> {
+        let Some(state) = self.aggregates.as_mut() else {
+            return Err(binder_error(self.aggregate_error));
+        };
+        if state.inside_aggregate {
+            return Err(binder_error("aggregate function calls cannot be nested"));
+        }
+        if !function.order_by.is_empty() {
+            return Err(crate::unported("ORDER BY in aggregates"));
+        }
+        if function.args.iter().any(|a| !a.name.is_empty()) {
+            return Err(crate::unported("named function arguments"));
+        }
+        if function.export_state {
+            return Err(crate::unported("EXPORT_STATE"));
+        }
+        state.bound_aggregate = true;
+        state.inside_aggregate = true;
+        let filter = match &function.filter {
+            Some(filter) => Some(self.bind_expression(filter)?.cast_to(&LogicalType::BOOLEAN, false)),
+            None => None,
+        };
+        let children = function
+            .args
+            .iter()
+            .map(|a| self.bind_expression(&a.expr))
+            .collect::<Result<Vec<_>>>()?;
+        let set = BuiltinFunctions::get()
+            .aggregate(&function.name.name)
+            .expect("checked by the caller");
+        for child in &children {
+            if !supported_aggregate_input(&child.return_type) {
+                return Err(crate::unported(format!("aggregates over {}", child.return_type)));
+            }
+        }
+        let aggregate = bind_aggregate_function(set, children, filter, function.distinct)?;
+        let state = self.aggregates.as_mut().expect("still bound");
+        state.inside_aggregate = false;
+        // equal aggregates are computed once
+        let key = format!(
+            "{:?}{:?}{:?}{}",
+            aggregate.function, aggregate.children, aggregate.filter, aggregate.distinct
+        );
+        let index = match state.aggregate_keys.iter().position(|k| *k == key) {
+            Some(index) => index,
+            None => {
+                state.aggregate_keys.push(key);
+                state.aggregates.push(aggregate);
+                state.aggregates.len() - 1
+            }
+        };
+        Ok(BoundExpr::column_ref(
+            ColumnBinding::new(state.aggregate_index, index),
+            state.aggregates[index].return_type.clone(),
+            function.name.name.clone(),
+        ))
+    }
+}
+
+/// The nested types have no vector support in the aggregate states yet.
+fn supported_aggregate_input(ty: &LogicalType) -> bool {
+    !ty.is_nested()
+}
+
+/// An expression with all aliases removed: `ParsedExpression::Equals` ignores aliases.
+pub(super) fn without_aliases(expr: &Expr) -> Expr {
+    let mut expr = expr.clone();
+    visit_expr_mut(&mut expr, &mut |e| e.alias.clear());
+    expr
 }
 
 /// `ComparisonBind` + `BoundComparisonExpression::TryBindComparison`: both sides are cast to
