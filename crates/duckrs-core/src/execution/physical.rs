@@ -12,18 +12,20 @@
 use super::constraints;
 use super::expression_executor::{execute, select};
 use super::upsert::upsert;
-use crate::catalog::{ColumnDefinition, OnCreateConflict, SchemaCatalogEntry, TableCatalogEntry, TableConstraint};
+use crate::catalog::{
+    ColumnDefinition, GeneratedColumn, OnCreateConflict, SchemaCatalogEntry, TableCatalogEntry, TableConstraint,
+};
 use crate::execution::run_plan;
 use crate::function::aggregates::{AggregateState, value_keys};
 use crate::planner::expression::{BoundAggregate, BoundExpr, ColumnBinding};
-use crate::planner::logical::{BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, LogicalOperator, OnConflict};
+use crate::planner::logical::{BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, CteKeyColumn, LogicalOperator, OnConflict};
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::{NullOrder, OrderModifiers, OrderType, create_sort_keys, sort_collection};
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, SelectionVector, Vector};
 use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
-use duckrs_parser::ast::{JoinType, sql_identifier};
+use duckrs_parser::ast::{JoinType, SampleMethod, SampleOptions, sql_identifier};
 use parking_lot::Mutex;
 use std::any::Any;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -45,6 +47,10 @@ pub enum OperatorResult {
 }
 
 pub trait PhysicalOperator: fmt::Debug + Send + Sync {
+    /// Lines of `EXPLAIN` under the name of the operator (`ParamsToString`).
+    fn explain_details(&self) -> Vec<String> {
+        Vec::new()
+    }
     fn name(&self) -> &'static str;
     fn types(&self) -> &[LogicalType];
     fn children(&self) -> &[Box<dyn PhysicalOperator>] {
@@ -416,11 +422,28 @@ pub struct PhysicalRecursiveCte {
     pub children: Vec<Box<dyn PhysicalOperator>>,
     union_all: bool,
     working: Arc<Mutex<ColumnDataCollection>>,
+    recurring: Arc<Mutex<ColumnDataCollection>>,
+    key: Vec<CteKeyColumn>,
     recursive: LogicalOperator,
     /// the rows of the current round
     data: Mutex<ColumnDataCollection>,
     /// what UNION has seen so far
     seen: Mutex<HashSet<Vec<u8>>>,
+}
+
+/// The rows of a USING KEY recursion, one per key.
+#[derive(Default)]
+struct KeyedRows {
+    positions: HashMap<Vec<u8>, usize>,
+    rows: Vec<Vec<Value>>,
+}
+
+fn value_sort_key(value: &Value) -> Result<Vec<u8>> {
+    let mut vector = Vector::new(value.logical_type().clone(), 1);
+    vector.prepare_flat(1);
+    vector.set_value(0, value)?;
+    let mut keys = group_keys(&[&vector], 1)?;
+    Ok(keys.remove(0))
 }
 
 impl PhysicalRecursiveCte {
@@ -429,6 +452,8 @@ impl PhysicalRecursiveCte {
         children: Vec<Box<dyn PhysicalOperator>>,
         union_all: bool,
         working: Arc<Mutex<ColumnDataCollection>>,
+        recurring: Arc<Mutex<ColumnDataCollection>>,
+        key: Vec<CteKeyColumn>,
         recursive: LogicalOperator,
     ) -> Self {
         let data = Mutex::new(ColumnDataCollection::new(types.clone()));
@@ -437,10 +462,107 @@ impl PhysicalRecursiveCte {
             children,
             union_all,
             working,
+            recurring,
+            key,
             recursive,
             data,
             seen: Mutex::default(),
         }
+    }
+
+    fn collection_of(&self, rows: impl Iterator<Item = Vec<Value>>) -> Result<ColumnDataCollection> {
+        let mut result = ColumnDataCollection::new(self.types.clone());
+        let mut chunk = DataChunk::new(&self.types);
+        for row in rows {
+            chunk.append_row(&row)?;
+            if chunk.len() == STANDARD_VECTOR_SIZE {
+                result.append(&chunk);
+                chunk = DataChunk::new(&self.types);
+            }
+        }
+        if !chunk.is_empty() {
+            result.append(&chunk);
+        }
+        Ok(result)
+    }
+
+    /// Takes `rows` into `state`, and returns what the next round reads.
+    fn apply_keyed(&self, rows: &ColumnDataCollection, state: &mut KeyedRows) -> Result<ColumnDataCollection> {
+        let key_columns: Vec<usize> = (0..self.key.len())
+            .filter(|c| self.key[*c] == CteKeyColumn::Key)
+            .collect();
+        let mut changed: Vec<usize> = Vec::new();
+        let mut changed_set: HashSet<usize> = HashSet::new();
+        for chunk in rows.chunks() {
+            let vectors: Vec<&Vector> = key_columns.iter().map(|c| chunk.column(*c)).collect();
+            let keys = group_keys(&vectors, chunk.len())?;
+            for (row, key) in keys.into_iter().enumerate() {
+                let values: Vec<Value> = chunk.columns().iter().map(|c| c.get_value(row)).collect();
+                let position = match state.positions.get(&key) {
+                    Some(position) => {
+                        let existing = &mut state.rows[*position];
+                        let mut updated = false;
+                        for (column, mode) in self.key.iter().enumerate() {
+                            let new = &values[column];
+                            let old = &existing[column];
+                            let take = match mode {
+                                CteKeyColumn::Key | CteKeyColumn::First => false,
+                                CteKeyColumn::Last => value_sort_key(new)? != value_sort_key(old)?,
+                                CteKeyColumn::Min => {
+                                    !new.is_null() && (old.is_null() || value_sort_key(new)? < value_sort_key(old)?)
+                                }
+                                CteKeyColumn::Max => {
+                                    !new.is_null() && (old.is_null() || value_sort_key(new)? > value_sort_key(old)?)
+                                }
+                            };
+                            if take {
+                                existing[column] = new.clone();
+                                updated = true;
+                            }
+                        }
+                        if !updated {
+                            continue;
+                        }
+                        *position
+                    }
+                    None => {
+                        state.positions.insert(key, state.rows.len());
+                        state.rows.push(values);
+                        state.rows.len() - 1
+                    }
+                };
+                if changed_set.insert(position) {
+                    changed.push(position);
+                }
+            }
+        }
+        *self.recurring.lock() = self.collection_of(state.rows.iter().cloned())?;
+        if self.union_all {
+            let mut raw = ColumnDataCollection::new(self.types.clone());
+            if !changed.is_empty() {
+                for chunk in rows.chunks() {
+                    raw.append(chunk);
+                }
+            }
+            return Ok(raw);
+        }
+        self.collection_of(changed.iter().map(|p| state.rows[*p].clone()))
+    }
+
+    /// USING KEY: runs all rounds, and leaves the rows of all keys in `data`.
+    fn run_keyed(&self) -> Result<()> {
+        let mut state = KeyedRows::default();
+        let anchor = std::mem::replace(&mut *self.data.lock(), ColumnDataCollection::new(self.types.clone()));
+        let mut round = self.apply_keyed(&anchor, &mut state)?;
+        while !round.is_empty() {
+            *self.working.lock() = round;
+            let mut plan = self.recursive.clone();
+            plan.clear_subquery_results();
+            let rows = run_plan(plan)?;
+            round = self.apply_keyed(&rows, &mut state)?;
+        }
+        *self.data.lock() = self.collection_of(state.rows.into_iter())?;
+        Ok(())
     }
 
     /// The rows of `rows` that UNION keeps: the ones not `seen` before.
@@ -488,6 +610,9 @@ impl PhysicalOperator for PhysicalRecursiveCte {
         check_buffered(&data)
     }
     fn finalize(&self) -> Result<()> {
+        if !self.key.is_empty() {
+            return self.run_keyed();
+        }
         let mut data = self.data.lock();
         let anchor = std::mem::replace(&mut *data, ColumnDataCollection::new(self.types.clone()));
         *data = self.new_rows(anchor, &mut self.seen.lock())?;
@@ -506,9 +631,18 @@ impl PhysicalOperator for PhysicalRecursiveCte {
             if let Some(chunk) = scan_collection(&self.data, state) {
                 return Ok(Some(chunk));
             }
+            if !self.key.is_empty() {
+                return Ok(None);
+            }
             let round = std::mem::replace(&mut *self.data.lock(), ColumnDataCollection::new(self.types.clone()));
             if round.is_empty() {
                 return Ok(None);
+            }
+            {
+                let mut recurring = self.recurring.lock();
+                for chunk in round.chunks() {
+                    recurring.append(chunk);
+                }
             }
             *self.working.lock() = round;
             let mut plan = self.recursive.clone();
@@ -891,6 +1025,178 @@ impl PhysicalOperator for PhysicalOrder {
     fn finalize(&self) -> Result<()> {
         let mut data = self.data.lock();
         *data = sort_collection(&data, &self.orders)?;
+        Ok(())
+    }
+    fn is_source(&self) -> bool {
+        true
+    }
+    fn source_state(&self) -> SourceState {
+        Box::new(0usize)
+    }
+    fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
+        Ok(scan_collection(&self.data, state))
+    }
+}
+
+/// `PhysicalLimitPercent`: the first part of its input, once it knows how long that is.
+#[derive(Debug)]
+pub struct PhysicalLimitPercent {
+    pub types: Vec<LogicalType>,
+    pub percent: f64,
+    pub offset: u64,
+    pub children: Vec<Box<dyn PhysicalOperator>>,
+    pub data: Mutex<ColumnDataCollection>,
+}
+
+impl PhysicalOperator for PhysicalLimitPercent {
+    fn name(&self) -> &'static str {
+        "LIMIT_PERCENT"
+    }
+    fn types(&self) -> &[LogicalType] {
+        &self.types
+    }
+    fn children(&self) -> &[Box<dyn PhysicalOperator>] {
+        &self.children
+    }
+    fn is_sink(&self) -> bool {
+        true
+    }
+    fn sink(&self, chunk: &DataChunk) -> Result<()> {
+        let mut data = self.data.lock();
+        data.append(chunk);
+        check_buffered(&data)
+    }
+    fn finalize(&self) -> Result<()> {
+        let mut data = self.data.lock();
+        let total = data.len() as u64;
+        let available = total.saturating_sub(self.offset);
+        let limit = ((available as f64) * self.percent / 100.0) as u64;
+        let mut kept = ColumnDataCollection::new(self.types.clone());
+        let mut position = 0u64;
+        for chunk in data.chunks() {
+            let rows: Vec<u32> = (0..chunk.len() as u64)
+                .filter(|row| {
+                    let index = position + row;
+                    index >= self.offset && index < self.offset + limit
+                })
+                .map(|row| row as u32)
+                .collect();
+            position += chunk.len() as u64;
+            if !rows.is_empty() {
+                let count = rows.len();
+                let mut chunk = chunk.clone();
+                chunk.slice(&SelectionVector::from_vec(rows), count);
+                kept.append(&chunk);
+            }
+        }
+        *data = kept;
+        Ok(())
+    }
+    fn is_source(&self) -> bool {
+        true
+    }
+    fn source_state(&self) -> SourceState {
+        Box::new(0usize)
+    }
+    fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
+        Ok(scan_collection(&self.data, state))
+    }
+}
+
+/// `PhysicalReservoirSample` and `PhysicalStreamingSample`. The same seed gives the same sample, but
+/// not the one C++ gives: its random engine is not ported. Rows come out in their input order.
+#[derive(Debug)]
+pub struct PhysicalSample {
+    pub types: Vec<LogicalType>,
+    pub options: SampleOptions,
+    pub children: Vec<Box<dyn PhysicalOperator>>,
+    pub data: Mutex<ColumnDataCollection>,
+}
+
+impl PhysicalSample {
+    pub fn new(options: SampleOptions, child: Box<dyn PhysicalOperator>) -> Self {
+        let types = child.types().to_vec();
+        Self {
+            options,
+            data: Mutex::new(ColumnDataCollection::new(types.clone())),
+            types,
+            children: vec![child],
+        }
+    }
+}
+
+/// A SplitMix64 stream.
+fn next_random(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+impl PhysicalOperator for PhysicalSample {
+    fn name(&self) -> &'static str {
+        match self.options.method {
+            SampleMethod::Reservoir => "RESERVOIR_SAMPLE",
+            _ => "STREAMING_SAMPLE",
+        }
+    }
+    fn types(&self) -> &[LogicalType] {
+        &self.types
+    }
+    fn children(&self) -> &[Box<dyn PhysicalOperator>] {
+        &self.children
+    }
+    fn is_sink(&self) -> bool {
+        true
+    }
+    fn sink(&self, chunk: &DataChunk) -> Result<()> {
+        let mut data = self.data.lock();
+        data.append(chunk);
+        check_buffered(&data)
+    }
+    fn finalize(&self) -> Result<()> {
+        let mut data = self.data.lock();
+        let total = data.len();
+        let mut random = self.options.seed.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos() as u64)
+        });
+        let size: f64 = self.options.sample_size.parse().unwrap_or(0.0);
+        let mut keep = vec![false; total];
+        if self.options.is_percentage && self.options.method != SampleMethod::Reservoir {
+            for row in &mut keep {
+                *row = (next_random(&mut random) as f64 / u64::MAX as f64) * 100.0 < size;
+            }
+        } else {
+            let wanted = if self.options.is_percentage {
+                ((total as f64) * size / 100.0).round() as usize
+            } else {
+                size as usize
+            };
+            // the first `wanted` of a shuffle
+            let mut rows: Vec<usize> = (0..total).collect();
+            for i in 0..wanted.min(total) {
+                let other = i + (next_random(&mut random) % (total - i) as u64) as usize;
+                rows.swap(i, other);
+                keep[rows[i]] = true;
+            }
+        }
+        let mut sampled = ColumnDataCollection::new(self.types.clone());
+        let mut offset = 0;
+        for chunk in data.chunks() {
+            let selected: Vec<u32> = (0..chunk.len())
+                .filter(|i| keep[offset + i])
+                .map(|i| i as u32)
+                .collect();
+            offset += chunk.len();
+            let mut chunk = chunk.clone();
+            let count = selected.len();
+            chunk.slice(&SelectionVector::from_vec(selected), count);
+            sampled.append(&chunk);
+        }
+        *data = sampled;
         Ok(())
     }
     fn is_source(&self) -> bool {
@@ -1766,9 +2072,13 @@ impl PhysicalOperator for PhysicalCreateTableAs {
         check_buffered(&data)
     }
     fn finalize(&self) -> Result<()> {
-        let table = self
-            .schema
-            .create_table(&self.table_name, self.columns.clone(), Vec::new(), self.on_conflict)?;
+        let table = self.schema.create_table(
+            &self.table_name,
+            self.columns.clone(),
+            Vec::new(),
+            Vec::new(),
+            self.on_conflict,
+        )?;
         if let Some(table) = table {
             let data = self.data.lock();
             let mut storage = table.storage.write();
@@ -1803,6 +2113,7 @@ pub struct PhysicalCreateTable {
     pub schema: Arc<SchemaCatalogEntry>,
     pub table_name: String,
     pub columns: Vec<ColumnDefinition>,
+    pub generated: Vec<GeneratedColumn>,
     pub constraints: Vec<TableConstraint>,
     pub on_conflict: OnCreateConflict,
 }
@@ -1821,6 +2132,7 @@ impl PhysicalOperator for PhysicalCreateTable {
         self.schema.create_table(
             &self.table_name,
             self.columns.clone(),
+            self.generated.clone(),
             self.constraints.clone(),
             self.on_conflict,
         )?;

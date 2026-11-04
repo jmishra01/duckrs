@@ -39,7 +39,7 @@ fn named_argument(argument: &FunctionArgument) -> FunctionArgument {
     argument.clone()
 }
 
-fn parse_select(sql: &str, message: &str) -> Result<SelectStatement> {
+pub(super) fn parse_select(sql: &str, message: &str) -> Result<SelectStatement> {
     let mut statements = parse_ast(sql)?;
     match (statements.pop(), statements.is_empty()) {
         (Some(Statement::Select(select)), true) => Ok(select),
@@ -83,7 +83,7 @@ fn union_tables_query(tables: &Value, by_name: bool) -> Result<String> {
 
 impl Binder<'_> {
     /// A table function's argument, which C++ evaluates when binding.
-    fn constant_argument(&mut self, expr: &Expr) -> Result<Value> {
+    pub(super) fn constant_argument(&mut self, expr: &Expr) -> Result<Value> {
         let mut binder = self.child_binder();
         let bound = binder.bind_expression(expr);
         self.next_table_index = binder.next_table_index;
@@ -241,6 +241,7 @@ impl Binder<'_> {
             names,
             types: types.clone(),
             row_id: None,
+            generated: Vec::new(),
         });
         Ok(LogicalOperator::new(
             LogicalOperatorKind::ExpressionGet {

@@ -8,18 +8,19 @@ pub mod settings;
 mod settings_table;
 
 use crate::catalog::{
-    Catalog, CatalogSnapshot, DEFAULT_CATALOG, OnCreateConflict, SequenceData, TableOrView, macro_type_name,
-    missing_entry,
+    Catalog, CatalogSnapshot, DEFAULT_CATALOG, OnCreateConflict, SequenceData, TEMP_SCHEMA, TableOrView,
+    macro_type_name, missing_entry,
 };
 use crate::execution::alter::{execute_alter, execute_create_index};
 use crate::execution::expression_executor::evaluate_scalar;
-use crate::execution::physical::PhysicalResultCollector;
+use crate::execution::physical::{PhysicalOperator, PhysicalResultCollector};
 use crate::execution::{create_plan, execute_plan};
 use crate::planner::binder::{
     BindOptions, Binder, DefaultNullOrder, ParameterValues, bind_constant_expression, schema_of,
 };
-use crate::planner::binder::{SessionValues, enum_type_from, is_builtin_type};
+use crate::planner::binder::{SessionValues, ShowBehavior, enum_type_from, is_builtin_type};
 use crate::planner::column_binding_resolver::resolve_column_bindings;
+use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::OrderType;
 use duckrs_common::types::LogicalType;
@@ -27,8 +28,8 @@ use duckrs_common::value::Value;
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ParserOptions;
 use duckrs_parser::ast::{
-    CreateInfo, CreateKind, CreateTypeKind, DropInfo, Expr, ExprKind, OnCreateConflict as AstConflict, PragmaInfo,
-    Statement, sql_quoted_identifier,
+    CreateInfo, CreateKind, CreateTypeKind, DropInfo, ExplainType, Expr, ExprKind, OnCreateConflict as AstConflict,
+    PragmaInfo, QualifiedName, Statement, sql_quoted_identifier,
 };
 use duckrs_parser::ast::{TransactionModifier, TransactionType};
 use parking_lot::{Mutex, RwLock};
@@ -189,6 +190,7 @@ fn is_write(statement: &Statement) -> bool {
         Statement::Insert(_)
         | Statement::Update(_)
         | Statement::Delete(_)
+        | Statement::Merge(_)
         | Statement::Drop(_)
         | Statement::Alter(_) => true,
         // temporary objects are private to the connection
@@ -257,6 +259,13 @@ impl ClientContext {
                 _ => DefaultNullOrder::NullsLast,
             },
             single_arrow_lambdas: self.setting_text("lambda_syntax") == "ENABLE_SINGLE_ARROW",
+            pivot_limit: self.setting_text("pivot_limit").parse().unwrap_or(100_000),
+            scalar_subquery_error: self.setting_text("scalar_subquery_error_on_multiple_rows") != "false",
+            show_behavior: match self.setting_text("show_behavior").to_uppercase().as_str() {
+                "SETTING" => ShowBehavior::Setting,
+                "TABLE" => ShowBehavior::Table,
+                _ => ShowBehavior::Auto,
+            },
         }
     }
 
@@ -457,6 +466,14 @@ impl ClientContext {
     /// (`ClientContext::PendingStatementOrPreparedStatementInternal` + `CleanupInternal`).
     fn run_statement(&mut self, statement: &Statement) -> Result<MaterializedQueryResult> {
         match statement {
+            // the statements a PIVOT was rewritten into: the last one has the result
+            Statement::Multi(statements) => {
+                let mut result = Self::success();
+                for statement in statements {
+                    result = self.run_statement(statement)?;
+                }
+                return Ok(result);
+            }
             Statement::Transaction {
                 transaction_type,
                 modifier,
@@ -521,6 +538,49 @@ impl ClientContext {
             }
         }
         result
+    }
+
+    /// `PhysicalExplain`: the plan in text form, as a key and a value per plan.
+    fn explain(&mut self, statement: &Statement, explain_type: ExplainType) -> Result<MaterializedQueryResult> {
+        if explain_type == ExplainType::Sql {
+            return Err(crate::unported("EXPLAIN (SQL)"));
+        }
+        let mut binder = Binder::with_options(&self.db.catalog, self.bind_options());
+        binder.parameters = self.parameters.clone();
+        binder.session = Some(self.session_values());
+        let mut bound = binder.bind(statement)?;
+        let logical = explain_logical(&bound.plan);
+        resolve_column_bindings(&mut bound.plan)?;
+        let physical = explain_physical(create_plan(bound.plan).as_ref());
+        if explain_type == ExplainType::Analyze {
+            self.execute_statement(statement)?;
+        }
+        let rows: Vec<(&str, String)> = if explain_type == ExplainType::Analyze {
+            vec![("analyzed_plan", physical)]
+        } else {
+            match self.setting_text("explain_output").to_uppercase().as_str() {
+                "ALL" => vec![
+                    ("logical_plan", logical.clone()),
+                    ("logical_opt", logical),
+                    ("physical_plan", physical),
+                ],
+                "OPTIMIZED_ONLY" => vec![("logical_opt", logical)],
+                _ => vec![("physical_plan", physical)],
+            }
+        };
+        let names = vec!["explain_key".to_string(), "explain_value".to_string()];
+        let types = vec![LogicalType::VARCHAR, LogicalType::VARCHAR];
+        let mut collection = ColumnDataCollection::new(types.clone());
+        let mut chunk = duckrs_common::vector::DataChunk::new(&types);
+        for (key, value) in rows {
+            chunk.append_row(&[Value::varchar(key), Value::varchar(value)])?;
+        }
+        collection.append(&chunk);
+        Ok(MaterializedQueryResult {
+            names,
+            types,
+            collection,
+        })
     }
 
     /// `CheckpointFunction`. In memory there is nothing to write, so only its errors are left;
@@ -604,8 +664,27 @@ impl ClientContext {
                 {
                     return Ok(Self::success());
                 }
+                let lower = name.to_lowercase();
+                let sql = match (lower.as_str(), parameters.as_slice()) {
+                    ("show_tables", []) => Some("SHOW TABLES".to_string()),
+                    ("show_tables_expanded", []) => Some("SHOW ALL TABLES".to_string()),
+                    ("show_databases" | "database_list", []) => Some("SELECT * FROM duckdb_databases()".to_string()),
+                    ("table_info" | "show", [table]) => {
+                        Some(format!("SELECT * FROM pragma_{lower}({})", pragma_argument(table)))
+                    }
+                    _ => None,
+                };
+                if let Some(sql) = sql {
+                    let query = duckrs_parser::parse_ast(&sql)?.remove(0);
+                    return self.execute_statement(&query);
+                }
                 return Err(crate::unported(format!("PRAGMA {name}")));
             }
+            Statement::Explain {
+                statement,
+                explain_type,
+                ..
+            } => return self.explain(statement, *explain_type),
             Statement::Alter(info) => {
                 let mut binder = Binder::new(&self.db.catalog);
                 let alter = binder.bind_alter(info)?;
@@ -702,6 +781,95 @@ impl ClientContext {
     }
 }
 
+/// The schema a CREATE puts its object in: temporary objects have one of their own.
+fn create_schema_of(info: &CreateInfo) -> Result<Option<&str>> {
+    if info.temporary {
+        return Ok(Some(TEMP_SCHEMA));
+    }
+    schema_of(&info.name)
+}
+
+/// The argument of a PRAGMA as a string: a bare name counts as one.
+fn pragma_argument(argument: &Expr) -> String {
+    let text = match &argument.kind {
+        ExprKind::ColumnRef(names) => names.join("."),
+        ExprKind::Constant(literal) => literal.text.clone(),
+        _ => argument.to_string(),
+    };
+    format!("'{}'", text.replace('\'', "''"))
+}
+
+/// The operators of a physical plan, each with its children below it. Not the box rendering of
+/// `TextTreeRenderer`: tests of plans look for operator names and join details.
+fn explain_physical(op: &dyn PhysicalOperator) -> String {
+    fn visit(op: &dyn PhysicalOperator, depth: usize, out: &mut String) {
+        let indent = "  ".repeat(depth);
+        out.push_str(&indent);
+        out.push_str(op.name());
+        out.push('\n');
+        for line in op.explain_details() {
+            out.push_str(&indent);
+            out.push_str("  ");
+            out.push_str(&line);
+            out.push('\n');
+        }
+        for child in op.children() {
+            visit(child.as_ref(), depth + 1, out);
+        }
+    }
+    let mut out = String::new();
+    visit(op, 0, &mut out);
+    out
+}
+
+/// The operators of a logical plan, by the names of `LogicalOperatorToString`.
+fn explain_logical(op: &LogicalOperator) -> String {
+    fn name(op: &LogicalOperator) -> String {
+        use LogicalOperatorKind as K;
+        match &op.kind {
+            K::Get { .. } | K::Range { .. } | K::ExpressionGet { .. } => "SEQ_SCAN".to_string(),
+            K::EmptyResult { .. } => "EMPTY_RESULT".to_string(),
+            K::DummyScan { .. } => "DUMMY_SCAN".to_string(),
+            K::Filter { .. } => "FILTER".to_string(),
+            K::Window { .. } => "WINDOW".to_string(),
+            K::Aggregate { .. } => "AGGREGATE".to_string(),
+            K::Order { .. } => "ORDER_BY".to_string(),
+            K::Limit { .. } | K::LimitPercent { .. } => "LIMIT".to_string(),
+            K::Sample { .. } => "SAMPLE".to_string(),
+            K::Distinct { .. } => "DISTINCT".to_string(),
+            K::Unnest { .. } => "UNNEST".to_string(),
+            K::Union { .. } => "UNION".to_string(),
+            K::ExceptIntersect { except: true, .. } => "EXCEPT".to_string(),
+            K::ExceptIntersect { .. } => "INTERSECT".to_string(),
+            K::RecursiveCte { .. } => "REC_CTE".to_string(),
+            K::WorkingTable { .. } => "CTE_SCAN".to_string(),
+            K::LateralJoin { .. } => "DEPENDENT_JOIN".to_string(),
+            K::Projection { .. } => "PROJECTION".to_string(),
+            K::CrossProduct => "CROSS_PRODUCT".to_string(),
+            K::AsOfJoin { .. } => "ASOF_JOIN".to_string(),
+            K::PositionalJoin => "POSITIONAL_JOIN".to_string(),
+            K::MarkJoin { .. } => "COMPARISON_JOIN MARK".to_string(),
+            K::Join { join_type, .. } => format!("COMPARISON_JOIN {}", join_type.name()),
+            K::Insert { .. } => "INSERT".to_string(),
+            K::Delete { .. } => "DELETE".to_string(),
+            K::Update { .. } => "UPDATE".to_string(),
+            K::MergeInto { .. } => "MERGE_INTO".to_string(),
+            K::CreateTableAs { .. } | K::CreateTable { .. } => "CREATE_TABLE".to_string(),
+        }
+    }
+    fn visit(op: &LogicalOperator, depth: usize, out: &mut String) {
+        out.push_str(&"  ".repeat(depth));
+        out.push_str(&name(op));
+        out.push('\n');
+        for child in &op.children {
+            visit(child, depth + 1, out);
+        }
+    }
+    let mut out = String::new();
+    visit(op, 0, &mut out);
+    out
+}
+
 fn on_create_conflict(conflict: AstConflict) -> OnCreateConflict {
     match conflict {
         AstConflict::Error => OnCreateConflict::Error,
@@ -757,9 +925,6 @@ impl ClientContext {
         else {
             unreachable!("checked by the caller");
         };
-        if info.temporary {
-            return Err(crate::unported("CREATE TEMPORARY VIEW"));
-        }
         if *secure {
             return Err(crate::unported("CREATE SECURE VIEW"));
         }
@@ -768,7 +933,7 @@ impl ClientContext {
             return Err(crate::unported("view dependencies"));
         }
         let catalog = &self.db.catalog;
-        let schema = catalog.schema_for(schema_of(&info.name)?)?;
+        let schema = catalog.schema_for(create_schema_of(info)?)?;
         let on_conflict = on_create_conflict(info.on_conflict);
         // IF NOT EXISTS for a view that exists does not look at the query
         let exists = matches!(schema.get_entry(&info.name.name), Some(TableOrView::View(_)));
@@ -785,14 +950,11 @@ impl ClientContext {
         let CreateKind::Macro { table_macro, macros } = &info.kind else {
             unreachable!("checked by the caller");
         };
-        if info.temporary {
-            return Err(crate::unported("CREATE TEMPORARY MACRO"));
-        }
         if self.setting_text("enable_macro_dependencies") == "true" {
             return Err(crate::unported("macro dependencies"));
         }
         let catalog = &self.db.catalog;
-        let schema = catalog.schema_for(schema_of(&info.name)?)?;
+        let schema = catalog.schema_for(create_schema_of(info)?)?;
         let mut binder = Binder::with_options(catalog, self.bind_options());
         binder.bind_create_macro(&info.name.name, macros, *table_macro, &schema.name)?;
         schema.create_macro(
@@ -808,9 +970,6 @@ impl ClientContext {
         let CreateKind::Type(kind) = &info.kind else {
             unreachable!("checked by the caller");
         };
-        if info.temporary {
-            return Err(crate::unported("CREATE TEMPORARY TYPE"));
-        }
         let ty = match kind {
             CreateTypeKind::Enum(values) => enum_type_from(values.clone())?,
             CreateTypeKind::EnumQuery(query) => {
@@ -836,7 +995,7 @@ impl ClientContext {
                 binder.bind_type(target)?
             }
         };
-        let schema = self.db.catalog.schema_for(schema_of(&info.name)?)?;
+        let schema = self.db.catalog.schema_for(create_schema_of(info)?)?;
         if is_builtin_type(&info.name.name) {
             return Err(Error::new(
                 ErrorKind::Catalog,
@@ -858,9 +1017,6 @@ impl ClientContext {
         else {
             unreachable!("checked by the caller");
         };
-        if info.temporary {
-            return Err(crate::unported("CREATE TEMPORARY SEQUENCE"));
-        }
         let data = SequenceData {
             counter: start_value,
             last_value: None,
@@ -869,13 +1025,38 @@ impl ClientContext {
             max_value,
             cycle,
         };
-        let schema = self.db.catalog.schema_for(schema_of(&info.name)?)?;
+        let schema = self.db.catalog.schema_for(create_schema_of(info)?)?;
         schema.create_sequence(&info.name.name, data, on_create_conflict(info.on_conflict))
     }
 
     /// `DROP TABLE`, `VIEW`, `SEQUENCE`, `MACRO` and `SCHEMA` (`Catalog::DropEntry`).
     fn drop_entry(&mut self, info: &DropInfo) -> Result<()> {
         let catalog = &self.db.catalog;
+        let temporary = catalog.schema_for(Some(TEMP_SCHEMA))?;
+        let in_temp = info.name.qualification.is_empty()
+            && match info.entry_type {
+                "TABLE" | "VIEW" => temporary.get_entry(&info.name.name).is_some(),
+                "SEQUENCE" => temporary.get_sequence(&info.name.name).is_some(),
+                "MACRO" | "MACRO TABLE" => {
+                    temporary.get_macro(&info.name.name, false).is_some()
+                        || temporary.get_macro(&info.name.name, true).is_some()
+                }
+                "TYPE" => temporary.get_type(&info.name.name).is_some(),
+                _ => false,
+            };
+        let qualified;
+        let info = if in_temp {
+            qualified = DropInfo {
+                name: QualifiedName {
+                    qualification: vec![TEMP_SCHEMA.to_string()],
+                    ..info.name.clone()
+                },
+                ..info.clone()
+            };
+            &qualified
+        } else {
+            info
+        };
         match info.entry_type {
             kind @ ("TABLE" | "VIEW") => {
                 let type_name = if kind == "TABLE" { "Table" } else { "View" };
@@ -2836,7 +3017,6 @@ mod tests {
     #[test]
     fn correlated_subqueries_match_duckdb() {
         let mut context = ClientContext::new(DatabaseInstance::new());
-        let err = |context: &mut ClientContext, sql: &str| context.query(sql).unwrap_err().to_string();
         run(&mut context, "CREATE TABLE a (x INTEGER, k INTEGER)");
         run(&mut context, "CREATE TABLE b (y INTEGER, k INTEGER)");
         run(&mut context, "INSERT INTO a VALUES (1, 1), (2, 1), (3, 2), (NULL, 3)");
@@ -2903,10 +3083,7 @@ mod tests {
             ),
             [["1", "2"], ["2", "1"], ["3", "0"]]
         );
-        assert_eq!(
-            err(&mut context, "SELECT (SELECT sum(a.x)) FROM a"),
-            "Not implemented Error: aggregates of the columns of an outer query is not yet ported to duckrs"
-        );
+        assert_eq!(run(&mut context, "SELECT (SELECT sum(a.x)) FROM a").len(), 1);
     }
 
     #[test]
@@ -3570,6 +3747,190 @@ mod tests {
             ),
             [["true", "2", "3", "3", "[2, 1]", "[1, 2, 3]", "true", "[1, NULL]"]]
         );
+    }
+
+    fn error(context: &mut ClientContext, sql: &str) -> String {
+        context.query(sql).expect_err("the statement fails").to_string()
+    }
+
+    #[test]
+    fn pivot_and_unpivot() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        run(&mut c, "CREATE TABLE s(y INT, q VARCHAR, v INT)");
+        run(&mut c, "INSERT INTO s VALUES (1, 'a', 10), (1, 'b', 20), (2, 'a', 30)");
+        assert_eq!(
+            run(&mut c, "SELECT * FROM s PIVOT (sum(v) FOR q IN ('a', 'b')) ORDER BY y"),
+            [["1", "10", "20"], ["2", "30", "NULL"]]
+        );
+        assert_eq!(
+            run(&mut c, "PIVOT s ON q USING sum(v) GROUP BY y ORDER BY y"),
+            [["1", "10", "20"], ["2", "30", "NULL"]]
+        );
+        run(&mut c, "CREATE TABLE w(id INT, a INT, b INT)");
+        run(&mut c, "INSERT INTO w VALUES (1, 5, NULL)");
+        assert_eq!(run(&mut c, "UNPIVOT w ON a, b INTO NAME n VALUE x"), [["1", "a", "5"]]);
+    }
+
+    #[test]
+    fn columns_expressions() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        run(&mut c, "CREATE TABLE t(a1 INT, a2 INT, b INT)");
+        run(&mut c, "INSERT INTO t VALUES (1, 2, 3), (4, 5, 6)");
+        assert_eq!(run(&mut c, "SELECT max(COLUMNS('a.')) FROM t"), [["4", "5"]]);
+        assert_eq!(run(&mut c, "SELECT COLUMNS(['b']) FROM t WHERE a1 = 1"), [["3"]]);
+        assert_eq!(run(&mut c, "SELECT * LIKE 'a%' FROM t WHERE a1 = 1"), [["1", "2"]]);
+        assert_eq!(run(&mut c, "SELECT count(*) FROM t WHERE COLUMNS('a.') > 1"), [["1"]]);
+    }
+
+    #[test]
+    fn temporary_objects() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        run(&mut c, "CREATE TABLE t AS SELECT 1 AS x");
+        run(&mut c, "CREATE TEMPORARY TABLE t AS SELECT 2 AS x");
+        assert_eq!(run(&mut c, "SELECT x FROM t"), [["2"]]);
+        run(&mut c, "DROP TABLE t");
+        assert_eq!(run(&mut c, "SELECT x FROM t"), [["1"]]);
+    }
+
+    #[test]
+    fn generated_columns() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        run(&mut c, "CREATE TABLE t(a INT, b AS (a + 1), c INT, d AS (b * c))");
+        run(&mut c, "INSERT INTO t VALUES (1, 2)");
+        assert_eq!(run(&mut c, "SELECT * FROM t"), [["1", "2", "2", "4"]]);
+        assert_eq!(run(&mut c, "SELECT s FROM t x(p, q, r, s)"), [["4"]]);
+        assert!(error(&mut c, "INSERT INTO t (b) VALUES (1)").contains("generated"));
+        assert!(error(&mut c, "ALTER TABLE t DROP COLUMN a").contains("dependency"));
+        run(&mut c, "ALTER TABLE t RENAME a TO z");
+        assert_eq!(run(&mut c, "SELECT b FROM t"), [["2"]]);
+        assert!(error(&mut c, "CREATE TABLE u(x AS (y), y AS (x), z INT)").contains("Circular"));
+    }
+
+    #[test]
+    fn describe_and_summarize() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        run(&mut c, "CREATE TABLE t(a INT PRIMARY KEY, b VARCHAR DEFAULT 'x')");
+        assert_eq!(
+            run(&mut c, "DESCRIBE t"),
+            [
+                ["a", "INTEGER", "NO", "PRI", "NULL", "NULL"],
+                ["b", "VARCHAR", "YES", "NULL", "'x'", "NULL"]
+            ]
+        );
+        assert_eq!(run(&mut c, "SHOW TABLES"), [["t"]]);
+        assert_eq!(run(&mut c, "SELECT table_name FROM duckdb_tables"), [["t"]]);
+        assert_eq!(
+            run(&mut c, "SELECT column_name, count FROM (SUMMARIZE t)"),
+            [["a", "0"], ["b", "0"]]
+        );
+    }
+
+    #[test]
+    fn merge_into() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        run(&mut c, "CREATE TABLE t(k INT, v INT)");
+        run(&mut c, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
+        let merge = "MERGE INTO t USING (VALUES (1, 11), (4, 44)) s(k, v) USING (k) \
+                     WHEN MATCHED THEN UPDATE SET v = s.v \
+                     WHEN NOT MATCHED THEN INSERT VALUES (s.k, s.v) \
+                     WHEN NOT MATCHED BY SOURCE AND t.k = 3 THEN DELETE";
+        assert_eq!(run(&mut c, merge), [["3"]]);
+        assert_eq!(
+            run(&mut c, "SELECT * FROM t ORDER BY k"),
+            [["1", "11"], ["2", "20"], ["4", "44"]]
+        );
+        assert!(
+            error(
+                &mut c,
+                "MERGE INTO t USING (VALUES (1), (1)) s(k) USING (k) WHEN MATCHED THEN DELETE"
+            )
+            .contains("more than once")
+        );
+    }
+
+    #[test]
+    fn asof_positional_and_mark_joins() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        run(&mut c, "CREATE TABLE p(t INT, v INT)");
+        run(&mut c, "INSERT INTO p VALUES (1, 10), (5, 50)");
+        run(&mut c, "CREATE TABLE q(t INT)");
+        run(&mut c, "INSERT INTO q VALUES (0), (3), (9)");
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT q.t, v FROM q ASOF LEFT JOIN p ON q.t >= p.t ORDER BY q.t"
+            ),
+            [["0", "NULL"], ["3", "10"], ["9", "50"]]
+        );
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT * FROM (VALUES (1), (2)) a(x) POSITIONAL JOIN (VALUES (3)) b(y)"
+            ),
+            [["1", "3"], ["2", "NULL"]]
+        );
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT t, __mark_join_marker FROM q JOIN BY (TYPE MARK) p ON q.t = p.t ORDER BY t"
+            ),
+            [["0", "false"], ["3", "false"], ["9", "false"]]
+        );
+    }
+
+    #[test]
+    fn recursive_cte_using_key() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        let sql = "WITH RECURSIVE t(k, v) USING KEY (k) AS (SELECT 1, 0 UNION ALL \
+                   SELECT k, v + 1 FROM t WHERE v < 3) SELECT * FROM t";
+        assert_eq!(run(&mut c, sql), [["1", "3"]]);
+    }
+
+    #[test]
+    fn samples_and_percent_limits() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT count(*) FROM range(100) USING SAMPLE 7 ROWS (reservoir, 1)"
+            ),
+            [["7"]]
+        );
+        assert_eq!(
+            run(&mut c, "SELECT count(*) FROM (SELECT * FROM range(100) LIMIT 10%)"),
+            [["10"]]
+        );
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT DISTINCT ON (x) x, y FROM (VALUES (1, 2), (1, 1), (2, 3)) t(x, y) ORDER BY x, y"
+            ),
+            [["1", "1"], ["2", "3"]]
+        );
+    }
+
+    #[test]
+    fn row_subqueries_and_outer_aggregates() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        run(&mut c, "CREATE TABLE t(a INT, b INT)");
+        run(&mut c, "INSERT INTO t VALUES (1, 2), (3, 4)");
+        assert_eq!(run(&mut c, "SELECT a FROM t WHERE (a, b) IN (SELECT 3, 4)"), [["3"]]);
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT max(a) > ANY(SELECT a FROM t WHERE a > min(t2.a)) FROM t t2"
+            ),
+            [["false"]]
+        );
+    }
+
+    #[test]
+    fn explain_names_the_operators() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        run(&mut c, "CREATE TABLE t(a INT)");
+        let plan = run(&mut c, "EXPLAIN SELECT a FROM t ORDER BY a");
+        assert_eq!(plan[0][0], "physical_plan");
+        assert!(plan[0][1].contains("ORDER_BY"));
     }
 
     #[test]

@@ -31,6 +31,7 @@ pub fn is_nested_function(name: &str) -> bool {
         name.to_ascii_lowercase().as_str(),
         "list_value"
             | "list_pack"
+            | "unpivot_list"
             | "array_value"
             | "row"
             | "struct_pack"
@@ -242,6 +243,27 @@ fn bind_list_value(name: &str, children: Vec<BoundExpr>) -> Result<BoundExpr> {
     let element = element_type(name, &children)?;
     let children = children.into_iter().map(|c| c.cast_to(&element, false)).collect();
     Ok(bound_function(name, children, LogicalType::list(element), list_value))
+}
+
+/// `UnpivotBind`: a list of columns, whose types have to go together.
+fn bind_unpivot_list(children: Vec<BoundExpr>) -> Result<BoundExpr> {
+    let mut element = LogicalType::SQLNULL;
+    for child in &children {
+        let ty = expression_return_type(child);
+        element = try_max_logical_type(&element, &ty).ok_or_else(|| {
+            binder_error(format!(
+                "Cannot unpivot columns of types {element} and {ty} - an explicit cast is required"
+            ))
+        })?;
+    }
+    let element = normalize_type(&element);
+    let children = children.into_iter().map(|c| c.cast_to(&element, false)).collect();
+    Ok(bound_function(
+        "unpivot_list",
+        children,
+        LogicalType::list(element),
+        list_value,
+    ))
 }
 
 fn bind_array_value(children: Vec<BoundExpr>) -> Result<BoundExpr> {
@@ -611,6 +633,7 @@ pub fn bind_nested_function(name: &str, names: Vec<String>, children: Vec<BoundE
     let lower = name.to_ascii_lowercase();
     match lower.as_str() {
         "list_value" | "list_pack" => bind_list_value(&lower, children),
+        "unpivot_list" => bind_unpivot_list(children),
         "array_value" => bind_array_value(children),
         "row" => Ok(bind_row(children)),
         "struct_pack" => bind_struct_pack(names, children),

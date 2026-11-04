@@ -6,10 +6,15 @@
 mod alter;
 mod create_index;
 mod expression;
+mod generated;
 mod join;
 mod lambda;
 mod macros;
+mod merge;
 mod on_conflict;
+mod pivot;
+mod show;
+mod star;
 mod statements;
 mod table_constraints;
 mod table_functions;
@@ -69,10 +74,15 @@ pub struct Binding {
     pub types: Vec<LogicalType>,
     /// where a base table scan puts the `rowid` pseudo-column
     pub row_id: Option<usize>,
+    /// with `names`, the expressions of the generated columns; empty without any
+    pub generated: Vec<Option<ast::Expr>>,
 }
 
 impl Binding {
     fn column_index(&self, name: &str) -> Option<usize> {
+        if let Some(position) = name.strip_prefix(generated::POSITIONAL_COLUMN) {
+            return position.parse().ok();
+        }
         self.names.iter().position(|n| n.eq_ignore_ascii_case(name))
     }
 
@@ -84,7 +94,11 @@ impl Binding {
     /// A column by name: its index, type and name as spelled here.
     fn column(&self, name: &str) -> Option<(usize, LogicalType, String)> {
         match self.column_index(name) {
-            Some(index) => Some((index, self.types[index].clone(), self.names[index].clone())),
+            Some(index) => {
+                let stored = self.generated.iter().take(index).filter(|g| g.is_none()).count();
+                let position = if self.generated.is_empty() { index } else { stored };
+                Some((position, self.types[index].clone(), self.names[index].clone()))
+            }
             None => self
                 .row_id_column(name)
                 .map(|index| (index, LogicalType::BIGINT, "rowid".to_string())),
@@ -176,6 +190,22 @@ impl BindContext {
             .find(|b| b.alias == alias)
             .and_then(|b| b.column_index(column).map(|i| b.names[i].clone()))
             .unwrap_or_else(|| column.to_string())
+    }
+
+    /// The expression of the generated column `names` refers to, if it does.
+    fn generated_expression(&self, names: &[String]) -> Option<ast::Expr> {
+        let (table, column) = match names {
+            [column] => (None, column),
+            [table, column] => (Some(table), column),
+            _ => return None,
+        };
+        let binding = self
+            .bindings
+            .iter()
+            .filter(|b| !b.generated.is_empty())
+            .filter(|b| table.is_none_or(|t| b.alias.eq_ignore_ascii_case(t)))
+            .find(|b| b.column_index(column).is_some())?;
+        binding.generated[binding.column_index(column)?].clone()
     }
 
     /// `BindContext::GetUsingBinding(column)`: the USING set of a column, which has to be unique.
@@ -480,6 +510,20 @@ pub struct BindOptions {
     pub default_null_order: DefaultNullOrder,
     /// `lambda_syntax = ENABLE_SINGLE_ARROW`
     pub single_arrow_lambdas: bool,
+    /// `pivot_limit`
+    pub pivot_limit: u64,
+    /// `scalar_subquery_error_on_multiple_rows`
+    pub scalar_subquery_error: bool,
+    /// `show_behavior`
+    pub show_behavior: ShowBehavior,
+}
+
+/// What `SHOW name` looks for (`ShowBehaviorType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShowBehavior {
+    Auto,
+    Setting,
+    Table,
 }
 
 impl Default for BindOptions {
@@ -488,6 +532,9 @@ impl Default for BindOptions {
             default_order: OrderType::Ascending,
             default_null_order: DefaultNullOrder::NullsLast,
             single_arrow_lambdas: false,
+            pivot_limit: 100_000,
+            scalar_subquery_error: true,
+            show_behavior: ShowBehavior::Auto,
         }
     }
 }
@@ -606,6 +653,10 @@ pub struct Binder<'a> {
     correlated: Arc<Mutex<Vec<CorrelatedColumn>>>,
     /// The recursive CTEs whose recursive part is being bound, innermost last.
     working_tables: Vec<WorkingTable>,
+    /// RETURNING of a MERGE can read `merge_action`
+    merge_action_column: bool,
+    /// the aggregate of an outer query's columns that stopped this binder
+    pending_outer_aggregate: Option<ast::FunctionExpr>,
 }
 
 /// What a recursive CTE is inside of its recursive part.
@@ -615,6 +666,8 @@ struct WorkingTable {
     names: Vec<String>,
     types: Vec<LogicalType>,
     rows: Arc<Mutex<ColumnDataCollection>>,
+    /// what `recurring.name` reads
+    recurring: Arc<Mutex<ColumnDataCollection>>,
     /// whether the recursive part reads it
     used: Arc<AtomicBool>,
 }
@@ -658,6 +711,8 @@ impl<'a> Binder<'a> {
             outer_contexts: Vec::new(),
             correlated: Arc::default(),
             working_tables: Vec::new(),
+            merge_action_column: false,
+            pending_outer_aggregate: None,
         }
     }
 
@@ -722,6 +777,7 @@ impl<'a> Binder<'a> {
             Statement::Insert(insert) => self.bind_insert(insert),
             Statement::Delete(delete) => self.bind_delete(delete),
             Statement::Update(update) => self.bind_update(update),
+            Statement::Merge(merge) => self.bind_merge(merge),
             Statement::CreateTable(info) => self.bind_create_table(info),
             // `Binder::Bind(CallStatement)`
             Statement::Call(function) => {

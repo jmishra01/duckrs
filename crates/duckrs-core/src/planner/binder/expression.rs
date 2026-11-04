@@ -29,7 +29,7 @@ use duckrs_parser::ast::sql_quoted_identifier;
 use duckrs_parser::ast::{
     CastType, ComparisonOp, Expr, ExprKind, FunctionExpr, Literal, LiteralKind, OperatorType, SubqueryType, TypeExpr,
 };
-use duckrs_parser::transformer::visit_expr_mut;
+use duckrs_parser::transformer::{visit_expr_mut, visit_query_node_exprs_mut};
 use parking_lot::Mutex;
 use std::sync::Arc;
 
@@ -514,21 +514,73 @@ impl Binder<'_> {
         child: Option<&Expr>,
         comparison: ComparisonOp,
     ) -> Result<BoundExpr> {
-        let mut binder = self.child_binder();
-        binder.outer_contexts.push(self.bind_context.clone());
-        binder.correlated = Arc::default();
-        let bound = binder
-            .bind_select_statement(subquery)
-            .map_err(|error| self.correlated_error(error))?;
+        let parsed_child = child;
+        let mut rewritten = subquery.clone();
+        // aggregates of this query's columns stand in the subquery under a name of their own
+        let mut outer_aggregates: Vec<(String, Expr, LogicalType)> = Vec::new();
+        let (binder, bound) = loop {
+            let mut context = self.bind_context.clone();
+            if !outer_aggregates.is_empty() {
+                let table_index = self.generate_table_index();
+                context.add_binding(super::Binding {
+                    alias: "__outer_aggregates".to_string(),
+                    schema: None,
+                    table_index,
+                    names: outer_aggregates.iter().map(|(n, ..)| n.clone()).collect(),
+                    types: outer_aggregates.iter().map(|(.., t)| t.clone()).collect(),
+                    row_id: None,
+                    generated: Vec::new(),
+                });
+            }
+            let mut binder = self.child_binder();
+            binder.outer_contexts.push(context);
+            binder.correlated = Arc::default();
+            match binder.bind_select_statement(&rewritten) {
+                Ok(bound) => break (binder, bound),
+                Err(error) => {
+                    let Some(function) = binder.pending_outer_aggregate.take() else {
+                        return Err(self.correlated_error(error));
+                    };
+                    self.next_table_index = binder.next_table_index;
+                    let expr = Expr::from(ExprKind::Function(function));
+                    let bound = self.bind_expression(&expr)?;
+                    let name = format!("__outer_aggregate_{}", outer_aggregates.len());
+                    let ty = bound.return_type.clone();
+                    visit_query_node_exprs_mut(&mut rewritten.node, &mut |e| {
+                        if e.kind == expr.kind {
+                            let alias = std::mem::take(&mut e.alias);
+                            *e = Expr::column(vec![name.clone()]);
+                            e.alias = alias;
+                        }
+                    });
+                    outer_aggregates.push((name, expr, ty));
+                }
+            }
+        };
         self.next_table_index = binder.next_table_index;
         // the correlated columns are columns of this query, or of one around it
         let columns: Vec<CorrelatedColumn> = binder.correlated.lock().clone();
         let mut correlated = Vec::with_capacity(columns.len());
         let mut bindings = Vec::with_capacity(columns.len());
+        let fallback_size = self.alias_fallback.len();
+        self.alias_fallback
+            .extend(outer_aggregates.iter().map(|(n, e, _)| (n.clone(), e.clone())));
         for column in columns {
-            correlated.push(self.bind_expression(&Expr::from(ExprKind::ColumnRef(column.names)))?);
+            let names = match column.names.as_slice() {
+                [alias, name] if alias == "__outer_aggregates" => vec![name.clone()],
+                _ => column.names,
+            };
+            let bound = self.bind_expression(&Expr::from(ExprKind::ColumnRef(names)));
+            match bound {
+                Ok(bound) => correlated.push(bound),
+                Err(error) => {
+                    self.alias_fallback.truncate(fallback_size);
+                    return Err(error);
+                }
+            }
             bindings.push(column.binding);
         }
+        self.alias_fallback.truncate(fallback_size);
         let child = child.map(|c| self.bind_expression(c)).transpose()?;
         let columns = bound.types.len();
         let row_width = child
@@ -537,7 +589,26 @@ impl Binder<'_> {
             .map(|c| c.return_type.struct_children().len());
         if subquery_type != SubqueryType::Exists && subquery_type != SubqueryType::NotExists {
             match row_width {
-                Some(width) if columns == width => return Err(crate::unported("subqueries compared to rows")),
+                Some(width) if columns == width && width > 0 && bound.types[0].id() != LogicalTypeId::Tuple => {
+                    if !bindings.is_empty() {
+                        return Err(crate::error_not_implemented(
+                            "Correlated IN/ANY/ALL with multiple columns not yet supported",
+                        ));
+                    }
+                    let names: Vec<String> = (0..width).map(|i| format!("__subquery_column_{i}")).collect();
+                    let row = FunctionExpr::new("row", names.iter().map(|n| Expr::column(vec![n.clone()])).collect());
+                    let mut from = ast::TableRef::subquery(rewritten);
+                    from.alias = "__subquery_row".to_string();
+                    from.column_name_alias = names;
+                    let select = ast::SelectNode {
+                        select_list: vec![row.into()],
+                        from_table: from,
+                        ..ast::SelectNode::default()
+                    };
+                    let node: ast::QueryNode = select.into();
+                    let wrapped = ast::SelectStatement { node };
+                    return self.bind_subquery(&wrapped, subquery_type, parsed_child, comparison);
+                }
                 Some(width) if bound.types[0].id() != LogicalTypeId::Tuple || columns != 1 => {
                     return Err(binder_error(format!(
                         "Subquery returns {columns} columns - expected {width}"
@@ -585,6 +656,7 @@ impl Binder<'_> {
                     plan,
                     correlated: bindings,
                     volatile,
+                    error_on_multiple_rows: self.options.scalar_subquery_error,
                     results: Mutex::default(),
                 }),
                 child,
@@ -669,6 +741,11 @@ impl Binder<'_> {
                     && let Some(using) = self.bind_context.using_expression(column)?
                 {
                     return self.bind_expression(&using);
+                }
+                if self.bind_context.bind_column_ref(names).is_ok()
+                    && let Some(generated) = self.bind_context.generated_expression(names)
+                {
+                    return self.bind_expression(&generated);
                 }
                 let (binding, ty, name) = match names.as_slice() {
                     [column] => match self.bind_context.bind_column(column) {
@@ -1203,6 +1280,7 @@ impl Binder<'_> {
     /// `BaseSelectBinder::BindAggregate`.
     fn bind_aggregate(&mut self, function: &FunctionExpr) -> Result<BoundExpr> {
         if self.aggregate_of_outer_query(function) {
+            self.pending_outer_aggregate = Some(function.clone());
             return Err(crate::unported("aggregates of the columns of an outer query"));
         }
         let Some(state) = self.aggregates.as_mut() else {

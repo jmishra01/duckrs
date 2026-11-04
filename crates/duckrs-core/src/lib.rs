@@ -8,6 +8,11 @@ pub mod execution;
 pub mod function;
 pub mod planner;
 
+/// `NotImplementedException` with DuckDB's own wording.
+pub(crate) fn error_not_implemented(message: &str) -> duckrs_common::Error {
+    duckrs_common::Error::not_implemented(message)
+}
+
 /// The error for SQL that DuckDB supports but duckrs does not run yet. The wording is kept
 /// apart from DuckDB's own messages, so that a test expecting an error never passes because
 /// of a feature that is missing here.

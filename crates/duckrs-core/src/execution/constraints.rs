@@ -124,6 +124,18 @@ fn still_referenced(name: &str) -> Error {
 
 /// `DataTable::VerifyNotNullConstraint` for each NOT NULL.
 pub fn verify_not_null(table: &TableCatalogEntry, chunk: &DataChunk) -> Result<()> {
+    // `VerifyGeneratedExpressionSuccess`
+    for column in &table.generated {
+        execute(&column.bound, chunk).map_err(|error| {
+            violation(format!(
+                "Incorrect value for generated column '{} {} AS ({})' : {}",
+                sql_identifier(&column.name),
+                column.ty,
+                column.expr,
+                error.message
+            ))
+        })?;
+    }
     for (i, column) in table.columns.iter().enumerate() {
         let unified = chunk.column(i).to_unified(chunk.len());
         if column.not_null && (0..chunk.len()).any(|r| !unified.is_valid(r)) {

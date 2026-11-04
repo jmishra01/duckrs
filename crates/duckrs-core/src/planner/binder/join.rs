@@ -7,14 +7,15 @@
 
 use super::expression::{bind_comparison, checked_cast};
 use super::statements::not_implemented;
-use super::{BindContext, Binder, UsingColumnSet, binder_error};
+use super::{BindContext, Binder, Binding, UsingColumnSet, binder_error};
 use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{JoinCondition, LogicalOperator, LogicalOperatorKind};
 use duckrs_common::Result;
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
 use duckrs_parser::ast::{
-    ComparisonOp, Expr, ExprKind, JoinRef, JoinRefType, JoinType, TableRef, sql_quoted_identifier,
+    ComparisonOp, Expr, ExprKind, JoinRef, JoinRefType, JoinType, Literal, NullOrder, OperatorType, OrderByNode,
+    OrderType, QueryNode, ResultModifier, SelectNode, SelectStatement, TableRef, TableRefKind, sql_quoted_identifier,
 };
 use std::collections::HashSet;
 
@@ -35,7 +36,7 @@ fn try_find_binding(context: &BindContext, column: &str, side: &str) -> Result<O
 
 /// `Binder::RetrieveUsingBinding`: the binding a USING column reads on one side, or `None` for
 /// a chained column without a primary binding, which binds by its bare name.
-fn using_binding(
+pub(super) fn using_binding(
     context: &BindContext,
     set: Option<&UsingColumnSet>,
     column: &str,
@@ -53,7 +54,7 @@ fn using_binding(
 }
 
 /// `SetPrimaryBinding`: the side whose value a USING column always has. A FULL join has none.
-fn primary_binding(join_type: JoinType, left: &Option<String>, right: &Option<String>) -> Option<String> {
+pub(super) fn primary_binding(join_type: JoinType, left: &Option<String>, right: &Option<String>) -> Option<String> {
     match join_type {
         JoinType::Left | JoinType::Inner | JoinType::Semi | JoinType::Anti => left.clone(),
         JoinType::Right | JoinType::RightSemi | JoinType::RightAnti => right.clone(),
@@ -117,7 +118,7 @@ fn table_indexes(plan: &LogicalOperator) -> HashSet<usize> {
 
 /// `ExtractJoinConditions`: the equalities between the two sides become join keys, and what
 /// remains is checked for each pair of rows the keys match.
-fn extract_join_conditions(
+pub(super) fn extract_join_conditions(
     predicates: Vec<BoundExpr>,
     left: &LogicalOperator,
     right: &LogicalOperator,
@@ -186,7 +187,7 @@ fn contains_subquery(expr: &BoundExpr) -> bool {
 }
 
 /// All of `predicates`, if there are any.
-fn conjunction_of(mut predicates: Vec<BoundExpr>) -> Option<BoundExpr> {
+pub(super) fn conjunction_of(mut predicates: Vec<BoundExpr>) -> Option<BoundExpr> {
     match predicates.len() {
         0 => None,
         1 => predicates.pop(),
@@ -203,7 +204,7 @@ fn conjunction_of(mut predicates: Vec<BoundExpr>) -> Option<BoundExpr> {
 impl Binder<'_> {
     /// Binds a reference to a USING column in `context`: `alias.column`, or the bare column when
     /// it has no binding of its own (`AddCondition`'s `BindColumn`).
-    fn bind_using_side(
+    pub(super) fn bind_using_side(
         &mut self,
         context: &mut BindContext,
         alias: &Option<String>,
@@ -225,13 +226,10 @@ impl Binder<'_> {
         if !table_ref.alias.is_empty() || !table_ref.column_name_alias.is_empty() {
             return Err(not_implemented("aliases on joins"));
         }
-        match join.ref_type {
-            JoinRefType::Regular | JoinRefType::Natural | JoinRefType::Cross => {}
-            JoinRefType::Positional => return Err(not_implemented("POSITIONAL JOIN")),
-            JoinRefType::Asof => return Err(not_implemented("ASOF JOIN")),
-            JoinRefType::Nearest => return Err(not_implemented("NEAREST JOIN")),
+        if join.ref_type == JoinRefType::Nearest {
+            return self.bind_nearest_join(table_ref, join);
         }
-        if matches!(join.join_type, JoinType::Mark | JoinType::Single) {
+        if join.join_type == JoinType::Single {
             return Err(not_implemented(join.join_type.name()));
         }
         let left = self.bind_table_ref(&join.left)?;
@@ -286,7 +284,14 @@ impl Binder<'_> {
             let right_alias = using_binding(&right_context, right_set.as_ref(), column, "right")?;
             let left_column = self.bind_using_side(&mut left_context, &left_alias, column)?;
             let right_column = self.bind_using_side(&mut right_context, &right_alias, column)?;
-            predicates.push(bind_comparison(ComparisonOp::Equal, left_column, right_column)?);
+            // the last column of ASOF JOIN ... USING is >=
+            let last = using_columns.last().is_some_and(|c| c == column);
+            let op = if join.ref_type == JoinRefType::Asof && last {
+                ComparisonOp::GreaterThanOrEqual
+            } else {
+                ComparisonOp::Equal
+            };
+            predicates.push(bind_comparison(op, left_column, right_column)?);
             let mut bindings = Vec::new();
             for (set, alias) in [(&left_set, &left_alias), (&right_set, &right_alias)] {
                 match set {
@@ -344,6 +349,32 @@ impl Binder<'_> {
                 vec![left],
             ));
         }
+        if join.ref_type == JoinRefType::Positional {
+            return Ok(LogicalOperator::new(
+                LogicalOperatorKind::PositionalJoin,
+                vec![left, right],
+            ));
+        }
+        if join.join_type == JoinType::Mark {
+            self.bind_context.remove_context(&right_aliases);
+            let table_index = self.generate_table_index();
+            self.bind_context.add_binding(Binding {
+                alias: "__mark_join".to_string(),
+                schema: None,
+                table_index,
+                names: vec!["__mark_join_marker".to_string()],
+                types: vec![LogicalType::BOOLEAN],
+                row_id: None,
+                generated: Vec::new(),
+            });
+            return Ok(LogicalOperator::new(
+                LogicalOperatorKind::MarkJoin {
+                    table_index,
+                    predicate: conjunction_of(predicates),
+                },
+                vec![left, right],
+            ));
+        }
         // these joins do not output the other side
         match join.join_type {
             JoinType::Semi | JoinType::Anti => self.bind_context.remove_context(&right_aliases),
@@ -359,11 +390,158 @@ impl Binder<'_> {
         if predicates.is_empty() {
             predicates.push(BoundExpr::constant(Value::boolean(true)));
         }
+        if join.ref_type == JoinRefType::Asof {
+            return self.plan_asof_join(join.join_type, predicates, left, right);
+        }
         let (conditions, predicate) = extract_join_conditions(predicates, &left, &right);
         Ok(LogicalOperator::new(
             LogicalOperatorKind::Join {
                 join_type: join.join_type,
                 conditions,
+                predicate,
+            },
+            vec![left, right],
+        ))
+    }
+
+    /// `Binder::BindNearestJoin`: a lateral join against the top rows of the target.
+    fn bind_nearest_join(&mut self, table_ref: &TableRef, join: &JoinRef) -> Result<LogicalOperator> {
+        let ranking = join
+            .ranking_expression
+            .as_deref()
+            .ok_or_else(|| binder_error("NEAREST join without a ranking expression"))?;
+        let alias = if !join.right.alias.is_empty() {
+            join.right.alias.clone()
+        } else if let TableRefKind::BaseTable { name, .. } = &join.right.kind {
+            name.name.clone()
+        } else {
+            String::new()
+        };
+        let select = SelectNode {
+            select_list: vec![Expr::star()],
+            from_table: (*join.right).clone(),
+            where_clause: Some(Box::new(Expr::operator(OperatorType::IsNotNull, vec![ranking.clone()]))),
+            ..SelectNode::default()
+        };
+        let mut node: QueryNode = select.into();
+        node.modifiers.push(ResultModifier::Order(vec![OrderByNode {
+            order: if join.nearest_descending {
+                OrderType::Descending
+            } else {
+                OrderType::Ascending
+            },
+            nulls: NullOrder::Default,
+            expr: ranking.clone(),
+        }]));
+        node.modifiers.push(ResultModifier::Limit {
+            limit: Some(Box::new(Expr::constant(Literal::integer(join.nearest_count as i64)))),
+            offset: None,
+            percent: false,
+        });
+        let mut right = TableRef::subquery(SelectStatement { node });
+        right.alias = alias;
+        let lateral = JoinRef {
+            right: Box::new(right),
+            ref_type: JoinRefType::Regular,
+            condition: Some(Box::new(Expr::constant(Literal::boolean(true)))),
+            ranking_expression: None,
+            ..join.clone()
+        };
+        self.bind_join(table_ref, &lateral)
+    }
+
+    /// `Binder::CreatePlan(BoundJoinRef)` for ASOF: finds the inequality of the predicates.
+    fn plan_asof_join(
+        &self,
+        join_type: JoinType,
+        predicates: Vec<BoundExpr>,
+        left: LogicalOperator,
+        right: LogicalOperator,
+    ) -> Result<LogicalOperator> {
+        let left_tables = table_indexes(&left);
+        let right_tables = table_indexes(&right);
+        let mut split = Vec::new();
+        for predicate in predicates {
+            split_predicates(predicate, &mut split);
+        }
+        let reads = |expr: &BoundExpr, tables: &HashSet<usize>, other: &HashSet<usize>| {
+            references(expr, tables) && !references(expr, other)
+        };
+        let mut inequality = None;
+        let mut rest = Vec::new();
+        for expr in split {
+            let is_inequality = matches!(
+                &expr.kind,
+                BoundExprKind::Comparison {
+                    op: ComparisonOp::GreaterThan
+                        | ComparisonOp::GreaterThanOrEqual
+                        | ComparisonOp::LessThan
+                        | ComparisonOp::LessThanOrEqual,
+                    left: first,
+                    right: second,
+                } if (reads(first, &left_tables, &right_tables) && reads(second, &right_tables, &left_tables))
+                    || (reads(first, &right_tables, &left_tables) && reads(second, &left_tables, &right_tables))
+            );
+            if !is_inequality {
+                rest.push(expr);
+                continue;
+            }
+            if inequality.is_some() {
+                return Err(binder_error("Multiple ASOF JOIN inequalities"));
+            }
+            inequality = Some(expr);
+        }
+        let Some(inequality) = inequality else {
+            return Err(binder_error("Missing ASOF JOIN inequality"));
+        };
+        let (conditions, predicate) = extract_join_conditions(rest, &left, &right);
+        if predicate.is_some() && matches!(join_type, JoinType::Right | JoinType::Outer) {
+            return Err(crate::error_not_implemented(&format!(
+                "Unsupported ASOF JOIN type ({}) with arbitrary predicate",
+                join_type.name()
+            )));
+        }
+        if matches!(join_type, JoinType::Semi | JoinType::Anti) {
+            // the match on the right does not matter, so a regular join does it
+            let (conditions, residual) = (
+                conditions,
+                conjunction_of([inequality].into_iter().chain(predicate).collect()),
+            );
+            return Ok(LogicalOperator::new(
+                LogicalOperatorKind::Join {
+                    join_type,
+                    conditions,
+                    predicate: residual,
+                },
+                vec![left, right],
+            ));
+        }
+        let BoundExprKind::Comparison {
+            op,
+            left: first,
+            right: second,
+        } = inequality.kind
+        else {
+            unreachable!("checked above");
+        };
+        let (first, op, second) = if reads(&first, &left_tables, &right_tables) {
+            (*first, op, *second)
+        } else {
+            let flipped = match op {
+                ComparisonOp::GreaterThan => ComparisonOp::LessThan,
+                ComparisonOp::GreaterThanOrEqual => ComparisonOp::LessThanOrEqual,
+                ComparisonOp::LessThan => ComparisonOp::GreaterThan,
+                _ => ComparisonOp::GreaterThanOrEqual,
+            };
+            (*second, flipped, *first)
+        };
+        Ok(LogicalOperator::new(
+            LogicalOperatorKind::AsOfJoin {
+                join_type,
+                conditions,
+                left: first,
+                op,
+                right: second,
                 predicate,
             },
             vec![left, right],

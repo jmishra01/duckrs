@@ -8,14 +8,15 @@
 //! DISTINCT), INSERT and CREATE TABLE.
 
 use super::expression::{checked_cast, without_aliases};
+use super::generated::{physical_constraints, table_binding};
 use super::window::WindowBindState;
 use super::{
     AggregateBindState, BindContext, Binder, Binding, BoundStatement, ColumnMode, StatementReturnType, WorkingTable,
     binder_error,
 };
 use crate::catalog::{
-    ColumnDefinition, DEFAULT_CATALOG, OnCreateConflict, SchemaCatalogEntry, TableCatalogEntry, TableOrView,
-    ViewCatalogEntry,
+    ColumnDefinition, DEFAULT_CATALOG, OnCreateConflict, SchemaCatalogEntry, TEMP_SCHEMA, TableCatalogEntry,
+    TableOrView, ViewCatalogEntry,
 };
 use crate::execution::expression_executor::evaluate_scalar;
 use crate::function::binder::expression_return_type;
@@ -23,7 +24,9 @@ use crate::function::combine_types::{force_max_logical_type, normalize_type, try
 use crate::function::generic::is_unnest_call;
 use crate::planner::column_binding_resolver::resolve_column_bindings;
 use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
-use crate::planner::logical::{BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, LogicalOperator, LogicalOperatorKind};
+use crate::planner::logical::{
+    BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, CteKeyColumn, LogicalOperator, LogicalOperatorKind,
+};
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::OrderModifiers;
 use duckrs_common::string_util::{candidates_message, similarity_rating, top_n_strings};
@@ -176,9 +179,19 @@ fn union_by_name_columns(
 /// A result modifier with its targets resolved to select list indexes.
 enum PreparedModifier {
     Distinct,
+    /// `DISTINCT ON`: the indexes of its targets
+    DistinctOn(Vec<usize>),
+    /// `LIMIT x%`
+    LimitPercent {
+        percent: f64,
+        offset: u64,
+    },
     Order(Vec<(OrderModifiers, usize)>),
     OrderAll(OrderModifiers),
-    Limit { limit: Option<u64>, offset: u64 },
+    Limit {
+        limit: Option<u64>,
+        offset: u64,
+    },
 }
 
 /// `GenerateRangeParameters`: the first value, the number of values and the increment.
@@ -237,6 +250,9 @@ pub fn schema_of(name: &QualifiedName) -> Result<Option<&str>> {
         [] => Ok(None),
         [schema] => Ok(Some(schema)),
         [catalog, schema] => {
+            if catalog.eq_ignore_ascii_case(TEMP_SCHEMA) {
+                return Ok(Some(TEMP_SCHEMA));
+            }
             if !catalog.eq_ignore_ascii_case(DEFAULT_CATALOG) {
                 return Err(binder_error(format!("Catalog \"{catalog}\" does not exist!")));
             }
@@ -259,8 +275,7 @@ impl Binder<'_> {
         for (name, cte) in &node.cte_map.0 {
             match &cte.query.kind {
                 QueryNodeKind::Select(_) | QueryNodeKind::SetOperation(_) => {}
-                QueryNodeKind::RecursiveCte(node) if node.key_targets.is_empty() => {}
-                QueryNodeKind::RecursiveCte(_) => return Err(not_implemented("USING KEY")),
+                QueryNodeKind::RecursiveCte(_) => {}
                 _ => return Err(not_implemented("data-modifying statements in WITH")),
             }
             self.ctes
@@ -321,7 +336,9 @@ impl Binder<'_> {
         for (column, alias) in names.iter_mut().zip(aliases) {
             column.clone_from(alias);
         }
+        let key = bind_cte_key(&node.key_targets, &names)?;
         let working = Arc::new(Mutex::new(ColumnDataCollection::new(types.clone())));
+        let recurring = Arc::new(Mutex::new(ColumnDataCollection::new(types.clone())));
         let used = Arc::new(AtomicBool::new(false));
         let mut binder = self.child_binder();
         binder.working_tables.push(WorkingTable {
@@ -329,6 +346,7 @@ impl Binder<'_> {
             names: names.clone(),
             types: types.clone(),
             rows: working.clone(),
+            recurring: recurring.clone(),
             used: used.clone(),
         });
         let recursive = binder.bind_query_node(&node.right)?;
@@ -340,7 +358,7 @@ impl Binder<'_> {
         }
         let columns = (0..types.len()).map(Some).collect();
         let mut recursive = self.cast_plan(recursive, &types, columns);
-        let plan = if used.load(Ordering::Relaxed) {
+        let plan = if used.load(Ordering::Relaxed) || !key.is_empty() {
             resolve_column_bindings(&mut recursive)?;
             LogicalOperator::new(
                 LogicalOperatorKind::RecursiveCte {
@@ -348,6 +366,8 @@ impl Binder<'_> {
                     types: types.clone(),
                     union_all: node.union_all,
                     working,
+                    recurring,
+                    key,
                     recursive: Box::new(recursive),
                 },
                 vec![anchor.plan],
@@ -566,11 +586,29 @@ impl Binder<'_> {
                 name,
             ))
         };
+        // DISTINCT ON keeps the first row of each group as ORDER BY sees them
+        let mut prepared = prepared;
+        if let Some(distinct) = prepared
+            .iter()
+            .position(|m| matches!(m, PreparedModifier::DistinctOn(_)))
+            && let Some(order) = prepared
+                .iter()
+                .position(|m| matches!(m, PreparedModifier::Order(_) | PreparedModifier::OrderAll(_)))
+            && order > distinct
+        {
+            prepared.swap(distinct, order);
+        }
         for modifier in prepared {
             let kind = match modifier {
                 PreparedModifier::Distinct => LogicalOperatorKind::Distinct {
                     targets: (0..column_count).map(column).collect::<Result<_>>()?,
                 },
+                PreparedModifier::DistinctOn(indexes) => LogicalOperatorKind::Distinct {
+                    targets: indexes.into_iter().map(column).collect::<Result<_>>()?,
+                },
+                PreparedModifier::LimitPercent { percent, offset } => {
+                    LogicalOperatorKind::LimitPercent { percent, offset }
+                }
                 PreparedModifier::Order(orders) => LogicalOperatorKind::Order {
                     orders: orders
                         .into_iter()
@@ -657,9 +695,6 @@ impl Binder<'_> {
     }
 
     fn bind_select_node(&mut self, node: &SelectNode, modifiers: &[ResultModifier]) -> Result<BoundStatement> {
-        if node.sample.is_some() {
-            return Err(not_implemented("SAMPLE"));
-        }
         let mut plan = self.bind_table_ref(&node.from_table)?;
         let mut select_list = self.expand_star_expressions(&node.select_list)?;
         if select_list.is_empty() {
@@ -718,7 +753,12 @@ impl Binder<'_> {
         for modifier in modifiers {
             prepared.push(self.prepare_modifier(modifier, &mut select_list, &mut state)?);
         }
-        if let Some(condition) = &node.where_clause {
+        let where_clause = node
+            .where_clause
+            .as_deref()
+            .map(|condition| self.bind_where_star_expression(condition))
+            .transpose()?;
+        if let Some(condition) = &where_clause {
             // the WHERE clause may refer to aliases of the select list (`ColumnAliasBinder`)
             self.alias_fallback = state
                 .alias_map
@@ -736,6 +776,9 @@ impl Binder<'_> {
                 },
                 vec![plan],
             );
+        }
+        if let Some(options) = &node.sample {
+            plan = bind_sample(options, plan)?;
         }
         self.aggregate_error = "GROUP BY clause cannot contain aggregates!";
         self.window_error = "GROUP BY clause cannot contain window functions!";
@@ -1018,7 +1061,13 @@ impl Binder<'_> {
     ) -> Result<PreparedModifier> {
         Ok(match modifier {
             ResultModifier::Distinct(targets) if targets.is_empty() => PreparedModifier::Distinct,
-            ResultModifier::Distinct(_) => return Err(not_implemented("DISTINCT ON")),
+            ResultModifier::Distinct(targets) => {
+                let mut indexes = Vec::with_capacity(targets.len());
+                for target in targets {
+                    indexes.push(self.bind_order_expression(target, select_list, state)?);
+                }
+                PreparedModifier::DistinctOn(indexes)
+            }
             ResultModifier::Order(nodes) => {
                 if let [OrderByNode { expr, order, nulls }] = nodes.as_slice()
                     && let ExprKind::Star(star) = &expr.kind
@@ -1041,7 +1090,14 @@ impl Binder<'_> {
             }
             ResultModifier::Limit { limit, offset, percent } => {
                 if *percent {
-                    return Err(not_implemented("LIMIT with a percentage"));
+                    let offset = match offset {
+                        Some(offset) => self.bind_limit_value(offset, true)?.unwrap_or(0),
+                        None => 0,
+                    };
+                    let Some(limit) = limit else {
+                        return Ok(PreparedModifier::Limit { limit: None, offset });
+                    };
+                    return self.bind_limit_percent(limit, offset);
                 }
                 let limit = match limit {
                     Some(limit) => self.bind_limit_value(limit, false)?,
@@ -1056,6 +1112,25 @@ impl Binder<'_> {
         })
     }
 
+    /// `Binder::BindLimitValue` for a percentage.
+    fn bind_limit_percent(&mut self, expr: &Expr, offset: u64) -> Result<PreparedModifier> {
+        let mut binder = self.child_binder();
+        let bound = binder.bind_expression(expr)?;
+        let value = evaluate_scalar(&bound.cast_to(&LogicalType::DOUBLE, false))?;
+        if value.is_null() {
+            return Ok(PreparedModifier::Limit { limit: None, offset });
+        }
+        let percent: f64 = value.try_to_string()?.parse().unwrap_or(0.0);
+        if !(0.0..=100.0).contains(&percent) {
+            return Err(binder_error(if percent < 0.0 {
+                "Percentage value(s) cannot be negative"
+            } else {
+                "Percentage value(s) must be between 0 and 100"
+            }));
+        }
+        Ok(PreparedModifier::LimitPercent { percent, offset })
+    }
+
     /// `Binder::BindLimitValue` for constant values: NULL means no limit (or no offset).
     fn bind_limit_value(&mut self, expr: &Expr, is_offset: bool) -> Result<Option<u64>> {
         let mut binder = self.child_binder();
@@ -1063,11 +1138,6 @@ impl Binder<'_> {
         let bound = binder.bind_expression(expr)?;
         if !binder.correlated.lock().is_empty() {
             return Err(binder_error("Correlated columns not supported in LIMIT/OFFSET"));
-        }
-        if !bound.is_foldable() {
-            return Err(not_implemented(
-                "LIMIT and OFFSET with expressions that are not constant",
-            ));
         }
         let value = evaluate_scalar(&bound.cast_to(&LogicalType::BIGINT, false))?;
         if value.is_null() {
@@ -1154,145 +1224,128 @@ impl Binder<'_> {
     fn expand_star_expressions(&self, select_list: &[Expr]) -> Result<Vec<Expr>> {
         let mut result = Vec::new();
         for expr in select_list {
-            let ExprKind::Star(star) = &expr.kind else {
-                // a star only stands for columns at the root of an expression
-                let mut nested = None;
-                visit_expr_mut(&mut expr.clone(), &mut |e| {
-                    if let ExprKind::Star(star) = &e.kind {
-                        nested = Some(star.columns || star.expr.is_some());
-                    }
-                });
-                match nested {
-                    Some(true) => return Err(not_implemented("COLUMNS")),
-                    Some(false) => {
-                        return Err(binder_error(
-                            "STAR expression is only allowed as the root element of an expression. Use COLUMNS(*) \
-                             instead.",
-                        ));
-                    }
-                    None => {}
-                }
-                result.push(expr.clone());
-                continue;
-            };
-            if star.columns || star.expr.is_some() {
-                return Err(not_implemented("COLUMNS"));
+            self.expand_star_expression(expr, &mut result)?;
+        }
+        Ok(result)
+    }
+
+    /// `BindContext::GenerateAllColumnExpressions` for one star.
+    pub(super) fn generate_all_columns(&self, star: &ast::StarExpr) -> Result<Vec<Expr>> {
+        let mut result = Vec::new();
+        if self.bind_context.bindings.is_empty() {
+            return Err(binder_error("SELECT * expression without FROM clause!"));
+        }
+        let bindings: Vec<&Binding> = if star.relation_name.is_empty() {
+            self.bind_context.bindings.iter().collect()
+        } else {
+            let found: Vec<&Binding> = self
+                .bind_context
+                .bindings
+                .iter()
+                .filter(|b| b.alias.eq_ignore_ascii_case(&star.relation_name))
+                .collect();
+            if found.is_empty() {
+                return Err(binder_error(format!(
+                    "Referenced table \"{}\" not found!",
+                    star.relation_name
+                )));
             }
-            if self.bind_context.bindings.is_empty() {
-                return Err(binder_error("SELECT * expression without FROM clause!"));
+            if found.len() > 1 {
+                return Err(BindContext::ambiguous_table(&star.relation_name));
             }
-            let bindings: Vec<&Binding> = if star.relation_name.is_empty() {
-                self.bind_context.bindings.iter().collect()
-            } else {
-                let found: Vec<&Binding> = self
-                    .bind_context
-                    .bindings
+            found
+        };
+        let in_scope = |qualification: &[String], binding: &Binding| match qualification.last() {
+            Some(table) => table.eq_ignore_ascii_case(&binding.alias),
+            None => true,
+        };
+        // a USING column appears once, as `*` and not `t.*` would have it
+        let mut handled_using_columns = Vec::new();
+        let mut excluded = vec![false; star.exclude_list.len()];
+        let mut replaced = vec![false; star.replace_list.len()];
+        for binding in &bindings {
+            for name in &binding.names {
+                // CheckExclusionList
+                let exclusion = star
+                    .exclude_list
                     .iter()
-                    .filter(|b| b.alias.eq_ignore_ascii_case(&star.relation_name))
-                    .collect();
-                if found.is_empty() {
-                    return Err(binder_error(format!(
-                        "Referenced table \"{}\" not found!",
-                        star.relation_name
-                    )));
+                    .position(|e| e.column.eq_ignore_ascii_case(name) && in_scope(&e.qualification, binding));
+                if let Some(position) = exclusion {
+                    excluded[position] = true;
+                    continue;
                 }
-                if found.len() > 1 {
-                    return Err(BindContext::ambiguous_table(&star.relation_name));
-                }
-                found
-            };
-            let in_scope = |qualification: &[String], binding: &Binding| match qualification.last() {
-                Some(table) => table.eq_ignore_ascii_case(&binding.alias),
-                None => true,
-            };
-            // a USING column appears once, as `*` and not `t.*` would have it
-            let mut handled_using_columns = Vec::new();
-            let mut excluded = vec![false; star.exclude_list.len()];
-            let mut replaced = vec![false; star.replace_list.len()];
-            for binding in &bindings {
-                for name in &binding.names {
-                    // CheckExclusionList
-                    let exclusion = star
-                        .exclude_list
-                        .iter()
-                        .position(|e| e.column.eq_ignore_ascii_case(name) && in_scope(&e.qualification, binding));
-                    if let Some(position) = exclusion {
-                        excluded[position] = true;
+                let set = if star.relation_name.is_empty() {
+                    self.bind_context.using_binding_of(name, &binding.alias)
+                } else {
+                    None
+                };
+                let mut column: Expr = match set {
+                    Some(set) if handled_using_columns.contains(&set) => continue,
+                    Some(set) => {
+                        handled_using_columns.push(set);
+                        self.bind_context.using_columns[set].expression(name)
+                    }
+                    None => ExprKind::ColumnRef(self.bind_context.qualified_names(binding, name)).into(),
+                };
+                column.alias = name.clone();
+                // HandleRename
+                if let Some(position) = star.replace_list.iter().position(|(n, _)| n.eq_ignore_ascii_case(name)) {
+                    if replaced[position] {
                         continue;
                     }
-                    let set = if star.relation_name.is_empty() {
-                        self.bind_context.using_binding_of(name, &binding.alias)
-                    } else {
-                        None
-                    };
-                    let mut column: Expr = match set {
-                        Some(set) if handled_using_columns.contains(&set) => continue,
-                        Some(set) => {
-                            handled_using_columns.push(set);
-                            self.bind_context.using_columns[set].expression(name)
-                        }
-                        None => ExprKind::ColumnRef(self.bind_context.qualified_names(binding, name)).into(),
-                    };
-                    column.alias = name.clone();
-                    // HandleRename
-                    if let Some(position) = star.replace_list.iter().position(|(n, _)| n.eq_ignore_ascii_case(name)) {
-                        if replaced[position] {
-                            continue;
-                        }
-                        replaced[position] = true;
-                        let (replaced_name, replacement) = &star.replace_list[position];
-                        column = replacement.clone();
-                        column.alias = replaced_name.clone();
-                    }
-                    let rename = star
-                        .rename_list
-                        .iter()
-                        .position(|(n, _)| n.column.eq_ignore_ascii_case(name) && in_scope(&n.qualification, binding));
-                    if let Some(position) = rename {
-                        column.alias = star.rename_list[position].1.clone();
-                    }
-                    result.push(column);
+                    replaced[position] = true;
+                    let (replaced_name, replacement) = &star.replace_list[position];
+                    column = replacement.clone();
+                    column.alias = replaced_name.clone();
                 }
-            }
-            let scope = if star.relation_name.is_empty() {
-                "FROM clause"
-            } else {
-                star.relation_name.as_str()
-            };
-            let candidates = |missing: &str| {
-                let mut unique: Vec<&String> = Vec::new();
-                for name in bindings.iter().flat_map(|b| &b.names) {
-                    if !unique.iter().any(|u| u.eq_ignore_ascii_case(name)) {
-                        unique.push(name);
-                    }
-                }
-                let scores = unique
-                    .into_iter()
-                    .map(|name| (name.clone(), similarity_rating(name, missing)))
-                    .collect();
-                candidates_message(&top_n_strings(scores), "Candidate bindings")
-            };
-            if let Some((name, _)) = star.exclude_list.iter().zip(&excluded).find(|(_, found)| !**found) {
-                let display: Vec<String> = name
-                    .qualification
+                let rename = star
+                    .rename_list
                     .iter()
-                    .chain([&name.column])
-                    .filter(|part| !part.is_empty())
-                    .map(|part| sql_quoted_identifier(part))
-                    .collect();
-                return Err(binder_error(format!(
-                    "Column {} in EXCLUDE list not found in {scope}{}",
-                    display.join("."),
-                    candidates(&name.column)
-                )));
+                    .position(|(n, _)| n.column.eq_ignore_ascii_case(name) && in_scope(&n.qualification, binding));
+                if let Some(position) = rename {
+                    column.alias = star.rename_list[position].1.clone();
+                }
+                result.push(column);
             }
-            if let Some(((name, _), _)) = star.replace_list.iter().zip(&replaced).find(|(_, found)| !**found) {
-                return Err(binder_error(format!(
-                    "Column {} in REPLACE list not found in {scope}{}",
-                    sql_quoted_identifier(name),
-                    candidates(name)
-                )));
+        }
+        let scope = if star.relation_name.is_empty() {
+            "FROM clause"
+        } else {
+            star.relation_name.as_str()
+        };
+        let candidates = |missing: &str| {
+            let mut unique: Vec<&String> = Vec::new();
+            for name in bindings.iter().flat_map(|b| &b.names) {
+                if !unique.iter().any(|u| u.eq_ignore_ascii_case(name)) {
+                    unique.push(name);
+                }
             }
+            let scores = unique
+                .into_iter()
+                .map(|name| (name.clone(), similarity_rating(name, missing)))
+                .collect();
+            candidates_message(&top_n_strings(scores), "Candidate bindings")
+        };
+        if let Some((name, _)) = star.exclude_list.iter().zip(&excluded).find(|(_, found)| !**found) {
+            let display: Vec<String> = name
+                .qualification
+                .iter()
+                .chain([&name.column])
+                .filter(|part| !part.is_empty())
+                .map(|part| sql_quoted_identifier(part))
+                .collect();
+            return Err(binder_error(format!(
+                "Column {} in EXCLUDE list not found in {scope}{}",
+                display.join("."),
+                candidates(&name.column)
+            )));
+        }
+        if let Some(((name, _), _)) = star.replace_list.iter().zip(&replaced).find(|(_, found)| !**found) {
+            return Err(binder_error(format!(
+                "Column {} in REPLACE list not found in {scope}{}",
+                sql_quoted_identifier(name),
+                candidates(name)
+            )));
         }
         Ok(result)
     }
@@ -1315,9 +1368,14 @@ impl Binder<'_> {
 
     /// `Binder::Bind(TableRef)` + `CreatePlan`: the FROM clause.
     pub(super) fn bind_table_ref(&mut self, table_ref: &TableRef) -> Result<LogicalOperator> {
-        if table_ref.sample.is_some() {
-            return Err(not_implemented("TABLESAMPLE"));
+        let plan = self.bind_unsampled_table_ref(table_ref)?;
+        match &table_ref.sample {
+            Some(options) => bind_sample(options, plan),
+            None => Ok(plan),
         }
+    }
+
+    fn bind_unsampled_table_ref(&mut self, table_ref: &TableRef) -> Result<LogicalOperator> {
         match &table_ref.kind {
             TableRefKind::Empty => {
                 let table_index = self.generate_table_index();
@@ -1330,15 +1388,19 @@ impl Binder<'_> {
                 if at_clause.is_some() {
                     return Err(not_implemented("AT clauses"));
                 }
-                if name.qualification.is_empty()
+                let recurring = matches!(name.qualification.as_slice(), [q] if q.eq_ignore_ascii_case("recurring"));
+                if (name.qualification.is_empty() || recurring)
                     && let Some(working) = self
                         .working_tables
                         .iter()
                         .rev()
                         .find(|w| w.name.eq_ignore_ascii_case(&name.name))
                 {
-                    let working = working.clone();
+                    let mut working = working.clone();
                     working.used.store(true, Ordering::Relaxed);
+                    if recurring {
+                        working.rows = working.recurring.clone();
+                    }
                     let alias = if table_ref.alias.is_empty() {
                         working.name.clone()
                     } else {
@@ -1353,6 +1415,7 @@ impl Binder<'_> {
                         names,
                         types: working.types.clone(),
                         row_id: None,
+                        generated: Vec::new(),
                     });
                     return Ok(LogicalOperator::new(
                         LogicalOperatorKind::WorkingTable {
@@ -1383,6 +1446,9 @@ impl Binder<'_> {
                         name.name
                     )));
                 }
+                if entry.is_err() && name.qualification.is_empty() && Self::is_system_table(&name.name) {
+                    return self.bind_system_table(table_ref, &name.name);
+                }
                 let table = match entry? {
                     TableOrView::Table(table) => table,
                     TableOrView::View(view) => return self.bind_view(table_ref, view),
@@ -1392,17 +1458,12 @@ impl Binder<'_> {
                 } else {
                     table_ref.alias.clone()
                 };
-                let names = table.columns.iter().map(|c| c.name.clone()).collect();
+                let names = table.logical_columns().iter().map(|c| c.name.to_string()).collect();
                 let names = Self::alias_columns(table_ref, &alias, names)?;
                 let table_index = self.generate_table_index();
-                self.bind_context.add_binding(Binding {
-                    schema: table_ref.alias.is_empty().then(|| table.schema.clone()),
-                    alias,
-                    table_index,
-                    names,
-                    types: table.types(),
-                    row_id: Some(table.columns.len()),
-                });
+                let mut binding = table_binding(&table, alias, table_index, names);
+                binding.schema = table_ref.alias.is_empty().then(|| table.schema.clone());
+                self.bind_context.add_binding(binding);
                 // the scan also outputs the rowid, past the columns
                 let column_ids = (0..table.columns.len()).chain([COLUMN_IDENTIFIER_ROW_ID]).collect();
                 Ok(LogicalOperator::new(
@@ -1431,6 +1492,7 @@ impl Binder<'_> {
                     names,
                     types: types.clone(),
                     row_id: None,
+                    generated: Vec::new(),
                 });
                 Ok(LogicalOperator::new(
                     LogicalOperatorKind::ExpressionGet {
@@ -1478,8 +1540,34 @@ impl Binder<'_> {
                 {
                     return Ok(plan);
                 }
+                if let ExprKind::Function(call) = &function.kind
+                    && call.name.qualification.is_empty()
+                    && matches!(
+                        call.name.name.to_lowercase().as_str(),
+                        "pragma_table_info" | "pragma_show"
+                    )
+                    && let [argument] = call.args.as_slice()
+                {
+                    let value = self.constant_argument(&argument.expr)?;
+                    let text = value.try_to_string()?;
+                    let mut parts: Vec<String> = text.split('.').map(str::to_string).collect();
+                    let table = QualifiedName {
+                        name: parts.pop().unwrap_or_default(),
+                        qualification: parts,
+                    };
+                    return self.bind_pragma_table_info(table_ref, &call.name.name, &table);
+                }
+                if let ExprKind::Function(call) = &function.kind
+                    && call.name.qualification.is_empty()
+                    && call.args.is_empty()
+                    && Self::is_system_table(&call.name.name)
+                {
+                    return self.bind_system_table(table_ref, &call.name.name);
+                }
                 self.bind_range(function, table_ref)
             }
+            TableRefKind::Pivot(pivot) => self.bind_pivot(table_ref, pivot),
+            TableRefKind::Show(show) => self.bind_show_ref(table_ref, show),
             _ => Err(not_implemented("this kind of table reference")),
         }
     }
@@ -1500,6 +1588,7 @@ impl Binder<'_> {
             names,
             types: bound.types,
             row_id: None,
+            generated: Vec::new(),
         });
         Ok(bound.plan)
     }
@@ -1593,6 +1682,7 @@ impl Binder<'_> {
             names,
             types: vec![LogicalType::BIGINT],
             row_id: None,
+            generated: Vec::new(),
         });
         Ok(LogicalOperator::new(
             LogicalOperatorKind::Range {
@@ -1666,7 +1756,7 @@ impl Binder<'_> {
 
     /// `Binder::Bind(InsertStatement)`.
     /// Makes the CTEs of a statement visible, for what `bind` binds.
-    fn with_ctes<T>(&mut self, cte_map: &CteMap, bind: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+    pub(super) fn with_ctes<T>(&mut self, cte_map: &CteMap, bind: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         let scope = self.ctes.len();
         for (name, cte) in &cte_map.0 {
             self.ctes
@@ -1678,7 +1768,7 @@ impl Binder<'_> {
     }
 
     /// The target of an UPDATE or DELETE, with what it binds to: only a base table will do.
-    fn bind_write_target(
+    pub(super) fn bind_write_target(
         &mut self,
         table_ref: &TableRef,
         error: &str,
@@ -1712,6 +1802,7 @@ impl Binder<'_> {
             names: table.columns.iter().map(|c| c.name.clone()).collect(),
             types: table.types(),
             row_id: None,
+            generated: Vec::new(),
         });
         let excluded_star =
             |e: &Expr| matches!(&e.kind, ExprKind::Star(s) if s.relation_name.eq_ignore_ascii_case("excluded"));
@@ -1735,6 +1826,23 @@ impl Binder<'_> {
             }
         }
         let names: Vec<String> = list.iter().map(expression_name).collect();
+        if self.merge_action_column {
+            // a virtual column: `*` left it out
+            let columns = table.columns.len();
+            let mut hidden: Vec<String> = (0..columns).map(|i| format!("\u{1}{i}")).collect();
+            hidden.push("merge_action".to_string());
+            let mut types = vec![LogicalType::SQLNULL; columns];
+            types.push(LogicalType::VARCHAR);
+            self.bind_context.add_binding(Binding {
+                alias: "\u{1}merge".to_string(),
+                schema: None,
+                table_index,
+                names: hidden,
+                types,
+                row_id: None,
+                generated: Vec::new(),
+            });
+        }
         let expressions = list
             .iter()
             .map(|e| self.bind_expression(e))
@@ -1768,7 +1876,7 @@ impl Binder<'_> {
     }
 
     /// The alias of the target of an UPDATE or DELETE.
-    fn write_alias(table_ref: &TableRef, table: &TableCatalogEntry) -> String {
+    pub(super) fn write_alias(table_ref: &TableRef, table: &TableCatalogEntry) -> String {
         if table_ref.alias.is_empty() {
             table.name.clone()
         } else {
@@ -1846,6 +1954,11 @@ impl Binder<'_> {
             let mut columns = Vec::with_capacity(info.columns.len());
             let mut expressions = Vec::with_capacity(info.columns.len() + 1);
             for (name, value) in info.columns.iter().zip(&info.expressions) {
+                if table.is_generated(name) {
+                    return Err(binder_error(format!(
+                        "Cant update column \"{name}\" because it is a generated column!"
+                    )));
+                }
                 let Some(index) = table.column_index(name) else {
                     return Err(binder_error(format!(
                         "Referenced update column {name} not found in table!\n{}",
@@ -1953,6 +2066,9 @@ impl Binder<'_> {
                         "Duplicate column name {} in INSERT",
                         sql_quoted_identifier(name)
                     )));
+                }
+                if table.is_generated(name) {
+                    return Err(binder_error("Cannot insert into a generated column"));
                 }
                 let Some(index) = table.column_index(name) else {
                     return Err(binder_error(format!(
@@ -2099,13 +2215,14 @@ impl Binder<'_> {
 
     /// `Binder::BindCreateTableInfo`.
     pub(super) fn bind_create_table(&mut self, info: &CreateTableInfo) -> Result<BoundStatement> {
-        if info.temporary {
-            return Err(not_implemented("CREATE TEMPORARY TABLE"));
-        }
         if !info.partition_keys.is_empty() || !info.sort_keys.is_empty() || !info.options.is_empty() {
             return Err(not_implemented("table options"));
         }
-        let schema = self.catalog.schema_for(schema_of(&info.name)?)?;
+        let schema = self.catalog.schema_for(
+            info.temporary
+                .then_some(TEMP_SCHEMA)
+                .map_or_else(|| schema_of(&info.name), |s| Ok(Some(s)))?,
+        )?;
         let on_conflict = match info.on_conflict {
             AstConflict::Error => OnCreateConflict::Error,
             AstConflict::Ignore => OnCreateConflict::Ignore,
@@ -2115,13 +2232,10 @@ impl Binder<'_> {
             return self.bind_create_table_as(info, query, schema, on_conflict);
         }
         let mut columns = Vec::with_capacity(info.columns.len());
-        for column in &info.columns {
-            if column.generated.is_some() {
-                return Err(not_implemented("generated columns"));
-            }
-            if columns
+        for (position, column) in info.columns.iter().enumerate() {
+            if info.columns[..position]
                 .iter()
-                .any(|c: &ColumnDefinition| c.name.eq_ignore_ascii_case(&column.name))
+                .any(|c| c.name.eq_ignore_ascii_case(&column.name))
             {
                 return Err(Error::new(
                     ErrorKind::Catalog,
@@ -2131,6 +2245,9 @@ impl Binder<'_> {
                     ),
                 ));
             }
+            if column.generated.is_some() {
+                continue;
+            }
             let Some(ty) = &column.column_type else {
                 return Err(not_implemented("columns without a type"));
             };
@@ -2139,15 +2256,28 @@ impl Binder<'_> {
                 let mut binder = Binder::new(self.catalog);
                 binder.aggregate_error = "DEFAULT value cannot contain aggregates!";
                 definition.default_value = Some(checked_cast(binder.bind_expression(default)?, &definition.ty)?);
+                definition.default_text = Some(default.to_string());
             }
             columns.push(definition);
         }
-        let constraints = self.bind_table_constraints(info, &mut columns, &schema)?;
+        let generated = self.bind_generated_columns(&info.name.name, &info.columns, &columns)?;
+        if columns.is_empty() {
+            return Err(binder_error(
+                "Creating a table without physical (non-generated) columns is not supported",
+            ));
+        }
+        let physical = CreateTableInfo {
+            columns: info.columns.iter().filter(|c| c.generated.is_none()).cloned().collect(),
+            constraints: physical_constraints(info)?,
+            ..info.clone()
+        };
+        let constraints = self.bind_table_constraints(&physical, &mut columns, &schema)?;
         let plan = LogicalOperator::new(
             LogicalOperatorKind::CreateTable {
                 schema,
                 name: info.name.name.clone(),
                 columns,
+                generated,
                 constraints,
                 on_conflict,
             },
@@ -2192,6 +2322,7 @@ impl Binder<'_> {
                             schema,
                             name: info.name.name.clone(),
                             columns: Vec::new(),
+                            generated: Vec::new(),
                             constraints: Vec::new(),
                             on_conflict,
                         },
@@ -2250,6 +2381,81 @@ impl Binder<'_> {
 }
 
 /// Fails like DuckDB would for a cast that is not implemented here yet.
+/// The USING KEY clause: the columns it names are keys, or aggregates of what they get.
+fn bind_cte_key(targets: &[Expr], names: &[String]) -> Result<Vec<CteKeyColumn>> {
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let position = |name: &str| -> Result<usize> {
+        names
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(name))
+            .ok_or_else(|| binder_error(format!("Referenced column \"{name}\" not found in FROM clause!")))
+    };
+    let mut columns = vec![CteKeyColumn::Last; names.len()];
+    let mut seen = vec![false; names.len()];
+    let mut has_key = false;
+    for target in targets {
+        let (column, mode) = match &target.kind {
+            ExprKind::ColumnRef(parts) => {
+                has_key = true;
+                (position(parts.last().expect("a name"))?, CteKeyColumn::Key)
+            }
+            ExprKind::Function(call) if call.args.len() == 1 => {
+                let ExprKind::ColumnRef(parts) = &call.args[0].expr.kind else {
+                    return Err(binder_error(
+                        "In USING KEY, an aggregate must either have a column reference or an empty argument list",
+                    ));
+                };
+                let mode = match call.name.name.to_lowercase().as_str() {
+                    "min" => CteKeyColumn::Min,
+                    "max" => CteKeyColumn::Max,
+                    "first" | "arbitrary" | "any_value" => CteKeyColumn::First,
+                    "last" => CteKeyColumn::Last,
+                    other => return Err(not_implemented(&format!("the aggregate {other} in USING KEY"))),
+                };
+                (position(parts.last().expect("a name"))?, mode)
+            }
+            _ => {
+                return Err(binder_error(format!(
+                    "'{target}' can't be used in the USING KEY clause."
+                )));
+            }
+        };
+        if std::mem::replace(&mut seen[column], true) {
+            return Err(binder_error(format!(
+                "Column {} referenced multiple times in USING KEY clause",
+                names[column]
+            )));
+        }
+        columns[column] = mode;
+    }
+    if !has_key {
+        return Err(binder_error("USING KEY clause requires at least one key column."));
+    }
+    Ok(columns)
+}
+
+/// `LogicalSample`, with the check of `PlanSample`.
+fn bind_sample(options: &ast::SampleOptions, plan: LogicalOperator) -> Result<LogicalOperator> {
+    if !options.is_percentage && options.method == ast::SampleMethod::Bernoulli {
+        return Err(Error::new(
+            ErrorKind::Parser,
+            format!(
+                "Sample method {} cannot be used with a discrete sample count, either switch to reservoir sampling \
+                 or use a sample_size",
+                options.method.name()
+            ),
+        ));
+    }
+    Ok(LogicalOperator::new(
+        LogicalOperatorKind::Sample {
+            options: options.clone(),
+        },
+        vec![plan],
+    ))
+}
+
 fn check_cast(from: &LogicalType, to: &LogicalType) -> Result<()> {
     if crate::function::cast::has_cast(from, to) {
         Ok(())

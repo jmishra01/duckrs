@@ -11,8 +11,8 @@ use super::statements::schema_of;
 use super::table_constraints::{bind_unique, check_key_types};
 use super::{Binder, Binding, binder_error};
 use crate::catalog::{
-    ColumnDefinition, SchemaCatalogEntry, TableCatalogEntry, TableConstraint, TableOrView, ViewCatalogEntry,
-    missing_entry,
+    ColumnDefinition, GeneratedColumn, SchemaCatalogEntry, TableCatalogEntry, TableConstraint, TableOrView,
+    ViewCatalogEntry, missing_entry,
 };
 use crate::planner::column_binding_resolver::resolve_expression;
 use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
@@ -43,6 +43,7 @@ pub struct BoundTableAlter {
     pub table: Arc<TableCatalogEntry>,
     pub name: String,
     pub columns: Vec<ColumnDefinition>,
+    pub generated: Vec<GeneratedColumn>,
     pub constraints: Vec<TableConstraint>,
     /// The new columns, reading the old ones; `None` when the rows stay as they are.
     pub projection: Option<Vec<BoundExpr>>,
@@ -50,6 +51,82 @@ pub struct BoundTableAlter {
     pub verify: bool,
     /// The error of an ADD constraint that the rows pass: C++ builds the index first.
     pub rejected: Option<Error>,
+}
+
+/// The columns of `table` and then `column`, as CREATE TABLE would list them.
+fn existing_columns(table: &TableCatalogEntry, column: &ParsedColumn) -> Vec<ParsedColumn> {
+    let mut parsed: Vec<ParsedColumn> = table
+        .logical_columns()
+        .iter()
+        .map(|c| ParsedColumn {
+            name: c.name.to_string(),
+            column_type: None,
+            generated: c.generated.map(|e| Box::new(e.clone())),
+            default_value: None,
+            compression: None,
+        })
+        .collect();
+    parsed.push(column.clone());
+    parsed
+}
+
+/// `ColumnDependencyManager::GetDependents`: the generated columns reading `name`, in any depth.
+fn generated_dependents(table: &TableCatalogEntry, name: &str) -> Result<Vec<String>> {
+    let mut result: Vec<String> = Vec::new();
+    let mut pending = vec![name.to_string()];
+    while let Some(next) = pending.pop() {
+        for column in &table.generated {
+            let reads = super::generated::dependencies(&column.expr)?;
+            if reads.iter().any(|r| r.eq_ignore_ascii_case(&next))
+                && !result.iter().any(|r| r.eq_ignore_ascii_case(&column.name))
+            {
+                result.push(column.name.clone());
+                pending.push(column.name.clone());
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn rename_in_generated(generated: &mut [GeneratedColumn], old: &str, new: &str) {
+    for column in generated {
+        if column.name.eq_ignore_ascii_case(old) {
+            column.name = new.to_string();
+        }
+        visit_expr_mut(&mut column.expr, &mut |e| {
+            if let ExprKind::ColumnRef(names) = &mut e.kind
+                && names.last().is_some_and(|n| n.eq_ignore_ascii_case(old))
+            {
+                *names.last_mut().expect("a name") = new.to_string();
+            }
+        });
+    }
+}
+
+/// The positions of the generated columns, after dropping `dropped` and its dependents.
+fn reposition_generated(generated: &mut [GeneratedColumn], table: &TableCatalogEntry, dropped: &str) {
+    let logical = table.logical_columns();
+    let keep = |name: &str| {
+        !name.eq_ignore_ascii_case(dropped)
+            && (generated_contains(table, name, generated) || table.column_index(name).is_some())
+    };
+    let remaining: Vec<&str> = logical.iter().map(|c| c.name).filter(|n| keep(n)).collect();
+    let positions: Vec<usize> = generated
+        .iter()
+        .map(|c| {
+            remaining
+                .iter()
+                .position(|n| n.eq_ignore_ascii_case(&c.name))
+                .unwrap_or(c.position)
+        })
+        .collect();
+    for (column, position) in generated.iter_mut().zip(positions) {
+        column.position = position;
+    }
+}
+
+fn generated_contains(table: &TableCatalogEntry, name: &str, generated: &[GeneratedColumn]) -> bool {
+    !table.is_generated(name) || generated.iter().any(|c| c.name.eq_ignore_ascii_case(name))
 }
 
 fn catalog_error(message: String) -> Error {
@@ -179,15 +256,13 @@ impl Binder<'_> {
     }
 
     fn bind_new_column(&self, column: &ParsedColumn) -> Result<ColumnDefinition> {
-        if column.generated.is_some() {
-            return Err(crate::unported("generated columns"));
-        }
         let Some(ty) = &column.column_type else {
             return Err(crate::unported("columns without a type"));
         };
         let mut definition = ColumnDefinition::new(column.name.clone(), self.bind_type(ty)?);
         if let Some(default) = &column.default_value {
             definition.default_value = Some(self.bind_default(default, &definition.ty)?);
+            definition.default_text = Some(default.to_string());
         }
         Ok(definition)
     }
@@ -231,6 +306,7 @@ impl Binder<'_> {
             names: table.columns.iter().map(|c| c.name.clone()).collect(),
             types: table.types(),
             row_id: None,
+            generated: Vec::new(),
         });
         let mut bound = binder.bind_expression(expression)?;
         let bindings: Vec<ColumnBinding> = (0..table.columns.len())
@@ -249,6 +325,7 @@ impl Binder<'_> {
         let mut alter = BoundTableAlter {
             name: table.name.clone(),
             columns: table.columns.clone(),
+            generated: table.generated.clone(),
             constraints: table.constraints.clone(),
             projection: None,
             verify: false,
@@ -268,6 +345,17 @@ impl Binder<'_> {
             }
             AlterKind::RenameColumn { path, new_name } => {
                 nested_error(path)?;
+                if table.is_generated(new_name) {
+                    return Err(catalog_error(format!(
+                        "Column with name {} already exists!",
+                        sql_quoted_identifier(new_name)
+                    )));
+                }
+                let renames_generated = table.is_generated(&path[0]);
+                rename_in_generated(&mut alter.generated, &path[0], new_name);
+                if renames_generated {
+                    return Ok(BoundAlter::Table(alter));
+                }
                 let index = column_index(&table, &path[0])?;
                 if table.column_index(new_name).is_some_and(|other| other != index) {
                     return Err(catalog_error(format!(
@@ -302,7 +390,7 @@ impl Binder<'_> {
                 not_null,
                 unique,
             } => {
-                if table.column_index(&column.name).is_some() {
+                if table.column_index(&column.name).is_some() || table.is_generated(&column.name) {
                     if *if_not_exists {
                         return Ok(BoundAlter::Nothing);
                     }
@@ -310,6 +398,18 @@ impl Binder<'_> {
                         "Column with name {} already exists!",
                         sql_quoted_identifier(&column.name)
                     )));
+                }
+                if column.generated.is_some() {
+                    let parsed = existing_columns(&table, column);
+                    let mut bound = self.bind_generated_columns(&table.name, &parsed, &table.columns)?;
+                    let position = parsed.len() - 1;
+                    alter.generated.push(
+                        bound
+                            .drain(..)
+                            .find(|c| c.position == position)
+                            .expect("the new column is generated"),
+                    );
+                    return Ok(BoundAlter::Table(alter));
                 }
                 let mut definition = self.bind_new_column(column)?;
                 definition.not_null = *not_null;
@@ -330,8 +430,26 @@ impl Binder<'_> {
                 alter.projection = Some(projection);
                 alter.verify = *not_null || *unique;
             }
-            AlterKind::RemoveColumn { path, if_exists, .. } => {
+            AlterKind::RemoveColumn {
+                path,
+                if_exists,
+                cascade,
+            } => {
                 nested_error(path)?;
+                let dependents = generated_dependents(&table, &path[0])?;
+                if !dependents.is_empty() && !cascade {
+                    return Err(catalog_error(
+                        "Cannot drop column: column is a dependency of 1 or more generated column(s)".to_string(),
+                    ));
+                }
+                alter
+                    .generated
+                    .retain(|c| !dependents.iter().any(|d| d.eq_ignore_ascii_case(&c.name)));
+                if table.is_generated(&path[0]) {
+                    alter.generated.retain(|c| !c.name.eq_ignore_ascii_case(&path[0]));
+                    reposition_generated(&mut alter.generated, &table, &path[0]);
+                    return Ok(BoundAlter::Table(alter));
+                }
                 let Some(index) = table.column_index(&path[0]) else {
                     if *if_exists {
                         return Ok(BoundAlter::Nothing);
@@ -339,12 +457,21 @@ impl Binder<'_> {
                     return Err(column_index(&table, &path[0]).expect_err("the column isn't there"));
                 };
                 remove_column(&mut alter, index)?;
+                reposition_generated(&mut alter.generated, &table, &path[0]);
             }
             AlterKind::ChangeColumnType { path, target, using } => {
                 if path.len() > 1 {
                     return Err(not_implemented(
                         "Changing the type of a nested field is not yet supported",
                     ));
+                }
+                if table.is_generated(&path[0]) {
+                    return Err(binder_error("Using generated columns in alter statement not supported"));
+                }
+                if let Some(dependent) = generated_dependents(&table, &path[0])?.first() {
+                    return Err(catalog_error(format!(
+                        "This column is referenced by the generated column {dependent}, so its type can not be changed"
+                    )));
                 }
                 let index = column_index(&table, &path[0])?;
                 self.change_type(&mut alter, index, target.as_ref(), using.as_deref())?;
@@ -354,6 +481,12 @@ impl Binder<'_> {
                     return Err(not_implemented(
                         "Setting a default value on a nested field is not yet supported",
                     ));
+                }
+                if table.is_generated(&path[0]) {
+                    return Err(binder_error(format!(
+                        "Cannot SET DEFAULT for generated column {}",
+                        path[0]
+                    )));
                 }
                 let index = column_index(&table, &path[0])?;
                 let default = match expression {
@@ -367,6 +500,9 @@ impl Binder<'_> {
                     return Err(not_implemented(
                         "Setting a NOT NULL constraint on a nested field is not yet supported",
                     ));
+                }
+                if table.is_generated(&path[0]) {
+                    return Err(binder_error("Unsupported constraint for generated column!"));
                 }
                 let index = column_index(&table, &path[0])?;
                 alter.columns[index].not_null = true;

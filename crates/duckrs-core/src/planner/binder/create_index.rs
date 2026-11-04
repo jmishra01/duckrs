@@ -109,6 +109,7 @@ impl Binder<'_> {
             names: table.columns.iter().map(|c| c.name.clone()).collect(),
             types: table.types(),
             row_id: None,
+            generated: Vec::new(),
         });
         let mut bound = binder.bind_expression(expression)?;
         let bindings: Vec<ColumnBinding> = (0..table.columns.len())

@@ -19,6 +19,8 @@ use physical::*;
 
 pub mod alter;
 pub mod constraints;
+mod merge;
+mod special_joins;
 mod upsert;
 mod window;
 
@@ -105,6 +107,17 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             children,
             remaining: Mutex::new((offset, limit)),
         }),
+        LogicalOperatorKind::LimitPercent { percent, offset } => {
+            let data = Mutex::new(ColumnDataCollection::new(types.clone()));
+            Box::new(PhysicalLimitPercent {
+                types,
+                percent,
+                offset,
+                children,
+                data,
+            })
+        }
+        LogicalOperatorKind::Sample { options } => Box::new(PhysicalSample::new(options, children.remove(0))),
         LogicalOperatorKind::Distinct { targets } => Box::new(PhysicalDistinct::new(&targets, children.remove(0))),
         LogicalOperatorKind::Delete { table, returning, .. } => {
             Box::new(PhysicalDelete::new(types, children, table, returning))
@@ -115,14 +128,38 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             returning,
             ..
         } => Box::new(PhysicalUpdate::new(types, children, table, columns, returning)),
+        LogicalOperatorKind::MergeInto {
+            table,
+            actions,
+            row_id,
+            marker,
+            returning,
+            ..
+        } => {
+            let input = Mutex::new(ColumnDataCollection::new(children[0].types().to_vec()));
+            let output = Mutex::new(ColumnDataCollection::new(types.clone()));
+            Box::new(merge::PhysicalMergeInto {
+                types,
+                children,
+                table,
+                actions,
+                row_id,
+                marker,
+                returning,
+                input,
+                output,
+            })
+        }
         LogicalOperatorKind::Union { .. } => Box::new(PhysicalUnion::new(types, children)),
         LogicalOperatorKind::RecursiveCte {
             union_all,
             working,
+            recurring,
+            key,
             recursive,
             ..
         } => Box::new(PhysicalRecursiveCte::new(
-            types, children, union_all, working, *recursive,
+            types, children, union_all, working, recurring, key, *recursive,
         )),
         LogicalOperatorKind::WorkingTable { working, .. } => Box::new(PhysicalWorkingTable { types, working }),
         LogicalOperatorKind::LateralJoin {
@@ -162,6 +199,34 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
         } => Box::new(join::PhysicalJoin::new(
             types, join_type, conditions, predicate, children,
         )),
+        LogicalOperatorKind::AsOfJoin {
+            join_type,
+            conditions,
+            left,
+            op,
+            right,
+            predicate,
+        } => Box::new(special_joins::PhysicalAsOfJoin {
+            types,
+            join_type,
+            conditions,
+            inequality: (left, op, right),
+            predicate,
+            children,
+            build: Mutex::default(),
+        }),
+        LogicalOperatorKind::PositionalJoin => Box::new(special_joins::PhysicalPositionalJoin {
+            types,
+            children,
+            rows: Mutex::default(),
+            position: Mutex::default(),
+        }),
+        LogicalOperatorKind::MarkJoin { predicate, .. } => Box::new(special_joins::PhysicalMarkJoin {
+            types,
+            predicate,
+            children,
+            rows: Mutex::default(),
+        }),
         LogicalOperatorKind::Insert {
             table,
             column_index_map,
@@ -188,6 +253,7 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             schema,
             name,
             columns,
+            generated,
             constraints,
             on_conflict,
         } => Box::new(PhysicalCreateTable {
@@ -195,6 +261,7 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             schema,
             table_name: name,
             columns,
+            generated,
             constraints,
             on_conflict,
         }),

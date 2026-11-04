@@ -5,12 +5,14 @@
 //! its output types and the column bindings its parents refer to.
 
 use super::expression::{BoundAggregate, BoundExpr, BoundExprKind, BoundWindow, ColumnBinding};
-use crate::catalog::{ColumnDefinition, OnCreateConflict, SchemaCatalogEntry, TableCatalogEntry, TableConstraint};
+use crate::catalog::{
+    ColumnDefinition, GeneratedColumn, OnCreateConflict, SchemaCatalogEntry, TableCatalogEntry, TableConstraint,
+};
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::OrderModifiers;
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
-use duckrs_parser::ast::JoinType;
+use duckrs_parser::ast::{ComparisonOp, JoinType, MergeActionType, MergeCondition, SampleOptions};
 use parking_lot::Mutex;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -71,6 +73,10 @@ pub enum LogicalOperatorKind {
     /// `LogicalLimit` with constant values: skips `offset` rows, then keeps `limit` rows (all
     /// of them with `None`).
     Limit { limit: Option<u64>, offset: u64 },
+    /// `LogicalLimit` with a percentage of the rows.
+    LimitPercent { percent: f64, offset: u64 },
+    /// `LogicalSample`: a random part of the child's rows.
+    Sample { options: SampleOptions },
     /// `LogicalDistinct` (`DISTINCT`, not `DISTINCT ON`): one row per distinct `targets`.
     Distinct { targets: Vec<BoundExpr> },
     /// `LogicalUnnest`: a row per element of the lists of `expressions`, next to the child's
@@ -99,6 +105,10 @@ pub enum LogicalOperatorKind {
         types: Vec<LogicalType>,
         union_all: bool,
         working: Arc<Mutex<ColumnDataCollection>>,
+        /// what `recurring.name` reads: all rows so far
+        recurring: Arc<Mutex<ColumnDataCollection>>,
+        /// USING KEY: what each column is; empty without one
+        key: Vec<CteKeyColumn>,
         recursive: Box<LogicalOperator>,
     },
     /// `LogicalCTERef` of a recursive CTE, inside of its recursive part: the rows of the last round.
@@ -132,6 +142,23 @@ pub enum LogicalOperatorKind {
         conditions: Vec<JoinCondition>,
         predicate: Option<BoundExpr>,
     },
+    /// `LogicalAsOfJoin`: for each left row, the closest right row with `left op right` among those
+    /// with equal `conditions` that `predicate` lets through.
+    AsOfJoin {
+        join_type: JoinType,
+        conditions: Vec<JoinCondition>,
+        left: BoundExpr,
+        op: ComparisonOp,
+        right: BoundExpr,
+        predicate: Option<BoundExpr>,
+    },
+    /// `LogicalPositionalJoin`: the rows of its children side by side.
+    PositionalJoin,
+    /// A MARK join: the left rows with a BOOLEAN for whether `predicate` finds a right row.
+    MarkJoin {
+        table_index: usize,
+        predicate: Option<BoundExpr>,
+    },
     /// `LogicalInsert`: appends its child's rows to `table`. `column_index_map[i]` is the child
     /// column that fills table column `i`, or `None` for the column's default (NULL).
     Insert {
@@ -156,6 +183,16 @@ pub enum LogicalOperatorKind {
         columns: Vec<usize>,
         returning: bool,
     },
+    /// `LogicalMergeInto`: its child is the join of the source and the target.
+    MergeInto {
+        table: Arc<TableCatalogEntry>,
+        table_index: usize,
+        actions: Vec<(MergeCondition, Vec<BoundMergeAction>)>,
+        row_id: BoundExpr,
+        /// NULL in a row without a source row; only with WHEN NOT MATCHED BY SOURCE
+        marker: Option<BoundExpr>,
+        returning: bool,
+    },
     /// `LogicalCreateTable` with a query: creates the table with the child's rows.
     CreateTableAs {
         schema: Arc<SchemaCatalogEntry>,
@@ -168,9 +205,35 @@ pub enum LogicalOperatorKind {
         schema: Arc<SchemaCatalogEntry>,
         name: String,
         columns: Vec<ColumnDefinition>,
+        generated: Vec<GeneratedColumn>,
         constraints: Vec<TableConstraint>,
         on_conflict: OnCreateConflict,
     },
+}
+
+/// What a column of a recursive CTE is to its USING KEY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CteKeyColumn {
+    Key,
+    /// The value of the last row with the key.
+    Last,
+    /// The value of the first row with the key.
+    First,
+    Min,
+    Max,
+}
+
+/// `BoundMergeIntoAction`.
+#[derive(Debug, Clone)]
+pub struct BoundMergeAction {
+    pub action_type: MergeActionType,
+    pub condition: Option<BoundExpr>,
+    /// The condition for error messages.
+    pub text: String,
+    /// UPDATE: the columns that `expressions` set.
+    pub columns: Vec<usize>,
+    /// UPDATE: the values; INSERT: every stored column; ERROR: the message.
+    pub expressions: Vec<BoundExpr>,
 }
 
 /// What an INSERT does about conflicts on keys (`OnConflictInfo`).
@@ -226,6 +289,12 @@ impl LogicalOperator {
                     condition.right.substitute_columns(columns);
                 }
             }
+            LogicalOperatorKind::AsOfJoin { conditions, .. } => {
+                for condition in conditions {
+                    condition.left.substitute_columns(columns);
+                    condition.right.substitute_columns(columns);
+                }
+            }
             LogicalOperatorKind::RecursiveCte { recursive: inner, .. }
             | LogicalOperatorKind::LateralJoin { right: inner, .. } => inner.substitute_columns(columns),
             _ => {}
@@ -241,7 +310,7 @@ impl LogicalOperator {
             expr.walk_mut(f);
         }
         match &mut self.kind {
-            LogicalOperatorKind::Join { conditions, .. } => {
+            LogicalOperatorKind::Join { conditions, .. } | LogicalOperatorKind::AsOfJoin { conditions, .. } => {
                 for condition in conditions {
                     condition.left.walk_mut(f);
                     condition.right.walk_mut(f);
@@ -314,6 +383,8 @@ impl LogicalOperator {
             LogicalOperatorKind::Filter { .. }
             | LogicalOperatorKind::Order { .. }
             | LogicalOperatorKind::Limit { .. }
+            | LogicalOperatorKind::Sample { .. }
+            | LogicalOperatorKind::LimitPercent { .. }
             | LogicalOperatorKind::Distinct { .. } => self.children[0].types(),
             LogicalOperatorKind::Projection { expressions, .. } => {
                 expressions.iter().map(|e| e.return_type.clone()).collect()
@@ -327,7 +398,16 @@ impl LogicalOperator {
             | LogicalOperatorKind::Update {
                 table, returning: true, ..
             } => table.types(),
-            LogicalOperatorKind::Delete { .. } | LogicalOperatorKind::Update { .. } => vec![LogicalType::BIGINT],
+            LogicalOperatorKind::MergeInto {
+                table, returning: true, ..
+            } => {
+                let mut types = table.types();
+                types.push(LogicalType::VARCHAR);
+                types
+            }
+            LogicalOperatorKind::Delete { .. }
+            | LogicalOperatorKind::Update { .. }
+            | LogicalOperatorKind::MergeInto { .. } => vec![LogicalType::BIGINT],
             LogicalOperatorKind::Union { types, .. }
             | LogicalOperatorKind::ExceptIntersect { types, .. }
             | LogicalOperatorKind::RecursiveCte { types, .. }
@@ -346,9 +426,15 @@ impl LogicalOperator {
                 );
                 types
             }
-            LogicalOperatorKind::CrossProduct | LogicalOperatorKind::Join { .. } => {
-                self.join_output(|child| child.types())
+            LogicalOperatorKind::MarkJoin { .. } => {
+                let mut types = self.children[0].types();
+                types.push(LogicalType::BOOLEAN);
+                types
             }
+            LogicalOperatorKind::CrossProduct
+            | LogicalOperatorKind::Join { .. }
+            | LogicalOperatorKind::AsOfJoin { .. }
+            | LogicalOperatorKind::PositionalJoin => self.join_output(|child| child.types()),
             LogicalOperatorKind::Insert { .. }
             | LogicalOperatorKind::CreateTable { .. }
             | LogicalOperatorKind::CreateTableAs { .. } => vec![LogicalType::BIGINT],
@@ -359,6 +445,10 @@ impl LogicalOperator {
     fn join_output<T>(&self, of_child: impl Fn(&LogicalOperator) -> Vec<T>) -> Vec<T> {
         match self.kind {
             LogicalOperatorKind::Join {
+                join_type: JoinType::Semi | JoinType::Anti,
+                ..
+            }
+            | LogicalOperatorKind::AsOfJoin {
                 join_type: JoinType::Semi | JoinType::Anti,
                 ..
             } => of_child(&self.children[0]),
@@ -412,6 +502,8 @@ impl LogicalOperator {
             LogicalOperatorKind::Filter { .. }
             | LogicalOperatorKind::Order { .. }
             | LogicalOperatorKind::Limit { .. }
+            | LogicalOperatorKind::Sample { .. }
+            | LogicalOperatorKind::LimitPercent { .. }
             | LogicalOperatorKind::Distinct { .. } => self.children[0].column_bindings(),
             LogicalOperatorKind::Projection {
                 table_index,
@@ -434,6 +526,12 @@ impl LogicalOperator {
                 returning,
                 ..
             } => numbered(*table_index, if *returning { table.columns.len() } else { 1 }),
+            LogicalOperatorKind::MergeInto {
+                table,
+                table_index,
+                returning,
+                ..
+            } => numbered(*table_index, if *returning { table.columns.len() + 1 } else { 1 }),
             LogicalOperatorKind::Union { table_index, types }
             | LogicalOperatorKind::ExceptIntersect { table_index, types, .. }
             | LogicalOperatorKind::RecursiveCte { table_index, types, .. }
@@ -451,9 +549,15 @@ impl LogicalOperator {
                 bindings.extend(numbered(*table_index, expressions.len()));
                 bindings
             }
-            LogicalOperatorKind::CrossProduct | LogicalOperatorKind::Join { .. } => {
-                self.join_output(|child| child.column_bindings())
+            LogicalOperatorKind::MarkJoin { table_index, .. } => {
+                let mut bindings = self.children[0].column_bindings();
+                bindings.push(ColumnBinding::new(*table_index, 0));
+                bindings
             }
+            LogicalOperatorKind::CrossProduct
+            | LogicalOperatorKind::Join { .. }
+            | LogicalOperatorKind::AsOfJoin { .. }
+            | LogicalOperatorKind::PositionalJoin => self.join_output(|child| child.column_bindings()),
             LogicalOperatorKind::CreateTable { .. } | LogicalOperatorKind::CreateTableAs { .. } => numbered(0, 1),
         }
     }
@@ -461,6 +565,28 @@ impl LogicalOperator {
     /// The expressions of this operator, for passes over the plan.
     pub fn expressions_mut(&mut self) -> Vec<&mut BoundExpr> {
         match &mut self.kind {
+            LogicalOperatorKind::AsOfJoin {
+                left, right, predicate, ..
+            } => {
+                let mut result: Vec<&mut BoundExpr> = vec![left, right];
+                result.extend(predicate.iter_mut());
+                result
+            }
+            LogicalOperatorKind::MarkJoin { predicate, .. } => predicate.iter_mut().collect(),
+            LogicalOperatorKind::MergeInto {
+                actions,
+                row_id,
+                marker,
+                ..
+            } => {
+                let mut result: Vec<&mut BoundExpr> = vec![row_id];
+                result.extend(marker.iter_mut());
+                for action in actions.iter_mut().flat_map(|(_, actions)| actions) {
+                    result.extend(action.condition.iter_mut());
+                    result.extend(action.expressions.iter_mut());
+                }
+                result
+            }
             LogicalOperatorKind::Filter { expressions }
             | LogicalOperatorKind::Projection { expressions, .. }
             | LogicalOperatorKind::Unnest { expressions, .. }

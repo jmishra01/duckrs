@@ -77,6 +77,8 @@ pub struct BoundSubquery {
     pub correlated: Vec<ColumnBinding>,
     /// a volatile plan runs for every row, and not per combination of correlated values
     pub volatile: bool,
+    /// `scalar_subquery_error_on_multiple_rows`
+    pub error_on_multiple_rows: bool,
     /// what ran so far, by the sort keys of the correlated values
     pub results: Mutex<HashMap<Vec<u8>, Arc<Result<SubqueryResult>>>>,
 }
@@ -402,6 +404,7 @@ impl BoundExpr {
                     plan,
                     correlated: subquery.correlated.clone(),
                     volatile: subquery.volatile,
+                    error_on_multiple_rows: subquery.error_on_multiple_rows,
                     results: Mutex::default(),
                 });
             }

@@ -322,6 +322,9 @@ impl PhysicalJoin {
 }
 
 impl PhysicalOperator for PhysicalJoin {
+    fn explain_details(&self) -> Vec<String> {
+        vec![format!("Join Type: {}", self.join_type.name())]
+    }
     fn name(&self) -> &'static str {
         if self.conditions.is_empty() {
             "BLOCKWISE_NL_JOIN"

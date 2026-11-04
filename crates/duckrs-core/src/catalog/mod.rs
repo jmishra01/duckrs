@@ -21,6 +21,9 @@ use std::sync::{Arc, Weak};
 pub const DEFAULT_CATALOG: &str = "memory";
 /// The schema used when a name is not qualified (`DEFAULT_SCHEMA`).
 pub const DEFAULT_SCHEMA: &str = "main";
+/// Where temporary objects live, ahead of the other schemas on the search path. DuckDB has a
+/// `temp` catalog per connection; here it is one schema until Phase 10 isolates connections.
+pub const TEMP_SCHEMA: &str = "temp";
 
 /// A column of a table (`ColumnDefinition`).
 #[derive(Debug, Clone)]
@@ -31,6 +34,29 @@ pub struct ColumnDefinition {
     pub default_value: Option<BoundExpr>,
     /// A `NOT NULL` constraint.
     pub not_null: bool,
+    /// The default as it was written.
+    pub default_text: Option<String>,
+}
+
+/// A generated column: not stored, only an expression over the other columns.
+#[derive(Debug, Clone)]
+pub struct GeneratedColumn {
+    pub name: String,
+    pub ty: LogicalType,
+    /// Reads columns by bare name.
+    pub expr: Expr,
+    /// The expression over the stored columns, by index.
+    pub bound: BoundExpr,
+    /// Among all the columns of the table.
+    pub position: usize,
+}
+
+/// A column of a table as a query sees it (`ColumnList::Logical`).
+pub struct LogicalColumn<'a> {
+    pub name: &'a str,
+    pub ty: &'a LogicalType,
+    pub definition: Option<&'a ColumnDefinition>,
+    pub generated: Option<&'a Expr>,
 }
 
 impl ColumnDefinition {
@@ -40,6 +66,7 @@ impl ColumnDefinition {
             ty,
             default_value: None,
             not_null: false,
+            default_text: None,
         }
     }
 }
@@ -49,7 +76,10 @@ impl ColumnDefinition {
 pub struct TableCatalogEntry {
     pub schema: String,
     pub name: String,
+    /// The columns that are stored.
     pub columns: Vec<ColumnDefinition>,
+    /// The columns that are not, in order of `position`.
+    pub generated: Vec<GeneratedColumn>,
     pub storage: RwLock<ColumnDataCollection>,
     /// Beyond the NOT NULLs, which are in `columns`.
     pub constraints: Vec<TableConstraint>,
@@ -143,6 +173,7 @@ impl TableCatalogEntry {
             schema,
             name,
             columns,
+            generated: Vec::new(),
             storage: RwLock::new(rows),
             constraints,
             referenced_by: Mutex::default(),
@@ -152,6 +183,37 @@ impl TableCatalogEntry {
     }
 
     /// What `unique_keys` holds the keys of, in that order.
+    /// The columns in the order a query sees them.
+    pub fn logical_columns(&self) -> Vec<LogicalColumn<'_>> {
+        let mut result: Vec<LogicalColumn<'_>> = self
+            .columns
+            .iter()
+            .map(|c| LogicalColumn {
+                name: &c.name,
+                ty: &c.ty,
+                definition: Some(c),
+                generated: None,
+            })
+            .collect();
+        for column in &self.generated {
+            let position = column.position.min(result.len());
+            result.insert(
+                position,
+                LogicalColumn {
+                    name: &column.name,
+                    ty: &column.ty,
+                    definition: None,
+                    generated: Some(&column.expr),
+                },
+            );
+        }
+        result
+    }
+
+    pub fn is_generated(&self, name: &str) -> bool {
+        self.generated.iter().any(|c| c.name.eq_ignore_ascii_case(name))
+    }
+
     pub fn keys(&self) -> Vec<TableKey> {
         let mut keys: Vec<TableKey> = self
             .constraints
@@ -423,6 +485,11 @@ impl SchemaCatalogEntry {
     }
 
     /// The table or view with this name.
+    /// All the tables and views, by name.
+    pub fn tables_and_views(&self) -> Vec<TableOrView> {
+        self.tables.read().values().cloned().collect()
+    }
+
     pub fn get_entry(&self, name: &str) -> Option<TableOrView> {
         self.tables.read().get(&key(name)).cloned()
     }
@@ -554,6 +621,7 @@ impl SchemaCatalogEntry {
         &self,
         name: &str,
         columns: Vec<ColumnDefinition>,
+        generated: Vec<GeneratedColumn>,
         constraints: Vec<TableConstraint>,
         on_conflict: OnCreateConflict,
     ) -> Result<Option<Arc<TableCatalogEntry>>> {
@@ -562,13 +630,15 @@ impl SchemaCatalogEntry {
             return Ok(None);
         }
         let types = columns.iter().map(|c| c.ty.clone()).collect();
-        let table = Arc::new(TableCatalogEntry::new(
+        let mut table = TableCatalogEntry::new(
             self.name.clone(),
             name.to_string(),
             columns,
             ColumnDataCollection::new(types),
             constraints,
-        ));
+        );
+        table.generated = generated;
+        let table = Arc::new(table);
         Self::register_foreign_keys(&tables, &table);
         tables.insert(key(name), TableOrView::Table(table.clone()));
         Ok(Some(table))
@@ -894,6 +964,10 @@ impl Catalog {
             .write()
             .insert(key(DEFAULT_SCHEMA), Arc::new(SchemaCatalogEntry::new(DEFAULT_SCHEMA)));
         catalog
+            .schemas
+            .write()
+            .insert(key(TEMP_SCHEMA), Arc::new(SchemaCatalogEntry::new(TEMP_SCHEMA)));
+        catalog
     }
 
     /// `DuckCatalog::CreateSchema`.
@@ -938,6 +1012,11 @@ impl Catalog {
         Ok(())
     }
 
+    /// All the schemas, by name.
+    pub fn schemas(&self) -> Vec<Arc<SchemaCatalogEntry>> {
+        self.schemas.read().values().cloned().collect()
+    }
+
     pub fn get_schema(&self, name: &str) -> Option<Arc<SchemaCatalogEntry>> {
         self.schemas.read().get(&key(name)).cloned()
     }
@@ -963,8 +1042,9 @@ impl Catalog {
                 }
                 self.schema_for(Some(schema))?.get_entry(name)
             }
-            None => search_first
+            None => [TEMP_SCHEMA]
                 .iter()
+                .chain(search_first.iter())
                 .chain([&DEFAULT_SCHEMA])
                 .find_map(|schema| self.get_schema(schema)?.get_entry(name)),
         };
@@ -977,7 +1057,11 @@ impl Catalog {
         const UNSEEN_PENALTY: f64 = 0.2;
         let searched: Vec<&str> = match schema {
             Some(schema) => vec![schema],
-            None => search_first.iter().copied().chain([DEFAULT_SCHEMA]).collect(),
+            None => [TEMP_SCHEMA]
+                .into_iter()
+                .chain(search_first)
+                .chain([DEFAULT_SCHEMA])
+                .collect(),
         };
         let schemas: Vec<Arc<SchemaCatalogEntry>> = self.schemas.read().values().cloned().collect();
         let mut seen: Option<(f64, String)> = None;
@@ -1030,8 +1114,9 @@ impl Catalog {
     ) -> Result<Arc<SequenceCatalogEntry>> {
         let entry = match schema {
             Some(schema) => self.schema_for(Some(schema))?.get_sequence(name),
-            None => search_first
+            None => [TEMP_SCHEMA]
                 .iter()
+                .chain(search_first.iter())
                 .chain([&DEFAULT_SCHEMA])
                 .find_map(|schema| self.get_schema(schema)?.get_sequence(name)),
         };
@@ -1048,8 +1133,9 @@ impl Catalog {
     ) -> Result<Option<Arc<MacroCatalogEntry>>> {
         Ok(match schema {
             Some(schema) => self.schema_for(Some(schema))?.get_macro(name, table_macro),
-            None => search_first
+            None => [TEMP_SCHEMA]
                 .iter()
+                .chain(search_first.iter())
                 .chain([&DEFAULT_SCHEMA])
                 .find_map(|schema| self.get_schema(schema)?.get_macro(name, table_macro)),
         })
@@ -1064,8 +1150,9 @@ impl Catalog {
     ) -> Result<Option<LogicalType>> {
         Ok(match schema {
             Some(schema) => self.schema_for(Some(schema))?.get_type(name),
-            None => search_first
+            None => [TEMP_SCHEMA]
                 .iter()
+                .chain(search_first.iter())
                 .chain([&DEFAULT_SCHEMA])
                 .find_map(|schema| self.get_schema(schema)?.get_type(name)),
         })
@@ -1122,11 +1209,11 @@ mod tests {
         let schema = catalog.schema_for(None).unwrap();
         let columns = vec![ColumnDefinition::new("i", LogicalType::INTEGER)];
         schema
-            .create_table("Tbl", columns.clone(), Vec::new(), OnCreateConflict::Error)
+            .create_table("Tbl", columns.clone(), Vec::new(), Vec::new(), OnCreateConflict::Error)
             .unwrap();
         assert_eq!(catalog.get_table(None, "TBL").unwrap().name, "Tbl");
         let err = schema
-            .create_table("tbl", columns.clone(), Vec::new(), OnCreateConflict::Error)
+            .create_table("tbl", columns.clone(), Vec::new(), Vec::new(), OnCreateConflict::Error)
             .unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -1134,7 +1221,7 @@ mod tests {
         );
         assert!(
             schema
-                .create_table("tbl", columns, Vec::new(), OnCreateConflict::Ignore)
+                .create_table("tbl", columns, Vec::new(), Vec::new(), OnCreateConflict::Ignore)
                 .unwrap()
                 .is_none()
         );

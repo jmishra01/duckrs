@@ -134,9 +134,7 @@ A statement goes `parse_ast` → `Binder` (bound expressions, `LogicalOperator` 
   no-ops.
 
 Deliberate gaps so far: no DECIMAL arithmetic (a DECIMAL meets a number in DOUBLE, which loses
-digits), no constraints beyond NOT NULL, no table options, no joins, no transactions, no DISTINCT ON, LIMIT PERCENT or
-non-constant LIMIT, no ORDER BY in aggregates, no collations, no
-SET VARIABLE or settings of MAP and list types. The expression executor evaluates a filter's
+digits), no table options, no collations. The expression executor evaluates a filter's
 condition to a BOOLEAN vector rather than using DuckDB's specialized `Select`, and casts to
 VARCHAR and from or to DECIMAL, CASE and COALESCE write row by row through `Value`. Tables and
 blocking operators are capped at about 2 GiB and fail as not yet ported beyond that, until
@@ -145,6 +143,35 @@ errors DuckDB's rewrites avoid (an overflow in a filter it removes) still surfac
 `LIMIT 0` skips its input. Errors for SQL beyond the slice
 say it `is not yet ported to duckrs`, wording DuckDB never uses, so that no test expecting an
 error passes because a feature is missing.
+
+## Phase 6
+
+- **Temporary objects** live in a `temp` schema ahead of the search path. DuckDB has a `temp`
+  catalog per connection; this one is shared until Phase 10 isolates connections.
+- **PIVOT** is always a set of filtered aggregates. C++ switches to a `PhysicalPivot` over `list()`
+  past `pivot_filter_threshold` values, which is only faster. **UNPIVOT** is `unpivot_list` and
+  `unnest`, as in C++.
+- **Generated columns** are in `TableCatalogEntry::generated`, apart from the stored `columns`, each
+  with its position among all columns. A `Binding` carries their expressions, and a reference binds
+  the expression instead of a column; renamed tables refer to columns by position
+  (`POSITIONAL_COLUMN`).
+- **DESCRIBE, SHOW, SUMMARIZE** and `duckdb_{databases,schemas,tables,views,columns}` are rows computed
+  while binding, in an `ExpressionGet`.
+- **EXPLAIN** renders an indented list of operator names, not C++'s box tree. `EXPLAIN (SQL)` and
+  JSON or YAML output are not ported.
+- **MERGE INTO** binds a join and gathers its rows; `PhysicalMergeInto` picks an action per row and
+  rewrites the table once at the end. A WHEN NOT MATCHED BY SOURCE marker is a cross product of
+  the source with one row, which leaves the source's bindings alone.
+- **ASOF, POSITIONAL and MARK joins** are in `execution/special_joins.rs` and work row by row.
+  NEAREST is a lateral join with ORDER BY and LIMIT, as in C++.
+- **USING KEY** keeps one row per key. Aggregates are limited to `min`, `max`, `first`, `last` and
+  `any_value`; `sum`, `avg`, `approx_count_distinct` and the rest are not ported.
+- **Samples** are seeded and repeatable, but not the rows C++ picks: its random engine is not ported.
+- **Aggregates of outer columns in a subquery** bind in the outer query, and reach the subquery as a
+  correlated column.
+
+Not ported from the Phase 6 list: data-modifying statements in WITH. Not in the plan's list but
+blocking its gate directories: COLLATE (Phase 6 has no collation work) and `SET schema`.
 
 ## Testing
 

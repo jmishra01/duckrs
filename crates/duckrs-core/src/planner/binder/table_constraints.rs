@@ -163,6 +163,7 @@ impl Binder<'_> {
             names: columns.iter().map(|c| c.name.clone()).collect(),
             types: columns.iter().map(|c| c.ty.clone()).collect(),
             row_id: None,
+            generated: Vec::new(),
         });
         let mut bound = checked_cast(binder.bind_expression(check)?, &LogicalType::INTEGER)?;
         let bindings: Vec<ColumnBinding> = (0..columns.len())

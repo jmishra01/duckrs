@@ -112,6 +112,7 @@ impl Binder<'_> {
                 names: table.columns.iter().map(|c| c.name.clone()).collect(),
                 types: table.types(),
                 row_id: None,
+                generated: Vec::new(),
             });
         }
         let bindings: Vec<ColumnBinding> = [row_index, excluded_index]

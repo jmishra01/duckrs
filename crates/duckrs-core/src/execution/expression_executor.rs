@@ -344,14 +344,14 @@ const MULTIPLE_ROWS: &str = "More than one row returned by a subquery used as an
 /// What one row of the query gets from a subquery. `key` is the sort key of ANY's child, and
 /// `None` if that is NULL.
 fn subquery_value(
-    kind: SubqueryKind,
+    subquery: &BoundSubquery,
     result: &SubqueryResult,
     key: Option<&[u8]>,
     return_type: &LogicalType,
 ) -> Result<Value> {
-    Ok(match kind {
+    Ok(match subquery.kind {
         SubqueryKind::Scalar => {
-            if result.rows > 1 {
+            if result.rows > 1 && subquery.error_on_multiple_rows {
                 return Err(Error::new(ErrorKind::InvalidInput, MULTIPLE_ROWS));
             }
             result.first.clone().unwrap_or_else(|| Value::null(return_type.clone()))
@@ -382,12 +382,7 @@ fn execute_subquery(
     if correlated.is_empty() && child.is_none() {
         let result = subquery_result(subquery, &[], &[]);
         let result = result.as_ref().as_ref().map_err(Clone::clone)?;
-        return Ok(Vector::constant(&subquery_value(
-            subquery.kind,
-            result,
-            None,
-            return_type,
-        )?));
+        return Ok(Vector::constant(&subquery_value(subquery, result, None, return_type)?));
     }
     let columns = correlated
         .iter()
@@ -415,7 +410,7 @@ fn execute_subquery(
             (Some(keys), Some(format)) if format.validity.is_valid(format.sel.get(row)) => Some(keys[row].as_slice()),
             _ => None,
         };
-        let value = subquery_value(subquery.kind, result, child_key, return_type)?;
+        let value = subquery_value(subquery, result, child_key, return_type)?;
         output.set_value(row, &value)?;
     }
     Ok(output)

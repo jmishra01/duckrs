@@ -41,13 +41,9 @@ fn execute_table_alter(alter: BoundTableAlter) -> Result<()> {
         None => source.clone(),
     };
     drop(source);
-    let table = Arc::new(TableCatalogEntry::new(
-        old.schema.clone(),
-        alter.name,
-        alter.columns,
-        rows,
-        alter.constraints,
-    ));
+    let mut table = TableCatalogEntry::new(old.schema.clone(), alter.name, alter.columns, rows, alter.constraints);
+    table.generated = alter.generated;
+    let table = Arc::new(table);
     if alter.verify {
         let rows = table.storage.read();
         for chunk in rows.chunks() {

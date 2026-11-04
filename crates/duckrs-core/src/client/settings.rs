@@ -69,10 +69,8 @@ const UNHONORED: &[&str] = &[
     "order_by_non_integer_literal",
     "preserve_identifier_case",
     "regex_match_operator_semantics",
-    "scalar_subquery_error_on_multiple_rows",
     "schema",
     "search_path",
-    "show_behavior",
     "table_function_identifier_conversion",
 ];
 
