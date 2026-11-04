@@ -262,6 +262,11 @@ impl Binder<'_> {
                 if mode == Some(ColumnMode::Having) {
                     return self.bind_having_column(names);
                 }
+                if let [column] = names.as_slice()
+                    && let Some(using) = self.bind_context.using_expression(column)?
+                {
+                    return self.bind_expression(&using);
+                }
                 let (binding, ty, name) = match names.as_slice() {
                     [column] => match self.bind_context.bind_column(column) {
                         Ok(bound) => bound,
@@ -272,7 +277,7 @@ impl Binder<'_> {
                                 .iter()
                                 .position(|(a, _)| a.eq_ignore_ascii_case(column));
                             let Some(position) = alias else {
-                                return Err(error);
+                                return Err(self.lateral_error(names, error));
                             };
                             // an alias may not refer to itself
                             let (_, aliased) = self.alias_fallback.remove(position);
@@ -281,7 +286,10 @@ impl Binder<'_> {
                             return bound;
                         }
                     },
-                    [table, column] => self.bind_context.bind_qualified_column(table, column)?,
+                    [table, column] => self
+                        .bind_context
+                        .bind_qualified_column(table, column)
+                        .map_err(|error| self.lateral_error(names, error))?,
                     _ => return Err(crate::unported("column references with schema qualification")),
                 };
                 if mode == Some(ColumnMode::SelectList) {
@@ -400,7 +408,7 @@ impl Binder<'_> {
 
 impl Binder<'_> {
     /// `BaseSelectBinder::TryBindGroup` + `BindGroup`: a reference to the group `expr` matches.
-    fn try_bind_group(&self, expr: &Expr) -> Option<BoundExpr> {
+    pub(super) fn try_bind_group(&self, expr: &Expr) -> Option<BoundExpr> {
         let state = self.aggregates.as_ref().filter(|s| !s.inside_aggregate)?;
         if state.group_map.is_empty() && state.group_alias_map.is_empty() {
             return None;
@@ -533,7 +541,7 @@ pub(super) fn without_aliases(expr: &Expr) -> Expr {
 
 /// `ComparisonBind` + `BoundComparisonExpression::TryBindComparison`: both sides are cast to
 /// the type they can be compared in.
-fn bind_comparison(op: ComparisonOp, left: BoundExpr, right: BoundExpr) -> Result<BoundExpr> {
+pub(super) fn bind_comparison(op: ComparisonOp, left: BoundExpr, right: BoundExpr) -> Result<BoundExpr> {
     let left_type = expression_return_type(&left);
     let right_type = expression_return_type(&right);
     let is_equality = matches!(

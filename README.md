@@ -3,7 +3,7 @@
 An analytical SQL database engine: a port of [DuckDB](https://github.com/duckdb/duckdb) to Rust.
 
 **Status: Phase 3 (minimal vertical slice) in progress.** The engine runs CREATE TABLE, INSERT
-and single-table SELECT (WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in memory. What exists today:
+and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in memory. What exists today:
 
 - `crates/duckrs-common`: the core building blocks every other crate uses:
   - the type system (`LogicalType`, `PhysicalType`, with DuckDB's ids and names), `string_t`
@@ -43,21 +43,25 @@ and single-table SELECT (WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT)
   bound expressions, logical operators and column binding resolution (`planner`); the expression
   executor, physical operators and single-threaded pipelines (`execution`); and the client
   context and settings (`client`, DuckDB's `src/main`). It runs CREATE TABLE (with AS, NOT NULL and
-  DEFAULT), CREATE SCHEMA, DROP, INSERT (VALUES or a query) and SELECT over one table, a VALUES
-  list, a subquery or `range`/`generate_series` with WHERE, GROUP BY (with aliases,
+  DEFAULT), CREATE SCHEMA, DROP, INSERT (VALUES or a query) and SELECT over tables, VALUES
+  lists, subqueries, `range`/`generate_series` and joins of those (CROSS, INNER, LEFT, RIGHT,
+  FULL, SEMI, ANTI and their RIGHT forms, with ON, USING or NATURAL; hash joins for equality
+  conditions and nested loops otherwise, single-threaded and in memory) with WHERE, GROUP BY (with aliases,
   positions and ALL), HAVING, aggregates (`count`, `sum`, `avg`, `min`, `max`, `first`, `last`,
   `any_value`, with DISTINCT and FILTER), ORDER BY (positions, aliases, expressions, ORDER BY
   ALL, NULLS FIRST/LAST), LIMIT/OFFSET and DISTINCT; expressions with comparisons, AND/OR/NOT,
   IS [NOT] NULL, BETWEEN, IN, CASE, COALESCE, `+`, `-`, `*`, `/`, `//`, `%`, casts between the numeric types, DECIMAL, BOOLEAN and VARCHAR,
   and aliases of the select list; and SET/RESET/`PRAGMA x = y` for all 196
   of DuckDB's settings (generated from its `settings.json` by `tools/generate_settings.py`), with
-  DuckDB's types and error messages. Joins are next. SQL it does not
+  DuckDB's types and error messages. There is no optimizer yet, so a filter over a cross product
+  (`FROM a, b WHERE a.x = b.x`) really does build every pair until Phase 7. Subqueries in
+  expressions and the rest of the Phase 3 statements are next. SQL it does not
   run yet fails with an error saying it `is not yet ported to duckrs`; the sqllogictest runner
   never counts that error as the one a test expects.
 - `crates/duckrs`: the public API (`Database`, `Connection`, `QueryResult`) over the engine.
   Databases live in memory; a database file is accepted but not written until Phase 9.
 - `tools/sqllogictest`: a port of DuckDB's sqllogictest runner. It runs the DuckDB `.test` corpus
-  against duckrs, or against the C++ DuckDB library as a reference. duckrs passes 229 files so far
+  against duckrs, or against the C++ DuckDB library as a reference. duckrs passes 310 files so far
   (`tools/sqllogictest/known_passing.txt`, a CI gate), among them
   `test/sql/projection/test_simple_projection.test`.
 
@@ -87,7 +91,7 @@ is pinned to the `rust-port-baseline` branch of that checkout.
 
 ```bash
 cargo build --release -p sqllogictest
-./target/release/sqllogictest --allow-failures --status-out docs/STATUS.md   # duckrs, whole corpus
+./target/release/sqllogictest --allow-failures --isolate --timeout 60 --status-out docs/STATUS.md   # duckrs, whole corpus
 ./target/release/sqllogictest test/sql/select -v                            # one directory, verbose
 ```
 
@@ -103,7 +107,7 @@ Useful flags: `--slow` (include `.test_slow`), `-j N`, `--continue-on-failure` (
 passing statement instead of stopping a file at its first failure), `--passing-out` / `--known-passing`
 (the regression gate CI uses), and `--isolate` (run each file in a child process with a
 `--timeout`, so an engine crash or hang fails one file instead of the whole run; use it for full
-runs of the reference engine).
+runs, since until the optimizer exists some files really do build a cross product of 100M rows).
 
 ### Reference engine notes
 

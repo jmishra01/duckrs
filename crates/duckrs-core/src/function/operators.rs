@@ -3,13 +3,15 @@
 //
 //! The arithmetic operators `+`, `-`, `*`, `/`, `//` and `%` over the numeric types. Integer
 //! arithmetic checks for overflow; floating point does not. `/` is floating point, and division
-//! by zero is an error for `//` and integer `%` (`error_on_division_by_zero`). DECIMAL, temporal
-//! and BIGNUM overloads come later.
+//! by zero is an error for `//` and `%` over integers and DECIMAL (`error_on_division_by_zero`).
+//! DECIMAL overloads work on the unscaled integers, and take their result type from the
+//! arguments. Temporal and BIGNUM overloads come later.
 
+use super::combine_types::decimal_properties;
 use super::{ScalarFunction, ScalarFunctionSet};
 use duckrs_common::executor;
 use duckrs_common::string_cast::{format_double, format_float};
-use duckrs_common::types::{LogicalType, NativeType, PhysicalType};
+use duckrs_common::types::{LogicalType, LogicalTypeId, NativeType, PhysicalType, decimal};
 use duckrs_common::vector::{DataChunk, Vector};
 use duckrs_common::{Error, ErrorKind, Result};
 
@@ -231,8 +233,8 @@ fn identity(args: &DataChunk, result: &mut Vector) -> Result<()> {
     Ok(())
 }
 
-/// The numeric types with arithmetic, in the order of `LogicalType::Numeric()` (DECIMAL left out).
-fn numeric_types() -> [LogicalType; 12] {
+/// `LogicalType::Numeric()`.
+fn numeric_types() -> [LogicalType; 13] {
     [
         LogicalType::TINYINT,
         LogicalType::SMALLINT,
@@ -241,6 +243,7 @@ fn numeric_types() -> [LogicalType; 12] {
         LogicalType::HUGEINT,
         LogicalType::FLOAT,
         LogicalType::DOUBLE,
+        LogicalType::new(LogicalTypeId::Decimal),
         LogicalType::UTINYINT,
         LogicalType::USMALLINT,
         LogicalType::UINTEGER,
@@ -269,6 +272,287 @@ macro_rules! dispatch {
     };
 }
 
+/// The largest absolute value of a DECIMAL stored in a hugeint is `10^38 - 1`.
+const DECIMAL_38_LIMIT: i128 = 10_i128.pow(decimal::MAX_WIDTH as u32);
+/// The largest absolute value of a DECIMAL stored in a bigint.
+const DECIMAL_18_MAX: i64 = 999_999_999_999_999_999;
+
+fn in_decimal_38(value: &i128) -> bool {
+    -DECIMAL_38_LIMIT < *value && *value < DECIMAL_38_LIMIT
+}
+
+/// `DecimalAddOverflowCheck`, which only runs over DECIMAL(38).
+fn decimal_add_overflow_check(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    executor::binary_fallible::<i128, i128, i128>(args.column(0), args.column(1), result, args.len(), |a, b| {
+        match a.checked_add(b).filter(in_decimal_38) {
+            Some(r) => Ok(Some(r)),
+            None => Err(Error::new(
+                ErrorKind::OutOfRange,
+                format!("Overflow in addition of DECIMAL(38) ({a} + {b});"),
+            )),
+        }
+    })
+}
+
+/// `DecimalSubtractOverflowCheck`, which only runs over DECIMAL(38).
+fn decimal_subtract_overflow_check(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    executor::binary_fallible::<i128, i128, i128>(args.column(0), args.column(1), result, args.len(), |a, b| {
+        match a.checked_sub(b).filter(in_decimal_38) {
+            Some(r) => Ok(Some(r)),
+            None => Err(Error::new(
+                ErrorKind::OutOfRange,
+                format!("Overflow in subtract of DECIMAL(38) ({a} - {b});"),
+            )),
+        }
+    })
+}
+
+/// `DecimalMultiplyOverflowCheck` over DECIMAL(18).
+fn decimal_multiply_overflow_check_18(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    executor::binary_fallible::<i64, i64, i64>(args.column(0), args.column(1), result, args.len(), |a, b| {
+        match a.checked_mul(b).filter(|r| r.abs() <= DECIMAL_18_MAX) {
+            Some(r) => Ok(Some(r)),
+            None => Err(Error::new(
+                ErrorKind::OutOfRange,
+                format!(
+                    "Overflow in multiplication of DECIMAL(18) ({a} * {b}). You might want to add an explicit cast \
+                     to a bigger decimal."
+                ),
+            )),
+        }
+    })
+}
+
+/// `DecimalMultiplyOverflowCheck` over DECIMAL(38).
+fn decimal_multiply_overflow_check_38(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    executor::binary_fallible::<i128, i128, i128>(args.column(0), args.column(1), result, args.len(), |a, b| {
+        match a.checked_mul(b).filter(in_decimal_38) {
+            Some(r) => Ok(Some(r)),
+            None => Err(Error::new(
+                ErrorKind::OutOfRange,
+                format!(
+                    "Overflow in multiplication of DECIMAL(38) ({a} * {b}). You might want to add an explicit cast \
+                     to a decimal with a smaller scale."
+                ),
+            )),
+        }
+    })
+}
+
+/// The callback of a DECIMAL overload before its types are resolved.
+fn unresolved_decimal(_: &DataChunk, _: &mut Vector) -> Result<()> {
+    unreachable!("a DECIMAL overload runs after ResolveTypes")
+}
+
+/// `LogicalType::GetDecimalProperties` for the arguments of an arithmetic operator.
+fn argument_decimal_properties(ty: &LogicalType) -> Result<(u8, u8)> {
+    decimal_properties(ty).ok_or_else(|| {
+        Error::new(
+            ErrorKind::Binder,
+            format!("Could not convert type {ty} to a decimal for the arithmetic operator - add an explicit cast"),
+        )
+    })
+}
+
+/// `DecimalArithmeticResultType`: the result type of a decimal addition, subtraction or modulo,
+/// and whether the operation needs an overflow check.
+fn decimal_arithmetic_result_type(input_types: &[LogicalType], is_modulo: bool) -> Result<(LogicalType, bool)> {
+    // get the max width and scale of the input arguments
+    let (mut max_width, mut max_scale, mut max_width_over_scale) = (0, 0, 0);
+    for input_type in input_types {
+        let (width, scale) = argument_decimal_properties(input_type)?;
+        max_width = max_width.max(width);
+        max_scale = max_scale.max(scale);
+        max_width_over_scale = max_width_over_scale.max(width - scale);
+    }
+    let mut required_width = (max_scale + max_width_over_scale).max(max_width);
+    if !is_modulo {
+        // for addition/subtraction, we add 1 to the width to ensure we don't overflow
+        required_width += 1;
+    }
+    if required_width > decimal::MAX_WIDTH {
+        // target width does not fit in decimal at all: truncate the scale and perform overflow detection
+        return Ok((LogicalType::decimal(decimal::MAX_WIDTH, max_scale), true));
+    }
+    Ok((LogicalType::decimal(required_width, max_scale), false))
+}
+
+/// `ResolveDecimalArithmeticTypes`: the parameter types of a decimal addition, subtraction or
+/// modulo with result type `result_type`.
+fn decimal_arithmetic_parameters(input_types: &[LogicalType], result_type: &LogicalType) -> Result<Vec<LogicalType>> {
+    let (_, result_scale) = result_type.decimal_properties().expect("a DECIMAL result");
+    input_types
+        .iter()
+        .map(|input_type| {
+            // if the argument has a matching scale and internal type as the output type, no
+            // casting is necessary
+            let (_, scale) = argument_decimal_properties(input_type)?;
+            Ok(
+                if scale == result_scale && input_type.physical_type() == result_type.physical_type() {
+                    input_type.clone()
+                } else {
+                    result_type.clone()
+                },
+            )
+        })
+        .collect()
+}
+
+/// `DecimalAddSubtractResolveTypes<AddOperator, DecimalAddOverflowCheck>`.
+fn resolve_decimal_add(function: &ScalarFunction, arguments: &[LogicalType]) -> Result<ScalarFunction> {
+    let (result_type, check_overflow) = decimal_arithmetic_result_type(arguments, false)?;
+    let parameters = decimal_arithmetic_parameters(arguments, &result_type)?;
+    let callback = if check_overflow {
+        decimal_add_overflow_check
+    } else {
+        dispatch!(result_type, binary::<Add>)
+    };
+    Ok(ScalarFunction::new(
+        function.name.clone(),
+        parameters,
+        result_type,
+        callback,
+    ))
+}
+
+/// `DecimalAddSubtractResolveTypes<SubtractOperator, DecimalSubtractOverflowCheck, true>`.
+fn resolve_decimal_subtract(function: &ScalarFunction, arguments: &[LogicalType]) -> Result<ScalarFunction> {
+    let (result_type, check_overflow) = decimal_arithmetic_result_type(arguments, false)?;
+    let parameters = decimal_arithmetic_parameters(arguments, &result_type)?;
+    let callback = if check_overflow {
+        decimal_subtract_overflow_check
+    } else {
+        dispatch!(result_type, binary::<Subtract>)
+    };
+    Ok(ScalarFunction::new(
+        function.name.clone(),
+        parameters,
+        result_type,
+        callback,
+    ))
+}
+
+/// `DecimalModuloResolveTypes`.
+fn resolve_decimal_modulo(function: &ScalarFunction, arguments: &[LogicalType]) -> Result<ScalarFunction> {
+    let (result_type, check_overflow) = decimal_arithmetic_result_type(arguments, true)?;
+    if check_overflow {
+        // fallback to DOUBLE if the decimal type is not guaranteed to fit within the max decimal width
+        return Ok(ScalarFunction::new(
+            function.name.clone(),
+            vec![LogicalType::DOUBLE; arguments.len()],
+            LogicalType::DOUBLE,
+            modulo::<f64>,
+        ));
+    }
+    let parameters = decimal_arithmetic_parameters(arguments, &result_type)?;
+    let callback = dispatch!(result_type, modulo);
+    Ok(ScalarFunction::new(
+        function.name.clone(),
+        parameters,
+        result_type,
+        callback,
+    ))
+}
+
+/// `DecimalMultiplyResultType`: the result type of a decimal multiplication, and whether it
+/// needs an overflow check.
+fn decimal_multiply_result_type(input_types: &[LogicalType]) -> Result<(LogicalType, bool)> {
+    const MAX_WIDTH_INT64: u8 = 18;
+    let mut check_overflow = false;
+    let (mut result_width, mut result_scale, mut max_width) = (0_u32, 0_u32, 0);
+    for input_type in input_types {
+        let (width, scale) = argument_decimal_properties(input_type)?;
+        max_width = max_width.max(width);
+        result_width += u32::from(width);
+        result_scale += u32::from(scale);
+    }
+    let max_decimal = u32::from(decimal::MAX_WIDTH);
+    if result_scale > max_decimal {
+        return Err(Error::new(
+            ErrorKind::OutOfRange,
+            format!(
+                "Needed scale {result_scale} to accurately represent the multiplication result, but this is out of \
+                 range of the DECIMAL type. Max scale is {max_decimal}; could not perform an accurate \
+                 multiplication. Either add a cast to DOUBLE, or add an explicit cast to a decimal with a lower \
+                 scale."
+            ),
+        ));
+    }
+    let max_int64 = u32::from(MAX_WIDTH_INT64);
+    if result_width > max_int64 && max_width <= MAX_WIDTH_INT64 && result_scale < max_int64 {
+        check_overflow = true;
+        result_width = max_int64;
+    }
+    if result_width > max_decimal {
+        check_overflow = true;
+        result_width = max_decimal;
+    }
+    Ok((
+        LogicalType::decimal(result_width as u8, result_scale as u8),
+        check_overflow,
+    ))
+}
+
+/// `DecimalMultiplyResolveTypes`.
+fn resolve_decimal_multiply(function: &ScalarFunction, arguments: &[LogicalType]) -> Result<ScalarFunction> {
+    let (result_type, check_overflow) = decimal_multiply_result_type(arguments)?;
+    let (result_width, _) = result_type.decimal_properties().expect("a DECIMAL result");
+    // since our scale is the summation of our input scales, we do not need to cast to the result
+    // scale; however, we might need to cast to the correct internal type
+    let parameters = arguments
+        .iter()
+        .map(|argument| {
+            if argument.physical_type() == result_type.physical_type() {
+                return argument.clone();
+            }
+            let (_, scale) = decimal_properties(argument).unwrap_or((0, 0));
+            LogicalType::decimal(result_width, scale)
+        })
+        .collect();
+    let callback = match (check_overflow, result_type.physical_type()) {
+        (true, PhysicalType::Int64) => decimal_multiply_overflow_check_18,
+        (true, _) => decimal_multiply_overflow_check_38,
+        (false, _) => dispatch!(result_type, binary::<Multiply>),
+    };
+    Ok(ScalarFunction::new(
+        function.name.clone(),
+        parameters,
+        result_type,
+        callback,
+    ))
+}
+
+/// `NopDecimalResolveTypes`: unary `+` over a DECIMAL.
+fn resolve_decimal_identity(function: &ScalarFunction, arguments: &[LogicalType]) -> Result<ScalarFunction> {
+    Ok(ScalarFunction::new(
+        function.name.clone(),
+        arguments.to_vec(),
+        arguments[0].clone(),
+        identity,
+    ))
+}
+
+/// `DecimalNegateResolveTypes`: unary `-` over a DECIMAL.
+fn resolve_decimal_negate(function: &ScalarFunction, arguments: &[LogicalType]) -> Result<ScalarFunction> {
+    let callback = dispatch!(arguments[0], negate);
+    Ok(ScalarFunction::new(
+        function.name.clone(),
+        arguments.to_vec(),
+        arguments[0].clone(),
+        callback,
+    ))
+}
+
+/// A DECIMAL overload of an operator, whose types and callback come from `resolve_types`.
+fn decimal_overload(
+    name: &str,
+    arity: usize,
+    ty: &LogicalType,
+    resolve_types: super::ResolveTypesCallback,
+) -> ScalarFunction {
+    ScalarFunction::new(name, vec![ty.clone(); arity], ty.clone(), unresolved_decimal).with_resolve_types(resolve_types)
+}
+
 /// `OperatorAddFun`, `OperatorSubtractFun` and `OperatorMultiplyFun` for the numeric types.
 pub(super) fn arithmetic_operators() -> Vec<ScalarFunctionSet> {
     let mut add = ScalarFunctionSet::new("+");
@@ -286,6 +570,15 @@ pub(super) fn arithmetic_operators() -> Vec<ScalarFunctionSet> {
         ));
     }
     for ty in numeric_types() {
+        if ty.id() == LogicalTypeId::Decimal {
+            remainder.add(decimal_overload("%", 2, &ty, resolve_decimal_modulo));
+            add.add(decimal_overload("+", 1, &ty, resolve_decimal_identity));
+            add.add(decimal_overload("+", 2, &ty, resolve_decimal_add));
+            subtract.add(decimal_overload("-", 1, &ty, resolve_decimal_negate));
+            subtract.add(decimal_overload("-", 2, &ty, resolve_decimal_subtract));
+            multiply.add(decimal_overload("*", 2, &ty, resolve_decimal_multiply));
+            continue;
+        }
         full_divide.add(ScalarFunction::new(
             "//",
             vec![ty.clone(), ty.clone()],

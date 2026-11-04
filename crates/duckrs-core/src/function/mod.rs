@@ -21,12 +21,17 @@ use std::sync::{Arc, OnceLock};
 /// (`scalar_function_t`).
 pub type ScalarCallback = fn(args: &DataChunk, result: &mut Vector) -> Result<()>;
 
+/// Derives the overload to run from the types of the arguments (`resolve_types_function_t`): the
+/// DECIMAL operators take their width and scale from the arguments.
+pub type ResolveTypesCallback = fn(function: &ScalarFunction, arguments: &[LogicalType]) -> Result<ScalarFunction>;
+
 /// One overload of a scalar function (`ScalarFunction`).
 pub struct ScalarFunction {
     pub name: String,
     pub arguments: Vec<LogicalType>,
     pub return_type: LogicalType,
     pub function: ScalarCallback,
+    pub resolve_types: Option<ResolveTypesCallback>,
 }
 
 impl ScalarFunction {
@@ -41,7 +46,14 @@ impl ScalarFunction {
             arguments,
             return_type,
             function,
+            resolve_types: None,
         }
+    }
+
+    /// `ScalarFunction::SetResolveTypesCallback`.
+    pub fn with_resolve_types(mut self, resolve_types: ResolveTypesCallback) -> Self {
+        self.resolve_types = Some(resolve_types);
+        self
     }
 }
 

@@ -4,7 +4,7 @@
 //! operator's input chunk (`BoundReferenceExpression`), which is what execution reads.
 
 use super::expression::{BoundExpr, BoundExprKind, ColumnBinding};
-use super::logical::LogicalOperator;
+use super::logical::{LogicalOperator, LogicalOperatorKind};
 use duckrs_common::{Error, ErrorKind, Result};
 
 /// `ColumnBindingResolver::VisitOperator`: resolves the children first, then this operator's
@@ -12,6 +12,14 @@ use duckrs_common::{Error, ErrorKind, Result};
 pub fn resolve_column_bindings(op: &mut LogicalOperator) -> Result<()> {
     for child in &mut op.children {
         resolve_column_bindings(child)?;
+    }
+    if let LogicalOperatorKind::Join { conditions, .. } = &mut op.kind {
+        let left = op.children[0].column_bindings();
+        let right = op.children[1].column_bindings();
+        for condition in conditions {
+            resolve_expression(&mut condition.left, &left)?;
+            resolve_expression(&mut condition.right, &right)?;
+        }
     }
     let bindings: Vec<ColumnBinding> = op.children.iter().flat_map(|c| c.column_bindings()).collect();
     for expr in op.expressions_mut() {

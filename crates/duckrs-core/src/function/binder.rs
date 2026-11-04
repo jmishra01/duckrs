@@ -138,8 +138,21 @@ pub fn bind_scalar_function(
     let function = select_function(set, &arguments)?;
     // if any of the arguments are NULL, the function is replaced with a NULL constant
     if children.iter().any(|c| c.return_type.id() == LogicalTypeId::SqlNull) {
-        return Ok(BoundExpr::constant(Value::null(function.return_type.clone())));
+        // untyped NULLs never go through type resolution
+        let incomplete = function.return_type.id() == LogicalTypeId::Decimal && !function.return_type.has_params();
+        return Ok(BoundExpr::constant(if incomplete {
+            Value::sql_null()
+        } else {
+            Value::null(function.return_type.clone())
+        }));
     }
+    let function = match function.resolve_types {
+        Some(resolve_types) => {
+            let types: Vec<LogicalType> = children.iter().map(|c| c.return_type.clone()).collect();
+            Arc::new(resolve_types(&function, &types)?)
+        }
+        None => function,
+    };
     for child in &mut children {
         if let BoundExprKind::Constant(value) = &child.kind {
             if value.is_null() {

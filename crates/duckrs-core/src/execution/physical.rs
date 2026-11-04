@@ -29,6 +29,17 @@ use std::sync::Arc;
 /// The state a source keeps between `get_data` calls (`GlobalSourceState`).
 pub type SourceState = Box<dyn Any + Send>;
 
+/// The state an operator keeps while it works through an input chunk (`OperatorState`).
+pub type OperatorState = Box<dyn Any + Send>;
+
+/// What an operator wants after producing a chunk (`OperatorResultType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorResult {
+    NeedMoreInput,
+    /// call it again with the same input
+    HaveMoreOutput,
+}
+
 pub trait PhysicalOperator: fmt::Debug + Send + Sync {
     fn name(&self) -> &'static str;
     fn types(&self) -> &[LogicalType];
@@ -53,6 +64,15 @@ pub trait PhysicalOperator: fmt::Debug + Send + Sync {
         unreachable!("{} is not an operator", self.name())
     }
 
+    fn operator_state(&self) -> OperatorState {
+        Box::new(())
+    }
+
+    /// Like `execute`, for an operator that can turn one input chunk into many.
+    fn execute_stateful(&self, input: &DataChunk, _state: &mut OperatorState) -> Result<(DataChunk, OperatorResult)> {
+        Ok((self.execute(input.clone())?, OperatorResult::NeedMoreInput))
+    }
+
     /// Whether the operator needs no more input, so that its pipeline can stop early.
     fn is_finished(&self) -> bool {
         false
@@ -67,6 +87,17 @@ pub trait PhysicalOperator: fmt::Debug + Send + Sync {
     }
     fn finalize(&self) -> Result<()> {
         Ok(())
+    }
+    /// Which child feeds the sink. Joins are sinks for their right child, and the left child
+    /// streams through them.
+    fn sink_child(&self) -> usize {
+        0
+    }
+
+    /// Whether a join has rows to emit through `get_data` after its input is done
+    /// (`IsSource` of RIGHT and FULL joins).
+    fn has_unmatched_source(&self) -> bool {
+        false
     }
 }
 
@@ -117,14 +148,28 @@ impl PhysicalOperator for PhysicalTableScan {
 /// instead of exhausting the machine.
 const MAX_BUFFERED_BYTES: usize = 2 << 30;
 
-fn check_buffered(collection: &ColumnDataCollection) -> Result<()> {
-    let row_size: usize = collection.types().iter().map(|t| t.physical_type().size().max(8)).sum();
-    if collection.len().saturating_mul(row_size) > MAX_BUFFERED_BYTES {
+pub(super) fn check_buffered(collection: &ColumnDataCollection) -> Result<()> {
+    check_buffered_rows(collection.types(), collection.len())
+}
+
+pub(super) fn check_buffered_rows(types: &[LogicalType], rows: usize) -> Result<()> {
+    let row_size: usize = types.iter().map(|t| t.physical_type().size().max(8)).sum();
+    if rows.saturating_mul(row_size) > MAX_BUFFERED_BYTES {
         return Err(crate::unported(
             "keeping more than 2 GiB of rows, which needs spilling to disk,",
         ));
     }
     Ok(())
+}
+
+/// A key per row that is equal exactly for rows with equal values, NULLs included.
+pub(super) fn group_keys(columns: &[&Vector], count: usize) -> Result<Vec<Vec<u8>>> {
+    let modifiers = OrderModifiers {
+        order: OrderType::Ascending,
+        nulls: NullOrder::NullsLast,
+    };
+    let columns: Vec<(&Vector, OrderModifiers)> = columns.iter().map(|&v| (v, modifiers)).collect();
+    create_sort_keys(&columns, count)
 }
 
 /// `PhysicalEmptyResult`.
@@ -464,14 +509,8 @@ impl PhysicalOperator for PhysicalDistinct {
         true
     }
     fn sink(&self, chunk: &DataChunk) -> Result<()> {
-        // equal values (NULLs included) have equal sort keys
-        let modifiers = OrderModifiers {
-            order: OrderType::Ascending,
-            nulls: NullOrder::NullsLast,
-        };
-        let columns: Vec<(&Vector, OrderModifiers)> =
-            self.targets.iter().map(|&i| (chunk.column(i), modifiers)).collect();
-        let keys = create_sort_keys(&columns, chunk.len())?;
+        let columns: Vec<&Vector> = self.targets.iter().map(|&i| chunk.column(i)).collect();
+        let keys = group_keys(&columns, chunk.len())?;
         let mut seen = self.seen.lock();
         let new_rows: Vec<u32> = keys
             .into_iter()
@@ -565,12 +604,7 @@ impl PhysicalAggregate {
             .iter()
             .map(|g| execute(g, chunk))
             .collect::<Result<Vec<_>>>()?;
-        let modifiers = OrderModifiers {
-            order: OrderType::Ascending,
-            nulls: NullOrder::NullsLast,
-        };
-        let columns: Vec<(&Vector, OrderModifiers)> = vectors.iter().map(|v| (v, modifiers)).collect();
-        let keys = create_sort_keys(&columns, chunk.len())?;
+        let keys = group_keys(&vectors.iter().collect::<Vec<_>>(), chunk.len())?;
         let mut new_rows = Vec::new();
         let mut ids = Vec::with_capacity(keys.len());
         for (row, key) in keys.into_iter().enumerate() {

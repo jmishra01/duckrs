@@ -6,7 +6,7 @@
 /// otherwise in scientific notation with a signed, at-least-two-digit exponent.
 pub fn format_double(value: f64) -> String {
     if value.is_nan() {
-        return "nan".into();
+        return if value.is_sign_negative() { "-nan" } else { "nan" }.into();
     }
     if value.is_infinite() {
         return if value > 0.0 { "inf" } else { "-inf" }.into();
@@ -17,7 +17,7 @@ pub fn format_double(value: f64) -> String {
 /// Formats a FLOAT with the shortest digits that round-trip as an `f32`.
 pub fn format_float(value: f32) -> String {
     if value.is_nan() {
-        return "nan".into();
+        return if value.is_sign_negative() { "-nan" } else { "nan" }.into();
     }
     if value.is_infinite() {
         return if value > 0.0 { "inf" } else { "-inf" }.into();
@@ -131,6 +131,7 @@ mod tests {
             (f64::MAX, "1.7976931348623157e+308"),
             (5e-324, "5e-324"),
             (f64::NAN, "nan"),
+            (-f64::NAN, "-nan"),
             (f64::INFINITY, "inf"),
             (f64::NEG_INFINITY, "-inf"),
             (1.0 / 3.0, "0.3333333333333333"),

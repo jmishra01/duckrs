@@ -84,7 +84,8 @@ mod tests {
             .unwrap();
         let mut other = db.connect().unwrap();
         assert_eq!(other.query("SELECT i FROM t").unwrap().row_count(), 2);
-        let err = con.query("SELECT * FROM t, t AS u").unwrap_err();
+        assert_eq!(con.query("SELECT * FROM t, t AS u").unwrap().row_count(), 4);
+        let err = con.query("SELECT * FROM t WHERE i IN (SELECT i FROM t)").unwrap_err();
         assert_eq!(err.kind, ErrorKind::NotImplemented);
     }
 }

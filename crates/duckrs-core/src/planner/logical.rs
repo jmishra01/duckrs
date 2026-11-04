@@ -8,6 +8,7 @@ use super::expression::{BoundAggregate, BoundExpr, ColumnBinding};
 use crate::catalog::{ColumnDefinition, OnCreateConflict, SchemaCatalogEntry, TableCatalogEntry};
 use duckrs_common::sort_key::OrderModifiers;
 use duckrs_common::types::LogicalType;
+use duckrs_parser::ast::JoinType;
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -59,6 +60,15 @@ pub enum LogicalOperatorKind {
         table_index: usize,
         expressions: Vec<BoundExpr>,
     },
+    /// `LogicalCrossProduct`: every pair of rows of its two children.
+    CrossProduct,
+    /// `LogicalComparisonJoin` and `LogicalAnyJoin`: the pairs of rows of its two children with
+    /// equal `conditions` for which `predicate`, which sees both sides, holds.
+    Join {
+        join_type: JoinType,
+        conditions: Vec<JoinCondition>,
+        predicate: Option<BoundExpr>,
+    },
     /// `LogicalInsert`: appends its child's rows to `table`. `column_index_map[i]` is the child
     /// column that fills table column `i`, or `None` for the column's default (NULL).
     Insert {
@@ -79,6 +89,17 @@ pub enum LogicalOperatorKind {
         columns: Vec<ColumnDefinition>,
         on_conflict: OnCreateConflict,
     },
+}
+
+/// An equality between the two sides of a join (`JoinCondition`).
+#[derive(Debug, Clone)]
+pub struct JoinCondition {
+    /// reads the left child
+    pub left: BoundExpr,
+    /// reads the right child
+    pub right: BoundExpr,
+    /// `IS NOT DISTINCT FROM`: NULLs are equal
+    pub null_safe: bool,
 }
 
 /// An ORDER BY term with its resolved order and NULL order (`BoundOrderByNode`).
@@ -122,9 +143,31 @@ impl LogicalOperator {
             LogicalOperatorKind::Projection { expressions, .. } => {
                 expressions.iter().map(|e| e.return_type.clone()).collect()
             }
+            LogicalOperatorKind::CrossProduct | LogicalOperatorKind::Join { .. } => {
+                self.join_output(|child| child.types())
+            }
             LogicalOperatorKind::Insert { .. }
             | LogicalOperatorKind::CreateTable { .. }
             | LogicalOperatorKind::CreateTableAs { .. } => vec![LogicalType::BIGINT],
+        }
+    }
+
+    /// What a join outputs of its children: both, or only one for SEMI and ANTI joins.
+    fn join_output<T>(&self, of_child: impl Fn(&LogicalOperator) -> Vec<T>) -> Vec<T> {
+        match self.kind {
+            LogicalOperatorKind::Join {
+                join_type: JoinType::Semi | JoinType::Anti,
+                ..
+            } => of_child(&self.children[0]),
+            LogicalOperatorKind::Join {
+                join_type: JoinType::RightSemi | JoinType::RightAnti,
+                ..
+            } => of_child(&self.children[1]),
+            _ => {
+                let mut output = of_child(&self.children[0]);
+                output.extend(of_child(&self.children[1]));
+                output
+            }
         }
     }
 
@@ -162,6 +205,9 @@ impl LogicalOperator {
                 table_index,
                 expressions,
             } => numbered(*table_index, expressions.len()),
+            LogicalOperatorKind::CrossProduct | LogicalOperatorKind::Join { .. } => {
+                self.join_output(|child| child.column_bindings())
+            }
             LogicalOperatorKind::Insert { .. }
             | LogicalOperatorKind::CreateTable { .. }
             | LogicalOperatorKind::CreateTableAs { .. } => numbered(0, 1),
@@ -184,6 +230,8 @@ impl LogicalOperator {
                 )
                 .collect(),
             LogicalOperatorKind::ExpressionGet { expressions, .. } => expressions.iter_mut().flatten().collect(),
+            // the join conditions read one child each, see `resolve_column_bindings`
+            LogicalOperatorKind::Join { predicate, .. } => predicate.iter_mut().collect(),
             _ => Vec::new(),
         }
     }

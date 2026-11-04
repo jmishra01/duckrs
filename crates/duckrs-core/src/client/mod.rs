@@ -335,6 +335,242 @@ mod tests {
         );
     }
 
+    /// Two small tables with a duplicate key, a NULL key and keys only one side has.
+    fn join_tables() -> ClientContext {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        run(&mut context, "CREATE TABLE l (k INTEGER, a VARCHAR)");
+        run(
+            &mut context,
+            "INSERT INTO l VALUES (1, 'x'), (2, 'y'), (2, 'z'), (NULL, 'n')",
+        );
+        run(&mut context, "CREATE TABLE r (k INTEGER, b INTEGER)");
+        run(
+            &mut context,
+            "INSERT INTO r VALUES (2, 20), (2, 21), (3, 30), (NULL, 40)",
+        );
+        context
+    }
+
+    fn rows(rows: &[&[&str]]) -> Vec<Vec<String>> {
+        rows.iter()
+            .map(|row| row.iter().map(|v| v.to_string()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn join_types() {
+        let mut c = join_tables();
+        let inner = rows(&[&["y", "20"], &["y", "21"], &["z", "20"], &["z", "21"]]);
+        for from in [
+            "l JOIN r ON l.k = r.k",
+            "l, r WHERE l.k = r.k",
+            "l JOIN r ON r.k = l.k AND true",
+        ] {
+            assert_eq!(
+                run(&mut c, &format!("SELECT a, b FROM {from} ORDER BY 1, 2")),
+                inner,
+                "{from}"
+            );
+        }
+        assert_eq!(
+            run(&mut c, "SELECT a, b FROM l LEFT JOIN r ON l.k = r.k ORDER BY 1, 2"),
+            rows(&[
+                &["n", "NULL"],
+                &["x", "NULL"],
+                &["y", "20"],
+                &["y", "21"],
+                &["z", "20"],
+                &["z", "21"]
+            ])
+        );
+        assert_eq!(
+            run(&mut c, "SELECT a, b FROM l RIGHT JOIN r ON l.k = r.k ORDER BY 2, 1"),
+            rows(&[
+                &["y", "20"],
+                &["z", "20"],
+                &["y", "21"],
+                &["z", "21"],
+                &["NULL", "30"],
+                &["NULL", "40"]
+            ])
+        );
+        assert_eq!(
+            run(&mut c, "SELECT a, b FROM l FULL JOIN r ON l.k = r.k ORDER BY 1, 2").len(),
+            8
+        );
+        assert_eq!(
+            run(&mut c, "SELECT a FROM l SEMI JOIN r ON l.k = r.k ORDER BY 1"),
+            rows(&[&["y"], &["z"]])
+        );
+        assert_eq!(
+            run(&mut c, "SELECT * FROM l ANTI JOIN r ON l.k = r.k ORDER BY 2"),
+            rows(&[&["NULL", "n"], &["1", "x"]])
+        );
+        // a NULL only finds a NULL with IS NOT DISTINCT FROM
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT a, b FROM l JOIN r ON l.k IS NOT DISTINCT FROM r.k AND a = 'n'"
+            ),
+            rows(&[&["n", "40"]])
+        );
+    }
+
+    #[test]
+    fn join_predicates() {
+        let mut c = join_tables();
+        // the predicate decides what counts as a match, not what the join keeps
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT a, b FROM l LEFT JOIN r ON l.k = r.k AND b > 20 ORDER BY 1, 2"
+            ),
+            rows(&[&["n", "NULL"], &["x", "NULL"], &["y", "21"], &["z", "21"]])
+        );
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT a, b FROM l JOIN r ON l.k < r.k AND b < 30 ORDER BY 1, 2"
+            ),
+            rows(&[&["x", "20"], &["x", "21"]])
+        );
+        assert_eq!(
+            run(&mut c, "SELECT a, b FROM l LEFT JOIN r ON false ORDER BY 1"),
+            rows(&[&["n", "NULL"], &["x", "NULL"], &["y", "NULL"], &["z", "NULL"]])
+        );
+        assert_eq!(
+            run(&mut c, "SELECT b FROM l RIGHT JOIN r ON l.k = 1 AND b = 30 ORDER BY 1"),
+            rows(&[&["20"], &["21"], &["30"], &["40"]])
+        );
+    }
+
+    #[test]
+    fn using_and_natural() {
+        let mut c = join_tables();
+        assert_eq!(
+            run(&mut c, "SELECT * FROM l JOIN r USING (k) ORDER BY a, b LIMIT 1"),
+            rows(&[&["2", "y", "20"]])
+        );
+        assert_eq!(
+            run(&mut c, "SELECT * FROM l NATURAL JOIN r ORDER BY a, b LIMIT 1"),
+            rows(&[&["2", "y", "20"]])
+        );
+        // k is whichever side has it
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT k, a, b FROM l FULL JOIN r USING (k) WHERE b = 30 OR a = 'x' ORDER BY k"
+            ),
+            rows(&[&["1", "x", "NULL"], &["3", "NULL", "30"]])
+        );
+        assert_eq!(
+            run(&mut c, "SELECT k FROM l RIGHT JOIN r USING (k) WHERE b = 30"),
+            rows(&[&["3"]])
+        );
+        assert_eq!(
+            run(&mut c, "SELECT k, count(*) FROM l JOIN r USING (k) GROUP BY k"),
+            rows(&[&["2", "4"]])
+        );
+        run(&mut c, "CREATE TABLE t (k INTEGER, c INTEGER)");
+        run(&mut c, "INSERT INTO t VALUES (2, 5)");
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT DISTINCT * FROM l JOIN r USING (k) JOIN t USING (k) WHERE a = 'y' AND b = 20"
+            ),
+            rows(&[&["2", "y", "20", "5"]])
+        );
+        // ON only sees the two sides of its join
+        let error = |c: &mut ClientContext, sql: &str| c.query(sql).unwrap_err().message;
+        let message = error(&mut c, "SELECT * FROM (l JOIN r ON t.k = l.k) JOIN t ON true");
+        assert!(message.contains("Referenced table \"t\" not found"), "{message}");
+        let message = error(&mut c, "SELECT * FROM l JOIN r USING (x)");
+        assert_eq!(message, "Column x does not exist on left side of join!");
+        let message = error(&mut c, "SELECT * FROM l NATURAL JOIN (SELECT 1 AS z) u");
+        assert!(
+            message.starts_with("No columns found to join on in NATURAL JOIN."),
+            "{message}"
+        );
+        let message = error(&mut c, "SELECT * FROM l JOIN r ON sum(l.k) = 1");
+        assert_eq!(message, "WHERE clause cannot contain aggregates!");
+        // a column of the left side is a LATERAL reference, not a mistake
+        for sql in [
+            "SELECT * FROM l, r JOIN t ON a = 'x'",
+            "SELECT * FROM l, (SELECT l.k) s",
+            "SELECT * FROM l, range(k)",
+            "SELECT * FROM l, (SELECT 1 FROM r JOIN t ON a = 'x') s",
+        ] {
+            assert_eq!(
+                c.query(sql).unwrap_err().kind,
+                duckrs_common::ErrorKind::NotImplemented,
+                "{sql}"
+            );
+        }
+        // a duplicate alias only matters to a reference that could mean either table
+        assert_eq!(
+            run(&mut c, "SELECT t.x, t.y FROM (SELECT 1 x) t, (SELECT 2 y) t"),
+            rows(&[&["1", "2"]])
+        );
+        assert_eq!(run(&mut c, "SELECT count(*) FROM t, t"), rows(&[&["1"]]));
+        let message = error(&mut c, "SELECT t.k FROM t, t");
+        assert!(message.contains("duplicate alias \"t\""), "{message}");
+        // nothing refers to the USING column of a side the join drops
+        assert_eq!(
+            run(&mut c, "SELECT k FROM t SEMI JOIN (l JOIN r USING (k)) ON true"),
+            rows(&[&["2"]])
+        );
+        // nested loops run in the order of DuckDB's cross product
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT x.k, y.k FROM (VALUES (1), (2)) x(k) JOIN (VALUES (1), (2)) y(k) ON x.k <> y.k"
+            ),
+            rows(&[&["2", "1"], &["1", "2"]])
+        );
+        let message = error(&mut c, "SELECT k FROM l, r");
+        assert!(message.contains("Ambiguous reference to column name k"), "{message}");
+    }
+
+    #[test]
+    fn joins_larger_than_a_vector() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        let count = "SELECT count(*), sum(a + b) FROM";
+        assert_eq!(
+            run(&mut c, &format!("{count} range(3000) x(a), range(5000) y(b)")),
+            rows(&[&["15000000", "59985000000"]])
+        );
+        // one key matching more rows than fit a chunk, and a build side of many chunks
+        assert_eq!(
+            run(
+                &mut c,
+                &format!(
+                    "{count} (SELECT a, 1 AS k FROM range(3000) t(a)) x JOIN (SELECT b, 1 AS k FROM range(5000) t(b)) y USING (k)"
+                )
+            ),
+            rows(&[&["15000000", "59985000000"]])
+        );
+        // every row of both sides is unmatched in a chunk of its own
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT count(a), count(b) FROM range(5000) x(a) FULL JOIN range(5000, 12000) y(b) ON a = b"
+            ),
+            rows(&[&["5000", "7000"]])
+        );
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT count(*) FROM range(3000) x(a) JOIN range(3000) y(b) ON a < b"
+            ),
+            rows(&[&["4498500"]])
+        );
+        // LIMIT stops a cross product that would never finish
+        assert_eq!(
+            run(&mut c, "SELECT * FROM range(100000000) x, range(100000000) y LIMIT 2").len(),
+            2
+        );
+    }
+
     #[test]
     fn order_limit_distinct() {
         let mut context = ClientContext::new(DatabaseInstance::new());
@@ -641,6 +877,106 @@ mod tests {
         assert_eq!(
             run(&mut context, "SELECT s IS DISTINCT FROM '30' FROM t WHERE i > 1"),
             vec![vec!["true"], vec!["false"]]
+        );
+    }
+
+    #[test]
+    fn insert_casts_below_order_and_limit() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        run(&mut context, "CREATE TABLE t (i INTEGER)");
+        // `range` is a BIGINT, and the root of the plan is no projection to put the cast in
+        run(
+            &mut context,
+            "INSERT INTO t SELECT range FROM range(3) ORDER BY range DESC",
+        );
+        run(&mut context, "INSERT INTO t SELECT range FROM range(5) LIMIT 1");
+        assert_eq!(
+            run(&mut context, "SELECT i FROM t ORDER BY i"),
+            [["0"], ["0"], ["1"], ["2"]]
+        );
+    }
+
+    #[test]
+    fn negative_nan_keeps_its_sign() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        assert_eq!(
+            run(
+                &mut context,
+                "SELECT '-NaN'::DOUBLE::VARCHAR, '-NaN'::FLOAT::VARCHAR, 'NaN'::DOUBLE::VARCHAR, \
+                 'NaN'::FLOAT::VARCHAR"
+            ),
+            [["-nan", "-nan", "nan", "nan"]]
+        );
+    }
+
+    #[test]
+    fn decimal_arithmetic_is_exact() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        assert_eq!(
+            run(
+                &mut context,
+                "SELECT '0.543215432154321'::DECIMAL(15,15) + 10000::DECIMAL(20,15), \
+                 '0.3'::DECIMAL(2,1) - '0.1'::DECIMAL(2,1), '0.1'::DECIMAL(2,1) * '0.2'::DECIMAL(2,1), \
+                 -'0.5'::DECIMAL(2,1), +'0.5'::DECIMAL(2,1)"
+            ),
+            [["10000.543215432154321", "0.2", "0.02", "-0.5", "0.5"]]
+        );
+        assert_eq!(
+            run(&mut context, "SELECT 12345678901111111 % 2.0, 10 % 2.4, -10.0 % 2.4"),
+            [["1.0", "0.4", "-0.4"]]
+        );
+        // the required width exceeds the maximum decimal width: modulo falls back to DOUBLE
+        let result = context
+            .query(
+                "SELECT 10000000000000000000000000000000000001::DECIMAL(38,0) % 0.00000000000000000000000000000000004",
+            )
+            .unwrap();
+        assert_eq!(result.types[0], LogicalType::DOUBLE);
+        let result = context.query("SELECT 1.5 + 1, 1.5 * 2, NULL + 1.5").unwrap();
+        assert_eq!(result.types[0], LogicalType::decimal(12, 1));
+        assert_eq!(result.types[1], LogicalType::decimal(12, 1));
+    }
+
+    #[test]
+    fn decimal_overflow_matches_duckdb() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        let big = "99999999999999999999999999999999999999::DECIMAL(38,0)";
+        let err = context.query(&format!("SELECT {big} + {big}")).unwrap_err().to_string();
+        assert!(err.contains("Overflow in addition of DECIMAL(38) ("), "{err}");
+        let err = context
+            .query(&format!("SELECT -{big} - {big}"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Overflow in subtract of DECIMAL(38) ("), "{err}");
+        let err = context.query(&format!("SELECT {big} * {big}")).unwrap_err().to_string();
+        assert!(err.contains("Overflow in multiplication of DECIMAL(38) ("), "{err}");
+    }
+
+    #[test]
+    fn having_prefers_a_group_to_an_alias() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        run(&mut context, "CREATE TABLE t1 (a INTEGER)");
+        run(&mut context, "INSERT INTO t1 VALUES (42), (84)");
+        assert_eq!(
+            run(&mut context, "SELECT a + 1 AS a FROM t1 GROUP BY a HAVING a = 42"),
+            [["43"]]
+        );
+        run(&mut context, "CREATE TABLE t2 (a INTEGER)");
+        run(&mut context, "INSERT INTO t2 VALUES (42), (84), (42)");
+        assert_eq!(
+            run(
+                &mut context,
+                "SELECT a AS b, sum(a) AS a FROM t2 GROUP BY b HAVING a = 42"
+            ),
+            [["42", "84"]]
+        );
+        // a name that is no group stays an alias
+        assert_eq!(
+            run(
+                &mut context,
+                "SELECT a, sum(a) AS s FROM t2 GROUP BY a HAVING s = 84 ORDER BY a"
+            ),
+            [["42", "84"], ["84", "84"]]
         );
     }
 

@@ -8,7 +8,9 @@
 //! DISTINCT), INSERT and CREATE TABLE.
 
 use super::expression::{checked_cast, without_aliases};
-use super::{AggregateBindState, Binder, Binding, BoundStatement, ColumnMode, StatementReturnType, binder_error};
+use super::{
+    AggregateBindState, BindContext, Binder, Binding, BoundStatement, ColumnMode, StatementReturnType, binder_error,
+};
 use crate::catalog::{ColumnDefinition, DEFAULT_CATALOG, OnCreateConflict, SchemaCatalogEntry};
 use crate::execution::expression_executor::evaluate_scalar;
 use crate::function::binder::expression_return_type;
@@ -27,7 +29,7 @@ use duckrs_parser::ast::{
 use duckrs_parser::transformer::visit_expr_mut;
 use std::sync::Arc;
 
-fn not_implemented(what: &str) -> Error {
+pub(super) fn not_implemented(what: &str) -> Error {
     crate::unported(what)
 }
 
@@ -348,12 +350,18 @@ impl Binder<'_> {
         // the HAVING clause binds after the select list and its groups
         let having = match &node.having {
             Some(having) => {
-                // an alias of the select list wins over a column of the FROM clause
+                // an alias of the select list wins over a column of the FROM clause, unless that
+                // column is a group (`ColumnQualifier::QualifyColumnName`)
                 let mut having = having.clone();
                 let alias_names = state
                     .alias_map
                     .iter()
                     .map(|(alias, _)| alias.clone())
+                    .filter(|alias| {
+                        let mut column = Expr::column(vec![alias.clone()]);
+                        self.qualify_column_names(&mut column);
+                        self.try_bind_group(&column).is_none()
+                    })
                     .collect::<Vec<_>>();
                 self.qualify_column_names_except(&mut having, &alias_names);
                 self.alias_fallback = state
@@ -512,6 +520,19 @@ impl Binder<'_> {
     /// (`BaseSelectBinder::ClaimsAlias`).
     fn qualify_column_names_except(&self, expr: &mut Expr, aliases: &[String]) {
         visit_expr_mut(expr, &mut |e| {
+            let using = match &e.kind {
+                ExprKind::ColumnRef(names) => match names.as_slice() {
+                    [name] if !aliases.iter().any(|a| a.eq_ignore_ascii_case(name)) => {
+                        self.bind_context.using_expression(name).ok().flatten()
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(using) = using {
+                e.kind = using.kind;
+                return;
+            }
             if let ExprKind::ColumnRef(names) = &mut e.kind
                 && !matches!(names.as_slice(), [name] if aliases.iter().any(|a| a.eq_ignore_ascii_case(name)))
                 && let Ok((binding, ..)) = match names.as_slice() {
@@ -701,11 +722,28 @@ impl Binder<'_> {
                         star.relation_name
                     )));
                 }
+                if found.len() > 1 {
+                    return Err(BindContext::ambiguous_table(&star.relation_name));
+                }
                 found
             };
+            // a USING column appears once, as `*` and not `t.*` would have it
+            let mut handled_using_columns = Vec::new();
             for binding in bindings {
                 for name in &binding.names {
-                    let mut column: Expr = ExprKind::ColumnRef(vec![binding.alias.clone(), name.clone()]).into();
+                    let set = if star.relation_name.is_empty() {
+                        self.bind_context.using_binding_of(name, &binding.alias)
+                    } else {
+                        None
+                    };
+                    let mut column: Expr = match set {
+                        Some(set) if handled_using_columns.contains(&set) => continue,
+                        Some(set) => {
+                            handled_using_columns.push(set);
+                            self.bind_context.using_columns[set].expression(name)
+                        }
+                        None => ExprKind::ColumnRef(vec![binding.alias.clone(), name.clone()]).into(),
+                    };
                     column.alias = name.clone();
                     result.push(column);
                 }
@@ -730,7 +768,7 @@ impl Binder<'_> {
     }
 
     /// `Binder::Bind(TableRef)` + `CreatePlan`: the FROM clause.
-    fn bind_table_ref(&mut self, table_ref: &TableRef) -> Result<LogicalOperator> {
+    pub(super) fn bind_table_ref(&mut self, table_ref: &TableRef) -> Result<LogicalOperator> {
         if table_ref.sample.is_some() {
             return Err(not_implemented("TABLESAMPLE"));
         }
@@ -760,7 +798,7 @@ impl Binder<'_> {
                     table_index,
                     names,
                     types: table.types(),
-                })?;
+                });
                 let column_ids = (0..table.columns.len()).collect();
                 Ok(LogicalOperator::new(
                     LogicalOperatorKind::Get {
@@ -786,7 +824,7 @@ impl Binder<'_> {
                     table_index,
                     names,
                     types: types.clone(),
-                })?;
+                });
                 Ok(LogicalOperator::new(
                     LogicalOperatorKind::ExpressionGet {
                         table_index,
@@ -796,12 +834,14 @@ impl Binder<'_> {
                     vec![],
                 ))
             }
-            TableRefKind::Join(_) => Err(not_implemented("joins")),
+            TableRefKind::Join(join) => self.bind_join(table_ref, join),
             TableRefKind::Subquery(select) => {
                 // `Binder::Bind(SubqueryRef)`
                 let mut binder = Binder::with_options(self.catalog, self.options);
                 binder.next_table_index = self.next_table_index;
+                binder.left_of_join = std::mem::take(&mut self.left_of_join);
                 let bound = binder.bind_select_statement(select)?;
+                self.left_of_join = binder.left_of_join;
                 self.next_table_index = binder.next_table_index;
                 let alias = if table_ref.alias.is_empty() {
                     let index = self.unnamed_subquery_index;
@@ -820,7 +860,7 @@ impl Binder<'_> {
                     table_index,
                     names,
                     types: bound.types,
-                })?;
+                });
                 Ok(bound.plan)
             }
             TableRefKind::TableFunction {
@@ -852,7 +892,10 @@ impl Binder<'_> {
         let mut values = Vec::with_capacity(call.args.len());
         for argument in &call.args {
             let mut binder = Binder::new(self.catalog);
-            let bound = binder.bind_expression(&argument.expr)?;
+            binder.left_of_join = std::mem::take(&mut self.left_of_join);
+            let bound = binder.bind_expression(&argument.expr);
+            self.left_of_join = binder.left_of_join;
+            let bound = bound?;
             if !bound.is_foldable() {
                 return Err(not_implemented("range with arguments that are not constant"));
             }
@@ -879,7 +922,7 @@ impl Binder<'_> {
             table_index,
             names,
             types: vec![LogicalType::BIGINT],
-        })?;
+        });
         Ok(LogicalOperator::new(
             LogicalOperatorKind::Range {
                 table_index,
@@ -1053,14 +1096,7 @@ impl Binder<'_> {
                         return Err(mismatch(expected_types.len(), bound.types.len()));
                     }
                     // cast the query's columns to the column types
-                    let mut plan = bound.plan;
-                    if let LogicalOperatorKind::Projection { expressions, .. } = &mut plan.kind {
-                        for (expr, ty) in expressions.iter_mut().zip(&expected_types) {
-                            check_cast(&expr.return_type, ty)?;
-                            *expr = std::mem::replace(expr, BoundExpr::constant(Value::sql_null())).cast_to(ty, false);
-                        }
-                    }
-                    plan
+                    self.cast_logical_operator_to_types(&bound.types, &expected_types, bound.plan)?
                 }
             },
         };
@@ -1077,6 +1113,45 @@ impl Binder<'_> {
             types: vec![LogicalType::BIGINT],
             return_type: StatementReturnType::ChangedRows,
         })
+    }
+
+    /// `Binder::CastLogicalOperatorToTypes`: casts inside a projection at the root of the plan,
+    /// or else pushes a new projection to hold the casts.
+    fn cast_logical_operator_to_types(
+        &mut self,
+        source_types: &[LogicalType],
+        target_types: &[LogicalType],
+        mut op: LogicalOperator,
+    ) -> Result<LogicalOperator> {
+        for (source, target) in source_types.iter().zip(target_types) {
+            check_cast(source, target)?;
+        }
+        if source_types == target_types {
+            return Ok(op);
+        }
+        if let LogicalOperatorKind::Projection { expressions, .. } = &mut op.kind {
+            for (expr, target) in expressions.iter_mut().zip(target_types) {
+                *expr = std::mem::replace(expr, BoundExpr::constant(Value::sql_null())).cast_to(target, false);
+            }
+            return Ok(op);
+        }
+        // found a non-projection operator: push a new projection containing the casts
+        let expressions = op
+            .column_bindings()
+            .into_iter()
+            .zip(source_types.iter().zip(target_types))
+            .map(|(binding, (source, target))| {
+                BoundExpr::column_ref(binding, source.clone(), String::new()).cast_to(target, false)
+            })
+            .collect();
+        let table_index = self.generate_table_index();
+        Ok(LogicalOperator::new(
+            LogicalOperatorKind::Projection {
+                table_index,
+                expressions,
+            },
+            vec![op],
+        ))
     }
 
     /// `Binder::BindCreateTableInfo`.

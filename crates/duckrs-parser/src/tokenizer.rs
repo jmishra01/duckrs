@@ -137,7 +137,7 @@ impl Tokens<'_> {
             && ((bytes[start] == b'"' && bytes[start + 1] == b'"')
                 || (bytes[start] == b'`' && bytes[start + 1] == b'`'))
         {
-            return Err(syntax_error("syntax error: zero-length delimited identifier"));
+            return Err(syntax_error("zero-length delimited identifier"));
         }
         let mut token = Token {
             token_type,

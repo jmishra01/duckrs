@@ -58,7 +58,7 @@ jobs:
       - run: cargo build --release -p sqllogictest
       - name: Run the corpus against duckrs (fails only on regressions)
         run: >
-          ./target/release/sqllogictest --duckdb-root duckdb --allow-failures
+          ./target/release/sqllogictest --duckdb-root duckdb --allow-failures --isolate --timeout 60
           --known-passing tools/sqllogictest/known_passing.txt
           --status-out STATUS.md
       - name: Parse and transform the corpus (parse rate >= 99.9%, every transformed SELECT round trips)

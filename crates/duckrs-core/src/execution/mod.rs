@@ -7,10 +7,12 @@
 //! the calling thread.
 
 pub mod expression_executor;
+pub mod join;
 pub mod physical;
 
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
 use duckrs_common::Result;
+use duckrs_common::vector::DataChunk;
 use parking_lot::Mutex;
 use physical::*;
 
@@ -91,6 +93,14 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             expressions,
             children,
         }),
+        LogicalOperatorKind::CrossProduct => Box::new(join::PhysicalCrossProduct::new(types, children)),
+        LogicalOperatorKind::Join {
+            join_type,
+            conditions,
+            predicate,
+        } => Box::new(join::PhysicalJoin::new(
+            types, join_type, conditions, predicate, children,
+        )),
         LogicalOperatorKind::Insert {
             table,
             column_index_map,
@@ -117,42 +127,66 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
 }
 
 /// A pipeline (`Pipeline`): chunks flow from the source through the operators into the sink.
+/// Several pipelines can feed one sink, and only the last of them finishes it.
 struct Pipeline<'a> {
     source: &'a dyn PhysicalOperator,
     operators: Vec<&'a dyn PhysicalOperator>,
     sink: &'a dyn PhysicalOperator,
+    finalize: bool,
 }
 
 impl Pipeline<'_> {
+    /// Pushes `chunk` through the operators from `index` on, into the sink, as many times as
+    /// each operator has output for it (`PipelineExecutor::Execute`).
+    fn push(&self, chunk: DataChunk, index: usize, states: &mut [OperatorState]) -> Result<()> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        let Some(op) = self.operators.get(index) else {
+            return self.sink.sink(&chunk);
+        };
+        loop {
+            let (output, result) = op.execute_stateful(&chunk, &mut states[index])?;
+            self.push(output, index + 1, states)?;
+            if result == OperatorResult::NeedMoreInput || self.is_finished() {
+                return Ok(());
+            }
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.operators.iter().any(|op| op.is_finished())
+    }
+
     /// `PipelineExecutor::Execute` + `PipelineFinishEvent`.
     fn run(&self) -> Result<()> {
         let mut state = self.source.source_state();
-        while let Some(mut chunk) = self.source.get_data(&mut state)? {
-            for op in &self.operators {
-                if chunk.is_empty() {
-                    break;
-                }
-                chunk = op.execute(chunk)?;
-            }
-            if !chunk.is_empty() {
-                self.sink.sink(&chunk)?;
-            }
-            if self.operators.iter().any(|op| op.is_finished()) {
+        let mut operator_states: Vec<OperatorState> = self.operators.iter().map(|op| op.operator_state()).collect();
+        while let Some(chunk) = self.source.get_data(&mut state)? {
+            self.push(chunk, 0, &mut operator_states)?;
+            if self.is_finished() {
                 break;
             }
         }
-        self.sink.finalize()
+        if self.finalize {
+            self.sink.finalize()?;
+        }
+        Ok(())
     }
 }
 
 /// `MetaPipeline::Build` / `PhysicalOperator::BuildPipelines`: collects, children first, the
-/// pipeline that feeds `sink` and the pipelines its source depends on.
+/// pipelines that feed `sink` and the ones they depend on.
 fn build_pipelines<'a>(sink: &'a dyn PhysicalOperator, pipelines: &mut Vec<Pipeline<'a>>) {
     let mut operators = Vec::new();
-    let mut current = sink.children()[0].as_ref();
+    let mut current = sink.children()[sink.sink_child()].as_ref();
     // walk down through the streaming operators to this pipeline's source
     while !current.is_source() {
         operators.push(current);
+        if current.is_sink() {
+            // a join: its build side runs first
+            build_pipelines(current, pipelines);
+        }
         current = current.children()[0].as_ref();
     }
     if current.is_sink() {
@@ -160,11 +194,26 @@ fn build_pipelines<'a>(sink: &'a dyn PhysicalOperator, pipelines: &mut Vec<Pipel
         build_pipelines(current, pipelines);
     }
     operators.reverse();
+    // the rows of RIGHT and FULL joins that nothing matched go through the operators above them
+    let unmatched: Vec<Pipeline<'a>> = operators
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| op.has_unmatched_source())
+        .map(|(position, op)| Pipeline {
+            source: *op,
+            operators: operators[position + 1..].to_vec(),
+            sink,
+            finalize: false,
+        })
+        .collect();
     pipelines.push(Pipeline {
         source: current,
         operators,
         sink,
+        finalize: false,
     });
+    pipelines.extend(unmatched);
+    pipelines.last_mut().expect("just added").finalize = true;
 }
 
 /// `Executor::Initialize` + `Execute`: runs a plan whose root is a sink.
