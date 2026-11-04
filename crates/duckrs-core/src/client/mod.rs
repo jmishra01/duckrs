@@ -17,6 +17,7 @@ use crate::execution::{create_plan, execute_plan};
 use crate::planner::binder::{
     BindOptions, Binder, DefaultNullOrder, ParameterValues, bind_constant_expression, schema_of,
 };
+use crate::planner::binder::{enum_type_from, is_builtin_type};
 use crate::planner::column_binding_resolver::resolve_column_bindings;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::OrderType;
@@ -25,7 +26,8 @@ use duckrs_common::value::Value;
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ParserOptions;
 use duckrs_parser::ast::{
-    CreateInfo, CreateKind, DropInfo, OnCreateConflict as AstConflict, PragmaInfo, Statement, sql_quoted_identifier,
+    CreateInfo, CreateKind, CreateTypeKind, DropInfo, OnCreateConflict as AstConflict, PragmaInfo, Statement,
+    sql_quoted_identifier,
 };
 use duckrs_parser::ast::{TransactionModifier, TransactionType};
 use parking_lot::{Mutex, RwLock};
@@ -543,6 +545,10 @@ impl ClientContext {
                 self.create_sequence(info)?;
                 return Ok(Self::success());
             }
+            Statement::Create(info) if matches!(info.kind, CreateKind::Type(_)) => {
+                self.create_type(info)?;
+                return Ok(Self::success());
+            }
             Statement::Create(info) if matches!(info.kind, CreateKind::View { .. }) => {
                 self.create_view(info)?;
                 return Ok(Self::success());
@@ -688,6 +694,49 @@ impl ClientContext {
         )
     }
 
+    /// `CREATE TYPE` (`Binder::Bind(CreateStatement)` + `PhysicalCreateType`).
+    fn create_type(&mut self, info: &CreateInfo) -> Result<()> {
+        let CreateKind::Type(kind) = &info.kind else {
+            unreachable!("checked by the caller");
+        };
+        if info.temporary {
+            return Err(crate::unported("CREATE TEMPORARY TYPE"));
+        }
+        let ty = match kind {
+            CreateTypeKind::Enum(values) => enum_type_from(values.clone())?,
+            CreateTypeKind::EnumQuery(query) => {
+                let result = self.execute_statement(&Statement::Select((**query).clone()))?;
+                if result.column_count() != 1 {
+                    return Err(Error::new(ErrorKind::Binder, "The query must return a single column"));
+                }
+                let mut values = Vec::with_capacity(result.row_count());
+                for row in 0..result.row_count() {
+                    let value = result.value(0, row);
+                    if value.is_null() {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            "Attempted to create ENUM type with NULL value!",
+                        ));
+                    }
+                    values.push(value.try_to_string()?);
+                }
+                enum_type_from(values)?
+            }
+            CreateTypeKind::Alias(target) => {
+                let binder = Binder::with_options(&self.db.catalog, self.bind_options());
+                binder.bind_type(target)?
+            }
+        };
+        let schema = self.db.catalog.schema_for(schema_of(&info.name)?)?;
+        if is_builtin_type(&info.name.name) {
+            return Err(Error::new(
+                ErrorKind::Catalog,
+                format!("Type with name \"{}\" already exists!", info.name.name),
+            ));
+        }
+        schema.create_type(&info.name.name, ty, on_create_conflict(info.on_conflict))
+    }
+
     /// `CREATE SEQUENCE`.
     fn create_sequence(&mut self, info: &CreateInfo) -> Result<()> {
         let CreateKind::Sequence {
@@ -758,6 +807,18 @@ impl ClientContext {
                 };
                 if !dropped && !info.if_exists {
                     return Err(missing_entry("Sequence", &info.name.name));
+                }
+                Ok(())
+            }
+            "TYPE" => {
+                let schema = schema_of(&info.name).map_err(|_| crate::unported("this form of DROP TYPE"))?;
+                let dropped = match catalog.schema_for(schema) {
+                    Ok(schema) => schema.drop_type(&info.name.name),
+                    Err(_) if info.if_exists => false,
+                    Err(error) => return Err(error),
+                };
+                if !dropped && !info.if_exists {
+                    return Err(missing_entry("Type", &info.name.name));
                 }
                 Ok(())
             }
@@ -2135,6 +2196,58 @@ mod tests {
         assert_eq!(
             err(&mut context, "SELECT map([1, 1], [2, 3])"),
             "Invalid Input Error: Map keys must be unique."
+        );
+    }
+
+    #[test]
+    fn types_and_enums_match_duckdb() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        let err = |context: &mut ClientContext, sql: &str| context.query(sql).unwrap_err().to_string();
+        run(&mut context, "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')");
+        run(&mut context, "CREATE TYPE name_t AS VARCHAR");
+        run(&mut context, "CREATE TABLE t (m mood, n name_t)");
+        run(
+            &mut context,
+            "INSERT INTO t VALUES ('happy', 'a'), ('sad', 'b'), (NULL, 'c')",
+        );
+        assert_eq!(
+            run(&mut context, "SELECT m, typeof(m), typeof(n) FROM t WHERE m = 'happy'"),
+            [["happy", "ENUM('sad', 'ok', 'happy')", "VARCHAR"]]
+        );
+        assert_eq!(
+            run(&mut context, "SELECT m FROM t ORDER BY m DESC NULLS LAST"),
+            [["happy"], ["sad"], ["NULL"]]
+        );
+        for (sql, expected) in [
+            ("SELECT enum_first(NULL::mood)", "sad"),
+            ("SELECT enum_last(NULL::mood)", "happy"),
+            ("SELECT enum_range(NULL::mood)", "[sad, ok, happy]"),
+            ("SELECT enum_code('ok'::mood)", "1"),
+            ("SELECT enum_range_boundary('ok'::mood, NULL)", "[ok, happy]"),
+            ("SELECT 'ok'::mood::VARCHAR", "ok"),
+            ("SELECT TRY_CAST('x' AS mood)", "NULL"),
+            ("SELECT 'a'::ENUM('a', 'b')", "a"),
+            ("SELECT typeof('a'::ENUM('a', 'b'))", "ENUM('a', 'b')"),
+            ("SELECT union_tag(1::UNION(a INTEGER, b VARCHAR))", "a"),
+        ] {
+            assert_eq!(run(&mut context, sql), [[expected]], "{sql}");
+        }
+        assert_eq!(
+            err(&mut context, "SELECT 'x'::mood"),
+            "Conversion Error: Could not convert string 'x' to ENUM('sad', 'ok', 'happy')"
+        );
+        assert_eq!(
+            err(&mut context, "CREATE TYPE mood AS INTEGER"),
+            "Catalog Error: Type with name \"mood\" already exists!"
+        );
+        assert_eq!(
+            err(&mut context, "CREATE TYPE dup AS ENUM ('a', 'a')"),
+            "Invalid Input Error: Attempted to create ENUM type with duplicate value a"
+        );
+        run(&mut context, "DROP TYPE name_t");
+        assert_eq!(
+            err(&mut context, "DROP TYPE name_t"),
+            "Catalog Error: Type with name name_t does not exist!"
         );
     }
 

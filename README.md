@@ -2,7 +2,7 @@
 
 An analytical SQL database engine: a port of [DuckDB](https://github.com/duckdb/duckdb) to Rust.
 
-**Status: everything Phase 3 lists is ported, but its gate is not met yet** (535 files, 10.4% of the corpus, against a 15% target; what `test/sql/select`, `projection` and `filter` still fail on belongs to later phases). Phase 4 (types and casts) has started: the scalar casts and the nested types (LIST, ARRAY, STRUCT, MAP, UNION) are in, and `CREATE TYPE` and ENUM are next. Nested casts and functions run row by row for now. The engine runs CREATE TABLE, CREATE VIEW, CREATE SEQUENCE, CREATE MACRO, INSERT, prepared statements
+**Status: everything Phase 3 lists is ported, but its gate is not met yet** (564 files, 11.0% of the corpus, against a 15% target; what `test/sql/select`, `projection` and `filter` still fail on belongs to later phases). Phase 4 (types and casts) has started: the scalar casts, the nested types (LIST, ARRAY, STRUCT, MAP, UNION), `CREATE TYPE` and ENUM are in, and BIT and BIGNUM are next. Nested casts and functions run row by row for now. The engine runs CREATE TABLE, CREATE VIEW, CREATE SEQUENCE, CREATE MACRO, INSERT, prepared statements
 and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in memory. What exists today:
 
 - `crates/duckrs-common`: the core building blocks every other crate uses:
@@ -61,7 +61,7 @@ and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in me
 - `crates/duckrs`: the public API (`Database`, `Connection`, `QueryResult`) over the engine.
   Databases live in memory; a database file is accepted but not written until Phase 9.
 - `tools/sqllogictest`: a port of DuckDB's sqllogictest runner. It runs the DuckDB `.test` corpus
-  against duckrs, or against the C++ DuckDB library as a reference. duckrs passes 535 files so far
+  against duckrs, or against the C++ DuckDB library as a reference. duckrs passes 564 files so far
   (`tools/sqllogictest/known_passing.txt`, a CI gate), among them
   `test/sql/projection/test_simple_projection.test`.
 

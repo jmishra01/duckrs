@@ -42,6 +42,12 @@ pub fn is_nested_function(name: &str) -> bool {
             | "array_extract"
             | "union_extract"
             | "union_value"
+            | "union_tag"
+            | "enum_first"
+            | "enum_last"
+            | "enum_range"
+            | "enum_code"
+            | "enum_range_boundary"
     )
 }
 
@@ -294,6 +300,130 @@ fn bind_union_value(names: Vec<String>, children: Vec<BoundExpr>) -> Result<Boun
     Ok(bound_function("union_value", children, ty, union_value))
 }
 
+/// `union_tag`: the name of the selected member, as an ENUM of the member names.
+fn union_tag(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let ty = result.logical_type().clone();
+    row_wise(args, result, |row| {
+        Ok(match row[0].data() {
+            ValueData::Struct(fields) => match fields[0].as_i128() {
+                Some(tag) => Value::enum_value(&ty, tag as usize),
+                None => Value::null(ty.clone()),
+            },
+            _ => Value::null(ty.clone()),
+        })
+    })
+}
+
+fn bind_union_tag(children: Vec<BoundExpr>) -> Result<BoundExpr> {
+    let ty = children[0].return_type.clone();
+    if ty.id() != LogicalTypeId::Union {
+        return Err(binder_error(
+            "First argument to union_tag function must be a union type.",
+        ));
+    }
+    let names = ty.struct_children()[1..].iter().map(|(n, _)| n.clone()).collect();
+    Ok(bound_function(
+        "union_tag",
+        children,
+        LogicalType::enum_type(names),
+        union_tag,
+    ))
+}
+
+/// `enum_code`: the position of a value in its ENUM.
+fn enum_code(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let ty = result.logical_type().clone();
+    row_wise(args, result, |row| {
+        if row[0].is_null() {
+            return Ok(Value::null(ty.clone()));
+        }
+        row[0].reinterpret(&ty)
+    })
+}
+
+/// `enum_first`, `enum_last`, `enum_range` and `enum_code`.
+fn bind_enum_function(name: &str, children: Vec<BoundExpr>) -> Result<BoundExpr> {
+    let ty = children[0].return_type.clone();
+    if ty.id() != LogicalTypeId::Enum {
+        return Err(binder_error("This function needs an ENUM as an argument"));
+    }
+    let values = ty.enum_values();
+    let text = |value: Option<&String>| value.map_or(Value::null(LogicalType::VARCHAR), |v| Value::varchar(v.clone()));
+    Ok(match name {
+        "enum_first" => BoundExpr::constant(text(values.first())),
+        "enum_last" => BoundExpr::constant(text(values.last())),
+        "enum_range" => {
+            let items = values.iter().map(|v| Value::varchar(v.clone())).collect();
+            BoundExpr::constant(Value::list(LogicalType::VARCHAR, items)?)
+        }
+        _ => {
+            let code = match ty.physical_type() {
+                PhysicalType::UInt8 => LogicalType::UTINYINT,
+                PhysicalType::UInt16 => LogicalType::USMALLINT,
+                _ => LogicalType::UINTEGER,
+            };
+            bound_function("enum_code", children, code, enum_code)
+        }
+    })
+}
+
+/// `enum_range_boundary`: the values between two values of an ENUM; NULL leaves that side open.
+fn enum_range_boundary(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let ty = args.column(0).logical_type().clone();
+    let enum_type = if ty.id() == LogicalTypeId::Enum {
+        ty
+    } else {
+        args.column(1).logical_type().clone()
+    };
+    let values = enum_type.enum_values();
+    let position = |value: &Value| {
+        value
+            .reinterpret(&LogicalType::new(value_type(&enum_type)))
+            .ok()?
+            .as_i128()
+    };
+    row_wise(args, result, |row| {
+        let start = position(&row[0]).unwrap_or(0) as usize;
+        let end = position(&row[1]).map_or(values.len(), |e| e as usize + 1);
+        let items = values
+            .iter()
+            .take(end)
+            .skip(start)
+            .map(|v| Value::varchar(v.clone()))
+            .collect();
+        Value::list(LogicalType::VARCHAR, items)
+    })
+}
+
+/// The unsigned integer type an ENUM is stored as.
+fn value_type(ty: &LogicalType) -> LogicalTypeId {
+    match ty.physical_type() {
+        PhysicalType::UInt8 => LogicalTypeId::UTinyInt,
+        PhysicalType::UInt16 => LogicalTypeId::USmallInt,
+        _ => LogicalTypeId::UInteger,
+    }
+}
+
+fn bind_enum_range_boundary(children: Vec<BoundExpr>) -> Result<BoundExpr> {
+    let [start, end] = children.as_slice() else {
+        return Err(binder_error("This function needs an ENUM as an argument"));
+    };
+    let is_enum = |c: &BoundExpr| c.return_type.id() == LogicalTypeId::Enum;
+    let is_null = |c: &BoundExpr| c.return_type.id() == LogicalTypeId::SqlNull;
+    if (!is_enum(start) && !is_null(start)) || (!is_enum(end) && !is_null(end)) || (is_null(start) && is_null(end)) {
+        return Err(binder_error("This function needs an ENUM as an argument"));
+    }
+    if is_enum(start) && is_enum(end) && start.return_type != end.return_type {
+        return Err(binder_error("The parameters need to link to ONLY one enum OR be NULL "));
+    }
+    Ok(bound_function(
+        "enum_range_boundary",
+        children,
+        LogicalType::list(LogicalType::VARCHAR),
+        enum_range_boundary,
+    ))
+}
+
 fn bind_map(children: Vec<BoundExpr>) -> Result<BoundExpr> {
     match <[BoundExpr; 2]>::try_from(children) {
         Ok([keys, values]) => {
@@ -476,6 +606,15 @@ pub fn bind_nested_function(name: &str, names: Vec<String>, children: Vec<BoundE
         "struct_pack" => bind_struct_pack(names, children),
         "map" => bind_map(children),
         "union_value" => bind_union_value(names, children),
+        "union_tag" | "enum_first" | "enum_last" | "enum_range" | "enum_code" if children.len() != 1 => {
+            Err(binder_error(format!(
+                "No function matches the given name and argument types of '{lower}'. You might need to add explicit \
+                 type casts."
+            )))
+        }
+        "union_tag" => bind_union_tag(children),
+        "enum_first" | "enum_last" | "enum_range" | "enum_code" => bind_enum_function(&lower, children),
+        "enum_range_boundary" => bind_enum_range_boundary(children),
         _ => {
             let Ok([child, key]) = <[BoundExpr; 2]>::try_from(children) else {
                 return Err(binder_error(format!(

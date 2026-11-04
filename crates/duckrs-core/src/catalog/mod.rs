@@ -233,6 +233,8 @@ pub struct SchemaCatalogEntry {
     sequences: RwLock<BTreeMap<String, Arc<SequenceCatalogEntry>>>,
     /// the scalar macros and the table macros, which can share a name
     macros: [RwLock<BTreeMap<String, Arc<MacroCatalogEntry>>>; 2],
+    /// the types of CREATE TYPE, by name
+    types: RwLock<BTreeMap<String, LogicalType>>,
 }
 
 /// What to do when an entry being created already exists (`OnCreateConflict`).
@@ -254,7 +256,36 @@ impl SchemaCatalogEntry {
             tables: RwLock::new(BTreeMap::new()),
             sequences: RwLock::new(BTreeMap::new()),
             macros: [RwLock::new(BTreeMap::new()), RwLock::new(BTreeMap::new())],
+            types: RwLock::new(BTreeMap::new()),
         }
+    }
+
+    pub fn get_type(&self, name: &str) -> Option<LogicalType> {
+        self.types.read().get(&key(name)).cloned()
+    }
+
+    /// `DuckSchemaEntry::CreateType`.
+    pub fn create_type(&self, name: &str, ty: LogicalType, on_conflict: OnCreateConflict) -> Result<()> {
+        let mut types = self.types.write();
+        if types.contains_key(&key(name)) {
+            match on_conflict {
+                OnCreateConflict::Error => {
+                    return Err(Error::new(
+                        ErrorKind::Catalog,
+                        format!("Type with name \"{name}\" already exists!"),
+                    ));
+                }
+                OnCreateConflict::Ignore => return Ok(()),
+                OnCreateConflict::Replace => {}
+            }
+        }
+        types.insert(key(name), ty);
+        Ok(())
+    }
+
+    /// Drops a type, returning whether it existed.
+    pub fn drop_type(&self, name: &str) -> bool {
+        self.types.write().remove(&key(name)).is_some()
     }
 
     /// The table or view with this name.
@@ -432,11 +463,13 @@ impl SchemaCatalogEntry {
     fn entries(&self) -> Vec<(String, String)> {
         let tables = self.tables.read();
         let sequences = self.sequences.read();
+        let types = self.types.read();
         let (scalar_macros, table_macros) = (self.macros[0].read(), self.macros[1].read());
         tables
             .values()
             .map(|e| (e.type_name().to_lowercase(), e.name().to_string()))
             .chain(sequences.values().map(|s| ("sequence".to_string(), s.name.clone())))
+            .chain(types.keys().map(|t| ("type".to_string(), t.clone())))
             .chain(
                 scalar_macros
                     .values()
@@ -470,6 +503,7 @@ struct SchemaEntries {
     tables: BTreeMap<String, TableOrView>,
     sequences: BTreeMap<String, Arc<SequenceCatalogEntry>>,
     macros: [BTreeMap<String, Arc<MacroCatalogEntry>>; 2],
+    types: BTreeMap<String, LogicalType>,
 }
 
 impl Catalog {
@@ -491,6 +525,7 @@ impl Catalog {
                 tables,
                 sequences: schema.sequences.read().clone(),
                 macros: [schema.macros[0].read().clone(), schema.macros[1].read().clone()],
+                types: schema.types.read().clone(),
             });
         }
         CatalogSnapshot {
@@ -509,6 +544,7 @@ impl Catalog {
             let [scalar, table] = saved.macros;
             *saved.schema.macros[0].write() = scalar;
             *saved.schema.macros[1].write() = table;
+            *saved.schema.types.write() = saved.types;
         }
         for (table, rows) in snapshot.table_rows {
             table.storage.write().truncate(rows);
@@ -624,6 +660,22 @@ impl Catalog {
                 .iter()
                 .chain([&DEFAULT_SCHEMA])
                 .find_map(|schema| self.get_schema(schema)?.get_macro(name, table_macro)),
+        })
+    }
+
+    /// `Catalog::GetEntry` for a type.
+    pub fn get_type(
+        &self,
+        schema: Option<&str>,
+        search_first: Option<&str>,
+        name: &str,
+    ) -> Result<Option<LogicalType>> {
+        Ok(match schema {
+            Some(schema) => self.schema_for(Some(schema))?.get_type(name),
+            None => search_first
+                .iter()
+                .chain([&DEFAULT_SCHEMA])
+                .find_map(|schema| self.get_schema(schema)?.get_type(name)),
         })
     }
 

@@ -360,6 +360,7 @@ fn cast_inner(value: &Value, target: &LogicalType, mode: CastMode) -> Result<Val
         }
         (L::Struct, ValueData::Struct(fields), L::Map) => struct_to_map(value, fields, target, mode),
         (L::Tuple, _, L::Map) => Err(conversion_error("Cannot cast unnamed STRUCTs to MAP".to_string())),
+        (L::Enum, _, _) if target.is_nested() => cast_inner(&Value::varchar(value.try_to_string()?), target, mode),
         _ if source.is_nested() || target.is_nested() => Err(unimplemented(source, target)),
         _ => cast_scalar(value, target, mode),
     }

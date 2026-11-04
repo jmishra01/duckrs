@@ -5,7 +5,7 @@
 //
 //! Binding parsed expressions into [`BoundExpr`]s.
 
-use super::{Binder, ColumnMode, binder_error};
+use super::{Binder, ColumnMode, binder_error, schema_of};
 use crate::catalog::DEFAULT_CATALOG;
 use crate::execution::expression_executor::{evaluate_scalar, try_evaluate_scalar};
 use crate::function::binder::{bind_aggregate_function, bind_scalar_function, expression_return_type};
@@ -186,6 +186,24 @@ fn type_parameter(expr: &Expr) -> Option<i64> {
     }
 }
 
+/// Whether `name` is a built-in type, which `CREATE TYPE` cannot shadow.
+pub fn is_builtin_type(name: &str) -> bool {
+    builtin_type(&name.to_lowercase()).is_some()
+}
+
+/// `LogicalType::ENUM`: values must be unique.
+pub fn enum_type_from(values: Vec<String>) -> Result<LogicalType> {
+    for (i, value) in values.iter().enumerate() {
+        if values[..i].contains(value) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("Attempted to create ENUM type with duplicate value {value}"),
+            ));
+        }
+    }
+    Ok(LogicalType::enum_type(values))
+}
+
 /// The type of a type parameter, for `TypeParametersToString`.
 fn type_parameter_type(expr: &Expr) -> &'static str {
     match &expr.kind {
@@ -202,19 +220,28 @@ fn type_parameter_type(expr: &Expr) -> &'static str {
 impl Binder<'_> {
     /// `Binder::BindLogicalType` for the types slice 1 executes: the scalar types without
     /// parameters, `VARCHAR(n)` and `DECIMAL(width, scale)`.
-    pub(super) fn bind_type(&self, target: &CastType) -> Result<LogicalType> {
+    pub fn bind_type(&self, target: &CastType) -> Result<LogicalType> {
         let (name, children): (String, &[Expr]) = match target {
             CastType::Builtin(name) => (name.to_lowercase(), &[]),
             CastType::Parsed(expr) => match &expr.kind {
                 ExprKind::Type(TypeExpr { name, children }) => {
                     if !name.qualification.is_empty() {
-                        return Err(crate::unported("qualified type names"));
+                        let schema = schema_of(name)?;
+                        return self.catalog.get_type(schema, None, &name.name)?.ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::Catalog,
+                                format!("Type with name {} does not exist!", name.name),
+                            )
+                        });
                     }
                     (name.name.to_lowercase(), children.as_slice())
                 }
                 _ => return Err(crate::unported(format!("type expression {expr}"))),
             },
         };
+        if let Some(ty) = self.catalog.get_type(None, self.search_schema.as_deref(), &name)? {
+            return Ok(ty);
+        }
         let Some(id) = builtin_type(&name) else {
             return Err(Error::new(
                 ErrorKind::Catalog,
@@ -266,9 +293,29 @@ impl Binder<'_> {
             | LogicalTypeId::Struct
             | LogicalTypeId::Tuple
             | LogicalTypeId::Union => self.bind_nested_type(&name, id, children),
+            LogicalTypeId::Enum => {
+                let mut values = Vec::with_capacity(children.len());
+                for child in children {
+                    match &child.kind {
+                        ExprKind::Constant(literal) if literal.kind == LiteralKind::String => {
+                            values.push(literal.text.clone())
+                        }
+                        _ => {
+                            let types: Vec<&str> = children.iter().map(type_parameter_type).collect();
+                            return Err(binder_error(format!(
+                                "Type \"ENUM\" does not accept type parameters ({})",
+                                types.join(", ")
+                            )));
+                        }
+                    }
+                }
+                if values.is_empty() {
+                    return Err(binder_error("ENUM type requires at least one argument"));
+                }
+                enum_type_from(values)
+            }
             _ if !children.is_empty() => Err(crate::unported(format!("type parameters for {}", name.to_uppercase()))),
-            LogicalTypeId::Enum
-            | LogicalTypeId::Variant
+            LogicalTypeId::Variant
             | LogicalTypeId::Bit
             | LogicalTypeId::Bignum
             | LogicalTypeId::Geometry

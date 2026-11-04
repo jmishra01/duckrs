@@ -8,6 +8,7 @@ mod join;
 mod macros;
 mod statements;
 
+pub use expression::{enum_type_from, is_builtin_type};
 pub use statements::schema_of;
 
 use super::expression::{BoundAggregate, BoundExpr, ColumnBinding};

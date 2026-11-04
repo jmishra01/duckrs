@@ -908,6 +908,7 @@ fn is_ported_scalar(ty: &LogicalType) -> bool {
             | Varchar
             | Blob
             | Uuid
+            | Enum
     )
 }
 
@@ -927,6 +928,62 @@ pub fn has_cast(source: &LogicalType, target: &LogicalType) -> bool {
         || nested_casts::has_nested_cast(source, target, &is_ported_scalar)
 }
 
+/// `ReinterpretCast`, row by row.
+fn reinterpret_cast(source: &Vector, result: &mut Vector, count: usize) -> Result<()> {
+    let target = result.logical_type().clone();
+    result.prepare_flat(count.max(1));
+    for i in 0..count {
+        result.set_value(i, &source.get_value(i).reinterpret(&target)?)?;
+    }
+    Ok(())
+}
+
+/// The cast of an ENUM value: through its string, except between ENUMs (`EnumCastSwitch`).
+fn enum_value_cast(value: &Value, target: &LogicalType) -> std::result::Result<Value, Error> {
+    let source = value.logical_type();
+    let text = value.try_to_string()?;
+    target
+        .enum_values()
+        .iter()
+        .position(|v| *v == text)
+        .map(|position| Value::enum_value(target, position))
+        .ok_or_else(|| {
+            conversion_error(if source.id() == LogicalTypeId::Enum {
+                format!("Type {source} with value {text} can't be cast to the destination type {target}")
+            } else {
+                format!("Could not convert string '{text}' to {target}")
+            })
+        })
+}
+
+/// `StringEnumCast`, `EnumEnumCast` and `EnumToAnyCast`.
+fn enum_cast(source: &Vector, result: &mut Vector, count: usize, mode: CastMode) -> Result<()> {
+    let (from, to) = (source.logical_type().clone(), result.logical_type().clone());
+    if to.id() != LogicalTypeId::Enum {
+        // the target is neither VARCHAR nor nested: both have been handled
+        let mut strings = Vector::new(LogicalType::VARCHAR, count.max(1));
+        to_varchar(source, &mut strings, count)?;
+        return cast_vector(&strings, result, count, mode);
+    }
+    if !matches!(from.id(), LogicalTypeId::Enum | LogicalTypeId::Varchar) {
+        return time_casts::null_cast(source, result, count, mode);
+    }
+    result.prepare_flat(count.max(1));
+    for i in 0..count {
+        let value = source.get_value(i);
+        if value.is_null() {
+            result.set_null(i, true);
+            continue;
+        }
+        match enum_value_cast(&value, &to) {
+            Ok(cast) => result.set_value(i, &cast)?,
+            Err(_) if mode == CastMode::Try => result.set_null(i, true),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// Casts `source` (of `count` rows) into `result`, whose type is the target type.
 pub fn cast_vector(source: &Vector, result: &mut Vector, count: usize, mode: CastMode) -> Result<()> {
     let (from, to) = (source.logical_type().clone(), result.logical_type().clone());
@@ -944,8 +1001,15 @@ pub fn cast_vector(source: &Vector, result: &mut Vector, count: usize, mode: Cas
     if from.is_nested() || to.is_nested() {
         return nested_casts::nested_cast(source, result, count, mode);
     }
+    if from.id() == LogicalTypeId::Enum || to.id() == LogicalTypeId::Enum {
+        return enum_cast(source, result, count, mode);
+    }
     if is_decimal_cast(&from, &to) {
         return decimal_cast(source, result, count, mode);
+    }
+    if from.id() == to.id() && from.id() != LogicalTypeId::Decimal {
+        // types that differ only by an alias
+        return reinterpret_cast(source, result, count);
     }
     if is_numeric_or_bool(&from) && is_numeric_or_bool(&to) {
         return match from.physical_type() {

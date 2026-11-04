@@ -79,6 +79,21 @@ impl Value {
         Ok(Self { ty, data })
     }
 
+    /// The value at `position` of an ENUM type.
+    pub fn enum_value(ty: &LogicalType, position: usize) -> Self {
+        let data = match ty.physical_type() {
+            PhysicalType::UInt8 => ValueData::UInt8(position as u8),
+            PhysicalType::UInt16 => ValueData::UInt16(position as u16),
+            _ => ValueData::UInt32(position as u32),
+        };
+        Self { ty: ty.clone(), data }
+    }
+
+    /// The same data under another type of the same physical type (`Vector::Reinterpret`).
+    pub fn reinterpret(&self, ty: &LogicalType) -> Result<Self> {
+        Self::new(ty.clone(), self.data.clone())
+    }
+
     pub fn null(ty: LogicalType) -> Self {
         Self {
             ty,
@@ -342,6 +357,15 @@ impl Value {
         }
         let ty = self.ty.id();
         Ok(match (&self.data, ty) {
+            (_, LogicalTypeId::Enum) => {
+                let position = match self.data {
+                    ValueData::UInt8(v) => v as usize,
+                    ValueData::UInt16(v) => v as usize,
+                    ValueData::UInt32(v) => v as usize,
+                    _ => unreachable!("an ENUM is stored as an unsigned integer"),
+                };
+                self.ty.enum_values()[position].clone()
+            }
             (ValueData::Bool(v), _) => if *v { "true" } else { "false" }.into(),
             (_, LogicalTypeId::Decimal) => {
                 let (width, scale) = self.ty.decimal_properties().expect("DECIMAL has properties");
