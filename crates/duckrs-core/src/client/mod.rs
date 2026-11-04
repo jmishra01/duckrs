@@ -1536,6 +1536,104 @@ mod tests {
     }
 
     #[test]
+    fn ordered_aggregates() {
+        let mut c = join_tables();
+        // the order is what makes this sum exact
+        run(&mut c, "CREATE TABLE d (n DOUBLE)");
+        run(&mut c, "INSERT INTO d VALUES (9007199254740992), (1), (1), (0)");
+        assert_eq!(
+            run(&mut c, "SELECT sum(n ORDER BY abs(n))::BIGINT FROM d"),
+            rows(&[&["9007199254740994"]])
+        );
+        assert_eq!(run(&mut c, "SELECT first(b ORDER BY b DESC) FROM r"), rows(&[&["40"]]));
+        assert_eq!(run(&mut c, "SELECT last(b ORDER BY b DESC) FROM r"), rows(&[&["20"]]));
+        // per group, on another column, with NULLs where they are asked for
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT k, first(b ORDER BY b DESC) FROM r WHERE k = 2 GROUP BY k"
+            ),
+            rows(&[&["2", "21"]])
+        );
+        assert_eq!(
+            run(&mut c, "SELECT first(b ORDER BY k NULLS FIRST) FROM r"),
+            rows(&[&["40"]])
+        );
+        // with FILTER
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT first(b ORDER BY b) FILTER (WHERE b > 25), count(b ORDER BY b) FROM r"
+            ),
+            rows(&[&["30", "4"]])
+        );
+        assert_eq!(run(&mut c, "SELECT count(1 ORDER BY 1)"), rows(&[&["1"]]));
+        // two aggregates that differ only in their order are not one
+        assert_eq!(
+            run(&mut c, "SELECT first(b ORDER BY b), first(b ORDER BY b DESC) FROM r"),
+            rows(&[&["20", "40"]])
+        );
+        // more rows than a chunk
+        assert_eq!(
+            run(&mut c, "SELECT first(i ORDER BY i DESC) FROM range(5000) t(i)"),
+            rows(&[&["4999"]])
+        );
+    }
+
+    #[test]
+    fn math_functions() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT abs(1), abs(-1), abs(NULL), abs(-1.5), abs(-2.5::DOUBLE)"
+            ),
+            rows(&[&["1", "1", "NULL", "1.5", "2.5"]])
+        );
+        assert_eq!(run(&mut c, "SELECT abs(-0.0::DOUBLE)"), rows(&[&["0.0"]]));
+        assert_eq!(
+            c.query("SELECT abs(-2147483647 - 1)").unwrap_err().to_string(),
+            "Out of Range Error: Overflow on abs(-2147483648)"
+        );
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT isnan('nan'::DOUBLE), isinf('inf'::DOUBLE), isfinite('inf'::FLOAT), isfinite(1.0::DOUBLE)"
+            ),
+            rows(&[&["true", "true", "false", "true"]])
+        );
+    }
+
+    #[test]
+    fn concat_operator() {
+        let mut c = join_tables();
+        assert_eq!(
+            run(&mut c, "SELECT 'a' || 'b', 'n' || 1, 1 || 2, 'a' || NULL, NULL || NULL"),
+            rows(&[&["ab", "n1", "12", "NULL", "NULL"]])
+        );
+        assert_eq!(
+            run(&mut c, "SELECT a || ':' || k FROM l WHERE k = 1"),
+            rows(&[&["x:1"]])
+        );
+        // a NULL in a column gives NULL for its row alone
+        assert_eq!(
+            run(&mut c, "SELECT k || a FROM l WHERE a IN ('x', 'n') ORDER BY a"),
+            rows(&[&["NULL"], &["1x"]])
+        );
+        let result = c
+            .query("SELECT 'long string past the inline limit ' || i FROM range(3000) t(i)")
+            .unwrap();
+        assert_eq!(
+            result.value(0, 2999).try_to_string().unwrap(),
+            "long string past the inline limit 2999"
+        );
+        assert_eq!(run(&mut c, "SELECT CAST(X'61' || X'62' AS VARCHAR)"), rows(&[&["ab"]]));
+        assert_eq!(c.query("SELECT X'61' || X'62'").unwrap().types, vec![LogicalType::BLOB]);
+        // OPERATOR() names the same function
+        assert_eq!(run(&mut c, "SELECT 1 OPERATOR(main.+) 2"), rows(&[&["3"]]));
+    }
+
+    #[test]
     fn order_limit_distinct() {
         let mut context = ClientContext::new(DatabaseInstance::new());
         run(&mut context, "CREATE TABLE t (a INTEGER, b VARCHAR)");

@@ -384,9 +384,6 @@ impl Binder<'_> {
                 self.bind_aggregate(function)?
             }
             ExprKind::Function(function) => {
-                if function.filter.is_some() || !function.order_by.is_empty() || function.distinct {
-                    return Err(crate::unported("aggregate modifiers"));
-                }
                 if !builtin_qualification(&function.name.qualification) {
                     return Err(crate::unported("qualified function names"));
                 }
@@ -399,6 +396,9 @@ impl Binder<'_> {
                         format!("Scalar Function with name {} does not exist!", function.name.name),
                     ));
                 };
+                if function.filter.is_some() || !function.order_by.is_empty() || function.distinct {
+                    return Err(crate::unported("aggregate modifiers on scalar functions"));
+                }
                 let children = function
                     .args
                     .iter()
@@ -438,12 +438,16 @@ impl Binder<'_> {
 /// Whether a function's qualification can name a built-in function, which live in the `main`
 /// schema of the system catalog.
 fn builtin_qualification(qualification: &[String]) -> bool {
-    match qualification {
+    // an operator's qualification has an empty entry for what it does not name
+    let parts: Vec<&String> = qualification.iter().filter(|q| !q.is_empty()).collect();
+    let builtin_schema =
+        |schema: &String| schema.eq_ignore_ascii_case("main") || schema.eq_ignore_ascii_case("pg_catalog");
+    match parts.as_slice() {
         [] => true,
-        [schema] => schema.eq_ignore_ascii_case("main") || schema.eq_ignore_ascii_case("pg_catalog"),
+        [schema] => builtin_schema(schema),
         [catalog, schema] => {
             (catalog.eq_ignore_ascii_case("system") || catalog.eq_ignore_ascii_case(DEFAULT_CATALOG))
-                && (schema.eq_ignore_ascii_case("main") || schema.eq_ignore_ascii_case("pg_catalog"))
+                && builtin_schema(schema)
         }
         _ => false,
     }
@@ -597,9 +601,6 @@ impl Binder<'_> {
         if state.inside_aggregate {
             return Err(binder_error("aggregate function calls cannot be nested"));
         }
-        if !function.order_by.is_empty() {
-            return Err(crate::unported("ORDER BY in aggregates"));
-        }
         if function.args.iter().any(|a| !a.name.is_empty()) {
             return Err(crate::unported("named function arguments"));
         }
@@ -625,13 +626,19 @@ impl Binder<'_> {
                 return Err(crate::unported(format!("aggregates over {}", child.return_type)));
             }
         }
-        let aggregate = bind_aggregate_function(set, children, filter, function.distinct)?;
+        let mut order_by = Vec::with_capacity(function.order_by.len());
+        for node in &function.order_by {
+            let expr = self.bind_expression(&node.expr)?;
+            order_by.push((expr, self.options.resolve_order(node.order, node.nulls)));
+        }
+        let mut aggregate = bind_aggregate_function(set, children, filter, function.distinct)?;
+        aggregate.order_by = order_by;
         let state = self.aggregates.as_mut().expect("still bound");
         state.inside_aggregate = false;
         // equal aggregates are computed once
         let key = format!(
-            "{:?}{:?}{:?}{}",
-            aggregate.function, aggregate.children, aggregate.filter, aggregate.distinct
+            "{:?}{:?}{:?}{}{:?}",
+            aggregate.function, aggregate.children, aggregate.filter, aggregate.distinct, aggregate.order_by
         );
         let index = match state.aggregate_keys.iter().position(|k| *k == key) {
             Some(index) => index,

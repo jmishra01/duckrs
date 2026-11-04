@@ -573,7 +573,18 @@ pub struct AggregateSinkState {
     states: Vec<Vec<AggregateState>>,
     /// per aggregate, per group, the values a DISTINCT aggregate has seen
     distinct_seen: Vec<std::collections::HashSet<(usize, Vec<u8>)>>,
+    /// per aggregate with ORDER BY, its rows, which it sees once they can be put in order
+    ordered: Vec<Vec<OrderedRow>>,
     output: Vec<DataChunk>,
+}
+
+/// A row an aggregate with ORDER BY has yet to see.
+#[derive(Debug)]
+struct OrderedRow {
+    group: usize,
+    key: Vec<u8>,
+    /// the aggregate's input; `None` for `count(*)`
+    value: Option<Value>,
 }
 
 impl PhysicalAggregate {
@@ -595,6 +606,7 @@ impl PhysicalAggregate {
                 .map(|a| vec![a.function.kind.initial_state(); group_count])
                 .collect(),
             distinct_seen: vec![std::collections::HashSet::new(); aggregates.len()],
+            ordered: aggregates.iter().map(|_| Vec::new()).collect(),
             output: Vec::new(),
         };
         Self {
@@ -679,6 +691,29 @@ impl PhysicalOperator for PhysicalAggregate {
                 let seen = &mut state.distinct_seen[i];
                 rows.retain(|&(row, group)| unified.is_valid(row) && seen.insert((group, keys[row].clone())));
             }
+            if !aggregate.order_by.is_empty() {
+                let vectors = aggregate
+                    .order_by
+                    .iter()
+                    .map(|(expr, _)| execute(expr, chunk))
+                    .collect::<Result<Vec<_>>>()?;
+                let columns: Vec<(&Vector, OrderModifiers)> = vectors
+                    .iter()
+                    .zip(&aggregate.order_by)
+                    .map(|(vector, (_, modifiers))| (vector, *modifiers))
+                    .collect();
+                let keys = create_sort_keys(&columns, chunk.len())?;
+                let ordered = &mut state.ordered[i];
+                for &(row, group) in &rows {
+                    ordered.push(OrderedRow {
+                        group,
+                        key: keys[row].clone(),
+                        value: input.as_ref().map(|input| input.get_value(row)),
+                    });
+                }
+                check_buffered_rows(&[LogicalType::HUGEINT, LogicalType::HUGEINT], ordered.len())?;
+                continue;
+            }
             aggregate
                 .function
                 .update(input.as_ref(), chunk.len(), &rows, &mut state.states[i])?;
@@ -688,6 +723,17 @@ impl PhysicalOperator for PhysicalAggregate {
     fn finalize(&self) -> Result<()> {
         let mut state = self.state.lock();
         let state = &mut *state;
+        // what ORDER BY held back goes in now, a row at a time, in order (stably, like DuckDB)
+        for (i, aggregate) in self.aggregates.iter().enumerate() {
+            let mut rows = std::mem::take(&mut state.ordered[i]);
+            rows.sort_by(|a, b| a.key.cmp(&b.key));
+            for row in rows {
+                let input = row.value.as_ref().map(Vector::constant);
+                aggregate
+                    .function
+                    .update(input.as_ref(), 1, &[(0, row.group)], &mut state.states[i])?;
+            }
+        }
         let finalize = |group: usize, count: usize| -> Result<Vec<Vector>> {
             self.aggregates
                 .iter()

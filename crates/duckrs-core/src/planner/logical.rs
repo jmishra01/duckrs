@@ -233,11 +233,12 @@ impl LogicalOperator {
             LogicalOperatorKind::Order { orders } => orders.iter_mut().map(|o| &mut o.expr).collect(),
             LogicalOperatorKind::Aggregate { groups, aggregates, .. } => groups
                 .iter_mut()
-                .chain(
-                    aggregates
+                .chain(aggregates.iter_mut().flat_map(|a| {
+                    a.children
                         .iter_mut()
-                        .flat_map(|a| a.children.iter_mut().chain(a.filter.iter_mut())),
-                )
+                        .chain(a.filter.iter_mut())
+                        .chain(a.order_by.iter_mut().map(|(expr, _)| expr))
+                }))
                 .collect(),
             LogicalOperatorKind::ExpressionGet { expressions, .. } => expressions.iter_mut().flatten().collect(),
             // the join conditions read one child each, see `resolve_column_bindings`

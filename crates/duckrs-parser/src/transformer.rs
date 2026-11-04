@@ -1623,7 +1623,12 @@ impl<'g> Transformer<'g> {
                         return Err(parser_error("Wrong number of arguments for MODE"));
                     }
                 }
-                _ => return Err(parser_error(format!("Unknown ordered aggregate {}.", name.name))),
+                _ => {
+                    return Err(parser_error(format!(
+                        "Unknown ordered aggregate {}.",
+                        sql_quoted_identifier(&name.name)
+                    )));
+                }
             }
         }
         Ok(FunctionExpr {

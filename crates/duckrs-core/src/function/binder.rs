@@ -218,6 +218,7 @@ pub fn bind_aggregate_function(
         children,
         filter,
         distinct,
+        order_by: Vec::new(),
     })
 }
 

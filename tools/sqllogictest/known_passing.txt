@@ -42,6 +42,7 @@ test/issues/general/test_1987.test
 test/issues/general/test_21160.test
 test/issues/general/test_21832.test
 test/issues/general/test_24542.test
+test/issues/general/test_27205.test
 test/issues/general/test_3140.test
 test/issues/general/test_9738.test
 test/issues/monetdb/test_boolean_not.test
@@ -81,6 +82,8 @@ test/issues/rigger/test_585.test
 test/issues/rigger/test_588.test
 test/issues/rigger/test_637.test
 test/issues/rigger/test_empty_string_statistics.test
+test/optimizer/column_lifetime_analyzer/must_visit_operator_expressions_first.test
+test/optimizer/compressed_materialization_many_aggregates.test
 test/optimizer/constant_argument_errors_case.test
 test/optimizer/issue_12181.test
 test/optimizer/joins/join_on_doubles.test
@@ -95,12 +98,14 @@ test/optimizer/remove_duplicate_groups_with_stats.test
 test/optimizer/statistics/statistics_join_always_matches_layout.test
 test/optimizer/stats_non_numeric_cast.test
 test/sql/aggregate/aggregates/test_any_value_noninlined.test
+test/sql/aggregate/aggregates/test_count.test
 test/sql/aggregate/aggregates/test_count_star.test
 test/sql/aggregate/aggregates/test_first_noninlined.test
 test/sql/aggregate/aggregates/test_group_on_expression.test
 test/sql/aggregate/aggregates/test_last_noninlined.test
 test/sql/aggregate/aggregates/test_null_aggregates.test
 test/sql/aggregate/aggregates/test_simple_filter.test
+test/sql/aggregate/aggregates/test_sum.test
 test/sql/aggregate/aggregates/test_sum_fastpath.test
 test/sql/aggregate/distinct/ungrouped/test_distinct_ungrouped.test
 test/sql/aggregate/group/group_by_all.test
@@ -122,6 +127,7 @@ test/sql/binder/column_value_alias_group.test
 test/sql/binder/duplicate_alias.test
 test/sql/binder/group_by_qualification.test
 test/sql/binder/table_alias_single_quotes.test
+test/sql/binder/table_view_alias.test
 test/sql/binder/test_string_alias.test
 test/sql/cast/boolean_autocast.test
 test/sql/cast/boolean_to_decimal_cast.test
@@ -138,6 +144,7 @@ test/sql/catalog/case_insensitive_using.test
 test/sql/catalog/dependencies/test_concurrent_schema_creation.test
 test/sql/catalog/dependencies/test_prepared_dependency.test
 test/sql/catalog/drop_create_rollback.test
+test/sql/catalog/function/python_style_macro_parameters.test
 test/sql/catalog/issue_9459.test
 test/sql/catalog/sequence/sequence_cycle.test
 test/sql/catalog/sequence/sequence_offset_increment.test
@@ -168,6 +175,7 @@ test/sql/create/create_table_as_no_data_limit.test
 test/sql/create/create_table_empty_name.test
 test/sql/create/create_using_index.test
 test/sql/error/error_location_not_duplicated.test
+test/sql/error/mix_aggregate_and_non_aggregate.test
 test/sql/filter/filter_cache.test
 test/sql/filter/test_alias_filter.test
 test/sql/filter/test_constant_comparisons.test
@@ -177,7 +185,9 @@ test/sql/filter/test_obsolete_filters.test
 test/sql/filter/test_transitive_filters.test
 test/sql/function/autocomplete/create_secret.test
 test/sql/function/generic/case_condition.test
+test/sql/function/generic/case_varchar.test
 test/sql/function/generic/test_boolean_test.test
+test/sql/function/numeric/abs.test
 test/sql/function/numeric/test_mod_min_negative_one.test
 test/sql/function/numeric/test_modulo_min_by_minus_one.test
 test/sql/function/numeric/test_type_resolution.test
@@ -201,6 +211,7 @@ test/sql/join/full_outer/test_full_outer_join.test
 test/sql/join/full_outer/test_full_outer_join_complex.test
 test/sql/join/full_outer/test_full_outer_join_inequality.test
 test/sql/join/full_outer/test_full_outer_join_range.test
+test/sql/join/hash_join/hash_join_local_build.test
 test/sql/join/inner/equality_join_limits.test
 test/sql/join/inner/join_cache.test
 test/sql/join/inner/not_between_is_null.test
@@ -278,6 +289,7 @@ test/sql/peg_parser/fuzzer/fuzzer_4434.test
 test/sql/peg_parser/fuzzer/internal_0001.test
 test/sql/peg_parser/fuzzer/internal_0206.test
 test/sql/peg_parser/identifier.test
+test/sql/peg_parser/qualified_operator.test
 test/sql/peg_parser/transformer/between_asymmetric.test
 test/sql/prepared/invalid_prepare.test
 test/sql/prepared/parameter_variants.test
@@ -294,6 +306,8 @@ test/sql/prepared/test_prepare_issue_5132.test
 test/sql/prepared/test_prepare_issue_8500.test
 test/sql/projection/coalesce_error.test
 test/sql/projection/coalesce_rowid.test
+test/sql/projection/select_star_replace.test
+test/sql/projection/test_complex_expressions.test
 test/sql/projection/test_scalar_projection.test
 test/sql/projection/test_simple_projection.test
 test/sql/projection/test_table_star.test
@@ -305,6 +319,7 @@ test/sql/select/test_schema_reference.test
 test/sql/select/test_select_empty_table.test
 test/sql/select/test_select_into.test
 test/sql/select/test_select_locking.test
+test/sql/select/test_select_qualified_view.test
 test/sql/settings/connection_local_settings.test
 test/sql/settings/setting_order.test
 test/sql/sql_export/compressed_materialization_sql_export.test

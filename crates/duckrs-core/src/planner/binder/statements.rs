@@ -699,6 +699,23 @@ impl Binder<'_> {
         let mut result = Vec::new();
         for expr in select_list {
             let ExprKind::Star(star) = &expr.kind else {
+                // a star only stands for columns at the root of an expression
+                let mut nested = None;
+                visit_expr_mut(&mut expr.clone(), &mut |e| {
+                    if let ExprKind::Star(star) = &e.kind {
+                        nested = Some(star.columns || star.expr.is_some());
+                    }
+                });
+                match nested {
+                    Some(true) => return Err(not_implemented("COLUMNS")),
+                    Some(false) => {
+                        return Err(binder_error(
+                            "STAR expression is only allowed as the root element of an expression. Use COLUMNS(*) \
+                             instead.",
+                        ));
+                    }
+                    None => {}
+                }
                 result.push(expr.clone());
                 continue;
             };
@@ -1004,7 +1021,10 @@ impl Binder<'_> {
         } else {
             table_ref.alias.clone()
         };
-        self.add_query_binding(alias, bound, &column_aliases)
+        let schema = table_ref.alias.is_empty().then(|| view.schema.clone());
+        let plan = self.add_query_binding(alias, bound, &column_aliases)?;
+        self.bind_context.bindings.last_mut().expect("just added").schema = schema;
+        Ok(plan)
     }
 
     /// The `range` and `generate_series` table functions over constant integers.

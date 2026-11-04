@@ -8,6 +8,7 @@
 use crate::catalog::SequenceCatalogEntry;
 use crate::function::ScalarFunction;
 use crate::function::aggregates::AggregateFunction;
+use duckrs_common::sort_key::OrderModifiers;
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
 use duckrs_parser::ast::ComparisonOp;
@@ -115,6 +116,8 @@ pub struct BoundAggregate {
     /// `FILTER (WHERE ...)`
     pub filter: Option<BoundExpr>,
     pub distinct: bool,
+    /// `ORDER BY`: the order the aggregate sees its rows in
+    pub order_by: Vec<(BoundExpr, OrderModifiers)>,
 }
 
 /// A bound expression (`Expression`).

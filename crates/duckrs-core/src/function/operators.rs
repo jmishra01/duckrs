@@ -21,6 +21,8 @@ trait Arithmetic: NativeType {
     fn sub(self, other: Self) -> Option<Self>;
     fn mul(self, other: Self) -> Option<Self>;
     fn neg(self) -> Option<Self>;
+    /// `TryAbsOperator`: `None` when the result does not fit.
+    fn abs(self) -> Option<Self>;
     /// `NumericHelper::ToString`, for overflow messages.
     fn render(self) -> String;
 }
@@ -39,6 +41,10 @@ macro_rules! integer_arithmetic {
             }
             fn neg(self) -> Option<Self> {
                 (0 as $t).checked_sub(self)
+            }
+            fn abs(self) -> Option<Self> {
+                let zero: $t = 0;
+                if self >= zero { Some(self) } else { self.neg() }
             }
             fn render(self) -> String {
                 self.to_string()
@@ -62,6 +68,9 @@ macro_rules! float_arithmetic {
             }
             fn neg(self) -> Option<Self> {
                 Some(-self)
+            }
+            fn abs(self) -> Option<Self> {
+                Some(<$t>::abs(self))
             }
             fn render(self) -> String {
                 $render(self)
@@ -226,6 +235,37 @@ fn negate<T: Arithmetic>(args: &DataChunk, result: &mut Vector) -> Result<()> {
         )),
     })
 }
+
+/// `abs` (`TryAbsOperator`).
+fn absolute<T: Arithmetic>(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    executor::unary_fallible::<T, T>(args.column(0), result, args.len(), |a| match a.abs() {
+        Some(r) => Ok(Some(r)),
+        None => Err(Error::new(
+            ErrorKind::OutOfRange,
+            format!("Overflow on abs({})", a.render()),
+        )),
+    })
+}
+
+/// `isnan`, `isinf` and `isfinite`, per floating point type.
+macro_rules! float_check {
+    ($name:ident, $check:expr) => {
+        fn $name(args: &DataChunk, result: &mut Vector) -> Result<()> {
+            if args.column(0).logical_type().id() == LogicalTypeId::Float {
+                let check: fn(f64) -> bool = $check;
+                executor::unary_fallible::<f32, bool>(args.column(0), result, args.len(), |a| {
+                    Ok(Some(check(f64::from(a))))
+                })
+            } else {
+                let check: fn(f64) -> bool = $check;
+                executor::unary_fallible::<f64, bool>(args.column(0), result, args.len(), |a| Ok(Some(check(a))))
+            }
+        }
+    };
+}
+float_check!(is_nan, f64::is_nan);
+float_check!(is_infinite, f64::is_infinite);
+float_check!(is_finite, f64::is_finite);
 
 /// Unary `+`: the input itself.
 fn identity(args: &DataChunk, result: &mut Vector) -> Result<()> {
@@ -543,6 +583,57 @@ fn resolve_decimal_negate(function: &ScalarFunction, arguments: &[LogicalType]) 
     ))
 }
 
+/// `DecimalUnaryOpBind`: `abs` over a DECIMAL.
+fn resolve_decimal_abs(function: &ScalarFunction, arguments: &[LogicalType]) -> Result<ScalarFunction> {
+    let callback = dispatch!(arguments[0], absolute);
+    Ok(ScalarFunction::new(
+        function.name.clone(),
+        arguments.to_vec(),
+        arguments[0].clone(),
+        callback,
+    ))
+}
+
+/// `ConcatOperator`: `||`, NULL if either side is.
+fn concat(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let (mut left, mut right) = (args.column(0).clone(), args.column(1).clone());
+    left.flatten(args.len());
+    right.flatten(args.len());
+    let mut buffer = Vec::new();
+    for row in 0..args.len() {
+        match (left.str_at(row), right.str_at(row)) {
+            (Some(left), Some(right)) => {
+                buffer.clear();
+                buffer.extend_from_slice(left);
+                buffer.extend_from_slice(right);
+                result.set_str(row, &buffer);
+            }
+            _ => result.set_null(row, true),
+        }
+    }
+    Ok(())
+}
+
+/// `ResolveConcatTypesInternal`: blobs stay blobs, and anything else becomes a string.
+fn resolve_concat(function: &ScalarFunction, arguments: &[LogicalType]) -> Result<ScalarFunction> {
+    let nested = |id| matches!(id, LogicalTypeId::List | LogicalTypeId::Array);
+    if arguments.iter().any(|ty| nested(ty.id())) {
+        return Err(crate::unported("concatenating lists"));
+    }
+    let all_blob = arguments.iter().all(|ty| ty.id() == LogicalTypeId::Blob);
+    let ty = if all_blob {
+        LogicalType::BLOB
+    } else {
+        LogicalType::VARCHAR
+    };
+    Ok(ScalarFunction::new(
+        function.name.clone(),
+        vec![ty.clone(); arguments.len()],
+        ty,
+        concat,
+    ))
+}
+
 /// A DECIMAL overload of an operator, whose types and callback come from `resolve_types`.
 fn decimal_overload(
     name: &str,
@@ -619,5 +710,47 @@ pub(super) fn arithmetic_operators() -> Vec<ScalarFunctionSet> {
             dispatch!(ty, binary::<Multiply>),
         ));
     }
-    vec![add, subtract, multiply, full_divide, remainder, fp_divide]
+    let mut abs = ScalarFunctionSet::new("abs");
+    for ty in numeric_types() {
+        if ty.id() == LogicalTypeId::Decimal {
+            abs.add(decimal_overload("abs", 1, &ty, resolve_decimal_abs));
+        } else {
+            abs.add(ScalarFunction::new(
+                "abs",
+                vec![ty.clone()],
+                ty.clone(),
+                dispatch!(ty, absolute),
+            ));
+        }
+    }
+    let mut concat_operator = ScalarFunctionSet::new("||");
+    concat_operator.add(
+        ScalarFunction::new(
+            "||",
+            vec![LogicalType::new(LogicalTypeId::Any); 2],
+            LogicalType::VARCHAR,
+            unresolved_decimal,
+        )
+        .with_resolve_types(resolve_concat),
+    );
+    let mut sets = vec![
+        add,
+        subtract,
+        multiply,
+        full_divide,
+        remainder,
+        fp_divide,
+        abs,
+        concat_operator,
+    ];
+    let checks: [(&str, super::ScalarCallback); 3] =
+        [("isnan", is_nan), ("isinf", is_infinite), ("isfinite", is_finite)];
+    for (name, check) in checks {
+        let mut set = ScalarFunctionSet::new(name);
+        for ty in [LogicalType::FLOAT, LogicalType::DOUBLE] {
+            set.add(ScalarFunction::new(name, vec![ty], LogicalType::BOOLEAN, check));
+        }
+        sets.push(set);
+    }
+    sets
 }
