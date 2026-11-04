@@ -91,6 +91,29 @@ impl ScalarFunctionSet {
     }
 }
 
+/// `nextval`, `currval` and `setval`. Their signatures resolve like any function's; once bound,
+/// the binder replaces them with [`crate::planner::expression::BoundExprKind::Sequence`].
+fn sequence_functions() -> Vec<ScalarFunctionSet> {
+    fn bound_elsewhere(_: &DataChunk, _: &mut Vector) -> Result<()> {
+        unreachable!("sequence functions execute as BoundExprKind::Sequence")
+    }
+    let function = |name: &str, arguments: Vec<LogicalType>| {
+        ScalarFunction::new(name, arguments, LogicalType::BIGINT, bound_elsewhere)
+    };
+    let (name, value, is_called) = (LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BOOLEAN);
+    let mut sets = Vec::new();
+    for sequence_function in ["nextval", "currval"] {
+        let mut set = ScalarFunctionSet::new(sequence_function);
+        set.add(function(sequence_function, vec![name.clone()]));
+        sets.push(set);
+    }
+    let mut set = ScalarFunctionSet::new("setval");
+    set.add(function("setval", vec![name.clone(), value.clone()]));
+    set.add(function("setval", vec![name, value, is_called]));
+    sets.push(set);
+    sets
+}
+
 /// The built-in functions by lowercase name. In DuckDB they are catalog entries of the system
 /// catalog; they move there when the catalog grows function entries.
 pub struct BuiltinFunctions {
@@ -107,6 +130,9 @@ impl BuiltinFunctions {
                 aggregate: HashMap::new(),
             };
             for set in operators::arithmetic_operators() {
+                functions.scalar.insert(set.name.clone(), set);
+            }
+            for set in sequence_functions() {
                 functions.scalar.insert(set.name.clone(), set);
             }
             for set in aggregates::aggregate_functions() {

@@ -6,11 +6,12 @@
 //! Binding parsed expressions into [`BoundExpr`]s.
 
 use super::{Binder, ColumnMode, binder_error};
-use crate::execution::expression_executor::try_evaluate_scalar;
+use crate::catalog::DEFAULT_CATALOG;
+use crate::execution::expression_executor::{evaluate_scalar, try_evaluate_scalar};
 use crate::function::BuiltinFunctions;
 use crate::function::binder::{bind_aggregate_function, bind_scalar_function, expression_return_type};
 use crate::function::combine_types::{force_max_logical_type, normalize_type, try_max_logical_type};
-use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, ColumnBinding};
+use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, ColumnBinding, SequenceOp};
 use duckrs_common::types::{LogicalType, LogicalTypeId, decimal};
 use duckrs_common::value::Value;
 use duckrs_common::{Error, ErrorKind, Result};
@@ -393,7 +394,8 @@ impl Binder<'_> {
                     .iter()
                     .map(|a| self.bind_expression(&a.expr))
                     .collect::<Result<Vec<_>>>()?;
-                bind_scalar_function(set, children, function.is_operator, &try_evaluate_scalar)?
+                let bound = bind_scalar_function(set, children, function.is_operator, &try_evaluate_scalar)?;
+                self.bind_sequence_function(bound)?
             }
             ExprKind::Star(_) => return Err(binder_error("STAR expression is not supported here")),
             other => {
@@ -406,7 +408,89 @@ impl Binder<'_> {
     }
 }
 
+/// `QualifiedName::TryParse`: the dot-separated, optionally double-quoted parts of a name.
+fn parse_qualified_name(input: &str) -> Result<Vec<String>> {
+    let error = |what: &str| {
+        Error::new(
+            ErrorKind::Parser,
+            format!("Zero-length {what} in qualified name! (input: {input})"),
+        )
+    };
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                chars.next();
+                current.push('"');
+            }
+            '"' if quoted => {
+                if current.is_empty() {
+                    return Err(error("delimited identifier"));
+                }
+                quoted = false;
+            }
+            '"' if current.is_empty() => quoted = true,
+            '.' if !quoted => parts.push(std::mem::take(&mut current)),
+            _ => current.push(c),
+        }
+    }
+    if quoted {
+        return Err(Error::new(
+            ErrorKind::Parser,
+            format!("Unterminated quote in qualified name! (input: {input})"),
+        ));
+    }
+    parts.push(current);
+    if parts.iter().any(String::is_empty) {
+        return Err(error("identifier"));
+    }
+    Ok(parts)
+}
+
 impl Binder<'_> {
+    /// `NextValBind`: the name of a sequence function is a constant, looked up once.
+    fn bind_sequence_function(&self, bound: BoundExpr) -> Result<BoundExpr> {
+        let BoundExprKind::Function { function, children, .. } = &bound.kind else {
+            return Ok(bound);
+        };
+        let op = match function.name.as_str() {
+            "nextval" => SequenceOp::Next,
+            "currval" => SequenceOp::Current,
+            "setval" => SequenceOp::Set,
+            _ => return Ok(bound),
+        };
+        let name = &children[0];
+        if !name.is_foldable() {
+            return Err(binder_error(format!(
+                "The sequence_name argument in function {} must be a constant expression",
+                function.name
+            )));
+        }
+        let value = evaluate_scalar(name)?;
+        if value.is_null() {
+            return Ok(BoundExpr::constant(Value::null(LogicalType::BIGINT)));
+        }
+        let parts = parse_qualified_name(&value.try_to_string()?)?;
+        let (schema, name) = match parts.as_slice() {
+            [name] => (None, name),
+            [schema, name] => (Some(schema.as_str()), name),
+            [catalog, schema, name] if catalog.eq_ignore_ascii_case(DEFAULT_CATALOG) => (Some(schema.as_str()), name),
+            _ => return Err(crate::unported("this sequence name")),
+        };
+        let sequence = self.catalog.get_sequence(schema, self.search_schema.as_deref(), name)?;
+        Ok(BoundExpr::new(
+            BoundExprKind::Sequence {
+                op,
+                sequence,
+                arguments: children[1..].to_vec(),
+            },
+            LogicalType::BIGINT,
+        ))
+    }
+
     /// `BaseSelectBinder::TryBindGroup` + `BindGroup`: a reference to the group `expr` matches.
     pub(super) fn try_bind_group(&self, expr: &Expr) -> Option<BoundExpr> {
         let state = self.aggregates.as_ref().filter(|s| !s.inside_aggregate)?;

@@ -1,5 +1,6 @@
 // Ported from duckdb/src/catalog/{catalog,catalog_set}.cpp,
-// duckdb/src/catalog/catalog_entry/{duck_schema_entry,table_catalog_entry,view_catalog_entry}.cpp and
+// duckdb/src/catalog/catalog_entry/{duck_schema_entry,sequence_catalog_entry,table_catalog_entry,
+// view_catalog_entry}.cpp and
 // duckdb/src/common/exception/catalog_exception.cpp @ rust-port-baseline
 //
 //! The catalog: schemas with their tables and views, in memory. Names are case-insensitive and keep the
@@ -11,7 +12,7 @@ use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::types::LogicalType;
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast::SelectStatement;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -72,6 +73,104 @@ pub struct ViewCatalogEntry {
     pub aliases: Vec<String>,
 }
 
+/// The state of a sequence (`SequenceData`).
+#[derive(Debug, Clone)]
+pub struct SequenceData {
+    /// the value `nextval` returns next
+    pub counter: i64,
+    pub last_value: Option<i64>,
+    pub increment: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub cycle: bool,
+}
+
+/// A sequence (`SequenceCatalogEntry`). Its values are not transactional, as in DuckDB.
+#[derive(Debug)]
+pub struct SequenceCatalogEntry {
+    pub name: String,
+    data: Mutex<SequenceData>,
+}
+
+impl SequenceCatalogEntry {
+    /// `SequenceCatalogEntry::CurrentValue`.
+    pub fn current_value(&self) -> Result<i64> {
+        self.data.lock().last_value.ok_or_else(|| {
+            Error::new(
+                ErrorKind::Sequence,
+                "currval: sequence is not yet defined in this session",
+            )
+        })
+    }
+
+    /// `SequenceCatalogEntry::NextValue`.
+    pub fn next_value(&self) -> Result<i64> {
+        let mut data = self.data.lock();
+        let result = data.counter;
+        let next = data.counter.checked_add(data.increment);
+        let next_counter = if data.cycle {
+            match next {
+                None if data.increment < 0 => data.max_value,
+                None => data.min_value,
+                Some(next) if next < data.min_value => data.max_value,
+                Some(next) if next > data.max_value => data.min_value,
+                Some(next) => next,
+            }
+        } else {
+            // an exhausted sequence keeps a counter outside of its range
+            let mut exhausted = result < data.min_value || result > data.max_value;
+            let mut counter = next.unwrap_or(0);
+            if !exhausted && next.is_none() {
+                // the counter moves to an int64 outside of the range, if there is one
+                let outside = [i64::MAX, i64::MIN]
+                    .into_iter()
+                    .find(|c| *c < data.min_value || *c > data.max_value);
+                match outside {
+                    Some(outside) => counter = outside,
+                    None => exhausted = true,
+                }
+            }
+            if exhausted {
+                let (bound, value) = if data.increment < 0 {
+                    ("minimum", data.min_value)
+                } else {
+                    ("maximum", data.max_value)
+                };
+                return Err(Error::new(
+                    ErrorKind::Sequence,
+                    format!("nextval: reached {bound} value of sequence {} ({value})", self.name),
+                ));
+            }
+            counter
+        };
+        data.counter = next_counter;
+        data.last_value = Some(result);
+        Ok(result)
+    }
+
+    /// `SequenceCatalogEntry::SetValue`.
+    pub fn set_value(&self, value: i64, is_called: bool) -> Result<i64> {
+        {
+            let mut data = self.data.lock();
+            if value < data.min_value || value > data.max_value {
+                return Err(Error::new(
+                    ErrorKind::Sequence,
+                    format!(
+                        "setval: value {value} is out of bounds for sequence {} ({}..{})",
+                        self.name, data.min_value, data.max_value
+                    ),
+                ));
+            }
+            data.counter = value;
+            if !is_called {
+                return Ok(value);
+            }
+        }
+        // as if nextval had just returned `value`
+        self.next_value()
+    }
+}
+
 /// An entry of a schema's table set, which tables and views share, so that a table and a view
 /// cannot have the same name.
 #[derive(Debug, Clone)]
@@ -102,6 +201,7 @@ impl TableOrView {
 pub struct SchemaCatalogEntry {
     pub name: String,
     tables: RwLock<BTreeMap<String, TableOrView>>,
+    sequences: RwLock<BTreeMap<String, Arc<SequenceCatalogEntry>>>,
 }
 
 /// What to do when an entry being created already exists (`OnCreateConflict`).
@@ -121,6 +221,7 @@ impl SchemaCatalogEntry {
         Self {
             name: name.to_string(),
             tables: RwLock::new(BTreeMap::new()),
+            sequences: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -219,8 +320,47 @@ impl SchemaCatalogEntry {
         Ok(true)
     }
 
-    fn entries(&self) -> Vec<TableOrView> {
-        self.tables.read().values().cloned().collect()
+    pub fn get_sequence(&self, name: &str) -> Option<Arc<SequenceCatalogEntry>> {
+        self.sequences.read().get(&key(name)).cloned()
+    }
+
+    /// `DuckSchemaEntry::CreateSequence`.
+    pub fn create_sequence(&self, name: &str, data: SequenceData, on_conflict: OnCreateConflict) -> Result<()> {
+        let mut sequences = self.sequences.write();
+        if sequences.contains_key(&key(name)) {
+            match on_conflict {
+                OnCreateConflict::Error => {
+                    return Err(Error::new(
+                        ErrorKind::Catalog,
+                        format!("Sequence with name \"{name}\" already exists!"),
+                    ));
+                }
+                OnCreateConflict::Ignore => return Ok(()),
+                OnCreateConflict::Replace => {}
+            }
+        }
+        let sequence = SequenceCatalogEntry {
+            name: name.to_string(),
+            data: Mutex::new(data),
+        };
+        sequences.insert(key(name), Arc::new(sequence));
+        Ok(())
+    }
+
+    /// Drops a sequence, returning whether it existed.
+    pub fn drop_sequence(&self, name: &str) -> bool {
+        self.sequences.write().remove(&key(name)).is_some()
+    }
+
+    /// The type and name of each entry, for "depends on" messages.
+    fn entries(&self) -> Vec<(String, String)> {
+        let tables = self.tables.read();
+        let sequences = self.sequences.read();
+        tables
+            .values()
+            .map(|e| (e.type_name().to_lowercase(), e.name().to_string()))
+            .chain(sequences.values().map(|s| ("sequence".to_string(), s.name.clone())))
+            .collect()
     }
 }
 
@@ -310,6 +450,23 @@ impl Catalog {
         entry.ok_or_else(|| missing_entry("Table", name))
     }
 
+    /// `Catalog::GetEntry` for a sequence, with the lookup of [`Self::get_entry`].
+    pub fn get_sequence(
+        &self,
+        schema: Option<&str>,
+        search_first: Option<&str>,
+        name: &str,
+    ) -> Result<Arc<SequenceCatalogEntry>> {
+        let entry = match schema {
+            Some(schema) => self.schema_for(Some(schema))?.get_sequence(name),
+            None => search_first
+                .iter()
+                .chain([&DEFAULT_SCHEMA])
+                .find_map(|schema| self.get_schema(schema)?.get_sequence(name)),
+        };
+        entry.ok_or_else(|| missing_entry("Sequence", name))
+    }
+
     /// `Catalog::GetEntry` for a table: a view by that name is an error.
     pub fn get_table(&self, schema: Option<&str>, name: &str) -> Result<Arc<TableCatalogEntry>> {
         match self.get_entry(schema, None, name)? {
@@ -329,13 +486,8 @@ fn dependency_check(schema: &SchemaCatalogEntry) -> Result<()> {
         "Cannot drop entry \"{}\" because there are entries that depend on it.\n",
         schema.name
     );
-    for entry in entries {
-        message += &format!(
-            "{} \"{}\" depends on schema \"{}\".\n",
-            entry.type_name().to_lowercase(),
-            entry.name(),
-            schema.name
-        );
+    for (type_name, name) in entries {
+        message += &format!("{type_name} \"{name}\" depends on schema \"{}\".\n", schema.name);
     }
     message += "Use DROP...CASCADE to drop all dependents.";
     Err(Error::new(ErrorKind::Dependency, message))

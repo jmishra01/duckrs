@@ -2,7 +2,7 @@
 
 An analytical SQL database engine: a port of [DuckDB](https://github.com/duckdb/duckdb) to Rust.
 
-**Status: Phase 3 (minimal vertical slice) in progress.** The engine runs CREATE TABLE, CREATE VIEW, INSERT
+**Status: Phase 3 (minimal vertical slice) in progress.** The engine runs CREATE TABLE, CREATE VIEW, CREATE SEQUENCE, INSERT
 and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in memory. What exists today:
 
 - `crates/duckrs-common`: the core building blocks every other crate uses:
@@ -43,7 +43,7 @@ and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in me
   bound expressions, logical operators and column binding resolution (`planner`); the expression
   executor, physical operators and single-threaded pipelines (`execution`); and the client
   context and settings (`client`, DuckDB's `src/main`). It runs CREATE TABLE (with AS, NOT NULL and
-  DEFAULT), CREATE VIEW, CREATE SCHEMA, DROP, INSERT (VALUES or a query) and SELECT over tables,
+  DEFAULT), CREATE VIEW, CREATE SEQUENCE (with `nextval`, `currval`, `setval`), CREATE SCHEMA, DROP, INSERT (VALUES or a query) and SELECT over tables,
   views, VALUES lists, subqueries, `range`/`generate_series` and joins of those (CROSS, INNER, LEFT, RIGHT,
   FULL, SEMI, ANTI and their RIGHT forms, with ON, USING or NATURAL; hash joins for equality
   conditions and nested loops otherwise, single-threaded and in memory) with WHERE, GROUP BY (with aliases,
@@ -54,14 +54,14 @@ and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in me
   and aliases of the select list; and SET/RESET/`PRAGMA x = y` for all 196
   of DuckDB's settings (generated from its `settings.json` by `tools/generate_settings.py`), with
   DuckDB's types and error messages. There is no optimizer yet, so a filter over a cross product
-  (`FROM a, b WHERE a.x = b.x`) really does build every pair until Phase 7. Sequences, macros and basic prepared statements are the rest of Phase 3; subqueries, CTEs and
+  (`FROM a, b WHERE a.x = b.x`) really does build every pair until Phase 7. Macros and basic prepared statements are the rest of Phase 3; subqueries, CTEs and
   set operations come with Phase 6. SQL it does not
   run yet fails with an error saying it `is not yet ported to duckrs`; the sqllogictest runner
   never counts that error as the one a test expects.
 - `crates/duckrs`: the public API (`Database`, `Connection`, `QueryResult`) over the engine.
   Databases live in memory; a database file is accepted but not written until Phase 9.
 - `tools/sqllogictest`: a port of DuckDB's sqllogictest runner. It runs the DuckDB `.test` corpus
-  against duckrs, or against the C++ DuckDB library as a reference. duckrs passes 325 files so far
+  against duckrs, or against the C++ DuckDB library as a reference. duckrs passes 330 files so far
   (`tools/sqllogictest/known_passing.txt`, a CI gate), among them
   `test/sql/projection/test_simple_projection.test`.
 

@@ -7,7 +7,7 @@
 pub mod settings;
 mod settings_table;
 
-use crate::catalog::{Catalog, DEFAULT_CATALOG, OnCreateConflict, TableOrView, missing_entry};
+use crate::catalog::{Catalog, DEFAULT_CATALOG, OnCreateConflict, SequenceData, TableOrView, missing_entry};
 use crate::execution::expression_executor::evaluate_scalar;
 use crate::execution::physical::PhysicalResultCollector;
 use crate::execution::{create_plan, execute_plan};
@@ -184,6 +184,10 @@ impl ClientContext {
                 }
                 return Err(crate::unported(format!("PRAGMA {name}")));
             }
+            Statement::Create(info) if matches!(info.kind, CreateKind::Sequence { .. }) => {
+                self.create_sequence(info)?;
+                return Ok(Self::success());
+            }
             Statement::Create(info) if matches!(info.kind, CreateKind::View { .. }) => {
                 self.create_view(info)?;
                 return Ok(Self::success());
@@ -293,7 +297,34 @@ impl ClientContext {
         schema.create_view(&info.name.name, (**query).clone(), aliases.clone(), on_conflict)
     }
 
-    /// `DROP TABLE`, `DROP VIEW` and `DROP SCHEMA` (`Catalog::DropEntry`).
+    /// `CREATE SEQUENCE`.
+    fn create_sequence(&mut self, info: &CreateInfo) -> Result<()> {
+        let CreateKind::Sequence {
+            increment,
+            min_value,
+            max_value,
+            start_value,
+            cycle,
+        } = info.kind
+        else {
+            unreachable!("checked by the caller");
+        };
+        if info.temporary {
+            return Err(crate::unported("CREATE TEMPORARY SEQUENCE"));
+        }
+        let data = SequenceData {
+            counter: start_value,
+            last_value: None,
+            increment,
+            min_value,
+            max_value,
+            cycle,
+        };
+        let schema = self.db.catalog.schema_for(schema_of(&info.name)?)?;
+        schema.create_sequence(&info.name.name, data, on_create_conflict(info.on_conflict))
+    }
+
+    /// `DROP TABLE`, `DROP VIEW`, `DROP SEQUENCE` and `DROP SCHEMA` (`Catalog::DropEntry`).
     fn drop_entry(&mut self, info: &DropInfo) -> Result<()> {
         let catalog = &self.db.catalog;
         match info.entry_type {
@@ -307,6 +338,18 @@ impl ClientContext {
                 };
                 if !dropped && !info.if_exists {
                     return Err(missing_entry(type_name, &info.name.name));
+                }
+                Ok(())
+            }
+            "SEQUENCE" => {
+                let schema = schema_of(&info.name).map_err(|_| crate::unported("this form of DROP SEQUENCE"))?;
+                let dropped = match catalog.schema_for(schema) {
+                    Ok(schema) => schema.drop_sequence(&info.name.name),
+                    Err(_) if info.if_exists => false,
+                    Err(error) => return Err(error),
+                };
+                if !dropped && !info.if_exists {
+                    return Err(missing_entry("Sequence", &info.name.name));
                 }
                 Ok(())
             }
@@ -688,6 +731,72 @@ mod tests {
         assert_eq!(run(&mut c, "SELECT * FROM s.sv"), rows(&[&["in s"]]));
         assert!(error(&mut c, "DROP SCHEMA s").contains("view \"sv\" depends on schema \"s\""));
         run(&mut c, "DROP SCHEMA s CASCADE");
+    }
+
+    #[test]
+    fn sequences() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        let error = |c: &mut ClientContext, sql: &str| c.query(sql).unwrap_err().to_string();
+        run(&mut c, "CREATE SEQUENCE s");
+        assert_eq!(
+            error(&mut c, "SELECT currval('s')"),
+            "Sequence Error: currval: sequence is not yet defined in this session"
+        );
+        assert_eq!(
+            run(&mut c, "SELECT nextval('s'), nextval('\"s\"')"),
+            rows(&[&["1", "2"]])
+        );
+        assert_eq!(run(&mut c, "SELECT currval('main.s')"), rows(&[&["2"]]));
+        // one value per row, and never folded away
+        assert_eq!(
+            run(&mut c, "SELECT nextval('s') FROM range(3) ORDER BY 1"),
+            rows(&[&["3"], &["4"], &["5"]])
+        );
+        assert_eq!(run(&mut c, "SELECT nextval(NULL)"), rows(&[&["NULL"]]));
+        assert_eq!(run(&mut c, "SELECT setval('s', 10)"), rows(&[&["10"]]));
+        assert_eq!(run(&mut c, "SELECT nextval('s')"), rows(&[&["11"]]));
+        assert_eq!(run(&mut c, "SELECT setval('s', 20, false)"), rows(&[&["20"]]));
+        assert_eq!(run(&mut c, "SELECT nextval('s')"), rows(&[&["20"]]));
+        // as a column default
+        run(&mut c, "CREATE TABLE t (i BIGINT DEFAULT nextval('s'), j INTEGER)");
+        run(&mut c, "INSERT INTO t (j) VALUES (1), (2)");
+        assert_eq!(run(&mut c, "SELECT i FROM t ORDER BY 1"), rows(&[&["21"], &["22"]]));
+        // bounds, cycles and negative increments
+        run(&mut c, "CREATE SEQUENCE b MAXVALUE 2");
+        run(&mut c, "SELECT nextval('b'), nextval('b')");
+        assert_eq!(
+            error(&mut c, "SELECT nextval('b')"),
+            "Sequence Error: nextval: reached maximum value of sequence b (2)"
+        );
+        run(&mut c, "CREATE SEQUENCE r INCREMENT BY -1 MINVALUE 1 MAXVALUE 2 CYCLE");
+        assert_eq!(
+            run(&mut c, "SELECT nextval('r'), nextval('r'), nextval('r')"),
+            rows(&[&["2", "1", "2"]])
+        );
+        assert_eq!(
+            error(&mut c, "SELECT setval('b', 9)"),
+            "Sequence Error: setval: value 9 is out of bounds for sequence b (1..2)"
+        );
+        // names
+        assert_eq!(
+            error(&mut c, "SELECT nextval('nope')"),
+            "Catalog Error: Sequence with name nope does not exist!"
+        );
+        assert!(error(&mut c, "SELECT nextval('main..s')").contains("Zero-length"));
+        assert!(error(&mut c, "SELECT nextval(a) FROM (VALUES ('s')) t(a)").contains("must be a constant expression"));
+        assert_eq!(
+            error(&mut c, "CREATE SEQUENCE s"),
+            "Catalog Error: Sequence with name \"s\" already exists!"
+        );
+        run(&mut c, "CREATE SEQUENCE IF NOT EXISTS s");
+        run(&mut c, "CREATE OR REPLACE SEQUENCE s");
+        assert_eq!(run(&mut c, "SELECT nextval('s')"), rows(&[&["1"]]));
+        run(&mut c, "DROP SEQUENCE s");
+        assert_eq!(
+            error(&mut c, "DROP SEQUENCE s"),
+            "Catalog Error: Sequence with name s does not exist!"
+        );
+        run(&mut c, "DROP SEQUENCE IF EXISTS s");
     }
 
     #[test]

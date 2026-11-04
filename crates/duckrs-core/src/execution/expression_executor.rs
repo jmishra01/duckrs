@@ -6,9 +6,10 @@
 //! their condition and keep the rows where it is true (DuckDB's specialized `Select` paths
 //! are a later optimization).
 
+use crate::catalog::SequenceCatalogEntry;
 use crate::function::cast::{CastMode, cast_vector};
 use crate::function::operators::DIVISION_BY_ZERO;
-use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator};
+use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, SequenceOp};
 use duckrs_common::comparison::{ComparisonType, DuckOrd};
 use duckrs_common::executor;
 use duckrs_common::types::{LogicalType, LogicalTypeId, NativeType, PhysicalType};
@@ -257,6 +258,11 @@ pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
             ErrorKind::Internal,
             "Attempted to execute an unresolved column reference",
         )),
+        BoundExprKind::Sequence {
+            op,
+            sequence,
+            arguments,
+        } => execute_sequence(*op, sequence, arguments, input),
         BoundExprKind::Cast { child, try_cast } => {
             let source = execute(child, input)?;
             let mut result = Vector::new(expr.return_type.clone(), count.max(1));
@@ -335,6 +341,40 @@ pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
             Ok(result)
         }
     }
+}
+
+/// `NextValFunction`: moves the sequence once per row, in order. A NULL argument gives NULL and
+/// leaves the sequence alone.
+fn execute_sequence(
+    op: SequenceOp,
+    sequence: &SequenceCatalogEntry,
+    arguments: &[BoundExpr],
+    input: &DataChunk,
+) -> Result<Vector> {
+    let count = input.len();
+    let vectors = arguments
+        .iter()
+        .map(|a| execute(a, input))
+        .collect::<Result<Vec<_>>>()?;
+    let mut result = Vector::new(LogicalType::BIGINT, count.max(1));
+    for row in 0..count {
+        let values: Vec<Value> = vectors.iter().map(|v| v.get_value(row)).collect();
+        if values.iter().any(Value::is_null) {
+            result.set_value(row, &Value::null(LogicalType::BIGINT))?;
+            continue;
+        }
+        let value = match (op, values.as_slice()) {
+            (SequenceOp::Next, _) => sequence.next_value()?,
+            (SequenceOp::Current, _) => sequence.current_value()?,
+            (SequenceOp::Set, [value]) => sequence.set_value(value.as_i128().unwrap_or(0) as i64, true)?,
+            (SequenceOp::Set, [value, is_called]) => {
+                sequence.set_value(value.as_i128().unwrap_or(0) as i64, *is_called == Value::boolean(true))?
+            }
+            (SequenceOp::Set, _) => unreachable!("setval takes one or two arguments after the name"),
+        };
+        result.set_value(row, &Value::bigint(value))?;
+    }
+    Ok(result)
 }
 
 /// `ExpressionExecutor::Select`: the rows of `input` for which a BOOLEAN expression is true.

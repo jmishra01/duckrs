@@ -5,6 +5,7 @@
 //! known return type, and functions and casts chosen. Like the AST, the C++ class hierarchy is
 //! an enum here.
 
+use crate::catalog::SequenceCatalogEntry;
 use crate::function::ScalarFunction;
 use crate::function::aggregates::AggregateFunction;
 use duckrs_common::types::LogicalType;
@@ -46,6 +47,14 @@ pub enum BoundOperator {
     Coalesce,
 }
 
+/// What a call of a sequence function does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequenceOp {
+    Next,
+    Current,
+    Set,
+}
+
 #[derive(Debug, Clone)]
 pub enum BoundExprKind {
     /// `BoundConstantExpression`.
@@ -80,6 +89,13 @@ pub enum BoundExprKind {
         input: Box<BoundExpr>,
         lower: Box<BoundExpr>,
         upper: Box<BoundExpr>,
+    },
+    /// `nextval`, `currval` or `setval` with the sequence bound (`NextvalBindData`); `arguments`
+    /// are the ones after its name. It changes state, so it never folds.
+    Sequence {
+        op: SequenceOp,
+        sequence: Arc<SequenceCatalogEntry>,
+        arguments: Vec<BoundExpr>,
     },
     /// `BoundFunctionExpression` of a scalar function; the children have its argument types.
     Function {
@@ -150,6 +166,9 @@ impl BoundExpr {
             }
             BoundExprKind::Conjunction { children, .. }
             | BoundExprKind::Operator { children, .. }
+            | BoundExprKind::Sequence {
+                arguments: children, ..
+            }
             | BoundExprKind::Function { children, .. } => children.iter().collect(),
         }
     }
@@ -168,6 +187,9 @@ impl BoundExpr {
             }
             BoundExprKind::Conjunction { children, .. }
             | BoundExprKind::Operator { children, .. }
+            | BoundExprKind::Sequence {
+                arguments: children, ..
+            }
             | BoundExprKind::Function { children, .. } => children.iter_mut().collect(),
         }
     }
@@ -175,7 +197,7 @@ impl BoundExpr {
     /// `Expression::IsFoldable`: whether the expression can be evaluated without input rows.
     pub fn is_foldable(&self) -> bool {
         match &self.kind {
-            BoundExprKind::ColumnRef { .. } | BoundExprKind::Reference(_) => false,
+            BoundExprKind::ColumnRef { .. } | BoundExprKind::Reference(_) | BoundExprKind::Sequence { .. } => false,
             _ => self.children().into_iter().all(BoundExpr::is_foldable),
         }
     }

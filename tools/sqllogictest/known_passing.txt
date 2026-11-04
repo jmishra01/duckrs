@@ -32,6 +32,7 @@ test/fuzzer/public/pragma_named_parameters.test
 test/fuzzer/public/semi_anti_join_using.test
 test/fuzzer/public/semi_join_using.test
 test/fuzzer/public/unsatisfiable_filter_prune.test
+test/issues/fuzz/sequence_overflow.test
 test/issues/fuzz/stats_propagation_overflow.test
 test/issues/general/test_1290.test
 test/issues/general/test_17310.test
@@ -128,6 +129,9 @@ test/sql/cast/test_try_cast.test
 test/sql/catalog/case_insensitive_using.test
 test/sql/catalog/dependencies/test_concurrent_schema_creation.test
 test/sql/catalog/issue_9459.test
+test/sql/catalog/sequence/sequence_cycle.test
+test/sql/catalog/sequence/sequence_offset_increment.test
+test/sql/catalog/sequence/sequence_overflow.test
 test/sql/catalog/table/create_table_as_abort.test
 test/sql/catalog/table/long_identifier.test
 test/sql/catalog/table/test_many_columns.test
@@ -249,6 +253,7 @@ test/sql/peg_parser/enable_peg_parser.test
 test/sql/peg_parser/fuzzer/diverge_0002.test
 test/sql/peg_parser/fuzzer/diverge_0004.test
 test/sql/peg_parser/fuzzer/diverge_0007.test
+test/sql/peg_parser/fuzzer/diverge_0009.test
 test/sql/peg_parser/fuzzer/diverge_0014.test
 test/sql/peg_parser/fuzzer/diverge_0020.test
 test/sql/peg_parser/fuzzer/diverge_0039.test
