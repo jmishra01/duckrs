@@ -1,14 +1,15 @@
 //! duckrs: an analytical SQL database engine, ported from DuckDB.
 //!
-//! The engine runs in memory and covers CREATE TABLE, INSERT and single-table SELECT with
-//! WHERE so far; other statements return a `Not implemented` error until later phases.
+//! The engine runs in memory and covers tables, views, sequences, macros, INSERT, SELECT with
+//! joins and prepared statements so far; other statements return a `Not implemented` error
+//! until later phases.
 
 pub use duckrs_common::types::{LogicalType, LogicalTypeId};
 pub use duckrs_common::value::Value;
 pub use duckrs_common::{Error, ErrorKind, Result};
 pub use duckrs_core::client::MaterializedQueryResult as QueryResult;
 
-use duckrs_core::client::{ClientContext, DatabaseInstance};
+use duckrs_core::client::{ClientContext, DatabaseInstance, PreparedStatementData};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -65,6 +66,24 @@ impl Connection {
     pub fn query(&mut self, sql: &str) -> Result<QueryResult> {
         self.context.query(sql)
     }
+
+    /// Prepares one statement, with `?` or `$1` for values given when it runs.
+    pub fn prepare(&mut self, sql: &str) -> Result<PreparedStatement> {
+        Ok(PreparedStatement {
+            data: self.context.prepare(sql)?,
+        })
+    }
+
+    /// Runs a prepared statement with values for its parameters, in order.
+    pub fn execute(&mut self, statement: &PreparedStatement, values: &[Value]) -> Result<QueryResult> {
+        self.context.execute_prepared(&statement.data, values)
+    }
+}
+
+/// A statement prepared on a [`Connection`].
+#[derive(Debug, Clone)]
+pub struct PreparedStatement {
+    data: Arc<PreparedStatementData>,
 }
 
 #[cfg(test)]
@@ -85,6 +104,9 @@ mod tests {
         let mut other = db.connect().unwrap();
         assert_eq!(other.query("SELECT i FROM t").unwrap().row_count(), 2);
         assert_eq!(con.query("SELECT * FROM t, t AS u").unwrap().row_count(), 4);
+        let prepared = con.prepare("SELECT i FROM t WHERE i = $1").unwrap();
+        let result = con.execute(&prepared, &[Value::integer(2)]).unwrap();
+        assert_eq!(result.value(0, 0), Value::integer(2));
         let err = con.query("SELECT * FROM t WHERE i IN (SELECT i FROM t)").unwrap_err();
         assert_eq!(err.kind, ErrorKind::NotImplemented);
     }

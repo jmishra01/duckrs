@@ -61,9 +61,10 @@ fn renders_expressions_like_duckdb() {
              (lambda elem: struct_extract(elem, 'result')))",
         ),
         (
-            "SELECT E'a\\tb', X'FF', B'101', N'x', $1, ?, $name, #1, 'it''s'",
-            "SELECT 'a\tb', X'FF', B'101', CAST('x' AS VARCHAR), $1, $2, $name, #1, 'it''s'",
+            "SELECT E'a\\tb', X'FF', B'101', N'x', $1, ?, #1, 'it''s'",
+            "SELECT 'a\tb', X'FF', B'101', CAST('x' AS VARCHAR), $1, $2, #1, 'it''s'",
         ),
+        ("SELECT $name, $other", "SELECT $name, $other"),
         (
             "SELECT COLUMNS('a.*'), * EXCLUDE (a) REPLACE (b + 1 AS b), t.*, \"Quoted\", \"select\"",
             "SELECT COLUMNS('a.*'), * EXCLUDE (a) REPLACE ((b + 1) AS b), t.*, Quoted, \"select\"",

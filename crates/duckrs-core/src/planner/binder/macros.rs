@@ -328,13 +328,9 @@ impl Binder<'_> {
         };
         let mut body = (**body).clone();
         replace_in_query(&mut body, &parameter_names(function), &arguments);
-        let mut binder = Binder::with_options(self.catalog, self.options);
-        binder.next_table_index = self.next_table_index;
+        let mut binder = self.child_binder();
         binder.left_of_join = std::mem::take(&mut self.left_of_join);
-        binder.bound_views = self.bound_views.clone();
-        binder.bound_macros = self.bound_macros.clone();
         binder.bound_macros.push(entry.clone());
-        binder.search_schema = self.search_schema.clone();
         let bound = binder.bind_select_statement(&SelectStatement { node: body });
         self.left_of_join = std::mem::take(&mut binder.left_of_join);
         self.next_table_index = binder.next_table_index;

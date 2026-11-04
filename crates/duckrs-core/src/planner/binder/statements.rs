@@ -602,7 +602,7 @@ impl Binder<'_> {
 
     /// `Binder::BindLimitValue` for constant values: NULL means no limit (or no offset).
     fn bind_limit_value(&mut self, expr: &Expr, is_offset: bool) -> Result<Option<u64>> {
-        let mut binder = Binder::new(self.catalog);
+        let mut binder = self.child_binder();
         let bound = binder.bind_expression(expr)?;
         if !bound.is_foldable() {
             return Err(not_implemented(
@@ -845,11 +845,8 @@ impl Binder<'_> {
             TableRefKind::Join(join) => self.bind_join(table_ref, join),
             TableRefKind::Subquery(select) => {
                 // `Binder::Bind(SubqueryRef)`
-                let mut binder = Binder::with_options(self.catalog, self.options);
-                binder.next_table_index = self.next_table_index;
+                let mut binder = self.child_binder();
                 binder.left_of_join = std::mem::take(&mut self.left_of_join);
-                binder.bound_views = self.bound_views.clone();
-                binder.search_schema = self.search_schema.clone();
                 let bound = binder.bind_select_statement(select)?;
                 self.left_of_join = binder.left_of_join;
                 self.next_table_index = binder.next_table_index;
@@ -919,9 +916,7 @@ impl Binder<'_> {
                 None => column_aliases.push(alias.clone()),
             }
         }
-        let mut binder = Binder::with_options(self.catalog, self.options);
-        binder.next_table_index = self.next_table_index;
-        binder.bound_views = self.bound_views.clone();
+        let mut binder = self.child_binder();
         binder.bound_views.push(view.clone());
         binder.search_schema = Some(view.schema.clone());
         let bound = binder.bind_select_statement(&view.query)?;
@@ -949,7 +944,7 @@ impl Binder<'_> {
         }
         let mut values = Vec::with_capacity(call.args.len());
         for argument in &call.args {
-            let mut binder = Binder::new(self.catalog);
+            let mut binder = self.child_binder();
             binder.left_of_join = std::mem::take(&mut self.left_of_join);
             let bound = binder.bind_expression(&argument.expr);
             self.left_of_join = binder.left_of_join;
@@ -1146,8 +1141,7 @@ impl Binder<'_> {
                     )
                 }
                 None => {
-                    let mut binder = Binder::new(self.catalog);
-                    binder.next_table_index = self.next_table_index;
+                    let mut binder = self.child_binder();
                     let bound = binder.bind_select_statement(select)?;
                     self.next_table_index = binder.next_table_index;
                     if bound.types.len() != expected_types.len() {
@@ -1321,7 +1315,7 @@ impl Binder<'_> {
                 OnCreateConflict::Replace => {}
             }
         }
-        let mut binder = Binder::with_options(self.catalog, self.options);
+        let mut binder = self.child_binder();
         let bound = binder.bind_select_statement(query)?;
         if info.columns.len() > bound.types.len() {
             return Err(binder_error("Target table has more column names than query result."));

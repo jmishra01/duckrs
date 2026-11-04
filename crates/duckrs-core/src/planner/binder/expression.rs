@@ -402,6 +402,23 @@ impl Binder<'_> {
                 let bound = bind_scalar_function(set, children, function.is_operator, &try_evaluate_scalar)?;
                 self.bind_sequence_function(bound)?
             }
+            ExprKind::Parameter(identifier) => {
+                // `Binder::Bind(ParameterExpression)`
+                let Some(parameters) = &self.parameters else {
+                    // a statement run directly has no values for its parameters
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("Values were not provided for the following parameters: {identifier}"),
+                    ));
+                };
+                let key = identifier.to_lowercase();
+                let mut seen = parameters.seen.lock();
+                if !seen.contains(&key) {
+                    seen.push(key.clone());
+                }
+                let value = parameters.values.as_ref().and_then(|values| values.get(&key));
+                BoundExpr::constant(value.cloned().unwrap_or_else(Value::sql_null))
+            }
             ExprKind::Star(_) => return Err(binder_error("STAR expression is not supported here")),
             other => {
                 let name = format!("{other:?}");

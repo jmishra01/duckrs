@@ -143,6 +143,7 @@ impl Transformer<'_> {
                 }
                 self.param_count = 0;
                 self.named_params.clear();
+                self.param_named = None;
                 Ok(Statement::Prepare {
                     name,
                     statement: Box::new(statement),

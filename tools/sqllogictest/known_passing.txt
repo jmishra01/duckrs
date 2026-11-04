@@ -17,6 +17,7 @@ test/fuzzer/pedro/duplicate_using_clause.test
 test/fuzzer/pedro/floating_point_conversion_overflow.test
 test/fuzzer/pedro/floating_point_inequality.test
 test/fuzzer/pedro/forced_parallelism_empty_select.test
+test/fuzzer/pedro/in_clause_optimization_error.test
 test/fuzzer/pedro/incorrect_offset_result.test
 test/fuzzer/pedro/is_distinct_from_validation.test
 test/fuzzer/pedro/last_memory_leak.test
@@ -129,6 +130,7 @@ test/sql/cast/test_exponent_in_cast.test
 test/sql/cast/test_try_cast.test
 test/sql/catalog/case_insensitive_using.test
 test/sql/catalog/dependencies/test_concurrent_schema_creation.test
+test/sql/catalog/dependencies/test_prepared_dependency.test
 test/sql/catalog/issue_9459.test
 test/sql/catalog/sequence/sequence_cycle.test
 test/sql/catalog/sequence/sequence_offset_increment.test
@@ -265,6 +267,19 @@ test/sql/peg_parser/fuzzer/internal_0001.test
 test/sql/peg_parser/fuzzer/internal_0206.test
 test/sql/peg_parser/identifier.test
 test/sql/peg_parser/transformer/between_asymmetric.test
+test/sql/prepared/invalid_prepare.test
+test/sql/prepared/parameter_variants.test
+test/sql/prepared/prepare_from_first.test
+test/sql/prepared/prepare_offset_first.test
+test/sql/prepared/prepared_named_param.test
+test/sql/prepared/test_issue_2079.test
+test/sql/prepared/test_issue_4010.test
+test/sql/prepared/test_issue_4042.test
+test/sql/prepared/test_issue_6276.test
+test/sql/prepared/test_prepare_drop.test
+test/sql/prepared/test_prepare_error.test
+test/sql/prepared/test_prepare_issue_5132.test
+test/sql/prepared/test_prepare_issue_8500.test
 test/sql/projection/coalesce_error.test
 test/sql/projection/test_scalar_projection.test
 test/sql/projection/test_simple_projection.test

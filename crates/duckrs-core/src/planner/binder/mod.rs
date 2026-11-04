@@ -16,9 +16,12 @@ use crate::catalog::{Catalog, MacroCatalogEntry, ViewCatalogEntry};
 use duckrs_common::sort_key::{NullOrder, OrderModifiers, OrderType};
 use duckrs_common::string_util::{candidates_message, similarity_rating, top_n_strings};
 use duckrs_common::types::LogicalType;
+use duckrs_common::value::Value;
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast;
 use duckrs_parser::ast::Statement;
+use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// What a statement returns to the client (`StatementReturnType`).
@@ -348,6 +351,16 @@ impl BindOptions {
     }
 }
 
+/// The parameters of the prepared statement being bound (`BoundParameterMap`).
+#[derive(Debug, Default)]
+pub struct ParameterValues {
+    /// lowercase name -> value; without values, parameters bind as NULLs, to check a statement
+    /// when it is prepared
+    pub values: Option<HashMap<String, Value>>,
+    /// the parameters the statement refers to (`named_param_map`), in order of appearance
+    pub seen: Mutex<Vec<String>>,
+}
+
 /// How column references bind while a select list or HAVING clause is being bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ColumnMode {
@@ -406,6 +419,8 @@ pub struct Binder<'a> {
     bound_macros: Vec<Arc<MacroCatalogEntry>>,
     /// How many scalar macros the expression being bound is nested in.
     macro_depth: usize,
+    /// The parameters of the prepared statement being bound, if it is one.
+    pub parameters: Option<Arc<ParameterValues>>,
 }
 
 impl<'a> Binder<'a> {
@@ -428,6 +443,7 @@ impl<'a> Binder<'a> {
             search_schema: None,
             bound_macros: Vec::new(),
             macro_depth: 0,
+            parameters: None,
         }
     }
 
@@ -456,6 +472,18 @@ impl<'a> Binder<'a> {
         } else {
             error
         }
+    }
+
+    /// `Binder::CreateBinder` for a query inside of this one: it numbers tables on from here and
+    /// knows what is being bound around it, but none of the columns.
+    fn child_binder(&self) -> Binder<'a> {
+        let mut binder = Binder::with_options(self.catalog, self.options);
+        binder.next_table_index = self.next_table_index;
+        binder.bound_views = self.bound_views.clone();
+        binder.bound_macros = self.bound_macros.clone();
+        binder.search_schema = self.search_schema.clone();
+        binder.parameters = self.parameters.clone();
+        binder
     }
 
     /// `Binder::GenerateTableIndex`.

@@ -13,17 +13,22 @@ use crate::catalog::{
 use crate::execution::expression_executor::evaluate_scalar;
 use crate::execution::physical::PhysicalResultCollector;
 use crate::execution::{create_plan, execute_plan};
-use crate::planner::binder::{BindOptions, Binder, DefaultNullOrder, bind_constant_expression, schema_of};
+use crate::planner::binder::{
+    BindOptions, Binder, DefaultNullOrder, ParameterValues, bind_constant_expression, schema_of,
+};
 use crate::planner::column_binding_resolver::resolve_column_bindings;
-use duckrs_common::Result;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::OrderType;
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
+use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ParserOptions;
-use duckrs_parser::ast::{CreateInfo, CreateKind, DropInfo, OnCreateConflict as AstConflict, PragmaInfo, Statement};
+use duckrs_parser::ast::{
+    CreateInfo, CreateKind, DropInfo, OnCreateConflict as AstConflict, PragmaInfo, Statement, sql_quoted_identifier,
+};
 use parking_lot::RwLock;
 use settings::SettingValues;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// A database (`DatabaseInstance`): its catalog, its global settings and, with Phase 9, its
@@ -97,6 +102,19 @@ pub struct ClientContext {
     db: Arc<DatabaseInstance>,
     /// session settings (`ClientConfig`)
     settings: SettingValues,
+    /// the statements of PREPARE (`ClientData::prepared_statements`)
+    prepared_statements: HashMap<String, Arc<PreparedStatementData>>,
+    /// the parameters of the prepared statement running now
+    parameters: Option<Arc<ParameterValues>>,
+}
+
+/// A prepared statement (`PreparedStatementData`). It binds anew each time it runs, as C++ does
+/// when the catalog changed, so that it always sees the catalog as it is then.
+#[derive(Debug)]
+pub struct PreparedStatementData {
+    statement: Statement,
+    /// the parameters, lowercase, in order of appearance
+    parameters: Vec<String>,
 }
 
 impl ClientContext {
@@ -104,6 +122,8 @@ impl ClientContext {
         Self {
             db,
             settings: SettingValues::default(),
+            prepared_statements: HashMap::new(),
+            parameters: None,
         }
     }
 
@@ -158,6 +178,100 @@ impl ClientContext {
         Ok(result)
     }
 
+    /// `ClientContext::Prepare`: checks one statement and keeps it to run later.
+    pub fn prepare(&mut self, sql: &str) -> Result<Arc<PreparedStatementData>> {
+        let mut statements = duckrs_parser::parse_ast_with(sql, &self.parser_options())?;
+        if statements.len() != 1 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Cannot prepare multiple statements at once!",
+            ));
+        }
+        self.prepare_statement(statements.remove(0))
+    }
+
+    fn prepare_statement(&mut self, statement: Statement) -> Result<Arc<PreparedStatementData>> {
+        let parameters = Arc::new(ParameterValues::default());
+        // these run without the binder, and have no parameters
+        let client_statement = matches!(
+            statement,
+            Statement::SetVariable { .. }
+                | Statement::ResetVariable { .. }
+                | Statement::Pragma(_)
+                | Statement::Create(_)
+                | Statement::Drop(_)
+        );
+        if !client_statement {
+            let mut binder = Binder::with_options(&self.db.catalog, self.bind_options());
+            binder.parameters = Some(parameters.clone());
+            binder.bind(&statement)?;
+        }
+        let seen = parameters.seen.lock().clone();
+        Ok(Arc::new(PreparedStatementData {
+            statement,
+            parameters: seen,
+        }))
+    }
+
+    /// `PreparedStatement::Execute` with values for parameters `1`, `2`, ...
+    pub fn execute_prepared(
+        &mut self,
+        prepared: &PreparedStatementData,
+        values: &[Value],
+    ) -> Result<MaterializedQueryResult> {
+        let named = values
+            .iter()
+            .enumerate()
+            .map(|(i, value)| ((i + 1).to_string(), value.clone()))
+            .collect();
+        self.execute_with(prepared, named)
+    }
+
+    /// `PreparedStatement::VerifyParameters`, then the statement with these values.
+    fn execute_with(
+        &mut self,
+        prepared: &PreparedStatementData,
+        values: HashMap<String, Value>,
+    ) -> Result<MaterializedQueryResult> {
+        let mut excess: Vec<&str> = values
+            .keys()
+            .filter(|k| !prepared.parameters.contains(*k))
+            .map(String::as_str)
+            .collect();
+        if !excess.is_empty() {
+            excess.sort_unstable();
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "Parameter argument/count mismatch, identifiers of the excess parameters: {}",
+                    excess.join(", ")
+                ),
+            ));
+        }
+        let missing: Vec<&str> = prepared
+            .parameters
+            .iter()
+            .filter(|p| !values.contains_key(*p))
+            .map(String::as_str)
+            .collect();
+        if !missing.is_empty() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "Values were not provided for the following parameters: {}",
+                    missing.join(", ")
+                ),
+            ));
+        }
+        self.parameters = Some(Arc::new(ParameterValues {
+            values: Some(values),
+            seen: Default::default(),
+        }));
+        let result = self.run_statement(&prepared.statement);
+        self.parameters = None;
+        result
+    }
+
     /// `ClientContext::PendingStatementOrPreparedStatement` + `ExecutePendingQueryInternal`.
     fn run_statement(&mut self, statement: &Statement) -> Result<MaterializedQueryResult> {
         match statement {
@@ -185,6 +299,29 @@ impl ClientContext {
                     return Ok(Self::success());
                 }
                 return Err(crate::unported(format!("PRAGMA {name}")));
+            }
+            Statement::Prepare { name, statement } => {
+                let prepared = self.prepare_statement((**statement).clone())?;
+                self.prepared_statements.insert(name.to_lowercase(), prepared);
+                return Ok(Self::success());
+            }
+            Statement::Execute { name, values } => {
+                let Some(prepared) = self.prepared_statements.get(&name.to_lowercase()).cloned() else {
+                    return Err(Error::new(
+                        ErrorKind::Binder,
+                        format!("Prepared statement {} does not exist", sql_quoted_identifier(name)),
+                    ));
+                };
+                let mut bound = HashMap::with_capacity(values.len());
+                for (parameter, value) in values {
+                    let value = evaluate_scalar(&bind_constant_expression(&self.db.catalog, value)?)?;
+                    bound.insert(parameter.to_lowercase(), value);
+                }
+                return self.execute_with(&prepared, bound);
+            }
+            Statement::Deallocate(name) => {
+                self.prepared_statements.remove(&name.to_lowercase());
+                return Ok(Self::success());
             }
             Statement::Create(info) if matches!(info.kind, CreateKind::Macro { .. }) => {
                 self.create_macro(info)?;
@@ -217,6 +354,7 @@ impl ClientContext {
             _ => {}
         }
         let mut binder = Binder::with_options(&self.db.catalog, self.bind_options());
+        binder.parameters = self.parameters.clone();
         let mut bound = binder.bind(statement)?;
         resolve_column_bindings(&mut bound.plan)?;
         let plan = create_plan(bound.plan);
@@ -626,11 +764,7 @@ mod tests {
             "SELECT * FROM l, range(k)",
             "SELECT * FROM l, (SELECT 1 FROM r JOIN t ON a = 'x') s",
         ] {
-            assert_eq!(
-                c.query(sql).unwrap_err().kind,
-                duckrs_common::ErrorKind::NotImplemented,
-                "{sql}"
-            );
+            assert_eq!(c.query(sql).unwrap_err().kind, ErrorKind::NotImplemented, "{sql}");
         }
         // a duplicate alias only matters to a reference that could mean either table
         assert_eq!(
@@ -933,6 +1067,65 @@ mod tests {
             "Catalog Error: Macro Function with name add1 does not exist!"
         );
         run(&mut c, "DROP MACRO IF EXISTS add1");
+    }
+
+    #[test]
+    fn prepared_statements() {
+        let mut c = join_tables();
+        let error = |c: &mut ClientContext, sql: &str| c.query(sql).unwrap_err().to_string();
+        run(&mut c, "PREPARE p AS SELECT a, $1 + k FROM l WHERE k = $2");
+        assert_eq!(run(&mut c, "EXECUTE p(10, 1)"), rows(&[&["x", "11"]]));
+        assert_eq!(run(&mut c, "EXECUTE p(20, 1 + 1) ").len(), 2);
+        // it sees later changes
+        run(&mut c, "INSERT INTO l VALUES (9, 'nine')");
+        assert_eq!(run(&mut c, "EXECUTE p(0, 9)"), rows(&[&["nine", "9"]]));
+        // through subqueries, and into INSERT
+        run(&mut c, "PREPARE q AS SELECT * FROM (SELECT $1 AS x) t");
+        assert_eq!(run(&mut c, "EXECUTE q('hi')"), rows(&[&["hi"]]));
+        run(&mut c, "PREPARE i AS INSERT INTO l VALUES ($1, $2)");
+        run(&mut c, "EXECUTE i(100, 'hundred')");
+        assert_eq!(run(&mut c, "SELECT a FROM l WHERE k = 100"), rows(&[&["hundred"]]));
+        // a repeated and a named parameter
+        run(&mut c, "PREPARE n AS SELECT $v + $v");
+        assert_eq!(run(&mut c, "EXECUTE n(v := 21)"), rows(&[&["42"]]));
+        // `?` numbers in the order of the text, whichever way around FROM is
+        run(
+            &mut c,
+            "PREPARE t AS SELECT ?::VARCHAR FROM (SELECT ?::INTEGER) x(i) WHERE i > ?::INTEGER",
+        );
+        assert_eq!(run(&mut c, "EXECUTE t('hello', 2, 1)"), rows(&[&["hello"]]));
+        run(
+            &mut c,
+            "PREPARE f AS FROM (SELECT ?::INTEGER AS i) SELECT i, ?::VARCHAR",
+        );
+        assert_eq!(run(&mut c, "EXECUTE f(1, 'one')"), rows(&[&["1", "one"]]));
+        // in LIMIT and OFFSET
+        run(&mut c, "PREPARE o AS SELECT x FROM range(10) t(x) OFFSET ? LIMIT ?");
+        assert_eq!(run(&mut c, "EXECUTE o(3, 1)"), rows(&[&["3"]]));
+        assert!(error(&mut c, "PREPARE m AS SELECT $1, $name").contains("Mixing named and positional"));
+        // without PREPARE there are no values
+        assert!(error(&mut c, "SELECT ?").contains("Values were not provided"));
+        // what cannot run says so when prepared, not with a confusing error when executed
+        assert!(error(&mut c, "PREPARE u AS UPDATE l SET k = ?").contains("not yet ported"));
+        // wrong arguments
+        assert!(error(&mut c, "EXECUTE p(1)").contains("Values were not provided"));
+        assert!(error(&mut c, "EXECUTE p(1, 2, 3)").contains("excess parameters"));
+        // checked when prepared
+        assert!(error(&mut c, "PREPARE bad AS SELECT * FROM nope").contains("does not exist"));
+        // and gone once deallocated
+        run(&mut c, "DEALLOCATE p");
+        assert_eq!(
+            error(&mut c, "EXECUTE p(1, 2)"),
+            "Binder Error: Prepared statement \"p\" does not exist"
+        );
+        // from the API
+        let prepared = c.prepare("SELECT b FROM r WHERE b = ?").unwrap();
+        let result = c.execute_prepared(&prepared, &[Value::integer(30)]).unwrap();
+        assert_eq!(result.value(0, 0), Value::integer(30));
+        assert_eq!(
+            c.execute_prepared(&prepared, &[Value::integer(1)]).unwrap().row_count(),
+            0
+        );
     }
 
     #[test]

@@ -201,6 +201,8 @@ pub struct Transformer<'g> {
     in_window_definition: bool,
     param_count: u64,
     named_params: HashMap<String, u64>,
+    /// whether the last parameter was a named one (`last_param_type`)
+    param_named: Option<bool>,
     pivot_entries: Vec<statements::PivotEntry>,
     /// The WITH clauses in scope, outermost first.
     cte_stack: Vec<CteMap>,
@@ -221,6 +223,7 @@ impl<'g> Transformer<'g> {
             in_window_definition: false,
             param_count: 0,
             named_params: HashMap::new(),
+            param_named: None,
             pivot_entries: Vec::new(),
             cte_stack: Vec::new(),
             max_expression_depth: DEFAULT_MAX_EXPRESSION_DEPTH,
@@ -1225,6 +1228,17 @@ impl<'g> Transformer<'g> {
     }
 
     fn parameter(&mut self, node: &ParseNode) -> Result<Expr> {
+        // `ParamTypeCheck`
+        let named = !matches!(
+            self.name(node),
+            "AnonymousParameter" | "QuestionMarkNumberedParameter" | "NumberedParameter"
+        );
+        if self.param_named.is_some_and(|last| last != named) {
+            return Err(Error::not_implemented(
+                "Mixing named and positional parameters is not supported yet",
+            ));
+        }
+        self.param_named = Some(named);
         let identifier = match self.name(node) {
             "AnonymousParameter" => {
                 let index = self.param_count + 1;
@@ -2242,11 +2256,15 @@ impl<'g> Transformer<'g> {
             }
         }
         let from = self.alt(self.req(node, "SelectFrom")?)?;
-        let from_table = match self.sub(from, "FromClause") {
-            Some(f) => Some(self.transform_from(f)?),
-            None => None,
-        };
-        let (mut select, mut modifiers) = match self.sub(from, "SelectClause") {
+        // in the order of the text, which is how `?` parameters number
+        let from_clause = self.sub(from, "FromClause");
+        let select_clause = self.sub(from, "SelectClause");
+        let from_first = self.name(from) == "FromSelectClause";
+        let mut from_table = None;
+        if from_first {
+            from_table = from_clause.map(|f| self.transform_from(f)).transpose()?;
+        }
+        let (mut select, mut modifiers) = match select_clause {
             Some(clause) => self.select_clause(clause)?,
             None => (
                 SelectNode {
@@ -2256,6 +2274,9 @@ impl<'g> Transformer<'g> {
                 Vec::new(),
             ),
         };
+        if !from_first {
+            from_table = from_clause.map(|f| self.transform_from(f)).transpose()?;
+        }
         select.from_table = from_table.unwrap_or_else(TableRef::empty);
         select.where_clause = self.opt_expr(node, "WhereClause")?.map(Box::new);
         if let Some(group) = self.sub(node, "GroupByClause") {
