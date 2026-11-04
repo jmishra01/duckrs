@@ -2,7 +2,7 @@
 
 An analytical SQL database engine: a port of [DuckDB](https://github.com/duckdb/duckdb) to Rust.
 
-**Status: Phase 3 (minimal vertical slice) in progress.** The engine runs CREATE TABLE, CREATE VIEW, CREATE SEQUENCE, CREATE MACRO, INSERT, prepared statements
+**Status: everything Phase 3 lists is ported, but its gate is not met yet** (385 files, 7.5% of the corpus, against a 15% target; what `test/sql/select`, `projection` and `filter` still fail on belongs to later phases). The engine runs CREATE TABLE, CREATE VIEW, CREATE SEQUENCE, CREATE MACRO, INSERT, prepared statements
 and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in memory. What exists today:
 
 - `crates/duckrs-common`: the core building blocks every other crate uses:
@@ -54,7 +54,7 @@ and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in me
   and aliases of the select list; and SET/RESET/`PRAGMA x = y` for all 196
   of DuckDB's settings (generated from its `settings.json` by `tools/generate_settings.py`), with
   DuckDB's types and error messages. There is no optimizer yet, so a filter over a cross product
-  (`FROM a, b WHERE a.x = b.x`) really does build every pair until Phase 7. BEGIN, COMMIT and ROLLBACK work, but connections are not isolated from each other until Phase 10: what would need that fails as not yet ported. Closing the Phase 3 gate is what remains; subqueries, CTEs and
+  (`FROM a, b WHERE a.x = b.x`) really does build every pair until Phase 7. BEGIN, COMMIT and ROLLBACK work, but connections are not isolated from each other until Phase 10: what would need that fails as not yet ported. The next work is deciding how to reach the Phase 3 gate; subqueries, CTEs and
   set operations come with Phase 6. SQL it does not
   run yet fails with an error saying it `is not yet ported to duckrs`; the sqllogictest runner
   never counts that error as the one a test expects.
