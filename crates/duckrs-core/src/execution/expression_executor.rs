@@ -12,6 +12,7 @@ use crate::function::operators::DIVISION_BY_ZERO;
 use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, SequenceOp};
 use duckrs_common::comparison::{ComparisonType, DuckOrd};
 use duckrs_common::executor;
+use duckrs_common::sort_key::{NullOrder, OrderModifiers, OrderType, create_sort_keys};
 use duckrs_common::types::{LogicalType, LogicalTypeId, NativeType, PhysicalType};
 use duckrs_common::value::Value;
 use duckrs_common::vector::{DataChunk, SelectionVector, Vector, VectorType};
@@ -106,9 +107,38 @@ fn compare(left: &Vector, right: &Vector, result: &mut Vector, count: usize, op:
         PhysicalType::Double => compare_typed::<f64>(left, right, result, count, op),
         PhysicalType::Interval => compare_typed::<duckrs_common::types::Interval>(left, right, result, count, op),
         PhysicalType::Varchar => compare_strings(left, right, result, count, op),
+        PhysicalType::List | PhysicalType::Struct | PhysicalType::Array => {
+            return compare_nested(left, right, result, count, op);
+        }
         other => {
             return Err(crate::unported(format!("comparisons of {other} values")));
         }
+    }
+    Ok(())
+}
+
+/// `VectorOperations::NestedEquals` and friends: inside of a nested value NULLs equal each other
+/// and sort last, which is what the bytes of a sort key compare like.
+fn compare_nested(left: &Vector, right: &Vector, result: &mut Vector, count: usize, op: ComparisonType) -> Result<()> {
+    let null_aware = matches!(op, ComparisonType::DistinctFrom | ComparisonType::NotDistinctFrom);
+    let modifiers = OrderModifiers {
+        order: OrderType::Ascending,
+        nulls: NullOrder::NullsLast,
+    };
+    let left_keys = create_sort_keys(&[(left, modifiers)], count)?;
+    let right_keys = create_sort_keys(&[(right, modifiers)], count)?;
+    let (lu, ru) = (left.to_unified(count), right.to_unified(count));
+    result.prepare_flat(count.max(1));
+    for i in 0..count {
+        let (lnull, rnull) = (
+            !lu.validity.is_valid(lu.sel.get(i)),
+            !ru.validity.is_valid(ru.sel.get(i)),
+        );
+        if !null_aware && (lnull || rnull) {
+            result.set_null(i, true);
+            continue;
+        }
+        result.data_mut::<bool>()[i] = op.evaluate(lnull, rnull, || left_keys[i].cmp(&right_keys[i]));
     }
     Ok(())
 }

@@ -1,6 +1,6 @@
 // Ported from duckdb/src/common/types/value.cpp @ rust-port-baseline
 
-use crate::string_cast::{format_blob, format_decimal, format_double, format_float};
+use crate::string_cast::{escape_nested_string, format_blob, format_decimal, format_double, format_float};
 use crate::types::{
     Date, Interval, LogicalType, LogicalTypeId, PhysicalType, Time, TimeTz, Timestamp, time_ns_to_string,
     timestamp_ms_to_string, timestamp_ns_to_string, timestamp_sec_to_string, timestamp_to_string, uuid_to_string,
@@ -306,10 +306,36 @@ impl Value {
         })
     }
 
+    /// The member a UNION's tag selects, if there is one.
+    fn union_member<'a>(&self, fields: &'a [Value]) -> Option<&'a Value> {
+        let tag = fields[0].as_i128()?;
+        fields.get(tag as usize + 1)
+    }
+
+    /// The value inside of a nested value's rendering: strings are escaped where they need it.
+    fn child_string(&self) -> Result<String> {
+        if self.is_null() {
+            return Ok("NULL".into());
+        }
+        if let (LogicalTypeId::Union, ValueData::Struct(fields)) = (self.ty.id(), &self.data) {
+            // `NestedToVarcharCast::WrapChildCast`: a UNION shows its member as a child would
+            return match self.union_member(fields) {
+                Some(member) => member.child_string(),
+                None => Ok("NULL".into()),
+            };
+        }
+        let text = self.try_to_string()?;
+        Ok(if self.ty.is_nested() {
+            text
+        } else {
+            escape_nested_string(&text, false)
+        })
+    }
+
     /// The value rendered as `CAST(value AS VARCHAR)` would (`Value::ToString`).
     ///
-    /// Nested, ENUM, BIT, BIGNUM and GEOMETRY values go through the cast functions that land in
-    /// Phase 4; until then they return `Not implemented`.
+    /// ENUM, BIT, BIGNUM and GEOMETRY values go through cast functions that are not ported yet,
+    /// and return `Not implemented`.
     pub fn try_to_string(&self) -> Result<String> {
         if self.is_null() {
             return Ok("NULL".into());
@@ -350,6 +376,44 @@ impl Value {
             (ValueData::Int64(v), LogicalTypeId::TimestampSec) => timestamp_sec_to_string(*v),
             (ValueData::Interval(v), _) => v.to_string(),
             (ValueData::Int128(v), LogicalTypeId::Uuid) => uuid_to_string(*v),
+            (ValueData::List(items), LogicalTypeId::Map) => {
+                let mut entries = Vec::with_capacity(items.len());
+                for item in items {
+                    let ValueData::Struct(fields) = &item.data else {
+                        unreachable!("a map entry is a STRUCT");
+                    };
+                    entries.push(format!("{}={}", fields[0].child_string()?, fields[1].child_string()?));
+                }
+                format!("{{{}}}", entries.join(", "))
+            }
+            (ValueData::List(items), _) => {
+                let items = items.iter().map(Value::child_string).collect::<Result<Vec<_>>>()?;
+                format!("[{}]", items.join(", "))
+            }
+            (ValueData::Struct(fields), LogicalTypeId::Union) => match self.union_member(fields) {
+                Some(member) => member.try_to_string()?,
+                None => "NULL".into(),
+            },
+            (ValueData::Struct(fields), LogicalTypeId::Tuple) => {
+                let fields = fields.iter().map(Value::child_string).collect::<Result<Vec<_>>>()?;
+                // a single-element tuple needs a trailing comma to round-trip
+                if let [field] = fields.as_slice() {
+                    format!("({field},)")
+                } else {
+                    format!("({})", fields.join(", "))
+                }
+            }
+            (ValueData::Struct(fields), _) => {
+                let mut entries = Vec::with_capacity(fields.len());
+                for ((name, _), field) in self.ty.struct_children().iter().zip(fields) {
+                    entries.push(format!(
+                        "{}: {}",
+                        escape_nested_string(name, true),
+                        field.child_string()?
+                    ));
+                }
+                format!("{{{}}}", entries.join(", "))
+            }
             _ => {
                 return Err(Error::not_implemented(format!(
                     "converting {} values to VARCHAR is not supported yet",
@@ -409,11 +473,34 @@ mod tests {
             Value::uuid(uuid).try_to_string().unwrap(),
             "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
         );
-        assert!(
-            Value::list(LogicalType::INTEGER, vec![])
-                .unwrap()
-                .try_to_string()
-                .is_err()
+        assert_eq!(
+            Value::list(
+                LogicalType::INTEGER,
+                vec![Value::integer(1), Value::null(LogicalType::INTEGER)]
+            )
+            .unwrap()
+            .try_to_string()
+            .unwrap(),
+            "[1, NULL]"
+        );
+        assert_eq!(
+            Value::list(
+                LogicalType::VARCHAR,
+                vec![Value::varchar("a b"), Value::varchar("c, d")]
+            )
+            .unwrap()
+            .try_to_string()
+            .unwrap(),
+            "[a b, 'c, d']"
+        );
+        assert_eq!(
+            Value::struct_value(vec![
+                ("a".into(), Value::integer(1)),
+                ("b c".into(), Value::varchar(""))
+            ])
+            .try_to_string()
+            .unwrap(),
+            "{'a': 1, 'b c': ''}"
         );
     }
 

@@ -132,6 +132,11 @@ pub fn candidates_message(candidates: &[String], label: &str) -> String {
     format!("\n{label}: {}", quoted.join(", "))
 }
 
+/// `StringUtil::CharacterIsSpace`.
+pub fn is_space(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

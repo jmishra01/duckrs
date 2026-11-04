@@ -91,6 +91,37 @@ pub fn format_decimal(value: i128, width: u8, scale: u8) -> String {
     out
 }
 
+/// A string inside of a nested value's rendering (`VectorCastHelpers::WriteEscapedString`): quoted
+/// with `'` where it would not read back as itself. STRUCT keys are always quoted.
+pub fn escape_nested_string(text: &str, struct_key: bool) -> String {
+    let bytes = text.as_bytes();
+    let is_special = |c: &u8| {
+        matches!(
+            c,
+            b'"' | b'\'' | b'(' | b')' | b',' | b':' | b'=' | b'[' | b'\\' | b']' | b'{' | b'}'
+        )
+    };
+    let needs_quotes = bytes.is_empty()
+        || struct_key
+        || crate::string_util::is_space(bytes[0])
+        || (bytes.len() >= 2 && crate::string_util::is_space(bytes[bytes.len() - 1]))
+        || text.eq_ignore_ascii_case("null")
+        || bytes.iter().any(is_special);
+    if !needs_quotes {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('\'');
+    for c in text.chars() {
+        if c == '\'' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
+}
+
 /// Renders a BLOB (`Blob::ToString`): printable ASCII as-is, everything else (including `\`,
 /// `'` and `"`) as `\xHH`.
 pub fn format_blob(bytes: &[u8]) -> String {

@@ -313,6 +313,31 @@ impl BindContext {
         Ok(matching)
     }
 
+    /// `Binder::QualifyColumnName`: where the struct fields of a dotted name start, if it has
+    /// any. What comes before is the column.
+    pub(super) fn struct_field_start(&self, names: &[String]) -> Option<usize> {
+        let has_table_column = |table: &str, column: &str| {
+            self.bindings
+                .iter()
+                .any(|b| b.alias.eq_ignore_ascii_case(table) && b.column_index(column).is_some())
+        };
+        let schema_table_column = |schema: &str, table: &str, column: &str| {
+            self.bindings.iter().any(|b| {
+                b.alias.eq_ignore_ascii_case(table)
+                    && b.schema.as_ref().is_some_and(|s| s.eq_ignore_ascii_case(schema))
+                    && b.column_index(column).is_some()
+            })
+        };
+        let has_column = |column: &str| self.bindings.iter().any(|b| b.column_index(column).is_some());
+        let column_parts = match names {
+            [schema, table, column, ..] if schema_table_column(schema, table, column) => 3,
+            [table, column, ..] if has_table_column(table, column) => 2,
+            [column, _, ..] if has_column(column) => 1,
+            _ => return None,
+        };
+        (column_parts < names.len()).then_some(column_parts)
+    }
+
     /// `AmbiguityException`, for bindings with one alias.
     fn ambiguous_table(table: &str) -> Error {
         binder_error(format!(

@@ -2093,6 +2093,52 @@ mod tests {
     }
 
     #[test]
+    fn nested_types_match_duckdb() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        let err = |context: &mut ClientContext, sql: &str| context.query(sql).unwrap_err().to_string();
+        for (sql, expected) in [
+            ("SELECT [1, 2, NULL]", "[1, 2, NULL]"),
+            ("SELECT ['a b', 'c, d', '']", "[a b, 'c, d', '']"),
+            ("SELECT {'a': 1, 'b': 'x'}", "{'a': 1, 'b': x}"),
+            ("SELECT row(1, 'x')", "(1, x)"),
+            ("SELECT row(1)", "(1,)"),
+            ("SELECT MAP {'a': 1}", "{a=1}"),
+            ("SELECT array_value(1, 2)", "[1, 2]"),
+            ("SELECT [1, 2]::BIGINT[2]", "[1, 2]"),
+            ("SELECT '[1, NULL]'::INTEGER[]", "[1, NULL]"),
+            ("SELECT '{a: 1}'::STRUCT(a INTEGER, b INTEGER)", "{'a': 1, 'b': NULL}"),
+            ("SELECT '{a=1}'::MAP(VARCHAR, INTEGER)", "{a=1}"),
+            ("SELECT TRY_CAST(['1', 'x'] AS INTEGER[])", "[1, NULL]"),
+            ("SELECT {'a': 1, 'b': 2}::STRUCT(b VARCHAR)", "{'b': 2}"),
+            ("SELECT [1, 2, 3][-1]", "3"),
+            ("SELECT {'a': 1}['a']", "1"),
+            ("SELECT MAP {'a': 1}['a']", "1"),
+            ("SELECT typeof([1]::BIGINT[])", "BIGINT[]"),
+            ("SELECT typeof({'a': 1})", "STRUCT(a INTEGER)"),
+            ("SELECT 1::UNION(a INTEGER, b VARCHAR)", "1"),
+            ("SELECT [[1, NULL]] = [[1, NULL]]", "true"),
+            ("SELECT [1, 2] < [1, 3]", "true"),
+            ("SELECT {'a': 1} = {'a': 2}", "false"),
+        ] {
+            assert_eq!(run(&mut context, sql), [[expected]], "{sql}");
+        }
+        run(
+            &mut context,
+            "CREATE TABLE t (s STRUCT(a INTEGER, b VARCHAR), l INTEGER[])",
+        );
+        run(&mut context, "INSERT INTO t VALUES ({'a': 1, 'b': 'x'}, [1, 2])");
+        assert_eq!(run(&mut context, "SELECT s.a, t.s.b, l[2] FROM t"), [["1", "x", "2"]]);
+        assert_eq!(
+            err(&mut context, "SELECT [1, 2]::INTEGER[3]"),
+            "Conversion Error: Cannot cast list with length 2 to array with length 3"
+        );
+        assert_eq!(
+            err(&mut context, "SELECT map([1, 1], [2, 3])"),
+            "Invalid Input Error: Map keys must be unique."
+        );
+    }
+
+    #[test]
     fn errors_match_duckdb() {
         let mut context = ClientContext::new(DatabaseInstance::new());
         let err = |context: &mut ClientContext, sql: &str| context.query(sql).unwrap_err().to_string();

@@ -10,11 +10,13 @@ use crate::catalog::DEFAULT_CATALOG;
 use crate::execution::expression_executor::{evaluate_scalar, try_evaluate_scalar};
 use crate::function::binder::{bind_aggregate_function, bind_scalar_function, expression_return_type};
 use crate::function::combine_types::{force_max_logical_type, normalize_type, try_max_logical_type};
+use crate::function::nested::{bind_nested_function, is_nested_function};
 use crate::function::{BuiltinFunctions, typeof_constant};
 use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, ColumnBinding, SequenceOp};
 use duckrs_common::types::{LogicalType, LogicalTypeId, decimal};
 use duckrs_common::value::Value;
 use duckrs_common::{Error, ErrorKind, Result};
+use duckrs_parser::ast;
 use duckrs_parser::ast::sql_quoted_identifier;
 use duckrs_parser::ast::{
     CastType, ComparisonOp, Expr, ExprKind, FunctionExpr, Literal, LiteralKind, OperatorType, TypeExpr,
@@ -122,6 +124,10 @@ fn literal_to_value(literal: &Literal) -> Result<Value> {
         LiteralKind::Bit => Err(crate::unported("BIT literals")),
     }
 }
+
+/// `ArrayType::MAX_ARRAY_SIZE` and `UnionType::MAX_UNION_MEMBERS`.
+const MAX_ARRAY_SIZE: i64 = 100_000;
+const MAX_UNION_MEMBERS: usize = 255;
 
 /// The built-in type names and their aliases (`BUILTIN_TYPES`), for types without parameters.
 fn builtin_type(name: &str) -> Option<LogicalTypeId> {
@@ -254,20 +260,80 @@ impl Binder<'_> {
             }
             // the width of a VARCHAR is accepted and ignored
             LogicalTypeId::Varchar if children.len() <= 1 => Ok(LogicalType::VARCHAR),
-            _ if !children.is_empty() => Err(crate::unported(format!("type parameters for {}", name.to_uppercase()))),
-            LogicalTypeId::Struct
-            | LogicalTypeId::Tuple
-            | LogicalTypeId::List
+            LogicalTypeId::List
             | LogicalTypeId::Array
             | LogicalTypeId::Map
-            | LogicalTypeId::Union
-            | LogicalTypeId::Enum
+            | LogicalTypeId::Struct
+            | LogicalTypeId::Tuple
+            | LogicalTypeId::Union => self.bind_nested_type(&name, id, children),
+            _ if !children.is_empty() => Err(crate::unported(format!("type parameters for {}", name.to_uppercase()))),
+            LogicalTypeId::Enum
             | LogicalTypeId::Variant
             | LogicalTypeId::Bit
             | LogicalTypeId::Bignum
             | LogicalTypeId::Geometry
             | LogicalTypeId::Type => Err(crate::unported(format!("the {} type", name.to_uppercase()))),
             id => Ok(LogicalType::new(id)),
+        }
+    }
+
+    /// The type constructors of `default_types.cpp` for the nested types.
+    fn bind_nested_type(&self, name: &str, id: LogicalTypeId, children: &[Expr]) -> Result<LogicalType> {
+        let upper = name.to_uppercase();
+        let child_type = |expr: &Expr| self.bind_type(&CastType::Parsed(Box::new(expr.clone())));
+        let rejected = || {
+            let types: Vec<&str> = children.iter().map(type_parameter_type).collect();
+            binder_error(format!(
+                "Type \"{upper}\" does not accept type parameters ({})",
+                types.join(", ")
+            ))
+        };
+        if children.is_empty() && !matches!(id, LogicalTypeId::Struct | LogicalTypeId::Tuple) {
+            return Err(binder_error(format!("Type \"{upper}\" requires type parameters")));
+        }
+        match (id, children) {
+            (LogicalTypeId::List, [child]) => Ok(LogicalType::list(child_type(child)?)),
+            (LogicalTypeId::Map, [key, value]) => Ok(LogicalType::map(child_type(key)?, child_type(value)?)),
+            (LogicalTypeId::Array, [child, size]) => {
+                let child = child_type(child)?;
+                let size = type_parameter(size).ok_or_else(rejected)?;
+                if size < 1 {
+                    return Err(binder_error("ARRAY type size must be at least 1"));
+                }
+                if size > MAX_ARRAY_SIZE {
+                    return Err(binder_error(format!(
+                        "ARRAY type size must be at most {MAX_ARRAY_SIZE}"
+                    )));
+                }
+                Ok(LogicalType::array(child, size as u32))
+            }
+            (LogicalTypeId::Struct | LogicalTypeId::Tuple | LogicalTypeId::Union, members) => {
+                let members = members
+                    .iter()
+                    .map(|m| Ok((m.alias.clone(), child_type(m)?)))
+                    .collect::<Result<Vec<_>>>()?;
+                for (i, (name, _)) in members.iter().enumerate() {
+                    if !name.is_empty() && members[..i].iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) {
+                        return Err(binder_error(format!(
+                            "Duplicate named type parameter {name} for type {upper}"
+                        )));
+                    }
+                }
+                let unnamed = members.iter().all(|(n, _)| n.is_empty());
+                Ok(match id {
+                    LogicalTypeId::Union => {
+                        if members.len() > MAX_UNION_MEMBERS {
+                            return Err(binder_error(format!(
+                                "UNION type supports at most {MAX_UNION_MEMBERS} type modifiers"
+                            )));
+                        }
+                        LogicalType::union_type(members)
+                    }
+                    _ if unnamed => LogicalType::tuple(members.into_iter().map(|(_, t)| t).collect()),
+                    _ => LogicalType::struct_type(members),
+                })
+            }
+            _ => Err(rejected()),
         }
     }
 
@@ -283,6 +349,29 @@ impl Binder<'_> {
         }
         let bound = match &expr.kind {
             ExprKind::Constant(literal) => BoundExpr::constant(literal_to_value(literal)?),
+            ExprKind::ColumnRef(names) if self.bind_context.struct_field_start(names).is_some() => {
+                let start = self
+                    .bind_context
+                    .struct_field_start(names)
+                    .expect("checked by the guard");
+                let column = ast::Expr::from(ExprKind::ColumnRef(names[..start].to_vec()));
+                let mut bound = self.bind_expression(&column)?;
+                for field in &names[start..] {
+                    if !matches!(
+                        bound.return_type.id(),
+                        LogicalTypeId::Struct | LogicalTypeId::Tuple | LogicalTypeId::Union
+                    ) {
+                        return Err(binder_error(format!(
+                            "Cannot extract field '{field}' from expression \"{}\" because it is not a struct",
+                            names[..start].join(".")
+                        )));
+                    }
+                    let key = BoundExpr::constant(Value::varchar(field.clone()));
+                    let children = vec![bound, key];
+                    bound = bind_nested_function("struct_extract", vec![String::new(); 2], children)?;
+                }
+                bound.with_alias(names.last().expect("a name").clone())
+            }
             ExprKind::ColumnRef(names) => {
                 let mode = self
                     .aggregates
@@ -342,6 +431,31 @@ impl Binder<'_> {
                 op: op @ (OperatorType::In | OperatorType::NotIn),
                 children,
             } => self.bind_in(children, *op == OperatorType::NotIn)?,
+            ExprKind::Operator {
+                op: OperatorType::ArrayConstructor,
+                children,
+            } => {
+                let bound = children
+                    .iter()
+                    .map(|c| self.bind_expression(c))
+                    .collect::<Result<Vec<_>>>()?;
+                bind_nested_function("list_value", vec![String::new(); bound.len()], bound)?
+            }
+            ExprKind::Operator {
+                op: op @ (OperatorType::ArrayExtract | OperatorType::StructExtract),
+                children,
+            } => {
+                let name = if *op == OperatorType::StructExtract {
+                    "struct_extract"
+                } else {
+                    "array_extract"
+                };
+                let bound = children
+                    .iter()
+                    .map(|c| self.bind_expression(c))
+                    .collect::<Result<Vec<_>>>()?;
+                bind_nested_function(name, vec![String::new(); bound.len()], bound)?
+            }
             ExprKind::Operator {
                 op: OperatorType::Coalesce,
                 children,
@@ -409,6 +523,15 @@ impl Binder<'_> {
             ExprKind::Function(function) => {
                 if !builtin_qualification(&function.name.qualification) {
                     return Err(crate::unported("qualified function names"));
+                }
+                if is_nested_function(&function.name.name) {
+                    let names = function.args.iter().map(|a| a.name.clone()).collect();
+                    let children = function
+                        .args
+                        .iter()
+                        .map(|a| self.bind_expression(&a.expr))
+                        .collect::<Result<Vec<_>>>()?;
+                    return bind_nested_function(&function.name.name, names, children);
                 }
                 if function.args.iter().any(|a| !a.name.is_empty()) {
                     return Err(crate::unported("named function arguments"));

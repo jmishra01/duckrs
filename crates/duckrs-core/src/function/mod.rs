@@ -8,7 +8,10 @@ pub mod binder;
 pub mod cast;
 pub mod cast_rules;
 pub mod combine_types;
+pub mod nested;
+mod nested_casts;
 pub(crate) mod operators;
+mod string_nested;
 pub(crate) mod time_casts;
 
 use duckrs_common::Result;

@@ -7,7 +7,7 @@
 //! and BOOLEAN. [`super::time_casts`] has the temporal types, BLOB and UUID. The casts of the
 //! types that are not ported yet fail as not ported.
 
-use super::time_casts;
+use super::{nested_casts, time_casts};
 use duckrs_common::executor;
 use duckrs_common::string_cast::{format_double, format_float};
 use duckrs_common::types::{LogicalType, LogicalTypeId, NativeType, PhysicalType};
@@ -469,9 +469,13 @@ fn try_cast_string_to_uhugeint(input: &[u8]) -> Option<u128> {
         .ok()?
         .trim_matches(|c: char| c.is_ascii() && is_space(c as u8));
     let radix_literal = |prefixes: [&str; 2]| prefixes.iter().find_map(|p| text.strip_prefix(p));
+    // underscores only go between digits
+    let separated = |digits: &str| !digits.starts_with('_') && !digits.ends_with('_') && !digits.contains("__");
     for (prefixes, radix) in [(["0x", "0X"], 16), (["0b", "0B"], 2)] {
         if let Some(digits) = radix_literal(prefixes) {
-            return u128::from_str_radix(&digits.replace('_', ""), radix).ok();
+            return separated(digits)
+                .then(|| u128::from_str_radix(&digits.replace('_', ""), radix).ok())
+                .flatten();
         }
     }
     let text = text.strip_prefix('+').unwrap_or(text);
@@ -481,7 +485,7 @@ fn try_cast_string_to_uhugeint(input: &[u8]) -> Option<u128> {
     };
     let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
     let digits: Vec<u8> = integer.bytes().chain(fraction.bytes()).filter(|c| *c != b'_').collect();
-    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) || !separated(integer) || !separated(fraction) {
         return None;
     }
     // the exponent moves the decimal point
@@ -920,6 +924,7 @@ pub fn has_cast(source: &LogicalType, target: &LogicalType) -> bool {
         || (source.id() == LogicalTypeId::Varchar && is_numeric_or_bool(target))
         || is_decimal_cast(source, target)
         || (is_ported_scalar(source) && is_ported_scalar(target))
+        || nested_casts::has_nested_cast(source, target, &is_ported_scalar)
 }
 
 /// Casts `source` (of `count` rows) into `result`, whose type is the target type.
@@ -935,6 +940,9 @@ pub fn cast_vector(source: &Vector, result: &mut Vector, count: usize, mode: Cas
     }
     if to.id() == LogicalTypeId::Varchar {
         return to_varchar(source, result, count);
+    }
+    if from.is_nested() || to.is_nested() {
+        return nested_casts::nested_cast(source, result, count, mode);
     }
     if is_decimal_cast(&from, &to) {
         return decimal_cast(source, result, count, mode);
