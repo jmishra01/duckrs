@@ -10,11 +10,15 @@ mod bit_functions;
 pub mod cast;
 pub mod cast_rules;
 pub mod combine_types;
+mod dates;
 pub mod generic;
+mod math;
 pub mod nested;
 mod nested_casts;
 pub(crate) mod operators;
+mod regexp;
 mod string_nested;
+mod strings;
 pub mod test_all_types;
 pub(crate) mod time_casts;
 pub mod variant;
@@ -172,6 +176,26 @@ impl BuiltinFunctions {
             for set in generic::generic_functions() {
                 match functions.scalar.get_mut(&set.name) {
                     Some(existing) => existing.functions.extend(set.functions),
+                    None => {
+                        functions.scalar.insert(set.name.clone(), set);
+                    }
+                }
+            }
+            for set in math::math_functions()
+                .into_iter()
+                .chain(strings::string_functions())
+                .chain(regexp::regexp_functions())
+                .chain(dates::date_functions())
+            {
+                match functions.scalar.get_mut(&set.name) {
+                    Some(existing) => {
+                        // the overloads that exist already stay
+                        for function in set.functions {
+                            if !existing.functions.iter().any(|f| f.arguments == function.arguments) {
+                                existing.functions.push(function);
+                            }
+                        }
+                    }
                     None => {
                         functions.scalar.insert(set.name.clone(), set);
                     }

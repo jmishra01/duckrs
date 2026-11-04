@@ -10,7 +10,9 @@
 
 use super::bit_functions::strict_rows;
 use super::combine_types::{force_max_logical_type, normalize_type};
+use super::dates::{bind_date_function, is_date_function};
 use super::nested::{bound_function, row_wise};
+use super::strings::format_callback;
 use super::{ScalarCallback, ScalarFunction, ScalarFunctionSet};
 use crate::planner::binder::range_parameters;
 use crate::planner::expression::{BoundExpr, BoundExprKind};
@@ -196,6 +198,10 @@ fn concat_ws(args: &DataChunk, result: &mut Vector) -> Result<()> {
         }
         let parts = row[1..]
             .iter()
+            .flat_map(|v| match v.data() {
+                ValueData::List(items) => items.as_slice(),
+                _ => std::slice::from_ref(v),
+            })
             .filter(|v| !v.is_null())
             .map(Value::try_to_string)
             .collect::<Result<Vec<_>>>()?;
@@ -584,47 +590,53 @@ pub fn bind_unnest(children: Vec<BoundExpr>) -> Result<BoundExpr> {
 
 /// Whether [`bind_generic_function`] binds the function `name`.
 pub fn is_generic_function(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "array_slice"
-            | "list_slice"
-            | "len"
-            | "array_length"
-            | "cardinality"
-            | "concat"
-            | "concat_ws"
-            | "list_concat"
-            | "array_concat"
-            | "list_cat"
-            | "array_cat"
-            | "array_to_string"
-            | "list_sort"
-            | "array_sort"
-            | "map_keys"
-            | "map_values"
-            | "map_entries"
-            | "map_from_entries"
-            | "hash"
-            | "repeat"
-            | "range"
-            | "generate_series"
-            | "length"
-            | "chr"
-            | "contains"
-            | "lpad"
-            | "rpad"
-            | "greatest"
-            | "least"
-            | "signbit"
-            | "random"
-            | "setseed"
-            | "uuid"
-            | "gen_random_uuid"
-    )
+    is_date_function(name)
+        || matches!(
+            name.to_ascii_lowercase().as_str(),
+            "array_slice"
+                | "list_slice"
+                | "len"
+                | "array_length"
+                | "cardinality"
+                | "concat"
+                | "concat_ws"
+                | "list_concat"
+                | "array_concat"
+                | "list_cat"
+                | "array_cat"
+                | "array_to_string"
+                | "list_sort"
+                | "array_sort"
+                | "map_keys"
+                | "map_values"
+                | "map_entries"
+                | "map_from_entries"
+                | "hash"
+                | "repeat"
+                | "range"
+                | "generate_series"
+                | "length"
+                | "chr"
+                | "contains"
+                | "lpad"
+                | "rpad"
+                | "greatest"
+                | "least"
+                | "signbit"
+                | "random"
+                | "setseed"
+                | "uuid"
+                | "gen_random_uuid"
+                | "printf"
+                | "format"
+        )
 }
 
 /// Binds a function of [`is_generic_function`].
 pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<BoundExpr> {
+    if is_date_function(name) {
+        return bind_date_function(name, children);
+    }
     let lower = name.to_ascii_lowercase();
     if lower.starts_with("map_") && null_map_argument(&children)
         || lower == "cardinality" && null_map_argument(&children)
@@ -845,6 +857,19 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
                 return Err(no_match(&lower, &children));
             }
             Ok(bound_function(&lower, children, LogicalType::UUID, uuid))
+        }
+        "printf" | "format" => {
+            if children.is_empty() {
+                return Err(no_match(&lower, &children));
+            }
+            let mut children = children;
+            children[0] = children[0].clone().cast_to(&LogicalType::VARCHAR, false);
+            Ok(bound_function(
+                &lower,
+                children,
+                LogicalType::VARCHAR,
+                format_callback(&lower),
+            ))
         }
         other => unreachable!("{other} is not a generic function"),
     }

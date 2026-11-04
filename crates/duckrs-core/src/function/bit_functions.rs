@@ -42,6 +42,21 @@ pub(super) fn strict_rows(args: &DataChunk, result: &mut Vector, f: impl Fn(&[Va
     })
 }
 
+/// `BitCntOperator` over the width of the argument's type.
+fn integer_bit_count(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| {
+        let value = row[0].as_i128().expect("an integer");
+        let bits = match row[0].logical_type().id() {
+            LogicalTypeId::TinyInt => (value as i8).count_ones(),
+            LogicalTypeId::SmallInt => (value as i16).count_ones(),
+            LogicalTypeId::Integer => (value as i32).count_ones(),
+            LogicalTypeId::BigInt => (value as i64).count_ones(),
+            _ => value.count_ones(),
+        };
+        Ok(Value::tinyint(bits as i8))
+    })
+}
+
 fn integer_of(value: &Value) -> i32 {
     value.as_i128().expect("an INTEGER argument") as i32
 }
@@ -335,6 +350,36 @@ pub(super) fn bit_functions() -> Vec<ScalarFunctionSet> {
         ("bit_length", vec![bit.clone()], bigint.clone(), bit_length),
         ("octet_length", vec![bit.clone()], bigint.clone(), octet_length),
         ("bit_count", vec![bit.clone()], bigint, bit_count),
+        (
+            "bit_count",
+            vec![LogicalType::TINYINT],
+            LogicalType::TINYINT,
+            integer_bit_count,
+        ),
+        (
+            "bit_count",
+            vec![LogicalType::SMALLINT],
+            LogicalType::TINYINT,
+            integer_bit_count,
+        ),
+        (
+            "bit_count",
+            vec![LogicalType::INTEGER],
+            LogicalType::TINYINT,
+            integer_bit_count,
+        ),
+        (
+            "bit_count",
+            vec![LogicalType::BIGINT],
+            LogicalType::TINYINT,
+            integer_bit_count,
+        ),
+        (
+            "bit_count",
+            vec![LogicalType::HUGEINT],
+            LogicalType::TINYINT,
+            integer_bit_count,
+        ),
         (
             "bit_position",
             vec![bit.clone(), bit.clone()],

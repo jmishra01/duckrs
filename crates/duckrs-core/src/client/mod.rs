@@ -3315,4 +3315,55 @@ mod tests {
             [["100", "100"]]
         );
     }
+
+    #[test]
+    fn function_library() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT substring('hello', 2, 3), replace('aXb', 'X', '-'), trim('  a '), left('abc', 2), \
+                 printf('%05.1f|%-3s|%d', 3.14159::DOUBLE, 'a', 7), format('{}-{:03d}', 'x', 5), \
+                 md5('abc'), split_part('a,b', ',', 2)"
+            ),
+            [[
+                "ell",
+                "a-b",
+                "a",
+                "ab",
+                "003.1|a  |7",
+                "x-005",
+                "900150983cd24fb0d6963f7d28e17f72",
+                "b"
+            ]]
+        );
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT regexp_matches('abc', 'b'), regexp_replace('aaa', 'a', 'b', 'g'), \
+                 regexp_extract('a1', '([a-z])(\\d)', 2), sqrt(16), round(2.675::DOUBLE, 2), pow(2, 10)"
+            ),
+            [["true", "bbb", "1", "4.0", "2.67", "1024.0"]]
+        );
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT year(DATE '2024-03-15'), date_part('dow', DATE '2024-03-15'), \
+                 DATE '2024-01-31' + INTERVAL 1 MONTH, DATE '2024-03-15' + 1, DATE '2024-03-15' - DATE '2024-03-01', \
+                 date_trunc('month', TIMESTAMP '2024-03-15 10:00:00'), date_diff('month', DATE '2024-01-31', DATE '2024-03-01'), \
+                 strftime(DATE '2024-03-05', '%d/%m/%Y %a'), strptime('05/03/2024', '%d/%m/%Y')"
+            ),
+            [[
+                "2024",
+                "5",
+                "2024-02-29 00:00:00",
+                "2024-03-16",
+                "14",
+                "2024-03-01 00:00:00",
+                "2",
+                "05/03/2024 Tue",
+                "2024-03-05 00:00:00"
+            ]]
+        );
+    }
 }

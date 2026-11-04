@@ -172,7 +172,18 @@ pub struct BoundAggregate {
 }
 
 /// The functions that give something else on each call (`FunctionStability::VOLATILE`).
-const VOLATILE_FUNCTIONS: &[&str] = &["random", "setseed", "uuid", "gen_random_uuid"];
+const VOLATILE_FUNCTIONS: &[&str] = &[
+    "random",
+    "setseed",
+    "uuid",
+    "gen_random_uuid",
+    "now",
+    "get_current_timestamp",
+    "transaction_timestamp",
+    "current_timestamp",
+    "current_date",
+    "today",
+];
 
 /// What a window computes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
