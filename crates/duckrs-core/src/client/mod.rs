@@ -11,6 +11,7 @@ use crate::catalog::{
     Catalog, CatalogSnapshot, DEFAULT_CATALOG, OnCreateConflict, SequenceData, TableOrView, macro_type_name,
     missing_entry,
 };
+use crate::execution::alter::execute_alter;
 use crate::execution::expression_executor::evaluate_scalar;
 use crate::execution::physical::PhysicalResultCollector;
 use crate::execution::{create_plan, execute_plan};
@@ -183,7 +184,11 @@ fn checkpoint_call(function: &Expr) -> Option<(bool, Option<&Expr>)> {
 /// Whether a statement changes the database (`StatementProperties::IsReadOnly`).
 fn is_write(statement: &Statement) -> bool {
     match statement {
-        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) | Statement::Drop(_) => true,
+        Statement::Insert(_)
+        | Statement::Update(_)
+        | Statement::Delete(_)
+        | Statement::Drop(_)
+        | Statement::Alter(_) => true,
         // temporary objects are private to the connection
         Statement::CreateTable(info) => !info.temporary,
         Statement::Create(info) => !info.temporary,
@@ -570,6 +575,12 @@ impl ClientContext {
                     return Ok(Self::success());
                 }
                 return Err(crate::unported(format!("PRAGMA {name}")));
+            }
+            Statement::Alter(info) => {
+                let mut binder = Binder::new(&self.db.catalog);
+                let alter = binder.bind_alter(info)?;
+                execute_alter(alter)?;
+                return Ok(Self::success());
             }
             Statement::Call(function) if checkpoint_call(function).is_some() => {
                 return self.checkpoint(function);
@@ -3122,5 +3133,50 @@ mod tests {
                 .to_string(),
             "Binder Error: WHERE clause cannot contain window functions!"
         );
+    }
+
+    #[test]
+    fn alter_table() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        run(&mut c, "CREATE TABLE t (i INTEGER, j INTEGER, CHECK (i < 10))");
+        run(&mut c, "INSERT INTO t VALUES (1, 2), (3, NULL)");
+        let error = |c: &mut ClientContext, sql: &str| c.query(sql).unwrap_err().to_string();
+        run(&mut c, "ALTER TABLE t ADD COLUMN k VARCHAR DEFAULT 'x'");
+        run(&mut c, "ALTER TABLE t RENAME COLUMN i TO a");
+        assert_eq!(run(&mut c, "SELECT a, k FROM t ORDER BY a"), [["1", "x"], ["3", "x"]]);
+        assert_eq!(
+            error(&mut c, "INSERT INTO t (a) VALUES (11)"),
+            "Constraint Error: CHECK constraint failed on table \"t\" with expression CHECK((a < 10))"
+        );
+        run(
+            &mut c,
+            "ALTER TABLE t ALTER COLUMN j TYPE VARCHAR USING a::VARCHAR || 'z'",
+        );
+        assert_eq!(run(&mut c, "SELECT j FROM t ORDER BY a"), [["1z"], ["3z"]]);
+        run(&mut c, "ALTER TABLE t DROP COLUMN k");
+        run(&mut c, "ALTER TABLE t ADD PRIMARY KEY (a)");
+        assert!(c.query("INSERT INTO t VALUES (1, 'dup')").is_err());
+        run(&mut c, "ALTER TABLE t RENAME TO u");
+        assert_eq!(run(&mut c, "SELECT count(*) FROM u"), [["2"]]);
+        run(&mut c, "ALTER TABLE IF EXISTS missing RENAME TO other");
+
+        // a rollback brings the old entry back
+        run(&mut c, "BEGIN");
+        run(&mut c, "ALTER TABLE u ADD COLUMN extra INTEGER");
+        run(&mut c, "ALTER TABLE u RENAME TO v");
+        run(&mut c, "ROLLBACK");
+        assert_eq!(run(&mut c, "SELECT * FROM u ORDER BY a"), [["1", "1z"], ["3", "3z"]]);
+
+        run(&mut c, "CREATE TABLE f (i INTEGER REFERENCES u)");
+        assert_eq!(
+            error(&mut c, "ALTER TABLE u RENAME TO w"),
+            "Dependency Error: Cannot alter entry \"u\" because there are entries that depend on it."
+        );
+        run(&mut c, "ALTER TABLE u ADD COLUMN extra INTEGER");
+        run(&mut c, "INSERT INTO f VALUES (3)");
+        assert!(c.query("INSERT INTO f VALUES (5)").is_err());
+        run(&mut c, "CREATE VIEW w AS SELECT 1 AS x");
+        run(&mut c, "ALTER VIEW w RENAME TO w2");
+        assert_eq!(run(&mut c, "FROM w2"), [["1"]]);
     }
 }

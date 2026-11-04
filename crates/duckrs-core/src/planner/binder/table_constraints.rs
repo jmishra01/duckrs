@@ -5,7 +5,7 @@
 
 use super::expression::checked_cast;
 use super::{Binder, Binding, binder_error};
-use crate::catalog::{ColumnDefinition, ForeignKey, SchemaCatalogEntry, TableConstraint, TableOrView};
+use crate::catalog::{ColumnDefinition, ForeignKey, ReferencedTable, SchemaCatalogEntry, TableConstraint, TableOrView};
 use crate::planner::column_binding_resolver::resolve_expression;
 use crate::planner::expression::{BoundExpr, ColumnBinding};
 use duckrs_common::types::{LogicalType, PhysicalType};
@@ -19,7 +19,7 @@ fn column_index(columns: &[ColumnDefinition], name: &str) -> Option<usize> {
 }
 
 /// `BindUniqueConstraint`.
-fn bind_unique(
+pub(super) fn bind_unique(
     table: &str,
     columns: &[ColumnDefinition],
     index: Option<usize>,
@@ -33,7 +33,11 @@ fn bind_unique(
         let Some(index) = column_index(columns, name) else {
             return Err(Error::new(
                 ErrorKind::Catalog,
-                format!("table {table} does not have a column named {name}"),
+                format!(
+                    "table {} does not have a column named {}",
+                    sql_quoted_identifier(table),
+                    sql_quoted_identifier(name)
+                ),
             ));
         };
         if indexes.contains(&index) {
@@ -48,7 +52,7 @@ fn bind_unique(
 }
 
 /// What `ART::ART` refuses as the type of a key.
-fn check_key_types(columns: &[ColumnDefinition], key: &[usize]) -> Result<()> {
+pub(super) fn check_key_types(columns: &[ColumnDefinition], key: &[usize]) -> Result<()> {
     for index in key {
         let ty = &columns[*index].ty;
         if matches!(
@@ -140,7 +144,7 @@ impl Binder<'_> {
                 error.get_or_insert_with(|| {
                     format!(
                         "Table does not contain column {} referenced in check constraint!",
-                        names[0]
+                        sql_quoted_identifier(&names[0])
                     )
                 });
             }
@@ -219,6 +223,7 @@ impl Binder<'_> {
             match constraint {
                 Constraint::Check(check) => bound.push(TableConstraint::Check {
                     expression: self.bind_check(table, columns, check)?,
+                    parsed: (**check).clone(),
                     text: constraint.to_string(),
                 }),
                 Constraint::ForeignKey {
@@ -334,7 +339,10 @@ impl Binder<'_> {
             .collect();
         Ok(ForeignKey {
             columns,
-            referenced: parent,
+            referenced: parent.as_ref().map(|parent| ReferencedTable {
+                schema: Arc::downgrade(schema),
+                name: parent.name.clone(),
+            }),
             referenced_columns: key.clone(),
         })
     }

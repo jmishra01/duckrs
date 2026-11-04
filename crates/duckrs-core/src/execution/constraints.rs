@@ -111,7 +111,7 @@ pub fn verify_not_null(table: &TableCatalogEntry, chunk: &DataChunk) -> Result<(
 /// `VerifyCheckConstraint` for each CHECK of `table` over rows of the whole table.
 pub fn verify_checks(table: &TableCatalogEntry, chunk: &DataChunk) -> Result<()> {
     for constraint in &table.constraints {
-        let TableConstraint::Check { expression, text } = constraint else {
+        let TableConstraint::Check { expression, text, .. } = constraint else {
             continue;
         };
         let result = execute(expression, chunk).map_err(|error| {
@@ -216,7 +216,9 @@ fn check_foreign_keys(table: &Arc<TableCatalogEntry>, chunk: &DataChunk, own: &[
         let position = |parent: &TableCatalogEntry| index_of(parent, &foreign_key.referenced_columns);
         match &foreign_key.referenced {
             None => verify_referenced(foreign_key, &own[position(table)], chunk, table)?,
-            Some(parent) => {
+            Some(reference) => {
+                let parent = reference.table();
+                let parent = &parent;
                 let rows = parent.storage.read();
                 let mut keys = parent.unique_keys.lock();
                 if keys.is_none() {
@@ -318,7 +320,7 @@ fn referencing_keys(table: &Arc<TableCatalogEntry>, rows: &ColumnDataCollection)
                 && foreign_key
                     .referenced
                     .as_ref()
-                    .is_some_and(|parent| Arc::ptr_eq(parent, table))
+                    .is_some_and(|parent| parent.name.eq_ignore_ascii_case(&table.name))
             {
                 let child_rows = child.storage.read();
                 gather(child, foreign_key, &child_rows)?;

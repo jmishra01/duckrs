@@ -11,7 +11,7 @@ use crate::planner::expression::BoundExpr;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::types::LogicalType;
 use duckrs_common::{Error, ErrorKind, Result};
-use duckrs_parser::ast::{MacroFunction, SelectStatement, sql_quoted_identifier};
+use duckrs_parser::ast::{Expr, MacroFunction, SelectStatement, sql_quoted_identifier};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Weak};
@@ -68,6 +68,7 @@ pub enum TableConstraint {
     /// The expression reads the columns of the table by index.
     Check {
         expression: BoundExpr,
+        parsed: Expr,
         text: String,
     },
     Unique {
@@ -83,11 +84,46 @@ pub enum TableConstraint {
 pub struct ForeignKey {
     pub columns: Vec<usize>,
     /// `None` for a table that references itself.
-    pub referenced: Option<Arc<TableCatalogEntry>>,
+    pub referenced: Option<ReferencedTable>,
     pub referenced_columns: Vec<usize>,
 }
 
+/// The table of a foreign key, by name: ALTER replaces entries. A referenced table can't go away.
+#[derive(Debug, Clone)]
+pub struct ReferencedTable {
+    pub schema: Weak<SchemaCatalogEntry>,
+    pub name: String,
+}
+
+impl ReferencedTable {
+    pub fn table(&self) -> Arc<TableCatalogEntry> {
+        let schema = self.schema.upgrade().expect("a table's schema outlives it");
+        match schema.get_entry(&self.name) {
+            Some(TableOrView::Table(table)) => table,
+            _ => unreachable!("a referenced table can't be dropped"),
+        }
+    }
+}
+
 impl TableCatalogEntry {
+    pub fn new(
+        schema: String,
+        name: String,
+        columns: Vec<ColumnDefinition>,
+        rows: ColumnDataCollection,
+        constraints: Vec<TableConstraint>,
+    ) -> Self {
+        Self {
+            schema,
+            name,
+            columns,
+            storage: RwLock::new(rows),
+            constraints,
+            referenced_by: Mutex::default(),
+            unique_keys: Mutex::default(),
+        }
+    }
+
     pub fn types(&self) -> Vec<LogicalType> {
         self.columns.iter().map(|c| c.ty.clone()).collect()
     }
@@ -366,6 +402,51 @@ impl SchemaCatalogEntry {
         }
     }
 
+    fn register_foreign_keys(tables: &BTreeMap<String, TableOrView>, table: &Arc<TableCatalogEntry>) {
+        for constraint in &table.constraints {
+            if let TableConstraint::ForeignKey(ForeignKey {
+                referenced: Some(parent),
+                ..
+            }) = constraint
+                && let Some(TableOrView::Table(parent)) = tables.get(&key(&parent.name))
+            {
+                parent.referenced_by.lock().push(Arc::downgrade(table));
+            }
+        }
+    }
+
+    /// Whether a table with a foreign key to `table` exists.
+    pub fn is_referenced(&self, table: &TableCatalogEntry) -> bool {
+        let tables = self.tables.read();
+        table
+            .referenced_by
+            .lock()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .any(|child| matches!(tables.get(&key(&child.name)), Some(TableOrView::Table(t)) if Arc::ptr_eq(t, &child)))
+    }
+
+    /// `AlterEntry`: `table` takes the place of the entry called `old_name`.
+    pub fn replace_table(&self, old_name: &str, table: Arc<TableCatalogEntry>) {
+        let mut tables = self.tables.write();
+        tables.remove(&key(old_name));
+        Self::register_foreign_keys(&tables, &table);
+        tables.insert(key(&table.name), TableOrView::Table(table));
+    }
+
+    pub fn rename_view(&self, view: &ViewCatalogEntry, new_name: &str) -> Result<()> {
+        let mut tables = self.tables.write();
+        tables.remove(&key(&view.name));
+        let view = ViewCatalogEntry {
+            schema: view.schema.clone(),
+            name: new_name.to_string(),
+            query: view.query.clone(),
+            aliases: view.aliases.clone(),
+        };
+        tables.insert(key(new_name), TableOrView::View(Arc::new(view)));
+        Ok(())
+    }
+
     /// `AlterFKInfo` of a DROP: a table that a foreign key points at has to stay.
     fn check_not_referenced(tables: &BTreeMap<String, TableOrView>, entry: &TableOrView) -> Result<()> {
         let TableOrView::Table(table) = entry else {
@@ -398,24 +479,14 @@ impl SchemaCatalogEntry {
             return Ok(None);
         }
         let types = columns.iter().map(|c| c.ty.clone()).collect();
-        let table = Arc::new(TableCatalogEntry {
-            schema: self.name.clone(),
-            name: name.to_string(),
+        let table = Arc::new(TableCatalogEntry::new(
+            self.name.clone(),
+            name.to_string(),
             columns,
-            storage: RwLock::new(ColumnDataCollection::new(types)),
+            ColumnDataCollection::new(types),
             constraints,
-            referenced_by: Mutex::default(),
-            unique_keys: Mutex::default(),
-        });
-        for constraint in &table.constraints {
-            if let TableConstraint::ForeignKey(ForeignKey {
-                referenced: Some(parent),
-                ..
-            }) = constraint
-            {
-                parent.referenced_by.lock().push(Arc::downgrade(&table));
-            }
-        }
+        ));
+        Self::register_foreign_keys(&tables, &table);
         tables.insert(key(name), TableOrView::Table(table.clone()));
         Ok(Some(table))
     }

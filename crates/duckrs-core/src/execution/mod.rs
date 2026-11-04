@@ -17,6 +17,7 @@ use duckrs_common::vector::DataChunk;
 use parking_lot::Mutex;
 use physical::*;
 
+pub mod alter;
 pub mod constraints;
 mod upsert;
 mod window;

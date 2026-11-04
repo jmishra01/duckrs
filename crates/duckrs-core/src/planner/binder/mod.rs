@@ -3,6 +3,7 @@
 //! The binder: resolves the names in a parsed statement against the catalog, types its
 //! expressions and plans it as a tree of logical operators.
 
+mod alter;
 mod expression;
 mod join;
 mod macros;
@@ -12,6 +13,7 @@ mod table_constraints;
 mod table_functions;
 mod window;
 
+pub use alter::{BoundAlter, BoundTableAlter};
 pub use expression::{enum_type_from, is_builtin_type};
 pub(crate) use statements::range_parameters;
 pub use statements::schema_of;
