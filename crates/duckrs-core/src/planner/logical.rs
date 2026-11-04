@@ -5,7 +5,7 @@
 //! its output types and the column bindings its parents refer to.
 
 use super::expression::{BoundAggregate, BoundExpr, BoundExprKind, ColumnBinding};
-use crate::catalog::{ColumnDefinition, OnCreateConflict, SchemaCatalogEntry, TableCatalogEntry};
+use crate::catalog::{ColumnDefinition, OnCreateConflict, SchemaCatalogEntry, TableCatalogEntry, TableConstraint};
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::OrderModifiers;
 use duckrs_common::types::LogicalType;
@@ -152,6 +152,7 @@ pub enum LogicalOperatorKind {
         schema: Arc<SchemaCatalogEntry>,
         name: String,
         columns: Vec<ColumnDefinition>,
+        constraints: Vec<TableConstraint>,
         on_conflict: OnCreateConflict,
     },
 }

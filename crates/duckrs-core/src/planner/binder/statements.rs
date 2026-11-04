@@ -31,9 +31,9 @@ use duckrs_common::value::Value;
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast::UpdateStatement;
 use duckrs_parser::ast::{
-    Constraint, CreateTableInfo, CteMap, DeleteStatement, Expr, ExprKind, InsertStatement, InsertValues, Literal,
-    LiteralKind, OnCreateConflict as AstConflict, OrderByNode, QualifiedName, QueryNode, QueryNodeKind,
-    RecursiveCteNode, ResultModifier, SelectNode, SelectStatement, SetOpType, SetOperationNode, TableRef, TableRefKind,
+    CreateTableInfo, CteMap, DeleteStatement, Expr, ExprKind, InsertStatement, InsertValues, Literal, LiteralKind,
+    OnCreateConflict as AstConflict, OrderByNode, QualifiedName, QueryNode, QueryNodeKind, RecursiveCteNode,
+    ResultModifier, SelectNode, SelectStatement, SetOpType, SetOperationNode, TableRef, TableRefKind,
     sql_quoted_identifier, values_list,
 };
 use duckrs_parser::transformer::visit_expr_mut;
@@ -2011,17 +2011,13 @@ impl Binder<'_> {
             }
             columns.push(definition);
         }
-        for constraint in &info.constraints {
-            match constraint {
-                Constraint::NotNull(index) => columns[*index].not_null = true,
-                _ => return Err(not_implemented("table constraints")),
-            }
-        }
+        let constraints = self.bind_table_constraints(info, &mut columns, &schema)?;
         let plan = LogicalOperator::new(
             LogicalOperatorKind::CreateTable {
                 schema,
                 name: info.name.name.clone(),
                 columns,
+                constraints,
                 on_conflict,
             },
             vec![],
@@ -2065,6 +2061,7 @@ impl Binder<'_> {
                             schema,
                             name: info.name.name.clone(),
                             columns: Vec::new(),
+                            constraints: Vec::new(),
                             on_conflict,
                         },
                         vec![],

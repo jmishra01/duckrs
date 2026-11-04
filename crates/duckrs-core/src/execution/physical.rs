@@ -9,8 +9,9 @@
 //! and pipelines are built from those roles. Execution is single-threaded for now, so the
 //! global and local states are one.
 
+use super::constraints;
 use super::expression_executor::{execute, select};
-use crate::catalog::{ColumnDefinition, OnCreateConflict, SchemaCatalogEntry, TableCatalogEntry};
+use crate::catalog::{ColumnDefinition, OnCreateConflict, SchemaCatalogEntry, TableCatalogEntry, TableConstraint};
 use crate::execution::run_plan;
 use crate::function::aggregates::{AggregateState, value_keys};
 use crate::planner::expression::{BoundAggregate, BoundExpr, ColumnBinding};
@@ -1329,7 +1330,9 @@ impl PhysicalOperator for PhysicalDelete {
                 }
             }
         }
+        constraints::verify_delete(&self.table, &storage, &deleted)?;
         *storage = kept;
+        *self.table.unique_keys.lock() = None;
         *self.output.lock() = changed_rows_output(&self.types, deleted, ids.len() as u64, self.returning);
         Ok(())
     }
@@ -1419,6 +1422,14 @@ impl PhysicalOperator for PhysicalUpdate {
         let mut storage = self.table.storage.write();
         let mut rewritten = ColumnDataCollection::new(storage.types().to_vec());
         let mut changed = ColumnDataCollection::new(storage.types().to_vec());
+        // C++ turns an UPDATE of indexed columns into a DELETE and an INSERT, which moves the rows
+        // to the end of the table
+        let moves_rows = self.table.constraints.iter().any(|constraint| match constraint {
+            TableConstraint::Check { .. } => false,
+            TableConstraint::Unique { columns, .. } => columns.iter().any(|c| self.columns.contains(c)),
+            TableConstraint::ForeignKey(key) => key.columns.iter().any(|c| self.columns.contains(c)),
+        });
+        let key_update = moves_rows || !self.table.referenced_by.lock().is_empty();
         for (index, chunk) in storage.chunks().enumerate() {
             let first_row = (index * STANDARD_VECTOR_SIZE) as i64;
             let rows: Vec<(usize, &Vec<Value>)> = (0..chunk.len())
@@ -1447,14 +1458,35 @@ impl PhysicalOperator for PhysicalUpdate {
                 columns[column] = target;
             }
             let updated = DataChunk::from_columns(columns, chunk.len());
-            rewritten.append(&updated);
-            if self.returning {
+            if moves_rows {
+                let stay: Vec<u32> = (0..chunk.len() as u32)
+                    .filter(|row| rows.iter().all(|(updated, _)| *updated != *row as usize))
+                    .collect();
+                let count = stay.len();
+                if count > 0 {
+                    let mut part = updated.clone();
+                    part.slice(&SelectionVector::from_vec(stay), count);
+                    rewritten.append(&part);
+                }
+            } else {
+                rewritten.append(&updated);
+            }
+            constraints::verify_checks(&self.table, &updated)?;
+            if self.returning || key_update {
                 let picked: Vec<u32> = rows.iter().map(|(row, _)| *row as u32).collect();
                 let count = picked.len();
                 let mut part = updated.clone();
                 part.slice(&SelectionVector::from_vec(picked), count);
                 changed.append(&part);
             }
+        }
+        if moves_rows {
+            for chunk in changed.chunks() {
+                rewritten.append(chunk);
+            }
+        }
+        if key_update {
+            constraints::verify_key_update(&self.table, &storage, &rewritten, &changed)?;
         }
         *storage = rewritten;
         *self.output.lock() = changed_rows_output(&self.types, changed, updates.len() as u64, self.returning);
@@ -1479,6 +1511,8 @@ pub struct PhysicalInsert {
     pub column_index_map: Vec<Option<usize>>,
     pub children: Vec<Box<dyn PhysicalOperator>>,
     pub inserted: Mutex<u64>,
+    /// The rows of the table when this statement started to add to them.
+    pub first_new_row: Mutex<Option<usize>>,
 }
 
 impl PhysicalOperator for PhysicalInsert {
@@ -1522,6 +1556,8 @@ impl PhysicalOperator for PhysicalInsert {
             }
         }
         let mut storage = self.table.storage.write();
+        let first_new_row = *self.first_new_row.lock().get_or_insert(storage.len());
+        constraints::verify_append(&self.table, &storage, &row, first_new_row)?;
         storage.append(&row);
         check_buffered(&storage)?;
         drop(storage);
@@ -1588,7 +1624,7 @@ impl PhysicalOperator for PhysicalCreateTableAs {
     fn finalize(&self) -> Result<()> {
         let table = self
             .schema
-            .create_table(&self.table_name, self.columns.clone(), self.on_conflict)?;
+            .create_table(&self.table_name, self.columns.clone(), Vec::new(), self.on_conflict)?;
         if let Some(table) = table {
             let data = self.data.lock();
             let mut storage = table.storage.write();
@@ -1623,6 +1659,7 @@ pub struct PhysicalCreateTable {
     pub schema: Arc<SchemaCatalogEntry>,
     pub table_name: String,
     pub columns: Vec<ColumnDefinition>,
+    pub constraints: Vec<TableConstraint>,
     pub on_conflict: OnCreateConflict,
 }
 
@@ -1637,8 +1674,12 @@ impl PhysicalOperator for PhysicalCreateTable {
         true
     }
     fn get_data(&self, _state: &mut SourceState) -> Result<Option<DataChunk>> {
-        self.schema
-            .create_table(&self.table_name, self.columns.clone(), self.on_conflict)?;
+        self.schema.create_table(
+            &self.table_name,
+            self.columns.clone(),
+            self.constraints.clone(),
+            self.on_conflict,
+        )?;
         Ok(None)
     }
 }

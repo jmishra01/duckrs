@@ -46,7 +46,7 @@ pub fn resolve_column_bindings(op: &mut LogicalOperator) -> Result<()> {
     Ok(())
 }
 
-fn resolve_expression(expr: &mut BoundExpr, bindings: &[ColumnBinding]) -> Result<()> {
+pub(crate) fn resolve_expression(expr: &mut BoundExpr, bindings: &[ColumnBinding]) -> Result<()> {
     let mut result = Ok(());
     expr.walk_mut(&mut |e| {
         // a correlated column gets its value when the subquery runs

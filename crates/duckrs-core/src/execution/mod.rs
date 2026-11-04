@@ -17,6 +17,8 @@ use duckrs_common::vector::DataChunk;
 use parking_lot::Mutex;
 use physical::*;
 
+pub mod constraints;
+
 /// `PhysicalPlanGenerator::CreatePlan`.
 pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
     let types = op.types();
@@ -154,17 +156,20 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             column_index_map,
             children: std::mem::take(&mut children),
             inserted: Mutex::new(0),
+            first_new_row: Mutex::new(None),
         }),
         LogicalOperatorKind::CreateTable {
             schema,
             name,
             columns,
+            constraints,
             on_conflict,
         } => Box::new(PhysicalCreateTable {
             types,
             schema,
             table_name: name,
             columns,
+            constraints,
             on_conflict,
         }),
     }

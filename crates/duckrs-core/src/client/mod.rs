@@ -467,23 +467,20 @@ impl ClientContext {
                         ),
                     ));
                 }
-                Some(transaction) => {
-                    if transaction.snapshot.is_none() {
-                        transaction.snapshot = Some(self.db.catalog.snapshot());
-                        self.db.transactions.lock().writer = Some(self.id);
-                    }
+                Some(transaction) if transaction.snapshot.is_none() => {
+                    transaction.snapshot = Some(self.db.catalog.snapshot());
+                    self.db.transactions.lock().writer = Some(self.id);
                 }
-                None => {
-                    if let Statement::Insert(insert) = statement
-                        && let Ok(table) = self
-                            .db
-                            .catalog
-                            .get_table(schema_of(&insert.table).ok().flatten(), &insert.table.name)
-                    {
-                        let rows = table.storage.read().len();
-                        appending = Some((table, rows));
-                    }
-                }
+                _ => {}
+            }
+            if let Statement::Insert(insert) = statement
+                && let Ok(table) = self
+                    .db
+                    .catalog
+                    .get_table(schema_of(&insert.table).ok().flatten(), &insert.table.name)
+            {
+                let rows = table.storage.read().len();
+                appending = Some((table, rows));
             }
         }
         // until Phase 10 isolates connections, a statement that writes runs alone: UPDATE and
@@ -499,8 +496,9 @@ impl ClientContext {
         if let Err(error) = &result {
             if let Some(transaction) = &mut self.transaction {
                 transaction.apply_invalidation_policy(error.kind);
-            } else if let Some((table, rows)) = appending {
-                table.storage.write().truncate(rows);
+            }
+            if let Some((table, rows)) = appending {
+                table.truncate(rows);
             }
         }
         result
@@ -2945,5 +2943,68 @@ mod tests {
             context.query("FORCE CHECKPOINT").unwrap_err().to_string(),
             "TransactionContext Error: Cannot FORCE CHECKPOINT: the current transaction has been started for this database"
         );
+    }
+
+    #[test]
+    fn table_constraints() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        run(
+            &mut c,
+            "CREATE TABLE p (a INTEGER PRIMARY KEY, b VARCHAR UNIQUE, CHECK (a < 10))",
+        );
+        run(&mut c, "INSERT INTO p VALUES (1, 'x'), (2, NULL), (3, NULL)");
+        let error = |c: &mut ClientContext, sql: &str| c.query(sql).unwrap_err().to_string();
+        assert_eq!(
+            error(&mut c, "INSERT INTO p VALUES (1, 'y')"),
+            "Constraint Error: Duplicate key \"a: 1\" violates primary key constraint."
+        );
+        assert_eq!(
+            error(&mut c, "INSERT INTO p VALUES (4, 'x')"),
+            "Constraint Error: Duplicate key \"b: x\" violates unique constraint."
+        );
+        assert_eq!(
+            error(&mut c, "INSERT INTO p VALUES (NULL, 'z')"),
+            "Constraint Error: NOT NULL constraint failed: p.a"
+        );
+        assert_eq!(
+            error(&mut c, "INSERT INTO p VALUES (11, 'z')"),
+            "Constraint Error: CHECK constraint failed on table \"p\" with expression CHECK((a < 10))"
+        );
+        // a failed INSERT leaves nothing behind, and its keys are free
+        assert_eq!(
+            error(&mut c, "INSERT INTO p VALUES (5, 'a'), (5, 'b')"),
+            "Constraint Error: PRIMARY KEY or UNIQUE constraint violation: duplicate key \"5\""
+        );
+        run(&mut c, "INSERT INTO p VALUES (5, 'a')");
+        run(&mut c, "UPDATE p SET a = a + 1");
+        assert_eq!(run(&mut c, "SELECT a FROM p ORDER BY a"), [["2"], ["3"], ["4"], ["6"]]);
+        assert_eq!(
+            error(&mut c, "UPDATE p SET a = 3 WHERE a = 2"),
+            "Constraint Error: Duplicate key \"a: 3\" violates primary key constraint."
+        );
+        run(&mut c, "DELETE FROM p WHERE a = 2");
+        run(&mut c, "INSERT INTO p VALUES (2, 'x')");
+
+        run(&mut c, "CREATE TABLE f (i INTEGER REFERENCES p)");
+        run(&mut c, "INSERT INTO f VALUES (2), (NULL)");
+        assert_eq!(
+            error(&mut c, "INSERT INTO f VALUES (7)"),
+            "Constraint Error: Violates foreign key constraint because key \"a: 7\" does not exist in the referenced table"
+        );
+        assert!(error(&mut c, "DELETE FROM p WHERE a = 2").contains("key \"i: 2\" is still referenced"));
+        assert!(error(&mut c, "UPDATE p SET a = 8 WHERE a = 2").contains("is still referenced"));
+        assert!(error(&mut c, "DROP TABLE p").contains("main key table of the table \"f\""));
+        run(&mut c, "DROP TABLE f");
+        run(&mut c, "DROP TABLE p");
+
+        // a rollback brings back the keys it took away
+        run(&mut c, "CREATE TABLE u (i INTEGER UNIQUE)");
+        run(&mut c, "INSERT INTO u VALUES (1)");
+        run(&mut c, "BEGIN");
+        run(&mut c, "DELETE FROM u");
+        run(&mut c, "INSERT INTO u VALUES (2)");
+        run(&mut c, "ROLLBACK");
+        run(&mut c, "INSERT INTO u VALUES (2)");
+        assert!(c.query("INSERT INTO u VALUES (1)").is_err());
     }
 }

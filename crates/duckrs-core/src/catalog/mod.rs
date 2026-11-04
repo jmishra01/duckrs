@@ -13,8 +13,8 @@ use duckrs_common::types::LogicalType;
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast::{MacroFunction, SelectStatement, sql_quoted_identifier};
 use parking_lot::{Mutex, RwLock};
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Weak};
 
 /// The name of the in-memory database's catalog.
 pub const DEFAULT_CATALOG: &str = "memory";
@@ -50,11 +50,52 @@ pub struct TableCatalogEntry {
     pub name: String,
     pub columns: Vec<ColumnDefinition>,
     pub storage: RwLock<ColumnDataCollection>,
+    /// Beyond the NOT NULLs, which are in `columns`.
+    pub constraints: Vec<TableConstraint>,
+    /// The tables with a foreign key to this one.
+    pub referenced_by: Mutex<Vec<Weak<TableCatalogEntry>>>,
+    /// The keys of each `TableConstraint::Unique`, in order, when somebody needed them since
+    /// the rows last moved. Whoever rewrites `storage` must reset this.
+    pub unique_keys: Mutex<Option<Vec<UniqueKeys>>>,
+}
+
+/// The keys of one UNIQUE or PRIMARY KEY, with the position of their rows.
+pub type UniqueKeys = HashMap<Vec<u8>, usize>;
+
+/// A bound constraint of a table (`BoundConstraint`).
+#[derive(Debug, Clone)]
+pub enum TableConstraint {
+    /// The expression reads the columns of the table by index.
+    Check {
+        expression: BoundExpr,
+        text: String,
+    },
+    Unique {
+        columns: Vec<usize>,
+        primary_key: bool,
+    },
+    ForeignKey(ForeignKey),
+}
+
+/// A foreign key, on the table that has it. `columns` match `referenced_columns` one by one,
+/// which are the columns of a UNIQUE or PRIMARY KEY of the referenced table in its order.
+#[derive(Debug, Clone)]
+pub struct ForeignKey {
+    pub columns: Vec<usize>,
+    /// `None` for a table that references itself.
+    pub referenced: Option<Arc<TableCatalogEntry>>,
+    pub referenced_columns: Vec<usize>,
 }
 
 impl TableCatalogEntry {
     pub fn types(&self) -> Vec<LogicalType> {
         self.columns.iter().map(|c| c.ty.clone()).collect()
+    }
+
+    /// Drops the rows from `rows` on, which a statement that failed added.
+    pub fn truncate(&self, rows: usize) {
+        self.storage.write().truncate(rows);
+        *self.unique_keys.lock() = None;
     }
 
     /// The column with this name (case-insensitive), by index.
@@ -318,8 +359,30 @@ impl SchemaCatalogEntry {
                     existing.type_name()
                 ),
             )),
-            OnCreateConflict::Replace => Ok(true),
+            OnCreateConflict::Replace => {
+                Self::check_not_referenced(tables, existing)?;
+                Ok(true)
+            }
         }
+    }
+
+    /// `AlterFKInfo` of a DROP: a table that a foreign key points at has to stay.
+    fn check_not_referenced(tables: &BTreeMap<String, TableOrView>, entry: &TableOrView) -> Result<()> {
+        let TableOrView::Table(table) = entry else {
+            return Ok(());
+        };
+        for child in table.referenced_by.lock().iter().filter_map(Weak::upgrade) {
+            if matches!(tables.get(&key(&child.name)), Some(TableOrView::Table(t)) if Arc::ptr_eq(t, &child)) {
+                return Err(Error::new(
+                    ErrorKind::Catalog,
+                    format!(
+                        "Could not drop the table because this table is main key table of the table {}",
+                        sql_quoted_identifier(&child.name)
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// `DuckSchemaEntry::CreateTable`: `None` when the table exists and the conflict is ignored.
@@ -327,6 +390,7 @@ impl SchemaCatalogEntry {
         &self,
         name: &str,
         columns: Vec<ColumnDefinition>,
+        constraints: Vec<TableConstraint>,
         on_conflict: OnCreateConflict,
     ) -> Result<Option<Arc<TableCatalogEntry>>> {
         let mut tables = self.tables.write();
@@ -339,7 +403,19 @@ impl SchemaCatalogEntry {
             name: name.to_string(),
             columns,
             storage: RwLock::new(ColumnDataCollection::new(types)),
+            constraints,
+            referenced_by: Mutex::default(),
+            unique_keys: Mutex::default(),
         });
+        for constraint in &table.constraints {
+            if let TableConstraint::ForeignKey(ForeignKey {
+                referenced: Some(parent),
+                ..
+            }) = constraint
+            {
+                parent.referenced_by.lock().push(Arc::downgrade(&table));
+            }
+        }
         tables.insert(key(name), TableOrView::Table(table.clone()));
         Ok(Some(table))
     }
@@ -381,6 +457,7 @@ impl SchemaCatalogEntry {
                 ),
             ));
         }
+        Self::check_not_referenced(&tables, existing)?;
         tables.remove(&key(name));
         Ok(true)
     }
@@ -548,6 +625,7 @@ impl Catalog {
         }
         for (table, rows) in snapshot.table_rows {
             *table.storage.write() = rows;
+            *table.unique_keys.lock() = None;
         }
     }
 
@@ -720,11 +798,11 @@ mod tests {
         let schema = catalog.schema_for(None).unwrap();
         let columns = vec![ColumnDefinition::new("i", LogicalType::INTEGER)];
         schema
-            .create_table("Tbl", columns.clone(), OnCreateConflict::Error)
+            .create_table("Tbl", columns.clone(), Vec::new(), OnCreateConflict::Error)
             .unwrap();
         assert_eq!(catalog.get_table(None, "TBL").unwrap().name, "Tbl");
         let err = schema
-            .create_table("tbl", columns.clone(), OnCreateConflict::Error)
+            .create_table("tbl", columns.clone(), Vec::new(), OnCreateConflict::Error)
             .unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -732,7 +810,7 @@ mod tests {
         );
         assert!(
             schema
-                .create_table("tbl", columns, OnCreateConflict::Ignore)
+                .create_table("tbl", columns, Vec::new(), OnCreateConflict::Ignore)
                 .unwrap()
                 .is_none()
         );

@@ -7,6 +7,7 @@ mod expression;
 mod join;
 mod macros;
 mod statements;
+mod table_constraints;
 mod table_functions;
 
 pub use expression::{enum_type_from, is_builtin_type};
