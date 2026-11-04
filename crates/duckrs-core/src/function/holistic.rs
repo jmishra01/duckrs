@@ -34,6 +34,9 @@ pub enum Holistic {
     VarPop,
     Skewness,
     Kurtosis,
+    Sem,
+    AvgInterval,
+    AvgTimestamp,
     Entropy,
     ArgMin,
     ArgMax,
@@ -84,7 +87,7 @@ impl Holistic {
             (QuantileCont, Some(ty)) => quantile(interpolated_type(ty)),
             (QuantileDisc, Some(ty)) => quantile(ty.clone()),
             (Histogram, Some(ty)) => LogicalType::map(ty.clone(), LogicalType::UBIGINT),
-            (Mode | BitAnd | BitOr | BitXor | ArgMin | ArgMax, Some(ty)) => ty.clone(),
+            (Mode | BitAnd | BitOr | BitXor | ArgMin | ArgMax | AvgTimestamp, Some(ty)) => ty.clone(),
             _ => declared.clone(),
         }
     }
@@ -634,6 +637,64 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
                 VarSamp => checked("VARSAMP", variance)?,
                 _ => checked("VARPOP", variance)?,
             }
+        }
+        Sem => {
+            let values = numbers(rows);
+            if values.is_empty() {
+                return Ok(null());
+            }
+            let (n, _, square, _, _) = moments(&values);
+            checked("SEM", (square / n).sqrt() / n.sqrt())?
+        }
+        AvgInterval => {
+            let (mut months, mut days, mut micros, mut count) = (0i32, 0i32, 0i64, 0i64);
+            for row in rows {
+                let ValueData::Interval(value) = row.data() else {
+                    continue;
+                };
+                let overflow = || out_of_range("Overflow in addition of INT32");
+                months = months.checked_add(value.months).ok_or_else(overflow)?;
+                days = days.checked_add(value.days).ok_or_else(overflow)?;
+                micros = micros
+                    .checked_add(value.micros)
+                    .ok_or_else(|| out_of_range("Overflow in addition of INT64"))?;
+                count += 1;
+            }
+            if count == 0 {
+                return Ok(null());
+            }
+            let (months, days) = (i64::from(months), i64::from(days));
+            let months_remainder = (months % count) * Interval::DAYS_PER_MONTH;
+            let day_total = days / count + months_remainder / count;
+            let days_remainder = days % count + months_remainder % count;
+            let shifted = i128::from(days_remainder) * i128::from(Interval::MICROS_PER_DAY) / i128::from(count);
+            let micro_total = micros / count + micros % count + shifted as i64;
+            Value::interval(Interval::new((months / count) as i32, day_total as i32, micro_total))
+        }
+        AvgTimestamp => {
+            let values: Vec<i64> = rows
+                .iter()
+                .filter_map(|row| match row.data() {
+                    ValueData::Int64(value) => Some(*value),
+                    _ => None,
+                })
+                .collect();
+            if values.is_empty() {
+                return Ok(null());
+            }
+            let positive = values.contains(&i64::MAX);
+            let negative = values.contains(&-i64::MAX);
+            let average = match (positive, negative) {
+                (true, true) => return Ok(null()),
+                (true, false) => i64::MAX,
+                (false, true) => -i64::MAX,
+                _ => {
+                    let sum: i128 = values.iter().map(|v| i128::from(*v)).sum();
+                    let count = values.len() as i128;
+                    (sum / count + i128::from(sum % count > count / 2)) as i64
+                }
+            };
+            Value::new(ty.clone(), ValueData::Int64(average))?
         }
         Skewness => {
             let values = numbers(rows);

@@ -8,11 +8,11 @@
 //! The helpers that the type tests lean on, ahead of the rest of Phase 5's function library.
 //! They run row by row over values.
 
-use super::bit_functions::strict_rows;
+use super::bit_functions::{bit_length, strict_rows};
 use super::combine_types::normalize_type;
 use super::dates::{bind_date_function, is_date_function};
 use super::lists::{bind_list_function, is_list_function};
-use super::nested::{bound_function, row_wise};
+use super::nested::{bind_nested_function, bound_function, row_wise};
 use super::strings::format_callback;
 use super::{ScalarCallback, ScalarFunction, ScalarFunctionSet};
 use crate::planner::binder::range_parameters;
@@ -611,6 +611,12 @@ pub fn is_generic_function(name: &str) -> bool {
                 | "concat"
                 | "concat_ws"
                 | "list_concat"
+                | "list_append"
+                | "array_append"
+                | "array_push_back"
+                | "list_prepend"
+                | "array_prepend"
+                | "array_push_front"
                 | "array_concat"
                 | "list_cat"
                 | "array_cat"
@@ -665,6 +671,9 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
         "len" | "array_length" | "length" => {
             let child = as_list(single(&children)?);
             let id = child.return_type.id();
+            if id == LogicalTypeId::Bit && lower == "length" {
+                return Ok(bound_function(&lower, vec![child], LogicalType::BIGINT, bit_length));
+            }
             if !matches!(
                 id,
                 LogicalTypeId::List | LogicalTypeId::Varchar | LogicalTypeId::SqlNull
@@ -729,6 +738,22 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             let list = LogicalType::list(element);
             let children = children.into_iter().map(|c| c.cast_to(&list, false)).collect();
             Ok(bound_function(&lower, children, list, list_concat))
+        }
+        "list_append" | "array_append" | "array_push_back" | "list_prepend" | "array_prepend" | "array_push_front" => {
+            let [first, second] = <[BoundExpr; 2]>::try_from(children).map_err(|c| no_match(&lower, &c))?;
+            // the element comes first in the prepend functions only
+            let (list, element, append) = match lower.as_str() {
+                "list_prepend" | "array_prepend" => (second, first, false),
+                "array_push_front" => (first, second, false),
+                _ => (first, second, true),
+            };
+            let element = bind_nested_function("list_value", vec![String::new()], vec![element])?;
+            let arguments = if append {
+                vec![list, element]
+            } else {
+                vec![element, list]
+            };
+            bind_generic_function("list_concat", arguments)
         }
         "array_to_string" => {
             if children.len() != 2 || !is_list(&children[0].return_type) {
@@ -834,6 +859,9 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             let [text, needle] = children.as_slice() else {
                 return Err(no_match("contains", &children));
             };
+            if is_list(&text.return_type) {
+                return bind_generic_function("list_contains", children);
+            }
             if children.iter().all(|c| c.return_type.id() == LogicalTypeId::SqlNull) {
                 return Err(binder_error(
                     "Could not choose a best candidate function for the function call \"contains(\"NULL\", \

@@ -141,7 +141,7 @@ fn set_bit(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
-fn bit_length(args: &DataChunk, result: &mut Vector) -> Result<()> {
+pub(super) fn bit_length(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
         Ok(Value::bigint(bit::bit_length(bytes_of(&row[0])) as i64))
     })

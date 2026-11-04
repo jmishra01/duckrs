@@ -12,6 +12,7 @@ use super::{ScalarFunction, ScalarFunctionSet};
 use duckrs_common::executor;
 use duckrs_common::string_cast::{format_double, format_float};
 use duckrs_common::types::{LogicalType, LogicalTypeId, NativeType, PhysicalType, decimal};
+use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, Vector};
 use duckrs_common::{Error, ErrorKind, Result};
 
@@ -618,11 +619,56 @@ fn concat(args: &DataChunk, result: &mut Vector) -> Result<()> {
     Ok(())
 }
 
+/// `ListConcatFunction` of the `||` operator: any NULL makes the result NULL.
+fn concat_lists(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let ty = result.logical_type().clone();
+    super::bit_functions::strict_rows(args, result, |row| {
+        let mut items = Vec::new();
+        for list in row {
+            if let ValueData::List(values) = list.data() {
+                items.extend_from_slice(values);
+            }
+        }
+        Value::new(ty.clone(), ValueData::List(items))
+    })
+}
+
 /// `ResolveConcatTypesInternal`: blobs stay blobs, and anything else becomes a string.
 fn resolve_concat(function: &ScalarFunction, arguments: &[LogicalType]) -> Result<ScalarFunction> {
     let nested = |id| matches!(id, LogicalTypeId::List | LogicalTypeId::Array);
     if arguments.iter().any(|ty| nested(ty.id())) {
-        return Err(crate::unported("concatenating lists"));
+        // `ResolveListConcatTypes`
+        let mut element = LogicalType::SQLNULL;
+        for argument in arguments {
+            if argument.id() == LogicalTypeId::SqlNull {
+                continue;
+            }
+            let Some(child) = argument.child_type().filter(|_| nested(argument.id())) else {
+                let types: Vec<String> = arguments.iter().map(ToString::to_string).collect();
+                return Err(Error::new(
+                    ErrorKind::Binder,
+                    format!(
+                        "Cannot concatenate types {} - an explicit cast is required",
+                        types.join(" and ")
+                    ),
+                ));
+            };
+            element = super::combine_types::try_max_logical_type(&element, child).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Binder,
+                    format!(
+                        "Cannot concatenate lists of types {element}[] and {child}[] - an explicit cast is required"
+                    ),
+                )
+            })?;
+        }
+        let ty = LogicalType::list(element);
+        return Ok(ScalarFunction::new(
+            function.name.clone(),
+            vec![ty.clone(); arguments.len()],
+            ty,
+            concat_lists,
+        ));
     }
     let all_blob = arguments.iter().all(|ty| ty.id() == LogicalTypeId::Blob);
     let ty = if all_blob {

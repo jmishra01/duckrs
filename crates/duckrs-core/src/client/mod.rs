@@ -1015,6 +1015,32 @@ mod tests {
     }
 
     #[test]
+    fn list_operators_and_temporal_averages() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT [1, 2] || [3], [1] || NULL, list_append([1], 2), list_prepend(0, [1])"
+            ),
+            [["[1, 2, 3]", "NULL", "[1, 2]", "[0, 1]"]]
+        );
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT avg(i) FROM (VALUES (INTERVAL 1 DAY), (INTERVAL 0 DAY)) t(i)"
+            ),
+            [["12:00:00"]]
+        );
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT avg(t) FROM (VALUES (TIMESTAMP '2000-01-01'), (TIMESTAMP '2000-01-03')) v(t)"
+            ),
+            [["2000-01-02 00:00:00"]]
+        );
+    }
+
+    #[test]
     fn simple_projection() {
         let mut context = ClientContext::new(DatabaseInstance::new());
         run(&mut context, "CREATE TABLE a (i integer, j integer)");

@@ -130,6 +130,18 @@ pub(super) fn aggregate_functions() -> Vec<AggregateFunctionSet> {
             overloads.push((vec![ty], LogicalType::DOUBLE, AvgInteger));
         }
         overloads.push((vec![LogicalType::DOUBLE], LogicalType::DOUBLE, AvgDouble));
+        overloads.push((
+            vec![LogicalType::INTERVAL],
+            LogicalType::INTERVAL,
+            AggregateKind::Holistic(super::holistic::Holistic::AvgInterval),
+        ));
+        for ty in [LogicalType::TIMESTAMP, LogicalType::new(LogicalTypeId::TimestampTz)] {
+            overloads.push((
+                vec![ty.clone()],
+                ty,
+                AggregateKind::Holistic(super::holistic::Holistic::AvgTimestamp),
+            ));
+        }
         overloads
     };
     let unary = |kind| vec![(vec![any()], any(), kind)];
@@ -179,8 +191,8 @@ fn holistic_functions() -> Vec<AggregateFunctionSet> {
         of(
             &["string_agg", "listagg", "group_concat"],
             vec![
-                (vec![v.clone()], v.clone(), kind(StringAgg)),
-                (vec![v.clone(), v.clone()], v.clone(), kind(StringAgg)),
+                (vec![any()], v.clone(), kind(StringAgg)),
+                (vec![any(), v.clone()], v.clone(), kind(StringAgg)),
             ],
         ),
         of(&["bool_and"], vec![(vec![b.clone()], b.clone(), kind(BoolAnd))]),
@@ -204,6 +216,7 @@ fn holistic_functions() -> Vec<AggregateFunctionSet> {
         of(&["var_pop"], unary_double(VarPop)),
         of(&["skewness"], unary_double(Skewness)),
         of(&["kurtosis"], unary_double(Kurtosis)),
+        of(&["sem"], unary_double(Sem)),
         of(&["entropy"], vec![(vec![any()], d.clone(), kind(Entropy))]),
         of(
             &["arg_min", "argmin", "min_by"],
