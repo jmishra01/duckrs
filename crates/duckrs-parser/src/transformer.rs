@@ -1663,49 +1663,53 @@ impl<'g> Transformer<'g> {
                 } else {
                     definition
                 };
-                let contents = self.window_frame_contents(self.req(contents_parent, "WindowFrameContents")?)?;
-                let Some(base) = self.sub(contents_parent, "BaseWindowName") else {
-                    return Ok(contents);
-                };
-                let base_name = Self::text(base);
-                if ["partition", "range", "rows", "groups"].contains(&base_name.to_lowercase().as_str()) {
-                    return Err(parser_error(format!("Invalid window name \"{base_name}\"")));
-                }
-                let mut copied = self.window_clause(&base_name)?;
-                check_copyable_window(&copied, &base_name)?;
-                copied.start = contents.start;
-                copied.end = contents.end;
-                copied.exclude = contents.exclude;
-                copied.start_expr = contents.start_expr;
-                copied.end_expr = contents.end_expr;
-                if !copied.orders.is_empty() && !contents.orders.is_empty() {
-                    return Err(parser_error(format!(
-                        "Cannot override ORDER BY clause of window \"{base_name}\""
-                    )));
-                }
-                if copied.orders.is_empty() {
-                    copied.orders = contents.orders;
-                }
-                if !copied.partitions.is_empty() && !contents.partitions.is_empty() {
-                    return Err(parser_error(format!(
-                        "Cannot override PARTITION BY clause of window \"{base_name}\""
-                    )));
-                }
-                if copied.partitions.is_empty() {
-                    copied.partitions = contents.partitions;
-                }
-                Ok(copied)
+                self.window_with_base(contents_parent)
             }
         }
     }
 
+    /// A window's contents on top of the window it names as its base, if any.
+    fn window_with_base(&mut self, contents_parent: &ParseNode) -> Result<WindowExpr> {
+        let contents = self.window_frame_contents(self.req(contents_parent, "WindowFrameContents")?)?;
+        let Some(base) = self.sub(contents_parent, "BaseWindowName") else {
+            return Ok(contents);
+        };
+        let base_name = Self::text(base);
+        if ["partition", "range", "rows", "groups"].contains(&base_name.to_lowercase().as_str()) {
+            return Err(parser_error(format!("Invalid window name \"{base_name}\"")));
+        }
+        let mut copied = self.window_clause(&base_name)?;
+        check_copyable_window(&copied, &base_name)?;
+        copied.start = contents.start;
+        copied.end = contents.end;
+        copied.exclude = contents.exclude;
+        copied.start_expr = contents.start_expr;
+        copied.end_expr = contents.end_expr;
+        if !copied.orders.is_empty() && !contents.orders.is_empty() {
+            return Err(parser_error(format!(
+                "Cannot override ORDER BY clause of window \"{base_name}\""
+            )));
+        }
+        if copied.orders.is_empty() {
+            copied.orders = contents.orders;
+        }
+        if !copied.partitions.is_empty() && !contents.partitions.is_empty() {
+            return Err(parser_error(format!(
+                "Cannot override PARTITION BY clause of window \"{base_name}\""
+            )));
+        }
+        if copied.partitions.is_empty() {
+            copied.partitions = contents.partitions;
+        }
+        Ok(copied)
+    }
+
     fn window_clause(&self, name: &str) -> Result<WindowExpr> {
         self.window_clauses
-            .iter()
-            .rev()
-            .find_map(|windows| windows.get(&name.to_lowercase()))
+            .last()
+            .and_then(|windows| windows.get(&name.to_lowercase()))
             .cloned()
-            .ok_or_else(|| parser_error(format!("window \"{name}\" does not exist")))
+            .ok_or_else(|| parser_error(format!("window {} does not exist", sql_quoted_identifier(name))))
     }
 
     fn window_frame_contents(&mut self, node: &ParseNode) -> Result<WindowExpr> {
@@ -2250,12 +2254,15 @@ impl<'g> Transformer<'g> {
                 } else {
                     frame
                 };
-                let window = self.window_frame_contents(self.req(contents_parent, "WindowFrameContents")?);
+                let window = self.window_with_base(contents_parent);
                 self.in_window_definition = false;
                 let window = window?;
                 let windows = self.window_clauses.last_mut().expect("window scope");
                 if windows.contains_key(&name.to_lowercase()) {
-                    return Err(parser_error(format!("window {name} is already defined")));
+                    return Err(parser_error(format!(
+                        "window {} is already defined",
+                        sql_quoted_identifier(&name)
+                    )));
                 }
                 windows.insert(name.to_lowercase(), window);
             }

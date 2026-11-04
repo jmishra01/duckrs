@@ -10,6 +10,7 @@ mod on_conflict;
 mod statements;
 mod table_constraints;
 mod table_functions;
+mod window;
 
 pub use expression::{enum_type_from, is_builtin_type};
 pub(crate) use statements::range_parameters;
@@ -543,6 +544,10 @@ pub struct Binder<'a> {
     aggregates: Option<AggregateBindState>,
     /// The error for an aggregate where it is not allowed (`UnsupportedAggregateMessage`).
     aggregate_error: &'static str,
+    /// The windows of the SELECT clause being bound, when it may have any here.
+    windows: Option<window::WindowBindState>,
+    window_error: &'static str,
+    inside_window: bool,
     /// The select list aliases the expression being bound may refer to: all of them in WHERE,
     /// the earlier ones in the select list (`ColumnAliasBinder`, `SelectBinder`).
     alias_fallback: Vec<(String, duckrs_parser::ast::Expr)>,
@@ -604,6 +609,9 @@ impl<'a> Binder<'a> {
             unnamed_subquery_index: 1,
             aggregates: None,
             aggregate_error: "Aggregate functions are not supported here",
+            windows: None,
+            window_error: "window functions are not supported here",
+            inside_window: false,
             alias_fallback: Vec::new(),
             left_of_join: Vec::new(),
             bound_views: Vec::new(),

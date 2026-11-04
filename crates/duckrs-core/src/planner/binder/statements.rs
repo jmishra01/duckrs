@@ -8,6 +8,7 @@
 //! DISTINCT), INSERT and CREATE TABLE.
 
 use super::expression::{checked_cast, without_aliases};
+use super::window::WindowBindState;
 use super::{
     AggregateBindState, BindContext, Binder, Binding, BoundStatement, ColumnMode, StatementReturnType, WorkingTable,
     binder_error,
@@ -665,9 +666,6 @@ impl Binder<'_> {
         if !plain_grouping {
             return Err(not_implemented("GROUPING SETS, ROLLUP and CUBE"));
         }
-        if node.qualify.is_some() {
-            return Err(not_implemented("QUALIFY"));
-        }
         if node.sample.is_some() {
             return Err(not_implemented("SAMPLE"));
         }
@@ -734,6 +732,7 @@ impl Binder<'_> {
                 .map(|(alias, i)| (alias.clone(), state.original_expressions[*i].clone()))
                 .collect();
             self.aggregate_error = "WHERE clause cannot contain aggregates!";
+            self.window_error = "WHERE clause cannot contain window functions!";
             let condition = self.bind_expression(condition);
             self.alias_fallback.clear();
             let condition = condition?.cast_to(&LogicalType::BOOLEAN, false);
@@ -745,6 +744,7 @@ impl Binder<'_> {
             );
         }
         self.aggregate_error = "GROUP BY clause cannot contain aggregates!";
+        self.window_error = "GROUP BY clause cannot contain window functions!";
         for group in &group_expressions {
             let mut alias_in_expression = None;
             visit_expr_mut(&mut group.clone(), &mut |e| {
@@ -764,6 +764,11 @@ impl Binder<'_> {
             aggregates.groups.push(self.bind_expression(group)?);
         }
         self.aggregates = Some(aggregates);
+        let window_index = self.generate_table_index();
+        self.windows = Some(WindowBindState {
+            window_index,
+            windows: Vec::new(),
+        });
         // a select list entry may refer to the aliases of the entries before it
         let mut expressions = Vec::with_capacity(select_list.len());
         let mut group_by_all = Vec::new();
@@ -809,30 +814,33 @@ impl Binder<'_> {
             Some(having) => {
                 // an alias of the select list wins over a column of the FROM clause, unless that
                 // column is a group (`ColumnQualifier::QualifyColumnName`)
-                let mut having = having.clone();
-                let alias_names = state
-                    .alias_map
-                    .iter()
-                    .map(|(alias, _)| alias.clone())
-                    .filter(|alias| {
-                        let mut column = Expr::column(vec![alias.clone()]);
-                        self.qualify_column_names(&mut column);
-                        self.try_bind_group(&column).is_none()
-                    })
-                    .collect::<Vec<_>>();
-                self.qualify_column_names_except(&mut having, &alias_names);
-                self.alias_fallback = state
-                    .alias_map
-                    .iter()
-                    .map(|(alias, i)| (alias.clone(), state.original_expressions[*i].clone()))
-                    .collect();
+                let having = self.qualified_with_aliases(having, &state);
                 self.aggregates.as_mut().expect("set above").mode = ColumnMode::Having;
+                let windows = self.windows.take();
+                self.window_error = "HAVING clause cannot contain window functions!";
                 let bound = self.bind_expression(&having);
+                self.windows = windows;
+                self.alias_fallback.clear();
+                self.aggregates.as_mut().expect("set above").mode = ColumnMode::SelectList;
+                Some(bound?.cast_to(&LogicalType::BOOLEAN, false))
+            }
+            None => None,
+        };
+        let qualify = match &node.qualify {
+            Some(qualify) => {
+                let qualify = self.qualified_with_aliases(qualify, &state);
+                let bound = self.bind_expression(&qualify);
                 self.alias_fallback.clear();
                 Some(bound?.cast_to(&LogicalType::BOOLEAN, false))
             }
             None => None,
         };
+        let windows = self.windows.take().expect("set above").windows;
+        if qualify.is_some() && windows.is_empty() {
+            return Err(binder_error(
+                "at least one window function must appear in the SELECT column or QUALIFY clause",
+            ));
+        }
         let aggregates = self.aggregates.take().expect("set above");
         let has_groups = !aggregates.groups.is_empty();
         let has_aggregates = !aggregates.aggregates.is_empty();
@@ -883,6 +891,23 @@ impl Binder<'_> {
                 vec![plan],
             );
         }
+        if !windows.is_empty() {
+            plan = LogicalOperator::new(
+                LogicalOperatorKind::Window {
+                    table_index: window_index,
+                    windows,
+                },
+                vec![plan],
+            );
+        }
+        if let Some(qualify) = qualify {
+            plan = LogicalOperator::new(
+                LogicalOperatorKind::Filter {
+                    expressions: vec![qualify],
+                },
+                vec![plan],
+            );
+        }
         let plan = self.plan_unnests(&mut expressions, plan);
         let types: Vec<LogicalType> = expressions.iter().map(|e| e.return_type.clone()).collect();
         let projection_index = self.generate_table_index();
@@ -903,6 +928,30 @@ impl Binder<'_> {
             column_aliases,
             return_type: StatementReturnType::QueryResult,
         })
+    }
+
+    /// A HAVING or QUALIFY clause with its columns qualified, and `alias_fallback` set for it: an
+    /// alias of the select list wins over a column of the FROM clause, unless that column is a
+    /// group (`ColumnQualifier::QualifyColumnName`).
+    fn qualified_with_aliases(&mut self, clause: &Expr, state: &SelectBindState) -> Expr {
+        let mut clause = clause.clone();
+        let alias_names = state
+            .alias_map
+            .iter()
+            .map(|(alias, _)| alias.clone())
+            .filter(|alias| {
+                let mut column = Expr::column(vec![alias.clone()]);
+                self.qualify_column_names(&mut column);
+                self.try_bind_group(&column).is_none()
+            })
+            .collect::<Vec<_>>();
+        self.qualify_column_names_except(&mut clause, &alias_names);
+        self.alias_fallback = state
+            .alias_map
+            .iter()
+            .map(|(alias, i)| (alias.clone(), state.original_expressions[*i].clone()))
+            .collect();
+        clause
     }
 
     /// `ExpressionBinder::QualifyColumnNames`: qualifies the column references that bind to a

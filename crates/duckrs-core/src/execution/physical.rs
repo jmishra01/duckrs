@@ -838,7 +838,7 @@ fn reference_index(expr: &BoundExpr) -> usize {
 }
 
 /// Emits the chunks of a collection one by one (the source half of a blocking operator).
-fn scan_collection(collection: &Mutex<ColumnDataCollection>, state: &mut SourceState) -> Option<DataChunk> {
+pub(super) fn scan_collection(collection: &Mutex<ColumnDataCollection>, state: &mut SourceState) -> Option<DataChunk> {
     let next = state.downcast_mut::<usize>().expect("collection scan state");
     let collection = collection.lock();
     if *next >= collection.chunk_count() {

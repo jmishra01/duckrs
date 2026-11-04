@@ -872,6 +872,7 @@ impl Binder<'_> {
             }
             ExprKind::Star(_) => return Err(binder_error("STAR expression is not supported here")),
             ExprKind::Default => return Err(binder_error("DEFAULT is not allowed here!")),
+            ExprKind::Window(window) => return self.bind_window(window),
             other => {
                 let name = format!("{other:?}");
                 let kind: String = name.chars().take_while(|c| c.is_alphanumeric()).collect();

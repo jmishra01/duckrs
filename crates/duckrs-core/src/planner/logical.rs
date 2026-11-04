@@ -4,7 +4,7 @@
 //! Logical operators (`LogicalOperator` and its subclasses), as an enum. Each operator knows
 //! its output types and the column bindings its parents refer to.
 
-use super::expression::{BoundAggregate, BoundExpr, BoundExprKind, ColumnBinding};
+use super::expression::{BoundAggregate, BoundExpr, BoundExprKind, BoundWindow, ColumnBinding};
 use crate::catalog::{ColumnDefinition, OnCreateConflict, SchemaCatalogEntry, TableCatalogEntry, TableConstraint};
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::OrderModifiers;
@@ -47,6 +47,11 @@ pub enum LogicalOperatorKind {
     },
     /// `LogicalFilter`: keeps the rows for which all expressions are true.
     Filter { expressions: Vec<BoundExpr> },
+    /// `LogicalWindow`: the columns of the child and those of the `windows`.
+    Window {
+        table_index: usize,
+        windows: Vec<BoundWindow>,
+    },
     /// `LogicalAggregate`: one row per distinct `groups`, with the `aggregates` of its rows.
     Aggregate {
         group_index: usize,
@@ -284,6 +289,11 @@ impl LogicalOperator {
             // the dummy scan's single column is never read
             LogicalOperatorKind::DummyScan { .. } => vec![LogicalType::INTEGER],
             LogicalOperatorKind::ExpressionGet { types, .. } => types.clone(),
+            LogicalOperatorKind::Window { windows, .. } => {
+                let mut types = self.children[0].types();
+                types.extend(windows.iter().map(|w| w.return_type.clone()));
+                types
+            }
             LogicalOperatorKind::Aggregate { groups, aggregates, .. } => groups
                 .iter()
                 .map(|g| g.return_type.clone())
@@ -368,6 +378,11 @@ impl LogicalOperator {
                 numbered(*table_index, 1)
             }
             LogicalOperatorKind::ExpressionGet { table_index, types, .. } => numbered(*table_index, types.len()),
+            LogicalOperatorKind::Window { table_index, windows } => {
+                let mut bindings = self.children[0].column_bindings();
+                bindings.extend(numbered(*table_index, windows.len()));
+                bindings
+            }
             LogicalOperatorKind::Aggregate {
                 group_index,
                 aggregate_index,
@@ -447,6 +462,9 @@ impl LogicalOperator {
                         .chain(a.order_by.iter_mut().map(|(expr, _)| expr))
                 }))
                 .collect(),
+            LogicalOperatorKind::Window { windows, .. } => {
+                windows.iter_mut().flat_map(BoundWindow::expressions_mut).collect()
+            }
             LogicalOperatorKind::ExpressionGet { expressions, .. } => expressions.iter_mut().flatten().collect(),
             // the join conditions read one child each, see `resolve_column_bindings`
             LogicalOperatorKind::Join { predicate, .. } => predicate.iter_mut().collect(),

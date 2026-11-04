@@ -19,6 +19,7 @@ use physical::*;
 
 pub mod constraints;
 mod upsert;
+mod window;
 
 /// `PhysicalPlanGenerator::CreatePlan`.
 pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
@@ -85,6 +86,7 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
         LogicalOperatorKind::Aggregate { groups, aggregates, .. } => {
             Box::new(PhysicalAggregate::new(types, groups, aggregates, children))
         }
+        LogicalOperatorKind::Window { windows, .. } => Box::new(window::PhysicalWindow::new(types, windows, children)),
         LogicalOperatorKind::Order { orders } => Box::new(PhysicalOrder::new(orders, children.remove(0))),
         LogicalOperatorKind::Limit { limit, offset } => Box::new(PhysicalLimit {
             types,

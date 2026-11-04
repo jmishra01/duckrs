@@ -13,7 +13,7 @@ use duckrs_common::Result;
 use duckrs_common::sort_key::OrderModifiers;
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
-use duckrs_parser::ast::ComparisonOp;
+use duckrs_parser::ast::{ComparisonOp, WindowBoundary, WindowExclude};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -169,6 +169,61 @@ pub struct BoundAggregate {
     pub distinct: bool,
     /// `ORDER BY`: the order the aggregate sees its rows in
     pub order_by: Vec<(BoundExpr, OrderModifiers)>,
+}
+
+/// What a window computes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFunction {
+    Aggregate,
+    RowNumber,
+    Rank,
+    DenseRank,
+    PercentRank,
+    CumeDist,
+    Ntile,
+    Lag,
+    Lead,
+    FirstValue,
+    LastValue,
+    NthValue,
+    Fill,
+}
+
+/// `BoundWindowExpression`.
+#[derive(Debug, Clone)]
+pub struct BoundWindow {
+    pub function: WindowFunction,
+    /// With `WindowFunction::Aggregate`.
+    pub aggregate: Option<Arc<AggregateFunction>>,
+    pub return_type: LogicalType,
+    pub children: Vec<BoundExpr>,
+    pub filter: Option<BoundExpr>,
+    pub distinct: bool,
+    pub ignore_nulls: bool,
+    pub partitions: Vec<BoundExpr>,
+    pub orders: Vec<(BoundExpr, OrderModifiers)>,
+    /// The ORDER BY among the arguments.
+    pub arg_orders: Vec<(BoundExpr, OrderModifiers)>,
+    pub start: WindowBoundary,
+    pub end: WindowBoundary,
+    /// With RANGE the value of the order at the boundary; otherwise the offset.
+    pub start_expr: Option<BoundExpr>,
+    pub end_expr: Option<BoundExpr>,
+    pub exclude: WindowExclude,
+}
+
+impl BoundWindow {
+    pub fn expressions_mut(&mut self) -> Vec<&mut BoundExpr> {
+        self.children
+            .iter_mut()
+            .chain(self.filter.iter_mut())
+            .chain(self.partitions.iter_mut())
+            .chain(self.orders.iter_mut().map(|(expr, _)| expr))
+            .chain(self.arg_orders.iter_mut().map(|(expr, _)| expr))
+            .chain(self.start_expr.iter_mut())
+            .chain(self.end_expr.iter_mut())
+            .collect()
+    }
 }
 
 /// A bound expression (`Expression`).

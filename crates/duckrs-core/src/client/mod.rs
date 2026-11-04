@@ -3049,4 +3049,78 @@ mod tests {
         run(&mut c, "WITH x AS (SELECT 5 AS a) INSERT INTO u SELECT a, a FROM x");
         assert_eq!(run(&mut c, "FROM u ORDER BY a"), [["2", "1"], ["5", "5"]]);
     }
+
+    #[test]
+    fn window_functions() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        run(&mut c, "CREATE TABLE t (g INTEGER, v INTEGER)");
+        run(
+            &mut c,
+            "INSERT INTO t VALUES (1, 10), (1, 20), (1, 20), (2, 5), (2, NULL)",
+        );
+        let window = |c: &mut ClientContext, over: &str| {
+            let sql = format!("SELECT {over} FROM t ORDER BY g, v NULLS LAST, 1");
+            run(c, &sql)
+                .into_iter()
+                .map(|mut r| r.remove(0))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert_eq!(
+            window(&mut c, "row_number() OVER (PARTITION BY g ORDER BY v)"),
+            "1 2 3 1 2"
+        );
+        assert_eq!(window(&mut c, "rank() OVER (PARTITION BY g ORDER BY v)"), "1 2 2 1 2");
+        assert_eq!(window(&mut c, "dense_rank() OVER (ORDER BY g)"), "1 1 1 2 2");
+        assert_eq!(
+            window(&mut c, "sum(v) OVER (PARTITION BY g ORDER BY v)"),
+            "10 50 50 5 5"
+        );
+        assert_eq!(
+            window(
+                &mut c,
+                "sum(v) OVER (PARTITION BY g ORDER BY v ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)"
+            ),
+            "10 30 40 5 5"
+        );
+        assert_eq!(
+            window(
+                &mut c,
+                "count(*) OVER (ORDER BY v RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING)"
+            ),
+            "2 2 2 2 1"
+        );
+        assert_eq!(
+            window(&mut c, "lag(v, 1, -1) OVER (PARTITION BY g ORDER BY v)"),
+            "-1 10 20 -1 5"
+        );
+        assert_eq!(
+            window(
+                &mut c,
+                "first_value(v) OVER (PARTITION BY g ORDER BY v DESC NULLS FIRST)"
+            ),
+            "20 20 20 NULL NULL"
+        );
+        assert_eq!(window(&mut c, "ntile(2) OVER (ORDER BY g, v)"), "1 1 1 2 2");
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT g FROM t QUALIFY row_number() OVER (ORDER BY v DESC NULLS LAST) = 1 ORDER BY g"
+            ),
+            [["1"]]
+        );
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT g, sum(sum(v)) OVER (ORDER BY g) FROM t GROUP BY g ORDER BY g"
+            ),
+            [["1", "50"], ["2", "55"]]
+        );
+        assert_eq!(
+            c.query("SELECT 1 FROM t WHERE rank() OVER () = 1")
+                .unwrap_err()
+                .to_string(),
+            "Binder Error: WHERE clause cannot contain window functions!"
+        );
+    }
 }
