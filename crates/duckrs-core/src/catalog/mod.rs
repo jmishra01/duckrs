@@ -1,8 +1,8 @@
 // Ported from duckdb/src/catalog/{catalog,catalog_set}.cpp,
-// duckdb/src/catalog/catalog_entry/{duck_schema_entry,table_catalog_entry}.cpp and
+// duckdb/src/catalog/catalog_entry/{duck_schema_entry,table_catalog_entry,view_catalog_entry}.cpp and
 // duckdb/src/common/exception/catalog_exception.cpp @ rust-port-baseline
 //
-//! The catalog: schemas and their tables, in memory. Names are case-insensitive and keep the
+//! The catalog: schemas with their tables and views, in memory. Names are case-insensitive and keep the
 //! case they were created with. There are no transactions yet, so changes are visible at once;
 //! MVCC visibility arrives with Phase 10, and table storage moves to `DataTable` with Phase 9.
 
@@ -10,6 +10,7 @@ use crate::planner::expression::BoundExpr;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::types::LogicalType;
 use duckrs_common::{Error, ErrorKind, Result};
+use duckrs_parser::ast::SelectStatement;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -61,11 +62,46 @@ impl TableCatalogEntry {
     }
 }
 
+/// A view (`ViewCatalogEntry`): a query, bound anew each time the view is read.
+#[derive(Debug)]
+pub struct ViewCatalogEntry {
+    pub schema: String,
+    pub name: String,
+    pub query: SelectStatement,
+    /// the names listed in `CREATE VIEW v (a, b)`
+    pub aliases: Vec<String>,
+}
+
+/// An entry of a schema's table set, which tables and views share, so that a table and a view
+/// cannot have the same name.
+#[derive(Debug, Clone)]
+pub enum TableOrView {
+    Table(Arc<TableCatalogEntry>),
+    View(Arc<ViewCatalogEntry>),
+}
+
+impl TableOrView {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Table(table) => &table.name,
+            Self::View(view) => &view.name,
+        }
+    }
+
+    /// `CatalogTypeToString`.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::Table(_) => "Table",
+            Self::View(_) => "View",
+        }
+    }
+}
+
 /// A schema (`SchemaCatalogEntry`).
 #[derive(Debug)]
 pub struct SchemaCatalogEntry {
     pub name: String,
-    tables: RwLock<BTreeMap<String, Arc<TableCatalogEntry>>>,
+    tables: RwLock<BTreeMap<String, TableOrView>>,
 }
 
 /// What to do when an entry being created already exists (`OnCreateConflict`).
@@ -88,8 +124,37 @@ impl SchemaCatalogEntry {
         }
     }
 
-    pub fn get_table(&self, name: &str) -> Option<Arc<TableCatalogEntry>> {
+    /// The table or view with this name.
+    pub fn get_entry(&self, name: &str) -> Option<TableOrView> {
         self.tables.read().get(&key(name)).cloned()
+    }
+
+    /// `DuckSchemaEntry::AddEntryInternal` up to adding the entry: whether to add it, given what
+    /// exists under its name.
+    fn check_conflict(
+        tables: &BTreeMap<String, TableOrView>,
+        name: &str,
+        type_name: &str,
+        on_conflict: OnCreateConflict,
+    ) -> Result<bool> {
+        let Some(existing) = tables.get(&key(name)) else {
+            return Ok(true);
+        };
+        match on_conflict {
+            OnCreateConflict::Error => Err(Error::new(
+                ErrorKind::Catalog,
+                format!("{} with name \"{name}\" already exists!", existing.type_name()),
+            )),
+            OnCreateConflict::Ignore => Ok(false),
+            OnCreateConflict::Replace if existing.type_name() != type_name => Err(Error::new(
+                ErrorKind::Catalog,
+                format!(
+                    "Existing object {name} is of type {}, trying to replace with type {type_name}",
+                    existing.type_name()
+                ),
+            )),
+            OnCreateConflict::Replace => Ok(true),
+        }
     }
 
     /// `DuckSchemaEntry::CreateTable`: `None` when the table exists and the conflict is ignored.
@@ -100,17 +165,8 @@ impl SchemaCatalogEntry {
         on_conflict: OnCreateConflict,
     ) -> Result<Option<Arc<TableCatalogEntry>>> {
         let mut tables = self.tables.write();
-        if tables.contains_key(&key(name)) {
-            match on_conflict {
-                OnCreateConflict::Error => {
-                    return Err(Error::new(
-                        ErrorKind::Catalog,
-                        format!("Table with name \"{name}\" already exists!"),
-                    ));
-                }
-                OnCreateConflict::Ignore => return Ok(None),
-                OnCreateConflict::Replace => {}
-            }
+        if !Self::check_conflict(&tables, name, "Table", on_conflict)? {
+            return Ok(None);
         }
         let types = columns.iter().map(|c| c.ty.clone()).collect();
         let table = Arc::new(TableCatalogEntry {
@@ -119,17 +175,52 @@ impl SchemaCatalogEntry {
             columns,
             storage: RwLock::new(ColumnDataCollection::new(types)),
         });
-        tables.insert(key(name), table.clone());
+        tables.insert(key(name), TableOrView::Table(table.clone()));
         Ok(Some(table))
     }
 
-    /// Drops a table, returning whether it existed.
-    pub fn drop_table(&self, name: &str) -> bool {
-        self.tables.write().remove(&key(name)).is_some()
+    /// `DuckSchemaEntry::CreateView`.
+    pub fn create_view(
+        &self,
+        name: &str,
+        query: SelectStatement,
+        aliases: Vec<String>,
+        on_conflict: OnCreateConflict,
+    ) -> Result<()> {
+        let mut tables = self.tables.write();
+        if Self::check_conflict(&tables, name, "View", on_conflict)? {
+            let view = ViewCatalogEntry {
+                schema: self.name.clone(),
+                name: name.to_string(),
+                query,
+                aliases,
+            };
+            tables.insert(key(name), TableOrView::View(Arc::new(view)));
+        }
+        Ok(())
     }
 
-    pub fn table_names(&self) -> Vec<String> {
-        self.tables.read().values().map(|t| t.name.clone()).collect()
+    /// `DuckSchemaEntry::DropEntry`, for `type_name` entries: whether there was one to drop.
+    pub fn drop_entry(&self, name: &str, type_name: &str) -> Result<bool> {
+        let mut tables = self.tables.write();
+        let Some(existing) = tables.get(&key(name)) else {
+            return Ok(false);
+        };
+        if existing.type_name() != type_name {
+            return Err(Error::new(
+                ErrorKind::Catalog,
+                format!(
+                    "Existing object {name} is of type {}, trying to drop type {type_name}",
+                    existing.type_name()
+                ),
+            ));
+        }
+        tables.remove(&key(name));
+        Ok(true)
+    }
+
+    fn entries(&self) -> Vec<TableOrView> {
+        self.tables.read().values().cloned().collect()
     }
 }
 
@@ -206,28 +297,45 @@ impl Catalog {
         self.get_schema(name).ok_or_else(|| missing_entry("Schema", name))
     }
 
-    /// `Catalog::GetEntry` for a table: looks the name up in `schema` (or the default schema).
-    pub fn get_table(&self, schema: Option<&str>, name: &str) -> Result<Arc<TableCatalogEntry>> {
+    /// `Catalog::GetEntry`: looks the name up in `schema`, or without one along the search path:
+    /// `search_first` (the schema of the view being bound), then the default schema.
+    pub fn get_entry(&self, schema: Option<&str>, search_first: Option<&str>, name: &str) -> Result<TableOrView> {
         let entry = match schema {
-            Some(schema) => self.schema_for(Some(schema))?.get_table(name),
-            None => self.get_schema(DEFAULT_SCHEMA).and_then(|s| s.get_table(name)),
+            Some(schema) => self.schema_for(Some(schema))?.get_entry(name),
+            None => search_first
+                .iter()
+                .chain([&DEFAULT_SCHEMA])
+                .find_map(|schema| self.get_schema(schema)?.get_entry(name)),
         };
         entry.ok_or_else(|| missing_entry("Table", name))
+    }
+
+    /// `Catalog::GetEntry` for a table: a view by that name is an error.
+    pub fn get_table(&self, schema: Option<&str>, name: &str) -> Result<Arc<TableCatalogEntry>> {
+        match self.get_entry(schema, None, name)? {
+            TableOrView::Table(table) => Ok(table),
+            TableOrView::View(_) => Err(Error::new(ErrorKind::Catalog, format!("{name} is not an table"))),
+        }
     }
 }
 
 /// `DependencyManager::VerifyExistence`: a schema with tables cannot just go away.
 fn dependency_check(schema: &SchemaCatalogEntry) -> Result<()> {
-    let names = schema.table_names();
-    if names.is_empty() {
+    let entries = schema.entries();
+    if entries.is_empty() {
         return Ok(());
     }
     let mut message = format!(
         "Cannot drop entry \"{}\" because there are entries that depend on it.\n",
         schema.name
     );
-    for table in names {
-        message += &format!("table \"{table}\" depends on schema \"{}\".\n", schema.name);
+    for entry in entries {
+        message += &format!(
+            "{} \"{}\" depends on schema \"{}\".\n",
+            entry.type_name().to_lowercase(),
+            entry.name(),
+            schema.name
+        );
     }
     message += "Use DROP...CASCADE to drop all dependents.";
     Err(Error::new(ErrorKind::Dependency, message))

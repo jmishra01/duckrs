@@ -7,11 +7,11 @@
 pub mod settings;
 mod settings_table;
 
-use crate::catalog::{Catalog, DEFAULT_CATALOG, OnCreateConflict, missing_entry};
+use crate::catalog::{Catalog, DEFAULT_CATALOG, OnCreateConflict, TableOrView, missing_entry};
 use crate::execution::expression_executor::evaluate_scalar;
 use crate::execution::physical::PhysicalResultCollector;
 use crate::execution::{create_plan, execute_plan};
-use crate::planner::binder::{BindOptions, Binder, DefaultNullOrder, bind_constant_expression};
+use crate::planner::binder::{BindOptions, Binder, DefaultNullOrder, bind_constant_expression, schema_of};
 use crate::planner::column_binding_resolver::resolve_column_bindings;
 use duckrs_common::Result;
 use duckrs_common::column_data::ColumnDataCollection;
@@ -19,7 +19,7 @@ use duckrs_common::sort_key::OrderType;
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
 use duckrs_parser::ParserOptions;
-use duckrs_parser::ast::{CreateKind, DropInfo, OnCreateConflict as AstConflict, PragmaInfo, Statement};
+use duckrs_parser::ast::{CreateInfo, CreateKind, DropInfo, OnCreateConflict as AstConflict, PragmaInfo, Statement};
 use parking_lot::RwLock;
 use settings::SettingValues;
 use std::sync::Arc;
@@ -184,6 +184,10 @@ impl ClientContext {
                 }
                 return Err(crate::unported(format!("PRAGMA {name}")));
             }
+            Statement::Create(info) if matches!(info.kind, CreateKind::View { .. }) => {
+                self.create_view(info)?;
+                return Ok(Self::success());
+            }
             Statement::Create(info) => {
                 let CreateKind::Schema { options } = &info.kind else {
                     return Err(crate::unported(create_kind_name(&info.kind)));
@@ -191,12 +195,9 @@ impl ClientContext {
                 if !options.is_empty() || info.temporary || !catalog_qualifier_only(&info.name.qualification) {
                     return Err(crate::unported("this form of CREATE SCHEMA"));
                 }
-                let on_conflict = match info.on_conflict {
-                    AstConflict::Error => OnCreateConflict::Error,
-                    AstConflict::Ignore => OnCreateConflict::Ignore,
-                    AstConflict::Replace => OnCreateConflict::Replace,
-                };
-                self.db.catalog.create_schema(&info.name.name, on_conflict)?;
+                self.db
+                    .catalog
+                    .create_schema(&info.name.name, on_create_conflict(info.on_conflict))?;
                 return Ok(Self::success());
             }
             Statement::Drop(info) => {
@@ -226,6 +227,14 @@ impl ClientContext {
     }
 }
 
+fn on_create_conflict(conflict: AstConflict) -> OnCreateConflict {
+    match conflict {
+        AstConflict::Error => OnCreateConflict::Error,
+        AstConflict::Ignore => OnCreateConflict::Ignore,
+        AstConflict::Replace => OnCreateConflict::Replace,
+    }
+}
+
 /// The name of a CREATE statement kind, for the not-ported error.
 fn create_kind_name(kind: &CreateKind) -> &'static str {
     match kind {
@@ -250,26 +259,54 @@ fn catalog_qualifier_only(qualification: &[String]) -> bool {
 }
 
 impl ClientContext {
-    /// `DROP TABLE` and `DROP SCHEMA` (`Catalog::DropEntry`).
+    /// `CREATE VIEW` (`Binder::BindCreateViewInfo` + `DuckSchemaEntry::CreateView`).
+    fn create_view(&mut self, info: &CreateInfo) -> Result<()> {
+        let CreateKind::View {
+            secure,
+            aliases,
+            defer_binding,
+            query,
+        } = &info.kind
+        else {
+            unreachable!("checked by the caller");
+        };
+        if info.temporary {
+            return Err(crate::unported("CREATE TEMPORARY VIEW"));
+        }
+        if *secure {
+            return Err(crate::unported("CREATE SECURE VIEW"));
+        }
+        // without them a view does not hold on to what it reads, which is the setting's whole point
+        if self.setting_text("enable_view_dependencies") == "true" {
+            return Err(crate::unported("view dependencies"));
+        }
+        let catalog = &self.db.catalog;
+        let schema = catalog.schema_for(schema_of(&info.name)?)?;
+        let on_conflict = on_create_conflict(info.on_conflict);
+        // IF NOT EXISTS for a view that exists does not look at the query
+        let exists = matches!(schema.get_entry(&info.name.name), Some(TableOrView::View(_)));
+        let skip_binding = *defer_binding || (on_conflict == OnCreateConflict::Ignore && exists);
+        if !skip_binding {
+            let mut binder = Binder::with_options(catalog, self.bind_options());
+            binder.bind_create_view(query, aliases, &schema.name)?;
+        }
+        schema.create_view(&info.name.name, (**query).clone(), aliases.clone(), on_conflict)
+    }
+
+    /// `DROP TABLE`, `DROP VIEW` and `DROP SCHEMA` (`Catalog::DropEntry`).
     fn drop_entry(&mut self, info: &DropInfo) -> Result<()> {
         let catalog = &self.db.catalog;
         match info.entry_type {
-            "TABLE" => {
-                let schema = match info.name.qualification.as_slice() {
-                    [] => None,
-                    [schema] => Some(schema.as_str()),
-                    [catalog_name, schema] if catalog_name.eq_ignore_ascii_case(DEFAULT_CATALOG) => {
-                        Some(schema.as_str())
-                    }
-                    _ => return Err(crate::unported("this form of DROP TABLE")),
-                };
+            kind @ ("TABLE" | "VIEW") => {
+                let type_name = if kind == "TABLE" { "Table" } else { "View" };
+                let schema = schema_of(&info.name).map_err(|_| crate::unported(format!("this form of DROP {kind}")))?;
                 let dropped = match catalog.schema_for(schema) {
-                    Ok(schema) => schema.drop_table(&info.name.name),
+                    Ok(schema) => schema.drop_entry(&info.name.name, type_name)?,
                     Err(_) if info.if_exists => false,
                     Err(error) => return Err(error),
                 };
                 if !dropped && !info.if_exists {
-                    return Err(missing_entry("Table", &info.name.name));
+                    return Err(missing_entry(type_name, &info.name.name));
                 }
                 Ok(())
             }
@@ -569,6 +606,88 @@ mod tests {
             run(&mut c, "SELECT * FROM range(100000000) x, range(100000000) y LIMIT 2").len(),
             2
         );
+    }
+
+    #[test]
+    fn views() {
+        let mut c = join_tables();
+        let error = |c: &mut ClientContext, sql: &str| c.query(sql).unwrap_err().to_string();
+        run(&mut c, "CREATE VIEW v AS SELECT k + 1 AS j, a FROM l WHERE k = 1");
+        assert_eq!(run(&mut c, "SELECT * FROM v"), rows(&[&["2", "x"]]));
+        assert_eq!(run(&mut c, "SELECT x FROM v t(x)"), rows(&[&["2"]]));
+        // a view sees later changes, and joins like a table
+        run(&mut c, "INSERT INTO l VALUES (1, 'w')");
+        assert_eq!(run(&mut c, "SELECT a FROM v ORDER BY a"), rows(&[&["w"], &["x"]]));
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT v.a, r.b FROM v JOIN r ON v.j = r.k AND r.b = 20 ORDER BY 1"
+            ),
+            rows(&[&["w", "20"], &["x", "20"]])
+        );
+        // views on views, and the column names of CREATE VIEW v (...)
+        run(&mut c, "CREATE VIEW w (p) AS SELECT j, a FROM v");
+        assert_eq!(
+            run(&mut c, "SELECT p, a FROM w ORDER BY a LIMIT 1"),
+            rows(&[&["2", "w"]])
+        );
+        assert_eq!(run(&mut c, "SELECT q FROM w z(q) LIMIT 1"), rows(&[&["2"]]));
+        // tables and views share their names
+        assert_eq!(
+            error(&mut c, "CREATE TABLE v (i INTEGER)"),
+            "Catalog Error: View with name \"v\" already exists!"
+        );
+        assert_eq!(
+            error(&mut c, "CREATE VIEW l AS SELECT 1"),
+            "Catalog Error: Table with name \"l\" already exists!"
+        );
+        assert_eq!(
+            error(&mut c, "CREATE TABLE v AS SELECT 1"),
+            "Catalog Error: View with name \"v\" already exists!"
+        );
+        assert_eq!(
+            error(&mut c, "CREATE OR REPLACE VIEW l AS SELECT 1"),
+            "Catalog Error: Existing object l is of type Table, trying to replace with type View"
+        );
+        assert_eq!(
+            error(&mut c, "DROP TABLE v"),
+            "Catalog Error: Existing object v is of type View, trying to drop type Table"
+        );
+        assert_eq!(
+            error(&mut c, "DROP VIEW l"),
+            "Catalog Error: Existing object l is of type Table, trying to drop type View"
+        );
+        assert_eq!(
+            error(&mut c, "INSERT INTO v VALUES (1, 'a')"),
+            "Catalog Error: v is not an table"
+        );
+        assert_eq!(
+            error(&mut c, "CREATE VIEW b (x, y) AS SELECT 1"),
+            "Binder Error: More VIEW aliases than columns in query result"
+        );
+        // IF NOT EXISTS never looks at the query of a view that exists; a new one must bind
+        run(&mut c, "CREATE VIEW IF NOT EXISTS v AS SELECT * FROM nope");
+        assert!(error(&mut c, "CREATE VIEW n AS SELECT * FROM nope").contains("does not exist"));
+        // replacing a view with one reading itself only fails on use
+        run(&mut c, "CREATE OR REPLACE VIEW w AS SELECT * FROM w");
+        assert!(error(&mut c, "SELECT * FROM w").contains("infinite recursion detected"));
+        run(&mut c, "DROP VIEW w");
+        assert_eq!(
+            error(&mut c, "DROP VIEW w"),
+            "Catalog Error: View with name w does not exist!"
+        );
+        run(&mut c, "DROP VIEW IF EXISTS w");
+        run(&mut c, "SET enable_view_dependencies = true");
+        assert!(error(&mut c, "CREATE VIEW d AS SELECT 1").contains("view dependencies is not yet ported"));
+        run(&mut c, "SET enable_view_dependencies = false");
+        // a view looks in its own schema first
+        run(&mut c, "CREATE SCHEMA s");
+        run(&mut c, "CREATE TABLE s.l (a VARCHAR)");
+        run(&mut c, "INSERT INTO s.l VALUES ('in s')");
+        run(&mut c, "CREATE VIEW s.sv AS SELECT a FROM l");
+        assert_eq!(run(&mut c, "SELECT * FROM s.sv"), rows(&[&["in s"]]));
+        assert!(error(&mut c, "DROP SCHEMA s").contains("view \"sv\" depends on schema \"s\""));
+        run(&mut c, "DROP SCHEMA s CASCADE");
     }
 
     #[test]

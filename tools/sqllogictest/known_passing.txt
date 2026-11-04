@@ -46,6 +46,7 @@ test/issues/monetdb/test_outerjoin_project.test
 test/issues/rigger/big_sum_cast_bug.test
 test/issues/rigger/decimal_int_between.test
 test/issues/rigger/double_bigint_cast_overflow.test
+test/issues/rigger/test_10087.test
 test/issues/rigger/test_1224.test
 test/issues/rigger/test_489.test
 test/issues/rigger/test_490.test
@@ -61,6 +62,7 @@ test/issues/rigger/test_522.test
 test/issues/rigger/test_525.test
 test/issues/rigger/test_527.test
 test/issues/rigger/test_533.test
+test/issues/rigger/test_537.test
 test/issues/rigger/test_540.test
 test/issues/rigger/test_543.test
 test/issues/rigger/test_549.test
@@ -71,6 +73,7 @@ test/issues/rigger/test_571.test
 test/issues/rigger/test_581.test
 test/issues/rigger/test_584.test
 test/issues/rigger/test_585.test
+test/issues/rigger/test_637.test
 test/optimizer/constant_argument_errors_case.test
 test/optimizer/issue_12181.test
 test/optimizer/joins/join_on_doubles.test
@@ -129,7 +132,13 @@ test/sql/catalog/table/create_table_as_abort.test
 test/sql/catalog/table/long_identifier.test
 test/sql/catalog/table/test_many_columns.test
 test/sql/catalog/test_create_from_select.test
+test/sql/catalog/test_if_not_exists.test
 test/sql/catalog/test_standard_schema.test
+test/sql/catalog/view/deferred_binding.test
+test/sql/catalog/view/test_stacked_view.test
+test/sql/catalog/view/test_view.test
+test/sql/catalog/view/test_view_alias.test
+test/sql/catalog/view/view_if_not_exists.test
 test/sql/copy/csv/afl/fuzz_20250211_crash.test
 test/sql/copy/csv/afl/test_afl_ignore_errors.test
 test/sql/copy/csv/afl/test_afl_no_parameter.test
@@ -139,6 +148,7 @@ test/sql/copy/csv/afl/test_fuzz_4172.test
 test/sql/copy/csv/test_afl.test
 test/sql/copy/csv/test_segfault.test
 test/sql/create/create_database.test
+test/sql/create/create_or_replace.test
 test/sql/create/create_table_as_error.test
 test/sql/create/create_table_as_no_data_limit.test
 test/sql/create/create_table_empty_name.test
@@ -195,6 +205,7 @@ test/sql/join/semianti/test_semianti_join_filter_pushdown.test
 test/sql/join/test_complex_join_expr.test
 test/sql/join/test_join_always_true_conditions.test
 test/sql/join/test_join_on_aggregates.test
+test/sql/join/test_predicate_binding.test
 test/sql/join/test_string_payload.test
 test/sql/limit/limit_exceeds_child_cardinality.test
 test/sql/limit/test_preserve_insertion_order.test

@@ -11,7 +11,9 @@ use super::expression::{checked_cast, without_aliases};
 use super::{
     AggregateBindState, BindContext, Binder, Binding, BoundStatement, ColumnMode, StatementReturnType, binder_error,
 };
-use crate::catalog::{ColumnDefinition, DEFAULT_CATALOG, OnCreateConflict, SchemaCatalogEntry};
+use crate::catalog::{
+    ColumnDefinition, DEFAULT_CATALOG, OnCreateConflict, SchemaCatalogEntry, TableOrView, ViewCatalogEntry,
+};
 use crate::execution::expression_executor::evaluate_scalar;
 use crate::function::binder::expression_return_type;
 use crate::function::combine_types::{normalize_type, try_max_logical_type};
@@ -168,7 +170,7 @@ fn alias_column_names(table: &str, names: &[String], aliases: &[String]) -> Resu
 }
 
 /// The schema of a qualified table name, checking that its catalog is ours.
-fn schema_of(name: &QualifiedName) -> Result<Option<&str>> {
+pub fn schema_of(name: &QualifiedName) -> Result<Option<&str>> {
     match name.qualification.as_slice() {
         [] => Ok(None),
         [schema] => Ok(Some(schema)),
@@ -784,7 +786,13 @@ impl Binder<'_> {
                 if at_clause.is_some() {
                     return Err(not_implemented("AT clauses"));
                 }
-                let table = self.catalog.get_table(schema_of(name)?, &name.name)?;
+                let table = match self
+                    .catalog
+                    .get_entry(schema_of(name)?, self.search_schema.as_deref(), &name.name)?
+                {
+                    TableOrView::Table(table) => table,
+                    TableOrView::View(view) => return self.bind_view(table_ref, view),
+                };
                 let alias = if table_ref.alias.is_empty() {
                     table.name.clone()
                 } else {
@@ -840,6 +848,8 @@ impl Binder<'_> {
                 let mut binder = Binder::with_options(self.catalog, self.options);
                 binder.next_table_index = self.next_table_index;
                 binder.left_of_join = std::mem::take(&mut self.left_of_join);
+                binder.bound_views = self.bound_views.clone();
+                binder.search_schema = self.search_schema.clone();
                 let bound = binder.bind_select_statement(select)?;
                 self.left_of_join = binder.left_of_join;
                 self.next_table_index = binder.next_table_index;
@@ -853,15 +863,7 @@ impl Binder<'_> {
                 } else {
                     table_ref.alias.clone()
                 };
-                let names = alias_column_names(&alias, &bound.names, &table_ref.column_name_alias)?;
-                let table_index = bound.plan.column_bindings()[0].table_index;
-                self.bind_context.add_binding(Binding {
-                    alias,
-                    table_index,
-                    names,
-                    types: bound.types,
-                });
-                Ok(bound.plan)
+                self.add_query_binding(alias, bound, &table_ref.column_name_alias)
             }
             TableRefKind::TableFunction {
                 function,
@@ -874,6 +876,57 @@ impl Binder<'_> {
             }
             _ => Err(not_implemented("this kind of table reference")),
         }
+    }
+
+    /// `BindContext::AddSubquery`: makes the columns of a bound query visible under `alias`.
+    fn add_query_binding(
+        &mut self,
+        alias: String,
+        bound: BoundStatement,
+        column_aliases: &[String],
+    ) -> Result<LogicalOperator> {
+        let names = alias_column_names(&alias, &bound.names, column_aliases)?;
+        let table_index = bound.plan.column_bindings()[0].table_index;
+        self.bind_context.add_binding(Binding {
+            alias,
+            table_index,
+            names,
+            types: bound.types,
+        });
+        Ok(bound.plan)
+    }
+
+    /// The view branch of `Binder::Bind(BaseTableRef)`: a view is a subquery with the view's
+    /// query, bound on its own, so that it sees nothing of this query, and looking in the view's
+    /// schema first.
+    fn bind_view(&mut self, table_ref: &TableRef, view: Arc<ViewCatalogEntry>) -> Result<LogicalOperator> {
+        if self.bound_views.iter().any(|bound| Arc::ptr_eq(bound, &view)) {
+            return Err(binder_error(format!(
+                "infinite recursion detected: attempting to recursively bind view {}",
+                view.name
+            )));
+        }
+        // the aliases of the reference override the ones of the view
+        let mut column_aliases = view.aliases.clone();
+        for (i, alias) in table_ref.column_name_alias.iter().enumerate() {
+            match column_aliases.get_mut(i) {
+                Some(column) => column.clone_from(alias),
+                None => column_aliases.push(alias.clone()),
+            }
+        }
+        let mut binder = Binder::with_options(self.catalog, self.options);
+        binder.next_table_index = self.next_table_index;
+        binder.bound_views = self.bound_views.clone();
+        binder.bound_views.push(view.clone());
+        binder.search_schema = Some(view.schema.clone());
+        let bound = binder.bind_select_statement(&view.query)?;
+        self.next_table_index = binder.next_table_index;
+        let alias = if table_ref.alias.is_empty() {
+            view.name.clone()
+        } else {
+            table_ref.alias.clone()
+        };
+        self.add_query_binding(alias, bound, &column_aliases)
     }
 
     /// The `range` and `generate_series` table functions over constant integers.
@@ -1231,12 +1284,16 @@ impl Binder<'_> {
             return Err(not_implemented("table constraints"));
         }
         // the conflict is checked before the query runs
-        if schema.get_table(&info.name.name).is_some() {
+        if let Some(existing) = schema.get_entry(&info.name.name) {
             match on_conflict {
                 OnCreateConflict::Error => {
                     return Err(Error::new(
                         ErrorKind::Catalog,
-                        format!("Table with name \"{}\" already exists!", info.name.name),
+                        format!(
+                            "{} with name \"{}\" already exists!",
+                            existing.type_name(),
+                            info.name.name
+                        ),
                     ));
                 }
                 OnCreateConflict::Ignore => {

@@ -7,15 +7,18 @@ mod expression;
 mod join;
 mod statements;
 
+pub use statements::schema_of;
+
 use super::expression::{BoundAggregate, BoundExpr, ColumnBinding};
 use super::logical::LogicalOperator;
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, ViewCatalogEntry};
 use duckrs_common::sort_key::{NullOrder, OrderModifiers, OrderType};
 use duckrs_common::string_util::{candidates_message, similarity_rating, top_n_strings};
 use duckrs_common::types::LogicalType;
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast;
 use duckrs_parser::ast::Statement;
+use std::sync::Arc;
 
 /// What a statement returns to the client (`StatementReturnType`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -393,6 +396,11 @@ pub struct Binder<'a> {
     /// The left sides of the joins whose right side is being bound. Their columns are out of
     /// reach until LATERAL exists, which is a missing feature and not a bad column.
     left_of_join: Vec<BindContext>,
+    /// The views being bound, innermost last (`bound_views`).
+    bound_views: Vec<Arc<ViewCatalogEntry>>,
+    /// The schema unqualified tables are looked up in before the default one: the schema of the
+    /// view being bound (`GetSearchPath`).
+    search_schema: Option<String>,
 }
 
 impl<'a> Binder<'a> {
@@ -411,7 +419,19 @@ impl<'a> Binder<'a> {
             aggregate_error: "Aggregate functions are not supported here",
             alias_fallback: Vec::new(),
             left_of_join: Vec::new(),
+            bound_views: Vec::new(),
+            search_schema: None,
         }
+    }
+
+    /// `Binder::BindView` + `BindCreateViewInfo`: checks the query of a view being created.
+    pub fn bind_create_view(&mut self, query: &ast::SelectStatement, aliases: &[String], schema: &str) -> Result<()> {
+        self.search_schema = Some(schema.to_string());
+        let bound = self.bind_select_statement(query)?;
+        if aliases.len() > bound.names.len() {
+            return Err(binder_error("More VIEW aliases than columns in query result"));
+        }
+        Ok(())
     }
 
     /// `error`, unless the column it did not find is one a LATERAL join could read.
