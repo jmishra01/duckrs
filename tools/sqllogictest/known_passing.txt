@@ -1107,6 +1107,7 @@ test/sql/join/right_outer/test_right_outer.test
 test/sql/join/runtime_filter_equivalent_keys.test
 test/sql/join/runtime_filter_recursive_routes.test
 test/sql/join/runtime_filter_route_effects.test
+test/sql/join/runtime_filter_routes.test
 test/sql/join/runtime_filter_row_number.test
 test/sql/join/semianti/10406-anti-on-ints-strings.test
 test/sql/join/semianti/constant_comparison_join.test

@@ -3571,4 +3571,43 @@ mod tests {
             [["true", "2", "3", "3", "[2, 1]", "[1, 2, 3]", "true", "[1, NULL]"]]
         );
     }
+
+    #[test]
+    fn a_finished_limit_lets_the_operators_above_it_drain() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        run(
+            &mut c,
+            "CREATE TABLE a AS SELECT i AS id, i % 100 AS k FROM range(10000) t(i)",
+        );
+        run(&mut c, "CREATE TABLE b AS SELECT 0 AS z, id, k FROM a");
+        // the LIMIT is done after its first chunk, with the cross product still on its first output
+        assert_eq!(
+            run(&mut c, "SELECT count(*) FROM (SELECT id FROM a LIMIT 2) a CROSS JOIN b"),
+            [["20000"]]
+        );
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT p.k, n FROM (SELECT b.k, count(*) AS n FROM (SELECT id FROM a LIMIT 2) a \
+                 CROSS JOIN b GROUP BY b.k) p WHERE p.k = 42"
+            ),
+            [["42", "200"]]
+        );
+        // the same for a hash join with more matches than fit in one output chunk
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT count(*) FROM (SELECT 0 AS z FROM a LIMIT 2) a JOIN b ON a.z = b.z"
+            ),
+            [["20000"]]
+        );
+        // a LIMIT above the join still ends the pipeline
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT count(*) FROM (SELECT a.id FROM a CROSS JOIN b LIMIT 5000) t"
+            ),
+            [["5000"]]
+        );
+    }
 }

@@ -225,7 +225,10 @@ impl Pipeline<'_> {
         loop {
             let (output, result) = op.execute_stateful(&chunk, &mut states[index])?;
             self.push(output, index + 1, states)?;
-            if result == OperatorResult::NeedMoreInput || self.is_finished() {
+            // A finished operator wants no more input, which only stops what feeds it: the
+            // operators above it still emit the output of the rows it already passed on.
+            let finished = self.operators[index + 1..].iter().any(|op| op.is_finished());
+            if result == OperatorResult::NeedMoreInput || finished {
                 return Ok(());
             }
         }
