@@ -6,7 +6,7 @@
 
 use super::expression::checked_cast;
 use super::{Binder, Binding, binder_error};
-use crate::catalog::{TableCatalogEntry, TableConstraint};
+use crate::catalog::TableCatalogEntry;
 use crate::planner::column_binding_resolver::resolve_expression;
 use crate::planner::expression::{BoundExpr, ColumnBinding};
 use crate::planner::logical::OnConflict;
@@ -17,15 +17,8 @@ use duckrs_parser::ast::{Expr, ExprKind, InsertStatement, OnConflictAction, OnCo
 use duckrs_parser::transformer::visit_expr_mut;
 use std::collections::BTreeSet;
 
-fn unique_keys(table: &TableCatalogEntry) -> Vec<&Vec<usize>> {
-    table
-        .constraints
-        .iter()
-        .filter_map(|c| match c {
-            TableConstraint::Unique { columns, .. } => Some(columns),
-            _ => None,
-        })
-        .collect()
+fn unique_keys(table: &TableCatalogEntry) -> Vec<Vec<usize>> {
+    table.keys().into_iter().map(|key| key.columns).collect()
 }
 
 /// `DoUpdateSetQualify`: unqualified columns are the table's, not `excluded`'s.
@@ -75,7 +68,7 @@ impl Binder<'_> {
                      UNIQUE/PRIMARY KEY constraints",
                 ));
             }
-            keys.iter().map(|k| (*k).clone()).collect()
+            keys.clone()
         } else {
             let mut named = BTreeSet::new();
             for name in &info.indexed_columns {
@@ -90,7 +83,7 @@ impl Binder<'_> {
                      or INDEX",
                 ));
             };
-            vec![(*key).clone()]
+            vec![key.clone()]
         };
         if info.condition.is_some() {
             return Err(binder_error(

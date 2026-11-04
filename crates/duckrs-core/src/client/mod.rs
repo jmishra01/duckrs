@@ -11,7 +11,7 @@ use crate::catalog::{
     Catalog, CatalogSnapshot, DEFAULT_CATALOG, OnCreateConflict, SequenceData, TableOrView, macro_type_name,
     missing_entry,
 };
-use crate::execution::alter::execute_alter;
+use crate::execution::alter::{execute_alter, execute_create_index};
 use crate::execution::expression_executor::evaluate_scalar;
 use crate::execution::physical::PhysicalResultCollector;
 use crate::execution::{create_plan, execute_plan};
@@ -616,6 +616,13 @@ impl ClientContext {
                 self.create_sequence(info)?;
                 return Ok(Self::success());
             }
+            Statement::Create(info) if matches!(info.kind, CreateKind::Index { .. }) => {
+                let mut binder = Binder::new(&self.db.catalog);
+                if let Some((table, index)) = binder.bind_create_index(info)? {
+                    execute_create_index(&table, index)?;
+                }
+                return Ok(Self::success());
+            }
             Statement::Create(info) if matches!(info.kind, CreateKind::Type(_)) => {
                 self.create_type(info)?;
                 return Ok(Self::success());
@@ -866,6 +873,18 @@ impl ClientContext {
                 };
                 if !dropped && !info.if_exists {
                     return Err(missing_entry(macro_type_name(table_macro), &info.name.name));
+                }
+                Ok(())
+            }
+            "INDEX" => {
+                let schema = schema_of(&info.name).map_err(|_| crate::unported("this form of DROP INDEX"))?;
+                let dropped = match catalog.schema_for(schema) {
+                    Ok(schema) => schema.drop_index(&info.name.name),
+                    Err(_) if info.if_exists => false,
+                    Err(error) => return Err(error),
+                };
+                if !dropped && !info.if_exists {
+                    return Err(missing_entry("Index", &info.name.name));
                 }
                 Ok(())
             }
@@ -3178,5 +3197,51 @@ mod tests {
         run(&mut c, "CREATE VIEW w AS SELECT 1 AS x");
         run(&mut c, "ALTER VIEW w RENAME TO w2");
         assert_eq!(run(&mut c, "FROM w2"), [["1"]]);
+    }
+
+    #[test]
+    fn indexes() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        run(&mut c, "CREATE TABLE t (i INTEGER, j VARCHAR)");
+        run(
+            &mut c,
+            "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (NULL, 'c'), (NULL, 'd')",
+        );
+        let error = |c: &mut ClientContext, sql: &str| c.query(sql).unwrap_err().to_string();
+        run(&mut c, "CREATE INDEX plain ON t (j)");
+        run(&mut c, "CREATE UNIQUE INDEX u ON t (i)");
+        assert_eq!(
+            error(&mut c, "INSERT INTO t VALUES (1, 'x')"),
+            "Constraint Error: Duplicate key \"i: 1\" violates unique constraint."
+        );
+        run(&mut c, "INSERT INTO t VALUES (NULL, 'x')");
+        assert_eq!(
+            error(&mut c, "CREATE UNIQUE INDEX v ON t ((i % 1))"),
+            "Constraint Error: Data contains duplicates on indexed column(s)"
+        );
+        assert_eq!(
+            error(&mut c, "CREATE INDEX u ON t (j)"),
+            "Catalog Error: Index with name \"u\" already exists!"
+        );
+        run(&mut c, "CREATE INDEX IF NOT EXISTS u ON t (j)");
+        assert!(error(&mut c, "ALTER TABLE t RENAME TO w").contains("Cannot alter entry \"t\""));
+        run(
+            &mut c,
+            "INSERT INTO t VALUES (1, 'y') ON CONFLICT (i) DO UPDATE SET j = excluded.j",
+        );
+        assert_eq!(run(&mut c, "SELECT j FROM t WHERE i = 1"), [["y"]]);
+
+        run(&mut c, "BEGIN");
+        run(&mut c, "DROP INDEX u");
+        run(&mut c, "INSERT INTO t VALUES (1, 'z')");
+        run(&mut c, "ROLLBACK");
+        assert!(c.query("INSERT INTO t VALUES (1, 'z')").is_err());
+        run(&mut c, "DROP INDEX u");
+        run(&mut c, "INSERT INTO t VALUES (1, 'z')");
+        assert_eq!(
+            error(&mut c, "DROP INDEX u"),
+            "Catalog Error: Index with name u does not exist!"
+        );
+        run(&mut c, "DROP INDEX IF EXISTS u");
     }
 }

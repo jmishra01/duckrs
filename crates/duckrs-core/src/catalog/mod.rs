@@ -57,6 +57,31 @@ pub struct TableCatalogEntry {
     /// The keys of each `TableConstraint::Unique`, in order, when somebody needed them since
     /// the rows last moved. Whoever rewrites `storage` must reset this.
     pub unique_keys: Mutex<Option<Vec<UniqueKeys>>>,
+    pub indexes: RwLock<Vec<Arc<IndexCatalogEntry>>>,
+}
+
+/// `DuckIndexEntry`. Nothing reads a table through an index until Phase 10 brings ART: the
+/// UNIQUE ones are checked through `TableCatalogEntry::unique_keys`, the others only exist.
+#[derive(Debug)]
+pub struct IndexCatalogEntry {
+    pub name: String,
+    pub unique: bool,
+    /// They read the columns of the table by index.
+    pub expressions: Vec<BoundExpr>,
+    /// How errors name the expressions.
+    pub names: Vec<String>,
+    /// The columns the expressions read.
+    pub columns: Vec<usize>,
+}
+
+/// A key that has to be unique: of a PRIMARY KEY, a UNIQUE or a UNIQUE index.
+#[derive(Debug, Clone)]
+pub struct TableKey {
+    pub columns: Vec<usize>,
+    /// Of an index; a constraint's key is its columns.
+    pub expressions: Option<Vec<BoundExpr>>,
+    pub names: Vec<String>,
+    pub primary_key: bool,
 }
 
 /// The keys of one UNIQUE or PRIMARY KEY, with the position of their rows.
@@ -121,7 +146,38 @@ impl TableCatalogEntry {
             constraints,
             referenced_by: Mutex::default(),
             unique_keys: Mutex::default(),
+            indexes: RwLock::default(),
         }
+    }
+
+    /// What `unique_keys` holds the keys of, in that order.
+    pub fn keys(&self) -> Vec<TableKey> {
+        let mut keys: Vec<TableKey> = self
+            .constraints
+            .iter()
+            .filter_map(|constraint| match constraint {
+                TableConstraint::Unique { columns, primary_key } => Some(TableKey {
+                    columns: columns.clone(),
+                    expressions: None,
+                    names: columns.iter().map(|c| self.columns[*c].name.clone()).collect(),
+                    primary_key: *primary_key,
+                }),
+                _ => None,
+            })
+            .collect();
+        keys.extend(
+            self.indexes
+                .read()
+                .iter()
+                .filter(|index| index.unique)
+                .map(|index| TableKey {
+                    columns: index.columns.clone(),
+                    expressions: Some(index.expressions.clone()),
+                    names: index.names.clone(),
+                    primary_key: false,
+                }),
+        );
+        keys
     }
 
     pub fn types(&self) -> Vec<LogicalType> {
@@ -426,6 +482,32 @@ impl SchemaCatalogEntry {
             .any(|child| matches!(tables.get(&key(&child.name)), Some(TableOrView::Table(t)) if Arc::ptr_eq(t, &child)))
     }
 
+    /// The index with this name, and its table.
+    pub fn get_index(&self, name: &str) -> Option<(Arc<TableCatalogEntry>, Arc<IndexCatalogEntry>)> {
+        self.tables.read().values().find_map(|entry| {
+            let TableOrView::Table(table) = entry else {
+                return None;
+            };
+            let index = table
+                .indexes
+                .read()
+                .iter()
+                .find(|i| i.name.eq_ignore_ascii_case(name))
+                .cloned()?;
+            Some((table.clone(), index))
+        })
+    }
+
+    /// Drops an index, returning whether it existed.
+    pub fn drop_index(&self, name: &str) -> bool {
+        let Some((table, index)) = self.get_index(name) else {
+            return false;
+        };
+        table.indexes.write().retain(|other| !Arc::ptr_eq(other, &index));
+        *table.unique_keys.lock() = None;
+        true
+    }
+
     /// `AlterEntry`: `table` takes the place of the entry called `old_name`.
     pub fn replace_table(&self, old_name: &str, table: Arc<TableCatalogEntry>) {
         let mut tables = self.tables.write();
@@ -641,7 +723,11 @@ pub struct CatalogSnapshot {
     schemas: BTreeMap<String, Arc<SchemaCatalogEntry>>,
     entries: Vec<SchemaEntries>,
     /// sharing their buffers with the tables, whose writes copy what they change
-    table_rows: Vec<(Arc<TableCatalogEntry>, ColumnDataCollection)>,
+    table_rows: Vec<(
+        Arc<TableCatalogEntry>,
+        ColumnDataCollection,
+        Vec<Arc<IndexCatalogEntry>>,
+    )>,
 }
 
 /// The contents of a schema in a [`CatalogSnapshot`].
@@ -665,7 +751,8 @@ impl Catalog {
             for entry in tables.values() {
                 if let TableOrView::Table(table) = entry {
                     let rows = table.storage.read().clone();
-                    table_rows.push((table.clone(), rows));
+                    let indexes = table.indexes.read().clone();
+                    table_rows.push((table.clone(), rows, indexes));
                 }
             }
             entries.push(SchemaEntries {
@@ -694,8 +781,9 @@ impl Catalog {
             *saved.schema.macros[1].write() = table;
             *saved.schema.types.write() = saved.types;
         }
-        for (table, rows) in snapshot.table_rows {
+        for (table, rows, indexes) in snapshot.table_rows {
             *table.storage.write() = rows;
+            *table.indexes.write() = indexes;
             *table.unique_keys.lock() = None;
         }
     }

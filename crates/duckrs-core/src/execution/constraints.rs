@@ -6,7 +6,7 @@
 //! table has hash maps of its keys, built when first needed and dropped when its rows move.
 
 use super::expression_executor::execute;
-use crate::catalog::{ForeignKey, TableCatalogEntry, TableConstraint, UniqueKeys};
+use crate::catalog::{ForeignKey, TableCatalogEntry, TableConstraint, TableKey, UniqueKeys};
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::{OrderModifiers, create_sort_keys};
 use duckrs_common::vector::DataChunk;
@@ -59,27 +59,56 @@ fn key_name(
     Ok(parts.join(", "))
 }
 
-fn duplicate_key(
-    table: &TableCatalogEntry,
-    chunk: &DataChunk,
-    columns: &[usize],
-    primary_key: bool,
-    row: usize,
-    local: bool,
-) -> Result<Error> {
+/// The key of each row for a key of the table.
+pub(super) fn keys_of(key: &TableKey, chunk: &DataChunk) -> Result<Vec<Option<Vec<u8>>>> {
+    match &key.expressions {
+        None => row_keys(chunk, &key.columns),
+        Some(_) => {
+            let values = key_values(key, chunk)?;
+            let columns: Vec<usize> = (0..values.columns().len()).collect();
+            row_keys(&values, &columns)
+        }
+    }
+}
+
+/// What the expressions of a key give for `chunk`.
+fn key_values(key: &TableKey, chunk: &DataChunk) -> Result<DataChunk> {
+    let columns = match &key.expressions {
+        None => key.columns.iter().map(|c| chunk.column(*c).clone()).collect(),
+        Some(expressions) => expressions
+            .iter()
+            .map(|expression| execute(expression, chunk))
+            .collect::<Result<Vec<_>>>()?,
+    };
+    Ok(DataChunk::from_columns(columns, chunk.len()))
+}
+
+fn duplicate_key(key: &TableKey, chunk: &DataChunk, row: usize, local: bool) -> Result<Error> {
+    let values = key_values(key, chunk)?;
+    let mut texts = Vec::with_capacity(key.names.len());
+    for column in values.columns() {
+        let value = column.get_value(row);
+        texts.push(if value.is_null() {
+            "NULL".to_string()
+        } else {
+            value.try_to_string()?
+        });
+    }
     if local {
         // the error of merging the indexes of a transaction into the table's, `ART::Append`
-        let mut values = Vec::with_capacity(columns.len());
-        for column in columns {
-            values.push(chunk.column(*column).get_value(row).try_to_string()?);
-        }
-        let key = values.join(", ");
+        let key = texts.join(", ");
         return Ok(violation(format!(
             "PRIMARY KEY or UNIQUE constraint violation: duplicate key \"{key}\""
         )));
     }
-    let name = key_name(table, chunk, columns, columns, row)?;
-    let kind = if primary_key { "primary key" } else { "unique" };
+    let name = key
+        .names
+        .iter()
+        .zip(&texts)
+        .map(|(name, text)| format!("{name}: {text}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let kind = if key.primary_key { "primary key" } else { "unique" };
     Ok(violation(format!(
         "Duplicate key \"{name}\" violates {kind} constraint."
     )))
@@ -137,19 +166,15 @@ pub fn verify_checks(table: &TableCatalogEntry, chunk: &DataChunk) -> Result<()>
 /// rows from `first_new_row` on are the ones of the statement that is running.
 fn build_keys(table: &TableCatalogEntry, rows: &ColumnDataCollection, first_new_row: usize) -> Result<Vec<UniqueKeys>> {
     let mut indexes = Vec::new();
-    for constraint in &table.constraints {
-        let TableConstraint::Unique { columns, primary_key } = constraint else {
-            continue;
-        };
+    for key in table.keys() {
         let mut index = UniqueKeys::new();
         let mut position = 0;
         for chunk in rows.chunks() {
-            for (row, key) in row_keys(chunk, columns)?.into_iter().enumerate() {
-                if let Some(key) = key
-                    && let Some(existing) = index.insert(key, position + row)
+            for (row, row_key) in keys_of(&key, chunk)?.into_iter().enumerate() {
+                if let Some(row_key) = row_key
+                    && let Some(existing) = index.insert(row_key, position + row)
                 {
-                    let local = existing >= first_new_row;
-                    return Err(duplicate_key(table, chunk, columns, *primary_key, row, local)?);
+                    return Err(duplicate_key(&key, chunk, row, existing >= first_new_row)?);
                 }
             }
             position += chunk.len();
@@ -174,13 +199,9 @@ pub(super) fn current_keys<'a>(
 /// Which of the indexes of [`build_keys`] holds exactly `columns`.
 pub(super) fn index_of(table: &TableCatalogEntry, columns: &[usize]) -> usize {
     table
-        .constraints
+        .keys()
         .iter()
-        .filter_map(|c| match c {
-            TableConstraint::Unique { columns, .. } => Some(columns),
-            _ => None,
-        })
-        .position(|unique| unique == columns)
+        .position(|key| key.columns == columns)
         .expect("the binder found this key")
 }
 
@@ -240,7 +261,7 @@ pub fn verify_append(
     chunk: &DataChunk,
     first_new_row: usize,
 ) -> Result<()> {
-    if table.constraints.is_empty() {
+    if table.constraints.is_empty() && !table.indexes.read().iter().any(|index| index.unique) {
         return Ok(());
     }
     verify_checks(table, chunk)?;
@@ -269,17 +290,12 @@ fn append_keys(
 ) -> Result<()> {
     // before the keys: a row can't reference the rows of its own chunk
     check_foreign_keys(table, chunk, keys)?;
-    let uniques = table.constraints.iter().filter_map(|c| match c {
-        TableConstraint::Unique { columns, primary_key } => Some((columns, *primary_key)),
-        _ => None,
-    });
-    for ((columns, primary_key), index) in uniques.zip(keys.iter_mut()) {
-        for (row, key) in row_keys(chunk, columns)?.into_iter().enumerate() {
-            if let Some(key) = key
-                && let Some(existing) = index.insert(key, next_row + row)
+    for (key, index) in table.keys().iter().zip(keys.iter_mut()) {
+        for (row, row_key) in keys_of(key, chunk)?.into_iter().enumerate() {
+            if let Some(row_key) = row_key
+                && let Some(existing) = index.insert(row_key, next_row + row)
             {
-                let local = existing >= first_new_row;
-                return Err(duplicate_key(table, chunk, columns, primary_key, row, local)?);
+                return Err(duplicate_key(key, chunk, row, existing >= first_new_row)?);
             }
         }
     }

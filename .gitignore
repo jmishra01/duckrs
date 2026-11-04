@@ -2,3 +2,5 @@
 /sqllogictest-results
 *.duckdb
 *.wal
+
+.idea

@@ -5,10 +5,10 @@
 //! INSERT ... ON CONFLICT. Rows with the same key in the input count once, the first of them;
 //! each of the others then updates the row it conflicts with, or goes in as a new row.
 
-use super::constraints::{self, current_keys, index_of, row_keys};
+use super::constraints::{self, current_keys, index_of, keys_of};
 use super::expression_executor::execute;
 use super::physical::check_buffered;
-use crate::catalog::TableCatalogEntry;
+use crate::catalog::{TableCatalogEntry, TableKey};
 use crate::planner::logical::OnConflict;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::value::{Value, ValueData};
@@ -157,15 +157,16 @@ fn split_input(
 ) -> Result<(Vec<MatchedRow>, Vec<InputRow>)> {
     let keys = current_keys(table, rows)?;
     let keys = keys.as_ref().expect("current_keys built them");
-    let targets: Vec<&Vec<usize>> = action.targets.iter().collect();
-    let indexes: Vec<usize> = targets.iter().map(|columns| index_of(table, columns)).collect();
+    let indexes: Vec<usize> = action.targets.iter().map(|columns| index_of(table, columns)).collect();
+    let table_keys = table.keys();
+    let targets: Vec<&TableKey> = indexes.iter().map(|index| &table_keys[*index]).collect();
     let mut seen = vec![HashSet::<Vec<u8>>::new(); targets.len()];
     let mut matched = Vec::new();
     let mut inserts = Vec::new();
     for (index, chunk) in input.iter().enumerate() {
         let chunk_keys = targets
             .iter()
-            .map(|columns| row_keys(chunk, columns))
+            .map(|key| keys_of(key, chunk))
             .collect::<Result<Vec<_>>>()?;
         for row in 0..chunk.len() {
             let row_keys: Vec<Option<&Vec<u8>>> = chunk_keys

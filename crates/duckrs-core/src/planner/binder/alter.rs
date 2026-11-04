@@ -141,9 +141,8 @@ impl Binder<'_> {
             return Err(catalog_error("Can only modify table with ALTER TABLE statement".into()));
         };
         // `DependencyManager::AlterObject`
-        if schema.is_referenced(&table)
-            && !matches!(info.kind, AlterKind::AddColumn { .. } | AlterKind::SetDefault { .. })
-        {
+        let has_dependents = schema.is_referenced(&table) || !table.indexes.read().is_empty();
+        if has_dependents && !matches!(info.kind, AlterKind::AddColumn { .. } | AlterKind::SetDefault { .. }) {
             return Err(Error::new(
                 ErrorKind::Dependency,
                 format!(

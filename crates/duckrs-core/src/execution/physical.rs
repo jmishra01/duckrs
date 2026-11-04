@@ -1429,7 +1429,12 @@ impl PhysicalOperator for PhysicalUpdate {
             TableConstraint::Check { .. } => false,
             TableConstraint::Unique { columns, .. } => columns.iter().any(|c| self.columns.contains(c)),
             TableConstraint::ForeignKey(key) => key.columns.iter().any(|c| self.columns.contains(c)),
-        });
+        }) || self
+            .table
+            .indexes
+            .read()
+            .iter()
+            .any(|index| index.columns.iter().any(|c| self.columns.contains(c)));
         let key_update = moves_rows || !self.table.referenced_by.lock().is_empty();
         for (index, chunk) in storage.chunks().enumerate() {
             let first_row = (index * STANDARD_VECTOR_SIZE) as i64;

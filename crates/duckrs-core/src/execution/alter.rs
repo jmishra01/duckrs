@@ -6,7 +6,7 @@
 
 use super::constraints;
 use super::expression_executor::execute;
-use crate::catalog::TableCatalogEntry;
+use crate::catalog::{IndexCatalogEntry, TableCatalogEntry};
 use crate::planner::binder::{BoundAlter, BoundTableAlter};
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::vector::DataChunk;
@@ -66,6 +66,26 @@ fn execute_table_alter(alter: BoundTableAlter) -> Result<()> {
         return Err(error);
     }
     *table.referenced_by.lock() = old.referenced_by.lock().clone();
+    *table.indexes.write() = old.indexes.read().clone();
     alter.schema.replace_table(&old.name, table);
     Ok(())
+}
+
+/// `PhysicalCreateARTIndex`: the keys of the rows have to be unique for a UNIQUE index.
+pub fn execute_create_index(table: &Arc<TableCatalogEntry>, index: IndexCatalogEntry) -> Result<()> {
+    let index = Arc::new(index);
+    table.indexes.write().push(index.clone());
+    *table.unique_keys.lock() = None;
+    let rows = table.storage.read();
+    let result = constraints::current_keys(table, &rows).map(drop);
+    drop(rows);
+    result.map_err(|error| {
+        table.indexes.write().retain(|other| !Arc::ptr_eq(other, &index));
+        *table.unique_keys.lock() = None;
+        if error.kind == ErrorKind::Constraint {
+            Error::new(ErrorKind::Constraint, "Data contains duplicates on indexed column(s)")
+        } else {
+            error
+        }
+    })
 }
