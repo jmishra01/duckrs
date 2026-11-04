@@ -8,12 +8,16 @@
 use crate::catalog::SequenceCatalogEntry;
 use crate::function::ScalarFunction;
 use crate::function::aggregates::AggregateFunction;
+use crate::planner::logical::LogicalOperator;
+use duckrs_common::Result;
 use duckrs_common::sort_key::OrderModifiers;
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
 use duckrs_parser::ast::ComparisonOp;
+use parking_lot::Mutex;
+use std::collections::HashSet;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// A column of a logical operator's output (`ColumnBinding`): which table index produced it,
 /// and its position there.
@@ -48,6 +52,37 @@ pub enum BoundOperator {
     Coalesce,
     /// the argument, with NULL for the rows that fail
     Try,
+}
+
+/// What a subquery asks of its rows (`SubqueryType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubqueryKind {
+    /// its only value
+    Scalar,
+    /// whether there are rows
+    Exists,
+    /// whether the comparison with the child holds for any of its rows
+    Any(ComparisonOp),
+}
+
+/// An uncorrelated subquery (`BoundSubqueryExpression`). DuckDB plans it into the query with a
+/// join. Here it runs once, the first time an expression needs it.
+#[derive(Debug)]
+pub struct BoundSubquery {
+    pub kind: SubqueryKind,
+    pub plan: Mutex<Option<LogicalOperator>>,
+    pub result: OnceLock<Result<SubqueryResult>>,
+}
+
+/// The rows of a subquery that ran.
+#[derive(Debug)]
+pub struct SubqueryResult {
+    pub rows: u64,
+    /// the only value of a scalar subquery, or a row of them
+    pub first: Option<Value>,
+    /// the sort keys of the non-NULL values, for ANY
+    pub keys: HashSet<Vec<u8>>,
+    pub has_null: bool,
 }
 
 /// What a call of a sequence function does.
@@ -99,6 +134,11 @@ pub enum BoundExprKind {
         op: SequenceOp,
         sequence: Arc<SequenceCatalogEntry>,
         arguments: Vec<BoundExpr>,
+    },
+    /// A subquery; `child` is what ANY compares with its rows.
+    Subquery {
+        subquery: Arc<BoundSubquery>,
+        child: Option<Box<BoundExpr>>,
     },
     /// `BoundFunctionExpression` of a scalar function; the children have its argument types.
     Function {
@@ -162,6 +202,7 @@ impl BoundExpr {
         match &self.kind {
             BoundExprKind::Constant(_) | BoundExprKind::ColumnRef { .. } | BoundExprKind::Reference(_) => Vec::new(),
             BoundExprKind::Cast { child, .. } => vec![child],
+            BoundExprKind::Subquery { child, .. } => child.iter().map(|c| &**c).collect(),
             BoundExprKind::Comparison { left, right, .. } => vec![left, right],
             BoundExprKind::Between { input, lower, upper } => vec![input, lower, upper],
             BoundExprKind::Case { checks, else_expr } => {
@@ -182,6 +223,7 @@ impl BoundExpr {
         match &mut self.kind {
             BoundExprKind::Constant(_) | BoundExprKind::ColumnRef { .. } | BoundExprKind::Reference(_) => Vec::new(),
             BoundExprKind::Cast { child, .. } => vec![child],
+            BoundExprKind::Subquery { child, .. } => child.iter_mut().map(|c| &mut **c).collect(),
             BoundExprKind::Comparison { left, right, .. } => vec![left, right],
             BoundExprKind::Between { input, lower, upper } => vec![input, lower, upper],
             BoundExprKind::Case { checks, else_expr } => {
@@ -202,7 +244,10 @@ impl BoundExpr {
     /// `Expression::IsFoldable`: whether the expression can be evaluated without input rows.
     pub fn is_foldable(&self) -> bool {
         match &self.kind {
-            BoundExprKind::ColumnRef { .. } | BoundExprKind::Reference(_) | BoundExprKind::Sequence { .. } => false,
+            BoundExprKind::ColumnRef { .. }
+            | BoundExprKind::Reference(_)
+            | BoundExprKind::Sequence { .. }
+            | BoundExprKind::Subquery { .. } => false,
             _ => self.children().into_iter().all(BoundExpr::is_foldable),
         }
     }

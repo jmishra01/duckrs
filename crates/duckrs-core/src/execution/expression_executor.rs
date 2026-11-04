@@ -7,9 +7,13 @@
 //! are a later optimization).
 
 use crate::catalog::SequenceCatalogEntry;
+use crate::execution::physical::PhysicalResultCollector;
+use crate::execution::{create_plan, execute_plan};
 use crate::function::cast::{CastMode, cast_vector};
 use crate::function::operators::DIVISION_BY_ZERO;
-use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, SequenceOp};
+use crate::planner::expression::{
+    BoundExpr, BoundExprKind, BoundOperator, BoundSubquery, SequenceOp, SubqueryKind, SubqueryResult,
+};
 use duckrs_common::comparison::{ComparisonType, DuckOrd};
 use duckrs_common::executor;
 use duckrs_common::sort_key::{NullOrder, OrderModifiers, OrderType, create_sort_keys};
@@ -18,6 +22,7 @@ use duckrs_common::value::Value;
 use duckrs_common::vector::{DataChunk, SelectionVector, Vector, VectorType};
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast::ComparisonOp;
+use std::collections::HashSet;
 
 fn comparison_type(op: ComparisonOp) -> ComparisonType {
     match op {
@@ -255,6 +260,127 @@ fn execute_case(
     Ok(result)
 }
 
+/// The result of a subquery, which runs the first time something asks. An error stays: TRY runs
+/// a failed chunk again, and the plan is gone by then.
+fn subquery_result(subquery: &BoundSubquery) -> Result<&SubqueryResult> {
+    subquery
+        .result
+        .get_or_init(|| run_subquery(subquery))
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+fn run_subquery(subquery: &BoundSubquery) -> Result<SubqueryResult> {
+    let plan = subquery.plan.lock().take().expect("a subquery runs once");
+    let collector = PhysicalResultCollector::new(create_plan(plan));
+    execute_plan(&collector)?;
+    let collection = collector.result.into_inner();
+    let mut result = SubqueryResult {
+        rows: collection.len() as u64,
+        first: None,
+        keys: HashSet::new(),
+        has_null: false,
+    };
+    let modifiers = OrderModifiers {
+        order: OrderType::Ascending,
+        nulls: NullOrder::NullsLast,
+    };
+    for index in 0..collection.chunk_count() {
+        let chunk = collection.chunk(index);
+        let column = chunk.column(0);
+        if result.first.is_none() && !chunk.is_empty() {
+            result.first = Some(column.get_value(0));
+        }
+        if !matches!(subquery.kind, SubqueryKind::Any(_)) {
+            continue;
+        }
+        let u = column.to_unified(chunk.len());
+        let keys = create_sort_keys(&[(column, modifiers)], chunk.len())?;
+        for (row, key) in keys.into_iter().enumerate() {
+            if u.validity.is_valid(u.sel.get(row)) {
+                result.keys.insert(key);
+            } else {
+                result.has_null = true;
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// `x op ANY (...)` for a value with sort key `key`: `None` for NULL.
+fn any_matches(result: &SubqueryResult, op: ComparisonOp, key: &[u8]) -> Option<bool> {
+    let found = match op {
+        ComparisonOp::Equal => result.keys.contains(key),
+        ComparisonOp::NotEqual => result.keys.iter().any(|k| k != key),
+        ComparisonOp::LessThan => result.keys.iter().any(|k| key < k.as_slice()),
+        ComparisonOp::LessThanOrEqual => result.keys.iter().any(|k| key <= k.as_slice()),
+        ComparisonOp::GreaterThan => result.keys.iter().any(|k| key > k.as_slice()),
+        _ => result.keys.iter().any(|k| key >= k.as_slice()),
+    };
+    if found {
+        Some(true)
+    } else if result.has_null {
+        None
+    } else {
+        Some(false)
+    }
+}
+
+/// `PlanSubquery`, for what it computes.
+fn execute_subquery(
+    subquery: &BoundSubquery,
+    child: Option<&BoundExpr>,
+    return_type: &LogicalType,
+    input: &DataChunk,
+) -> Result<Vector> {
+    let result = subquery_result(subquery)?;
+    match subquery.kind {
+        SubqueryKind::Scalar => {
+            if result.rows > 1 {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "More than one row returned by a subquery used as an expression - scalar subqueries can only \
+                     return a single row.\n\nUse \"SET scalar_subquery_error_on_multiple_rows=false\" to revert to \
+                     previous behavior of returning a random row.",
+                ));
+            }
+            Ok(match &result.first {
+                Some(value) => Vector::constant(value),
+                None => Vector::constant_null(return_type.clone()),
+            })
+        }
+        SubqueryKind::Exists => Ok(Vector::constant(&Value::boolean(result.rows > 0))),
+        SubqueryKind::Any(op) => {
+            let count = input.len();
+            if result.rows == 0 {
+                // ANY over nothing is false, even for NULL
+                return Ok(Vector::constant(&Value::boolean(false)));
+            }
+            let values = execute(child.expect("ANY compares a child"), input)?;
+            let modifiers = OrderModifiers {
+                order: OrderType::Ascending,
+                nulls: NullOrder::NullsLast,
+            };
+            let keys = create_sort_keys(&[(&values, modifiers)], count)?;
+            let u = values.to_unified(count);
+            let mut output = Vector::new(LogicalType::BOOLEAN, count.max(1));
+            output.prepare_flat(count.max(1));
+            for (row, key) in keys.iter().enumerate() {
+                let answer = if u.validity.is_valid(u.sel.get(row)) {
+                    any_matches(result, op, key)
+                } else {
+                    None
+                };
+                match answer {
+                    Some(answer) => output.data_mut::<bool>()[row] = answer,
+                    None => output.set_null(row, true),
+                }
+            }
+            Ok(output)
+        }
+    }
+}
+
 /// `OPERATOR_TRY`: if a chunk fails, each of its rows runs by itself, and those that fail are NULL.
 fn execute_try(child: &BoundExpr, return_type: &LogicalType, input: &DataChunk) -> Result<Vector> {
     match execute(child, input) {
@@ -358,6 +484,9 @@ pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
             Ok(conjunction(&[at_least, at_most], true, count))
         }
         BoundExprKind::Case { checks, else_expr } => execute_case(checks, else_expr, &expr.return_type, input),
+        BoundExprKind::Subquery { subquery, child } => {
+            execute_subquery(subquery, child.as_deref(), &expr.return_type, input)
+        }
         BoundExprKind::Operator {
             op: BoundOperator::Coalesce,
             children,

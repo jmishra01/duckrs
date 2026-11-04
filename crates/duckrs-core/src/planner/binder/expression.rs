@@ -14,16 +14,21 @@ use crate::function::generic::{bind_generic_function, bind_unnest, is_generic_fu
 use crate::function::nested::{bind_nested_function, is_nested_function};
 use crate::function::variant::{bind_variant_function, is_variant_function};
 use crate::function::{BuiltinFunctions, typeof_constant};
-use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, ColumnBinding, SequenceOp};
+use crate::planner::column_binding_resolver::resolve_column_bindings;
+use crate::planner::expression::{
+    BoundExpr, BoundExprKind, BoundOperator, BoundSubquery, ColumnBinding, SequenceOp, SubqueryKind,
+};
 use duckrs_common::types::{LogicalType, LogicalTypeId, bignum, bit, decimal};
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast;
 use duckrs_parser::ast::sql_quoted_identifier;
 use duckrs_parser::ast::{
-    CastType, ComparisonOp, Expr, ExprKind, FunctionExpr, Literal, LiteralKind, OperatorType, TypeExpr,
+    CastType, ComparisonOp, Expr, ExprKind, FunctionExpr, Literal, LiteralKind, OperatorType, SubqueryType, TypeExpr,
 };
 use duckrs_parser::transformer::visit_expr_mut;
+use parking_lot::Mutex;
+use std::sync::{Arc, OnceLock};
 
 /// `NumberToValue`: an integer literal is INTEGER, BIGINT, HUGEINT or UHUGEINT if it fits, a
 /// number with a fraction is a DECIMAL as wide as it is written, anything else a DOUBLE.
@@ -395,6 +400,111 @@ impl Binder<'_> {
         }
     }
 
+    /// A name a subquery could not find may be a correlated column, which is a missing feature
+    /// and not a mistake in the query.
+    fn correlated_error(&self, error: Error) -> Error {
+        let name = error.message.split('"').nth(1).unwrap_or_default();
+        let correlated = error.kind == ErrorKind::Binder
+            && error.message.starts_with("Referenced")
+            && [&self.bind_context]
+                .into_iter()
+                .chain(&self.outer_contexts)
+                .flat_map(|context| &context.bindings)
+                .any(|b| b.alias.eq_ignore_ascii_case(name) || b.column_index(name).is_some());
+        if correlated {
+            crate::unported("correlated subqueries")
+        } else {
+            error
+        }
+    }
+
+    /// `ExpressionBinder::BindExpression(SubqueryExpression)`.
+    fn bind_subquery(
+        &mut self,
+        subquery: &ast::SelectStatement,
+        subquery_type: SubqueryType,
+        child: Option<&Expr>,
+        comparison: ComparisonOp,
+    ) -> Result<BoundExpr> {
+        let mut binder = self.child_binder();
+        binder.outer_contexts = self.outer_contexts.clone();
+        binder.outer_contexts.push(self.bind_context.clone());
+        let bound = binder
+            .bind_select_statement(subquery)
+            .map_err(|error| self.correlated_error(error))?;
+        self.next_table_index = binder.next_table_index;
+        let child = child.map(|c| self.bind_expression(c)).transpose()?;
+        let columns = bound.types.len();
+        let row_width = child
+            .as_ref()
+            .filter(|c| c.return_type.id() == LogicalTypeId::Tuple)
+            .map(|c| c.return_type.struct_children().len());
+        if subquery_type != SubqueryType::Exists && subquery_type != SubqueryType::NotExists {
+            match row_width {
+                Some(width) if columns == width => return Err(crate::unported("subqueries compared to rows")),
+                Some(width) if bound.types[0].id() != LogicalTypeId::Tuple || columns != 1 => {
+                    return Err(binder_error(format!(
+                        "Subquery returns {columns} columns - expected {width}"
+                    )));
+                }
+                None if columns != 1 => {
+                    return Err(binder_error(format!("Subquery returns {columns} columns - expected 1")));
+                }
+                _ => {}
+            }
+        }
+        let (kind, return_type, mut plan, child) = match subquery_type {
+            SubqueryType::Scalar => (SubqueryKind::Scalar, bound.types[0].clone(), bound.plan, None),
+            SubqueryType::Exists | SubqueryType::NotExists => {
+                (SubqueryKind::Exists, LogicalType::BOOLEAN, bound.plan, None)
+            }
+            SubqueryType::Any => {
+                let Some(child) = child else {
+                    return Err(crate::unported("ANY without a value to compare"));
+                };
+                let child_type = expression_return_type(&child);
+                let Some(compare_type) = try_max_logical_type(&child_type, &bound.types[0]) else {
+                    return Err(binder_error(format!(
+                        "Cannot compare values of type {} and {} in IN/ANY/ALL clause - an explicit cast is required",
+                        child.return_type, bound.types[0]
+                    )));
+                };
+                let compare_type = normalize_type(&compare_type);
+                let child = checked_cast(child, &compare_type)?;
+                let plan = self.cast_plan(bound, std::slice::from_ref(&compare_type), vec![Some(0)]);
+                (
+                    SubqueryKind::Any(comparison),
+                    LogicalType::BOOLEAN,
+                    plan,
+                    Some(Box::new(child)),
+                )
+            }
+        };
+        resolve_column_bindings(&mut plan)?;
+        let expression = BoundExpr::new(
+            BoundExprKind::Subquery {
+                subquery: Arc::new(BoundSubquery {
+                    kind,
+                    plan: Mutex::new(Some(plan)),
+                    result: OnceLock::new(),
+                }),
+                child,
+            },
+            return_type,
+        );
+        Ok(if subquery_type == SubqueryType::NotExists {
+            BoundExpr::new(
+                BoundExprKind::Operator {
+                    op: BoundOperator::Not,
+                    children: vec![expression],
+                },
+                LogicalType::BOOLEAN,
+            )
+        } else {
+            expression
+        })
+    }
+
     /// `ExpressionBinder::Bind`.
     pub(super) fn bind_expression(&mut self, expr: &Expr) -> Result<BoundExpr> {
         if let Some(group) = self.try_bind_group(expr) {
@@ -667,6 +777,12 @@ impl Binder<'_> {
                     }
                 }
             }
+            ExprKind::Subquery {
+                subquery,
+                subquery_type,
+                child,
+                comparison,
+            } => self.bind_subquery(subquery, *subquery_type, child.as_deref(), *comparison)?,
             ExprKind::Parameter(identifier) => {
                 // `Binder::Bind(ParameterExpression)`
                 let Some(parameters) = &self.parameters else {

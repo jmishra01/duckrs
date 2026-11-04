@@ -361,7 +361,7 @@ impl Binder<'_> {
 
     /// `CastLogicalOperatorToTypes`: a projection of a child of a set operation. `columns[i]` is
     /// the child's column that makes column `i`, or `None` for NULL.
-    fn cast_plan(
+    pub(super) fn cast_plan(
         &mut self,
         child: BoundStatement,
         types: &[LogicalType],

@@ -107,7 +107,11 @@ mod tests {
         let prepared = con.prepare("SELECT i FROM t WHERE i = $1").unwrap();
         let result = con.execute(&prepared, &[Value::integer(2)]).unwrap();
         assert_eq!(result.value(0, 0), Value::integer(2));
-        let err = con.query("SELECT * FROM t WHERE i IN (SELECT i FROM t)").unwrap_err();
+        let result = con.query("SELECT * FROM t WHERE i IN (SELECT i FROM t)").unwrap();
+        assert_eq!(result.row_count(), 2);
+        let err = con
+            .query("SELECT * FROM t AS o WHERE EXISTS (SELECT 1 FROM t WHERE t.i = o.i)")
+            .unwrap_err();
         assert_eq!(err.kind, ErrorKind::NotImplemented);
     }
 }

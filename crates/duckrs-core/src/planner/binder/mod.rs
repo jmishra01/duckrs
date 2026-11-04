@@ -107,7 +107,7 @@ impl UsingColumnSet {
 }
 
 /// The bindings of the current query level (`BindContext`), in FROM clause order.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct BindContext {
     pub bindings: Vec<Binding>,
     pub using_columns: Vec<UsingColumnSet>,
@@ -556,6 +556,8 @@ pub struct Binder<'a> {
     pub parameters: Option<Arc<ParameterValues>>,
     /// The CTEs in scope, innermost last.
     ctes: Vec<(String, Arc<ast::CteInfo>)>,
+    /// What the queries around a subquery can see, for telling correlated columns from typos.
+    outer_contexts: Vec<BindContext>,
 }
 
 impl<'a> Binder<'a> {
@@ -580,6 +582,7 @@ impl<'a> Binder<'a> {
             macro_depth: 0,
             parameters: None,
             ctes: Vec::new(),
+            outer_contexts: Vec::new(),
         }
     }
 
@@ -595,15 +598,17 @@ impl<'a> Binder<'a> {
 
     /// `error`, unless the column it did not find is one a LATERAL join could read.
     fn lateral_error(&self, names: &[String], error: Error) -> Error {
-        let lateral = self.left_of_join.iter().any(|context| match names {
+        let names_column = |context: &BindContext| match names {
             [column] => !context.matching_bindings(column).is_empty(),
             [table, column] => context
                 .bindings
                 .iter()
                 .any(|b| b.alias.eq_ignore_ascii_case(table) && b.column_index(column).is_some()),
             _ => false,
-        });
-        if lateral {
+        };
+        if self.outer_contexts.iter().any(names_column) {
+            crate::unported("correlated subqueries")
+        } else if self.left_of_join.iter().any(names_column) {
             crate::unported("LATERAL joins")
         } else {
             error

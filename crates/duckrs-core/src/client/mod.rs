@@ -2486,6 +2486,70 @@ mod tests {
     }
 
     #[test]
+    fn uncorrelated_subqueries_match_duckdb() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        let err = |context: &mut ClientContext, sql: &str| context.query(sql).unwrap_err().to_string();
+        run(&mut context, "CREATE TABLE a (x INTEGER)");
+        run(&mut context, "CREATE TABLE b (y INTEGER)");
+        run(&mut context, "INSERT INTO a VALUES (1), (2), (3), (NULL)");
+        run(&mut context, "INSERT INTO b VALUES (2), (4)");
+        for (sql, expected) in [
+            ("SELECT (SELECT max(y) FROM b)", "4"),
+            ("SELECT (SELECT y FROM b WHERE y > 100)", "NULL"),
+            ("SELECT EXISTS (SELECT 1 FROM b)", "true"),
+            ("SELECT NOT EXISTS (SELECT 1 FROM b)", "false"),
+            ("SELECT EXISTS (SELECT 1 FROM b WHERE y > 100)", "false"),
+            ("SELECT 2 IN (SELECT y FROM b)", "true"),
+            ("SELECT 3 IN (SELECT y FROM b)", "false"),
+            ("SELECT 3 NOT IN (SELECT y FROM b)", "true"),
+            ("SELECT NULL IN (SELECT y FROM b)", "NULL"),
+            ("SELECT NULL IN (SELECT y FROM b WHERE y > 100)", "false"),
+            ("SELECT 7 IN (SELECT x FROM a)", "NULL"),
+            ("SELECT 1 IN (SELECT x FROM a)", "true"),
+            ("SELECT 5 > ALL (SELECT y FROM b)", "true"),
+            ("SELECT 3 > ALL (SELECT y FROM b)", "false"),
+            ("SELECT 3 > ANY (SELECT y FROM b)", "true"),
+            ("SELECT 5 > ALL (SELECT x FROM a)", "NULL"),
+            ("SELECT 1 <> ANY (SELECT y FROM b)", "true"),
+            ("SELECT TRY((SELECT y FROM b))", "NULL"),
+        ] {
+            assert_eq!(run(&mut context, sql), [[expected]], "{sql}");
+        }
+        assert_eq!(
+            run(
+                &mut context,
+                "SELECT x FROM a WHERE x IN (SELECT y FROM b) OR x = (SELECT min(x) FROM a)"
+            ),
+            [["1"], ["2"]]
+        );
+        assert_eq!(
+            run(
+                &mut context,
+                "SELECT x FROM a WHERE x NOT IN (SELECT y FROM b) ORDER BY x"
+            ),
+            [["1"], ["3"]]
+        );
+        assert_eq!(
+            err(&mut context, "SELECT (SELECT y FROM b)"),
+            "Invalid Input Error: More than one row returned by a subquery used as an expression - scalar subqueries \
+             can only return a single row.\n\nUse \"SET scalar_subquery_error_on_multiple_rows=false\" to revert to \
+             previous behavior of returning a random row."
+        );
+        assert_eq!(
+            err(&mut context, "SELECT (SELECT 1, 2)"),
+            "Binder Error: Subquery returns 2 columns - expected 1"
+        );
+        assert_eq!(
+            err(&mut context, "SELECT (SELECT x + y FROM b) FROM a"),
+            "Not implemented Error: correlated subqueries is not yet ported to duckrs"
+        );
+        assert_eq!(
+            err(&mut context, "SELECT (SELECT nope FROM b) FROM a"),
+            "Binder Error: Referenced column \"nope\" not found in FROM clause!\nCandidate bindings: \"y\""
+        );
+    }
+
+    #[test]
     fn errors_match_duckdb() {
         let mut context = ClientContext::new(DatabaseInstance::new());
         let err = |context: &mut ClientContext, sql: &str| context.query(sql).unwrap_err().to_string();
