@@ -11,6 +11,9 @@ use duckrs_common::types::LogicalType;
 use duckrs_parser::ast::JoinType;
 use std::sync::Arc;
 
+/// The `column_ids` entry of a scan for the `rowid` pseudo-column (`COLUMN_IDENTIFIER_ROW_ID`).
+pub const COLUMN_IDENTIFIER_ROW_ID: usize = usize::MAX;
+
 #[derive(Debug)]
 pub enum LogicalOperatorKind {
     /// `LogicalGet` of a table: scans `column_ids` (indexes into the table's columns).
@@ -123,9 +126,16 @@ impl LogicalOperator {
     /// `LogicalOperator::types` after `ResolveOperatorTypes`.
     pub fn types(&self) -> Vec<LogicalType> {
         match &self.kind {
-            LogicalOperatorKind::Get { table, column_ids, .. } => {
-                column_ids.iter().map(|&i| table.columns[i].ty.clone()).collect()
-            }
+            LogicalOperatorKind::Get { table, column_ids, .. } => column_ids
+                .iter()
+                .map(|&i| {
+                    if i == COLUMN_IDENTIFIER_ROW_ID {
+                        LogicalType::BIGINT
+                    } else {
+                        table.columns[i].ty.clone()
+                    }
+                })
+                .collect(),
             LogicalOperatorKind::Range { .. } => vec![LogicalType::BIGINT],
             LogicalOperatorKind::EmptyResult { types, .. } => types.clone(),
             // the dummy scan's single column is never read

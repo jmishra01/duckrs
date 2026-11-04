@@ -18,8 +18,9 @@ use crate::execution::expression_executor::evaluate_scalar;
 use crate::function::binder::expression_return_type;
 use crate::function::combine_types::{normalize_type, try_max_logical_type};
 use crate::planner::expression::{BoundExpr, ColumnBinding};
-use crate::planner::logical::{BoundOrderByNode, LogicalOperator, LogicalOperatorKind};
+use crate::planner::logical::{BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, LogicalOperator, LogicalOperatorKind};
 use duckrs_common::sort_key::OrderModifiers;
+use duckrs_common::string_util::{candidates_message, similarity_rating, top_n_strings};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::Value;
 use duckrs_common::{Error, ErrorKind, Result};
@@ -150,7 +151,8 @@ fn range_parameters(values: &[i128], generate_series: bool) -> Result<(i128, u64
 fn alias_column_names(table: &str, names: &[String], aliases: &[String]) -> Result<Vec<String>> {
     if aliases.len() > names.len() {
         return Err(binder_error(format!(
-            "table {table} has {} columns available but {} columns specified",
+            "table {} has {} columns available but {} columns specified",
+            sql_quoted_identifier(table),
             names.len(),
             aliases.len()
         )));
@@ -385,6 +387,7 @@ impl Binder<'_> {
         if has_groups || has_aggregates || having.is_some() || has_grouping_sets {
             // a column outside of the groups and aggregates has no single value per group
             if let Some(column) = aggregates.bound_columns.first() {
+                let column = sql_quoted_identifier(column);
                 let mut error = format!(
                     "column {column} must appear in the GROUP BY clause or must be part of an aggregate function."
                 );
@@ -535,20 +538,21 @@ impl Binder<'_> {
                 e.kind = using.kind;
                 return;
             }
+            if let ExprKind::Positional(position) = e.kind
+                && let Ok(names) = self.bind_context.position_to_column(position)
+            {
+                e.kind = ExprKind::ColumnRef(names);
+            }
             if let ExprKind::ColumnRef(names) = &mut e.kind
                 && !matches!(names.as_slice(), [name] if aliases.iter().any(|a| a.eq_ignore_ascii_case(name)))
-                && let Ok((binding, ..)) = match names.as_slice() {
-                    [column] => self.bind_context.bind_column(column),
-                    [table, column] => self.bind_context.bind_qualified_column(table, column),
-                    _ => return,
-                }
+                && let Ok((binding, _, column)) = self.bind_context.bind_column_ref(names)
                 && let Some(table) = self
                     .bind_context
                     .bindings
                     .iter()
                     .find(|b| b.table_index == binding.table_index)
             {
-                *names = vec![table.alias.clone(), table.names[binding.column_index].clone()];
+                *names = self.bind_context.qualified_names(table, &column);
             }
         });
     }
@@ -698,13 +702,8 @@ impl Binder<'_> {
                 result.push(expr.clone());
                 continue;
             };
-            if star.columns
-                || star.expr.is_some()
-                || !star.exclude_list.is_empty()
-                || !star.replace_list.is_empty()
-                || !star.rename_list.is_empty()
-            {
-                return Err(not_implemented("COLUMNS, EXCLUDE, REPLACE and RENAME"));
+            if star.columns || star.expr.is_some() {
+                return Err(not_implemented("COLUMNS"));
             }
             if self.bind_context.bindings.is_empty() {
                 return Err(binder_error("SELECT * expression without FROM clause!"));
@@ -729,10 +728,25 @@ impl Binder<'_> {
                 }
                 found
             };
+            let in_scope = |qualification: &[String], binding: &Binding| match qualification.last() {
+                Some(table) => table.eq_ignore_ascii_case(&binding.alias),
+                None => true,
+            };
             // a USING column appears once, as `*` and not `t.*` would have it
             let mut handled_using_columns = Vec::new();
-            for binding in bindings {
+            let mut excluded = vec![false; star.exclude_list.len()];
+            let mut replaced = vec![false; star.replace_list.len()];
+            for binding in &bindings {
                 for name in &binding.names {
+                    // CheckExclusionList
+                    let exclusion = star
+                        .exclude_list
+                        .iter()
+                        .position(|e| e.column.eq_ignore_ascii_case(name) && in_scope(&e.qualification, binding));
+                    if let Some(position) = exclusion {
+                        excluded[position] = true;
+                        continue;
+                    }
                     let set = if star.relation_name.is_empty() {
                         self.bind_context.using_binding_of(name, &binding.alias)
                     } else {
@@ -744,11 +758,67 @@ impl Binder<'_> {
                             handled_using_columns.push(set);
                             self.bind_context.using_columns[set].expression(name)
                         }
-                        None => ExprKind::ColumnRef(vec![binding.alias.clone(), name.clone()]).into(),
+                        None => ExprKind::ColumnRef(self.bind_context.qualified_names(binding, name)).into(),
                     };
                     column.alias = name.clone();
+                    // HandleRename
+                    if let Some(position) = star.replace_list.iter().position(|(n, _)| n.eq_ignore_ascii_case(name)) {
+                        if replaced[position] {
+                            continue;
+                        }
+                        replaced[position] = true;
+                        let (replaced_name, replacement) = &star.replace_list[position];
+                        column = replacement.clone();
+                        column.alias = replaced_name.clone();
+                    }
+                    let rename = star
+                        .rename_list
+                        .iter()
+                        .position(|(n, _)| n.column.eq_ignore_ascii_case(name) && in_scope(&n.qualification, binding));
+                    if let Some(position) = rename {
+                        column.alias = star.rename_list[position].1.clone();
+                    }
                     result.push(column);
                 }
+            }
+            let scope = if star.relation_name.is_empty() {
+                "FROM clause"
+            } else {
+                star.relation_name.as_str()
+            };
+            let candidates = |missing: &str| {
+                let mut unique: Vec<&String> = Vec::new();
+                for name in bindings.iter().flat_map(|b| &b.names) {
+                    if !unique.iter().any(|u| u.eq_ignore_ascii_case(name)) {
+                        unique.push(name);
+                    }
+                }
+                let scores = unique
+                    .into_iter()
+                    .map(|name| (name.clone(), similarity_rating(name, missing)))
+                    .collect();
+                candidates_message(&top_n_strings(scores), "Candidate bindings")
+            };
+            if let Some((name, _)) = star.exclude_list.iter().zip(&excluded).find(|(_, found)| !**found) {
+                let display: Vec<String> = name
+                    .qualification
+                    .iter()
+                    .chain([&name.column])
+                    .filter(|part| !part.is_empty())
+                    .map(|part| sql_quoted_identifier(part))
+                    .collect();
+                return Err(binder_error(format!(
+                    "Column {} in EXCLUDE list not found in {scope}{}",
+                    display.join("."),
+                    candidates(&name.column)
+                )));
+            }
+            if let Some(((name, _), _)) = star.replace_list.iter().zip(&replaced).find(|(_, found)| !**found) {
+                return Err(binder_error(format!(
+                    "Column {} in REPLACE list not found in {scope}{}",
+                    sql_quoted_identifier(name),
+                    candidates(name)
+                )));
             }
         }
         Ok(result)
@@ -758,7 +828,8 @@ impl Binder<'_> {
     fn alias_columns(table_ref: &TableRef, alias: &str, mut names: Vec<String>) -> Result<Vec<String>> {
         if table_ref.column_name_alias.len() > names.len() {
             return Err(binder_error(format!(
-                "table {alias} has {} columns available but {} columns specified",
+                "table {} has {} columns available but {} columns specified",
+                sql_quoted_identifier(alias),
                 names.len(),
                 table_ref.column_name_alias.len()
             )));
@@ -802,12 +873,15 @@ impl Binder<'_> {
                 let names = Self::alias_columns(table_ref, &alias, names)?;
                 let table_index = self.generate_table_index();
                 self.bind_context.add_binding(Binding {
+                    schema: table_ref.alias.is_empty().then(|| table.schema.clone()),
                     alias,
                     table_index,
                     names,
                     types: table.types(),
+                    row_id: Some(table.columns.len()),
                 });
-                let column_ids = (0..table.columns.len()).collect();
+                // the scan also outputs the rowid, past the columns
+                let column_ids = (0..table.columns.len()).chain([COLUMN_IDENTIFIER_ROW_ID]).collect();
                 Ok(LogicalOperator::new(
                     LogicalOperatorKind::Get {
                         table,
@@ -829,9 +903,11 @@ impl Binder<'_> {
                 let table_index = self.generate_table_index();
                 self.bind_context.add_binding(Binding {
                     alias,
+                    schema: None,
                     table_index,
                     names,
                     types: types.clone(),
+                    row_id: None,
                 });
                 Ok(LogicalOperator::new(
                     LogicalOperatorKind::ExpressionGet {
@@ -891,9 +967,11 @@ impl Binder<'_> {
         let table_index = bound.plan.column_bindings()[0].table_index;
         self.bind_context.add_binding(Binding {
             alias,
+            schema: None,
             table_index,
             names,
             types: bound.types,
+            row_id: None,
         });
         Ok(bound.plan)
     }
@@ -972,9 +1050,11 @@ impl Binder<'_> {
         let table_index = self.generate_table_index();
         self.bind_context.add_binding(Binding {
             alias,
+            schema: None,
             table_index,
             names,
             types: vec![LogicalType::BIGINT],
+            row_id: None,
         });
         Ok(LogicalOperator::new(
             LogicalOperatorKind::Range {
@@ -1071,12 +1151,16 @@ impl Binder<'_> {
             let mut named = Vec::new();
             for (i, name) in insert.columns.iter().enumerate() {
                 if insert.columns[..i].iter().any(|n| n.eq_ignore_ascii_case(name)) {
-                    return Err(binder_error(format!("Duplicate column name {name} in INSERT")));
+                    return Err(binder_error(format!(
+                        "Duplicate column name {} in INSERT",
+                        sql_quoted_identifier(name)
+                    )));
                 }
                 let Some(index) = table.column_index(name) else {
                     return Err(binder_error(format!(
-                        "Table {} does not have a column with name {name}",
-                        table.name
+                        "Table {} does not have a column with name {}",
+                        sql_quoted_identifier(&table.name),
+                        sql_quoted_identifier(name)
                     )));
                 };
                 expected_types.push(table.columns[index].ty.clone());
@@ -1093,12 +1177,12 @@ impl Binder<'_> {
                 format!(
                     "Column name/value mismatch for insert on {}: expected {expected} columns but {supplied} values \
                      were supplied",
-                    table.name
+                    sql_quoted_identifier(&table.name)
                 )
             } else {
                 format!(
                     "table {} has {expected} columns but {supplied} values were supplied",
-                    table.name
+                    sql_quoted_identifier(&table.name)
                 )
             })
         };
@@ -1234,7 +1318,10 @@ impl Binder<'_> {
             {
                 return Err(Error::new(
                     ErrorKind::Catalog,
-                    format!("Column with name {} already exists!", column.name),
+                    format!(
+                        "Column with name {} already exists!",
+                        sql_quoted_identifier(&column.name)
+                    ),
                 ));
             }
             let Some(ty) = &column.column_type else {
@@ -1326,7 +1413,7 @@ impl Binder<'_> {
             if columns.iter().any(|c| c.name.eq_ignore_ascii_case(name)) {
                 return Err(Error::new(
                     ErrorKind::Catalog,
-                    format!("Column with name {name} already exists!"),
+                    format!("Column with name {} already exists!", sql_quoted_identifier(name)),
                 ));
             }
             // a column of untyped NULLs becomes an INTEGER column

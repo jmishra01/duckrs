@@ -48,14 +48,33 @@ pub struct BoundStatement {
 #[derive(Debug, Clone)]
 pub struct Binding {
     pub alias: String,
+    /// the schema of a base table that kept its name, which can tell it from another's
+    pub schema: Option<String>,
     pub table_index: usize,
     pub names: Vec<String>,
     pub types: Vec<LogicalType>,
+    /// where a base table scan puts the `rowid` pseudo-column
+    pub row_id: Option<usize>,
 }
 
 impl Binding {
     fn column_index(&self, name: &str) -> Option<usize> {
         self.names.iter().position(|n| n.eq_ignore_ascii_case(name))
+    }
+
+    /// `rowid`, for a table that has no column of that name (`TableBinding::Bind`).
+    fn row_id_column(&self, name: &str) -> Option<usize> {
+        self.row_id.filter(|_| name.eq_ignore_ascii_case("rowid"))
+    }
+
+    /// A column by name: its index, type and name as spelled here.
+    fn column(&self, name: &str) -> Option<(usize, LogicalType, String)> {
+        match self.column_index(name) {
+            Some(index) => Some((index, self.types[index].clone(), self.names[index].clone())),
+            None => self
+                .row_id_column(name)
+                .map(|index| (index, LogicalType::BIGINT, "rowid".to_string())),
+        }
     }
 }
 
@@ -218,10 +237,12 @@ impl BindContext {
         for binding in &self.bindings {
             if let Some(index) = binding.column_index(name) {
                 if let Some((previous, _)) = found {
-                    let quoted = duckrs_parser::ast::sql_identifier(name);
+                    let quoted = ast::sql_identifier(name);
                     return Err(binder_error(format!(
-                        "Ambiguous reference to column name {name} (use: '{}.{quoted}' or '{}.{quoted}')",
-                        previous.alias, binding.alias
+                        "Ambiguous reference to column name {} (use: '{}.{quoted}' or '{}.{quoted}')",
+                        ast::sql_quoted_identifier(name),
+                        previous.alias,
+                        binding.alias
                     )));
                 }
                 found = Some((binding, index));
@@ -232,12 +253,27 @@ impl BindContext {
 
     /// Binds an unqualified column (`BindContext::GetMatchingBinding` + `TableBinding::Bind`).
     fn bind_column(&self, name: &str) -> Result<(ColumnBinding, LogicalType, String)> {
-        match self.matching_binding(name)? {
-            Some((binding, index)) => Ok((
-                ColumnBinding::new(binding.table_index, index),
-                binding.types[index].clone(),
-                binding.names[index].clone(),
-            )),
+        let found = match self.matching_binding(name)? {
+            Some((binding, _)) => Some(binding),
+            None => {
+                let mut with_row_id = self.bindings.iter().filter(|b| b.row_id_column(name).is_some());
+                let first = with_row_id.next();
+                if let (Some(first), Some(second)) = (first, with_row_id.next()) {
+                    return Err(binder_error(format!(
+                        "Ambiguous reference to column name {} (use: '{}.{name}' or '{}.{name}')",
+                        ast::sql_quoted_identifier(name),
+                        first.alias,
+                        second.alias
+                    )));
+                }
+                first
+            }
+        };
+        match found {
+            Some(binding) => {
+                let (index, ty, name) = binding.column(name).expect("the binding has this column");
+                Ok((ColumnBinding::new(binding.table_index, index), ty, name))
+            }
             None if self.bindings.is_empty() => Err(binder_error(format!(
                 "Referenced column \"{name}\" was not found because the FROM clause is missing"
             ))),
@@ -249,11 +285,15 @@ impl BindContext {
     }
 
     /// `BindContext::GetBindings`: the bindings with this alias, at least one.
-    fn bindings_of(&self, table: &str) -> Result<Vec<&Binding>> {
+    fn bindings_of(&self, schema: Option<&str>, table: &str) -> Result<Vec<&Binding>> {
         let matching: Vec<&Binding> = self
             .bindings
             .iter()
             .filter(|b| b.alias.eq_ignore_ascii_case(table))
+            .filter(|b| match schema {
+                Some(schema) => b.schema.as_ref().is_some_and(|s| s.eq_ignore_ascii_case(schema)),
+                None => true,
+            })
             .collect();
         if matching.is_empty() {
             let scores = self
@@ -261,8 +301,12 @@ impl BindContext {
                 .iter()
                 .map(|b| (b.alias.clone(), similarity_rating(&b.alias, table)))
                 .collect();
+            let name = match schema {
+                Some(schema) => format!("{schema}.{table}"),
+                None => table.to_string(),
+            };
             return Err(binder_error(format!(
-                "Referenced table \"{table}\" not found!{}",
+                "Referenced table \"{name}\" not found!{}",
                 candidates_message(&top_n_strings(scores), "Candidate tables")
             )));
         }
@@ -277,26 +321,87 @@ impl BindContext {
         ))
     }
 
-    /// Binds `table.column` (`BindContext::GetBinding(alias, column)`): of the bindings with this
-    /// alias, the one with the column.
-    fn bind_qualified_column(&self, table: &str, name: &str) -> Result<(ColumnBinding, LogicalType, String)> {
-        let matching = self.bindings_of(table)?;
-        let mut with_column = matching.iter().filter(|b| b.column_index(name).is_some());
+    /// Binds `[schema.]table.column` (`BindContext::GetBinding(alias, column)`): of the bindings
+    /// with this alias, the one with the column.
+    fn bind_qualified_column(
+        &self,
+        schema: Option<&str>,
+        table: &str,
+        name: &str,
+    ) -> Result<(ColumnBinding, LogicalType, String)> {
+        let matching = self.bindings_of(schema, table)?;
+        let mut with_column = matching.iter().filter(|b| b.column(name).is_some());
         let Some(binding) = with_column.next() else {
             return Err(binder_error(format!(
-                "Table {} does not have a column named {name}",
-                matching[0].alias
+                "Table {} does not have a column named {}",
+                ast::sql_quoted_identifier(&matching[0].alias),
+                ast::sql_quoted_identifier(name)
             )));
         };
         if with_column.next().is_some() {
             return Err(Self::ambiguous_table(table));
         }
-        let index = binding.column_index(name).expect("filtered above");
-        Ok((
-            ColumnBinding::new(binding.table_index, index),
-            binding.types[index].clone(),
-            binding.names[index].clone(),
-        ))
+        let (index, ty, name) = binding.column(name).expect("filtered above");
+        Ok((ColumnBinding::new(binding.table_index, index), ty, name))
+    }
+
+    /// Binds a column reference of any qualification.
+    fn bind_column_ref(&self, names: &[String]) -> Result<(ColumnBinding, LogicalType, String)> {
+        match names {
+            [column] => self.bind_column(column),
+            [table, column] => self.bind_qualified_column(None, table, column),
+            [schema, table, column] => {
+                // `table.column.field` needs STRUCT, which `schema.table.column` is not
+                let is_field = self.bindings_of(Some(schema), table).is_err()
+                    && self
+                        .bindings
+                        .iter()
+                        .any(|b| b.alias.eq_ignore_ascii_case(schema) && b.column_index(table).is_some());
+                if is_field {
+                    return Err(crate::unported("struct field references"));
+                }
+                self.bind_qualified_column(Some(schema), table, column)
+            }
+            [catalog, schema, table, column] if catalog.eq_ignore_ascii_case(crate::catalog::DEFAULT_CATALOG) => {
+                self.bind_qualified_column(Some(schema), table, column)
+            }
+            _ => Err(crate::unported("column references with this qualification")),
+        }
+    }
+
+    /// `BindContext::BindColumn(PositionalReferenceExpression)`: the column at a position of the
+    /// FROM clause; `#0` is the first table's rowid.
+    fn position_to_column(&self, position: u64) -> Result<Vec<String>> {
+        let mut total = 0;
+        let mut current = position.wrapping_sub(1) as usize;
+        for binding in &self.bindings {
+            if position == 0 {
+                return Ok(vec![binding.alias.clone(), "rowid".to_string()]);
+            }
+            if let Some(name) = binding.names.get(current) {
+                return Ok(self.qualified_names(binding, name));
+            }
+            total += binding.names.len();
+            current -= binding.names.len();
+        }
+        Err(binder_error(format!(
+            "Positional reference {position} out of range (total {total} columns)"
+        )))
+    }
+
+    /// The names that refer to a column of `binding`: with its schema if other bindings share
+    /// its alias (`BindContext::CreateColumnReference`).
+    fn qualified_names(&self, binding: &Binding, column: &str) -> Vec<String> {
+        let shared = self
+            .bindings
+            .iter()
+            .filter(|b| b.alias.eq_ignore_ascii_case(&binding.alias))
+            .count()
+            > 1;
+        match &binding.schema {
+            Some(schema) if shared => vec![schema.clone(), binding.alias.clone(), column.to_string()],
+            _ => vec![binding.alias.clone(), column.to_string()],
+        }
     }
 }
 

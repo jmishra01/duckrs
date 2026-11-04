@@ -61,7 +61,7 @@ and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in me
 - `crates/duckrs`: the public API (`Database`, `Connection`, `QueryResult`) over the engine.
   Databases live in memory; a database file is accepted but not written until Phase 9.
 - `tools/sqllogictest`: a port of DuckDB's sqllogictest runner. It runs the DuckDB `.test` corpus
-  against duckrs, or against the C++ DuckDB library as a reference. duckrs passes 359 files so far
+  against duckrs, or against the C++ DuckDB library as a reference. duckrs passes 370 files so far
   (`tools/sqllogictest/known_passing.txt`, a CI gate), among them
   `test/sql/projection/test_simple_projection.test`.
 

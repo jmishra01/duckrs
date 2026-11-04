@@ -5,6 +5,7 @@ test/fuzzer/afl/decimal_string_roundtrip.test
 test/fuzzer/afl/generate_series_null.test
 test/fuzzer/afl/issue_8185.test
 test/fuzzer/afl/self_referential_alias.test
+test/fuzzer/duckfuzz/group_by_all_positional_ref.test
 test/fuzzer/duckfuzz/hugeint_negate_underflow.test
 test/fuzzer/duckfuzz/late_materialization_filter.test
 test/fuzzer/duckfuzz/order_by_positional_reference.test
@@ -49,6 +50,7 @@ test/issues/monetdb/test_outerjoin_project.test
 test/issues/rigger/big_sum_cast_bug.test
 test/issues/rigger/decimal_int_between.test
 test/issues/rigger/double_bigint_cast_overflow.test
+test/issues/rigger/string_comparison_bug.test
 test/issues/rigger/test_10087.test
 test/issues/rigger/test_1224.test
 test/issues/rigger/test_489.test
@@ -76,6 +78,7 @@ test/issues/rigger/test_571.test
 test/issues/rigger/test_581.test
 test/issues/rigger/test_584.test
 test/issues/rigger/test_585.test
+test/issues/rigger/test_588.test
 test/issues/rigger/test_637.test
 test/issues/rigger/test_empty_string_statistics.test
 test/optimizer/constant_argument_errors_case.test
@@ -110,12 +113,14 @@ test/sql/aggregate/group/test_group_by_multi_column.test
 test/sql/aggregate/group/test_group_by_skip_lookups.test
 test/sql/aggregate/group/test_group_null.test
 test/sql/aggregate/having/having_alias.test
+test/sql/aggregate/having/having_without_groupby.test
 test/sql/alter/drop_constraint.test
 test/sql/alter/rename_schema/rename_schema.test
 test/sql/attach/attach_conflicting_options.test
 test/sql/attach/attach_null.test
 test/sql/binder/column_value_alias_group.test
 test/sql/binder/duplicate_alias.test
+test/sql/binder/group_by_qualification.test
 test/sql/binder/table_alias_single_quotes.test
 test/sql/binder/test_string_alias.test
 test/sql/cast/boolean_autocast.test
@@ -166,6 +171,7 @@ test/sql/error/error_location_not_duplicated.test
 test/sql/filter/filter_cache.test
 test/sql/filter/test_alias_filter.test
 test/sql/filter/test_constant_comparisons.test
+test/sql/filter/test_expression_executor_select.test
 test/sql/filter/test_illegal_filters.test
 test/sql/filter/test_obsolete_filters.test
 test/sql/filter/test_transitive_filters.test
@@ -185,8 +191,10 @@ test/sql/generated_columns/virtual/alter_table.test
 test/sql/insert/insert_rollback.test
 test/sql/insert/null_values.test
 test/sql/insert/test_insert_ignored_syntax.test
+test/sql/insert/test_insert_invalid.test
 test/sql/insert/test_insert_query.test
 test/sql/join/cross_product/test_cross_product.test
+test/sql/join/empty_joins.test
 test/sql/join/external/external_join_repartition_probe_side.test
 test/sql/join/full_outer/full_outer_join_cache.test
 test/sql/join/full_outer/test_full_outer_join.test
@@ -285,6 +293,7 @@ test/sql/prepared/test_prepare_error.test
 test/sql/prepared/test_prepare_issue_5132.test
 test/sql/prepared/test_prepare_issue_8500.test
 test/sql/projection/coalesce_error.test
+test/sql/projection/coalesce_rowid.test
 test/sql/projection/test_scalar_projection.test
 test/sql/projection/test_simple_projection.test
 test/sql/projection/test_table_star.test
@@ -292,6 +301,7 @@ test/sql/sample/table_samples/basic_sample_tests.test
 test/sql/sample/table_samples/table_sample_converts_to_block_sample.test
 test/sql/sample/table_samples/test_sample_is_destroyed_on_updates.test
 test/sql/sample/table_samples/test_sample_types.test
+test/sql/select/test_schema_reference.test
 test/sql/select/test_select_empty_table.test
 test/sql/select/test_select_into.test
 test/sql/select/test_select_locking.test
@@ -341,6 +351,7 @@ test/sql/types/hugeint/test_hugeint_aggregates.test
 test/sql/types/hugeint/test_hugeint_ops.test
 test/sql/types/nested/map/map_from_entries/invalid.test
 test/sql/types/null/test_boolean_null.test
+test/sql/types/null/test_is_null.test
 test/sql/types/null/test_null_aggr.test
 test/sql/types/numeric/bigint_try_cast.test
 test/sql/types/numeric/bool_casts.test

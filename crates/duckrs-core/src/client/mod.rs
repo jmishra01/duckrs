@@ -68,6 +68,8 @@ impl DatabaseInstance {
 const NO_OP_PRAGMAS: &[&str] = &[
     "enable_verification",
     "disable_verification",
+    "enable_optimizer",
+    "disable_optimizer",
     "verify_external",
     "disable_verify_external",
     "verify_serializer",
@@ -1010,7 +1012,10 @@ mod tests {
             rows(&[&["2", "1"], &["1", "2"]])
         );
         let message = error(&mut c, "SELECT k FROM l, r");
-        assert!(message.contains("Ambiguous reference to column name k"), "{message}");
+        assert!(
+            message.contains("Ambiguous reference to column name \"k\""),
+            "{message}"
+        );
     }
 
     #[test]
@@ -1459,6 +1464,78 @@ mod tests {
     }
 
     #[test]
+    fn column_references() {
+        let mut c = join_tables();
+        let error = |c: &mut ClientContext, sql: &str| c.query(sql).unwrap_err().to_string();
+        run(&mut c, "CREATE SCHEMA s");
+        run(&mut c, "CREATE TABLE s.l (k INTEGER)");
+        run(&mut c, "INSERT INTO s.l VALUES (7)");
+        // schema and catalog qualified
+        assert_eq!(run(&mut c, "SELECT s.l.k FROM s.l"), rows(&[&["7"]]));
+        assert_eq!(run(&mut c, "SELECT memory.s.l.k FROM s.l"), rows(&[&["7"]]));
+        assert!(error(&mut c, "SELECT s.l.k FROM s.l t").contains("not found"));
+        assert!(error(&mut c, "SELECT x.l.k FROM s.l").contains("not found"));
+        // two tables of one name, told apart by their schema
+        assert_eq!(
+            run(&mut c, "SELECT main.l.a, s.l.k FROM main.l, s.l WHERE main.l.k = 1"),
+            rows(&[&["x", "7"]])
+        );
+        assert_eq!(run(&mut c, "SELECT * FROM s.l, main.l WHERE main.l.k = 1").len(), 1);
+        // rowid
+        assert_eq!(
+            run(&mut c, "SELECT rowid, a FROM l ORDER BY rowid"),
+            rows(&[&["0", "x"], &["1", "y"], &["2", "z"], &["3", "n"]])
+        );
+        assert_eq!(run(&mut c, "SELECT a FROM l WHERE rowid = 2"), rows(&[&["z"]]));
+        assert_eq!(run(&mut c, "SELECT l.rowid + 1 FROM l WHERE a = 'y'"), rows(&[&["2"]]));
+        assert_eq!(c.query("SELECT * FROM l").unwrap().column_count(), 2);
+        assert!(error(&mut c, "SELECT rowid FROM (SELECT 1) t").contains("not found"));
+        assert!(error(&mut c, "SELECT rowid FROM l, r").contains("Ambiguous reference"));
+        run(&mut c, "CREATE TABLE own (rowid VARCHAR)");
+        run(&mut c, "INSERT INTO own VALUES ('mine')");
+        assert_eq!(run(&mut c, "SELECT rowid FROM own"), rows(&[&["mine"]]));
+        // rows of a later chunk
+        run(&mut c, "CREATE TABLE big AS SELECT range AS i FROM range(5000)");
+        assert_eq!(
+            run(&mut c, "SELECT rowid, i FROM big WHERE i = 4097"),
+            rows(&[&["4097", "4097"]])
+        );
+        // positions
+        assert_eq!(run(&mut c, "SELECT #2 FROM l WHERE #1 = 1"), rows(&[&["x"]]));
+        assert_eq!(
+            run(&mut c, "SELECT #3 FROM (SELECT 1 a, 2 b) x, (SELECT 3 c) y"),
+            rows(&[&["3"]])
+        );
+        assert_eq!(
+            run(&mut c, "SELECT #1, count(*) FROM r WHERE #1 = 2 GROUP BY #1"),
+            rows(&[&["2", "2"]])
+        );
+        assert!(error(&mut c, "SELECT #5 FROM l").contains("Positional reference 5 out of range (total 2 columns)"));
+        // star modifiers
+        assert_eq!(run(&mut c, "SELECT * EXCLUDE (k) FROM l WHERE k = 1"), rows(&[&["x"]]));
+        assert_eq!(run(&mut c, "SELECT * EXCLUDE k FROM r WHERE b = 30"), rows(&[&["30"]]));
+        assert_eq!(
+            run(&mut c, "SELECT * REPLACE (k + 1 AS k) FROM l WHERE a = 'x'"),
+            rows(&[&["2", "x"]])
+        );
+        let renamed = c.query("SELECT * RENAME (k AS key) FROM l").unwrap();
+        assert_eq!(renamed.names, vec!["key", "a"]);
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT l.* EXCLUDE (a), r.b FROM l, r WHERE l.k = 1 AND r.b = 30"
+            ),
+            rows(&[&["1", "30"]])
+        );
+        assert!(error(&mut c, "SELECT * EXCLUDE (nope) FROM l").contains("in EXCLUDE list not found in FROM clause"));
+        assert!(error(&mut c, "SELECT * REPLACE (1 AS nope) FROM l").contains("in REPLACE list not found"));
+        assert!(error(&mut c, "SELECT * EXCLUDE (k, a) FROM l").contains("SELECT list is empty"));
+        // names in messages
+        assert!(error(&mut c, "SELECT k, sum(b) FROM r").contains("column \"k\" must appear in the GROUP BY clause"));
+        assert!(error(&mut c, "INSERT INTO r VALUES (1)").contains("table \"r\" has 2 columns but 1 values"));
+    }
+
+    #[test]
     fn order_limit_distinct() {
         let mut context = ClientContext::new(DatabaseInstance::new());
         run(&mut context, "CREATE TABLE t (a INTEGER, b VARCHAR)");
@@ -1595,8 +1672,8 @@ mod tests {
         let err = |context: &mut ClientContext, sql: &str| context.query(sql).unwrap_err().to_string();
         assert_eq!(
             err(&mut context, "SELECT v, sum(v) FROM t"),
-            "Binder Error: column v must appear in the GROUP BY clause or must be part of an aggregate function.\n\
-             Either add it to the GROUP BY list, or use ANY_VALUE(v) if the exact value of v is not important."
+            "Binder Error: column \"v\" must appear in the GROUP BY clause or must be part of an aggregate function.\n\
+             Either add it to the GROUP BY list, or use ANY_VALUE(\"v\") if the exact value of \"v\" is not important."
         );
         assert_eq!(
             err(&mut context, "SELECT g FROM t WHERE sum(v) > 1"),
@@ -1608,7 +1685,7 @@ mod tests {
         );
         assert_eq!(
             err(&mut context, "SELECT g FROM t GROUP BY g HAVING v > 1"),
-            "Binder Error: column v must appear in the GROUP BY clause or be used in an aggregate function"
+            "Binder Error: column \"v\" must appear in the GROUP BY clause or be used in an aggregate function"
         );
     }
 
@@ -1886,7 +1963,7 @@ mod tests {
         );
         assert_eq!(
             err(&mut context, "INSERT INTO t VALUES (1, 2)"),
-            "Binder Error: table t has 1 columns but 2 values were supplied"
+            "Binder Error: table \"t\" has 1 columns but 2 values were supplied"
         );
         assert_eq!(
             err(&mut context, "SELECT 2147483647 + 1"),

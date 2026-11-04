@@ -15,6 +15,7 @@ use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, Column
 use duckrs_common::types::{LogicalType, LogicalTypeId, decimal};
 use duckrs_common::value::Value;
 use duckrs_common::{Error, ErrorKind, Result};
+use duckrs_parser::ast::sql_quoted_identifier;
 use duckrs_parser::ast::{
     CastType, ComparisonOp, Expr, ExprKind, FunctionExpr, Literal, LiteralKind, OperatorType, TypeExpr,
 };
@@ -292,16 +293,20 @@ impl Binder<'_> {
                             return bound;
                         }
                     },
-                    [table, column] => self
+                    names => self
                         .bind_context
-                        .bind_qualified_column(table, column)
+                        .bind_column_ref(names)
                         .map_err(|error| self.lateral_error(names, error))?,
-                    _ => return Err(crate::unported("column references with schema qualification")),
                 };
                 if mode == Some(ColumnMode::SelectList) {
                     self.aggregates.as_mut().unwrap().bound_columns.push(name.clone());
                 }
                 BoundExpr::column_ref(binding, ty, name)
+            }
+            ExprKind::Positional(position) => {
+                let names = self.bind_context.position_to_column(*position)?;
+                let column = Expr::from(ExprKind::ColumnRef(names));
+                return self.bind_expression(&column);
             }
             ExprKind::Comparison { op, left, right } => {
                 let left = self.bind_expression(left)?;
@@ -570,15 +575,12 @@ impl Binder<'_> {
         let state = self.aggregates.as_ref().expect("HAVING binds with a grouping");
         if !state.force_aggregates {
             return Err(binder_error(format!(
-                "column {column} must appear in the GROUP BY clause or be used in an aggregate function"
+                "column {} must appear in the GROUP BY clause or be used in an aggregate function",
+                sql_quoted_identifier(&column)
             )));
         }
         let group_index = state.group_index;
-        let (binding, ty, name) = match names {
-            [column] => self.bind_context.bind_column(column)?,
-            [table, column] => self.bind_context.bind_qualified_column(table, column)?,
-            _ => return Err(crate::unported("column references with schema qualification")),
-        };
+        let (binding, ty, name) = self.bind_context.bind_column_ref(names)?;
         let state = self.aggregates.as_mut().expect("HAVING binds with a grouping");
         let group = state.groups.len();
         state

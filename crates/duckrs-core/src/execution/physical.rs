@@ -13,7 +13,7 @@ use super::expression_executor::{execute, select};
 use crate::catalog::{ColumnDefinition, OnCreateConflict, SchemaCatalogEntry, TableCatalogEntry};
 use crate::function::aggregates::{AggregateState, value_keys};
 use crate::planner::expression::{BoundAggregate, BoundExpr};
-use crate::planner::logical::BoundOrderByNode;
+use crate::planner::logical::{BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID};
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::{NullOrder, OrderModifiers, OrderType, create_sort_keys, sort_collection};
 use duckrs_common::types::LogicalType;
@@ -131,10 +131,22 @@ impl PhysicalOperator for PhysicalTableScan {
         }
         let storage = self.table.storage.read();
         let chunk = storage.chunk(*next);
+        // all chunks but the last are full, so that a row's position gives its id
+        let first_row = (*next * STANDARD_VECTOR_SIZE) as i64;
         *next += 1;
         let count = chunk.len().min(*remaining);
         *remaining -= count;
-        let columns = self.column_ids.iter().map(|&i| chunk.column(i).clone()).collect();
+        let columns = self
+            .column_ids
+            .iter()
+            .map(|&i| {
+                if i == COLUMN_IDENTIFIER_ROW_ID {
+                    Vector::sequence(LogicalType::BIGINT, first_row, 1)
+                } else {
+                    Ok(chunk.column(i).clone())
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut result = DataChunk::from_columns(columns, chunk.len());
         if count < chunk.len() {
             result.slice(&SelectionVector::from_vec((0..count as u32).collect()), count);
