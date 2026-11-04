@@ -23,6 +23,7 @@ use duckrs_common::vector::{DataChunk, SelectionVector, Vector, VectorType};
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast::ComparisonOp;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 fn comparison_type(op: ComparisonOp) -> ComparisonType {
     match op {
@@ -260,18 +261,28 @@ fn execute_case(
     Ok(result)
 }
 
-/// The result of a subquery, which runs the first time something asks. An error stays: TRY runs
-/// a failed chunk again, and the plan is gone by then.
-fn subquery_result(subquery: &BoundSubquery) -> Result<&SubqueryResult> {
-    subquery
-        .result
-        .get_or_init(|| run_subquery(subquery))
-        .as_ref()
-        .map_err(Clone::clone)
+/// The result of a subquery for correlated values with this key, which runs the first time
+/// something asks. An error stays too: TRY runs a failed chunk again.
+fn subquery_result(subquery: &BoundSubquery, key: &[u8], values: &[Value]) -> Arc<Result<SubqueryResult>> {
+    if let Some(result) = subquery.results.lock().get(key) {
+        return result.clone();
+    }
+    let result = Arc::new(run_subquery(subquery, values));
+    subquery.results.lock().insert(key.to_vec(), result.clone());
+    result
 }
 
-fn run_subquery(subquery: &BoundSubquery) -> Result<SubqueryResult> {
-    let plan = subquery.plan.lock().take().expect("a subquery runs once");
+fn run_subquery(subquery: &BoundSubquery, values: &[Value]) -> Result<SubqueryResult> {
+    let mut plan = subquery.plan.clone();
+    if !values.is_empty() {
+        let columns: Vec<_> = subquery
+            .correlated
+            .iter()
+            .copied()
+            .zip(values.iter().cloned())
+            .collect();
+        plan.substitute_columns(&columns);
+    }
     let collector = PhysicalResultCollector::new(create_plan(plan));
     execute_plan(&collector)?;
     let collection = collector.result.into_inner();
@@ -326,59 +337,88 @@ fn any_matches(result: &SubqueryResult, op: ComparisonOp, key: &[u8]) -> Option<
     }
 }
 
+const MULTIPLE_ROWS: &str = "More than one row returned by a subquery used as an expression - scalar subqueries can \
+                             only return a single row.\n\nUse \"SET scalar_subquery_error_on_multiple_rows=false\" to \
+                             revert to previous behavior of returning a random row.";
+
+/// What one row of the query gets from a subquery. `key` is the sort key of ANY's child, and
+/// `None` if that is NULL.
+fn subquery_value(
+    kind: SubqueryKind,
+    result: &SubqueryResult,
+    key: Option<&[u8]>,
+    return_type: &LogicalType,
+) -> Result<Value> {
+    Ok(match kind {
+        SubqueryKind::Scalar => {
+            if result.rows > 1 {
+                return Err(Error::new(ErrorKind::InvalidInput, MULTIPLE_ROWS));
+            }
+            result.first.clone().unwrap_or_else(|| Value::null(return_type.clone()))
+        }
+        SubqueryKind::Exists => Value::boolean(result.rows > 0),
+        // ANY over nothing is false, even for NULL
+        SubqueryKind::Any(_) if result.rows == 0 => Value::boolean(false),
+        SubqueryKind::Any(op) => match key.and_then(|key| any_matches(result, op, key)) {
+            Some(answer) => Value::boolean(answer),
+            None => Value::null(LogicalType::BOOLEAN),
+        },
+    })
+}
+
 /// `PlanSubquery`, for what it computes.
 fn execute_subquery(
     subquery: &BoundSubquery,
     child: Option<&BoundExpr>,
+    correlated: &[BoundExpr],
     return_type: &LogicalType,
     input: &DataChunk,
 ) -> Result<Vector> {
-    let result = subquery_result(subquery)?;
-    match subquery.kind {
-        SubqueryKind::Scalar => {
-            if result.rows > 1 {
-                return Err(Error::new(
-                    ErrorKind::InvalidInput,
-                    "More than one row returned by a subquery used as an expression - scalar subqueries can only \
-                     return a single row.\n\nUse \"SET scalar_subquery_error_on_multiple_rows=false\" to revert to \
-                     previous behavior of returning a random row.",
-                ));
-            }
-            Ok(match &result.first {
-                Some(value) => Vector::constant(value),
-                None => Vector::constant_null(return_type.clone()),
-            })
-        }
-        SubqueryKind::Exists => Ok(Vector::constant(&Value::boolean(result.rows > 0))),
-        SubqueryKind::Any(op) => {
-            let count = input.len();
-            if result.rows == 0 {
-                // ANY over nothing is false, even for NULL
-                return Ok(Vector::constant(&Value::boolean(false)));
-            }
-            let values = execute(child.expect("ANY compares a child"), input)?;
-            let modifiers = OrderModifiers {
-                order: OrderType::Ascending,
-                nulls: NullOrder::NullsLast,
-            };
-            let keys = create_sort_keys(&[(&values, modifiers)], count)?;
-            let u = values.to_unified(count);
-            let mut output = Vector::new(LogicalType::BOOLEAN, count.max(1));
-            output.prepare_flat(count.max(1));
-            for (row, key) in keys.iter().enumerate() {
-                let answer = if u.validity.is_valid(u.sel.get(row)) {
-                    any_matches(result, op, key)
-                } else {
-                    None
-                };
-                match answer {
-                    Some(answer) => output.data_mut::<bool>()[row] = answer,
-                    None => output.set_null(row, true),
-                }
-            }
-            Ok(output)
-        }
+    let count = input.len();
+    let modifiers = OrderModifiers {
+        order: OrderType::Ascending,
+        nulls: NullOrder::NullsLast,
+    };
+    if correlated.is_empty() && child.is_none() {
+        let result = subquery_result(subquery, &[], &[]);
+        let result = result.as_ref().as_ref().map_err(Clone::clone)?;
+        return Ok(Vector::constant(&subquery_value(
+            subquery.kind,
+            result,
+            None,
+            return_type,
+        )?));
     }
+    let columns = correlated
+        .iter()
+        .map(|c| execute(c, input))
+        .collect::<Result<Vec<_>>>()?;
+    let keyed: Vec<_> = columns.iter().map(|c| (c, modifiers)).collect();
+    let row_keys = if keyed.is_empty() {
+        vec![Vec::new(); count]
+    } else {
+        create_sort_keys(&keyed, count)?
+    };
+    let child_values = child.map(|c| execute(c, input)).transpose()?;
+    let child_keys = child_values
+        .as_ref()
+        .map(|values| create_sort_keys(&[(values, modifiers)], count))
+        .transpose()?;
+    let child_format = child_values.as_ref().map(|values| values.to_unified(count));
+    let mut output = Vector::new(return_type.clone(), count.max(1));
+    output.prepare_flat(count.max(1));
+    for (row, key) in row_keys.iter().enumerate() {
+        let values: Vec<Value> = columns.iter().map(|c| c.get_value(row)).collect();
+        let result = subquery_result(subquery, key, &values);
+        let result = result.as_ref().as_ref().map_err(Clone::clone)?;
+        let child_key = match (&child_keys, &child_format) {
+            (Some(keys), Some(format)) if format.validity.is_valid(format.sel.get(row)) => Some(keys[row].as_slice()),
+            _ => None,
+        };
+        let value = subquery_value(subquery.kind, result, child_key, return_type)?;
+        output.set_value(row, &value)?;
+    }
+    Ok(output)
 }
 
 /// `OPERATOR_TRY`: if a chunk fails, each of its rows runs by itself, and those that fail are NULL.
@@ -484,9 +524,11 @@ pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
             Ok(conjunction(&[at_least, at_most], true, count))
         }
         BoundExprKind::Case { checks, else_expr } => execute_case(checks, else_expr, &expr.return_type, input),
-        BoundExprKind::Subquery { subquery, child } => {
-            execute_subquery(subquery, child.as_deref(), &expr.return_type, input)
-        }
+        BoundExprKind::Subquery {
+            subquery,
+            child,
+            correlated,
+        } => execute_subquery(subquery, child.as_deref(), correlated, &expr.return_type, input),
         BoundExprKind::Operator {
             op: BoundOperator::Coalesce,
             children,

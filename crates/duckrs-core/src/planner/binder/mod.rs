@@ -556,8 +556,19 @@ pub struct Binder<'a> {
     pub parameters: Option<Arc<ParameterValues>>,
     /// The CTEs in scope, innermost last.
     ctes: Vec<(String, Arc<ast::CteInfo>)>,
-    /// What the queries around a subquery can see, for telling correlated columns from typos.
+    /// What the queries around a subquery can see, innermost last.
     outer_contexts: Vec<BindContext>,
+    /// The columns of those queries this subquery uses. Binders of the queries inside of it that
+    /// are not subqueries themselves share the list.
+    correlated: Arc<Mutex<Vec<CorrelatedColumn>>>,
+}
+
+/// A column of a query around a subquery (`CorrelatedColumnInfo`).
+#[derive(Debug, Clone)]
+pub struct CorrelatedColumn {
+    pub binding: ColumnBinding,
+    /// what the query around it calls the column
+    pub names: Vec<String>,
 }
 
 impl<'a> Binder<'a> {
@@ -583,6 +594,7 @@ impl<'a> Binder<'a> {
             parameters: None,
             ctes: Vec::new(),
             outer_contexts: Vec::new(),
+            correlated: Arc::default(),
         }
     }
 
@@ -625,6 +637,8 @@ impl<'a> Binder<'a> {
         binder.search_schema = self.search_schema.clone();
         binder.parameters = self.parameters.clone();
         binder.ctes = self.ctes.clone();
+        binder.outer_contexts = self.outer_contexts.clone();
+        binder.correlated = self.correlated.clone();
         binder
     }
 

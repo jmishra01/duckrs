@@ -5,7 +5,7 @@
 //
 //! Binding parsed expressions into [`BoundExpr`]s.
 
-use super::{Binder, ColumnMode, binder_error, schema_of};
+use super::{Binder, ColumnMode, CorrelatedColumn, binder_error, schema_of};
 use crate::catalog::DEFAULT_CATALOG;
 use crate::execution::expression_executor::{evaluate_scalar, try_evaluate_scalar};
 use crate::function::binder::{bind_aggregate_function, bind_scalar_function, expression_return_type};
@@ -28,7 +28,7 @@ use duckrs_parser::ast::{
 };
 use duckrs_parser::transformer::visit_expr_mut;
 use parking_lot::Mutex;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 /// `NumberToValue`: an integer literal is INTEGER, BIGINT, HUGEINT or UHUGEINT if it fits, a
 /// number with a fraction is a DECIMAL as wide as it is written, anything else a DOUBLE.
@@ -400,6 +400,50 @@ impl Binder<'_> {
         }
     }
 
+    /// Whether an aggregate over `function`'s arguments belongs to a query around this one: its
+    /// arguments name columns, and all of them are that query's.
+    fn aggregate_of_outer_query(&self, function: &FunctionExpr) -> bool {
+        let (mut own, mut outer) = (false, false);
+        for argument in &function.args {
+            visit_expr_mut(&mut argument.expr.clone(), &mut |e| {
+                if let ExprKind::ColumnRef(names) = &e.kind {
+                    if self.bind_context.bind_column_ref(names).is_ok() {
+                        own = true;
+                    } else if self.outer_contexts.iter().any(|c| c.bind_column_ref(names).is_ok()) {
+                        outer = true;
+                    }
+                }
+            });
+        }
+        outer && !own
+    }
+
+    /// `Binder::BindCorrelatedColumns`: a column of a query around this one.
+    fn bind_outer_column(&mut self, names: &[String]) -> Option<BoundExpr> {
+        for context in self.outer_contexts.iter().rev() {
+            let Ok((binding, ty, name)) = context.bind_column_ref(names) else {
+                continue;
+            };
+            let alias = context
+                .bindings
+                .iter()
+                .find(|b| b.table_index == binding.table_index)?
+                .alias
+                .clone();
+            let mut correlated = self.correlated.lock();
+            if !correlated.iter().any(|c| c.binding == binding) {
+                correlated.push(CorrelatedColumn {
+                    binding,
+                    names: vec![alias, name.clone()],
+                });
+            }
+            let mut expr = BoundExpr::column_ref(binding, ty, name);
+            expr.kind = BoundExprKind::ColumnRef { binding, depth: 1 };
+            return Some(expr);
+        }
+        None
+    }
+
     /// A name a subquery could not find may be a correlated column, which is a missing feature
     /// and not a mistake in the query.
     fn correlated_error(&self, error: Error) -> Error {
@@ -409,6 +453,7 @@ impl Binder<'_> {
             && [&self.bind_context]
                 .into_iter()
                 .chain(&self.outer_contexts)
+                .chain(&self.left_of_join)
                 .flat_map(|context| &context.bindings)
                 .any(|b| b.alias.eq_ignore_ascii_case(name) || b.column_index(name).is_some());
         if correlated {
@@ -427,12 +472,20 @@ impl Binder<'_> {
         comparison: ComparisonOp,
     ) -> Result<BoundExpr> {
         let mut binder = self.child_binder();
-        binder.outer_contexts = self.outer_contexts.clone();
         binder.outer_contexts.push(self.bind_context.clone());
+        binder.correlated = Arc::default();
         let bound = binder
             .bind_select_statement(subquery)
             .map_err(|error| self.correlated_error(error))?;
         self.next_table_index = binder.next_table_index;
+        // the correlated columns are columns of this query, or of one around it
+        let columns: Vec<CorrelatedColumn> = binder.correlated.lock().clone();
+        let mut correlated = Vec::with_capacity(columns.len());
+        let mut bindings = Vec::with_capacity(columns.len());
+        for column in columns {
+            correlated.push(self.bind_expression(&Expr::from(ExprKind::ColumnRef(column.names)))?);
+            bindings.push(column.binding);
+        }
         let child = child.map(|c| self.bind_expression(c)).transpose()?;
         let columns = bound.types.len();
         let row_width = child
@@ -485,10 +538,12 @@ impl Binder<'_> {
             BoundExprKind::Subquery {
                 subquery: Arc::new(BoundSubquery {
                     kind,
-                    plan: Mutex::new(Some(plan)),
-                    result: OnceLock::new(),
+                    plan,
+                    correlated: bindings,
+                    results: Mutex::default(),
                 }),
                 child,
+                correlated,
             },
             return_type,
         );
@@ -546,6 +601,19 @@ impl Binder<'_> {
                     .as_ref()
                     .filter(|state| !state.inside_aggregate)
                     .map(|state| state.mode);
+                // an ambiguous name is this query's too, and an error
+                let is_own = self
+                    .bind_context
+                    .bind_column_ref(names)
+                    .map_or_else(|error| error.message.starts_with("Ambiguous"), |_| true)
+                    || (names.len() == 1
+                        && self
+                            .alias_fallback
+                            .iter()
+                            .any(|(a, _)| a.eq_ignore_ascii_case(&names[0])));
+                if !is_own && let Some(outer) = self.bind_outer_column(names) {
+                    return Ok(outer);
+                }
                 if mode == Some(ColumnMode::Having) {
                     return self.bind_having_column(names);
                 }
@@ -971,6 +1039,9 @@ impl Binder<'_> {
 
     /// `BaseSelectBinder::BindAggregate`.
     fn bind_aggregate(&mut self, function: &FunctionExpr) -> Result<BoundExpr> {
+        if self.aggregate_of_outer_query(function) {
+            return Err(crate::unported("aggregates of the columns of an outer query"));
+        }
         let Some(state) = self.aggregates.as_mut() else {
             return Err(binder_error(self.aggregate_error));
         };

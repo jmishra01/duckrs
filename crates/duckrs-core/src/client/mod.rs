@@ -2540,12 +2540,84 @@ mod tests {
             "Binder Error: Subquery returns 2 columns - expected 1"
         );
         assert_eq!(
-            err(&mut context, "SELECT (SELECT x + y FROM b) FROM a"),
-            "Not implemented Error: correlated subqueries is not yet ported to duckrs"
-        );
-        assert_eq!(
             err(&mut context, "SELECT (SELECT nope FROM b) FROM a"),
             "Binder Error: Referenced column \"nope\" not found in FROM clause!\nCandidate bindings: \"y\""
+        );
+    }
+
+    #[test]
+    fn correlated_subqueries_match_duckdb() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        let err = |context: &mut ClientContext, sql: &str| context.query(sql).unwrap_err().to_string();
+        run(&mut context, "CREATE TABLE a (x INTEGER, k INTEGER)");
+        run(&mut context, "CREATE TABLE b (y INTEGER, k INTEGER)");
+        run(&mut context, "INSERT INTO a VALUES (1, 1), (2, 1), (3, 2), (NULL, 3)");
+        run(&mut context, "INSERT INTO b VALUES (10, 1), (20, 1), (30, 2)");
+        assert_eq!(
+            run(
+                &mut context,
+                "SELECT x, (SELECT sum(y) FROM b WHERE b.k = a.k) FROM a ORDER BY x NULLS LAST"
+            ),
+            [["1", "30"], ["2", "30"], ["3", "30"], ["NULL", "NULL"]]
+        );
+        assert_eq!(
+            run(
+                &mut context,
+                "SELECT x FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k) ORDER BY x"
+            ),
+            [["1"], ["2"], ["3"]]
+        );
+        assert_eq!(
+            run(
+                &mut context,
+                "SELECT x FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k)"
+            ),
+            [["NULL"]]
+        );
+        assert_eq!(
+            run(
+                &mut context,
+                "SELECT x FROM a WHERE x * 10 IN (SELECT y FROM b WHERE b.k = a.k) ORDER BY x"
+            ),
+            [["1"], ["2"], ["3"]]
+        );
+        assert_eq!(
+            run(
+                &mut context,
+                "SELECT x FROM a WHERE x * 10 < ALL (SELECT y FROM b WHERE b.k = a.k) ORDER BY x"
+            ),
+            // ALL over no rows holds, even for NULL
+            [["NULL"]]
+        );
+        // two levels: the innermost query reads the outermost one
+        assert_eq!(
+            run(
+                &mut context,
+                "SELECT x, (SELECT (SELECT max(y) FROM b WHERE b.k = a.k AND b.y > c.y) FROM b AS c WHERE c.y = 10) \
+                 FROM a WHERE x = 1"
+            ),
+            [["1", "20"]]
+        );
+        // a correlated column in a query in FROM, and in a set operation
+        assert_eq!(
+            run(
+                &mut context,
+                "SELECT x, (SELECT count(*) FROM (SELECT y FROM b WHERE b.k = a.k UNION ALL SELECT a.x)) FROM a \
+                 WHERE x = 3"
+            ),
+            [["3", "2"]]
+        );
+        // grouped: the correlated column must be a group
+        assert_eq!(
+            run(
+                &mut context,
+                "SELECT k, (SELECT count(*) FROM b WHERE b.k = a.k) FROM a GROUP BY k ORDER BY k"
+            ),
+            [["1", "2"], ["2", "1"], ["3", "0"]]
+        );
+        assert_eq!(
+            err(&mut context, "SELECT (SELECT sum(a.x)) FROM a"),
+            "Not implemented Error: aggregates of the columns of an outer query is not yet ported to duckrs"
         );
     }
 

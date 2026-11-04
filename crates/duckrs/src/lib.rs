@@ -109,9 +109,7 @@ mod tests {
         assert_eq!(result.value(0, 0), Value::integer(2));
         let result = con.query("SELECT * FROM t WHERE i IN (SELECT i FROM t)").unwrap();
         assert_eq!(result.row_count(), 2);
-        let err = con
-            .query("SELECT * FROM t AS o WHERE EXISTS (SELECT 1 FROM t WHERE t.i = o.i)")
-            .unwrap_err();
+        let err = con.query("SELECT row_number() OVER () FROM t").unwrap_err();
         assert_eq!(err.kind, ErrorKind::NotImplemented);
     }
 }

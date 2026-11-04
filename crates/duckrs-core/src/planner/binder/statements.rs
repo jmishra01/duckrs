@@ -900,7 +900,11 @@ impl Binder<'_> {
     /// `Binder::BindLimitValue` for constant values: NULL means no limit (or no offset).
     fn bind_limit_value(&mut self, expr: &Expr, is_offset: bool) -> Result<Option<u64>> {
         let mut binder = self.child_binder();
+        binder.correlated = Arc::default();
         let bound = binder.bind_expression(expr)?;
+        if !binder.correlated.lock().is_empty() {
+            return Err(binder_error("Correlated columns not supported in LIMIT/OFFSET"));
+        }
         if !bound.is_foldable() {
             return Err(not_implemented(
                 "LIMIT and OFFSET with expressions that are not constant",
@@ -1311,6 +1315,7 @@ impl Binder<'_> {
         }
         let mut binder = self.child_binder();
         binder.ctes.clear();
+        binder.outer_contexts.clear();
         binder.bound_views.push(view.clone());
         binder.search_schema = Some(view.schema.clone());
         let bound = binder.bind_select_statement(&view.query)?;

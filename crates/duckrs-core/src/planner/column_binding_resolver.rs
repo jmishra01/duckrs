@@ -31,7 +31,8 @@ pub fn resolve_column_bindings(op: &mut LogicalOperator) -> Result<()> {
 fn resolve_expression(expr: &mut BoundExpr, bindings: &[ColumnBinding]) -> Result<()> {
     let mut result = Ok(());
     expr.walk_mut(&mut |e| {
-        if let BoundExprKind::ColumnRef { binding, .. } = &e.kind {
+        // a correlated column gets its value when the subquery runs
+        if let BoundExprKind::ColumnRef { binding, depth: 0 } = &e.kind {
             match bindings.iter().position(|b| b == binding) {
                 Some(index) => e.kind = BoundExprKind::Reference(index),
                 None if result.is_ok() => {

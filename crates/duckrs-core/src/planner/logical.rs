@@ -8,13 +8,14 @@ use super::expression::{BoundAggregate, BoundExpr, ColumnBinding};
 use crate::catalog::{ColumnDefinition, OnCreateConflict, SchemaCatalogEntry, TableCatalogEntry};
 use duckrs_common::sort_key::OrderModifiers;
 use duckrs_common::types::LogicalType;
+use duckrs_common::value::Value;
 use duckrs_parser::ast::JoinType;
 use std::sync::Arc;
 
 /// The `column_ids` entry of a scan for the `rowid` pseudo-column (`COLUMN_IDENTIFIER_ROW_ID`).
 pub const COLUMN_IDENTIFIER_ROW_ID: usize = usize::MAX;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum LogicalOperatorKind {
     /// `LogicalGet` of a table: scans `column_ids` (indexes into the table's columns).
     Get {
@@ -131,13 +132,29 @@ pub struct BoundOrderByNode {
     pub expr: BoundExpr,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LogicalOperator {
     pub kind: LogicalOperatorKind,
     pub children: Vec<LogicalOperator>,
 }
 
 impl LogicalOperator {
+    /// Replaces the correlated columns of `columns`, here and in the operators below.
+    pub fn substitute_columns(&mut self, columns: &[(ColumnBinding, Value)]) {
+        for child in &mut self.children {
+            child.substitute_columns(columns);
+        }
+        for expr in self.expressions_mut() {
+            expr.substitute_columns(columns);
+        }
+        if let LogicalOperatorKind::Join { conditions, .. } = &mut self.kind {
+            for condition in conditions {
+                condition.left.substitute_columns(columns);
+                condition.right.substitute_columns(columns);
+            }
+        }
+    }
+
     pub fn new(kind: LogicalOperatorKind, children: Vec<LogicalOperator>) -> Self {
         Self { kind, children }
     }

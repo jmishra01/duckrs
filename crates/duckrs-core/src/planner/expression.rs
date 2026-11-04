@@ -15,9 +15,9 @@ use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
 use duckrs_parser::ast::ComparisonOp;
 use parking_lot::Mutex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 /// A column of a logical operator's output (`ColumnBinding`): which table index produced it,
 /// and its position there.
@@ -65,13 +65,18 @@ pub enum SubqueryKind {
     Any(ComparisonOp),
 }
 
-/// An uncorrelated subquery (`BoundSubqueryExpression`). DuckDB plans it into the query with a
-/// join. Here it runs once, the first time an expression needs it.
+/// A subquery (`BoundSubqueryExpression`). DuckDB plans it into the query with a join, which
+/// for a correlated one takes flattening it. Here it stays a plan of its own, which runs once
+/// for each combination of values of its correlated columns, with them as constants.
 #[derive(Debug)]
 pub struct BoundSubquery {
     pub kind: SubqueryKind,
-    pub plan: Mutex<Option<LogicalOperator>>,
-    pub result: OnceLock<Result<SubqueryResult>>,
+    /// has its column bindings resolved; correlated columns stay
+    pub plan: LogicalOperator,
+    /// the correlated columns, as the plan refers to them
+    pub correlated: Vec<ColumnBinding>,
+    /// what ran so far, by the sort keys of the correlated values
+    pub results: Mutex<HashMap<Vec<u8>, Arc<Result<SubqueryResult>>>>,
 }
 
 /// The rows of a subquery that ran.
@@ -135,10 +140,12 @@ pub enum BoundExprKind {
         sequence: Arc<SequenceCatalogEntry>,
         arguments: Vec<BoundExpr>,
     },
-    /// A subquery; `child` is what ANY compares with its rows.
+    /// A subquery; `child` is what ANY compares with its rows, and `correlated` the values of
+    /// `subquery.correlated` for a row of this query.
     Subquery {
         subquery: Arc<BoundSubquery>,
         child: Option<Box<BoundExpr>>,
+        correlated: Vec<BoundExpr>,
     },
     /// `BoundFunctionExpression` of a scalar function; the children have its argument types.
     Function {
@@ -202,7 +209,7 @@ impl BoundExpr {
         match &self.kind {
             BoundExprKind::Constant(_) | BoundExprKind::ColumnRef { .. } | BoundExprKind::Reference(_) => Vec::new(),
             BoundExprKind::Cast { child, .. } => vec![child],
-            BoundExprKind::Subquery { child, .. } => child.iter().map(|c| &**c).collect(),
+            BoundExprKind::Subquery { child, correlated, .. } => child.iter().map(|c| &**c).chain(correlated).collect(),
             BoundExprKind::Comparison { left, right, .. } => vec![left, right],
             BoundExprKind::Between { input, lower, upper } => vec![input, lower, upper],
             BoundExprKind::Case { checks, else_expr } => {
@@ -223,7 +230,9 @@ impl BoundExpr {
         match &mut self.kind {
             BoundExprKind::Constant(_) | BoundExprKind::ColumnRef { .. } | BoundExprKind::Reference(_) => Vec::new(),
             BoundExprKind::Cast { child, .. } => vec![child],
-            BoundExprKind::Subquery { child, .. } => child.iter_mut().map(|c| &mut **c).collect(),
+            BoundExprKind::Subquery { child, correlated, .. } => {
+                child.iter_mut().map(|c| &mut **c).chain(correlated).collect()
+            }
             BoundExprKind::Comparison { left, right, .. } => vec![left, right],
             BoundExprKind::Between { input, lower, upper } => vec![input, lower, upper],
             BoundExprKind::Case { checks, else_expr } => {
@@ -250,6 +259,30 @@ impl BoundExpr {
             | BoundExprKind::Subquery { .. } => false,
             _ => self.children().into_iter().all(BoundExpr::is_foldable),
         }
+    }
+
+    /// Replaces the correlated columns of `columns` with their values, also in subqueries.
+    pub fn substitute_columns(&mut self, columns: &[(ColumnBinding, Value)]) {
+        self.walk_mut(&mut |e| match &mut e.kind {
+            BoundExprKind::ColumnRef { binding, depth } if *depth > 0 => {
+                if let Some((_, value)) = columns.iter().find(|(b, _)| b == binding) {
+                    e.kind = BoundExprKind::Constant(value.clone());
+                }
+            }
+            BoundExprKind::Subquery { subquery, .. }
+                if subquery.correlated.iter().any(|c| columns.iter().any(|(b, _)| b == c)) =>
+            {
+                let mut plan = subquery.plan.clone();
+                plan.substitute_columns(columns);
+                *subquery = Arc::new(BoundSubquery {
+                    kind: subquery.kind,
+                    plan,
+                    correlated: subquery.correlated.clone(),
+                    results: Mutex::default(),
+                });
+            }
+            _ => {}
+        });
     }
 
     /// Visits this expression and all its descendants, parents first.
