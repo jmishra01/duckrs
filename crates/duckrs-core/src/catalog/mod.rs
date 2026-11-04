@@ -1,6 +1,6 @@
 // Ported from duckdb/src/catalog/{catalog,catalog_set}.cpp,
-// duckdb/src/catalog/catalog_entry/{duck_schema_entry,sequence_catalog_entry,table_catalog_entry,
-// view_catalog_entry}.cpp and
+// duckdb/src/catalog/catalog_entry/{duck_schema_entry,macro_catalog_entry,sequence_catalog_entry,
+// table_catalog_entry,view_catalog_entry}.cpp and
 // duckdb/src/common/exception/catalog_exception.cpp @ rust-port-baseline
 //
 //! The catalog: schemas with their tables and views, in memory. Names are case-insensitive and keep the
@@ -11,7 +11,7 @@ use crate::planner::expression::BoundExpr;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::types::LogicalType;
 use duckrs_common::{Error, ErrorKind, Result};
-use duckrs_parser::ast::SelectStatement;
+use duckrs_parser::ast::{MacroFunction, SelectStatement, sql_quoted_identifier};
 use parking_lot::{Mutex, RwLock};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -71,6 +71,30 @@ pub struct ViewCatalogEntry {
     pub query: SelectStatement,
     /// the names listed in `CREATE VIEW v (a, b)`
     pub aliases: Vec<String>,
+}
+
+/// A macro with its overloads (`ScalarMacroCatalogEntry`, `TableMacroCatalogEntry`).
+#[derive(Debug)]
+pub struct MacroCatalogEntry {
+    pub name: String,
+    pub table_macro: bool,
+    pub macros: Vec<MacroFunction>,
+}
+
+impl MacroCatalogEntry {
+    /// `CatalogTypeToString`.
+    pub fn type_name(&self) -> &'static str {
+        macro_type_name(self.table_macro)
+    }
+}
+
+/// `CatalogTypeToString` of a macro entry.
+pub fn macro_type_name(table_macro: bool) -> &'static str {
+    if table_macro {
+        "Table Macro Function"
+    } else {
+        "Macro Function"
+    }
 }
 
 /// The state of a sequence (`SequenceData`).
@@ -138,7 +162,10 @@ impl SequenceCatalogEntry {
                 };
                 return Err(Error::new(
                     ErrorKind::Sequence,
-                    format!("nextval: reached {bound} value of sequence {} ({value})", self.name),
+                    format!(
+                        "nextval: reached {bound} value of sequence {} ({value})",
+                        sql_quoted_identifier(&self.name)
+                    ),
                 ));
             }
             counter
@@ -157,7 +184,9 @@ impl SequenceCatalogEntry {
                     ErrorKind::Sequence,
                     format!(
                         "setval: value {value} is out of bounds for sequence {} ({}..{})",
-                        self.name, data.min_value, data.max_value
+                        sql_quoted_identifier(&self.name),
+                        data.min_value,
+                        data.max_value
                     ),
                 ));
             }
@@ -202,6 +231,8 @@ pub struct SchemaCatalogEntry {
     pub name: String,
     tables: RwLock<BTreeMap<String, TableOrView>>,
     sequences: RwLock<BTreeMap<String, Arc<SequenceCatalogEntry>>>,
+    /// the scalar macros and the table macros, which can share a name
+    macros: [RwLock<BTreeMap<String, Arc<MacroCatalogEntry>>>; 2],
 }
 
 /// What to do when an entry being created already exists (`OnCreateConflict`).
@@ -222,6 +253,7 @@ impl SchemaCatalogEntry {
             name: name.to_string(),
             tables: RwLock::new(BTreeMap::new()),
             sequences: RwLock::new(BTreeMap::new()),
+            macros: [RwLock::new(BTreeMap::new()), RwLock::new(BTreeMap::new())],
         }
     }
 
@@ -250,7 +282,8 @@ impl SchemaCatalogEntry {
             OnCreateConflict::Replace if existing.type_name() != type_name => Err(Error::new(
                 ErrorKind::Catalog,
                 format!(
-                    "Existing object {name} is of type {}, trying to replace with type {type_name}",
+                    "Existing object {} is of type {}, trying to replace with type {type_name}",
+                    sql_quoted_identifier(name),
                     existing.type_name()
                 ),
             )),
@@ -311,7 +344,8 @@ impl SchemaCatalogEntry {
             return Err(Error::new(
                 ErrorKind::Catalog,
                 format!(
-                    "Existing object {name} is of type {}, trying to drop type {type_name}",
+                    "Existing object {} is of type {}, trying to drop type {type_name}",
+                    sql_quoted_identifier(name),
                     existing.type_name()
                 ),
             ));
@@ -352,14 +386,63 @@ impl SchemaCatalogEntry {
         self.sequences.write().remove(&key(name)).is_some()
     }
 
+    pub fn get_macro(&self, name: &str, table_macro: bool) -> Option<Arc<MacroCatalogEntry>> {
+        self.macros[usize::from(table_macro)].read().get(&key(name)).cloned()
+    }
+
+    /// `DuckSchemaEntry::CreateFunction` for a macro.
+    pub fn create_macro(
+        &self,
+        name: &str,
+        table_macro: bool,
+        macros: Vec<MacroFunction>,
+        on_conflict: OnCreateConflict,
+    ) -> Result<()> {
+        let mut entries = self.macros[usize::from(table_macro)].write();
+        if entries.contains_key(&key(name)) {
+            match on_conflict {
+                OnCreateConflict::Error => {
+                    return Err(Error::new(
+                        ErrorKind::Catalog,
+                        format!("{} with name \"{name}\" already exists!", macro_type_name(table_macro)),
+                    ));
+                }
+                OnCreateConflict::Ignore => return Ok(()),
+                OnCreateConflict::Replace => {}
+            }
+        }
+        let entry = MacroCatalogEntry {
+            name: name.to_string(),
+            table_macro,
+            macros,
+        };
+        entries.insert(key(name), Arc::new(entry));
+        Ok(())
+    }
+
+    /// Drops a macro of this kind: whether there was one to drop.
+    pub fn drop_macro(&self, name: &str, table_macro: bool) -> bool {
+        self.macros[usize::from(table_macro)]
+            .write()
+            .remove(&key(name))
+            .is_some()
+    }
+
     /// The type and name of each entry, for "depends on" messages.
     fn entries(&self) -> Vec<(String, String)> {
         let tables = self.tables.read();
         let sequences = self.sequences.read();
+        let (scalar_macros, table_macros) = (self.macros[0].read(), self.macros[1].read());
         tables
             .values()
             .map(|e| (e.type_name().to_lowercase(), e.name().to_string()))
             .chain(sequences.values().map(|s| ("sequence".to_string(), s.name.clone())))
+            .chain(
+                scalar_macros
+                    .values()
+                    .chain(table_macros.values())
+                    .map(|m| (m.type_name().to_lowercase(), m.name.clone())),
+            )
             .collect()
     }
 }
@@ -465,6 +548,23 @@ impl Catalog {
                 .find_map(|schema| self.get_schema(schema)?.get_sequence(name)),
         };
         entry.ok_or_else(|| missing_entry("Sequence", name))
+    }
+
+    /// `Catalog::GetEntry` for a macro, with the lookup of [`Self::get_entry`].
+    pub fn get_macro(
+        &self,
+        schema: Option<&str>,
+        search_first: Option<&str>,
+        name: &str,
+        table_macro: bool,
+    ) -> Result<Option<Arc<MacroCatalogEntry>>> {
+        Ok(match schema {
+            Some(schema) => self.schema_for(Some(schema))?.get_macro(name, table_macro),
+            None => search_first
+                .iter()
+                .chain([&DEFAULT_SCHEMA])
+                .find_map(|schema| self.get_schema(schema)?.get_macro(name, table_macro)),
+        })
     }
 
     /// `Catalog::GetEntry` for a table: a view by that name is an error.

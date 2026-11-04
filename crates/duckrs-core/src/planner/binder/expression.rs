@@ -252,6 +252,11 @@ impl Binder<'_> {
         if let Some(group) = self.try_bind_group(expr) {
             return Ok(group);
         }
+        if let ExprKind::Function(function) = &expr.kind
+            && let Some(entry) = self.find_macro(&function.name, false)?
+        {
+            return self.bind_macro(function, &entry);
+        }
         let bound = match &expr.kind {
             ExprKind::Constant(literal) => BoundExpr::constant(literal_to_value(literal)?),
             ExprKind::ColumnRef(names) => {
@@ -368,7 +373,7 @@ impl Binder<'_> {
                 )
             }
             ExprKind::Function(function)
-                if function.name.qualification.is_empty()
+                if builtin_qualification(&function.name.qualification)
                     && BuiltinFunctions::get().aggregate(&function.name.name).is_some() =>
             {
                 self.bind_aggregate(function)?
@@ -377,7 +382,7 @@ impl Binder<'_> {
                 if function.filter.is_some() || !function.order_by.is_empty() || function.distinct {
                     return Err(crate::unported("aggregate modifiers"));
                 }
-                if !function.name.qualification.is_empty() {
+                if !builtin_qualification(&function.name.qualification) {
                     return Err(crate::unported("qualified function names"));
                 }
                 if function.args.iter().any(|a| !a.name.is_empty()) {
@@ -405,6 +410,20 @@ impl Binder<'_> {
             }
         };
         Ok(bound)
+    }
+}
+
+/// Whether a function's qualification can name a built-in function, which live in the `main`
+/// schema of the system catalog.
+fn builtin_qualification(qualification: &[String]) -> bool {
+    match qualification {
+        [] => true,
+        [schema] => schema.eq_ignore_ascii_case("main") || schema.eq_ignore_ascii_case("pg_catalog"),
+        [catalog, schema] => {
+            (catalog.eq_ignore_ascii_case("system") || catalog.eq_ignore_ascii_case(DEFAULT_CATALOG))
+                && (schema.eq_ignore_ascii_case("main") || schema.eq_ignore_ascii_case("pg_catalog"))
+        }
+        _ => false,
     }
 }
 

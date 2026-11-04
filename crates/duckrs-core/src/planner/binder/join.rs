@@ -13,7 +13,9 @@ use crate::planner::logical::{JoinCondition, LogicalOperator, LogicalOperatorKin
 use duckrs_common::Result;
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
-use duckrs_parser::ast::{ComparisonOp, Expr, ExprKind, JoinRef, JoinRefType, JoinType, TableRef};
+use duckrs_parser::ast::{
+    ComparisonOp, Expr, ExprKind, JoinRef, JoinRefType, JoinType, TableRef, sql_quoted_identifier,
+};
 use std::collections::HashSet;
 
 /// `Binder::TryFindBinding`: the one binding of `context` with this column.
@@ -41,9 +43,12 @@ fn using_binding(
 ) -> Result<Option<String>> {
     match set {
         Some(set) => Ok(set.primary.clone()),
-        None => try_find_binding(context, column, side)?
-            .map(Some)
-            .ok_or_else(|| binder_error(format!("Column {column} does not exist on {side} side of join!"))),
+        None => try_find_binding(context, column, side)?.map(Some).ok_or_else(|| {
+            binder_error(format!(
+                "Column {} does not exist on {side} side of join!",
+                sql_quoted_identifier(column)
+            ))
+        }),
     }
 }
 

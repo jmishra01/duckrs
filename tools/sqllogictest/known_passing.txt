@@ -41,6 +41,7 @@ test/issues/general/test_21160.test
 test/issues/general/test_21832.test
 test/issues/general/test_24542.test
 test/issues/general/test_3140.test
+test/issues/general/test_9738.test
 test/issues/monetdb/test_boolean_not.test
 test/issues/monetdb/test_null_matches_outer.test
 test/issues/monetdb/test_outerjoin_project.test
@@ -172,6 +173,7 @@ test/sql/function/numeric/test_modulo_min_by_minus_one.test
 test/sql/function/numeric/test_type_resolution.test
 test/sql/function/operator/test_arithmetic.test
 test/sql/function/operator/test_comparison.test
+test/sql/function/operator/test_conjunction_nulls.test
 test/sql/function/operator/test_division_overflow.test
 test/sql/function/operator/test_in_empty_table.test
 test/sql/generated_columns/stored/basic.test
@@ -238,6 +240,7 @@ test/sql/parallelism/interquery/concurrent_appends.test
 test/sql/parallelism/intraquery/test_verify_parallelism.test
 test/sql/parallelism/modify_thread_settings.test
 test/sql/parser/bare_column_alias_keywords.test
+test/sql/parser/create_macro_tostring.test
 test/sql/parser/division_operator_precedence.test
 test/sql/parser/dollar_quotes_internal_issue2224.test
 test/sql/parser/empty_quoted_identifier.test

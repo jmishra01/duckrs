@@ -3438,6 +3438,53 @@ pub fn visit_expr_mut(expr: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
     }
 }
 
+/// Calls `f` on every expression of a SELECT, like [`visit_expr_mut`]
+/// (`ParsedExpressionIterator::EnumerateQueryNodeChildren`).
+pub fn visit_query_node_exprs_mut(node: &mut QueryNode, f: &mut impl FnMut(&mut Expr)) {
+    if let QueryNodeKind::Select(select) = &mut node.kind {
+        select.select_list.iter_mut().for_each(|e| visit_expr_mut(e, f));
+        visit_table_ref_exprs_mut(&mut select.from_table, f);
+        for clause in [&mut select.where_clause, &mut select.having, &mut select.qualify]
+            .into_iter()
+            .flatten()
+        {
+            visit_expr_mut(clause, f);
+        }
+        select
+            .groups
+            .group_expressions
+            .iter_mut()
+            .for_each(|e| visit_expr_mut(e, f));
+    }
+    for modifier in &mut node.modifiers {
+        match modifier {
+            ResultModifier::Order(nodes) => nodes.iter_mut().for_each(|n| visit_expr_mut(&mut n.expr, f)),
+            ResultModifier::Limit { limit, offset, .. } => {
+                for e in [limit, offset].into_iter().flatten() {
+                    visit_expr_mut(e, f);
+                }
+            }
+            ResultModifier::Distinct(targets) => targets.iter_mut().for_each(|e| visit_expr_mut(e, f)),
+        }
+    }
+}
+
+fn visit_table_ref_exprs_mut(table_ref: &mut TableRef, f: &mut impl FnMut(&mut Expr)) {
+    match &mut table_ref.kind {
+        TableRefKind::Join(join) => {
+            visit_table_ref_exprs_mut(&mut join.left, f);
+            visit_table_ref_exprs_mut(&mut join.right, f);
+            if let Some(condition) = &mut join.condition {
+                visit_expr_mut(condition, f);
+            }
+        }
+        TableRefKind::Subquery(select) => visit_query_node_exprs_mut(&mut select.node, f),
+        TableRefKind::TableFunction { function, .. } => visit_expr_mut(function, f),
+        TableRefKind::ExpressionList(rows) => rows.iter_mut().flatten().for_each(|e| visit_expr_mut(e, f)),
+        _ => {}
+    }
+}
+
 /// `ToRecursiveCTE`: a UNION in a recursive CTE becomes a recursive CTE node.
 fn to_recursive_cte(node: QueryNode, name: &str, aliases: &[String], key_targets: &[Expr]) -> Result<QueryNode> {
     let QueryNode {

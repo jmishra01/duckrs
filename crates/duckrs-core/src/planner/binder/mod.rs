@@ -5,13 +5,14 @@
 
 mod expression;
 mod join;
+mod macros;
 mod statements;
 
 pub use statements::schema_of;
 
 use super::expression::{BoundAggregate, BoundExpr, ColumnBinding};
 use super::logical::LogicalOperator;
-use crate::catalog::{Catalog, ViewCatalogEntry};
+use crate::catalog::{Catalog, MacroCatalogEntry, ViewCatalogEntry};
 use duckrs_common::sort_key::{NullOrder, OrderModifiers, OrderType};
 use duckrs_common::string_util::{candidates_message, similarity_rating, top_n_strings};
 use duckrs_common::types::LogicalType;
@@ -401,6 +402,10 @@ pub struct Binder<'a> {
     /// The schema unqualified tables are looked up in before the default one: the schema of the
     /// view being bound (`GetSearchPath`).
     search_schema: Option<String>,
+    /// The table macros being bound, innermost last (`bound_macros`).
+    bound_macros: Vec<Arc<MacroCatalogEntry>>,
+    /// How many scalar macros the expression being bound is nested in.
+    macro_depth: usize,
 }
 
 impl<'a> Binder<'a> {
@@ -421,6 +426,8 @@ impl<'a> Binder<'a> {
             left_of_join: Vec::new(),
             bound_views: Vec::new(),
             search_schema: None,
+            bound_macros: Vec::new(),
+            macro_depth: 0,
         }
     }
 

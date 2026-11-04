@@ -9,6 +9,11 @@ use std::collections::BTreeSet;
 use std::fmt::{self, Display, Formatter, Write};
 
 /// `SQLIdentifier`: an identifier, double-quoted when it would not read back as itself.
+/// `SQLQuotedIdentifier::ToString`: always quoted, which is how `Identifier`s print in messages.
+pub fn sql_quoted_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 pub fn sql_identifier(text: &str) -> String {
     let b = text.as_bytes();
     let ambiguous_after_dot = b.len() > 1 && b[0] == b'_' && b[1].is_ascii_digit();

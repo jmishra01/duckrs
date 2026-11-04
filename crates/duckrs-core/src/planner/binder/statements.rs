@@ -26,7 +26,7 @@ use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast::{
     Constraint, CreateTableInfo, Expr, ExprKind, InsertStatement, InsertValues, Literal, LiteralKind,
     OnCreateConflict as AstConflict, OrderByNode, QualifiedName, QueryNodeKind, ResultModifier, SelectNode,
-    SelectStatement, TableRef, TableRefKind, values_list,
+    SelectStatement, TableRef, TableRefKind, sql_quoted_identifier, values_list,
 };
 use duckrs_parser::transformer::visit_expr_mut;
 use std::sync::Arc;
@@ -872,6 +872,11 @@ impl Binder<'_> {
                 if *with_ordinality {
                     return Err(not_implemented("WITH ORDINALITY"));
                 }
+                if let ExprKind::Function(call) = &function.kind
+                    && let Some(entry) = self.find_macro(&call.name, true)?
+                {
+                    return self.bind_table_macro(table_ref, call, entry);
+                }
                 self.bind_range(function, table_ref)
             }
             _ => Err(not_implemented("this kind of table reference")),
@@ -879,7 +884,7 @@ impl Binder<'_> {
     }
 
     /// `BindContext::AddSubquery`: makes the columns of a bound query visible under `alias`.
-    fn add_query_binding(
+    pub(super) fn add_query_binding(
         &mut self,
         alias: String,
         bound: BoundStatement,
@@ -903,7 +908,7 @@ impl Binder<'_> {
         if self.bound_views.iter().any(|bound| Arc::ptr_eq(bound, &view)) {
             return Err(binder_error(format!(
                 "infinite recursion detected: attempting to recursively bind view {}",
-                view.name
+                sql_quoted_identifier(&view.name)
             )));
         }
         // the aliases of the reference override the ones of the view

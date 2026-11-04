@@ -7,7 +7,9 @@
 pub mod settings;
 mod settings_table;
 
-use crate::catalog::{Catalog, DEFAULT_CATALOG, OnCreateConflict, SequenceData, TableOrView, missing_entry};
+use crate::catalog::{
+    Catalog, DEFAULT_CATALOG, OnCreateConflict, SequenceData, TableOrView, macro_type_name, missing_entry,
+};
 use crate::execution::expression_executor::evaluate_scalar;
 use crate::execution::physical::PhysicalResultCollector;
 use crate::execution::{create_plan, execute_plan};
@@ -184,6 +186,10 @@ impl ClientContext {
                 }
                 return Err(crate::unported(format!("PRAGMA {name}")));
             }
+            Statement::Create(info) if matches!(info.kind, CreateKind::Macro { .. }) => {
+                self.create_macro(info)?;
+                return Ok(Self::success());
+            }
             Statement::Create(info) if matches!(info.kind, CreateKind::Sequence { .. }) => {
                 self.create_sequence(info)?;
                 return Ok(Self::success());
@@ -297,6 +303,29 @@ impl ClientContext {
         schema.create_view(&info.name.name, (**query).clone(), aliases.clone(), on_conflict)
     }
 
+    /// `CREATE MACRO` (`Binder::BindCreateFunctionInfo` + `DuckSchemaEntry::CreateFunction`).
+    fn create_macro(&mut self, info: &CreateInfo) -> Result<()> {
+        let CreateKind::Macro { table_macro, macros } = &info.kind else {
+            unreachable!("checked by the caller");
+        };
+        if info.temporary {
+            return Err(crate::unported("CREATE TEMPORARY MACRO"));
+        }
+        if self.setting_text("enable_macro_dependencies") == "true" {
+            return Err(crate::unported("macro dependencies"));
+        }
+        let catalog = &self.db.catalog;
+        let schema = catalog.schema_for(schema_of(&info.name)?)?;
+        let mut binder = Binder::with_options(catalog, self.bind_options());
+        binder.bind_create_macro(&info.name.name, macros, *table_macro, &schema.name)?;
+        schema.create_macro(
+            &info.name.name,
+            *table_macro,
+            macros.clone(),
+            on_create_conflict(info.on_conflict),
+        )
+    }
+
     /// `CREATE SEQUENCE`.
     fn create_sequence(&mut self, info: &CreateInfo) -> Result<()> {
         let CreateKind::Sequence {
@@ -324,7 +353,7 @@ impl ClientContext {
         schema.create_sequence(&info.name.name, data, on_create_conflict(info.on_conflict))
     }
 
-    /// `DROP TABLE`, `DROP VIEW`, `DROP SEQUENCE` and `DROP SCHEMA` (`Catalog::DropEntry`).
+    /// `DROP TABLE`, `VIEW`, `SEQUENCE`, `MACRO` and `SCHEMA` (`Catalog::DropEntry`).
     fn drop_entry(&mut self, info: &DropInfo) -> Result<()> {
         let catalog = &self.db.catalog;
         match info.entry_type {
@@ -338,6 +367,23 @@ impl ClientContext {
                 };
                 if !dropped && !info.if_exists {
                     return Err(missing_entry(type_name, &info.name.name));
+                }
+                Ok(())
+            }
+            kind @ ("MACRO" | "MACRO TABLE") => {
+                let table_macro = kind == "MACRO TABLE";
+                let schema = schema_of(&info.name).map_err(|_| crate::unported("this form of DROP MACRO"))?;
+                let dropped = match catalog.schema_for(schema) {
+                    // DROP MACRO also drops a table macro, if there is no scalar one
+                    Ok(schema) => {
+                        schema.drop_macro(&info.name.name, table_macro)
+                            || (!table_macro && schema.drop_macro(&info.name.name, true))
+                    }
+                    Err(_) if info.if_exists => false,
+                    Err(error) => return Err(error),
+                };
+                if !dropped && !info.if_exists {
+                    return Err(missing_entry(macro_type_name(table_macro), &info.name.name));
                 }
                 Ok(())
             }
@@ -565,7 +611,7 @@ mod tests {
         let message = error(&mut c, "SELECT * FROM (l JOIN r ON t.k = l.k) JOIN t ON true");
         assert!(message.contains("Referenced table \"t\" not found"), "{message}");
         let message = error(&mut c, "SELECT * FROM l JOIN r USING (x)");
-        assert_eq!(message, "Column x does not exist on left side of join!");
+        assert_eq!(message, "Column \"x\" does not exist on left side of join!");
         let message = error(&mut c, "SELECT * FROM l NATURAL JOIN (SELECT 1 AS z) u");
         assert!(
             message.starts_with("No columns found to join on in NATURAL JOIN."),
@@ -690,15 +736,15 @@ mod tests {
         );
         assert_eq!(
             error(&mut c, "CREATE OR REPLACE VIEW l AS SELECT 1"),
-            "Catalog Error: Existing object l is of type Table, trying to replace with type View"
+            "Catalog Error: Existing object \"l\" is of type Table, trying to replace with type View"
         );
         assert_eq!(
             error(&mut c, "DROP TABLE v"),
-            "Catalog Error: Existing object v is of type View, trying to drop type Table"
+            "Catalog Error: Existing object \"v\" is of type View, trying to drop type Table"
         );
         assert_eq!(
             error(&mut c, "DROP VIEW l"),
-            "Catalog Error: Existing object l is of type Table, trying to drop type View"
+            "Catalog Error: Existing object \"l\" is of type Table, trying to drop type View"
         );
         assert_eq!(
             error(&mut c, "INSERT INTO v VALUES (1, 'a')"),
@@ -766,7 +812,7 @@ mod tests {
         run(&mut c, "SELECT nextval('b'), nextval('b')");
         assert_eq!(
             error(&mut c, "SELECT nextval('b')"),
-            "Sequence Error: nextval: reached maximum value of sequence b (2)"
+            "Sequence Error: nextval: reached maximum value of sequence \"b\" (2)"
         );
         run(&mut c, "CREATE SEQUENCE r INCREMENT BY -1 MINVALUE 1 MAXVALUE 2 CYCLE");
         assert_eq!(
@@ -775,7 +821,7 @@ mod tests {
         );
         assert_eq!(
             error(&mut c, "SELECT setval('b', 9)"),
-            "Sequence Error: setval: value 9 is out of bounds for sequence b (1..2)"
+            "Sequence Error: setval: value 9 is out of bounds for sequence \"b\" (1..2)"
         );
         // names
         assert_eq!(
@@ -797,6 +843,96 @@ mod tests {
             "Catalog Error: Sequence with name s does not exist!"
         );
         run(&mut c, "DROP SEQUENCE IF EXISTS s");
+    }
+
+    #[test]
+    fn macros() {
+        let mut c = join_tables();
+        let error = |c: &mut ClientContext, sql: &str| c.query(sql).unwrap_err().to_string();
+        run(&mut c, "CREATE MACRO add1(a) AS a + 1");
+        assert_eq!(run(&mut c, "SELECT add1(41)"), rows(&[&["42"]]));
+        assert_eq!(
+            run(&mut c, "SELECT add1(k), a FROM l WHERE add1(k) = 2"),
+            rows(&[&["2", "x"]])
+        );
+        // arguments keep their own meaning: `b` here is the caller's, not the parameter
+        run(&mut c, "CREATE MACRO sub(a, b) AS a - b");
+        assert_eq!(
+            run(&mut c, "SELECT sub(b + 1, 2) FROM r WHERE b = 20"),
+            rows(&[&["19"]])
+        );
+        assert_eq!(run(&mut c, "SELECT sub(b, b) FROM (SELECT 7 AS b) t"), rows(&[&["0"]]));
+        // the result is named after the call
+        assert_eq!(c.query("SELECT add1(1)").unwrap().names, vec!["add1(1)"]);
+        // aggregates and groups see through macros
+        run(&mut c, "CREATE MACRO total(x) AS sum(x) + 1");
+        assert_eq!(run(&mut c, "SELECT total(b) FROM r"), rows(&[&["112"]]));
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT add1(k), count(*) FROM r GROUP BY add1(k) ORDER BY 1 NULLS LAST"
+            ),
+            rows(&[&["3", "2"], &["4", "1"], &["NULL", "1"]])
+        );
+        // defaults, named arguments and overloads
+        run(&mut c, "CREATE MACRO d(a, b := 10) AS a + b");
+        assert_eq!(
+            run(&mut c, "SELECT d(1), d(1, 2), d(1, b := 3)"),
+            rows(&[&["11", "3", "4"]])
+        );
+        assert!(error(&mut c, "SELECT d(b := 6, 3)").contains("positional argument following named argument"));
+        run(&mut c, "CREATE MACRO o(a) AS 1, (a, b) AS 2");
+        assert_eq!(run(&mut c, "SELECT o(0), o(0, 0)"), rows(&[&["1", "2"]]));
+        assert!(error(&mut c, "SELECT o(1, 2, 3)").contains("does not support the supplied arguments"));
+        // typed parameters and return types
+        run(&mut c, "CREATE MACRO t1(a INTEGER) AS a + 1, (a VARCHAR) AS 0");
+        assert_eq!(run(&mut c, "SELECT t1(1), t1('x')"), rows(&[&["2", "0"]]));
+        // a macro shadows a built-in function, which stays reachable through its schema
+        run(&mut c, "CREATE MACRO \"sum\"(x) AS system.main.sum(x) + 100");
+        assert_eq!(run(&mut c, "SELECT sum(b) FROM r"), rows(&[&["211"]]));
+        run(&mut c, "DROP MACRO sum");
+        // a macro calling itself ends
+        run(&mut c, "CREATE MACRO m1(a) AS a");
+        run(&mut c, "CREATE OR REPLACE MACRO m1(a) AS m1(a) + 1");
+        assert!(error(&mut c, "SELECT m1(1)").contains("Max expression depth limit"));
+        // table macros
+        run(
+            &mut c,
+            "CREATE MACRO big(n) AS TABLE SELECT k, b FROM r WHERE b > n ORDER BY b",
+        );
+        assert_eq!(run(&mut c, "SELECT b FROM big(25)"), rows(&[&["30"], &["40"]]));
+        assert_eq!(
+            run(&mut c, "SELECT z.x FROM big(35) z(x, y) JOIN l ON true WHERE a = 'x'"),
+            rows(&[&["NULL"]])
+        );
+        assert!(error(&mut c, "SELECT big(1)").contains("is a table function but it was used as a scalar function"));
+        assert!(error(&mut c, "SELECT * FROM add1(1)").contains("with name add1 does not exist"));
+        run(&mut c, "CREATE OR REPLACE MACRO big(n) AS TABLE SELECT * FROM big(n)");
+        assert!(error(&mut c, "SELECT * FROM big(1)").contains("infinite recursion detected"));
+        // checked when they are created
+        assert!(error(&mut c, "CREATE MACRO bad(a) AS a + z").contains("\"z\" was not found because the FROM clause"));
+        assert!(error(&mut c, "CREATE MACRO add1(a) AS a").contains("already exists"));
+        assert!(error(&mut c, "CREATE MACRO dup(a) AS 1, (b) AS 2").contains("Ambiguity in macro overloads"));
+        assert!(error(&mut c, "CREATE MACRO nc(a := nextval('s')) AS a").contains("does not exist"));
+        // dropping
+        assert_eq!(
+            error(&mut c, "DROP MACRO TABLE add1"),
+            "Catalog Error: Table Macro Function with name add1 does not exist!"
+        );
+        // a scalar and a table macro can share a name, and DROP MACRO takes the scalar one first
+        run(&mut c, "CREATE MACRO twin() AS 1");
+        run(&mut c, "CREATE MACRO twin() AS TABLE SELECT 2 AS i");
+        assert_eq!(run(&mut c, "SELECT twin(), i FROM twin()"), rows(&[&["1", "2"]]));
+        run(&mut c, "DROP MACRO twin");
+        assert!(error(&mut c, "SELECT twin()").contains("is a table function"));
+        assert_eq!(run(&mut c, "SELECT i FROM twin()"), rows(&[&["2"]]));
+        run(&mut c, "DROP MACRO twin");
+        run(&mut c, "DROP MACRO add1");
+        assert_eq!(
+            error(&mut c, "DROP MACRO add1"),
+            "Catalog Error: Macro Function with name add1 does not exist!"
+        );
+        run(&mut c, "DROP MACRO IF EXISTS add1");
     }
 
     #[test]
