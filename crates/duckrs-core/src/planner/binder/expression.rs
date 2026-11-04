@@ -241,7 +241,24 @@ impl Binder<'_> {
             ExprKind::Constant(literal) => BoundExpr::constant(literal_to_value(literal)?),
             ExprKind::ColumnRef(names) => {
                 let (binding, ty, name) = match names.as_slice() {
-                    [column] => self.bind_context.bind_column(column)?,
+                    [column] => match self.bind_context.bind_column(column) {
+                        Ok(bound) => bound,
+                        Err(error) => {
+                            // a column that is not in the FROM clause may name a select list alias
+                            let alias = self
+                                .alias_fallback
+                                .iter()
+                                .position(|(a, _)| a.eq_ignore_ascii_case(column));
+                            let Some(position) = alias else {
+                                return Err(error);
+                            };
+                            // an alias may not refer to itself
+                            let (_, aliased) = self.alias_fallback.remove(position);
+                            let bound = self.bind_expression(&aliased);
+                            self.alias_fallback.insert(position, (column.clone(), aliased));
+                            return bound;
+                        }
+                    },
                     [table, column] => self.bind_context.bind_qualified_column(table, column)?,
                     _ => return Err(crate::unported("column references with schema qualification")),
                 };

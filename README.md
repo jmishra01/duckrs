@@ -3,7 +3,7 @@
 An analytical SQL database engine: a port of [DuckDB](https://github.com/duckdb/duckdb) to Rust.
 
 **Status: Phase 3 (minimal vertical slice) in progress.** The engine runs CREATE TABLE, INSERT
-and single-table SELECT in memory. What exists today:
+and single-table SELECT (WHERE, ORDER BY, LIMIT, DISTINCT) in memory. What exists today:
 
 - `crates/duckrs-common`: the core building blocks every other crate uses:
   - the type system (`LogicalType`, `PhysicalType`, with DuckDB's ids and names), `string_t`
@@ -42,16 +42,19 @@ and single-table SELECT in memory. What exists today:
   unification (`MaxLogicalType`), overload resolution and vector casts (`function`); the binder,
   bound expressions, logical operators and column binding resolution (`planner`); the expression
   executor, physical operators and single-threaded pipelines (`execution`); and the client
-  context (`client`, DuckDB's `src/main`). It runs CREATE TABLE, INSERT (VALUES or a query) and
-  SELECT over one table or VALUES list with WHERE, comparisons, AND/OR/NOT, IS [NOT] NULL, `+`,
-  `-`, `*` and casts between the numeric types, BOOLEAN and VARCHAR, with DuckDB's types and
-  error messages. Joins, aggregates, ORDER BY and LIMIT are next. SQL it does not run yet fails
-  with an error saying it `is not yet ported to duckrs`; the sqllogictest runner never counts
-  that error as the one a test expects.
+  context and settings (`client`, DuckDB's `src/main`). It runs CREATE TABLE, INSERT (VALUES or
+  a query) and SELECT over one table or VALUES list with WHERE, ORDER BY (positions, aliases,
+  expressions, ORDER BY ALL, NULLS FIRST/LAST), LIMIT/OFFSET and DISTINCT; expressions with
+  comparisons, AND/OR/NOT, IS [NOT] NULL, `+`, `-`, `*`, casts between the numeric types,
+  BOOLEAN and VARCHAR, and aliases of the select list; and SET/RESET/`PRAGMA x = y` for all 196
+  of DuckDB's settings (generated from its `settings.json` by `tools/generate_settings.py`), with
+  DuckDB's types and error messages. Aggregates, GROUP BY and joins are next. SQL it does not
+  run yet fails with an error saying it `is not yet ported to duckrs`; the sqllogictest runner
+  never counts that error as the one a test expects.
 - `crates/duckrs`: the public API (`Database`, `Connection`, `QueryResult`) over the engine.
   Databases live in memory; a database file is accepted but not written until Phase 9.
 - `tools/sqllogictest`: a port of DuckDB's sqllogictest runner. It runs the DuckDB `.test` corpus
-  against duckrs, or against the C++ DuckDB library as a reference. duckrs passes 82 files so far
+  against duckrs, or against the C++ DuckDB library as a reference. duckrs passes 103 files so far
   (`tools/sqllogictest/known_passing.txt`, a CI gate), among them
   `test/sql/projection/test_simple_projection.test`.
 

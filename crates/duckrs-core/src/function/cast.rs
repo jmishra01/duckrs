@@ -113,8 +113,12 @@ impl CastNumber for f32 {
     }
     fn from_number(n: Number) -> Option<Self> {
         match n {
-            Number::Int(v) => Some(v as f32),
-            Number::UHuge(v) => Some(v as f32),
+            // 64-bit integers convert directly, (U)HUGEINT through a double
+            Number::Int(v) => Some(match i64::try_from(v) {
+                Ok(v) => v as f32,
+                Err(_) => huge_to_double(v) as f32,
+            }),
+            Number::UHuge(v) => Some(uhuge_to_double(v) as f32),
             Number::Float(v) => Some(v),
             Number::Double(v) => {
                 let result = v as f32;
@@ -134,14 +138,39 @@ impl CastNumber for f64 {
     }
     fn from_number(n: Number) -> Option<Self> {
         Some(match n {
-            Number::Int(v) => v as f64,
-            Number::UHuge(v) => v as f64,
+            Number::Int(v) => int_to_double(v),
+            Number::UHuge(v) => uhuge_to_double(v),
             Number::Float(v) => v as f64,
             Number::Double(v) => v,
         })
     }
     fn render(self) -> String {
         format_double(self)
+    }
+}
+
+/// `CastBigintToFloating`: a (U)HUGEINT as a double, the way DuckDB computes it (which rounds
+/// some values differently from a direct conversion).
+fn huge_to_double(value: i128) -> f64 {
+    let lower = value as u64;
+    let upper = (value >> 64) as i64;
+    if upper == -1 {
+        // special case for upper = -1 to avoid rounding issues in small negative numbers
+        -((u64::MAX - lower) as f64) - 1.0
+    } else {
+        lower as f64 + upper as f64 * (u64::MAX as f64 + 1.0)
+    }
+}
+
+fn uhuge_to_double(value: u128) -> f64 {
+    (value as u64) as f64 + ((value >> 64) as u64) as f64 * (u64::MAX as f64 + 1.0)
+}
+
+/// An integer as a double: 64-bit values convert directly, wider ones like `Hugeint::TryCast`.
+fn int_to_double(value: i128) -> f64 {
+    match i64::try_from(value) {
+        Ok(v) => v as f64,
+        Err(_) => huge_to_double(value),
     }
 }
 
@@ -662,5 +691,7 @@ mod tests {
         assert_eq!(i8::from_number(Number::Double(-128.4)), Some(-128));
         assert_eq!(i64::from_number(Number::Double(f64::NAN)), None);
         assert_eq!(f32::from_number(Number::Double(1e300)), None);
+        // (U)HUGEINT converts through a double, like DuckDB
+        assert_eq!(f32::from_number(Number::Int(18446743523953736704)), Some(2f32.powi(64)));
     }
 }

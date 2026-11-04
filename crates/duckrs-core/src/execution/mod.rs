@@ -47,6 +47,13 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
                 children,
             })
         }
+        LogicalOperatorKind::Order { orders } => Box::new(PhysicalOrder::new(orders, children.remove(0))),
+        LogicalOperatorKind::Limit { limit, offset } => Box::new(PhysicalLimit {
+            types,
+            children,
+            remaining: Mutex::new((offset, limit)),
+        }),
+        LogicalOperatorKind::Distinct { targets } => Box::new(PhysicalDistinct::new(&targets, children.remove(0))),
         LogicalOperatorKind::Projection { expressions, .. } => Box::new(PhysicalProjection {
             types,
             expressions,

@@ -52,9 +52,11 @@ pub fn similarity_rating(a: &str, b: &str) -> f64 {
 
 /// `StringUtil::TopNStrings` (n = 5, threshold = 0.5): the best-scoring strings, best first,
 /// ties broken case-insensitively. The best one is always included.
-pub fn top_n_strings(mut scores: Vec<(String, f64)>) -> Vec<String> {
-    const N: usize = 5;
-    const THRESHOLD: f64 = 0.5;
+pub fn top_n_strings(scores: Vec<(String, f64)>) -> Vec<String> {
+    top_n_strings_with(scores, 5, 0.5)
+}
+
+fn top_n_strings_with(mut scores: Vec<(String, f64)>, n: usize, threshold: f64) -> Vec<String> {
     if scores.is_empty() {
         return Vec::new();
     }
@@ -64,13 +66,61 @@ pub fn top_n_strings(mut scores: Vec<(String, f64)>) -> Vec<String> {
             .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
     });
     let mut result = vec![scores[0].0.clone()];
-    for (name, score) in scores.into_iter().take(N).skip(1) {
-        if score < THRESHOLD {
+    for (name, score) in scores.into_iter().take(n).skip(1) {
+        if score < threshold {
             break;
         }
         result.push(name);
     }
     result
+}
+
+/// `StringUtil::LevenshteinDistance` (case-insensitive), with a configurable substitution cost.
+fn levenshtein_distance(a: &str, b: &str, not_equal_penalty: usize) -> usize {
+    let (a, b) = (a.to_lowercase().into_bytes(), b.to_lowercase().into_bytes());
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    for i in 1..=a.len() {
+        let mut current = vec![i; b.len() + 1];
+        for j in 1..=b.len() {
+            let substitution = previous[j - 1] + if a[i - 1] == b[j - 1] { 0 } else { not_equal_penalty };
+            current[j] = (previous[j] + 1).min(current[j - 1] + 1).min(substitution);
+        }
+        previous = current;
+    }
+    previous[b.len()]
+}
+
+/// `StringUtil::TopNLevenshtein` (n = 5, threshold = 5): the strings closest to `target`, where
+/// a string longer than the target is compared by its prefix of the target's length.
+pub fn top_n_levenshtein(strings: &[String], target: &str) -> Vec<String> {
+    const THRESHOLD: usize = 5;
+    let scores: Vec<(String, usize)> = strings
+        .iter()
+        .map(|s| {
+            let compared = if target.len() < s.len() {
+                s.get(..target.len()).unwrap_or(s)
+            } else {
+                s
+            };
+            (s.clone(), levenshtein_distance(compared, target, 3))
+        })
+        .collect();
+    // normalize the distances to [0, 1] ratings
+    let max_score = scores.iter().map(|(_, d)| *d).max().unwrap_or(0).max(THRESHOLD);
+    let normalize = |d: usize| 1.0 - d as f64 / max_score as f64;
+    let rated = scores.into_iter().map(|(s, d)| (s, normalize(d))).collect();
+    top_n_strings_with(rated, 5, normalize(THRESHOLD))
+}
+
+/// `StringUtil::CandidatesErrorMessage`: the closest strings by Levenshtein distance.
+pub fn candidates_error_message(strings: &[String], target: &str, label: &str) -> String {
+    candidates_message(&top_n_levenshtein(strings, target), label)
 }
 
 /// `StringUtil::CandidatesMessage`: `\n<label>: "a", "b"`, or nothing without candidates.
@@ -93,6 +143,15 @@ mod tests {
         assert!((similarity_rating("DIXON", "DICKSONX") - 0.8133).abs() < 1e-3);
         assert_eq!(similarity_rating("abc", "abc"), 1.0);
         assert_eq!(similarity_rating("abc", "xyz"), 0.0);
+    }
+
+    #[test]
+    fn levenshtein_suggestions() {
+        let names: Vec<String> = ["threads", "temp_directory", "default_order"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(top_n_levenshtein(&names, "thread")[0], "threads");
+        assert_eq!(levenshtein_distance("abc", "abd", 3), 2);
     }
 
     #[test]

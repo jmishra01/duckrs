@@ -9,9 +9,11 @@ mod statements;
 use super::expression::{BoundExpr, ColumnBinding};
 use super::logical::LogicalOperator;
 use crate::catalog::Catalog;
+use duckrs_common::sort_key::{NullOrder, OrderModifiers, OrderType};
 use duckrs_common::string_util::{candidates_message, similarity_rating, top_n_strings};
 use duckrs_common::types::LogicalType;
 use duckrs_common::{Error, ErrorKind, Result};
+use duckrs_parser::ast;
 use duckrs_parser::ast::Statement;
 
 /// What a statement returns to the client (`StatementReturnType`).
@@ -153,19 +155,80 @@ impl BindContext {
     }
 }
 
+/// The `default_null_order` setting (`DefaultOrderByNullType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultNullOrder {
+    NullsFirst,
+    NullsLast,
+    NullsFirstOnAscLastOnDesc,
+    NullsLastOnAscFirstOnDesc,
+}
+
+/// The settings that change how statements bind.
+#[derive(Debug, Clone, Copy)]
+pub struct BindOptions {
+    /// `default_order`
+    pub default_order: OrderType,
+    /// `default_null_order`
+    pub default_null_order: DefaultNullOrder,
+}
+
+impl Default for BindOptions {
+    fn default() -> Self {
+        Self {
+            default_order: OrderType::Ascending,
+            default_null_order: DefaultNullOrder::NullsLast,
+        }
+    }
+}
+
+impl BindOptions {
+    /// `DBConfig::ResolveOrder` + `ResolveNullOrder`: an ORDER BY term's order and NULL order,
+    /// filling in the defaults.
+    pub fn resolve_order(&self, order: ast::OrderType, nulls: ast::NullOrder) -> OrderModifiers {
+        let order = match order {
+            ast::OrderType::Ascending => OrderType::Ascending,
+            ast::OrderType::Descending => OrderType::Descending,
+            ast::OrderType::Default => self.default_order,
+        };
+        let nulls = match nulls {
+            ast::NullOrder::NullsFirst => NullOrder::NullsFirst,
+            ast::NullOrder::NullsLast => NullOrder::NullsLast,
+            ast::NullOrder::Default => match (self.default_null_order, order) {
+                (DefaultNullOrder::NullsFirst, _) => NullOrder::NullsFirst,
+                (DefaultNullOrder::NullsLast, _) => NullOrder::NullsLast,
+                (DefaultNullOrder::NullsFirstOnAscLastOnDesc, OrderType::Ascending)
+                | (DefaultNullOrder::NullsLastOnAscFirstOnDesc, OrderType::Descending) => NullOrder::NullsFirst,
+                _ => NullOrder::NullsLast,
+            },
+        };
+        OrderModifiers { order, nulls }
+    }
+}
+
 /// Binds statements (`Binder`).
 pub struct Binder<'a> {
     catalog: &'a Catalog,
+    pub options: BindOptions,
     bind_context: BindContext,
     next_table_index: usize,
+    /// The select list aliases the expression being bound may refer to: all of them in WHERE,
+    /// the earlier ones in the select list (`ColumnAliasBinder`, `SelectBinder`).
+    alias_fallback: Vec<(String, duckrs_parser::ast::Expr)>,
 }
 
 impl<'a> Binder<'a> {
     pub fn new(catalog: &'a Catalog) -> Self {
+        Self::with_options(catalog, BindOptions::default())
+    }
+
+    pub fn with_options(catalog: &'a Catalog, options: BindOptions) -> Self {
         Self {
             catalog,
+            options,
             bind_context: BindContext::default(),
             next_table_index: 0,
+            alias_fallback: Vec::new(),
         }
     }
 

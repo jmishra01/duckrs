@@ -4,21 +4,26 @@
 // bind_create_table}.cpp and duckdb/src/planner/bind_context.cpp (alias and star expansion)
 // @ rust-port-baseline
 //
-//! Binding SELECT (one table or VALUES, WHERE, a select list), INSERT and CREATE TABLE.
+//! Binding SELECT (one table or VALUES, WHERE, a select list, ORDER BY, LIMIT/OFFSET and
+//! DISTINCT), INSERT and CREATE TABLE.
 
 use super::{Binder, Binding, BoundStatement, StatementReturnType, binder_error};
 use crate::catalog::{ColumnDefinition, DEFAULT_CATALOG, OnCreateConflict};
+use crate::execution::expression_executor::evaluate_scalar;
 use crate::function::binder::expression_return_type;
 use crate::function::combine_types::{normalize_type, try_max_logical_type};
-use crate::planner::expression::BoundExpr;
-use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
+use crate::planner::expression::{BoundExpr, ColumnBinding};
+use crate::planner::logical::{BoundOrderByNode, LogicalOperator, LogicalOperatorKind};
+use duckrs_common::sort_key::OrderModifiers;
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast::{
-    CreateTableInfo, Expr, ExprKind, InsertStatement, InsertValues, OnCreateConflict as AstConflict, QualifiedName,
-    QueryNodeKind, SelectNode, SelectStatement, TableRef, TableRefKind, values_list,
+    CreateTableInfo, Expr, ExprKind, InsertStatement, InsertValues, LiteralKind, OnCreateConflict as AstConflict,
+    OrderByNode, QualifiedName, QueryNodeKind, ResultModifier, SelectNode, SelectStatement, TableRef, TableRefKind,
+    values_list,
 };
+use duckrs_parser::transformer::visit_expr_mut;
 
 fn not_implemented(what: &str) -> Error {
     crate::unported(what)
@@ -33,6 +38,32 @@ fn expression_name(expr: &Expr) -> String {
         ExprKind::ColumnRef(names) => names.last().cloned().unwrap_or_default(),
         _ => expr.to_string(),
     }
+}
+
+/// An expression with all aliases removed: `ParsedExpression::Equals` ignores aliases.
+fn without_aliases(expr: &Expr) -> Expr {
+    let mut expr = expr.clone();
+    visit_expr_mut(&mut expr, &mut |e| e.alias.clear());
+    expr
+}
+
+/// What binding the select list needs to know about it (`SelectBindState`).
+#[derive(Default)]
+struct SelectBindState {
+    /// alias -> select list index
+    alias_map: Vec<(String, usize)>,
+    /// (qualified, alias-free) select list entry -> index; the last one wins
+    projection_map: Vec<(Expr, usize)>,
+    /// the select list as written (qualified)
+    original_expressions: Vec<Expr>,
+}
+
+/// A result modifier with its targets resolved to select list indexes.
+enum PreparedModifier {
+    Distinct,
+    Order(Vec<(OrderModifiers, usize)>),
+    OrderAll(OrderModifiers),
+    Limit { limit: Option<u64>, offset: u64 },
 }
 
 /// The schema of a qualified table name, checking that its catalog is ours.
@@ -54,22 +85,23 @@ impl Binder<'_> {
     /// `Binder::Bind(SelectStatement)`.
     pub(super) fn bind_select_statement(&mut self, select: &SelectStatement) -> Result<BoundStatement> {
         let node = &select.node;
-        if !node.modifiers.is_empty() {
-            return Err(not_implemented("ORDER BY, LIMIT and DISTINCT"));
-        }
         if !node.cte_map.0.is_empty() {
             return Err(not_implemented("WITH"));
         }
         match &node.kind {
-            QueryNodeKind::Select(select) => self.bind_select_node(select),
+            QueryNodeKind::Select(select) => self.bind_select_node(select, &node.modifiers),
             QueryNodeKind::SetOperation(_) => Err(not_implemented("UNION, EXCEPT and INTERSECT")),
             _ => Err(not_implemented("this kind of query")),
         }
     }
 
-    /// `Binder::BindNode(SelectNode)` + `CreatePlan(BoundSelectNode)`.
-    fn bind_select_node(&mut self, node: &SelectNode) -> Result<BoundStatement> {
-        if !node.groups.group_expressions.is_empty() || node.force_aggregates || node.having.is_some() {
+    /// `Binder::BindNode(SelectNode)` + `CreatePlan(BoundSelectNode)` + `VisitQueryNode`.
+    fn bind_select_node(&mut self, node: &SelectNode, modifiers: &[ResultModifier]) -> Result<BoundStatement> {
+        if !node.groups.group_expressions.is_empty()
+            || !node.groups.grouping_sets.is_empty()
+            || node.force_aggregates
+            || node.having.is_some()
+        {
             return Err(not_implemented("GROUP BY"));
         }
         if node.qualify.is_some() {
@@ -79,8 +111,39 @@ impl Binder<'_> {
             return Err(not_implemented("SAMPLE"));
         }
         let mut plan = self.bind_table_ref(&node.from_table)?;
+        let mut select_list = self.expand_star_expressions(&node.select_list)?;
+        if select_list.is_empty() {
+            return Err(binder_error("SELECT list is empty after resolving * expressions!"));
+        }
+        // SelectBindState: names, aliases and the (qualified) select list entries
+        let mut names = Vec::with_capacity(select_list.len());
+        let mut state = SelectBindState::default();
+        for (i, expr) in select_list.iter_mut().enumerate() {
+            names.push(expression_name(expr));
+            self.qualify_column_names(expr);
+            if !expr.alias.is_empty() {
+                state.alias_map.push((expr.alias.clone(), i));
+            }
+            state.projection_map.push((without_aliases(expr), i));
+            state.original_expressions.push(expr.clone());
+        }
+        let column_count = select_list.len();
+        // PrepareModifiers: ORDER BY and DISTINCT targets refer to select list entries,
+        // appending the ones that are not there yet
+        let mut prepared = Vec::new();
+        for modifier in modifiers {
+            prepared.push(self.prepare_modifier(modifier, &mut select_list, &mut state)?);
+        }
         if let Some(condition) = &node.where_clause {
-            let condition = self.bind_expression(condition)?.cast_to(&LogicalType::BOOLEAN, false);
+            // the WHERE clause may refer to aliases of the select list (`ColumnAliasBinder`)
+            self.alias_fallback = state
+                .alias_map
+                .iter()
+                .map(|(alias, i)| (alias.clone(), select_list[*i].clone()))
+                .collect();
+            let condition = self.bind_expression(condition);
+            self.alias_fallback.clear();
+            let condition = condition?.cast_to(&LogicalType::BOOLEAN, false);
             plan = LogicalOperator::new(
                 LogicalOperatorKind::Filter {
                     expressions: vec![condition],
@@ -88,28 +151,244 @@ impl Binder<'_> {
                 vec![plan],
             );
         }
-        let select_list = self.expand_star_expressions(&node.select_list)?;
-        let mut names = Vec::with_capacity(select_list.len());
+        // a select list entry may refer to the aliases of the entries before it
         let mut expressions = Vec::with_capacity(select_list.len());
-        for expr in &select_list {
-            names.push(expression_name(expr));
-            expressions.push(self.bind_expression(expr)?);
+        for (i, expr) in select_list.iter().enumerate() {
+            self.alias_fallback = state
+                .alias_map
+                .iter()
+                .filter(|(_, j)| *j < i)
+                .map(|(alias, j)| (alias.clone(), select_list[*j].clone()))
+                .collect();
+            let bound = self.bind_expression(expr);
+            self.alias_fallback.clear();
+            expressions.push(bound?);
         }
-        let types = expressions.iter().map(|e: &BoundExpr| e.return_type.clone()).collect();
-        let table_index = self.generate_table_index();
-        let plan = LogicalOperator::new(
+        let types: Vec<LogicalType> = expressions.iter().map(|e| e.return_type.clone()).collect();
+        let projection_index = self.generate_table_index();
+        let mut plan = LogicalOperator::new(
             LogicalOperatorKind::Projection {
-                table_index,
+                table_index: projection_index,
                 expressions,
             },
             vec![plan],
         );
+        // BindModifiers + VisitQueryNode: the modifiers in the order they were written
+        let column = |i: usize| -> Result<BoundExpr> {
+            if i >= types.len() {
+                return Err(binder_error(format!(
+                    "ORDER term out of range - should be between 1 and {}",
+                    types.len()
+                )));
+            }
+            let name = names.get(i).cloned().unwrap_or_default();
+            Ok(BoundExpr::column_ref(
+                ColumnBinding::new(projection_index, i),
+                types[i].clone(),
+                name,
+            ))
+        };
+        for modifier in prepared {
+            let kind = match modifier {
+                PreparedModifier::Distinct => LogicalOperatorKind::Distinct {
+                    targets: (0..column_count).map(column).collect::<Result<_>>()?,
+                },
+                PreparedModifier::Order(orders) => LogicalOperatorKind::Order {
+                    orders: orders
+                        .into_iter()
+                        .map(|(modifiers, index)| {
+                            Ok(BoundOrderByNode {
+                                modifiers,
+                                expr: column(index)?,
+                            })
+                        })
+                        .collect::<Result<_>>()?,
+                },
+                PreparedModifier::OrderAll(modifiers) => LogicalOperatorKind::Order {
+                    orders: (0..column_count)
+                        .map(|i| {
+                            Ok(BoundOrderByNode {
+                                modifiers,
+                                expr: column(i)?,
+                            })
+                        })
+                        .collect::<Result<_>>()?,
+                },
+                PreparedModifier::Limit { limit, offset } => LogicalOperatorKind::Limit { limit, offset },
+            };
+            plan = LogicalOperator::new(kind, vec![plan]);
+        }
+        // prune the entries ORDER BY added to the select list
+        if types.len() > column_count {
+            let prune_index = self.generate_table_index();
+            let expressions = (0..column_count).map(column).collect::<Result<_>>()?;
+            plan = LogicalOperator::new(
+                LogicalOperatorKind::Projection {
+                    table_index: prune_index,
+                    expressions,
+                },
+                vec![plan],
+            );
+        }
         Ok(BoundStatement {
             plan,
+            types: types[..column_count].to_vec(),
             names,
-            types,
             return_type: StatementReturnType::QueryResult,
         })
+    }
+
+    /// `ExpressionBinder::QualifyColumnNames`: qualifies the column references that bind to a
+    /// table with that table's alias, so that equal expressions compare equal.
+    fn qualify_column_names(&self, expr: &mut Expr) {
+        visit_expr_mut(expr, &mut |e| {
+            if let ExprKind::ColumnRef(names) = &mut e.kind
+                && let [column] = names.as_slice()
+                && let Ok((binding, ..)) = self.bind_context.bind_column(column)
+                && let Some(table) = self
+                    .bind_context
+                    .bindings
+                    .iter()
+                    .find(|b| b.table_index == binding.table_index)
+            {
+                *names = vec![table.alias.clone(), table.names[binding.column_index].clone()];
+            }
+        });
+    }
+
+    /// `Binder::PrepareModifiers` for one modifier.
+    fn prepare_modifier(
+        &mut self,
+        modifier: &ResultModifier,
+        select_list: &mut Vec<Expr>,
+        state: &mut SelectBindState,
+    ) -> Result<PreparedModifier> {
+        Ok(match modifier {
+            ResultModifier::Distinct(targets) if targets.is_empty() => PreparedModifier::Distinct,
+            ResultModifier::Distinct(_) => return Err(not_implemented("DISTINCT ON")),
+            ResultModifier::Order(nodes) => {
+                if let [OrderByNode { expr, order, nulls }] = nodes.as_slice()
+                    && let ExprKind::Star(star) = &expr.kind
+                    && star.exclude_list.is_empty()
+                    && star.replace_list.is_empty()
+                    && star.expr.is_none()
+                {
+                    // ORDER BY ALL
+                    return Ok(PreparedModifier::OrderAll(self.options.resolve_order(*order, *nulls)));
+                }
+                let mut orders = Vec::with_capacity(nodes.len());
+                for node in nodes {
+                    if matches!(node.expr.kind, ExprKind::Star(_)) {
+                        return Err(not_implemented("ORDER BY with a star expression"));
+                    }
+                    let index = self.bind_order_expression(&node.expr, select_list, state)?;
+                    orders.push((self.options.resolve_order(node.order, node.nulls), index));
+                }
+                PreparedModifier::Order(orders)
+            }
+            ResultModifier::Limit { limit, offset, percent } => {
+                if *percent {
+                    return Err(not_implemented("LIMIT with a percentage"));
+                }
+                let limit = match limit {
+                    Some(limit) => self.bind_limit_value(limit, false)?,
+                    None => None,
+                };
+                let offset = match offset {
+                    Some(offset) => self.bind_limit_value(offset, true)?.unwrap_or(0),
+                    None => 0,
+                };
+                PreparedModifier::Limit { limit, offset }
+            }
+        })
+    }
+
+    /// `Binder::BindLimitValue` for constant values: NULL means no limit (or no offset).
+    fn bind_limit_value(&mut self, expr: &Expr, is_offset: bool) -> Result<Option<u64>> {
+        let mut binder = Binder::new(self.catalog);
+        let bound = binder.bind_expression(expr)?;
+        if !bound.is_foldable() {
+            return Err(not_implemented(
+                "LIMIT and OFFSET with expressions that are not constant",
+            ));
+        }
+        let value = evaluate_scalar(&bound.cast_to(&LogicalType::BIGINT, false))?;
+        if value.is_null() {
+            return Ok(if is_offset { Some(0) } else { None });
+        }
+        let value = value.as_i128().expect("a BIGINT");
+        if value < 0 {
+            return Err(binder_error("LIMIT/OFFSET cannot be negative"));
+        }
+        Ok(Some(value as u64))
+    }
+
+    /// `OrderBinder::Bind`: the select list entry an ORDER BY expression refers to, appending
+    /// the expression to the select list when it is not there.
+    fn bind_order_expression(
+        &self,
+        expr: &Expr,
+        select_list: &mut Vec<Expr>,
+        state: &mut SelectBindState,
+    ) -> Result<usize> {
+        match &expr.kind {
+            ExprKind::Constant(literal) => {
+                // ORDER BY an integer refers to a select list entry; other constants are an error
+                if literal.kind != LiteralKind::Integer {
+                    return Err(binder_error(
+                        "ORDER BY non-integer literal has no effect.\n* SET order_by_non_integer_literal=true to \
+                         allow this behavior.",
+                    ));
+                }
+                let value: i64 = literal.text.replace('_', "").parse().unwrap_or(i64::MAX);
+                return Ok(if value <= 0 {
+                    i64::MAX as usize
+                } else {
+                    value as usize - 1
+                });
+            }
+            ExprKind::Positional(index) => return Ok(*index as usize - 1),
+            ExprKind::ColumnRef(names) if names.len() == 1 => {
+                let name = &names[0];
+                // an alias of the select list
+                if let Some((_, i)) = state.alias_map.iter().find(|(a, _)| a.eq_ignore_ascii_case(name)) {
+                    return Ok(*i);
+                }
+                // a column the select list names without an alias
+                let matching: Vec<usize> = state
+                    .original_expressions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| {
+                        e.alias.is_empty()
+                            && matches!(&e.kind, ExprKind::ColumnRef(n) if n.last().is_some_and(|c| c == name))
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                if let [i] = matching.as_slice() {
+                    return Ok(*i);
+                }
+            }
+            ExprKind::Parameter(_) => {
+                return Err(Error::new(
+                    ErrorKind::ParameterNotAllowed,
+                    "Parameter not supported in ORDER BY clause",
+                ));
+            }
+            ExprKind::Collate { .. } => return Err(not_implemented("COLLATE")),
+            _ => {}
+        }
+        // the general case: an expression of the select list, or a new entry
+        let mut qualified = expr.clone();
+        self.qualify_column_names(&mut qualified);
+        let key = without_aliases(&qualified);
+        if let Some((_, i)) = state.projection_map.iter().rev().find(|(e, _)| *e == key) {
+            return Ok(*i);
+        }
+        let index = select_list.len();
+        state.projection_map.push((key, index));
+        select_list.push(qualified);
+        Ok(index)
     }
 
     /// `BindContext::GenerateAllColumnExpressions`: replaces `*` and `t.*` with the columns of

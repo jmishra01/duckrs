@@ -109,9 +109,25 @@ A statement goes `parse_ast` → `Binder` (bound expressions, `LogicalOperator` 
   are built from those roles as in `PhysicalOperator::BuildPipelines` and run in dependency order
   on the calling thread; the task scheduler and parallelism arrive with Phase 8.
 - **The catalog** is in memory and has no transactions yet: tables hold their rows in a
-  `ColumnDataCollection` until storage (Phase 9) and MVCC (Phase 10) land.
+  `ColumnDataCollection` until storage (Phase 9) and MVCC (Phase 10) land. In place of a
+  transaction's snapshot, a table scan reads the rows the table had when it started, so
+  `INSERT INTO t FROM t` ends.
+- **Result modifiers** bind like `BindSelectNode`: ORDER BY and DISTINCT targets resolve to
+  select list entries (by position, alias, unaliased column name or equal expression, after
+  qualifying column names), entries ORDER BY needs are appended and pruned by a final
+  projection, and the modifiers apply in the order they were written. ORDER BY gathers and
+  sorts with the byte-comparable sort keys of `duckrs-common`; DISTINCT keeps the first row
+  per sort key. Select list entries and WHERE may use select list aliases.
+- **Settings** are generated from DuckDB's `settings.json` (`tools/generate_settings.py`) with
+  their aliases, types, scopes and defaults, and kept per database and per connection.
+  Settings that only tune performance, storage, extensions or logging are stored; the
+  default sort order and the expression depth limit take effect; the settings that would
+  change results in ways duckrs does not implement yet (`integer_division`, `search_path`,
+  `default_collation`, ...) fail as not yet ported when set to anything but their default.
+  Pragmas that only switch DuckDB's debug verification, profiling or progress output are
+  no-ops.
 
-Deliberate gaps of this slice: no DECIMAL arithmetic (a DECIMAL meets a number in DOUBLE), no
+Deliberate gaps so far: no DECIMAL arithmetic (a DECIMAL meets a number in DOUBLE), no
 `/`, `//` or `%`, no constraints, defaults or table options, the expression executor evaluates a
 filter's condition to a BOOLEAN vector rather than using DuckDB's specialized `Select`, and
 casts to VARCHAR go row by row through `Value`. Errors for SQL beyond the slice say it `is not

@@ -3374,7 +3374,7 @@ fn remove_order_qualification(expr: &mut Expr) {
 }
 
 /// Visits `expr` and every expression nested in it (not descending into subqueries).
-fn visit_expr_mut(expr: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
+pub fn visit_expr_mut(expr: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
     f(expr);
     let mut visit = |e: &mut Expr| visit_expr_mut(e, f);
     match &mut expr.kind {

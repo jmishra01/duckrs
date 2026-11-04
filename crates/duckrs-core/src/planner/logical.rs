@@ -6,6 +6,7 @@
 
 use super::expression::{BoundExpr, ColumnBinding};
 use crate::catalog::{ColumnDefinition, OnCreateConflict, SchemaCatalogEntry, TableCatalogEntry};
+use duckrs_common::sort_key::OrderModifiers;
 use duckrs_common::types::LogicalType;
 use std::sync::Arc;
 
@@ -27,6 +28,13 @@ pub enum LogicalOperatorKind {
     },
     /// `LogicalFilter`: keeps the rows for which all expressions are true.
     Filter { expressions: Vec<BoundExpr> },
+    /// `LogicalOrder`: sorts by the expressions, in order.
+    Order { orders: Vec<BoundOrderByNode> },
+    /// `LogicalLimit` with constant values: skips `offset` rows, then keeps `limit` rows (all
+    /// of them with `None`).
+    Limit { limit: Option<u64>, offset: u64 },
+    /// `LogicalDistinct` (`DISTINCT`, not `DISTINCT ON`): one row per distinct `targets`.
+    Distinct { targets: Vec<BoundExpr> },
     /// `LogicalProjection`.
     Projection {
         table_index: usize,
@@ -45,6 +53,13 @@ pub enum LogicalOperatorKind {
         columns: Vec<ColumnDefinition>,
         on_conflict: OnCreateConflict,
     },
+}
+
+/// An ORDER BY term with its resolved order and NULL order (`BoundOrderByNode`).
+#[derive(Debug, Clone)]
+pub struct BoundOrderByNode {
+    pub modifiers: OrderModifiers,
+    pub expr: BoundExpr,
 }
 
 #[derive(Debug)]
@@ -67,7 +82,10 @@ impl LogicalOperator {
             // the dummy scan's single column is never read
             LogicalOperatorKind::DummyScan { .. } => vec![LogicalType::INTEGER],
             LogicalOperatorKind::ExpressionGet { types, .. } => types.clone(),
-            LogicalOperatorKind::Filter { .. } => self.children[0].types(),
+            LogicalOperatorKind::Filter { .. }
+            | LogicalOperatorKind::Order { .. }
+            | LogicalOperatorKind::Limit { .. }
+            | LogicalOperatorKind::Distinct { .. } => self.children[0].types(),
             LogicalOperatorKind::Projection { expressions, .. } => {
                 expressions.iter().map(|e| e.return_type.clone()).collect()
             }
@@ -90,7 +108,10 @@ impl LogicalOperator {
             } => numbered(*table_index, column_ids.len()),
             LogicalOperatorKind::DummyScan { table_index } => numbered(*table_index, 1),
             LogicalOperatorKind::ExpressionGet { table_index, types, .. } => numbered(*table_index, types.len()),
-            LogicalOperatorKind::Filter { .. } => self.children[0].column_bindings(),
+            LogicalOperatorKind::Filter { .. }
+            | LogicalOperatorKind::Order { .. }
+            | LogicalOperatorKind::Limit { .. }
+            | LogicalOperatorKind::Distinct { .. } => self.children[0].column_bindings(),
             LogicalOperatorKind::Projection {
                 table_index,
                 expressions,
@@ -102,9 +123,10 @@ impl LogicalOperator {
     /// The expressions of this operator, for passes over the plan.
     pub fn expressions_mut(&mut self) -> Vec<&mut BoundExpr> {
         match &mut self.kind {
-            LogicalOperatorKind::Filter { expressions } | LogicalOperatorKind::Projection { expressions, .. } => {
-                expressions.iter_mut().collect()
-            }
+            LogicalOperatorKind::Filter { expressions }
+            | LogicalOperatorKind::Projection { expressions, .. }
+            | LogicalOperatorKind::Distinct { targets: expressions } => expressions.iter_mut().collect(),
+            LogicalOperatorKind::Order { orders } => orders.iter_mut().map(|o| &mut o.expr).collect(),
             LogicalOperatorKind::ExpressionGet { expressions, .. } => expressions.iter_mut().flatten().collect(),
             _ => Vec::new(),
         }
