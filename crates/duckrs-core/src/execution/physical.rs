@@ -11,11 +11,12 @@
 
 use super::constraints;
 use super::expression_executor::{execute, select};
+use super::upsert::upsert;
 use crate::catalog::{ColumnDefinition, OnCreateConflict, SchemaCatalogEntry, TableCatalogEntry, TableConstraint};
 use crate::execution::run_plan;
 use crate::function::aggregates::{AggregateState, value_keys};
 use crate::planner::expression::{BoundAggregate, BoundExpr, ColumnBinding};
-use crate::planner::logical::{BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, LogicalOperator};
+use crate::planner::logical::{BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, LogicalOperator, OnConflict};
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::{NullOrder, OrderModifiers, OrderType, create_sort_keys, sort_collection};
 use duckrs_common::types::LogicalType;
@@ -1513,6 +1514,12 @@ pub struct PhysicalInsert {
     pub inserted: Mutex<u64>,
     /// The rows of the table when this statement started to add to them.
     pub first_new_row: Mutex<Option<usize>>,
+    pub returning: bool,
+    pub on_conflict: Option<OnConflict>,
+    /// With `on_conflict`, the rows wait here for the statement's end.
+    pub pending: Mutex<ColumnDataCollection>,
+    /// With `returning`, the rows to return.
+    pub output: Mutex<ColumnDataCollection>,
 }
 
 impl PhysicalOperator for PhysicalInsert {
@@ -1542,19 +1549,11 @@ impl PhysicalOperator for PhysicalInsert {
             })
             .collect::<Result<Vec<_>>>()?;
         let row = DataChunk::from_columns(columns, chunk.len());
-        for (i, column) in self.table.columns.iter().enumerate() {
-            let unified = row.column(i).to_unified(row.len());
-            if column.not_null && (0..row.len()).any(|r| !unified.is_valid(r)) {
-                return Err(Error::new(
-                    ErrorKind::Constraint,
-                    format!(
-                        "NOT NULL constraint failed: {}.{}",
-                        sql_identifier(&self.table.name),
-                        sql_identifier(&column.name)
-                    ),
-                ));
-            }
+        if self.on_conflict.is_some() {
+            self.pending.lock().append(&row);
+            return Ok(());
         }
+        constraints::verify_not_null(&self.table, &row)?;
         let mut storage = self.table.storage.write();
         let first_new_row = *self.first_new_row.lock().get_or_insert(storage.len());
         constraints::verify_append(&self.table, &storage, &row, first_new_row)?;
@@ -1562,15 +1561,33 @@ impl PhysicalOperator for PhysicalInsert {
         check_buffered(&storage)?;
         drop(storage);
         *self.inserted.lock() += chunk.len() as u64;
+        if self.returning {
+            self.output.lock().append(&row);
+        }
+        Ok(())
+    }
+    fn finalize(&self) -> Result<()> {
+        if let Some(action) = &self.on_conflict {
+            let (count, rows) = upsert(&self.table, action, &self.pending.lock(), self.returning)?;
+            *self.inserted.lock() = count;
+            *self.output.lock() = rows;
+        }
         Ok(())
     }
     fn is_source(&self) -> bool {
         true
     }
     fn source_state(&self) -> SourceState {
-        Box::new(false)
+        if self.returning {
+            Box::new(0usize)
+        } else {
+            Box::new(false)
+        }
     }
     fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
+        if self.returning {
+            return Ok(scan_collection(&self.output, state));
+        }
         let done = state.downcast_mut::<bool>().expect("insert source state");
         if *done {
             return Ok(None);

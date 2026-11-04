@@ -11,7 +11,8 @@ use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::{OrderModifiers, create_sort_keys};
 use duckrs_common::vector::DataChunk;
 use duckrs_common::{Error, ErrorKind, Result};
-use duckrs_parser::ast::sql_quoted_identifier;
+use duckrs_parser::ast::{sql_identifier, sql_quoted_identifier};
+use parking_lot::MutexGuard;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -20,7 +21,7 @@ fn violation(message: String) -> Error {
 }
 
 /// The key of each row in `columns`: `None` for a row with a NULL in it, which never conflicts.
-fn row_keys(chunk: &DataChunk, columns: &[usize]) -> Result<Vec<Option<Vec<u8>>>> {
+pub(super) fn row_keys(chunk: &DataChunk, columns: &[usize]) -> Result<Vec<Option<Vec<u8>>>> {
     let vectors: Vec<_> = columns
         .iter()
         .map(|c| (chunk.column(*c), OrderModifiers::ASC_NULLS_LAST))
@@ -92,6 +93,21 @@ fn still_referenced(name: &str) -> Error {
     ))
 }
 
+/// `DataTable::VerifyNotNullConstraint` for each NOT NULL.
+pub fn verify_not_null(table: &TableCatalogEntry, chunk: &DataChunk) -> Result<()> {
+    for (i, column) in table.columns.iter().enumerate() {
+        let unified = chunk.column(i).to_unified(chunk.len());
+        if column.not_null && (0..chunk.len()).any(|r| !unified.is_valid(r)) {
+            return Err(violation(format!(
+                "NOT NULL constraint failed: {}.{}",
+                sql_identifier(&table.name),
+                sql_identifier(&column.name)
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// `VerifyCheckConstraint` for each CHECK of `table` over rows of the whole table.
 pub fn verify_checks(table: &TableCatalogEntry, chunk: &DataChunk) -> Result<()> {
     for constraint in &table.constraints {
@@ -143,8 +159,20 @@ fn build_keys(table: &TableCatalogEntry, rows: &ColumnDataCollection, first_new_
     Ok(indexes)
 }
 
+/// The key maps of `table`, of which `rows` are the rows.
+pub(super) fn current_keys<'a>(
+    table: &'a TableCatalogEntry,
+    rows: &ColumnDataCollection,
+) -> Result<MutexGuard<'a, Option<Vec<UniqueKeys>>>> {
+    let mut keys = table.unique_keys.lock();
+    if keys.is_none() {
+        *keys = Some(build_keys(table, rows, usize::MAX)?);
+    }
+    Ok(keys)
+}
+
 /// Which of the indexes of [`build_keys`] holds exactly `columns`.
-fn index_of(table: &TableCatalogEntry, columns: &[usize]) -> usize {
+pub(super) fn index_of(table: &TableCatalogEntry, columns: &[usize]) -> usize {
     table
         .constraints
         .iter()
@@ -214,10 +242,7 @@ pub fn verify_append(
         return Ok(());
     }
     verify_checks(table, chunk)?;
-    let mut keys = table.unique_keys.lock();
-    if keys.is_none() {
-        *keys = Some(build_keys(table, rows, usize::MAX)?);
-    }
+    let mut keys = current_keys(table, rows)?;
     let next_row = rows.len();
     let result = append_keys(
         table,

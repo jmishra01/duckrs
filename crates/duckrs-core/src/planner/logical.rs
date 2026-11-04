@@ -125,6 +125,10 @@ pub enum LogicalOperatorKind {
     Insert {
         table: Arc<TableCatalogEntry>,
         column_index_map: Vec<Option<usize>>,
+        table_index: usize,
+        /// Return the rows instead of their count.
+        returning: bool,
+        on_conflict: Option<Box<OnConflict>>,
     },
     /// `LogicalDelete`: removes the rows whose ids the child's only column holds. Returns their
     /// count, or with `returning` the rows.
@@ -155,6 +159,19 @@ pub enum LogicalOperatorKind {
         constraints: Vec<TableConstraint>,
         on_conflict: OnCreateConflict,
     },
+}
+
+/// What an INSERT does about conflicts on keys (`OnConflictInfo`).
+#[derive(Debug, Clone)]
+pub struct OnConflict {
+    /// DO UPDATE; otherwise DO NOTHING.
+    pub do_update: bool,
+    /// The columns of the UNIQUEs and PRIMARY KEYs it catches. The rest raise their errors.
+    pub targets: Vec<Vec<usize>>,
+    pub set_columns: Vec<usize>,
+    /// These and the condition read the columns of the table, then those of `excluded`.
+    pub set_expressions: Vec<BoundExpr>,
+    pub condition: Option<BoundExpr>,
 }
 
 /// An equality between the two sides of a join (`JoinCondition`).
@@ -282,6 +299,9 @@ impl LogicalOperator {
             LogicalOperatorKind::Delete {
                 table, returning: true, ..
             }
+            | LogicalOperatorKind::Insert {
+                table, returning: true, ..
+            }
             | LogicalOperatorKind::Update {
                 table, returning: true, ..
             } => table.types(),
@@ -371,6 +391,12 @@ impl LogicalOperator {
                 table_index,
                 returning,
             }
+            | LogicalOperatorKind::Insert {
+                table,
+                table_index,
+                returning,
+                ..
+            }
             | LogicalOperatorKind::Update {
                 table,
                 table_index,
@@ -397,9 +423,7 @@ impl LogicalOperator {
             LogicalOperatorKind::CrossProduct | LogicalOperatorKind::Join { .. } => {
                 self.join_output(|child| child.column_bindings())
             }
-            LogicalOperatorKind::Insert { .. }
-            | LogicalOperatorKind::CreateTable { .. }
-            | LogicalOperatorKind::CreateTableAs { .. } => numbered(0, 1),
+            LogicalOperatorKind::CreateTable { .. } | LogicalOperatorKind::CreateTableAs { .. } => numbered(0, 1),
         }
     }
 

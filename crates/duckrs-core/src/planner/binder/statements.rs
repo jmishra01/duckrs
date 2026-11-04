@@ -42,6 +42,13 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+fn excluded_in_returning() -> Error {
+    Error::new(
+        ErrorKind::NotImplemented,
+        "'excluded' qualified columns are not supported in the RETURNING clause yet",
+    )
+}
+
 pub(super) fn not_implemented(what: &str) -> Error {
     crate::unported(what)
 }
@@ -1615,7 +1622,7 @@ impl Binder<'_> {
     }
 
     /// `Binder::BindReturning`: the expressions over the rows a statement changed.
-    fn bind_returning(
+    pub(super) fn bind_returning(
         &mut self,
         plan: LogicalOperator,
         returning: &[Expr],
@@ -1632,7 +1639,27 @@ impl Binder<'_> {
             types: table.types(),
             row_id: None,
         });
+        let excluded_star =
+            |e: &Expr| matches!(&e.kind, ExprKind::Star(s) if s.relation_name.eq_ignore_ascii_case("excluded"));
+        if returning.iter().any(excluded_star) {
+            return Err(excluded_in_returning());
+        }
         let list = self.expand_star_expressions(returning)?;
+        // `VerifyNotExcluded`
+        for expr in &list {
+            let mut excluded = false;
+            visit_expr_mut(&mut expr.clone(), &mut |e| {
+                if let ExprKind::ColumnRef(names) = &e.kind
+                    && names.len() > 1
+                    && names[names.len() - 2].eq_ignore_ascii_case("excluded")
+                {
+                    excluded = true;
+                }
+            });
+            if excluded {
+                return Err(excluded_in_returning());
+            }
+        }
         let names: Vec<String> = list.iter().map(expression_name).collect();
         let expressions = list
             .iter()
@@ -1802,20 +1829,42 @@ impl Binder<'_> {
         })
     }
 
+    /// `Binder::BindNode(InsertQueryNode)`.
     pub(super) fn bind_insert(&mut self, insert: &InsertStatement) -> Result<BoundStatement> {
-        if !insert.cte_map.0.is_empty() {
-            return Err(not_implemented("WITH in INSERT"));
-        }
-        if insert.on_conflict.is_some() {
-            return Err(not_implemented("ON CONFLICT"));
-        }
-        if !insert.returning.is_empty() {
-            return Err(not_implemented("RETURNING"));
-        }
-        if insert.by_name {
-            return Err(not_implemented("INSERT BY NAME"));
-        }
+        self.with_ctes(&insert.cte_map, |binder| binder.bind_insert_body(insert))
+    }
+
+    fn bind_insert_body(&mut self, insert: &InsertStatement) -> Result<BoundStatement> {
         let table = self.catalog.get_table(schema_of(&insert.table)?, &insert.table.name)?;
+        if insert.by_name {
+            // the columns are the names of the query
+            let InsertValues::Select(select) = &insert.values else {
+                return Err(binder_error(
+                    "INSERT BY NAME cannot be combined with with DEFAULT VALUES",
+                ));
+            };
+            if values_list(select).is_some() {
+                return Err(binder_error(
+                    "INSERT BY NAME can only be used when inserting from a SELECT statement",
+                ));
+            }
+            if !insert.columns.is_empty() {
+                return Err(binder_error(
+                    "INSERT BY NAME cannot be combined with an explicit column list",
+                ));
+            }
+            let mut binder = self.child_binder();
+            let names = binder.bind_select_statement(select)?.names;
+            let mut by_position = insert.clone();
+            by_position.by_name = false;
+            by_position.columns = names;
+            return self.bind_insert_body(&by_position);
+        }
+        let on_conflict = insert
+            .on_conflict
+            .as_ref()
+            .map(|info| self.bind_on_conflict(insert, info, &table))
+            .transpose()?;
         // BindInsertColumnList: which table column each inserted column fills
         let mut expected_types = Vec::new();
         let mut column_index_map: Vec<Option<usize>>;
@@ -1911,13 +1960,21 @@ impl Binder<'_> {
                 }
             },
         };
+        let table_index = self.generate_table_index();
         let plan = LogicalOperator::new(
             LogicalOperatorKind::Insert {
-                table,
+                table: table.clone(),
                 column_index_map,
+                table_index,
+                returning: !insert.returning.is_empty(),
+                on_conflict: on_conflict.map(Box::new),
             },
             vec![source],
         );
+        if !insert.returning.is_empty() {
+            let alias = insert.table_alias.clone().unwrap_or_else(|| table.name.clone());
+            return self.bind_returning(plan, &insert.returning, &table, table_index, alias);
+        }
         Ok(BoundStatement {
             plan,
             names: vec!["Count".to_string()],

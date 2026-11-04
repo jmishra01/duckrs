@@ -6,6 +6,7 @@
 mod expression;
 mod join;
 mod macros;
+mod on_conflict;
 mod statements;
 mod table_constraints;
 mod table_functions;

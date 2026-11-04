@@ -18,6 +18,7 @@ use parking_lot::Mutex;
 use physical::*;
 
 pub mod constraints;
+mod upsert;
 
 /// `PhysicalPlanGenerator::CreatePlan`.
 pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
@@ -150,14 +151,25 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
         LogicalOperatorKind::Insert {
             table,
             column_index_map,
-        } => Box::new(PhysicalInsert {
-            types,
-            table,
-            column_index_map,
-            children: std::mem::take(&mut children),
-            inserted: Mutex::new(0),
-            first_new_row: Mutex::new(None),
-        }),
+            returning,
+            on_conflict,
+            ..
+        } => {
+            let empty = || Mutex::new(ColumnDataCollection::new(table.types()));
+            let (pending, output) = (empty(), empty());
+            Box::new(PhysicalInsert {
+                types,
+                column_index_map,
+                children: std::mem::take(&mut children),
+                inserted: Mutex::new(0),
+                first_new_row: Mutex::new(None),
+                returning,
+                on_conflict: on_conflict.map(|action| *action),
+                pending,
+                output,
+                table,
+            })
+        }
         LogicalOperatorKind::CreateTable {
             schema,
             name,

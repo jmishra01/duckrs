@@ -3007,4 +3007,46 @@ mod tests {
         run(&mut c, "INSERT INTO u VALUES (2)");
         assert!(c.query("INSERT INTO u VALUES (1)").is_err());
     }
+
+    #[test]
+    fn upserts() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        run(
+            &mut c,
+            "CREATE TABLE t (i INTEGER PRIMARY KEY, j INTEGER DEFAULT 7, k VARCHAR)",
+        );
+        run(&mut c, "INSERT INTO t VALUES (1, 1, 'a')");
+        assert_eq!(
+            run(&mut c, "INSERT INTO t (i, k) VALUES (2, 'b') RETURNING i, j"),
+            [["2", "7"]]
+        );
+        assert_eq!(
+            run(
+                &mut c,
+                "INSERT INTO t VALUES (1, 9, 'x'), (3, 3, 'c') ON CONFLICT DO NOTHING"
+            ),
+            [["1"]]
+        );
+        assert_eq!(
+            run(
+                &mut c,
+                "INSERT INTO t VALUES (1, 5, 'y'), (4, 4, 'd') ON CONFLICT (i) DO UPDATE SET j = j + excluded.j RETURNING *"
+            ),
+            [["1", "6", "a"], ["4", "4", "d"]]
+        );
+        run(
+            &mut c,
+            "INSERT INTO t VALUES (2, 0, 'z') ON CONFLICT (i) DO UPDATE SET j = 1 WHERE excluded.j > 0",
+        );
+        run(&mut c, "INSERT OR REPLACE INTO t VALUES (3, 30, 'cc')");
+        run(&mut c, "INSERT OR IGNORE INTO t VALUES (3, 31, 'ccc')");
+        assert_eq!(
+            run(&mut c, "SELECT i, j, k FROM t ORDER BY i"),
+            [["1", "6", "a"], ["2", "7", "b"], ["3", "30", "cc"], ["4", "4", "d"]]
+        );
+        run(&mut c, "CREATE TABLE u (a INTEGER, b INTEGER)");
+        run(&mut c, "INSERT INTO u BY NAME SELECT 1 AS b, 2 AS a");
+        run(&mut c, "WITH x AS (SELECT 5 AS a) INSERT INTO u SELECT a, a FROM x");
+        assert_eq!(run(&mut c, "FROM u ORDER BY a"), [["2", "1"], ["5", "5"]]);
+    }
 }
