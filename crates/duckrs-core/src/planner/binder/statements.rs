@@ -16,7 +16,7 @@ use crate::catalog::{
 };
 use crate::execution::expression_executor::evaluate_scalar;
 use crate::function::binder::expression_return_type;
-use crate::function::combine_types::{normalize_type, try_max_logical_type};
+use crate::function::combine_types::{force_max_logical_type, normalize_type, try_max_logical_type};
 use crate::function::generic::is_unnest_call;
 use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, LogicalOperator, LogicalOperatorKind};
@@ -27,8 +27,8 @@ use duckrs_common::value::Value;
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast::{
     Constraint, CreateTableInfo, Expr, ExprKind, InsertStatement, InsertValues, Literal, LiteralKind,
-    OnCreateConflict as AstConflict, OrderByNode, QualifiedName, QueryNodeKind, ResultModifier, SelectNode,
-    SelectStatement, TableRef, TableRefKind, sql_quoted_identifier, values_list,
+    OnCreateConflict as AstConflict, OrderByNode, QualifiedName, QueryNode, QueryNodeKind, ResultModifier, SelectNode,
+    SelectStatement, SetOpType, SetOperationNode, TableRef, TableRefKind, sql_quoted_identifier, values_list,
 };
 use duckrs_parser::transformer::visit_expr_mut;
 use std::sync::Arc;
@@ -114,6 +114,48 @@ fn replace_select_ref(
     Ok(())
 }
 
+/// `Binder::BuildUnionByNameInfo`: the names and types of the result, and for each child the
+/// child's column that makes each result column.
+#[allow(clippy::type_complexity)]
+fn union_by_name_columns(
+    children: &[BoundStatement],
+) -> Result<(Vec<String>, Vec<LogicalType>, Vec<Vec<Option<usize>>>)> {
+    let mut names: Vec<String> = Vec::new();
+    for child in children {
+        for (i, name) in child.names.iter().enumerate() {
+            if child.names[..i].iter().any(|n| n.eq_ignore_ascii_case(name)) {
+                return Err(binder_error(format!(
+                    "UNION (ALL) BY NAME operation doesn't support duplicate names in the SELECT list - the name \
+                     {name} occurs multiple times"
+                )));
+            }
+            if !names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+                names.push(name.clone());
+            }
+        }
+    }
+    let position =
+        |child: &BoundStatement, name: &String| child.names.iter().position(|n| n.eq_ignore_ascii_case(name));
+    let mut types = Vec::with_capacity(names.len());
+    for name in &names {
+        let mut ty: Option<LogicalType> = None;
+        for child in children {
+            if let Some(i) = position(child, name) {
+                ty = Some(match ty {
+                    Some(ty) => force_max_logical_type(&ty, &child.types[i]),
+                    None => child.types[i].clone(),
+                });
+            }
+        }
+        types.push(ty.expect("a name comes from a child"));
+    }
+    let sources = children
+        .iter()
+        .map(|child| names.iter().map(|name| position(child, name)).collect())
+        .collect();
+    Ok((names, types, sources))
+}
+
 /// A result modifier with its targets resolved to select list indexes.
 enum PreparedModifier {
     Distinct,
@@ -190,15 +232,295 @@ pub fn schema_of(name: &QualifiedName) -> Result<Option<&str>> {
 impl Binder<'_> {
     /// `Binder::Bind(SelectStatement)`.
     pub(super) fn bind_select_statement(&mut self, select: &SelectStatement) -> Result<BoundStatement> {
-        let node = &select.node;
-        if !node.cte_map.0.is_empty() {
-            return Err(not_implemented("WITH"));
+        self.bind_query_node(&select.node)
+    }
+
+    /// `Binder::BindNode(QueryNode)`: the CTEs of a query are visible for what the query binds.
+    /// They are not materialized: each reference binds and plans the CTE's query again.
+    pub(super) fn bind_query_node(&mut self, node: &QueryNode) -> Result<BoundStatement> {
+        let scope = self.ctes.len();
+        for (name, cte) in &node.cte_map.0 {
+            match &cte.query.kind {
+                QueryNodeKind::Select(_) | QueryNodeKind::SetOperation(_) => {}
+                QueryNodeKind::RecursiveCte(_) => return Err(not_implemented("WITH RECURSIVE")),
+                _ => return Err(not_implemented("data-modifying statements in WITH")),
+            }
+            self.ctes.push((name.clone(), Arc::new(cte.clone())));
         }
-        match &node.kind {
+        let result = match &node.kind {
             QueryNodeKind::Select(select) => self.bind_select_node(select, &node.modifiers),
-            QueryNodeKind::SetOperation(_) => Err(not_implemented("UNION, EXCEPT and INTERSECT")),
+            QueryNodeKind::SetOperation(operation) => self.bind_set_operation(operation, &node.modifiers),
             _ => Err(not_implemented("this kind of query")),
+        };
+        self.ctes.truncate(scope);
+        result
+    }
+
+    /// A reference to the CTE at `index` of the visible ones (`Binder::Bind(BaseTableRef)`).
+    fn bind_cte_reference(&mut self, table_ref: &TableRef, index: usize) -> Result<LogicalOperator> {
+        let (name, cte) = self.ctes[index].clone();
+        let mut binder = self.child_binder();
+        // a CTE sees the ones before it, and not itself
+        binder.ctes.truncate(index);
+        let bound = binder.bind_query_node(&cte.query)?;
+        self.next_table_index = binder.next_table_index;
+        // the aliases of the reference override the ones of the CTE
+        let mut column_aliases = cte.aliases.clone();
+        for (i, alias) in table_ref.column_name_alias.iter().enumerate() {
+            match column_aliases.get_mut(i) {
+                Some(column) => column.clone_from(alias),
+                None => column_aliases.push(alias.clone()),
+            }
         }
+        let alias = if table_ref.alias.is_empty() {
+            name
+        } else {
+            table_ref.alias.clone()
+        };
+        self.add_query_binding(alias, bound, &column_aliases)
+    }
+
+    /// `Binder::BindNode(SetOperationNode)`.
+    fn bind_set_operation(&mut self, node: &SetOperationNode, modifiers: &[ResultModifier]) -> Result<BoundStatement> {
+        let mut children = Vec::with_capacity(node.children.len());
+        for child in &node.children {
+            let mut binder = self.child_binder();
+            binder.ctes = self.ctes.clone();
+            let bound = binder.bind_query_node(child)?;
+            self.next_table_index = binder.next_table_index;
+            children.push(bound);
+        }
+        let by_name = node.setop_type == SetOpType::UnionByName;
+        let (names, types, sources) = if by_name {
+            union_by_name_columns(&children)?
+        } else {
+            let columns = children[0].types.len();
+            if children.iter().any(|c| c.types.len() != columns) {
+                return Err(binder_error(
+                    "Set operations can only apply to expressions with the same number of result columns",
+                ));
+            }
+            let types = (0..columns)
+                .map(|i| {
+                    children[1..].iter().fold(children[0].types[i].clone(), |ty, child| {
+                        force_max_logical_type(&ty, &child.types[i])
+                    })
+                })
+                .collect::<Vec<_>>();
+            let sources = children.iter().map(|_| (0..columns).map(Some).collect()).collect();
+            (children[0].names.clone(), types, sources)
+        };
+        // an alias of any of the children can name a column in ORDER BY
+        let mut aliases: Vec<(String, usize)> = Vec::new();
+        for child in &children {
+            for (name, i) in &child.column_aliases {
+                let index = if by_name {
+                    names.iter().position(|n| n == name).unwrap_or(*i)
+                } else {
+                    *i
+                };
+                if !aliases.iter().any(|(a, _)| a.eq_ignore_ascii_case(name)) {
+                    aliases.push((name.clone(), index));
+                }
+            }
+        }
+        let mut plans = Vec::with_capacity(children.len());
+        for (child, columns) in children.into_iter().zip(sources) {
+            plans.push(self.cast_plan(child, &types, columns));
+        }
+        let table_index = self.generate_table_index();
+        let kind = match node.setop_type {
+            SetOpType::Union | SetOpType::UnionByName => LogicalOperatorKind::Union {
+                table_index,
+                types: types.clone(),
+            },
+            operation => LogicalOperatorKind::ExceptIntersect {
+                table_index,
+                types: types.clone(),
+                except: operation == SetOpType::Except,
+                all: node.setop_all,
+            },
+        };
+        let plan = LogicalOperator::new(kind, plans);
+        let mut prepared = Vec::with_capacity(modifiers.len() + 1);
+        if !node.setop_all {
+            prepared.push(PreparedModifier::Distinct);
+        }
+        for modifier in modifiers {
+            prepared.push(self.prepare_set_operation_modifier(modifier, &aliases, &types)?);
+        }
+        let plan = self.apply_modifiers(plan, prepared, table_index, &names, &types, types.len())?;
+        Ok(BoundStatement {
+            plan,
+            column_aliases: aliases,
+            names,
+            types,
+            return_type: StatementReturnType::QueryResult,
+        })
+    }
+
+    /// `CastLogicalOperatorToTypes`: a projection of a child of a set operation. `columns[i]` is
+    /// the child's column that makes column `i`, or `None` for NULL.
+    fn cast_plan(
+        &mut self,
+        child: BoundStatement,
+        types: &[LogicalType],
+        columns: Vec<Option<usize>>,
+    ) -> LogicalOperator {
+        let in_order = columns.iter().enumerate().all(|(i, c)| *c == Some(i)) && columns.len() == child.types.len();
+        if in_order && child.types == types {
+            return child.plan;
+        }
+        let bindings = child.plan.column_bindings();
+        let expressions = columns
+            .iter()
+            .zip(types)
+            .map(|(column, ty)| match column {
+                Some(i) => BoundExpr::column_ref(bindings[*i], child.types[*i].clone(), child.names[*i].clone())
+                    .cast_to(ty, false),
+                None => BoundExpr::constant(Value::null(ty.clone())),
+            })
+            .collect();
+        LogicalOperator::new(
+            LogicalOperatorKind::Projection {
+                table_index: self.generate_table_index(),
+                expressions,
+            },
+            vec![child.plan],
+        )
+    }
+
+    /// `Binder::PrepareModifiers` for a set operation, whose ORDER BY can only name its columns.
+    fn prepare_set_operation_modifier(
+        &mut self,
+        modifier: &ResultModifier,
+        aliases: &[(String, usize)],
+        types: &[LogicalType],
+    ) -> Result<PreparedModifier> {
+        let ResultModifier::Order(nodes) = modifier else {
+            let mut unused = Vec::new();
+            return self.prepare_modifier(modifier, &mut unused, &mut SelectBindState::default());
+        };
+        if matches!(nodes.as_slice(), [node] if matches!(node.expr.kind, ExprKind::Star(_))) {
+            let node = &nodes[0];
+            return Ok(PreparedModifier::OrderAll(
+                self.options.resolve_order(node.order, node.nulls),
+            ));
+        }
+        let mut orders = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let index = match &node.expr.kind {
+                ExprKind::Constant(literal) if literal.kind == LiteralKind::Integer => {
+                    let value: i64 = literal.text.replace('_', "").parse().unwrap_or(i64::MAX);
+                    if value <= 0 || value as usize > types.len() {
+                        return Err(binder_error(format!(
+                            "ORDER term out of range - should be between 1 and {}",
+                            types.len()
+                        )));
+                    }
+                    value as usize - 1
+                }
+                ExprKind::Positional(index) => *index as usize - 1,
+                _ => {
+                    let name = match &node.expr.kind {
+                        ExprKind::ColumnRef(names) => names.last().expect("a name").clone(),
+                        _ => expression_name(&node.expr),
+                    };
+                    let found = aliases.iter().find(|(a, _)| a.eq_ignore_ascii_case(&name));
+                    let Some((_, index)) = found else {
+                        return Err(binder_error(format!(
+                            "Could not ORDER BY column \"{}\": add the expression/function to every SELECT, or move \
+                             the UNION into a FROM clause.",
+                            node.expr
+                        )));
+                    };
+                    *index
+                }
+            };
+            orders.push((self.options.resolve_order(node.order, node.nulls), index));
+        }
+        Ok(PreparedModifier::Order(orders))
+    }
+
+    /// `VisitQueryNode`: the modifiers in the order they were written, on top of `plan`, whose
+    /// columns are numbered by `table_index`.
+    fn apply_modifiers(
+        &mut self,
+        mut plan: LogicalOperator,
+        prepared: Vec<PreparedModifier>,
+        table_index: usize,
+        names: &[String],
+        types: &[LogicalType],
+        column_count: usize,
+    ) -> Result<LogicalOperator> {
+        let column = |i: usize| -> Result<BoundExpr> {
+            if i >= types.len() {
+                return Err(binder_error(format!(
+                    "ORDER term out of range - should be between 1 and {}",
+                    types.len()
+                )));
+            }
+            let name = names.get(i).cloned().unwrap_or_default();
+            Ok(BoundExpr::column_ref(
+                ColumnBinding::new(table_index, i),
+                types[i].clone(),
+                name,
+            ))
+        };
+        for modifier in prepared {
+            let kind = match modifier {
+                PreparedModifier::Distinct => LogicalOperatorKind::Distinct {
+                    targets: (0..column_count).map(column).collect::<Result<_>>()?,
+                },
+                PreparedModifier::Order(orders) => LogicalOperatorKind::Order {
+                    orders: orders
+                        .into_iter()
+                        .map(|(modifiers, index)| {
+                            Ok(BoundOrderByNode {
+                                modifiers,
+                                expr: column(index)?,
+                            })
+                        })
+                        .collect::<Result<_>>()?,
+                },
+                PreparedModifier::OrderAll(modifiers) => LogicalOperatorKind::Order {
+                    orders: (0..column_count)
+                        .map(|i| {
+                            Ok(BoundOrderByNode {
+                                modifiers,
+                                expr: column(i)?,
+                            })
+                        })
+                        .collect::<Result<_>>()?,
+                },
+                // LIMIT 0 needs nothing from its input, however expensive that is
+                // (`LimitPushdown`/`EmptyResultPullup` in the optimizer)
+                PreparedModifier::Limit { limit: Some(0), .. } => LogicalOperatorKind::EmptyResult {
+                    types: plan.types(),
+                    bindings: plan.column_bindings(),
+                },
+                PreparedModifier::Limit { limit, offset } => LogicalOperatorKind::Limit { limit, offset },
+            };
+            let children = if matches!(kind, LogicalOperatorKind::EmptyResult { .. }) {
+                vec![]
+            } else {
+                vec![plan]
+            };
+            plan = LogicalOperator::new(kind, children);
+        }
+        // prune the entries ORDER BY added to the select list
+        if types.len() > column_count {
+            let prune_index = self.generate_table_index();
+            let expressions = (0..column_count).map(column).collect::<Result<_>>()?;
+            plan = LogicalOperator::new(
+                LogicalOperatorKind::Projection {
+                    table_index: prune_index,
+                    expressions,
+                },
+                vec![plan],
+            );
+        }
+        Ok(plan)
     }
 
     /// `Binder::BindNode(SelectNode)` + `CreatePlan(BoundSelectNode)` + `VisitQueryNode`.
@@ -467,85 +789,21 @@ impl Binder<'_> {
         let plan = self.plan_unnests(&mut expressions, plan);
         let types: Vec<LogicalType> = expressions.iter().map(|e| e.return_type.clone()).collect();
         let projection_index = self.generate_table_index();
-        let mut plan = LogicalOperator::new(
+        let plan = LogicalOperator::new(
             LogicalOperatorKind::Projection {
                 table_index: projection_index,
                 expressions,
             },
             vec![plan],
         );
-        // BindModifiers + VisitQueryNode: the modifiers in the order they were written
-        let column = |i: usize| -> Result<BoundExpr> {
-            if i >= types.len() {
-                return Err(binder_error(format!(
-                    "ORDER term out of range - should be between 1 and {}",
-                    types.len()
-                )));
-            }
-            let name = names.get(i).cloned().unwrap_or_default();
-            Ok(BoundExpr::column_ref(
-                ColumnBinding::new(projection_index, i),
-                types[i].clone(),
-                name,
-            ))
-        };
-        for modifier in prepared {
-            let kind = match modifier {
-                PreparedModifier::Distinct => LogicalOperatorKind::Distinct {
-                    targets: (0..column_count).map(column).collect::<Result<_>>()?,
-                },
-                PreparedModifier::Order(orders) => LogicalOperatorKind::Order {
-                    orders: orders
-                        .into_iter()
-                        .map(|(modifiers, index)| {
-                            Ok(BoundOrderByNode {
-                                modifiers,
-                                expr: column(index)?,
-                            })
-                        })
-                        .collect::<Result<_>>()?,
-                },
-                PreparedModifier::OrderAll(modifiers) => LogicalOperatorKind::Order {
-                    orders: (0..column_count)
-                        .map(|i| {
-                            Ok(BoundOrderByNode {
-                                modifiers,
-                                expr: column(i)?,
-                            })
-                        })
-                        .collect::<Result<_>>()?,
-                },
-                // LIMIT 0 needs nothing from its input, however expensive that is
-                // (`LimitPushdown`/`EmptyResultPullup` in the optimizer)
-                PreparedModifier::Limit { limit: Some(0), .. } => LogicalOperatorKind::EmptyResult {
-                    types: plan.types(),
-                    bindings: plan.column_bindings(),
-                },
-                PreparedModifier::Limit { limit, offset } => LogicalOperatorKind::Limit { limit, offset },
-            };
-            let children = if matches!(kind, LogicalOperatorKind::EmptyResult { .. }) {
-                vec![]
-            } else {
-                vec![plan]
-            };
-            plan = LogicalOperator::new(kind, children);
-        }
-        // prune the entries ORDER BY added to the select list
-        if types.len() > column_count {
-            let prune_index = self.generate_table_index();
-            let expressions = (0..column_count).map(column).collect::<Result<_>>()?;
-            plan = LogicalOperator::new(
-                LogicalOperatorKind::Projection {
-                    table_index: prune_index,
-                    expressions,
-                },
-                vec![plan],
-            );
-        }
+        let plan = self.apply_modifiers(plan, prepared, projection_index, &names, &types, column_count)?;
+        let mut column_aliases: Vec<(String, usize)> = names.iter().cloned().zip(0..).collect();
+        column_aliases.truncate(column_count);
         Ok(BoundStatement {
             plan,
             types: types[..column_count].to_vec(),
             names,
+            column_aliases,
             return_type: StatementReturnType::QueryResult,
         })
     }
@@ -909,6 +1167,11 @@ impl Binder<'_> {
                 if at_clause.is_some() {
                     return Err(not_implemented("AT clauses"));
                 }
+                if name.qualification.is_empty()
+                    && let Some(index) = self.ctes.iter().rposition(|(n, _)| n.eq_ignore_ascii_case(&name.name))
+                {
+                    return self.bind_cte_reference(table_ref, index);
+                }
                 let table = match self
                     .catalog
                     .get_entry(schema_of(name)?, self.search_schema.as_deref(), &name.name)?
@@ -1047,6 +1310,7 @@ impl Binder<'_> {
             }
         }
         let mut binder = self.child_binder();
+        binder.ctes.clear();
         binder.bound_views.push(view.clone());
         binder.search_schema = Some(view.schema.clone());
         let bound = binder.bind_select_statement(&view.query)?;
@@ -1302,6 +1566,7 @@ impl Binder<'_> {
             plan,
             names: vec!["Count".to_string()],
             types: vec![LogicalType::BIGINT],
+            column_aliases: Vec::new(),
             return_type: StatementReturnType::ChangedRows,
         })
     }
@@ -1409,6 +1674,7 @@ impl Binder<'_> {
             plan,
             names: vec!["Count".to_string()],
             types: vec![LogicalType::BIGINT],
+            column_aliases: Vec::new(),
             return_type: StatementReturnType::Nothing,
         })
     }
@@ -1451,6 +1717,7 @@ impl Binder<'_> {
                         plan,
                         names: vec!["Count".to_string()],
                         types: vec![LogicalType::BIGINT],
+                        column_aliases: Vec::new(),
                         return_type: StatementReturnType::ChangedRows,
                     });
                 }
@@ -1492,6 +1759,7 @@ impl Binder<'_> {
             plan,
             names: vec!["Count".to_string()],
             types: vec![LogicalType::BIGINT],
+            column_aliases: Vec::new(),
             return_type: StatementReturnType::ChangedRows,
         })
     }

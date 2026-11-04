@@ -64,6 +64,19 @@ pub enum LogicalOperatorKind {
         table_index: usize,
         expressions: Vec<BoundExpr>,
     },
+    /// `LogicalSetOperation` for UNION: the rows of all children.
+    Union {
+        table_index: usize,
+        types: Vec<LogicalType>,
+    },
+    /// `LogicalSetOperation` for EXCEPT and INTERSECT of the first child with the second. With
+    /// `all` they work on bags; without, on the rows of the first child (DISTINCT goes on top).
+    ExceptIntersect {
+        table_index: usize,
+        types: Vec<LogicalType>,
+        except: bool,
+        all: bool,
+    },
     /// `LogicalProjection`.
     Projection {
         table_index: usize,
@@ -159,6 +172,9 @@ impl LogicalOperator {
             LogicalOperatorKind::Projection { expressions, .. } => {
                 expressions.iter().map(|e| e.return_type.clone()).collect()
             }
+            LogicalOperatorKind::Union { types, .. } | LogicalOperatorKind::ExceptIntersect { types, .. } => {
+                types.clone()
+            }
             LogicalOperatorKind::Unnest { expressions, .. } => {
                 let mut types = self.children[0].types();
                 types.extend(
@@ -230,6 +246,8 @@ impl LogicalOperator {
                 table_index,
                 expressions,
             } => numbered(*table_index, expressions.len()),
+            LogicalOperatorKind::Union { table_index, types }
+            | LogicalOperatorKind::ExceptIntersect { table_index, types, .. } => numbered(*table_index, types.len()),
             LogicalOperatorKind::Unnest {
                 table_index,
                 expressions,

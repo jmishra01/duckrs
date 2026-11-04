@@ -88,6 +88,10 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             remaining: Mutex::new((offset, limit)),
         }),
         LogicalOperatorKind::Distinct { targets } => Box::new(PhysicalDistinct::new(&targets, children.remove(0))),
+        LogicalOperatorKind::Union { .. } => Box::new(PhysicalUnion::new(types, children)),
+        LogicalOperatorKind::ExceptIntersect { except, all, .. } => {
+            Box::new(PhysicalExceptIntersect::new(types, children, except, all))
+        }
         LogicalOperatorKind::Unnest { expressions, .. } => Box::new(PhysicalUnnest {
             types,
             expressions,
@@ -137,6 +141,8 @@ struct Pipeline<'a> {
     source: &'a dyn PhysicalOperator,
     operators: Vec<&'a dyn PhysicalOperator>,
     sink: &'a dyn PhysicalOperator,
+    /// which of the sink's children this pipeline comes from
+    input: usize,
     finalize: bool,
 }
 
@@ -148,7 +154,7 @@ impl Pipeline<'_> {
             return Ok(());
         }
         let Some(op) = self.operators.get(index) else {
-            return self.sink.sink(&chunk);
+            return self.sink.sink_input(self.input, &chunk);
         };
         loop {
             let (output, result) = op.execute_stateful(&chunk, &mut states[index])?;
@@ -183,41 +189,45 @@ impl Pipeline<'_> {
 /// `MetaPipeline::Build` / `PhysicalOperator::BuildPipelines`: collects, children first, the
 /// pipelines that feed `sink` and the ones they depend on.
 fn build_pipelines<'a>(sink: &'a dyn PhysicalOperator, pipelines: &mut Vec<Pipeline<'a>>) {
-    let mut operators = Vec::new();
-    let mut current = sink.children()[sink.sink_child()].as_ref();
-    // walk down through the streaming operators to this pipeline's source
-    while !current.is_source() {
-        operators.push(current);
+    for input in sink.sink_children() {
+        let mut operators = Vec::new();
+        let mut current = sink.children()[input].as_ref();
+        // walk down through the streaming operators to this pipeline's source
+        while !current.is_source() {
+            operators.push(current);
+            if current.is_sink() {
+                // a join: its build side runs first
+                build_pipelines(current, pipelines);
+            }
+            current = current.children()[0].as_ref();
+        }
         if current.is_sink() {
-            // a join: its build side runs first
+            // the source is also a sink (e.g. INSERT): its own input pipeline runs first
             build_pipelines(current, pipelines);
         }
-        current = current.children()[0].as_ref();
-    }
-    if current.is_sink() {
-        // the source is also a sink (e.g. INSERT): its own input pipeline runs first
-        build_pipelines(current, pipelines);
-    }
-    operators.reverse();
-    // the rows of RIGHT and FULL joins that nothing matched go through the operators above them
-    let unmatched: Vec<Pipeline<'a>> = operators
-        .iter()
-        .enumerate()
-        .filter(|(_, op)| op.has_unmatched_source())
-        .map(|(position, op)| Pipeline {
-            source: *op,
-            operators: operators[position + 1..].to_vec(),
+        operators.reverse();
+        // the rows of RIGHT and FULL joins that nothing matched go through the operators above them
+        let unmatched: Vec<Pipeline<'a>> = operators
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| op.has_unmatched_source())
+            .map(|(position, op)| Pipeline {
+                source: *op,
+                operators: operators[position + 1..].to_vec(),
+                sink,
+                input,
+                finalize: false,
+            })
+            .collect();
+        pipelines.push(Pipeline {
+            source: current,
+            operators,
             sink,
+            input,
             finalize: false,
-        })
-        .collect();
-    pipelines.push(Pipeline {
-        source: current,
-        operators,
-        sink,
-        finalize: false,
-    });
-    pipelines.extend(unmatched);
+        });
+        pipelines.extend(unmatched);
+    }
     pipelines.last_mut().expect("just added").finalize = true;
 }
 

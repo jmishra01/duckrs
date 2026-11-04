@@ -2412,6 +2412,80 @@ mod tests {
     }
 
     #[test]
+    fn set_operations_and_ctes_match_duckdb() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        let err = |context: &mut ClientContext, sql: &str| context.query(sql).unwrap_err().to_string();
+        run(&mut context, "CREATE TABLE a (x INTEGER)");
+        run(&mut context, "CREATE TABLE b (x INTEGER)");
+        run(&mut context, "INSERT INTO a VALUES (1), (1), (2), (NULL)");
+        run(&mut context, "INSERT INTO b VALUES (1), (3), (NULL)");
+        let rows = |context: &mut ClientContext, sql: &str| run(context, &format!("{sql} ORDER BY 1 NULLS LAST"));
+        assert_eq!(
+            rows(&mut context, "SELECT x FROM a UNION ALL SELECT x FROM b"),
+            [["1"], ["1"], ["1"], ["2"], ["3"], ["NULL"], ["NULL"]]
+        );
+        assert_eq!(
+            rows(&mut context, "SELECT x FROM a UNION SELECT x FROM b"),
+            [["1"], ["2"], ["3"], ["NULL"]]
+        );
+        assert_eq!(rows(&mut context, "SELECT x FROM a EXCEPT SELECT x FROM b"), [["2"]]);
+        assert_eq!(
+            rows(&mut context, "SELECT x FROM a EXCEPT ALL SELECT x FROM b"),
+            [["1"], ["2"]]
+        );
+        assert_eq!(
+            rows(&mut context, "SELECT x FROM a INTERSECT SELECT x FROM b"),
+            [["1"], ["NULL"]]
+        );
+        assert_eq!(
+            rows(&mut context, "SELECT x FROM a INTERSECT ALL SELECT x FROM a"),
+            [["1"], ["1"], ["2"], ["NULL"]]
+        );
+        assert_eq!(
+            run(
+                &mut context,
+                "SELECT 1 AS p, 'a' AS q UNION ALL BY NAME SELECT 'b' AS q, 2 AS r ORDER BY q"
+            ),
+            [["1", "a", "NULL"], ["NULL", "b", "2"]]
+        );
+        assert_eq!(
+            run(
+                &mut context,
+                "SELECT 1 AS v UNION ALL SELECT 2.5 ORDER BY v DESC LIMIT 1"
+            ),
+            [["2.5"]]
+        );
+        assert_eq!(
+            run(
+                &mut context,
+                "WITH t(y) AS (SELECT 1), u AS (SELECT y + 1 AS z FROM t) SELECT y, z FROM t, u"
+            ),
+            [["1", "2"]]
+        );
+        // a CTE shadows a table, and does not see itself
+        assert_eq!(
+            run(&mut context, "WITH a AS (SELECT count(*) AS c FROM a) SELECT * FROM a"),
+            [["4"]]
+        );
+        assert_eq!(
+            run(
+                &mut context,
+                "WITH t AS (SELECT 1 AS v) SELECT v FROM (WITH t AS (SELECT 2 AS v) SELECT v FROM t) s"
+            ),
+            [["2"]]
+        );
+        assert_eq!(
+            err(&mut context, "SELECT 1, 2 UNION ALL SELECT 1"),
+            "Binder Error: Set operations can only apply to expressions with the same number of result columns"
+        );
+        assert_eq!(
+            err(&mut context, "SELECT 1 AS a UNION ALL SELECT 2 ORDER BY nope"),
+            "Binder Error: Could not ORDER BY column \"nope\": add the expression/function to every SELECT, or move \
+             the UNION into a FROM clause."
+        );
+    }
+
+    #[test]
     fn errors_match_duckdb() {
         let mut context = ClientContext::new(DatabaseInstance::new());
         let err = |context: &mut ClientContext, sql: &str| context.query(sql).unwrap_err().to_string();

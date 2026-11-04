@@ -42,6 +42,8 @@ pub struct BoundStatement {
     pub plan: LogicalOperator,
     pub names: Vec<String>,
     pub types: Vec<LogicalType>,
+    /// what ORDER BY of an enclosing set operation can call the columns
+    pub column_aliases: Vec<(String, usize)>,
     pub return_type: StatementReturnType,
 }
 
@@ -552,6 +554,8 @@ pub struct Binder<'a> {
     macro_depth: usize,
     /// The parameters of the prepared statement being bound, if it is one.
     pub parameters: Option<Arc<ParameterValues>>,
+    /// The CTEs in scope, innermost last.
+    ctes: Vec<(String, Arc<ast::CteInfo>)>,
 }
 
 impl<'a> Binder<'a> {
@@ -575,6 +579,7 @@ impl<'a> Binder<'a> {
             bound_macros: Vec::new(),
             macro_depth: 0,
             parameters: None,
+            ctes: Vec::new(),
         }
     }
 
@@ -614,6 +619,7 @@ impl<'a> Binder<'a> {
         binder.bound_macros = self.bound_macros.clone();
         binder.search_schema = self.search_schema.clone();
         binder.parameters = self.parameters.clone();
+        binder.ctes = self.ctes.clone();
         binder
     }
 

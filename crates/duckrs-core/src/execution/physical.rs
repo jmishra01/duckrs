@@ -93,6 +93,14 @@ pub trait PhysicalOperator: fmt::Debug + Send + Sync {
     fn sink_child(&self) -> usize {
         0
     }
+    /// All the children that feed the sink.
+    fn sink_children(&self) -> Vec<usize> {
+        vec![self.sink_child()]
+    }
+    /// `sink`, for an operator that tells its inputs apart.
+    fn sink_input(&self, _input: usize, chunk: &DataChunk) -> Result<()> {
+        self.sink(chunk)
+    }
 
     /// Whether a join has rows to emit through `get_data` after its input is done
     /// (`IsSource` of RIGHT and FULL joins).
@@ -393,6 +401,155 @@ impl PhysicalOperator for PhysicalUnnest {
             columns.push(vector);
         }
         Ok(DataChunk::from_columns(columns, count))
+    }
+}
+
+/// `PhysicalUnion`: collects the rows of its children, and emits them in that order.
+#[derive(Debug)]
+pub struct PhysicalUnion {
+    pub types: Vec<LogicalType>,
+    pub children: Vec<Box<dyn PhysicalOperator>>,
+    data: Mutex<ColumnDataCollection>,
+}
+
+impl PhysicalUnion {
+    pub fn new(types: Vec<LogicalType>, children: Vec<Box<dyn PhysicalOperator>>) -> Self {
+        let data = Mutex::new(ColumnDataCollection::new(types.clone()));
+        Self { types, children, data }
+    }
+}
+
+impl PhysicalOperator for PhysicalUnion {
+    fn name(&self) -> &'static str {
+        "UNION"
+    }
+    fn types(&self) -> &[LogicalType] {
+        &self.types
+    }
+    fn children(&self) -> &[Box<dyn PhysicalOperator>] {
+        &self.children
+    }
+    fn is_sink(&self) -> bool {
+        true
+    }
+    fn sink_children(&self) -> Vec<usize> {
+        (0..self.children.len()).collect()
+    }
+    fn sink(&self, chunk: &DataChunk) -> Result<()> {
+        let mut data = self.data.lock();
+        data.append(chunk);
+        check_buffered(&data)
+    }
+    fn is_source(&self) -> bool {
+        true
+    }
+    fn source_state(&self) -> SourceState {
+        Box::new(0usize)
+    }
+    fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
+        Ok(scan_collection(&self.data, state))
+    }
+}
+
+/// EXCEPT and INTERSECT: C++ plans them as joins, with a window for the `ALL` forms.
+#[derive(Debug)]
+pub struct PhysicalExceptIntersect {
+    pub types: Vec<LogicalType>,
+    pub children: Vec<Box<dyn PhysicalOperator>>,
+    except: bool,
+    all: bool,
+    /// the rows of the first child, and of the result once it is final
+    data: Mutex<ColumnDataCollection>,
+    /// how often each row of the second child occurs
+    counts: Mutex<std::collections::HashMap<Vec<u8>, usize>>,
+}
+
+impl PhysicalExceptIntersect {
+    pub fn new(types: Vec<LogicalType>, children: Vec<Box<dyn PhysicalOperator>>, except: bool, all: bool) -> Self {
+        let data = Mutex::new(ColumnDataCollection::new(types.clone()));
+        Self {
+            types,
+            children,
+            except,
+            all,
+            data,
+            counts: Mutex::default(),
+        }
+    }
+}
+
+impl PhysicalOperator for PhysicalExceptIntersect {
+    fn name(&self) -> &'static str {
+        if self.except { "EXCEPT" } else { "INTERSECT" }
+    }
+    fn types(&self) -> &[LogicalType] {
+        &self.types
+    }
+    fn children(&self) -> &[Box<dyn PhysicalOperator>] {
+        &self.children
+    }
+    fn is_sink(&self) -> bool {
+        true
+    }
+    fn sink_children(&self) -> Vec<usize> {
+        vec![0, 1]
+    }
+    fn sink(&self, _chunk: &DataChunk) -> Result<()> {
+        unreachable!("the input is told apart")
+    }
+    fn sink_input(&self, input: usize, chunk: &DataChunk) -> Result<()> {
+        if input == 0 {
+            let mut data = self.data.lock();
+            data.append(chunk);
+            return check_buffered(&data);
+        }
+        let columns: Vec<&Vector> = chunk.columns().iter().collect();
+        let mut counts = self.counts.lock();
+        for key in group_keys(&columns, chunk.len())? {
+            *counts.entry(key).or_default() += 1;
+        }
+        Ok(())
+    }
+    fn finalize(&self) -> Result<()> {
+        let mut data = self.data.lock();
+        let mut counts = self.counts.lock();
+        let mut result = ColumnDataCollection::new(self.types.clone());
+        for index in 0..data.chunk_count() {
+            let mut chunk = data.chunk(index).clone();
+            let columns: Vec<&Vector> = chunk.columns().iter().collect();
+            let keys = group_keys(&columns, chunk.len())?;
+            let mut keep = Vec::new();
+            for (row, key) in keys.iter().enumerate() {
+                let found = match counts.get_mut(key) {
+                    Some(count) if *count > 0 => {
+                        if self.all {
+                            *count -= 1;
+                        }
+                        true
+                    }
+                    _ => false,
+                };
+                if found != self.except {
+                    keep.push(row as u32);
+                }
+            }
+            let count = keep.len();
+            chunk.slice(&SelectionVector::from_vec(keep), count);
+            if count > 0 {
+                result.append(&chunk);
+            }
+        }
+        *data = result;
+        Ok(())
+    }
+    fn is_source(&self) -> bool {
+        true
+    }
+    fn source_state(&self) -> SourceState {
+        Box::new(0usize)
+    }
+    fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
+        Ok(scan_collection(&self.data, state))
     }
 }
 
