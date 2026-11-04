@@ -7,13 +7,19 @@
 
 use super::expression::checked_cast;
 use super::{Binder, binder_error};
+use crate::function::combine_types::try_max_logical_type;
 use crate::function::nested::bind_nested_function;
 use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding, LambdaKind};
-use duckrs_common::Result;
 use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::Value;
-use duckrs_parser::ast::{Expr, ExprKind, FunctionExpr};
+use duckrs_common::{ErrorKind, Result};
+use duckrs_parser::ast::{Expr, ExprKind, FunctionExpr, LambdaSyntax};
 use duckrs_parser::transformer::visit_expr_mut;
+
+const DEPRECATED_ARROW: &str = "Deprecated lambda arrow (->) detected. Please transition to the new lambda syntax, \
+                                i.e.., lambda x, i: x + i, before DuckDB's next release.\nUse SET \
+                                lambda_syntax='ENABLE_SINGLE_ARROW' to revert to the deprecated behavior.\nFor more \
+                                information, see https://duckdb.org/docs/current/sql/functions/lambda.html.";
 
 /// The parameters of a lambda in scope, innermost last.
 #[derive(Debug)]
@@ -32,16 +38,24 @@ fn lambda_kind(name: &str) -> Option<LambdaKind> {
     })
 }
 
-fn parameter_names(lhs: &Expr) -> Vec<String> {
+/// `LambdaExpression::ExtractColumnRefExpressions`.
+fn parameter_names(lhs: &Expr) -> Result<Vec<String>> {
     let mut names = Vec::new();
+    let mut qualified = false;
     visit_expr_mut(&mut lhs.clone(), &mut |e: &mut Expr| {
-        if let ExprKind::ColumnRef(parts) = &e.kind
-            && let [name] = parts.as_slice()
-        {
-            names.push(name.clone());
+        if let ExprKind::ColumnRef(parts) = &e.kind {
+            match parts.as_slice() {
+                [name] => names.push(name.clone()),
+                _ => qualified = true,
+            }
         }
     });
-    names
+    if qualified || names.is_empty() {
+        return Err(binder_error(
+            "Invalid lambda parameters! Parameters must be unqualified comma-separated names like x or (x, y).",
+        ));
+    }
+    Ok(names)
 }
 
 impl Binder<'_> {
@@ -68,8 +82,30 @@ impl Binder<'_> {
         Ok(Some(bound))
     }
 
-    /// `ExpressionBinder::BindLambdaFunction`.
+    /// `ExpressionBinder::TryBindLambdaOrJson`: the deprecated arrow only binds when the
+    /// `lambda_syntax` setting enables it.
     pub(super) fn bind_lambda_function(&mut self, function: &FunctionExpr) -> Result<Option<BoundExpr>> {
+        let arrow = matches!(
+            function.args.get(1).map(|lambda| &lambda.expr.kind),
+            Some(ExprKind::Lambda {
+                syntax: LambdaSyntax::Arrow,
+                ..
+            })
+        );
+        let bound = self.bind_lambda(function);
+        if !arrow || self.options.single_arrow_lambdas {
+            return bound;
+        }
+        match bound {
+            Ok(None) => Ok(None),
+            Ok(Some(_)) => Err(binder_error(DEPRECATED_ARROW)),
+            Err(error) if error.kind == ErrorKind::ParameterNotResolved => Err(binder_error(DEPRECATED_ARROW)),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// `ExpressionBinder::BindLambdaFunction`.
+    fn bind_lambda(&mut self, function: &FunctionExpr) -> Result<Option<BoundExpr>> {
         let Some(kind) = lambda_kind(&function.name.name) else {
             return Ok(None);
         };
@@ -79,14 +115,20 @@ impl Binder<'_> {
         let ExprKind::Lambda { lhs, expr, .. } = &lambda.expr.kind else {
             return Err(binder_error("Invalid lambda expression!"));
         };
-        let maximum = if kind == LambdaKind::Reduce { 3 } else { 2 };
-        let names = parameter_names(lhs);
-        if names.is_empty() || names.len() > maximum || (kind == LambdaKind::Reduce && names.len() < 2) {
-            return Err(binder_error(format!(
-                "The lambda function {} takes a different number of parameters than the {} given",
-                function.name.name,
-                names.len()
-            )));
+        let names = parameter_names(lhs)?;
+        if kind == LambdaKind::Reduce {
+            if names.len() < 2 {
+                return Err(binder_error("list_reduce expects a function with 2 or 3 arguments"));
+            }
+            if names.len() > 3 {
+                return Err(binder_error(
+                    "This lambda function only supports up to three lambda parameters!",
+                ));
+            }
+        } else if names.len() > 2 {
+            return Err(binder_error(
+                "This lambda function only supports up to two lambda parameters!",
+            ));
         }
         let mut list = self.bind_expression(&function.args[0].expr)?;
         if list.return_type.id() == LogicalTypeId::SqlNull {
@@ -104,9 +146,17 @@ impl Binder<'_> {
             Some(initial) if kind == LambdaKind::Reduce => Some(self.bind_expression(&initial.expr)?),
             _ => None,
         };
-        let accumulator = initial
-            .as_ref()
-            .map_or_else(|| element.clone(), |i| i.return_type.clone());
+        // the initial value and the elements meet in one type
+        let accumulator = match &initial {
+            Some(initial) => try_max_logical_type(&element, &initial.return_type).ok_or_else(|| {
+                binder_error(format!(
+                    "Cannot combine the types {element} and {} of the list and the initial value",
+                    initial.return_type
+                ))
+            })?,
+            None => element.clone(),
+        };
+        let initial = initial.map(|initial| initial.cast_to(&accumulator, false));
         let mut types = if kind == LambdaKind::Reduce {
             vec![accumulator.clone(), element.clone()]
         } else {

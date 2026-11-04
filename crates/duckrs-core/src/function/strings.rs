@@ -2,7 +2,7 @@
 // duckdb/extension/core_functions/scalar/string/*.cpp @ rust-port-baseline
 //
 //! The string functions. They run row by row over `Value`s; the vectorized loops come with
-//! Phase 13. Lengths count characters, not the graphemes C++ uses in a few of them.
+//! Phase 13. Lengths count characters, except in the `_grapheme` functions.
 
 use super::bit_functions::strict_rows;
 use super::nested::row_wise;
@@ -11,6 +11,7 @@ use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, Vector};
 use duckrs_common::{Error, ErrorKind, Result};
+use unicode_segmentation::UnicodeSegmentation;
 
 fn invalid_input(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::InvalidInput, message)
@@ -31,43 +32,83 @@ fn integer(value: &Value) -> i64 {
     value.as_i128().expect("an integer") as i64
 }
 
-/// `SubstringStartEnd`.
+const SUBSTRING_UPPER_BOUND: i64 = u32::MAX as i64;
+const SUBSTRING_LOWER_BOUND: i64 = -SUBSTRING_UPPER_BOUND - 1;
+
+/// `AssertInSupportedRange`.
+pub(super) fn check_substring_range(size: usize, offset: i64, length: i64) -> Result<()> {
+    let out_of_range = |message: String| Err(Error::new(ErrorKind::OutOfRange, message));
+    if size as i64 > SUBSTRING_UPPER_BOUND {
+        return out_of_range(format!("Substring input size is too large (> {SUBSTRING_UPPER_BOUND})"));
+    }
+    for (name, value) in [("offset", offset), ("length", length)] {
+        if value < SUBSTRING_LOWER_BOUND {
+            return out_of_range(format!(
+                "Substring {name} outside of supported range (< {SUBSTRING_LOWER_BOUND})"
+            ));
+        }
+        if value > SUBSTRING_UPPER_BOUND {
+            return out_of_range(format!(
+                "Substring {name} outside of supported range (> {SUBSTRING_UPPER_BOUND})"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `SubstringStartEnd` and `SubstringASCIIBounds`, on a string of `size` units.
 fn substring_bounds(size: i64, offset: i64, length: i64) -> Option<(usize, usize)> {
     if length == 0 {
         return None;
     }
     let mut length = length;
-    let mut start;
+    let mut start = offset;
     if offset > 0 {
-        start = size.min(offset - 1);
-    } else if offset < 0 {
-        start = (size + offset).max(0);
-    } else {
-        start = 0;
-        if length > 0 {
-            length -= 1;
-            if length == 0 {
-                return None;
-            }
+        start = offset - 1;
+    } else if offset == 0 {
+        length -= 1;
+        if length <= 0 {
+            return None;
         }
     }
-    let end;
-    if length > 0 {
-        end = size.min(start.saturating_add(length));
-    } else {
+    let mut end = start + length;
+    if length < 0 {
         end = start;
-        start = end.saturating_add(length).max(0);
+        start += length;
     }
-    (start != end).then_some((start as usize, end as usize))
+    if offset < 0 {
+        start += size;
+        end += size;
+    }
+    let (start, end) = (start.clamp(0, size), end.clamp(0, size));
+    (start < end).then_some((start as usize, end as usize))
 }
 
 fn substring(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
-        let chars: Vec<char> = text(&row[0]).chars().collect();
-        let length = row.get(2).map_or(i64::from(u32::MAX), integer);
+        let input = text(&row[0]);
+        let (offset, length) = (integer(&row[1]), row.get(2).map_or(i64::from(u32::MAX), integer));
+        check_substring_range(input.len(), offset, length)?;
+        let chars: Vec<char> = input.chars().collect();
         Ok(Value::varchar(
-            match substring_bounds(chars.len() as i64, integer(&row[1]), length) {
+            match substring_bounds(chars.len() as i64, offset, length) {
                 Some((start, end)) => chars[start..end].iter().collect(),
+                None => String::new(),
+            },
+        ))
+    })
+}
+
+/// `SubstringGrapheme`.
+fn substring_grapheme(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| {
+        let input = text(&row[0]);
+        let (offset, length) = (integer(&row[1]), row.get(2).map_or(i64::from(u32::MAX), integer));
+        check_substring_range(input.len(), offset, length)?;
+        let graphemes: Vec<&str> = input.graphemes(true).collect();
+        Ok(Value::varchar(
+            match substring_bounds(graphemes.len() as i64, offset, length) {
+                Some((start, end)) => graphemes[start..end].concat(),
                 None => String::new(),
             },
         ))
@@ -87,7 +128,7 @@ fn replace(args: &DataChunk, result: &mut Vector) -> Result<()> {
 
 fn reverse(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
-        Ok(Value::varchar(text(&row[0]).chars().rev().collect::<String>()))
+        Ok(Value::varchar(text(&row[0]).graphemes(true).rev().collect::<String>()))
     })
 }
 
@@ -118,6 +159,36 @@ fn ltrim(args: &DataChunk, result: &mut Vector) -> Result<()> {
 
 fn rtrim(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| Ok(trim_with(row, false, true)))
+}
+
+/// `LeftScalarFunction` over grapheme clusters.
+fn left_grapheme(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| {
+        let input = text(&row[0]);
+        let graphemes: Vec<&str> = input.graphemes(true).collect();
+        let (count, size) = (integer(&row[1]), graphemes.len() as i64);
+        let take = if count >= 0 {
+            count.min(size)
+        } else {
+            (size + count).max(0)
+        };
+        Ok(Value::varchar(graphemes[..take as usize].concat()))
+    })
+}
+
+/// `RightScalarFunction` over grapheme clusters.
+fn right_grapheme(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| {
+        let input = text(&row[0]);
+        let graphemes: Vec<&str> = input.graphemes(true).collect();
+        let (count, size) = (integer(&row[1]), graphemes.len() as i64);
+        let take = if count >= 0 {
+            count.min(size)
+        } else {
+            (size + count).max(0)
+        };
+        Ok(Value::varchar(graphemes[(size - take) as usize..].concat()))
+    })
 }
 
 fn left(args: &DataChunk, result: &mut Vector) -> Result<()> {
@@ -322,6 +393,9 @@ fn hamming(args: &DataChunk, result: &mut Vector) -> Result<()> {
         if left.len() != right.len() {
             return Err(invalid_input("Mismatch Function: Strings must be of equal length!"));
         }
+        if left.is_empty() {
+            return Err(invalid_input("Mismatch Function: Strings must be of length > 0!"));
+        }
         let distance = left.iter().zip(&right).filter(|(l, r)| l != r).count();
         Ok(Value::bigint(distance as i64))
     })
@@ -386,7 +460,10 @@ fn check_pattern(pattern: &[char], escape: Option<char>) -> Result<()> {
     while at < pattern.len() {
         if Some(pattern[at]) == escape {
             if at + 1 == pattern.len() {
-                return Err(invalid_input("Like pattern must not end with escape character!"));
+                return Err(Error::new(
+                    ErrorKind::Syntax,
+                    "Like pattern must not end with escape character!",
+                ));
             }
             at += 1;
         }
@@ -584,24 +661,37 @@ fn from_base64(args: &DataChunk, result: &mut Vector) -> Result<()> {
             ));
         }
         let mut out = Vec::with_capacity(input.len() / 4 * 3);
-        for group in input.as_bytes().chunks(4) {
+        let final_group = input.len().saturating_sub(4);
+        for (index, group) in input.as_bytes().chunks(4).enumerate() {
+            let base = index * 4;
+            let last = base == final_group;
+            if last && group[2] == b'=' && group[3] != b'=' {
+                return Err(Error::new(
+                    ErrorKind::Conversion,
+                    format!(
+                        "Could not decode string \"{input}\" as base64: data after the padding at position {}",
+                        base + 3
+                    ),
+                ));
+            }
             let mut bits = 0u32;
             let mut padding = 0;
-            for c in group {
+            for (at, c) in group.iter().enumerate() {
                 bits <<= 6;
-                if *c == b'=' {
+                if last && at >= 2 && *c == b'=' {
                     padding += 1;
                 } else {
-                    let Some(at) = BASE64.iter().position(|b| b == c) else {
+                    let Some(digit) = BASE64.iter().position(|b| b == c) else {
                         return Err(Error::new(
                             ErrorKind::Conversion,
                             format!(
-                                "Could not decode string \"{input}\" as base64: invalid byte value '{}'",
-                                *c as char
+                                "Could not decode string \"{input}\" as base64: invalid byte value '{c}' at \
+                                 position {}",
+                                base + at
                             ),
                         ));
                     };
-                    bits |= at as u32;
+                    bits |= digit as u32;
                 }
             }
             let bytes = bits.to_be_bytes();
@@ -649,6 +739,35 @@ fn exponent_form(value: f64, precision: usize, upper: bool) -> String {
     let sign = if exponent < 0 { '-' } else { '+' };
     let out = format!("{mantissa}e{sign}{:02}", exponent.abs());
     if upper { out.to_uppercase() } else { out }
+}
+
+/// `%g`: `precision` significant digits, in the shorter of the fixed and exponent forms, without
+/// trailing zeros.
+fn general_form(value: f64, precision: usize, upper: bool) -> String {
+    if !value.is_finite() || value == 0.0 {
+        return format!("{value}");
+    }
+    let precision = precision.max(1);
+    let scientific = format!("{:.*e}", precision - 1, value);
+    let exponent: i32 = scientific
+        .split_once('e')
+        .expect("LowerExp has an e")
+        .1
+        .parse()
+        .expect("an exponent");
+    let strip = |text: &str| -> String {
+        if text.contains('.') {
+            text.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            text.to_string()
+        }
+    };
+    if exponent < -4 || exponent >= precision as i32 {
+        let form = exponent_form(value, precision - 1, upper);
+        let at = form.find(['e', 'E']).expect("an exponent");
+        return format!("{}{}", strip(&form[..at]), &form[at..]);
+    }
+    strip(&format!("{:.*}", (precision as i32 - 1 - exponent) as usize, value))
 }
 
 fn number_of(value: &Value) -> Result<f64> {
@@ -724,11 +843,8 @@ fn format_one(spec: &Spec, value: &Value) -> Result<String> {
         }
         'g' | 'G' => {
             let number = number_of(value)?;
-            pad_to(
-                spec,
-                signed(spec, number.is_sign_negative(), format!("{}", number.abs())),
-                true,
-            )
+            let body = general_form(number.abs(), spec.precision.unwrap_or(6), spec.conversion == 'G');
+            pad_to(spec, signed(spec, number.is_sign_negative(), body), true)
         }
         'c' => {
             let code = value
@@ -907,12 +1023,20 @@ fn format_fmt_argument(value: &Value, spec: &str) -> Result<String> {
         Some(conversion) => printf_spec.conversion = conversion,
         None => {
             printf_spec.conversion = match value.data() {
-                ValueData::Double(_) | ValueData::Float(_) if printf_spec.precision.is_some() => 'f',
+                ValueData::Double(_) | ValueData::Float(_) if printf_spec.precision.is_some() => 'g',
+                _ if printf_spec.precision.is_some() && value.logical_type().id() == LogicalTypeId::Decimal => 'g',
                 ValueData::Bytes(_) => 's',
                 _ if value.as_i128().is_some() => 'd',
                 _ => 's',
             };
         }
+    }
+    // a general format keeps the digits it was asked for, which the zero has none of
+    if printf_spec.conversion == 'g'
+        && let Some(precision) = printf_spec.precision.filter(|p| *p > 1)
+        && number_of(value).is_ok_and(|number| number == 0.0)
+    {
+        return Ok(format!("0.{}", "0".repeat(precision - 1)));
     }
     format_one(&printf_spec, value)
 }
@@ -933,11 +1057,16 @@ pub fn string_functions() -> Vec<ScalarFunctionSet> {
     let list = LogicalType::list(LogicalType::VARCHAR);
     let mut sets = Vec::new();
     for name in ["substring", "substr", "substring_grapheme"] {
+        let callback: ScalarCallback = if name == "substring_grapheme" {
+            substring_grapheme
+        } else {
+            substring
+        };
         sets.push(set_of(
             name,
             vec![
-                (vec![v.clone(), i.clone()], v.clone(), substring as ScalarCallback),
-                (vec![v.clone(), i.clone(), i.clone()], v.clone(), substring),
+                (vec![v.clone(), i.clone()], v.clone(), callback),
+                (vec![v.clone(), i.clone(), i.clone()], v.clone(), callback),
             ],
         ));
     }
@@ -965,9 +1094,9 @@ pub fn string_functions() -> Vec<ScalarFunctionSet> {
         ("replace", vec![v.clone(), v.clone(), v.clone()], v.clone(), replace),
         ("reverse", vec![v.clone()], v.clone(), reverse),
         ("left", vec![v.clone(), i.clone()], v.clone(), left),
-        ("left_grapheme", vec![v.clone(), i.clone()], v.clone(), left),
+        ("left_grapheme", vec![v.clone(), i.clone()], v.clone(), left_grapheme),
         ("right", vec![v.clone(), i.clone()], v.clone(), right),
-        ("right_grapheme", vec![v.clone(), i.clone()], v.clone(), right),
+        ("right_grapheme", vec![v.clone(), i.clone()], v.clone(), right_grapheme),
         ("starts_with", vec![v.clone(), v.clone()], b.clone(), starts_with),
         ("prefix", vec![v.clone(), v.clone()], b.clone(), starts_with),
         ("^@", vec![v.clone(), v.clone()], b.clone(), starts_with),

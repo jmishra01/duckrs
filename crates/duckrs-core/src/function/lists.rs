@@ -5,12 +5,12 @@
 
 use super::BuiltinFunctions;
 use super::aggregates::value_keys;
-use super::binder::bind_aggregate_function;
+use super::binder::{bind_aggregate_function, expression_return_type};
 use super::bit_functions::strict_rows;
 use super::combine_types::force_max_logical_type;
 use super::nested::{bound_function, row_wise};
 use crate::execution::expression_executor::evaluate_scalar;
-use crate::planner::expression::BoundExpr;
+use crate::planner::expression::{BoundExpr, BoundExprKind};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, Vector};
@@ -136,31 +136,44 @@ fn keys_of(values: &[Value], ty: &LogicalType) -> Result<Vec<Vec<u8>>> {
     value_keys(&vector, values.len())
 }
 
+/// `ListSearchSimpleOp`: where the needle is among the elements. A NULL needle matches a NULL
+/// element only.
+fn search(values: &[Value], needle: &Value) -> Result<Option<usize>> {
+    let ty = needle.logical_type();
+    let keys = keys_of(values, ty)?;
+    let target = keys_of(std::slice::from_ref(needle), ty)?;
+    Ok(values
+        .iter()
+        .zip(&keys)
+        .position(|(value, key)| value.is_null() == needle.is_null() && *key == target[0]))
+}
+
 fn list_contains(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    strict_rows(args, result, |row| {
+    row_wise(args, result, |row| {
+        if row[0].is_null() {
+            return Ok(Value::null(LogicalType::BOOLEAN));
+        }
         let values = items(&row[0]);
-        let ty = row[1].logical_type();
-        let needle = keys_of(std::slice::from_ref(&row[1]), ty)?;
-        let keys = keys_of(values, ty)?;
-        let found = values
-            .iter()
-            .zip(&keys)
-            .any(|(value, key)| !value.is_null() && *key == needle[0]);
-        Ok(Value::boolean(found))
+        // an empty list never contains anything, not even NULL
+        if values.is_empty() {
+            return Ok(Value::boolean(false));
+        }
+        if row[1].is_null() {
+            return Ok(Value::null(LogicalType::BOOLEAN));
+        }
+        Ok(Value::boolean(search(values, &row[1])?.is_some()))
     })
 }
 
 fn list_position(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    strict_rows(args, result, |row| {
-        let values = items(&row[0]);
-        let ty = row[1].logical_type();
-        let needle = keys_of(std::slice::from_ref(&row[1]), ty)?;
-        let keys = keys_of(values, ty)?;
-        let found = values
-            .iter()
-            .zip(&keys)
-            .position(|(value, key)| !value.is_null() && *key == needle[0]);
-        Ok(found.map_or_else(|| Value::integer(0), |at| Value::integer(at as i32 + 1)))
+    row_wise(args, result, |row| {
+        if row[0].is_null() {
+            return Ok(Value::null(LogicalType::INTEGER));
+        }
+        Ok(match search(items(&row[0]), &row[1])? {
+            Some(at) => Value::integer(at as i32 + 1),
+            None => Value::null(LogicalType::INTEGER),
+        })
     })
 }
 
@@ -278,21 +291,29 @@ fn list_zip(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+fn null_selection() -> Error {
+    Error::new(
+        ErrorKind::InvalidInput,
+        "NULLs are not allowed as list elements in the second input parameter.",
+    )
+}
+
 fn list_select(args: &DataChunk, result: &mut Vector) -> Result<()> {
     let ty = result.logical_type().clone();
     let element = ty.child_type().expect("a list").clone();
     strict_rows(args, result, |row| {
         let values = items(&row[0]);
-        let picked = items(&row[1])
-            .iter()
-            .map(|index| {
-                index
-                    .as_i128()
-                    .filter(|i| *i > 0)
-                    .and_then(|i| values.get(i as usize - 1).cloned())
-                    .unwrap_or_else(|| Value::null(element.clone()))
-            })
-            .collect();
+        let mut picked = Vec::new();
+        for index in items(&row[1]) {
+            let Some(index) = index.as_i128() else {
+                return Err(null_selection());
+            };
+            let at = usize::try_from(index - 1).ok();
+            picked.push(
+                at.and_then(|at| values.get(at).cloned())
+                    .unwrap_or_else(|| Value::null(element.clone())),
+            );
+        }
         Value::new(ty.clone(), ValueData::List(picked))
     })
 }
@@ -306,6 +327,9 @@ fn list_where(args: &DataChunk, result: &mut Vector) -> Result<()> {
                 ErrorKind::InvalidInput,
                 "list_where: The list and the mask must have the same length",
             ));
+        }
+        if mask.iter().any(Value::is_null) {
+            return Err(null_selection());
         }
         let picked = values
             .iter()
@@ -401,7 +425,10 @@ fn bind_list_aggr(name: &str, aggregate: Option<&str>, children: Vec<BoundExpr>)
     let mut children = children;
     if let Some(aggregate) = aggregate {
         if children.is_empty() {
-            return Err(no_match(name, &children));
+            return Err(Error::new(
+                ErrorKind::Binder,
+                format!("Macro {name}() does not support the supplied arguments."),
+            ));
         }
         children.insert(1, BoundExpr::constant(Value::varchar(aggregate)));
     }
@@ -426,6 +453,12 @@ fn bind_list_aggr(name: &str, aggregate: Option<&str>, children: Vec<BoundExpr>)
             format!("Aggregate Function with name {function} does not exist!"),
         ));
     };
+    if children.iter().any(|child| !child.is_foldable()) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("Aggregate function {function} is not supported for list_aggr: extra arguments must be constant"),
+        ));
+    }
     let mut probe = vec![BoundExpr::constant(Value::null(element))];
     probe.extend(children.iter().cloned());
     let return_type = bind_aggregate_function(set, probe, None, false)?.return_type;
@@ -442,14 +475,26 @@ fn bind_search(
     return_type: LogicalType,
     callback: super::ScalarCallback,
 ) -> Result<BoundExpr> {
-    let list = as_list(list);
+    // a string constant has to cast to a list, like any other argument of the template LIST(T)
+    let list = if matches!(&list.kind, BoundExprKind::Constant(_)) && list.return_type.id() == LogicalTypeId::Varchar {
+        list.cast_to(&LogicalType::list(needle.return_type.clone()), false)
+    } else {
+        as_list(list)
+    };
     let Some(element) = element_of(&list) else {
         return Err(no_match(name, &[list, needle]));
     };
-    if element.id() == LogicalTypeId::SqlNull {
-        return Ok(BoundExpr::constant(Value::null(return_type)));
-    }
-    let common = force_max_logical_type(&element, &needle.return_type);
+    // a string literal takes the type of the elements, and fails to cast to it if it has to
+    let needle_type = match expression_return_type(&needle) {
+        literal if literal.id() == LogicalTypeId::StringLiteral && element.id() != LogicalTypeId::SqlNull => {
+            element.clone()
+        }
+        _ => needle.return_type.clone(),
+    };
+    let common = match force_max_logical_type(&element, &needle_type) {
+        common if common.id() == LogicalTypeId::SqlNull => LogicalType::INTEGER,
+        common => common,
+    };
     let list = list.cast_to(&LogicalType::list(common.clone()), false);
     let needle = needle.cast_to(&common, false);
     Ok(bound_function(name, vec![list, needle], return_type, callback))
@@ -482,11 +527,17 @@ pub fn bind_list_function(name: &str, children: Vec<BoundExpr>) -> Result<BoundE
             bind_search("list_position", list, needle, LogicalType::INTEGER, list_position)
         }
         "list_distinct" | "array_distinct" => {
+            if children.len() != 1 {
+                return Err(no_match(&lower, &children));
+            }
             let (list, _) = list_arg(&children)?;
             let ty = list.return_type.clone();
             Ok(bound_function("list_distinct", vec![list], ty, list_distinct))
         }
         "list_unique" | "array_unique" => {
+            if children.len() != 1 {
+                return Err(no_match(&lower, &children));
+            }
             let (list, _) = list_arg(&children)?;
             Ok(bound_function(
                 "list_unique",
@@ -517,11 +568,16 @@ pub fn bind_list_function(name: &str, children: Vec<BoundExpr>) -> Result<BoundE
             }
         }
         "flatten" => {
+            if children
+                .first()
+                .is_some_and(|c| c.return_type.id() == LogicalTypeId::SqlNull)
+            {
+                return Ok(BoundExpr::constant(Value::sql_null()));
+            }
             let (list, element) = list_arg(&children)?;
             if element.id() == LogicalTypeId::SqlNull {
-                return Ok(BoundExpr::constant(Value::null(LogicalType::list(
-                    LogicalType::SQLNULL,
-                ))));
+                let ty = LogicalType::list(LogicalType::SQLNULL);
+                return Ok(bound_function("flatten", vec![list], ty, flatten));
             }
             let inner = as_list(BoundExpr::constant(Value::null(element.clone())));
             if element_of(&inner).is_none() {

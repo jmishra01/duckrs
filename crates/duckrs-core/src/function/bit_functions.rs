@@ -44,6 +44,7 @@ pub(super) fn strict_rows(args: &DataChunk, result: &mut Vector, f: impl Fn(&[Va
 
 /// `BitCntOperator` over the width of the argument's type.
 fn integer_bit_count(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let result_is_small = result.logical_type().id() == LogicalTypeId::SmallInt;
     strict_rows(args, result, |row| {
         let value = row[0].as_i128().expect("an integer");
         let bits = match row[0].logical_type().id() {
@@ -53,6 +54,9 @@ fn integer_bit_count(args: &DataChunk, result: &mut Vector) -> Result<()> {
             LogicalTypeId::BigInt => (value as i64).count_ones(),
             _ => value.count_ones(),
         };
+        if result_is_small {
+            return Ok(Value::smallint(bits as i16));
+        }
         Ok(Value::tinyint(bits as i8))
     })
 }
@@ -231,6 +235,163 @@ fn shift_right(args: &DataChunk, result: &mut Vector) -> Result<()> {
 }
 
 /// `bitstring_byte_comparable`: bytes that order like the bits.
+/// An integer value as its sign-extended (or for a UHUGEINT its raw) bits.
+fn integer_bits(value: &Value) -> i128 {
+    match value.data() {
+        ValueData::UInt128(v) => *v as i128,
+        _ => value.as_i128().expect("an integer"),
+    }
+}
+
+fn integer_of_type(ty: &LogicalType, bits: i128) -> Result<Value> {
+    let data = match ty.id() {
+        LogicalTypeId::TinyInt => ValueData::Int8(bits as i8),
+        LogicalTypeId::SmallInt => ValueData::Int16(bits as i16),
+        LogicalTypeId::Integer => ValueData::Int32(bits as i32),
+        LogicalTypeId::BigInt => ValueData::Int64(bits as i64),
+        LogicalTypeId::HugeInt => ValueData::Int128(bits),
+        LogicalTypeId::UTinyInt => ValueData::UInt8(bits as u8),
+        LogicalTypeId::USmallInt => ValueData::UInt16(bits as u16),
+        LogicalTypeId::UInteger => ValueData::UInt32(bits as u32),
+        LogicalTypeId::UBigInt => ValueData::UInt64(bits as u64),
+        LogicalTypeId::UHugeInt => ValueData::UInt128(bits as u128),
+        other => unreachable!("{other:?} is not an integer"),
+    };
+    Value::new(ty.clone(), data)
+}
+
+fn integer_binary(args: &DataChunk, result: &mut Vector, op: fn(i128, i128) -> i128) -> Result<()> {
+    let ty = result.logical_type().clone();
+    strict_rows(args, result, |row| {
+        integer_of_type(&ty, op(integer_bits(&row[0]), integer_bits(&row[1])))
+    })
+}
+
+fn integer_and(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    integer_binary(args, result, |a, b| a & b)
+}
+
+fn integer_or(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    integer_binary(args, result, |a, b| a | b)
+}
+
+fn integer_xor(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    integer_binary(args, result, |a, b| a ^ b)
+}
+
+fn integer_not(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let ty = result.logical_type().clone();
+    strict_rows(args, result, |row| integer_of_type(&ty, !integer_bits(&row[0])))
+}
+
+/// The bits of an integer type, and whether it has a sign.
+fn integer_width(ty: &LogicalType) -> (u128, bool) {
+    match ty.id() {
+        LogicalTypeId::TinyInt => (8, true),
+        LogicalTypeId::SmallInt => (16, true),
+        LogicalTypeId::Integer => (32, true),
+        LogicalTypeId::BigInt => (64, true),
+        LogicalTypeId::HugeInt => (128, true),
+        LogicalTypeId::UTinyInt => (8, false),
+        LogicalTypeId::USmallInt => (16, false),
+        LogicalTypeId::UInteger => (32, false),
+        LogicalTypeId::UBigInt => (64, false),
+        _ => (128, false),
+    }
+}
+
+/// `BitwiseShiftLeftOperator`.
+fn integer_shift_left(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let ty = result.logical_type().clone();
+    let (bits, signed) = integer_width(&ty);
+    let max_shift = bits + u128::from(!signed);
+    strict_rows(args, result, |row| {
+        let (input, shift) = (integer_bits(&row[0]), integer_bits(&row[1]));
+        if signed && input < 0 {
+            return Err(out_of_range(format!("Cannot left-shift negative number {input}")));
+        }
+        if signed && shift < 0 {
+            return Err(out_of_range(format!("Cannot left-shift by negative number {shift}")));
+        }
+        let (input, shift) = (input as u128, shift as u128);
+        if shift >= max_shift {
+            if input == 0 {
+                return integer_of_type(&ty, 0);
+            }
+            return Err(out_of_range(format!("Left-shift value {shift} is out of range")));
+        }
+        if shift == 0 || input == 0 {
+            return Ok(row[0].clone());
+        }
+        if input >= 1u128 << (max_shift - shift - 1) {
+            return Err(out_of_range(format!("Overflow in left shift ({input} << {shift})")));
+        }
+        integer_of_type(&ty, (input << shift) as i128)
+    })
+}
+
+/// `BitwiseShiftRightOperator`.
+fn integer_shift_right(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let ty = result.logical_type().clone();
+    let (bits, signed) = integer_width(&ty);
+    strict_rows(args, result, |row| {
+        let (input, shift) = (integer_bits(&row[0]), integer_bits(&row[1]));
+        if (signed && shift < 0) || shift as u128 >= bits {
+            return integer_of_type(&ty, 0);
+        }
+        integer_of_type(
+            &ty,
+            if signed {
+                input >> shift
+            } else {
+                ((input as u128) >> shift) as i128
+            },
+        )
+    })
+}
+
+/// `&`, `|`, `xor`, `~`, `<<` and `>>` over the integers.
+pub(super) fn integer_bit_functions() -> Vec<ScalarFunctionSet> {
+    let types = [
+        LogicalType::TINYINT,
+        LogicalType::SMALLINT,
+        LogicalType::INTEGER,
+        LogicalType::BIGINT,
+        LogicalType::HUGEINT,
+        LogicalType::UTINYINT,
+        LogicalType::USMALLINT,
+        LogicalType::UINTEGER,
+        LogicalType::UBIGINT,
+        LogicalType::UHUGEINT,
+    ];
+    let binary: [(&str, ScalarCallback); 5] = [
+        ("&", integer_and),
+        ("|", integer_or),
+        ("xor", integer_xor),
+        ("<<", integer_shift_left),
+        (">>", integer_shift_right),
+    ];
+    let mut sets = Vec::new();
+    for (name, callback) in binary {
+        let mut set = ScalarFunctionSet::new(name);
+        for ty in &types {
+            set.add(ScalarFunction::new(
+                name,
+                vec![ty.clone(), ty.clone()],
+                ty.clone(),
+                callback,
+            ));
+        }
+        sets.push(set);
+    }
+    let mut not = ScalarFunctionSet::new("~");
+    for ty in &types {
+        not.add(ScalarFunction::new("~", vec![ty.clone()], ty.clone(), integer_not));
+    }
+    sets.push(not);
+    sets
+}
+
 fn byte_comparable(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
         let input = bytes_of(&row[0]);
@@ -377,7 +538,7 @@ pub(super) fn bit_functions() -> Vec<ScalarFunctionSet> {
         (
             "bit_count",
             vec![LogicalType::HUGEINT],
-            LogicalType::TINYINT,
+            LogicalType::SMALLINT,
             integer_bit_count,
         ),
         (

@@ -143,7 +143,7 @@ fn union_by_name_columns(
             if child.names[..i].iter().any(|n| n.eq_ignore_ascii_case(name)) {
                 return Err(binder_error(format!(
                     "UNION (ALL) BY NAME operation doesn't support duplicate names in the SELECT list - the name \
-                     {name} occurs multiple times"
+                     \"{name}\" occurs multiple times"
                 )));
             }
             if !names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
@@ -281,6 +281,7 @@ impl Binder<'_> {
         let mut binder = self.child_binder();
         // a CTE sees the ones before it, and not itself
         binder.ctes.truncate(index);
+        binder.ctes_being_bound.push(name.clone());
         // a CTE sees what is around its definition, and not what is around a reference to it
         binder.outer_contexts.truncate(outer_depth);
         let bound = match &cte.query.kind {
@@ -1371,10 +1372,22 @@ impl Binder<'_> {
                 {
                     return self.bind_cte_reference(table_ref, index);
                 }
-                let table = match self
+                let entry = self
                     .catalog
-                    .get_entry(schema_of(name)?, self.search_schema.as_deref(), &name.name)?
+                    .get_entry(schema_of(name)?, self.search_schema.as_deref(), &name.name);
+                if entry.is_err()
+                    && name.qualification.is_empty()
+                    && self
+                        .ctes_being_bound
+                        .iter()
+                        .any(|cte| cte.eq_ignore_ascii_case(&name.name))
                 {
+                    return Err(binder_error(format!(
+                        "Circular reference to CTE {}, use WITH RECURSIVE to use recursive CTEs.",
+                        name.name
+                    )));
+                }
+                let table = match entry? {
                     TableOrView::Table(table) => table,
                     TableOrView::View(view) => return self.bind_view(table_ref, view),
                 };
@@ -1853,7 +1866,7 @@ impl Binder<'_> {
                     )));
                 };
                 if columns.contains(&index) {
-                    return Err(binder_error(format!("Multiple assignments to same column {name}")));
+                    return Err(binder_error(format!("Multiple assignments to same column \"{name}\"")));
                 }
                 columns.push(index);
                 let column = &table.columns[index];

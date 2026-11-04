@@ -379,7 +379,7 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token>> {
         State::MultiLineComment => t.push(last_pos, n, None, true)?,
         State::Operator => t.push_operator(last_pos, n)?,
         State::DollarQuotedString => t.push(last_pos, n, Some(TokenType::StringLiteral), true)?,
-        State::StringLiteral => return Err(syntax_error("syntax error: unterminated string literal")),
+        State::StringLiteral => return Err(syntax_error("unterminated string literal")),
         State::QuotedIdentifier => return Err(syntax_error("syntax error: unterminated quoted identifier")),
         State::Keyword | State::Standard | State::Numeric if last_pos < n => {
             let word = &sql[last_pos..];

@@ -416,8 +416,8 @@ fn truncate(part: DatePart, micros: i64) -> Result<i64> {
     let (year, month, _) = Date(days).to_ymd();
     let ymd = |year: i32, month: i32| {
         Date::from_ymd(year, month, 1)
-            .map(|d| start_of_day(d.0))
-            .ok_or_else(|| out_of_range("Date out of range"))
+            .and_then(|d| i64::from(d.0).checked_mul(MICROS_PER_DAY))
+            .ok_or_else(|| conversion("Date out of range".to_string()))
     };
     let floor_to = |value: i32, size: i32| value.div_euclid(size) * size;
     match part {
@@ -452,9 +452,17 @@ fn date_trunc(args: &DataChunk, result: &mut Vector) -> Result<()> {
             Some(Moment::Interval(interval)) => {
                 return Ok(Value::interval(truncate_interval(part, interval)?));
             }
-            Some(Moment::Date(days)) => i64::from(days)
-                .checked_mul(MICROS_PER_DAY)
-                .ok_or_else(|| conversion(format!("Date {} not in timestamp range", Date(days).0)))?,
+            Some(Moment::Date(days)) => i64::from(days).checked_mul(MICROS_PER_DAY).ok_or_else(|| {
+                conversion(match part {
+                    DatePart::Hour
+                    | DatePart::Minute
+                    | DatePart::Second
+                    | DatePart::Epoch
+                    | DatePart::Milliseconds
+                    | DatePart::Microseconds => format!("Date {} not in timestamp range", Date(days).0),
+                    _ => "Date out of range".to_string(),
+                })
+            })?,
             Some(m) => micros_of(m).expect("a date or a timestamp"),
             None => {
                 let raw = row[1].as_i128().unwrap_or(0);
@@ -538,6 +546,11 @@ fn date_diff(args: &DataChunk, result: &mut Vector) -> Result<()> {
             DatePart::Week | DatePart::YearWeek => (i64::from(last) - i64::from(first)) / 7,
             DatePart::IsoYear => i64::from(iso_week(last).0 - iso_week(first).0),
             DatePart::Era => i64::from(y2 > 0) - i64::from(y1 > 0),
+            DatePart::Microseconds => {
+                let moment = |days: i32, time: i64| i128::from(days) * i128::from(MICROS_PER_DAY) + i128::from(time);
+                i64::try_from(moment(last, last_time) - moment(first, first_time))
+                    .map_err(|_| Error::new(ErrorKind::OutOfRange, "Overflow in microsecond subtraction"))?
+            }
             other => diff_micros(other, start, end, "timestamp")?,
         }))
     })
@@ -1149,13 +1162,14 @@ fn strftime_text(format: &str, days: i32, time: i64, zoned: bool) -> Result<Stri
             'U' => out += &pad(i64::from(sunday_week), 2),
             'W' => out += &pad(i64::from(monday_week), 2),
             'V' => out += &pad(i64::from(iso), 2),
+            'G' if (0..=9999).contains(&iso_year) => out += &format!("{iso_year:04}"),
             'G' => out += &iso_year.to_string(),
             'y' => out += &pad(i64::from(year.rem_euclid(100)), 2),
             'Y' if year < 0 => out += &year.to_string(),
             'Y' => out += &format!("{year:04}"),
-            'z' if zoned => out += "+00",
+            'z' => out += "+00",
             'Z' if zoned => out += "UTC",
-            'z' | 'Z' => {}
+            'Z' => {}
             '%' => out.push('%'),
             other => {
                 return Err(Error::new(
@@ -1247,7 +1261,13 @@ fn strptime_micros(input: &str, format: &str) -> std::result::Result<i64, String
                 if negative {
                     at += 1;
                 }
-                year = number(&mut at, 7).ok_or_else(|| bad("a number"))?;
+                // a number right after it has to leave its digits alone
+                let mut following = pattern.clone();
+                let adjacent = following.next() == Some('%')
+                    && following
+                        .next()
+                        .is_some_and(|next| matches!(next, 'd' | 'e' | 'm' | 'H' | 'I' | 'M' | 'S' | 'y' | 'j'));
+                year = number(&mut at, if adjacent { 4 } else { 7 }).ok_or_else(|| bad("a number"))?;
                 if negative {
                     year = -year;
                 }
@@ -1333,6 +1353,12 @@ fn strptime_micros(input: &str, format: &str) -> std::result::Result<i64, String
         hour = hour % 12 + if is_pm { 12 } else { 0 };
     }
     let year = i32::try_from(year).map_err(|_| "Year out of range")?;
+    if let Some(yday) = yday {
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        if !(1..=if leap { 366 } else { 365 }).contains(&yday) {
+            return Err("Day of the year out of range".into());
+        }
+    }
     let date = match yday {
         Some(yday) => Date::from_ymd(year, 1, 1).map(|d| Date(d.0 + yday as i32 - 1)),
         None => Date::from_ymd(year, month as i32, day as i32),

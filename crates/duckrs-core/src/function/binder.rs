@@ -8,8 +8,10 @@
 use super::aggregates::AggregateKind;
 use super::aggregates::{AggregateFunction, AggregateFunctionSet};
 use super::cast_rules::implicit_cast;
+use super::holistic::check_quantile_parameter;
 use super::nested::bind_struct_pack;
 use super::{ScalarFunction, ScalarFunctionSet};
+use crate::execution::expression_executor::evaluate_scalar;
 use crate::planner::expression::{BoundAggregate, BoundExpr, BoundExprKind};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::{Value, ValueData};
@@ -101,6 +103,10 @@ fn select_overload<F: std::fmt::Display>(
         cheapest.push((function, cost));
     }
     match cheapest.len() {
+        // a macro in C++
+        0 if name == "split_part" => Err(binder_error(format!(
+            "Macro {name}() does not support the supplied arguments."
+        ))),
         0 => Err(binder_error(format!(
             "No function matches the given name and argument types '{}'. You might need to add explicit type casts.",
             call_to_string(name, arguments)
@@ -138,6 +144,27 @@ pub fn bind_scalar_function(
 ) -> Result<BoundExpr> {
     let arguments: Vec<LogicalType> = children.iter().map(expression_return_type).collect();
     let function = select_function(set, &arguments)?;
+    // `FunctionNullHandling::SPECIAL_HANDLING`: the function decides what a NULL argument means
+    let special_nulls = matches!(
+        function.name.as_str(),
+        "string_split" | "str_split" | "string_to_array" | "split"
+    );
+    if special_nulls {
+        let children = children
+            .into_iter()
+            .zip(&function.arguments)
+            .map(|(child, parameter)| child.cast_to(parameter, false))
+            .collect();
+        let return_type = function.return_type.clone();
+        return Ok(BoundExpr::new(
+            BoundExprKind::Function {
+                function,
+                children,
+                is_operator,
+            },
+            return_type,
+        ));
+    }
     // if any of the arguments are NULL, the function is replaced with a NULL constant
     if children.iter().any(|c| c.return_type.id() == LogicalTypeId::SqlNull) {
         // untyped NULLs never go through type resolution
@@ -190,6 +217,55 @@ pub fn bind_scalar_function(
     ))
 }
 
+/// `BindFunctionInput::GetConstant`: the value of a parameter of `function` that has to be a
+/// constant. `None` while the parameter is an unresolved prepared statement parameter.
+pub(super) fn constant_parameter(
+    function: &str,
+    child: &BoundExpr,
+    at: usize,
+    accept_null: bool,
+) -> Result<Option<Value>> {
+    if child.return_type.id() == LogicalTypeId::Unknown {
+        return Ok(None);
+    }
+    if !child.is_foldable() {
+        return Err(binder_error(format!(
+            "Argument #{} in function {function} must be a constant expression",
+            at + 1
+        )));
+    }
+    let value = evaluate_scalar(child)?;
+    if !accept_null && value.is_null() {
+        return Err(binder_error(format!(
+            "Argument #{} in function {function} must not be NULL",
+            at + 1
+        )));
+    }
+    Ok(Some(value))
+}
+
+/// The bind callbacks of the aggregates with a parameter that has to be constant.
+fn check_constant_parameters(name: &str, children: &mut [BoundExpr]) -> Result<()> {
+    match (name, children) {
+        ("string_agg" | "listagg" | "group_concat", [input, separator]) => {
+            if constant_parameter(name, separator, 1, true)?.is_some_and(|value| value.is_null()) {
+                *input = BoundExpr::constant(Value::null(LogicalType::VARCHAR));
+            }
+            Ok(())
+        }
+        ("quantile_cont" | "quantile_disc" | "quantile", [_]) => Err(binder_error(
+            "QUANTILE requires a range argument between [0, 1]".to_string(),
+        )),
+        ("quantile_cont" | "quantile_disc" | "quantile", [_, parameter]) => {
+            match constant_parameter(name, parameter, 1, false)? {
+                Some(value) => check_quantile_parameter(&value),
+                None => Ok(()),
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
 /// `FunctionBinder::BindAggregateFunction`: selects the overload and casts the arguments. ANY
 /// and DECIMAL parameters take the argument as it is, and may decide the return type.
 pub fn bind_aggregate_function(
@@ -198,6 +274,8 @@ pub fn bind_aggregate_function(
     filter: Option<BoundExpr>,
     distinct: bool,
 ) -> Result<BoundAggregate> {
+    let mut children = children;
+    check_constant_parameters(&set.name, &mut children)?;
     let arguments: Vec<LogicalType> = children.iter().map(expression_return_type).collect();
     let function: Arc<AggregateFunction> = select_overload(&set.name, &set.functions, |f| &f.arguments, &arguments)?;
     let children: Vec<BoundExpr> = children

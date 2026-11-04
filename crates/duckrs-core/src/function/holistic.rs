@@ -8,7 +8,7 @@
 use super::aggregates::value_keys;
 use crate::execution::expression_executor::evaluate_scalar;
 use crate::planner::expression::BoundExpr;
-use duckrs_common::types::{LogicalType, LogicalTypeId, MICROS_PER_DAY};
+use duckrs_common::types::{Interval, LogicalType, LogicalTypeId, bit};
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::Vector;
 use duckrs_common::{Error, ErrorKind, Result};
@@ -142,74 +142,218 @@ fn sorted(values: Vec<Value>) -> Result<Vec<Value>> {
     Ok(order.into_iter().map(|at| values[at].clone()).collect())
 }
 
-/// A date or time as the number it interpolates by.
-fn position(value: &Value) -> Option<f64> {
-    match value.logical_type().id() {
-        LogicalTypeId::Date => value.as_i128().map(|days| days as f64 * MICROS_PER_DAY as f64),
-        _ => number(value),
-    }
+/// `InterpolateInt64`.
+fn interpolate_i64(lo: i64, d: f64, hi: i64) -> i64 {
+    let (lower, upper) = (lo.min(hi), lo.max(hi));
+    let offset = ((i128::from(hi) - i128::from(lo)) as f64 * d).round() as i128;
+    (i128::from(lo) + offset).clamp(i128::from(lower), i128::from(upper)) as i64
 }
 
-fn from_position(position: f64, input: &Value, ty: &LogicalType) -> Result<Value> {
-    if input.logical_type().id() == LogicalTypeId::Date
-        || matches!(
-            ty.id(),
-            LogicalTypeId::Timestamp | LogicalTypeId::TimestampTz | LogicalTypeId::Time
+/// `Interval::GetMicro`.
+fn interval_micros(interval: &Interval) -> Result<i64> {
+    let per_day = Interval::MICROS_PER_DAY;
+    let conversion = |from: &str| {
+        Error::new(
+            ErrorKind::Conversion,
+            format!("Could not convert {from} to Microseconds"),
         )
-    {
-        return Value::new(ty.clone(), ValueData::Int64(position.round() as i64));
-    }
-    cast(Value::double(position), ty)
-}
-
-/// `Interpolator`: the value at fraction `q` of the sorted `values`.
-fn quantile(values: &[Value], q: f64, continuous: bool, ty: &LogicalType) -> Result<Value> {
-    let count = values.len() as f64;
-    if !continuous {
-        let index = (count - (count - q * count).floor()).max(1.0) as usize - 1;
-        return cast(values[index.min(values.len() - 1)].clone(), ty);
-    }
-    let rank = (count - 1.0) * q;
-    let (low, high) = (rank.floor(), rank.ceil());
-    let (first, second) = (&values[low as usize], &values[high as usize]);
-    match (position(first), position(second)) {
-        (Some(a), Some(b)) => {
-            if low == high {
-                return from_position(a, first, ty);
-            }
-            from_position(a + (b - a) * (rank - low), first, ty)
-        }
-        _ => cast(first.clone(), ty),
-    }
-}
-
-fn fractions(row: &Value) -> Result<(Vec<f64>, bool)> {
-    let parameter = fields(row).get(1).cloned().unwrap_or_else(|| Value::double(0.5));
-    let (items, is_list) = match parameter.data() {
-        ValueData::List(items) => (items.clone(), true),
-        _ => (vec![parameter.clone()], false),
     };
-    let mut fractions = Vec::with_capacity(items.len());
-    for item in &items {
+    let months = i64::from(interval.months)
+        .checked_mul(Interval::DAYS_PER_MONTH * per_day)
+        .ok_or_else(|| conversion("Month"))?;
+    let days = i64::from(interval.days)
+        .checked_mul(per_day)
+        .ok_or_else(|| conversion("Day"))?;
+    months
+        .checked_add(days)
+        .and_then(|sum| sum.checked_add(interval.micros))
+        .ok_or_else(|| conversion("Interval"))
+}
+
+/// `InterpolateOperator`: the value a fraction `d` of the way from `lo` to `hi`, both of type `ty`.
+fn interpolate(lo: &Value, d: f64, hi: &Value, ty: &LogicalType) -> Result<Value> {
+    match (lo.data(), hi.data()) {
+        (ValueData::Interval(lo), ValueData::Interval(hi)) => {
+            let (lo, hi) = (i128::from(interval_micros(lo)?), i128::from(interval_micros(hi)?));
+            let micros = lo + ((hi - lo) as f64 * d).round() as i128;
+            let per_day = i128::from(Interval::MICROS_PER_DAY);
+            Ok(Value::interval(Interval::new(
+                0,
+                (micros / per_day) as i32,
+                (micros % per_day) as i64,
+            )))
+        }
+        (ValueData::Int64(a), ValueData::Int64(b)) if ty.id() != LogicalTypeId::Double => {
+            if a == b {
+                return Ok(lo.clone());
+            }
+            if matches!(
+                ty.id(),
+                LogicalTypeId::Timestamp
+                    | LogicalTypeId::TimestampTz
+                    | LogicalTypeId::TimestampNs
+                    | LogicalTypeId::TimestampMs
+                    | LogicalTypeId::TimestampSec
+            ) && [a, b].iter().any(|v| v.abs() == i64::MAX)
+            {
+                return Err(Error::new(
+                    ErrorKind::Conversion,
+                    "Cannot interpolate infinite TIMESTAMP values",
+                ));
+            }
+            Value::new(ty.clone(), ValueData::Int64(interpolate_i64(*a, d, *b)))
+        }
+        _ if ty.id() == LogicalTypeId::Decimal => {
+            // `InterpolateOperator`: over the integers a DECIMAL stores, and truncating
+            let (Some(a), Some(b)) = (lo.as_i128(), hi.as_i128()) else {
+                return Ok(lo.clone());
+            };
+            let (width, scale) = ty.decimal_properties().expect("a DECIMAL");
+            Value::decimal((a as f64 + (b as f64 - a as f64) * d) as i128, width, scale)
+        }
+        _ => {
+            let (Some(a), Some(b)) = (number(lo), number(hi)) else {
+                return Ok(lo.clone());
+            };
+            let mixed = if ty.id() == LogicalTypeId::Double {
+                a * (1.0 - d) + b * d
+            } else {
+                a + (b - a) * d
+            };
+            cast(Value::double(mixed), ty)
+        }
+    }
+}
+
+/// `QuantileInterpolator<true>::Index`: `ceil(n * q)`, snapped to an integer that the rounding of
+/// `q` missed.
+fn discrete_index(count: usize, q: f64) -> usize {
+    let n = count as f64;
+    let scaled = n * q;
+    let nearest = scaled.round();
+    let tolerance = n * 4.0 * f64::EPSILON;
+    let ceiled = if (scaled - nearest).abs() <= tolerance {
+        nearest
+    } else {
+        scaled.ceil()
+    };
+    (ceiled as usize).max(1) - 1
+}
+
+/// `QuantileInterpolator`: the value at fraction `q` of `values`, sorted in the quantile's order.
+fn quantile(values: &[Value], q: f64, continuous: bool, ty: &LogicalType) -> Result<Value> {
+    if !continuous {
+        return cast(
+            values[discrete_index(values.len(), q).min(values.len() - 1)].clone(),
+            ty,
+        );
+    }
+    let rank = (values.len() as f64 - 1.0) * q;
+    let (low, high) = (rank.floor(), rank.ceil());
+    let lo = cast(values[low as usize].clone(), ty)?;
+    if low == high {
+        return Ok(lo);
+    }
+    let hi = cast(values[high as usize].clone(), ty)?;
+    interpolate(&lo, rank - low, &hi, ty)
+}
+
+/// `NegatePercentileFractions`: a descending ordered-set aggregate is a negative fraction. The
+/// sign of a zero fraction has to survive too.
+pub fn negate_fractions(parameter: &Value, descending: bool) -> Result<Value> {
+    let negate = |value: &Value| match number(value) {
+        Some(fraction) if !(0.0..=1.0).contains(&fraction) => Err(Error::new(
+            ErrorKind::Binder,
+            "PERCENTILEs can only take parameters in the range [0, 1]",
+        )),
+        Some(fraction) if descending => Ok(Value::double(-fraction)),
+        _ => Ok(value.clone()),
+    };
+    match parameter.data() {
+        ValueData::List(items) => {
+            let negated = items.iter().map(negate).collect::<Result<Vec<_>>>()?;
+            let child = negated
+                .first()
+                .map_or(LogicalType::DOUBLE, |v| v.logical_type().clone());
+            Value::new(LogicalType::list(child), ValueData::List(negated))
+        }
+        _ => negate(parameter),
+    }
+}
+
+/// `CheckQuantile` over a constant parameter of a quantile aggregate.
+pub fn check_quantile_parameter(parameter: &Value) -> Result<()> {
+    let items = match parameter.data() {
+        ValueData::List(items) => items.as_slice(),
+        _ => std::slice::from_ref(parameter),
+    };
+    let (mut ascending, mut descending) = (false, false);
+    for item in items {
         let Some(fraction) = number(item) else {
             return Err(Error::new(ErrorKind::Binder, "QUANTILE parameter cannot be NULL"));
         };
-        if !(-1.0..=1.0).contains(&fraction) {
+        if !(-1.0..=1.0).contains(&fraction) && !fraction.is_nan() {
             return Err(Error::new(
                 ErrorKind::Binder,
                 "QUANTILE can only take parameters in the range [-1, 1]",
             ));
         }
-        fractions.push(if fraction < 0.0 { 1.0 + fraction } else { fraction });
+        if fraction.is_nan() {
+            return Err(Error::new(ErrorKind::Binder, "QUANTILE parameter cannot be NaN"));
+        }
+        ascending |= fraction > 0.0;
+        descending |= fraction.is_sign_negative();
     }
-    Ok((fractions, is_list))
+    if ascending && descending {
+        return Err(Error::new(
+            ErrorKind::Binder,
+            "QUANTILE parameters must have consistent signs",
+        ));
+    }
+    Ok(())
+}
+
+/// The fractions of a quantile, whether they are a list, and whether the order is descending.
+fn fractions(row: &Value) -> Result<(Vec<f64>, bool, bool)> {
+    let parameter = fields(row).get(1).cloned().unwrap_or_else(|| Value::double(0.5));
+    let (items, is_list) = match parameter.data() {
+        ValueData::List(items) => (items.clone(), true),
+        _ => (vec![parameter.clone()], false),
+    };
+    check_quantile_parameter(&parameter)?;
+    let fractions: Vec<f64> = items.iter().filter_map(number).collect();
+    let descending = fractions.iter().any(|q| q.is_sign_negative());
+    Ok((fractions.iter().map(|q| q.abs()).collect(), is_list, descending))
+}
+
+/// `QuantileInterpolator<true>::Index` on a DECIMAL fraction computes `n * 10^scale` with an
+/// overflow check, which a scale above 18 can trip.
+fn check_decimal_rank(row: &Value, count: usize) -> Result<()> {
+    let Some(parameter) = fields(row).get(1) else {
+        return Ok(());
+    };
+    let parameter = match parameter.data() {
+        ValueData::List(items) if !items.is_empty() => &items[0],
+        _ => parameter,
+    };
+    let Some((_, scale)) = parameter.logical_type().decimal_properties() else {
+        return Ok(());
+    };
+    let limit = 10i128.pow(38);
+    match (count as i128).checked_mul(10i128.pow(scale.into())) {
+        Some(scaled) if scaled < limit => Ok(()),
+        _ => Err(out_of_range(format!(
+            "Overflow in multiplication of DECIMAL(38) ({count} * {})",
+            10i128.pow(scale.into())
+        ))),
+    }
 }
 
 fn quantiles(rows: &[Value], ty: &LogicalType, continuous: bool) -> Result<Value> {
     let Some(first) = rows.first() else {
         return Ok(Value::null(ty.clone()));
     };
-    let (fractions, is_list) = fractions(first)?;
+    let (fractions, is_list, descending) = fractions(first)?;
     let values: Vec<Value> = rows
         .iter()
         .map(|row| fields(row)[0].clone())
@@ -218,7 +362,13 @@ fn quantiles(rows: &[Value], ty: &LogicalType, continuous: bool) -> Result<Value
     if values.is_empty() {
         return Ok(Value::null(ty.clone()));
     }
-    let values = sorted(values)?;
+    if !continuous {
+        check_decimal_rank(first, values.len())?;
+    }
+    let mut values = sorted(values)?;
+    if descending {
+        values.reverse();
+    }
     if is_list {
         let child = ty.child_type().expect("a list of quantiles");
         let items = fractions
@@ -290,7 +440,10 @@ fn regression(pairs: &[(f64, f64)]) -> Regression {
 }
 
 fn arg_extreme(rows: &[Value], ty: &LogicalType, greatest: bool) -> Result<Value> {
-    let chosen: Vec<&Value> = rows.iter().filter(|row| !fields(row)[1].is_null()).collect();
+    let chosen: Vec<&Value> = rows
+        .iter()
+        .filter(|row| !fields(row)[0].is_null() && !fields(row)[1].is_null())
+        .collect();
     let Some(first) = chosen.first() else {
         return Ok(Value::null(ty.clone()));
     };
@@ -360,6 +513,30 @@ fn distinct_count(rows: &[Value]) -> Result<i64> {
     Ok(keys.len() as i64)
 }
 
+/// `bit_and` and the like over BIT: every value must have the same length.
+fn bit_strings(rows: &[Value], ty: &LogicalType, name: &str, combine: fn(u8, u8) -> u8) -> Result<Value> {
+    let mut result: Option<Vec<u8>> = None;
+    for row in rows {
+        let ValueData::Bytes(value) = row.data() else {
+            continue;
+        };
+        result = Some(match result {
+            None => value.clone(),
+            Some(bits) if bit::bit_length(&bits) == bit::bit_length(value) => bit::bitwise(&bits, value, combine),
+            Some(_) => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("Cannot {name} bit strings of different sizes"),
+                ));
+            }
+        });
+    }
+    result.map_or_else(
+        || Ok(Value::null(ty.clone())),
+        |bits| Value::new(ty.clone(), ValueData::Bytes(bits)),
+    )
+}
+
 fn bits(rows: &[Value], ty: &LogicalType, combine: fn(u128, u128) -> u128) -> Result<Value> {
     let mut result: Option<u128> = None;
     for row in rows {
@@ -378,7 +555,6 @@ fn bits(rows: &[Value], ty: &LogicalType, combine: fn(u128, u128) -> u128) -> Re
 pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value> {
     use Holistic::*;
     let null = || Value::null(ty.clone());
-    let double_or_null = |value: Option<f64>| value.map_or_else(null, Value::double);
     Ok(match kind {
         StringAgg => {
             let mut out: Option<String> = None;
@@ -418,6 +594,9 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
                 Value::boolean(flags.iter().any(|f| *f))
             }
         }
+        BitAnd if ty.id() == LogicalTypeId::Bit => bit_strings(rows, ty, "AND", |a, b| a & b)?,
+        BitOr if ty.id() == LogicalTypeId::Bit => bit_strings(rows, ty, "OR", |a, b| a | b)?,
+        BitXor if ty.id() == LogicalTypeId::Bit => bit_strings(rows, ty, "XOR", |a, b| a ^ b)?,
         BitAnd => bits(rows, ty, |a, b| a & b)?,
         BitOr => bits(rows, ty, |a, b| a | b)?,
         BitXor => bits(rows, ty, |a, b| a ^ b)?,
@@ -461,12 +640,24 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
             if values.len() <= 2 {
                 return Ok(null());
             }
-            let (n, _, square, cube, _) = moments(&values);
-            if square == 0.0 {
+            // the running central moments stay exactly 0 over constant input
+            let (mut seen, mut mean, mut m2, mut m3) = (0.0, 0.0, 0.0, 0.0);
+            for value in &values {
+                let previous = seen;
+                seen += 1.0;
+                let delta = value - mean;
+                let delta_n = delta / seen;
+                let term = delta * delta_n * previous;
+                mean += delta_n;
+                m3 += term * delta_n * (seen - 2.0) - 3.0 * delta_n * m2;
+                m2 += term;
+            }
+            if m2 <= 0.0 {
                 return Ok(null());
             }
-            let g1 = (cube / n) / (square / n).powf(1.5);
-            checked("SKEWNESS", (n * (n - 1.0)).sqrt() / (n - 2.0) * g1)?
+            let n = seen;
+            let g1 = n.sqrt() * (m3 / m2) / m2.sqrt();
+            checked("SKEW", (n * (n - 1.0)).sqrt() / (n - 2.0) * g1)?
         }
         Kurtosis => {
             let values = numbers(rows);
@@ -495,6 +686,7 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
         }
         ArgMin => arg_extreme(rows, ty, false)?,
         ArgMax => arg_extreme(rows, ty, true)?,
+        CountIf if rows.is_empty() => null(),
         CountIf => {
             let count = rows
                 .iter()
@@ -540,14 +732,28 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
                 return Ok(null());
             }
             let r = regression(&pairs);
-            let finite = |value: f64| value.is_finite().then_some(value);
+            // a single pair has no spread at all, whatever rounding leaves in the sums
+            let (var_x, var_y) = if r.n > 1.0 {
+                (r.sxx / r.n, r.syy / r.n)
+            } else {
+                (0.0, 0.0)
+            };
+            let slope = if var_x != 0.0 { (r.sxy / r.n) / var_x } else { f64::NAN };
             match kind {
-                Corr => double_or_null(finite(r.sxy / (r.sxx * r.syy).sqrt())),
+                Corr => {
+                    let spread = var_x.sqrt() * var_y.sqrt();
+                    Value::double(if spread != 0.0 {
+                        (r.sxy / r.n) / spread
+                    } else {
+                        f64::NAN
+                    })
+                }
                 CovarPop => Value::double(r.sxy / r.n),
                 CovarSamp if r.n < 2.0 => null(),
                 CovarSamp => Value::double(r.sxy / (r.n - 1.0)),
-                RegrSlope => double_or_null(finite(r.sxy / r.sxx)),
-                RegrIntercept => double_or_null(finite(r.y - r.sxy / r.sxx * r.x)),
+                RegrSlope => Value::double(slope),
+                RegrIntercept if slope.is_nan() => null(),
+                RegrIntercept => Value::double(r.y - slope * r.x),
                 RegrR2 if r.sxx == 0.0 => null(),
                 RegrR2 if r.syy == 0.0 => Value::double(1.0),
                 RegrR2 => Value::double(r.sxy * r.sxy / (r.sxx * r.syy)),

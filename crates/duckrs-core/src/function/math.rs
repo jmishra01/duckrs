@@ -2,8 +2,12 @@
 //
 //! The math functions. They run row by row; the vectorized loops come with Phase 13.
 
+use super::binder::constant_parameter;
 use super::bit_functions::strict_rows;
+use super::nested::bound_function;
 use super::{ScalarCallback, ScalarFunction, ScalarFunctionSet};
+use crate::execution::expression_executor::evaluate_scalar;
+use crate::planner::expression::BoundExpr;
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, Vector};
@@ -176,6 +180,13 @@ fn is_finite(args: &DataChunk, result: &mut Vector) -> Result<()> {
 
 /// Rounds half away from zero by the exact value of `input`, which a product with a power of ten
 /// can land on a midpoint it isn't on: the stored 2.675 lies below it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DecimalRounding {
+    Round,
+    RoundEven,
+    Trunc,
+}
+
 fn round_exact(input: f64, precision: usize) -> f64 {
     let text = format!("{:.*}", precision + 1100, input.abs());
     let point = text.find('.').expect("a fraction was asked for");
@@ -245,6 +256,128 @@ fn trunc_precision(args: &DataChunk, result: &mut Vector) -> Result<()> {
         let precision = row[1].as_i128().expect("an INTEGER");
         Ok(Value::double(round_double(float(&row[0]), precision, f64::trunc)))
     })
+}
+
+/// `RoundDivide`: `input / power`, rounded away from zero from one half up. With `even`, a tie
+/// goes to the even quotient.
+fn round_divide(input: i128, power: i128, even: bool) -> i128 {
+    let (quotient, remainder) = (input / power, (input % power).abs());
+    let half = power / 2;
+    let away = remainder > half || (remainder == half && (!even || quotient % 2 != 0));
+    if !away {
+        quotient
+    } else if input < 0 {
+        quotient - 1
+    } else {
+        quotient + 1
+    }
+}
+
+/// `DecimalRoundNegativePrecisionOperator` and `DecimalRoundPositivePrecisionOperator`, and the
+/// same for `trunc`.
+fn decimal_round_row(row: &[Value], result: &LogicalType, policy: DecimalRounding) -> Result<Value> {
+    let (width, scale) = row[0].logical_type().decimal_properties().expect("a DECIMAL");
+    let (width, scale) = (i32::from(width), i32::from(scale));
+    let value = row[0].as_i128().expect("a DECIMAL is stored as an integer");
+    let target = row[1].as_i128().expect("an INTEGER") as i32;
+    let divide = |input: i128, power: i128| match policy {
+        DecimalRounding::Round => round_divide(input, power, false),
+        DecimalRounding::RoundEven => round_divide(input, power, true),
+        DecimalRounding::Trunc => input / power,
+    };
+    let (result_width, result_scale) = result.decimal_properties().expect("a DECIMAL");
+    let rounded = if target < 0 {
+        let too_big = match policy {
+            DecimalRounding::Trunc => target <= -(width - scale),
+            _ => target < -(width - scale),
+        };
+        if too_big {
+            0
+        } else {
+            let name = if policy == DecimalRounding::RoundEven {
+                "ROUND_EVEN"
+            } else {
+                "ROUND"
+            };
+            let overflow = || Error::new(ErrorKind::OutOfRange, format!("Overflow in {name} of DECIMAL(38)"));
+            let rounded = divide(value, 10i128.pow((scale - target) as u32))
+                .checked_mul(10i128.pow((-target) as u32))
+                .ok_or_else(overflow)?;
+            if rounded.unsigned_abs() >= 10u128.pow(38) {
+                return Err(overflow());
+            }
+            rounded
+        }
+    } else if target >= scale {
+        value
+    } else {
+        divide(value, 10i128.pow((scale - target) as u32))
+    };
+    Value::decimal(rounded, result_width, result_scale)
+}
+
+fn decimal_round(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let ty = result.logical_type().clone();
+    strict_rows(args, result, |row| decimal_round_row(row, &ty, DecimalRounding::Round))
+}
+
+fn decimal_round_even(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let ty = result.logical_type().clone();
+    strict_rows(args, result, |row| {
+        decimal_round_row(row, &ty, DecimalRounding::RoundEven)
+    })
+}
+
+fn decimal_trunc(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let ty = result.logical_type().clone();
+    strict_rows(args, result, |row| decimal_round_row(row, &ty, DecimalRounding::Trunc))
+}
+
+/// `ResolveDecimalRoundPrecision`: `round(DECIMAL, precision)` stays a DECIMAL, of a scale that
+/// depends on the constant precision. `None` when the call is not such a call.
+pub fn bind_decimal_round(name: &str, children: &[BoundExpr]) -> Result<Option<BoundExpr>> {
+    let [decimal, precision] = children else {
+        return Ok(None);
+    };
+    let Some((width, scale)) = decimal.return_type.decimal_properties() else {
+        return Ok(None);
+    };
+    let (policy, callback): (DecimalRounding, ScalarCallback) = match name {
+        "round" => (DecimalRounding::Round, decimal_round),
+        "round_even" | "roundbankers" => (DecimalRounding::RoundEven, decimal_round_even),
+        "trunc" => (DecimalRounding::Trunc, decimal_trunc),
+        _ => return Ok(None),
+    };
+    if !precision.is_foldable() {
+        return Err(Error::new(
+            ErrorKind::Binder,
+            format!(
+                "No function matches the given name and argument types '{name}({}, {})'. You might need to add \
+                 explicit type casts.",
+                decimal.return_type, precision.return_type
+            ),
+        ));
+    }
+    let Some(value) = constant_parameter(name, precision, 1, false)? else {
+        return Ok(None);
+    };
+    let value = evaluate_scalar(&BoundExpr::constant(value).cast_to(&LogicalType::INTEGER, false))?;
+    let target = value.as_i128().expect("an INTEGER") as i32;
+    let mut result_width = width;
+    let result_scale = if target < 0 {
+        let can_carry = policy != DecimalRounding::Trunc;
+        if can_carry && scale == 0 && target >= -i32::from(width) && result_width < 38 {
+            result_width += 1;
+        }
+        0
+    } else if target >= i32::from(scale) {
+        scale
+    } else {
+        target as u8
+    };
+    let return_type = LogicalType::decimal(result_width, result_scale);
+    let arguments = vec![decimal.clone(), BoundExpr::constant(value)];
+    Ok(Some(bound_function(name, arguments, return_type, callback)))
 }
 
 fn round_even_unary(args: &DataChunk, result: &mut Vector) -> Result<()> {

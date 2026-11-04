@@ -174,6 +174,8 @@ fn string_extract(args: &DataChunk, result: &mut Vector) -> Result<()> {
             return Ok(Value::null(LogicalType::VARCHAR));
         };
         let text = String::from_utf8_lossy(bytes);
+        let offset = i64::try_from(index).unwrap_or(if index < 0 { i64::MIN } else { i64::MAX });
+        super::strings::check_substring_range(bytes.len(), offset, 1)?;
         let length = text.chars().count() as i128;
         let position = if index < 0 { index + length } else { index - 1 };
         let character = usize::try_from(position)
@@ -540,7 +542,7 @@ fn bind_struct_extract(child: BoundExpr, key: BoundExpr) -> Result<BoundExpr> {
     }
     let BoundExprKind::Constant(key) = &key.kind else {
         return Err(binder_error(
-            "Key name for struct_extract needs to be a constant string",
+            "Argument #2 in function struct_extract must be a constant expression",
         ));
     };
     let index = if key.logical_type().id() == LogicalTypeId::Varchar {

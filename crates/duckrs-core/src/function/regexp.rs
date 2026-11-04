@@ -14,6 +14,38 @@ use regex::{Regex, RegexBuilder};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+/// The message RE2 has for what the `regex` crate reports as `error`, which shows the pattern with
+/// carets under the part it means.
+fn regex_error(error: &str, pattern: &str) -> String {
+    let lines: Vec<&str> = error.lines().collect();
+    let reason = lines
+        .iter()
+        .rev()
+        .find_map(|line| line.strip_prefix("error: "))
+        .unwrap_or("");
+    let span = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with('^'))
+        .filter(|at| *at > 0)
+        .and_then(|at| {
+            let (text, carets) = (lines[at - 1].trim_start(), lines[at]);
+            let indent = lines[at - 1].len() - text.len();
+            let start = carets.find('^')?.checked_sub(indent)?;
+            let end = carets.rfind('^')?.checked_sub(indent)? + 1;
+            text.chars().skip(start).take(end - start).collect::<String>().into()
+        })
+        .unwrap_or_else(|| pattern.to_string());
+    match reason {
+        "unclosed group" => format!("missing ): {pattern}"),
+        "unclosed character class" => format!("missing ]: {span}"),
+        "repetition operator missing expression" => format!("no argument for repetition operator: {span}"),
+        "unrecognized escape sequence" | "invalid hexadecimal digit" | "invalid Unicode scalar value" => {
+            format!("invalid escape sequence: {span}")
+        }
+        _ => format!("Invalid regular expression: {error}"),
+    }
+}
+
 thread_local! {
     static CACHE: RefCell<HashMap<String, Regex>> = RefCell::new(HashMap::new());
 }
@@ -65,7 +97,7 @@ fn compile(pattern: &str, options: Options, anchored: bool) -> Result<Regex> {
         .dot_matches_new_line(options.dot_matches_newline)
         .multi_line(options.multi_line)
         .build()
-        .map_err(|error| Error::new(ErrorKind::InvalidInput, format!("Invalid regular expression: {error}")))?;
+        .map_err(|error| Error::new(ErrorKind::InvalidInput, regex_error(&error.to_string(), pattern)))?;
     CACHE.with(|cache| cache.borrow_mut().insert(key, regex.clone()));
     Ok(regex)
 }

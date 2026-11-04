@@ -526,7 +526,7 @@ fn execute_lambda(
                         Some((_, first)) => first.clone(),
                         None => {
                             return Err(Error::new(
-                                ErrorKind::InvalidInput,
+                                ErrorKind::ParameterNotAllowed,
                                 "Cannot perform list_reduce on an empty input list",
                             ));
                         }

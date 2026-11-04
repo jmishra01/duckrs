@@ -11,6 +11,7 @@ duckrs-common.workspace = true
 duckrs-parser.workspace = true
 parking_lot.workspace = true
 regex.workspace = true
+unicode-segmentation.workspace = true
 
 [lints]
 workspace = true

@@ -272,7 +272,15 @@ fn union_to_union(value: &Value, fields: &[Value], target: &LogicalType, mode: C
     let (from, to) = (&source.struct_children()[1..], &target.struct_children()[1..]);
     let mut tags = Vec::with_capacity(from.len());
     for (name, ty) in from {
-        let index = to.iter().position(|(n, _)| n.eq_ignore_ascii_case(name))?;
+        let Some(index) = to.iter().position(|(n, _)| n.eq_ignore_ascii_case(name)) else {
+            // the source may still cast to a member of the target as a whole
+            if union_member(source, target).is_ok() {
+                return None;
+            }
+            return Some(Err(conversion_error(format!(
+                "Type {source} can't be cast as {target}. The member {name} is not present in target union"
+            ))));
+        };
         if !super::cast::has_cast(ty, &to[index].1) {
             return None;
         }
@@ -282,7 +290,12 @@ fn union_to_union(value: &Value, fields: &[Value], target: &LogicalType, mode: C
         return Some(Ok(Value::null(target.clone())));
     };
     let tag = tag as usize;
-    Some(cast_value(&fields[tag + 1], &to[tags[tag]].1, mode).and_then(|v| union_value(target, tags[tag], v)))
+    let member = cast_inner(&fields[tag + 1], &to[tags[tag]].1, mode);
+    Some(match member {
+        // a TRY_CAST that fails on the member loses the whole UNION
+        Err(_) if mode == CastMode::Try => Ok(Value::null(target.clone())),
+        member => member.and_then(|v| union_value(target, tags[tag], v)),
+    })
 }
 
 /// Casts one value, which may be nested on either side. A TRY_CAST loses only what failed.

@@ -113,7 +113,9 @@ fn combine_struct_types(force: bool, left: &LogicalType, right: &LogicalType) ->
             let name = if left_unnamed { right_name } else { left_name };
             children.push((name.clone(), child));
         }
-        return Some(if left_unnamed && right_unnamed {
+        return Some(if children.is_empty() && left.id() == LogicalTypeId::Struct {
+            left.clone()
+        } else if left_unnamed && right_unnamed {
             LogicalType::tuple(children.into_iter().map(|(_, c)| c).collect())
         } else {
             LogicalType::struct_type(children)

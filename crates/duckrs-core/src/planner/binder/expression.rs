@@ -11,6 +11,8 @@ use crate::execution::expression_executor::{evaluate_scalar, try_evaluate_scalar
 use crate::function::binder::{bind_aggregate_function, bind_scalar_function, expression_return_type};
 use crate::function::combine_types::{force_max_logical_type, normalize_type, try_max_logical_type};
 use crate::function::generic::{bind_generic_function, bind_unnest, is_generic_function, is_unnest};
+use crate::function::holistic::negate_fractions;
+use crate::function::math::bind_decimal_round;
 use crate::function::nested::{bind_nested_function, is_nested_function};
 use crate::function::variant::{bind_variant_function, is_variant_function};
 use crate::function::{BuiltinFunctions, typeof_constant};
@@ -18,6 +20,7 @@ use crate::planner::column_binding_resolver::resolve_column_bindings;
 use crate::planner::expression::{
     BoundExpr, BoundExprKind, BoundOperator, BoundSubquery, ColumnBinding, SequenceOp, SubqueryKind,
 };
+use duckrs_common::string_util::similarity_rating;
 use duckrs_common::types::{LogicalType, LogicalTypeId, bignum, bit, decimal};
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::{Error, ErrorKind, Result};
@@ -142,6 +145,34 @@ fn literal_to_value(literal: &Literal) -> Result<Value> {
 const MAX_ARRAY_SIZE: i64 = 100_000;
 const MAX_UNION_MEMBERS: usize = 255;
 
+/// The names a misspelled type is compared with.
+const BUILTIN_TYPE_NAMES: &[&str] = &[
+    "bigint",
+    "bit",
+    "blob",
+    "boolean",
+    "date",
+    "decimal",
+    "double",
+    "float",
+    "hugeint",
+    "integer",
+    "interval",
+    "real",
+    "smallint",
+    "text",
+    "time",
+    "timestamp",
+    "tinyint",
+    "ubigint",
+    "uhugeint",
+    "uinteger",
+    "usmallint",
+    "utinyint",
+    "uuid",
+    "varchar",
+];
+
 /// The built-in type names and their aliases (`BUILTIN_TYPES`), for types without parameters.
 fn builtin_type(name: &str) -> Option<LogicalTypeId> {
     use LogicalTypeId::*;
@@ -235,8 +266,8 @@ impl Binder<'_> {
     /// `Binder::BindLogicalType` for the types slice 1 executes: the scalar types without
     /// parameters, `VARCHAR(n)` and `DECIMAL(width, scale)`.
     pub fn bind_type(&self, target: &CastType) -> Result<LogicalType> {
-        let (name, children): (String, &[Expr]) = match target {
-            CastType::Builtin(name) => (name.to_lowercase(), &[]),
+        let (original, children): (&str, &[Expr]) = match target {
+            CastType::Builtin(name) => (&**name, &[]),
             CastType::Parsed(expr) => match &expr.kind {
                 ExprKind::Type(TypeExpr { name, children }) => {
                     if !name.qualification.is_empty() {
@@ -248,18 +279,25 @@ impl Binder<'_> {
                             )
                         });
                     }
-                    (name.name.to_lowercase(), children.as_slice())
+                    (name.name.as_str(), children.as_slice())
                 }
                 _ => return Err(crate::unported(format!("type expression {expr}"))),
             },
         };
+        let name = original.to_lowercase();
         if let Some(ty) = self.catalog.get_type(None, self.search_schema.as_deref(), &name)? {
             return Ok(ty);
         }
         let Some(id) = builtin_type(&name) else {
+            let closest = BUILTIN_TYPE_NAMES
+                .iter()
+                .map(|candidate| (similarity_rating(candidate, &name), *candidate))
+                .max_by(|a, b| a.0.total_cmp(&b.0))
+                .filter(|(score, _)| *score > 0.7);
+            let hint = closest.map_or_else(String::new, |(_, type_name)| format!("\nDid you mean \"{type_name}\"?"));
             return Err(Error::new(
                 ErrorKind::Catalog,
-                format!("Type with name {name} does not exist!"),
+                format!("Type with name {original} does not exist!{hint}"),
             ));
         };
         match id {
@@ -267,7 +305,8 @@ impl Binder<'_> {
                 let rejected = || {
                     let types: Vec<&str> = children.iter().map(type_parameter_type).collect();
                     binder_error(format!(
-                        "Type \"DECIMAL\" does not accept type parameters ({})",
+                        "Type \"DECIMAL\" does not accept type parameters ({})\nCandidates:\n    DECIMAL\n    \
+                         DECIMAL(width UTINYINT, scale UTINYINT := 0)",
                         types.join(", ")
                     ))
                 };
@@ -280,6 +319,10 @@ impl Binder<'_> {
                     ),
                     _ => return Err(rejected()),
                 };
+                // the parameters are UTINYINT
+                if !(0..=255).contains(&width) || !(0..=255).contains(&scale) {
+                    return Err(rejected());
+                }
                 if !(1..=decimal::MAX_WIDTH as i64).contains(&width) {
                     return Err(binder_error(format!(
                         "DECIMAL type width must be between 1 and {}",
@@ -857,11 +900,29 @@ impl Binder<'_> {
                     ("typeof", [child]) if child.return_type.id() != LogicalTypeId::Unknown => {
                         BoundExpr::constant(typeof_constant(&child.return_type))
                     }
-                    _ => {
-                        let bound = bind_scalar_function(set, children, function.is_operator, &try_evaluate_scalar)?;
-                        self.bind_sequence_function(bound)?
+                    ("strftime" | "strptime" | "try_strptime", [first, second])
+                        if {
+                            // strftime takes its arguments in either order
+                            let swapped = set.name == "strftime" && first.return_type.id() == LogicalTypeId::Varchar;
+                            let format = if swapped { first } else { second };
+                            !format.is_foldable() && format.return_type.id() != LogicalTypeId::Unknown
+                        } =>
+                    {
+                        let name = if set.name == "strftime" { "strftime" } else { "strptime" };
+                        return Err(binder_error(format!("{name} format must be a constant")));
                     }
+                    (name, _) => match bind_decimal_round(name, &children)? {
+                        Some(bound) => bound,
+                        None => {
+                            let bound =
+                                bind_scalar_function(set, children, function.is_operator, &try_evaluate_scalar)?;
+                            self.bind_sequence_function(bound)?
+                        }
+                    },
                 }
+            }
+            ExprKind::Subquery { .. } if !self.lambda_scopes.is_empty() => {
+                return Err(binder_error("subqueries in lambda expressions are not supported"));
             }
             ExprKind::Subquery {
                 subquery,
@@ -1075,6 +1136,12 @@ impl Binder<'_> {
         }
         let key = evaluate_scalar(&bound)?;
         if key.is_null() {
+            if name == "current_setting" {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "Variable name to current_setting must be non-NULL",
+                ));
+            }
             return Ok(Some(BoundExpr::constant(Value::sql_null())));
         }
         let key = key.try_to_string()?;
@@ -1114,7 +1181,7 @@ impl Binder<'_> {
             Some(filter) => Some(self.bind_expression(filter)?.cast_to(&LogicalType::BOOLEAN, false)),
             None => None,
         };
-        let children = function
+        let mut children = function
             .args
             .iter()
             .map(|a| self.bind_expression(&a.expr))
@@ -1122,10 +1189,55 @@ impl Binder<'_> {
         let set = BuiltinFunctions::get()
             .aggregate(&function.name.name)
             .expect("checked by the caller");
+        // ordered-set aggregates: the single ORDER BY expression moves to the front of the arguments
+        let ordered_set = match (function.order_by.len(), function.name.name.as_str()) {
+            (1, "mode") => 1,
+            (1, "quantile_cont" | "quantile_disc") => 2,
+            _ => 0,
+        };
+        if ordered_set == 2
+            && let Some(parameter) = children.last_mut()
+            && parameter.is_foldable()
+        {
+            let value = evaluate_scalar(parameter)?;
+            if matches!(value.data(), ValueData::List(items) if items.is_empty()) {
+                return Err(binder_error("Empty list in percentile not allowed"));
+            }
+            let node = &function.order_by[0];
+            let order = self.options.resolve_order(node.order, node.nulls).order;
+            let descending = order == duckrs_common::sort_key::OrderType::Descending;
+            *parameter = BoundExpr::constant(negate_fractions(&value, descending)?);
+        }
         let mut order_by = Vec::with_capacity(function.order_by.len());
         for node in &function.order_by {
+            if matches!(&node.expr.kind, ExprKind::Constant(literal) if literal.kind != LiteralKind::Integer) {
+                return Err(binder_error(
+                    "ORDER BY non-integer literal has no effect.\n* SET order_by_non_integer_literal=true to allow \
+                     this behavior.\n\nPerhaps you misplaced ORDER BY; ORDER BY must appear after all regular \
+                     arguments of the aggregate.",
+                ));
+            }
             let expr = self.bind_expression(&node.expr)?;
             order_by.push((expr, self.options.resolve_order(node.order, node.nulls)));
+        }
+        if ordered_set > 0 {
+            if children.len() < ordered_set {
+                children.insert(0, order_by[0].0.clone());
+            }
+            if ordered_set == 2 {
+                order_by.clear();
+            }
+        }
+        if function.distinct
+            && !order_by.iter().all(|(order, _)| {
+                children
+                    .iter()
+                    .any(|child| format!("{:?}", child.kind) == format!("{:?}", order.kind))
+            })
+        {
+            return Err(binder_error(
+                "In a DISTINCT aggregate, ORDER BY expressions must appear in the argument list",
+            ));
         }
         let mut aggregate = bind_aggregate_function(set, children, filter, function.distinct)?;
         aggregate.order_by = order_by;

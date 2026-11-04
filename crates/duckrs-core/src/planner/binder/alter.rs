@@ -140,6 +140,19 @@ impl Binder<'_> {
         let TableOrView::Table(table) = entry else {
             return Err(catalog_error("Can only modify table with ALTER TABLE statement".into()));
         };
+        // `DuckTableEntry::RemoveColumn` and `ChangeColumnType`
+        let touched = match &info.kind {
+            AlterKind::RemoveColumn { path, .. } => Some((path, "drop this column")),
+            AlterKind::ChangeColumnType { path, .. } => Some((path, "change the type of this column")),
+            _ => None,
+        };
+        if let Some((path, action)) = touched
+            && let [column] = path.as_slice()
+            && let Some(index) = table.column_index(column)
+            && table.indexes.read().iter().any(|i| i.columns.contains(&index))
+        {
+            return Err(catalog_error(format!("Cannot {action}: an index depends on it!")));
+        }
         // `DependencyManager::AlterObject`
         let has_dependents = schema.is_referenced(&table) || !table.indexes.read().is_empty();
         if has_dependents && !matches!(info.kind, AlterKind::AddColumn { .. } | AlterKind::SetDefault { .. }) {

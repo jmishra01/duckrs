@@ -1380,9 +1380,7 @@ impl<'g> Transformer<'g> {
                 parts.push(Self::text(self.req(label, "ColLabel")?));
             }
             if parts.len() > 4 {
-                return Err(parser_error(
-                    "Expected a qualified column name with at most 4 components",
-                ));
+                return Err(parser_error("Expected at most 4 entries in a qualified column name"));
             }
             let column = parts.pop().unwrap();
             return Ok(QualifiedColumnName {

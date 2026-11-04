@@ -69,6 +69,7 @@ struct KeyColumn {
     physical: PhysicalType,
     is_varchar: bool,
     is_bit: bool,
+    is_timetz: bool,
     null_byte: u8,
     valid_byte: u8,
     kind: Kind,
@@ -143,6 +144,7 @@ impl KeyColumn {
             physical,
             is_varchar: input.logical_type().id() == LogicalTypeId::Varchar,
             is_bit: input.logical_type().id() == LogicalTypeId::Bit,
+            is_timetz: input.logical_type().id() == LogicalTypeId::TimeTz,
             null_byte,
             valid_byte,
             kind,
@@ -208,6 +210,12 @@ impl KeyColumn {
             PhysicalType::UInt8 => unsigned!(u8),
             PhysicalType::UInt16 => unsigned!(u16),
             PhysicalType::UInt32 => unsigned!(u32),
+            // TIMETZ orders by its time at UTC, then by its offset (`dtime_tz_t::sort_key`)
+            PhysicalType::UInt64 if self.is_timetz => {
+                let bits = self.format.data::<u64>()[idx];
+                let (micros, offset) = (bits >> 24, bits & 0xFF_FFFF);
+                out.extend_from_slice(&(((micros + offset * 1_000_000) << 24) | offset).to_be_bytes());
+            }
             PhysicalType::UInt64 => unsigned!(u64),
             PhysicalType::Int128 => {
                 let v = self.format.data::<i128>()[idx];
@@ -220,11 +228,13 @@ impl KeyColumn {
             PhysicalType::Float => out.extend_from_slice(&encode_float(self.format.data::<f32>()[idx]).to_be_bytes()),
             PhysicalType::Double => out.extend_from_slice(&encode_double(self.format.data::<f64>()[idx]).to_be_bytes()),
             PhysicalType::Interval => {
-                // Raw fields, as DuckDB's Radix::EncodeData<interval_t> does (not normalized).
-                let Interval { months, days, micros } = self.format.data::<Interval>()[idx];
+                // The layout of Radix::EncodeData<interval_t>, over the normalized fields, so that
+                // '1 month' and '30 days' order and group as equals (issue #25108).
+                let (months, days, micros) = self.format.data::<Interval>()[idx].normalize();
+                let months = months.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
                 for mut bytes in [
                     months.to_be_bytes().to_vec(),
-                    days.to_be_bytes().to_vec(),
+                    (days as i32).to_be_bytes().to_vec(),
                     micros.to_be_bytes().to_vec(),
                 ] {
                     bytes[0] ^= 0x80;

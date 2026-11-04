@@ -7,9 +7,10 @@
 //! case they were created with. There are no transactions yet, so changes are visible at once;
 //! MVCC visibility arrives with Phase 10, and table storage moves to `DataTable` with Phase 9.
 
-use crate::planner::expression::BoundExpr;
+use crate::planner::expression::{BoundExpr, BoundExprKind};
 use duckrs_common::column_data::ColumnDataCollection;
-use duckrs_common::types::LogicalType;
+use duckrs_common::string_util::similarity_rating;
+use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast::{Expr, MacroFunction, SelectStatement, sql_quoted_identifier};
 use parking_lot::{Mutex, RwLock};
@@ -689,6 +690,100 @@ impl SchemaCatalogEntry {
             .is_some()
     }
 
+    /// `CatalogSet::SimilarEntry`: the score and the name of the closest table or view.
+    fn similar_entry(&self, name: &str) -> Option<(f64, String)> {
+        let mut best: Option<(f64, String)> = None;
+        for entry in self.tables.read().values() {
+            let score = similarity_rating(entry.name(), name);
+            if score > best.as_ref().map_or(0.0, |(best, _)| *best) {
+                best = Some((score, entry.name().to_string()));
+            }
+        }
+        best
+    }
+
+    /// The tables whose defaults use the sequence `name`.
+    fn tables_using_sequence(&self, name: &str) -> Vec<String> {
+        let Some(current) = self.get_sequence(name) else {
+            return Vec::new();
+        };
+        let mut users = Vec::new();
+        for entry in self.tables.read().values() {
+            let TableOrView::Table(table) = entry else {
+                continue;
+            };
+            let mut uses = false;
+            for column in &table.columns {
+                let Some(default_value) = &column.default_value else {
+                    continue;
+                };
+                default_value.clone().walk_mut(&mut |e| {
+                    if let BoundExprKind::Sequence { sequence, .. } = &e.kind {
+                        uses |= Arc::ptr_eq(sequence, &current);
+                    }
+                });
+            }
+            if uses {
+                users.push(table.name.clone());
+            }
+        }
+        users
+    }
+
+    /// The tables with a column of the ENUM `name`, however deep in a nested type. A column does
+    /// not remember the name of its type, so an ENUM is known by its type, and other user types
+    /// are not tracked yet.
+    fn tables_using_type(&self, name: &str) -> Vec<String> {
+        fn mentions(ty: &LogicalType, target: &LogicalType) -> bool {
+            ty == target
+                || ty.child_type().is_some_and(|child| mentions(child, target))
+                || ty.struct_children().iter().any(|(_, child)| mentions(child, target))
+        }
+        let Some(target) = self.get_type(name).filter(|ty| ty.id() == LogicalTypeId::Enum) else {
+            return Vec::new();
+        };
+        self.tables
+            .read()
+            .values()
+            .filter_map(|entry| match entry {
+                TableOrView::Table(table) if table.columns.iter().any(|c| mentions(&c.ty, &target)) => {
+                    Some(table.name.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `DROP SEQUENCE`: the tables that use it stop it, or go with it under CASCADE.
+    pub fn drop_sequence_checked(&self, name: &str, cascade: bool) -> Result<bool> {
+        if self.get_sequence(name).is_none() {
+            return Ok(false);
+        }
+        let users = self.tables_using_sequence(name);
+        if !users.is_empty() && !cascade {
+            return Err(entry_in_use(name, "sequence", &users));
+        }
+        for table in &users {
+            self.drop_entry(table, "Table")?;
+        }
+        Ok(self.drop_sequence(name))
+    }
+
+    /// `DROP TYPE`: the tables that use it stop it, or go with it under CASCADE.
+    pub fn drop_type_checked(&self, name: &str, cascade: bool) -> Result<bool> {
+        if self.get_type(name).is_none() {
+            return Ok(false);
+        }
+        let users = self.tables_using_type(name);
+        if !users.is_empty() && !cascade {
+            return Err(entry_in_use(name, "type", &users));
+        }
+        for table in &users {
+            self.drop_entry(table, "Table")?;
+        }
+        Ok(self.drop_type(name))
+    }
+
     /// The type and name of each entry, for "depends on" messages.
     fn entries(&self) -> Vec<(String, String)> {
         let tables = self.tables.read();
@@ -857,13 +952,73 @@ impl Catalog {
     /// `search_first` (the schema of the view being bound), then the default schema.
     pub fn get_entry(&self, schema: Option<&str>, search_first: Option<&str>, name: &str) -> Result<TableOrView> {
         let entry = match schema {
-            Some(schema) => self.schema_for(Some(schema))?.get_entry(name),
+            Some(schema) => {
+                if self.get_schema(schema).is_none() {
+                    return Err(Error::new(
+                        ErrorKind::Catalog,
+                        format!(
+                            "Table with name \"{schema}.{name}\" does not exist because schema \"{schema}\" does not exist."
+                        ),
+                    ));
+                }
+                self.schema_for(Some(schema))?.get_entry(name)
+            }
             None => search_first
                 .iter()
                 .chain([&DEFAULT_SCHEMA])
                 .find_map(|schema| self.get_schema(schema)?.get_entry(name)),
         };
-        entry.ok_or_else(|| missing_entry("Table", name))
+        entry.ok_or_else(|| self.missing_table(schema, search_first, name))
+    }
+
+    /// `Catalog::CreateMissingEntryException`: suggests the most similar table, and one in a schema
+    /// off the search path, qualified, when that one is much closer.
+    fn missing_table(&self, schema: Option<&str>, search_first: Option<&str>, name: &str) -> Error {
+        const UNSEEN_PENALTY: f64 = 0.2;
+        let searched: Vec<&str> = match schema {
+            Some(schema) => vec![schema],
+            None => search_first.iter().copied().chain([DEFAULT_SCHEMA]).collect(),
+        };
+        let schemas: Vec<Arc<SchemaCatalogEntry>> = self.schemas.read().values().cloned().collect();
+        let mut seen: Option<(f64, String)> = None;
+        let mut unseen: Vec<(f64, String)> = Vec::new();
+        for entry in &schemas {
+            let Some((score, similar)) = entry.similar_entry(name) else {
+                continue;
+            };
+            if searched.iter().any(|s| s.eq_ignore_ascii_case(&entry.name)) {
+                if seen.as_ref().is_none_or(|(best, _)| score > *best) {
+                    seen = Some((score, similar));
+                }
+                continue;
+            }
+            let qualified = format!("{}.{similar}", entry.name);
+            match unseen.first().map(|(best, _)| *best) {
+                Some(best) if score < best => {}
+                Some(best) if score > best => unseen = vec![(score, qualified)],
+                _ => unseen.push((score, qualified)),
+            }
+        }
+        let best_seen = seen.as_ref().map_or(0.0, |(score, _)| *score);
+        let mut suggestions: Vec<String> = match unseen.first() {
+            Some((score, _)) if *score == 1.0 || score - UNSEEN_PENALTY > best_seen => {
+                unseen.into_iter().map(|(_, name)| name).collect()
+            }
+            _ => seen.into_iter().map(|(_, name)| name).collect(),
+        };
+        suggestions.sort();
+        let message = format!("Table with name {name} does not exist!");
+        Error::new(
+            ErrorKind::Catalog,
+            match suggestions.as_slice() {
+                [] => message,
+                [.., last] if suggestions.len() > 2 => {
+                    let rest = suggestions[..suggestions.len() - 1].join(", ");
+                    format!("{message}\nDid you mean \"{rest}, or {last}\"?")
+                }
+                _ => format!("{message}\nDid you mean \"{}\"?", suggestions.join(" or ")),
+            },
+        )
     }
 
     /// `Catalog::GetEntry` for a sequence, with the lookup of [`Self::get_entry`].
@@ -925,6 +1080,16 @@ impl Catalog {
     }
 }
 
+/// `DependencyManager::CollectDependents`: why `name` cannot be dropped.
+fn entry_in_use(name: &str, kind: &str, tables: &[String]) -> Error {
+    let mut message = format!("Cannot drop entry \"{name}\" because there are entries that depend on it.\n");
+    for table in tables {
+        message += &format!("table \"{table}\" depends on {kind} \"{name}\".\n");
+    }
+    message += "Use DROP...CASCADE to drop all dependents.";
+    Error::new(ErrorKind::Dependency, message)
+}
+
 /// `DependencyManager::VerifyExistence`: a schema with tables cannot just go away.
 fn dependency_check(schema: &SchemaCatalogEntry) -> Result<()> {
     let entries = schema.entries();
@@ -942,7 +1107,7 @@ fn dependency_check(schema: &SchemaCatalogEntry) -> Result<()> {
     Err(Error::new(ErrorKind::Dependency, message))
 }
 
-/// `CatalogException::MissingEntry`, without the "Did you mean" suggestion yet.
+/// `CatalogException::MissingEntry`.
 pub fn missing_entry(kind: &str, name: &str) -> Error {
     Error::new(ErrorKind::Catalog, format!("{kind} with name {name} does not exist!"))
 }

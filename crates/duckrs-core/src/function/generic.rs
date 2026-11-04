@@ -9,7 +9,7 @@
 //! They run row by row over values.
 
 use super::bit_functions::strict_rows;
-use super::combine_types::{force_max_logical_type, normalize_type};
+use super::combine_types::normalize_type;
 use super::dates::{bind_date_function, is_date_function};
 use super::lists::{bind_list_function, is_list_function};
 use super::nested::{bound_function, row_wise};
@@ -192,6 +192,13 @@ fn concat(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+/// `error`: fails with the given message.
+fn error_function(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| {
+        Err(Error::new(ErrorKind::InvalidInput, row[0].try_to_string()?))
+    })
+}
+
 fn concat_ws(args: &DataChunk, result: &mut Vector) -> Result<()> {
     row_wise(args, result, |row| {
         if row[0].is_null() {
@@ -210,12 +217,10 @@ fn concat_ws(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+/// `ListConcatFunction`: `list_concat` skips NULLs.
 fn list_concat(args: &DataChunk, result: &mut Vector) -> Result<()> {
     let ty = result.logical_type().clone();
     row_wise(args, result, |row| {
-        if row.iter().all(Value::is_null) {
-            return Ok(Value::null(ty.clone()));
-        }
         Value::new(
             ty.clone(),
             ValueData::List(row.iter().flat_map(|v| items_of(v).to_vec()).collect()),
@@ -401,7 +406,10 @@ fn pad(row: &[Value], left: bool) -> Result<Value> {
     if length > MAX_PAD_LENGTH {
         return Err(Error::new(
             ErrorKind::OutOfRange,
-            format!("Padding length {length} is larger than the maximum of {MAX_PAD_LENGTH}"),
+            format!(
+                "Cannot create a string of size: '{length}' in PAD, the maximum supported string size is: \
+                 '{MAX_PAD_LENGTH}'"
+            ),
         ));
     }
     let length = length.max(0) as usize;
@@ -519,7 +527,7 @@ fn setseed(args: &DataChunk, result: &mut Vector) -> Result<()> {
         // xorshift never leaves zero
         *RANDOM_STATE.lock() = seed.to_bits() | 1;
     }
-    let _ = result;
+    *result = Vector::constant_null(LogicalType::SQLNULL);
     Ok(())
 }
 
@@ -671,13 +679,14 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             Ok(bound_function(&lower, vec![child], LogicalType::UBIGINT, cardinality))
         }
         "concat" => {
-            let all_blob = !children.is_empty() && children.iter().all(|c| c.return_type.id() == LogicalTypeId::Blob);
-            let ty = if all_blob {
-                LogicalType::BLOB
-            } else {
-                LogicalType::VARCHAR
-            };
-            Ok(bound_function("concat", children, ty, concat))
+            if children.is_empty() {
+                return Err(no_match(&lower, &children));
+            }
+            if children.iter().any(|c| is_list(&c.return_type)) {
+                return bind_generic_function("list_concat", children);
+            }
+            // blob concat is only supported for the concat operator
+            Ok(bound_function("concat", children, LogicalType::VARCHAR, concat))
         }
         "concat_ws" => {
             if children.len() < 2 {
@@ -686,6 +695,20 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             let mut children = children;
             let separator = children.remove(0).cast_to(&LogicalType::VARCHAR, false);
             children.insert(0, separator);
+            for child in &mut children[1..] {
+                if child.return_type.id() == LogicalTypeId::List {
+                    if child
+                        .return_type
+                        .child_type()
+                        .is_some_and(|c| c.id() == LogicalTypeId::List)
+                    {
+                        return Err(binder_error("concat_ws() does not support nested lists"));
+                    }
+                    *child = child.clone().cast_to(&LogicalType::list(LogicalType::VARCHAR), false);
+                } else {
+                    *child = child.clone().cast_to(&LogicalType::VARCHAR, false);
+                }
+            }
             Ok(bound_function("concat_ws", children, LogicalType::VARCHAR, concat_ws))
         }
         "list_concat" | "array_concat" | "list_cat" | "array_cat" => {
@@ -693,7 +716,12 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             for child in &children {
                 if is_list(&child.return_type) {
                     let child_type = child.return_type.child_type().expect("a child type");
-                    element = super::combine_types::force_max_logical_type(&element, child_type);
+                    element = super::combine_types::try_max_logical_type(&element, child_type).ok_or_else(|| {
+                        binder_error(format!(
+                            "Cannot concatenate lists of types {element}[] and {child_type}[] - an explicit cast is \
+                             required"
+                        ))
+                    })?;
                 } else if child.return_type.id() != LogicalTypeId::SqlNull {
                     return Err(no_match(&lower, &children));
                 }
@@ -806,6 +834,12 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             let [text, needle] = children.as_slice() else {
                 return Err(no_match("contains", &children));
             };
+            if children.iter().all(|c| c.return_type.id() == LogicalTypeId::SqlNull) {
+                return Err(binder_error(
+                    "Could not choose a best candidate function for the function call \"contains(\"NULL\", \
+                     \"NULL\")\". In order to select one, please add explicit type casts.",
+                ));
+            }
             if !matches!(
                 text.return_type.id(),
                 LogicalTypeId::Varchar | LogicalTypeId::StringLiteral | LogicalTypeId::SqlNull
@@ -836,7 +870,15 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             }
             let mut ty = children[0].return_type.clone();
             for child in &children[1..] {
-                ty = force_max_logical_type(&ty, &child.return_type);
+                ty = super::combine_types::try_max_logical_type(&ty, &child.return_type).ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::NotImplemented,
+                        format!(
+                            "Cannot combine types {ty} and {} - an explicit cast is required",
+                            child.return_type
+                        ),
+                    )
+                })?;
             }
             let ty = normalize_type(&ty);
             let children = children.into_iter().map(|c| c.cast_to(&ty, false)).collect();
@@ -1101,6 +1143,7 @@ pub(super) fn generic_functions() -> Vec<ScalarFunctionSet> {
         one("lower", &varchar, &varchar, lower),
         one("lcase", &varchar, &varchar, lower),
         one("strlen", &varchar, &bigint, strlen),
+        one("error", &varchar, &LogicalType::SQLNULL, error_function),
         one("octet_length", &LogicalType::BLOB, &bigint, octet_length),
         one("trunc", &double, &double, trunc),
         one("floor", &double, &double, floor),

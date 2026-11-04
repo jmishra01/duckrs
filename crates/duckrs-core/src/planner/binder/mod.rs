@@ -478,6 +478,8 @@ pub struct BindOptions {
     pub default_order: OrderType,
     /// `default_null_order`
     pub default_null_order: DefaultNullOrder,
+    /// `lambda_syntax = ENABLE_SINGLE_ARROW`
+    pub single_arrow_lambdas: bool,
 }
 
 impl Default for BindOptions {
@@ -485,6 +487,7 @@ impl Default for BindOptions {
         Self {
             default_order: OrderType::Ascending,
             default_null_order: DefaultNullOrder::NullsLast,
+            single_arrow_lambdas: false,
         }
     }
 }
@@ -591,6 +594,8 @@ pub struct Binder<'a> {
     pub parameters: Option<Arc<ParameterValues>>,
     /// The CTEs in scope, innermost last, with how many outer contexts they can see.
     ctes: Vec<(String, Arc<ast::CteInfo>, usize)>,
+    /// The CTEs whose definition is being bound, which cannot refer to themselves.
+    ctes_being_bound: Vec<String>,
     /// What the queries around a subquery can see, innermost last.
     outer_contexts: Vec<BindContext>,
     /// The columns of those queries this subquery uses. Binders of the queries inside of it that
@@ -646,6 +651,7 @@ impl<'a> Binder<'a> {
             macro_depth: 0,
             parameters: None,
             ctes: Vec::new(),
+            ctes_being_bound: Vec::new(),
             outer_contexts: Vec::new(),
             correlated: Arc::default(),
             working_tables: Vec::new(),
@@ -691,6 +697,7 @@ impl<'a> Binder<'a> {
         binder.search_schema = self.search_schema.clone();
         binder.parameters = self.parameters.clone();
         binder.ctes = self.ctes.clone();
+        binder.ctes_being_bound = self.ctes_being_bound.clone();
         binder.outer_contexts = self.outer_contexts.clone();
         binder.session = self.session.clone();
         binder.correlated = self.correlated.clone();

@@ -256,6 +256,7 @@ impl ClientContext {
                 "NULLS_LAST_ON_ASC_FIRST_ON_DESC" => DefaultNullOrder::NullsLastOnAscFirstOnDesc,
                 _ => DefaultNullOrder::NullsLast,
             },
+            single_arrow_lambdas: self.setting_text("lambda_syntax") == "ENABLE_SINGLE_ARROW",
         }
     }
 
@@ -921,7 +922,7 @@ impl ClientContext {
             "SEQUENCE" => {
                 let schema = schema_of(&info.name).map_err(|_| crate::unported("this form of DROP SEQUENCE"))?;
                 let dropped = match catalog.schema_for(schema) {
-                    Ok(schema) => schema.drop_sequence(&info.name.name),
+                    Ok(schema) => schema.drop_sequence_checked(&info.name.name, info.cascade)?,
                     Err(_) if info.if_exists => false,
                     Err(error) => return Err(error),
                 };
@@ -933,7 +934,7 @@ impl ClientContext {
             "TYPE" => {
                 let schema = schema_of(&info.name).map_err(|_| crate::unported("this form of DROP TYPE"))?;
                 let dropped = match catalog.schema_for(schema) {
-                    Ok(schema) => schema.drop_type(&info.name.name),
+                    Ok(schema) => schema.drop_type_checked(&info.name.name, info.cascade)?,
                     Err(_) if info.if_exists => false,
                     Err(error) => return Err(error),
                 };
@@ -979,6 +980,38 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn single_arrow_lambdas_need_the_setting() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        let error = |c: &mut ClientContext, sql: &str| c.query(sql).unwrap_err().to_string();
+        run(&mut c, "SET lambda_syntax='DISABLE_SINGLE_ARROW'");
+        assert!(error(&mut c, "SELECT list_transform([1], x -> x + 1)").contains("Deprecated lambda arrow"));
+        run(&mut c, "SELECT list_transform([1], lambda x: x + 1)");
+        run(&mut c, "SET lambda_syntax='ENABLE_SINGLE_ARROW'");
+        run(&mut c, "SELECT list_transform([1], x -> x + 1)");
+    }
+
+    #[test]
+    fn tables_keep_the_sequences_and_types_they_use() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        let error = |c: &mut ClientContext, sql: &str| c.query(sql).unwrap_err().to_string();
+        run(&mut c, "CREATE SEQUENCE seq");
+        run(&mut c, "CREATE TYPE mood AS ENUM ('sad', 'ok')");
+        run(&mut c, "CREATE TABLE t(i INTEGER DEFAULT nextval('seq'), m mood)");
+        assert!(error(&mut c, "DROP SEQUENCE seq").contains("table \"t\" depends on sequence \"seq\""));
+        assert!(error(&mut c, "DROP TYPE mood").contains("table \"t\" depends on type \"mood\""));
+        run(&mut c, "DROP SEQUENCE seq CASCADE");
+        assert!(error(&mut c, "SELECT * FROM t").contains("does not exist"));
+    }
+
+    #[test]
+    fn a_missing_table_suggests_the_closest_one() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        run(&mut c, "CREATE TABLE hello(i INTEGER)");
+        let message = c.query("SELECT * FROM helloo").unwrap_err().to_string();
+        assert!(message.contains("Did you mean \"hello\"?"), "{message}");
     }
 
     #[test]
@@ -2898,7 +2931,7 @@ mod tests {
         );
         assert_eq!(
             err(&mut context, "UPDATE t SET i = 1, i = 2"),
-            "Binder Error: Multiple assignments to same column i"
+            "Binder Error: Multiple assignments to same column \"i\""
         );
         run(&mut context, "CREATE VIEW v AS SELECT 1 AS a");
         assert_eq!(
@@ -3370,6 +3403,7 @@ mod tests {
     #[test]
     fn aggregates_and_lambdas() {
         let mut c = ClientContext::new(DatabaseInstance::new());
+        run(&mut c, "SET lambda_syntax='ENABLE_SINGLE_ARROW'");
         run(&mut c, "CREATE TABLE t (g INTEGER, v INTEGER, s VARCHAR)");
         run(
             &mut c,

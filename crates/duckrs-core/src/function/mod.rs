@@ -12,9 +12,9 @@ pub mod cast_rules;
 pub mod combine_types;
 mod dates;
 pub mod generic;
-mod holistic;
+pub(crate) mod holistic;
 mod lists;
-mod math;
+pub(crate) mod math;
 pub mod nested;
 mod nested_casts;
 pub(crate) mod operators;
@@ -175,7 +175,10 @@ impl BuiltinFunctions {
             for set in bit_functions::bit_functions() {
                 functions.scalar.insert(set.name.clone(), set);
             }
-            for set in generic::generic_functions() {
+            for set in generic::generic_functions()
+                .into_iter()
+                .chain(bit_functions::integer_bit_functions())
+            {
                 match functions.scalar.get_mut(&set.name) {
                     Some(existing) => existing.functions.extend(set.functions),
                     None => {
@@ -202,6 +205,23 @@ impl BuiltinFunctions {
                         functions.scalar.insert(set.name.clone(), set);
                     }
                 }
+            }
+            // the operators under their function names
+            for (operator, alias) in [
+                ("+", "add"),
+                ("-", "subtract"),
+                ("*", "multiply"),
+                ("//", "divide"),
+                ("%", "mod"),
+            ] {
+                let functions_of_operator = functions.scalar[operator].functions.clone();
+                functions.scalar.insert(
+                    alias.to_string(),
+                    ScalarFunctionSet {
+                        name: alias.to_string(),
+                        functions: functions_of_operator,
+                    },
+                );
             }
             let typeof_set = typeof_function();
             functions.scalar.insert(typeof_set.name.clone(), typeof_set);

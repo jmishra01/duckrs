@@ -192,9 +192,10 @@ fn holistic_functions() -> Vec<AggregateFunctionSet> {
         of(&["mode"], same(Mode)),
         of(&["median"], same(Median)),
         of(&["quantile_cont"], quantile(QuantileCont)),
+        of(&["quantile_disc", "quantile"], quantile(QuantileDisc)),
         of(
-            &["quantile_disc", "quantile", "approx_quantile", "reservoir_quantile"],
-            quantile(QuantileDisc),
+            &["approx_quantile", "reservoir_quantile"],
+            vec![(vec![any(), any()], any(), kind(QuantileDisc))],
         ),
         of(&["mad"], unary_double(Mad)),
         of(&["stddev_samp", "stddev"], unary_double(StddevSamp)),
