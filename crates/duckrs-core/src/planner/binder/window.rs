@@ -9,7 +9,7 @@ use crate::function::BuiltinFunctions;
 use crate::function::binder::bind_aggregate_function;
 use crate::function::combine_types::force_max_logical_type;
 use crate::function::generic::is_generic_function;
-use crate::planner::expression::{BoundExpr, BoundExprKind, BoundWindow, ColumnBinding, WindowFunction};
+use crate::planner::expression::{BoundExpr, BoundWindow, ColumnBinding, WindowFunction};
 use duckrs_common::sort_key::{OrderModifiers, OrderType};
 use duckrs_common::types::{LogicalType, LogicalTypeId, PhysicalType};
 use duckrs_common::value::Value;
@@ -23,13 +23,6 @@ use duckrs_parser::ast::{
 pub(super) struct WindowBindState {
     pub(super) window_index: usize,
     pub(super) windows: Vec<BoundWindow>,
-}
-
-fn is_volatile(expr: &BoundExpr) -> bool {
-    let mut volatile = false;
-    expr.clone()
-        .walk_mut(&mut |e| volatile |= matches!(e.kind, BoundExprKind::Sequence { .. }));
-    volatile
 }
 
 fn is_range_boundary(boundary: WindowBoundary) -> bool {
@@ -174,10 +167,10 @@ impl Binder<'_> {
             .map(|partition| self.bind_expression(partition))
             .collect::<Result<Vec<_>>>()?;
         let mut orders = self.bind_orders(&window.orders)?;
-        if partitions.iter().any(is_volatile) {
+        if partitions.iter().any(BoundExpr::is_volatile) {
             return Err(binder_error("PARTITION BY window expressions cannot be volatile"));
         }
-        if orders.iter().any(|(order, _)| is_volatile(order)) {
+        if orders.iter().any(|(order, _)| order.is_volatile()) {
             return Err(binder_error("ORDER BY window expressions cannot be volatile"));
         }
         let filter = match &window.filter {

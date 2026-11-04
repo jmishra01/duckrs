@@ -115,11 +115,7 @@ impl Binder<'_> {
             .map(|column| ColumnBinding::new(table_index, column))
             .collect();
         resolve_expression(&mut bound, &bindings)?;
-        let mut volatile = false;
-        bound
-            .clone()
-            .walk_mut(&mut |e| volatile |= matches!(e.kind, BoundExprKind::Sequence { .. }));
-        if volatile {
+        if bound.is_volatile() {
             return Err(binder_error(
                 "Index keys cannot contain expressions with side effects. They also cannot depend on settings such \
                  as TimeZone.",

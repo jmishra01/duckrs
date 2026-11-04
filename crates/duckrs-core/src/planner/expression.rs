@@ -171,6 +171,9 @@ pub struct BoundAggregate {
     pub order_by: Vec<(BoundExpr, OrderModifiers)>,
 }
 
+/// The functions that give something else on each call (`FunctionStability::VOLATILE`).
+const VOLATILE_FUNCTIONS: &[&str] = &["random", "setseed", "uuid", "gen_random_uuid"];
+
 /// What a window computes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowFunction {
@@ -308,7 +311,20 @@ impl BoundExpr {
     }
 
     /// `Expression::IsFoldable`: whether the expression can be evaluated without input rows.
+    /// `Expression::IsVolatile`: whether running it twice can differ.
+    pub fn is_volatile(&self) -> bool {
+        let volatile = match &self.kind {
+            BoundExprKind::Sequence { .. } => true,
+            BoundExprKind::Function { function, .. } => VOLATILE_FUNCTIONS.contains(&function.name.as_str()),
+            _ => false,
+        };
+        volatile || self.children().into_iter().any(BoundExpr::is_volatile)
+    }
+
     pub fn is_foldable(&self) -> bool {
+        if self.is_volatile() {
+            return false;
+        }
         match &self.kind {
             BoundExprKind::ColumnRef { .. }
             | BoundExprKind::Reference(_)

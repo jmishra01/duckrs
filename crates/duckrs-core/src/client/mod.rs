@@ -18,7 +18,7 @@ use crate::execution::{create_plan, execute_plan};
 use crate::planner::binder::{
     BindOptions, Binder, DefaultNullOrder, ParameterValues, bind_constant_expression, schema_of,
 };
-use crate::planner::binder::{enum_type_from, is_builtin_type};
+use crate::planner::binder::{SessionValues, enum_type_from, is_builtin_type};
 use crate::planner::column_binding_resolver::resolve_column_bindings;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::OrderType;
@@ -134,6 +134,8 @@ pub struct ClientContext {
     prepared_statements: HashMap<String, Arc<PreparedStatementData>>,
     /// the parameters of the prepared statement running now
     parameters: Option<Arc<ParameterValues>>,
+    /// what SET VARIABLE set (`ClientConfig::user_variables`), by lower-case name
+    variables: HashMap<String, Value>,
 }
 
 /// A transaction started with BEGIN.
@@ -215,6 +217,7 @@ impl ClientContext {
             settings: SettingValues::default(),
             prepared_statements: HashMap::new(),
             parameters: None,
+            variables: HashMap::new(),
         }
     }
 
@@ -227,6 +230,16 @@ impl ClientContext {
         self.setting(name)
             .and_then(|v| v.try_to_string().ok())
             .unwrap_or_default()
+    }
+
+    /// What `current_setting` and `getvariable` read.
+    fn session_values(&self) -> Arc<SessionValues> {
+        let db = self.db.clone();
+        let session = self.settings.clone();
+        Arc::new(SessionValues {
+            variables: self.variables.clone(),
+            setting: Box::new(move |name| settings::get_setting(name, &db.settings.read(), &session)),
+        })
     }
 
     /// The settings the binder needs.
@@ -546,6 +559,22 @@ impl ClientContext {
     /// `ClientContext::PendingStatementOrPreparedStatement` + `ExecutePendingQueryInternal`.
     fn execute_statement(&mut self, statement: &Statement) -> Result<MaterializedQueryResult> {
         match statement {
+            Statement::SetVariable { name, value, scope } if *scope == duckrs_parser::ast::SetScope::Variable => {
+                // a query, because the value can be a subquery
+                let query = duckrs_parser::parse_ast(&format!("SELECT {value}"))?.remove(0);
+                let result = self.execute_statement(&query)?;
+                let value = if result.row_count() == 0 {
+                    Value::sql_null()
+                } else {
+                    result.value(0, 0)
+                };
+                self.variables.insert(name.to_lowercase(), value);
+                return Ok(Self::success());
+            }
+            Statement::ResetVariable { name, scope } if *scope == duckrs_parser::ast::SetScope::Variable => {
+                self.variables.remove(&name.to_lowercase());
+                return Ok(Self::success());
+            }
             Statement::SetVariable { name, value, scope } => {
                 // `Binder::Bind(SetVariableStatement)` + `PhysicalSet`
                 let value = evaluate_scalar(&bind_constant_expression(&self.db.catalog, value)?)?;
@@ -651,6 +680,7 @@ impl ClientContext {
         }
         let mut binder = Binder::with_options(&self.db.catalog, self.bind_options());
         binder.parameters = self.parameters.clone();
+        binder.session = Some(self.session_values());
         let mut bound = binder.bind(statement)?;
         resolve_column_bindings(&mut bound.plan)?;
         let plan = create_plan(bound.plan);
@@ -3243,5 +3273,46 @@ mod tests {
             "Catalog Error: Index with name u does not exist!"
         );
         run(&mut c, "DROP INDEX IF EXISTS u");
+    }
+
+    #[test]
+    fn session_values() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        run(
+            &mut c,
+            "SET profiling_renderer_settings = MAP {'operator_casing': 'upper'}",
+        );
+        run(&mut c, "SET VARIABLE v = 40 + 2");
+        run(&mut c, "SET VARIABLE q = (SELECT 'SELECT 7')");
+        assert_eq!(
+            run(&mut c, "SELECT getvariable('v'), getvariable('missing')"),
+            [["42", "NULL"]]
+        );
+        assert_eq!(run(&mut c, "FROM query(getvariable('q'))"), [["7"]]);
+        run(&mut c, "RESET VARIABLE v");
+        assert_eq!(run(&mut c, "SELECT getvariable('v')"), [["NULL"]]);
+        assert_eq!(run(&mut c, "SELECT current_setting('default_order')"), [["ASC"]]);
+        assert!(c.query("SELECT current_setting('nonsense')").is_err());
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT chr(65), contains('abc', 'b'), lpad('a', 3, 'xy'), rpad('abcd', 2, 'x'), nullif(1, 1), nullif(1, 2)"
+            ),
+            [["A", "true", "xya", "ab", "NULL", "1"]]
+        );
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT greatest(1, NULL, 3), least(2.5, 1), greatest('a', 'b'), signbit(-1.0)"
+            ),
+            [["3", "1.0", "b", "true"]]
+        );
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT count(DISTINCT random()), count(DISTINCT uuid()) FROM range(100)"
+            ),
+            [["100", "100"]]
+        );
     }
 }

@@ -786,6 +786,16 @@ impl Binder<'_> {
                 if !builtin_qualification(&function.name.qualification) {
                     return Err(crate::unported("qualified function names"));
                 }
+                if let Some(bound) = self.bind_session_function(function)? {
+                    return Ok(bound);
+                }
+                if function.name.name.eq_ignore_ascii_case("nullif") {
+                    let [left, right] = function.args.as_slice() else {
+                        return Err(binder_error("nullif expects two arguments"));
+                    };
+                    let equal = Expr::comparison(ComparisonOp::Equal, left.expr.clone(), right.expr.clone());
+                    return self.bind_case(&[(equal, Expr::constant(Literal::null()))], &left.expr);
+                }
                 if function.name.name.eq_ignore_ascii_case("if") {
                     let [condition, then, otherwise] = function.args.as_slice() else {
                         return Err(binder_error("if expects three arguments"));
@@ -1039,6 +1049,40 @@ impl Binder<'_> {
             .groups
             .push(BoundExpr::column_ref(binding, ty.clone(), name.clone()));
         Ok(BoundExpr::column_ref(ColumnBinding::new(group_index, group), ty, name))
+    }
+
+    /// The functions that are constants of the session.
+    fn bind_session_function(&mut self, function: &FunctionExpr) -> Result<Option<BoundExpr>> {
+        let name = function.name.name.to_lowercase();
+        if name == "current_schema" && function.args.is_empty() {
+            return Ok(Some(BoundExpr::constant(Value::varchar("main"))));
+        }
+        if !matches!(name.as_str(), "getvariable" | "current_setting") {
+            return Ok(None);
+        }
+        let [argument] = function.args.as_slice() else {
+            return Ok(None);
+        };
+        let bound = self.bind_expression(&argument.expr)?;
+        if !bound.is_foldable() {
+            return Err(binder_error(format!("{name} requires a constant input")));
+        }
+        let key = evaluate_scalar(&bound)?;
+        if key.is_null() {
+            return Ok(Some(BoundExpr::constant(Value::sql_null())));
+        }
+        let key = key.try_to_string()?;
+        let session = self.session.clone();
+        Ok(Some(BoundExpr::constant(match (name.as_str(), session) {
+            ("getvariable", Some(session)) => session
+                .variables
+                .get(&key.to_lowercase())
+                .cloned()
+                .unwrap_or_else(Value::sql_null),
+            ("getvariable", None) => Value::sql_null(),
+            (_, Some(session)) => (session.setting)(&key)?,
+            (_, None) => return Err(crate::unported("current_setting here")),
+        })))
     }
 
     /// `BaseSelectBinder::BindAggregate`.

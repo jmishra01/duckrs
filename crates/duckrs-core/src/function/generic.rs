@@ -9,6 +9,7 @@
 //! They run row by row over values.
 
 use super::bit_functions::strict_rows;
+use super::combine_types::{force_max_logical_type, normalize_type};
 use super::nested::{bound_function, row_wise};
 use super::{ScalarCallback, ScalarFunction, ScalarFunctionSet};
 use crate::planner::binder::range_parameters;
@@ -19,6 +20,7 @@ use duckrs_common::types::{Interval, LogicalType, LogicalTypeId};
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, Vector};
 use duckrs_common::{Error, ErrorKind, Result};
+use parking_lot::Mutex;
 
 fn binder_error(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::Binder, message)
@@ -363,6 +365,169 @@ fn repeat_list(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+fn chr(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| {
+        let code = row[0].as_i128().expect("an INTEGER");
+        let character = u32::try_from(code).ok().and_then(char::from_u32);
+        let character =
+            character.ok_or_else(|| Error::new(ErrorKind::InvalidInput, format!("Invalid UTF8 Codepoint {code}")))?;
+        Ok(Value::varchar(character.to_string()))
+    })
+}
+
+fn contains(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| {
+        Ok(Value::boolean(
+            row[0].try_to_string()?.contains(&row[1].try_to_string()?),
+        ))
+    })
+}
+
+/// What a pad can ask for (`NumericLimits<int32_t>::Maximum` in characters, 4 bytes each, fits
+/// a string).
+const MAX_PAD_LENGTH: i128 = (u32::MAX / 4) as i128;
+
+/// `PadFunction`: `text` cut or filled up to `length` characters.
+fn pad(row: &[Value], left: bool) -> Result<Value> {
+    let text: Vec<char> = row[0].try_to_string()?.chars().collect();
+    let length = row[1].as_i128().expect("an INTEGER");
+    if length > MAX_PAD_LENGTH {
+        return Err(Error::new(
+            ErrorKind::OutOfRange,
+            format!("Padding length {length} is larger than the maximum of {MAX_PAD_LENGTH}"),
+        ));
+    }
+    let length = length.max(0) as usize;
+    if length <= text.len() {
+        return Ok(Value::varchar(text[..length].iter().collect::<String>()));
+    }
+    let fill: Vec<char> = row[2].try_to_string()?.chars().collect();
+    if fill.is_empty() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            if left {
+                "Insufficient padding in LPAD."
+            } else {
+                "Insufficient padding in RPAD."
+            },
+        ));
+    }
+    let padding = fill.iter().cycle().take(length - text.len());
+    Ok(Value::varchar(if left {
+        padding.chain(text.iter()).collect::<String>()
+    } else {
+        text.iter().chain(padding).collect::<String>()
+    }))
+}
+
+fn lpad(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| pad(row, true))
+}
+
+fn rpad(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| pad(row, false))
+}
+
+/// `LeastGreatestFunction`: NULLs don't count, unless there is nothing else.
+fn extreme(args: &DataChunk, result: &mut Vector, greatest: bool) -> Result<()> {
+    let modifiers = OrderModifiers::new(OrderType::Ascending, NullOrder::NullsLast);
+    let keys = args
+        .columns()
+        .iter()
+        .map(|column| create_sort_keys(&[(column, modifiers)], args.len()))
+        .collect::<Result<Vec<_>>>()?;
+    for row in 0..args.len() {
+        let mut best: Option<usize> = None;
+        for (column, column_keys) in keys.iter().enumerate() {
+            if args.column(column).get_value(row).is_null() {
+                continue;
+            }
+            let wins = best.is_none_or(|current| {
+                let (key, other) = (&column_keys[row], &keys[current][row]);
+                if greatest { key > other } else { key < other }
+            });
+            if wins {
+                best = Some(column);
+            }
+        }
+        let value = match best {
+            Some(column) => args.column(column).get_value(row),
+            None => Value::null(result.logical_type().clone()),
+        };
+        result.set_value(row, &value)?;
+    }
+    Ok(())
+}
+
+fn greatest(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    extreme(args, result, true)
+}
+
+fn least(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    extreme(args, result, false)
+}
+
+fn signbit(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| {
+        let ValueData::Double(value) = row[0].data() else {
+            unreachable!("cast to DOUBLE");
+        };
+        Ok(Value::boolean(value.is_sign_negative()))
+    })
+}
+
+/// The state of `random`, shared by the connections. C++ has one per connection; a test that
+/// relies on the numbers of a seed needs its pcg32, which isn't ported.
+static RANDOM_STATE: Mutex<u64> = Mutex::new(0x9E37_79B9_7F4A_7C15);
+
+fn next_random() -> u64 {
+    // xorshift64*
+    let mut state = RANDOM_STATE.lock();
+    *state ^= *state >> 12;
+    *state ^= *state << 25;
+    *state ^= *state >> 27;
+    state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+}
+
+fn random(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    for row in 0..args.len() {
+        let value = (next_random() >> 11) as f64 / (1u64 << 53) as f64;
+        result.set_value(row, &Value::double(value))?;
+    }
+    Ok(())
+}
+
+fn setseed(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    for row in 0..args.len() {
+        let value = args.column(0).get_value(row);
+        let ValueData::Double(seed) = value.data() else {
+            continue;
+        };
+        if !(-1.0..=1.0).contains(seed) {
+            return Err(Error::new(
+                ErrorKind::OutOfRange,
+                "SETSEED accepts seed values between -1.0 and 1.0, inclusive",
+            ));
+        }
+        // xorshift never leaves zero
+        *RANDOM_STATE.lock() = seed.to_bits() | 1;
+    }
+    let _ = result;
+    Ok(())
+}
+
+fn uuid(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    for row in 0..args.len() {
+        let high = u128::from(next_random());
+        let bits = (high << 64 | u128::from(next_random())) as i128;
+        // version 4, variant 1
+        let bits = bits & !(0xF000_i128 << 64) | (0x4000_i128 << 64);
+        let bits = bits & !(0xC000_i128 << 48) | (0x8000_i128 << 48);
+        result.set_value(row, &Value::uuid(bits))?;
+    }
+    Ok(())
+}
+
 /// `ListRangeFunction`: the numbers a `range` of the same arguments gives as rows.
 fn range_list(args: &DataChunk, result: &mut Vector, generate_series: bool) -> Result<()> {
     let ty = result.logical_type().clone();
@@ -444,6 +609,17 @@ pub fn is_generic_function(name: &str) -> bool {
             | "range"
             | "generate_series"
             | "length"
+            | "chr"
+            | "contains"
+            | "lpad"
+            | "rpad"
+            | "greatest"
+            | "least"
+            | "signbit"
+            | "random"
+            | "setseed"
+            | "uuid"
+            | "gen_random_uuid"
     )
 }
 
@@ -604,6 +780,71 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             } else {
                 Ok(bound_function("generate_series", children, list, list_generate_series))
             }
+        }
+        "chr" => {
+            let child = single(&children)?.cast_to(&LogicalType::INTEGER, false);
+            Ok(bound_function("chr", vec![child], LogicalType::VARCHAR, chr))
+        }
+        "contains" => {
+            let [text, needle] = children.as_slice() else {
+                return Err(no_match("contains", &children));
+            };
+            if !matches!(
+                text.return_type.id(),
+                LogicalTypeId::Varchar | LogicalTypeId::StringLiteral | LogicalTypeId::SqlNull
+            ) {
+                return Err(no_match("contains", &children));
+            }
+            let args = vec![
+                text.clone().cast_to(&LogicalType::VARCHAR, false),
+                needle.clone().cast_to(&LogicalType::VARCHAR, false),
+            ];
+            Ok(bound_function("contains", args, LogicalType::BOOLEAN, contains))
+        }
+        "lpad" | "rpad" => {
+            let [text, length, fill] = children.as_slice() else {
+                return Err(no_match(&lower, &children));
+            };
+            let args = vec![
+                text.clone().cast_to(&LogicalType::VARCHAR, false),
+                length.clone().cast_to(&LogicalType::INTEGER, false),
+                fill.clone().cast_to(&LogicalType::VARCHAR, false),
+            ];
+            let callback: ScalarCallback = if lower == "lpad" { lpad } else { rpad };
+            Ok(bound_function(&lower, args, LogicalType::VARCHAR, callback))
+        }
+        "greatest" | "least" => {
+            if children.is_empty() {
+                return Err(no_match(&lower, &children));
+            }
+            let mut ty = children[0].return_type.clone();
+            for child in &children[1..] {
+                ty = force_max_logical_type(&ty, &child.return_type);
+            }
+            let ty = normalize_type(&ty);
+            let children = children.into_iter().map(|c| c.cast_to(&ty, false)).collect();
+            let callback: ScalarCallback = if lower == "greatest" { greatest } else { least };
+            Ok(bound_function(&lower, children, ty, callback))
+        }
+        "signbit" => {
+            let child = single(&children)?.cast_to(&LogicalType::DOUBLE, false);
+            Ok(bound_function("signbit", vec![child], LogicalType::BOOLEAN, signbit))
+        }
+        "random" => {
+            if !children.is_empty() {
+                return Err(no_match("random", &children));
+            }
+            Ok(bound_function("random", children, LogicalType::DOUBLE, random))
+        }
+        "setseed" => {
+            let child = single(&children)?.cast_to(&LogicalType::DOUBLE, false);
+            Ok(bound_function("setseed", vec![child], LogicalType::SQLNULL, setseed))
+        }
+        "uuid" | "gen_random_uuid" => {
+            if !children.is_empty() {
+                return Err(no_match(&lower, &children));
+            }
+            Ok(bound_function(&lower, children, LogicalType::UUID, uuid))
         }
         other => unreachable!("{other} is not a generic function"),
     }

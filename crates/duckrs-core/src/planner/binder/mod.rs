@@ -452,6 +452,24 @@ pub enum DefaultNullOrder {
     NullsLastOnAscFirstOnDesc,
 }
 
+/// What the session knows that binding can ask for: `current_setting` and `getvariable` are
+/// constants by the time they run.
+pub struct SessionValues {
+    pub variables: HashMap<String, Value>,
+    pub setting: SettingLookup,
+}
+
+/// `current_setting`.
+pub type SettingLookup = Box<dyn Fn(&str) -> Result<Value> + Send + Sync>;
+
+impl std::fmt::Debug for SessionValues {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionValues")
+            .field("variables", &self.variables)
+            .finish()
+    }
+}
+
 /// The settings that change how statements bind.
 #[derive(Debug, Clone, Copy)]
 pub struct BindOptions {
@@ -547,6 +565,7 @@ pub struct Binder<'a> {
     aggregates: Option<AggregateBindState>,
     /// The error for an aggregate where it is not allowed (`UnsupportedAggregateMessage`).
     aggregate_error: &'static str,
+    pub session: Option<Arc<SessionValues>>,
     /// The windows of the SELECT clause being bound, when it may have any here.
     windows: Option<window::WindowBindState>,
     window_error: &'static str,
@@ -612,6 +631,7 @@ impl<'a> Binder<'a> {
             unnamed_subquery_index: 1,
             aggregates: None,
             aggregate_error: "Aggregate functions are not supported here",
+            session: None,
             windows: None,
             window_error: "window functions are not supported here",
             inside_window: false,
@@ -669,6 +689,7 @@ impl<'a> Binder<'a> {
         binder.parameters = self.parameters.clone();
         binder.ctes = self.ctes.clone();
         binder.outer_contexts = self.outer_contexts.clone();
+        binder.session = self.session.clone();
         binder.correlated = self.correlated.clone();
         binder.working_tables = self.working_tables.clone();
         binder

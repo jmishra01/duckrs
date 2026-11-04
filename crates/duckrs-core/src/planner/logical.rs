@@ -260,9 +260,8 @@ impl LogicalOperator {
     pub fn is_volatile(&self) -> bool {
         let mut volatile = false;
         self.clone().visit_expressions(&mut |e| match &e.kind {
-            BoundExprKind::Sequence { .. } => volatile = true,
             BoundExprKind::Subquery { subquery, .. } => volatile |= subquery.plan.is_volatile(),
-            _ => {}
+            _ => volatile |= e.is_volatile(),
         });
         volatile
     }

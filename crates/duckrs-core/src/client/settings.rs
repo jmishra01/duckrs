@@ -54,7 +54,6 @@ const UNHONORED: &[&str] = &[
     "active_grammar_extensions",
     "allow_parser_override_extension",
     "current_dialect",
-    "debug_force_no_cross_product",
     "default_collation",
     "dialect_compatibility_mode",
     "disable_timestamptz_casts",
@@ -64,10 +63,8 @@ const UNHONORED: &[&str] = &[
     "home_directory",
     "ieee_floating_point_ops",
     "integer_division",
-    "lambda_syntax",
     "legacy_disable_null_type",
     "lock_configuration",
-    "max_execution_time",
     "old_implicit_casting",
     "order_by_non_integer_literal",
     "preserve_identifier_case",
@@ -108,6 +105,7 @@ fn input_type(setting: &SettingDefinition) -> Result<LogicalType> {
         "UBIGINT" => LogicalType::UBIGINT,
         "BIGINT" => LogicalType::BIGINT,
         "DOUBLE" => LogicalType::DOUBLE,
+        "MAP(VARCHAR, VARCHAR)" => LogicalType::map(LogicalType::VARCHAR, LogicalType::VARCHAR),
         other => return Err(crate::unported(format!("settings of type {other}"))),
     })
 }
@@ -189,7 +187,7 @@ fn default_value(setting: &SettingDefinition) -> Option<Value> {
 }
 
 /// Setting values of one scope.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SettingValues(HashMap<usize, Value>);
 
 /// `PhysicalSet::GetSettingScope`: the scope `SET` without a scope uses, and the checks of an
@@ -258,6 +256,14 @@ pub fn reset_variable(
 }
 
 /// The current value of a setting: the session's, else the database's, else the default.
+/// `current_setting`.
+pub fn get_setting(name: &str, global: &SettingValues, session: &SettingValues) -> Result<Value> {
+    if find_setting(name).is_none() {
+        return Err(unrecognized(name));
+    }
+    Ok(current_value(name, global, session).unwrap_or_else(Value::sql_null))
+}
+
 pub fn current_value(name: &str, global: &SettingValues, session: &SettingValues) -> Option<Value> {
     let (index, setting) = find_setting(name)?;
     session
