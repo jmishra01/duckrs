@@ -2,7 +2,7 @@
 
 An analytical SQL database engine: a port of [DuckDB](https://github.com/duckdb/duckdb) to Rust.
 
-**Status: everything Phase 3 lists is ported, but its gate is not met yet** (604 files, 11.7% of the corpus, against a 15% target; what `test/sql/select`, `projection` and `filter` still fail on belongs to later phases). Phase 4 (types and casts) has started: the scalar casts, the nested types (LIST, ARRAY, STRUCT, MAP, UNION), `CREATE TYPE`, ENUM, BIT, BIGNUM and VARIANT are in, the last in its own in-memory encoding until Phase 9. What is left of the phase is GEOMETRY, which the plan defers. Nested casts and functions run row by row for now. The engine runs CREATE TABLE, CREATE VIEW, CREATE SEQUENCE, CREATE MACRO, INSERT, prepared statements
+**Status: everything Phase 3 lists is ported, but its gate is not met yet** (690 files, 13.4% of the corpus, against a 15% target; what `test/sql/select`, `projection` and `filter` still fail on belongs to later phases). Phase 4 (types and casts) has started: the scalar casts, the nested types (LIST, ARRAY, STRUCT, MAP, UNION), `CREATE TYPE`, ENUM, BIT, BIGNUM and VARIANT are in, the last in its own in-memory encoding until Phase 9. What is left of the phase is GEOMETRY, which the plan defers. A first batch of Phase 5's functions is in too, because the type tests need them: `unnest`, `TRY(...)`, list slicing, the `list` aggregate, LIKE, and common string, list, map and interval helpers. Nested casts and functions run row by row for now. The engine runs CREATE TABLE, CREATE VIEW, CREATE SEQUENCE, CREATE MACRO, INSERT, prepared statements
 and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in memory. What exists today:
 
 - `crates/duckrs-common`: the core building blocks every other crate uses:
@@ -61,7 +61,7 @@ and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in me
 - `crates/duckrs`: the public API (`Database`, `Connection`, `QueryResult`) over the engine.
   Databases live in memory; a database file is accepted but not written until Phase 9.
 - `tools/sqllogictest`: a port of DuckDB's sqllogictest runner. It runs the DuckDB `.test` corpus
-  against duckrs, or against the C++ DuckDB library as a reference. duckrs passes 604 files so far
+  against duckrs, or against the C++ DuckDB library as a reference. duckrs passes 690 files so far
   (`tools/sqllogictest/known_passing.txt`, a CI gate), among them
   `test/sql/projection/test_simple_projection.test`.
 

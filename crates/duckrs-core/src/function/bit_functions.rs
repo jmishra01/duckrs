@@ -32,7 +32,7 @@ fn invalid_input(message: &str) -> Error {
 }
 
 /// Runs `f` on rows without NULLs; the others give NULL.
-fn strict_rows(args: &DataChunk, result: &mut Vector, f: impl Fn(&[Value]) -> Result<Value>) -> Result<()> {
+pub(super) fn strict_rows(args: &DataChunk, result: &mut Vector, f: impl Fn(&[Value]) -> Result<Value>) -> Result<()> {
     let ty = result.logical_type().clone();
     row_wise(args, result, |row| {
         if row.iter().any(Value::is_null) {

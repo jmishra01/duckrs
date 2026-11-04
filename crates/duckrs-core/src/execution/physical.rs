@@ -17,7 +17,7 @@ use crate::planner::logical::{BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID};
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::{NullOrder, OrderModifiers, OrderType, create_sort_keys, sort_collection};
 use duckrs_common::types::LogicalType;
-use duckrs_common::value::Value;
+use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, SelectionVector, Vector};
 use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
 use duckrs_parser::ast::sql_identifier;
@@ -337,6 +337,62 @@ impl PhysicalOperator for PhysicalFilter {
             input.slice(&sel, count);
         }
         Ok(input)
+    }
+}
+
+/// `PhysicalUnnest`: the input's columns, repeated, and then the elements of the lists.
+#[derive(Debug)]
+pub struct PhysicalUnnest {
+    pub types: Vec<LogicalType>,
+    pub expressions: Vec<BoundExpr>,
+    pub children: Vec<Box<dyn PhysicalOperator>>,
+}
+
+impl PhysicalOperator for PhysicalUnnest {
+    fn name(&self) -> &'static str {
+        "UNNEST"
+    }
+    fn types(&self) -> &[LogicalType] {
+        &self.types
+    }
+    fn children(&self) -> &[Box<dyn PhysicalOperator>] {
+        &self.children
+    }
+    fn execute(&self, input: DataChunk) -> Result<DataChunk> {
+        let lists = self
+            .expressions
+            .iter()
+            .map(|e| execute(e, &input))
+            .collect::<Result<Vec<_>>>()?;
+        let mut rows: Vec<u32> = Vec::new();
+        let mut elements: Vec<Vec<Value>> = vec![Vec::new(); lists.len()];
+        let items = |list: &Vector, row: usize| match list.get_value(row).data() {
+            ValueData::List(items) => items.clone(),
+            _ => Vec::new(),
+        };
+        for row in 0..input.len() {
+            let values: Vec<Vec<Value>> = lists.iter().map(|l| items(l, row)).collect();
+            let length = values.iter().map(Vec::len).max().unwrap_or(0);
+            rows.extend(std::iter::repeat_n(row as u32, length));
+            for (column, mut value) in elements.iter_mut().zip(values) {
+                let missing = length - value.len();
+                value.extend((0..missing).map(|_| Value::sql_null()));
+                column.extend(value);
+            }
+        }
+        let mut output = input;
+        let count = rows.len();
+        output.slice(&SelectionVector::from_vec(rows), count);
+        let mut columns: Vec<Vector> = output.columns().to_vec();
+        let offset = columns.len();
+        for (i, column) in elements.into_iter().enumerate() {
+            let mut vector = Vector::new(self.types[offset + i].clone(), count.max(1));
+            for (row, value) in column.iter().enumerate() {
+                vector.set_value(row, value)?;
+            }
+            columns.push(vector);
+        }
+        Ok(DataChunk::from_columns(columns, count))
     }
 }
 

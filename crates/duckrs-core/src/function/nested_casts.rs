@@ -273,7 +273,7 @@ fn union_to_union(value: &Value, fields: &[Value], target: &LogicalType, mode: C
     let mut tags = Vec::with_capacity(from.len());
     for (name, ty) in from {
         let index = to.iter().position(|(n, _)| n.eq_ignore_ascii_case(name))?;
-        if to[index].1.id() != LogicalTypeId::Variant && implicit_cast(ty, &to[index].1) < 0 {
+        if !super::cast::has_cast(ty, &to[index].1) {
             return None;
         }
         tags.push(index);
@@ -350,6 +350,9 @@ fn cast_inner(value: &Value, target: &LogicalType, mode: CastMode) -> Result<Val
         }
         (L::Map, ValueData::List(items), L::Map) => {
             let items = cast_items(items, target, mode)?;
+            if items.iter().any(|item| item.is_null() || map_key(item).is_null()) {
+                return Err(Error::new(ErrorKind::InvalidInput, "Map keys can not be NULL."));
+            }
             check_unique_keys(&items)?;
             Value::new(target.clone(), ValueData::List(items))
         }

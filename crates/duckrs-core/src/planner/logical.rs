@@ -58,6 +58,12 @@ pub enum LogicalOperatorKind {
     Limit { limit: Option<u64>, offset: u64 },
     /// `LogicalDistinct` (`DISTINCT`, not `DISTINCT ON`): one row per distinct `targets`.
     Distinct { targets: Vec<BoundExpr> },
+    /// `LogicalUnnest`: a row per element of the lists of `expressions`, next to the child's
+    /// columns. A list that runs out gives NULL.
+    Unnest {
+        table_index: usize,
+        expressions: Vec<BoundExpr>,
+    },
     /// `LogicalProjection`.
     Projection {
         table_index: usize,
@@ -153,6 +159,15 @@ impl LogicalOperator {
             LogicalOperatorKind::Projection { expressions, .. } => {
                 expressions.iter().map(|e| e.return_type.clone()).collect()
             }
+            LogicalOperatorKind::Unnest { expressions, .. } => {
+                let mut types = self.children[0].types();
+                types.extend(
+                    expressions
+                        .iter()
+                        .map(|e| e.return_type.child_type().cloned().unwrap_or(LogicalType::SQLNULL)),
+                );
+                types
+            }
             LogicalOperatorKind::CrossProduct | LogicalOperatorKind::Join { .. } => {
                 self.join_output(|child| child.types())
             }
@@ -215,6 +230,14 @@ impl LogicalOperator {
                 table_index,
                 expressions,
             } => numbered(*table_index, expressions.len()),
+            LogicalOperatorKind::Unnest {
+                table_index,
+                expressions,
+            } => {
+                let mut bindings = self.children[0].column_bindings();
+                bindings.extend(numbered(*table_index, expressions.len()));
+                bindings
+            }
             LogicalOperatorKind::CrossProduct | LogicalOperatorKind::Join { .. } => {
                 self.join_output(|child| child.column_bindings())
             }
@@ -229,6 +252,7 @@ impl LogicalOperator {
         match &mut self.kind {
             LogicalOperatorKind::Filter { expressions }
             | LogicalOperatorKind::Projection { expressions, .. }
+            | LogicalOperatorKind::Unnest { expressions, .. }
             | LogicalOperatorKind::Distinct { targets: expressions } => expressions.iter_mut().collect(),
             LogicalOperatorKind::Order { orders } => orders.iter_mut().map(|o| &mut o.expr).collect(),
             LogicalOperatorKind::Aggregate { groups, aggregates, .. } => groups

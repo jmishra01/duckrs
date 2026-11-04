@@ -2349,6 +2349,69 @@ mod tests {
     }
 
     #[test]
+    fn helpers_match_duckdb() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        let err = |context: &mut ClientContext, sql: &str| context.query(sql).unwrap_err().to_string();
+        for (sql, expected) in [
+            ("SELECT repeat('ab', 2)", "abab"),
+            ("SELECT repeat([1], 2)", "[1, 1]"),
+            ("SELECT len([1, 2])", "2"),
+            ("SELECT length('héllo')", "5"),
+            ("SELECT strlen('héllo')", "6"),
+            ("SELECT concat('a', NULL, 1)", "a1"),
+            ("SELECT concat_ws(',', 'a', NULL, 'b')", "a,b"),
+            ("SELECT list_concat([1], [2, 3])", "[1, 2, 3]"),
+            ("SELECT array_to_string([1, NULL, 2], '-')", "1-2"),
+            ("SELECT list_sort([3, NULL, 1])", "[NULL, 1, 3]"),
+            ("SELECT array_sort([3, 1], 'DESC', 'NULLS LAST')", "[3, 1]"),
+            ("SELECT map_keys(MAP {'a': 1})", "[a]"),
+            ("SELECT map_values(MAP {'a': 1})", "[1]"),
+            ("SELECT cardinality(MAP {'a': 1})", "1"),
+            ("SELECT map_from_entries([{'k': 'a', 'v': 1}])", "{a=1}"),
+            ("SELECT if(1 = 1, 'y', 'n')", "y"),
+            ("SELECT upper('ab'), lower('AB')", "AB"),
+            ("SELECT 'abc' LIKE 'a%'", "true"),
+            ("SELECT 'abc' NOT LIKE 'a_'", "true"),
+            ("SELECT 'ABC' ILIKE 'a%'", "true"),
+            ("SELECT sign(-5)", "-1"),
+            ("SELECT to_days(2)", "2 days"),
+            ("SELECT -INTERVAL 1 DAY", "-1 day"),
+            ("SELECT [1, 2, 3, 4][2:3]", "[2, 3]"),
+            ("SELECT [1, 2, 3][:-1]", "[1, 2, 3]"),
+            ("SELECT [1, 2, 3, 4, 5][:-:-2]", "[5, 3, 1]"),
+            ("SELECT 'hello'[2:3]", "el"),
+            ("SELECT TRY(1 // 0)", "NULL"),
+            ("SELECT TRY('x'::INTEGER)", "NULL"),
+            ("SELECT TRY(CAST('3' AS INTEGER))", "3"),
+        ] {
+            assert_eq!(run(&mut context, sql)[0][0], expected, "{sql}");
+        }
+        run(&mut context, "CREATE TABLE t (i INTEGER, l INTEGER[])");
+        run(&mut context, "INSERT INTO t VALUES (1, [10, 20]), (2, NULL), (3, [])");
+        assert_eq!(
+            run(&mut context, "SELECT i, unnest(l) FROM t ORDER BY 1, 2"),
+            [["1", "10"], ["1", "20"]]
+        );
+        assert_eq!(
+            run(&mut context, "SELECT unnest([1, 2]), unnest(['a'])"),
+            [["1", "a"], ["2", "NULL"]]
+        );
+        assert_eq!(run(&mut context, "SELECT unnest(unnest([[1], [2]]))"), [["1"], ["2"]]);
+        assert_eq!(
+            run(&mut context, "SELECT list(i ORDER BY i DESC) FROM t"),
+            [["[3, 2, 1]"]]
+        );
+        assert_eq!(
+            err(&mut context, "SELECT 85070591730234615865843651857942052864 * 2"),
+            "Out of Range Error: Overflow in multiplication of INT128 (85070591730234615865843651857942052864 * 2)!"
+        );
+        assert_eq!(
+            err(&mut context, "SELECT 1 FROM t WHERE unnest(l) = 1"),
+            "Binder Error: UNNEST not supported here"
+        );
+    }
+
+    #[test]
     fn errors_match_duckdb() {
         let mut context = ClientContext::new(DatabaseInstance::new());
         let err = |context: &mut ClientContext, sql: &str| context.query(sql).unwrap_err().to_string();

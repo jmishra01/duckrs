@@ -88,6 +88,11 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             remaining: Mutex::new((offset, limit)),
         }),
         LogicalOperatorKind::Distinct { targets } => Box::new(PhysicalDistinct::new(&targets, children.remove(0))),
+        LogicalOperatorKind::Unnest { expressions, .. } => Box::new(PhysicalUnnest {
+            types,
+            expressions,
+            children,
+        }),
         LogicalOperatorKind::Projection { expressions, .. } => Box::new(PhysicalProjection {
             types,
             expressions,

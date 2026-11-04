@@ -46,6 +46,8 @@ pub enum BoundOperator {
     IsNotNull,
     /// the first argument that is not NULL
     Coalesce,
+    /// the argument, with NULL for the rows that fail
+    Try,
 }
 
 /// What a call of a sequence function does.

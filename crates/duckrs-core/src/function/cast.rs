@@ -481,7 +481,7 @@ fn try_cast_string_to_uhugeint(input: &[u8]) -> Option<u128> {
     }
     let text = text.strip_prefix('+').unwrap_or(text);
     let (mantissa, exponent) = match text.find(['e', 'E']) {
-        Some(i) => (&text[..i], text[i + 1..].parse::<i32>().ok()?),
+        Some(i) => (&text[..i], text[i + 1..].parse::<i16>().ok()? as i32),
         None => (text, 0),
     };
     let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
@@ -614,10 +614,14 @@ fn string_to<T: CastNumber>(source: &Vector, result: &mut Vector, count: usize, 
         PhysicalType::Double => string_to_number::<T>(source, result, count, mode, |s| {
             try_cast_string_to_double(s).map(Number::Double)
         }),
-        _ => string_to_number::<T>(source, result, count, mode, |s| {
+        // only a UHUGEINT goes past what the integer loop holds
+        PhysicalType::UInt128 => string_to_number::<T>(source, result, count, mode, |s| {
             try_cast_string_to_integer(s)
                 .map(Number::Int)
                 .or_else(|| try_cast_string_to_uhugeint(s).map(Number::UHuge))
+        }),
+        _ => string_to_number::<T>(source, result, count, mode, |s| {
+            try_cast_string_to_integer(s).map(Number::Int)
         }),
     }
 }

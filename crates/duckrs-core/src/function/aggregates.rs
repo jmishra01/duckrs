@@ -24,6 +24,7 @@ pub enum AggregateKind {
     SumDouble,
     SumDecimal,
     SumBignum,
+    List,
     AvgInteger,
     AvgDouble,
     AvgDecimal,
@@ -57,6 +58,7 @@ impl AggregateFunction {
             (AggregateKind::Min | AggregateKind::Max | AggregateKind::First | AggregateKind::Last, Some(ty))
             | (AggregateKind::AnyValue, Some(ty)) => ty.clone(),
             // the sum of a DECIMAL is a DECIMAL(38)
+            (AggregateKind::List, Some(ty)) => LogicalType::list(ty.clone()),
             (AggregateKind::SumDecimal, Some(ty)) => {
                 let (_, scale) = ty.decimal_properties().expect("a DECIMAL argument");
                 LogicalType::decimal(duckrs_common::types::decimal::MAX_WIDTH, scale)
@@ -143,6 +145,8 @@ pub(super) fn aggregate_functions() -> Vec<AggregateFunctionSet> {
         AggregateFunctionSet::new("mean", avg()),
         AggregateFunctionSet::new("min", unary(Min)),
         AggregateFunctionSet::new("max", unary(Max)),
+        AggregateFunctionSet::new("list", unary(List)),
+        AggregateFunctionSet::new("array_agg", unary(List)),
         AggregateFunctionSet::new("first", unary(First)),
         AggregateFunctionSet::new("arbitrary", unary(First)),
         AggregateFunctionSet::new("last", unary(Last)),
@@ -166,6 +170,8 @@ pub enum AggregateState {
     Extreme(Option<(Vec<u8>, Value)>),
     /// whether a value was taken, and the value
     Value(Option<Value>),
+    /// the values, NULLs included; `None` before the first row
+    List(Option<Vec<Value>>),
 }
 
 impl AggregateKind {
@@ -178,6 +184,7 @@ impl AggregateKind {
             SumDouble | AvgDouble => AggregateState::Double { sum: 0.0, count: 0 },
             Min | Max => AggregateState::Extreme(None),
             First | Last | AnyValue | SumBignum => AggregateState::Value(None),
+            List => AggregateState::List(None),
         }
     }
 }
@@ -268,6 +275,14 @@ impl AggregateFunction {
                 PhysicalType::Int128 => add_integers::<i128>(input, count, rows, states)?,
                 other => unreachable!("integer aggregate over {other}"),
             },
+            List => {
+                for &(row, group) in rows {
+                    let AggregateState::List(state) = &mut states[group] else {
+                        unreachable!("a list state");
+                    };
+                    state.get_or_insert_with(Vec::new).push(input.get_value(row));
+                }
+            }
             SumBignum => {
                 for &(row, group) in rows {
                     let value = input.get_value(row);
@@ -349,6 +364,10 @@ impl AggregateFunction {
         let null = || Value::null(return_type.clone());
         Ok(match (self.kind, state) {
             (_, AggregateState::Count(n)) => Value::bigint(*n),
+            (_, AggregateState::List(None)) => null(),
+            (_, AggregateState::List(Some(values))) => {
+                Value::new(return_type.clone(), ValueData::List(values.clone()))?
+            }
             (_, AggregateState::Integer { count: 0, .. } | AggregateState::Double { count: 0, .. }) => null(),
             (SumInteger, AggregateState::Integer { sum, .. }) => Value::hugeint(*sum),
             (SumDecimal, AggregateState::Integer { sum, .. }) => {

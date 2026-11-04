@@ -316,6 +316,9 @@ fn union_tag(args: &DataChunk, result: &mut Vector) -> Result<()> {
 
 fn bind_union_tag(children: Vec<BoundExpr>) -> Result<BoundExpr> {
     let ty = children[0].return_type.clone();
+    if ty.id() == LogicalTypeId::SqlNull {
+        return Ok(BoundExpr::constant(Value::sql_null()));
+    }
     if ty.id() != LogicalTypeId::Union {
         return Err(binder_error(
             "First argument to union_tag function must be a union type.",

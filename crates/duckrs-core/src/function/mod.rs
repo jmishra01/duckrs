@@ -10,6 +10,7 @@ mod bit_functions;
 pub mod cast;
 pub mod cast_rules;
 pub mod combine_types;
+pub mod generic;
 pub mod nested;
 mod nested_casts;
 pub(crate) mod operators;
@@ -166,6 +167,14 @@ impl BuiltinFunctions {
             }
             for set in bit_functions::bit_functions() {
                 functions.scalar.insert(set.name.clone(), set);
+            }
+            for set in generic::generic_functions() {
+                match functions.scalar.get_mut(&set.name) {
+                    Some(existing) => existing.functions.extend(set.functions),
+                    None => {
+                        functions.scalar.insert(set.name.clone(), set);
+                    }
+                }
             }
             let typeof_set = typeof_function();
             functions.scalar.insert(typeof_set.name.clone(), typeof_set);

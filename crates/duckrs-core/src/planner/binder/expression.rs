@@ -10,6 +10,7 @@ use crate::catalog::DEFAULT_CATALOG;
 use crate::execution::expression_executor::{evaluate_scalar, try_evaluate_scalar};
 use crate::function::binder::{bind_aggregate_function, bind_scalar_function, expression_return_type};
 use crate::function::combine_types::{force_max_logical_type, normalize_type, try_max_logical_type};
+use crate::function::generic::{bind_generic_function, bind_unnest, is_generic_function, is_unnest};
 use crate::function::nested::{bind_nested_function, is_nested_function};
 use crate::function::variant::{bind_variant_function, is_variant_function};
 use crate::function::{BuiltinFunctions, typeof_constant};
@@ -220,7 +221,8 @@ fn type_parameter_type(expr: &Expr) -> &'static str {
             LiteralKind::Null => "NULL",
             _ => "DECIMAL",
         },
-        _ => "ANY",
+        // a negative number is a parenthesized expression here
+        _ => "INTEGER",
     }
 }
 
@@ -383,7 +385,9 @@ impl Binder<'_> {
                         }
                         LogicalType::union_type(members)
                     }
-                    _ if unnamed => LogicalType::tuple(members.into_iter().map(|(_, t)| t).collect()),
+                    _ if unnamed && !members.is_empty() => {
+                        LogicalType::tuple(members.into_iter().map(|(_, t)| t).collect())
+                    }
                     _ => LogicalType::struct_type(members),
                 })
             }
@@ -486,6 +490,30 @@ impl Binder<'_> {
                 children,
             } => self.bind_in(children, *op == OperatorType::NotIn)?,
             ExprKind::Operator {
+                op: OperatorType::Try,
+                children,
+            } => {
+                let child = self.bind_expression(&children[0])?;
+                let ty = child.return_type.clone();
+                BoundExpr::new(
+                    BoundExprKind::Operator {
+                        op: BoundOperator::Try,
+                        children: vec![child],
+                    },
+                    ty,
+                )
+            }
+            ExprKind::Operator {
+                op: OperatorType::ArraySlice,
+                children,
+            } => {
+                let bound = children
+                    .iter()
+                    .map(|c| self.bind_expression(c))
+                    .collect::<Result<Vec<_>>>()?;
+                bind_generic_function("array_slice", bound)?
+            }
+            ExprKind::Operator {
                 op: OperatorType::ArrayConstructor,
                 children,
             } => {
@@ -577,6 +605,23 @@ impl Binder<'_> {
             ExprKind::Function(function) => {
                 if !builtin_qualification(&function.name.qualification) {
                     return Err(crate::unported("qualified function names"));
+                }
+                if function.name.name.eq_ignore_ascii_case("if") {
+                    let [condition, then, otherwise] = function.args.as_slice() else {
+                        return Err(binder_error("if expects three arguments"));
+                    };
+                    return self.bind_case(&[(condition.expr.clone(), then.expr.clone())], &otherwise.expr);
+                }
+                if is_generic_function(&function.name.name) || is_unnest(&function.name.name) {
+                    let children = function
+                        .args
+                        .iter()
+                        .map(|a| self.bind_expression(&a.expr))
+                        .collect::<Result<Vec<_>>>()?;
+                    if is_unnest(&function.name.name) {
+                        return bind_unnest(children);
+                    }
+                    return bind_generic_function(&function.name.name, children);
                 }
                 if is_variant_function(&function.name.name) {
                     let children = function

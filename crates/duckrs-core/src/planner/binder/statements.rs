@@ -17,7 +17,8 @@ use crate::catalog::{
 use crate::execution::expression_executor::evaluate_scalar;
 use crate::function::binder::expression_return_type;
 use crate::function::combine_types::{normalize_type, try_max_logical_type};
-use crate::planner::expression::{BoundExpr, ColumnBinding};
+use crate::function::generic::is_unnest_call;
+use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, LogicalOperator, LogicalOperatorKind};
 use duckrs_common::sort_key::OrderModifiers;
 use duckrs_common::string_util::{candidates_message, similarity_rating, top_n_strings};
@@ -201,6 +202,39 @@ impl Binder<'_> {
     }
 
     /// `Binder::BindNode(SelectNode)` + `CreatePlan(BoundSelectNode)` + `VisitQueryNode`.
+    /// `PlanUnnest`: takes the `unnest` calls out of `expressions` and puts a `LogicalUnnest` on
+    /// top of `plan` for them. An unnest of an unnest needs another one below.
+    fn plan_unnests(&mut self, expressions: &mut [BoundExpr], plan: LogicalOperator) -> LogicalOperator {
+        let table_index = self.generate_table_index();
+        let mut lists: Vec<BoundExpr> = Vec::new();
+        for expression in expressions.iter_mut() {
+            expression.walk_mut(&mut |e| {
+                if !is_unnest_call(e) {
+                    return;
+                }
+                let BoundExprKind::Function { children, .. } = &mut e.kind else {
+                    unreachable!("an unnest is a function");
+                };
+                let list = children.pop().expect("unnest has an argument");
+                let binding = ColumnBinding::new(table_index, lists.len());
+                lists.push(list);
+                let alias = std::mem::take(&mut e.alias);
+                *e = BoundExpr::column_ref(binding, e.return_type.clone(), alias);
+            });
+        }
+        if lists.is_empty() {
+            return plan;
+        }
+        let plan = self.plan_unnests(&mut lists, plan);
+        LogicalOperator::new(
+            LogicalOperatorKind::Unnest {
+                table_index,
+                expressions: lists,
+            },
+            vec![plan],
+        )
+    }
+
     fn bind_select_node(&mut self, node: &SelectNode, modifiers: &[ResultModifier]) -> Result<BoundStatement> {
         // a single grouping set of all groups is a plain GROUP BY
         let groups = &node.groups;
@@ -430,6 +464,7 @@ impl Binder<'_> {
                 vec![plan],
             );
         }
+        let plan = self.plan_unnests(&mut expressions, plan);
         let types: Vec<LogicalType> = expressions.iter().map(|e| e.return_type.clone()).collect();
         let projection_index = self.generate_table_index();
         let mut plan = LogicalOperator::new(
