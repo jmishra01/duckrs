@@ -10,6 +10,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: Some("AccessMode"),
+        enum_values: &["UNDEFINED", "AUTOMATIC", "READ_ONLY", "READ_WRITE"],
     },
     SettingDefinition {
         name: "active_grammar_extensions",
@@ -17,6 +19,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR[]",
         scope: SettingScope::LocalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "allocator_background_threads",
@@ -24,6 +28,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "allocator_bulk_deallocation_flush_threshold",
@@ -31,6 +37,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "allocator_flush_threshold",
@@ -38,6 +46,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalDefault,
         default_value: Some("134217728B"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "allow_community_extensions",
@@ -45,6 +55,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalOnly,
         default_value: Some("true"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "allow_extension_repositories",
@@ -52,6 +64,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: Some("undecided"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "allow_extensions_metadata_mismatch",
@@ -59,6 +73,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalOnly,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "allow_parser_override_extension",
@@ -66,6 +82,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalDefault,
         default_value: Some("DEFAULT"),
+        enum_name: Some("AllowParserOverride"),
+        enum_values: &["DEFAULT", "FALLBACK", "STRICT"],
     },
     SettingDefinition {
         name: "allow_persistent_secrets",
@@ -73,6 +91,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "allow_unredacted_secrets",
@@ -80,6 +100,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalOnly,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "allow_unsigned_extensions",
@@ -87,6 +109,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalOnly,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "allowed_configs",
@@ -94,6 +118,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR[]",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "allowed_directories",
@@ -101,6 +127,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR[]",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "allowed_paths",
@@ -108,6 +136,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR[]",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "approximate_join_order_threshold",
@@ -115,6 +145,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::LocalDefault,
         default_value: Some("12"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "arrow_large_buffer_size",
@@ -122,6 +154,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "arrow_lossless_conversion",
@@ -129,6 +163,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "arrow_output_list_view",
@@ -136,6 +172,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "arrow_output_version",
@@ -143,6 +181,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalDefault,
         default_value: Some("1.0"),
+        enum_name: Some("ArrowFormatVersion"),
+        enum_values: &["1.0", "1.1", "1.2", "1.3", "1.4", "1.5"],
     },
     SettingDefinition {
         name: "asof_loop_join_threshold",
@@ -150,6 +190,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::LocalDefault,
         default_value: Some("64"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "async_threads",
@@ -157,6 +199,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BIGINT",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "auto_checkpoint_skip_wal_threshold",
@@ -164,6 +208,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::GlobalDefault,
         default_value: Some("100000"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "autoinstall_extension_repository",
@@ -171,6 +217,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: Some(""),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "autoinstall_known_extensions",
@@ -178,6 +226,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalOnly,
         default_value: Some("true"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "autoload_known_extensions",
@@ -185,6 +235,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalOnly,
         default_value: Some("true"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "cache_local_files",
@@ -192,6 +244,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalOnly,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "catalog_error_max_schemas",
@@ -199,6 +253,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::GlobalDefault,
         default_value: Some("100"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "checkpoint_on_detach",
@@ -206,6 +262,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::LocalDefault,
         default_value: Some("DEFAULT"),
+        enum_name: Some("CheckpointOnDetach"),
+        enum_values: &["DEFAULT", "ENABLED", "DISABLED"],
     },
     SettingDefinition {
         name: "checkpoint_threshold",
@@ -213,6 +271,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "current_dialect",
@@ -220,6 +280,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::LocalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "current_transaction_invalidation_policy",
@@ -227,6 +289,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: Some("STANDARD_POLICY"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "custom_extension_repository",
@@ -234,6 +298,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: Some(""),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "custom_user_agent",
@@ -241,6 +307,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_abort_on_wal_failure",
@@ -248,6 +316,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_asof_iejoin",
@@ -255,6 +325,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::LocalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_checkpoint_abort",
@@ -262,6 +334,19 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalDefault,
         default_value: Some("NONE"),
+        enum_name: Some("CheckpointAbort"),
+        enum_values: &[
+            "NONE",
+            "BEFORE_TRUNCATE",
+            "BEFORE_HEADER",
+            "AFTER_FREE_LIST_WRITE",
+            "BEFORE_WAL_FINISH",
+            "BEFORE_MOVING_RECOVERY",
+            "BEFORE_DELETING_CHECKPOINT_WAL",
+            "BEFORE_HEADER_NON_FATAL",
+            "IN_MEMORY_CHECKPOINT",
+            "BEFORE_WAL_FLUSH",
+        ],
     },
     SettingDefinition {
         name: "debug_checkpoint_scan_sleep_ms",
@@ -269,6 +354,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::GlobalDefault,
         default_value: Some("0"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_checkpoint_sleep_ms",
@@ -276,6 +363,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::GlobalDefault,
         default_value: Some("0"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_delta_only_variant_encoding_enabled",
@@ -283,6 +372,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_disable_optimizer",
@@ -290,6 +381,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::LocalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_enable_caching_operators",
@@ -297,6 +390,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::LocalDefault,
         default_value: Some("true"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_eviction_queue_sleep_micro_seconds",
@@ -304,6 +399,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::GlobalOnly,
         default_value: Some("0"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_file_descriptor_limit",
@@ -311,6 +408,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::LocalDefault,
         default_value: Some("0"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_force_bitpacking_mode",
@@ -318,6 +417,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: Some("AUTO"),
+        enum_name: Some("BitpackingMode"),
+        enum_values: &["INVALID", "AUTO", "CONSTANT", "CONSTANT_DELTA", "DELTA_FOR", "FOR"],
     },
     SettingDefinition {
         name: "debug_force_commit_failure",
@@ -325,6 +426,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_force_commit_revert_failure",
@@ -332,6 +435,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_force_external",
@@ -339,6 +444,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::LocalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_force_fetch_row",
@@ -346,6 +453,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::LocalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_force_mbedtls_unsafe",
@@ -353,6 +462,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_force_no_cross_product",
@@ -360,6 +471,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::LocalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_force_update_to_del_and_insert",
@@ -367,6 +480,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::LocalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_force_variant_shredding",
@@ -374,6 +489,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_force_wal_fsync_failure",
@@ -381,6 +498,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_local_file_system_delay_ms",
@@ -388,6 +507,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::GlobalOnly,
         default_value: Some("0"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_order_verification",
@@ -395,6 +516,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: Some("DebugOrderVerification"),
+        enum_values: &["NONE", "CREATE_SORT_KEY", "VARIANT"],
     },
     SettingDefinition {
         name: "debug_physical_table_scan_execution_strategy",
@@ -402,6 +525,13 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalDefault,
         default_value: Some("DEFAULT"),
+        enum_name: Some("PhysicalTableScanExecutionStrategy"),
+        enum_values: &[
+            "DEFAULT",
+            "TASK_EXECUTOR",
+            "SYNCHRONOUS",
+            "TASK_EXECUTOR_BUT_FORCE_SYNC_CHECKS",
+        ],
     },
     SettingDefinition {
         name: "debug_skip_checkpoint_on_commit",
@@ -409,6 +539,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_verification_mode",
@@ -416,6 +548,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_verification_projection",
@@ -423,6 +557,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_verify_aggregate_state_export",
@@ -430,6 +566,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_verify_blocks",
@@ -437,6 +575,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_verify_column_bindings",
@@ -444,6 +584,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_verify_progress",
@@ -451,6 +593,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::LocalDefault,
         default_value: Some("NONE"),
+        enum_name: Some("DebugProgressVerification"),
+        enum_values: &["NONE", "LOG", "ERROR"],
     },
     SettingDefinition {
         name: "debug_verify_progress_ignore",
@@ -458,6 +602,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::LocalDefault,
         default_value: Some(""),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_verify_serializer",
@@ -465,6 +611,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_verify_statement",
@@ -472,6 +620,17 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalDefault,
         default_value: Some("NONE"),
+        enum_name: Some("DebugStatementVerification"),
+        enum_values: &[
+            "NONE",
+            "COPY_STATEMENT",
+            "REPARSE_STATEMENT",
+            "SERIALIZE_STATEMENT",
+            "PREPARED_STATEMENT",
+            "EXPLAIN_STATEMENT",
+            "EXPLAIN_SQL",
+            "EXPLAIN_SQL_STRICT",
+        ],
     },
     SettingDefinition {
         name: "debug_verify_stats",
@@ -479,6 +638,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_verify_vector",
@@ -486,6 +647,17 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalDefault,
         default_value: Some("NONE"),
+        enum_name: Some("DebugVectorVerification"),
+        enum_values: &[
+            "NONE",
+            "DICTIONARY_EXPRESSION",
+            "DICTIONARY_OPERATOR",
+            "CONSTANT_OPERATOR",
+            "SEQUENCE_OPERATOR",
+            "NESTED_SHUFFLE",
+            "VARIANT_VECTOR",
+            "SHREDDED_VECTOR",
+        ],
     },
     SettingDefinition {
         name: "debug_wal_fsync_sleep_ms",
@@ -493,6 +665,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::GlobalDefault,
         default_value: Some("0"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "debug_window_mode",
@@ -500,6 +674,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalDefault,
         default_value: Some("WINDOW"),
+        enum_name: Some("WindowAggregationMode"),
+        enum_values: &["WINDOW", "COMBINE", "SEPARATE"],
     },
     SettingDefinition {
         name: "default_block_size",
@@ -507,6 +683,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::GlobalOnly,
         default_value: Some("262144"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "default_collation",
@@ -514,6 +692,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalDefault,
         default_value: Some(""),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "default_null_order",
@@ -521,6 +701,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalDefault,
         default_value: Some("NULLS_LAST"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "default_order",
@@ -528,6 +710,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalDefault,
         default_value: Some("ASCENDING"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "default_secret_storage",
@@ -535,6 +719,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "default_transaction_invalidation_policy",
@@ -542,6 +728,12 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalDefault,
         default_value: Some("ALL_ERRORS_INVALIDATE_TRANSACTION"),
+        enum_name: Some("TransactionInvalidationPolicy"),
+        enum_values: &[
+            "STANDARD_POLICY",
+            "SYNTACTIC_ERRORS_DO_NOT_INVALIDATE",
+            "ALL_ERRORS_INVALIDATE_TRANSACTION",
+        ],
     },
     SettingDefinition {
         name: "delim_join_as_cte",
@@ -549,6 +741,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::LocalDefault,
         default_value: Some("true"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "dialect_compatibility_mode",
@@ -556,6 +750,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::LocalDefault,
         default_value: Some("NONE"),
+        enum_name: Some("DialectCompatibilityMode"),
+        enum_values: &["NONE", "SPARK"],
     },
     SettingDefinition {
         name: "disable_database_invalidation",
@@ -563,6 +759,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalOnly,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "disable_timestamptz_casts",
@@ -570,6 +768,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::LocalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "disabled_compression_methods",
@@ -577,6 +777,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "disabled_filesystems",
@@ -584,6 +786,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "disabled_log_types",
@@ -591,6 +795,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "disabled_optimizers",
@@ -598,6 +804,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "duckdb_api",
@@ -605,6 +813,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: Some(""),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "dynamic_or_filter_threshold",
@@ -612,6 +822,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::LocalDefault,
         default_value: Some("50"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "enable_block_allocator",
@@ -619,6 +831,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "enable_external_access",
@@ -626,6 +840,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalOnly,
         default_value: Some("true"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "enable_external_file_cache",
@@ -633,6 +849,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalOnly,
         default_value: Some("true"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "enable_fsst_vectors",
@@ -640,6 +858,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalOnly,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "enable_http_metadata_cache",
@@ -647,6 +867,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "enable_logging",
@@ -654,6 +876,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "enable_macro_dependencies",
@@ -661,6 +885,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "enable_object_cache",
@@ -668,6 +894,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "enable_optimistic_write",
@@ -675,6 +903,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalDefault,
         default_value: Some("true"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "enable_optimizer",
@@ -682,6 +912,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalDefault,
         default_value: Some("true"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "enable_profiling",
@@ -689,6 +921,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::LocalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "enable_progress_bar",
@@ -696,6 +930,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::LocalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "enable_progress_bar_print",
@@ -703,6 +939,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::LocalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "enable_view_dependencies",
@@ -710,6 +948,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "enabled_log_types",
@@ -717,6 +957,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "error_on_division_by_zero",
@@ -724,6 +966,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::LocalDefault,
         default_value: Some("true"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "errors_as_json",
@@ -731,6 +975,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::LocalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "experimental_metadata_reuse",
@@ -738,6 +984,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalOnly,
         default_value: Some("true"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "explain_output",
@@ -745,6 +993,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::LocalDefault,
         default_value: Some("PHYSICAL_ONLY"),
+        enum_name: Some("ExplainOutputType"),
+        enum_values: &["ALL", "OPTIMIZED_ONLY", "PHYSICAL_ONLY"],
     },
     SettingDefinition {
         name: "extension_directories",
@@ -752,6 +1002,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR[]",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "extension_directory",
@@ -759,6 +1011,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: Some(""),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "extension_repository_directory",
@@ -766,6 +1020,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: Some(""),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "external_file_cache_local_max_block_size",
@@ -773,6 +1029,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::GlobalOnly,
         default_value: Some("16384"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "external_file_cache_remote_max_block_size",
@@ -780,6 +1038,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::GlobalOnly,
         default_value: Some("2097152"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "external_file_cache_remote_min_block_size",
@@ -787,6 +1047,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::GlobalOnly,
         default_value: Some("4096"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "external_file_cache_request_sizing",
@@ -794,6 +1056,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: Some("AUTO"),
+        enum_name: Some("ExternalFileCacheRequestSizing"),
+        enum_values: &["AUTO", "GRID", "EXACT"],
     },
     SettingDefinition {
         name: "external_file_cache_spill",
@@ -801,6 +1065,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalOnly,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "external_threads",
@@ -808,6 +1074,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::GlobalOnly,
         default_value: Some("1"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "file_search_path",
@@ -815,6 +1083,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::LocalDefault,
         default_value: Some(""),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "force_column_metadata_reuse",
@@ -822,6 +1092,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalOnly,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "force_compression",
@@ -829,6 +1101,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: Some("auto"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "fsync_mode",
@@ -836,6 +1110,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: Some("STANDARD"),
+        enum_name: Some("FileSyncMode"),
+        enum_values: &["STANDARD", "NONE", "FULL"],
     },
     SettingDefinition {
         name: "geometry_minimum_shredding_size",
@@ -843,6 +1119,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BIGINT",
         scope: SettingScope::GlobalOnly,
         default_value: Some("30000"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "home_directory",
@@ -850,6 +1128,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::LocalDefault,
         default_value: Some(""),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "http_client_pool_capacity",
@@ -857,6 +1137,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BIGINT",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "http_proxy",
@@ -864,6 +1146,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "http_proxy_password",
@@ -871,6 +1155,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: Some(""),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "http_proxy_username",
@@ -878,6 +1164,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: Some(""),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "ieee_floating_point_ops",
@@ -885,6 +1173,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::LocalDefault,
         default_value: Some("true"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "ignore_unknown_crs",
@@ -892,6 +1182,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::LocalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "immediate_transaction_mode",
@@ -899,6 +1191,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "index_scan_max_count",
@@ -906,6 +1200,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::GlobalDefault,
         default_value: Some("2048"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "index_scan_percentage",
@@ -913,6 +1209,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "DOUBLE",
         scope: SettingScope::GlobalDefault,
         default_value: Some("0.001"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "initial_column_segment_size",
@@ -920,6 +1218,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::GlobalDefault,
         default_value: Some("2048"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "integer_division",
@@ -927,6 +1227,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::LocalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "lambda_syntax",
@@ -934,6 +1236,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::LocalDefault,
         default_value: Some("DEFAULT"),
+        enum_name: Some("LambdaSyntax"),
+        enum_values: &["DEFAULT", "ENABLE_SINGLE_ARROW", "DISABLE_SINGLE_ARROW"],
     },
     SettingDefinition {
         name: "late_materialization_max_rows",
@@ -941,6 +1245,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::LocalDefault,
         default_value: Some("50"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "legacy_disable_null_type",
@@ -948,6 +1254,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::LocalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "legacy_metrics_format",
@@ -955,6 +1263,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::LocalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "lock_configuration",
@@ -962,6 +1272,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalOnly,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "log_query_path",
@@ -969,6 +1281,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::LocalDefault,
         default_value: Some(""),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "logging_level",
@@ -976,6 +1290,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "logging_mode",
@@ -983,6 +1299,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "logging_storage",
@@ -990,6 +1308,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "match_recognize_max_states",
@@ -997,6 +1317,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::LocalDefault,
         default_value: Some("1000000"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "max_execution_time",
@@ -1004,6 +1326,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BIGINT",
         scope: SettingScope::LocalDefault,
         default_value: Some("0"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "max_expression_depth",
@@ -1011,6 +1335,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::LocalDefault,
         default_value: Some("1000"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "max_memory",
@@ -1018,6 +1344,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "max_streaming_buffer_size",
@@ -1025,6 +1353,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::LocalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "max_temp_directory_size",
@@ -1032,6 +1362,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "max_vacuum_tasks",
@@ -1039,6 +1371,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::GlobalOnly,
         default_value: Some("100"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "merge_join_threshold",
@@ -1046,6 +1380,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::LocalDefault,
         default_value: Some("1000"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "nested_loop_join_threshold",
@@ -1053,6 +1389,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::LocalDefault,
         default_value: Some("5"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "old_implicit_casting",
@@ -1060,6 +1398,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "operator_memory_limit",
@@ -1067,6 +1407,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::LocalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "order_by_non_integer_literal",
@@ -1074,6 +1416,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::LocalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "ordered_aggregate_threshold",
@@ -1081,6 +1425,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::LocalDefault,
         default_value: Some("262144"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "partitioned_write_flush_threshold",
@@ -1088,6 +1434,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::LocalDefault,
         default_value: Some("524288"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "partitioned_write_max_open_files",
@@ -1095,6 +1443,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::LocalDefault,
         default_value: Some("100"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "password",
@@ -1102,6 +1452,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalDefault,
         default_value: Some(""),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "perfect_ht_threshold",
@@ -1109,6 +1461,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::LocalDefault,
         default_value: Some("12"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "pin_threads",
@@ -1116,6 +1470,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: Some("auto"),
+        enum_name: Some("ThreadPinMode"),
+        enum_values: &["OFF", "ON", "AUTO"],
     },
     SettingDefinition {
         name: "pivot_filter_threshold",
@@ -1123,6 +1479,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::LocalDefault,
         default_value: Some("20"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "pivot_limit",
@@ -1130,6 +1488,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::LocalDefault,
         default_value: Some("100000"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "prefer_range_joins",
@@ -1137,6 +1497,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::LocalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "preserve_identifier_case",
@@ -1144,6 +1506,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::LocalDefault,
         default_value: Some("preserve_case"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "preserve_insertion_order",
@@ -1151,6 +1515,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalDefault,
         default_value: Some("true"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "produce_arrow_string_view",
@@ -1158,6 +1524,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalDefault,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "profiling_coverage",
@@ -1165,6 +1533,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::LocalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "profiling_mode",
@@ -1172,6 +1542,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::LocalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "profiling_output",
@@ -1179,6 +1551,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::LocalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "profiling_renderer_settings",
@@ -1186,6 +1560,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "MAP(VARCHAR, VARCHAR)",
         scope: SettingScope::LocalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "progress_bar_time",
@@ -1193,6 +1569,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BIGINT",
         scope: SettingScope::LocalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "read_ahead_depth",
@@ -1200,6 +1578,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BIGINT",
         scope: SettingScope::GlobalDefault,
         default_value: Some("-1"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "redact_http_logs",
@@ -1207,6 +1587,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalOnly,
         default_value: Some("true"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "regex_match_operator_semantics",
@@ -1214,6 +1596,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::LocalDefault,
         default_value: Some("partial"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "scalar_subquery_error_on_multiple_rows",
@@ -1221,6 +1605,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::LocalDefault,
         default_value: Some("true"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "scheduler_process_partial",
@@ -1228,6 +1614,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalOnly,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "schema",
@@ -1235,6 +1623,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::LocalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "search_path",
@@ -1242,6 +1632,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::LocalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "secret_directory",
@@ -1249,6 +1641,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "show_behavior",
@@ -1256,6 +1650,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalDefault,
         default_value: Some("AUTO"),
+        enum_name: Some("ShowBehaviorType"),
+        enum_values: &["AUTO", "SETTING", "TABLE"],
     },
     SettingDefinition {
         name: "standard_vector_size",
@@ -1263,6 +1659,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "storage_block_prefetch",
@@ -1270,6 +1668,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: Some("REMOTE_ONLY"),
+        enum_name: Some("StorageBlockPrefetch"),
+        enum_values: &["REMOTE_ONLY", "NEVER", "ALWAYS_PREFETCH", "DEBUG_FORCE_ALWAYS"],
     },
     SettingDefinition {
         name: "storage_compatibility_version",
@@ -1277,6 +1677,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "table_function_identifier_conversion",
@@ -1284,6 +1686,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::LocalDefault,
         default_value: Some("DEFAULT"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "temp_directory",
@@ -1291,6 +1695,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "temp_file_encryption",
@@ -1298,6 +1704,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalOnly,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "threads",
@@ -1305,6 +1713,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BIGINT",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "tracked_metrics",
@@ -1312,6 +1722,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR[]",
         scope: SettingScope::LocalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "username",
@@ -1319,6 +1731,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalDefault,
         default_value: Some(""),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "vacuum_rebuild_indexes",
@@ -1326,6 +1740,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::GlobalDefault,
         default_value: Some("0"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "validate_external_file_cache",
@@ -1333,6 +1749,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalDefault,
         default_value: Some("VALIDATE_ALL"),
+        enum_name: Some("CacheValidationMode"),
+        enum_values: &["VALIDATE_ALL", "VALIDATE_REMOTE", "NO_VALIDATION"],
     },
     SettingDefinition {
         name: "variant_minimum_shredding_size",
@@ -1340,6 +1758,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BIGINT",
         scope: SettingScope::GlobalOnly,
         default_value: Some("30000"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "wal_autocheckpoint_entries",
@@ -1347,6 +1767,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::GlobalDefault,
         default_value: Some("0"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "warnings_as_errors",
@@ -1354,6 +1776,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "BOOLEAN",
         scope: SettingScope::GlobalOnly,
         default_value: Some("false"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "write_buffer_row_group_count",
@@ -1361,6 +1785,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::GlobalDefault,
         default_value: Some("5"),
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "write_buffer_row_group_memory_limit",
@@ -1368,6 +1794,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "VARCHAR",
         scope: SettingScope::GlobalOnly,
         default_value: None,
+        enum_name: None,
+        enum_values: &[],
     },
     SettingDefinition {
         name: "zstd_min_string_length",
@@ -1375,5 +1803,7 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         input_type: "UBIGINT",
         scope: SettingScope::GlobalOnly,
         default_value: Some("4096"),
+        enum_name: None,
+        enum_values: &[],
     },
 ];

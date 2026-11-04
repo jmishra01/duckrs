@@ -6,6 +6,7 @@
 //! case they were created with. There are no transactions yet, so changes are visible at once;
 //! MVCC visibility arrives with Phase 10, and table storage moves to `DataTable` with Phase 9.
 
+use crate::planner::expression::BoundExpr;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::types::LogicalType;
 use duckrs_common::{Error, ErrorKind, Result};
@@ -23,6 +24,21 @@ pub const DEFAULT_SCHEMA: &str = "main";
 pub struct ColumnDefinition {
     pub name: String,
     pub ty: LogicalType,
+    /// The value of the column when an INSERT leaves it out; NULL without one.
+    pub default_value: Option<BoundExpr>,
+    /// A `NOT NULL` constraint.
+    pub not_null: bool,
+}
+
+impl ColumnDefinition {
+    pub fn new(name: impl Into<String>, ty: LogicalType) -> Self {
+        Self {
+            name: name.into(),
+            ty,
+            default_value: None,
+            not_null: false,
+        }
+    }
 }
 
 /// A table (`TableCatalogEntry`) and its rows.
@@ -138,6 +154,48 @@ impl Catalog {
         catalog
     }
 
+    /// `DuckCatalog::CreateSchema`.
+    pub fn create_schema(&self, name: &str, on_conflict: OnCreateConflict) -> Result<()> {
+        let mut schemas = self.schemas.write();
+        if schemas.contains_key(&key(name)) {
+            match on_conflict {
+                OnCreateConflict::Error => {
+                    return Err(Error::new(
+                        ErrorKind::Catalog,
+                        format!("Schema with name \"{name}\" already exists!"),
+                    ));
+                }
+                OnCreateConflict::Ignore => return Ok(()),
+                OnCreateConflict::Replace => dependency_check(&schemas[&key(name)])?,
+            }
+        }
+        schemas.insert(key(name), Arc::new(SchemaCatalogEntry::new(name)));
+        Ok(())
+    }
+
+    /// `DuckCatalog::DropSchema`: a schema with tables only goes with CASCADE.
+    pub fn drop_schema(&self, name: &str, if_exists: bool, cascade: bool) -> Result<()> {
+        let mut schemas = self.schemas.write();
+        let Some(schema) = schemas.get(&key(name)) else {
+            return if if_exists {
+                Ok(())
+            } else {
+                Err(missing_entry("Schema", name))
+            };
+        };
+        if name.eq_ignore_ascii_case(DEFAULT_SCHEMA) {
+            return Err(Error::new(
+                ErrorKind::Catalog,
+                format!("Cannot drop entry {name} because it is an internal system entry"),
+            ));
+        }
+        if !cascade {
+            dependency_check(schema)?;
+        }
+        schemas.remove(&key(name));
+        Ok(())
+    }
+
     pub fn get_schema(&self, name: &str) -> Option<Arc<SchemaCatalogEntry>> {
         self.schemas.read().get(&key(name)).cloned()
     }
@@ -158,6 +216,23 @@ impl Catalog {
     }
 }
 
+/// `DependencyManager::VerifyExistence`: a schema with tables cannot just go away.
+fn dependency_check(schema: &SchemaCatalogEntry) -> Result<()> {
+    let names = schema.table_names();
+    if names.is_empty() {
+        return Ok(());
+    }
+    let mut message = format!(
+        "Cannot drop entry \"{}\" because there are entries that depend on it.\n",
+        schema.name
+    );
+    for table in names {
+        message += &format!("table \"{table}\" depends on schema \"{}\".\n", schema.name);
+    }
+    message += "Use DROP...CASCADE to drop all dependents.";
+    Err(Error::new(ErrorKind::Dependency, message))
+}
+
 /// `CatalogException::MissingEntry`, without the "Did you mean" suggestion yet.
 pub fn missing_entry(kind: &str, name: &str) -> Error {
     Error::new(ErrorKind::Catalog, format!("{kind} with name {name} does not exist!"))
@@ -171,10 +246,7 @@ mod tests {
     fn tables_are_case_insensitive() {
         let catalog = Catalog::new(DEFAULT_CATALOG);
         let schema = catalog.schema_for(None).unwrap();
-        let columns = vec![ColumnDefinition {
-            name: "i".into(),
-            ty: LogicalType::INTEGER,
-        }];
+        let columns = vec![ColumnDefinition::new("i", LogicalType::INTEGER)];
         schema
             .create_table("Tbl", columns.clone(), OnCreateConflict::Error)
             .unwrap();

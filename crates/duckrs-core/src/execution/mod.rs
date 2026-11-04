@@ -24,6 +24,35 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             column_ids,
             types,
         }),
+        LogicalOperatorKind::Range {
+            start,
+            increment,
+            count,
+            ..
+        } => Box::new(PhysicalRange {
+            types,
+            start,
+            increment,
+            count,
+        }),
+        LogicalOperatorKind::CreateTableAs {
+            schema,
+            name,
+            columns,
+            on_conflict,
+        } => {
+            let types_of_columns: Vec<_> = columns.iter().map(|c| c.ty.clone()).collect();
+            Box::new(PhysicalCreateTableAs {
+                types,
+                schema,
+                table_name: name,
+                columns,
+                on_conflict,
+                children,
+                data: Mutex::new(duckrs_common::column_data::ColumnDataCollection::new(types_of_columns)),
+            })
+        }
+        LogicalOperatorKind::EmptyResult { .. } => Box::new(PhysicalEmptyResult { types }),
         LogicalOperatorKind::DummyScan { .. } => Box::new(PhysicalDummyScan { types }),
         LogicalOperatorKind::ExpressionGet { expressions, .. } => {
             Box::new(PhysicalExpressionScan { types, expressions })
@@ -107,6 +136,9 @@ impl Pipeline<'_> {
             }
             if !chunk.is_empty() {
                 self.sink.sink(&chunk)?;
+            }
+            if self.operators.iter().any(|op| op.is_finished()) {
+                break;
             }
         }
         self.sink.finalize()

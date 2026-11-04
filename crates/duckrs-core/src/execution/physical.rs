@@ -19,7 +19,8 @@ use duckrs_common::sort_key::{NullOrder, OrderModifiers, OrderType, create_sort_
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
 use duckrs_common::vector::{DataChunk, SelectionVector, Vector};
-use duckrs_common::{Result, STANDARD_VECTOR_SIZE};
+use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
+use duckrs_parser::ast::sql_identifier;
 use parking_lot::Mutex;
 use std::any::Any;
 use std::fmt;
@@ -50,6 +51,11 @@ pub trait PhysicalOperator: fmt::Debug + Send + Sync {
     // Operator interface: one input chunk becomes one output chunk
     fn execute(&self, _input: DataChunk) -> Result<DataChunk> {
         unreachable!("{} is not an operator", self.name())
+    }
+
+    /// Whether the operator needs no more input, so that its pipeline can stop early.
+    fn is_finished(&self) -> bool {
+        false
     }
 
     // Sink interface
@@ -103,6 +109,80 @@ impl PhysicalOperator for PhysicalTableScan {
             result.slice(&SelectionVector::from_vec((0..count as u32).collect()), count);
         }
         Ok(Some(result))
+    }
+}
+
+/// How much a blocking operator or table may hold, roughly. Everything lives in memory until
+/// out-of-core operators (Phase 8) and storage (Phase 9) arrive, so more than this fails
+/// instead of exhausting the machine.
+const MAX_BUFFERED_BYTES: usize = 2 << 30;
+
+fn check_buffered(collection: &ColumnDataCollection) -> Result<()> {
+    let row_size: usize = collection.types().iter().map(|t| t.physical_type().size().max(8)).sum();
+    if collection.len().saturating_mul(row_size) > MAX_BUFFERED_BYTES {
+        return Err(crate::unported(
+            "keeping more than 2 GiB of rows, which needs spilling to disk,",
+        ));
+    }
+    Ok(())
+}
+
+/// `PhysicalEmptyResult`.
+#[derive(Debug)]
+pub struct PhysicalEmptyResult {
+    pub types: Vec<LogicalType>,
+}
+
+impl PhysicalOperator for PhysicalEmptyResult {
+    fn name(&self) -> &'static str {
+        "EMPTY_RESULT"
+    }
+    fn types(&self) -> &[LogicalType] {
+        &self.types
+    }
+    fn is_source(&self) -> bool {
+        true
+    }
+    fn get_data(&self, _state: &mut SourceState) -> Result<Option<DataChunk>> {
+        Ok(None)
+    }
+}
+
+/// The `range` and `generate_series` table functions.
+#[derive(Debug)]
+pub struct PhysicalRange {
+    pub types: Vec<LogicalType>,
+    pub start: i128,
+    pub increment: i128,
+    pub count: u64,
+}
+
+impl PhysicalOperator for PhysicalRange {
+    fn name(&self) -> &'static str {
+        "RANGE"
+    }
+    fn types(&self) -> &[LogicalType] {
+        &self.types
+    }
+    fn is_source(&self) -> bool {
+        true
+    }
+    fn source_state(&self) -> SourceState {
+        Box::new(0u64)
+    }
+    fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
+        let done = state.downcast_mut::<u64>().expect("range state");
+        if *done >= self.count {
+            return Ok(None);
+        }
+        let count = (self.count - *done).min(STANDARD_VECTOR_SIZE as u64) as usize;
+        let mut column = Vector::new(LogicalType::BIGINT, count);
+        let first = self.start + *done as i128 * self.increment;
+        for (i, slot) in column.data_mut::<i64>().iter_mut().enumerate().take(count) {
+            *slot = (first + i as i128 * self.increment) as i64;
+        }
+        *done += count as u64;
+        Ok(Some(DataChunk::from_columns(vec![column], count)))
     }
 }
 
@@ -286,8 +366,9 @@ impl PhysicalOperator for PhysicalOrder {
         true
     }
     fn sink(&self, chunk: &DataChunk) -> Result<()> {
-        self.data.lock().append(chunk);
-        Ok(())
+        let mut data = self.data.lock();
+        data.append(chunk);
+        check_buffered(&data)
     }
     fn finalize(&self) -> Result<()> {
         let mut data = self.data.lock();
@@ -339,6 +420,9 @@ impl PhysicalOperator for PhysicalLimit {
             input.slice(&sel, take as usize);
         }
         Ok(input)
+    }
+    fn is_finished(&self) -> bool {
+        self.remaining.lock().1 == Some(0)
     }
 }
 
@@ -399,7 +483,9 @@ impl PhysicalOperator for PhysicalDistinct {
             let mut rows = chunk.clone();
             let count = new_rows.len();
             rows.slice(&SelectionVector::from_vec(new_rows), count);
-            self.data.lock().append(&rows);
+            let mut data = self.data.lock();
+            data.append(&rows);
+            check_buffered(&data)?;
         }
         Ok(())
     }
@@ -501,6 +587,7 @@ impl PhysicalAggregate {
             let mut values = DataChunk::from_columns(vectors, chunk.len());
             values.slice(&SelectionVector::from_vec(new_rows), count);
             state.group_values.append(&values);
+            check_buffered(&state.group_values)?;
             for (states, aggregate) in state.states.iter_mut().zip(&self.aggregates) {
                 states.resize(state.group_count, aggregate.function.kind.initial_state());
             }
@@ -623,19 +710,36 @@ impl PhysicalOperator for PhysicalInsert {
         true
     }
     fn sink(&self, chunk: &DataChunk) -> Result<()> {
-        // ResolveDefaults: each table column from its input column, or its default (NULL)
+        // ResolveDefaults: each table column from its input column, or its default
         let columns = self
             .table
             .columns
             .iter()
             .zip(&self.column_index_map)
-            .map(|(column, source)| match source {
-                Some(i) => chunk.column(*i).clone(),
-                None => Vector::constant_null(column.ty.clone()),
+            .map(|(column, source)| match (source, &column.default_value) {
+                (Some(i), _) => Ok(chunk.column(*i).clone()),
+                (None, Some(default)) => execute(default, chunk),
+                (None, None) => Ok(Vector::constant_null(column.ty.clone())),
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let row = DataChunk::from_columns(columns, chunk.len());
-        self.table.storage.write().append(&row);
+        for (i, column) in self.table.columns.iter().enumerate() {
+            let unified = row.column(i).to_unified(row.len());
+            if column.not_null && (0..row.len()).any(|r| !unified.is_valid(r)) {
+                return Err(Error::new(
+                    ErrorKind::Constraint,
+                    format!(
+                        "NOT NULL constraint failed: {}.{}",
+                        sql_identifier(&self.table.name),
+                        sql_identifier(&column.name)
+                    ),
+                ));
+            }
+        }
+        let mut storage = self.table.storage.write();
+        storage.append(&row);
+        check_buffered(&storage)?;
+        drop(storage);
         *self.inserted.lock() += chunk.len() as u64;
         Ok(())
     }
@@ -654,6 +758,75 @@ impl PhysicalOperator for PhysicalInsert {
         let count = *self.inserted.lock() as i64;
         let mut chunk = DataChunk::new(&self.types);
         chunk.append_row(&[Value::bigint(count)])?;
+        Ok(Some(chunk))
+    }
+}
+
+/// `PhysicalCreateTable` with a query (`PhysicalBatchInsert`): gathers the rows, then creates
+/// the table with them, so that the query may read a table it replaces.
+#[derive(Debug)]
+pub struct PhysicalCreateTableAs {
+    pub types: Vec<LogicalType>,
+    pub schema: Arc<SchemaCatalogEntry>,
+    pub table_name: String,
+    pub columns: Vec<ColumnDefinition>,
+    pub on_conflict: OnCreateConflict,
+    pub children: Vec<Box<dyn PhysicalOperator>>,
+    pub data: Mutex<ColumnDataCollection>,
+}
+
+impl PhysicalOperator for PhysicalCreateTableAs {
+    fn name(&self) -> &'static str {
+        "CREATE_TABLE_AS"
+    }
+    fn types(&self) -> &[LogicalType] {
+        &self.types
+    }
+    fn children(&self) -> &[Box<dyn PhysicalOperator>] {
+        &self.children
+    }
+    fn is_sink(&self) -> bool {
+        true
+    }
+    fn sink(&self, chunk: &DataChunk) -> Result<()> {
+        let mut columns = chunk.columns().to_vec();
+        for (vector, column) in columns.iter_mut().zip(&self.columns) {
+            if vector.logical_type() != &column.ty {
+                // an untyped NULL column
+                *vector = Vector::constant_null(column.ty.clone());
+            }
+        }
+        let mut data = self.data.lock();
+        data.append(&DataChunk::from_columns(columns, chunk.len()));
+        check_buffered(&data)
+    }
+    fn finalize(&self) -> Result<()> {
+        let table = self
+            .schema
+            .create_table(&self.table_name, self.columns.clone(), self.on_conflict)?;
+        if let Some(table) = table {
+            let data = self.data.lock();
+            let mut storage = table.storage.write();
+            for chunk in data.chunks() {
+                storage.append(chunk);
+            }
+        }
+        Ok(())
+    }
+    fn is_source(&self) -> bool {
+        true
+    }
+    fn source_state(&self) -> SourceState {
+        Box::new(false)
+    }
+    fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
+        let done = state.downcast_mut::<bool>().expect("create table state");
+        if *done {
+            return Ok(None);
+        }
+        *done = true;
+        let mut chunk = DataChunk::new(&self.types);
+        chunk.append_row(&[Value::bigint(self.data.lock().len() as i64)])?;
         Ok(Some(chunk))
     }
 }
@@ -718,7 +891,8 @@ impl PhysicalOperator for PhysicalResultCollector {
         true
     }
     fn sink(&self, chunk: &DataChunk) -> Result<()> {
-        self.result.lock().append(chunk);
-        Ok(())
+        let mut result = self.result.lock();
+        result.append(chunk);
+        check_buffered(&result)
     }
 }

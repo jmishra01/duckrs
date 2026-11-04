@@ -15,7 +15,7 @@
 
 use super::settings_table::SETTINGS;
 use crate::function::cast::{CastMode, cast_vector};
-use duckrs_common::string_util::candidates_error_message;
+use duckrs_common::string_util::{candidates_error_message, candidates_message, similarity_rating, top_n_strings};
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
 use duckrs_common::vector::Vector;
@@ -42,6 +42,9 @@ pub struct SettingDefinition {
     pub scope: SettingScope,
     /// The default as text, for the generic settings that have one.
     pub default_value: Option<&'static str>,
+    /// The enum a value must name (`EnumUtil::FromString`), if the setting is checked that way.
+    pub enum_name: Option<&'static str>,
+    pub enum_values: &'static [&'static str],
 }
 
 /// Settings that change query results or how SQL is read, whose effect duckrs does not
@@ -122,6 +125,23 @@ fn cast_value(value: &Value, target: &LogicalType) -> Result<Value> {
 /// The custom `OnSet` callbacks of the settings duckrs honors: they normalize the value.
 fn on_set(setting: &SettingDefinition, value: Value) -> Result<Value> {
     let text = || value.try_to_string().map(|s| s.to_lowercase());
+    if let Some(enum_name) = setting.enum_name {
+        let input = value.try_to_string()?;
+        if !setting.enum_values.iter().any(|v| v.eq_ignore_ascii_case(&input)) {
+            let scores = setting
+                .enum_values
+                .iter()
+                .map(|v| (v.to_string(), similarity_rating(v, &input)))
+                .collect();
+            return Err(Error::new(
+                ErrorKind::NotImplemented,
+                format!(
+                    "Enum value: unrecognized value \"{input}\" for enum \"{enum_name}\"\n{}",
+                    candidates_message(&top_n_strings(scores), "Candidates")
+                ),
+            ));
+        }
+    }
     Ok(match setting.name {
         "default_null_order" => {
             let parameter = text()?;

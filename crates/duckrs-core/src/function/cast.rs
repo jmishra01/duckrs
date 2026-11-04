@@ -64,6 +64,8 @@ macro_rules! integer_cast_number {
                     }
                     Number::Double(v) => round_into_range(v, min, max).map(|r| r as $t),
                 }
+                // `Hugeint::TryConvert`: -2^127 itself is out of range for floating point input
+                .filter(|r| !(<$t>::BITS == 128 && *r == <$t>::MIN && matches!(n, Number::Float(_) | Number::Double(_))))
             }
             fn render(self) -> String {
                 self.to_string()
@@ -458,6 +460,23 @@ fn integer_radix_loop(buf: &[u8], radix: u32) -> Option<i128> {
     Some(result)
 }
 
+/// A UHUGEINT from a plain digit string, for values no `i128` holds.
+fn try_cast_string_to_uhugeint(input: &[u8]) -> Option<u128> {
+    let text = std::str::from_utf8(input)
+        .ok()?
+        .trim_matches(|c: char| c.is_ascii() && is_space(c as u8));
+    let (integer, fraction) = text.split_once('.').unwrap_or((text, ""));
+    if !fraction.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let value = integer.strip_prefix('+').unwrap_or(integer).parse::<u128>().ok()?;
+    if fraction.as_bytes().first().is_some_and(|d| *d >= b'5') {
+        value.checked_add(1)
+    } else {
+        Some(value)
+    }
+}
+
 /// `TryIntegerCast` (non-strict): the integer a string spells, rounding a fraction.
 pub fn try_cast_string_to_integer(input: &[u8]) -> Option<i128> {
     let mut buf = input;
@@ -571,7 +590,9 @@ fn string_to<T: CastNumber>(source: &Vector, result: &mut Vector, count: usize, 
             try_cast_string_to_double(s).map(Number::Double)
         }),
         _ => string_to_number::<T>(source, result, count, mode, |s| {
-            try_cast_string_to_integer(s).map(Number::Int)
+            try_cast_string_to_integer(s)
+                .map(Number::Int)
+                .or_else(|| try_cast_string_to_uhugeint(s).map(Number::UHuge))
         }),
     }
 }

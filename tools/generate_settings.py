@@ -41,10 +41,22 @@ def rust_string(text):
     return json.dumps(text)
 
 
+def enum_values(setting, enum_util):
+    """The values of an enum setting checked with EnumUtil::FromString (no custom parsing)."""
+    match = re.fullmatch(r"ENUM<(\w+)>", setting["type"])
+    if match is None or "custom_implementation" in setting:
+        return None
+    body = re.search(rf"Get{match.group(1)}Values\(\) \{{(.*?)\n\}}", enum_util, re.S)
+    if body is None:
+        return None
+    return match.group(1), re.findall(r'static_cast<uint\d+_t>\([^)]*\), "([^"]+)"', body.group(1))
+
+
 def main():
     settings = json.loads((DUCKDB / "src/common/settings.json").read_text())
     aliases = {s["name"]: list(s.get("aliases", [])) for s in settings}
     by_struct = {struct_name(s): s["name"] for s in settings}
+    enum_util = (DUCKDB / "src/common/enum_util.cpp").read_text()
     config = (DUCKDB / "src/main/config.cpp").read_text()
     for alias, struct in re.findall(r'DUCKDB_SETTING_ALIAS\("([^"]+)",\s*(\w+)\)', config):
         name = by_struct.get(struct)
@@ -60,6 +72,7 @@ def main():
     ]
     for s in sorted(settings, key=lambda s: s["name"]):
         default = s.get("default_value")
+        enum = enum_values(s, enum_util)
         lines += [
             "    SettingDefinition {",
             f"        name: {rust_string(s['name'])},",
@@ -67,6 +80,8 @@ def main():
             f"        input_type: {rust_string(input_type(s))},",
             f"        scope: SettingScope::{scope(s)},",
             f"        default_value: {'None' if default is None else 'Some(' + rust_string(str(default)) + ')'},",
+            f"        enum_name: {'None' if enum is None else 'Some(' + rust_string(enum[0]) + ')'},",
+            f"        enum_values: &[{'' if enum is None else ', '.join(rust_string(v) for v in enum[1])}],",
             "    },",
         ]
     lines.append("];")

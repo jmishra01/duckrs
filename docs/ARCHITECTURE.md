@@ -133,12 +133,16 @@ A statement goes `parse_ast` → `Binder` (bound expressions, `LogicalOperator` 
   Pragmas that only switch DuckDB's debug verification, profiling or progress output are
   no-ops.
 
-Deliberate gaps so far: no DECIMAL arithmetic (a DECIMAL meets a number in DOUBLE), no `/`, `//`
-or `%`, no constraints, defaults or table options, no joins, no DISTINCT ON, LIMIT PERCENT or
+Deliberate gaps so far: no DECIMAL arithmetic (a DECIMAL meets a number in DOUBLE, which loses
+digits), no constraints beyond NOT NULL, no table options, no joins, no transactions, no DISTINCT ON, LIMIT PERCENT or
 non-constant LIMIT, no GROUPING SETS/ROLLUP/CUBE, no ORDER BY in aggregates, no collations, no
 SET VARIABLE or settings of MAP and list types. The expression executor evaluates a filter's
 condition to a BOOLEAN vector rather than using DuckDB's specialized `Select`, and casts to
-VARCHAR and from or to DECIMAL go row by row through `Value`. Errors for SQL beyond the slice
+VARCHAR and from or to DECIMAL, CASE and COALESCE write row by row through `Value`. Tables and
+blocking operators are capped at about 2 GiB and fail as not yet ported beyond that, until
+out-of-core operators (Phase 8) and storage (Phase 9) exist. There is no optimizer yet, so
+errors DuckDB's rewrites avoid (an overflow in a filter it removes) still surface; only
+`LIMIT 0` skips its input. Errors for SQL beyond the slice
 say it `is not yet ported to duckrs`, wording DuckDB never uses, so that no test expecting an
 error passes because a feature is missing.
 

@@ -243,6 +243,8 @@ pub struct Binder<'a> {
     pub options: BindOptions,
     bind_context: BindContext,
     next_table_index: usize,
+    /// Numbers the subqueries in FROM without an alias.
+    unnamed_subquery_index: usize,
     /// The grouping of the select node being bound; `None` where aggregates are not allowed.
     aggregates: Option<AggregateBindState>,
     /// The error for an aggregate where it is not allowed (`UnsupportedAggregateMessage`).
@@ -263,6 +265,7 @@ impl<'a> Binder<'a> {
             options,
             bind_context: BindContext::default(),
             next_table_index: 0,
+            unnamed_subquery_index: 1,
             aggregates: None,
             aggregate_error: "Aggregate functions are not supported here",
             alias_fallback: Vec::new(),

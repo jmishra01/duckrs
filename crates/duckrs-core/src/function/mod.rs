@@ -8,7 +8,7 @@ pub mod binder;
 pub mod cast;
 pub mod cast_rules;
 pub mod combine_types;
-mod operators;
+pub(crate) mod operators;
 
 use duckrs_common::Result;
 use duckrs_common::types::LogicalType;

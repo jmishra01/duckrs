@@ -7,7 +7,7 @@
 pub mod settings;
 mod settings_table;
 
-use crate::catalog::{Catalog, DEFAULT_CATALOG};
+use crate::catalog::{Catalog, DEFAULT_CATALOG, OnCreateConflict, missing_entry};
 use crate::execution::expression_executor::evaluate_scalar;
 use crate::execution::physical::PhysicalResultCollector;
 use crate::execution::{create_plan, execute_plan};
@@ -19,7 +19,7 @@ use duckrs_common::sort_key::OrderType;
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
 use duckrs_parser::ParserOptions;
-use duckrs_parser::ast::{PragmaInfo, Statement};
+use duckrs_parser::ast::{CreateKind, DropInfo, OnCreateConflict as AstConflict, PragmaInfo, Statement};
 use parking_lot::RwLock;
 use settings::SettingValues;
 use std::sync::Arc;
@@ -41,8 +41,8 @@ impl DatabaseInstance {
     }
 }
 
-/// Pragmas that only switch DuckDB's debug verification, profiling or progress output, none of
-/// which changes a result; duckrs runs them as no-ops.
+/// Pragmas that only switch DuckDB's debug verification, profiling, progress output or
+/// checkpointing, none of which changes a result; duckrs runs them as no-ops.
 const NO_OP_PRAGMAS: &[&str] = &[
     "enable_verification",
     "disable_verification",
@@ -62,6 +62,8 @@ const NO_OP_PRAGMAS: &[&str] = &[
     "disable_print_progress_bar",
     "enable_object_cache",
     "disable_object_cache",
+    "enable_checkpoint_on_shutdown",
+    "disable_checkpoint_on_shutdown",
 ];
 
 /// A fully materialized result (`MaterializedQueryResult`).
@@ -182,6 +184,25 @@ impl ClientContext {
                 }
                 return Err(crate::unported(format!("PRAGMA {name}")));
             }
+            Statement::Create(info) => {
+                let CreateKind::Schema { options } = &info.kind else {
+                    return Err(crate::unported(create_kind_name(&info.kind)));
+                };
+                if !options.is_empty() || info.temporary || !catalog_qualifier_only(&info.name.qualification) {
+                    return Err(crate::unported("this form of CREATE SCHEMA"));
+                }
+                let on_conflict = match info.on_conflict {
+                    AstConflict::Error => OnCreateConflict::Error,
+                    AstConflict::Ignore => OnCreateConflict::Ignore,
+                    AstConflict::Replace => OnCreateConflict::Replace,
+                };
+                self.db.catalog.create_schema(&info.name.name, on_conflict)?;
+                return Ok(Self::success());
+            }
+            Statement::Drop(info) => {
+                self.drop_entry(info)?;
+                return Ok(Self::success());
+            }
             _ => {}
         }
         let mut binder = Binder::with_options(&self.db.catalog, self.bind_options());
@@ -205,7 +226,60 @@ impl ClientContext {
     }
 }
 
+/// The name of a CREATE statement kind, for the not-ported error.
+fn create_kind_name(kind: &CreateKind) -> &'static str {
+    match kind {
+        CreateKind::View { .. } => "CREATE VIEW",
+        CreateKind::Schema { .. } => "CREATE SCHEMA",
+        CreateKind::Sequence { .. } => "CREATE SEQUENCE",
+        CreateKind::Index { .. } => "CREATE INDEX",
+        CreateKind::Macro { .. } => "CREATE MACRO",
+        CreateKind::Type(_) => "CREATE TYPE",
+        CreateKind::Trigger { .. } => "CREATE TRIGGER",
+        CreateKind::Secret { .. } => "CREATE SECRET",
+    }
+}
+
+/// Whether a schema's qualification names no more than this database's catalog.
+fn catalog_qualifier_only(qualification: &[String]) -> bool {
+    match qualification {
+        [] => true,
+        [catalog] => catalog.eq_ignore_ascii_case(DEFAULT_CATALOG),
+        _ => false,
+    }
+}
+
 impl ClientContext {
+    /// `DROP TABLE` and `DROP SCHEMA` (`Catalog::DropEntry`).
+    fn drop_entry(&mut self, info: &DropInfo) -> Result<()> {
+        let catalog = &self.db.catalog;
+        match info.entry_type {
+            "TABLE" => {
+                let schema = match info.name.qualification.as_slice() {
+                    [] => None,
+                    [schema] => Some(schema.as_str()),
+                    [catalog_name, schema] if catalog_name.eq_ignore_ascii_case(DEFAULT_CATALOG) => {
+                        Some(schema.as_str())
+                    }
+                    _ => return Err(crate::unported("this form of DROP TABLE")),
+                };
+                let dropped = match catalog.schema_for(schema) {
+                    Ok(schema) => schema.drop_table(&info.name.name),
+                    Err(_) if info.if_exists => false,
+                    Err(error) => return Err(error),
+                };
+                if !dropped && !info.if_exists {
+                    return Err(missing_entry("Table", &info.name.name));
+                }
+                Ok(())
+            }
+            "SCHEMA" if catalog_qualifier_only(&info.name.qualification) => {
+                catalog.drop_schema(&info.name.name, info.if_exists, info.cascade)
+            }
+            other => Err(crate::unported(format!("DROP {other}"))),
+        }
+    }
+
     /// The empty result of a statement that returns nothing (`Success` column).
     fn success() -> MaterializedQueryResult {
         MaterializedQueryResult {
@@ -412,6 +486,145 @@ mod tests {
         assert_eq!(
             err(&mut context, "SELECT g FROM t GROUP BY g HAVING v > 1"),
             "Binder Error: column v must appear in the GROUP BY clause or be used in an aggregate function"
+        );
+    }
+
+    #[test]
+    fn expressions_and_sources() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        let rows = |context: &mut ClientContext, sql: &str| {
+            run(context, sql).into_iter().map(|r| r.join(",")).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            rows(&mut context, "SELECT 7 / 2, 7 // 2, 7 % 2, -7 % 2, 1.0 / 0"),
+            ["3.5,3,1,-1,inf"]
+        );
+        assert_eq!(
+            rows(
+                &mut context,
+                "SELECT CASE WHEN 1 > 2 THEN 'a' WHEN 2 > 1 THEN 'b' END, COALESCE(NULL, 2, 3), 2 BETWEEN 1 AND 3"
+            ),
+            ["b,2,true"]
+        );
+        assert_eq!(
+            rows(&mut context, "SELECT 1 IN (1, 2), 3 NOT IN (1, 2), 1 IN (2, NULL)"),
+            ["true,true,NULL"]
+        );
+        // range, subqueries, and early exit from an endless-looking range
+        assert_eq!(
+            rows(&mut context, "SELECT count(*), sum(range) FROM range(5)"),
+            ["5,10"]
+        );
+        assert_eq!(
+            rows(&mut context, "SELECT * FROM generate_series(1, 7, 3) t(x)"),
+            ["1", "4", "7"]
+        );
+        assert_eq!(
+            rows(&mut context, "SELECT i FROM range(100000000000) t(i) LIMIT 2"),
+            ["0", "1"]
+        );
+        assert!(run(&mut context, "SELECT * FROM range(5, 1)").is_empty());
+        assert_eq!(
+            rows(
+                &mut context,
+                "SELECT x + 1 FROM (SELECT i * 2 AS x FROM range(3) t(i) ORDER BY i DESC LIMIT 2) s"
+            ),
+            ["5", "3"]
+        );
+        assert_eq!(
+            rows(&mut context, "SELECT a, a_1 FROM (SELECT 1 AS a, 2 AS a)"),
+            ["1,2"]
+        );
+        // CREATE TABLE AS, including reading the table it replaces
+        assert_eq!(
+            rows(
+                &mut context,
+                "CREATE TABLE t AS SELECT i, i % 2 AS odd FROM range(4) r(i)"
+            ),
+            ["4"]
+        );
+        assert_eq!(
+            rows(&mut context, "SELECT odd, count(*) FROM t GROUP BY odd ORDER BY odd"),
+            ["0,2", "1,2"]
+        );
+        run(
+            &mut context,
+            "CREATE OR REPLACE TABLE t AS SELECT i FROM t WHERE odd = 1",
+        );
+        assert_eq!(rows(&mut context, "SELECT i FROM t ORDER BY i"), ["1", "3"]);
+        // an existing table is noticed before the query runs, as is LIMIT 0
+        run(
+            &mut context,
+            "CREATE TABLE IF NOT EXISTS t AS SELECT i FROM range(10000000000000000) r(i)",
+        );
+        assert_eq!(
+            context
+                .query("CREATE TABLE t AS SELECT i FROM range(10000000000000000) r(i)")
+                .unwrap_err()
+                .to_string(),
+            "Catalog Error: Table with name \"t\" already exists!"
+        );
+        assert!(
+            run(
+                &mut context,
+                "SELECT * FROM (SELECT sum(i) FROM range(100000000000) r(i)) LIMIT 0"
+            )
+            .is_empty()
+        );
+        // an alias wins in HAVING, and a group alias may be used in an aggregate
+        assert_eq!(
+            rows(
+                &mut context,
+                "SELECT b, sum(a) AS a FROM (VALUES (1, 0), (1, 1)) v(a, b) GROUP BY b HAVING a > 0 ORDER BY ALL"
+            ),
+            ["0,1", "1,1"]
+        );
+        assert_eq!(
+            rows(&mut context, "SELECT i % 2 AS k, sum(k) FROM t GROUP BY k"),
+            ["1,2"]
+        );
+        assert_eq!(
+            rows(&mut context, "SELECT i AS x FROM t ORDER BY alias.x DESC"),
+            ["3", "1"]
+        );
+        let err = context
+            .query("SET debug_window_mode='unknown'")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unrecognized value"), "{err}");
+        // defaults, NOT NULL, schemas and DROP
+        run(&mut context, "CREATE SCHEMA s");
+        run(
+            &mut context,
+            "CREATE TABLE s.d (a INTEGER NOT NULL, b INTEGER DEFAULT 41 + 1, c INTEGER)",
+        );
+        run(&mut context, "INSERT INTO s.d (a) VALUES (1)");
+        run(&mut context, "INSERT INTO s.d VALUES (2, DEFAULT, 3)");
+        assert_eq!(
+            rows(&mut context, "SELECT * FROM s.d ORDER BY a"),
+            ["1,42,NULL", "2,42,3"]
+        );
+        let err = |context: &mut ClientContext, sql: &str| context.query(sql).unwrap_err().to_string();
+        assert_eq!(
+            err(&mut context, "INSERT INTO s.d (b) VALUES (1)"),
+            "Constraint Error: NOT NULL constraint failed: d.a"
+        );
+        assert_eq!(
+            err(&mut context, "SELECT 1 // 0"),
+            "Invalid Input Error: Division by zero in expression (1 // 0). Use TRY(...) to return NULL for this \
+             expression, or SET error_on_division_by_zero=false to return NULL for all divisions by zero."
+        );
+        assert_eq!(
+            err(&mut context, "SELECT * FROM range(1, 2, 0)"),
+            "Binder Error: interval cannot be 0!"
+        );
+        assert!(err(&mut context, "DROP SCHEMA s").starts_with("Dependency Error: Cannot drop entry \"s\""));
+        run(&mut context, "DROP TABLE s.d");
+        run(&mut context, "DROP SCHEMA s");
+        run(&mut context, "DROP TABLE IF EXISTS nope");
+        assert_eq!(
+            err(&mut context, "DROP TABLE nope"),
+            "Catalog Error: Table with name nope does not exist!"
         );
     }
 

@@ -42,6 +42,8 @@ pub enum BoundOperator {
     Not,
     IsNull,
     IsNotNull,
+    /// the first argument that is not NULL
+    Coalesce,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +69,17 @@ pub enum BoundExprKind {
     Operator {
         op: BoundOperator,
         children: Vec<BoundExpr>,
+    },
+    /// `BoundCaseExpression`; a THEN or ELSE only runs on the rows that reach it.
+    Case {
+        checks: Vec<(BoundExpr, BoundExpr)>,
+        else_expr: Box<BoundExpr>,
+    },
+    /// `BoundBetweenExpression`, inclusive on both sides.
+    Between {
+        input: Box<BoundExpr>,
+        lower: Box<BoundExpr>,
+        upper: Box<BoundExpr>,
     },
     /// `BoundFunctionExpression` of a scalar function; the children have its argument types.
     Function {
@@ -129,6 +142,12 @@ impl BoundExpr {
             BoundExprKind::Constant(_) | BoundExprKind::ColumnRef { .. } | BoundExprKind::Reference(_) => Vec::new(),
             BoundExprKind::Cast { child, .. } => vec![child],
             BoundExprKind::Comparison { left, right, .. } => vec![left, right],
+            BoundExprKind::Between { input, lower, upper } => vec![input, lower, upper],
+            BoundExprKind::Case { checks, else_expr } => {
+                let mut children: Vec<&BoundExpr> = checks.iter().flat_map(|(when, then)| [when, then]).collect();
+                children.push(else_expr);
+                children
+            }
             BoundExprKind::Conjunction { children, .. }
             | BoundExprKind::Operator { children, .. }
             | BoundExprKind::Function { children, .. } => children.iter().collect(),
@@ -140,6 +159,13 @@ impl BoundExpr {
             BoundExprKind::Constant(_) | BoundExprKind::ColumnRef { .. } | BoundExprKind::Reference(_) => Vec::new(),
             BoundExprKind::Cast { child, .. } => vec![child],
             BoundExprKind::Comparison { left, right, .. } => vec![left, right],
+            BoundExprKind::Between { input, lower, upper } => vec![input, lower, upper],
+            BoundExprKind::Case { checks, else_expr } => {
+                let mut children: Vec<&mut BoundExpr> =
+                    checks.iter_mut().flat_map(|(when, then)| [when, then]).collect();
+                children.push(else_expr);
+                children
+            }
             BoundExprKind::Conjunction { children, .. }
             | BoundExprKind::Operator { children, .. }
             | BoundExprKind::Function { children, .. } => children.iter_mut().collect(),
@@ -178,5 +204,41 @@ impl BoundExpr {
         );
         cast.alias = alias;
         cast
+    }
+}
+
+impl fmt::Display for BoundExpr {
+    /// `Expression::ToString`, as far as error messages need it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.kind {
+            BoundExprKind::Constant(value) if value.is_null() => f.write_str("NULL"),
+            BoundExprKind::Constant(value) => {
+                let text = value.try_to_string().unwrap_or_default();
+                if value.logical_type().id() == duckrs_common::types::LogicalTypeId::Varchar {
+                    write!(f, "'{}'", text.replace('\'', "''"))
+                } else {
+                    f.write_str(&text)
+                }
+            }
+            BoundExprKind::ColumnRef { .. } | BoundExprKind::Reference(_) => f.write_str(&self.alias),
+            BoundExprKind::Cast { child, try_cast } => {
+                let name = if *try_cast { "TRY_CAST" } else { "CAST" };
+                write!(f, "{name}({child} AS {})", self.return_type)
+            }
+            BoundExprKind::Comparison { op, left, right } => write!(f, "({left} {} {right})", op.operator()),
+            BoundExprKind::Function {
+                function,
+                children,
+                is_operator,
+            } => match children.as_slice() {
+                [left, right] if *is_operator => write!(f, "({left} {} {right})", function.name),
+                [child] if *is_operator => write!(f, "{}{child}", function.name),
+                _ => {
+                    let args: Vec<String> = children.iter().map(|c| c.to_string()).collect();
+                    write!(f, "{}({})", function.name, args.join(", "))
+                }
+            },
+            _ => write!(f, "{:?}", self.kind),
+        }
     }
 }

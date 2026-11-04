@@ -7,24 +7,25 @@
 //! Binding SELECT (one table or VALUES, WHERE, a select list, ORDER BY, LIMIT/OFFSET and
 //! DISTINCT), INSERT and CREATE TABLE.
 
-use super::expression::without_aliases;
+use super::expression::{checked_cast, without_aliases};
 use super::{AggregateBindState, Binder, Binding, BoundStatement, ColumnMode, StatementReturnType, binder_error};
-use crate::catalog::{ColumnDefinition, DEFAULT_CATALOG, OnCreateConflict};
+use crate::catalog::{ColumnDefinition, DEFAULT_CATALOG, OnCreateConflict, SchemaCatalogEntry};
 use crate::execution::expression_executor::evaluate_scalar;
 use crate::function::binder::expression_return_type;
 use crate::function::combine_types::{normalize_type, try_max_logical_type};
 use crate::planner::expression::{BoundExpr, ColumnBinding};
 use crate::planner::logical::{BoundOrderByNode, LogicalOperator, LogicalOperatorKind};
 use duckrs_common::sort_key::OrderModifiers;
-use duckrs_common::types::LogicalType;
+use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::Value;
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast::{
-    CreateTableInfo, Expr, ExprKind, InsertStatement, InsertValues, Literal, LiteralKind,
+    Constraint, CreateTableInfo, Expr, ExprKind, InsertStatement, InsertValues, Literal, LiteralKind,
     OnCreateConflict as AstConflict, OrderByNode, QualifiedName, QueryNodeKind, ResultModifier, SelectNode,
     SelectStatement, TableRef, TableRefKind, values_list,
 };
 use duckrs_parser::transformer::visit_expr_mut;
+use std::sync::Arc;
 
 fn not_implemented(what: &str) -> Error {
     crate::unported(what)
@@ -113,6 +114,55 @@ enum PreparedModifier {
     Order(Vec<(OrderModifiers, usize)>),
     OrderAll(OrderModifiers),
     Limit { limit: Option<u64>, offset: u64 },
+}
+
+/// `GenerateRangeParameters`: the first value, the number of values and the increment.
+fn range_parameters(values: &[i128], generate_series: bool) -> Result<(i128, u64, i128)> {
+    let (start, mut end) = match values {
+        [end] => (0, *end),
+        [start, end, ..] => (*start, *end),
+        [] => unreachable!("checked by the caller"),
+    };
+    let increment = values.get(2).copied().unwrap_or(1);
+    if increment == 0 {
+        return Err(binder_error("interval cannot be 0!"));
+    }
+    if (start > end && increment > 0) || (start < end && increment < 0) {
+        return Ok((start, 0, increment));
+    }
+    if generate_series {
+        // generate_series has inclusive bounds on the RHS
+        end += if increment < 0 { -1 } else { 1 };
+    }
+    let difference = end - start;
+    let mut count = difference / increment;
+    if difference % increment != 0 {
+        count += 1;
+    }
+    Ok((start, count as u64, increment))
+}
+
+/// `BindContext::AliasColumnNames`: column aliases first, and duplicate names made unique.
+fn alias_column_names(table: &str, names: &[String], aliases: &[String]) -> Result<Vec<String>> {
+    if aliases.len() > names.len() {
+        return Err(binder_error(format!(
+            "table {table} has {} columns available but {} columns specified",
+            names.len(),
+            aliases.len()
+        )));
+    }
+    let mut result: Vec<String> = Vec::with_capacity(names.len());
+    for (i, name) in names.iter().enumerate() {
+        let base = aliases.get(i).unwrap_or(name);
+        let mut candidate = base.clone();
+        let mut index = 1;
+        while result.iter().any(|n| n.eq_ignore_ascii_case(&candidate)) {
+            candidate = format!("{base}_{index}");
+            index += 1;
+        }
+        result.push(candidate);
+    }
+    Ok(result)
 }
 
 /// The schema of a qualified table name, checking that its catalog is ours.
@@ -222,7 +272,7 @@ impl Binder<'_> {
             self.alias_fallback = state
                 .alias_map
                 .iter()
-                .map(|(alias, i)| (alias.clone(), select_list[*i].clone()))
+                .map(|(alias, i)| (alias.clone(), state.original_expressions[*i].clone()))
                 .collect();
             self.aggregate_error = "WHERE clause cannot contain aggregates!";
             let condition = self.bind_expression(condition);
@@ -263,7 +313,7 @@ impl Binder<'_> {
                 .alias_map
                 .iter()
                 .filter(|(_, j)| *j < i)
-                .map(|(alias, j)| (alias.clone(), select_list[*j].clone()))
+                .map(|(alias, j)| (alias.clone(), state.original_expressions[*j].clone()))
                 .collect();
             let bound = self.bind_expression(expr);
             self.alias_fallback.clear();
@@ -298,12 +348,18 @@ impl Binder<'_> {
         // the HAVING clause binds after the select list and its groups
         let having = match &node.having {
             Some(having) => {
+                // an alias of the select list wins over a column of the FROM clause
                 let mut having = having.clone();
-                self.qualify_column_names(&mut having);
+                let alias_names = state
+                    .alias_map
+                    .iter()
+                    .map(|(alias, _)| alias.clone())
+                    .collect::<Vec<_>>();
+                self.qualify_column_names_except(&mut having, &alias_names);
                 self.alias_fallback = state
                     .alias_map
                     .iter()
-                    .map(|(alias, i)| (alias.clone(), select_list[*i].clone()))
+                    .map(|(alias, i)| (alias.clone(), state.original_expressions[*i].clone()))
                     .collect();
                 self.aggregates.as_mut().expect("set above").mode = ColumnMode::Having;
                 let bound = self.bind_expression(&having);
@@ -411,9 +467,20 @@ impl Binder<'_> {
                         })
                         .collect::<Result<_>>()?,
                 },
+                // LIMIT 0 needs nothing from its input, however expensive that is
+                // (`LimitPushdown`/`EmptyResultPullup` in the optimizer)
+                PreparedModifier::Limit { limit: Some(0), .. } => LogicalOperatorKind::EmptyResult {
+                    types: plan.types(),
+                    bindings: plan.column_bindings(),
+                },
                 PreparedModifier::Limit { limit, offset } => LogicalOperatorKind::Limit { limit, offset },
             };
-            plan = LogicalOperator::new(kind, vec![plan]);
+            let children = if matches!(kind, LogicalOperatorKind::EmptyResult { .. }) {
+                vec![]
+            } else {
+                vec![plan]
+            };
+            plan = LogicalOperator::new(kind, children);
         }
         // prune the entries ORDER BY added to the select list
         if types.len() > column_count {
@@ -438,8 +505,15 @@ impl Binder<'_> {
     /// `ExpressionBinder::QualifyColumnNames`: qualifies the column references that bind to a
     /// table with that table's alias, so that equal expressions compare equal.
     fn qualify_column_names(&self, expr: &mut Expr) {
+        self.qualify_column_names_except(expr, &[]);
+    }
+
+    /// [`Self::qualify_column_names`], leaving the unqualified `aliases` alone
+    /// (`BaseSelectBinder::ClaimsAlias`).
+    fn qualify_column_names_except(&self, expr: &mut Expr, aliases: &[String]) {
         visit_expr_mut(expr, &mut |e| {
             if let ExprKind::ColumnRef(names) = &mut e.kind
+                && !matches!(names.as_slice(), [name] if aliases.iter().any(|a| a.eq_ignore_ascii_case(name)))
                 && let Ok((binding, ..)) = match names.as_slice() {
                     [column] => self.bind_context.bind_column(column),
                     [table, column] => self.bind_context.bind_qualified_column(table, column),
@@ -548,8 +622,9 @@ impl Binder<'_> {
                 });
             }
             ExprKind::Positional(index) => return Ok(*index as usize - 1),
-            ExprKind::ColumnRef(names) if names.len() == 1 => {
-                let name = &names[0];
+            // `IsPotentialAlias`: a plain name, or one qualified with the word "alias"
+            ExprKind::ColumnRef(names) if names.len() == 1 || (names.len() == 2 && names[0] == "alias") => {
+                let name = names.last().expect("checked above");
                 // an alias of the select list
                 if let Some((_, i)) = state.alias_map.iter().find(|(a, _)| a.eq_ignore_ascii_case(name)) {
                     return Ok(*i);
@@ -697,7 +772,7 @@ impl Binder<'_> {
                 ))
             }
             TableRefKind::ExpressionList(rows) => {
-                let (types, expressions) = self.bind_values(rows, None)?;
+                let (types, expressions) = self.bind_values(rows, None, &[])?;
                 let alias = if table_ref.alias.is_empty() {
                     "valueslist".to_string()
                 } else {
@@ -722,10 +797,98 @@ impl Binder<'_> {
                 ))
             }
             TableRefKind::Join(_) => Err(not_implemented("joins")),
-            TableRefKind::Subquery(_) => Err(not_implemented("subqueries in FROM")),
-            TableRefKind::TableFunction { .. } => Err(not_implemented("table functions")),
+            TableRefKind::Subquery(select) => {
+                // `Binder::Bind(SubqueryRef)`
+                let mut binder = Binder::with_options(self.catalog, self.options);
+                binder.next_table_index = self.next_table_index;
+                let bound = binder.bind_select_statement(select)?;
+                self.next_table_index = binder.next_table_index;
+                let alias = if table_ref.alias.is_empty() {
+                    let index = self.unnamed_subquery_index;
+                    self.unnamed_subquery_index += 1;
+                    match index {
+                        1 => "unnamed_subquery".to_string(),
+                        index => format!("unnamed_subquery{index}"),
+                    }
+                } else {
+                    table_ref.alias.clone()
+                };
+                let names = alias_column_names(&alias, &bound.names, &table_ref.column_name_alias)?;
+                let table_index = bound.plan.column_bindings()[0].table_index;
+                self.bind_context.add_binding(Binding {
+                    alias,
+                    table_index,
+                    names,
+                    types: bound.types,
+                })?;
+                Ok(bound.plan)
+            }
+            TableRefKind::TableFunction {
+                function,
+                with_ordinality,
+            } => {
+                if *with_ordinality {
+                    return Err(not_implemented("WITH ORDINALITY"));
+                }
+                self.bind_range(function, table_ref)
+            }
             _ => Err(not_implemented("this kind of table reference")),
         }
+    }
+
+    /// The `range` and `generate_series` table functions over constant integers.
+    fn bind_range(&mut self, function: &Expr, table_ref: &TableRef) -> Result<LogicalOperator> {
+        let ExprKind::Function(call) = &function.kind else {
+            return Err(not_implemented("table functions"));
+        };
+        let name = call.name.name.to_lowercase();
+        let generate_series = name == "generate_series";
+        if !(generate_series || name == "range") || !call.name.qualification.is_empty() {
+            return Err(not_implemented("table functions"));
+        }
+        if call.args.is_empty() || call.args.len() > 3 || call.args.iter().any(|a| !a.name.is_empty()) {
+            return Err(not_implemented("this call of a range function"));
+        }
+        let mut values = Vec::with_capacity(call.args.len());
+        for argument in &call.args {
+            let mut binder = Binder::new(self.catalog);
+            let bound = binder.bind_expression(&argument.expr)?;
+            if !bound.is_foldable() {
+                return Err(not_implemented("range with arguments that are not constant"));
+            }
+            if !bound.return_type.is_integral() && bound.return_type.id() != LogicalTypeId::SqlNull {
+                return Err(not_implemented("range over this type"));
+            }
+            let value = evaluate_scalar(&bound.cast_to(&LogicalType::BIGINT, false))?;
+            values.push(value.as_i128());
+        }
+        // any NULL argument makes the range empty
+        let (start, count, increment) = match values.iter().copied().collect::<Option<Vec<i128>>>() {
+            Some(values) => range_parameters(&values, generate_series)?,
+            None => (0, 0, 1),
+        };
+        let alias = if table_ref.alias.is_empty() {
+            name.clone()
+        } else {
+            table_ref.alias.clone()
+        };
+        let names = Self::alias_columns(table_ref, &alias, vec![name])?;
+        let table_index = self.generate_table_index();
+        self.bind_context.add_binding(Binding {
+            alias,
+            table_index,
+            names,
+            types: vec![LogicalType::BIGINT],
+        })?;
+        Ok(LogicalOperator::new(
+            LogicalOperatorKind::Range {
+                table_index,
+                start,
+                increment,
+                count,
+            },
+            vec![],
+        ))
     }
 
     /// `Binder::Bind(ExpressionListRef)`: binds the rows of a VALUES list. With
@@ -735,6 +898,7 @@ impl Binder<'_> {
         &mut self,
         rows: &[Vec<Expr>],
         expected_types: Option<&[LogicalType]>,
+        defaults: &[Option<BoundExpr>],
     ) -> Result<(Vec<LogicalType>, Vec<Vec<BoundExpr>>)> {
         let column_count = rows.first().map_or(0, Vec::len);
         if rows.iter().any(|row| row.len() != column_count) {
@@ -745,8 +909,11 @@ impl Binder<'_> {
             let mut list = Vec::with_capacity(row.len());
             for (i, expr) in row.iter().enumerate() {
                 let value = match (&expr.kind, expected_types) {
-                    // DEFAULT is the column's default, which is NULL until defaults are supported
-                    (ExprKind::Default, Some(types)) => BoundExpr::constant(Value::null(types[i].clone())),
+                    (ExprKind::Default, Some(types)) => defaults
+                        .get(i)
+                        .cloned()
+                        .flatten()
+                        .unwrap_or_else(|| BoundExpr::constant(Value::null(types[i].clone()))),
                     (ExprKind::Default, None) => {
                         return Err(binder_error("DEFAULT is not allowed here!"));
                     }
@@ -853,7 +1020,20 @@ impl Binder<'_> {
                     {
                         return Err(mismatch(expected_types.len(), row.len()));
                     }
-                    let (types, expressions) = self.bind_values(rows, Some(&expected_types))?;
+                    let defaults: Vec<Option<BoundExpr>> = if insert.columns.is_empty() {
+                        table.columns.iter().map(|c| c.default_value.clone()).collect()
+                    } else {
+                        insert
+                            .columns
+                            .iter()
+                            .map(|name| {
+                                table
+                                    .column_index(name)
+                                    .and_then(|i| table.columns[i].default_value.clone())
+                            })
+                            .collect()
+                    };
+                    let (types, expressions) = self.bind_values(rows, Some(&expected_types), &defaults)?;
                     let table_index = self.generate_table_index();
                     LogicalOperator::new(
                         LogicalOperatorKind::ExpressionGet {
@@ -904,22 +1084,22 @@ impl Binder<'_> {
         if info.temporary {
             return Err(not_implemented("CREATE TEMPORARY TABLE"));
         }
-        if info.query.is_some() {
-            return Err(not_implemented("CREATE TABLE AS"));
-        }
-        if !info.constraints.is_empty() {
-            return Err(not_implemented("table constraints"));
-        }
         if !info.partition_keys.is_empty() || !info.sort_keys.is_empty() || !info.options.is_empty() {
             return Err(not_implemented("table options"));
+        }
+        let schema = self.catalog.schema_for(schema_of(&info.name)?)?;
+        let on_conflict = match info.on_conflict {
+            AstConflict::Error => OnCreateConflict::Error,
+            AstConflict::Ignore => OnCreateConflict::Ignore,
+            AstConflict::Replace => OnCreateConflict::Replace,
+        };
+        if let Some(query) = &info.query {
+            return self.bind_create_table_as(info, query, schema, on_conflict);
         }
         let mut columns = Vec::with_capacity(info.columns.len());
         for column in &info.columns {
             if column.generated.is_some() {
                 return Err(not_implemented("generated columns"));
-            }
-            if column.default_value.is_some() {
-                return Err(not_implemented("column defaults"));
             }
             if columns
                 .iter()
@@ -933,17 +1113,20 @@ impl Binder<'_> {
             let Some(ty) = &column.column_type else {
                 return Err(not_implemented("columns without a type"));
             };
-            columns.push(ColumnDefinition {
-                name: column.name.clone(),
-                ty: self.bind_type(ty)?,
-            });
+            let mut definition = ColumnDefinition::new(column.name.clone(), self.bind_type(ty)?);
+            if let Some(default) = &column.default_value {
+                let mut binder = Binder::new(self.catalog);
+                binder.aggregate_error = "DEFAULT value cannot contain aggregates!";
+                definition.default_value = Some(checked_cast(binder.bind_expression(default)?, &definition.ty)?);
+            }
+            columns.push(definition);
         }
-        let schema = self.catalog.schema_for(schema_of(&info.name)?)?;
-        let on_conflict = match info.on_conflict {
-            AstConflict::Error => OnCreateConflict::Error,
-            AstConflict::Ignore => OnCreateConflict::Ignore,
-            AstConflict::Replace => OnCreateConflict::Replace,
-        };
+        for constraint in &info.constraints {
+            match constraint {
+                Constraint::NotNull(index) => columns[*index].not_null = true,
+                _ => return Err(not_implemented("table constraints")),
+            }
+        }
         let plan = LogicalOperator::new(
             LogicalOperatorKind::CreateTable {
                 schema,
@@ -958,6 +1141,85 @@ impl Binder<'_> {
             names: vec!["Count".to_string()],
             types: vec![LogicalType::BIGINT],
             return_type: StatementReturnType::Nothing,
+        })
+    }
+
+    /// CREATE TABLE ... AS: the columns come from the query, with the names listed if any.
+    fn bind_create_table_as(
+        &mut self,
+        info: &CreateTableInfo,
+        query: &SelectStatement,
+        schema: Arc<SchemaCatalogEntry>,
+        on_conflict: OnCreateConflict,
+    ) -> Result<BoundStatement> {
+        if !info.constraints.is_empty() {
+            return Err(not_implemented("table constraints"));
+        }
+        // the conflict is checked before the query runs
+        if schema.get_table(&info.name.name).is_some() {
+            match on_conflict {
+                OnCreateConflict::Error => {
+                    return Err(Error::new(
+                        ErrorKind::Catalog,
+                        format!("Table with name \"{}\" already exists!", info.name.name),
+                    ));
+                }
+                OnCreateConflict::Ignore => {
+                    let plan = LogicalOperator::new(
+                        LogicalOperatorKind::CreateTable {
+                            schema,
+                            name: info.name.name.clone(),
+                            columns: Vec::new(),
+                            on_conflict,
+                        },
+                        vec![],
+                    );
+                    return Ok(BoundStatement {
+                        plan,
+                        names: vec!["Count".to_string()],
+                        types: vec![LogicalType::BIGINT],
+                        return_type: StatementReturnType::ChangedRows,
+                    });
+                }
+                OnCreateConflict::Replace => {}
+            }
+        }
+        let mut binder = Binder::with_options(self.catalog, self.options);
+        let bound = binder.bind_select_statement(query)?;
+        if info.columns.len() > bound.types.len() {
+            return Err(binder_error("Target table has more column names than query result."));
+        }
+        let mut columns: Vec<ColumnDefinition> = Vec::with_capacity(bound.names.len());
+        for (i, (name, ty)) in bound.names.iter().zip(&bound.types).enumerate() {
+            let name = info.columns.get(i).map_or(name, |c| &c.name);
+            if columns.iter().any(|c| c.name.eq_ignore_ascii_case(name)) {
+                return Err(Error::new(
+                    ErrorKind::Catalog,
+                    format!("Column with name {name} already exists!"),
+                ));
+            }
+            // a column of untyped NULLs becomes an INTEGER column
+            let ty = if ty.id() == LogicalTypeId::SqlNull {
+                LogicalType::INTEGER
+            } else {
+                ty.clone()
+            };
+            columns.push(ColumnDefinition::new(name.clone(), ty));
+        }
+        let plan = LogicalOperator::new(
+            LogicalOperatorKind::CreateTableAs {
+                schema,
+                name: info.name.name.clone(),
+                columns,
+                on_conflict,
+            },
+            vec![bound.plan],
+        );
+        Ok(BoundStatement {
+            plan,
+            names: vec!["Count".to_string()],
+            types: vec![LogicalType::BIGINT],
+            return_type: StatementReturnType::ChangedRows,
         })
     }
 }

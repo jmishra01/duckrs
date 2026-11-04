@@ -7,10 +7,11 @@
 //! are a later optimization).
 
 use crate::function::cast::{CastMode, cast_vector};
+use crate::function::operators::DIVISION_BY_ZERO;
 use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator};
 use duckrs_common::comparison::{ComparisonType, DuckOrd};
 use duckrs_common::executor;
-use duckrs_common::types::{LogicalTypeId, NativeType, PhysicalType};
+use duckrs_common::types::{LogicalType, LogicalTypeId, NativeType, PhysicalType};
 use duckrs_common::value::Value;
 use duckrs_common::vector::{DataChunk, SelectionVector, Vector, VectorType};
 use duckrs_common::{Error, ErrorKind, Result};
@@ -116,7 +117,7 @@ fn conjunction(children: &[Vector], and: bool, count: usize) -> Vector {
     let refs: Vec<&Vector> = children.iter().collect();
     let rows = if all_constant(&refs) { 1 } else { count };
     let unified: Vec<_> = children.iter().map(|c| c.to_unified(count)).collect();
-    let mut result = Vector::new(duckrs_common::types::LogicalType::BOOLEAN, rows.max(1));
+    let mut result = Vector::new(LogicalType::BOOLEAN, rows.max(1));
     let mut nulls = Vec::new();
     {
         let out = result.data_mut::<bool>();
@@ -154,7 +155,7 @@ fn null_check(input: &Vector, count: usize, is_null: bool) -> Vector {
     let constant = input.vector_type() == VectorType::Constant;
     let rows = if constant { 1 } else { count };
     let u = input.to_unified(count);
-    let mut result = Vector::new(duckrs_common::types::LogicalType::BOOLEAN, rows.max(1));
+    let mut result = Vector::new(LogicalType::BOOLEAN, rows.max(1));
     {
         let out = result.data_mut::<bool>();
         for (i, slot) in out.iter_mut().enumerate().take(rows) {
@@ -165,6 +166,85 @@ fn null_check(input: &Vector, count: usize, is_null: bool) -> Vector {
         result.set_constant();
     }
     result
+}
+
+/// The rows of `input` listed in `rows`.
+fn slice_rows(input: &DataChunk, rows: &[u32]) -> DataChunk {
+    let mut chunk = input.clone();
+    if rows.len() != input.len() {
+        chunk.slice(&SelectionVector::from_vec(rows.to_vec()), rows.len());
+    }
+    chunk
+}
+
+/// Writes `source[i]` to `result[rows[i]]`.
+fn scatter(source: &Vector, rows: &[u32], result: &mut Vector) -> Result<()> {
+    for (i, &row) in rows.iter().enumerate() {
+        result.set_value(row as usize, &source.get_value(i))?;
+    }
+    Ok(())
+}
+
+/// `ExecuteExpression(BoundCaseExpression)`: rows go to the first check that holds, and each
+/// THEN only sees its own rows.
+fn execute_case(
+    checks: &[(BoundExpr, BoundExpr)],
+    else_expr: &BoundExpr,
+    return_type: &LogicalType,
+    input: &DataChunk,
+) -> Result<Vector> {
+    let mut result = Vector::new(return_type.clone(), input.len().max(1));
+    let mut remaining: Vec<u32> = (0..input.len() as u32).collect();
+    for (when, then) in checks {
+        if remaining.is_empty() {
+            break;
+        }
+        let rows = slice_rows(input, &remaining);
+        let (selected, count) = select(when, &rows)?;
+        let mut matched = Vec::with_capacity(count);
+        let mut positions = Vec::with_capacity(count);
+        for i in 0..count {
+            matched.push(remaining[selected.get(i)]);
+            positions.push(selected.get(i) as u32);
+        }
+        if !matched.is_empty() {
+            let values = execute(then, &slice_rows(&rows, &positions))?;
+            scatter(&values, &matched, &mut result)?;
+            let chosen: std::collections::HashSet<u32> = matched.into_iter().collect();
+            remaining.retain(|row| !chosen.contains(row));
+        }
+    }
+    if !remaining.is_empty() {
+        let values = execute(else_expr, &slice_rows(input, &remaining))?;
+        scatter(&values, &remaining, &mut result)?;
+    }
+    Ok(result)
+}
+
+/// `OPERATOR_COALESCE`: each argument only sees the rows that are still NULL.
+fn execute_coalesce(children: &[BoundExpr], return_type: &LogicalType, input: &DataChunk) -> Result<Vector> {
+    let mut result = Vector::new(return_type.clone(), input.len().max(1));
+    let mut remaining: Vec<u32> = (0..input.len() as u32).collect();
+    for child in children {
+        if remaining.is_empty() {
+            break;
+        }
+        let values = execute(child, &slice_rows(input, &remaining))?;
+        let unified = values.to_unified(remaining.len());
+        let mut next = Vec::new();
+        for (i, &row) in remaining.iter().enumerate() {
+            if unified.is_valid(i) {
+                result.set_value(row as usize, &values.get_value(i))?;
+            } else {
+                next.push(row);
+            }
+        }
+        remaining = next;
+    }
+    for row in remaining {
+        result.set_null(row as usize, true);
+    }
+    Ok(result)
 }
 
 /// `ExpressionExecutor::Execute`: the expression's value for each of the `input` rows.
@@ -192,7 +272,7 @@ pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
                 let value = match op {
                     ComparisonType::DistinctFrom => Value::boolean(false),
                     ComparisonType::NotDistinctFrom => Value::boolean(true),
-                    _ => Value::null(duckrs_common::types::LogicalType::BOOLEAN),
+                    _ => Value::null(LogicalType::BOOLEAN),
                 };
                 return Ok(Vector::constant(&value));
             }
@@ -204,6 +284,26 @@ pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
             let children = children.iter().map(|c| execute(c, input)).collect::<Result<Vec<_>>>()?;
             Ok(conjunction(&children, *and, count))
         }
+        BoundExprKind::Between {
+            input: value,
+            lower,
+            upper,
+        } => {
+            let (v, l, u) = (execute(value, input)?, execute(lower, input)?, execute(upper, input)?);
+            if v.logical_type().id() == LogicalTypeId::SqlNull {
+                return Ok(Vector::constant(&Value::null(LogicalType::BOOLEAN)));
+            }
+            let mut at_least = Vector::new(LogicalType::BOOLEAN, count.max(1));
+            compare(&v, &l, &mut at_least, count, ComparisonType::GreaterThanOrEqual)?;
+            let mut at_most = Vector::new(LogicalType::BOOLEAN, count.max(1));
+            compare(&v, &u, &mut at_most, count, ComparisonType::LessThanOrEqual)?;
+            Ok(conjunction(&[at_least, at_most], true, count))
+        }
+        BoundExprKind::Case { checks, else_expr } => execute_case(checks, else_expr, &expr.return_type, input),
+        BoundExprKind::Operator {
+            op: BoundOperator::Coalesce,
+            children,
+        } => execute_coalesce(children, &expr.return_type, input),
         BoundExprKind::Operator { op, children } => {
             let child = execute(&children[0], input)?;
             Ok(match op {
@@ -214,13 +314,24 @@ pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
                 }
                 BoundOperator::IsNull => null_check(&child, count, true),
                 BoundOperator::IsNotNull => null_check(&child, count, false),
+                BoundOperator::Coalesce => unreachable!("handled above"),
             })
         }
         BoundExprKind::Function { function, children, .. } => {
             let arguments = children.iter().map(|c| execute(c, input)).collect::<Result<Vec<_>>>()?;
             let arguments = DataChunk::from_columns(arguments, count);
             let mut result = Vector::new(expr.return_type.clone(), count.max(1));
-            (function.function)(&arguments, &mut result)?;
+            (function.function)(&arguments, &mut result).map_err(|error| {
+                if error.message == DIVISION_BY_ZERO {
+                    let message = format!(
+                        "Division by zero in expression {expr}. Use TRY(...) to return NULL for this expression, or \
+                         SET error_on_division_by_zero=false to return NULL for all divisions by zero."
+                    );
+                    Error::new(ErrorKind::InvalidInput, message)
+                } else {
+                    error
+                }
+            })?;
             Ok(result)
         }
     }

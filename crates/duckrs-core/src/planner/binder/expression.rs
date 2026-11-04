@@ -294,6 +294,25 @@ impl Binder<'_> {
                 let right = self.bind_expression(right)?;
                 bind_comparison(*op, left, right)?
             }
+            ExprKind::Case { checks, else_expr } => self.bind_case(checks, else_expr)?,
+            ExprKind::Between { input, lower, upper } => self.bind_between(input, lower, upper)?,
+            ExprKind::Operator {
+                op: op @ (OperatorType::In | OperatorType::NotIn),
+                children,
+            } => self.bind_in(children, *op == OperatorType::NotIn)?,
+            ExprKind::Operator {
+                op: OperatorType::Coalesce,
+                children,
+            } => {
+                let (children, return_type) = self.resolve_coalesce_type(children, None)?;
+                BoundExpr::new(
+                    BoundExprKind::Operator {
+                        op: BoundOperator::Coalesce,
+                        children,
+                    },
+                    return_type,
+                )
+            }
             ExprKind::Conjunction { and, children } => {
                 let children = children
                     .iter()
@@ -521,19 +540,40 @@ fn bind_comparison(op: ComparisonOp, left: BoundExpr, right: BoundExpr) -> Resul
         op,
         ComparisonOp::Equal | ComparisonOp::NotEqual | ComparisonOp::DistinctFrom | ComparisonOp::NotDistinctFrom
     );
+    let input_type = try_comparison_type(&left_type, &right_type, is_equality).ok_or_else(|| {
+        binder_error(format!(
+            "Cannot compare values of type {left_type} and type {right_type} - an explicit cast is required"
+        ))
+    })?;
+    Ok(BoundExpr::new(
+        BoundExprKind::Comparison {
+            op,
+            left: Box::new(checked_cast(left, &input_type)?),
+            right: Box::new(checked_cast(right, &input_type)?),
+        },
+        LogicalType::BOOLEAN,
+    ))
+}
+
+/// A cast the executor can run, or the not-ported error.
+pub(super) fn checked_cast(expr: BoundExpr, target: &LogicalType) -> Result<BoundExpr> {
+    if !crate::function::cast::has_cast(&expr.return_type, target) {
+        return Err(crate::unported(format!("casting {} to {target}", expr.return_type)));
+    }
+    Ok(expr.cast_to(target, false))
+}
+
+/// `BoundComparisonExpression::TryBindComparison`: the type two values compare in.
+fn try_comparison_type(left: &LogicalType, right: &LogicalType, is_equality: bool) -> Option<LogicalType> {
     let mut input_type = if is_equality {
-        force_max_logical_type(&left_type, &right_type)
+        force_max_logical_type(left, right)
     } else {
-        try_max_logical_type(&left_type, &right_type).ok_or_else(|| {
-            binder_error(format!(
-                "Cannot compare values of type {left_type} and type {right_type} - an explicit cast is required"
-            ))
-        })?
+        try_max_logical_type(left, right)?
     };
     match input_type.id() {
         LogicalTypeId::Decimal => {
             // the maximum width and the maximum scale over width
-            let props = [&left_type, &right_type].map(crate::function::combine_types::decimal_properties);
+            let props = [left, right].map(crate::function::combine_types::decimal_properties);
             if let [Some((lw, ls)), Some((rw, rs))] = props {
                 let max_scale = ls.max(rs);
                 let max_width_over_scale = (lw - ls).max(rw - rs);
@@ -546,28 +586,147 @@ fn bind_comparison(op: ComparisonOp, left: BoundExpr, right: BoundExpr) -> Resul
         }
         LogicalTypeId::Varchar => {
             // for comparison with strings, we prefer to bind to the numeric types
-            if left_type.id() != LogicalTypeId::Varchar && switch_varchar_comparison(&left_type) {
-                input_type = normalize_type(&left_type);
-            } else if right_type.id() != LogicalTypeId::Varchar && switch_varchar_comparison(&right_type) {
-                input_type = normalize_type(&right_type);
+            if left.id() != LogicalTypeId::Varchar && switch_varchar_comparison(left) {
+                input_type = normalize_type(left);
+            } else if right.id() != LogicalTypeId::Varchar && switch_varchar_comparison(right) {
+                input_type = normalize_type(right);
             }
         }
         _ => {}
     }
-    let input_type = normalize_type(&input_type);
-    for side in [&left, &right] {
-        if !crate::function::cast::has_cast(&side.return_type, &input_type) {
-            return Err(crate::unported(format!("casting {} to {input_type}", side.return_type)));
+    Some(normalize_type(&input_type))
+}
+
+impl Binder<'_> {
+    /// `ExpressionBinder::BindExpression(CaseExpression)`.
+    fn bind_case(&mut self, checks: &[(Expr, Expr)], else_expr: &Expr) -> Result<BoundExpr> {
+        let mut bound = Vec::with_capacity(checks.len());
+        for (when, then) in checks {
+            bound.push((self.bind_expression(when)?, self.bind_expression(then)?));
         }
+        let else_expr = self.bind_expression(else_expr)?;
+        let mut return_type = expression_return_type(&else_expr);
+        for (_, then) in &bound {
+            let then_type = expression_return_type(then);
+            return_type = try_max_logical_type(&return_type, &then_type).ok_or_else(|| {
+                binder_error(format!(
+                    "Cannot mix values of type {return_type} and {then_type} in CASE expression - an explicit cast \
+                     is required"
+                ))
+            })?;
+        }
+        let return_type = normalize_type(&return_type);
+        let mut checks = Vec::with_capacity(bound.len());
+        for (when, then) in bound {
+            checks.push((
+                checked_cast(when, &LogicalType::BOOLEAN)?,
+                checked_cast(then, &return_type)?,
+            ));
+        }
+        let else_expr = Box::new(checked_cast(else_expr, &return_type)?);
+        Ok(BoundExpr::new(BoundExprKind::Case { checks, else_expr }, return_type))
     }
-    Ok(BoundExpr::new(
-        BoundExprKind::Comparison {
-            op,
-            left: Box::new(left.cast_to(&input_type, false)),
-            right: Box::new(right.cast_to(&input_type, false)),
-        },
-        LogicalType::BOOLEAN,
-    ))
+
+    /// `ExpressionBinder::BindExpression(BetweenExpression)`.
+    fn bind_between(&mut self, input: &Expr, lower: &Expr, upper: &Expr) -> Result<BoundExpr> {
+        let (input, lower, upper) = (
+            self.bind_expression(input)?,
+            self.bind_expression(lower)?,
+            self.bind_expression(upper)?,
+        );
+        let mix = |a: &LogicalType, b: &LogicalType| {
+            binder_error(format!(
+                "Cannot mix values of type {a} and {b} in BETWEEN clause - an explicit cast is required"
+            ))
+        };
+        let input_type = expression_return_type(&input);
+        let lower_type = expression_return_type(&lower);
+        let upper_type = expression_return_type(&upper);
+        let first =
+            try_comparison_type(&input_type, &lower_type, false).ok_or_else(|| mix(&input_type, &lower_type))?;
+        let target = try_comparison_type(&first, &upper_type, false).ok_or_else(|| mix(&first, &upper_type))?;
+        Ok(BoundExpr::new(
+            BoundExprKind::Between {
+                input: Box::new(checked_cast(input, &target)?),
+                lower: Box::new(checked_cast(lower, &target)?),
+                upper: Box::new(checked_cast(upper, &target)?),
+            },
+            LogicalType::BOOLEAN,
+        ))
+    }
+
+    /// `ResolveCoalesceType`, for COALESCE and (NOT) IN: casts the children to their common type.
+    fn resolve_coalesce_type(
+        &mut self,
+        children: &[Expr],
+        in_operator: Option<&str>,
+    ) -> Result<(Vec<BoundExpr>, LogicalType)> {
+        let bound = children
+            .iter()
+            .map(|c| self.bind_expression(c))
+            .collect::<Result<Vec<_>>>()?;
+        let mut max_type = expression_return_type(&bound[0]);
+        for child in &bound[1..] {
+            let child_type = expression_return_type(child);
+            let next = match in_operator {
+                Some(_) => try_comparison_type(&max_type, &child_type, true),
+                None => try_max_logical_type(&max_type, &child_type),
+            };
+            max_type = next.ok_or_else(|| {
+                let clause = match in_operator {
+                    Some(name) => format!("{name} clause"),
+                    None => "COALESCE operator".to_string(),
+                };
+                binder_error(format!(
+                    "Cannot mix values of type {max_type} and {child_type} in {clause} - an explicit cast is required"
+                ))
+            })?;
+        }
+        let max_type = normalize_type(&max_type);
+        let bound = bound
+            .into_iter()
+            .map(|c| checked_cast(c, &max_type))
+            .collect::<Result<Vec<_>>>()?;
+        Ok((bound, max_type))
+    }
+
+    /// `x IN (a, b)` as `x = a OR x = b`, which has its three-valued logic.
+    fn bind_in(&mut self, children: &[Expr], negated: bool) -> Result<BoundExpr> {
+        let name = if negated { "NOT IN" } else { "IN" };
+        let (mut bound, _) = self.resolve_coalesce_type(children, Some(name))?;
+        let input = bound.remove(0);
+        let comparisons = bound
+            .into_iter()
+            .map(|value| {
+                BoundExpr::new(
+                    BoundExprKind::Comparison {
+                        op: ComparisonOp::Equal,
+                        left: Box::new(input.clone()),
+                        right: Box::new(value),
+                    },
+                    LogicalType::BOOLEAN,
+                )
+            })
+            .collect();
+        let result = BoundExpr::new(
+            BoundExprKind::Conjunction {
+                and: false,
+                children: comparisons,
+            },
+            LogicalType::BOOLEAN,
+        );
+        Ok(if negated {
+            BoundExpr::new(
+                BoundExprKind::Operator {
+                    op: BoundOperator::Not,
+                    children: vec![result],
+                },
+                LogicalType::BOOLEAN,
+            )
+        } else {
+            result
+        })
+    }
 }
 
 /// `SwitchVarcharComparison`: types a string is cast to when compared with them.

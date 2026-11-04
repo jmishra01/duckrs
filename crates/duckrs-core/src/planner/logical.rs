@@ -18,6 +18,18 @@ pub enum LogicalOperatorKind {
         table_index: usize,
         column_ids: Vec<usize>,
     },
+    /// The `range` and `generate_series` table functions: `count` integers from `start`.
+    Range {
+        table_index: usize,
+        start: i128,
+        increment: i128,
+        count: u64,
+    },
+    /// `LogicalEmptyResult`: no rows, with the columns of the plan it replaced.
+    EmptyResult {
+        types: Vec<LogicalType>,
+        bindings: Vec<ColumnBinding>,
+    },
     /// `LogicalDummyScan`: a single row with no columns, for a SELECT without FROM.
     DummyScan { table_index: usize },
     /// `LogicalExpressionGet`: rows of expressions (VALUES), evaluated once per row.
@@ -53,6 +65,13 @@ pub enum LogicalOperatorKind {
         table: Arc<TableCatalogEntry>,
         column_index_map: Vec<Option<usize>>,
     },
+    /// `LogicalCreateTable` with a query: creates the table with the child's rows.
+    CreateTableAs {
+        schema: Arc<SchemaCatalogEntry>,
+        name: String,
+        columns: Vec<ColumnDefinition>,
+        on_conflict: OnCreateConflict,
+    },
     /// `LogicalCreateTable`.
     CreateTable {
         schema: Arc<SchemaCatalogEntry>,
@@ -86,6 +105,8 @@ impl LogicalOperator {
             LogicalOperatorKind::Get { table, column_ids, .. } => {
                 column_ids.iter().map(|&i| table.columns[i].ty.clone()).collect()
             }
+            LogicalOperatorKind::Range { .. } => vec![LogicalType::BIGINT],
+            LogicalOperatorKind::EmptyResult { types, .. } => types.clone(),
             // the dummy scan's single column is never read
             LogicalOperatorKind::DummyScan { .. } => vec![LogicalType::INTEGER],
             LogicalOperatorKind::ExpressionGet { types, .. } => types.clone(),
@@ -101,9 +122,9 @@ impl LogicalOperator {
             LogicalOperatorKind::Projection { expressions, .. } => {
                 expressions.iter().map(|e| e.return_type.clone()).collect()
             }
-            LogicalOperatorKind::Insert { .. } | LogicalOperatorKind::CreateTable { .. } => {
-                vec![LogicalType::BIGINT]
-            }
+            LogicalOperatorKind::Insert { .. }
+            | LogicalOperatorKind::CreateTable { .. }
+            | LogicalOperatorKind::CreateTableAs { .. } => vec![LogicalType::BIGINT],
         }
     }
 
@@ -118,7 +139,10 @@ impl LogicalOperator {
                 column_ids,
                 ..
             } => numbered(*table_index, column_ids.len()),
-            LogicalOperatorKind::DummyScan { table_index } => numbered(*table_index, 1),
+            LogicalOperatorKind::EmptyResult { bindings, .. } => bindings.clone(),
+            LogicalOperatorKind::DummyScan { table_index } | LogicalOperatorKind::Range { table_index, .. } => {
+                numbered(*table_index, 1)
+            }
             LogicalOperatorKind::ExpressionGet { table_index, types, .. } => numbered(*table_index, types.len()),
             LogicalOperatorKind::Aggregate {
                 group_index,
@@ -138,7 +162,9 @@ impl LogicalOperator {
                 table_index,
                 expressions,
             } => numbered(*table_index, expressions.len()),
-            LogicalOperatorKind::Insert { .. } | LogicalOperatorKind::CreateTable { .. } => numbered(0, 1),
+            LogicalOperatorKind::Insert { .. }
+            | LogicalOperatorKind::CreateTable { .. }
+            | LogicalOperatorKind::CreateTableAs { .. } => numbered(0, 1),
         }
     }
 

@@ -1,8 +1,10 @@
 // Ported from duckdb/src/function/scalar/operator/arithmetic.cpp and
 // duckdb/src/include/duckdb/common/operator/{add,subtract,multiply,negate}.hpp @ rust-port-baseline
 //
-//! The arithmetic operators `+`, `-` and `*` over the numeric types. Integer arithmetic checks
-//! for overflow; floating point does not. DECIMAL, temporal and BIGNUM overloads come later.
+//! The arithmetic operators `+`, `-`, `*`, `/`, `//` and `%` over the numeric types. Integer
+//! arithmetic checks for overflow; floating point does not. `/` is floating point, and division
+//! by zero is an error for `//` and integer `%` (`error_on_division_by_zero`). DECIMAL, temporal
+//! and BIGNUM overloads come later.
 
 use super::{ScalarFunction, ScalarFunctionSet};
 use duckrs_common::executor;
@@ -103,6 +105,91 @@ impl BinaryOperator for Multiply {
     }
 }
 
+/// What the division operators do to a value pair: `None` means a division by zero.
+trait Division: Arithmetic {
+    /// `//`, which for floating point is an ordinary division
+    fn divide(self, other: Self) -> Result<Option<Self>>;
+    /// `%`, which never fails for floating point (IEEE: `x % 0` is NaN)
+    fn modulo(self, other: Self) -> Option<Self>;
+    /// `/` exists for floating point only; integers cast to DOUBLE.
+    fn float_divide(self, other: Self) -> Self;
+}
+
+macro_rules! integer_division {
+    ($($t:ty),*) => {$(
+        impl Division for $t {
+            fn divide(self, other: Self) -> Result<Option<Self>> {
+                if other == 0 {
+                    return Ok(None);
+                }
+                match self.checked_div(other) {
+                    Some(result) => Ok(Some(result)),
+                    None => Err(Error::new(
+                        ErrorKind::OutOfRange,
+                        format!("Overflow in division of {self} / {other}"),
+                    )),
+                }
+            }
+            fn modulo(self, other: Self) -> Option<Self> {
+                if other == 0 {
+                    return None;
+                }
+                // the remainder of MIN / -1 is 0 - only the division itself overflows
+                Some(self.checked_rem(other).unwrap_or(0))
+            }
+            fn float_divide(self, _: Self) -> Self {
+                unreachable!("`/` is not defined for integers")
+            }
+        }
+    )*};
+}
+integer_division!(i8, i16, i32, i64, i128, u8, u16, u32, u64, u128);
+
+macro_rules! float_division {
+    ($($t:ty),*) => {$(
+        impl Division for $t {
+            fn divide(self, other: Self) -> Result<Option<Self>> {
+                Ok((other != 0.0).then(|| self / other))
+            }
+            fn modulo(self, other: Self) -> Option<Self> {
+                Some(self % other)
+            }
+            fn float_divide(self, other: Self) -> Self {
+                self / other
+            }
+        }
+    )*};
+}
+float_division!(f32, f64);
+
+/// The error of a division by zero. Its message names the expression, which the expression
+/// executor fills in.
+pub(crate) const DIVISION_BY_ZERO: &str = "Division by zero";
+
+fn division_by_zero() -> Error {
+    Error::new(ErrorKind::InvalidInput, DIVISION_BY_ZERO)
+}
+
+/// `//`
+fn integer_divide<T: Division>(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    executor::binary_fallible::<T, T, T>(args.column(0), args.column(1), result, args.len(), |a, b| {
+        a.divide(b)?.map(Some).ok_or_else(division_by_zero)
+    })
+}
+
+/// `%`
+fn modulo<T: Division>(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    executor::binary_fallible::<T, T, T>(args.column(0), args.column(1), result, args.len(), |a, b| {
+        a.modulo(b).map(Some).ok_or_else(division_by_zero)
+    })
+}
+
+/// `/`
+fn float_divide<T: Division>(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    executor::binary::<T, T, T>(args.column(0), args.column(1), result, args.len(), T::float_divide);
+    Ok(())
+}
+
 /// `ScalarFunction::BinaryFunction<T, T, T, OP>` with `*OperatorOverflowCheck`.
 fn binary<T: Arithmetic, OP: BinaryOperator>(args: &DataChunk, result: &mut Vector) -> Result<()> {
     executor::binary_fallible::<T, T, T>(
@@ -187,7 +274,30 @@ pub(super) fn arithmetic_operators() -> Vec<ScalarFunctionSet> {
     let mut add = ScalarFunctionSet::new("+");
     let mut subtract = ScalarFunctionSet::new("-");
     let mut multiply = ScalarFunctionSet::new("*");
+    let mut full_divide = ScalarFunctionSet::new("//");
+    let mut remainder = ScalarFunctionSet::new("%");
+    let mut fp_divide = ScalarFunctionSet::new("/");
+    for ty in [LogicalType::FLOAT, LogicalType::DOUBLE] {
+        fp_divide.add(ScalarFunction::new(
+            "/",
+            vec![ty.clone(), ty.clone()],
+            ty.clone(),
+            dispatch!(ty, float_divide),
+        ));
+    }
     for ty in numeric_types() {
+        full_divide.add(ScalarFunction::new(
+            "//",
+            vec![ty.clone(), ty.clone()],
+            ty.clone(),
+            dispatch!(ty, integer_divide),
+        ));
+        remainder.add(ScalarFunction::new(
+            "%",
+            vec![ty.clone(), ty.clone()],
+            ty.clone(),
+            dispatch!(ty, modulo),
+        ));
         // unary add function is a nop, but only exists for numeric types
         add.add(ScalarFunction::new("+", vec![ty.clone()], ty.clone(), identity));
         add.add(ScalarFunction::new(
@@ -216,5 +326,5 @@ pub(super) fn arithmetic_operators() -> Vec<ScalarFunctionSet> {
             dispatch!(ty, binary::<Multiply>),
         ));
     }
-    vec![add, subtract, multiply]
+    vec![add, subtract, multiply, full_divide, remainder, fp_divide]
 }
