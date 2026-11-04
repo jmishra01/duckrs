@@ -7,6 +7,7 @@
 use super::cast::{CastMode, cast_vector, conversion_error};
 use super::cast_rules::implicit_cast;
 use super::string_nested::{split_list, split_map, split_struct};
+use super::variant::{from_variant, to_variant};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{Vector, VectorType};
@@ -272,7 +273,7 @@ fn union_to_union(value: &Value, fields: &[Value], target: &LogicalType, mode: C
     let mut tags = Vec::with_capacity(from.len());
     for (name, ty) in from {
         let index = to.iter().position(|(n, _)| n.eq_ignore_ascii_case(name))?;
-        if implicit_cast(ty, &to[index].1) < 0 {
+        if to[index].1.id() != LogicalTypeId::Variant && implicit_cast(ty, &to[index].1) < 0 {
             return None;
         }
         tags.push(index);
@@ -300,6 +301,12 @@ fn cast_inner(value: &Value, target: &LogicalType, mode: CastMode) -> Result<Val
     let source = value.logical_type();
     if source == target {
         return Ok(value.clone());
+    }
+    if target.id() == L::Variant {
+        return to_variant(value);
+    }
+    if source.id() == L::Variant {
+        return from_variant(value, target);
     }
     if target.id() == L::Union {
         if let (L::Union, ValueData::Struct(fields)) = (source.id(), value.data())

@@ -11,6 +11,7 @@ use crate::execution::expression_executor::{evaluate_scalar, try_evaluate_scalar
 use crate::function::binder::{bind_aggregate_function, bind_scalar_function, expression_return_type};
 use crate::function::combine_types::{force_max_logical_type, normalize_type, try_max_logical_type};
 use crate::function::nested::{bind_nested_function, is_nested_function};
+use crate::function::variant::{bind_variant_function, is_variant_function};
 use crate::function::{BuiltinFunctions, typeof_constant};
 use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, ColumnBinding, SequenceOp};
 use duckrs_common::types::{LogicalType, LogicalTypeId, bignum, bit, decimal};
@@ -323,7 +324,7 @@ impl Binder<'_> {
             // the length of a BIT is accepted and ignored
             LogicalTypeId::Bit if children.len() <= 1 => Ok(LogicalType::new(id)),
             _ if !children.is_empty() => Err(crate::unported(format!("type parameters for {}", name.to_uppercase()))),
-            LogicalTypeId::Variant | LogicalTypeId::Geometry | LogicalTypeId::Type => {
+            LogicalTypeId::Geometry | LogicalTypeId::Type => {
                 Err(crate::unported(format!("the {} type", name.to_uppercase())))
             }
             id => Ok(LogicalType::new(id)),
@@ -412,7 +413,7 @@ impl Binder<'_> {
                 for field in &names[start..] {
                     if !matches!(
                         bound.return_type.id(),
-                        LogicalTypeId::Struct | LogicalTypeId::Tuple | LogicalTypeId::Union
+                        LogicalTypeId::Struct | LogicalTypeId::Tuple | LogicalTypeId::Union | LogicalTypeId::Variant
                     ) {
                         return Err(binder_error(format!(
                             "Cannot extract field '{field}' from expression \"{}\" because it is not a struct",
@@ -576,6 +577,14 @@ impl Binder<'_> {
             ExprKind::Function(function) => {
                 if !builtin_qualification(&function.name.qualification) {
                     return Err(crate::unported("qualified function names"));
+                }
+                if is_variant_function(&function.name.name) {
+                    let children = function
+                        .args
+                        .iter()
+                        .map(|a| self.bind_expression(&a.expr))
+                        .collect::<Result<Vec<_>>>()?;
+                    return bind_variant_function(&function.name.name, children);
                 }
                 if is_nested_function(&function.name.name) {
                     let names = function.args.iter().map(|a| a.name.clone()).collect();
@@ -827,11 +836,6 @@ impl Binder<'_> {
         let set = BuiltinFunctions::get()
             .aggregate(&function.name.name)
             .expect("checked by the caller");
-        for child in &children {
-            if !supported_aggregate_input(&child.return_type) {
-                return Err(crate::unported(format!("aggregates over {}", child.return_type)));
-            }
-        }
         let mut order_by = Vec::with_capacity(function.order_by.len());
         for node in &function.order_by {
             let expr = self.bind_expression(&node.expr)?;
@@ -860,11 +864,6 @@ impl Binder<'_> {
             function.name.name.clone(),
         ))
     }
-}
-
-/// The nested types have no vector support in the aggregate states yet.
-fn supported_aggregate_input(ty: &LogicalType) -> bool {
-    !ty.is_nested()
 }
 
 /// An expression with all aliases removed: `ParsedExpression::Equals` ignores aliases.

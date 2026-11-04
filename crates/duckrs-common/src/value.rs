@@ -339,6 +339,9 @@ impl Value {
                 None => Ok("NULL".into()),
             };
         }
+        if let (LogicalTypeId::Variant, ValueData::Bytes(bytes)) = (self.ty.id(), &self.data) {
+            return crate::variant::VariantNode::decode(bytes)?.render_child();
+        }
         let text = self.try_to_string()?;
         Ok(if self.ty.is_nested() {
             text
@@ -376,6 +379,7 @@ impl Value {
             (ValueData::Bytes(b), LogicalTypeId::Varchar | LogicalTypeId::Char) => String::from_utf8_lossy(b).into(),
             (ValueData::Bytes(b), LogicalTypeId::Blob) => format_blob(b),
             (ValueData::Bytes(b), LogicalTypeId::Bit) => crate::types::bit::bit_to_string(b),
+            (ValueData::Bytes(b), LogicalTypeId::Variant) => crate::variant::VariantNode::decode(b)?.render()?,
             (ValueData::Bytes(b), LogicalTypeId::Bignum) => crate::types::bignum::to_string(b),
             (
                 _,

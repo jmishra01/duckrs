@@ -201,7 +201,7 @@ fn map_extract(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
-fn bound_function(
+pub(super) fn bound_function(
     name: &str,
     children: Vec<BoundExpr>,
     return_type: LogicalType,
@@ -524,6 +524,9 @@ fn bind_struct_extract(child: BoundExpr, key: BoundExpr) -> Result<BoundExpr> {
     if ty.id() == LogicalTypeId::Union {
         return bind_union_extract(child, &key);
     }
+    if ty.id() == LogicalTypeId::Variant {
+        return super::variant::bind_extract(child, key);
+    }
     if !matches!(ty.id(), LogicalTypeId::Struct | LogicalTypeId::Tuple) {
         return Err(binder_error(format!(
             "struct_extract can only be used on a STRUCT, not on {ty}"
@@ -566,7 +569,9 @@ fn bind_struct_extract(child: BoundExpr, key: BoundExpr) -> Result<BoundExpr> {
 fn bind_extract(name: &str, child: BoundExpr, key: BoundExpr) -> Result<BoundExpr> {
     let ty = child.return_type.clone();
     match ty.id() {
-        LogicalTypeId::Struct | LogicalTypeId::Tuple | LogicalTypeId::Union => bind_struct_extract(child, key),
+        LogicalTypeId::Struct | LogicalTypeId::Tuple | LogicalTypeId::Union | LogicalTypeId::Variant => {
+            bind_struct_extract(child, key)
+        }
         LogicalTypeId::SqlNull => Ok(BoundExpr::constant(Value::sql_null())),
         LogicalTypeId::List | LogicalTypeId::Array => {
             let element = ty.child_type().expect("a child type").clone();

@@ -2313,6 +2313,42 @@ mod tests {
     }
 
     #[test]
+    fn variants_match_duckdb() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        let err = |context: &mut ClientContext, sql: &str| context.query(sql).unwrap_err().to_string();
+        for (sql, expected) in [
+            ("SELECT VARIANT 'a'", "a"),
+            ("SELECT 42::VARIANT::BIGINT", "42"),
+            ("SELECT [1, 2]::VARIANT", "[1, 2]"),
+            ("SELECT {'b': 1, 'a': 'x, y'}::VARIANT", "{'a': 'x, y', 'b': 1}"),
+            ("SELECT ({'a': 42}::VARIANT).a::BIGINT", "42"),
+            ("SELECT ([10, 20]::VARIANT)[2]::INTEGER", "20"),
+            ("SELECT {'a': 'true'}::VARIANT::STRUCT(a BOOLEAN)", "{'a': true}"),
+            ("SELECT '[1, 2]'::VARIANT::INTEGER[]", "[1, 2]"),
+            ("SELECT MAP {'k': 1}::VARIANT::MAP(VARCHAR, INTEGER)", "{k=1}"),
+            ("SELECT variant_typeof({'o': 1, 'l': 2}::VARIANT)", "OBJECT(l, o)"),
+            ("SELECT variant_typeof([1, 2]::VARIANT)", "ARRAY(2)"),
+            ("SELECT variant_typeof(1::VARIANT)", "INT32"),
+            ("SELECT variant_typeof(1.5::VARIANT)", "DECIMAL(2, 1)"),
+            ("SELECT variant_typeof(NULL::VARIANT)", "VARIANT_NULL"),
+            ("SELECT variant_keys({'b': 1, 'a': 2}::VARIANT)", "[a, b]"),
+            ("SELECT ({'a': NULL}::VARIANT).a IS NULL", "true"),
+            ("SELECT TRY_CAST('hello'::VARIANT AS INTEGER)", "NULL"),
+            ("SELECT typeof([1::VARIANT, 'a'])", "VARIANT[]"),
+        ] {
+            assert_eq!(run(&mut context, sql), [[expected]], "{sql}");
+        }
+        assert_eq!(
+            err(&mut context, "SELECT {'a': 'x'}::VARIANT::STRUCT(a BOOLEAN)"),
+            "Conversion Error: Can't convert VARIANT(VARCHAR) value 'x' to 'STRUCT(a BOOLEAN)'"
+        );
+        assert_eq!(
+            err(&mut context, "SELECT {'a': 1}::VARIANT::STRUCT(b INTEGER)"),
+            "Conversion Error: VARIANT(OBJECT(a)) is missing key 'b' to 'STRUCT(b INTEGER)'"
+        );
+    }
+
+    #[test]
     fn errors_match_duckdb() {
         let mut context = ClientContext::new(DatabaseInstance::new());
         let err = |context: &mut ClientContext, sql: &str| context.query(sql).unwrap_err().to_string();

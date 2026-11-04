@@ -15,6 +15,7 @@ mod nested_casts;
 pub(crate) mod operators;
 mod string_nested;
 pub(crate) mod time_casts;
+pub mod variant;
 
 use duckrs_common::Result;
 use duckrs_common::types::{LogicalType, LogicalTypeId};

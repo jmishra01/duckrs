@@ -184,7 +184,8 @@ impl LogicalTypeId {
             L::Double => P::Double,
             L::Bignum | L::Varchar | L::Char | L::Blob | L::Bit | L::Type | L::Geometry => P::Varchar,
             L::Interval => P::Interval,
-            L::Union | L::Variant | L::Struct | L::Tuple => P::Struct,
+            L::Variant => P::Varchar,
+            L::Union | L::Struct | L::Tuple => P::Struct,
             L::List | L::Map => P::List,
             L::Array => P::Array,
             L::Pointer => {

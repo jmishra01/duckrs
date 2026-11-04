@@ -128,12 +128,14 @@ test/sql/aggregate/aggregates/test_count_star.test
 test/sql/aggregate/aggregates/test_first_noninlined.test
 test/sql/aggregate/aggregates/test_group_on_expression.test
 test/sql/aggregate/aggregates/test_last_noninlined.test
+test/sql/aggregate/aggregates/test_minmax.test
 test/sql/aggregate/aggregates/test_null_aggregates.test
 test/sql/aggregate/aggregates/test_simple_filter.test
 test/sql/aggregate/aggregates/test_sum.test
 test/sql/aggregate/aggregates/test_sum_fastpath.test
 test/sql/aggregate/distinct/test_distinct.test
 test/sql/aggregate/distinct/ungrouped/test_distinct_ungrouped.test
+test/sql/aggregate/first_last_nested_vectors.test
 test/sql/aggregate/group/group_by_all.test
 test/sql/aggregate/group/group_by_all_order.test
 test/sql/aggregate/group/group_by_limits.test
@@ -171,9 +173,11 @@ test/sql/cast/string_to_list_escapes.test
 test/sql/cast/string_to_map_escapes.test
 test/sql/cast/string_to_map_invalid_entries.test
 test/sql/cast/string_to_struct_roundtrip.test
+test/sql/cast/string_to_struct_variant_child.test
 test/sql/cast/string_to_unnamed_struct.test
 test/sql/cast/struct_from_string_duplicate_keys.test
 test/sql/cast/struct_to_map.test
+test/sql/cast/struct_to_map_null_cast.test
 test/sql/cast/test_bit_cast.test
 test/sql/cast/test_boolean_cast.test
 test/sql/cast/test_exponent_in_cast.test
@@ -266,6 +270,7 @@ test/sql/join/full_outer/test_full_outer_join_complex.test
 test/sql/join/full_outer/test_full_outer_join_inequality.test
 test/sql/join/full_outer/test_full_outer_join_range.test
 test/sql/join/hash_join/hash_join_local_build.test
+test/sql/join/iejoin/iejoin_outer_struct_payload.test
 test/sql/join/inner/equality_join_limits.test
 test/sql/join/inner/join_cache.test
 test/sql/join/inner/list_join.test
@@ -327,6 +332,7 @@ test/sql/overflow/integer_overflow.test
 test/sql/overflow/test_numeric_overflow.test
 test/sql/overflow/test_overflow.test
 test/sql/parallelism/interquery/concurrent_appends.test
+test/sql/parallelism/intraquery/test_parallel_nested_aggregates.test
 test/sql/parallelism/intraquery/test_verify_parallelism.test
 test/sql/parallelism/modify_thread_settings.test
 test/sql/parser/bare_column_alias_keywords.test
@@ -404,6 +410,7 @@ test/sql/storage/optimistic_write/optimistic_write_cyclic_scan_single_thread.tes
 test/sql/storage/partial_blocks/many_columns_drop_table.test
 test/sql/storage/test_empty_shutdown.test
 test/sql/storage/types/struct/struct_of_empty_list.test
+test/sql/storage/types/variant/append_shredded.test
 test/sql/subquery/table/test_aliasing.test
 test/sql/subquery/table/test_table_subquery.test
 test/sql/subquery/table/test_unnamed_subquery.test
@@ -580,6 +587,7 @@ test/sql/types/uhugeint/test_uhugeint_ops.test
 test/sql/types/uhugeint/uhugeint_literal.test
 test/sql/types/uhugeint/uhugeint_multiply.test
 test/sql/types/uhugeint/uhugeint_try_cast.test
+test/sql/types/union/union_aggregate.test
 test/sql/types/union/union_ambiguous.test
 test/sql/types/union/union_limit_offset.test
 test/sql/types/union/union_limits.test
@@ -590,3 +598,10 @@ test/sql/types/unsigned/test_unsigned_conversion.test
 test/sql/types/unsigned/test_unsigned_verify.test
 test/sql/types/uuid/test_uuid_cast.test
 test/sql/types/uuid/test_uuid_uhugeint_cast.test
+test/sql/types/variant/try_cast_nested_list_writer.test
+test/sql/types/variant/variant_cast_parent_path_order.test
+test/sql/types/variant/variant_map_to_variant_filter.test
+test/sql/types/variant/variant_object_key_order.test
+test/sql/types/variant/variant_struct_cast_parent_projection.test
+test/sql/types/variant/variant_struct_field_subquery_cast_parent.test
+test/sql/types/variant/variant_to_array_try_cast.test

@@ -8,7 +8,7 @@
 //! [`super::bit_casts`] has BIT and BIGNUM. The casts of the types that are not ported yet fail
 //! as not ported.
 
-use super::{bit_casts, nested_casts, time_casts};
+use super::{bit_casts, nested_casts, time_casts, variant};
 use duckrs_common::executor;
 use duckrs_common::string_cast::{format_double, format_float};
 use duckrs_common::types::{LogicalType, LogicalTypeId, NativeType, PhysicalType};
@@ -912,6 +912,7 @@ fn is_ported_scalar(ty: &LogicalType) -> bool {
             | Enum
             | Bit
             | Bignum
+            | Variant
     )
 }
 
@@ -1000,6 +1001,9 @@ pub fn cast_vector(source: &Vector, result: &mut Vector, count: usize, mode: Cas
     }
     if to.id() == LogicalTypeId::Varchar {
         return to_varchar(source, result, count);
+    }
+    if from.id() == LogicalTypeId::Variant || to.id() == LogicalTypeId::Variant {
+        return variant::variant_cast(source, result, count, mode);
     }
     if from.is_nested() || to.is_nested() {
         return nested_casts::nested_cast(source, result, count, mode);
