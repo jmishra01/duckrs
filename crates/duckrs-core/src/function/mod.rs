@@ -15,6 +15,7 @@ pub mod nested;
 mod nested_casts;
 pub(crate) mod operators;
 mod string_nested;
+pub mod test_all_types;
 pub(crate) mod time_casts;
 pub mod variant;
 

@@ -26,8 +26,8 @@ use duckrs_common::value::Value;
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ParserOptions;
 use duckrs_parser::ast::{
-    CreateInfo, CreateKind, CreateTypeKind, DropInfo, OnCreateConflict as AstConflict, PragmaInfo, Statement,
-    sql_quoted_identifier,
+    CreateInfo, CreateKind, CreateTypeKind, DropInfo, Expr, ExprKind, OnCreateConflict as AstConflict, PragmaInfo,
+    Statement, sql_quoted_identifier,
 };
 use duckrs_parser::ast::{TransactionModifier, TransactionType};
 use parking_lot::{Mutex, RwLock};
@@ -165,6 +165,19 @@ impl ActiveTransaction {
             self.invalidated = true;
         }
     }
+}
+
+/// Whether `function` is `checkpoint` or `force_checkpoint`, and if so whether it forces, and of
+/// which database.
+fn checkpoint_call(function: &Expr) -> Option<(bool, Option<&Expr>)> {
+    let ExprKind::Function(call) = &function.kind else {
+        return None;
+    };
+    let name = call.name.name.to_lowercase();
+    if !matches!(name.as_str(), "checkpoint" | "force_checkpoint") || call.args.len() > 1 {
+        return None;
+    }
+    Some((name == "force_checkpoint", call.args.first().map(|a| &a.expr)))
 }
 
 /// Whether a statement changes the database (`StatementProperties::IsReadOnly`).
@@ -493,6 +506,40 @@ impl ClientContext {
         result
     }
 
+    /// `CheckpointFunction`. In memory there is nothing to write, so only its errors are left;
+    /// Phase 12 brings the rest with the storage.
+    fn checkpoint(&mut self, function: &Expr) -> Result<MaterializedQueryResult> {
+        let (force, argument) = checkpoint_call(function).expect("checked by the caller");
+        if let Some(argument) = argument {
+            let database = evaluate_scalar(&bind_constant_expression(&self.db.catalog, argument)?)?;
+            if database.is_null() {
+                return Err(Error::new(ErrorKind::Binder, "Database cannot be NULL"));
+            }
+            let database = database.try_to_string()?;
+            if database != DEFAULT_CATALOG {
+                return Err(Error::new(
+                    ErrorKind::Binder,
+                    format!("Database \"{database}\" not found"),
+                ));
+            }
+        }
+        if let Some(transaction) = &self.transaction {
+            if force {
+                return Err(Error::new(
+                    ErrorKind::Transaction,
+                    "Cannot FORCE CHECKPOINT: the current transaction has been started for this database",
+                ));
+            }
+            if transaction.snapshot.is_some() {
+                return Err(Error::new(
+                    ErrorKind::Transaction,
+                    "Cannot CHECKPOINT: the current transaction has transaction local changes",
+                ));
+            }
+        }
+        Ok(Self::success())
+    }
+
     /// `ClientContext::PendingStatementOrPreparedStatement` + `ExecutePendingQueryInternal`.
     fn execute_statement(&mut self, statement: &Statement) -> Result<MaterializedQueryResult> {
         match statement {
@@ -525,6 +572,9 @@ impl ClientContext {
                     return Ok(Self::success());
                 }
                 return Err(crate::unported(format!("PRAGMA {name}")));
+            }
+            Statement::Call(function) if checkpoint_call(function).is_some() => {
+                return self.checkpoint(function);
             }
             Statement::Prepare { name, statement } => {
                 let prepared = self.prepare_statement((**statement).clone())?;
@@ -1071,10 +1121,6 @@ mod tests {
         assert_eq!(
             sorted(&mut c, "SELECT * FROM l, (SELECT 1 FROM r JOIN t ON a = 'x') s"),
             sorted(&mut c, "SELECT l.*, 1 FROM l, r, t WHERE a = 'x'")
-        );
-        assert_eq!(
-            c.query("SELECT * FROM l, range(k)").unwrap_err().kind,
-            ErrorKind::NotImplemented
         );
         // a duplicate alias only matters to a reference that could mean either table
         assert_eq!(
@@ -2835,6 +2881,69 @@ mod tests {
         assert_eq!(
             err(&mut context, "SELECT CAST('abc' AS INTEGER)"),
             "Conversion Error: Could not convert string 'abc' to INT32"
+        );
+    }
+
+    #[test]
+    fn table_functions() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        let single = |rows: Vec<Vec<String>>| rows.into_iter().map(|mut r| r.remove(0)).collect::<Vec<_>>();
+        assert_eq!(single(run(&mut context, "SELECT * FROM unnest([1, 2])")), ["1", "2"]);
+        assert_eq!(
+            single(run(&mut context, "SELECT repeat FROM repeat('a', 2)")),
+            ["a", "a"]
+        );
+        assert_eq!(
+            run(&mut context, "FROM repeat_row(1, 'b', num_rows = 2)"),
+            [["1", "b"], ["1", "b"]]
+        );
+        run(&mut context, "CREATE TABLE t AS SELECT range AS i FROM range(1, 3)");
+        assert_eq!(
+            single(run(&mut context, "FROM query('SELECT i * 2 FROM t')")),
+            ["2", "4"]
+        );
+        assert_eq!(single(run(&mut context, "FROM query_table('t')")), ["1", "2"]);
+        assert_eq!(
+            run(&mut context, "SELECT i, r FROM t, range(i) r(r) ORDER BY ALL"),
+            [["1", "0"], ["2", "0"], ["2", "1"]]
+        );
+        assert_eq!(single(run(&mut context, "SELECT range(3)")), ["[0, 1, 2]"]);
+        assert_eq!(single(run(&mut context, "SELECT generate_series(1, 2)")), ["[1, 2]"]);
+        assert_eq!(single(run(&mut context, "CALL range(2)")), ["0", "1"]);
+        assert_eq!(
+            context
+                .query("FROM query('INSERT INTO t VALUES (1)')")
+                .unwrap_err()
+                .to_string(),
+            "Parser Error: Expected a single SELECT statement"
+        );
+        assert_eq!(
+            single(run(&mut context, "SELECT count(*) FROM test_all_types()")),
+            ["3"]
+        );
+    }
+
+    #[test]
+    fn checkpoints() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        for sql in [
+            "CHECKPOINT",
+            "FORCE CHECKPOINT",
+            "CHECKPOINT memory",
+            "CALL checkpoint()",
+        ] {
+            run(&mut context, sql);
+        }
+        assert_eq!(
+            context.query("CHECKPOINT other").unwrap_err().to_string(),
+            "Binder Error: Database \"other\" not found"
+        );
+        run(&mut context, "CREATE TABLE t (i INTEGER)");
+        run(&mut context, "BEGIN");
+        run(&mut context, "CHECKPOINT");
+        assert_eq!(
+            context.query("FORCE CHECKPOINT").unwrap_err().to_string(),
+            "TransactionContext Error: Cannot FORCE CHECKPOINT: the current transaction has been started for this database"
         );
     }
 }

@@ -205,7 +205,7 @@ pub fn to_u128_magnitude(bignum: &[u8]) -> Option<(bool, u128)> {
 }
 
 /// The most data bytes a BIGNUM can hold (`Bignum::MAX_DATA_SIZE`).
-const MAX_DATA_SIZE: usize = 8_388_607;
+pub const MAX_DATA_SIZE: usize = 8_388_607;
 
 /// A magnitude in base 2^32, least significant limb first, without leading zero limbs.
 type Limbs = Vec<u32>;

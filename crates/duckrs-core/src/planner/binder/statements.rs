@@ -37,6 +37,7 @@ use duckrs_parser::ast::{
     sql_quoted_identifier, values_list,
 };
 use duckrs_parser::transformer::visit_expr_mut;
+use duckrs_parser::{ast, parse_ast};
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -173,7 +174,7 @@ enum PreparedModifier {
 }
 
 /// `GenerateRangeParameters`: the first value, the number of values and the increment.
-fn range_parameters(values: &[i128], generate_series: bool) -> Result<(i128, u64, i128)> {
+pub(crate) fn range_parameters(values: &[i128], generate_series: bool) -> Result<(i128, u64, i128)> {
     let (start, mut end) = match values {
         [end] => (0, *end),
         [start, end, ..] => (*start, *end),
@@ -1228,7 +1229,7 @@ impl Binder<'_> {
     }
 
     /// Applies a table reference's column aliases (`t(a, b)`) to its column names.
-    fn alias_columns(table_ref: &TableRef, alias: &str, mut names: Vec<String>) -> Result<Vec<String>> {
+    pub(super) fn alias_columns(table_ref: &TableRef, alias: &str, mut names: Vec<String>) -> Result<Vec<String>> {
         if table_ref.column_name_alias.len() > names.len() {
             return Err(binder_error(format!(
                 "table {} has {} columns available but {} columns specified",
@@ -1391,6 +1392,11 @@ impl Binder<'_> {
                 {
                     return self.bind_table_macro(table_ref, call, entry);
                 }
+                if let ExprKind::Function(call) = &function.kind
+                    && let Some(plan) = self.bind_rewritten_function(function, call, table_ref)?
+                {
+                    return Ok(plan);
+                }
                 self.bind_range(function, table_ref)
             }
             _ => Err(not_implemented("this kind of table reference")),
@@ -1461,7 +1467,7 @@ impl Binder<'_> {
         let name = call.name.name.to_lowercase();
         let generate_series = name == "generate_series";
         if !(generate_series || name == "range") || !call.name.qualification.is_empty() {
-            return Err(not_implemented("table functions"));
+            return Err(not_implemented(&format!("the table function {name}")));
         }
         if call.args.is_empty() || call.args.len() > 3 || call.args.iter().any(|a| !a.name.is_empty()) {
             return Err(not_implemented("this call of a range function"));
@@ -1474,7 +1480,12 @@ impl Binder<'_> {
             self.left_of_join = binder.left_of_join;
             let bound = bound?;
             if !bound.is_foldable() {
-                return Err(not_implemented("range with arguments that are not constant"));
+                // what depends on the row around it: a list per row that unnests
+                let select = parse_ast(&format!("SELECT unnest({function}) AS {name}"))?.remove(0);
+                let ast::Statement::Select(select) = select else {
+                    unreachable!("this text is a SELECT");
+                };
+                return self.bind_rewritten(&select, table_ref, &name);
             }
             if !bound.return_type.is_integral() && bound.return_type.id() != LogicalTypeId::SqlNull {
                 return Err(not_implemented("range over this type"));

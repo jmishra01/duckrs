@@ -11,6 +11,7 @@
 use super::bit_functions::strict_rows;
 use super::nested::{bound_function, row_wise};
 use super::{ScalarCallback, ScalarFunction, ScalarFunctionSet};
+use crate::planner::binder::range_parameters;
 use crate::planner::expression::{BoundExpr, BoundExprKind};
 use duckrs_common::hash::{combine_hash, hash_vector};
 use duckrs_common::sort_key::{NullOrder, OrderModifiers, OrderType, create_sort_keys};
@@ -362,6 +363,33 @@ fn repeat_list(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+/// `ListRangeFunction`: the numbers a `range` of the same arguments gives as rows.
+fn range_list(args: &DataChunk, result: &mut Vector, generate_series: bool) -> Result<()> {
+    let ty = result.logical_type().clone();
+    strict_rows(args, result, |row| {
+        let values: Vec<i128> = row.iter().filter_map(Value::as_i128).collect();
+        let (start, count, increment) = range_parameters(&values, generate_series)?;
+        if count >= 1 << 32 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Lists larger than 2^32 elements are not supported",
+            ));
+        }
+        let items = (0..i128::from(count))
+            .map(|i| Value::bigint((start + i * increment) as i64))
+            .collect();
+        Value::new(ty.clone(), ValueData::List(items))
+    })
+}
+
+fn list_range(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    range_list(args, result, false)
+}
+
+fn list_generate_series(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    range_list(args, result, true)
+}
+
 /// Whether `name` is the `unnest` of a select list.
 pub fn is_unnest(name: &str) -> bool {
     name.eq_ignore_ascii_case("unnest")
@@ -413,6 +441,8 @@ pub fn is_generic_function(name: &str) -> bool {
             | "map_from_entries"
             | "hash"
             | "repeat"
+            | "range"
+            | "generate_series"
             | "length"
     )
 }
@@ -559,6 +589,21 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             };
             let input = input.clone().cast_to(&ty, false);
             Ok(bound_function("repeat", vec![input, times], ty, repeat))
+        }
+        "range" | "generate_series" => {
+            if children.is_empty() || children.len() > 3 {
+                return Err(no_match(&lower, &children));
+            }
+            let children = children
+                .iter()
+                .map(|c| c.clone().cast_to(&LogicalType::BIGINT, false))
+                .collect();
+            let list = LogicalType::list(LogicalType::BIGINT);
+            if lower == "range" {
+                Ok(bound_function("range", children, list, list_range))
+            } else {
+                Ok(bound_function("generate_series", children, list, list_generate_series))
+            }
         }
         other => unreachable!("{other} is not a generic function"),
     }

@@ -7,8 +7,10 @@ mod expression;
 mod join;
 mod macros;
 mod statements;
+mod table_functions;
 
 pub use expression::{enum_type_from, is_builtin_type};
+pub(crate) use statements::range_parameters;
 pub use statements::schema_of;
 
 use super::expression::{BoundAggregate, BoundExpr, ColumnBinding};
@@ -674,6 +676,14 @@ impl<'a> Binder<'a> {
             Statement::Delete(delete) => self.bind_delete(delete),
             Statement::Update(update) => self.bind_update(update),
             Statement::CreateTable(info) => self.bind_create_table(info),
+            // `Binder::Bind(CallStatement)`
+            Statement::Call(function) => {
+                let select = duckrs_parser::parse_ast(&format!("SELECT * FROM {function}"))?.remove(0);
+                let Statement::Select(select) = select else {
+                    unreachable!("this text is a SELECT");
+                };
+                self.bind_select_statement(&select)
+            }
             other => Err(crate::unported(format!("{} statements", statement_kind(other)))),
         }
     }

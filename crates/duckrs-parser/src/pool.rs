@@ -59,9 +59,9 @@ pub(crate) fn run<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 mod tests {
     #[test]
     fn reuses_threads_and_survives_panics() {
-        let first = super::run(|| std::thread::current().id()).unwrap();
-        let second = super::run(|| std::thread::current().id()).unwrap();
-        assert_eq!(first, second);
+        // that the same thread runs twice in a row can't be asserted: the pool is global and
+        // the tests running next to this one take threads out of it
+        super::run(|| std::thread::current().id()).unwrap();
         assert!(super::run(|| panic!("boom")).is_err());
         assert_eq!(super::run(|| 42).unwrap(), 42);
         let handles: Vec<_> = (0..4)
