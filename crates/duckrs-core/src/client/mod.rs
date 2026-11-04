@@ -15,6 +15,7 @@ use crate::execution::alter::{execute_alter, execute_create_index};
 use crate::execution::expression_executor::evaluate_scalar;
 use crate::execution::physical::{PhysicalOperator, PhysicalResultCollector};
 use crate::execution::{create_plan, execute_plan};
+use crate::optimizer::{OptimizerOptions, optimize};
 use crate::planner::binder::{
     BindOptions, Binder, DefaultNullOrder, ParameterValues, bind_constant_expression, schema_of,
 };
@@ -75,8 +76,6 @@ impl DatabaseInstance {
 const NO_OP_PRAGMAS: &[&str] = &[
     "enable_verification",
     "disable_verification",
-    "enable_optimizer",
-    "disable_optimizer",
     "verify_external",
     "disable_verify_external",
     "verify_serializer",
@@ -245,6 +244,15 @@ impl ClientContext {
     }
 
     /// The settings the binder needs.
+    /// `enable_optimizer` and `disabled_optimizers`.
+    fn optimizer_options(&self) -> OptimizerOptions {
+        if self.setting_text("enable_optimizer") == "false" {
+            OptimizerOptions::none()
+        } else {
+            OptimizerOptions::from_disabled(&self.setting_text("disabled_optimizers"))
+        }
+    }
+
     fn bind_options(&self) -> BindOptions {
         BindOptions {
             default_order: if self.setting_text("default_order") == "DESC" {
@@ -258,6 +266,7 @@ impl ClientContext {
                 "NULLS_LAST_ON_ASC_FIRST_ON_DESC" => DefaultNullOrder::NullsLastOnAscFirstOnDesc,
                 _ => DefaultNullOrder::NullsLast,
             },
+            optimizer: self.optimizer_options(),
             single_arrow_lambdas: self.setting_text("lambda_syntax") == "ENABLE_SINGLE_ARROW",
             pivot_limit: self.setting_text("pivot_limit").parse().unwrap_or(100_000),
             scalar_subquery_error: self.setting_text("scalar_subquery_error_on_multiple_rows") != "false",
@@ -548,10 +557,12 @@ impl ClientContext {
         let mut binder = Binder::with_options(&self.db.catalog, self.bind_options());
         binder.parameters = self.parameters.clone();
         binder.session = Some(self.session_values());
-        let mut bound = binder.bind(statement)?;
+        let bound = binder.bind(statement)?;
         let logical = explain_logical(&bound.plan);
-        resolve_column_bindings(&mut bound.plan)?;
-        let physical = explain_physical(create_plan(bound.plan).as_ref());
+        let mut plan = optimize(bound.plan, self.optimizer_options());
+        let logical_optimized = explain_logical(&plan);
+        resolve_column_bindings(&mut plan)?;
+        let physical = explain_physical(create_plan(plan).as_ref());
         if explain_type == ExplainType::Analyze {
             self.execute_statement(statement)?;
         }
@@ -561,10 +572,10 @@ impl ClientContext {
             match self.setting_text("explain_output").to_uppercase().as_str() {
                 "ALL" => vec![
                     ("logical_plan", logical.clone()),
-                    ("logical_opt", logical),
+                    ("logical_opt", logical_optimized),
                     ("physical_plan", physical),
                 ],
-                "OPTIMIZED_ONLY" => vec![("logical_opt", logical)],
+                "OPTIMIZED_ONLY" => vec![("logical_opt", logical_optimized)],
                 _ => vec![("physical_plan", physical)],
             }
         };
@@ -666,6 +677,8 @@ impl ClientContext {
                 }
                 let lower = name.to_lowercase();
                 let sql = match (lower.as_str(), parameters.as_slice()) {
+                    ("enable_optimizer", []) => Some("SET enable_optimizer = true".to_string()),
+                    ("disable_optimizer", []) => Some("SET enable_optimizer = false".to_string()),
                     ("show_tables", []) => Some("SHOW TABLES".to_string()),
                     ("show_tables_expanded", []) => Some("SHOW ALL TABLES".to_string()),
                     ("show_databases" | "database_list", []) => Some("SELECT * FROM duckdb_databases()".to_string()),
@@ -761,9 +774,10 @@ impl ClientContext {
         let mut binder = Binder::with_options(&self.db.catalog, self.bind_options());
         binder.parameters = self.parameters.clone();
         binder.session = Some(self.session_values());
-        let mut bound = binder.bind(statement)?;
-        resolve_column_bindings(&mut bound.plan)?;
-        let plan = create_plan(bound.plan);
+        let bound = binder.bind(statement)?;
+        let mut plan = optimize(bound.plan, self.optimizer_options());
+        resolve_column_bindings(&mut plan)?;
+        let plan = create_plan(plan);
         let collector = PhysicalResultCollector::new(plan);
         execute_plan(&collector)?;
         let collection = collector.result.into_inner();

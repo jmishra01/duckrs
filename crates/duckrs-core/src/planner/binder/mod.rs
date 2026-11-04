@@ -20,6 +20,7 @@ mod table_constraints;
 mod table_functions;
 mod window;
 
+use crate::optimizer::OptimizerOptions;
 pub use alter::{BoundAlter, BoundTableAlter};
 pub use expression::{enum_type_from, is_builtin_type};
 pub(crate) use statements::range_parameters;
@@ -516,6 +517,8 @@ pub struct BindOptions {
     pub scalar_subquery_error: bool,
     /// `show_behavior`
     pub show_behavior: ShowBehavior,
+    /// The optimizer passes for the plans of subqueries.
+    pub optimizer: OptimizerOptions,
 }
 
 /// What `SHOW name` looks for (`ShowBehaviorType`).
@@ -535,6 +538,7 @@ impl Default for BindOptions {
             pivot_limit: 100_000,
             scalar_subquery_error: true,
             show_behavior: ShowBehavior::Auto,
+            optimizer: OptimizerOptions::default(),
         }
     }
 }

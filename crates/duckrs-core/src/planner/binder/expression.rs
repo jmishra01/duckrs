@@ -16,6 +16,7 @@ use crate::function::math::bind_decimal_round;
 use crate::function::nested::{bind_nested_function, is_nested_function};
 use crate::function::variant::{bind_variant_function, is_variant_function};
 use crate::function::{BuiltinFunctions, typeof_constant};
+use crate::optimizer::optimize;
 use crate::planner::column_binding_resolver::resolve_column_bindings;
 use crate::planner::expression::{
     BoundExpr, BoundExprKind, BoundOperator, BoundSubquery, ColumnBinding, SequenceOp, SubqueryKind,
@@ -620,7 +621,7 @@ impl Binder<'_> {
                 _ => {}
             }
         }
-        let (kind, return_type, mut plan, child) = match subquery_type {
+        let (kind, return_type, plan, child) = match subquery_type {
             SubqueryType::Scalar => (SubqueryKind::Scalar, bound.types[0].clone(), bound.plan, None),
             SubqueryType::Exists | SubqueryType::NotExists => {
                 (SubqueryKind::Exists, LogicalType::BOOLEAN, bound.plan, None)
@@ -647,6 +648,7 @@ impl Binder<'_> {
                 )
             }
         };
+        let mut plan = optimize(plan, self.options.optimizer);
         resolve_column_bindings(&mut plan)?;
         let volatile = plan.is_volatile();
         let expression = BoundExpr::new(

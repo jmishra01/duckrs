@@ -1,4 +1,5 @@
 use clap::{Parser, ValueEnum};
+use sqllogictest::diff::{DiffEngine, DiffOptions};
 use sqllogictest::engine::{DuckrsEngine, Engine};
 use sqllogictest::report;
 use sqllogictest::runner::{self, FileReport, Outcome, RunConfig};
@@ -14,6 +15,14 @@ use std::time::{Duration, Instant};
 enum EngineKind {
     /// The Rust engine under development.
     Duckrs,
+    /// The C++ DuckDB library (requires the `reference` cargo feature).
+    Reference,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum DiffKind {
+    /// duckrs with the optimizer off, like `PRAGMA enable_verification`.
+    Unoptimized,
     /// The C++ DuckDB library (requires the `reference` cargo feature).
     Reference,
 }
@@ -73,6 +82,14 @@ struct Args {
     #[arg(long, default_value_t = 300)]
     timeout: u64,
 
+    /// Also run every statement on this engine and report where the results differ.
+    #[arg(long, value_enum)]
+    diff_against: Option<DiffKind>,
+
+    /// Append the differences to this file, one per line, instead of printing them.
+    #[arg(long)]
+    diff_out: Option<PathBuf>,
+
     /// Internal: run exactly this file (index, path) and print its report for the parent.
     #[arg(long, hide = true, num_args = 2, value_names = ["INDEX", "FILE"])]
     worker: Option<Vec<String>>,
@@ -96,6 +113,30 @@ fn engine(kind: EngineKind) -> Result<(Box<dyn Engine>, String), String> {
     }
 }
 
+/// Wraps `primary` for `--diff-against`. Outside of a worker `label` is empty: a run without
+/// `--isolate` reports differences without their file.
+fn with_diff(
+    args: &Args,
+    primary: Box<dyn Engine>,
+    out: Option<PathBuf>,
+    label: &str,
+) -> Result<Box<dyn Engine>, String> {
+    let Some(kind) = args.diff_against else {
+        return Ok(primary);
+    };
+    let (secondary, setup, allow_secondary_errors): (Box<dyn Engine>, _, _) = match kind {
+        DiffKind::Unoptimized => (Box::new(DuckrsEngine), Some("PRAGMA disable_optimizer"), true),
+        DiffKind::Reference => (engine(EngineKind::Reference)?.0, None, false),
+    };
+    let options = DiffOptions {
+        setup,
+        allow_secondary_errors,
+        out,
+        label: label.to_string(),
+    };
+    Ok(Box::new(DiffEngine::new(primary, secondary, options)))
+}
+
 fn baseline(root: &std::path::Path) -> String {
     std::process::Command::new("git")
         .arg("-C")
@@ -109,7 +150,7 @@ fn baseline(root: &std::path::Path) -> String {
 }
 
 fn main() -> ExitCode {
-    let args = Args::parse();
+    let mut args = Args::parse();
     let (engine, engine_version) = match engine(args.engine) {
         Ok(e) => e,
         Err(e) => {
@@ -127,6 +168,8 @@ fn main() -> ExitCode {
     // Output paths are relative to where the user ran us, not the DuckDB checkout.
     let cwd = std::env::current_dir().expect("current directory");
     let resolve = |p: &Option<PathBuf>| p.as_ref().map(|p| cwd.join(p));
+    let diff_out = resolve(&args.diff_out);
+    args.diff_out = diff_out.clone();
     let (status_out, passing_out, known_passing) = (
         resolve(&args.status_out),
         resolve(&args.passing_out),
@@ -143,12 +186,26 @@ fn main() -> ExitCode {
             vector_size: 2048,
         };
         let index = worker[0].parse().unwrap_or(0);
+        let engine = match with_diff(&args, engine, diff_out, &worker[1]) {
+            Ok(engine) => engine,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::from(2);
+            }
+        };
         let report = runner::run_file(&config, engine.as_ref(), &worker[1], index);
         let _ = std::fs::remove_dir_all(&scratch);
         println!("{RESULT_MARKER}{}", encode_report(&report));
         return ExitCode::SUCCESS;
     }
 
+    let engine = match with_diff(&args, engine, diff_out, "") {
+        Ok(engine) => engine,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    };
     let files = sqllogictest::discover(&root, &args.patterns, args.slow);
     if files.is_empty() {
         eprintln!("error: no test files matched");
@@ -363,6 +420,14 @@ fn run_isolated(args: &Args, root: &std::path::Path, file: &str, index: usize) -
         .stderr(Stdio::piped());
     if args.continue_on_failure {
         command.arg("--continue-on-failure");
+    }
+    if let Some(kind) = args.diff_against {
+        command
+            .arg("--diff-against")
+            .arg(kind.to_possible_value().expect("diff name").get_name());
+    }
+    if let Some(path) = &args.diff_out {
+        command.arg("--diff-out").arg(path);
     }
     let mut child = match command.spawn() {
         Ok(child) => child,

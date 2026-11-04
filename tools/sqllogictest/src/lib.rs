@@ -5,6 +5,7 @@
 //! harness and serves as the oracle for differential testing.
 
 pub mod compare;
+pub mod diff;
 pub mod engine;
 pub mod parser;
 pub mod report;

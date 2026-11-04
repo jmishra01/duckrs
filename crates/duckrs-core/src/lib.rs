@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod client;
 pub mod execution;
 pub mod function;
+pub mod optimizer;
 pub mod planner;
 
 /// `NotImplementedException` with DuckDB's own wording.

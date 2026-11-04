@@ -138,9 +138,7 @@ digits), no table options, no collations. The expression executor evaluates a fi
 condition to a BOOLEAN vector rather than using DuckDB's specialized `Select`, and casts to
 VARCHAR and from or to DECIMAL, CASE and COALESCE write row by row through `Value`. Tables and
 blocking operators are capped at about 2 GiB and fail as not yet ported beyond that, until
-out-of-core operators (Phase 8) and storage (Phase 9) exist. There is no optimizer yet, so
-errors DuckDB's rewrites avoid (an overflow in a filter it removes) still surface; only
-`LIMIT 0` skips its input. Errors for SQL beyond the slice
+out-of-core operators (Phase 8) and storage (Phase 9) exist. Errors for SQL beyond the slice
 say it `is not yet ported to duckrs`, wording DuckDB never uses, so that no test expecting an
 error passes because a feature is missing.
 
@@ -173,8 +171,41 @@ error passes because a feature is missing.
 Not ported from the Phase 6 list: data-modifying statements in WITH. Not in the plan's list but
 blocking its gate directories: COLLATE (Phase 6 has no collation work) and `SET schema`.
 
+## Phase 7
+
+The optimizer (`crates/duckrs-core/src/optimizer`) runs between the binder and the
+`ColumnBindingResolver`. Subquery plans and the recursive part of a recursive CTE are resolved
+while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` turns it off, and
+`disabled_optimizers` turns off single passes.
+
+- **Expression rewriter:** constant folding, distributivity, arithmetic, CASE, conjunction,
+  comparison with NULL, NOT over comparisons and conjunctions.
+- **Filter pushdown:** through aggregates, cross products (which become joins), inner, left, semi
+  and anti joins, projections, set operations, DISTINCT and UNNEST. A filter that is always false
+  empties the plan, and **empty result pull-up** carries that upward.
+- **Unused columns** become typed NULL constants instead of going away, which keeps column
+  bindings stable: subquery plans refer to outer columns by binding. Scans keep all their columns,
+  because in-memory scans clone `Arc`s and pruning them would gain nothing.
+
+A filter stays above a projection or an aggregate if it, or an entry it would be substituted with,
+can fail: below, `a::int < b::int` would run ahead of the filter that guards those casts.
+`can_throw` allows only what is known not to fail, so some filters stay higher than they do in C++.
+
+Not ported yet: join order, statistics, `FilterCombiner` beyond splitting, deduplicating and
+deciding constants, transitive filters, MoveConstants, ConstantOrderNormalization, `x * 0`,
+pushdown through outer, right, mark, ASOF and window operators, CheckMarkToSemi and subquery
+flattening. The gate is not met: `test/optimizer` is at 41.3% against 80%, and TPC-H and TPC-DS do
+not run yet.
+
 ## Testing
 
 The DuckDB sqllogictest corpus is the acceptance oracle. `tools/sqllogictest` runs it against
 duckrs, or against the C++ library (`--engine reference`, behind the `reference` cargo feature).
 CI fails when a file in `tools/sqllogictest/known_passing.txt` stops passing.
+
+`--diff-against` is the plan's differential tester, as a mode of the runner and not a crate of its
+own: every statement also runs on a second engine, either duckrs with the optimizer off
+(`unoptimized`) or C++ (`reference`, which is v2.0.0 and not the baseline), and differences go to
+`--diff-out`. It needs `--isolate`. Rows are sorted unless the query has ORDER BY, LIMIT without
+ORDER BY is skipped, and floats compare within 1e-6. Tests with `random()` or concurrent loops
+differ between any two runs, so read those as noise.

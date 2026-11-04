@@ -402,6 +402,7 @@ test/optimizer/joins/join_on_floats.test
 test/optimizer/joins/joins_with_correlated_subqueries.test
 test/optimizer/joins/lateral_cross_join.test
 test/optimizer/joins/left_join_reordering/non_inner_join_edge_constraints.test
+test/optimizer/joins/no_duplicate_elimination_join.test
 test/optimizer/joins/relation_statistics_bindings.test
 test/optimizer/joins/single_sided_predicate_reconstruction.test
 test/optimizer/joins/test_delim_join_with_cross_product_in_rhs.test
@@ -425,6 +426,7 @@ test/optimizer/pushdown/distinct_from_pushdown.test
 test/optimizer/pushdown/filters_on_limit_optimizer.test
 test/optimizer/pushdown/issue_16863.test
 test/optimizer/pushdown/join_filter_pushdown_sample.test
+test/optimizer/pushdown/lateral_projection_evaluation.test
 test/optimizer/pushdown/prefix_pushdown_null_constant.test
 test/optimizer/pushdown/pushdown_window_decreasing_partition.test
 test/optimizer/pushdown/timestamp_to_date_infinity_pushdown.test
@@ -447,6 +449,7 @@ test/optimizer/topn_window_elimination_group_stats.test
 test/optimizer/union_exclude.test
 test/optimizer/unused_columns/cte_unused_columns.test
 test/optimizer/unused_columns/distinct_on_projection_pushdown.test
+test/optimizer/using_optimizer.test
 test/planner/projection_binding.test
 test/sql/aggregate/aggregates/approx_quantile_decimal_scalar.test
 test/sql/aggregate/aggregates/approx_quantile_parallel_finalize.test
@@ -1275,6 +1278,7 @@ test/sql/keywords/keywords_in_expressions.test
 test/sql/limit/limit_exceeds_child_cardinality.test
 test/sql/limit/streaming_limit_pipeline_flush2.test
 test/sql/limit/test_batch_limit_filters.test
+test/sql/limit/test_limit0.test
 test/sql/limit/test_preserve_insertion_order.test
 test/sql/merge/merge_into_bind_matching_columns.test
 test/sql/merge/merge_into_by_source.test
@@ -1320,6 +1324,7 @@ test/sql/optimizer/expression/uncommitted_appends_fold_guard.test
 test/sql/optimizer/joins/join_order_deep_setop_chain.test
 test/sql/optimizer/late_materialization_pushdown_extract.test
 test/sql/optimizer/monotone_preimage_tinyint_boundaries.test
+test/sql/optimizer/plan/test_anti_join_empty_child.test
 test/sql/optimizer/plan/test_anti_join_projection_map.test
 test/sql/optimizer/plan/test_disable_build_side_probe_side.test
 test/sql/optimizer/plan/test_except_empty_rhs.test

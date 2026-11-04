@@ -2,7 +2,7 @@
 
 An analytical SQL database engine: a port of [DuckDB](https://github.com/duckdb/duckdb) to Rust.
 
-**Status: 2210 files pass, 43.1% of the files that ran (35.7% of all 6,197).** The Phase 6 feature list is ported apart from data-modifying CTEs and a few binder corners, but its gates are not met yet; see "Phase 6" in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Phase 4 (types and casts) has started: the scalar casts, the nested types (LIST, ARRAY, STRUCT, MAP, UNION), `CREATE TYPE`, ENUM, BIT, BIGNUM and VARIANT are in, the last in its own in-memory encoding until Phase 9. What is left of the phase is GEOMETRY, which the plan defers. A first batch of Phase 5's functions is in too, because the type tests need them: `unnest`, `TRY(...)`, list slicing, the `list` aggregate, LIKE, and common string, list, map and interval helpers. Nested casts and functions run row by row for now. The engine runs CREATE TABLE, CREATE VIEW, CREATE SEQUENCE, CREATE MACRO, INSERT, prepared statements
+**Status: 2215 files pass, 43.2% of the files that ran (35.7% of all 6,197).** The Phase 6 feature list is ported apart from data-modifying CTEs and a few binder corners, but its gates are not met yet; see "Phase 6" in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Phase 7 has started: expression rewriting, filter pushdown, empty result pull-up and unused column removal are in, join ordering, statistics and subquery flattening are not; see "Phase 7" there. Phase 4 (types and casts) has started: the scalar casts, the nested types (LIST, ARRAY, STRUCT, MAP, UNION), `CREATE TYPE`, ENUM, BIT, BIGNUM and VARIANT are in, the last in its own in-memory encoding until Phase 9. What is left of the phase is GEOMETRY, which the plan defers. A first batch of Phase 5's functions is in too, because the type tests need them: `unnest`, `TRY(...)`, list slicing, the `list` aggregate, LIKE, and common string, list, map and interval helpers. Nested casts and functions run row by row for now. The engine runs CREATE TABLE, CREATE VIEW, CREATE SEQUENCE, CREATE MACRO, INSERT, prepared statements
 and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in memory. What exists today:
 
 - `crates/duckrs-common`: the core building blocks every other crate uses:
@@ -53,14 +53,14 @@ and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in me
   IS [NOT] NULL, BETWEEN, IN, CASE, COALESCE, `+`, `-`, `*`, `/`, `//`, `%`, casts between the numeric types, DECIMAL, BOOLEAN, the temporal types, INTERVAL, UUID, BLOB and VARCHAR,
   and aliases of the select list; and SET/RESET/`PRAGMA x = y` for all 196
   of DuckDB's settings (generated from its `settings.json` by `tools/generate_settings.py`), with
-  DuckDB's types and error messages. There is no optimizer yet, so a filter over a cross product
-  (`FROM a, b WHERE a.x = b.x`) really does build every pair until Phase 7. BEGIN, COMMIT and ROLLBACK work, but connections are not isolated from each other until Phase 10: what would need that fails as not yet ported. UNION, EXCEPT and INTERSECT (with ALL, and BY NAME) and non-recursive CTEs work, the CTEs inlined at each reference. Scalar, EXISTS, IN, ANY and ALL subqueries work, correlated too. They run as plans of their own: once if uncorrelated, and otherwise once per combination of correlated values, until flattening comes with the optimizer in Phase 7. Recursive CTEs run round by round, and LATERAL joins run their right side per combination of left values. UPDATE and DELETE work, with RETURNING, and rewrite the table at the end of the statement; until Phase 10 a statement that writes runs alone. SQL it does not
+  DuckDB's types and error messages. The optimizer turns a filter over a cross product
+  (`FROM a, b WHERE a.x = b.x`) into a join, but joins run in the order they were written until join ordering comes in Phase 7. BEGIN, COMMIT and ROLLBACK work, but connections are not isolated from each other until Phase 10: what would need that fails as not yet ported. UNION, EXCEPT and INTERSECT (with ALL, and BY NAME) and non-recursive CTEs work, the CTEs inlined at each reference. Scalar, EXISTS, IN, ANY and ALL subqueries work, correlated too. They run as plans of their own: once if uncorrelated, and otherwise once per combination of correlated values, until flattening comes in a later slice of Phase 7. Recursive CTEs run round by round, and LATERAL joins run their right side per combination of left values. UPDATE and DELETE work, with RETURNING, and rewrite the table at the end of the statement; until Phase 10 a statement that writes runs alone. SQL it does not
   run yet fails with an error saying it `is not yet ported to duckrs`; the sqllogictest runner
   never counts that error as the one a test expects.
 - `crates/duckrs`: the public API (`Database`, `Connection`, `QueryResult`) over the engine.
   Databases live in memory; a database file is accepted but not written until Phase 9.
 - `tools/sqllogictest`: a port of DuckDB's sqllogictest runner. It runs the DuckDB `.test` corpus
-  against duckrs, or against the C++ DuckDB library as a reference. duckrs passes 2210 files so far
+  against duckrs, or against the C++ DuckDB library as a reference. duckrs passes 2215 files so far
   (`tools/sqllogictest/known_passing.txt`, a CI gate), among them
   `test/sql/projection/test_simple_projection.test`.
 
@@ -104,9 +104,10 @@ cargo build --release -p sqllogictest --features reference
 
 Useful flags: `--slow` (include `.test_slow`), `-j N`, `--continue-on-failure` (count every
 passing statement instead of stopping a file at its first failure), `--passing-out` / `--known-passing`
-(the regression gate CI uses), and `--isolate` (run each file in a child process with a
+(the regression gate CI uses), `--diff-against unoptimized|reference` with `--diff-out FILE` (run every
+statement on a second engine and record where they differ), and `--isolate` (run each file in a child process with a
 `--timeout`, so an engine crash or hang fails one file instead of the whole run; use it for full
-runs, since until the optimizer exists some files really do build a cross product of 100M rows).
+runs, since some files still build very large intermediate results).
 
 ### Reference engine notes
 

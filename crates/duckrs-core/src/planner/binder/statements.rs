@@ -22,6 +22,7 @@ use crate::execution::expression_executor::evaluate_scalar;
 use crate::function::binder::expression_return_type;
 use crate::function::combine_types::{force_max_logical_type, normalize_type, try_max_logical_type};
 use crate::function::generic::is_unnest_call;
+use crate::optimizer::optimize;
 use crate::planner::column_binding_resolver::resolve_column_bindings;
 use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{
@@ -357,8 +358,9 @@ impl Binder<'_> {
             ));
         }
         let columns = (0..types.len()).map(Some).collect();
-        let mut recursive = self.cast_plan(recursive, &types, columns);
+        let recursive = self.cast_plan(recursive, &types, columns);
         let plan = if used.load(Ordering::Relaxed) || !key.is_empty() {
+            let mut recursive = optimize(recursive, self.options.optimizer);
             resolve_column_bindings(&mut recursive)?;
             LogicalOperator::new(
                 LogicalOperatorKind::RecursiveCte {

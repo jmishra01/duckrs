@@ -1,0 +1,91 @@
+// Ported from duckdb/src/optimizer/optimizer.cpp @ rust-port-baseline
+//
+//! The optimizer: passes that rewrite a logical plan into one with the same result. Each pass can
+//! be turned off with `disabled_optimizers`, under DuckDB's name for it, and all of them with
+//! `PRAGMA disable_optimizer`.
+//!
+//! Plans reach the optimizer before `resolve_column_bindings`. A subquery has a plan of its own,
+//! which the binder resolves, so it runs the optimizer on that plan itself.
+
+pub mod empty_result_pullup;
+pub mod filter_pushdown;
+pub mod rewriter;
+pub mod unused_columns;
+
+use crate::planner::expression::{BoundExpr, BoundExprKind};
+use crate::planner::logical::LogicalOperator;
+use duckrs_common::types::LogicalType;
+
+/// The passes that run (`enable_optimizer` and `disabled_optimizers`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OptimizerOptions {
+    pub expression_rewriter: bool,
+    pub filter_pushdown: bool,
+    pub empty_result_pullup: bool,
+    pub unused_columns: bool,
+}
+
+impl Default for OptimizerOptions {
+    fn default() -> Self {
+        Self {
+            expression_rewriter: true,
+            filter_pushdown: true,
+            empty_result_pullup: true,
+            unused_columns: true,
+        }
+    }
+}
+
+impl OptimizerOptions {
+    /// No pass runs.
+    pub fn none() -> Self {
+        Self {
+            expression_rewriter: false,
+            filter_pushdown: false,
+            empty_result_pullup: false,
+            unused_columns: false,
+        }
+    }
+
+    /// From the value of `disabled_optimizers`: names separated by commas.
+    pub fn from_disabled(disabled: &str) -> Self {
+        let off = |name: &str| disabled.split(',').any(|d| d.trim().eq_ignore_ascii_case(name));
+        Self {
+            expression_rewriter: !off("expression_rewriter"),
+            filter_pushdown: !off("filter_pushdown"),
+            empty_result_pullup: !off("empty_result_pullup"),
+            unused_columns: !off("unused_columns"),
+        }
+    }
+}
+
+/// `Optimizer::Optimize`, in DuckDB's order of these passes.
+pub fn optimize(mut plan: LogicalOperator, options: OptimizerOptions) -> LogicalOperator {
+    if options.expression_rewriter {
+        rewriter::rewrite_plan(&mut plan);
+    }
+    if options.filter_pushdown {
+        plan = filter_pushdown::push_down(plan);
+    }
+    if options.empty_result_pullup {
+        plan = empty_result_pullup::pull_up(plan);
+    }
+    if options.unused_columns {
+        unused_columns::remove_unused_columns(&mut plan);
+    }
+    plan
+}
+
+/// The conjunction of `expressions`, of which there is at least one.
+pub(crate) fn conjunction_of(mut expressions: Vec<BoundExpr>) -> BoundExpr {
+    if expressions.len() == 1 {
+        return expressions.remove(0);
+    }
+    BoundExpr::new(
+        BoundExprKind::Conjunction {
+            and: true,
+            children: expressions,
+        },
+        LogicalType::BOOLEAN,
+    )
+}
