@@ -148,6 +148,7 @@ impl FilterPushdown {
                 JoinType::Semi | JoinType::Anti => self.pushdown_semi_anti_join(op),
                 _ => self.finish_pushdown(op),
             },
+            LogicalOperatorKind::DelimJoin { .. } => self.pushdown_delim_join(op),
             LogicalOperatorKind::Projection { .. } => self.pushdown_projection(op),
             LogicalOperatorKind::Union { .. } | LogicalOperatorKind::ExceptIntersect { .. } => {
                 self.pushdown_set_operation(op)
@@ -162,6 +163,21 @@ impl FilterPushdown {
             LogicalOperatorKind::Unnest { .. } => self.pushdown_unnest(op),
             _ => self.finish_pushdown(op),
         }
+    }
+
+    /// `PushdownMarkJoin` and `PushdownSingleJoin`: each left row stays, once, so what reads only
+    /// the left side can go there, which also makes the domain smaller.
+    fn pushdown_delim_join(self, mut op: LogicalOperator) -> LogicalOperator {
+        let left_tables = plan_tables(&op.children[0]);
+        let (left, rest): (Vec<_>, Vec<_>) = self
+            .filters
+            .into_iter()
+            .partition(|f| !f.tables.is_empty() && f.tables.is_subset(&left_tables));
+        let right = op.children.pop().expect("a join has two children");
+        let left_child = op.children.pop().expect("a join has two children");
+        op.children.push(FilterPushdown { filters: left }.rewrite(left_child));
+        op.children.push(FilterPushdown::default().rewrite(right));
+        FilterPushdown { filters: rest }.push_final_filters(op)
     }
 
     /// `FilterPushdown::PushFinalFilters`.

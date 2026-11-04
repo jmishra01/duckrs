@@ -857,6 +857,8 @@ fn explain_logical(op: &LogicalOperator) -> String {
             K::ExceptIntersect { .. } => "INTERSECT".to_string(),
             K::RecursiveCte { .. } => "REC_CTE".to_string(),
             K::WorkingTable { .. } => "CTE_SCAN".to_string(),
+            K::DelimGet { .. } => "DELIM_GET".to_string(),
+            K::DelimJoin { join_type, .. } => format!("DELIM_JOIN {}", join_type.name()),
             K::LateralJoin { .. } => "DEPENDENT_JOIN".to_string(),
             K::Projection { .. } => "PROJECTION".to_string(),
             K::CrossProduct => "CROSS_PRODUCT".to_string(),
@@ -3026,6 +3028,103 @@ mod tests {
             err(&mut context, "SELECT (SELECT nope FROM b) FROM a"),
             "Binder Error: Referenced column \"nope\" not found in FROM clause!\nCandidate bindings: \"y\""
         );
+    }
+
+    #[test]
+    fn flattened_subqueries_match_duckdb() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        run(&mut context, "CREATE TABLE a (x INTEGER, k INTEGER)");
+        run(&mut context, "CREATE TABLE b (y INTEGER, k INTEGER)");
+        run(&mut context, "INSERT INTO a VALUES (1, 1), (2, 1), (3, 2), (NULL, 3)");
+        run(&mut context, "INSERT INTO b VALUES (10, 1), (20, 1), (30, 2)");
+        let explained = run(
+            &mut context,
+            "EXPLAIN SELECT x FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)",
+        );
+        assert!(explained[0][1].contains("LEFT_DELIM_JOIN"), "{explained:?}");
+        // the left rows keep their order
+        assert_eq!(
+            run(&mut context, "SELECT x, (SELECT sum(y) FROM b WHERE b.k = a.k) FROM a"),
+            [["1", "30"], ["2", "30"], ["3", "30"], ["NULL", "NULL"]]
+        );
+        // a value without rows still gets what the aggregate gives for no rows
+        assert_eq!(
+            run(
+                &mut context,
+                "SELECT x, (SELECT count(*) FROM b WHERE b.k = a.k) FROM a"
+            ),
+            [["1", "2"], ["2", "2"], ["3", "1"], ["NULL", "0"]]
+        );
+        // LIMIT and OFFSET hold per value
+        assert_eq!(
+            run(
+                &mut context,
+                "SELECT x, (SELECT y FROM b WHERE b.k = a.k ORDER BY y DESC LIMIT 1) FROM a"
+            ),
+            [["1", "20"], ["2", "20"], ["3", "30"], ["NULL", "NULL"]]
+        );
+        assert_eq!(
+            run(
+                &mut context,
+                "SELECT x, (SELECT y FROM b WHERE b.k = a.k ORDER BY y DESC LIMIT 1 OFFSET 1) FROM a"
+            ),
+            [["1", "10"], ["2", "10"], ["3", "NULL"], ["NULL", "NULL"]]
+        );
+        // set operations carry the values along
+        assert_eq!(
+            run(
+                &mut context,
+                "SELECT x, (SELECT sum(v) FROM (SELECT y AS v FROM b WHERE b.k = a.k UNION ALL SELECT a.x) s) FROM a"
+            ),
+            [["1", "31"], ["2", "32"], ["3", "33"], ["NULL", "NULL"]]
+        );
+        // nested: the inner one reads the middle query, or the outer one, which stays row by row
+        for inner in ["b2.k = b.k", "b2.k = a.k"] {
+            let sql = format!(
+                "SELECT x FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.y = \
+                 (SELECT max(b2.y) FROM b b2 WHERE {inner}))"
+            );
+            assert_eq!(run(&mut context, &sql), [["1"], ["2"], ["3"]]);
+        }
+        // NULLs are equal in the domain
+        run(&mut context, "CREATE TABLE n (k INTEGER)");
+        run(&mut context, "INSERT INTO n VALUES (1), (NULL)");
+        assert_eq!(
+            run(&mut context, "SELECT k, (SELECT 42 WHERE n.k IS NULL) FROM n"),
+            [["1", "NULL"], ["NULL", "42"]]
+        );
+        // ANY: TRUE, NULL for a NULL among the rows or as the value, and FALSE, also for no rows
+        run(&mut context, "CREATE TABLE c (k INTEGER, v INTEGER)");
+        run(&mut context, "INSERT INTO c VALUES (1, NULL), (1, 5), (2, 6)");
+        run(&mut context, "CREATE TABLE l (x INTEGER, k INTEGER)");
+        run(
+            &mut context,
+            "INSERT INTO l VALUES (5, 1), (7, 1), (7, 2), (NULL, 2), (1, 3)",
+        );
+        assert_eq!(
+            run(&mut context, "SELECT x IN (SELECT v FROM c WHERE c.k = l.k) FROM l"),
+            [["true"], ["NULL"], ["false"], ["NULL"], ["false"]]
+        );
+        // more than one row
+        let error = context
+            .query("SELECT (SELECT y FROM b WHERE b.k = a.k) FROM a")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("More than one row returned by a subquery"), "{error}");
+        run(&mut context, "SET scalar_subquery_error_on_multiple_rows = false");
+        assert_eq!(
+            run(
+                &mut context,
+                "SELECT x, (SELECT y FROM b WHERE b.k = a.k) FROM a WHERE x = 3"
+            ),
+            [["3", "30"]]
+        );
+        // an operator that reads its child by position does not see the columns of the join
+        run(
+            &mut context,
+            "DELETE FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.y > 20)",
+        );
+        assert_eq!(run(&mut context, "SELECT x FROM a"), [["1"], ["2"], ["NULL"]]);
     }
 
     #[test]

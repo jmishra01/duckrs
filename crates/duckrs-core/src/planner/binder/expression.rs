@@ -21,6 +21,7 @@ use crate::planner::column_binding_resolver::resolve_column_bindings;
 use crate::planner::expression::{
     BoundExpr, BoundExprKind, BoundOperator, BoundSubquery, ColumnBinding, SequenceOp, SubqueryKind,
 };
+use crate::planner::subquery::flatten_subqueries;
 use duckrs_common::string_util::similarity_rating;
 use duckrs_common::types::{LogicalType, LogicalTypeId, bignum, bit, decimal};
 use duckrs_common::value::{Value, ValueData};
@@ -648,6 +649,9 @@ impl Binder<'_> {
                 )
             }
         };
+        let mut plan = plan;
+        flatten_subqueries(&mut plan, &mut self.next_table_index);
+        let raw = plan.clone();
         let mut plan = optimize(plan, self.options.optimizer);
         resolve_column_bindings(&mut plan)?;
         let volatile = plan.is_volatile();
@@ -656,6 +660,7 @@ impl Binder<'_> {
                 subquery: Arc::new(BoundSubquery {
                     kind,
                     plan,
+                    raw: (!volatile).then_some(raw),
                     correlated: bindings,
                     volatile,
                     error_on_multiple_rows: self.options.scalar_subquery_error,

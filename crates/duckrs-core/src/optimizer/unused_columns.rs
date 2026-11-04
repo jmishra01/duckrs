@@ -43,7 +43,7 @@ fn visit(op: &mut LogicalOperator, by_position: bool, used: &mut HashSet<ColumnB
     for expr in op.expressions_mut() {
         collect_columns(expr, used);
     }
-    if let K::Join { conditions, .. } = &op.kind {
+    if let K::Join { conditions, .. } | K::DelimJoin { conditions, .. } = &op.kind {
         for condition in conditions {
             collect_columns(&condition.left, used);
             collect_columns(&condition.right, used);

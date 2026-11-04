@@ -776,6 +776,12 @@ impl<'a> Binder<'a> {
 
     /// `Planner::CreatePlan`: binds and plans one statement.
     pub fn bind(&mut self, statement: &Statement) -> Result<BoundStatement> {
+        let mut bound = self.bind_statement(statement)?;
+        crate::planner::subquery::flatten_subqueries(&mut bound.plan, &mut self.next_table_index);
+        Ok(bound)
+    }
+
+    fn bind_statement(&mut self, statement: &Statement) -> Result<BoundStatement> {
         match statement {
             Statement::Select(select) => self.bind_select_statement(select),
             Statement::Insert(insert) => self.bind_insert(insert),

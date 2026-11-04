@@ -32,7 +32,9 @@ pub fn rewrite_plan(op: &mut LogicalOperator) {
     for expr in op.expressions_mut() {
         rewrite_expression(expr, is_filter);
     }
-    if let LogicalOperatorKind::Join { conditions, .. } = &mut op.kind {
+    if let LogicalOperatorKind::Join { conditions, .. } | LogicalOperatorKind::DelimJoin { conditions, .. } =
+        &mut op.kind
+    {
         for condition in conditions {
             rewrite_expression(&mut condition.left, false);
             rewrite_expression(&mut condition.right, false);

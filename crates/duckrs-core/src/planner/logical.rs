@@ -117,8 +117,29 @@ pub enum LogicalOperatorKind {
         types: Vec<LogicalType>,
         working: Arc<Mutex<ColumnDataCollection>>,
     },
+    /// `LogicalDelimGet`: the distinct values of the correlated columns of a `DelimJoin` around it.
+    DelimGet {
+        table_index: usize,
+        types: Vec<LogicalType>,
+        delim: Arc<Mutex<ColumnDataCollection>>,
+    },
+    /// `LogicalComparisonJoin` of type DELIM_JOIN: a flattened subquery. The left side is gathered,
+    /// the distinct values of the left sides of `conditions` go into `delim`, and then the right
+    /// side runs, which reads them through `DelimGet`. All left rows stay, in their order, each
+    /// with either the one right row it matches (SINGLE) or a BOOLEAN (MARK, in `mark_index`) for
+    /// whether `predicate` holds for its right rows.
+    DelimJoin {
+        join_type: JoinType,
+        conditions: Vec<JoinCondition>,
+        predicate: Option<BoundExpr>,
+        delim: Arc<Mutex<ColumnDataCollection>>,
+        mark_index: Option<usize>,
+        /// `scalar_subquery_error_on_multiple_rows`
+        error_on_multiple_rows: bool,
+    },
     /// A join whose right side reads columns of its left side: `right` runs for each combination
-    /// of values of `correlated`, as constants for the columns `bindings`. DuckDB flattens these.
+    /// of values of `correlated`, as constants for the columns `bindings`. DuckDB flattens these,
+    /// which `planner::subquery` does not do yet.
     LateralJoin {
         join_type: JoinType,
         right: Box<LogicalOperator>,
@@ -283,7 +304,7 @@ impl LogicalOperator {
             expr.substitute_columns(columns);
         }
         match &mut self.kind {
-            LogicalOperatorKind::Join { conditions, .. } => {
+            LogicalOperatorKind::Join { conditions, .. } | LogicalOperatorKind::DelimJoin { conditions, .. } => {
                 for condition in conditions {
                     condition.left.substitute_columns(columns);
                     condition.right.substitute_columns(columns);
@@ -302,7 +323,7 @@ impl LogicalOperator {
     }
 
     /// Every expression of this plan, in the operators below too.
-    fn visit_expressions(&mut self, f: &mut impl FnMut(&mut BoundExpr)) {
+    pub(crate) fn visit_expressions(&mut self, f: &mut impl FnMut(&mut BoundExpr)) {
         for child in &mut self.children {
             child.visit_expressions(f);
         }
@@ -310,7 +331,9 @@ impl LogicalOperator {
             expr.walk_mut(f);
         }
         match &mut self.kind {
-            LogicalOperatorKind::Join { conditions, .. } | LogicalOperatorKind::AsOfJoin { conditions, .. } => {
+            LogicalOperatorKind::Join { conditions, .. }
+            | LogicalOperatorKind::DelimJoin { conditions, .. }
+            | LogicalOperatorKind::AsOfJoin { conditions, .. } => {
                 for condition in conditions {
                     condition.left.walk_mut(f);
                     condition.right.walk_mut(f);
@@ -411,7 +434,16 @@ impl LogicalOperator {
             LogicalOperatorKind::Union { types, .. }
             | LogicalOperatorKind::ExceptIntersect { types, .. }
             | LogicalOperatorKind::RecursiveCte { types, .. }
-            | LogicalOperatorKind::WorkingTable { types, .. } => types.clone(),
+            | LogicalOperatorKind::WorkingTable { types, .. }
+            | LogicalOperatorKind::DelimGet { types, .. } => types.clone(),
+            LogicalOperatorKind::DelimJoin { mark_index, .. } => {
+                let mut types = self.children[0].types();
+                match mark_index {
+                    Some(_) => types.push(LogicalType::BOOLEAN),
+                    None => types.extend(self.children[1].types()),
+                }
+                types
+            }
             LogicalOperatorKind::LateralJoin { right, .. } => {
                 let mut types = self.children[0].types();
                 types.extend(right.types());
@@ -535,7 +567,16 @@ impl LogicalOperator {
             LogicalOperatorKind::Union { table_index, types }
             | LogicalOperatorKind::ExceptIntersect { table_index, types, .. }
             | LogicalOperatorKind::RecursiveCte { table_index, types, .. }
-            | LogicalOperatorKind::WorkingTable { table_index, types, .. } => numbered(*table_index, types.len()),
+            | LogicalOperatorKind::WorkingTable { table_index, types, .. }
+            | LogicalOperatorKind::DelimGet { table_index, types, .. } => numbered(*table_index, types.len()),
+            LogicalOperatorKind::DelimJoin { mark_index, .. } => {
+                let mut bindings = self.children[0].column_bindings();
+                match mark_index {
+                    Some(index) => bindings.push(ColumnBinding::new(*index, 0)),
+                    None => bindings.extend(self.children[1].column_bindings()),
+                }
+                bindings
+            }
             LogicalOperatorKind::LateralJoin { right, .. } => {
                 let mut bindings = self.children[0].column_bindings();
                 bindings.extend(right.column_bindings());
@@ -609,7 +650,9 @@ impl LogicalOperator {
             }
             LogicalOperatorKind::ExpressionGet { expressions, .. } => expressions.iter_mut().flatten().collect(),
             // the join conditions read one child each, see `resolve_column_bindings`
-            LogicalOperatorKind::Join { predicate, .. } => predicate.iter_mut().collect(),
+            LogicalOperatorKind::Join { predicate, .. } | LogicalOperatorKind::DelimJoin { predicate, .. } => {
+                predicate.iter_mut().collect()
+            }
             _ => Vec::new(),
         }
     }

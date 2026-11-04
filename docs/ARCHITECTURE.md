@@ -183,6 +183,16 @@ while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` 
 - **Filter pushdown:** through aggregates, cross products (which become joins), inner, left, semi
   and anti joins, projections, set operations, DISTINCT and UNNEST. A filter that is always false
   empties the plan, and **empty result pull-up** carries that upward.
+- **Subquery flattening** (`planner/subquery.rs`) runs at the end of binding, before the optimizer.
+  A correlated subquery in a filter or a projection becomes a `DelimJoin`: the left side is
+  gathered, its distinct correlated values go into the right side through `DelimGet`, and a hash
+  join on those values follows. It is SINGLE for a scalar and MARK for EXISTS and ANY, and keeps the
+  left rows in order. `BoundSubquery::raw` keeps the plan as it was bound for this, next to the
+  resolved `plan`. What cannot be flattened stays an expression that runs per combination of
+  correlated values: subqueries in other operators or under TRY, volatile ones, ones reading a
+  column of a query further out, and plans with an operator `push` has no rule for (VALUES with
+  correlated columns, FULL joins, grouping sets with an empty set, LIMIT with a percentage, SAMPLE,
+  ASOF, recursive CTEs). C++ decorrelates nearly all of those. LATERAL joins are not flattened yet.
 - **Unused columns** become typed NULL constants instead of going away, which keeps column
   bindings stable: subquery plans refer to outer columns by binding. Scans keep all their columns,
   because in-memory scans clone `Arc`s and pruning them would gain nothing.
@@ -193,8 +203,9 @@ can fail: below, `a::int < b::int` would run ahead of the filter that guards tho
 
 Not ported yet: join order, statistics, `FilterCombiner` beyond splitting, deduplicating and
 deciding constants, transitive filters, MoveConstants, ConstantOrderNormalization, `x * 0`,
-pushdown through outer, right, mark, ASOF and window operators, CheckMarkToSemi and subquery
-flattening. The gate is not met: `test/optimizer` is at 41.3% against 80%, and TPC-H and TPC-DS do
+pushdown through outer, right, mark, ASOF and window operators, CheckMarkToSemi, the deliminator,
+and flattening of the cases above, the extremum rewrite of `> ANY` among them. MARK joins with a
+predicate check each pair of a key's rows, where C++ hashes on the comparison. The gate is not met: `test/optimizer` is at 41.3% against 80%, and TPC-H and TPC-DS do
 not run yet.
 
 ## Testing

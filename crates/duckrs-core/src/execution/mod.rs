@@ -162,6 +162,23 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             types, children, union_all, working, recurring, key, *recursive,
         )),
         LogicalOperatorKind::WorkingTable { working, .. } => Box::new(PhysicalWorkingTable { types, working }),
+        LogicalOperatorKind::DelimGet { delim, .. } => Box::new(PhysicalWorkingTable { types, working: delim }),
+        LogicalOperatorKind::DelimJoin {
+            join_type,
+            conditions,
+            predicate,
+            delim,
+            error_on_multiple_rows,
+            ..
+        } => Box::new(special_joins::PhysicalDelimJoin::new(
+            types,
+            join_type,
+            conditions,
+            predicate,
+            delim,
+            error_on_multiple_rows,
+            children,
+        )),
         LogicalOperatorKind::LateralJoin {
             join_type,
             right,
@@ -276,6 +293,8 @@ struct Pipeline<'a> {
     sink: &'a dyn PhysicalOperator,
     /// which of the sink's children this pipeline comes from
     input: usize,
+    /// the last pipeline of this input of the sink
+    finish_input: bool,
     finalize: bool,
 }
 
@@ -315,6 +334,9 @@ impl Pipeline<'_> {
                 break;
             }
         }
+        if self.finish_input {
+            self.sink.finish_input(self.input)?;
+        }
         if self.finalize {
             self.sink.finalize()?;
         }
@@ -352,6 +374,7 @@ fn build_pipelines<'a>(sink: &'a dyn PhysicalOperator, pipelines: &mut Vec<Pipel
                 operators: operators[position + 1..].to_vec(),
                 sink,
                 input,
+                finish_input: false,
                 finalize: false,
             })
             .collect();
@@ -360,9 +383,11 @@ fn build_pipelines<'a>(sink: &'a dyn PhysicalOperator, pipelines: &mut Vec<Pipel
             operators,
             sink,
             input,
+            finish_input: false,
             finalize: false,
         });
         pipelines.extend(unmatched);
+        pipelines.last_mut().expect("just added").finish_input = true;
     }
     pipelines.last_mut().expect("just added").finalize = true;
 }

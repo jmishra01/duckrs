@@ -66,13 +66,17 @@ pub enum SubqueryKind {
 }
 
 /// A subquery (`BoundSubqueryExpression`). DuckDB plans it into the query with a join, which
-/// for a correlated one takes flattening it. Here it stays a plan of its own, which runs once
-/// for each combination of values of its correlated columns, with them as constants.
+/// for a correlated one takes flattening it. `planner::subquery` does that where it can. The rest
+/// stay a plan of their own, which runs once for each combination of values of its correlated
+/// columns, with them as constants.
 #[derive(Debug)]
 pub struct BoundSubquery {
     pub kind: SubqueryKind,
     /// has its column bindings resolved; correlated columns stay
     pub plan: LogicalOperator,
+    /// the plan before the optimizer and resolving bindings, to flatten it into the query around
+    /// it; `None` if that is not an option
+    pub raw: Option<LogicalOperator>,
     /// the correlated columns, as the plan refers to them
     pub correlated: Vec<ColumnBinding>,
     /// a volatile plan runs for every row, and not per combination of correlated values
@@ -404,6 +408,7 @@ impl BoundExpr {
                 *subquery = Arc::new(BoundSubquery {
                     kind: subquery.kind,
                     plan,
+                    raw: None,
                     correlated: subquery.correlated.clone(),
                     volatile: subquery.volatile,
                     error_on_multiple_rows: subquery.error_on_multiple_rows,

@@ -5,3 +5,4 @@ pub mod binder;
 pub mod column_binding_resolver;
 pub mod expression;
 pub mod logical;
+pub mod subquery;

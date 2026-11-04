@@ -1916,6 +1916,7 @@ test/sql/types/nested/array/array_case.test
 test/sql/types/nested/array/array_cast.test
 test/sql/types/nested/array/array_coverage.test
 test/sql/types/nested/array/array_fuzzer_failures.test
+test/sql/types/nested/array/array_join_gather.test
 test/sql/types/nested/array/array_joins.test
 test/sql/types/nested/array/array_joins_2.test
 test/sql/types/nested/array/array_large.test

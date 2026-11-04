@@ -5,16 +5,22 @@
 //! right side's rows and work row by row: the morsel-wise versions come with Phase 8.
 
 use super::expression_executor::execute;
-use super::physical::{OperatorResult, OperatorState, PhysicalOperator, SourceState, check_buffered_rows, group_keys};
+use super::join::PhysicalJoin;
+use super::physical::{
+    OperatorResult, OperatorState, PhysicalEmptyResult, PhysicalOperator, SourceState, check_buffered,
+    check_buffered_rows, group_keys,
+};
 use crate::planner::expression::BoundExpr;
 use crate::planner::logical::JoinCondition;
+use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, SelectionVector, Vector};
 use duckrs_common::{Result, STANDARD_VECTOR_SIZE};
 use duckrs_parser::ast::{ComparisonOp, JoinType};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 fn row_values(chunk: &DataChunk, row: usize) -> Vec<Value> {
     chunk.columns().iter().map(|c| c.get_value(row)).collect()
@@ -361,5 +367,153 @@ impl PhysicalOperator for PhysicalMarkJoin {
             output.append_row(&values)?;
         }
         Ok((output, OperatorResult::NeedMoreInput))
+    }
+}
+
+/// `PhysicalLeftDelimJoin`: gathers the left side, hands the distinct values of its join keys to the
+/// right side, and then runs `join` with its rows. The inputs are two pipelines in that order, and
+/// the left rows come out as a source, since all of them have to be there before the right side
+/// starts.
+#[derive(Debug)]
+pub struct PhysicalDelimJoin {
+    pub types: Vec<LogicalType>,
+    pub children: Vec<Box<dyn PhysicalOperator>>,
+    pub join: PhysicalJoin,
+    pub left: Mutex<ColumnDataCollection>,
+    pub delim: Arc<Mutex<ColumnDataCollection>>,
+}
+
+/// Where the source is: the left chunk `join` is at, and the state of `join` in that chunk.
+struct DelimJoinSource {
+    chunk: usize,
+    state: OperatorState,
+}
+
+impl PhysicalDelimJoin {
+    pub fn new(
+        types: Vec<LogicalType>,
+        join_type: JoinType,
+        conditions: Vec<JoinCondition>,
+        predicate: Option<BoundExpr>,
+        delim: Arc<Mutex<ColumnDataCollection>>,
+        error_on_multiple_rows: bool,
+        children: Vec<Box<dyn PhysicalOperator>>,
+    ) -> Self {
+        // `join` is fed from here, so it only needs to know the types of its children
+        let stub = |child: &dyn PhysicalOperator| -> Box<dyn PhysicalOperator> {
+            Box::new(PhysicalEmptyResult {
+                types: child.types().to_vec(),
+            })
+        };
+        let stubs = vec![stub(children[0].as_ref()), stub(children[1].as_ref())];
+        let mut join = PhysicalJoin::new(types.clone(), join_type, conditions, predicate, stubs);
+        join.error_on_multiple_rows = error_on_multiple_rows;
+        let left = Mutex::new(ColumnDataCollection::new(children[0].types().to_vec()));
+        Self {
+            types,
+            children,
+            join,
+            left,
+            delim,
+        }
+    }
+}
+
+impl PhysicalOperator for PhysicalDelimJoin {
+    fn explain_details(&self) -> Vec<String> {
+        vec![format!("Join Type: {}", self.join.join_type.name())]
+    }
+    fn name(&self) -> &'static str {
+        "LEFT_DELIM_JOIN"
+    }
+    fn types(&self) -> &[LogicalType] {
+        &self.types
+    }
+    fn children(&self) -> &[Box<dyn PhysicalOperator>] {
+        &self.children
+    }
+    fn is_sink(&self) -> bool {
+        true
+    }
+    fn sink_children(&self) -> Vec<usize> {
+        vec![0, 1]
+    }
+    fn sink(&self, _chunk: &DataChunk) -> Result<()> {
+        unreachable!("the inputs of a delim join go through sink_input")
+    }
+    fn sink_input(&self, input: usize, chunk: &DataChunk) -> Result<()> {
+        if input == 1 {
+            return self.join.sink(chunk);
+        }
+        let mut left = self.left.lock();
+        left.append(chunk);
+        check_buffered(&left)
+    }
+    fn finish_input(&self, input: usize) -> Result<()> {
+        if input != 0 {
+            return Ok(());
+        }
+        let left = self.left.lock();
+        let types: Vec<LogicalType> = self
+            .join
+            .conditions
+            .iter()
+            .map(|c| c.left.return_type.clone())
+            .collect();
+        let mut distinct = ColumnDataCollection::new(types);
+        let mut seen = HashSet::new();
+        for index in 0..left.chunk_count() {
+            let chunk = left.chunk(index);
+            let columns = self
+                .join
+                .conditions
+                .iter()
+                .map(|c| execute(&c.left, chunk))
+                .collect::<Result<Vec<_>>>()?;
+            let references: Vec<&Vector> = columns.iter().collect();
+            let rows: Vec<u32> = group_keys(&references, chunk.len())?
+                .into_iter()
+                .enumerate()
+                .filter(|(_, key)| seen.insert(key.clone()))
+                .map(|(row, _)| row as u32)
+                .collect();
+            if rows.is_empty() {
+                continue;
+            }
+            let count = rows.len();
+            let mut keys = DataChunk::from_columns(columns, chunk.len());
+            keys.slice(&SelectionVector::from_vec(rows), count);
+            distinct.append(&keys);
+        }
+        *self.delim.lock() = distinct;
+        Ok(())
+    }
+    fn finalize(&self) -> Result<()> {
+        self.join.finalize()
+    }
+    fn is_source(&self) -> bool {
+        true
+    }
+    fn source_state(&self) -> SourceState {
+        Box::new(DelimJoinSource {
+            chunk: 0,
+            state: self.join.operator_state(),
+        })
+    }
+    fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
+        let source = state.downcast_mut::<DelimJoinSource>().expect("delim join state");
+        let left = self.left.lock();
+        while source.chunk < left.chunk_count() {
+            let (output, result) = self
+                .join
+                .execute_stateful(left.chunk(source.chunk), &mut source.state)?;
+            if result == OperatorResult::NeedMoreInput {
+                source.chunk += 1;
+            }
+            if !output.is_empty() {
+                return Ok(Some(output));
+            }
+        }
+        Ok(None)
     }
 }

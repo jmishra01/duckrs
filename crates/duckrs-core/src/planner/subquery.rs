@@ -1,0 +1,759 @@
+// Ported from duckdb/src/planner/subquery/flatten_dependent_join.cpp,
+// duckdb/src/planner/subquery/rewrite_correlated_expressions.cpp and
+// duckdb/src/planner/binder/query_node/plan_subquery.cpp @ rust-port-baseline
+//
+//! Flattening correlated subqueries ("Unnesting Arbitrary Subqueries"): a subquery in a filter or a
+//! projection becomes a duplicate eliminated join. The distinct values of its correlated columns
+//! (the domain) go into the subquery through `DelimGet`, down to where the plan stops depending on
+//! the query around it, and the subquery then runs once for all of them.
+//!
+//! This covers less than C++, and what it does not cover keeps working: a subquery that cannot be
+//! flattened stays an expression, which runs its own plan per combination of correlated values. So
+//! a case here gives up with [`Unsupported`], where C++ handles it or raises an error. That is the
+//! case for subqueries in other operators or under TRY, volatile ones, columns of a query further
+//! out, and operators that `push` has no rule for.
+
+use super::column_binding_resolver::resolve_column_bindings;
+use super::expression::{BoundExpr, BoundExprKind, BoundOperator, BoundSubquery, BoundWindow, ColumnBinding};
+use super::expression::{SubqueryKind, WindowFunction};
+use super::logical::{JoinCondition, LogicalOperator, LogicalOperatorKind as K};
+use crate::execution::run_plan;
+use crate::function::BuiltinFunctions;
+use crate::function::binder::bind_aggregate_function;
+use crate::optimizer::conjunction_of;
+use duckrs_common::column_data::ColumnDataCollection;
+use duckrs_common::types::LogicalType;
+use duckrs_common::value::Value;
+use duckrs_parser::ast::{ComparisonOp, JoinType, WindowBoundary, WindowExclude};
+use parking_lot::Mutex;
+use std::sync::Arc;
+
+/// This subquery stays an expression.
+struct Unsupported;
+
+type Flat<T> = std::result::Result<T, Unsupported>;
+
+fn numbered(table_index: usize, offset: usize, count: usize) -> Vec<ColumnBinding> {
+    (offset..offset + count)
+        .map(|i| ColumnBinding::new(table_index, i))
+        .collect()
+}
+
+/// Flattens the subqueries of a plan. Its output stays what it was.
+pub fn flatten_subqueries(plan: &mut LogicalOperator, next_table_index: &mut usize) {
+    let bindings = plan.column_bindings();
+    let types = plan.types();
+    flatten_operator(plan, next_table_index);
+    restore_output(plan, bindings, types, next_table_index);
+}
+
+/// A join below adds columns at the end of the output. Most operators read their child through
+/// bindings, and the others get a projection that takes the added columns off again.
+fn restore_output(
+    plan: &mut LogicalOperator,
+    bindings: Vec<ColumnBinding>,
+    types: Vec<LogicalType>,
+    next_table_index: &mut usize,
+) {
+    if plan.column_bindings().len() == bindings.len() {
+        return;
+    }
+    let expressions = bindings
+        .into_iter()
+        .zip(types)
+        .map(|(binding, ty)| BoundExpr::column_ref(binding, ty, ""))
+        .collect();
+    let table_index = take_index(next_table_index);
+    let child = std::mem::replace(plan, LogicalOperator::new(K::CrossProduct, Vec::new()));
+    *plan = LogicalOperator::new(
+        K::Projection {
+            table_index,
+            expressions,
+        },
+        vec![child],
+    );
+}
+
+fn take_index(next_table_index: &mut usize) -> usize {
+    let index = *next_table_index;
+    *next_table_index += 1;
+    index
+}
+
+fn flatten_operator(op: &mut LogicalOperator, next_table_index: &mut usize) {
+    let by_binding = matches!(
+        op.kind,
+        K::Filter { .. }
+            | K::Projection { .. }
+            | K::Aggregate { .. }
+            | K::Order { .. }
+            | K::Limit { .. }
+            | K::LimitPercent { .. }
+            | K::Sample { .. }
+            | K::Window { .. }
+            | K::Distinct { .. }
+            | K::Unnest { .. }
+            | K::CrossProduct
+            | K::Join { .. }
+            | K::DelimJoin { .. }
+            | K::MarkJoin { .. }
+            | K::AsOfJoin { .. }
+            | K::LateralJoin { .. }
+    );
+    for child in &mut op.children {
+        let bindings = child.column_bindings();
+        let types = child.types();
+        flatten_operator(child, next_table_index);
+        if !by_binding {
+            restore_output(child, bindings, types, next_table_index);
+        }
+    }
+    if let K::LateralJoin { right, .. } = &mut op.kind {
+        flatten_subqueries(right, next_table_index);
+    }
+    if op.children.len() != 1 {
+        return;
+    }
+    if let K::Filter { expressions } | K::Projection { expressions, .. } = &mut op.kind {
+        for expr in expressions {
+            flatten_expression(expr, &mut op.children[0], next_table_index);
+        }
+    }
+}
+
+/// `Binder::PlanSubqueries`: `left` is the child of the operator `expr` belongs to.
+fn flatten_expression(expr: &mut BoundExpr, left: &mut LogicalOperator, next_table_index: &mut usize) {
+    // TRY runs a failed chunk again row by row, and a lambda has parameters for columns
+    if matches!(
+        expr.kind,
+        BoundExprKind::Operator {
+            op: BoundOperator::Try,
+            ..
+        } | BoundExprKind::ListLambda { .. }
+    ) {
+        return;
+    }
+    for child in expr.children_mut() {
+        flatten_expression(child, left, next_table_index);
+    }
+    if let Ok(flattened) = flatten_subquery(expr, left, next_table_index) {
+        *expr = flattened;
+    }
+}
+
+/// Whether an expression can run on the output of `left`.
+fn is_local(expr: &BoundExpr, bindings: &[ColumnBinding]) -> bool {
+    match &expr.kind {
+        BoundExprKind::ColumnRef { binding, depth } => *depth == 0 && bindings.contains(binding),
+        BoundExprKind::Subquery { .. } => false,
+        _ => expr.children().into_iter().all(|child| is_local(child, bindings)),
+    }
+}
+
+/// `PlanCorrelatedSubquery`: puts the join on top of `left`, and gives what stands in for `expr`.
+fn flatten_subquery(expr: &BoundExpr, left: &mut LogicalOperator, next_table_index: &mut usize) -> Flat<BoundExpr> {
+    let BoundExprKind::Subquery {
+        subquery,
+        child,
+        correlated,
+    } = &expr.kind
+    else {
+        return Err(Unsupported);
+    };
+    let BoundSubquery {
+        kind,
+        raw: Some(raw),
+        correlated: bindings,
+        volatile: false,
+        error_on_multiple_rows,
+        ..
+    } = subquery.as_ref()
+    else {
+        return Err(Unsupported);
+    };
+    let left_bindings = left.column_bindings();
+    if correlated.is_empty()
+        || !correlated.iter().all(|c| is_local(c, &left_bindings))
+        || !child.iter().all(|c| is_local(c, &left_bindings))
+    {
+        return Err(Unsupported);
+    }
+    let mut right = raw.clone();
+    let output = right.column_bindings()[0];
+    let output_type = right.types()[0].clone();
+    let domain: Vec<(ColumnBinding, LogicalType)> = bindings
+        .iter()
+        .zip(correlated)
+        .map(|(binding, value)| (*binding, value.return_type.clone()))
+        .collect();
+    let types = domain.iter().map(|(_, ty)| ty.clone()).collect::<Vec<_>>();
+    let delim = Arc::new(Mutex::new(ColumnDataCollection::new(types)));
+    let mut flatten = Flatten {
+        domain,
+        delim: delim.clone(),
+        next_table_index,
+        empty_values: Vec::new(),
+    };
+    let state = flatten.push(&mut right)?;
+    flatten.apply_empty_values(&mut right);
+    if flatten.reads_domain(&mut right) {
+        return Err(Unsupported);
+    }
+    // a copy of a subquery that is flattened already has the same bindings as that one
+    let right_bindings = right.column_bindings();
+    if right_bindings.iter().any(|b| left_bindings.contains(b)) {
+        return Err(Unsupported);
+    }
+    let result_value = flatten.empty_value_of(output, &expr.return_type);
+    let conditions = correlated
+        .iter()
+        .zip(&state)
+        .map(|(value, binding)| JoinCondition {
+            left: value.clone(),
+            right: BoundExpr::column_ref(*binding, value.return_type.clone(), ""),
+            null_safe: true,
+        })
+        .collect();
+    let (join_type, mark_index, predicate) = match kind {
+        SubqueryKind::Scalar => (JoinType::Single, None, None),
+        SubqueryKind::Exists => (JoinType::Mark, Some(take_index(next_table_index)), None),
+        SubqueryKind::Any(op) => {
+            let Some(child) = child else {
+                return Err(Unsupported);
+            };
+            let comparison = BoundExpr::new(
+                BoundExprKind::Comparison {
+                    op: *op,
+                    left: child.clone(),
+                    right: Box::new(BoundExpr::column_ref(output, output_type, "")),
+                },
+                LogicalType::BOOLEAN,
+            );
+            (JoinType::Mark, Some(take_index(next_table_index)), Some(comparison))
+        }
+    };
+    let replacement = match mark_index {
+        Some(index) => BoundExpr::column_ref(ColumnBinding::new(index, 0), LogicalType::BOOLEAN, ""),
+        None => result_value,
+    };
+    let outer = std::mem::replace(left, LogicalOperator::new(K::CrossProduct, Vec::new()));
+    *left = LogicalOperator::new(
+        K::DelimJoin {
+            join_type,
+            conditions,
+            predicate,
+            delim,
+            mark_index,
+            error_on_multiple_rows: *error_on_multiple_rows,
+        },
+        vec![outer, right],
+    );
+    Ok(replacement.with_alias(expr.alias.clone()))
+}
+
+/// An aggregate without groups gives a row for no rows, and now has a group per domain value. A
+/// domain value without rows gets `value`: what the aggregate gives for no rows, where that is not
+/// NULL. `marker` is NULL for those.
+struct EmptyValue {
+    aggregate: ColumnBinding,
+    marker: ColumnBinding,
+    value: Value,
+}
+
+/// `FlattenDependentJoins`.
+struct Flatten<'a> {
+    domain: Vec<(ColumnBinding, LogicalType)>,
+    delim: Arc<Mutex<ColumnDataCollection>>,
+    next_table_index: &'a mut usize,
+    empty_values: Vec<EmptyValue>,
+}
+
+impl Flatten<'_> {
+    fn domain_index(&self, binding: &ColumnBinding) -> Option<usize> {
+        self.domain.iter().position(|(b, _)| b == binding)
+    }
+
+    fn expression_reads_domain(&self, expr: &BoundExpr) -> bool {
+        if let BoundExprKind::ColumnRef { binding, depth } = &expr.kind
+            && *depth > 0
+            && self.domain_index(binding).is_some()
+        {
+            return true;
+        }
+        expr.children().into_iter().any(|c| self.expression_reads_domain(c))
+    }
+
+    /// `FlattenDependentJoins::RequiresDomain`.
+    fn reads_domain(&self, plan: &mut LogicalOperator) -> bool {
+        let mut found = false;
+        plan.visit_expressions(&mut |e| {
+            if let BoundExprKind::ColumnRef { binding, depth } = &e.kind {
+                found |= *depth > 0 && self.domain_index(binding).is_some();
+            }
+        });
+        found
+    }
+
+    fn state_refs(&self, state: &[ColumnBinding]) -> Vec<BoundExpr> {
+        state
+            .iter()
+            .zip(&self.domain)
+            .map(|(binding, (_, ty))| BoundExpr::column_ref(*binding, ty.clone(), ""))
+            .collect()
+    }
+
+    fn delim_get(&mut self) -> (LogicalOperator, Vec<ColumnBinding>) {
+        let table_index = take_index(self.next_table_index);
+        let types: Vec<LogicalType> = self.domain.iter().map(|(_, ty)| ty.clone()).collect();
+        let state = numbered(table_index, 0, types.len());
+        let get = K::DelimGet {
+            table_index,
+            types,
+            delim: self.delim.clone(),
+        };
+        (LogicalOperator::new(get, Vec::new()), state)
+    }
+
+    /// `AttachDomainToIndependentSubtree`: the plan does not depend on the domain, so each of its
+    /// rows goes with each domain value.
+    fn attach(&mut self, plan: &mut LogicalOperator) -> Vec<ColumnBinding> {
+        let (get, state) = self.delim_get();
+        if matches!(plan.kind, K::DummyScan { .. }) {
+            *plan = get;
+        } else {
+            let independent = std::mem::replace(plan, LogicalOperator::new(K::CrossProduct, Vec::new()));
+            *plan = LogicalOperator::new(K::CrossProduct, vec![independent, get]);
+        }
+        state
+    }
+
+    /// `RewriteCorrelatedExpressions`: the expressions of this operator read `state`.
+    fn rewrite(&self, op: &mut LogicalOperator, state: &[ColumnBinding]) {
+        let rewrite_expression = |expr: &mut BoundExpr| {
+            expr.walk_mut(&mut |e| {
+                if let BoundExprKind::ColumnRef { binding, depth } = &e.kind
+                    && *depth > 0
+                    && let Some(index) = self.domain_index(binding)
+                {
+                    e.kind = BoundExprKind::ColumnRef {
+                        binding: state[index],
+                        depth: 0,
+                    };
+                }
+            });
+        };
+        for expr in op.expressions_mut() {
+            rewrite_expression(expr);
+        }
+        if let K::Join { conditions, .. } = &mut op.kind {
+            for condition in conditions {
+                rewrite_expression(&mut condition.left);
+                rewrite_expression(&mut condition.right);
+            }
+        }
+    }
+
+    /// `PushDownCorrelatedNode`: makes `plan` independent of the query around it. It then has the
+    /// domain values among its columns, which the result says where.
+    fn push(&mut self, plan: &mut LogicalOperator) -> Flat<Vec<ColumnBinding>> {
+        if !self.reads_domain(plan) {
+            return Ok(self.attach(plan));
+        }
+        match &plan.kind {
+            K::Filter { .. } | K::Order { .. } | K::Unnest { .. } => self.push_through(plan),
+            K::Window { .. } => {
+                let state = self.push_through(plan)?;
+                let refs = self.state_refs(&state);
+                let K::Window { windows, .. } = &mut plan.kind else {
+                    unreachable!()
+                };
+                for window in windows {
+                    window.partitions.extend(refs.iter().cloned());
+                }
+                Ok(state)
+            }
+            K::Distinct { .. } => {
+                let state = self.push_through(plan)?;
+                let refs = self.state_refs(&state);
+                let K::Distinct { targets } = &mut plan.kind else {
+                    unreachable!()
+                };
+                targets.extend(refs);
+                Ok(state)
+            }
+            K::Projection { .. } => {
+                let state = self.push_through(plan)?;
+                let refs = self.state_refs(&state);
+                let K::Projection {
+                    table_index,
+                    expressions,
+                } = &mut plan.kind
+                else {
+                    unreachable!()
+                };
+                let offset = expressions.len();
+                expressions.extend(refs);
+                Ok(numbered(*table_index, offset, state.len()))
+            }
+            K::Aggregate { .. } => self.push_aggregate(plan),
+            K::Limit { .. } => self.push_limit(plan),
+            K::Union { .. } | K::ExceptIntersect { .. } => self.push_set_operation(plan),
+            K::CrossProduct => self.push_cross_product(plan),
+            K::Join { .. } => self.push_join(plan),
+            K::DelimJoin { .. } | K::MarkJoin { .. } => {
+                // the right side has no values of the left side's domain to tell apart
+                if self.reads_domain(&mut plan.children[1]) {
+                    return Err(Unsupported);
+                }
+                self.push_through(plan)
+            }
+            _ => Err(Unsupported),
+        }
+    }
+
+    /// `PushDownChild` of the first child, for an operator with the columns of that child.
+    fn push_through(&mut self, plan: &mut LogicalOperator) -> Flat<Vec<ColumnBinding>> {
+        let state = self.push(&mut plan.children[0])?;
+        self.rewrite(plan, &state);
+        Ok(state)
+    }
+
+    /// `PushDownAggregate`: the domain values are groups too.
+    fn push_aggregate(&mut self, plan: &mut LogicalOperator) -> Flat<Vec<ColumnBinding>> {
+        let K::Aggregate { grouping_sets, .. } = &plan.kind else {
+            unreachable!()
+        };
+        if grouping_sets.iter().any(|set| set.is_empty()) {
+            return Err(Unsupported);
+        }
+        let state = self.push_through(plan)?;
+        let refs = self.state_refs(&state);
+        let child_types = plan.children[0].types();
+        let child_bindings = plan.children[0].column_bindings();
+        let K::Aggregate {
+            group_index,
+            aggregate_index,
+            groups,
+            aggregates,
+            grouping_sets,
+            ..
+        } = &mut plan.kind
+        else {
+            unreachable!()
+        };
+        let offset = groups.len();
+        let has_groups = offset > 0;
+        let group_state = numbered(*group_index, offset, refs.len());
+        groups.extend(refs.iter().cloned());
+        for set in grouping_sets.iter_mut() {
+            set.extend(offset..offset + refs.len());
+        }
+        if has_groups {
+            return Ok(group_state);
+        }
+        // a domain value without rows still has its row: join all of them with the groups
+        let values = self.aggregates_of_no_rows(aggregates, child_types, child_bindings)?;
+        if values.iter().any(|value| !value.is_null()) {
+            let marker = ColumnBinding::new(*aggregate_index, aggregates.len());
+            let table_index = *aggregate_index;
+            for (index, value) in values.into_iter().enumerate() {
+                if !value.is_null() {
+                    self.empty_values.push(EmptyValue {
+                        aggregate: ColumnBinding::new(table_index, index),
+                        marker,
+                        value,
+                    });
+                }
+            }
+            let count_star = BuiltinFunctions::get().aggregate("count_star").ok_or(Unsupported)?;
+            aggregates.push(bind_aggregate_function(count_star, Vec::new(), None, false).map_err(|_| Unsupported)?);
+        }
+        let (get, left_state) = self.delim_get();
+        let conditions = self.state_conditions(&left_state, &group_state);
+        let aggregate = std::mem::replace(plan, LogicalOperator::new(K::CrossProduct, Vec::new()));
+        *plan = LogicalOperator::new(
+            K::Join {
+                join_type: JoinType::Left,
+                conditions,
+                predicate: None,
+            },
+            vec![get, aggregate],
+        );
+        Ok(left_state)
+    }
+
+    /// What `aggregates` give for no rows.
+    fn aggregates_of_no_rows(
+        &mut self,
+        aggregates: &[super::expression::BoundAggregate],
+        types: Vec<LogicalType>,
+        bindings: Vec<ColumnBinding>,
+    ) -> Flat<Vec<Value>> {
+        let input = LogicalOperator::new(K::EmptyResult { types, bindings }, Vec::new());
+        let mut plan = LogicalOperator::new(
+            K::Aggregate {
+                group_index: take_index(self.next_table_index),
+                aggregate_index: take_index(self.next_table_index),
+                groupings_index: take_index(self.next_table_index),
+                groups: Vec::new(),
+                aggregates: aggregates.to_vec(),
+                grouping_sets: Vec::new(),
+                grouping_functions: Vec::new(),
+            },
+            vec![input],
+        );
+        resolve_column_bindings(&mut plan).map_err(|_| Unsupported)?;
+        let rows = run_plan(plan).map_err(|_| Unsupported)?;
+        Ok((0..aggregates.len()).map(|column| rows.get_value(column, 0)).collect())
+    }
+
+    /// `PushDownLimit`: LIMIT holds per domain value, which takes a row number per domain value.
+    fn push_limit(&mut self, plan: &mut LogicalOperator) -> Flat<Vec<ColumnBinding>> {
+        let K::Limit { limit, offset } = plan.kind else {
+            unreachable!()
+        };
+        let mut child = plan.children.remove(0);
+        let mut orders = Vec::new();
+        if let K::Order { orders: child_orders } = &mut child.kind {
+            orders = std::mem::take(child_orders);
+            child = child.children.remove(0);
+        }
+        let state = self.push(&mut child)?;
+        let mut sort = LogicalOperator::new(K::Order { orders }, Vec::new());
+        self.rewrite(&mut sort, &state);
+        let K::Order { orders } = sort.kind else { unreachable!() };
+        let window_index = take_index(self.next_table_index);
+        let window = BoundWindow {
+            function: WindowFunction::RowNumber,
+            aggregate: None,
+            return_type: LogicalType::BIGINT,
+            children: Vec::new(),
+            filter: None,
+            distinct: false,
+            ignore_nulls: false,
+            partitions: self.state_refs(&state),
+            orders: orders.into_iter().map(|o| (o.expr, o.modifiers)).collect(),
+            arg_orders: Vec::new(),
+            start: WindowBoundary::UnboundedPreceding,
+            end: WindowBoundary::CurrentRowRows,
+            start_expr: None,
+            end_expr: None,
+            exclude: WindowExclude::NoOther,
+        };
+        let row_number = BoundExpr::column_ref(ColumnBinding::new(window_index, 0), LogicalType::BIGINT, "");
+        let compare = |op: ComparisonOp, bound: u64| {
+            let bound = i64::try_from(bound).unwrap_or(i64::MAX);
+            BoundExpr::new(
+                BoundExprKind::Comparison {
+                    op,
+                    left: Box::new(row_number.clone()),
+                    right: Box::new(BoundExpr::constant(Value::bigint(bound))),
+                },
+                LogicalType::BOOLEAN,
+            )
+        };
+        let mut expressions = Vec::new();
+        if let Some(limit) = limit {
+            expressions.push(compare(ComparisonOp::LessThanOrEqual, limit.saturating_add(offset)));
+        }
+        if offset > 0 {
+            expressions.push(compare(ComparisonOp::GreaterThan, offset));
+        }
+        let window = LogicalOperator::new(
+            K::Window {
+                table_index: window_index,
+                windows: vec![window],
+            },
+            vec![child],
+        );
+        *plan = if expressions.is_empty() {
+            window
+        } else {
+            LogicalOperator::new(K::Filter { expressions }, vec![window])
+        };
+        Ok(state)
+    }
+
+    /// `PushDownSetOperation`: its children line up by position, with the domain values last.
+    fn push_set_operation(&mut self, plan: &mut LogicalOperator) -> Flat<Vec<ColumnBinding>> {
+        let domain_types: Vec<LogicalType> = self.domain.iter().map(|(_, ty)| ty.clone()).collect();
+        for child in &mut plan.children {
+            let bindings = child.column_bindings();
+            let types = child.types();
+            let state = self.push(child)?;
+            let mut expressions: Vec<BoundExpr> = bindings
+                .into_iter()
+                .zip(types)
+                .map(|(binding, ty)| BoundExpr::column_ref(binding, ty, ""))
+                .collect();
+            expressions.extend(self.state_refs(&state));
+            let table_index = take_index(self.next_table_index);
+            let input = std::mem::replace(child, LogicalOperator::new(K::CrossProduct, Vec::new()));
+            *child = LogicalOperator::new(
+                K::Projection {
+                    table_index,
+                    expressions,
+                },
+                vec![input],
+            );
+        }
+        let (K::Union { table_index, types } | K::ExceptIntersect { table_index, types, .. }) = &mut plan.kind else {
+            unreachable!()
+        };
+        let offset = types.len();
+        types.extend(domain_types);
+        Ok(numbered(*table_index, offset, self.domain.len()))
+    }
+
+    /// `AddCorrelatedJoinConditions`: both sides have the domain, so they join on it.
+    fn state_conditions(&self, left: &[ColumnBinding], right: &[ColumnBinding]) -> Vec<JoinCondition> {
+        self.state_refs(left)
+            .into_iter()
+            .zip(self.state_refs(right))
+            .map(|(left, right)| JoinCondition {
+                left,
+                right,
+                null_safe: true,
+            })
+            .collect()
+    }
+
+    /// `PushDownCrossProduct`.
+    fn push_cross_product(&mut self, plan: &mut LogicalOperator) -> Flat<Vec<ColumnBinding>> {
+        let left_reads = self.reads_domain(&mut plan.children[0]);
+        let right_reads = self.reads_domain(&mut plan.children[1]);
+        if !right_reads {
+            return self.push(&mut plan.children[0]);
+        }
+        if !left_reads {
+            return self.push(&mut plan.children[1]);
+        }
+        let left_state = self.push(&mut plan.children[0])?;
+        let right_state = self.push(&mut plan.children[1])?;
+        plan.kind = K::Join {
+            join_type: JoinType::Inner,
+            conditions: self.state_conditions(&left_state, &right_state),
+            predicate: None,
+        };
+        Ok(left_state)
+    }
+
+    /// `PushDownJoin`.
+    fn push_join(&mut self, plan: &mut LogicalOperator) -> Flat<Vec<ColumnBinding>> {
+        // a condition reads one side, and the domain may be on the other one: the predicate sees both
+        let K::Join {
+            join_type,
+            conditions,
+            predicate,
+        } = &mut plan.kind
+        else {
+            unreachable!()
+        };
+        let join_type = *join_type;
+        let (moved, kept): (Vec<_>, Vec<_>) = std::mem::take(conditions)
+            .into_iter()
+            .partition(|c| self.expression_reads_domain(&c.left) || self.expression_reads_domain(&c.right));
+        *conditions = kept;
+        if !moved.is_empty() {
+            let mut conjuncts: Vec<BoundExpr> = predicate.take().into_iter().collect();
+            conjuncts.extend(moved.into_iter().map(|condition| {
+                let op = if condition.null_safe {
+                    ComparisonOp::NotDistinctFrom
+                } else {
+                    ComparisonOp::Equal
+                };
+                BoundExpr::new(
+                    BoundExprKind::Comparison {
+                        op,
+                        left: Box::new(condition.left),
+                        right: Box::new(condition.right),
+                    },
+                    LogicalType::BOOLEAN,
+                )
+            }));
+            *predicate = Some(conjunction_of(conjuncts));
+        }
+        let left_reads = self.reads_domain(&mut plan.children[0]);
+        let right_reads = self.reads_domain(&mut plan.children[1]);
+        let state = match join_type {
+            JoinType::Inner | JoinType::Left | JoinType::Semi | JoinType::Anti if !right_reads => {
+                self.push(&mut plan.children[0])?
+            }
+            JoinType::Inner | JoinType::Right if !left_reads => self.push(&mut plan.children[1])?,
+            JoinType::Inner | JoinType::Left | JoinType::Right => {
+                let left_state = self.push(&mut plan.children[0])?;
+                let right_state = self.push(&mut plan.children[1])?;
+                let added = self.state_conditions(&left_state, &right_state);
+                let K::Join { conditions, .. } = &mut plan.kind else {
+                    unreachable!()
+                };
+                conditions.extend(added);
+                if join_type == JoinType::Right {
+                    right_state
+                } else {
+                    left_state
+                }
+            }
+            _ => return Err(Unsupported),
+        };
+        self.rewrite(plan, &state);
+        Ok(state)
+    }
+
+    /// The column `binding`, or what stands in for it if it is an aggregate of no rows.
+    fn empty_value_of(&self, binding: ColumnBinding, ty: &LogicalType) -> BoundExpr {
+        let mut expr = BoundExpr::column_ref(binding, ty.clone(), "");
+        self.replace_empty_values(&mut expr);
+        expr
+    }
+
+    /// `RewriteCorrelatedAggregates`.
+    fn apply_empty_values(&self, plan: &mut LogicalOperator) {
+        if self.empty_values.is_empty() {
+            return;
+        }
+        for child in &mut plan.children {
+            self.apply_empty_values(child);
+        }
+        for expr in plan.expressions_mut() {
+            self.replace_empty_values(expr);
+        }
+        if let K::Join { conditions, .. } | K::DelimJoin { conditions, .. } = &mut plan.kind {
+            for condition in conditions {
+                self.replace_empty_values(&mut condition.left);
+                self.replace_empty_values(&mut condition.right);
+            }
+        }
+    }
+
+    fn replace_empty_values(&self, expr: &mut BoundExpr) {
+        if let BoundExprKind::ColumnRef { binding, depth: 0 } = &expr.kind {
+            if let Some(empty) = self.empty_values.iter().find(|e| e.aggregate == *binding) {
+                let marker = BoundExpr::column_ref(empty.marker, LogicalType::BIGINT, "");
+                let is_null = BoundExpr::new(
+                    BoundExprKind::Operator {
+                        op: BoundOperator::IsNull,
+                        children: vec![marker],
+                    },
+                    LogicalType::BOOLEAN,
+                );
+                let value = BoundExpr::constant(empty.value.clone());
+                let ty = expr.return_type.clone();
+                let alias = expr.alias.clone();
+                let column = expr.clone();
+                *expr = BoundExpr::new(
+                    BoundExprKind::Case {
+                        checks: vec![(is_null, value)],
+                        else_expr: Box::new(column),
+                    },
+                    ty,
+                )
+                .with_alias(alias);
+            }
+            return;
+        }
+        for child in expr.children_mut() {
+            self.replace_empty_values(child);
+        }
+    }
+}

@@ -112,6 +112,11 @@ pub trait PhysicalOperator: fmt::Debug + Send + Sync {
         self.sink(chunk)
     }
 
+    /// All of input `input` went through `sink_input`.
+    fn finish_input(&self, _input: usize) -> Result<()> {
+        Ok(())
+    }
+
     /// Whether a join has rows to emit through `get_data` after its input is done
     /// (`IsSource` of RIGHT and FULL joins).
     fn has_unmatched_source(&self) -> bool {

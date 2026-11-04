@@ -337,7 +337,7 @@ fn any_matches(result: &SubqueryResult, op: ComparisonOp, key: &[u8]) -> Option<
     }
 }
 
-const MULTIPLE_ROWS: &str = "More than one row returned by a subquery used as an expression - scalar subqueries can \
+pub(super) const MULTIPLE_ROWS: &str = "More than one row returned by a subquery used as an expression - scalar subqueries can \
                              only return a single row.\n\nUse \"SET scalar_subquery_error_on_multiple_rows=false\" to \
                              revert to previous behavior of returning a random row.";
 

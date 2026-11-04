@@ -10,7 +10,7 @@
 //! key of its join keys, like grouping; `JoinHashTable` over the row format replaces that when
 //! performance gets its turn (Phase 13).
 
-use super::expression_executor::{execute, select};
+use super::expression_executor::{MULTIPLE_ROWS, execute, select};
 use super::physical::{
     OperatorResult, OperatorState, PhysicalOperator, SourceState, check_buffered, check_buffered_rows, group_keys,
 };
@@ -18,8 +18,9 @@ use crate::planner::expression::BoundExpr;
 use crate::planner::logical::JoinCondition;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::types::LogicalType;
+use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, SelectionVector, StringCopy, Vector};
-use duckrs_common::{Result, STANDARD_VECTOR_SIZE};
+use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
 use duckrs_parser::ast::JoinType;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -131,6 +132,8 @@ pub struct PhysicalJoin {
     pub predicate: Option<BoundExpr>,
     pub children: Vec<Box<dyn PhysicalOperator>>,
     pub build: Mutex<JoinBuild>,
+    /// SINGLE: a left row with two matches fails, instead of taking the first one
+    pub error_on_multiple_rows: bool,
 }
 
 /// The build side.
@@ -157,6 +160,10 @@ struct Probe {
     candidate: usize,
     /// whether each input row found a match
     found: Vec<bool>,
+    /// MARK: whether the predicate was NULL for a pair of each input row
+    nulls: Vec<bool>,
+    /// SINGLE: the build row of each input row
+    single: Vec<Option<u32>>,
 }
 
 impl PhysicalJoin {
@@ -187,6 +194,7 @@ impl PhysicalJoin {
             predicate,
             children,
             build: Mutex::new(build),
+            error_on_multiple_rows: false,
         }
     }
 
@@ -216,7 +224,11 @@ impl PhysicalJoin {
 
     /// Whether a left row is done at its first match.
     fn first_match_only(&self) -> bool {
-        matches!(self.join_type, JoinType::Semi | JoinType::Anti)
+        match self.join_type {
+            JoinType::Semi | JoinType::Anti | JoinType::Mark => true,
+            JoinType::Single => !self.error_on_multiple_rows,
+            _ => false,
+        }
     }
 
     /// The next pairs of a left and a build row with equal keys, at most a vector of them.
@@ -304,20 +316,55 @@ impl PhysicalJoin {
     }
 
     /// What the input chunk adds now that all its pairs are done (`NextLeftJoin` and friends).
-    fn finish_probe(&self, input: &DataChunk, found: &[bool]) -> DataChunk {
+    fn finish_probe(&self, input: &DataChunk, probe: &Probe, data: &DataChunk) -> Result<DataChunk> {
+        let found = &probe.found;
         let rows = |wanted: bool| -> Vec<u32> {
             (0..found.len() as u32)
                 .filter(|&r| found[r as usize] == wanted)
                 .collect()
         };
-        match self.join_type {
+        Ok(match self.join_type {
+            JoinType::Mark => {
+                let count = input.len();
+                let mut mark = Vector::new(LogicalType::BOOLEAN, count.max(1));
+                mark.prepare_flat(count.max(1));
+                for (row, (found, null)) in found.iter().zip(&probe.nulls).enumerate() {
+                    let value = if *found {
+                        Value::boolean(true)
+                    } else if *null {
+                        Value::null(LogicalType::BOOLEAN)
+                    } else {
+                        Value::boolean(false)
+                    };
+                    mark.set_value(row, &value)?;
+                }
+                let mut columns = input.columns().to_vec();
+                columns.push(mark);
+                DataChunk::from_columns(columns, count)
+            }
+            JoinType::Single if data.is_empty() => Self::with_nulls(input.clone(), self.children[1].types()),
+            JoinType::Single => {
+                let count = input.len();
+                let sel = SelectionVector::from_vec(probe.single.iter().map(|row| row.unwrap_or(0)).collect());
+                let mut columns = input.columns().to_vec();
+                for source in data.columns() {
+                    let mut column = Vector::new(source.logical_type().clone(), count.max(1));
+                    column.prepare_flat(count.max(1));
+                    column.copy_from(source, &sel, count, 0, StringCopy::Deep);
+                    for (row, _) in probe.single.iter().enumerate().filter(|(_, row)| row.is_none()) {
+                        column.validity_mut().set_invalid(row);
+                    }
+                    columns.push(column);
+                }
+                DataChunk::from_columns(columns, count)
+            }
             JoinType::Left | JoinType::Outer => {
                 Self::with_nulls(Self::rows_of(input, rows(false)), self.children[1].types())
             }
             JoinType::Semi => Self::rows_of(input, rows(true)),
             JoinType::Anti => Self::rows_of(input, rows(false)),
             _ => empty_chunk(),
-        }
+        })
     }
 }
 
@@ -401,6 +448,8 @@ impl PhysicalOperator for PhysicalJoin {
                     row: 0,
                     candidate: 0,
                     found: vec![false; input.len()],
+                    nulls: vec![false; input.len()],
+                    single: vec![None; input.len()],
                 })
             }
         };
@@ -416,7 +465,7 @@ impl PhysicalOperator for PhysicalJoin {
                 self.next_key_pairs(build, probe)
             };
             if left.is_empty() {
-                let result = self.finish_probe(input, &probe.found);
+                let result = self.finish_probe(input, probe, data)?;
                 *state = None;
                 return Ok((result, OperatorResult::NeedMoreInput));
             }
@@ -425,6 +474,19 @@ impl PhysicalOperator for PhysicalJoin {
             columns.extend_from_slice(Self::rows_of(data, right.clone()).columns());
             let mut pairs = DataChunk::from_columns(columns, count);
             let matches = match &self.predicate {
+                Some(predicate) if self.join_type == JoinType::Mark => {
+                    let result = execute(predicate, &pairs)?;
+                    let mut selected = Vec::new();
+                    for (row, left) in left.iter().enumerate() {
+                        match result.get_value(row).data() {
+                            ValueData::Bool(true) => selected.push(row as u32),
+                            ValueData::Bool(false) => {}
+                            _ => probe.nulls[*left as usize] = true,
+                        }
+                    }
+                    let matched = selected.len();
+                    Some((SelectionVector::from_vec(selected), matched))
+                }
                 Some(predicate) => {
                     let (sel, matched) = select(predicate, &pairs)?;
                     (matched != count).then_some((sel, matched))
@@ -442,6 +504,20 @@ impl PhysicalOperator for PhysicalJoin {
                     for (left, right) in left.iter().zip(&right) {
                         probe.found[*left as usize] = true;
                         build.matched[*right as usize] = true;
+                    }
+                }
+            }
+            if self.join_type == JoinType::Single {
+                let pairs_found: Vec<(u32, u32)> = match &matches {
+                    Some((sel, matched)) => (0..*matched).map(|i| (left[sel.get(i)], right[sel.get(i)])).collect(),
+                    None => left.iter().copied().zip(right.iter().copied()).collect(),
+                };
+                for (left, right) in pairs_found {
+                    let slot = &mut probe.single[left as usize];
+                    if slot.is_none() {
+                        *slot = Some(right);
+                    } else if self.error_on_multiple_rows {
+                        return Err(Error::new(ErrorKind::InvalidInput, MULTIPLE_ROWS));
                     }
                 }
             }
