@@ -13,7 +13,8 @@ use super::{
     binder_error,
 };
 use crate::catalog::{
-    ColumnDefinition, DEFAULT_CATALOG, OnCreateConflict, SchemaCatalogEntry, TableOrView, ViewCatalogEntry,
+    ColumnDefinition, DEFAULT_CATALOG, OnCreateConflict, SchemaCatalogEntry, TableCatalogEntry, TableOrView,
+    ViewCatalogEntry,
 };
 use crate::execution::expression_executor::evaluate_scalar;
 use crate::function::binder::expression_return_type;
@@ -28,10 +29,11 @@ use duckrs_common::string_util::{candidates_message, similarity_rating, top_n_st
 use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::Value;
 use duckrs_common::{Error, ErrorKind, Result};
+use duckrs_parser::ast::UpdateStatement;
 use duckrs_parser::ast::{
-    Constraint, CreateTableInfo, Expr, ExprKind, InsertStatement, InsertValues, Literal, LiteralKind,
-    OnCreateConflict as AstConflict, OrderByNode, QualifiedName, QueryNode, QueryNodeKind, RecursiveCteNode,
-    ResultModifier, SelectNode, SelectStatement, SetOpType, SetOperationNode, TableRef, TableRefKind,
+    Constraint, CreateTableInfo, CteMap, DeleteStatement, Expr, ExprKind, InsertStatement, InsertValues, Literal,
+    LiteralKind, OnCreateConflict as AstConflict, OrderByNode, QualifiedName, QueryNode, QueryNodeKind,
+    RecursiveCteNode, ResultModifier, SelectNode, SelectStatement, SetOpType, SetOperationNode, TableRef, TableRefKind,
     sql_quoted_identifier, values_list,
 };
 use duckrs_parser::transformer::visit_expr_mut;
@@ -1571,6 +1573,224 @@ impl Binder<'_> {
     }
 
     /// `Binder::Bind(InsertStatement)`.
+    /// Makes the CTEs of a statement visible, for what `bind` binds.
+    fn with_ctes<T>(&mut self, cte_map: &CteMap, bind: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let scope = self.ctes.len();
+        for (name, cte) in &cte_map.0 {
+            self.ctes
+                .push((name.clone(), Arc::new(cte.clone()), self.outer_contexts.len()));
+        }
+        let result = bind(self);
+        self.ctes.truncate(scope);
+        result
+    }
+
+    /// The target of an UPDATE or DELETE, with what it binds to: only a base table will do.
+    fn bind_write_target(
+        &mut self,
+        table_ref: &TableRef,
+        error: &str,
+    ) -> Result<(LogicalOperator, Arc<TableCatalogEntry>, ColumnBinding)> {
+        if !matches!(table_ref.kind, TableRefKind::BaseTable { .. }) {
+            return Err(binder_error(error));
+        }
+        let plan = self.bind_table_ref(table_ref)?;
+        let LogicalOperatorKind::Get { table, table_index, .. } = &plan.kind else {
+            return Err(binder_error(error));
+        };
+        let table = table.clone();
+        let row_id = ColumnBinding::new(*table_index, table.columns.len());
+        Ok((plan, table, row_id))
+    }
+
+    /// `Binder::BindReturning`: the expressions over the rows a statement changed.
+    fn bind_returning(
+        &mut self,
+        plan: LogicalOperator,
+        returning: &[Expr],
+        table: &TableCatalogEntry,
+        table_index: usize,
+        alias: String,
+    ) -> Result<BoundStatement> {
+        self.bind_context = BindContext::default();
+        self.bind_context.add_binding(Binding {
+            alias,
+            schema: None,
+            table_index,
+            names: table.columns.iter().map(|c| c.name.clone()).collect(),
+            types: table.types(),
+            row_id: None,
+        });
+        let list = self.expand_star_expressions(returning)?;
+        let names: Vec<String> = list.iter().map(expression_name).collect();
+        let expressions = list
+            .iter()
+            .map(|e| self.bind_expression(e))
+            .collect::<Result<Vec<_>>>()?;
+        let types: Vec<LogicalType> = expressions.iter().map(|e| e.return_type.clone()).collect();
+        let plan = LogicalOperator::new(
+            LogicalOperatorKind::Projection {
+                table_index: self.generate_table_index(),
+                expressions,
+            },
+            vec![plan],
+        );
+        let column_aliases = names.iter().cloned().zip(0..).collect();
+        Ok(BoundStatement {
+            plan,
+            names,
+            types,
+            column_aliases,
+            return_type: StatementReturnType::QueryResult,
+        })
+    }
+
+    fn changed_rows(plan: LogicalOperator) -> BoundStatement {
+        BoundStatement {
+            plan,
+            names: vec!["Count".to_string()],
+            types: vec![LogicalType::BIGINT],
+            column_aliases: Vec::new(),
+            return_type: StatementReturnType::ChangedRows,
+        }
+    }
+
+    /// The alias of the target of an UPDATE or DELETE.
+    fn write_alias(table_ref: &TableRef, table: &TableCatalogEntry) -> String {
+        if table_ref.alias.is_empty() {
+            table.name.clone()
+        } else {
+            table_ref.alias.clone()
+        }
+    }
+
+    /// `Binder::Bind(DeleteStatement)`.
+    pub(super) fn bind_delete(&mut self, delete: &DeleteStatement) -> Result<BoundStatement> {
+        self.with_ctes(&delete.cte_map, |binder| {
+            let (mut plan, table, row_id) =
+                binder.bind_write_target(&delete.table, "Can only delete from base table")?;
+            for using in &delete.using {
+                let mut context = std::mem::take(&mut binder.bind_context);
+                let right = binder.bind_table_ref(using)?;
+                context.add_context(std::mem::take(&mut binder.bind_context));
+                binder.bind_context = context;
+                plan = LogicalOperator::new(LogicalOperatorKind::CrossProduct, vec![plan, right]);
+            }
+            if let Some(condition) = &delete.condition {
+                let condition = binder.bind_expression(condition)?.cast_to(&LogicalType::BOOLEAN, false);
+                plan = LogicalOperator::new(
+                    LogicalOperatorKind::Filter {
+                        expressions: vec![condition],
+                    },
+                    vec![plan],
+                );
+            }
+            let projection = LogicalOperator::new(
+                LogicalOperatorKind::Projection {
+                    table_index: binder.generate_table_index(),
+                    expressions: vec![BoundExpr::column_ref(row_id, LogicalType::BIGINT, "rowid")],
+                },
+                vec![plan],
+            );
+            let table_index = binder.generate_table_index();
+            let returning = !delete.returning.is_empty();
+            let plan = LogicalOperator::new(
+                LogicalOperatorKind::Delete {
+                    table: table.clone(),
+                    table_index,
+                    returning,
+                },
+                vec![projection],
+            );
+            if returning {
+                let alias = Self::write_alias(&delete.table, &table);
+                return binder.bind_returning(plan, &delete.returning, &table, table_index, alias);
+            }
+            Ok(Self::changed_rows(plan))
+        })
+    }
+
+    /// `Binder::Bind(UpdateStatement)`.
+    pub(super) fn bind_update(&mut self, update: &UpdateStatement) -> Result<BoundStatement> {
+        self.with_ctes(&update.cte_map, |binder| {
+            let (mut plan, table, row_id) = binder.bind_write_target(&update.table, "Can only update base table")?;
+            if let Some(from) = &update.from_table {
+                let mut context = std::mem::take(&mut binder.bind_context);
+                let right = binder.bind_table_ref(from)?;
+                context.add_context(std::mem::take(&mut binder.bind_context));
+                binder.bind_context = context;
+                plan = LogicalOperator::new(LogicalOperatorKind::CrossProduct, vec![plan, right]);
+            }
+            let info = &update.set_info;
+            if let Some(condition) = &info.condition {
+                let condition = binder.bind_expression(condition)?.cast_to(&LogicalType::BOOLEAN, false);
+                plan = LogicalOperator::new(
+                    LogicalOperatorKind::Filter {
+                        expressions: vec![condition],
+                    },
+                    vec![plan],
+                );
+            }
+            let mut columns = Vec::with_capacity(info.columns.len());
+            let mut expressions = Vec::with_capacity(info.columns.len() + 1);
+            for (name, value) in info.columns.iter().zip(&info.expressions) {
+                let Some(index) = table.column_index(name) else {
+                    return Err(binder_error(format!(
+                        "Referenced update column {name} not found in table!\n{}",
+                        candidates_message(
+                            &top_n_strings(
+                                table
+                                    .columns
+                                    .iter()
+                                    .map(|c| (c.name.clone(), similarity_rating(&c.name, name)))
+                                    .collect()
+                            ),
+                            "Candidate bindings"
+                        )
+                    )));
+                };
+                if columns.contains(&index) {
+                    return Err(binder_error(format!("Multiple assignments to same column {name}")));
+                }
+                columns.push(index);
+                let column = &table.columns[index];
+                let bound = if matches!(value.kind, ExprKind::Default) {
+                    match &column.default_value {
+                        Some(default) => default.clone(),
+                        None => BoundExpr::constant(Value::null(column.ty.clone())),
+                    }
+                } else {
+                    binder.bind_expression(value)?
+                };
+                expressions.push(checked_cast(bound, &column.ty)?);
+            }
+            expressions.push(BoundExpr::column_ref(row_id, LogicalType::BIGINT, "rowid"));
+            let projection = LogicalOperator::new(
+                LogicalOperatorKind::Projection {
+                    table_index: binder.generate_table_index(),
+                    expressions,
+                },
+                vec![plan],
+            );
+            let table_index = binder.generate_table_index();
+            let returning = !update.returning.is_empty();
+            let plan = LogicalOperator::new(
+                LogicalOperatorKind::Update {
+                    table: table.clone(),
+                    table_index,
+                    columns,
+                    returning,
+                },
+                vec![projection],
+            );
+            if returning {
+                let alias = Self::write_alias(&update.table, &table);
+                return binder.bind_returning(plan, &update.returning, &table, table_index, alias);
+            }
+            Ok(Self::changed_rows(plan))
+        })
+    }
+
     pub(super) fn bind_insert(&mut self, insert: &InsertStatement) -> Result<BoundStatement> {
         if !insert.cte_map.0.is_empty() {
             return Err(not_implemented("WITH in INSERT"));

@@ -126,6 +126,20 @@ pub enum LogicalOperatorKind {
         table: Arc<TableCatalogEntry>,
         column_index_map: Vec<Option<usize>>,
     },
+    /// `LogicalDelete`: removes the rows whose ids the child's only column holds. Returns their
+    /// count, or with `returning` the rows.
+    Delete {
+        table: Arc<TableCatalogEntry>,
+        table_index: usize,
+        returning: bool,
+    },
+    /// `LogicalUpdate`: the child's columns are the new values of `columns`, and then the row id.
+    Update {
+        table: Arc<TableCatalogEntry>,
+        table_index: usize,
+        columns: Vec<usize>,
+        returning: bool,
+    },
     /// `LogicalCreateTable` with a query: creates the table with the child's rows.
     CreateTableAs {
         schema: Arc<SchemaCatalogEntry>,
@@ -264,6 +278,13 @@ impl LogicalOperator {
             LogicalOperatorKind::Projection { expressions, .. } => {
                 expressions.iter().map(|e| e.return_type.clone()).collect()
             }
+            LogicalOperatorKind::Delete {
+                table, returning: true, ..
+            }
+            | LogicalOperatorKind::Update {
+                table, returning: true, ..
+            } => table.types(),
+            LogicalOperatorKind::Delete { .. } | LogicalOperatorKind::Update { .. } => vec![LogicalType::BIGINT],
             LogicalOperatorKind::Union { types, .. }
             | LogicalOperatorKind::ExceptIntersect { types, .. }
             | LogicalOperatorKind::RecursiveCte { types, .. }
@@ -344,6 +365,17 @@ impl LogicalOperator {
                 table_index,
                 expressions,
             } => numbered(*table_index, expressions.len()),
+            LogicalOperatorKind::Delete {
+                table,
+                table_index,
+                returning,
+            }
+            | LogicalOperatorKind::Update {
+                table,
+                table_index,
+                returning,
+                ..
+            } => numbered(*table_index, if *returning { table.columns.len() } else { 1 }),
             LogicalOperatorKind::Union { table_index, types }
             | LogicalOperatorKind::ExceptIntersect { table_index, types, .. }
             | LogicalOperatorKind::RecursiveCte { table_index, types, .. }

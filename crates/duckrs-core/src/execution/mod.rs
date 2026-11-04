@@ -89,6 +89,15 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             remaining: Mutex::new((offset, limit)),
         }),
         LogicalOperatorKind::Distinct { targets } => Box::new(PhysicalDistinct::new(&targets, children.remove(0))),
+        LogicalOperatorKind::Delete { table, returning, .. } => {
+            Box::new(PhysicalDelete::new(types, children, table, returning))
+        }
+        LogicalOperatorKind::Update {
+            table,
+            columns,
+            returning,
+            ..
+        } => Box::new(PhysicalUpdate::new(types, children, table, columns, returning)),
         LogicalOperatorKind::Union { .. } => Box::new(PhysicalUnion::new(types, children)),
         LogicalOperatorKind::RecursiveCte {
             union_all,

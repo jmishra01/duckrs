@@ -1237,6 +1237,240 @@ impl PhysicalOperator for PhysicalAggregate {
     }
 }
 
+/// What a statement that changes rows gives back: their count, or with RETURNING the rows.
+fn changed_rows_output(
+    types: &[LogicalType],
+    rows: ColumnDataCollection,
+    count: u64,
+    returning: bool,
+) -> ColumnDataCollection {
+    if returning {
+        return rows;
+    }
+    let mut output = ColumnDataCollection::new(types.to_vec());
+    let mut column = Vector::new(LogicalType::BIGINT, 1);
+    column.data_mut::<i64>()[0] = count as i64;
+    output.append(&DataChunk::from_columns(vec![column], 1));
+    output
+}
+
+/// `PhysicalDelete`: gathers the ids of its input (sink), and removes those rows at the end, so
+/// that the statement reads the table as it was.
+#[derive(Debug)]
+pub struct PhysicalDelete {
+    pub types: Vec<LogicalType>,
+    pub children: Vec<Box<dyn PhysicalOperator>>,
+    table: Arc<TableCatalogEntry>,
+    returning: bool,
+    row_ids: Mutex<HashSet<i64>>,
+    output: Mutex<ColumnDataCollection>,
+}
+
+impl PhysicalDelete {
+    pub fn new(
+        types: Vec<LogicalType>,
+        children: Vec<Box<dyn PhysicalOperator>>,
+        table: Arc<TableCatalogEntry>,
+        returning: bool,
+    ) -> Self {
+        let output = Mutex::new(ColumnDataCollection::new(types.clone()));
+        Self {
+            types,
+            children,
+            table,
+            returning,
+            row_ids: Mutex::default(),
+            output,
+        }
+    }
+}
+
+impl PhysicalOperator for PhysicalDelete {
+    fn name(&self) -> &'static str {
+        "DELETE"
+    }
+    fn types(&self) -> &[LogicalType] {
+        &self.types
+    }
+    fn children(&self) -> &[Box<dyn PhysicalOperator>] {
+        &self.children
+    }
+    fn is_sink(&self) -> bool {
+        true
+    }
+    fn sink(&self, chunk: &DataChunk) -> Result<()> {
+        let mut ids = self.row_ids.lock();
+        for row in 0..chunk.len() {
+            if let Some(id) = chunk.column(0).get_value(row).as_i128() {
+                ids.insert(id as i64);
+            }
+        }
+        Ok(())
+    }
+    fn finalize(&self) -> Result<()> {
+        let ids = self.row_ids.lock();
+        let mut storage = self.table.storage.write();
+        let mut kept = ColumnDataCollection::new(storage.types().to_vec());
+        let mut deleted = ColumnDataCollection::new(storage.types().to_vec());
+        for (index, chunk) in storage.chunks().enumerate() {
+            let first_row = (index * STANDARD_VECTOR_SIZE) as i64;
+            let (gone, stay): (Vec<u32>, Vec<u32>) =
+                (0..chunk.len() as u32).partition(|row| ids.contains(&(first_row + i64::from(*row))));
+            if gone.is_empty() {
+                kept.append(chunk);
+                continue;
+            }
+            for (rows, target) in [(stay, &mut kept), (gone, &mut deleted)] {
+                let count = rows.len();
+                if count > 0 {
+                    let mut part = chunk.clone();
+                    part.slice(&SelectionVector::from_vec(rows), count);
+                    target.append(&part);
+                }
+            }
+        }
+        *storage = kept;
+        *self.output.lock() = changed_rows_output(&self.types, deleted, ids.len() as u64, self.returning);
+        Ok(())
+    }
+    fn is_source(&self) -> bool {
+        true
+    }
+    fn source_state(&self) -> SourceState {
+        Box::new(0usize)
+    }
+    fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
+        Ok(scan_collection(&self.output, state))
+    }
+}
+
+/// `PhysicalUpdate`: gathers the new values (sink), and writes them at the end.
+#[derive(Debug)]
+pub struct PhysicalUpdate {
+    pub types: Vec<LogicalType>,
+    pub children: Vec<Box<dyn PhysicalOperator>>,
+    table: Arc<TableCatalogEntry>,
+    columns: Vec<usize>,
+    returning: bool,
+    /// the new values by row id; a row a join matches twice keeps its first ones
+    updates: Mutex<HashMap<i64, Vec<Value>>>,
+    output: Mutex<ColumnDataCollection>,
+}
+
+impl PhysicalUpdate {
+    pub fn new(
+        types: Vec<LogicalType>,
+        children: Vec<Box<dyn PhysicalOperator>>,
+        table: Arc<TableCatalogEntry>,
+        columns: Vec<usize>,
+        returning: bool,
+    ) -> Self {
+        let output = Mutex::new(ColumnDataCollection::new(types.clone()));
+        Self {
+            types,
+            children,
+            table,
+            columns,
+            returning,
+            updates: Mutex::default(),
+            output,
+        }
+    }
+}
+
+impl PhysicalOperator for PhysicalUpdate {
+    fn name(&self) -> &'static str {
+        "UPDATE"
+    }
+    fn types(&self) -> &[LogicalType] {
+        &self.types
+    }
+    fn children(&self) -> &[Box<dyn PhysicalOperator>] {
+        &self.children
+    }
+    fn is_sink(&self) -> bool {
+        true
+    }
+    fn sink(&self, chunk: &DataChunk) -> Result<()> {
+        let id_column = self.columns.len();
+        let mut updates = self.updates.lock();
+        for row in 0..chunk.len() {
+            let values: Vec<Value> = (0..id_column).map(|c| chunk.column(c).get_value(row)).collect();
+            for (value, column) in values.iter().zip(&self.columns) {
+                let column = &self.table.columns[*column];
+                if column.not_null && value.is_null() {
+                    return Err(Error::new(
+                        ErrorKind::Constraint,
+                        format!(
+                            "NOT NULL constraint failed: {}.{}",
+                            sql_identifier(&self.table.name),
+                            sql_identifier(&column.name)
+                        ),
+                    ));
+                }
+            }
+            let id = chunk.column(id_column).get_value(row).as_i128().expect("a row id") as i64;
+            updates.entry(id).or_insert(values);
+        }
+        Ok(())
+    }
+    fn finalize(&self) -> Result<()> {
+        let updates = self.updates.lock();
+        let mut storage = self.table.storage.write();
+        let mut rewritten = ColumnDataCollection::new(storage.types().to_vec());
+        let mut changed = ColumnDataCollection::new(storage.types().to_vec());
+        for (index, chunk) in storage.chunks().enumerate() {
+            let first_row = (index * STANDARD_VECTOR_SIZE) as i64;
+            let rows: Vec<(usize, &Vec<Value>)> = (0..chunk.len())
+                .filter_map(|row| Some((row, updates.get(&(first_row + row as i64))?)))
+                .collect();
+            if rows.is_empty() {
+                rewritten.append(chunk);
+                continue;
+            }
+            let mut columns: Vec<Vector> = chunk.columns().to_vec();
+            for (position, &column) in self.columns.iter().enumerate() {
+                let mut target = Vector::new(columns[column].logical_type().clone(), chunk.len().max(1));
+                let mut updated = rows.iter();
+                let mut next = updated.next();
+                for row in 0..chunk.len() {
+                    let value = match next {
+                        Some((at, values)) if *at == row => {
+                            let value = values[position].clone();
+                            next = updated.next();
+                            value
+                        }
+                        _ => columns[column].get_value(row),
+                    };
+                    target.set_value(row, &value)?;
+                }
+                columns[column] = target;
+            }
+            let updated = DataChunk::from_columns(columns, chunk.len());
+            rewritten.append(&updated);
+            if self.returning {
+                let picked: Vec<u32> = rows.iter().map(|(row, _)| *row as u32).collect();
+                let count = picked.len();
+                let mut part = updated.clone();
+                part.slice(&SelectionVector::from_vec(picked), count);
+                changed.append(&part);
+            }
+        }
+        *storage = rewritten;
+        *self.output.lock() = changed_rows_output(&self.types, changed, updates.len() as u64, self.returning);
+        Ok(())
+    }
+    fn is_source(&self) -> bool {
+        true
+    }
+    fn source_state(&self) -> SourceState {
+        Box::new(0usize)
+    }
+    fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
+        Ok(scan_collection(&self.output, state))
+    }
+}
+
 /// `PhysicalInsert`: appends its input to a table (sink), then returns the row count (source).
 #[derive(Debug)]
 pub struct PhysicalInsert {

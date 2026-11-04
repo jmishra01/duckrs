@@ -671,6 +671,8 @@ impl<'a> Binder<'a> {
         match statement {
             Statement::Select(select) => self.bind_select_statement(select),
             Statement::Insert(insert) => self.bind_insert(insert),
+            Statement::Delete(delete) => self.bind_delete(delete),
+            Statement::Update(update) => self.bind_update(update),
             Statement::CreateTable(info) => self.bind_create_table(info),
             other => Err(crate::unported(format!("{} statements", statement_kind(other)))),
         }

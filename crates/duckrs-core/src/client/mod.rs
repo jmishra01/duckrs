@@ -43,6 +43,8 @@ pub struct DatabaseInstance {
     pub catalog: Catalog,
     settings: RwLock<SettingValues>,
     transactions: Mutex<OpenTransactions>,
+    /// held to read while a SELECT runs, and to write while anything else does
+    statements: RwLock<()>,
 }
 
 /// Which connections have a transaction open. There is no MVCC until Phase 10, so transactions
@@ -61,6 +63,7 @@ impl DatabaseInstance {
             catalog: Catalog::new(DEFAULT_CATALOG),
             settings: RwLock::new(SettingValues::default()),
             transactions: Mutex::new(OpenTransactions::default()),
+            statements: RwLock::new(()),
         })
     }
 }
@@ -167,7 +170,7 @@ impl ActiveTransaction {
 /// Whether a statement changes the database (`StatementProperties::IsReadOnly`).
 fn is_write(statement: &Statement) -> bool {
     match statement {
-        Statement::Insert(_) | Statement::Drop(_) => true,
+        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) | Statement::Drop(_) => true,
         // temporary objects are private to the connection
         Statement::CreateTable(info) => !info.temporary,
         Statement::Create(info) => !info.temporary,
@@ -470,7 +473,16 @@ impl ClientContext {
                 }
             }
         }
-        let result = self.execute_statement(statement);
+        // until Phase 10 isolates connections, a statement that writes runs alone: UPDATE and
+        // DELETE rewrite tables, which would pull the rows from under a scan
+        let db = self.db.clone();
+        let result = if matches!(statement, Statement::Select(_)) {
+            let _reading = db.statements.read();
+            self.execute_statement(statement)
+        } else {
+            let _writing = db.statements.write();
+            self.execute_statement(statement)
+        };
         if let Err(error) = &result {
             if let Some(transaction) = &mut self.transaction {
                 transaction.apply_invalidation_policy(error.kind);
@@ -1407,7 +1419,10 @@ mod tests {
         // without PREPARE there are no values
         assert!(error(&mut c, "SELECT ?").contains("Values were not provided"));
         // what cannot run says so when prepared, not with a confusing error when executed
-        assert!(error(&mut c, "PREPARE u AS UPDATE l SET k = ?").contains("not yet ported"));
+        run(&mut c, "PREPARE u AS UPDATE l SET k = k + ? WHERE k = 1");
+        assert_eq!(run(&mut c, "EXECUTE u(100)"), rows(&[&["1"]]));
+        assert_eq!(run(&mut c, "SELECT count(*) FROM l WHERE k = 101"), rows(&[&["1"]]));
+        run(&mut c, "UPDATE l SET k = 1 WHERE k = 101");
         // wrong arguments
         assert!(error(&mut c, "EXECUTE p(1)").contains("Values were not provided"));
         assert!(error(&mut c, "EXECUTE p(1, 2, 3)").contains("excess parameters"));
@@ -2706,6 +2721,89 @@ mod tests {
         assert_eq!(
             run(&mut context, "SELECT max((SELECT nextval('s') + k - k)) FROM same"),
             [["3"]]
+        );
+    }
+
+    #[test]
+    fn updates_and_deletes_match_duckdb() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        let err = |context: &mut ClientContext, sql: &str| context.query(sql).unwrap_err().to_string();
+        run(
+            &mut context,
+            "CREATE TABLE t (i INTEGER, s VARCHAR DEFAULT 'd', n INTEGER NOT NULL DEFAULT 0)",
+        );
+        run(
+            &mut context,
+            "INSERT INTO t VALUES (1, 'a', 1), (2, 'b', 2), (3, 'c', 3), (NULL, NULL, 4)",
+        );
+        assert_eq!(
+            run(&mut context, "UPDATE t SET i = i + 10, s = upper(s) WHERE i >= 2"),
+            [["2"]]
+        );
+        assert_eq!(
+            run(&mut context, "SELECT i, s FROM t ORDER BY n"),
+            [["1", "a"], ["12", "B"], ["13", "C"], ["NULL", "NULL"]]
+        );
+        // the right side sees the table as it was
+        run(&mut context, "UPDATE t SET i = (SELECT max(n) FROM t) WHERE n = 1");
+        assert_eq!(run(&mut context, "SELECT i FROM t WHERE n = 1"), [["4"]]);
+        run(&mut context, "UPDATE t SET s = DEFAULT WHERE n = 2");
+        assert_eq!(run(&mut context, "SELECT s FROM t WHERE n = 2"), [["d"]]);
+        assert_eq!(
+            run(
+                &mut context,
+                "UPDATE t AS o SET i = 0 WHERE n = 3 RETURNING o.n, i + 1 AS next"
+            ),
+            [["3", "1"]]
+        );
+        assert_eq!(
+            run(&mut context, "DELETE FROM t WHERE i IS NULL RETURNING *"),
+            [["NULL", "NULL", "4"]]
+        );
+        run(&mut context, "CREATE TABLE d (k INTEGER)");
+        run(&mut context, "INSERT INTO d VALUES (1), (1), (2)");
+        assert_eq!(run(&mut context, "DELETE FROM t USING d WHERE t.n = d.k"), [["2"]]);
+        assert_eq!(run(&mut context, "SELECT n FROM t"), [["3"]]);
+        assert_eq!(
+            run(
+                &mut context,
+                "WITH c AS (SELECT 3 AS v) DELETE FROM t WHERE n IN (SELECT v FROM c)"
+            ),
+            [["1"]]
+        );
+        run(&mut context, "INSERT INTO t VALUES (1, 'x', 1), (2, 'y', 2)");
+        // ROLLBACK undoes both, and a chunk's worth of rows keeps row ids right
+        run(&mut context, "BEGIN");
+        run(&mut context, "DELETE FROM t WHERE n = 1");
+        run(&mut context, "UPDATE t SET s = 'z'");
+        run(&mut context, "ROLLBACK");
+        assert_eq!(
+            run(&mut context, "SELECT n, s FROM t ORDER BY n"),
+            [["1", "x"], ["2", "y"]]
+        );
+        run(&mut context, "CREATE TABLE big AS SELECT range AS i FROM range(5000)");
+        run(&mut context, "DELETE FROM big WHERE i % 2 = 0");
+        run(&mut context, "UPDATE big SET i = -i WHERE i = 4999");
+        assert_eq!(
+            run(&mut context, "SELECT count(*), min(i), max(i) FROM big"),
+            [["2500", "-4999", "4997"]]
+        );
+        assert_eq!(
+            err(&mut context, "UPDATE t SET n = NULL"),
+            "Constraint Error: NOT NULL constraint failed: t.n"
+        );
+        assert_eq!(
+            err(&mut context, "UPDATE t SET i = 1, i = 2"),
+            "Binder Error: Multiple assignments to same column i"
+        );
+        run(&mut context, "CREATE VIEW v AS SELECT 1 AS a");
+        assert_eq!(
+            err(&mut context, "DELETE FROM v"),
+            "Binder Error: Can only delete from base table"
+        );
+        assert_eq!(
+            err(&mut context, "UPDATE v SET a = 2"),
+            "Binder Error: Can only update base table"
         );
     }
 

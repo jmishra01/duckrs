@@ -487,13 +487,13 @@ pub struct Catalog {
     schemas: RwLock<BTreeMap<String, Arc<SchemaCatalogEntry>>>,
 }
 
-/// What a catalog holds at a moment, to go back to on ROLLBACK. Tables only grow, so that their
-/// row counts are enough; `UPDATE` and `DELETE` will need the undo buffer of Phase 10.
+/// What a catalog holds at a moment, to go back to on ROLLBACK, until the undo buffer of Phase 10.
 #[derive(Debug)]
 pub struct CatalogSnapshot {
     schemas: BTreeMap<String, Arc<SchemaCatalogEntry>>,
     entries: Vec<SchemaEntries>,
-    table_rows: Vec<(Arc<TableCatalogEntry>, usize)>,
+    /// sharing their buffers with the tables, whose writes copy what they change
+    table_rows: Vec<(Arc<TableCatalogEntry>, ColumnDataCollection)>,
 }
 
 /// The contents of a schema in a [`CatalogSnapshot`].
@@ -516,7 +516,7 @@ impl Catalog {
             let tables = schema.tables.read().clone();
             for entry in tables.values() {
                 if let TableOrView::Table(table) = entry {
-                    let rows = table.storage.read().len();
+                    let rows = table.storage.read().clone();
                     table_rows.push((table.clone(), rows));
                 }
             }
@@ -547,7 +547,7 @@ impl Catalog {
             *saved.schema.types.write() = saved.types;
         }
         for (table, rows) in snapshot.table_rows {
-            table.storage.write().truncate(rows);
+            *table.storage.write() = rows;
         }
     }
 
