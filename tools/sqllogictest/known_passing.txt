@@ -5,6 +5,7 @@ test/common/test_cast_hugeint.test
 test/fuzzer/afl/alter_if_exists.test
 test/fuzzer/afl/decimal_string_roundtrip.test
 test/fuzzer/afl/generate_series_null.test
+test/fuzzer/afl/grouping_empty_table.test
 test/fuzzer/afl/invalid_foreign_key.test
 test/fuzzer/afl/issue_7551.test
 test/fuzzer/afl/issue_8185.test
@@ -76,6 +77,7 @@ test/fuzzer/pedro/forced_parallelism_empty_select.test
 test/fuzzer/pedro/foreign_key_type_mismatch.test
 test/fuzzer/pedro/group_by_all_row_alias.test
 test/fuzzer/pedro/hash_finalize_race.test
+test/fuzzer/pedro/having_query_wrong_result.test
 test/fuzzer/pedro/in_clause_optimization_error.test
 test/fuzzer/pedro/in_clause_setop_rewrite.test
 test/fuzzer/pedro/incorrect_offset_result.test
@@ -108,6 +110,7 @@ test/fuzzer/pedro/recursive_cte_dependent_join.test
 test/fuzzer/pedro/regr_count_validity.test
 test/fuzzer/pedro/rename_column_assertion.test
 test/fuzzer/pedro/restart_current_time.test
+test/fuzzer/pedro/rollup_wrong_result.test
 test/fuzzer/pedro/segment_tree_index_issue.test
 test/fuzzer/pedro/signed_and_unsigned_comparison.test
 test/fuzzer/pedro/statistics_propagation_set_op.test
@@ -119,6 +122,7 @@ test/fuzzer/pedro/test_window_function_nullptr.test
 test/fuzzer/pedro/update_join_bind_error.test
 test/fuzzer/pedro/update_join_statistics.test
 test/fuzzer/pedro/verify_parallelism_batch_index.test
+test/fuzzer/pedro/window_function_timeout.test
 test/fuzzer/pedro/window_self_reference.test
 test/fuzzer/public/duplicate_alias_using.test
 test/fuzzer/public/enum_empty_type.test
@@ -156,6 +160,7 @@ test/issues/fuzz/bitwise_shift_overflow.test
 test/issues/fuzz/encode_string_data_crash.test
 test/issues/fuzz/foreign_key_index_selection.test
 test/issues/fuzz/function_pointer_crash_in_subquery.test
+test/issues/fuzz/multi_rollup_assertion.test
 test/issues/fuzz/nan_progress.test
 test/issues/fuzz/prepared_statement_crash.test
 test/issues/fuzz/recursive_view_expression_assertion.test
@@ -202,6 +207,7 @@ test/issues/general/test_21431.test
 test/issues/general/test_21832.test
 test/issues/general/test_2240.test
 test/issues/general/test_23860.test
+test/issues/general/test_23940.test
 test/issues/general/test_2407.test
 test/issues/general/test_24442.test
 test/issues/general/test_24542.test
@@ -238,6 +244,10 @@ test/issues/general/test_9456.test
 test/issues/general/test_9738.test
 test/issues/internal/test_7738.test
 test/issues/internal/test_9415.test
+test/issues/monetdb/analytics10.test
+test/issues/monetdb/analytics11.test
+test/issues/monetdb/analytics12.test
+test/issues/monetdb/groupings.test
 test/issues/monetdb/test_boolean_not.test
 test/issues/monetdb/test_correlated_update.test
 test/issues/monetdb/test_left_join_bug.test
@@ -336,6 +346,7 @@ test/optimizer/constant_argument_errors.test
 test/optimizer/constant_argument_errors_case.test
 test/optimizer/constant_argument_errors_like_regex.test
 test/optimizer/disjunctive_join_rewriter_nested.test
+test/optimizer/expression_rewriter/ordered_aggregate_incorrectly_remove_order.test
 test/optimizer/filter_pushdown/like_prefix_boundary.test
 test/optimizer/issue_12181.test
 test/optimizer/issue_20928.test
@@ -434,8 +445,12 @@ test/sql/aggregate/aggregates/test_string_agg_big.test
 test/sql/aggregate/aggregates/test_sum.test
 test/sql/aggregate/aggregates/test_sum_fastpath.test
 test/sql/aggregate/count_execution_paths.test
+test/sql/aggregate/distinct/grouped/combined_with_grouping.test
 test/sql/aggregate/distinct/grouped/identical_inputs.test
 test/sql/aggregate/distinct/grouped/issue_5070.test
+test/sql/aggregate/distinct/grouped/multiple_grouping_sets.test
+test/sql/aggregate/distinct/issue19616.test
+test/sql/aggregate/distinct/rewrite/distinct_aggregate_rewrite_join_order.test
 test/sql/aggregate/distinct/test_distinct.test
 test/sql/aggregate/distinct/ungrouped/test_distinct_ungrouped.test
 test/sql/aggregate/distinct/ungrouped/test_distinct_ungrouped_shared_input.test
@@ -454,6 +469,15 @@ test/sql/aggregate/group/test_group_by_nested.test
 test/sql/aggregate/group/test_group_by_null_length.test
 test/sql/aggregate/group/test_group_by_skip_lookups.test
 test/sql/aggregate/group/test_group_null.test
+test/sql/aggregate/grouping_sets/cube.test
+test/sql/aggregate/grouping_sets/grouping.test
+test/sql/aggregate/grouping_sets/grouping_sets.test
+test/sql/aggregate/grouping_sets/grouping_sets_filter.test
+test/sql/aggregate/grouping_sets/grouping_sets_many_sets.test
+test/sql/aggregate/grouping_sets/issue_3730.test
+test/sql/aggregate/grouping_sets/many_duplicate_grouping_sets.test
+test/sql/aggregate/grouping_sets/multiple_empty_grouping_sets.test
+test/sql/aggregate/grouping_sets/rollup.test
 test/sql/aggregate/having/having_alias.test
 test/sql/aggregate/having/having_without_groupby.test
 test/sql/aggregate/having/test_scalar_having.test
@@ -1002,6 +1026,7 @@ test/sql/index/art/types/test_art_integer_types.test
 test/sql/index/art/types/test_art_real.test
 test/sql/index/art/types/test_art_real_pk.test
 test/sql/index/art/types/test_art_varchar.test
+test/sql/insert/insert_from_many_grouping_sets.test
 test/sql/insert/insert_query_node.test
 test/sql/insert/insert_rollback.test
 test/sql/insert/null_values.test
@@ -1221,6 +1246,7 @@ test/sql/peg_parser/fuzzer/internal_0208.test
 test/sql/peg_parser/fuzzer/new_parser_failure_0074.test
 test/sql/peg_parser/fuzzer/new_parser_failure_0076.test
 test/sql/peg_parser/identifier.test
+test/sql/peg_parser/peg_syntax_error.test
 test/sql/peg_parser/qualified_operator.test
 test/sql/peg_parser/transformer/between_asymmetric.test
 test/sql/peg_parser/transformer/is_predicate_operators.test
@@ -1397,11 +1423,14 @@ test/sql/subquery/exists/test_issue_9308.test
 test/sql/subquery/exists/test_scalar_exists.test
 test/sql/subquery/exists/test_uncorrelated_exists_subquery.test
 test/sql/subquery/lateral/lateral_arrays.test
+test/sql/subquery/lateral/lateral_empty_grouping_sets.test
 test/sql/subquery/lateral/lateral_fuzzer_1463.test
 test/sql/subquery/lateral/lateral_fuzzer_5984_23.test
+test/sql/subquery/lateral/lateral_grouping_sets.test
 test/sql/subquery/lateral/lateral_join_macro.test
 test/sql/subquery/lateral/lateral_large_lists.test
 test/sql/subquery/lateral/lateral_left_join.test
+test/sql/subquery/lateral/lateral_null_propagation_shortcut.test
 test/sql/subquery/lateral/lateral_qualify.test
 test/sql/subquery/lateral/lateral_values.test
 test/sql/subquery/lateral/test_lateral_join.test
@@ -1413,6 +1442,7 @@ test/sql/subquery/scalar/order_by_correlated.test
 test/sql/subquery/scalar/test_complex_correlated_subquery.test
 test/sql/subquery/scalar/test_complex_nested_correlated_subquery.test
 test/sql/subquery/scalar/test_correlated_count_nested_subquery.test
+test/sql/subquery/scalar/test_correlated_grouping_set.test
 test/sql/subquery/scalar/test_correlated_set_op.test
 test/sql/subquery/scalar/test_correlated_side_effects.test
 test/sql/subquery/scalar/test_correlated_subquery_where.test

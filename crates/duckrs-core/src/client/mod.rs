@@ -1941,6 +1941,103 @@ mod tests {
     }
 
     #[test]
+    fn grouping_sets() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        run(&mut context, "CREATE TABLE t (a INTEGER, b VARCHAR, v INTEGER)");
+        run(
+            &mut context,
+            "INSERT INTO t VALUES (1, 'x', 10), (1, 'y', 20), (2, 'x', 5), (2, 'x', 5)",
+        );
+        let rows = |context: &mut ClientContext, sql: &str| {
+            run(context, sql).into_iter().map(|r| r.join(",")).collect::<Vec<_>>()
+        };
+        // groups outside of a set are NULL, and aggregates still see their values
+        assert_eq!(
+            rows(
+                &mut context,
+                "SELECT a, b, sum(a), count(*) FROM t GROUP BY GROUPING SETS ((a), (b), ()) \
+                 ORDER BY a NULLS LAST, b NULLS LAST"
+            ),
+            ["1,NULL,2,2", "2,NULL,4,2", "NULL,x,5,3", "NULL,y,1,1", "NULL,NULL,6,4"]
+        );
+        assert_eq!(
+            rows(
+                &mut context,
+                "SELECT a, b, sum(v) FROM t GROUP BY ROLLUP (a, b) ORDER BY a NULLS LAST, b NULLS LAST"
+            ),
+            ["1,x,10", "1,y,20", "1,NULL,30", "2,x,10", "2,NULL,10", "NULL,NULL,40"]
+        );
+        assert_eq!(
+            run(&mut context, "SELECT a, b, count(*) FROM t GROUP BY CUBE (a, b)").len(),
+            8
+        );
+        // GROUPING has a bit per argument, the first one highest, set outside of the grouping set
+        assert_eq!(
+            rows(
+                &mut context,
+                "SELECT GROUPING(a), GROUPING(b), GROUPING(a, b), GROUPING_ID(b, a), GROUPING(), count(*) \
+                 FROM t GROUP BY CUBE (a, b) HAVING a IS NULL OR b IS NULL"
+            )
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>(),
+            ["0,1,1,2,1,2", "1,0,2,1,2,1", "1,0,2,1,2,3", "1,1,3,3,3,4"]
+        );
+        // DISTINCT, FILTER and ORDER BY aggregate per set
+        assert_eq!(
+            rows(
+                &mut context,
+                "SELECT a, count(DISTINCT v), count(*) FILTER (v > 5), first(v ORDER BY v DESC) \
+                 FROM t GROUP BY ROLLUP (a) ORDER BY a NULLS LAST"
+            ),
+            ["1,2,2,20", "2,1,0,5", "NULL,3,2,20"]
+        );
+        // equal sets each give their rows
+        assert_eq!(
+            rows(&mut context, "SELECT count(*) FROM t GROUP BY GROUPING SETS ((), ())"),
+            ["4", "4"]
+        );
+        // the set without groups has a row for no input, the others have none
+        assert_eq!(
+            rows(
+                &mut context,
+                "SELECT a, count(*) FROM t WHERE a > 5 GROUP BY ROLLUP (a)"
+            ),
+            ["NULL,0"]
+        );
+        assert!(run(&mut context, "SELECT a, count(*) FROM t WHERE a > 5 GROUP BY a").is_empty());
+        // a grouping set that is all the groups is a plain GROUP BY
+        assert_eq!(
+            rows(
+                &mut context,
+                "SELECT a, GROUPING(a) FROM t GROUP BY GROUPING SETS ((a)) ORDER BY a"
+            ),
+            ["1,0", "2,0"]
+        );
+    }
+
+    #[test]
+    fn grouping_function_errors() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        run(&mut context, "CREATE TABLE t (a INTEGER, b INTEGER)");
+        let err = |context: &mut ClientContext, sql: &str| context.query(sql).unwrap_err().to_string();
+        assert_eq!(
+            err(&mut context, "SELECT GROUPING(a) FROM t"),
+            "Binder Error: GROUPING statement cannot be used without groups"
+        );
+        assert!(err(&mut context, "SELECT GROUPING(b) FROM t GROUP BY a").contains("must be a grouping column"));
+        assert!(
+            err(&mut context, "SELECT a FROM t WHERE GROUPING(a) = 0 GROUP BY a")
+                .contains("GROUPING function is not supported here")
+        );
+        assert!(
+            err(&mut context, "SELECT sum(GROUPING(a)) FROM t GROUP BY a")
+                .contains("GROUPING function is not supported here")
+        );
+    }
+
+    #[test]
     fn aggregates() {
         let mut context = ClientContext::new(DatabaseInstance::new());
         run(

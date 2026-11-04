@@ -540,6 +540,9 @@ enum ColumnMode {
 struct AggregateBindState {
     group_index: usize,
     aggregate_index: usize,
+    groupings_index: usize,
+    /// the GROUPING calls, as the groups each one reports on (`grouping_functions`)
+    grouping_functions: Vec<Vec<usize>>,
     /// (qualified, alias-free) group expression -> group (`group_map`)
     group_map: Vec<(ast::Expr, usize)>,
     /// alias or select list position -> group (`group_alias_map`)

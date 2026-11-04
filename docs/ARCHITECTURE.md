@@ -135,7 +135,7 @@ A statement goes `parse_ast` → `Binder` (bound expressions, `LogicalOperator` 
 
 Deliberate gaps so far: no DECIMAL arithmetic (a DECIMAL meets a number in DOUBLE, which loses
 digits), no constraints beyond NOT NULL, no table options, no joins, no transactions, no DISTINCT ON, LIMIT PERCENT or
-non-constant LIMIT, no GROUPING SETS/ROLLUP/CUBE, no ORDER BY in aggregates, no collations, no
+non-constant LIMIT, no ORDER BY in aggregates, no collations, no
 SET VARIABLE or settings of MAP and list types. The expression executor evaluates a filter's
 condition to a BOOLEAN vector rather than using DuckDB's specialized `Select`, and casts to
 VARCHAR and from or to DECIMAL, CASE and COALESCE write row by row through `Value`. Tables and

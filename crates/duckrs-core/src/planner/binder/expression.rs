@@ -784,6 +784,10 @@ impl Binder<'_> {
                     .collect::<Result<Vec<_>>>()?;
                 BoundExpr::new(BoundExprKind::Conjunction { and: *and, children }, LogicalType::BOOLEAN)
             }
+            ExprKind::Operator {
+                op: OperatorType::Grouping,
+                children,
+            } => self.bind_grouping_function(children, expr.to_string())?,
             ExprKind::Operator { op, children } => {
                 let op = match op {
                     OperatorType::Not => BoundOperator::Not,
@@ -1063,6 +1067,17 @@ impl Binder<'_> {
 
     /// `BaseSelectBinder::TryBindGroup` + `BindGroup`: a reference to the group `expr` matches.
     pub(super) fn try_bind_group(&self, expr: &Expr) -> Option<BoundExpr> {
+        let group = self.find_group(expr)?;
+        let state = self.aggregates.as_ref()?;
+        Some(BoundExpr::column_ref(
+            ColumnBinding::new(state.group_index, group),
+            state.groups[group].return_type.clone(),
+            expr.alias.clone(),
+        ))
+    }
+
+    /// `BaseSelectBinder::TryBindGroup`: the group `expr` matches.
+    fn find_group(&self, expr: &Expr) -> Option<usize> {
         let state = self.aggregates.as_ref().filter(|s| !s.inside_aggregate)?;
         if state.group_map.is_empty() && state.group_alias_map.is_empty() {
             return None;
@@ -1075,15 +1090,42 @@ impl Binder<'_> {
                 .map(|(_, group)| *group),
             _ => None,
         };
-        let group = aliased.or_else(|| {
+        aliased.or_else(|| {
             let key = without_aliases(expr);
             state.group_map.iter().find(|(e, _)| *e == key).map(|(_, group)| *group)
-        })?;
-        Some(BoundExpr::column_ref(
-            ColumnBinding::new(state.group_index, group),
-            state.groups[group].return_type.clone(),
-            expr.alias.clone(),
-        ))
+        })
+    }
+
+    /// `BaseSelectBinder::BindGroupingFunction`: a column with the bitmask of a GROUPING call,
+    /// which the aggregate computes per grouping set.
+    fn bind_grouping_function(&mut self, children: &[Expr], name: String) -> Result<BoundExpr> {
+        let Some(state) = self.aggregates.as_ref().filter(|s| !s.inside_aggregate) else {
+            return Err(binder_error("GROUPING function is not supported here"));
+        };
+        if state.groups.is_empty() {
+            return Err(binder_error("GROUPING statement cannot be used without groups"));
+        }
+        let mut groups: Vec<usize> = (0..state.groups.len()).collect();
+        if !children.is_empty() {
+            groups.clear();
+            for child in children {
+                let mut child = child.clone();
+                self.qualify_column_names(&mut child);
+                let Some(group) = self.find_group(&child) else {
+                    return Err(binder_error(format!(
+                        "GROUPING child {child} must be a grouping column"
+                    )));
+                };
+                groups.push(group);
+            }
+        }
+        if groups.len() >= 64 {
+            return Err(binder_error("GROUPING statement cannot have more than 64 groups"));
+        }
+        let state = self.aggregates.as_mut().expect("checked above");
+        let binding = ColumnBinding::new(state.groupings_index, state.grouping_functions.len());
+        state.grouping_functions.push(groups);
+        Ok(BoundExpr::column_ref(binding, LogicalType::BIGINT, name))
     }
 
     /// `HavingBinder::BindColumnRef`: a column that is no group names a select list alias;

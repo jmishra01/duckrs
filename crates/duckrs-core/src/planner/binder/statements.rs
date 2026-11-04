@@ -657,16 +657,6 @@ impl Binder<'_> {
     }
 
     fn bind_select_node(&mut self, node: &SelectNode, modifiers: &[ResultModifier]) -> Result<BoundStatement> {
-        // a single grouping set of all groups is a plain GROUP BY
-        let groups = &node.groups;
-        let plain_grouping = match groups.grouping_sets.as_slice() {
-            [] => true,
-            [set] => set.len() == groups.group_expressions.len(),
-            _ => false,
-        };
-        if !plain_grouping {
-            return Err(not_implemented("GROUPING SETS, ROLLUP and CUBE"));
-        }
         if node.sample.is_some() {
             return Err(not_implemented("SAMPLE"));
         }
@@ -691,9 +681,12 @@ impl Binder<'_> {
         // qualify the groups, and swap the ones naming a select list entry with that entry
         let group_index = self.generate_table_index();
         let aggregate_index = self.generate_table_index();
+        let groupings_index = self.generate_table_index();
         let mut aggregates = AggregateBindState {
             group_index,
             aggregate_index,
+            groupings_index,
+            grouping_functions: Vec::new(),
             group_map: Vec::new(),
             group_alias_map: Vec::new(),
             groups: Vec::new(),
@@ -870,8 +863,11 @@ impl Binder<'_> {
                 LogicalOperatorKind::Aggregate {
                     group_index,
                     aggregate_index,
+                    groupings_index,
                     groups: aggregates.groups,
                     aggregates: aggregates.aggregates,
+                    grouping_sets: node.groups.grouping_sets.clone(),
+                    grouping_functions: aggregates.grouping_functions,
                 },
                 vec![plan],
             );
@@ -957,7 +953,7 @@ impl Binder<'_> {
 
     /// `ExpressionBinder::QualifyColumnNames`: qualifies the column references that bind to a
     /// table with that table's alias, so that equal expressions compare equal.
-    fn qualify_column_names(&self, expr: &mut Expr) {
+    pub(super) fn qualify_column_names(&self, expr: &mut Expr) {
         self.qualify_column_names_except(expr, &[]);
     }
 

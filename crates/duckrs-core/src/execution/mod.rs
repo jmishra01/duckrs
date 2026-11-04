@@ -84,9 +84,20 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
                 children,
             })
         }
-        LogicalOperatorKind::Aggregate { groups, aggregates, .. } => {
-            Box::new(PhysicalAggregate::new(types, groups, aggregates, children))
-        }
+        LogicalOperatorKind::Aggregate {
+            groups,
+            aggregates,
+            grouping_sets,
+            grouping_functions,
+            ..
+        } => Box::new(PhysicalAggregate::new(
+            types,
+            groups,
+            aggregates,
+            &grouping_sets,
+            &grouping_functions,
+            children,
+        )),
         LogicalOperatorKind::Window { windows, .. } => Box::new(window::PhysicalWindow::new(types, windows, children)),
         LogicalOperatorKind::Order { orders } => Box::new(PhysicalOrder::new(orders, children.remove(0))),
         LogicalOperatorKind::Limit { limit, offset } => Box::new(PhysicalLimit {

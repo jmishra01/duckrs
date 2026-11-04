@@ -12,6 +12,7 @@ use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
 use duckrs_parser::ast::JoinType;
 use parking_lot::Mutex;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// The `column_ids` entry of a scan for the `rowid` pseudo-column (`COLUMN_IDENTIFIER_ROW_ID`).
@@ -52,12 +53,18 @@ pub enum LogicalOperatorKind {
         table_index: usize,
         windows: Vec<BoundWindow>,
     },
-    /// `LogicalAggregate`: one row per distinct `groups`, with the `aggregates` of its rows.
+    /// `LogicalAggregate`: one row per distinct `groups`, with the `aggregates` of its rows. With
+    /// `grouping_sets` there is such a set of rows per set, where the groups outside of the set
+    /// are NULL; without any, all groups form the one set. The `grouping_functions` are the
+    /// GROUPING calls, as the groups each one reports on.
     Aggregate {
         group_index: usize,
         aggregate_index: usize,
+        groupings_index: usize,
         groups: Vec<BoundExpr>,
         aggregates: Vec<BoundAggregate>,
+        grouping_sets: Vec<BTreeSet<usize>>,
+        grouping_functions: Vec<Vec<usize>>,
     },
     /// `LogicalOrder`: sorts by the expressions, in order.
     Order { orders: Vec<BoundOrderByNode> },
@@ -293,10 +300,16 @@ impl LogicalOperator {
                 types.extend(windows.iter().map(|w| w.return_type.clone()));
                 types
             }
-            LogicalOperatorKind::Aggregate { groups, aggregates, .. } => groups
+            LogicalOperatorKind::Aggregate {
+                groups,
+                aggregates,
+                grouping_functions,
+                ..
+            } => groups
                 .iter()
                 .map(|g| g.return_type.clone())
                 .chain(aggregates.iter().map(|a| a.return_type.clone()))
+                .chain(grouping_functions.iter().map(|_| LogicalType::BIGINT))
                 .collect(),
             LogicalOperatorKind::Filter { .. }
             | LogicalOperatorKind::Order { .. }
@@ -385,11 +398,15 @@ impl LogicalOperator {
             LogicalOperatorKind::Aggregate {
                 group_index,
                 aggregate_index,
+                groupings_index,
                 groups,
                 aggregates,
+                grouping_functions,
+                ..
             } => {
                 let mut bindings = numbered(*group_index, groups.len());
                 bindings.extend(numbered(*aggregate_index, aggregates.len()));
+                bindings.extend(numbered(*groupings_index, grouping_functions.len()));
                 bindings
             }
             LogicalOperatorKind::Filter { .. }

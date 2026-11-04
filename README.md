@@ -2,7 +2,7 @@
 
 An analytical SQL database engine: a port of [DuckDB](https://github.com/duckdb/duckdb) to Rust.
 
-**Status: 1900 files pass, 37.1% of the corpus.** Phase 4 (types and casts) has started: the scalar casts, the nested types (LIST, ARRAY, STRUCT, MAP, UNION), `CREATE TYPE`, ENUM, BIT, BIGNUM and VARIANT are in, the last in its own in-memory encoding until Phase 9. What is left of the phase is GEOMETRY, which the plan defers. A first batch of Phase 5's functions is in too, because the type tests need them: `unnest`, `TRY(...)`, list slicing, the `list` aggregate, LIKE, and common string, list, map and interval helpers. Nested casts and functions run row by row for now. The engine runs CREATE TABLE, CREATE VIEW, CREATE SEQUENCE, CREATE MACRO, INSERT, prepared statements
+**Status: 1930 files pass, 37.6% of the corpus.** Phase 4 (types and casts) has started: the scalar casts, the nested types (LIST, ARRAY, STRUCT, MAP, UNION), `CREATE TYPE`, ENUM, BIT, BIGNUM and VARIANT are in, the last in its own in-memory encoding until Phase 9. What is left of the phase is GEOMETRY, which the plan defers. A first batch of Phase 5's functions is in too, because the type tests need them: `unnest`, `TRY(...)`, list slicing, the `list` aggregate, LIKE, and common string, list, map and interval helpers. Nested casts and functions run row by row for now. The engine runs CREATE TABLE, CREATE VIEW, CREATE SEQUENCE, CREATE MACRO, INSERT, prepared statements
 and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in memory. What exists today:
 
 - `crates/duckrs-common`: the core building blocks every other crate uses:
@@ -47,7 +47,7 @@ and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in me
   views, VALUES lists, subqueries, `range`/`generate_series` and joins of those (CROSS, INNER, LEFT, RIGHT,
   FULL, SEMI, ANTI and their RIGHT forms, with ON, USING or NATURAL; hash joins for equality
   conditions and nested loops otherwise, single-threaded and in memory) with WHERE, GROUP BY (with aliases,
-  positions and ALL), HAVING, aggregates (`count`, `sum`, `avg`, `min`, `max`, `first`, `last`,
+  positions, ALL, GROUPING SETS, ROLLUP and CUBE, and `GROUPING()`), HAVING, aggregates (`count`, `sum`, `avg`, `min`, `max`, `first`, `last`,
   `any_value`, with DISTINCT and FILTER), ORDER BY (positions, aliases, expressions, ORDER BY
   ALL, NULLS FIRST/LAST), LIMIT/OFFSET and DISTINCT; expressions with comparisons, AND/OR/NOT,
   IS [NOT] NULL, BETWEEN, IN, CASE, COALESCE, `+`, `-`, `*`, `/`, `//`, `%`, casts between the numeric types, DECIMAL, BOOLEAN, the temporal types, INTERVAL, UUID, BLOB and VARCHAR,
@@ -60,7 +60,7 @@ and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in me
 - `crates/duckrs`: the public API (`Database`, `Connection`, `QueryResult`) over the engine.
   Databases live in memory; a database file is accepted but not written until Phase 9.
 - `tools/sqllogictest`: a port of DuckDB's sqllogictest runner. It runs the DuckDB `.test` corpus
-  against duckrs, or against the C++ DuckDB library as a reference. duckrs passes 1900 files so far
+  against duckrs, or against the C++ DuckDB library as a reference. duckrs passes 1930 files so far
   (`tools/sqllogictest/known_passing.txt`, a CI gate), among them
   `test/sql/projection/test_simple_projection.test`.
 
