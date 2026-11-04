@@ -2043,6 +2043,56 @@ mod tests {
     }
 
     #[test]
+    fn scalar_casts_match_duckdb() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        let err = |context: &mut ClientContext, sql: &str| context.query(sql).unwrap_err().to_string();
+        for (sql, expected) in [
+            ("SELECT '1992-01-01 12:00:00'::DATE", "1992-01-01"),
+            ("SELECT DATE '1992-01-01'::TIMESTAMP", "1992-01-01 00:00:00"),
+            ("SELECT DATE 'infinity'::TIMESTAMP_MS", "infinity"),
+            (
+                "SELECT '2000-01-01 00:00:00.5'::TIMESTAMP::TIMESTAMP_S",
+                "2000-01-01 00:00:01",
+            ),
+            ("SELECT '12:30:00+02'::TIMETZ::TIME", "12:30:00"),
+            ("SELECT '12:30:00.123456789'::TIME_NS::TIME", "12:30:00.123457"),
+            ("SELECT '1 day 2 hours'::INTERVAL", "1 day 02:00:00"),
+            ("SELECT 'a\\x00b'::BLOB", "a\\x00b"),
+            (
+                "SELECT '6ba7b810-9dad-11d1-80b4-00c04fd430c8'::UUID",
+                "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+            ),
+            (
+                "SELECT '00000000-0000-0000-0000-000000000001'::UUID::BLOB::UUID",
+                "00000000-0000-0000-0000-000000000001",
+            ),
+            ("SELECT typeof(1::TINYINT)", "TINYINT"),
+            ("SELECT typeof(DATE '1992-01-01')", "DATE"),
+            ("SELECT TRY_CAST(DATE '1992-01-01' AS INTEGER)", "NULL"),
+            ("SELECT CAST(NULL::DATE AS INTEGER)", "NULL"),
+            ("SELECT TRY_CAST('nonsense' AS TIMESTAMP)", "NULL"),
+        ] {
+            assert_eq!(run(&mut context, sql), [[expected]], "{sql}");
+        }
+        assert_eq!(
+            err(&mut context, "SELECT 'nonsense'::DATE"),
+            "Conversion Error: invalid date field format: \"nonsense\", expected format is (YYYY-MM-DD)"
+        );
+        assert_eq!(
+            err(&mut context, "SELECT DATE '1992-01-01'::INTEGER"),
+            "Conversion Error: Unimplemented type for cast (DATE -> INTEGER)"
+        );
+        assert_eq!(
+            err(&mut context, "SELECT 'nonsense'::UUID"),
+            "Conversion Error: Could not convert string 'nonsense' to UUID"
+        );
+        assert_eq!(
+            err(&mut context, "SELECT 'infinity'::TIMESTAMP::TIME"),
+            "Conversion Error: Can't get TIME of infinite TIMESTAMP"
+        );
+    }
+
+    #[test]
     fn errors_match_duckdb() {
         let mut context = ClientContext::new(DatabaseInstance::new());
         let err = |context: &mut ClientContext, sql: &str| context.query(sql).unwrap_err().to_string();

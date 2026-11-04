@@ -9,9 +9,11 @@ pub mod cast;
 pub mod cast_rules;
 pub mod combine_types;
 pub(crate) mod operators;
+pub(crate) mod time_casts;
 
 use duckrs_common::Result;
-use duckrs_common::types::LogicalType;
+use duckrs_common::types::{LogicalType, LogicalTypeId};
+use duckrs_common::value::Value;
 use duckrs_common::vector::{DataChunk, Vector};
 use std::collections::HashMap;
 use std::fmt;
@@ -114,6 +116,27 @@ fn sequence_functions() -> Vec<ScalarFunctionSet> {
     sets
 }
 
+/// `typeof`: the binder replaces it with a constant ([`typeof_constant`]), so its signature only
+/// has to resolve.
+fn typeof_function() -> ScalarFunctionSet {
+    fn bound_elsewhere(_: &DataChunk, _: &mut Vector) -> Result<()> {
+        unreachable!("typeof is a constant once its argument has a type")
+    }
+    let mut set = ScalarFunctionSet::new("typeof");
+    set.add(ScalarFunction::new(
+        "typeof",
+        vec![LogicalType::new(LogicalTypeId::Any)],
+        LogicalType::VARCHAR,
+        bound_elsewhere,
+    ));
+    set
+}
+
+/// `BindTypeOfFunctionExpression`: the name of the argument's type, which needs no evaluation.
+pub fn typeof_constant(argument: &LogicalType) -> Value {
+    Value::varchar(argument.to_string())
+}
+
 /// The built-in functions by lowercase name. In DuckDB they are catalog entries of the system
 /// catalog; they move there when the catalog grows function entries.
 pub struct BuiltinFunctions {
@@ -135,6 +158,8 @@ impl BuiltinFunctions {
             for set in sequence_functions() {
                 functions.scalar.insert(set.name.clone(), set);
             }
+            let typeof_set = typeof_function();
+            functions.scalar.insert(typeof_set.name.clone(), typeof_set);
             for set in aggregates::aggregate_functions() {
                 functions.aggregate.insert(set.name.clone(), set);
             }

@@ -4,8 +4,10 @@
 //
 //! Vector casts (`CastFunctionSet::GetCastFunction` + the default cast functions): between the
 //! numeric types and BOOLEAN, from anything to VARCHAR, and from VARCHAR to the numeric types
-//! and BOOLEAN. The other casts arrive with Phase 4.
+//! and BOOLEAN. [`super::time_casts`] has the temporal types, BLOB and UUID. The casts of the
+//! types that are not ported yet fail as not ported.
 
+use super::time_casts;
 use duckrs_common::executor;
 use duckrs_common::string_cast::{format_double, format_float};
 use duckrs_common::types::{LogicalType, LogicalTypeId, NativeType, PhysicalType};
@@ -184,7 +186,7 @@ pub enum CastMode {
     Try,
 }
 
-fn conversion_error(message: String) -> Error {
+pub(super) fn conversion_error(message: String) -> Error {
     Error::new(ErrorKind::Conversion, message)
 }
 
@@ -460,21 +462,39 @@ fn integer_radix_loop(buf: &[u8], radix: u32) -> Option<i128> {
     Some(result)
 }
 
-/// A UHUGEINT from a plain digit string, for values no `i128` holds.
+/// A UHUGEINT from a string, for values no `i128` holds: a hex or binary literal, or digits with
+/// an optional fraction and exponent, rounding half up.
 fn try_cast_string_to_uhugeint(input: &[u8]) -> Option<u128> {
     let text = std::str::from_utf8(input)
         .ok()?
         .trim_matches(|c: char| c.is_ascii() && is_space(c as u8));
-    let (integer, fraction) = text.split_once('.').unwrap_or((text, ""));
-    if !fraction.bytes().all(|c| c.is_ascii_digit()) {
+    let radix_literal = |prefixes: [&str; 2]| prefixes.iter().find_map(|p| text.strip_prefix(p));
+    for (prefixes, radix) in [(["0x", "0X"], 16), (["0b", "0B"], 2)] {
+        if let Some(digits) = radix_literal(prefixes) {
+            return u128::from_str_radix(&digits.replace('_', ""), radix).ok();
+        }
+    }
+    let text = text.strip_prefix('+').unwrap_or(text);
+    let (mantissa, exponent) = match text.find(['e', 'E']) {
+        Some(i) => (&text[..i], text[i + 1..].parse::<i32>().ok()?),
+        None => (text, 0),
+    };
+    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits: Vec<u8> = integer.bytes().chain(fraction.bytes()).filter(|c| *c != b'_').collect();
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
         return None;
     }
-    let value = integer.strip_prefix('+').unwrap_or(integer).parse::<u128>().ok()?;
-    if fraction.as_bytes().first().is_some_and(|d| *d >= b'5') {
-        value.checked_add(1)
-    } else {
-        Some(value)
+    // the exponent moves the decimal point
+    let point = integer.bytes().filter(|c| *c != b'_').count() as i64 + exponent as i64;
+    let mut value: u128 = 0;
+    for position in 0..point.max(0) {
+        let digit = digits.get(position as usize).map_or(0, |d| d - b'0');
+        value = value.checked_mul(10)?.checked_add(digit as u128)?;
     }
+    if point >= 0 && digits.get(point as usize).is_some_and(|d| *d >= b'5') {
+        value = value.checked_add(1)?;
+    }
+    Some(value)
 }
 
 /// `TryIntegerCast` (non-strict): the integer a string spells, rounding a fraction.
@@ -851,6 +871,42 @@ fn is_numeric_or_bool(ty: &LogicalType) -> bool {
     ty.id() == Boolean || (ty.is_numeric() && ty.id() != Decimal)
 }
 
+/// Whether every cast of `ty` is settled: it either exists, or is one only NULL survives.
+fn is_ported_scalar(ty: &LogicalType) -> bool {
+    use LogicalTypeId::*;
+    matches!(
+        ty.id(),
+        Boolean
+            | TinyInt
+            | SmallInt
+            | Integer
+            | BigInt
+            | HugeInt
+            | UTinyInt
+            | USmallInt
+            | UInteger
+            | UBigInt
+            | UHugeInt
+            | Float
+            | Double
+            | Decimal
+            | Date
+            | Time
+            | TimeNs
+            | TimeTz
+            | Timestamp
+            | TimestampSec
+            | TimestampMs
+            | TimestampNs
+            | TimestampTz
+            | TimestampTzNs
+            | Interval
+            | Varchar
+            | Blob
+            | Uuid
+    )
+}
+
 fn unimplemented_cast(source: &LogicalType, target: &LogicalType) -> Error {
     crate::unported(format!("casting {source} to {target}"))
 }
@@ -863,6 +919,7 @@ pub fn has_cast(source: &LogicalType, target: &LogicalType) -> bool {
         || (is_numeric_or_bool(source) && is_numeric_or_bool(target))
         || (source.id() == LogicalTypeId::Varchar && is_numeric_or_bool(target))
         || is_decimal_cast(source, target)
+        || (is_ported_scalar(source) && is_ported_scalar(target))
 }
 
 /// Casts `source` (of `count` rows) into `result`, whose type is the target type.
@@ -918,6 +975,12 @@ pub fn cast_vector(source: &Vector, result: &mut Vector, count: usize, mode: Cas
             _ => Err(unimplemented_cast(&from, &to)),
         };
     }
+    if time_casts::has_temporal_cast(&from, &to) {
+        return time_casts::temporal_cast(source, result, count, mode);
+    }
+    if is_ported_scalar(&from) && is_ported_scalar(&to) {
+        return time_casts::null_cast(source, result, count, mode);
+    }
     Err(unimplemented_cast(&from, &to))
 }
 
@@ -944,6 +1007,19 @@ mod tests {
         assert_eq!(cast("abc"), None);
         assert_eq!(cast(""), None);
         assert_eq!(cast("- 1"), None);
+    }
+
+    #[test]
+    fn strings_to_uhugeint_like_duckdb() {
+        let cast = |s: &str| try_cast_string_to_uhugeint(s.as_bytes());
+        let max = u128::MAX;
+        assert_eq!(cast(&max.to_string()), Some(max));
+        assert_eq!(cast("340282366920938463463374607431768211455e0"), Some(max));
+        assert_eq!(cast("34028236692093846346337460743176821145.5e1"), Some(max));
+        assert_eq!(cast("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"), Some(max));
+        assert_eq!(cast("340282366920938463463374607431768211456"), None);
+        assert_eq!(cast("340282366920938463463374607431768211455.5"), None);
+        assert_eq!(cast("abc"), None);
     }
 
     #[test]

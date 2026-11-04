@@ -2,7 +2,7 @@
 
 An analytical SQL database engine: a port of [DuckDB](https://github.com/duckdb/duckdb) to Rust.
 
-**Status: everything Phase 3 lists is ported, but its gate is not met yet** (385 files, 7.5% of the corpus, against a 15% target; what `test/sql/select`, `projection` and `filter` still fail on belongs to later phases). The engine runs CREATE TABLE, CREATE VIEW, CREATE SEQUENCE, CREATE MACRO, INSERT, prepared statements
+**Status: everything Phase 3 lists is ported, but its gate is not met yet** (447 files, 8.7% of the corpus, against a 15% target; what `test/sql/select`, `projection` and `filter` still fail on belongs to later phases). Phase 4 (types and casts) has started: the scalar casts are in, nested types are next. The engine runs CREATE TABLE, CREATE VIEW, CREATE SEQUENCE, CREATE MACRO, INSERT, prepared statements
 and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in memory. What exists today:
 
 - `crates/duckrs-common`: the core building blocks every other crate uses:
@@ -50,7 +50,7 @@ and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in me
   positions and ALL), HAVING, aggregates (`count`, `sum`, `avg`, `min`, `max`, `first`, `last`,
   `any_value`, with DISTINCT and FILTER), ORDER BY (positions, aliases, expressions, ORDER BY
   ALL, NULLS FIRST/LAST), LIMIT/OFFSET and DISTINCT; expressions with comparisons, AND/OR/NOT,
-  IS [NOT] NULL, BETWEEN, IN, CASE, COALESCE, `+`, `-`, `*`, `/`, `//`, `%`, casts between the numeric types, DECIMAL, BOOLEAN and VARCHAR,
+  IS [NOT] NULL, BETWEEN, IN, CASE, COALESCE, `+`, `-`, `*`, `/`, `//`, `%`, casts between the numeric types, DECIMAL, BOOLEAN, the temporal types, INTERVAL, UUID, BLOB and VARCHAR,
   and aliases of the select list; and SET/RESET/`PRAGMA x = y` for all 196
   of DuckDB's settings (generated from its `settings.json` by `tools/generate_settings.py`), with
   DuckDB's types and error messages. There is no optimizer yet, so a filter over a cross product
@@ -61,7 +61,7 @@ and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in me
 - `crates/duckrs`: the public API (`Database`, `Connection`, `QueryResult`) over the engine.
   Databases live in memory; a database file is accepted but not written until Phase 9.
 - `tools/sqllogictest`: a port of DuckDB's sqllogictest runner. It runs the DuckDB `.test` corpus
-  against duckrs, or against the C++ DuckDB library as a reference. duckrs passes 385 files so far
+  against duckrs, or against the C++ DuckDB library as a reference. duckrs passes 447 files so far
   (`tools/sqllogictest/known_passing.txt`, a CI gate), among them
   `test/sql/projection/test_simple_projection.test`.
 

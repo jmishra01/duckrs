@@ -149,13 +149,16 @@ impl Time {
 
     /// Parses a complete TIME string (`Time::FromCString`).
     pub fn parse(s: &str, strict: bool) -> crate::Result<Time> {
-        Self::try_convert(s.as_bytes(), strict, None).ok_or_else(|| {
-            crate::Error::new(
-                crate::ErrorKind::Conversion,
-                format!("time field value out of range: \"{s}\", expected format is ([YYYY-MM-DD ]HH:MM:SS[.MS])"),
-            )
-        })
+        Self::try_convert(s.as_bytes(), strict, None).ok_or_else(|| time_error(s))
     }
+}
+
+/// `Time::ConversionError`.
+pub fn time_error(s: &str) -> crate::Error {
+    crate::Error::new(
+        crate::ErrorKind::Conversion,
+        format!("time field value out of range: \"{s}\", expected format is ([YYYY-MM-DD ]HH:MM:SS[.MS])"),
+    )
 }
 
 /// Appends `digits` zero-padded to `width`, dropping trailing zeros (`TimeToStringCast::FormatMicros`).
@@ -237,7 +240,7 @@ impl TimeTz {
         }
         let (mut hh, mut mm, mut ss) = (0, 0, 0);
         if pos < len {
-            (hh, mm, ss) = parse_utc_offset(buf, &mut pos, false)?;
+            (hh, mm, ss) = parse_utc_offset(buf, &mut pos, true)?;
         }
         let offset = (hh * 60 + mm) * 60 + ss;
         if !(Self::MIN_OFFSET..=Self::MAX_OFFSET).contains(&offset) {

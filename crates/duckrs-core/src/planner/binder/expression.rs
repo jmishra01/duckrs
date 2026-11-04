@@ -8,9 +8,9 @@
 use super::{Binder, ColumnMode, binder_error};
 use crate::catalog::DEFAULT_CATALOG;
 use crate::execution::expression_executor::{evaluate_scalar, try_evaluate_scalar};
-use crate::function::BuiltinFunctions;
 use crate::function::binder::{bind_aggregate_function, bind_scalar_function, expression_return_type};
 use crate::function::combine_types::{force_max_logical_type, normalize_type, try_max_logical_type};
+use crate::function::{BuiltinFunctions, typeof_constant};
 use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, ColumnBinding, SequenceOp};
 use duckrs_common::types::{LogicalType, LogicalTypeId, decimal};
 use duckrs_common::value::Value;
@@ -180,6 +180,19 @@ fn type_parameter(expr: &Expr) -> Option<i64> {
     }
 }
 
+/// The type of a type parameter, for `TypeParametersToString`.
+fn type_parameter_type(expr: &Expr) -> &'static str {
+    match &expr.kind {
+        ExprKind::Constant(literal) => match literal.kind {
+            LiteralKind::Integer => "INTEGER",
+            LiteralKind::String => "VARCHAR",
+            LiteralKind::Null => "NULL",
+            _ => "DECIMAL",
+        },
+        _ => "ANY",
+    }
+}
+
 impl Binder<'_> {
     /// `Binder::BindLogicalType` for the types slice 1 executes: the scalar types without
     /// parameters, `VARCHAR(n)` and `DECIMAL(width, scale)`.
@@ -204,20 +217,30 @@ impl Binder<'_> {
         };
         match id {
             LogicalTypeId::Decimal => {
+                let rejected = || {
+                    let types: Vec<&str> = children.iter().map(type_parameter_type).collect();
+                    binder_error(format!(
+                        "Type \"DECIMAL\" does not accept type parameters ({})",
+                        types.join(", ")
+                    ))
+                };
                 let (width, scale) = match children {
                     [] => (18, 3),
-                    [w] => (type_parameter(w).unwrap_or(-1), 0),
-                    [w, s] => (type_parameter(w).unwrap_or(-1), type_parameter(s).unwrap_or(-1)),
-                    _ => return Err(binder_error("DECIMAL type requires at most two type parameters")),
+                    [w] => (type_parameter(w).ok_or_else(rejected)?, 0),
+                    [w, s] => (
+                        type_parameter(w).ok_or_else(rejected)?,
+                        type_parameter(s).ok_or_else(rejected)?,
+                    ),
+                    _ => return Err(rejected()),
                 };
                 if !(1..=decimal::MAX_WIDTH as i64).contains(&width) {
                     return Err(binder_error(format!(
-                        "Width must be between 1 and {}!",
+                        "DECIMAL type width must be between 1 and {}",
                         decimal::MAX_WIDTH
                     )));
                 }
                 if !(0..=width).contains(&scale) {
-                    return Err(binder_error("Scale must be between 0 and the width!"));
+                    return Err(binder_error("DECIMAL type scale cannot be greater than width"));
                 }
                 Ok(LogicalType::decimal(width as u8, scale as u8))
             }
@@ -404,8 +427,15 @@ impl Binder<'_> {
                     .iter()
                     .map(|a| self.bind_expression(&a.expr))
                     .collect::<Result<Vec<_>>>()?;
-                let bound = bind_scalar_function(set, children, function.is_operator, &try_evaluate_scalar)?;
-                self.bind_sequence_function(bound)?
+                match (set.name.as_str(), children.as_slice()) {
+                    ("typeof", [child]) if child.return_type.id() != LogicalTypeId::Unknown => {
+                        BoundExpr::constant(typeof_constant(&child.return_type))
+                    }
+                    _ => {
+                        let bound = bind_scalar_function(set, children, function.is_operator, &try_evaluate_scalar)?;
+                        self.bind_sequence_function(bound)?
+                    }
+                }
             }
             ExprKind::Parameter(identifier) => {
                 // `Binder::Bind(ParameterExpression)`

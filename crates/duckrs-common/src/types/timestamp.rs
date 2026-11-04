@@ -97,7 +97,8 @@ impl Timestamp {
     }
 }
 
-fn timestamp_error(s: &str, e: TimestampCastError) -> crate::Error {
+/// `Timestamp::FormatError`, `RangeError` and `UnsupportedTimezoneError`.
+pub fn timestamp_error(s: &str, e: TimestampCastError) -> crate::Error {
     let message = match e {
         TimestampCastError::IncorrectFormat => format!(
             "invalid timestamp field format: \"{s}\", expected format is (YYYY-MM-DD HH:MM[:SS[.US]][±HH[:MM[:SS]]| ZONE])"
@@ -180,7 +181,7 @@ fn convert_tz<'a>(
     if pos < len {
         if buf[pos] == b'Z' {
             pos += 1;
-        } else if let Some((hh, mm, ss)) = parse_utc_offset(buf, &mut pos, false) {
+        } else if let Some((hh, mm, ss)) = parse_utc_offset(buf, &mut pos, true) {
             let delta =
                 i64::from(hh) * MICROS_PER_HOUR + i64::from(mm) * MICROS_PER_MINUTE + i64::from(ss) * MICROS_PER_SEC;
             if use_offset {

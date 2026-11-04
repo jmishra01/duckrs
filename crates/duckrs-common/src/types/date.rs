@@ -226,18 +226,21 @@ impl Date {
 
     /// Parses a complete date string (`Date::FromCString`), with DuckDB's error messages.
     pub fn parse(s: &str, strict: bool) -> crate::Result<Date> {
-        match Self::try_convert(s.as_bytes(), strict) {
-            Ok(parsed) => Ok(parsed.date),
-            Err(DateCastError::IncorrectFormat) => Err(crate::Error::new(
-                crate::ErrorKind::Conversion,
-                format!("invalid date field format: \"{s}\", expected format is (YYYY-MM-DD)"),
-            )),
-            Err(DateCastError::Range) => Err(crate::Error::new(
-                crate::ErrorKind::Conversion,
-                format!("date field value out of range: \"{s}\""),
-            )),
-        }
+        Self::try_convert(s.as_bytes(), strict)
+            .map(|parsed| parsed.date)
+            .map_err(|e| date_error(s, e))
     }
+}
+
+/// `Date::FormatError` and `Date::RangeError`.
+pub fn date_error(s: &str, e: DateCastError) -> crate::Error {
+    let message = match e {
+        DateCastError::IncorrectFormat => {
+            format!("invalid date field format: \"{s}\", expected format is (YYYY-MM-DD)")
+        }
+        DateCastError::Range => format!("date field value out of range: \"{s}\""),
+    };
+    crate::Error::new(crate::ErrorKind::Conversion, message)
 }
 
 /// `Date::ParseDoubleDigit`: one or two digits.

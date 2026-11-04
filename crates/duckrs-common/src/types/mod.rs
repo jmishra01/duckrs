@@ -11,7 +11,7 @@ mod time;
 mod timestamp;
 mod uuid;
 
-pub use date::{Date, DateCastError, ParsedDate};
+pub use date::{Date, DateCastError, ParsedDate, date_error};
 pub use date_part::DatePart;
 pub use identifier::sql_identifier;
 pub use interval::{Interval, IntervalParseError};
@@ -19,11 +19,11 @@ pub use native::{ListEntry, NativeType};
 pub use string_t::{StringHeap, StringT};
 pub use time::{
     MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MINUTE, MICROS_PER_SEC, NANOS_PER_DAY, NANOS_PER_MICRO, Time, TimeTz,
-    time_ns_to_string,
+    time_error, time_ns_to_string,
 };
 pub use timestamp::{
-    Timestamp, TimestampCastError, timestamp_ms_to_string, timestamp_ns_to_string, timestamp_sec_to_string,
-    timestamp_to_string,
+    Timestamp, TimestampCastError, timestamp_error, timestamp_ms_to_string, timestamp_ns_to_string,
+    timestamp_sec_to_string, timestamp_to_string,
 };
 pub use uuid::{uuid_from_str, uuid_to_string};
 
