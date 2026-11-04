@@ -8,8 +8,8 @@
 
 use super::cast::{int_to_double, uhuge_to_double};
 use duckrs_common::sort_key::{NullOrder, OrderModifiers, OrderType, create_sort_keys};
-use duckrs_common::types::{LogicalType, LogicalTypeId, NativeType, PhysicalType};
-use duckrs_common::value::Value;
+use duckrs_common::types::{LogicalType, LogicalTypeId, NativeType, PhysicalType, bignum};
+use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::Vector;
 use duckrs_common::{Error, ErrorKind, Result};
 use std::fmt;
@@ -23,6 +23,7 @@ pub enum AggregateKind {
     SumInteger,
     SumDouble,
     SumDecimal,
+    SumBignum,
     AvgInteger,
     AvgDouble,
     AvgDecimal,
@@ -110,6 +111,8 @@ pub(super) fn aggregate_functions() -> Vec<AggregateFunctionSet> {
             overloads.push((vec![ty], LogicalType::HUGEINT, SumInteger));
         }
         overloads.push((vec![LogicalType::DOUBLE], LogicalType::DOUBLE, SumDouble));
+        let bignum = LogicalType::new(LogicalTypeId::Bignum);
+        overloads.push((vec![bignum.clone()], bignum, SumBignum));
         overloads
     };
     let avg = || {
@@ -174,7 +177,7 @@ impl AggregateKind {
             SumInteger | SumDecimal | AvgInteger | AvgDecimal => AggregateState::Integer { sum: 0, count: 0 },
             SumDouble | AvgDouble => AggregateState::Double { sum: 0.0, count: 0 },
             Min | Max => AggregateState::Extreme(None),
-            First | Last | AnyValue => AggregateState::Value(None),
+            First | Last | AnyValue | SumBignum => AggregateState::Value(None),
         }
     }
 }
@@ -205,6 +208,15 @@ fn add_integers<T: NativeType + Into<i128>>(
         *seen += 1;
     }
     Ok(())
+}
+
+/// `BignumOperation`: the running sum of `sum` over BIGNUM.
+fn add_bignums(left: &Value, right: &Value) -> Result<Value> {
+    let (ValueData::Bytes(a), ValueData::Bytes(b)) = (left.data(), right.data()) else {
+        unreachable!("a BIGNUM is stored as bytes");
+    };
+    let sum = bignum::add(a, b).map_err(|message| Error::new(ErrorKind::OutOfRange, message))?;
+    Value::new(left.logical_type().clone(), ValueData::Bytes(sum))
 }
 
 /// The sort key both `min`/`max` and DISTINCT compare values by.
@@ -256,6 +268,21 @@ impl AggregateFunction {
                 PhysicalType::Int128 => add_integers::<i128>(input, count, rows, states)?,
                 other => unreachable!("integer aggregate over {other}"),
             },
+            SumBignum => {
+                for &(row, group) in rows {
+                    let value = input.get_value(row);
+                    if value.is_null() {
+                        continue;
+                    }
+                    let AggregateState::Value(state) = &mut states[group] else {
+                        unreachable!("a value state");
+                    };
+                    *state = Some(match state.take() {
+                        Some(sum) => add_bignums(&sum, &value)?,
+                        None => value,
+                    });
+                }
+            }
             SumDouble | AvgDouble => {
                 let u = input.to_unified(count);
                 let data = u.data::<f64>();

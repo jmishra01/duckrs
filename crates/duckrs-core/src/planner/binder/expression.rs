@@ -13,8 +13,8 @@ use crate::function::combine_types::{force_max_logical_type, normalize_type, try
 use crate::function::nested::{bind_nested_function, is_nested_function};
 use crate::function::{BuiltinFunctions, typeof_constant};
 use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, ColumnBinding, SequenceOp};
-use duckrs_common::types::{LogicalType, LogicalTypeId, decimal};
-use duckrs_common::value::Value;
+use duckrs_common::types::{LogicalType, LogicalTypeId, bignum, bit, decimal};
+use duckrs_common::value::{Value, ValueData};
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast;
 use duckrs_parser::ast::sql_quoted_identifier;
@@ -65,7 +65,9 @@ fn number_to_value(text: &str) -> Result<Value> {
         if let Ok(v) = digits.parse::<u128>() {
             return Ok(Value::uhugeint(v));
         }
-        return Err(crate::unported("BIGNUM literals"));
+        let digits = digits.as_bytes();
+        let bignum = bignum::from_str(digits).expect("the digits of an integer literal");
+        return Value::new(LogicalType::new(LogicalTypeId::Bignum), ValueData::Bytes(bignum));
     }
     let decimal_offset = if bytes[0] == b'-' { 3 } else { 2 };
     if let Some(position) = decimal_position
@@ -121,7 +123,11 @@ fn literal_to_value(literal: &Literal) -> Result<Value> {
                 .collect::<Vec<u8>>();
             Ok(Value::blob(bytes))
         }
-        LiteralKind::Bit => Err(crate::unported("BIT literals")),
+        LiteralKind::Bit => {
+            let bytes =
+                bit::string_to_bit(literal.text.as_bytes()).map_err(|e| Error::new(ErrorKind::Conversion, e))?;
+            Value::new(LogicalType::new(LogicalTypeId::Bit), ValueData::Bytes(bytes))
+        }
     }
 }
 
@@ -314,12 +320,12 @@ impl Binder<'_> {
                 }
                 enum_type_from(values)
             }
+            // the length of a BIT is accepted and ignored
+            LogicalTypeId::Bit if children.len() <= 1 => Ok(LogicalType::new(id)),
             _ if !children.is_empty() => Err(crate::unported(format!("type parameters for {}", name.to_uppercase()))),
-            LogicalTypeId::Variant
-            | LogicalTypeId::Bit
-            | LogicalTypeId::Bignum
-            | LogicalTypeId::Geometry
-            | LogicalTypeId::Type => Err(crate::unported(format!("the {} type", name.to_uppercase()))),
+            LogicalTypeId::Variant | LogicalTypeId::Geometry | LogicalTypeId::Type => {
+                Err(crate::unported(format!("the {} type", name.to_uppercase())))
+            }
             id => Ok(LogicalType::new(id)),
         }
     }

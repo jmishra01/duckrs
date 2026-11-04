@@ -5,6 +5,8 @@
 
 pub mod aggregates;
 pub mod binder;
+mod bit_casts;
+mod bit_functions;
 pub mod cast;
 pub mod cast_rules;
 pub mod combine_types;
@@ -159,6 +161,9 @@ impl BuiltinFunctions {
                 functions.scalar.insert(set.name.clone(), set);
             }
             for set in sequence_functions() {
+                functions.scalar.insert(set.name.clone(), set);
+            }
+            for set in bit_functions::bit_functions() {
                 functions.scalar.insert(set.name.clone(), set);
             }
             let typeof_set = typeof_function();

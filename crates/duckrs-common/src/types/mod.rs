@@ -1,6 +1,8 @@
 // Ported from duckdb/src/common/types.cpp and duckdb/src/include/duckdb/common/types.hpp
 // @ rust-port-baseline
 
+pub mod bignum;
+pub mod bit;
 mod date;
 mod date_part;
 mod identifier;

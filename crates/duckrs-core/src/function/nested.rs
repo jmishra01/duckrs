@@ -52,7 +52,7 @@ pub fn is_nested_function(name: &str) -> bool {
 }
 
 /// Runs `f` on the arguments of each row.
-fn row_wise(args: &DataChunk, result: &mut Vector, f: impl Fn(&[Value]) -> Result<Value>) -> Result<()> {
+pub(super) fn row_wise(args: &DataChunk, result: &mut Vector, f: impl Fn(&[Value]) -> Result<Value>) -> Result<()> {
     let count = args.len();
     result.prepare_flat(count.max(1));
     let mut row = Vec::with_capacity(args.column_count());

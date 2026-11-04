@@ -4,10 +4,11 @@
 //
 //! Vector casts (`CastFunctionSet::GetCastFunction` + the default cast functions): between the
 //! numeric types and BOOLEAN, from anything to VARCHAR, and from VARCHAR to the numeric types
-//! and BOOLEAN. [`super::time_casts`] has the temporal types, BLOB and UUID. The casts of the
-//! types that are not ported yet fail as not ported.
+//! and BOOLEAN. [`super::time_casts`] has the temporal types, BLOB and UUID, and
+//! [`super::bit_casts`] has BIT and BIGNUM. The casts of the types that are not ported yet fail
+//! as not ported.
 
-use super::{nested_casts, time_casts};
+use super::{bit_casts, nested_casts, time_casts};
 use duckrs_common::executor;
 use duckrs_common::string_cast::{format_double, format_float};
 use duckrs_common::types::{LogicalType, LogicalTypeId, NativeType, PhysicalType};
@@ -821,7 +822,7 @@ fn cast_decimal_value(value: &Value, target: &LogicalType) -> Result<Value> {
 }
 
 /// An integer as a value of the integer type `target`.
-fn integer_value(input: i128, target: &LogicalType) -> Result<Value> {
+pub(super) fn integer_value(input: i128, target: &LogicalType) -> Result<Value> {
     use LogicalTypeId::*;
     Ok(match target.id() {
         TinyInt => Value::tinyint(input as i8),
@@ -909,6 +910,8 @@ fn is_ported_scalar(ty: &LogicalType) -> bool {
             | Blob
             | Uuid
             | Enum
+            | Bit
+            | Bignum
     )
 }
 
@@ -1003,6 +1006,10 @@ pub fn cast_vector(source: &Vector, result: &mut Vector, count: usize, mode: Cas
     }
     if from.id() == LogicalTypeId::Enum || to.id() == LogicalTypeId::Enum {
         return enum_cast(source, result, count, mode);
+    }
+    let is_bit = |id| matches!(id, LogicalTypeId::Bit | LogicalTypeId::Bignum);
+    if is_bit(from.id()) || is_bit(to.id()) {
+        return bit_casts::bit_cast(source, result, count, mode);
     }
     if is_decimal_cast(&from, &to) {
         return decimal_cast(source, result, count, mode);

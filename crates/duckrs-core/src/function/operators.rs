@@ -177,7 +177,7 @@ float_division!(f32, f64);
 /// executor fills in.
 pub(crate) const DIVISION_BY_ZERO: &str = "Division by zero";
 
-fn division_by_zero() -> Error {
+pub(super) fn division_by_zero() -> Error {
     Error::new(ErrorKind::InvalidInput, DIVISION_BY_ZERO)
 }
 
@@ -733,6 +733,15 @@ pub(super) fn arithmetic_operators() -> Vec<ScalarFunctionSet> {
         )
         .with_resolve_types(resolve_concat),
     );
+    for overload in super::bit_functions::bignum_operators() {
+        match overload.name.as_str() {
+            "+" => add.add(overload),
+            "-" => subtract.add(overload),
+            "*" => multiply.add(overload),
+            "//" => full_divide.add(overload),
+            _ => remainder.add(overload),
+        }
+    }
     let mut sets = vec![
         add,
         subtract,

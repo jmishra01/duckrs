@@ -349,8 +349,8 @@ impl Value {
 
     /// The value rendered as `CAST(value AS VARCHAR)` would (`Value::ToString`).
     ///
-    /// ENUM, BIT, BIGNUM and GEOMETRY values go through cast functions that are not ported yet,
-    /// and return `Not implemented`.
+    /// GEOMETRY values go through cast functions that are not ported yet, and return
+    /// `Not implemented`.
     pub fn try_to_string(&self) -> Result<String> {
         if self.is_null() {
             return Ok("NULL".into());
@@ -375,6 +375,8 @@ impl Value {
             (ValueData::Double(v), _) => format_double(*v),
             (ValueData::Bytes(b), LogicalTypeId::Varchar | LogicalTypeId::Char) => String::from_utf8_lossy(b).into(),
             (ValueData::Bytes(b), LogicalTypeId::Blob) => format_blob(b),
+            (ValueData::Bytes(b), LogicalTypeId::Bit) => crate::types::bit::bit_to_string(b),
+            (ValueData::Bytes(b), LogicalTypeId::Bignum) => crate::types::bignum::to_string(b),
             (
                 _,
                 LogicalTypeId::TinyInt

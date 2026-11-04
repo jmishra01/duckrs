@@ -2252,6 +2252,67 @@ mod tests {
     }
 
     #[test]
+    fn bit_and_bignum_match_duckdb() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        let err = |context: &mut ClientContext, sql: &str| context.query(sql).unwrap_err().to_string();
+        let huge = "340282366920938463463374607431768211456000";
+        for (sql, expected) in [
+            ("SELECT '0101'::BIT", "0101"),
+            ("SELECT 'xFA'::BIT", "11111010"),
+            ("SELECT '101'::BIT::INTEGER", "5"),
+            ("SELECT 5::TINYINT::BIT", "00000101"),
+            ("SELECT '0'::BIT < '10101010'::BIT", "true"),
+            ("SELECT '101'::BIT & '110'::BIT", "100"),
+            ("SELECT ~'101'::BIT", "010"),
+            ("SELECT '1001'::BIT << 1", "0010"),
+            ("SELECT bit_count('1101'::BIT)", "3"),
+            ("SELECT get_bit('0110'::BIT, 2)", "1"),
+            ("SELECT set_bit('0110'::BIT, 0, 1)", "1110"),
+            ("SELECT bit_position('10'::BIT, '0010'::BIT)", "3"),
+            ("SELECT bitstring('101', 5)", "00101"),
+            ("SELECT '-0010'::BIGNUM", "-10"),
+            ("SELECT '0.5'::BIGNUM", "1"),
+            ("SELECT 1e3::BIGNUM", "1000"),
+            (
+                "SELECT 170141183460469231731687303715884105728000::BIGNUM // 1000",
+                "170141183460469231731687303715884105728",
+            ),
+            (
+                "SELECT 9223372036854775807::BIGNUM + 9223372036854775807::BIGNUM",
+                "18446744073709551614",
+            ),
+            ("SELECT (-7)::BIGNUM % 2::BIGNUM", "-1"),
+            ("SELECT 5::BIGNUM * 3", "15"),
+            ("SELECT typeof(5::BIGNUM * 3)", "BIGNUM"),
+            ("SELECT (-1)::BIGNUM < 1::BIGNUM", "true"),
+            ("SELECT 300::BIGNUM::SMALLINT", "300"),
+            ("SELECT TRY_CAST(300::BIGNUM AS TINYINT)", "NULL"),
+        ] {
+            assert_eq!(run(&mut context, sql), [[expected]], "{sql}");
+        }
+        assert_eq!(run(&mut context, &format!("SELECT {huge}")), [[huge]]);
+        run(&mut context, "CREATE TABLE b (x BIGNUM)");
+        run(&mut context, "INSERT INTO b VALUES (9223372036854775807), (2), (NULL)");
+        assert_eq!(run(&mut context, "SELECT sum(x) FROM b"), [["9223372036854775809"]]);
+        assert_eq!(
+            err(&mut context, "SELECT '012'::BIT"),
+            "Conversion Error: Invalid character encountered in string -> bit conversion: '2'"
+        );
+        assert_eq!(
+            err(&mut context, "SELECT '101'::BIT & '11'::BIT"),
+            "Invalid Input Error: Cannot AND bit strings of different sizes"
+        );
+        assert_eq!(
+            err(&mut context, "SELECT 300::BIGNUM::TINYINT"),
+            "Conversion Error: BIGNUM value 300 is out of range for type INT8"
+        );
+        assert_eq!(
+            err(&mut context, "SELECT 'x'::BIGNUM"),
+            "Conversion Error: Could not convert string 'x' to BIGNUM"
+        );
+    }
+
+    #[test]
     fn errors_match_duckdb() {
         let mut context = ClientContext::new(DatabaseInstance::new());
         let err = |context: &mut ClientContext, sql: &str| context.query(sql).unwrap_err().to_string();

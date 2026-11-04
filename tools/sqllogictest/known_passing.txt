@@ -1,6 +1,7 @@
 # Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
 # stop passing. Regenerate with:
 #   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
+test/common/test_cast_hugeint.test
 test/fuzzer/afl/decimal_string_roundtrip.test
 test/fuzzer/afl/generate_series_null.test
 test/fuzzer/afl/issue_7551.test
@@ -103,6 +104,7 @@ test/issues/rigger/test_590.test
 test/issues/rigger/test_637.test
 test/issues/rigger/test_empty_string_statistics.test
 test/optimizer/column_lifetime_analyzer/must_visit_operator_expressions_first.test
+test/optimizer/compare_blob.test
 test/optimizer/compressed_materialization_many_aggregates.test
 test/optimizer/constant_argument_errors_case.test
 test/optimizer/disjunctive_join_rewriter_nested.test
@@ -157,6 +159,7 @@ test/sql/binder/test_string_alias.test
 test/sql/cast/array_to_varchar_quoting.test
 test/sql/cast/boolean_autocast.test
 test/sql/cast/boolean_to_decimal_cast.test
+test/sql/cast/cast_error_logical_types.test
 test/sql/cast/common_operator_coverage.test
 test/sql/cast/decimal_cast.test
 test/sql/cast/decimal_integer_cast.test
@@ -171,10 +174,12 @@ test/sql/cast/string_to_struct_roundtrip.test
 test/sql/cast/string_to_unnamed_struct.test
 test/sql/cast/struct_from_string_duplicate_keys.test
 test/sql/cast/struct_to_map.test
+test/sql/cast/test_bit_cast.test
 test/sql/cast/test_boolean_cast.test
 test/sql/cast/test_exponent_in_cast.test
 test/sql/cast/test_string_cast.test
 test/sql/cast/test_try_cast.test
+test/sql/cast/try_cast_blob_to_bit.test
 test/sql/cast/union_cast.test
 test/sql/catalog/case_insensitive_using.test
 test/sql/catalog/dependencies/test_concurrent_schema_creation.test
@@ -296,6 +301,7 @@ test/sql/keywords/keywords_in_expressions.test
 test/sql/limit/limit_exceeds_child_cardinality.test
 test/sql/limit/test_preserve_insertion_order.test
 test/sql/optimizer/expression/enum_compare_null.test
+test/sql/optimizer/expression/test_casting_negative_integer_to_bit.test
 test/sql/optimizer/expression/test_conjunction_optimization.test
 test/sql/optimizer/expression/test_in_clause_simplification.test
 test/sql/optimizer/expression/test_move_constants.test
@@ -416,6 +422,23 @@ test/sql/types/alias/test_alias_map.test
 test/sql/types/alias/test_alias_struct.test
 test/sql/types/alias/test_alias_struct_nested_alias.test
 test/sql/types/alias/type_with_schema.test
+test/sql/types/bignum/issue25939.test
+test/sql/types/bignum/test_bignum_comparisons.test
+test/sql/types/bignum/test_bignum_double.test
+test/sql/types/bignum/test_bignum_float_string_cast.test
+test/sql/types/bignum/test_bignum_implicit_cast.test
+test/sql/types/bignum/test_bignum_try_cast.test
+test/sql/types/bignum/test_bignum_varchar_invalid.test
+test/sql/types/bignum/test_double_bignum.test
+test/sql/types/bignum/test_int_bignum_conversion.test
+test/sql/types/bignum/test_varchar_bignum_conversion.test
+test/sql/types/bignum/test_varchar_bignum_unhappy.test
+test/sql/types/bit/bit_issue_11211.test
+test/sql/types/bit/bit_try_cast.test
+test/sql/types/bit/test_bit_bitwise_operations.test
+test/sql/types/bit/test_bit_equality.test
+test/sql/types/bit/test_bit_functions.test
+test/sql/types/bit/test_hex_to_bit.test
 test/sql/types/blob/test_blob_cast.test
 test/sql/types/blob/test_blob_operator.test
 test/sql/types/blob/test_blob_try_cast.test
@@ -551,8 +574,10 @@ test/sql/types/timestamp/timestamp_round_out_of_range.test
 test/sql/types/timestamp/timestamp_try_cast.test
 test/sql/types/timestamp/timestamptz_ns_casts.test
 test/sql/types/uhugeint/test_uhugeint_aggregates.test
+test/sql/types/uhugeint/test_uhugeint_conversion.test
 test/sql/types/uhugeint/test_uhugeint_exponent.test
 test/sql/types/uhugeint/test_uhugeint_ops.test
+test/sql/types/uhugeint/uhugeint_literal.test
 test/sql/types/uhugeint/uhugeint_multiply.test
 test/sql/types/uhugeint/uhugeint_try_cast.test
 test/sql/types/union/union_ambiguous.test

@@ -68,6 +68,7 @@ struct KeyColumn {
     format: UnifiedFormat,
     physical: PhysicalType,
     is_varchar: bool,
+    is_bit: bool,
     null_byte: u8,
     valid_byte: u8,
     kind: Kind,
@@ -141,6 +142,7 @@ impl KeyColumn {
             format,
             physical,
             is_varchar: input.logical_type().id() == LogicalTypeId::Varchar,
+            is_bit: input.logical_type().id() == LogicalTypeId::Bit,
             null_byte,
             valid_byte,
             kind,
@@ -228,6 +230,11 @@ impl KeyColumn {
                     bytes[0] ^= 0x80;
                     out.extend_from_slice(&bytes);
                 }
+            }
+            PhysicalType::Varchar if self.is_bit => {
+                // BIT orders by its bits, not by its padded bytes
+                out.extend(crate::types::bit::byte_comparable(self.format.str_at(r)));
+                out.push(STRING_DELIMITER);
             }
             PhysicalType::Varchar if self.is_varchar => {
                 // Every byte + 1, so none collides with the 0 delimiter (UTF-8 never has 0xFF).
