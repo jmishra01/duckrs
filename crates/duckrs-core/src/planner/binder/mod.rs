@@ -7,6 +7,7 @@ mod alter;
 mod create_index;
 mod expression;
 mod join;
+mod lambda;
 mod macros;
 mod on_conflict;
 mod statements;
@@ -566,6 +567,7 @@ pub struct Binder<'a> {
     /// The error for an aggregate where it is not allowed (`UnsupportedAggregateMessage`).
     aggregate_error: &'static str,
     pub session: Option<Arc<SessionValues>>,
+    lambda_scopes: Vec<lambda::LambdaScope>,
     /// The windows of the SELECT clause being bound, when it may have any here.
     windows: Option<window::WindowBindState>,
     window_error: &'static str,
@@ -632,6 +634,7 @@ impl<'a> Binder<'a> {
             aggregates: None,
             aggregate_error: "Aggregate functions are not supported here",
             session: None,
+            lambda_scopes: Vec::new(),
             windows: None,
             window_error: "window functions are not supported here",
             inside_window: false,

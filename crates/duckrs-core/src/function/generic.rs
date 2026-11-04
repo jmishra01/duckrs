@@ -11,6 +11,7 @@
 use super::bit_functions::strict_rows;
 use super::combine_types::{force_max_logical_type, normalize_type};
 use super::dates::{bind_date_function, is_date_function};
+use super::lists::{bind_list_function, is_list_function};
 use super::nested::{bound_function, row_wise};
 use super::strings::format_callback;
 use super::{ScalarCallback, ScalarFunction, ScalarFunctionSet};
@@ -591,6 +592,7 @@ pub fn bind_unnest(children: Vec<BoundExpr>) -> Result<BoundExpr> {
 /// Whether [`bind_generic_function`] binds the function `name`.
 pub fn is_generic_function(name: &str) -> bool {
     is_date_function(name)
+        || is_list_function(name)
         || matches!(
             name.to_ascii_lowercase().as_str(),
             "array_slice"
@@ -636,6 +638,9 @@ pub fn is_generic_function(name: &str) -> bool {
 pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<BoundExpr> {
     if is_date_function(name) {
         return bind_date_function(name, children);
+    }
+    if is_list_function(name) {
+        return bind_list_function(name, children);
     }
     let lower = name.to_ascii_lowercase();
     if lower.starts_with("map_") && null_map_argument(&children)

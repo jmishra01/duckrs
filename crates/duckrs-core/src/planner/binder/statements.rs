@@ -963,7 +963,23 @@ impl Binder<'_> {
     /// [`Self::qualify_column_names`], leaving the unqualified `aliases` alone
     /// (`BaseSelectBinder::ClaimsAlias`).
     fn qualify_column_names_except(&self, expr: &mut Expr, aliases: &[String]) {
+        // the parameters of lambdas are no columns; they come before their bodies in this walk
+        let mut parameters: Vec<String> = Vec::new();
         visit_expr_mut(expr, &mut |e| {
+            if let ExprKind::Lambda { lhs, .. } = &e.kind {
+                let mut lhs = (**lhs).clone();
+                visit_expr_mut(&mut lhs, &mut |p| {
+                    if let ExprKind::ColumnRef(names) = &p.kind {
+                        parameters.extend(names.iter().map(|n| n.to_lowercase()));
+                    }
+                });
+                return;
+            }
+            if let ExprKind::ColumnRef(names) = &e.kind
+                && parameters.contains(&names[0].to_lowercase())
+            {
+                return;
+            }
             let using = match &e.kind {
                 ExprKind::ColumnRef(names) => match names.as_slice() {
                     [name] if !aliases.iter().any(|a| a.eq_ignore_ascii_case(name)) => {

@@ -104,6 +104,15 @@ pub enum SequenceOp {
 pub enum BoundExprKind {
     /// `BoundConstantExpression`.
     Constant(Value),
+    /// `list_transform`, `list_filter` or `list_reduce`. `body` reads the chunk the operator
+    /// builds: the parameters and the index, then the `captures`, which are in the input's.
+    ListLambda {
+        kind: LambdaKind,
+        list: Box<BoundExpr>,
+        initial: Option<Box<BoundExpr>>,
+        captures: Vec<BoundExpr>,
+        body: Box<BoundExpr>,
+    },
     /// `BoundColumnRefExpression`: a column of an operator below, until the
     /// `ColumnBindingResolver` turns it into a [`BoundExprKind::Reference`].
     ColumnRef { binding: ColumnBinding, depth: usize },
@@ -184,6 +193,14 @@ const VOLATILE_FUNCTIONS: &[&str] = &[
     "current_date",
     "today",
 ];
+
+/// What a lambda function does with its lambda.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LambdaKind {
+    Transform,
+    Filter,
+    Reduce,
+}
 
 /// What a window computes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,6 +300,17 @@ impl BoundExpr {
             BoundExprKind::Subquery { child, correlated, .. } => child.iter().map(|c| &**c).chain(correlated).collect(),
             BoundExprKind::Comparison { left, right, .. } => vec![left, right],
             BoundExprKind::Between { input, lower, upper } => vec![input, lower, upper],
+            BoundExprKind::ListLambda {
+                list,
+                initial,
+                captures,
+                ..
+            } => {
+                let mut children = vec![&**list];
+                children.extend(initial.iter().map(|i| &**i));
+                children.extend(captures.iter());
+                children
+            }
             BoundExprKind::Case { checks, else_expr } => {
                 let mut children: Vec<&BoundExpr> = checks.iter().flat_map(|(when, then)| [when, then]).collect();
                 children.push(else_expr);
@@ -306,6 +334,17 @@ impl BoundExpr {
             }
             BoundExprKind::Comparison { left, right, .. } => vec![left, right],
             BoundExprKind::Between { input, lower, upper } => vec![input, lower, upper],
+            BoundExprKind::ListLambda {
+                list,
+                initial,
+                captures,
+                ..
+            } => {
+                let mut children: Vec<&mut BoundExpr> = vec![&mut **list];
+                children.extend(initial.iter_mut().map(|i| &mut **i));
+                children.extend(captures.iter_mut());
+                children
+            }
             BoundExprKind::Case { checks, else_expr } => {
                 let mut children: Vec<&mut BoundExpr> =
                     checks.iter_mut().flat_map(|(when, then)| [when, then]).collect();

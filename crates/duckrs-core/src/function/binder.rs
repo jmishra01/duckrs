@@ -5,8 +5,10 @@
 //! arguments by implicit cast is a match, and the cheapest match wins. Only positional
 //! arguments are supported so far; named arguments, varargs and templates come later.
 
+use super::aggregates::AggregateKind;
 use super::aggregates::{AggregateFunction, AggregateFunctionSet};
 use super::cast_rules::implicit_cast;
+use super::nested::bind_struct_pack;
 use super::{ScalarFunction, ScalarFunctionSet};
 use crate::planner::expression::{BoundAggregate, BoundExpr, BoundExprKind};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
@@ -211,7 +213,17 @@ pub fn bind_aggregate_function(
             }
         })
         .collect();
-    let return_type = function.resolve_return_type(children.first().map(|c| &c.return_type));
+    let mut return_type = function.resolve_return_type(children.first().map(|c| &c.return_type));
+    let mut children = children;
+    if let AggregateKind::Holistic(kind) = function.kind {
+        let types: Vec<LogicalType> = children.iter().map(|c| c.return_type.clone()).collect();
+        return_type = kind.return_type(&return_type, &types);
+        // the state keeps one value per row
+        if children.len() > 1 {
+            let names = (0..children.len()).map(|i| format!("a{i}")).collect();
+            children = vec![bind_struct_pack(names, children)?];
+        }
+    }
     Ok(BoundAggregate {
         function,
         return_type,

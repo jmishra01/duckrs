@@ -574,6 +574,9 @@ impl Binder<'_> {
         }
         let bound = match &expr.kind {
             ExprKind::Constant(literal) => BoundExpr::constant(literal_to_value(literal)?),
+            ExprKind::ColumnRef(names) if !self.lambda_scopes.is_empty() && self.is_lambda_parameter(names) => {
+                return Ok(self.bind_lambda_parameter(names)?.expect("just checked"));
+            }
             ExprKind::ColumnRef(names) if self.bind_context.struct_field_start(names).is_some() => {
                 let start = self
                     .bind_context
@@ -787,6 +790,9 @@ impl Binder<'_> {
                     return Err(crate::unported("qualified function names"));
                 }
                 if let Some(bound) = self.bind_session_function(function)? {
+                    return Ok(bound);
+                }
+                if let Some(bound) = self.bind_lambda_function(function)? {
                     return Ok(bound);
                 }
                 if function.name.name.eq_ignore_ascii_case("nullif") {

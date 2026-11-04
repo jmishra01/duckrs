@@ -7,6 +7,7 @@
 //! `finalize` turns the states into a result column.
 
 use super::cast::{int_to_double, uhuge_to_double};
+use super::holistic::{Holistic, finish};
 use duckrs_common::sort_key::{NullOrder, OrderModifiers, OrderType, create_sort_keys};
 use duckrs_common::types::{LogicalType, LogicalTypeId, NativeType, PhysicalType, bignum};
 use duckrs_common::value::{Value, ValueData};
@@ -33,6 +34,7 @@ pub enum AggregateKind {
     First,
     Last,
     AnyValue,
+    Holistic(Holistic),
 }
 
 /// One overload of an aggregate function (`AggregateFunction`).
@@ -152,6 +154,93 @@ pub(super) fn aggregate_functions() -> Vec<AggregateFunctionSet> {
         AggregateFunctionSet::new("last", unary(Last)),
         AggregateFunctionSet::new("any_value", unary(AnyValue)),
     ]
+    .into_iter()
+    .chain(holistic_functions())
+    .collect()
+}
+
+fn holistic_functions() -> Vec<AggregateFunctionSet> {
+    use Holistic::*;
+    use LogicalType as L;
+    let any = || LogicalType::new(LogicalTypeId::Any);
+    let (v, d, b) = (L::VARCHAR, L::DOUBLE, L::BOOLEAN);
+    let kind = AggregateKind::Holistic;
+    let of = |names: &[&str], overloads: Vec<(Vec<LogicalType>, LogicalType, AggregateKind)>| {
+        names
+            .iter()
+            .map(|name| AggregateFunctionSet::new(name, overloads.clone()))
+            .collect::<Vec<_>>()
+    };
+    let unary_double = |h| vec![(vec![d.clone()], d.clone(), kind(h))];
+    let binary_double = |h| vec![(vec![d.clone(), d.clone()], d.clone(), kind(h))];
+    let same = |h| vec![(vec![any()], any(), kind(h))];
+    let quantile = |h| vec![(vec![any()], any(), kind(h)), (vec![any(), any()], any(), kind(h))];
+    let groups = vec![
+        of(
+            &["string_agg", "listagg", "group_concat"],
+            vec![
+                (vec![v.clone()], v.clone(), kind(StringAgg)),
+                (vec![v.clone(), v.clone()], v.clone(), kind(StringAgg)),
+            ],
+        ),
+        of(&["bool_and"], vec![(vec![b.clone()], b.clone(), kind(BoolAnd))]),
+        of(&["bool_or"], vec![(vec![b.clone()], b.clone(), kind(BoolOr))]),
+        of(&["bit_and"], same(BitAnd)),
+        of(&["bit_or"], same(BitOr)),
+        of(&["bit_xor"], same(BitXor)),
+        of(&["product"], unary_double(Product)),
+        of(&["mode"], same(Mode)),
+        of(&["median"], same(Median)),
+        of(&["quantile_cont"], quantile(QuantileCont)),
+        of(
+            &["quantile_disc", "quantile", "approx_quantile", "reservoir_quantile"],
+            quantile(QuantileDisc),
+        ),
+        of(&["mad"], unary_double(Mad)),
+        of(&["stddev_samp", "stddev"], unary_double(StddevSamp)),
+        of(&["stddev_pop"], unary_double(StddevPop)),
+        of(&["var_samp", "variance"], unary_double(VarSamp)),
+        of(&["var_pop"], unary_double(VarPop)),
+        of(&["skewness"], unary_double(Skewness)),
+        of(&["kurtosis"], unary_double(Kurtosis)),
+        of(&["entropy"], vec![(vec![any()], d.clone(), kind(Entropy))]),
+        of(
+            &["arg_min", "argmin", "min_by"],
+            vec![(vec![any(), any()], any(), kind(ArgMin))],
+        ),
+        of(
+            &["arg_max", "argmax", "max_by"],
+            vec![(vec![any(), any()], any(), kind(ArgMax))],
+        ),
+        of(
+            &["count_if", "countif"],
+            vec![(vec![b.clone()], L::HUGEINT, kind(CountIf))],
+        ),
+        of(&["histogram"], same(Histogram)),
+        of(
+            &["approx_count_distinct"],
+            vec![(vec![any()], L::BIGINT, kind(ApproxCountDistinct))],
+        ),
+        of(&["fsum", "sumkahan", "kahan_sum"], unary_double(Fsum)),
+        of(&["favg"], unary_double(Favg)),
+        of(&["geomean", "geometric_mean"], unary_double(GeoMean)),
+        of(&["corr"], binary_double(Corr)),
+        of(&["covar_pop"], binary_double(CovarPop)),
+        of(&["covar_samp"], binary_double(CovarSamp)),
+        of(
+            &["regr_count"],
+            vec![(vec![d.clone(), d.clone()], L::UINTEGER, kind(RegrCount))],
+        ),
+        of(&["regr_slope"], binary_double(RegrSlope)),
+        of(&["regr_intercept"], binary_double(RegrIntercept)),
+        of(&["regr_r2"], binary_double(RegrR2)),
+        of(&["regr_avgx"], binary_double(RegrAvgX)),
+        of(&["regr_avgy"], binary_double(RegrAvgY)),
+        of(&["regr_sxx"], binary_double(RegrSxx)),
+        of(&["regr_syy"], binary_double(RegrSyy)),
+        of(&["regr_sxy"], binary_double(RegrSxy)),
+    ];
+    groups.into_iter().flatten().collect()
 }
 
 /// The state of one aggregate in one group.
@@ -172,6 +261,8 @@ pub enum AggregateState {
     Value(Option<Value>),
     /// the values, NULLs included; `None` before the first row
     List(Option<Vec<Value>>),
+    /// what a [`Holistic`] aggregate computes its result from
+    Rows(Vec<Value>),
 }
 
 impl AggregateKind {
@@ -179,6 +270,7 @@ impl AggregateKind {
     pub fn initial_state(self) -> AggregateState {
         use AggregateKind::*;
         match self {
+            Holistic(_) => AggregateState::Rows(Vec::new()),
             CountStar | Count => AggregateState::Count(0),
             SumInteger | SumDecimal | AvgInteger | AvgDecimal => AggregateState::Integer { sum: 0, count: 0 },
             SumDouble | AvgDouble => AggregateState::Double { sum: 0.0, count: 0 },
@@ -256,6 +348,14 @@ impl AggregateFunction {
             return Ok(());
         };
         match self.kind {
+            Holistic(_) => {
+                for &(row, group) in rows {
+                    let AggregateState::Rows(state) = &mut states[group] else {
+                        unreachable!("a holistic state");
+                    };
+                    state.push(input.get_value(row));
+                }
+            }
             CountStar => unreachable!("count_star takes no argument"),
             Count => {
                 let u = input.to_unified(count);
@@ -363,6 +463,7 @@ impl AggregateFunction {
         use AggregateKind::*;
         let null = || Value::null(return_type.clone());
         Ok(match (self.kind, state) {
+            (Holistic(kind), AggregateState::Rows(rows)) => finish(kind, rows, return_type)?,
             (_, AggregateState::Count(n)) => Value::bigint(*n),
             (_, AggregateState::List(None)) => null(),
             (_, AggregateState::List(Some(values))) => {

@@ -11,15 +11,15 @@ use crate::execution::run_plan;
 use crate::function::cast::{CastMode, cast_vector};
 use crate::function::operators::DIVISION_BY_ZERO;
 use crate::planner::expression::{
-    BoundExpr, BoundExprKind, BoundOperator, BoundSubquery, SequenceOp, SubqueryKind, SubqueryResult,
+    BoundExpr, BoundExprKind, BoundOperator, BoundSubquery, LambdaKind, SequenceOp, SubqueryKind, SubqueryResult,
 };
 use duckrs_common::comparison::{ComparisonType, DuckOrd};
 use duckrs_common::executor;
 use duckrs_common::sort_key::{NullOrder, OrderModifiers, OrderType, create_sort_keys};
 use duckrs_common::types::{LogicalType, LogicalTypeId, NativeType, PhysicalType};
-use duckrs_common::value::Value;
+use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, SelectionVector, Vector, VectorType};
-use duckrs_common::{Error, ErrorKind, Result};
+use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
 use duckrs_parser::ast::ComparisonOp;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -467,10 +467,121 @@ fn execute_coalesce(children: &[BoundExpr], return_type: &LogicalType, input: &D
 }
 
 /// `ExpressionExecutor::Execute`: the expression's value for each of the `input` rows.
+/// `ListLambdaBindData` at work: the body runs over chunks of items.
+fn execute_lambda(
+    kind: LambdaKind,
+    list: &BoundExpr,
+    initial: Option<&BoundExpr>,
+    captures: &[BoundExpr],
+    body: &BoundExpr,
+    return_type: &LogicalType,
+    input: &DataChunk,
+) -> Result<Vector> {
+    let count = input.len();
+    let lists = execute(list, input)?;
+    let initial = initial.map(|i| execute(i, input)).transpose()?;
+    let captured = captures.iter().map(|c| execute(c, input)).collect::<Result<Vec<_>>>()?;
+    let element = list.return_type.child_type().expect("a list").clone();
+    let mut types = if kind == LambdaKind::Reduce {
+        vec![return_type.clone(), element, LogicalType::BIGINT]
+    } else {
+        vec![element, LogicalType::BIGINT]
+    };
+    types.extend(captures.iter().map(|c| c.return_type.clone()));
+    let mut result = Vector::new(return_type.clone(), count.max(1));
+    let run = |rows: &[Vec<Value>]| -> Result<Vec<Value>> {
+        let mut out = Vec::with_capacity(rows.len());
+        for batch in rows.chunks(STANDARD_VECTOR_SIZE) {
+            let mut chunk = DataChunk::new(&types);
+            for row in batch {
+                chunk.append_row(row)?;
+            }
+            let column = execute(body, &chunk)?;
+            out.extend((0..batch.len()).map(|at| column.get_value(at)));
+        }
+        Ok(out)
+    };
+    for row in 0..count {
+        let value = lists.get_value(row);
+        let ValueData::List(items) = value.data() else {
+            result.set_value(row, &Value::null(return_type.clone()))?;
+            continue;
+        };
+        let capture_values: Vec<Value> = captured.iter().map(|c| c.get_value(row)).collect();
+        let parameters = |item: &Value, at: usize, accumulator: Option<&Value>| {
+            let mut values = Vec::with_capacity(types.len());
+            values.extend(accumulator.cloned());
+            values.push(item.clone());
+            values.push(Value::bigint(at as i64 + 1));
+            values.extend(capture_values.iter().cloned());
+            values
+        };
+        let output = match kind {
+            LambdaKind::Reduce => {
+                let start = initial.as_ref().map(|i| i.get_value(row));
+                let mut rest = items.iter().enumerate();
+                let mut accumulator = match start {
+                    Some(start) => start,
+                    None => match rest.next() {
+                        Some((_, first)) => first.clone(),
+                        None => {
+                            return Err(Error::new(
+                                ErrorKind::InvalidInput,
+                                "Cannot perform list_reduce on an empty input list",
+                            ));
+                        }
+                    },
+                };
+                for (at, item) in rest {
+                    let step = parameters(item, at, Some(&accumulator));
+                    accumulator = run(std::slice::from_ref(&step))?.remove(0);
+                }
+                accumulator
+            }
+            LambdaKind::Transform | LambdaKind::Filter => {
+                let rows: Vec<Vec<Value>> = items
+                    .iter()
+                    .enumerate()
+                    .map(|(at, item)| parameters(item, at, None))
+                    .collect();
+                let outputs = run(&rows)?;
+                let values = if kind == LambdaKind::Transform {
+                    outputs
+                } else {
+                    items
+                        .iter()
+                        .zip(outputs)
+                        .filter(|(_, keep)| matches!(keep.data(), ValueData::Bool(true)))
+                        .map(|(item, _)| item.clone())
+                        .collect()
+                };
+                Value::new(return_type.clone(), ValueData::List(values))?
+            }
+        };
+        result.set_value(row, &output)?;
+    }
+    Ok(result)
+}
+
 pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
     let count = input.len();
     match &expr.kind {
         BoundExprKind::Constant(value) => Ok(Vector::constant(value)),
+        BoundExprKind::ListLambda {
+            kind,
+            list,
+            initial,
+            captures,
+            body,
+        } => execute_lambda(
+            *kind,
+            list,
+            initial.as_deref(),
+            captures,
+            body,
+            &expr.return_type,
+            input,
+        ),
         BoundExprKind::Reference(index) => Ok(input.column(*index).clone()),
         BoundExprKind::ColumnRef { .. } => Err(Error::new(
             ErrorKind::Internal,

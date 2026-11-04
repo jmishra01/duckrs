@@ -3366,4 +3366,52 @@ mod tests {
             ]]
         );
     }
+
+    #[test]
+    fn aggregates_and_lambdas() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        run(&mut c, "CREATE TABLE t (g INTEGER, v INTEGER, s VARCHAR)");
+        run(
+            &mut c,
+            "INSERT INTO t VALUES (1, 1, 'a'), (1, 3, 'b'), (2, 5, NULL), (2, 7, 'c')",
+        );
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT string_agg(s, '-'), median(v), quantile_disc(v, 0.5), quantile_cont(v, [0.0, 1.0]), \
+                 mode(g), arg_max(s, v), bool_or(v > 6), stddev_pop(v) > 2, bit_or(v), count_if(v > 2) FROM t"
+            ),
+            [["a-b-c", "4.0", "3", "[1.0, 7.0]", "1", "c", "true", "true", "7", "3"]]
+        );
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT string_agg(s, ',' ORDER BY v DESC) FROM t GROUP BY g ORDER BY g"
+            ),
+            [["b,a"], ["c"]]
+        );
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT list_transform([1, 2], x -> x + 1), list_filter([1, 2, 3], x -> x > 1), \
+                 list_reduce([1, 2, 3], (a, b) -> a + b), list_transform([10], (x, i) -> x + i)"
+            ),
+            [["[2, 3]", "[2, 3]", "6", "[11]"]]
+        );
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT g, list_transform([1], x -> x + g) FROM t GROUP BY g ORDER BY g"
+            ),
+            [["1", "[2]"], ["2", "[3]"]]
+        );
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT list_contains([1, 2], 2), list_position([1, 2], 2), list_sum([1, 2]), list_aggr([1, 3], 'max'), \
+                 list_reverse([1, 2]), flatten([[1], [2, 3]]), list_has_any([1], [1, 2]), list_resize([1], 2)"
+            ),
+            [["true", "2", "3", "3", "[2, 1]", "[1, 2, 3]", "true", "[1, NULL]"]]
+        );
+    }
 }
