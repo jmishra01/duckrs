@@ -54,14 +54,14 @@ and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in me
   and aliases of the select list; and SET/RESET/`PRAGMA x = y` for all 196
   of DuckDB's settings (generated from its `settings.json` by `tools/generate_settings.py`), with
   DuckDB's types and error messages. There is no optimizer yet, so a filter over a cross product
-  (`FROM a, b WHERE a.x = b.x`) really does build every pair until Phase 7. Simple transactions are the rest of Phase 3; subqueries, CTEs and
+  (`FROM a, b WHERE a.x = b.x`) really does build every pair until Phase 7. BEGIN, COMMIT and ROLLBACK work, but connections are not isolated from each other until Phase 10: what would need that fails as not yet ported. Closing the Phase 3 gate is what remains; subqueries, CTEs and
   set operations come with Phase 6. SQL it does not
   run yet fails with an error saying it `is not yet ported to duckrs`; the sqllogictest runner
   never counts that error as the one a test expects.
 - `crates/duckrs`: the public API (`Database`, `Connection`, `QueryResult`) over the engine.
   Databases live in memory; a database file is accepted but not written until Phase 9.
 - `tools/sqllogictest`: a port of DuckDB's sqllogictest runner. It runs the DuckDB `.test` corpus
-  against duckrs, or against the C++ DuckDB library as a reference. duckrs passes 348 files so far
+  against duckrs, or against the C++ DuckDB library as a reference. duckrs passes 359 files so far
   (`tools/sqllogictest/known_passing.txt`, a CI gate), among them
   `test/sql/projection/test_simple_projection.test`.
 

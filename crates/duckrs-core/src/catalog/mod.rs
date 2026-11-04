@@ -454,7 +454,67 @@ pub struct Catalog {
     schemas: RwLock<BTreeMap<String, Arc<SchemaCatalogEntry>>>,
 }
 
+/// What a catalog holds at a moment, to go back to on ROLLBACK. Tables only grow, so that their
+/// row counts are enough; `UPDATE` and `DELETE` will need the undo buffer of Phase 10.
+#[derive(Debug)]
+pub struct CatalogSnapshot {
+    schemas: BTreeMap<String, Arc<SchemaCatalogEntry>>,
+    entries: Vec<SchemaEntries>,
+    table_rows: Vec<(Arc<TableCatalogEntry>, usize)>,
+}
+
+/// The contents of a schema in a [`CatalogSnapshot`].
+#[derive(Debug)]
+struct SchemaEntries {
+    schema: Arc<SchemaCatalogEntry>,
+    tables: BTreeMap<String, TableOrView>,
+    sequences: BTreeMap<String, Arc<SequenceCatalogEntry>>,
+    macros: [BTreeMap<String, Arc<MacroCatalogEntry>>; 2],
+}
+
 impl Catalog {
+    /// A snapshot to [`Catalog::restore`] later.
+    pub fn snapshot(&self) -> CatalogSnapshot {
+        let schemas = self.schemas.read().clone();
+        let mut entries = Vec::with_capacity(schemas.len());
+        let mut table_rows = Vec::new();
+        for schema in schemas.values() {
+            let tables = schema.tables.read().clone();
+            for entry in tables.values() {
+                if let TableOrView::Table(table) = entry {
+                    let rows = table.storage.read().len();
+                    table_rows.push((table.clone(), rows));
+                }
+            }
+            entries.push(SchemaEntries {
+                schema: schema.clone(),
+                tables,
+                sequences: schema.sequences.read().clone(),
+                macros: [schema.macros[0].read().clone(), schema.macros[1].read().clone()],
+            });
+        }
+        CatalogSnapshot {
+            schemas,
+            entries,
+            table_rows,
+        }
+    }
+
+    /// Goes back to a snapshot: what was created since is gone, and what was dropped is back.
+    pub fn restore(&self, snapshot: CatalogSnapshot) {
+        *self.schemas.write() = snapshot.schemas;
+        for saved in snapshot.entries {
+            *saved.schema.tables.write() = saved.tables;
+            *saved.schema.sequences.write() = saved.sequences;
+            let [scalar, table] = saved.macros;
+            *saved.schema.macros[0].write() = scalar;
+            *saved.schema.macros[1].write() = table;
+        }
+        for (table, rows) in snapshot.table_rows {
+            table.storage.write().truncate(rows);
+        }
+    }
+
     /// A catalog with the default `main` schema.
     pub fn new(name: &str) -> Self {
         let catalog = Self {

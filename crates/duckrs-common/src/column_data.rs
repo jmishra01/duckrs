@@ -78,6 +78,21 @@ impl ColumnDataCollection {
         self.count += chunk.len();
     }
 
+    /// Drops the rows after the first `count`, which undoes appends.
+    pub fn truncate(&mut self, count: usize) {
+        if count >= self.count {
+            return;
+        }
+        self.chunks.truncate(count.div_ceil(STANDARD_VECTOR_SIZE));
+        if let Some(last) = self.chunks.last_mut() {
+            let rest = count % STANDARD_VECTOR_SIZE;
+            if rest != 0 {
+                last.set_len(rest);
+            }
+        }
+        self.count = count;
+    }
+
     /// Appends every row of `other` (`Append(const ColumnDataCollection &)`).
     pub fn append_collection(&mut self, other: &ColumnDataCollection) {
         for chunk in &other.chunks {

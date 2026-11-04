@@ -8,7 +8,8 @@ pub mod settings;
 mod settings_table;
 
 use crate::catalog::{
-    Catalog, DEFAULT_CATALOG, OnCreateConflict, SequenceData, TableOrView, macro_type_name, missing_entry,
+    Catalog, CatalogSnapshot, DEFAULT_CATALOG, OnCreateConflict, SequenceData, TableOrView, macro_type_name,
+    missing_entry,
 };
 use crate::execution::expression_executor::evaluate_scalar;
 use crate::execution::physical::PhysicalResultCollector;
@@ -26,10 +27,12 @@ use duckrs_parser::ParserOptions;
 use duckrs_parser::ast::{
     CreateInfo, CreateKind, DropInfo, OnCreateConflict as AstConflict, PragmaInfo, Statement, sql_quoted_identifier,
 };
-use parking_lot::RwLock;
+use duckrs_parser::ast::{TransactionModifier, TransactionType};
+use parking_lot::{Mutex, RwLock};
 use settings::SettingValues;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A database (`DatabaseInstance`): its catalog, its global settings and, with Phase 9, its
 /// storage.
@@ -37,6 +40,17 @@ use std::sync::Arc;
 pub struct DatabaseInstance {
     pub catalog: Catalog,
     settings: RwLock<SettingValues>,
+    transactions: Mutex<OpenTransactions>,
+}
+
+/// Which connections have a transaction open. There is no MVCC until Phase 10, so transactions
+/// do not isolate connections from each other: what would need that fails as not yet ported
+/// rather than show one connection's uncommitted changes to another.
+#[derive(Debug, Default)]
+struct OpenTransactions {
+    open: HashSet<u64>,
+    /// the connection whose transaction has uncommitted changes
+    writer: Option<u64>,
 }
 
 impl DatabaseInstance {
@@ -44,6 +58,7 @@ impl DatabaseInstance {
         Arc::new(Self {
             catalog: Catalog::new(DEFAULT_CATALOG),
             settings: RwLock::new(SettingValues::default()),
+            transactions: Mutex::new(OpenTransactions::default()),
         })
     }
 }
@@ -100,12 +115,60 @@ impl MaterializedQueryResult {
 #[derive(Debug)]
 pub struct ClientContext {
     db: Arc<DatabaseInstance>,
+    /// identifies the connection among the database's connections
+    id: u64,
+    /// the transaction BEGIN started (`TransactionContext`); without one, each statement is its
+    /// own (auto-commit)
+    transaction: Option<ActiveTransaction>,
     /// session settings (`ClientConfig`)
     settings: SettingValues,
     /// the statements of PREPARE (`ClientData::prepared_statements`)
     prepared_statements: HashMap<String, Arc<PreparedStatementData>>,
     /// the parameters of the prepared statement running now
     parameters: Option<Arc<ParameterValues>>,
+}
+
+/// A transaction started with BEGIN.
+#[derive(Debug)]
+struct ActiveTransaction {
+    read_only: bool,
+    /// a statement failed in a way that leaves only ROLLBACK (`ValidChecker`)
+    invalidated: bool,
+    /// the transaction's `TransactionInvalidationPolicy`
+    invalidation_policy: String,
+    /// what ROLLBACK goes back to, from before the transaction's first write
+    snapshot: Option<CatalogSnapshot>,
+}
+
+impl ActiveTransaction {
+    /// `ClientContext::ApplyInvalidationPolicy`: any error ends a transaction, unless its policy
+    /// spares the errors that cannot have changed anything (`Exception::InvalidatesTransaction`).
+    fn apply_invalidation_policy(&mut self, kind: ErrorKind) {
+        let syntactic = matches!(
+            kind,
+            ErrorKind::Binder
+                | ErrorKind::Catalog
+                | ErrorKind::Connection
+                | ErrorKind::ParameterNotAllowed
+                | ErrorKind::Parser
+                | ErrorKind::Permission
+                | ErrorKind::ResourceInUse
+        );
+        if !(syntactic && self.invalidation_policy == "SYNTACTIC_ERRORS_DO_NOT_INVALIDATE") {
+            self.invalidated = true;
+        }
+    }
+}
+
+/// Whether a statement changes the database (`StatementProperties::IsReadOnly`).
+fn is_write(statement: &Statement) -> bool {
+    match statement {
+        Statement::Insert(_) | Statement::Drop(_) => true,
+        // temporary objects are private to the connection
+        Statement::CreateTable(info) => !info.temporary,
+        Statement::Create(info) => !info.temporary,
+        _ => false,
+    }
 }
 
 /// A prepared statement (`PreparedStatementData`). It binds anew each time it runs, as C++ does
@@ -119,8 +182,11 @@ pub struct PreparedStatementData {
 
 impl ClientContext {
     pub fn new(db: Arc<DatabaseInstance>) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         Self {
             db,
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            transaction: None,
             settings: SettingValues::default(),
             prepared_statements: HashMap::new(),
             parameters: None,
@@ -166,7 +232,15 @@ impl ClientContext {
 
     /// `ClientContext::Query`: runs every statement in `sql` and returns the last result.
     pub fn query(&mut self, sql: &str) -> Result<MaterializedQueryResult> {
-        let statements = duckrs_parser::parse_ast_with(sql, &self.parser_options())?;
+        let statements = match duckrs_parser::parse_ast_with(sql, &self.parser_options()) {
+            Ok(statements) => statements,
+            Err(error) => {
+                if let Some(transaction) = &mut self.transaction {
+                    transaction.apply_invalidation_policy(error.kind);
+                }
+                return Err(error);
+            }
+        };
         let mut result = MaterializedQueryResult {
             names: Vec::new(),
             types: Vec::new(),
@@ -272,12 +346,148 @@ impl ClientContext {
         result
     }
 
-    /// `ClientContext::PendingStatementOrPreparedStatement` + `ExecutePendingQueryInternal`.
+    /// `ClientContext::RunTransactionStatementInternal`.
+    fn run_transaction_statement(
+        &mut self,
+        transaction_type: TransactionType,
+        modifier: TransactionModifier,
+    ) -> Result<MaterializedQueryResult> {
+        let error = |message: &str| Error::new(ErrorKind::Transaction, message);
+        match transaction_type {
+            TransactionType::Begin => {
+                match &self.transaction {
+                    Some(transaction) if transaction.invalidated => return Err(error(INVALIDATED_TRANSACTION)),
+                    Some(_) => return Err(error("cannot start a transaction within a transaction")),
+                    None => {}
+                }
+                self.db.transactions.lock().open.insert(self.id);
+                self.transaction = Some(ActiveTransaction {
+                    read_only: modifier == TransactionModifier::ReadOnly,
+                    invalidated: false,
+                    invalidation_policy: self.setting_text("default_transaction_invalidation_policy"),
+                    snapshot: None,
+                });
+            }
+            TransactionType::Commit => {
+                let Some(transaction) = self.transaction.take() else {
+                    return Err(error("cannot commit - no transaction is active"));
+                };
+                // COMMIT of an invalidated transaction rolls it back
+                let rollback = transaction.invalidated;
+                self.end_transaction(transaction, rollback);
+            }
+            TransactionType::Rollback => {
+                let Some(transaction) = self.transaction.take() else {
+                    return Err(error("cannot rollback - no transaction is active"));
+                };
+                self.end_transaction(transaction, true);
+            }
+        }
+        Ok(Self::success())
+    }
+
+    fn end_transaction(&self, transaction: ActiveTransaction, rollback: bool) {
+        if rollback && let Some(snapshot) = transaction.snapshot {
+            self.db.catalog.restore(snapshot);
+        }
+        let mut transactions = self.db.transactions.lock();
+        transactions.open.remove(&self.id);
+        if transactions.writer == Some(self.id) {
+            transactions.writer = None;
+        }
+    }
+
+    /// Fails for what would need other connections to be isolated from this one, or the other
+    /// way around.
+    fn check_other_connections(&self, write: bool) -> Result<()> {
+        let transactions = self.db.transactions.lock();
+        if transactions.writer.is_some_and(|writer| writer != self.id) {
+            return Err(crate::unported(
+                "running a statement while another connection has uncommitted changes",
+            ));
+        }
+        if write && transactions.open.iter().any(|id| *id != self.id) {
+            return Err(crate::unported(
+                "changing the database while another connection has a transaction open",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Runs one statement within the current transaction, or as a transaction of its own
+    /// (`ClientContext::PendingStatementOrPreparedStatementInternal` + `CleanupInternal`).
     fn run_statement(&mut self, statement: &Statement) -> Result<MaterializedQueryResult> {
+        match statement {
+            Statement::Transaction {
+                transaction_type,
+                modifier,
+            } => return self.run_transaction_statement(*transaction_type, *modifier),
+            // EXECUTE comes back here with the statement it runs
+            Statement::Prepare { .. } | Statement::Execute { .. } | Statement::Deallocate(_) => {
+                return self.execute_statement(statement);
+            }
+            _ => {}
+        }
+        if self.transaction.as_ref().is_some_and(|t| t.invalidated) {
+            return Err(Error::new(ErrorKind::Transaction, INVALIDATED_TRANSACTION));
+        }
+        let write = is_write(statement);
+        self.check_other_connections(write)?;
+        // what a failed statement outside of a transaction undoes: INSERT is the one that can
+        // fail halfway through
+        let mut appending = None;
+        if write {
+            match &mut self.transaction {
+                Some(transaction) if transaction.read_only => {
+                    return Err(Error::new(
+                        ErrorKind::Transaction,
+                        format!(
+                            "Cannot write to database {} - transaction is launched in read-only mode",
+                            sql_quoted_identifier(DEFAULT_CATALOG)
+                        ),
+                    ));
+                }
+                Some(transaction) => {
+                    if transaction.snapshot.is_none() {
+                        transaction.snapshot = Some(self.db.catalog.snapshot());
+                        self.db.transactions.lock().writer = Some(self.id);
+                    }
+                }
+                None => {
+                    if let Statement::Insert(insert) = statement
+                        && let Ok(table) = self
+                            .db
+                            .catalog
+                            .get_table(schema_of(&insert.table).ok().flatten(), &insert.table.name)
+                    {
+                        let rows = table.storage.read().len();
+                        appending = Some((table, rows));
+                    }
+                }
+            }
+        }
+        let result = self.execute_statement(statement);
+        if let Err(error) = &result {
+            if let Some(transaction) = &mut self.transaction {
+                transaction.apply_invalidation_policy(error.kind);
+            } else if let Some((table, rows)) = appending {
+                table.storage.write().truncate(rows);
+            }
+        }
+        result
+    }
+
+    /// `ClientContext::PendingStatementOrPreparedStatement` + `ExecutePendingQueryInternal`.
+    fn execute_statement(&mut self, statement: &Statement) -> Result<MaterializedQueryResult> {
         match statement {
             Statement::SetVariable { name, value, scope } => {
                 // `Binder::Bind(SetVariableStatement)` + `PhysicalSet`
                 let value = evaluate_scalar(&bind_constant_expression(&self.db.catalog, value)?)?;
+                if name.eq_ignore_ascii_case("current_transaction_invalidation_policy")
+                    && let Some(transaction) = &mut self.transaction
+                {
+                    transaction.invalidation_policy = value.try_to_string()?.to_uppercase();
+                }
                 let mut global = self.db.settings.write();
                 settings::set_variable(name, *scope, &value, &mut global, &mut self.settings)?;
                 return Ok(Self::success());
@@ -382,6 +592,18 @@ fn on_create_conflict(conflict: AstConflict) -> OnCreateConflict {
         AstConflict::Replace => OnCreateConflict::Replace,
     }
 }
+
+impl Drop for ClientContext {
+    /// A connection that goes away rolls back what it did not commit.
+    fn drop(&mut self) {
+        if let Some(transaction) = self.transaction.take() {
+            self.end_transaction(transaction, true);
+        }
+    }
+}
+
+/// `ErrorType::INVALIDATED_TRANSACTION`.
+const INVALIDATED_TRANSACTION: &str = "Current transaction is aborted (please ROLLBACK)";
 
 /// The name of a CREATE statement kind, for the not-ported error.
 fn create_kind_name(kind: &CreateKind) -> &'static str {
@@ -1126,6 +1348,114 @@ mod tests {
             c.execute_prepared(&prepared, &[Value::integer(1)]).unwrap().row_count(),
             0
         );
+    }
+
+    #[test]
+    fn transactions() {
+        let db = DatabaseInstance::new();
+        let mut c = ClientContext::new(db.clone());
+        let error = |c: &mut ClientContext, sql: &str| c.query(sql).unwrap_err().to_string();
+        run(&mut c, "CREATE TABLE t (i INTEGER NOT NULL)");
+        run(&mut c, "INSERT INTO t VALUES (1)");
+        // ROLLBACK takes back rows and catalog changes, and brings back what was dropped
+        run(&mut c, "BEGIN TRANSACTION");
+        run(&mut c, "INSERT INTO t VALUES (2)");
+        assert_eq!(run(&mut c, "SELECT count(*) FROM t"), rows(&[&["2"]]));
+        run(&mut c, "CREATE TABLE gone (i INTEGER)");
+        run(&mut c, "CREATE VIEW v AS SELECT 1");
+        run(&mut c, "ROLLBACK");
+        assert_eq!(run(&mut c, "SELECT count(*) FROM t"), rows(&[&["1"]]));
+        assert!(error(&mut c, "SELECT * FROM gone").contains("does not exist"));
+        assert!(error(&mut c, "SELECT * FROM v").contains("does not exist"));
+        run(&mut c, "BEGIN");
+        run(&mut c, "DROP TABLE t");
+        assert!(error(&mut c, "SELECT * FROM t").contains("does not exist"));
+        run(&mut c, "ROLLBACK");
+        assert_eq!(run(&mut c, "SELECT i FROM t"), rows(&[&["1"]]));
+        // rows beyond a chunk go too, and appending goes on from there
+        run(&mut c, "BEGIN");
+        run(&mut c, "INSERT INTO t SELECT 5 FROM range(5000)");
+        run(&mut c, "ROLLBACK");
+        assert_eq!(run(&mut c, "SELECT count(*) FROM t"), rows(&[&["1"]]));
+        run(&mut c, "INSERT INTO t VALUES (2)");
+        assert_eq!(run(&mut c, "SELECT i FROM t ORDER BY 1"), rows(&[&["1"], &["2"]]));
+        // COMMIT keeps them
+        run(&mut c, "BEGIN");
+        run(&mut c, "INSERT INTO t VALUES (3)");
+        run(&mut c, "COMMIT");
+        assert_eq!(run(&mut c, "SELECT count(*) FROM t"), rows(&[&["3"]]));
+        // a failed statement outside of a transaction leaves nothing behind
+        assert!(
+            error(
+                &mut c,
+                "INSERT INTO t SELECT CASE WHEN x = 3000 THEN NULL ELSE 1 END FROM range(4000) r(x)"
+            )
+            .contains("NOT NULL")
+        );
+        assert_eq!(run(&mut c, "SELECT count(*) FROM t"), rows(&[&["3"]]));
+        // any error leaves only ROLLBACK, and COMMIT then rolls back
+        for bad in [
+            "SELECT * FROM nope",
+            "INSER INTO t VALUES (1)",
+            "INSERT INTO t VALUES (NULL)",
+        ] {
+            run(&mut c, "BEGIN");
+            run(&mut c, "INSERT INTO t VALUES (4)");
+            c.query(bad).unwrap_err();
+            assert_eq!(
+                error(&mut c, "SELECT 1"),
+                "TransactionContext Error: Current transaction is aborted (please ROLLBACK)",
+                "{bad}"
+            );
+            run(&mut c, "COMMIT");
+            assert_eq!(run(&mut c, "SELECT count(*) FROM t"), rows(&[&["3"]]));
+        }
+        // unless the policy spares what cannot have changed anything
+        run(
+            &mut c,
+            "SET default_transaction_invalidation_policy = 'SYNTACTIC_ERRORS_DO_NOT_INVALIDATE'",
+        );
+        run(&mut c, "BEGIN");
+        c.query("SELECT * FROM nope").unwrap_err();
+        c.query("INSER INTO t").unwrap_err();
+        assert_eq!(run(&mut c, "SELECT count(*) FROM t"), rows(&[&["3"]]));
+        c.query("INSERT INTO t VALUES (NULL)").unwrap_err();
+        assert!(error(&mut c, "SELECT 1").contains("Current transaction is aborted"));
+        run(&mut c, "ROLLBACK");
+        run(&mut c, "RESET default_transaction_invalidation_policy");
+        // misuse
+        assert_eq!(
+            error(&mut c, "COMMIT"),
+            "TransactionContext Error: cannot commit - no transaction is active"
+        );
+        assert_eq!(
+            error(&mut c, "ROLLBACK"),
+            "TransactionContext Error: cannot rollback - no transaction is active"
+        );
+        run(&mut c, "BEGIN");
+        assert_eq!(
+            error(&mut c, "BEGIN"),
+            "TransactionContext Error: cannot start a transaction within a transaction"
+        );
+        run(&mut c, "ROLLBACK");
+        run(&mut c, "BEGIN TRANSACTION READ ONLY");
+        assert!(error(&mut c, "INSERT INTO t VALUES (9)").contains("transaction is launched in read-only mode"));
+        run(&mut c, "COMMIT");
+        // without isolation, what would need it says so instead of showing uncommitted rows
+        let mut other = ClientContext::new(db.clone());
+        run(&mut c, "BEGIN");
+        assert_eq!(run(&mut other, "SELECT count(*) FROM t"), rows(&[&["3"]]));
+        assert!(error(&mut other, "INSERT INTO t VALUES (9)").contains("not yet ported"));
+        run(&mut c, "INSERT INTO t VALUES (10)");
+        assert!(error(&mut other, "SELECT * FROM t").contains("not yet ported"));
+        run(&mut c, "COMMIT");
+        assert_eq!(run(&mut other, "SELECT count(*) FROM t"), rows(&[&["4"]]));
+        // a connection that goes away rolls back
+        run(&mut other, "BEGIN");
+        run(&mut other, "INSERT INTO t VALUES (11)");
+        drop(other);
+        assert_eq!(run(&mut c, "SELECT count(*) FROM t"), rows(&[&["4"]]));
+        run(&mut c, "INSERT INTO t VALUES (12)");
     }
 
     #[test]
