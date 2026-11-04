@@ -14,6 +14,7 @@ pub use statements::schema_of;
 use super::expression::{BoundAggregate, BoundExpr, ColumnBinding};
 use super::logical::LogicalOperator;
 use crate::catalog::{Catalog, MacroCatalogEntry, ViewCatalogEntry};
+use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::{NullOrder, OrderModifiers, OrderType};
 use duckrs_common::string_util::{candidates_message, similarity_rating, top_n_strings};
 use duckrs_common::types::LogicalType;
@@ -24,6 +25,7 @@ use duckrs_parser::ast::Statement;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 /// What a statement returns to the client (`StatementReturnType`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -554,13 +556,26 @@ pub struct Binder<'a> {
     macro_depth: usize,
     /// The parameters of the prepared statement being bound, if it is one.
     pub parameters: Option<Arc<ParameterValues>>,
-    /// The CTEs in scope, innermost last.
-    ctes: Vec<(String, Arc<ast::CteInfo>)>,
+    /// The CTEs in scope, innermost last, with how many outer contexts they can see.
+    ctes: Vec<(String, Arc<ast::CteInfo>, usize)>,
     /// What the queries around a subquery can see, innermost last.
     outer_contexts: Vec<BindContext>,
     /// The columns of those queries this subquery uses. Binders of the queries inside of it that
     /// are not subqueries themselves share the list.
     correlated: Arc<Mutex<Vec<CorrelatedColumn>>>,
+    /// The recursive CTEs whose recursive part is being bound, innermost last.
+    working_tables: Vec<WorkingTable>,
+}
+
+/// What a recursive CTE is inside of its recursive part.
+#[derive(Debug, Clone)]
+struct WorkingTable {
+    name: String,
+    names: Vec<String>,
+    types: Vec<LogicalType>,
+    rows: Arc<Mutex<ColumnDataCollection>>,
+    /// whether the recursive part reads it
+    used: Arc<AtomicBool>,
 }
 
 /// A column of a query around a subquery (`CorrelatedColumnInfo`).
@@ -595,6 +610,7 @@ impl<'a> Binder<'a> {
             ctes: Vec::new(),
             outer_contexts: Vec::new(),
             correlated: Arc::default(),
+            working_tables: Vec::new(),
         }
     }
 
@@ -639,6 +655,7 @@ impl<'a> Binder<'a> {
         binder.ctes = self.ctes.clone();
         binder.outer_contexts = self.outer_contexts.clone();
         binder.correlated = self.correlated.clone();
+        binder.working_tables = self.working_tables.clone();
         binder
     }
 

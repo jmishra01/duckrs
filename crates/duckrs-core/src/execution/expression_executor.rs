@@ -7,8 +7,7 @@
 //! are a later optimization).
 
 use crate::catalog::SequenceCatalogEntry;
-use crate::execution::physical::PhysicalResultCollector;
-use crate::execution::{create_plan, execute_plan};
+use crate::execution::run_plan;
 use crate::function::cast::{CastMode, cast_vector};
 use crate::function::operators::DIVISION_BY_ZERO;
 use crate::planner::expression::{
@@ -264,11 +263,14 @@ fn execute_case(
 /// The result of a subquery for correlated values with this key, which runs the first time
 /// something asks. An error stays too: TRY runs a failed chunk again.
 fn subquery_result(subquery: &BoundSubquery, key: &[u8], values: &[Value]) -> Arc<Result<SubqueryResult>> {
-    if let Some(result) = subquery.results.lock().get(key) {
+    let cached = !subquery.volatile || values.is_empty();
+    if cached && let Some(result) = subquery.results.lock().get(key) {
         return result.clone();
     }
     let result = Arc::new(run_subquery(subquery, values));
-    subquery.results.lock().insert(key.to_vec(), result.clone());
+    if cached {
+        subquery.results.lock().insert(key.to_vec(), result.clone());
+    }
     result
 }
 
@@ -283,9 +285,7 @@ fn run_subquery(subquery: &BoundSubquery, values: &[Value]) -> Result<SubqueryRe
             .collect();
         plan.substitute_columns(&columns);
     }
-    let collector = PhysicalResultCollector::new(create_plan(plan));
-    execute_plan(&collector)?;
-    let collection = collector.result.into_inner();
+    let collection = run_plan(plan)?;
     let mut result = SubqueryResult {
         rows: collection.len() as u64,
         first: None,

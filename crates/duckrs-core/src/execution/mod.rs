@@ -12,6 +12,7 @@ pub mod physical;
 
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
 use duckrs_common::Result;
+use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::vector::DataChunk;
 use parking_lot::Mutex;
 use physical::*;
@@ -89,6 +90,31 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
         }),
         LogicalOperatorKind::Distinct { targets } => Box::new(PhysicalDistinct::new(&targets, children.remove(0))),
         LogicalOperatorKind::Union { .. } => Box::new(PhysicalUnion::new(types, children)),
+        LogicalOperatorKind::RecursiveCte {
+            union_all,
+            working,
+            recursive,
+            ..
+        } => Box::new(PhysicalRecursiveCte::new(
+            types, children, union_all, working, *recursive,
+        )),
+        LogicalOperatorKind::WorkingTable { working, .. } => Box::new(PhysicalWorkingTable { types, working }),
+        LogicalOperatorKind::LateralJoin {
+            join_type,
+            right,
+            bindings,
+            correlated,
+            predicate,
+        } => Box::new(PhysicalLateralJoin {
+            types,
+            children,
+            join_type,
+            right: *right,
+            bindings,
+            correlated,
+            predicate,
+            results: Mutex::default(),
+        }),
         LogicalOperatorKind::ExceptIntersect { except, all, .. } => {
             Box::new(PhysicalExceptIntersect::new(types, children, except, all))
         }
@@ -229,6 +255,13 @@ fn build_pipelines<'a>(sink: &'a dyn PhysicalOperator, pipelines: &mut Vec<Pipel
         pipelines.extend(unmatched);
     }
     pipelines.last_mut().expect("just added").finalize = true;
+}
+
+/// Runs a plan with resolved column bindings, and returns its rows.
+pub fn run_plan(plan: LogicalOperator) -> Result<ColumnDataCollection> {
+    let collector = PhysicalResultCollector::new(create_plan(plan));
+    execute_plan(&collector)?;
+    Ok(collector.result.into_inner())
 }
 
 /// `Executor::Initialize` + `Execute`: runs a plan whose root is a sink.

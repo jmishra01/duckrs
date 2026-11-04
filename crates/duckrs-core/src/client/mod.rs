@@ -1043,14 +1043,27 @@ mod tests {
         let message = error(&mut c, "SELECT * FROM l JOIN r ON sum(l.k) = 1");
         assert_eq!(message, "WHERE clause cannot contain aggregates!");
         // a column of the left side is a LATERAL reference, not a mistake
-        for sql in [
-            "SELECT * FROM l, r JOIN t ON a = 'x'",
-            "SELECT * FROM l, (SELECT l.k) s",
-            "SELECT * FROM l, range(k)",
-            "SELECT * FROM l, (SELECT 1 FROM r JOIN t ON a = 'x') s",
-        ] {
-            assert_eq!(c.query(sql).unwrap_err().kind, ErrorKind::NotImplemented, "{sql}");
-        }
+        let sorted = |c: &mut ClientContext, sql: &str| {
+            let mut rows = run(c, sql);
+            rows.sort();
+            rows
+        };
+        assert_eq!(
+            sorted(&mut c, "SELECT * FROM l, r JOIN t ON a = 'x'"),
+            sorted(&mut c, "SELECT * FROM l, r, t WHERE a = 'x'")
+        );
+        assert_eq!(
+            sorted(&mut c, "SELECT * FROM l, (SELECT l.k) s"),
+            sorted(&mut c, "SELECT *, k FROM l")
+        );
+        assert_eq!(
+            sorted(&mut c, "SELECT * FROM l, (SELECT 1 FROM r JOIN t ON a = 'x') s"),
+            sorted(&mut c, "SELECT l.*, 1 FROM l, r, t WHERE a = 'x'")
+        );
+        assert_eq!(
+            c.query("SELECT * FROM l, range(k)").unwrap_err().kind,
+            ErrorKind::NotImplemented
+        );
         // a duplicate alias only matters to a reference that could mean either table
         assert_eq!(
             run(&mut c, "SELECT t.x, t.y FROM (SELECT 1 x) t, (SELECT 2 y) t"),
@@ -2618,6 +2631,81 @@ mod tests {
         assert_eq!(
             err(&mut context, "SELECT (SELECT sum(a.x)) FROM a"),
             "Not implemented Error: aggregates of the columns of an outer query is not yet ported to duckrs"
+        );
+    }
+
+    #[test]
+    fn recursive_ctes_and_lateral_joins_match_duckdb() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        let err = |context: &mut ClientContext, sql: &str| context.query(sql).unwrap_err().to_string();
+        assert_eq!(
+            run(
+                &mut context,
+                "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) SELECT n FROM t ORDER BY n"
+            ),
+            [["1"], ["2"], ["3"]]
+        );
+        // UNION stops at what it has seen
+        assert_eq!(
+            run(
+                &mut context,
+                "WITH RECURSIVE t(n) AS (SELECT 1 UNION SELECT (n + 1) % 3 FROM t) SELECT n FROM t ORDER BY n"
+            ),
+            [["0"], ["1"], ["2"]]
+        );
+        // LIMIT ends recursion that would not end
+        assert_eq!(
+            run(
+                &mut context,
+                "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) SELECT n FROM t LIMIT 2"
+            ),
+            [["1"], ["2"]]
+        );
+        // RECURSIVE without a reference to itself is a set operation
+        assert_eq!(
+            run(
+                &mut context,
+                "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT 2) SELECT n FROM t ORDER BY n"
+            ),
+            [["1"], ["2"]]
+        );
+        run(&mut context, "CREATE TABLE a (x INTEGER)");
+        run(&mut context, "INSERT INTO a VALUES (1), (2)");
+        assert_eq!(
+            run(
+                &mut context,
+                "SELECT x, y FROM a, LATERAL (SELECT x + 10 AS y UNION ALL SELECT x + 20) ORDER BY x, y"
+            ),
+            [["1", "11"], ["1", "21"], ["2", "12"], ["2", "22"]]
+        );
+        assert_eq!(
+            run(
+                &mut context,
+                "SELECT x, y FROM a LEFT JOIN LATERAL (SELECT x AS y WHERE x > 1) ON true ORDER BY x"
+            ),
+            [["1", "NULL"], ["2", "2"]]
+        );
+        assert_eq!(
+            run(
+                &mut context,
+                "SELECT x, y FROM a JOIN LATERAL (SELECT x * 2 AS y) ON y > 2"
+            ),
+            [["2", "4"]]
+        );
+        assert_eq!(
+            err(
+                &mut context,
+                "SELECT * FROM a RIGHT JOIN LATERAL (SELECT x AS y) ON true"
+            ),
+            "Binder Error: The combining JOIN type must be INNER or LEFT for a LATERAL reference"
+        );
+        // a volatile subquery runs for every row, not for every value
+        run(&mut context, "CREATE SEQUENCE s");
+        run(&mut context, "CREATE TABLE same (k INTEGER)");
+        run(&mut context, "INSERT INTO same VALUES (1), (1), (1)");
+        assert_eq!(
+            run(&mut context, "SELECT max((SELECT nextval('s') + k - k)) FROM same"),
+            [["3"]]
         );
     }
 

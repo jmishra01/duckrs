@@ -534,12 +534,14 @@ impl Binder<'_> {
             }
         };
         resolve_column_bindings(&mut plan)?;
+        let volatile = plan.is_volatile();
         let expression = BoundExpr::new(
             BoundExprKind::Subquery {
                 subquery: Arc::new(BoundSubquery {
                     kind,
                     plan,
                     correlated: bindings,
+                    volatile,
                     results: Mutex::default(),
                 }),
                 child,

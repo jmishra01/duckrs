@@ -21,6 +21,24 @@ pub fn resolve_column_bindings(op: &mut LogicalOperator) -> Result<()> {
             resolve_expression(&mut condition.right, &right)?;
         }
     }
+    if let LogicalOperatorKind::LateralJoin {
+        right,
+        correlated,
+        predicate,
+        ..
+    } = &mut op.kind
+    {
+        resolve_column_bindings(right)?;
+        let mut bindings = op.children[0].column_bindings();
+        for expr in correlated {
+            resolve_expression(expr, &bindings)?;
+        }
+        bindings.extend(right.column_bindings());
+        if let Some(expr) = predicate {
+            resolve_expression(expr, &bindings)?;
+        }
+        return Ok(());
+    }
     let bindings: Vec<ColumnBinding> = op.children.iter().flat_map(|c| c.column_bindings()).collect();
     for expr in op.expressions_mut() {
         resolve_expression(expr, &bindings)?;

@@ -181,6 +181,25 @@ fn extract_join_conditions(
     (conditions, predicate)
 }
 
+fn contains_subquery(expr: &BoundExpr) -> bool {
+    matches!(expr.kind, BoundExprKind::Subquery { .. }) || expr.children().into_iter().any(contains_subquery)
+}
+
+/// All of `predicates`, if there are any.
+fn conjunction_of(mut predicates: Vec<BoundExpr>) -> Option<BoundExpr> {
+    match predicates.len() {
+        0 => None,
+        1 => predicates.pop(),
+        _ => Some(BoundExpr::new(
+            BoundExprKind::Conjunction {
+                and: true,
+                children: predicates,
+            },
+            LogicalType::BOOLEAN,
+        )),
+    }
+}
+
 impl Binder<'_> {
     /// Binds a reference to a USING column in `context`: `alias.column`, or the bare column when
     /// it has no binding of its own (`AddCondition`'s `BindColumn`).
@@ -218,8 +237,22 @@ impl Binder<'_> {
         let left = self.bind_table_ref(&join.left)?;
         let left_context = std::mem::take(&mut self.bind_context);
         self.left_of_join.push(left_context);
-        let right = self.bind_table_ref(&join.right)?;
+        // the right side can read the columns of the left side
+        let enclosing = std::mem::take(&mut self.correlated);
+        self.outer_contexts
+            .push(self.left_of_join.last().expect("pushed above").clone());
+        let right = self.bind_table_ref(&join.right);
+        self.outer_contexts.pop();
+        let lateral_columns = std::mem::replace(&mut self.correlated, enclosing);
+        let right = right?;
+        let lateral_columns = lateral_columns.lock().clone();
         let mut left_context = self.left_of_join.pop().expect("pushed above");
+        // what the left side does not have is correlated with a query around this one
+        let (lateral_columns, outer_columns): (Vec<_>, Vec<_>) = lateral_columns.into_iter().partition(|column| {
+            let table = column.binding.table_index;
+            left_context.bindings.iter().any(|b| b.table_index == table)
+        });
+        self.correlated.lock().extend(outer_columns);
         let mut right_context = std::mem::take(&mut self.bind_context);
 
         let requested = if join.ref_type == JoinRefType::Natural {
@@ -283,6 +316,33 @@ impl Binder<'_> {
             let bound = self.bind_expression(condition);
             self.aggregate_error = aggregate_error;
             predicates.insert(0, checked_cast(bound?, &LogicalType::BOOLEAN)?);
+        }
+        if !lateral_columns.is_empty() {
+            if !matches!(join.join_type, JoinType::Inner | JoinType::Left) {
+                return Err(binder_error(
+                    "The combining JOIN type must be INNER or LEFT for a LATERAL reference",
+                ));
+            }
+            if predicates.iter().any(contains_subquery) {
+                return Err(binder_error("Subqueries are not supported in LATERAL join conditions"));
+            }
+            let mut correlated = Vec::with_capacity(lateral_columns.len());
+            let mut bindings = Vec::with_capacity(lateral_columns.len());
+            for column in lateral_columns {
+                let names = Expr::from(ExprKind::ColumnRef(column.names));
+                correlated.push(self.bind_expression(&names)?);
+                bindings.push(column.binding);
+            }
+            return Ok(LogicalOperator::new(
+                LogicalOperatorKind::LateralJoin {
+                    join_type: join.join_type,
+                    right: Box::new(right),
+                    bindings,
+                    correlated,
+                    predicate: conjunction_of(predicates),
+                },
+                vec![left],
+            ));
         }
         // these joins do not output the other side
         match join.join_type {

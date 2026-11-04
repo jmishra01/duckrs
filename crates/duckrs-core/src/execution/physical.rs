@@ -11,18 +11,20 @@
 
 use super::expression_executor::{execute, select};
 use crate::catalog::{ColumnDefinition, OnCreateConflict, SchemaCatalogEntry, TableCatalogEntry};
+use crate::execution::run_plan;
 use crate::function::aggregates::{AggregateState, value_keys};
-use crate::planner::expression::{BoundAggregate, BoundExpr};
-use crate::planner::logical::{BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID};
+use crate::planner::expression::{BoundAggregate, BoundExpr, ColumnBinding};
+use crate::planner::logical::{BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, LogicalOperator};
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::{NullOrder, OrderModifiers, OrderType, create_sort_keys, sort_collection};
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, SelectionVector, Vector};
 use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
-use duckrs_parser::ast::sql_identifier;
+use duckrs_parser::ast::{JoinType, sql_identifier};
 use parking_lot::Mutex;
 use std::any::Any;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 
@@ -401,6 +403,250 @@ impl PhysicalOperator for PhysicalUnnest {
             columns.push(vector);
         }
         Ok(DataChunk::from_columns(columns, count))
+    }
+}
+
+/// `PhysicalRecursiveCTE`: gathers the child's rows, then runs the recursive part on the rows of
+/// the last round until it adds nothing.
+#[derive(Debug)]
+pub struct PhysicalRecursiveCte {
+    pub types: Vec<LogicalType>,
+    pub children: Vec<Box<dyn PhysicalOperator>>,
+    union_all: bool,
+    working: Arc<Mutex<ColumnDataCollection>>,
+    recursive: LogicalOperator,
+    /// the rows of the current round
+    data: Mutex<ColumnDataCollection>,
+    /// what UNION has seen so far
+    seen: Mutex<HashSet<Vec<u8>>>,
+}
+
+impl PhysicalRecursiveCte {
+    pub fn new(
+        types: Vec<LogicalType>,
+        children: Vec<Box<dyn PhysicalOperator>>,
+        union_all: bool,
+        working: Arc<Mutex<ColumnDataCollection>>,
+        recursive: LogicalOperator,
+    ) -> Self {
+        let data = Mutex::new(ColumnDataCollection::new(types.clone()));
+        Self {
+            types,
+            children,
+            union_all,
+            working,
+            recursive,
+            data,
+            seen: Mutex::default(),
+        }
+    }
+
+    /// The rows of `rows` that UNION keeps: the ones not `seen` before.
+    fn new_rows(&self, rows: ColumnDataCollection, seen: &mut HashSet<Vec<u8>>) -> Result<ColumnDataCollection> {
+        if self.union_all {
+            return Ok(rows);
+        }
+        let mut fresh = ColumnDataCollection::new(self.types.clone());
+        for chunk in rows.chunks() {
+            let columns: Vec<&Vector> = chunk.columns().iter().collect();
+            let keys = group_keys(&columns, chunk.len())?;
+            let keep: Vec<u32> = keys
+                .into_iter()
+                .enumerate()
+                .filter(|(_, key)| seen.insert(key.clone()))
+                .map(|(row, _)| row as u32)
+                .collect();
+            let count = keep.len();
+            if count > 0 {
+                let mut chunk = chunk.clone();
+                chunk.slice(&SelectionVector::from_vec(keep), count);
+                fresh.append(&chunk);
+            }
+        }
+        Ok(fresh)
+    }
+}
+
+impl PhysicalOperator for PhysicalRecursiveCte {
+    fn name(&self) -> &'static str {
+        "RECURSIVE_CTE"
+    }
+    fn types(&self) -> &[LogicalType] {
+        &self.types
+    }
+    fn children(&self) -> &[Box<dyn PhysicalOperator>] {
+        &self.children
+    }
+    fn is_sink(&self) -> bool {
+        true
+    }
+    fn sink(&self, chunk: &DataChunk) -> Result<()> {
+        let mut data = self.data.lock();
+        data.append(chunk);
+        check_buffered(&data)
+    }
+    fn finalize(&self) -> Result<()> {
+        let mut data = self.data.lock();
+        let anchor = std::mem::replace(&mut *data, ColumnDataCollection::new(self.types.clone()));
+        *data = self.new_rows(anchor, &mut self.seen.lock())?;
+        Ok(())
+    }
+    fn is_source(&self) -> bool {
+        true
+    }
+    fn source_state(&self) -> SourceState {
+        Box::new(0usize)
+    }
+    /// A round runs when the rows of the last one have gone, so a LIMIT above can stop recursion
+    /// that would never end.
+    fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
+        loop {
+            if let Some(chunk) = scan_collection(&self.data, state) {
+                return Ok(Some(chunk));
+            }
+            let round = std::mem::replace(&mut *self.data.lock(), ColumnDataCollection::new(self.types.clone()));
+            if round.is_empty() {
+                return Ok(None);
+            }
+            *self.working.lock() = round;
+            let mut plan = self.recursive.clone();
+            plan.clear_subquery_results();
+            let rows = run_plan(plan)?;
+            *self.data.lock() = self.new_rows(rows, &mut self.seen.lock())?;
+            *state.downcast_mut::<usize>().expect("collection scan state") = 0;
+        }
+    }
+}
+
+/// The rows of the last round of a recursive CTE.
+#[derive(Debug)]
+pub struct PhysicalWorkingTable {
+    pub types: Vec<LogicalType>,
+    pub working: Arc<Mutex<ColumnDataCollection>>,
+}
+
+impl PhysicalOperator for PhysicalWorkingTable {
+    fn name(&self) -> &'static str {
+        "CTE_SCAN"
+    }
+    fn types(&self) -> &[LogicalType] {
+        &self.types
+    }
+    fn is_source(&self) -> bool {
+        true
+    }
+    fn source_state(&self) -> SourceState {
+        Box::new(0usize)
+    }
+    fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
+        Ok(scan_collection(&self.working, state))
+    }
+}
+
+/// A join whose right side runs once per combination of correlated values of the left side.
+#[derive(Debug)]
+pub struct PhysicalLateralJoin {
+    pub types: Vec<LogicalType>,
+    pub children: Vec<Box<dyn PhysicalOperator>>,
+    pub join_type: JoinType,
+    pub right: LogicalOperator,
+    pub bindings: Vec<ColumnBinding>,
+    pub correlated: Vec<BoundExpr>,
+    pub predicate: Option<BoundExpr>,
+    pub results: Mutex<HashMap<Vec<u8>, Arc<ColumnDataCollection>>>,
+}
+
+impl PhysicalLateralJoin {
+    /// The rows of the right side for a row of the left one.
+    fn right_rows(&self, key: &[u8], values: Vec<Value>, volatile: bool) -> Result<Arc<ColumnDataCollection>> {
+        if !volatile && let Some(rows) = self.results.lock().get(key) {
+            return Ok(rows.clone());
+        }
+        let mut plan = self.right.clone();
+        let columns: Vec<_> = self.bindings.iter().copied().zip(values).collect();
+        plan.substitute_columns(&columns);
+        let rows = Arc::new(run_plan(plan)?);
+        if !volatile {
+            self.results.lock().insert(key.to_vec(), rows.clone());
+        }
+        Ok(rows)
+    }
+
+    fn join_chunk(&self, input: &DataChunk) -> Result<VecDeque<DataChunk>> {
+        let count = input.len();
+        let left_count = input.column_count();
+        let columns = self
+            .correlated
+            .iter()
+            .map(|c| execute(c, input))
+            .collect::<Result<Vec<_>>>()?;
+        let keys = group_keys(&columns.iter().collect::<Vec<_>>(), count)?;
+        let volatile = self.right.is_volatile();
+        let mut output = VecDeque::new();
+        for (row, key) in keys.iter().enumerate() {
+            let values = columns.iter().map(|c| c.get_value(row)).collect();
+            let rows = self.right_rows(key, values, volatile)?;
+            let mut matched = false;
+            for chunk in rows.chunks() {
+                let mut left = input.clone();
+                left.slice(&SelectionVector::from_vec(vec![row as u32; chunk.len()]), chunk.len());
+                let mut joined = left.columns().to_vec();
+                joined.extend(chunk.columns().iter().cloned());
+                let mut joined = DataChunk::from_columns(joined, chunk.len());
+                if let Some(predicate) = &self.predicate {
+                    let (selection, selected) = select(predicate, &joined)?;
+                    if selected != joined.len() {
+                        joined.slice(&selection, selected);
+                    }
+                }
+                if !joined.is_empty() {
+                    matched = true;
+                    output.push_back(joined);
+                }
+            }
+            if !matched && self.join_type == JoinType::Left {
+                let mut left = input.clone();
+                left.slice(&SelectionVector::from_vec(vec![row as u32]), 1);
+                let mut joined = left.columns().to_vec();
+                joined.extend(
+                    self.types[left_count..]
+                        .iter()
+                        .map(|t| Vector::constant_null(t.clone())),
+                );
+                output.push_back(DataChunk::from_columns(joined, 1));
+            }
+        }
+        Ok(output)
+    }
+}
+
+impl PhysicalOperator for PhysicalLateralJoin {
+    fn name(&self) -> &'static str {
+        "LATERAL_JOIN"
+    }
+    fn types(&self) -> &[LogicalType] {
+        &self.types
+    }
+    fn children(&self) -> &[Box<dyn PhysicalOperator>] {
+        &self.children
+    }
+    fn operator_state(&self) -> OperatorState {
+        Box::new(VecDeque::<DataChunk>::new())
+    }
+    fn execute_stateful(&self, input: &DataChunk, state: &mut OperatorState) -> Result<(DataChunk, OperatorResult)> {
+        let pending = state.downcast_mut::<VecDeque<DataChunk>>().expect("lateral join state");
+        if pending.is_empty() {
+            *pending = self.join_chunk(input)?;
+        }
+        let Some(chunk) = pending.pop_front() else {
+            return Ok((DataChunk::from_columns(Vec::new(), 0), OperatorResult::NeedMoreInput));
+        };
+        let result = if pending.is_empty() {
+            OperatorResult::NeedMoreInput
+        } else {
+            OperatorResult::HaveMoreOutput
+        };
+        Ok((chunk, result))
     }
 }
 

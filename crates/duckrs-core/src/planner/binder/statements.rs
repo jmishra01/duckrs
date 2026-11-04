@@ -9,7 +9,8 @@
 
 use super::expression::{checked_cast, without_aliases};
 use super::{
-    AggregateBindState, BindContext, Binder, Binding, BoundStatement, ColumnMode, StatementReturnType, binder_error,
+    AggregateBindState, BindContext, Binder, Binding, BoundStatement, ColumnMode, StatementReturnType, WorkingTable,
+    binder_error,
 };
 use crate::catalog::{
     ColumnDefinition, DEFAULT_CATALOG, OnCreateConflict, SchemaCatalogEntry, TableOrView, ViewCatalogEntry,
@@ -18,8 +19,10 @@ use crate::execution::expression_executor::evaluate_scalar;
 use crate::function::binder::expression_return_type;
 use crate::function::combine_types::{force_max_logical_type, normalize_type, try_max_logical_type};
 use crate::function::generic::is_unnest_call;
+use crate::planner::column_binding_resolver::resolve_column_bindings;
 use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, LogicalOperator, LogicalOperatorKind};
+use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::OrderModifiers;
 use duckrs_common::string_util::{candidates_message, similarity_rating, top_n_strings};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
@@ -27,11 +30,14 @@ use duckrs_common::value::Value;
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast::{
     Constraint, CreateTableInfo, Expr, ExprKind, InsertStatement, InsertValues, Literal, LiteralKind,
-    OnCreateConflict as AstConflict, OrderByNode, QualifiedName, QueryNode, QueryNodeKind, ResultModifier, SelectNode,
-    SelectStatement, SetOpType, SetOperationNode, TableRef, TableRefKind, sql_quoted_identifier, values_list,
+    OnCreateConflict as AstConflict, OrderByNode, QualifiedName, QueryNode, QueryNodeKind, RecursiveCteNode,
+    ResultModifier, SelectNode, SelectStatement, SetOpType, SetOperationNode, TableRef, TableRefKind,
+    sql_quoted_identifier, values_list,
 };
 use duckrs_parser::transformer::visit_expr_mut;
+use parking_lot::Mutex;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(super) fn not_implemented(what: &str) -> Error {
     crate::unported(what)
@@ -242,10 +248,12 @@ impl Binder<'_> {
         for (name, cte) in &node.cte_map.0 {
             match &cte.query.kind {
                 QueryNodeKind::Select(_) | QueryNodeKind::SetOperation(_) => {}
-                QueryNodeKind::RecursiveCte(_) => return Err(not_implemented("WITH RECURSIVE")),
+                QueryNodeKind::RecursiveCte(node) if node.key_targets.is_empty() => {}
+                QueryNodeKind::RecursiveCte(_) => return Err(not_implemented("USING KEY")),
                 _ => return Err(not_implemented("data-modifying statements in WITH")),
             }
-            self.ctes.push((name.clone(), Arc::new(cte.clone())));
+            self.ctes
+                .push((name.clone(), Arc::new(cte.clone()), self.outer_contexts.len()));
         }
         let result = match &node.kind {
             QueryNodeKind::Select(select) => self.bind_select_node(select, &node.modifiers),
@@ -258,11 +266,16 @@ impl Binder<'_> {
 
     /// A reference to the CTE at `index` of the visible ones (`Binder::Bind(BaseTableRef)`).
     fn bind_cte_reference(&mut self, table_ref: &TableRef, index: usize) -> Result<LogicalOperator> {
-        let (name, cte) = self.ctes[index].clone();
+        let (name, cte, outer_depth) = self.ctes[index].clone();
         let mut binder = self.child_binder();
         // a CTE sees the ones before it, and not itself
         binder.ctes.truncate(index);
-        let bound = binder.bind_query_node(&cte.query)?;
+        // a CTE sees what is around its definition, and not what is around a reference to it
+        binder.outer_contexts.truncate(outer_depth);
+        let bound = match &cte.query.kind {
+            QueryNodeKind::RecursiveCte(node) => binder.bind_recursive_cte(&name, node, &cte.aliases)?,
+            _ => binder.bind_query_node(&cte.query)?,
+        };
         self.next_table_index = binder.next_table_index;
         // the aliases of the reference override the ones of the CTE
         let mut column_aliases = cte.aliases.clone();
@@ -278,6 +291,80 @@ impl Binder<'_> {
             table_ref.alias.clone()
         };
         self.add_query_binding(alias, bound, &column_aliases)
+    }
+
+    /// `Binder::BindNode(RecursiveCTENode)`: the recursive part sees the CTE as the rows of the
+    /// last round, of the types of the anchor.
+    fn bind_recursive_cte(
+        &mut self,
+        name: &str,
+        node: &RecursiveCteNode,
+        aliases: &[String],
+    ) -> Result<BoundStatement> {
+        let mut anchor_binder = self.child_binder();
+        let anchor = anchor_binder.bind_query_node(&node.left)?;
+        self.next_table_index = anchor_binder.next_table_index;
+        let types = anchor.types.clone();
+        let mut names = anchor.names.clone();
+        for (column, alias) in names.iter_mut().zip(aliases) {
+            column.clone_from(alias);
+        }
+        let working = Arc::new(Mutex::new(ColumnDataCollection::new(types.clone())));
+        let used = Arc::new(AtomicBool::new(false));
+        let mut binder = self.child_binder();
+        binder.working_tables.push(WorkingTable {
+            name: name.to_string(),
+            names: names.clone(),
+            types: types.clone(),
+            rows: working.clone(),
+            used: used.clone(),
+        });
+        let recursive = binder.bind_query_node(&node.right)?;
+        self.next_table_index = binder.next_table_index;
+        if recursive.types.len() != types.len() {
+            return Err(binder_error(
+                "Set operations can only apply to expressions with the same number of result columns",
+            ));
+        }
+        let columns = (0..types.len()).map(Some).collect();
+        let mut recursive = self.cast_plan(recursive, &types, columns);
+        let plan = if used.load(Ordering::Relaxed) {
+            resolve_column_bindings(&mut recursive)?;
+            LogicalOperator::new(
+                LogicalOperatorKind::RecursiveCte {
+                    table_index: self.generate_table_index(),
+                    types: types.clone(),
+                    union_all: node.union_all,
+                    working,
+                    recursive: Box::new(recursive),
+                },
+                vec![anchor.plan],
+            )
+        } else {
+            // WITH RECURSIVE that does not recurse is a plain set operation
+            let table_index = self.generate_table_index();
+            let plan = LogicalOperator::new(
+                LogicalOperatorKind::Union {
+                    table_index,
+                    types: types.clone(),
+                },
+                vec![anchor.plan, recursive],
+            );
+            let distinct = if node.union_all {
+                Vec::new()
+            } else {
+                vec![PreparedModifier::Distinct]
+            };
+            self.apply_modifiers(plan, distinct, table_index, &names, &types, types.len())?
+        };
+        let column_aliases = names.iter().cloned().zip(0..).collect();
+        Ok(BoundStatement {
+            plan,
+            names,
+            types,
+            column_aliases,
+            return_type: StatementReturnType::QueryResult,
+        })
     }
 
     /// `Binder::BindNode(SetOperationNode)`.
@@ -1172,7 +1259,40 @@ impl Binder<'_> {
                     return Err(not_implemented("AT clauses"));
                 }
                 if name.qualification.is_empty()
-                    && let Some(index) = self.ctes.iter().rposition(|(n, _)| n.eq_ignore_ascii_case(&name.name))
+                    && let Some(working) = self
+                        .working_tables
+                        .iter()
+                        .rev()
+                        .find(|w| w.name.eq_ignore_ascii_case(&name.name))
+                {
+                    let working = working.clone();
+                    working.used.store(true, Ordering::Relaxed);
+                    let alias = if table_ref.alias.is_empty() {
+                        working.name.clone()
+                    } else {
+                        table_ref.alias.clone()
+                    };
+                    let names = Self::alias_columns(table_ref, &alias, working.names)?;
+                    let table_index = self.generate_table_index();
+                    self.bind_context.add_binding(Binding {
+                        alias,
+                        schema: None,
+                        table_index,
+                        names,
+                        types: working.types.clone(),
+                        row_id: None,
+                    });
+                    return Ok(LogicalOperator::new(
+                        LogicalOperatorKind::WorkingTable {
+                            table_index,
+                            types: working.types,
+                            working: working.rows,
+                        },
+                        vec![],
+                    ));
+                }
+                if name.qualification.is_empty()
+                    && let Some(index) = self.ctes.iter().rposition(|(n, ..)| n.eq_ignore_ascii_case(&name.name))
                 {
                     return self.bind_cte_reference(table_ref, index);
                 }
