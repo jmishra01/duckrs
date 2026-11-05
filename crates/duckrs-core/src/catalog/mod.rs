@@ -99,6 +99,16 @@ pub struct TableCatalogEntry {
 pub struct TableStatistics {
     pub version: u64,
     pub columns: Option<Arc<Vec<ColumnStatistics>>>,
+    /// The rows and each column's distinct values, for the join order.
+    pub distinct: Option<Arc<TableDistinctCounts>>,
+}
+
+/// How many rows a table has and how many distinct values each column holds, approximately.
+#[derive(Debug)]
+pub struct TableDistinctCounts {
+    pub rows: u64,
+    /// `None` for a column of a type that has no count
+    pub columns: Vec<Option<u64>>,
 }
 
 /// What is known about the values of a column (`BaseStatistics`).
@@ -211,6 +221,7 @@ impl TableCatalogEntry {
         let mut statistics = self.statistics.lock();
         statistics.version += 1;
         statistics.columns = None;
+        statistics.distinct = None;
         storage
     }
 

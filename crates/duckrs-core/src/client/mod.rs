@@ -3057,6 +3057,81 @@ mod tests {
     }
 
     #[test]
+    fn join_order_matches_duckdb() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        run(&mut context, "SET explain_output = 'OPTIMIZED_ONLY'");
+        run(
+            &mut context,
+            "CREATE TABLE big AS SELECT i AS id, i % 500 AS mid_id, i % 20 AS small_id FROM range(20000) t(i)",
+        );
+        run(&mut context, "CREATE TABLE mid AS SELECT i AS id FROM range(500) t(i)");
+        run(&mut context, "CREATE TABLE small AS SELECT i AS id FROM range(20) t(i)");
+        let explain = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let at = |plan: &str, table: &str| {
+            let line = plan.lines().position(|line| line.trim() == table);
+            line.unwrap_or_else(|| panic!("{table} in {plan}"))
+        };
+        // written with the cross product first; the smaller tables are built, with no cross product
+        let query = "FROM small, mid, big WHERE big.mid_id = mid.id AND big.small_id = small.id";
+        let plan = explain(&mut context, &format!("SELECT count(*) {query}"));
+        assert!(!plan.contains("CROSS_PRODUCT"), "{plan}");
+        assert!(
+            at(&plan, "big") < at(&plan, "mid") && at(&plan, "big") < at(&plan, "small"),
+            "{plan}"
+        );
+        assert_eq!(run(&mut context, &format!("SELECT count(*) {query}")), [["20000"]]);
+        // the smaller side of a join is on the right, however the query has it
+        for query in [
+            "big, mid WHERE big.mid_id = mid.id",
+            "mid, big WHERE big.mid_id = mid.id",
+        ] {
+            let plan = explain(&mut context, &format!("SELECT count(*) FROM {query}"));
+            assert!(at(&plan, "big") < at(&plan, "mid"), "{plan}");
+        }
+        // columns keep their order, also through a set operation, which reads them by position
+        run(&mut context, "CREATE TABLE l (a INTEGER)");
+        run(&mut context, "CREATE TABLE r AS SELECT i AS b FROM range(100) t(i)");
+        run(&mut context, "INSERT INTO l VALUES (1)");
+        let rows = run(&mut context, "SELECT * FROM l, r WHERE a = b UNION ALL SELECT 5, 6");
+        assert_eq!(rows, [["1", "1"], ["5", "6"]]);
+        assert_eq!(run(&mut context, "SELECT * FROM r, l WHERE a = b"), [["1", "1"]]);
+        // a filter that reads three relations is on the join that has all of them
+        let rows = run(
+            &mut context,
+            "SELECT count(*) FROM small s1, small s2, small s3 WHERE s1.id = s2.id AND s1.id + s2.id > s3.id",
+        );
+        assert_eq!(rows, [["290"]]);
+        // what cannot move: volatile filters, the sides of outer joins
+        let rows = run(
+            &mut context,
+            "SELECT count(*) FROM (SELECT * FROM small s1, small s2 WHERE s1.id = s2.id AND random() < 2) x",
+        );
+        assert_eq!(rows, [["20"]]);
+        let rows = run(
+            &mut context,
+            "SELECT count(*), count(m.id) FROM big b LEFT JOIN mid m ON b.mid_id = m.id AND m.id < 10, small s \
+             WHERE b.small_id = s.id",
+        );
+        assert_eq!(rows, [["20000", "400"]]);
+        // over the limit of the exact search, and without anything to connect two of them
+        let many = (0..14).map(|i| format!("small s{i}")).collect::<Vec<_>>().join(", ");
+        let joins = (1..14)
+            .map(|i| format!("s{}.id = s{i}.id", i - 1))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        assert_eq!(
+            run(&mut context, &format!("SELECT count(*) FROM {many} WHERE {joins}")),
+            [["20"]]
+        );
+        let plan = explain(&mut context, "SELECT * FROM l, r, mid WHERE a = b");
+        assert!(plan.contains("CROSS_PRODUCT"), "{plan}");
+        // off under the name DuckDB has for it: the query stays as it is written
+        run(&mut context, "SET disabled_optimizers = 'join_order'");
+        let plan = explain(&mut context, "SELECT count(*) FROM mid, big WHERE big.mid_id = mid.id");
+        assert!(at(&plan, "mid") < at(&plan, "big"), "{plan}");
+    }
+
+    #[test]
     fn statistics_match_duckdb() {
         let mut context = ClientContext::new(DatabaseInstance::new());
         run(&mut context, "SET explain_output = 'OPTIMIZED_ONLY'");

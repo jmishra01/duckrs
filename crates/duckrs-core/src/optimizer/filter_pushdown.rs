@@ -484,7 +484,7 @@ fn add_filter_operator(op: LogicalOperator, expressions: Vec<BoundExpr>) -> Logi
 }
 
 /// `JoinCondition::CreateExpression`.
-fn condition_expression(condition: JoinCondition) -> BoundExpr {
+pub(super) fn condition_expression(condition: JoinCondition) -> BoundExpr {
     BoundExpr::new(
         BoundExprKind::Comparison {
             op: if condition.null_safe {

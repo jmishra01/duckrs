@@ -202,6 +202,15 @@ while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` 
   it saw. Plans do not outlive a statement, so what they fold cannot go stale. A plan in which a
   table index appears twice is left alone, as narrowing one use of a binding would apply to all.
   Decided comparisons become constants, or `constant_or_null` where a side can be NULL.
+- **Join order** takes trees of inner joins and cross products apart into relations and conjuncts,
+  and DPhyp, or Greedy Operator Ordering from 12 relations on, picks the order with the lowest sum
+  of estimated join sizes. Each conjunct goes on the lowest join that has its relations, and of
+  each join the side with the fewest rows is on the right, which is the side a hash join builds.
+  Column positions change, so a tree stays as it is under what reads its columns by position
+  (set operations, DML, `DISTINCT`, the root); those have a projection below them in practice.
+  Estimates use the total domain of each equivalence class and DuckDB's selectivities, from
+  `approx_count_distinct` on the first 100,000 rows of a table, per state of its rows. Those counts
+  only steer the order, so being stale or uncommitted can make a plan slower but not wrong.
 - **Unused columns** become typed NULL constants instead of going away, which keeps column
   bindings stable: subquery plans refer to outer columns by binding. Scans keep all their columns,
   because in-memory scans clone `Arc`s and pruning them would gain nothing.
@@ -210,7 +219,9 @@ A filter stays above a projection or an aggregate if it, or an entry it would be
 can fail: below, `a::int < b::int` would run ahead of the filter that guards those casts.
 `can_throw` allows only what is known not to fail, so some filters stay higher than they do in C++.
 
-Not ported yet: join order, statistics per row group or for functions (`stats()`, `length`, `abs`,
+Not ported yet: moving LEFT, SEMI and ANTI joins in the join order (they are relations, with their
+sides ordered apart), the estimator's caps for composite keys, estimated rows in EXPLAIN, flipping
+LEFT to RIGHT joins for the build side, statistics per row group or for functions (`stats()`, `length`, `abs`,
 `greatest`, `lower`, ...), aggregates and windows, `ANALYZE`, `FilterCombiner` beyond splitting,
 deduplicating and deciding constants, transitive filters, MoveConstants of floats and DECIMALs,
 `x * 0`,

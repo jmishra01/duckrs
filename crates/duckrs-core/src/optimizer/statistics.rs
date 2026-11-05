@@ -15,7 +15,7 @@
 
 use super::filter_pushdown::empty_result;
 use super::rewriter::{fold_boolean, rewrite_expression};
-use crate::catalog::{ColumnStatistics, TableCatalogEntry};
+use crate::catalog::{ColumnStatistics, TableCatalogEntry, TableDistinctCounts};
 use crate::execution::run_plan;
 use crate::function::binder::bind_aggregate_function;
 use crate::function::{BuiltinFunctions, constant_or_null};
@@ -128,6 +128,94 @@ fn table_statistics(table: &Arc<TableCatalogEntry>) -> Option<Arc<Vec<Stats>>> {
         cached.columns = Some(columns.clone());
     }
     Some(columns)
+}
+
+/// How many rows `compute_distinct_counts` reads, which a statement can pay for after every write.
+const DISTINCT_SAMPLE_ROWS: u64 = 100_000;
+
+/// A scan that counts the distinct values of the columns of `table`, in its first rows. Nearly
+/// all distinct there is taken to go on in the same way, and otherwise for the values to be all
+/// there are.
+fn compute_distinct_counts(table: &Arc<TableCatalogEntry>) -> Option<TableDistinctCounts> {
+    let functions = BuiltinFunctions::get();
+    let mut aggregates = Vec::new();
+    let mut columns = Vec::with_capacity(table.columns.len());
+    for (index, column) in table.columns.iter().enumerate() {
+        if !has_ordered_statistics(&column.ty) {
+            columns.push(None);
+            continue;
+        }
+        let reference = BoundExpr::column_ref(ColumnBinding::new(0, index), column.ty.clone(), "");
+        let distinct = functions.aggregate("approx_count_distinct")?;
+        aggregates.push(bind_aggregate_function(distinct, vec![reference], None, false).ok()?);
+        columns.push(Some(aggregates.len() - 1));
+    }
+    let count_star = functions.aggregate("count_star")?;
+    aggregates.push(bind_aggregate_function(count_star, Vec::new(), None, false).ok()?);
+    let rows_at = aggregates.len() - 1;
+    let scan = LogicalOperator::new(
+        K::Get {
+            table: table.clone(),
+            table_index: 0,
+            column_ids: (0..table.columns.len()).collect(),
+        },
+        Vec::new(),
+    );
+    let rows = table.storage.read().len() as u64;
+    let scan = if rows > DISTINCT_SAMPLE_ROWS {
+        let limit = K::Limit {
+            limit: Some(DISTINCT_SAMPLE_ROWS),
+            offset: 0,
+        };
+        LogicalOperator::new(limit, vec![scan])
+    } else {
+        scan
+    };
+    let mut plan = LogicalOperator::new(
+        K::Aggregate {
+            group_index: 1,
+            aggregate_index: 2,
+            groupings_index: 3,
+            groups: Vec::new(),
+            aggregates,
+            grouping_sets: Vec::new(),
+            grouping_functions: Vec::new(),
+        },
+        vec![scan],
+    );
+    resolve_column_bindings(&mut plan).ok()?;
+    let result = run_plan(plan).ok()?;
+    let as_count = |at: usize| result.get_value(at, 0).try_to_string().ok()?.parse::<u64>().ok();
+    let sampled = as_count(rows_at)?;
+    let rows = rows.max(sampled);
+    let scale = |distinct: u64| {
+        if sampled > 0 && distinct as f64 >= 0.9 * sampled as f64 {
+            (distinct as f64 * rows as f64 / sampled as f64) as u64
+        } else {
+            distinct
+        }
+    };
+    Some(TableDistinctCounts {
+        rows,
+        columns: columns.into_iter().map(|at| at.and_then(as_count).map(scale)).collect(),
+    })
+}
+
+/// `compute_distinct_counts`, once per state of the rows.
+pub(super) fn table_distinct_counts(table: &Arc<TableCatalogEntry>) -> Option<Arc<TableDistinctCounts>> {
+    let version = {
+        let cached = table.statistics.lock();
+        if let Some(distinct) = &cached.distinct {
+            return Some(distinct.clone());
+        }
+        cached.version
+    };
+    let distinct = Arc::new(compute_distinct_counts(table)?);
+    let mut cached = table.statistics.lock();
+    if cached.version == version {
+        cached.distinct = Some(distinct.clone());
+    }
+    Some(distinct)
 }
 
 /// `a op b` for two values of a type, if that can be told.
