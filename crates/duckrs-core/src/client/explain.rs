@@ -9,7 +9,7 @@
 
 use crate::execution::physical::PhysicalOperator;
 use crate::optimizer::join_order::PlanEstimate;
-use crate::planner::expression::BoundAggregate;
+use crate::planner::expression::{BoundAggregate, BoundExpr};
 use crate::planner::logical::{BoundOrderByNode, JoinCondition, LogicalOperator, LogicalOperatorKind as K};
 use duckrs_common::sort_key::OrderType;
 
@@ -80,6 +80,27 @@ fn aggregate_text(aggregate: &BoundAggregate) -> String {
     }
 }
 
+/// `ExpressionFilter::ToString`: without the parentheses around all of it, if there are any.
+fn filter_text(filter: &BoundExpr) -> String {
+    let text = filter.to_string();
+    let Some(inner) = text.strip_prefix('(').and_then(|t| t.strip_suffix(')')) else {
+        return text;
+    };
+    // (a) OR (b) starts and ends with them too, but those are not one pair
+    let mut depth = 0i32;
+    for c in inner.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+        if depth < 0 {
+            return text;
+        }
+    }
+    inner.to_string()
+}
+
 fn order_text(orders: &[BoundOrderByNode]) -> String {
     lines(orders.iter().map(|order| {
         let direction = match order.modifiers.order {
@@ -101,9 +122,12 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
         info
     };
     match &op.kind {
-        K::Get { table, .. } => {
+        K::Get { table, filters, .. } => {
             let mut info = entry("Table", table.name.clone());
             info.extend(entry("Type", "Sequential Scan".to_string()));
+            if !filters.is_empty() {
+                info.extend(entry("Filters", lines(filters.iter().map(filter_text))));
+            }
             info
         }
         K::Filter { expressions } => {

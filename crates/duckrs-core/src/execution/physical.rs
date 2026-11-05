@@ -130,6 +130,8 @@ pub struct PhysicalTableScan {
     pub table: Arc<TableCatalogEntry>,
     pub column_ids: Vec<usize>,
     pub types: Vec<LogicalType>,
+    /// what rows must meet, on the output of the scan
+    pub filter: Option<BoundExpr>,
 }
 
 impl PhysicalOperator for PhysicalTableScan {
@@ -149,32 +151,42 @@ impl PhysicalOperator for PhysicalTableScan {
     }
     fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
         let (next, remaining) = state.downcast_mut::<(usize, usize)>().expect("table scan state");
-        if *remaining == 0 {
-            return Ok(None);
+        while *remaining > 0 {
+            let storage = self.table.storage.read();
+            let chunk = storage.chunk(*next);
+            // all chunks but the last are full, so that a row's position gives its id
+            let first_row = (*next * STANDARD_VECTOR_SIZE) as i64;
+            *next += 1;
+            let count = chunk.len().min(*remaining);
+            *remaining -= count;
+            let columns = self
+                .column_ids
+                .iter()
+                .map(|&i| {
+                    if i == COLUMN_IDENTIFIER_ROW_ID {
+                        Vector::sequence(LogicalType::BIGINT, first_row, 1)
+                    } else {
+                        Ok(chunk.column(i).clone())
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut result = DataChunk::from_columns(columns, chunk.len());
+            if count < chunk.len() {
+                result.slice(&SelectionVector::from_vec((0..count as u32).collect()), count);
+            }
+            let Some(filter) = &self.filter else {
+                return Ok(Some(result));
+            };
+            let (sel, matched) = select(filter, &result)?;
+            if matched == 0 {
+                continue;
+            }
+            if matched != result.len() {
+                result.slice(&sel, matched);
+            }
+            return Ok(Some(result));
         }
-        let storage = self.table.storage.read();
-        let chunk = storage.chunk(*next);
-        // all chunks but the last are full, so that a row's position gives its id
-        let first_row = (*next * STANDARD_VECTOR_SIZE) as i64;
-        *next += 1;
-        let count = chunk.len().min(*remaining);
-        *remaining -= count;
-        let columns = self
-            .column_ids
-            .iter()
-            .map(|&i| {
-                if i == COLUMN_IDENTIFIER_ROW_ID {
-                    Vector::sequence(LogicalType::BIGINT, first_row, 1)
-                } else {
-                    Ok(chunk.column(i).clone())
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let mut result = DataChunk::from_columns(columns, chunk.len());
-        if count < chunk.len() {
-            result.slice(&SelectionVector::from_vec((0..count as u32).collect()), count);
-        }
-        Ok(Some(result))
+        Ok(None)
     }
 }
 

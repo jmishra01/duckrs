@@ -76,6 +76,7 @@ fn compute_statistics(table: &Arc<TableCatalogEntry>) -> Option<Vec<Stats>> {
             table: table.clone(),
             table_index: 0,
             column_ids: (0..table.columns.len()).collect(),
+            filters: Vec::new(),
         },
         Vec::new(),
     );
@@ -114,7 +115,7 @@ fn compute_statistics(table: &Arc<TableCatalogEntry>) -> Option<Vec<Stats>> {
     Some(statistics)
 }
 
-fn table_statistics(table: &Arc<TableCatalogEntry>) -> Option<Arc<Vec<Stats>>> {
+pub(super) fn table_statistics(table: &Arc<TableCatalogEntry>) -> Option<Arc<Vec<Stats>>> {
     let version = {
         let cached = table.statistics.lock();
         if let Some(columns) = &cached.columns {
@@ -158,6 +159,7 @@ fn compute_distinct_counts(table: &Arc<TableCatalogEntry>) -> Option<TableDistin
             table: table.clone(),
             table_index: 0,
             column_ids: (0..table.columns.len()).collect(),
+            filters: Vec::new(),
         },
         Vec::new(),
     );
@@ -948,6 +950,7 @@ impl StatisticsPropagator {
                 table,
                 table_index,
                 column_ids,
+                ..
             } => {
                 for (position, column) in column_ids.iter().enumerate() {
                     if *column != COLUMN_IDENTIFIER_ROW_ID {

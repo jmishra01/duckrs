@@ -1473,6 +1473,7 @@ impl Binder<'_> {
                         table,
                         table_index,
                         column_ids,
+                        filters: Vec::new(),
                     },
                     vec![],
                 ))

@@ -16,8 +16,9 @@
 use super::conjunction_of;
 use super::filter_pushdown::condition_expression;
 use super::rewriter::split_conjuncts;
-use super::statistics::table_distinct_counts;
-use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
+use super::statistics::{table_distinct_counts, table_statistics};
+use crate::catalog::TableCatalogEntry;
+use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, ColumnBinding};
 use crate::planner::logical::{COLUMN_IDENTIFIER_ROW_ID, JoinCondition, LogicalOperator, LogicalOperatorKind as K};
 use duckrs_common::value::Value;
 use duckrs_parser::ast::{ComparisonOp, JoinType};
@@ -549,6 +550,7 @@ impl JoinOrderOptimizer {
                 table,
                 table_index,
                 column_ids,
+                filters,
             } => {
                 let Some(counts) = table_distinct_counts(table) else {
                     return RelationStats {
@@ -568,10 +570,17 @@ impl JoinOrderOptimizer {
                         Some((ColumnBinding::new(*table_index, at), count? as f64))
                     })
                     .collect();
-                RelationStats {
+                let stats = RelationStats {
                     cardinality: counts.rows as f64,
                     distinct,
-                }
+                };
+                let filters: Vec<BoundExpr> = filters
+                    .iter()
+                    .filter(|filter| !is_proven_not_null(filter, table, *table_index, column_ids))
+                    .cloned()
+                    .collect();
+                let cardinality = filter_cardinality(&filters, &stats);
+                stats.scaled(cardinality)
             }
             K::Range { count, .. } => RelationStats {
                 cardinality: *count as f64,
@@ -913,6 +922,28 @@ impl JoinOrderOptimizer {
         }
         LogicalOperator::new(K::Filter { expressions: above }, vec![plan])
     }
+}
+
+/// Whether a filter of a scan is `x IS NOT NULL` for a column that has no NULLs, so keeps all rows.
+fn is_proven_not_null(filter: &BoundExpr, table: &Arc<TableCatalogEntry>, table_index: usize, ids: &[usize]) -> bool {
+    let BoundExprKind::Operator {
+        op: BoundOperator::IsNotNull,
+        children,
+    } = &filter.kind
+    else {
+        return false;
+    };
+    let Some(column) = children.first().and_then(bare_column) else {
+        return false;
+    };
+    if column.table_index != table_index {
+        return false;
+    }
+    let Some(statistics) = table_statistics(table) else {
+        return false;
+    };
+    let id = ids.get(column.column_index).copied();
+    id.and_then(|id| statistics.get(id)).is_some_and(|s| !s.can_be_null)
 }
 
 /// How many rows filters leave of `child`: an equality with a constant keeps a value's worth of

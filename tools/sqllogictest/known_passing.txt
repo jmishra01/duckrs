@@ -438,7 +438,9 @@ test/optimizer/pushdown/join_filter_pushdown_sample.test
 test/optimizer/pushdown/lateral_projection_evaluation.test
 test/optimizer/pushdown/no_mark_to_semi_if_mark_index_is_projected.test
 test/optimizer/pushdown/prefix_pushdown_null_constant.test
+test/optimizer/pushdown/pushdown_unnest_into_cte.test
 test/optimizer/pushdown/pushdown_window_decreasing_partition.test
+test/optimizer/pushdown/test_pushdown_cte_group_by_all.test
 test/optimizer/pushdown/timestamp_to_date_infinity_pushdown.test
 test/optimizer/regex_optimizer_coverage.test
 test/optimizer/regex_to_like_optimizer.test
@@ -1349,6 +1351,7 @@ test/sql/optimizer/plan/test_except_empty_rhs.test
 test/sql/optimizer/plan/test_filter_pushdown_duplicate.test
 test/sql/optimizer/plan/test_table_filter_pushdown.test
 test/sql/optimizer/plan/test_unused_column_after_join.test
+test/sql/optimizer/predicate_factoring.test
 test/sql/optimizer/pushdown_extract_multiple_filters.test
 test/sql/optimizer/rewrite_nan_null.test
 test/sql/optimizer/string_stats_merge_truncated_prefix.test

@@ -101,6 +101,7 @@ fn base_table_column(op: &LogicalOperator, binding: ColumnBinding) -> Option<(Ar
             table,
             table_index,
             column_ids,
+            ..
         } => {
             if *table_index != binding.table_index {
                 return None;

@@ -29,10 +29,16 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
     let types = op.types();
     let mut children: Vec<Box<dyn PhysicalOperator>> = op.children.into_iter().map(create_plan).collect();
     match op.kind {
-        LogicalOperatorKind::Get { table, column_ids, .. } => Box::new(PhysicalTableScan {
+        LogicalOperatorKind::Get {
+            table,
+            column_ids,
+            filters,
+            ..
+        } => Box::new(PhysicalTableScan {
             table,
             column_ids,
             types,
+            filter: (!filters.is_empty()).then(|| crate::optimizer::conjunction_of(filters)),
         }),
         LogicalOperatorKind::Range {
             start,

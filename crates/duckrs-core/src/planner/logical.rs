@@ -27,6 +27,8 @@ pub enum LogicalOperatorKind {
         table: Arc<TableCatalogEntry>,
         table_index: usize,
         column_ids: Vec<usize>,
+        /// conditions on its output, each on one column, that rows must meet (`TableFilterSet`)
+        filters: Vec<BoundExpr>,
     },
     /// The `range` and `generate_series` table functions: `count` integers from `start`.
     Range {
@@ -620,6 +622,7 @@ impl LogicalOperator {
                 result
             }
             LogicalOperatorKind::MarkJoin { predicate, .. } => predicate.iter_mut().collect(),
+            LogicalOperatorKind::Get { filters, .. } => filters.iter_mut().collect(),
             LogicalOperatorKind::MergeInto {
                 actions,
                 row_id,

@@ -217,12 +217,15 @@ while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` 
   own after filter pushdown, which counts the reads, where C++ flags the joins up front. `NOT IN`
   stays MARK, since a NULL on either side changes its answer. In a tree of joins, a SEMI or ANTI
   join that reads one relation goes down to it.
+- **Scan filters** move a conjunct from a `FILTER` directly on a scan into it, if it reads one
+  column of that scan, is not volatile and cannot fail. It runs last, so the other passes see plain
+  filters. With no zone maps yet it saves the operator, not the scan.
 - **EXPLAIN** (`client::explain`) turns a plan into a tree that renders as text or JSON. Names are
   in title case unless `operator_casing` says `upper`, and JSON keeps them as they are. The text is
   one line per fact, not boxes. A physical plan takes its details and estimates from the logical
   plan it came from wherever the shapes line up, as resolved expressions have lost their names.
   `~N rows` comes from the join order's statistics, per operator, so an estimate is only as good
-  as those: scans show the table's rows, as filters are not pushed into scans yet.
+  as those.
 - **Unused columns** become typed NULL constants instead of going away, which keeps column
   bindings stable: subquery plans refer to outer columns by binding. Scans keep all their columns,
   because in-memory scans clone `Arc`s and pruning them would gain nothing.

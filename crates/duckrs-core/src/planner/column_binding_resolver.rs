@@ -65,7 +65,12 @@ pub fn resolve_column_bindings(op: &mut LogicalOperator) -> Result<()> {
         }
         return Ok(());
     }
-    let bindings: Vec<ColumnBinding> = op.children.iter().flat_map(|c| c.column_bindings()).collect();
+    // a scan's filters read what it outputs; everything else reads its children
+    let bindings: Vec<ColumnBinding> = if matches!(op.kind, LogicalOperatorKind::Get { .. }) {
+        op.column_bindings()
+    } else {
+        op.children.iter().flat_map(|c| c.column_bindings()).collect()
+    };
     for expr in op.expressions_mut() {
         resolve_expression(expr, &bindings)?;
     }

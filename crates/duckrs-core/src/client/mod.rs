@@ -3031,6 +3031,62 @@ mod tests {
     }
 
     #[test]
+    fn scan_filters_match_duckdb() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        run(&mut context, "SET explain_output = 'OPTIMIZED_ONLY'");
+        run(&mut context, "CREATE TABLE t (i INTEGER, j INTEGER, s VARCHAR)");
+        run(
+            &mut context,
+            "INSERT INTO t SELECT r, r % 10, r::VARCHAR FROM range(5000) x(r)",
+        );
+        let explain = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        // one column goes into the scan, and no operator is left
+        let plan = explain(&mut context, "SELECT i FROM t WHERE j = 5");
+        assert!(plan.contains("Filters: j = 5") && !plan.contains("Filter\n"), "{plan}");
+        // several columns stay above it, and each conjunct goes its own way
+        let plan = explain(&mut context, "SELECT i FROM t WHERE j = 5 AND i > j AND s <> '55'");
+        assert!(
+            plan.contains("Filters: j = 5\n") && plan.contains("s != '55'"),
+            "{plan}"
+        );
+        assert!(plan.contains("Filter\n") && plan.contains("i > j"), "{plan}");
+        // and an OR on one column is one filter, without parentheses around all of it
+        let plan = explain(&mut context, "SELECT i FROM t WHERE j = 5 OR j = 6");
+        assert!(!plan.contains("Filter\n"), "{plan}");
+        // the answers stay, across the chunks a filter empties
+        for (sql, count) in [
+            ("SELECT count(*) FROM t WHERE j = 5", "500"),
+            ("SELECT count(*) FROM t WHERE i = 4999", "1"),
+            ("SELECT count(*) FROM t WHERE i >= 2048 AND i < 2050", "2"),
+            ("SELECT count(*) FROM t WHERE i < 0", "0"),
+            ("SELECT count(*) FROM t WHERE j = 5 AND i > j", "499"),
+            ("SELECT count(*) FROM t WHERE j IS NULL", "0"),
+        ] {
+            assert_eq!(run(&mut context, sql), [[count]], "{sql}");
+        }
+        // what the filter does not output still counts, and rowids are those of the table
+        assert_eq!(run(&mut context, "SELECT rowid FROM t WHERE i = 3000"), [["3000"]]);
+        run(&mut context, "UPDATE t SET j = 100 WHERE i = 4000");
+        assert_eq!(run(&mut context, "SELECT i FROM t WHERE j = 100"), [["4000"]]);
+        run(&mut context, "DELETE FROM t WHERE i >= 10");
+        assert_eq!(run(&mut context, "SELECT count(*) FROM t"), [["10"]]);
+        // what can fail, or differ per call, or reads the query around it, stays an operator
+        let plan = explain(&mut context, "SELECT i FROM t WHERE s::INTEGER = 3");
+        assert!(plan.contains("Filter\n"), "{plan}");
+        let plan = explain(&mut context, "SELECT i FROM t WHERE i < random() * 100");
+        assert!(plan.contains("Filter\n"), "{plan}");
+        let rows = run(
+            &mut context,
+            "SELECT i FROM t t1 WHERE EXISTS (SELECT 1 FROM t t2 WHERE t2.i = t1.i AND t2.j > 8) ORDER BY i",
+        );
+        assert_eq!(rows, [["9"]]);
+        // a filter that keeps all rows leaves the estimate alone
+        run(&mut context, "SET disabled_optimizers = 'statistics_propagation'");
+        let plan = explain(&mut context, "SELECT i FROM t WHERE i IS NOT NULL");
+        assert!(plan.contains("~10 rows"), "{plan}");
+    }
+
+    #[test]
     fn in_subqueries_match_duckdb() {
         let mut context = ClientContext::new(DatabaseInstance::new());
         run(&mut context, "SET explain_output = 'OPTIMIZED_ONLY'");

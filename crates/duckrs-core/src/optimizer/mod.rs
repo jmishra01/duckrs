@@ -11,6 +11,7 @@ pub mod empty_result_pullup;
 pub mod filter_pushdown;
 pub mod join_order;
 pub mod rewriter;
+pub mod scan_filters;
 pub mod statistics;
 pub mod unused_columns;
 
@@ -89,6 +90,9 @@ pub fn optimize(mut plan: LogicalOperator, options: OptimizerOptions) -> Logical
     }
     if options.unused_columns {
         unused_columns::remove_unused_columns(&mut plan);
+    }
+    if options.filter_pushdown {
+        scan_filters::push_into_scans(&mut plan);
     }
     plan
 }
