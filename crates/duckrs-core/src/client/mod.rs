@@ -3247,6 +3247,49 @@ mod tests {
     }
 
     #[test]
+    fn left_join_on_conditions_of_the_right_side_go_below_it() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        run(&mut context, "SET explain_output = 'OPTIMIZED_ONLY'");
+        run(&mut context, "CREATE TABLE a (k INTEGER)");
+        run(&mut context, "INSERT INTO a VALUES (1), (2), (3), (NULL)");
+        run(&mut context, "CREATE TABLE b (k INTEGER, s VARCHAR)");
+        run(
+            &mut context,
+            "INSERT INTO b VALUES (1, 'keep'), (1, 'drop'), (2, 'drop'), (NULL, 'keep'), (9, NULL)",
+        );
+        let plan = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        // the left rows stay, with NULLs where the condition left no partner
+        let sql = "SELECT a.k, b.s FROM a LEFT JOIN b ON a.k = b.k AND b.s LIKE 'k%' ORDER BY 1 NULLS LAST, 2";
+        let below = plan(&mut context, sql);
+        assert!(below.contains("Filters: "), "{below}");
+        assert!(!below.contains("Join Type: INNER"), "{below}");
+        let rows = [["1", "keep"], ["2", "NULL"], ["3", "NULL"], ["NULL", "NULL"]];
+        assert_eq!(run(&mut context, sql), rows);
+        // both sides or the left side alone stay on the join, next to one that moves
+        let sql =
+            "SELECT a.k, b.s FROM a LEFT JOIN b ON a.k = b.k AND b.s LIKE 'k%' AND a.k <> 1 ORDER BY 1 NULLS LAST";
+        let rows = [["1", "NULL"], ["2", "NULL"], ["3", "NULL"], ["NULL", "NULL"]];
+        assert_eq!(run(&mut context, sql), rows);
+        let sql = "SELECT a.k, b.s FROM a LEFT JOIN b ON a.k = b.k AND a.k + length(b.s) = 5 ORDER BY 1 NULLS LAST, 2";
+        let rows = [
+            ["1", "drop"],
+            ["1", "keep"],
+            ["2", "NULL"],
+            ["3", "NULL"],
+            ["NULL", "NULL"],
+        ];
+        assert_eq!(run(&mut context, sql), rows);
+        // NULL is not true either
+        let sql = "SELECT count(b.k) FROM a LEFT JOIN b ON a.k = b.k AND b.s NOT LIKE 'k%'";
+        assert_eq!(run(&mut context, sql), [["2"]]);
+        // what can fail stays on the join, where only rows with a partner reach it
+        let sql = "SELECT count(*) FROM (SELECT * FROM a WHERE k = 3) a LEFT JOIN b ON a.k = b.k AND b.s::INTEGER = 1";
+        assert_eq!(run(&mut context, sql), [["1"]]);
+        let sql = "SELECT count(*) FROM a LEFT JOIN b ON a.k = b.k AND b.s::INTEGER = 1";
+        assert!(context.query(sql).is_err(), "a partner reaches the cast");
+    }
+
+    #[test]
     fn deliminator_matches_duckdb() {
         let mut context = ClientContext::new(DatabaseInstance::new());
         run(&mut context, "SET explain_output = 'OPTIMIZED_ONLY'");

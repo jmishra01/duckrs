@@ -183,7 +183,9 @@ while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` 
   comparisons, constant order, LIKE as a comparison or `prefix`, `suffix`, `contains`, and empty
   needles.
 - **Filter pushdown:** through aggregates, cross products (which become joins), inner, left, semi
-  and anti joins, projections, set operations, DISTINCT and UNNEST. A filter that is always false
+  and anti joins, projections, set operations, DISTINCT and UNNEST. An ON condition of a LEFT join
+  that reads only the right side goes below the join, unless it can fail, which C++ does in the
+  binder without that check. A filter that is always false
   empties the plan, and **empty result pull-up** carries that upward.
 - **Subquery flattening** (`planner/subquery.rs`) runs at the end of binding, before the optimizer.
   A correlated subquery in a filter or a projection becomes a `DelimJoin`: the left side is

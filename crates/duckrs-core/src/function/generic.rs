@@ -1033,47 +1033,124 @@ pub(super) fn interval_negation() -> ScalarFunction {
     ScalarFunction::new("-", vec![LogicalType::INTERVAL], LogicalType::INTERVAL, interval_negate)
 }
 
-/// `LikeOperatorFunction`: `%` is any characters, `_` is one, and `escape` quotes the next one.
-fn like_matches(text: &[char], pattern: &[char], escape: Option<char>) -> bool {
-    let Some((&first, rest)) = pattern.split_first() else {
-        return text.is_empty();
-    };
-    if Some(first) == escape {
-        return match rest.split_first() {
-            Some((&literal, rest)) => text.first() == Some(&literal) && like_matches(&text[1..], rest, escape),
-            None => false,
-        };
+/// One position of a LIKE pattern between two `%`: a byte of the text, or with `None` a character.
+type LikeSegment = Vec<Option<u8>>;
+
+/// `LikeOperatorFunction`: a pattern as what is between its `%`. Each segment after the first can
+/// start anywhere after the one before, and the first match is the one that leaves the most text.
+/// UTF-8 lets literal bytes compare without decoding, as no character starts inside another.
+struct LikePattern {
+    segments: Vec<LikeSegment>,
+}
+
+fn is_continuation(byte: u8) -> bool {
+    byte & 0xC0 == 0x80
+}
+
+impl LikePattern {
+    fn new(pattern: &[u8]) -> Self {
+        let segment = |part: &[u8]| part.iter().map(|&b| (b != b'_').then_some(b)).collect();
+        Self {
+            segments: pattern.split(|&b| b == b'%').map(segment).collect(),
+        }
     }
-    match first {
-        '%' => (0..=text.len()).any(|skip| like_matches(&text[skip..], rest, escape)),
-        '_' => !text.is_empty() && like_matches(&text[1..], rest, escape),
-        c => text.first() == Some(&c) && like_matches(&text[1..], rest, escape),
+
+    /// Where `segment` ends if it matches at the start of `text`.
+    fn match_at(segment: &[Option<u8>], text: &[u8]) -> Option<usize> {
+        let mut at = 0;
+        for position in segment {
+            let byte = *text.get(at)?;
+            at += 1;
+            match position {
+                Some(literal) if *literal != byte => return None,
+                Some(_) => {}
+                None => {
+                    while text.get(at).is_some_and(|b| is_continuation(*b)) {
+                        at += 1;
+                    }
+                }
+            }
+        }
+        Some(at)
+    }
+
+    fn matches(&self, text: &[u8]) -> bool {
+        let (first, rest) = self.segments.split_first().expect("split gives at least one");
+        let Some(mut at) = Self::match_at(first, text) else {
+            return false;
+        };
+        let Some((last, middle)) = rest.split_last() else {
+            return at == text.len();
+        };
+        for segment in middle {
+            match Self::find(segment, &text[at..]) {
+                Some(end) => at += end,
+                None => return false,
+            }
+        }
+        // only the last one has to end where the text ends
+        (at..=text.len())
+            .filter(|&start| start == text.len() || !is_continuation(text[start]))
+            .any(|start| Self::match_at(last, &text[start..]) == Some(text.len() - start))
+    }
+
+    /// Where the first match of `segment` in `text` ends.
+    fn find(segment: &[Option<u8>], text: &[u8]) -> Option<usize> {
+        if segment.is_empty() {
+            return Some(0);
+        }
+        (0..text.len())
+            .filter(|&start| !is_continuation(text[start]))
+            .find_map(|start| Self::match_at(segment, &text[start..]).map(|end| start + end))
     }
 }
 
-fn like_row(row: &[Value], ignore_case: bool) -> bool {
-    let fold = |value: &Value| {
-        let text = text_of(value);
-        if ignore_case { text.to_lowercase() } else { text }
-    };
-    let (text, pattern): (Vec<char>, Vec<char>) = (fold(&row[0]).chars().collect(), fold(&row[1]).chars().collect());
-    like_matches(&text, &pattern, None)
+fn like_rows(args: &DataChunk, result: &mut Vector, ignore_case: bool, negated: bool) -> Result<()> {
+    let count = args.len();
+    let (texts, patterns) = (args.column(0).to_unified(count), args.column(1).to_unified(count));
+    result.prepare_flat(count.max(1));
+    // the pattern is nearly always a constant
+    let mut compiled: Option<(Vec<u8>, LikePattern)> = None;
+    for row in 0..count {
+        if !texts.is_valid(row) || !patterns.is_valid(row) {
+            result.set_null(row, true);
+            continue;
+        }
+        let pattern = patterns.str_at(row);
+        if compiled.as_ref().is_none_or(|(bytes, _)| bytes != pattern) {
+            let folded = if ignore_case {
+                String::from_utf8_lossy(pattern).to_lowercase().into_bytes()
+            } else {
+                pattern.to_vec()
+            };
+            compiled = Some((pattern.to_vec(), LikePattern::new(&folded)));
+        }
+        let (_, like) = compiled.as_ref().expect("just compiled");
+        let text = texts.str_at(row);
+        let matched = if ignore_case {
+            like.matches(String::from_utf8_lossy(text).to_lowercase().as_bytes())
+        } else {
+            like.matches(text)
+        };
+        result.data_mut::<bool>()[row] = matched != negated;
+    }
+    Ok(())
 }
 
 fn like(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    strict_rows(args, result, |row| Ok(Value::boolean(like_row(row, false))))
+    like_rows(args, result, false, false)
 }
 
 fn not_like(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    strict_rows(args, result, |row| Ok(Value::boolean(!like_row(row, false))))
+    like_rows(args, result, false, true)
 }
 
 fn ilike(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    strict_rows(args, result, |row| Ok(Value::boolean(like_row(row, true))))
+    like_rows(args, result, true, false)
 }
 
 fn not_ilike(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    strict_rows(args, result, |row| Ok(Value::boolean(!like_row(row, true))))
+    like_rows(args, result, true, true)
 }
 
 fn sign(args: &DataChunk, result: &mut Vector) -> Result<()> {
@@ -1216,4 +1293,68 @@ pub(super) fn generic_functions() -> Vec<ScalarFunctionSet> {
             .add(ScalarFunction::new(name, arguments, return_type, callback));
     }
     sets
+}
+
+#[cfg(test)]
+mod like_tests {
+    use super::LikePattern;
+    use proptest::prelude::*;
+
+    /// The definition, on characters: `%` is any characters and `_` is one.
+    fn expected(text: &[char], pattern: &[char]) -> bool {
+        let Some((&first, rest)) = pattern.split_first() else {
+            return text.is_empty();
+        };
+        match first {
+            '%' => (0..=text.len()).any(|skip| expected(&text[skip..], rest)),
+            '_' => !text.is_empty() && expected(&text[1..], rest),
+            c => text.first() == Some(&c) && expected(&text[1..], rest),
+        }
+    }
+
+    fn matches(text: &str, pattern: &str) -> bool {
+        LikePattern::new(pattern.as_bytes()).matches(text.as_bytes())
+    }
+
+    #[test]
+    fn like_matches_duckdb() {
+        for (text, pattern, result) in [
+            ("", "", true),
+            ("a", "", false),
+            ("", "%", true),
+            ("", "_", false),
+            ("", "%%", true),
+            ("abc", "abc", true),
+            ("abc", "ab", false),
+            ("abc", "a%", true),
+            ("abc", "%c", true),
+            ("abc", "%b%", true),
+            ("abc", "a_c", true),
+            ("abc", "___", true),
+            ("abc", "____", false),
+            ("abcabc", "%abc", true),
+            ("abab", "%ab%ab", true),
+            ("aXbXc", "a%b%c", true),
+            ("ab", "a%b%c", false),
+            ("package requests special", "%special%requests%", false),
+            ("special packages requests", "%special%requests%", true),
+            // `_` is a character, not a byte
+            ("é", "_", true),
+            ("é", "__", false),
+            ("aéb", "a_b", true),
+            ("日本語", "%_語", true),
+            ("日本語", "_本%", true),
+            ("日本語", "%本%", true),
+        ] {
+            assert_eq!(matches(text, pattern), result, "{text} LIKE {pattern}");
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn like_agrees_with_its_definition(text in "[abé日]{0,8}", pattern in "[abé日%_]{0,8}") {
+            let characters = |s: &str| s.chars().collect::<Vec<_>>();
+            prop_assert_eq!(matches(&text, &pattern), expected(&characters(&text), &characters(&pattern)));
+        }
+    }
 }

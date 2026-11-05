@@ -333,9 +333,28 @@ impl FilterPushdown {
                 remaining.push(f);
             }
         }
+        let mut right = FilterPushdown::default();
+        let LogicalOperatorKind::Join { predicate, .. } = &mut op.kind else {
+            unreachable!()
+        };
+        if let Some(expr) = predicate.take() {
+            let mut conjuncts = Vec::new();
+            split_conjuncts(expr, &mut conjuncts);
+            let (below, stay): (Vec<_>, Vec<_>) = conjuncts.into_iter().map(Filter::new).partition(|f| {
+                // an ON condition of the right side alone drops right rows as well below the join,
+                // but there it also sees rows without a partner
+                join_side(&f.tables, &left_tables, &right_tables) == JoinSide::Right
+                    && !f.filter.is_volatile()
+                    && !can_throw(&f.filter)
+            });
+            right.filters = below;
+            if !stay.is_empty() {
+                *predicate = Some(conjunction_of(stay.into_iter().map(|f| f.filter).collect()));
+            }
+        }
         let right_child = op.children.remove(1);
         let left_child = op.children.remove(0);
-        op.children = vec![left.rewrite(left_child), push_down(right_child)];
+        op.children = vec![left.rewrite(left_child), right.rewrite(right_child)];
         add_filter_operator(op, remaining.into_iter().map(|f| f.filter).collect())
     }
 

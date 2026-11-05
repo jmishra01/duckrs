@@ -418,6 +418,7 @@ dependencies = [
  "duckrs-common",
  "duckrs-parser",
  "parking_lot",
+ "proptest",
  "regex",
  "unicode-segmentation",
 ]
