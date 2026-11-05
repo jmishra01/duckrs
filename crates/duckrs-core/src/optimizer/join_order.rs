@@ -609,6 +609,7 @@ impl JoinOrderOptimizer {
                 table_index,
                 column_ids,
                 filters,
+                ..
             } => {
                 let Some(counts) = table_distinct_counts(table) else {
                     return RelationStats {

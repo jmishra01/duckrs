@@ -145,8 +145,10 @@ struct TableScanState {
 pub struct PhysicalTableScan {
     pub table: Arc<TableCatalogEntry>,
     pub column_ids: Vec<usize>,
+    /// the positions in `column_ids` that it outputs, without one all of them
+    pub projection: Option<Vec<usize>>,
     pub types: Vec<LogicalType>,
-    /// what rows must meet, on the output of the scan
+    /// what rows must meet, on `column_ids`
     pub filter: Option<BoundExpr>,
 }
 
@@ -209,14 +211,22 @@ impl PhysicalOperator for PhysicalTableScan {
             if count < chunk.len() {
                 result.slice(&SelectionVector::from_vec((0..count as u32).collect()), count);
             }
-            let Some(filter) = &self.filter else {
-                return Ok(Some(result));
-            };
-            let (sel, matched) = select(filter, &result)?;
-            if matched == 0 {
-                continue;
+            // the filter reads what it scans, so the columns go after that and before the slice
+            let mut selected = None;
+            if let Some(filter) = &self.filter {
+                let (sel, matched) = select(filter, &result)?;
+                if matched == 0 {
+                    continue;
+                }
+                if matched != result.len() {
+                    selected = Some((sel, matched));
+                }
             }
-            if matched != result.len() {
+            if let Some(positions) = &self.projection {
+                let columns = positions.iter().map(|&p| result.column(p).clone()).collect();
+                result = DataChunk::from_columns(columns, result.len());
+            }
+            if let Some((sel, matched)) = selected {
                 result.slice(&sel, matched);
             }
             return Ok(Some(result));

@@ -247,9 +247,11 @@ while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` 
   plan it came from wherever the shapes line up, as resolved expressions have lost their names.
   `~N rows` comes from the join order's statistics, per operator, so an estimate is only as good
   as those.
-- **Unused columns** become typed NULL constants instead of going away, which keeps column
-  bindings stable: subquery plans refer to outer columns by binding. Scans keep all their columns,
-  because in-memory scans clone `Arc`s and pruning them would gain nothing.
+- **Unused columns** of a projection become typed NULL constants instead of going away, which
+  keeps column bindings stable: subquery plans refer to outer columns by binding. A scan keeps its
+  `column_ids` and bindings, and `projection` says which it outputs, so a column that only its
+  filters read stays behind and joins do not copy what nothing above reads. Columns that a join or
+  a `Filter` above a scan read for themselves still go up through it.
 
 A filter stays above a projection or an aggregate if it, or an entry it would be substituted with,
 can fail: below, `a::int < b::int` would run ahead of the filter that guards those casts.
@@ -266,10 +268,10 @@ until Phase 9; the others want statistics per function (`contains`, `substr`, `l
 
 TPC-H gives all 22 answers right at SF 0.01, 0.1 and 1, with `examples/tpch.rs` against DuckDB's
 answer files. Data comes from `tools/tpch/build_dbgen.sh`, which builds DuckDB's generators with text
-output. At SF 1 it is 8 times slower than DuckDB on one thread, by the geometric mean, and no
+output. At SF 1 it is 7 times slower than DuckDB on one thread, by the geometric mean, and no
 query is more than 15 times slower. Phase 8 brings parallelism. TPC-DS does not run yet.
 
-Not ported yet: the box rendering of EXPLAIN, `Projections` of scans, moving LEFT joins in the join order, and SEMI and ANTI joins that read several
+Not ported yet: the box rendering of EXPLAIN, moving LEFT joins in the join order, and SEMI and ANTI joins that read several
 relations (those stay on top of the tree), the estimator's caps for composite keys, estimated rows in EXPLAIN, flipping
 LEFT to RIGHT joins for the build side, statistics per row group or for functions (`stats()`, `length`, `abs`,
 `greatest`, `lower`, ...), aggregates and windows, `ANALYZE`, `FilterCombiner` beyond splitting,

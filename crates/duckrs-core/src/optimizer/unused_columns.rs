@@ -1,9 +1,11 @@
 // Ported from duckdb/src/optimizer/remove_unused_columns.cpp @ rust-port-baseline
 //
-//! `RemoveUnusedColumns`, so far for computed columns: what nothing reads is not computed, also not
-//! when computing it would fail. C++ removes the columns and renumbers the column bindings. Here
-//! a projection keeps its columns and an unused one becomes a NULL, since subquery plans refer to
-//! column bindings of the plans around them and scans of in-memory tables copy nothing.
+//! `RemoveUnusedColumns`: what nothing reads is not computed, also not when computing it would
+//! fail, and a scan does not output what nothing above it reads, so that joins do not copy it. C++
+//! removes the columns and renumbers the column bindings. Here a projection keeps its columns and
+//! an unused one becomes a NULL, and a scan keeps its `column_ids` and says which it outputs, since
+//! subquery plans refer to column bindings of the plans around them. What a join needed for itself
+//! still goes through it, which C++ removes with projection maps.
 
 use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind as K};
@@ -27,6 +29,23 @@ fn collect_columns(expr: &BoundExpr, used: &mut HashSet<ColumnBinding>) {
 /// `used` holds the columns that the operators above read. `by_position` says something above reads
 /// this operator's output by position and not through bindings.
 fn visit(op: &mut LogicalOperator, by_position: bool, used: &mut HashSet<ColumnBinding>) {
+    if let K::Get {
+        table_index,
+        column_ids,
+        projection,
+        ..
+    } = &mut op.kind
+        && !by_position
+        && !column_ids.is_empty()
+    {
+        let read = (0..column_ids.len()).filter(|&column| used.contains(&ColumnBinding::new(*table_index, column)));
+        let mut read: Vec<usize> = read.collect();
+        // a chunk without columns would have no rows to count
+        if read.is_empty() {
+            read.push(0);
+        }
+        *projection = Some(read);
+    }
     if let K::Projection {
         table_index,
         expressions,
@@ -57,6 +76,8 @@ fn visit(op: &mut LogicalOperator, by_position: bool, used: &mut HashSet<ColumnB
         | K::Distinct { .. }
         | K::CrossProduct
         | K::Join { .. }
+        | K::DelimJoin { .. }
+        | K::MarkJoin { .. }
         | K::Window { .. }
         | K::Unnest { .. } => by_position,
         _ => true,

@@ -27,8 +27,11 @@ pub enum LogicalOperatorKind {
         table: Arc<TableCatalogEntry>,
         table_index: usize,
         column_ids: Vec<usize>,
-        /// conditions on its output, each on one column, that rows must meet (`TableFilterSet`)
+        /// conditions on `column_ids`, each on one column, that rows must meet (`TableFilterSet`)
         filters: Vec<BoundExpr>,
+        /// `projection_ids`: the positions in `column_ids` that it outputs, without one all of them.
+        /// A column keeps its binding either way.
+        projection: Option<Vec<usize>>,
     },
     /// The `range` and `generate_series` table functions: `count` integers from `start`.
     Range {
@@ -380,16 +383,24 @@ impl LogicalOperator {
     /// `LogicalOperator::types` after `ResolveOperatorTypes`.
     pub fn types(&self) -> Vec<LogicalType> {
         match &self.kind {
-            LogicalOperatorKind::Get { table, column_ids, .. } => column_ids
-                .iter()
-                .map(|&i| {
+            LogicalOperatorKind::Get {
+                table,
+                column_ids,
+                projection,
+                ..
+            } => {
+                let type_of = |&i: &usize| {
                     if i == COLUMN_IDENTIFIER_ROW_ID {
                         LogicalType::BIGINT
                     } else {
                         table.columns[i].ty.clone()
                     }
-                })
-                .collect(),
+                };
+                match projection {
+                    Some(positions) => positions.iter().map(|&p| type_of(&column_ids[p])).collect(),
+                    None => column_ids.iter().map(type_of).collect(),
+                }
+            }
             LogicalOperatorKind::Range { .. } => vec![LogicalType::BIGINT],
             LogicalOperatorKind::EmptyResult { types, .. } => types.clone(),
             // the dummy scan's single column is never read
@@ -513,8 +524,12 @@ impl LogicalOperator {
             LogicalOperatorKind::Get {
                 table_index,
                 column_ids,
+                projection,
                 ..
-            } => numbered(*table_index, column_ids.len()),
+            } => match projection {
+                Some(positions) => positions.iter().map(|&p| ColumnBinding::new(*table_index, p)).collect(),
+                None => numbered(*table_index, column_ids.len()),
+            },
             LogicalOperatorKind::EmptyResult { bindings, .. } => bindings.clone(),
             LogicalOperatorKind::DummyScan { table_index } | LogicalOperatorKind::Range { table_index, .. } => {
                 numbered(*table_index, 1)

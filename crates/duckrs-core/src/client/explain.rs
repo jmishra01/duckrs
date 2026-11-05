@@ -122,9 +122,24 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
         info
     };
     match &op.kind {
-        K::Get { table, filters, .. } => {
+        K::Get {
+            table,
+            column_ids,
+            filters,
+            projection,
+            ..
+        } => {
             let mut info = entry("Table", table.name.clone());
             info.extend(entry("Type", "Sequential Scan".to_string()));
+            let name = |&column: &usize| {
+                let name = table.columns.get(column).map(|c| c.name.as_str());
+                name.unwrap_or("rowid").to_string()
+            };
+            let projected: Vec<String> = match projection {
+                Some(positions) => positions.iter().map(|&p| name(&column_ids[p])).collect(),
+                None => column_ids.iter().map(name).collect(),
+            };
+            info.extend(entry("Projections", lines(projected)));
             if !filters.is_empty() {
                 info.extend(entry("Filters", lines(filters.iter().map(filter_text))));
             }

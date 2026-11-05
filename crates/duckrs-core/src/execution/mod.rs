@@ -34,10 +34,12 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             table,
             column_ids,
             filters,
+            projection,
             ..
         } => Box::new(PhysicalTableScan {
             table,
             column_ids,
+            projection,
             types,
             filter: (!filters.is_empty()).then(|| crate::optimizer::conjunction_of(filters)),
         }),

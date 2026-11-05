@@ -3247,6 +3247,82 @@ mod tests {
     }
 
     #[test]
+    fn scans_output_only_what_is_read() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        run(&mut context, "SET explain_output = 'OPTIMIZED_ONLY'");
+        run(&mut context, "CREATE TABLE a (k INTEGER, x INTEGER, unused VARCHAR)");
+        run(
+            &mut context,
+            "INSERT INTO a VALUES (1, 10, 'u'), (2, 20, 'v'), (3, 30, 'w')",
+        );
+        run(&mut context, "CREATE TABLE b (k INTEGER, y INTEGER, spare VARCHAR)");
+        run(
+            &mut context,
+            "INSERT INTO b VALUES (1, 5, 's'), (1, 6, 't'), (2, 7, 'r')",
+        );
+        let plan = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+
+        let sql = "SELECT a.x, b.y FROM a JOIN b ON a.k = b.k ORDER BY a.x, b.y";
+        let joined = plan(&mut context, sql);
+        assert!(!joined.contains("unused") && !joined.contains("spare"), "{joined}");
+        assert_eq!(run(&mut context, sql), [["10", "5"], ["10", "6"], ["20", "7"]]);
+        // a column that only a filter of the scan reads stays in the scan
+        let sql = "SELECT a.x FROM a JOIN b ON a.k = b.k WHERE b.spare = 'r' AND a.unused = 'v'";
+        let filtered = plan(&mut context, sql);
+        assert!(!filtered.contains("Projections: spare"), "{filtered}");
+        assert!(filtered.contains("Filters: spare = 'r'"), "{filtered}");
+        assert_eq!(run(&mut context, sql), [["20"]]);
+        // no column is read at all, and the rows still count
+        assert_eq!(run(&mut context, "SELECT count(*) FROM a"), [["3"]]);
+        assert_eq!(run(&mut context, "SELECT 1 FROM a WHERE x > 15"), [["1"], ["1"]]);
+        assert_eq!(run(&mut context, "SELECT count(*) FROM a, b"), [["9"]]);
+        assert_eq!(run(&mut context, "SELECT count(*) FROM a WHERE x > 15"), [["2"]]);
+        // read above in other ways than a plain column: by position, for order, in other operators
+        assert_eq!(run(&mut context, "SELECT * FROM a WHERE k = 2"), [["2", "20", "v"]]);
+        assert_eq!(
+            run(&mut context, "SELECT x FROM a ORDER BY unused DESC LIMIT 1"),
+            [["30"]]
+        );
+        assert_eq!(run(&mut context, "SELECT DISTINCT k FROM b ORDER BY k"), [["1"], ["2"]]);
+        let sql = "SELECT sum(x) OVER (ORDER BY k) FROM a ORDER BY 1";
+        assert_eq!(run(&mut context, sql), [["10"], ["30"], ["60"]]);
+        assert_eq!(run(&mut context, "SELECT rowid FROM a WHERE x = 20"), [["1"]]);
+        let sql = "SELECT k FROM a UNION ALL SELECT y FROM b ORDER BY 1";
+        assert_eq!(run(&mut context, sql), [["1"], ["2"], ["3"], ["5"], ["6"], ["7"]]);
+        let sql = "WITH c AS MATERIALIZED (SELECT x, unused FROM a) SELECT x FROM c WHERE unused = 'w'";
+        assert_eq!(run(&mut context, sql), [["30"]]);
+        // read by a subquery of the query around them
+        let sql = "SELECT x FROM a WHERE (SELECT sum(y) FROM b WHERE b.k = a.k) > 10 ORDER BY x";
+        assert_eq!(run(&mut context, sql), [["10"]]);
+        let sql = "SELECT x FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k) ORDER BY x";
+        assert_eq!(run(&mut context, sql), [["10"], ["20"]]);
+        let sql = "SELECT x FROM a WHERE x > 15 AND NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k)";
+        assert_eq!(run(&mut context, sql), [["30"]]);
+        let sql = "SELECT x, (SELECT max(y) FROM b WHERE b.k = a.k AND random() >= 0) FROM a WHERE x = 20";
+        assert_eq!(run(&mut context, sql), [["20", "7"]]);
+        let sql = "SELECT x, y FROM a, LATERAL (SELECT y FROM b WHERE b.k = a.k) ORDER BY y";
+        assert_eq!(run(&mut context, sql), [["10", "5"], ["10", "6"], ["20", "7"]]);
+        // writes read their rows by position
+        run(
+            &mut context,
+            "CREATE TABLE c AS SELECT a.x FROM a JOIN b ON a.k = b.k WHERE b.y = 7",
+        );
+        assert_eq!(run(&mut context, "SELECT * FROM c"), [["20"]]);
+        run(&mut context, "INSERT INTO c SELECT y FROM b WHERE k = 2");
+        run(&mut context, "UPDATE a SET x = 11 WHERE unused = 'u'");
+        run(&mut context, "DELETE FROM a WHERE unused = 'v'");
+        assert_eq!(
+            run(&mut context, "SELECT k, x FROM a ORDER BY k"),
+            [["1", "11"], ["3", "30"]]
+        );
+        assert_eq!(run(&mut context, "SELECT count(*) FROM c"), [["2"]]);
+        // off, a scan outputs everything
+        run(&mut context, "SET disabled_optimizers = 'unused_columns'");
+        let sql = "SELECT a.x FROM a JOIN b ON a.k = b.k";
+        assert!(plan(&mut context, sql).contains("unused"));
+    }
+
+    #[test]
     fn left_join_on_conditions_of_the_right_side_go_below_it() {
         let mut context = ClientContext::new(DatabaseInstance::new());
         run(&mut context, "SET explain_output = 'OPTIMIZED_ONLY'");

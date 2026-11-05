@@ -98,11 +98,12 @@ pub fn optimize(mut plan: LogicalOperator, options: OptimizerOptions) -> Logical
     if options.empty_result_pullup {
         plan = empty_result_pullup::pull_up(plan);
     }
-    if options.unused_columns {
-        unused_columns::remove_unused_columns(&mut plan);
-    }
+    // a column only a scan's filter reads need not leave the scan
     if options.filter_pushdown {
         scan_filters::push_into_scans(&mut plan);
+    }
+    if options.unused_columns {
+        unused_columns::remove_unused_columns(&mut plan);
     }
     plan
 }

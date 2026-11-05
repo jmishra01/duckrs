@@ -1474,6 +1474,7 @@ impl Binder<'_> {
                         table_index,
                         column_ids,
                         filters: Vec::new(),
+                        projection: None,
                     },
                     vec![],
                 ))

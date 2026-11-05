@@ -77,6 +77,7 @@ fn compute_statistics(table: &Arc<TableCatalogEntry>) -> Option<Vec<Stats>> {
             table_index: 0,
             column_ids: (0..table.columns.len()).collect(),
             filters: Vec::new(),
+            projection: None,
         },
         Vec::new(),
     );
@@ -232,6 +233,7 @@ fn compute_distinct_counts(table: &Arc<TableCatalogEntry>) -> Option<TableDistin
             table_index: 0,
             column_ids: (0..table.columns.len()).collect(),
             filters: Vec::new(),
+            projection: None,
         },
         Vec::new(),
     );
