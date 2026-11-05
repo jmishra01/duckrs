@@ -7,6 +7,7 @@
 //! Plans reach the optimizer before `resolve_column_bindings`. A subquery has a plan of its own,
 //! which the binder resolves, so it runs the optimizer on that plan itself.
 
+pub mod deliminator;
 pub mod empty_result_pullup;
 pub mod filter_pushdown;
 pub mod join_order;
@@ -24,6 +25,7 @@ use duckrs_common::types::LogicalType;
 pub struct OptimizerOptions {
     pub expression_rewriter: bool,
     pub filter_pushdown: bool,
+    pub deliminator: bool,
     pub join_order: bool,
     pub statistics_propagation: bool,
     pub empty_result_pullup: bool,
@@ -35,6 +37,7 @@ impl Default for OptimizerOptions {
         Self {
             expression_rewriter: true,
             filter_pushdown: true,
+            deliminator: true,
             join_order: true,
             statistics_propagation: true,
             empty_result_pullup: true,
@@ -49,6 +52,7 @@ impl OptimizerOptions {
         Self {
             expression_rewriter: false,
             filter_pushdown: false,
+            deliminator: false,
             join_order: false,
             statistics_propagation: false,
             empty_result_pullup: false,
@@ -62,6 +66,7 @@ impl OptimizerOptions {
         Self {
             expression_rewriter: !off("expression_rewriter"),
             filter_pushdown: !off("filter_pushdown"),
+            deliminator: !off("deliminator"),
             join_order: !off("join_order"),
             statistics_propagation: !off("statistics_propagation"),
             empty_result_pullup: !off("empty_result_pullup"),
@@ -77,6 +82,11 @@ pub fn optimize(mut plan: LogicalOperator, options: OptimizerOptions) -> Logical
     }
     if options.filter_pushdown {
         plan = filter_pushdown::push_down(plan);
+    }
+    if options.deliminator {
+        deliminator::deliminate(&mut plan);
+    }
+    if options.filter_pushdown {
         filter_pushdown::convert_mark_joins(&mut plan);
     }
     if options.join_order {

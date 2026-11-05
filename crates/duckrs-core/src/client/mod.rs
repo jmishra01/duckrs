@@ -3247,6 +3247,83 @@ mod tests {
     }
 
     #[test]
+    fn deliminator_matches_duckdb() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        run(&mut context, "SET explain_output = 'OPTIMIZED_ONLY'");
+        run(&mut context, "CREATE TABLE a (k INTEGER, v INTEGER)");
+        run(
+            &mut context,
+            "INSERT INTO a VALUES (1, 10), (2, 20), (3, 30), (NULL, 40)",
+        );
+        run(&mut context, "CREATE TABLE b (k INTEGER, w INTEGER)");
+        run(
+            &mut context,
+            "INSERT INTO b VALUES (1, 1), (1, 2), (2, 3), (9, 4), (NULL, 5)",
+        );
+        let plan = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let delim_gets = |plan: &str| plan.lines().filter(|line| line.contains("Delim Get")).count();
+
+        // nothing filters the outer rows, so nothing of the delim join is left, and a key that the
+        // outer query does not have (9) goes nowhere
+        let sql = "SELECT k, (SELECT sum(w) FROM b WHERE b.k = a.k) FROM a ORDER BY v";
+        let unfiltered = plan(&mut context, sql);
+        assert!(!unfiltered.contains("Delim"), "{unfiltered}");
+        assert!(unfiltered.contains("LEFT"), "{unfiltered}");
+        let rows = [["1", "3"], ["2", "3"], ["3", "NULL"], ["NULL", "NULL"]];
+        assert_eq!(run(&mut context, sql), rows);
+        // a filter keeps the join that is deepest, and the one above the aggregate goes
+        let sql = "SELECT k, (SELECT sum(w) FROM b WHERE b.k = a.k) FROM a WHERE v > 15 ORDER BY v";
+        let filtered = plan(&mut context, sql);
+        assert_eq!(delim_gets(&filtered), 1, "{filtered}");
+        assert!(filtered.contains("Join Type: LEFT"), "{filtered}");
+        assert!(!filtered.contains("SINGLE"), "{filtered}");
+        assert_eq!(run(&mut context, sql), [["2", "3"], ["3", "NULL"], ["NULL", "NULL"]]);
+        // what an empty subquery gives has to survive: no NULL here, or NULL turned into something
+        let sql = "SELECT k, (SELECT count(*) FROM b WHERE b.k = a.k) FROM a ORDER BY v";
+        assert_eq!(
+            run(&mut context, sql),
+            [["1", "2"], ["2", "1"], ["3", "0"], ["NULL", "0"]]
+        );
+        let sql = "SELECT k, (SELECT sum(w) IS NULL FROM b WHERE b.k = a.k) FROM a ORDER BY v";
+        let rows = [["1", "false"], ["2", "false"], ["3", "true"], ["NULL", "true"]];
+        assert_eq!(run(&mut context, sql), rows);
+        let sql = "SELECT k, (SELECT coalesce(sum(w), 7) FROM b WHERE b.k = a.k) + 1 FROM a ORDER BY v";
+        assert_eq!(
+            run(&mut context, sql),
+            [["1", "4"], ["2", "4"], ["3", "8"], ["NULL", "8"]]
+        );
+        // HAVING can see the row of NULLs that only exists without the delim join
+        let sql = "SELECT k, (SELECT 5 FROM b WHERE b.k = a.k HAVING sum(w) IS NULL) FROM a ORDER BY v";
+        let rows = [["1", "NULL"], ["2", "NULL"], ["3", "5"], ["NULL", "5"]];
+        assert_eq!(run(&mut context, sql), rows);
+        // grouped by more than the keys there can be two rows, and that remains an error
+        let sql = "SELECT (SELECT w FROM b WHERE b.k = a.k GROUP BY w) FROM a";
+        assert!(plan(&mut context, sql).contains("SINGLE"));
+        assert!(context.query(sql).is_err());
+        // the IS NOT NULL that the join stood for: `=` does not find the NULL of `a`
+        let sql = "SELECT k, EXISTS (SELECT 1 FROM b WHERE b.k = a.k) FROM a ORDER BY v";
+        let exists = plan(&mut context, sql);
+        assert!(!exists.contains("Delim"), "{exists}");
+        let rows = [["1", "true"], ["2", "true"], ["3", "false"], ["NULL", "false"]];
+        assert_eq!(run(&mut context, sql), rows);
+        let sql = "SELECT k, NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k) FROM a ORDER BY v";
+        let rows = [["1", "false"], ["2", "false"], ["3", "true"], ["NULL", "true"]];
+        assert_eq!(run(&mut context, sql), rows);
+        // while IS NOT DISTINCT FROM finds it
+        let sql = "SELECT k, EXISTS (SELECT 1 FROM b WHERE b.k IS NOT DISTINCT FROM a.k) FROM a ORDER BY v";
+        let rows = [["1", "true"], ["2", "true"], ["3", "false"], ["NULL", "true"]];
+        assert_eq!(run(&mut context, sql), rows);
+        // a marker that stays as a filter and a join that leaves no duplicates of the outer rows
+        let sql = "SELECT v FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k) ORDER BY v";
+        assert_eq!(run(&mut context, sql), [["10"], ["20"]]);
+        // an ANY keeps its NULL: 30 is unknown next to the NULL of key 3, and no row is false
+        run(&mut context, "INSERT INTO b VALUES (3, NULL)");
+        let sql = "SELECT k, v = ANY (SELECT w FROM b WHERE b.k = a.k) FROM a ORDER BY v";
+        let rows = [["1", "false"], ["2", "false"], ["3", "NULL"], ["NULL", "false"]];
+        assert_eq!(run(&mut context, sql), rows);
+    }
+
+    #[test]
     fn join_dependent_filters_match_duckdb() {
         let mut context = ClientContext::new(DatabaseInstance::new());
         run(&mut context, "SET explain_output = 'OPTIMIZED_ONLY'");
@@ -3549,7 +3626,7 @@ mod tests {
         run(&mut context, "INSERT INTO b VALUES (10, 1), (20, 1), (30, 2)");
         let explained = run(
             &mut context,
-            "EXPLAIN SELECT x FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)",
+            "EXPLAIN SELECT x FROM a WHERE x > 1 AND EXISTS (SELECT 1 FROM b WHERE b.k = a.k)",
         );
         assert!(explained[0][1].contains("LEFT_DELIM_JOIN"), "{explained:?}");
         // the left rows keep their order

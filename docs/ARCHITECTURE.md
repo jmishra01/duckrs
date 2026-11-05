@@ -195,6 +195,15 @@ while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` 
   column of a query further out, and plans with an operator `push` has no rule for (VALUES with
   correlated columns, FULL joins, grouping sets with an empty set, LIMIT with a percentage, SAMPLE,
   ASOF, recursive CTEs). C++ decorrelates nearly all of those. LATERAL joins are not flattened yet.
+- The **deliminator** (`optimizer/deliminator.rs`) runs right after filter pushdown. An equality
+  join with `DelimGet` only filters, so it goes, and an IS NOT NULL stands in for what `=` dropped.
+  When the query filters the outer rows the deepest such join stays, as DuckDB does, so most of
+  TPC-H keeps its delim joins: the distinct values make the subquery read less. A join with no
+  `DelimGet` left is an ordinary one, except SINGLE, which stays a `DelimJoin` because that operator
+  raises the error for two rows. SINGLE becomes LEFT when an aggregate proves one row per key.
+  Joins with an inequality stay, since those are predicates here. With a scalar subquery whose
+  result is NULL on no rows anyway, flattening also joins the aggregate with `DelimGet` by INNER
+  and not LEFT, which is what lets this pass drop that join.
 - **Statistics** (`optimizer/statistics.rs`) follow C++ in what they decide, not in where they come
   from. Each table has min, max and whether it has NULLs per column, not per row group, worked out
   with aggregates when a plan first needs them after a write, and thrown away by
@@ -251,7 +260,7 @@ until Phase 9; the others want statistics per function (`contains`, `substr`, `l
 
 TPC-H gives all 22 answers right at SF 0.01, 0.1 and 1, with `examples/tpch.rs` against DuckDB's
 answer files. Data comes from `tools/tpch/build_dbgen.sh`, which builds DuckDB's generators with text
-output. At SF 1 it is 14 times slower than DuckDB on one thread, by the geometric mean, and no
+output. At SF 1 it is 13 times slower than DuckDB on one thread, by the geometric mean, and no
 query is more than 45 times slower. Phase 8 brings parallelism. TPC-DS does not run yet.
 
 Not ported yet: the box rendering of EXPLAIN, `Projections` of scans, moving LEFT joins in the join order, and SEMI and ANTI joins that read several
@@ -260,9 +269,9 @@ LEFT to RIGHT joins for the build side, statistics per row group or for function
 `greatest`, `lower`, ...), aggregates and windows, `ANALYZE`, `FilterCombiner` beyond splitting,
 deduplicating and deciding constants, transitive filters, MoveConstants of floats and DECIMALs,
 `x * 0`,
-pushdown through outer, right, ASOF and window operators, the deliminator,
+pushdown through outer, right, ASOF and window operators, SEMI and ANTI delim joins,
 and flattening of the cases above, the extremum rewrite of `> ANY` among them. MARK joins with a
-predicate check each pair of a key's rows, where C++ hashes on the comparison. The gate is not met: `test/optimizer` is at 41.3% against 80%, and TPC-DS does
+predicate check each pair of a key's rows, where C++ hashes on the comparison. The gate is not met: `test/optimizer` is at 44.4% against 80%, and TPC-DS does
 not run yet.
 
 ## Testing

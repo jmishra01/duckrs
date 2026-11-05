@@ -240,6 +240,7 @@ fn flatten_subquery(expr: &BoundExpr, left: &mut LogicalOperator, next_table_ind
         delim: delim.clone(),
         next_table_index,
         empty_values: Vec::new(),
+        propagate_null: matches!(kind, SubqueryKind::Scalar),
     };
     let state = flatten.push(&mut right)?;
     flatten.apply_empty_values(&mut right);
@@ -313,6 +314,25 @@ struct Flatten<'a> {
     delim: Arc<Mutex<ColumnDataCollection>>,
     next_table_index: &'a mut usize,
     empty_values: Vec<EmptyValue>,
+    /// `propagate_null_values`: a row of NULLs at this point in the plan gives what the join
+    /// gives for no row at all, so such a row need not exist.
+    propagate_null: bool,
+}
+
+/// `ExpressionBecomesNull`, leaning towards false: whether `expr` is NULL for NULL in `columns`.
+fn becomes_null(expr: &BoundExpr, columns: &[ColumnBinding]) -> bool {
+    match &expr.kind {
+        BoundExprKind::ColumnRef { binding, depth: 0 } => columns.contains(binding),
+        BoundExprKind::Cast { child, .. } => becomes_null(child, columns),
+        BoundExprKind::Function {
+            function,
+            children,
+            is_operator: true,
+        } if matches!(function.name.as_str(), "+" | "-" | "*" | "/" | "%") => {
+            children.iter().any(|child| becomes_null(child, columns))
+        }
+        _ => false,
+    }
 }
 
 impl Flatten<'_> {
@@ -406,6 +426,14 @@ impl Flatten<'_> {
         if !self.reads_domain(plan) {
             return Ok(self.attach(plan));
         }
+        self.propagate_null &= match &plan.kind {
+            K::Projection { expressions, .. } => {
+                let columns = plan.children[0].column_bindings();
+                expressions.iter().all(|expr| becomes_null(expr, &columns))
+            }
+            K::Aggregate { .. } => true,
+            _ => false,
+        };
         match &plan.kind {
             K::Filter { .. } | K::Order { .. } | K::Unnest { .. } => self.push_through(plan),
             K::Window { .. } => {
@@ -473,6 +501,7 @@ impl Flatten<'_> {
         if grouping_sets.iter().any(|set| set.is_empty()) {
             return Err(Unsupported);
         }
+        let propagate_null = std::mem::take(&mut self.propagate_null);
         let state = self.push_through(plan)?;
         let refs = self.state_refs(&state);
         let child_types = plan.children[0].types();
@@ -500,6 +529,7 @@ impl Flatten<'_> {
         }
         // a domain value without rows still has its row: join all of them with the groups
         let values = self.aggregates_of_no_rows(aggregates, child_types, child_bindings)?;
+        let drop_missing_keys = propagate_null && values.iter().all(Value::is_null);
         if values.iter().any(|value| !value.is_null()) {
             let marker = ColumnBinding::new(*aggregate_index, aggregates.len());
             let table_index = *aggregate_index;
@@ -520,7 +550,11 @@ impl Flatten<'_> {
         let aggregate = std::mem::replace(plan, LogicalOperator::new(K::CrossProduct, Vec::new()));
         *plan = LogicalOperator::new(
             K::Join {
-                join_type: JoinType::Left,
+                join_type: if drop_missing_keys {
+                    JoinType::Inner
+                } else {
+                    JoinType::Left
+                },
                 conditions,
                 predicate: None,
             },
