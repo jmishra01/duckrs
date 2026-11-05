@@ -240,6 +240,8 @@ A filter stays above a projection or an aggregate if it, or an entry it would be
 can fail: below, `a::int < b::int` would run ahead of the filter that guards those casts.
 `can_throw` allows only what is known not to fail, so some filters stay higher than they do in C++.
 
+`JoinDependentFilterRule` adds, next to an OR of ANDs, what each branch says of a table on its own,
+so that it can go down to that table. It leaves out what can fail, where C++ does not.
 `EqualOrNullSimplification` runs only at the root of a filter, where NULL counts as false, and the
 conjuncts of a filter are split before rewriting so that each is such a root. `DatePartSimplificationRule`
 leaves `date_part` alone where the function would need a cast, as `TIMESTAMP_NS` to microseconds rounds.
@@ -250,7 +252,7 @@ until Phase 9; the others want statistics per function (`contains`, `substr`, `l
 TPC-H gives all 22 answers right at SF 0.01, 0.1 and 1, with `examples/tpch.rs` against DuckDB's
 answer files. Data comes from `tools/tpch/build_dbgen.sh`, which builds DuckDB's generators with text
 output. At SF 1 it is 14 times slower than DuckDB on one thread, by the geometric mean, and no
-query is more than 50 times slower. Phase 8 brings parallelism. TPC-DS does not run yet.
+query is more than 45 times slower. Phase 8 brings parallelism. TPC-DS does not run yet.
 
 Not ported yet: the box rendering of EXPLAIN, `Projections` of scans, moving LEFT joins in the join order, and SEMI and ANTI joins that read several
 relations (those stay on top of the tree), the estimator's caps for composite keys, estimated rows in EXPLAIN, flipping

@@ -16,6 +16,7 @@ use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::{Value, ValueData};
 use duckrs_parser::ast::ComparisonOp;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A rule changing an expression can enable another, also on the expressions below it; this many
 /// rounds is more than any expression takes.
@@ -104,6 +105,86 @@ fn apply_rules(expr: &mut BoundExpr, in_filter: bool) -> bool {
         || comparison_simplification(expr)
         || not_comparison_simplification(expr)
         || not_conjunction_simplification(expr)
+        || join_dependent_filter(expr, in_filter)
+}
+
+/// The tables an expression reads, if all it reads is in the query itself.
+fn tables_read(expr: &BoundExpr, tables: &mut BTreeSet<usize>) -> bool {
+    match &expr.kind {
+        BoundExprKind::ColumnRef { binding, depth: 0 } => {
+            tables.insert(binding.table_index);
+        }
+        BoundExprKind::ColumnRef { .. } => return false,
+        _ => {}
+    }
+    expr.children().into_iter().all(|child| tables_read(child, tables))
+}
+
+/// `ExtractConjunctedExpressions`: the conjuncts of `expr` that read one table, by that table. They
+/// leave out what can fail: they would run on rows the OR might not have got to.
+fn conjuncts_per_table(expr: &BoundExpr, result: &mut BTreeMap<usize, Vec<BoundExpr>>) {
+    if let BoundExprKind::Conjunction { and: true, children } = &expr.kind {
+        for child in children {
+            conjuncts_per_table(child, result);
+        }
+        return;
+    }
+    let mut tables = BTreeSet::new();
+    if tables_read(expr, &mut tables) && tables.len() == 1 && !expr.is_volatile() && !can_throw(expr) {
+        result
+            .entry(*tables.first().expect("just checked"))
+            .or_default()
+            .push(expr.clone());
+    }
+}
+
+/// `JoinDependentFilterRule`: `(a.x = 1 AND b.y = 2) OR (a.x = 3 AND b.y = 4)` needs a join to tell,
+/// but a row of `a` can only pass with `a.x = 1 OR a.x = 3`, whichever `b` it meets. Those filters
+/// go next to the original, which stays, and can then go down to the tables.
+fn join_dependent_filter(expr: &mut BoundExpr, in_filter: bool) -> bool {
+    if !in_filter {
+        return false;
+    }
+    let BoundExprKind::Conjunction { and: false, children } = &expr.kind else {
+        return false;
+    };
+    let eligible = children.iter().any(|child| {
+        let mut tables = BTreeSet::new();
+        tables_read(child, &mut tables);
+        matches!(child.kind, BoundExprKind::Conjunction { and: true, .. }) && tables.len() > 1
+    });
+    if !eligible {
+        return false;
+    }
+    let branches: Vec<BTreeMap<usize, Vec<BoundExpr>>> = children
+        .iter()
+        .map(|child| {
+            let mut conjuncts = BTreeMap::new();
+            conjuncts_per_table(child, &mut conjuncts);
+            conjuncts
+        })
+        .collect();
+    let mut derived = Vec::new();
+    for table in branches[0].keys() {
+        // a branch without the table says nothing about it
+        let per_branch: Option<Vec<BoundExpr>> = branches
+            .iter()
+            .map(|branch| branch.get(table).map(|conjuncts| conjunction_of(conjuncts.clone())))
+            .collect();
+        if let Some(children) = per_branch {
+            let kind = BoundExprKind::Conjunction { and: false, children };
+            derived.push(BoundExpr::new(kind, LogicalType::BOOLEAN));
+        }
+    }
+    if derived.is_empty() {
+        return false;
+    }
+    derived.insert(0, take(expr));
+    expr.kind = BoundExprKind::Conjunction {
+        and: true,
+        children: derived,
+    };
+    true
 }
 
 /// `EqualOrNullSimplification`: `a = b OR (a IS NULL AND b IS NULL)` is `a IS NOT DISTINCT FROM b`

@@ -3247,6 +3247,47 @@ mod tests {
     }
 
     #[test]
+    fn join_dependent_filters_match_duckdb() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        run(&mut context, "SET explain_output = 'OPTIMIZED_ONLY'");
+        run(
+            &mut context,
+            "CREATE TABLE a AS SELECT i AS x, i AS y FROM range(10) t(i)",
+        );
+        run(
+            &mut context,
+            "CREATE TABLE b AS SELECT i AS x, i::VARCHAR AS s FROM range(10) t(i)",
+        );
+        let explain = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let filters = |plan: &str| plan.lines().filter(|line| line.contains("Filters: ")).count();
+        // both tables get what they alone can tell, and the OR stays for the pairs
+        let sql = "SELECT count(*) FROM a, b WHERE (a.x = 2 AND b.x = 4) OR (a.x = 0 AND b.x = 2)";
+        assert_eq!(filters(&explain(&mut context, sql)), 2, "{sql}");
+        assert_eq!(run(&mut context, sql), [["2"]]);
+        // with the filters on their own this would be four pairs
+        let sql = "SELECT a.x, b.x FROM a, b WHERE (a.x = 2 AND b.x = 4) OR (a.x = 0 AND b.x = 2) ORDER BY 1";
+        assert_eq!(run(&mut context, sql), [["0", "2"], ["2", "4"]]);
+        // a branch that does not read a table says nothing about it
+        let sql = "SELECT count(*) FROM a, b WHERE (a.x = 2 AND b.x = 4) OR b.x = 7";
+        assert_eq!(filters(&explain(&mut context, sql)), 1, "{sql}");
+        assert_eq!(run(&mut context, sql), [["11"]]);
+        // several conditions on a table in one branch stay together
+        let sql = "SELECT count(*) FROM a, b WHERE (a.x = 2 AND a.y = 2 AND b.x = 4) OR (a.x = 3 AND b.x = 5)";
+        assert_eq!(run(&mut context, sql), [["2"]]);
+        // as a value it is not a filter, and NULL has to stay
+        let sql = "SELECT count(*) FROM (SELECT (a.x = 2 AND b.x = 4) OR (a.x = 0 AND b.x = 2) AS v FROM a, b) WHERE v";
+        assert_eq!(run(&mut context, sql), [["2"]]);
+        // nothing that can fail moves: only pairs that reach it may run the cast
+        let sql = "SELECT count(*) FROM a, b WHERE (b.s::INTEGER = 4 AND a.x = 2) OR (b.s::INTEGER = 2 AND a.x = 0)";
+        let plan = explain(&mut context, sql);
+        assert_eq!(filters(&plan), 1, "{plan}");
+        assert_eq!(run(&mut context, sql), [["2"]]);
+        // and what differs per call neither
+        let sql = "SELECT count(*) FROM a, b WHERE (a.x < random() * 0 AND b.x = 1) OR (a.x = 1 AND b.x = 2)";
+        assert_eq!(run(&mut context, sql), [["1"]]);
+    }
+
+    #[test]
     fn in_subqueries_match_duckdb() {
         let mut context = ClientContext::new(DatabaseInstance::new());
         run(&mut context, "SET explain_output = 'OPTIMIZED_ONLY'");
