@@ -1630,7 +1630,6 @@ test/sql/sql_export/sql_export_join_scopes.test
 test/sql/sql_export/sql_export_quantiles.test
 test/sql/sql_export/table_row_number_sql_export.test
 test/sql/sql_export/union_value.test
-test/sql/storage/bc/test_broken_view_v092.test
 test/sql/storage/checkpointed_self_append.test
 test/sql/storage/checkpointed_self_append_tinyint.test
 test/sql/storage/compression/alp/alp_inf_null_nan.test

@@ -1,5 +1,5 @@
 //! The duckrs engine (DuckDB's `src/` beyond `common` and `parser`): the catalog, functions,
-//! the binder and planner, and execution. It starts as one crate with a module per C++
+//! the binder and planner, execution and storage. It starts as one crate with a module per C++
 //! directory; the modules split into crates once their boundaries settle.
 
 pub mod catalog;
@@ -8,6 +8,7 @@ pub mod execution;
 pub mod function;
 pub mod optimizer;
 pub mod planner;
+pub mod storage;
 
 /// `NotImplementedException` with DuckDB's own wording.
 pub(crate) fn error_not_implemented(message: &str) -> duckrs_common::Error {

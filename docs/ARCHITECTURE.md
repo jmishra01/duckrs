@@ -27,7 +27,7 @@ has an obvious Rust home:
 | `duckrs-parallel` | `src/parallel` | 3, 8 | `duckrs-core::execution` (pipelines) |
 | `duckrs-function` | `src/function`, `extension/core_functions` | 4–5 | `duckrs-core::function` |
 | `duckrs-optimizer` | `src/optimizer` | 7 | |
-| `duckrs-storage` | `src/storage` | 9 | |
+| `duckrs-storage` | `src/storage` | 9 | `duckrs-core::storage` |
 | `duckrs-transaction` | `src/transaction` | 10 | |
 | `duckrs-main` | `src/main` | 3, 12 | `duckrs-core::client` |
 | `duckrs` | public API facade | 0 | crate |
@@ -138,7 +138,7 @@ digits), no table options, no collations. The expression executor evaluates a fi
 condition to a BOOLEAN vector rather than using DuckDB's specialized `Select`, and casts to
 VARCHAR and from or to DECIMAL, CASE and COALESCE write row by row through `Value`. Tables and
 blocking operators are capped at about 2 GiB and fail as not yet ported beyond that, until
-out-of-core operators (Phase 8) and storage (Phase 9) exist. Errors for SQL beyond the slice
+out-of-core operators (Phase 8) and the rest of storage (Phase 9) exist. Errors for SQL beyond the slice
 say it `is not yet ported to duckrs`, wording DuckDB never uses, so that no test expecting an
 error passes because a feature is missing.
 
@@ -292,6 +292,69 @@ deduplicating and deciding constants, transitive filters, MoveConstants of float
 pushdown through outer, right, ASOF and window operators, SEMI and ANTI delim joins,
 and flattening of the cases above, the extremum rewrite of `> ANY` among them. MARK joins with a
 predicate check each pair of a key's rows, where C++ hashes on the comparison. The gate is not met: `test/optimizer` is at 46.5% against 80%.
+
+## Phase 9
+
+Files stay byte-compatible with DuckDB, the choice the plan recommends: `storage` reads what DuckDB
+writes, and block-level files that it makes open in DuckDB, which went on to store and checkpoint a
+table in one. What exists so far reads a database into memory at open; tables are not scanned in
+place yet and nothing but the block layer writes.
+
+- **Block file** (`block_manager`): the main header, the two database headers (the higher iteration
+  wins), checksums and blocks of 16 to 256 KiB. `write_header` syncs the blocks first, so a crash
+  leaves the last header or this one. A corrupt current or spare header fails the open, as in C++.
+- **Buffer manager** (`buffer_manager`): a cache of blocks with a memory limit, least recently used
+  first. A pinned block is an `Arc`, and one that is held stays however far over the limit that
+  goes. Spilling and `memory_limit` errors come with Phase 8's temporary files.
+- **Metadata** (`metadata`): C++ reads a chain of sub-blocks as a stream, but `BinaryDeserializer`
+  reads a slice, so a chain is read into memory without its pointers and `MetadataChains` remembers
+  where each sub-block landed. The columns of a table are pointers into one chain, which would
+  otherwise be read anew from each of them.
+- **Catalog** (`checkpoint`): serialized properties have neither a type nor a length, so nothing can
+  be skipped without understanding it. Statistics and the sample of a table are in front of the
+  row group pointers, so they are decoded just to get past them (`statistics`). Elements that are
+  pointers in C++ (`unique_ptr`, `shared_ptr`) have a presence flag in front.
+- **Columns** (`table_data`, `compression`): uncompressed, constant, RLE, bitpacking (all four modes
+  and hugeint), dictionary and FSST, plus validity, overflow strings and the empty validity
+  segment. A scan decodes a whole segment, row by row. Packed values are one stream of bits,
+  least significant first, whatever fastpforlib does to get there, so one reader handles all widths.
+
+What is read comes from outside, so it is bounds-checked, and damage is an error, never a panic.
+
+A file opened read-only stays as it is, and the file is only ever opened read-only for now. Rows
+are copied into each table's `ColumnDataCollection`, so a database has to fit in memory, and its
+tables have the 2 GiB cap of Phase 3. A database opened for writing fails on any write, as storing it
+is not ported and the change would get lost at the end. A file that does not exist is an in-memory
+database as before: new files are not written, which the corpus relies on until checkpoints work.
+
+These fail with an error that says they are not ported, because going on would give wrong answers
+or lose data:
+
+- ALP, ALPRD, Roaring, ZSTD, DICT_FSST, Chimp and Patas. Floating point columns usually have ALP,
+  and files written with `storage_version` v1.5.0 have DICT_FSST strings, so those can't be read
+  yet. Files with DuckDB's default compatibility can, floats aside;
+- LIST, STRUCT, ARRAY, MAP, UNION, VARIANT and GEOMETRY columns;
+- views, macros, sequences, indexes, custom types, triggers, and default values, generated columns,
+  CHECK, UNIQUE and FOREIGN KEY constraints, which take the serialized parsed expressions;
+- deleted rows in a row group, a write-ahead log that waits to be replayed, encrypted files.
+
+Next, in order: the rest of the codecs and nested columns; the parsed expression serializer (ported
+through the generator, as the plan says) for defaults, views and macros; deletes and WAL replay;
+scanning row groups in place through the buffer manager; then checkpoints, for which the block
+layer is ready. `ATTACH` follows from there.
+
+`crates/duckrs/tests/read_database_file.rs` compares every row of files from the real DuckDB with what
+DuckDB reads from them; `tests/fixtures/generate.sh` makes both. `damaged_database_file.rs` changes
+bytes of a block and fixes its checksum, to get past that to the decoders. Layout checks match C++
+exactly and not just bounds: an FSST symbol table in the wrong place is corruption even if it is in
+bounds, as otherwise strings decode to garbage without an error.
+
+Of the 34 database files in DuckDB's `data/storage`, 14 open. The rest fail on views (6), indexes (3),
+dependencies between entries (2), macros, constraints and types (3), or codecs (3), and 3 are refused
+as DuckDB refuses them: damaged, or of another vector size. A file whose test used to pass because it was ignored can now fail:
+`test/sql/storage/bc/test_broken_view_v092.test` left `known_passing.txt`, as it needs views.
+
+The gate is not met: `test/sql/storage` is at 9.6% against 85% and needs checkpoints.
 
 ## Testing
 

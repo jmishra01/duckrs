@@ -284,6 +284,11 @@ impl<'a> BinaryDeserializer<'a> {
         Ok(result as i64)
     }
 
+    /// `CanDeserializeProperty`: whether the next field is `field_id`.
+    pub fn has_property(&mut self, field_id: u16) -> Result<bool> {
+        Ok(self.peek_field()? == field_id)
+    }
+
     /// `ReadProperty`: the next field must be `field_id`.
     pub fn read_property<T: Deserialize>(&mut self, field_id: u16, _tag: &str) -> Result<T> {
         let field = self.next_field()?;
@@ -337,6 +342,22 @@ impl<'a> BinaryDeserializer<'a> {
             )));
         }
         Ok(value)
+    }
+
+    /// `ReadProperty` of a value that reads its own object, which `body` does.
+    pub fn read_object_field<T>(
+        &mut self,
+        field_id: u16,
+        _tag: &str,
+        body: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let field = self.next_field()?;
+        if field != field_id {
+            return Err(serialization_error(format!(
+                "Failed to deserialize: field id mismatch, expected: {field_id}, got: {field}"
+            )));
+        }
+        body(self)
     }
 
     /// `ReadObject`.

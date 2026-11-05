@@ -23,6 +23,7 @@ use crate::planner::binder::{
 };
 use crate::planner::binder::{SessionValues, ShowBehavior, enum_type_from, is_builtin_type};
 use crate::planner::column_binding_resolver::resolve_column_bindings;
+use crate::storage;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::OrderType;
 use duckrs_common::types::LogicalType;
@@ -37,6 +38,7 @@ use duckrs_parser::ast::{TransactionModifier, TransactionType};
 use parking_lot::{Mutex, RwLock};
 use settings::SettingValues;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -49,6 +51,17 @@ pub struct DatabaseInstance {
     transactions: Mutex<OpenTransactions>,
     /// held to read while a SELECT runs, and to write while anything else does
     statements: RwLock<()>,
+    /// Set when this database came from a file, which nothing writes to yet.
+    file_access: Option<FileAccess>,
+}
+
+/// Why a database that came from a file takes no writes.
+#[derive(Debug)]
+enum FileAccess {
+    /// It was opened read-only: this is its name.
+    ReadOnly(String),
+    /// Storing changes is not ported, and they must not get lost silently.
+    WritesNotPorted,
 }
 
 /// Which connections have a transaction open. There is no MVCC until Phase 10, so transactions
@@ -62,13 +75,52 @@ struct OpenTransactions {
 }
 
 impl DatabaseInstance {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
+    fn with_file_access(file_access: Option<FileAccess>) -> Self {
+        Self {
             catalog: Catalog::new(DEFAULT_CATALOG),
             settings: RwLock::new(SettingValues::default()),
             transactions: Mutex::new(OpenTransactions::default()),
             statements: RwLock::new(()),
-        })
+            file_access,
+        }
+    }
+
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::with_file_access(None))
+    }
+
+    /// A database with what is in the file at `path`. Without a database there it stays in memory
+    /// and goes away at the end, as all of them did before storage: a new file is not written yet.
+    pub fn open_file(path: &Path, read_only: bool) -> Result<Arc<Self>> {
+        if !storage::is_database_file(path) {
+            return Ok(Self::new());
+        }
+        let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let access = if read_only {
+            FileAccess::ReadOnly(name)
+        } else {
+            FileAccess::WritesNotPorted
+        };
+        let db = Self::with_file_access(Some(access));
+        storage::load_database(path, &db.catalog)?;
+        Ok(Arc::new(db))
+    }
+
+    /// Fails if this database takes no writes.
+    fn check_writable(&self, statement: &Statement) -> Result<()> {
+        match &self.file_access {
+            None => Ok(()),
+            Some(FileAccess::ReadOnly(name)) => Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "Cannot execute statement of type \"{}\" on database \"{name}\" which is attached in read-only mode!",
+                    statement_type_name(statement)
+                ),
+            )),
+            Some(FileAccess::WritesNotPorted) => Err(Error::not_implemented(
+                "writing to a database file is not yet ported to duckrs",
+            )),
+        }
     }
 }
 
@@ -197,6 +249,19 @@ fn is_write(statement: &Statement) -> bool {
         Statement::CreateTable(info) => !info.temporary,
         Statement::Create(info) => !info.temporary,
         _ => false,
+    }
+}
+
+/// `StatementTypeToString`, of a statement that `is_write`.
+fn statement_type_name(statement: &Statement) -> &'static str {
+    match statement {
+        Statement::Insert(_) => "INSERT",
+        Statement::Update(_) => "UPDATE",
+        Statement::Delete(_) => "DELETE",
+        Statement::Merge(_) => "MERGE_INTO",
+        Statement::Drop(_) => "DROP",
+        Statement::Alter(_) => "ALTER",
+        _ => "CREATE",
     }
 }
 
@@ -499,6 +564,9 @@ impl ClientContext {
             return Err(Error::new(ErrorKind::Transaction, INVALIDATED_TRANSACTION));
         }
         let write = is_write(statement);
+        if write {
+            self.db.check_writable(statement)?;
+        }
         self.check_other_connections(write)?;
         // what a failed statement outside of a transaction undoes: INSERT is the one that can
         // fail halfway through

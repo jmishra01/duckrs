@@ -2,7 +2,7 @@
 
 An analytical SQL database engine: a port of [DuckDB](https://github.com/duckdb/duckdb) to Rust.
 
-**Status: 2242 files pass, 43.7% of the files that ran (36.2% of all 6,197).** The Phase 6 feature list is ported apart from data-modifying CTEs and a few binder corners, but its gates are not met yet; see "Phase 6" in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Phase 7 has started: expression rewriting, filter pushdown, empty result pull-up and unused column removal are in, correlated subqueries are flattened where the port covers them, table statistics decide comparisons ahead of time, and inner joins and cross products are reordered by estimated cost; see "Phase 7" there. Phase 4 (types and casts) has started: the scalar casts, the nested types (LIST, ARRAY, STRUCT, MAP, UNION), `CREATE TYPE`, ENUM, BIT, BIGNUM and VARIANT are in, the last in its own in-memory encoding until Phase 9. What is left of the phase is GEOMETRY, which the plan defers. A first batch of Phase 5's functions is in too, because the type tests need them: `unnest`, `TRY(...)`, list slicing, the `list` aggregate, LIKE, and common string, list, map and interval helpers. Nested casts and functions run row by row for now. The engine runs CREATE TABLE, CREATE VIEW, CREATE SEQUENCE, CREATE MACRO, INSERT, prepared statements
+**Status: 2253 files pass, 43.9% of the files that ran (36.4% of all 6,197).** The Phase 6 feature list is ported apart from data-modifying CTEs and a few binder corners, but its gates are not met yet; see "Phase 6" in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Phase 7 has started: expression rewriting, filter pushdown, empty result pull-up and unused column removal are in, correlated subqueries are flattened where the port covers them, table statistics decide comparisons ahead of time, and inner joins and cross products are reordered by estimated cost; see "Phase 7" there. Phase 4 (types and casts) has started: the scalar casts, the nested types (LIST, ARRAY, STRUCT, MAP, UNION), `CREATE TYPE`, ENUM, BIT, BIGNUM and VARIANT are in, the last in its own in-memory encoding until Phase 9. What is left of the phase is GEOMETRY, which the plan defers. A first batch of Phase 5's functions is in too, because the type tests need them: `unnest`, `TRY(...)`, list slicing, the `list` aggregate, LIKE, and common string, list, map and interval helpers. Nested casts and functions run row by row for now. The engine runs CREATE TABLE, CREATE VIEW, CREATE SEQUENCE, CREATE MACRO, INSERT, prepared statements
 and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in memory. What exists today:
 
 - `crates/duckrs-common`: the core building blocks every other crate uses:
@@ -54,13 +54,17 @@ and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in me
   and aliases of the select list; and SET/RESET/`PRAGMA x = y` for all 196
   of DuckDB's settings (generated from its `settings.json` by `tools/generate_settings.py`), with
   DuckDB's types and error messages. The optimizer turns a filter over a cross product
-  (`FROM a, b WHERE a.x = b.x`) into a join, but joins run in the order they were written until join ordering comes in Phase 7. BEGIN, COMMIT and ROLLBACK work, but connections are not isolated from each other until Phase 10: what would need that fails as not yet ported. UNION, EXCEPT and INTERSECT (with ALL, and BY NAME) and non-recursive CTEs work, the CTEs inlined at each reference. Scalar, EXISTS, IN, ANY and ALL subqueries work, correlated too. Correlated ones in a filter or a projection are flattened into duplicate eliminated joins where possible; the others run as plans of their own, once if uncorrelated and otherwise once per combination of correlated values. Recursive CTEs run round by round, and LATERAL joins run their right side per combination of left values. UPDATE and DELETE work, with RETURNING, and rewrite the table at the end of the statement; until Phase 10 a statement that writes runs alone. SQL it does not
+  (`FROM a, b WHERE a.x = b.x`) into a join, and Phase 7 reorders inner joins by estimated cost. BEGIN, COMMIT and ROLLBACK work, but connections are not isolated from each other until Phase 10: what would need that fails as not yet ported. UNION, EXCEPT and INTERSECT (with ALL, and BY NAME) and non-recursive CTEs work, the CTEs inlined at each reference. Scalar, EXISTS, IN, ANY and ALL subqueries work, correlated too. Correlated ones in a filter or a projection are flattened into duplicate eliminated joins where possible; the others run as plans of their own, once if uncorrelated and otherwise once per combination of correlated values. Recursive CTEs run round by round, and LATERAL joins run their right side per combination of left values. UPDATE and DELETE work, with RETURNING, and rewrite the table at the end of the statement; until Phase 10 a statement that writes runs alone. SQL it does not
   run yet fails with an error saying it `is not yet ported to duckrs`; the sqllogictest runner
   never counts that error as the one a test expects.
 - `crates/duckrs`: the public API (`Database`, `Connection`, `QueryResult`) over the engine.
-  Databases live in memory; a database file is accepted but not written until Phase 9.
+  Phase 9 has started: `Database::open` reads files written by DuckDB into memory, for tables of
+  scalar types with uncompressed, constant, RLE, bitpacked, dictionary and FSST columns. Such a
+  database takes no writes, and what a file holds beyond that is an error; see "Phase 9" in
+  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Without a file a database lives in memory, and
+  nothing is written to the path yet.
 - `tools/sqllogictest`: a port of DuckDB's sqllogictest runner. It runs the DuckDB `.test` corpus
-  against duckrs, or against the C++ DuckDB library as a reference. duckrs passes 2242 files so far
+  against duckrs, or against the C++ DuckDB library as a reference. duckrs passes 2253 files so far
   (`tools/sqllogictest/known_passing.txt`, a CI gate), among them
   `test/sql/projection/test_simple_projection.test`.
 
@@ -77,7 +81,7 @@ The full roadmap is in [`../RUST_PORT_PLAN.md`](../RUST_PORT_PLAN.md).
 duckrs/
 ├── crates/duckrs/          # public API (facade crate)
 ├── crates/duckrs-common/   # types, vectors, executors, values
-├── crates/duckrs-core/     # catalog, functions, binder/planner, execution, client context
+├── crates/duckrs-core/     # catalog, functions, binder/planner, execution, storage, client context
 ├── crates/duckrs-parser/   # tokenizer, PEG grammar engine (+ vendored grammar), AST, transformer
 ├── tools/sqllogictest/     # test runner + known_passing.txt
 └── docs/                   # ARCHITECTURE, PORTING_GUIDE, UPSTREAM_SYNC

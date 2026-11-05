@@ -30,11 +30,12 @@ impl Database {
         })
     }
 
-    /// Opens a database file. Storage arrives with Phase 9; until then the database lives in
-    /// memory and nothing is written to `path`.
+    /// Opens a database file. What is in the file is read into memory, and it takes no writes
+    /// until storing them is ported. If there is no file, the database lives in memory and
+    /// nothing is written to `path` yet.
     pub fn open(path: impl AsRef<Path>, read_only: bool) -> Result<Self> {
         Ok(Self {
-            instance: DatabaseInstance::new(),
+            instance: DatabaseInstance::open_file(path.as_ref(), read_only)?,
             path: Some(path.as_ref().to_path_buf()),
             read_only,
         })

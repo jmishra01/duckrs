@@ -1,0 +1,475 @@
+//! Ported from duckdb/src/storage/single_file_block_manager.cpp and
+//! duckdb/src/include/duckdb/storage/storage_info.hpp @ rust-port-baseline.
+//!
+//! A database file is three 4 KiB headers (one main header, then two database headers, of which
+//! the one with the higher iteration is the current one) followed by blocks. Each header and block
+//! starts with the checksum of the rest of it. Nothing here interprets what is in a block.
+
+use super::checksum::checksum;
+use duckrs_common::{Error, ErrorKind, Result};
+use parking_lot::Mutex;
+use std::collections::{BTreeSet, HashMap};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+pub const FILE_HEADER_SIZE: usize = 4096;
+/// `sizeof(idx_t)`: the checksum in front of a block.
+pub const BLOCK_HEADER_SIZE: usize = 8;
+pub const DEFAULT_BLOCK_ALLOC_SIZE: u64 = 262144;
+const MIN_BLOCK_ALLOC_SIZE: u64 = 16384;
+const MAX_BLOCK_ALLOC_SIZE: u64 = DEFAULT_BLOCK_ALLOC_SIZE;
+/// `BLOCK_START`: where block 0 is in the file.
+const BLOCK_START: u64 = FILE_HEADER_SIZE as u64 * 3;
+const MAGIC_BYTES: &[u8; 4] = b"DUCK";
+const MAX_VERSION_SIZE: usize = 32;
+const FLAG_COUNT: usize = 4;
+const ENCRYPTED_DATABASE_FLAG: u64 = 1;
+/// `VERSION_NUMBER_LOWER` and `VERSION_NUMBER_UPPER`.
+const VERSION_NUMBER_LOWER: u64 = 64;
+const VERSION_NUMBER_UPPER: u64 = 70;
+/// `StorageVersion::DEPRECATED`: from v2.0.0 on the main header no longer says the version.
+const DEPRECATED_VERSION_NUMBER: u64 = 999;
+const STANDARD_VECTOR_SIZE: u64 = 2048;
+/// `INVALID_BLOCK`.
+pub const INVALID_BLOCK: u64 = u64::MAX;
+
+/// The version a file made here says it has: v1.0.0's, the oldest that DuckDB still reads, which
+/// `SerializationVersion` 1 goes with. Nothing newer has to be written yet.
+const NEW_FILE_VERSION_NUMBER: u64 = 64;
+const NEW_FILE_SERIALIZATION_VERSION: u64 = 1;
+
+pub(super) fn corrupt(message: impl std::fmt::Display) -> Error {
+    Error::new(ErrorKind::DataCorruption, format!("Corrupt database file: {message}"))
+}
+
+fn io_error(path: &Path, error: std::io::Error) -> Error {
+    Error::new(ErrorKind::Io, format!("{}: {error}", path.display()))
+}
+
+fn invalid_file(path: &Path) -> Error {
+    Error::new(
+        ErrorKind::Io,
+        format!(
+            "The file \"{}\" exists, but it is not a valid DuckDB database file!",
+            path.display()
+        ),
+    )
+}
+
+fn u64_at(data: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(data[offset..offset + 8].try_into().expect("8 bytes"))
+}
+
+/// `MainHeader`, without what only encrypted files use.
+#[derive(Debug, Clone)]
+pub struct MainHeader {
+    pub version_number: u64,
+    pub flags: [u64; FLAG_COUNT],
+    pub library_git_desc: String,
+    pub library_git_hash: String,
+}
+
+impl MainHeader {
+    fn read(data: &[u8]) -> Result<Self> {
+        let version_number = u64_at(data, 4);
+        if version_number != DEPRECATED_VERSION_NUMBER
+            && !(VERSION_NUMBER_LOWER..=VERSION_NUMBER_UPPER).contains(&version_number)
+        {
+            return Err(Error::new(
+                ErrorKind::Io,
+                format!(
+                    "Trying to read a database file with storage version number {version_number}, but we can only \
+                     read storage versions between {VERSION_NUMBER_LOWER} and {VERSION_NUMBER_UPPER}."
+                ),
+            ));
+        }
+        let mut flags = [0; FLAG_COUNT];
+        for (i, flag) in flags.iter_mut().enumerate() {
+            *flag = u64_at(data, 12 + i * 8);
+        }
+        let text = |offset: usize| {
+            let bytes = &data[offset..offset + MAX_VERSION_SIZE];
+            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            String::from_utf8_lossy(&bytes[..end]).into_owned()
+        };
+        let desc_at = 12 + FLAG_COUNT * 8;
+        Ok(Self {
+            version_number,
+            flags,
+            library_git_desc: text(desc_at),
+            library_git_hash: text(desc_at + MAX_VERSION_SIZE),
+        })
+    }
+
+    fn is_encrypted(&self) -> bool {
+        self.flags[0] & ENCRYPTED_DATABASE_FLAG != 0
+    }
+}
+
+/// `DatabaseHeader`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseHeader {
+    pub iteration: u64,
+    /// A `MetaBlockPointer`'s `block_pointer`, or `INVALID_BLOCK`.
+    pub meta_block: u64,
+    pub free_list: u64,
+    pub block_count: u64,
+    pub block_alloc_size: u64,
+    pub vector_size: u64,
+    pub storage_compatibility: u64,
+}
+
+impl DatabaseHeader {
+    fn read(data: &[u8]) -> Result<Self> {
+        let mut header = Self {
+            iteration: u64_at(data, 0),
+            meta_block: u64_at(data, 8),
+            free_list: u64_at(data, 16),
+            block_count: u64_at(data, 24),
+            block_alloc_size: u64_at(data, 32),
+            vector_size: u64_at(data, 40),
+            storage_compatibility: u64_at(data, 48),
+        };
+        if header.block_alloc_size == 0 {
+            header.block_alloc_size = DEFAULT_BLOCK_ALLOC_SIZE;
+        }
+        if header.vector_size == 0 {
+            header.vector_size = STANDARD_VECTOR_SIZE;
+        }
+        if header.vector_size != STANDARD_VECTOR_SIZE {
+            return Err(Error::new(
+                ErrorKind::Io,
+                format!(
+                    "Cannot read database file: DuckDB's compiled vector size is {STANDARD_VECTOR_SIZE} bytes, but \
+                     the file has a vector size of {} bytes.",
+                    header.vector_size
+                ),
+            ));
+        }
+        Ok(header)
+    }
+
+    fn write(&self, target: &mut [u8]) {
+        let fields = [
+            self.iteration,
+            self.meta_block,
+            self.free_list,
+            self.block_count,
+            self.block_alloc_size,
+            self.vector_size,
+            self.storage_compatibility,
+        ];
+        for (i, field) in fields.iter().enumerate() {
+            target[i * 8..i * 8 + 8].copy_from_slice(&field.to_le_bytes());
+        }
+    }
+}
+
+fn verify_block_alloc_size(size: u64) -> Result<()> {
+    if !size.is_power_of_two() || !(MIN_BLOCK_ALLOC_SIZE..=MAX_BLOCK_ALLOC_SIZE).contains(&size) {
+        return Err(corrupt(format!("invalid block allocation size {size}")));
+    }
+    Ok(())
+}
+
+/// Reads and writes the blocks of one file (`SingleFileBlockManager`).
+#[derive(Debug)]
+pub struct SingleFileBlockManager {
+    path: PathBuf,
+    file: Mutex<File>,
+    main_header: MainHeader,
+    state: Mutex<State>,
+}
+
+#[derive(Debug)]
+struct State {
+    /// The headers are written in turn: this one is current, the next goes to the other slot.
+    active_header: usize,
+    header: DatabaseHeader,
+    /// `free_list`.
+    free_list: BTreeSet<u64>,
+    /// `multi_use_blocks`: blocks that several segments or tables share.
+    multi_use_blocks: HashMap<u64, u32>,
+}
+
+impl SingleFileBlockManager {
+    /// `LoadExistingDatabase`, up to the free list, which takes the metadata layer to read.
+    pub fn open(path: &Path, read_only: bool) -> Result<Self> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(!read_only)
+            .open(path)
+            .map_err(|e| io_error(path, e))?;
+        let size = file.metadata().map_err(|e| io_error(path, e))?.len();
+        if size < 12 {
+            return Err(invalid_file(path));
+        }
+        let mut magic = [0; 12];
+        file.read_exact(&mut magic).map_err(|e| io_error(path, e))?;
+        if &magic[8..12] != MAGIC_BYTES {
+            return Err(invalid_file(path));
+        }
+        let mut buffer = vec![0; FILE_HEADER_SIZE];
+        read_checked(&mut file, path, 0, &mut buffer)?;
+        let main_header = MainHeader::read(&buffer[BLOCK_HEADER_SIZE..])?;
+        if main_header.is_encrypted() {
+            return Err(Error::not_implemented(
+                "reading an encrypted database file is not yet ported to duckrs",
+            ));
+        }
+        read_checked(&mut file, path, FILE_HEADER_SIZE as u64, &mut buffer)?;
+        let h1 = DatabaseHeader::read(&buffer[BLOCK_HEADER_SIZE..])?;
+        read_checked(&mut file, path, FILE_HEADER_SIZE as u64 * 2, &mut buffer)?;
+        let h2 = DatabaseHeader::read(&buffer[BLOCK_HEADER_SIZE..])?;
+        let (active_header, header) = if h1.iteration > h2.iteration { (0, h1) } else { (1, h2) };
+        verify_block_alloc_size(header.block_alloc_size)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file: Mutex::new(file),
+            main_header,
+            state: Mutex::new(State {
+                active_header,
+                header,
+                free_list: BTreeSet::new(),
+                multi_use_blocks: HashMap::new(),
+            }),
+        })
+    }
+
+    /// `CreateNewDatabase`: a file with no blocks, which DuckDB can open too.
+    pub fn create(path: &Path, block_alloc_size: u64) -> Result<Self> {
+        verify_block_alloc_size(block_alloc_size)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| io_error(path, e))?;
+
+        let mut buffer = vec![0; FILE_HEADER_SIZE];
+        let data = &mut buffer[BLOCK_HEADER_SIZE..];
+        data[..4].copy_from_slice(MAGIC_BYTES);
+        data[4..12].copy_from_slice(&NEW_FILE_VERSION_NUMBER.to_le_bytes());
+        let desc_at = 12 + FLAG_COUNT * 8;
+        let version = concat!("duckrs ", env!("CARGO_PKG_VERSION")).as_bytes();
+        data[desc_at..desc_at + version.len()].copy_from_slice(version);
+        write_checked(&mut file, path, 0, &mut buffer)?;
+
+        let header = DatabaseHeader {
+            iteration: 0,
+            meta_block: INVALID_BLOCK,
+            free_list: INVALID_BLOCK,
+            block_count: 0,
+            block_alloc_size,
+            vector_size: STANDARD_VECTOR_SIZE,
+            storage_compatibility: NEW_FILE_SERIALIZATION_VERSION,
+        };
+        for slot in 1..=2 {
+            buffer.fill(0);
+            header.write(&mut buffer[BLOCK_HEADER_SIZE..]);
+            write_checked(&mut file, path, FILE_HEADER_SIZE as u64 * slot, &mut buffer)?;
+        }
+        file.sync_all().map_err(|e| io_error(path, e))?;
+        drop(file);
+        Self::open(path, false)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn main_header(&self) -> &MainHeader {
+        &self.main_header
+    }
+
+    pub fn header(&self) -> DatabaseHeader {
+        self.state.lock().header.clone()
+    }
+
+    pub fn block_alloc_size(&self) -> usize {
+        self.state.lock().header.block_alloc_size as usize
+    }
+
+    /// `GetBlockSize`: what a block holds.
+    pub fn block_size(&self) -> usize {
+        self.block_alloc_size() - BLOCK_HEADER_SIZE
+    }
+
+    pub fn free_list(&self) -> Vec<u64> {
+        self.state.lock().free_list.iter().copied().collect()
+    }
+
+    pub fn multi_use_blocks(&self) -> HashMap<u64, u32> {
+        self.state.lock().multi_use_blocks.clone()
+    }
+
+    pub fn set_free_list(&self, free_list: BTreeSet<u64>, multi_use_blocks: HashMap<u64, u32>) {
+        let mut state = self.state.lock();
+        state.free_list = free_list;
+        state.multi_use_blocks = multi_use_blocks;
+    }
+
+    fn location(&self, block_id: u64) -> Result<u64> {
+        let state = self.state.lock();
+        if block_id >= state.header.block_count {
+            return Err(corrupt(format!(
+                "block {block_id} is past the end of the file, which has {} blocks",
+                state.header.block_count
+            )));
+        }
+        Ok(BLOCK_START + block_id * state.header.block_alloc_size)
+    }
+
+    /// `Read`: the block without its checksum, which is verified.
+    pub fn read_block(&self, block_id: u64) -> Result<Vec<u8>> {
+        let location = self.location(block_id)?;
+        let mut buffer = vec![0; self.block_alloc_size()];
+        read_checked(&mut self.file.lock(), &self.path, location, &mut buffer)?;
+        buffer.drain(..BLOCK_HEADER_SIZE);
+        Ok(buffer)
+    }
+
+    /// `Write`: `data` is what a block holds. The block must be in the current header's count or
+    /// be a new one, which grows it.
+    pub fn write_block(&self, block_id: u64, data: &[u8]) -> Result<()> {
+        let alloc_size = self.block_alloc_size();
+        if data.len() != alloc_size - BLOCK_HEADER_SIZE {
+            return Err(Error::new(
+                ErrorKind::Internal,
+                format!(
+                    "a block holds {} bytes, not {}",
+                    alloc_size - BLOCK_HEADER_SIZE,
+                    data.len()
+                ),
+            ));
+        }
+        let mut buffer = vec![0; alloc_size];
+        buffer[BLOCK_HEADER_SIZE..].copy_from_slice(data);
+        let location = BLOCK_START + block_id * alloc_size as u64;
+        write_checked(&mut self.file.lock(), &self.path, location, &mut buffer)?;
+        let mut state = self.state.lock();
+        state.header.block_count = state.header.block_count.max(block_id + 1);
+        Ok(())
+    }
+
+    /// `WriteHeader`: makes `header` the current one. The blocks it needs must be on disk, and they
+    /// are synced before it goes out, so that a crash leaves either this header or the last.
+    pub fn write_header(&self, mut header: DatabaseHeader) -> Result<()> {
+        let mut file = self.file.lock();
+        file.sync_all().map_err(|e| io_error(&self.path, e))?;
+        let mut state = self.state.lock();
+        header.iteration = state.header.iteration + 1;
+        let slot = 1 - state.active_header;
+        let mut buffer = vec![0; FILE_HEADER_SIZE];
+        header.write(&mut buffer[BLOCK_HEADER_SIZE..]);
+        let location = FILE_HEADER_SIZE as u64 * (slot as u64 + 1);
+        write_checked(&mut file, &self.path, location, &mut buffer)?;
+        file.sync_all().map_err(|e| io_error(&self.path, e))?;
+        state.active_header = slot;
+        state.header = header;
+        Ok(())
+    }
+}
+
+/// `ReadAndChecksum`.
+fn read_checked(file: &mut File, path: &Path, location: u64, buffer: &mut [u8]) -> Result<()> {
+    file.seek(SeekFrom::Start(location)).map_err(|e| io_error(path, e))?;
+    file.read_exact(buffer).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            corrupt(format!("the file ends before the block at location {location}"))
+        } else {
+            io_error(path, e)
+        }
+    })?;
+    let stored = u64_at(buffer, 0);
+    let computed = checksum(&buffer[BLOCK_HEADER_SIZE..]);
+    if stored != computed {
+        return Err(corrupt(format!(
+            "computed checksum {computed} does not match stored checksum {stored} in block at location {location}"
+        )));
+    }
+    Ok(())
+}
+
+/// `ChecksumAndWrite`.
+fn write_checked(file: &mut File, path: &Path, location: u64, buffer: &mut [u8]) -> Result<()> {
+    let sum = checksum(&buffer[BLOCK_HEADER_SIZE..]);
+    buffer[..BLOCK_HEADER_SIZE].copy_from_slice(&sum.to_le_bytes());
+    file.seek(SeekFrom::Start(location)).map_err(|e| io_error(path, e))?;
+    file.write_all(buffer).map_err(|e| io_error(path, e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn directory(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("duckrs-blocks-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_new_file_has_no_blocks() {
+        let directory = directory("new");
+        let path = directory.join("new.db");
+        drop(SingleFileBlockManager::create(&path, 16384).unwrap());
+        let blocks = SingleFileBlockManager::open(&path, true).unwrap();
+        let header = blocks.header();
+        assert_eq!(header.iteration, 0);
+        assert_eq!(header.meta_block, INVALID_BLOCK);
+        assert_eq!(header.block_count, 0);
+        assert_eq!(blocks.block_size(), 16384 - BLOCK_HEADER_SIZE);
+        assert!(blocks.main_header().library_git_desc.starts_with("duckrs"));
+        assert!(blocks.read_block(0).is_err());
+        assert!(SingleFileBlockManager::create(&path, 16384).is_err(), "it is there");
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn blocks_and_headers_survive_reopening_and_headers_take_turns() {
+        let directory = directory("blocks");
+        let path = directory.join("blocks.db");
+        let blocks = SingleFileBlockManager::create(&path, 16384).unwrap();
+        let data = vec![7; blocks.block_size()];
+        blocks.write_block(0, &data).unwrap();
+        blocks.write_block(1, &vec![9; blocks.block_size()]).unwrap();
+        assert!(blocks.write_block(2, &[1, 2, 3]).is_err());
+
+        let mut header = blocks.header();
+        header.meta_block = 1;
+        blocks.write_header(header.clone()).unwrap();
+        header.meta_block = 0;
+        blocks.write_header(header).unwrap();
+        drop(blocks);
+
+        let blocks = SingleFileBlockManager::open(&path, true).unwrap();
+        assert_eq!(blocks.header().iteration, 2);
+        assert_eq!(blocks.header().meta_block, 0);
+        assert_eq!(blocks.header().block_count, 2);
+        assert_eq!(blocks.read_block(0).unwrap(), data);
+
+        // the last header that made it to disk wins, so a torn one takes us back a step
+        let mut bytes = std::fs::read(&path).unwrap();
+        let newest = FILE_HEADER_SIZE * if blocks.state.lock().active_header == 0 { 1 } else { 2 };
+        drop(blocks);
+        bytes[newest + BLOCK_HEADER_SIZE] ^= 1;
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(
+            SingleFileBlockManager::open(&path, true).is_err(),
+            "C++ gives up here too"
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn invalid_block_sizes_are_refused() {
+        let directory = directory("size");
+        for size in [0, 1000, 16385, 524288] {
+            assert!(SingleFileBlockManager::create(&directory.join("x.db"), size).is_err());
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+}
