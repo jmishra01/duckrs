@@ -205,3 +205,110 @@ fn sorts_a_collection() {
     let sel = sort_chunk(&chunk, &orders).unwrap();
     assert_eq!(chunk.get_value(1, sel.get(500)), rows[500][1]);
 }
+
+fn row_key_bytes(columns: &[Vector], count: usize) -> Vec<Vec<u8>> {
+    let references: Vec<&Vector> = columns.iter().collect();
+    let keys = create_row_keys(&references, count).unwrap();
+    keys.iter().map(|key| key.as_bytes().to_vec()).collect()
+}
+
+fn sort_key_bytes(columns: &[Vector], count: usize) -> Vec<Vec<u8>> {
+    let columns: Vec<(&Vector, OrderModifiers)> = columns.iter().map(|v| (v, OrderModifiers::ASC_NULLS_LAST)).collect();
+    create_sort_keys(&columns, count).unwrap()
+}
+
+#[test]
+fn row_keys_are_sort_keys() {
+    let values = |values: Vec<Value>| {
+        let ty = values[0].logical_type().clone();
+        let mut vector = Vector::new(ty, values.len());
+        vector.prepare_flat(values.len());
+        for (row, value) in values.iter().enumerate() {
+            vector.set_value(row, value).unwrap();
+        }
+        vector
+    };
+    let integers = values(vec![
+        Value::integer(-1),
+        Value::null(LogicalType::INTEGER),
+        Value::integer(i32::MAX),
+    ]);
+    let bigints = values(vec![
+        Value::bigint(i64::MIN),
+        Value::bigint(0),
+        Value::null(LogicalType::BIGINT),
+    ]);
+    let doubles = values(vec![Value::double(-0.0), Value::double(0.0), Value::double(f64::NAN)]);
+    let strings = values(vec![
+        Value::varchar("a".to_string()),
+        Value::null(LogicalType::VARCHAR),
+        Value::varchar("x".repeat(100)),
+    ]);
+    for columns in [
+        vec![integers.clone()],
+        vec![bigints.clone(), integers.clone()],
+        vec![doubles.clone()],
+        vec![strings.clone()],
+        // across the size that stays inline: 9 bytes per BIGINT, and a string that spills over
+        vec![bigints.clone(), bigints.clone(), bigints.clone()],
+        vec![bigints.clone(), bigints.clone(), bigints.clone(), bigints.clone()],
+        vec![integers.clone(), strings.clone(), bigints.clone()],
+    ] {
+        assert_eq!(row_key_bytes(&columns, 3), sort_key_bytes(&columns, 3));
+    }
+    // a selection and a constant read the rows they stand for
+    let mut sliced = bigints.clone();
+    sliced.slice(&SelectionVector::from_vec(vec![2, 0]), 2);
+    let columns = [sliced, Vector::constant(&Value::integer(7))];
+    assert_eq!(row_key_bytes(&columns, 2), sort_key_bytes(&columns, 2));
+    // -0.0 and 0.0 are one group
+    let keys = row_key_bytes(std::slice::from_ref(&doubles), 3);
+    assert_eq!(keys[0], keys[1]);
+}
+
+#[test]
+fn row_keys_compare_by_their_bytes() {
+    use std::hash::{BuildHasher, BuildHasherDefault};
+    let hash = |key: &RowKey| BuildHasherDefault::<KeyHasher>::default().hash_one(key);
+    let of = |length: usize| {
+        let mut key = RowKey::EMPTY;
+        key.append(&vec![7; length]);
+        key
+    };
+    for length in [0, 1, 8, 29, 30, 31, 100] {
+        assert_eq!(of(length).as_bytes().len(), length);
+        assert_eq!(of(length), of(length));
+        assert_eq!(hash(&of(length)), hash(&of(length)));
+    }
+    assert_ne!(of(30), of(31));
+    // a key that grows past the inline size equals one that was never inline
+    let mut grown = of(25);
+    grown.append(&[7; 10]);
+    assert!(matches!(grown, RowKey::Heap(_)));
+    assert_eq!(grown, of(35));
+    assert_eq!(hash(&grown), hash(&of(35)));
+    // integers that differ in any byte spread over the low bits, which the table reads
+    let low_bits: std::collections::HashSet<u64> = (0u64..1024)
+        .map(|i| {
+            let mut key = RowKey::EMPTY;
+            key.append(&[1]);
+            key.append(&i.to_be_bytes());
+            hash(&key) & 0xFFFF
+        })
+        .collect();
+    assert!(low_bits.len() > 1000, "{}", low_bits.len());
+}
+
+proptest! {
+    #[test]
+    fn row_keys_agree_with_sort_keys(a in proptest::collection::vec(proptest::option::of(any::<i64>()), 1..50)) {
+        let mut vector = Vector::new(LogicalType::BIGINT, a.len());
+        vector.prepare_flat(a.len());
+        for (row, value) in a.iter().enumerate() {
+            let value = value.map_or(Value::null(LogicalType::BIGINT), Value::bigint);
+            vector.set_value(row, &value).unwrap();
+        }
+        let columns = [vector];
+        prop_assert_eq!(row_key_bytes(&columns, a.len()), sort_key_bytes(&columns, a.len()));
+    }
+}

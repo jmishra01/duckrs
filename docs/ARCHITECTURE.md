@@ -195,6 +195,10 @@ while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` 
   column of a query further out, and plans with an operator `push` has no rule for (VALUES with
   correlated columns, FULL joins, grouping sets with an empty set, LIMIT with a percentage, SAMPLE,
   ASOF, recursive CTEs). C++ decorrelates nearly all of those. LATERAL joins are not flattened yet.
+- Hash joins, grouping, DISTINCT and delim joins key their rows with `RowKey`
+  (`duckrs-common/src/sort_key.rs`): the bytes of a sort key, built a column at a time, inline up to
+  30 bytes, and hashed with `KeyHasher`. Keys are not chosen to attack a hash table here, so it is
+  a multiplicative hash and not SipHash. Other operators use the slower `group_keys`.
 - The **deliminator** (`optimizer/deliminator.rs`) runs right after filter pushdown. An equality
   join with `DelimGet` only filters, so it goes, and an IS NOT NULL stands in for what `=` dropped.
   When the query filters the outer rows the deepest such join stays, as DuckDB does, so most of
@@ -260,8 +264,8 @@ until Phase 9; the others want statistics per function (`contains`, `substr`, `l
 
 TPC-H gives all 22 answers right at SF 0.01, 0.1 and 1, with `examples/tpch.rs` against DuckDB's
 answer files. Data comes from `tools/tpch/build_dbgen.sh`, which builds DuckDB's generators with text
-output. At SF 1 it is 13 times slower than DuckDB on one thread, by the geometric mean, and no
-query is more than 45 times slower. Phase 8 brings parallelism. TPC-DS does not run yet.
+output. At SF 1 it is 8 times slower than DuckDB on one thread, by the geometric mean, and no
+query is more than 15 times slower. Phase 8 brings parallelism. TPC-DS does not run yet.
 
 Not ported yet: the box rendering of EXPLAIN, `Projections` of scans, moving LEFT joins in the join order, and SEMI and ANTI joins that read several
 relations (those stay on top of the tree), the estimator's caps for composite keys, estimated rows in EXPLAIN, flipping

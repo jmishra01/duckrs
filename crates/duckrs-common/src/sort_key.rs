@@ -269,6 +269,146 @@ impl KeyColumn {
     }
 }
 
+/// The bytes of a key that fit in a [`RowKey`] without an allocation.
+const INLINE_KEY_SIZE: usize = 30;
+
+/// What [`create_row_keys`] gives for a row: the bytes of its sort key. Most keys are a few integers
+/// or a short string, so those stay in here. A key has one representation, so comparing the bytes
+/// compares the keys.
+#[derive(Debug, Clone)]
+pub enum RowKey {
+    Inline { len: u8, bytes: [u8; INLINE_KEY_SIZE] },
+    Heap(Vec<u8>),
+}
+
+impl RowKey {
+    const EMPTY: Self = Self::Inline {
+        len: 0,
+        bytes: [0; INLINE_KEY_SIZE],
+    };
+
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Inline { len, bytes } => &bytes[..*len as usize],
+            Self::Heap(bytes) => bytes,
+        }
+    }
+
+    fn append(&mut self, new: &[u8]) {
+        match self {
+            Self::Inline { len, bytes } => {
+                let end = *len as usize + new.len();
+                if end <= INLINE_KEY_SIZE {
+                    bytes[*len as usize..end].copy_from_slice(new);
+                    *len = end as u8;
+                } else {
+                    let mut heap = bytes[..*len as usize].to_vec();
+                    heap.extend_from_slice(new);
+                    *self = Self::Heap(heap);
+                }
+            }
+            Self::Heap(bytes) => bytes.extend_from_slice(new),
+        }
+    }
+}
+
+impl PartialEq for RowKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for RowKey {}
+
+impl std::hash::Hash for RowKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write(self.as_bytes());
+    }
+}
+
+/// A multiplicative hash of the key bytes. The keys come from the query's own data and nothing
+/// here relies on keeping them apart, so it need not resist chosen input, unlike the default.
+#[derive(Default, Clone, Copy)]
+pub struct KeyHasher(u64);
+
+const KEY_HASH_MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
+
+impl KeyHasher {
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(23) ^ word).wrapping_mul(KEY_HASH_MULTIPLIER);
+    }
+}
+
+impl std::hash::Hasher for KeyHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            self.add(u64::from_le_bytes(chunk.try_into().expect("8 bytes")));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut word = [0; 8];
+            word[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(word));
+        }
+    }
+    fn finish(&self) -> u64 {
+        // the table reads the low bits, and the multiplication moves entropy to the high ones
+        let hash = self.0 ^ (self.0 >> 32);
+        hash.wrapping_mul(KEY_HASH_MULTIPLIER) ^ (hash >> 29)
+    }
+}
+
+/// A map from row keys.
+pub type RowKeyMap<V> = std::collections::HashMap<RowKey, V, std::hash::BuildHasherDefault<KeyHasher>>;
+/// A set of row keys.
+pub type RowKeySet = std::collections::HashSet<RowKey, std::hash::BuildHasherDefault<KeyHasher>>;
+
+impl KeyColumn {
+    /// Appends the key of each row to `keys`: `encode`, but a column at a time.
+    fn append_to(&self, keys: &mut [RowKey]) {
+        macro_rules! fixed {
+            ($t:ty, $encode:expr) => {{
+                let data = self.format.data::<$t>();
+                let encode = $encode;
+                let valid_byte = [self.valid_byte];
+                for (row, key) in keys.iter_mut().enumerate() {
+                    let idx = self.format.sel.get(row);
+                    if self.format.validity.is_valid(idx) {
+                        key.append(&valid_byte);
+                        key.append(&encode(data[idx]));
+                    } else {
+                        key.append(&[self.null_byte]);
+                    }
+                }
+            }};
+        }
+        match self.physical {
+            PhysicalType::Int32 => fixed!(i32, |v: i32| (v as u32 ^ (1 << 31)).to_be_bytes()),
+            PhysicalType::Int64 => fixed!(i64, |v: i64| (v as u64 ^ (1 << 63)).to_be_bytes()),
+            PhysicalType::UInt32 => fixed!(u32, |v: u32| v.to_be_bytes()),
+            PhysicalType::Double => fixed!(f64, |v: f64| encode_double(v).to_be_bytes()),
+            _ => {
+                let mut scratch = Vec::new();
+                for (row, key) in keys.iter_mut().enumerate() {
+                    scratch.clear();
+                    self.encode(row, false, &mut scratch);
+                    key.append(&scratch);
+                }
+            }
+        }
+    }
+}
+
+/// A key per row, in the bytes of [`create_sort_keys`] for ascending columns with NULLs last.
+pub fn create_row_keys(columns: &[&Vector], count: usize) -> Result<Vec<RowKey>> {
+    let mut keys = vec![RowKey::EMPTY; count];
+    for column in columns {
+        KeyColumn::new(column, count, OrderModifiers::ASC_NULLS_LAST)?.append_to(&mut keys);
+    }
+    Ok(keys)
+}
+
 /// `Radix::EncodeFloat`: an order-preserving u32 (NaN largest, -0.0 == 0.0).
 fn encode_float(x: f32) -> u32 {
     if x == 0.0 {

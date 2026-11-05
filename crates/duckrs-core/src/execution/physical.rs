@@ -21,7 +21,9 @@ use crate::function::aggregates::{AggregateState, value_keys};
 use crate::planner::expression::{BoundAggregate, BoundExpr, ColumnBinding};
 use crate::planner::logical::{BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, CteKeyColumn, LogicalOperator, OnConflict};
 use duckrs_common::column_data::ColumnDataCollection;
-use duckrs_common::sort_key::{NullOrder, OrderModifiers, OrderType, create_sort_keys, sort_collection};
+use duckrs_common::sort_key::{
+    NullOrder, OrderModifiers, OrderType, RowKeyMap, RowKeySet, create_row_keys, create_sort_keys, sort_collection,
+};
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, SelectionVector, Vector};
@@ -1310,7 +1312,7 @@ pub struct PhysicalDistinct {
     pub types: Vec<LogicalType>,
     pub targets: Vec<usize>,
     pub children: Vec<Box<dyn PhysicalOperator>>,
-    pub seen: Mutex<std::collections::HashSet<Vec<u8>>>,
+    pub seen: Mutex<RowKeySet>,
     pub data: Mutex<ColumnDataCollection>,
 }
 
@@ -1319,7 +1321,7 @@ impl PhysicalDistinct {
         let types = child.types().to_vec();
         Self {
             targets: targets.iter().map(reference_index).collect(),
-            seen: Mutex::new(std::collections::HashSet::new()),
+            seen: Mutex::default(),
             data: Mutex::new(ColumnDataCollection::new(types.clone())),
             types,
             children: vec![child],
@@ -1342,13 +1344,12 @@ impl PhysicalOperator for PhysicalDistinct {
     }
     fn sink(&self, chunk: &DataChunk) -> Result<()> {
         let columns: Vec<&Vector> = self.targets.iter().map(|&i| chunk.column(i)).collect();
-        let keys = group_keys(&columns, chunk.len())?;
+        let keys = create_row_keys(&columns, chunk.len())?;
         let mut seen = self.seen.lock();
         let new_rows: Vec<u32> = keys
             .into_iter()
             .enumerate()
-            .filter(|(_, key)| seen.insert(key.clone()))
-            .map(|(i, _)| i as u32)
+            .filter_map(|(i, key)| seen.insert(key).then_some(i as u32))
             .collect();
         if !new_rows.is_empty() {
             let mut rows = chunk.clone();
@@ -1417,7 +1418,7 @@ impl GroupingSet {
 /// The groups of a grouping set so far and their aggregate states.
 #[derive(Debug)]
 struct AggregateSinkState {
-    group_ids: std::collections::HashMap<Vec<u8>, usize>,
+    group_ids: RowKeyMap<usize>,
     group_values: ColumnDataCollection,
     group_count: usize,
     /// per aggregate, the states of the groups
@@ -1433,7 +1434,7 @@ impl AggregateSinkState {
         // a set without groups has its one group from the start, so it has a row for no input
         let group_count = usize::from(group_types.is_empty());
         Self {
-            group_ids: std::collections::HashMap::new(),
+            group_ids: RowKeyMap::default(),
             group_values: ColumnDataCollection::new(group_types),
             group_count,
             states: aggregates
@@ -1513,7 +1514,7 @@ impl PhysicalAggregate {
             return Ok(vec![0; count]);
         }
         let columns: Vec<&Vector> = set.groups.iter().map(|&g| &vectors[g]).collect();
-        let keys = group_keys(&columns, count)?;
+        let keys = create_row_keys(&columns, count)?;
         let mut new_rows = Vec::new();
         let mut ids = Vec::with_capacity(keys.len());
         for (row, key) in keys.into_iter().enumerate() {

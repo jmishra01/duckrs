@@ -9,7 +9,7 @@ use super::nested::row_wise;
 use super::{ScalarCallback, ScalarFunction, ScalarFunctionSet};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::{Value, ValueData};
-use duckrs_common::vector::{DataChunk, Vector};
+use duckrs_common::vector::{DataChunk, UnifiedFormat, Vector};
 use duckrs_common::{Error, ErrorKind, Result};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -85,18 +85,34 @@ fn substring_bounds(size: i64, offset: i64, length: i64) -> Option<(usize, usize
 }
 
 fn substring(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    strict_rows(args, result, |row| {
-        let input = text(&row[0]);
-        let (offset, length) = (integer(&row[1]), row.get(2).map_or(i64::from(u32::MAX), integer));
-        check_substring_range(input.len(), offset, length)?;
-        let chars: Vec<char> = input.chars().collect();
-        Ok(Value::varchar(
-            match substring_bounds(chars.len() as i64, offset, length) {
-                Some((start, end)) => chars[start..end].iter().collect(),
-                None => String::new(),
-            },
-        ))
-    })
+    let count = args.len();
+    let input = args.column(0).to_unified(count);
+    let offsets = args.column(1).to_unified(count);
+    let lengths = (args.column_count() > 2).then(|| args.column(2).to_unified(count));
+    let integer_at = |format: &UnifiedFormat, row: usize| format.data::<i64>()[format.sel.get(row)];
+    result.prepare_flat(count.max(1));
+    for row in 0..count {
+        if !input.is_valid(row) || !offsets.is_valid(row) || lengths.as_ref().is_some_and(|l| !l.is_valid(row)) {
+            result.set_null(row, true);
+            continue;
+        }
+        let bytes = input.str_at(row);
+        let offset = integer_at(&offsets, row);
+        let length = lengths.as_ref().map_or(i64::from(u32::MAX), |l| integer_at(l, row));
+        check_substring_range(bytes.len(), offset, length)?;
+        if bytes.is_ascii() {
+            let part =
+                substring_bounds(bytes.len() as i64, offset, length).map_or(&[][..], |(from, to)| &bytes[from..to]);
+            result.set_str(row, part);
+        } else {
+            let text = String::from_utf8_lossy(bytes);
+            let chars: Vec<char> = text.chars().collect();
+            let part: String = substring_bounds(chars.len() as i64, offset, length)
+                .map_or_else(String::new, |(from, to)| chars[from..to].iter().collect());
+            result.set_str(row, part.as_bytes());
+        }
+    }
+    Ok(())
 }
 
 /// `SubstringGrapheme`.

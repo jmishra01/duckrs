@@ -12,18 +12,18 @@
 
 use super::expression_executor::{MULTIPLE_ROWS, execute, select};
 use super::physical::{
-    OperatorResult, OperatorState, PhysicalOperator, SourceState, check_buffered, check_buffered_rows, group_keys,
+    OperatorResult, OperatorState, PhysicalOperator, SourceState, check_buffered, check_buffered_rows,
 };
 use crate::planner::expression::BoundExpr;
 use crate::planner::logical::JoinCondition;
 use duckrs_common::column_data::ColumnDataCollection;
+use duckrs_common::sort_key::{RowKey, RowKeyMap, create_row_keys};
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, SelectionVector, StringCopy, Vector};
 use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
 use duckrs_parser::ast::JoinType;
 use parking_lot::Mutex;
-use std::collections::HashMap;
 
 /// A chunk without rows, for when an operator has nothing to output this time.
 fn empty_chunk() -> DataChunk {
@@ -144,7 +144,7 @@ pub struct JoinBuild {
     count: usize,
     data: Option<DataChunk>,
     /// key -> index in `rows`; rows with a NULL key that is not null-safe are not in there
-    groups: HashMap<Vec<u8>, usize>,
+    groups: RowKeyMap<usize>,
     /// the build rows of each key
     rows: Vec<Vec<u32>>,
     /// whether each build row found a match
@@ -185,7 +185,7 @@ impl PhysicalJoin {
             columns,
             count: 0,
             data: None,
-            groups: HashMap::new(),
+            groups: RowKeyMap::default(),
             rows: Vec::new(),
             matched: Vec::new(),
             has_null_key: false,
@@ -203,14 +203,14 @@ impl PhysicalJoin {
 
     /// The key of each row of `chunk`, or `None` for a row that can match nothing because a key
     /// that is not null-safe is NULL.
-    fn keys(&self, chunk: &DataChunk, side: impl Fn(&JoinCondition) -> &BoundExpr) -> Result<Vec<Option<Vec<u8>>>> {
+    fn keys(&self, chunk: &DataChunk, side: impl Fn(&JoinCondition) -> &BoundExpr) -> Result<Vec<Option<RowKey>>> {
         let vectors = self
             .conditions
             .iter()
             .map(|c| execute(side(c), chunk))
             .collect::<Result<Vec<_>>>()?;
         let references: Vec<&Vector> = vectors.iter().collect();
-        let keys = group_keys(&references, chunk.len())?;
+        let keys = create_row_keys(&references, chunk.len())?;
         let nulls: Vec<_> = self
             .conditions
             .iter()

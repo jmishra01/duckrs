@@ -13,13 +13,14 @@ use super::physical::{
 use crate::planner::expression::BoundExpr;
 use crate::planner::logical::JoinCondition;
 use duckrs_common::column_data::ColumnDataCollection;
+use duckrs_common::sort_key::{RowKeySet, create_row_keys};
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, SelectionVector, Vector};
 use duckrs_common::{Result, STANDARD_VECTOR_SIZE};
 use duckrs_parser::ast::{ComparisonOp, JoinType};
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 fn row_values(chunk: &DataChunk, row: usize) -> Vec<Value> {
@@ -461,7 +462,7 @@ impl PhysicalOperator for PhysicalDelimJoin {
             .map(|c| c.left.return_type.clone())
             .collect();
         let mut distinct = ColumnDataCollection::new(types);
-        let mut seen = HashSet::new();
+        let mut seen = RowKeySet::default();
         for index in 0..left.chunk_count() {
             let chunk = left.chunk(index);
             let columns = self
@@ -471,11 +472,10 @@ impl PhysicalOperator for PhysicalDelimJoin {
                 .map(|c| execute(&c.left, chunk))
                 .collect::<Result<Vec<_>>>()?;
             let references: Vec<&Vector> = columns.iter().collect();
-            let rows: Vec<u32> = group_keys(&references, chunk.len())?
+            let rows: Vec<u32> = create_row_keys(&references, chunk.len())?
                 .into_iter()
                 .enumerate()
-                .filter(|(_, key)| seen.insert(key.clone()))
-                .map(|(row, _)| row as u32)
+                .filter_map(|(row, key)| seen.insert(key).then_some(row as u32))
                 .collect();
             if rows.is_empty() {
                 continue;
