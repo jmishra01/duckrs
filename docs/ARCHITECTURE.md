@@ -209,7 +209,8 @@ while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` 
   Column positions change, so a tree stays as it is under what reads its columns by position
   (set operations, DML, `DISTINCT`, the root); those have a projection below them in practice.
   Estimates use the total domain of each equivalence class and DuckDB's selectivities, from
-  `approx_count_distinct` on the first 100,000 rows of a table, per state of its rows. Those counts
+  `approx_count_distinct` on the first 100,000 rows of a table, per state of its rows, except that
+  integer and date columns are counted in all rows with a sketch, as a sample says little of keys. Those counts
   only steer the order, so being stale or uncommitted can make a plan slower but not wrong.
 - **`x IN (subquery)`** without correlated columns becomes a MARK join in `planner::subquery`, on a
   hash of the one key; the other uncorrelated subqueries stay expressions, which run once. A filter
@@ -248,8 +249,8 @@ until Phase 9; the others want statistics per function (`contains`, `substr`, `l
 
 TPC-H gives all 22 answers right at SF 0.01, 0.1 and 1, with `examples/tpch.rs` against DuckDB's
 answer files. Data comes from `tools/tpch/build_dbgen.sh`, which builds DuckDB's generators with text
-output. At SF 1 it is 15 times slower than DuckDB on one thread, by the geometric mean; Q9 is the
-worst at 70 times. Phase 8 brings parallelism. TPC-DS does not run yet.
+output. At SF 1 it is 14 times slower than DuckDB on one thread, by the geometric mean, and no
+query is more than 50 times slower. Phase 8 brings parallelism. TPC-DS does not run yet.
 
 Not ported yet: the box rendering of EXPLAIN, `Projections` of scans, moving LEFT joins in the join order, and SEMI and ANTI joins that read several
 relations (those stay on top of the tree), the estimator's caps for composite keys, estimated rows in EXPLAIN, flipping

@@ -134,9 +134,81 @@ pub(super) fn table_statistics(table: &Arc<TableCatalogEntry>) -> Option<Arc<Vec
 /// How many rows `compute_distinct_counts` reads, which a statement can pay for after every write.
 const DISTINCT_SAMPLE_ROWS: u64 = 100_000;
 
+/// A HyperLogLog sketch of 2^14 registers, for about 1.6% of error.
+struct DistinctSketch {
+    registers: Vec<u8>,
+}
+
+impl DistinctSketch {
+    const BITS: u32 = 14;
+
+    fn new() -> Self {
+        Self {
+            registers: vec![0; 1 << Self::BITS],
+        }
+    }
+
+    fn add(&mut self, value: u64) {
+        // the finalizer of MurmurHash3: nearby keys have to end up far apart
+        let mut hash = value;
+        hash ^= hash >> 33;
+        hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        hash ^= hash >> 33;
+        hash = hash.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        hash ^= hash >> 33;
+        let register = (hash >> (64 - Self::BITS)) as usize;
+        let rest = hash << Self::BITS | 1 << (Self::BITS - 1);
+        let slot = &mut self.registers[register];
+        *slot = (*slot).max(rest.leading_zeros() as u8 + 1);
+    }
+
+    fn estimate(&self) -> u64 {
+        let m = self.registers.len() as f64;
+        let harmonic: f64 = self.registers.iter().map(|&r| 2f64.powi(-i32::from(r))).sum();
+        let raw = 0.7213 / (1.0 + 1.079 / m) * m * m / harmonic;
+        let empty = self.registers.iter().filter(|&&r| r == 0).count();
+        // few values leave registers empty, and counting those is more exact
+        let estimate = if raw <= 2.5 * m && empty > 0 {
+            m * (m / empty as f64).ln()
+        } else {
+            raw
+        };
+        estimate.round() as u64
+    }
+}
+
+/// The distinct values in all rows of an integer or date column, which is what keys are. Those are
+/// cheap to read, and of keys a sample says little: the first rows of a sorted key have a part of
+/// its values, and those of a random one miss some.
+fn key_column_distinct(table: &TableCatalogEntry, column: usize) -> Option<u64> {
+    let mut sketch = DistinctSketch::new();
+    let id = table.columns[column].ty.id();
+    let storage = table.storage.read();
+    for chunk in storage.chunks() {
+        let count = chunk.len();
+        let unified = chunk.column(column).to_unified(count);
+        match id {
+            LogicalTypeId::BigInt => {
+                let data = unified.data::<i64>();
+                for row in (0..count).filter(|&row| unified.is_valid(row)) {
+                    sketch.add(data[unified.sel.get(row)] as u64);
+                }
+            }
+            LogicalTypeId::Integer | LogicalTypeId::Date => {
+                let data = unified.data::<i32>();
+                for row in (0..count).filter(|&row| unified.is_valid(row)) {
+                    sketch.add(data[unified.sel.get(row)] as u64);
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(sketch.estimate())
+}
+
 /// A scan that counts the distinct values of the columns of `table`, in its first rows. Nearly
 /// all distinct there is taken to go on in the same way, and otherwise for the values to be all
-/// there are.
+/// there are. Key columns are counted in all rows, with [`key_column_distinct`].
 fn compute_distinct_counts(table: &Arc<TableCatalogEntry>) -> Option<TableDistinctCounts> {
     let functions = BuiltinFunctions::get();
     let mut aggregates = Vec::new();
@@ -197,9 +269,13 @@ fn compute_distinct_counts(table: &Arc<TableCatalogEntry>) -> Option<TableDistin
             distinct
         }
     };
+    let columns = columns.into_iter().enumerate().map(|(column, at)| {
+        let exact = (rows > sampled).then(|| key_column_distinct(table, column)).flatten();
+        exact.or_else(|| at.and_then(as_count).map(scale))
+    });
     Some(TableDistinctCounts {
         rows,
-        columns: columns.into_iter().map(|at| at.and_then(as_count).map(scale)).collect(),
+        columns: columns.collect(),
     })
 }
 
@@ -1029,4 +1105,24 @@ fn expr_with_constants(
         },
         return_type.clone(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DistinctSketch;
+
+    #[test]
+    fn distinct_sketch_counts_within_its_error() {
+        for (values, repeats) in [(1u64, 100u64), (100, 5), (5_000, 3), (200_000, 30), (3_000_000, 1)] {
+            let mut sketch = DistinctSketch::new();
+            for _ in 0..repeats {
+                for value in 0..values {
+                    sketch.add(value);
+                }
+            }
+            let estimate = sketch.estimate() as f64;
+            let error = (estimate - values as f64).abs() / values as f64;
+            assert!(error < 0.05, "{values} values counted as {estimate}");
+        }
+    }
 }

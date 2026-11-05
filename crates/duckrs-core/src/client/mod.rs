@@ -3384,6 +3384,27 @@ mod tests {
         let plan = explain(&mut context, sql);
         let joins: Vec<&str> = plan.lines().filter(|l| l.contains("Join Type")).collect();
         assert!(joins[0].contains("SEMI") && joins[1].contains("INNER"), "{plan}");
+        // a join on two keys divides by the rows of the smaller side, not by both of its domains:
+        // with the domains multiplied, this one would look like 0 rows and go first
+        run(
+            &mut context,
+            "CREATE TABLE fact AS SELECT i % 400 AS p, i % 50 AS q FROM range(20000) t(i)",
+        );
+        run(
+            &mut context,
+            "CREATE TABLE pairs AS SELECT i % 400 AS p, i % 50 AS q, i AS id FROM range(2000) t(i)",
+        );
+        let plan = explain(
+            &mut context,
+            "SELECT count(*) FROM fact f, pairs x WHERE f.p = x.p AND f.q = x.q",
+        );
+        assert!(plan.contains("~20,000 rows\n      Seq Scan"), "{plan}");
+        // the answer does not depend on any of that
+        let rows = run(
+            &mut context,
+            "SELECT count(*) FROM fact f, pairs x WHERE f.p = x.p AND f.q = x.q AND x.id < 400",
+        );
+        assert_eq!(rows, [["20000"]]);
         // over the limit of the exact search, and without anything to connect two of them
         let many = (0..14).map(|i| format!("small s{i}")).collect::<Vec<_>>().join(", ");
         let joins = (1..14)

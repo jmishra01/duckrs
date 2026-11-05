@@ -5,7 +5,7 @@
 //! ```
 //!
 //! The `.tbl` files are pipe-delimited rows, as dbgen writes them. duckrs has no COPY yet, so they
-//! go in through INSERT.
+//! go in through INSERT. With `TPCH_EXPLAIN` set it prints the plan of each query first.
 
 use duckrs::{Connection, Database, Result};
 use std::fs;
@@ -134,6 +134,11 @@ fn main() -> Result<()> {
     let (mut correct, mut total_time) = (0, 0.0);
     for q in &queries {
         let mut sql = fs::read_to_string(dbgen.join(format!("queries/q{q:02}.sql"))).expect("the query");
+        if std::env::var_os("TPCH_EXPLAIN").is_some() {
+            connection.query("SET explain_output = 'ALL'")?;
+            let plan = run(&mut connection, &format!("EXPLAIN {sql}"))?;
+            println!("{}", plan.last().map(|row| row[1].as_str()).unwrap_or(""));
+        }
         // Q11's FRACTION is 0.0001 / SF, and the stored query has it for SF 1
         sql = sql.replace("0.0001000000", &format!("{:.10}", 0.0001 / scale));
         let expected = answer(&dbgen.join(format!("answers/sf{sf}/q{q:02}.csv")));

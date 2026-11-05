@@ -11,7 +11,7 @@
 //! A SEMI or ANTI join on a tree goes down to the one relation it reads, and stays on top of the
 //! tree's other joins otherwise. LEFT joins are relations, with their sides optimized apart, where
 //! DuckDB also moves them with conflict detection. The cardinality estimator is reduced to total
-//! domains per equivalence class and DuckDB's selectivities, without the caps for composite keys.
+//! domains per equivalence class, the cap for composite keys and DuckDB's selectivities.
 
 use super::conjunction_of;
 use super::filter_pushdown::condition_expression;
@@ -33,6 +33,9 @@ const MAX_PAIRS: usize = 10_000;
 const MAX_RELATIONS: usize = 63;
 /// `RelationStatisticsHelper::DEFAULT_SELECTIVITY`.
 const DEFAULT_SELECTIVITY: f64 = 0.2;
+/// `CompositeJoinPairStats::MAX_CARDINALITY_TO_DISTINCT_RATIO`: with more rows than this per value
+/// of a key column, the rows say little about how many keys there are.
+const MAX_CARDINALITY_TO_DISTINCT_RATIO: f64 = 8.0;
 /// What a recursive CTE round is assumed to hold.
 const UNKNOWN_CARDINALITY: f64 = 1000.0;
 
@@ -157,11 +160,23 @@ fn bare_column(expr: &BoundExpr) -> Option<ColumnBinding> {
     }
 }
 
+/// `ApplyJoinPairCap`: what a join on several keys divides by, for that of its keys on their own.
+/// A composite key has at most as many values as the smaller side has rows, where it is unique.
+fn composite_denominator(domains: &[f64], left_rows: f64, right_rows: f64) -> Option<f64> {
+    let cap = left_rows.min(right_rows);
+    let largest = domains.iter().copied().fold(0.0, f64::max);
+    let product: f64 = domains.iter().product();
+    let applies = domains.len() >= 2 && product > cap && cap >= largest;
+    (applies && cap > 0.0 && cap <= largest * MAX_CARDINALITY_TO_DISTINCT_RATIO).then_some(cap)
+}
+
 /// `CardinalityEstimator`, for one tree.
 struct Estimator {
     cardinalities: Vec<f64>,
     /// per equivalence class: the relations in it and its total domain
     classes: Vec<(u64, f64)>,
+    /// per pair of relations joined on several keys: the two, and the classes of those keys
+    composites: Vec<(u64, Vec<usize>)>,
     /// per predicate outside of the classes: its relations and what it divides the size by
     denominators: Vec<(u64, f64)>,
     estimates: HashMap<u64, f64>,
@@ -220,11 +235,38 @@ impl Estimator {
             class.0 |= 1 << relation_of[&binding];
             class.1 = class.1.max(distinct_of(&binding).unwrap_or(1.0));
         }
-        let mut classes: Vec<_> = classes.into_values().collect();
-        classes.sort_by_key(|class| class.0);
+        let mut classes: Vec<_> = classes.into_iter().collect();
+        classes.sort_by_key(|(root, _)| (root.table_index, root.column_index));
+        // `HasDirectCompositeEquality`: pairs of relations with equalities in several classes
+        let mut pairs: HashMap<u64, Vec<usize>> = HashMap::new();
+        for predicate in predicates {
+            if let BoundExprKind::Comparison {
+                op: ComparisonOp::Equal | ComparisonOp::NotDistinctFrom,
+                left,
+                ..
+            } = &predicate.expr.kind
+                && let Some(column) = bare_column(left)
+                && predicate.set.count_ones() == 2
+                && relation_of.contains_key(&column)
+                && parents.contains_key(&column)
+            {
+                let root = find(&mut parents, column);
+                let class = classes
+                    .iter()
+                    .position(|(r, _)| *r == root)
+                    .expect("every root has a class");
+                let keys = pairs.entry(predicate.set).or_default();
+                if !keys.contains(&class) {
+                    keys.push(class);
+                }
+            }
+        }
+        let mut composites: Vec<_> = pairs.into_iter().filter(|(_, keys)| keys.len() >= 2).collect();
+        composites.sort_unstable();
         Self {
             cardinalities: relations.iter().map(|r| r.cardinality).collect(),
-            classes,
+            classes: classes.into_iter().map(|(_, class)| class).collect(),
+            composites,
             denominators,
             estimates: HashMap::new(),
         }
@@ -251,6 +293,22 @@ impl Estimator {
         for &(relations, by) in &self.denominators {
             if relations & !set == 0 {
                 denominator *= by;
+            }
+        }
+        // the key of a pair counts once, and its class only for one pair
+        let mut used = vec![false; self.classes.len()];
+        for (pair, keys) in &self.composites {
+            if pair & !set != 0 || keys.iter().any(|&key| used[key]) {
+                continue;
+            }
+            let rows: Vec<f64> = (0..self.cardinalities.len())
+                .filter(|relation| pair & (1 << relation) != 0)
+                .map(|relation| self.cardinalities[relation])
+                .collect();
+            let domains: Vec<f64> = keys.iter().map(|&key| self.classes[key].1).collect();
+            if let Some(cap) = composite_denominator(&domains, rows[0], rows[1]) {
+                denominator = denominator / domains.iter().product::<f64>() * cap;
+                keys.iter().for_each(|&key| used[key] = true);
             }
         }
         let estimate = numerator / denominator;
@@ -687,12 +745,16 @@ impl JoinOrderOptimizer {
                     let distinct = columns.iter().filter_map(|c| left.distinct.get(c).copied());
                     distinct.reduce(f64::max)
                 };
-                let mut denominator = 1.0;
-                for condition in conditions {
-                    let sides = [domain_of(&condition.left), domain_of(&condition.right)];
-                    let domain = sides.into_iter().flatten().reduce(f64::max);
-                    denominator *= domain.unwrap_or(left_rows.max(right_rows)).max(1.0);
-                }
+                let domains: Vec<f64> = conditions
+                    .iter()
+                    .map(|condition| {
+                        let sides = [domain_of(&condition.left), domain_of(&condition.right)];
+                        let domain = sides.into_iter().flatten().reduce(f64::max);
+                        domain.unwrap_or(left_rows.max(right_rows)).max(1.0)
+                    })
+                    .collect();
+                let mut denominator =
+                    composite_denominator(&domains, left_rows, right_rows).unwrap_or_else(|| domains.iter().product());
                 if let Some(predicate) = predicate {
                     let mut conjuncts = Vec::new();
                     split_conjuncts(predicate.clone(), &mut conjuncts);
