@@ -795,7 +795,6 @@ fn number_of(value: &Value) -> Result<f64> {
     }
     Ok(match value.data() {
         ValueData::Double(v) => *v,
-        ValueData::Float(v) => f64::from(*v),
         _ => value
             .as_i128()
             .map(|v| v as f64)
@@ -1039,7 +1038,7 @@ fn format_fmt_argument(value: &Value, spec: &str) -> Result<String> {
         Some(conversion) => printf_spec.conversion = conversion,
         None => {
             printf_spec.conversion = match value.data() {
-                ValueData::Double(_) | ValueData::Float(_) if printf_spec.precision.is_some() => 'g',
+                ValueData::Double(_) if printf_spec.precision.is_some() => 'g',
                 _ if printf_spec.precision.is_some() && value.logical_type().id() == LogicalTypeId::Decimal => 'g',
                 ValueData::Bytes(_) => 's',
                 _ if value.as_i128().is_some() => 'd',
