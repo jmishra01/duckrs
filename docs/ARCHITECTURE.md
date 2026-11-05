@@ -359,9 +359,7 @@ refused as DuckDB refuses them: damaged, or of another vector size. A file whose
 because it was ignored can now fail: `test/sql/storage/bc/test_broken_view_v092.test` left
 `known_passing.txt`, as it needs views.
 
-The tests compare FLOAT and DOUBLE columns by value. Their text differs at times: DuckDB prints the
-FLOAT 63.9921875 in full where duckrs prints `63.992188`, and DuckDB's `8.124038696289062` is
-duckrs's `8.124038696289063`, both one double. That is `string_cast`, not storage.
+The tests compare every column as the text that DuckDB prints, FLOAT and DOUBLE included.
 
 The gate is not met: `test/sql/storage` is at 9.6% against 85%, and the corpus doesn't move until
 checkpoints, as nearly all of those tests write first.

@@ -1,71 +1,38 @@
 // Ported from duckdb/src/common/operator/string_cast.cpp, cast_helpers.hpp (DecimalToString) and
 // types/blob.cpp (Blob::ToString) @ rust-port-baseline
 
-/// Formats a DOUBLE like `duckdb_fmt::format("{}", value)`: the shortest digits that round-trip,
-/// in fixed notation when the decimal exponent is in `-4..16` (with `.0` for integral values),
-/// otherwise in scientific notation with a signed, at-least-two-digit exponent.
+use crate::fmt_float::format_finite;
+
+/// Formats a DOUBLE like `duckdb_fmt::format("{}", value)`: fixed notation when the decimal exponent
+/// is in `-4..16` (with `.0` for integral values), otherwise scientific notation with a signed,
+/// at-least-two-digit exponent. The digits are what fmt's Grisu produces, which are nearly always,
+/// but not always, the shortest and closest ones (see `fmt_float`).
 pub fn format_double(value: f64) -> String {
-    if value.is_nan() {
-        return if value.is_sign_negative() { "-nan" } else { "nan" }.into();
-    }
-    if value.is_infinite() {
-        return if value > 0.0 { "inf" } else { "-inf" }.into();
-    }
-    format_shortest(&format!("{value:e}"))
-}
-
-/// Formats a FLOAT with the shortest digits that round-trip as an `f32`.
-pub fn format_float(value: f32) -> String {
-    if value.is_nan() {
-        return if value.is_sign_negative() { "-nan" } else { "nan" }.into();
-    }
-    if value.is_infinite() {
-        return if value > 0.0 { "inf" } else { "-inf" }.into();
-    }
-    format_shortest(&format!("{value:e}"))
-}
-
-/// Re-renders Rust's shortest `{:e}` output (`-1.2345e-7`) in fmt's general format.
-fn format_shortest(scientific: &str) -> String {
-    let (mantissa, exponent) = scientific.split_once('e').expect("{:e} output has an exponent");
-    let exponent: i32 = exponent.parse().expect("valid exponent");
-    let (negative, mantissa) = match mantissa.strip_prefix('-') {
-        Some(m) => (true, m),
-        None => (false, mantissa),
-    };
-    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    let mut out = String::with_capacity(digits.len() + 8);
-    if negative {
-        out.push('-');
-    }
-    if (-4..16).contains(&exponent) {
-        if exponent < 0 {
-            out.push_str("0.");
-            out.extend(std::iter::repeat_n('0', (-exponent - 1) as usize));
-            out.push_str(&digits);
-        } else {
-            let int_len = exponent as usize + 1;
-            if digits.len() <= int_len {
-                out.push_str(&digits);
-                out.extend(std::iter::repeat_n('0', int_len - digits.len()));
-                out.push_str(".0");
-            } else {
-                out.push_str(&digits[..int_len]);
-                out.push('.');
-                out.push_str(&digits[int_len..]);
-            }
-        }
+    if value.is_finite() {
+        format_finite(value, false)
     } else {
-        out.push_str(&digits[..1]);
-        if digits.len() > 1 {
-            out.push('.');
-            out.push_str(&digits[1..]);
-        }
-        out.push('e');
-        out.push(if exponent < 0 { '-' } else { '+' });
-        out.push_str(&format!("{:02}", exponent.unsigned_abs()));
+        format_non_finite(value.is_nan(), value.is_sign_negative())
     }
-    out
+}
+
+/// Formats a FLOAT in the same way. fmt looks for digits that round-trip as an `f32`, but where
+/// that fails it prints the shortest ones of the `f64` that the value converts to.
+pub fn format_float(value: f32) -> String {
+    if value.is_finite() {
+        format_finite(f64::from(value), true)
+    } else {
+        format_non_finite(value.is_nan(), value.is_sign_negative())
+    }
+}
+
+fn format_non_finite(nan: bool, negative: bool) -> String {
+    match (nan, negative) {
+        (true, false) => "nan",
+        (true, true) => "-nan",
+        (false, false) => "inf",
+        (false, true) => "-inf",
+    }
+    .into()
 }
 
 /// Formats an unscaled decimal value (`DecimalToString::FormatDecimal`). When `width == scale`
@@ -168,6 +135,7 @@ mod tests {
             (1.0 / 3.0, "0.3333333333333333"),
             (-12.75, "-12.75"),
             (9.999e-5, "9.999e-05"),
+            (8.124038696289062, "8.124038696289062"),
         ];
         for (value, expected) in cases {
             assert_eq!(format_double(*value), *expected, "{value:e}");
@@ -185,9 +153,97 @@ mod tests {
             (1e-7, "1e-07"),
             (16777216.0, "16777216.0"),
             (1e16, "1e+16"),
+            (1e30, "1e+30"),
+            (0.0, "0.0"),
+            (-0.0, "-0.0"),
+            (f32::INFINITY, "inf"),
+            (f32::NEG_INFINITY, "-inf"),
         ];
         for (value, expected) in cases {
             assert_eq!(format_float(*value), *expected, "{value:e}");
+        }
+    }
+
+    /// Bit patterns, and what DuckDB v1.5.6 prints for them: awkward cases of fmt's digit generation.
+    #[test]
+    fn awkward_floats_match_duckdb() {
+        let cases: &[(u32, &str)] = &[
+            // the examples
+            (0x427ff800, "63.9921875"),
+            (0x3dcccccd, "0.1"),
+            (0x7149f2ca, "1e+30"),
+            // prints the shortest DOUBLE, as Grisu gives up on these
+            (0x39800000, "0.000244140625"),
+            (0x3ac00000, "0.00146484375"),
+            (0x40004000, "2.00390625"),
+            (0x4002c000, "2.04296875"),
+            (0x500001c6, "8590399488.0"),
+            (0x50000438, "8591040512.0"),
+            // subnormals, and around the smallest normal value
+            (0x00000001, "1e-45"),
+            (0x00000002, "3e-45"),
+            (0x00000003, "4e-45"),
+            (0x000fffff, "1.469367e-39"),
+            (0x007fffff, "1.1754942e-38"),
+            (0x00800000, "1.1754944e-38"),
+            (0x00800001, "1.1754945e-38"),
+            // powers of two
+            (0x3f800000, "1.0"),
+            (0x40000000, "2.0"),
+            (0x01000000, "2.3509887e-38"),
+            (0x7f000000, "1.7014118e+38"),
+            (0x7f7fffff, "3.4028235e+38"),
+            // fixed and scientific
+            (0x38d1b717, "0.0001"),
+            (0x38d1b68e, "9.9999e-05"),
+            (0x3727c5ac, "1e-05"),
+            (0x58635fa9, "1000000000000000.0"),
+            (0x5a0e1bc9, "9999999000000000.0"),
+            (0x5a0e1bca, "1e+16"),
+            (0x5a0e1bcb, "1.0000001e+16"),
+        ];
+        for (bits, expected) in cases {
+            let value = f32::from_bits(*bits);
+            assert_eq!(format_float(value), *expected, "{bits:#x}");
+            assert_eq!(format_float(-value), format!("-{expected}"), "{bits:#x}");
+        }
+    }
+
+    /// The same for doubles.
+    #[test]
+    fn awkward_doubles_match_duckdb() {
+        let cases: &[(u64, &str)] = &[
+            // ties between two shortest forms
+            (0x40203f8200000000, "8.124038696289062"),
+            (0x3e60000000000000, "2.9802322387695312e-08"),
+            (0x42a0000000000020, "8796093022208.062"),
+            (0x42bfffffffffffd0, "35184372088831.812"),
+            (0x42d0000000000008, "70368744177664.12"),
+            (0x42effffffffffff4, "281474976710655.62"),
+            // subnormals, and around the smallest normal value
+            (0x0000000000000002, "1e-323"),
+            (0x0000000000000003, "1.5e-323"),
+            (0x000fffffffffffff, "2.225073858507201e-308"),
+            (0x0010000000000000, "2.2250738585072014e-308"),
+            (0x0010000000000001, "2.225073858507202e-308"),
+            // fixed and scientific
+            (0x3f1a36e2eb1c432d, "0.0001"),
+            (0x3f1a36e2eb1c432c, "9.999999999999999e-05"),
+            (0x3ee4f8b588e368f1, "1e-05"),
+            (0x4341c37937e07fff, "9999999999999998.0"),
+            (0x4341c37937e08000, "1e+16"),
+            (0x4341c37937e08001, "1.0000000000000002e+16"),
+            // fmt's fallback scales powers of two from 2^53 up wrongly: 2^81 and 2^91 print as twice
+            // their value, and the first digit of 2^807 runs past 9
+            (0x4340000000000000, "9007199254740992.0"),
+            (0x4500000000000000, "4.835703278458517e+24"),
+            (0x45a0000000000000, "4.951760157141521e+27"),
+            (0x7260000000000000, "A.070116948172427e+242"),
+        ];
+        for (bits, expected) in cases {
+            let value = f64::from_bits(*bits);
+            assert_eq!(format_double(value), *expected, "{bits:#x}");
+            assert_eq!(format_double(-value), format!("-{expected}"), "{bits:#x}");
         }
     }
 

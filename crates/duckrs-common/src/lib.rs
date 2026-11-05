@@ -6,6 +6,7 @@ pub mod column_data;
 pub mod comparison;
 mod error;
 pub mod executor;
+mod fmt_float;
 pub mod hash;
 pub mod row;
 pub mod serializer;

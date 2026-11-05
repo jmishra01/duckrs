@@ -152,14 +152,13 @@ DELETE FROM deletes WHERE i % 97 = 0 OR i BETWEEN 2048 AND 4095 OR i BETWEEN 410
 CHECKPOINT;
 SQL
 
-# FLOATs go through DOUBLE, to compare their values: duckrs and DuckDB can print one differently.
 expected() { # file table...
     file=$1
     shift
     for table in "$@"; do
         name=$(echo "$table" | tr . _)
         columns=$("$DUCKDB" -readonly -noheader -list "$file" \
-            -c "SELECT string_agg('\"' || column_name || '\"' || if(data_type = 'FLOAT', '::DOUBLE', '') || '::VARCHAR', ', ' ORDER BY ordinal_position)
+            -c "SELECT string_agg('\"' || column_name || '\"::VARCHAR', ', ' ORDER BY ordinal_position)
                 FROM information_schema.columns
                 WHERE table_schema || '.' || table_name = '$table' OR table_name = '$table'")
         "$DUCKDB" -readonly -noheader -list -separator '|' -nullvalue NULL "$file" \
