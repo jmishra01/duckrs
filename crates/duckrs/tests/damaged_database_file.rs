@@ -89,6 +89,26 @@ fn bitpacked_blocks() {
 }
 
 #[test]
+fn floats() {
+    fuzz("floats.db", 0x8CB92BA72F3D8DD7, 300);
+}
+
+#[test]
+fn roaring_and_dict_fsst() {
+    fuzz("modern.db", 0xA0761D6478BD642F, 1200);
+}
+
+#[test]
+fn nested_columns() {
+    fuzz("nested.db", 0xE7037ED1A0B428DB, 1200);
+}
+
+#[test]
+fn deletes() {
+    fuzz("deletes.db", 0x8EBC6AF09C88C6E3, 800);
+}
+
+#[test]
 fn uncompressed_blocks() {
     fuzz("compatible.db", 0x2545F4914F6CDD1D, 1000);
 }

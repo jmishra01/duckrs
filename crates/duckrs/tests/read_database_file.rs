@@ -1,7 +1,7 @@
 //! Reads files written by the real DuckDB and compares every row with what DuckDB read from them.
 //! `tests/fixtures/generate.sh` makes both.
 
-use duckrs::{Connection, Database, Error, ErrorKind};
+use duckrs::{Connection, Database, Error, ErrorKind, LogicalType};
 use std::path::{Path, PathBuf};
 
 fn fixture(name: &str) -> PathBuf {
@@ -14,11 +14,16 @@ fn connect(file: &str) -> Connection {
 
 /// `SELECT *` as text, with DuckDB's `-list` format.
 fn rows(connection: &mut Connection, table: &str) -> Vec<String> {
-    let columns = connection
-        .query(&format!("SELECT * FROM {table} LIMIT 0"))
-        .unwrap()
-        .names;
-    let casts: Vec<String> = columns.iter().map(|c| format!("\"{c}\"::VARCHAR")).collect();
+    let columns = connection.query(&format!("SELECT * FROM {table} LIMIT 0")).unwrap();
+    let casts: Vec<String> = columns
+        .names
+        .iter()
+        .zip(&columns.types)
+        .map(|(c, ty)| {
+            let through = if *ty == LogicalType::FLOAT { "::DOUBLE" } else { "" };
+            format!("\"{c}\"{through}::VARCHAR")
+        })
+        .collect();
     let result = connection
         .query(&format!("SELECT {} FROM {table}", casts.join(", ")))
         .unwrap();
@@ -49,10 +54,28 @@ fn compare(file: &str, tables: &[&str]) {
         let expected: Vec<&str> = std::str::from_utf8(&bytes).unwrap().lines().collect();
         let actual = rows(&mut connection, table);
         assert_eq!(actual.len(), expected.len(), "rows of {table}");
+        let types = connection
+            .query(&format!("SELECT * FROM {table} LIMIT 0"))
+            .unwrap()
+            .types;
         for (row, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
-            assert_eq!(actual, expected, "row {row} of {table}");
+            let same = actual == expected || same_floats(actual, expected, &types);
+            assert!(same, "row {row} of {table}: {actual} and {expected}");
         }
     }
+}
+
+/// Whether two rows differ at most in how floats are printed. A value can have two shortest forms,
+/// and DuckDB and duckrs pick differently: `8.124038696289062` and `...063` are one double.
+fn same_floats(actual: &str, expected: &str, types: &[LogicalType]) -> bool {
+    let (actual, expected): (Vec<_>, Vec<_>) = (actual.split('|').collect(), expected.split('|').collect());
+    actual.len() == types.len()
+        && expected.len() == types.len()
+        && (0..types.len()).all(|i| {
+            let float = types[i] == LogicalType::FLOAT || types[i] == LogicalType::DOUBLE;
+            let bits = |text: &str| text.parse::<f64>().map(f64::to_bits).ok();
+            actual[i] == expected[i] || (float && bits(actual[i]).is_some() && bits(actual[i]) == bits(expected[i]))
+        })
 }
 
 #[test]
@@ -74,6 +97,26 @@ fn rle_dictionary_fsst_and_constant() {
 #[test]
 fn bitpacking() {
     compare("bitpacked.db", &["bitpacking", "groups"]);
+}
+
+#[test]
+fn floats() {
+    compare("floats.db", &["alp", "alprd"]);
+}
+
+#[test]
+fn roaring_and_dict_fsst_from_newer_storage_versions() {
+    compare("modern.db", &["validity", "dict_fsst"]);
+}
+
+#[test]
+fn nested_columns() {
+    compare("nested.db", &["lists", "empty_lists", "structs", "arrays", "maps"]);
+}
+
+#[test]
+fn deleted_rows_stay_deleted() {
+    compare("deletes.db", &["deletes"]);
 }
 
 #[test]

@@ -315,11 +315,17 @@ place yet and nothing but the block layer writes.
   row group pointers, so they are decoded just to get past them (`statistics`). Elements that are
   pointers in C++ (`unique_ptr`, `shared_ptr`) have a presence flag in front.
 - **Columns** (`table_data`, `compression`): uncompressed, constant, RLE, bitpacking (all four modes
-  and hugeint), dictionary and FSST, plus validity, overflow strings and the empty validity
-  segment. A scan decodes a whole segment, row by row. Packed values are one stream of bits,
-  least significant first, whatever fastpforlib does to get there, so one reader handles all widths.
+  and hugeint), dictionary, FSST, DICT_FSST, ALP, ALPRD and Roaring (for validity and booleans), plus
+  validity, overflow strings and the empty validity segment, which says nothing: DICT_FSST keeps
+  NULLs as dictionary index 0. A scan decodes a whole segment, row by row. Packed values are one
+  stream of bits, least significant first, whatever fastpforlib does to get there, so one reader
+  handles all widths. LIST (with MAP), ARRAY and STRUCT (with UNION) are read column by column into a
+  nested `Vector`; a list stores cumulative offsets into its child.
+- **Deleted rows**: a row group's first delete pointer leads to one mask per vector, and the rows that
+  are left go through a selection.
 
 What is read comes from outside, so it is bounds-checked, and damage is an error, never a panic.
+Segment counts must add up to their column's rows before anything is decoded or allocated.
 
 A file opened read-only stays as it is, and the file is only ever opened read-only for now. Rows
 are copied into each table's `ColumnDataCollection`, so a database has to fit in memory, and its
@@ -330,18 +336,16 @@ database as before: new files are not written, which the corpus relies on until 
 These fail with an error that says they are not ported, because going on would give wrong answers
 or lose data:
 
-- ALP, ALPRD, Roaring, ZSTD, DICT_FSST, Chimp and Patas. Floating point columns usually have ALP,
-  and files written with `storage_version` v1.5.0 have DICT_FSST strings, so those can't be read
-  yet. Files with DuckDB's default compatibility can, floats aside;
-- LIST, STRUCT, ARRAY, MAP, UNION, VARIANT and GEOMETRY columns;
+- ZSTD, Chimp and Patas;
+- VARIANT and GEOMETRY columns;
 - views, macros, sequences, indexes, custom types, triggers, and default values, generated columns,
   CHECK, UNIQUE and FOREIGN KEY constraints, which take the serialized parsed expressions;
-- deleted rows in a row group, a write-ahead log that waits to be replayed, encrypted files.
+- a write-ahead log that waits to be replayed, encrypted files.
 
-Next, in order: the rest of the codecs and nested columns; the parsed expression serializer (ported
-through the generator, as the plan says) for defaults, views and macros; deletes and WAL replay;
-scanning row groups in place through the buffer manager; then checkpoints, for which the block
-layer is ready. `ATTACH` follows from there.
+Next, in order: the parsed expression serializer (ported through the generator, as the plan says)
+for defaults, views and macros, which most real files need; indexes; WAL replay; scanning row
+groups in place through the buffer manager; then checkpoints, for which the block layer is ready.
+`ATTACH` follows from there. ZSTD takes a new dependency, and Chimp and Patas are only in old files.
 
 `crates/duckrs/tests/read_database_file.rs` compares every row of files from the real DuckDB with what
 DuckDB reads from them; `tests/fixtures/generate.sh` makes both. `damaged_database_file.rs` changes
@@ -350,11 +354,17 @@ exactly and not just bounds: an FSST symbol table in the wrong place is corrupti
 bounds, as otherwise strings decode to garbage without an error.
 
 Of the 34 database files in DuckDB's `data/storage`, 14 open. The rest fail on views (6), indexes (3),
-dependencies between entries (2), macros, constraints and types (3), or codecs (3), and 3 are refused
-as DuckDB refuses them: damaged, or of another vector size. A file whose test used to pass because it was ignored can now fail:
-`test/sql/storage/bc/test_broken_view_v092.test` left `known_passing.txt`, as it needs views.
+dependencies between entries (2), macros, constraints and types (3), and Patas (1), and 5 are
+refused as DuckDB refuses them: damaged, or of another vector size. A file whose test used to pass
+because it was ignored can now fail: `test/sql/storage/bc/test_broken_view_v092.test` left
+`known_passing.txt`, as it needs views.
 
-The gate is not met: `test/sql/storage` is at 9.6% against 85% and needs checkpoints.
+The tests compare FLOAT and DOUBLE columns by value. Their text differs at times: DuckDB prints the
+FLOAT 63.9921875 in full where duckrs prints `63.992188`, and DuckDB's `8.124038696289062` is
+duckrs's `8.124038696289063`, both one double. That is `string_cast`, not storage.
+
+The gate is not met: `test/sql/storage` is at 9.6% against 85%, and the corpus doesn't move until
+checkpoints, as nearly all of those tests write first.
 
 ## Testing
 

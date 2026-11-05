@@ -22,7 +22,7 @@ ROWS="SELECT
   ('blob' || (i % 9))::BLOB
   FROM range(COUNT_ROWS) r(i)"
 
-rm -f compatible.db compressed.db bitpacked.db *.expected
+rm -f compatible.db compressed.db bitpacked.db floats.db modern.db nested.db deletes.db *.expected
 "$DUCKDB" <<SQL
 ATTACH 'compatible.db' (BLOCK_SIZE 16384);
 USE compatible;
@@ -78,13 +78,88 @@ INSERT INTO groups SELECT CASE WHEN i < 2048 THEN 7 ELSE i END, CASE WHEN i % 2 
 CHECKPOINT;
 SQL
 
+# Floats: DuckDB uses ALP and ALPRD only in blocks of the default size. Then what is new since v1.0.
+"$DUCKDB" <<SQL
+ATTACH 'floats.db';
+USE floats;
+PRAGMA force_compression = 'alp';
+CREATE TABLE alp (d DOUBLE, f FLOAT, exceptions DOUBLE);
+INSERT INTO alp SELECT i / 100, (i % 1000) / 8, CASE WHEN i % 50 = 0 THEN 1 / 3 * i WHEN i % 7 = 0 THEN NULL ELSE i / 1000 END
+  FROM range(5000) r(i);
+INSERT INTO alp VALUES ('NaN', 'NaN', 'infinity'), (0.0, -0.0, '-infinity'), (1e300, 1e30, 1e-300);
+CHECKPOINT;
+PRAGMA force_compression = 'alprd';
+CREATE TABLE alprd (d DOUBLE, f FLOAT);
+INSERT INTO alprd SELECT sqrt(i) * 3.14159, sqrt(i)::FLOAT FROM range(5000) r(i);
+CHECKPOINT;
+PRAGMA force_compression = 'auto';
+SQL
+
+"$DUCKDB" <<SQL
+ATTACH 'modern.db' (BLOCK_SIZE 16384, STORAGE_VERSION 'v1.5.0');
+USE modern;
+PRAGMA force_compression = 'roaring';
+CREATE TABLE validity (few_nulls INTEGER, few_values INTEGER, runs INTEGER, many_runs INTEGER, bits INTEGER, b BOOLEAN);
+INSERT INTO validity SELECT
+  CASE WHEN i % 1000 = 0 OR i % 1009 = 0 THEN NULL ELSE i END,
+  CASE WHEN i % 1000 = 0 OR i % 1009 = 0 THEN i END,
+  CASE WHEN i % 4000 < 1000 THEN NULL ELSE i END,
+  CASE WHEN i % 300 < 20 THEN NULL ELSE i END,
+  CASE WHEN (i * 2654435761) % 4294967296 % 5 < 2 THEN NULL ELSE i END,
+  CASE WHEN i % 7 = 0 THEN NULL ELSE (i * 2654435761) % 4294967296 % 3 = 0 END
+  FROM range(9000) r(i);
+CHECKPOINT;
+PRAGMA force_compression = 'dict_fsst';
+CREATE TABLE dict_fsst (few VARCHAR, unique_strings VARCHAR, n VARCHAR);
+INSERT INTO dict_fsst SELECT 'category number ' || (i % 20), 'unique value that compresses well ' || i,
+  CASE WHEN i % 3 = 0 THEN NULL WHEN i % 3 = 1 THEN '' ELSE 'x' END FROM range(4000) r(i);
+CHECKPOINT;
+PRAGMA force_compression = 'auto';
+SQL
+
+"$DUCKDB" <<SQL
+ATTACH 'nested.db' (BLOCK_SIZE 16384);
+USE nested;
+CREATE TABLE lists (l INTEGER[], s VARCHAR[], ll INTEGER[][]);
+INSERT INTO lists SELECT
+  CASE WHEN i % 5 = 0 THEN NULL WHEN i % 5 = 1 THEN [] ELSE [i, NULL, i + 1] END,
+  CASE WHEN i % 7 = 0 THEN NULL ELSE ['a' || i, NULL, ''] END,
+  [[i], [], NULL, [i, i]] FROM range(3000) r(i);
+CREATE TABLE empty_lists (l INTEGER[]);
+INSERT INTO empty_lists SELECT [] FROM range(10);
+CREATE TABLE structs (s STRUCT(a INTEGER, b VARCHAR), n STRUCT(x STRUCT(y INTEGER[], z DOUBLE)));
+INSERT INTO structs SELECT CASE WHEN i % 5 = 0 THEN NULL ELSE {'a': i, 'b': CASE WHEN i % 2 = 0 THEN NULL ELSE 'v' || i END} END,
+  {'x': {'y': [i], 'z': i / 2}} FROM range(3000) r(i);
+CREATE TABLE arrays (a INTEGER[3], s VARCHAR[2], aa INTEGER[2][2]);
+INSERT INTO arrays SELECT [i, NULL, i + 2]::INTEGER[3], ['x' || i, NULL]::VARCHAR[2],
+  [[i, i], [i, NULL]]::INTEGER[2][2] FROM range(3000) r(i);
+INSERT INTO arrays SELECT NULL, ['y' || i, 'z']::VARCHAR[2], NULL FROM range(100) r(i);
+CREATE TABLE maps (m MAP(VARCHAR, INTEGER), u UNION(num INTEGER, str VARCHAR), e ENUM('sad', 'ok', 'happy'));
+INSERT INTO maps SELECT CASE WHEN i % 5 = 0 THEN NULL ELSE map(['k' || i, 'other'], [i, NULL]) END,
+  CASE WHEN i % 2 = 0 THEN union_value(num := i)::UNION(num INTEGER, str VARCHAR)
+       ELSE union_value(str := 's' || i)::UNION(num INTEGER, str VARCHAR) END,
+  (['sad', 'ok', 'happy'])[i % 3 + 1]::ENUM('sad', 'ok', 'happy') FROM range(3000) r(i);
+CHECKPOINT;
+SQL
+
+"$DUCKDB" <<SQL
+ATTACH 'deletes.db' (BLOCK_SIZE 16384);
+USE deletes;
+CREATE TABLE deletes (i INTEGER, s VARCHAR);
+INSERT INTO deletes SELECT i, 's' || (i % 10) FROM range(30000) r(i);
+CHECKPOINT;
+DELETE FROM deletes WHERE i % 97 = 0 OR i BETWEEN 2048 AND 4095 OR i BETWEEN 4100 AND 6000;
+CHECKPOINT;
+SQL
+
+# FLOATs go through DOUBLE, to compare their values: duckrs and DuckDB can print one differently.
 expected() { # file table...
     file=$1
     shift
     for table in "$@"; do
         name=$(echo "$table" | tr . _)
         columns=$("$DUCKDB" -readonly -noheader -list "$file" \
-            -c "SELECT string_agg('\"' || column_name || '\"::VARCHAR', ', ' ORDER BY ordinal_position)
+            -c "SELECT string_agg('\"' || column_name || '\"' || if(data_type = 'FLOAT', '::DOUBLE', '') || '::VARCHAR', ', ' ORDER BY ordinal_position)
                 FROM information_schema.columns
                 WHERE table_schema || '.' || table_name = '$table' OR table_name = '$table'")
         "$DUCKDB" -readonly -noheader -list -separator '|' -nullvalue NULL "$file" \
@@ -94,3 +169,7 @@ expected() { # file table...
 expected compatible.db other.t uncompressed long_strings empty_table
 expected compressed.db rle dictionary fsst fsst_empty constant
 expected bitpacked.db bitpacking groups
+expected floats.db alp alprd
+expected modern.db validity dict_fsst
+expected nested.db lists empty_lists structs arrays maps
+expected deletes.db deletes

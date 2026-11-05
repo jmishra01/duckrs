@@ -16,7 +16,11 @@ pub const COMPRESSION_RLE: u8 = 3;
 pub const COMPRESSION_DICTIONARY: u8 = 4;
 pub const COMPRESSION_BITPACKING: u8 = 6;
 pub const COMPRESSION_FSST: u8 = 7;
+pub const COMPRESSION_ALP: u8 = 10;
+pub const COMPRESSION_ALPRD: u8 = 11;
+pub const COMPRESSION_ROARING: u8 = 13;
 pub const COMPRESSION_EMPTY: u8 = 14;
+pub const COMPRESSION_DICT_FSST: u8 = 15;
 
 /// `BITPACKING_ALGORITHM_GROUP_SIZE`.
 const ALGORITHM_GROUP_SIZE: usize = 32;
@@ -27,11 +31,7 @@ pub fn compression_name(compression: u8) -> &'static str {
     match compression {
         8 => "Chimp",
         9 => "Patas",
-        10 => "ALP",
-        11 => "ALPRD",
         12 => "ZSTD",
-        13 => "Roaring",
-        15 => "DICT_FSST",
         _ => "this",
     }
 }
@@ -491,6 +491,422 @@ pub fn scan_fsst(segment: &[u8], count: usize, out: &mut Vec<Vec<u8>>) -> Result
             .checked_sub(offset)
             .ok_or_else(|| out_of_bounds("an FSST string"))?;
         out.push(decoder.decompress(&dictionary[from..from + length])?);
+    }
+    Ok(())
+}
+
+/// `AlpConstants::ALP_VECTOR_SIZE`.
+const ALP_VECTOR_SIZE: usize = 1024;
+/// `AlpConstants::MAX_BIT_WIDTH`: the encoded values are 64 bits wide.
+const ALP_MAX_BIT_WIDTH: usize = 64;
+
+/// The table at the end of an ALP or ALPRD segment: where each vector starts, last vector first.
+/// Yields the bytes of each vector.
+fn alp_vectors<'a>(
+    segment: &'a [u8],
+    count: usize,
+    data_start: usize,
+) -> Result<impl Iterator<Item = Result<(usize, &'a [u8])>> + 'a> {
+    let what = "the metadata of an ALP segment";
+    let metadata_end = u32_at(segment, 0, what)? as usize;
+    let vector_count = count.div_ceil(ALP_VECTOR_SIZE);
+    let metadata_start = metadata_end
+        .checked_sub(vector_count * 4)
+        .filter(|&start| start >= data_start)
+        .ok_or_else(|| out_of_bounds(what))?;
+    let table = bytes(segment, metadata_start, vector_count * 4, what)?;
+    let offset = move |index: usize| {
+        let at = (vector_count - 1 - index) * 4;
+        u32::from_le_bytes(table[at..at + 4].try_into().expect("4 bytes")) as usize
+    };
+    Ok((0..vector_count).map(move |index| {
+        let start = offset(index);
+        let end = if index + 1 < vector_count {
+            offset(index + 1)
+        } else {
+            metadata_start
+        };
+        if start < data_start || start > end || end > metadata_start {
+            return Err(out_of_bounds("a vector of an ALP segment"));
+        }
+        let rows = ALP_VECTOR_SIZE.min(count - index * ALP_VECTOR_SIZE);
+        Ok((rows, &segment[start..end]))
+    }))
+}
+
+/// Takes `size` bytes off the front of `data`.
+fn advance<'a>(data: &mut &'a [u8], size: usize, what: &str) -> Result<&'a [u8]> {
+    let head = bytes(data, 0, size, what)?;
+    *data = &data[size..];
+    Ok(head)
+}
+
+/// The exceptions at the end of a vector: their values and where they go.
+fn alp_exceptions<'a>(
+    vector: &mut &'a [u8],
+    count: usize,
+    width: usize,
+    rows: usize,
+) -> Result<(&'a [u8], Vec<usize>)> {
+    let what = "the exceptions of an ALP vector";
+    if count > rows {
+        return Err(corrupt("an ALP vector has more exceptions than rows"));
+    }
+    let values = advance(vector, count * width, what)?;
+    let positions = advance(vector, count * 2, what)?
+        .chunks_exact(2)
+        .map(|b| usize::from(u16::from_le_bytes(b.try_into().expect("2 bytes"))))
+        .collect::<Vec<_>>();
+    if positions.iter().any(|&position| position >= rows) {
+        return Err(corrupt("the position of an ALP exception is out of range"));
+    }
+    Ok((values, positions))
+}
+
+/// `AlpTypedConstants<double>::FRAC_ARR`.
+const ALP_FRAC_F64: [f64; 21] = [
+    1.0,
+    0.1,
+    0.01,
+    0.001,
+    0.0001,
+    0.00001,
+    0.000001,
+    0.0000001,
+    0.00000001,
+    0.000000001,
+    0.0000000001,
+    0.00000000001,
+    0.000000000001,
+    0.0000000000001,
+    0.00000000000001,
+    0.000000000000001,
+    0.0000000000000001,
+    0.00000000000000001,
+    0.000000000000000001,
+    0.0000000000000000001,
+    0.00000000000000000001,
+];
+/// `AlpTypedConstants<float>::FRAC_ARR`.
+const ALP_FRAC_F32: [f32; 11] = [
+    1.0,
+    0.1,
+    0.01,
+    0.001,
+    0.0001,
+    0.00001,
+    0.000001,
+    0.0000001,
+    0.00000001,
+    0.000000001,
+    0.0000000001,
+];
+
+/// `AlpScanState`: floats written as decimals. Each vector of 1024 has an exponent and a factor,
+/// and packed integers with a frame of reference; what doesn't round trip is an exception.
+pub fn scan_alp(segment: &[u8], count: usize, width: usize, out: &mut Vec<u8>) -> Result<()> {
+    const UNCOMPRESSED_MODE: u8 = 255;
+    let what = "an ALP vector";
+    let max_exponent = if width == 8 { 18 } else { 10 };
+    for vector in alp_vectors(segment, count, 4)? {
+        let (rows, mut vector) = vector?;
+        let exponent = advance(&mut vector, 1, what)?[0];
+        if exponent == UNCOMPRESSED_MODE {
+            out.extend_from_slice(bytes(vector, 0, rows * width, what)?);
+            continue;
+        }
+        if exponent > max_exponent {
+            return Err(corrupt(format!("ALP exponent {exponent} is out of range")));
+        }
+        let factor = advance(&mut vector, 1, what)?[0];
+        if factor > exponent {
+            return Err(corrupt(format!("ALP factor {factor} is out of range")));
+        }
+        let exceptions = u16::from_le_bytes(advance(&mut vector, 2, what)?.try_into().expect("2 bytes"));
+        let frame = u64::from_le_bytes(advance(&mut vector, 8, what)?.try_into().expect("8 bytes"));
+        let bit_width = usize::from(advance(&mut vector, 1, what)?[0]);
+        if bit_width > ALP_MAX_BIT_WIDTH {
+            return Err(corrupt(format!("ALP bit width {bit_width} is out of range")));
+        }
+        let packed = advance(&mut vector, packed_size(rows, bit_width), what)?;
+        let (values, positions) = alp_exceptions(&mut vector, usize::from(exceptions), width, rows)?;
+
+        let start = out.len();
+        let factor = 10i64.wrapping_pow(u32::from(factor));
+        for encoded in unpack(packed, rows, bit_width, what)? {
+            let encoded = (encoded as u64).wrapping_add(frame) as i64;
+            // the order of the operations is part of the format, as they round
+            if width == 8 {
+                let value = encoded as f64 * factor as f64 * ALP_FRAC_F64[usize::from(exponent)];
+                out.extend_from_slice(&value.to_le_bytes());
+            } else {
+                let value = encoded as f32 * factor as f32 * ALP_FRAC_F32[usize::from(exponent)];
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        for (value, position) in values.chunks_exact(width).zip(positions) {
+            out[start + position * width..start + (position + 1) * width].copy_from_slice(value);
+        }
+    }
+    Ok(())
+}
+
+/// `AlpRDScanState`: floats split in two, the left parts through a small dictionary.
+pub fn scan_alprd(segment: &[u8], count: usize, width: usize, out: &mut Vec<u8>) -> Result<()> {
+    const UNCOMPRESSED_MODE: u16 = u16::MAX;
+    const MAX_DICTIONARY_SIZE: usize = 8;
+    let what = "an ALPRD vector";
+    let header = bytes(segment, 4, 3, "the header of an ALPRD segment")?;
+    let (right_width, left_width, entries) = (usize::from(header[0]), usize::from(header[1]), usize::from(header[2]));
+    if right_width >= width * 8 || left_width > 3 || entries > MAX_DICTIONARY_SIZE {
+        return Err(corrupt("the header of an ALPRD segment is invalid"));
+    }
+    let stored = bytes(segment, 7, entries * 2, "the dictionary of an ALPRD segment")?;
+    // an index past the stored entries reads zero, which exceptions rely on
+    let mut dictionary = [0u16; MAX_DICTIONARY_SIZE];
+    for (entry, b) in dictionary.iter_mut().zip(stored.chunks_exact(2)) {
+        *entry = u16::from_le_bytes(b.try_into().expect("2 bytes"));
+    }
+    for vector in alp_vectors(segment, count, 7 + entries * 2)? {
+        let (rows, mut vector) = vector?;
+        let exceptions = u16::from_le_bytes(advance(&mut vector, 2, what)?.try_into().expect("2 bytes"));
+        if exceptions == UNCOMPRESSED_MODE {
+            out.extend_from_slice(bytes(vector, 0, rows * width, what)?);
+            continue;
+        }
+        let left = advance(&mut vector, packed_size(rows, left_width), what)?;
+        let left = unpack(left, rows, left_width, what)?;
+        let right = advance(&mut vector, packed_size(rows, right_width), what)?;
+        let right = unpack(right, rows, right_width, what)?;
+        let (values, positions) = alp_exceptions(&mut vector, usize::from(exceptions), 2, rows)?;
+
+        let mut decoded: Vec<u64> = left
+            .iter()
+            .zip(&right)
+            .map(|(&left, &right)| u64::from(dictionary[left as usize]) << right_width | right as u64)
+            .collect();
+        for (value, position) in values.chunks_exact(2).zip(positions) {
+            let value = u64::from(u16::from_le_bytes(value.try_into().expect("2 bytes")));
+            decoded[position] = value << right_width | right[position] as u64;
+        }
+        for value in decoded {
+            out.extend_from_slice(&value.to_le_bytes()[..width]);
+        }
+    }
+    Ok(())
+}
+
+/// `ROARING_CONTAINER_SIZE`, `COMPRESSED_SEGMENT_COUNT` and the rest of roaring.hpp.
+const ROARING_CONTAINER_SIZE: usize = 2048;
+const COMPRESSED_SEGMENT_COUNT: usize = 8;
+const COMPRESSED_SEGMENT_SIZE: usize = 256;
+const COMPRESSED_ARRAY_THRESHOLD: usize = 8;
+const COMPRESSED_RUN_THRESHOLD: usize = 4;
+const BITSET_CONTAINER_SENTINEL: usize = 249;
+
+/// `ContainerSegmentScan`: positions kept as a byte, each 256 of them under a count of how many
+/// are there.
+struct ContainerSegments<'a> {
+    counts: &'a [u8],
+    index: usize,
+    count: u8,
+}
+
+impl ContainerSegments<'_> {
+    /// The base of the next position.
+    fn next_base(&mut self) -> usize {
+        while self.index < COMPRESSED_SEGMENT_COUNT && self.count >= self.counts[self.index] {
+            self.count = 0;
+            self.index += 1;
+        }
+        self.count = self.count.wrapping_add(1);
+        self.index * COMPRESSED_SEGMENT_SIZE
+    }
+}
+
+/// The positions of an array or run container, which are absolute or kept by 256 at a time.
+fn compressed_positions(data: &[u8], stored: usize, compressed: bool, wide: usize) -> Result<Vec<usize>> {
+    let what = "a Roaring container";
+    if compressed {
+        let counts = bytes(data, 0, COMPRESSED_SEGMENT_COUNT, what)?;
+        let low = bytes(data, COMPRESSED_SEGMENT_COUNT, stored, what)?;
+        let mut segments = ContainerSegments {
+            counts,
+            index: 0,
+            count: 0,
+        };
+        Ok(low.iter().map(|&low| segments.next_base() + usize::from(low)).collect())
+    } else {
+        Ok(bytes(data, 0, stored * wide, what)?
+            .chunks_exact(2)
+            .map(|b| usize::from(u16::from_le_bytes(b.try_into().expect("2 bytes"))))
+            .collect())
+    }
+}
+
+/// Aligns `position`, an offset from the start of the data, to `to` bytes.
+fn align(position: usize, to: usize) -> usize {
+    position.div_ceil(to) * to
+}
+
+/// `RoaringScanState`: containers of 2048 bits, each a list of NULL runs, of positions that are
+/// (or aren't) NULL, or a bitset, whichever is the smallest. A set bit is a value.
+pub fn scan_roaring(segment: &[u8], count: usize, out: &mut Vec<bool>) -> Result<()> {
+    const IS_RUN: u8 = 2;
+    const IS_INVERTED: u8 = 1;
+    let what = "a Roaring segment";
+    let metadata_offset = u64_at(segment, 0, what)? as usize;
+    let body = segment.get(8..).ok_or_else(|| out_of_bounds(what))?;
+    let mut metadata = body.get(metadata_offset..).ok_or_else(|| out_of_bounds(what))?;
+
+    let containers = count.div_ceil(ROARING_CONTAINER_SIZE);
+    let types = advance(&mut metadata, packed_size(containers, 2), what)?;
+    let types = unpack(types, containers, 2, what)?;
+    let runs = types.iter().filter(|&&t| t as u8 & IS_RUN != 0).count();
+    let run_counts = advance(&mut metadata, packed_size(runs, 7), what)?;
+    let mut run_counts = unpack(run_counts, runs, 7, what)?.into_iter();
+    let mut cardinalities = advance(&mut metadata, containers - runs, what)?.iter();
+
+    let mut position = 0;
+    for (index, &container_type) in types.iter().enumerate() {
+        let container_type = container_type as u8;
+        let size = ROARING_CONTAINER_SIZE.min(count - index * ROARING_CONTAINER_SIZE);
+        let start = out.len();
+        if container_type & IS_RUN != 0 {
+            let number = run_counts.next().expect("one count per run container") as usize;
+            let compressed = number >= COMPRESSED_RUN_THRESHOLD;
+            if !compressed {
+                position = align(position, 4);
+            }
+            let data = body.get(position..).ok_or_else(|| out_of_bounds(what))?;
+            let values = compressed_positions(data, number * 2, compressed, 2)?;
+            position += if compressed {
+                COMPRESSED_SEGMENT_COUNT + number * 2
+            } else {
+                number * 4
+            };
+            out.resize(start + size, true);
+            let mut previous_end = 0;
+            for pair in values.chunks_exact(2) {
+                // compressed runs store their end, the others their length less one
+                let end = if compressed { pair[1] } else { pair[0] + 1 + pair[1] };
+                if pair[0] < previous_end || end <= pair[0] {
+                    return Err(corrupt("an invalid run in a Roaring container"));
+                }
+                previous_end = end;
+                // finalizing can make the last run end one past the container
+                let end = end.min(size);
+                if pair[0] >= size {
+                    return Err(corrupt("an invalid run in a Roaring container"));
+                }
+                out[start + pair[0]..start + end].fill(false);
+            }
+            continue;
+        }
+        let cardinality = usize::from(*cardinalities.next().expect("one count per other container"));
+        if cardinality == BITSET_CONTAINER_SENTINEL {
+            position = align(position, 8);
+            let stored = size.div_ceil(64) * 8;
+            let data = body.get(position..).ok_or_else(|| out_of_bounds(what))?;
+            scan_validity(data, size, out)?;
+            position += stored;
+            continue;
+        }
+        let compressed = cardinality >= COMPRESSED_ARRAY_THRESHOLD;
+        if !compressed {
+            position = align(position, 2);
+        }
+        let data = body.get(position..).ok_or_else(|| out_of_bounds(what))?;
+        let values = compressed_positions(data, cardinality, compressed, 2)?;
+        position += if compressed {
+            COMPRESSED_SEGMENT_COUNT + cardinality
+        } else {
+            cardinality * 2
+        };
+        // inverted arrays list the NULLs, and the others the values
+        let listed_valid = container_type & IS_INVERTED == 0;
+        out.resize(start + size, !listed_valid);
+        for &value in &values {
+            *out.get_mut(start + value)
+                .filter(|_| value < size)
+                .ok_or_else(|| corrupt("invalid array position in a Roaring container"))? = listed_valid;
+        }
+    }
+    Ok(())
+}
+
+/// `dict_fsst::CompressedStringScanState`: a dictionary, whose strings can be compressed with FSST
+/// as a whole, and per row an index of it. Index 0 is NULL, and the rows that have it go to `nulls`:
+/// such a segment takes care of NULLs by itself, and its validity is an empty segment that says
+/// nothing.
+pub fn scan_dict_fsst(segment: &[u8], count: usize, out: &mut Vec<Vec<u8>>, nulls: &mut Vec<usize>) -> Result<()> {
+    const HEADER_SIZE: usize = 16;
+    const DICTIONARY: u8 = 0;
+    const DICT_FSST: u8 = 1;
+    const FSST_ONLY: u8 = 2;
+    let what = "a DICT_FSST segment";
+    let dict_size = u32_at(segment, 0, what)? as usize;
+    let dict_count = u32_at(segment, 4, what)? as usize;
+    let header = bytes(segment, 8, 3, what)?;
+    let (mode, lengths_width, indices_width) = (header[0], usize::from(header[1]), usize::from(header[2]));
+    let table_size = u32_at(segment, 12, what)? as usize;
+    if mode > FSST_ONLY {
+        return Err(corrupt(format!("unrecognized DICT_FSST compression mode {mode}")));
+    }
+    if dict_count == 0 || (mode == FSST_ONLY && count > dict_count - 1) {
+        return Err(corrupt("a DICT_FSST dictionary is out of range"));
+    }
+    if indices_width > 32 || lengths_width > 32 || (lengths_width == 0 && (mode != DICTIONARY || dict_count > 2)) {
+        return Err(corrupt("a DICT_FSST bitpacking width is invalid"));
+    }
+    let mut position = HEADER_SIZE;
+    let dictionary = bytes(segment, position, dict_size, what)?;
+    position = align(position + dict_size, 8);
+    let table = bytes(segment, position, table_size, what)?;
+    position = align(position + table_size, 8);
+    let packed = bytes(segment, position, packed_size(dict_count, lengths_width), what)?;
+    let lengths = unpack(packed, dict_count, lengths_width, what)?;
+    position = align(position + packed.len(), 8);
+    let packed = bytes(segment, position, packed_size(count, indices_width), what)?;
+    let indices = if mode == FSST_ONLY {
+        Vec::new()
+    } else {
+        unpack(packed, count, indices_width, what)?
+    };
+
+    if lengths[0] != 0 {
+        return Err(corrupt("the NULL entry of a DICT_FSST dictionary has a length"));
+    }
+    let decoder = if mode == DICT_FSST || mode == FSST_ONLY {
+        Some(fsst_import(table)?.ok_or_else(|| corrupt("an invalid FSST symbol table"))?)
+    } else {
+        None
+    };
+    let mut strings = Vec::with_capacity(dict_count.min(1 << 16));
+    let mut offset = 0usize;
+    for &length in &lengths {
+        let length = length as usize;
+        let entry = bytes(dictionary, offset, length, "a DICT_FSST string")?;
+        offset += length;
+        strings.push(match &decoder {
+            Some(decoder) => decoder.decompress(entry)?,
+            None => entry.to_vec(),
+        });
+    }
+    if mode == FSST_ONLY {
+        out.extend_from_slice(&strings[1..=count]);
+        return Ok(());
+    }
+    for index in indices {
+        if index == 0 {
+            nulls.push(out.len());
+        }
+        let string = strings.get(index as usize);
+        out.push(
+            string
+                .ok_or_else(|| corrupt("a DICT_FSST dictionary index is out of range"))?
+                .clone(),
+        );
     }
     Ok(())
 }

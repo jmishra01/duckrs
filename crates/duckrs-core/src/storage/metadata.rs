@@ -106,10 +106,10 @@ impl MetadataChains {
     }
 }
 
-fn take<const N: usize>(data: &mut &[u8]) -> Result<[u8; N]> {
+pub(super) fn take<const N: usize>(data: &mut &[u8]) -> Result<[u8; N]> {
     let (head, tail) = data
         .split_first_chunk::<N>()
-        .ok_or_else(|| corrupt("the free list ends early"))?;
+        .ok_or_else(|| corrupt("metadata ends early"))?;
     *data = tail;
     Ok(*head)
 }
