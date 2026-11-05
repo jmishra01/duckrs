@@ -5,11 +5,12 @@
 //! Date and time functions. They run row by row; the vectorized loops come with Phase 13. Time
 //! zones wait for the ICU port: a TIMESTAMPTZ reads as UTC here.
 
+use super::binder::bind_scalar_function;
 use super::bit_functions::strict_rows;
 use super::nested::bound_function;
-use super::{ScalarCallback, ScalarFunction, ScalarFunctionSet};
+use super::{BuiltinFunctions, ScalarCallback, ScalarFunction, ScalarFunctionSet};
 use crate::execution::expression_executor::evaluate_scalar;
-use crate::planner::expression::BoundExpr;
+use crate::planner::expression::{BoundExpr, BoundExprKind};
 use duckrs_common::types::{
     Date, DatePart, Interval, LogicalType, LogicalTypeId, MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MINUTE,
     MICROS_PER_SEC, Time, TimeTz, Timestamp,
@@ -1409,6 +1410,40 @@ fn strptime(args: &DataChunk, result: &mut Vector) -> Result<()> {
 
 fn try_strptime(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| strptime_row(row, false))
+}
+
+/// The function of its own that a `date_part` of `name` amounts to, if it has one. An unknown name
+/// has none, so it fails where `date_part` would.
+pub fn date_part_call_of(name: &str, value: BoundExpr) -> Option<BoundExpr> {
+    let function = match DatePart::parse(name)? {
+        DatePart::Year => "year",
+        DatePart::Month => "month",
+        DatePart::Day => "day",
+        DatePart::Decade => "decade",
+        DatePart::Century => "century",
+        DatePart::Millennium => "millennium",
+        DatePart::Quarter => "quarter",
+        DatePart::Week => "week",
+        DatePart::YearWeek => "yearweek",
+        DatePart::Dow => "dayofweek",
+        DatePart::IsoDow => "isodow",
+        DatePart::Doy => "dayofyear",
+        DatePart::Microseconds => "microsecond",
+        DatePart::Milliseconds => "millisecond",
+        DatePart::Second => "second",
+        DatePart::Minute => "minute",
+        DatePart::Hour => "hour",
+        _ => return None,
+    };
+    let set = BuiltinFunctions::get().scalar(function)?;
+    let ty = value.return_type.clone();
+    let call = bind_scalar_function(set, vec![value], false, &|_| None).ok()?;
+    // without an overload for its type the value gets a cast, which date_part does not have and
+    // which can change it: TIMESTAMP_NS rounds to microseconds
+    match &call.kind {
+        BoundExprKind::Function { children, .. } if children[0].return_type == ty => Some(call),
+        _ => None,
+    }
 }
 
 /// Whether [`bind_date_function`] binds `name`.

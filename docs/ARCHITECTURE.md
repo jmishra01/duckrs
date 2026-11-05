@@ -234,6 +234,10 @@ A filter stays above a projection or an aggregate if it, or an entry it would be
 can fail: below, `a::int < b::int` would run ahead of the filter that guards those casts.
 `can_throw` allows only what is known not to fail, so some filters stay higher than they do in C++.
 
+`EqualOrNullSimplification` runs only at the root of a filter, where NULL counts as false, and the
+conjuncts of a filter are split before rewriting so that each is such a root. `DatePartSimplificationRule`
+leaves `date_part` alone where the function would need a cast, as `TIMESTAMP_NS` to microseconds rounds.
+
 Not ported yet: the box rendering of EXPLAIN, `Projections` of scans, moving LEFT joins in the join order, and SEMI and ANTI joins that read several
 relations (those stay on top of the tree), the estimator's caps for composite keys, estimated rows in EXPLAIN, flipping
 LEFT to RIGHT joins for the build side, statistics per row group or for functions (`stats()`, `length`, `abs`,

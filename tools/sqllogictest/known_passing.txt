@@ -387,6 +387,7 @@ test/optimizer/distributivity_rule.test
 test/optimizer/estimated_cardinalities_are_in_logical_plan.test
 test/optimizer/expression_rewriter/ordered_aggregate_incorrectly_remove_order.test
 test/optimizer/filter_pushdown/like_prefix_boundary.test
+test/optimizer/grouping_expression_simplification.test
 test/optimizer/issue_12181.test
 test/optimizer/issue_20928.test
 test/optimizer/issue_21011.test
@@ -1334,6 +1335,7 @@ test/sql/optimizer/expression/test_conjunction_optimization.test
 test/sql/optimizer/expression/test_cse.test
 test/sql/optimizer/expression/test_date_subtract_filter.test
 test/sql/optimizer/expression/test_empty_needle_dead_branch.test
+test/sql/optimizer/expression/test_equal_or_null_optimization.test
 test/sql/optimizer/expression/test_in_clause_simplification.test
 test/sql/optimizer/expression/test_indistinct_aggregates.test
 test/sql/optimizer/expression/test_move_constants.test

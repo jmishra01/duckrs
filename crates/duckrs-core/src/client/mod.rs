@@ -3087,6 +3087,87 @@ mod tests {
     }
 
     #[test]
+    fn date_part_and_equal_or_null_match_duckdb() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        run(&mut context, "SET explain_output = 'OPTIMIZED_ONLY'");
+        run(&mut context, "CREATE TABLE d (t TIMESTAMP)");
+        run(&mut context, "INSERT INTO d VALUES ('2024-03-05 06:07:08.5'), (NULL)");
+        let explain = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        // the plan is that of the function, and the value that of date_part
+        let plan = explain(&mut context, "SELECT EXTRACT(year FROM t) FROM d");
+        assert!(plan.contains("year(t)") && !plan.contains("date_part"), "{plan}");
+        for (part, value) in [
+            ("year", "2024"),
+            ("yr", "2024"),
+            ("month", "3"),
+            ("day", "5"),
+            ("decade", "202"),
+            ("century", "21"),
+            ("millennium", "3"),
+            ("quarter", "1"),
+            ("week", "10"),
+            ("dow", "2"),
+            ("isodow", "2"),
+            ("doy", "65"),
+            ("hour", "6"),
+            ("minute", "7"),
+            ("second", "8"),
+            ("millisecond", "8500"),
+            ("microsecond", "8500000"),
+        ] {
+            let sql = format!("SELECT date_part('{part}', t) FROM d WHERE t IS NOT NULL");
+            assert_eq!(run(&mut context, &sql), [[value]], "{sql}");
+        }
+        // a type the function has no overload for keeps date_part, as a cast would round it
+        let sql = "SELECT date_part('microsecond', TIMESTAMP_NS '2020-01-01 01:23:45.123456789')";
+        assert_eq!(run(&mut context, sql), [["45123456"]]);
+        run(&mut context, "CREATE TABLE ns (t TIMESTAMP_NS)");
+        run(&mut context, "INSERT INTO ns VALUES ('2020-01-01 01:23:45.123456789')");
+        let sql = "SELECT EXTRACT(microseconds FROM t) FROM ns";
+        assert!(explain(&mut context, sql).contains("date_part"), "{sql}");
+        assert_eq!(run(&mut context, sql), [["45123456"]]);
+        // NULL stays, and what has no function of its own stays date_part
+        assert_eq!(run(&mut context, "SELECT year(t) FROM d WHERE t IS NULL"), [["NULL"]]);
+        let plan = explain(&mut context, "SELECT date_part('epoch', t) FROM d");
+        assert!(plan.contains("date_part"), "{plan}");
+        // a specifier nobody knows fails as it did
+        let error = context.query("SELECT date_part('nonsense', t) FROM d").unwrap_err();
+        assert!(error.to_string().contains("not recognized"), "{error}");
+        run(&mut context, "CREATE TABLE n (a INTEGER, b INTEGER)");
+        run(
+            &mut context,
+            "INSERT INTO n VALUES (1, 1), (1, 2), (0, NULL), (NULL, NULL)",
+        );
+        // both orders, and on the conjunct of a filter too
+        for sql in [
+            "SELECT count(*) FROM n WHERE a = b OR (a IS NULL AND b IS NULL)",
+            "SELECT count(*) FROM n WHERE (b IS NULL AND a IS NULL) OR a = b",
+        ] {
+            assert!(explain(&mut context, sql).contains("IS NOT DISTINCT FROM"), "{sql}");
+            assert_eq!(run(&mut context, sql), [["2"]], "{sql}");
+        }
+        let sql = "SELECT count(*) FROM n WHERE (a = b OR (a IS NULL AND b IS NULL)) AND a IS NULL";
+        assert!(explain(&mut context, sql).contains("IS NOT DISTINCT FROM"), "{sql}");
+        assert_eq!(run(&mut context, sql), [["1"]]);
+        // as a value the two differ, for a value and a NULL
+        let sql = "SELECT a = b OR (a IS NULL AND b IS NULL) FROM n";
+        assert!(!explain(&mut context, sql).contains("DISTINCT"), "{sql}");
+        assert_eq!(run(&mut context, sql), [["true"], ["false"], ["NULL"], ["true"]]);
+        // other columns under IS NULL are something else
+        let sql = "SELECT count(*) FROM n WHERE a = b OR (a IS NULL AND a IS NULL)";
+        assert!(!explain(&mut context, sql).contains("DISTINCT"), "{sql}");
+        assert_eq!(run(&mut context, sql), [["2"]]);
+        // and between tables it makes a hash join with NULLs as equal
+        let sql = "SELECT count(*) FROM n x, n y WHERE x.b = y.b OR (x.b IS NULL AND y.b IS NULL)";
+        let plan = explain(&mut context, sql);
+        assert!(
+            plan.contains("IS NOT DISTINCT FROM") && plan.contains("Comparison Join"),
+            "{plan}"
+        );
+        assert_eq!(run(&mut context, sql), [["6"]]);
+    }
+
+    #[test]
     fn in_subqueries_match_duckdb() {
         let mut context = ClientContext::new(DatabaseInstance::new());
         run(&mut context, "SET explain_output = 'OPTIMIZED_ONLY'");

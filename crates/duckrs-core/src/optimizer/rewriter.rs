@@ -10,6 +10,7 @@
 
 use super::conjunction_of;
 use crate::execution::expression_executor::try_evaluate_scalar;
+use crate::function::date_part_call_of;
 use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator};
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
@@ -30,6 +31,10 @@ pub fn rewrite_plan(op: &mut LogicalOperator) {
     }
     // the expressions of RecursiveCte's recursive part are resolved already; the binder rewrote them
     let is_filter = matches!(op.kind, LogicalOperatorKind::Filter { .. });
+    // each conjunct of a filter is a root of its own
+    if let LogicalOperatorKind::Filter { expressions } = &mut op.kind {
+        split_predicates(expressions);
+    }
     for expr in op.expressions_mut() {
         rewrite_expression(expr, is_filter);
     }
@@ -86,6 +91,8 @@ pub(crate) fn rewrite_expression(expr: &mut BoundExpr, in_filter: bool) {
 
 fn apply_rules(expr: &mut BoundExpr, in_filter: bool) -> bool {
     constant_folding(expr)
+        || equal_or_null_simplification(expr, in_filter)
+        || date_part_simplification(expr)
         || distributivity(expr)
         || arithmetic_simplification(expr)
         || constant_order_normalization(expr)
@@ -97,6 +104,90 @@ fn apply_rules(expr: &mut BoundExpr, in_filter: bool) -> bool {
         || comparison_simplification(expr)
         || not_comparison_simplification(expr)
         || not_conjunction_simplification(expr)
+}
+
+/// `EqualOrNullSimplification`: `a = b OR (a IS NULL AND b IS NULL)` is `a IS NOT DISTINCT FROM b`
+/// where NULL counts as false. Elsewhere they differ: the first is NULL for a NULL and a value.
+fn equal_or_null_simplification(expr: &mut BoundExpr, in_filter: bool) -> bool {
+    if !in_filter {
+        return false;
+    }
+    let BoundExprKind::Conjunction { and: false, children } = &expr.kind else {
+        return false;
+    };
+    let [first, second] = children.as_slice() else {
+        return false;
+    };
+    let Some(rewritten) = equal_or_is_null(first, second).or_else(|| equal_or_is_null(second, first)) else {
+        return false;
+    };
+    expr.kind = rewritten;
+    true
+}
+
+/// `TryRewriteEqualOrIsNull`.
+fn equal_or_is_null(equal: &BoundExpr, nulls: &BoundExpr) -> Option<BoundExprKind> {
+    let BoundExprKind::Comparison {
+        op: ComparisonOp::Equal,
+        left,
+        right,
+    } = &equal.kind
+    else {
+        return None;
+    };
+    let BoundExprKind::Conjunction { and: true, children } = &nulls.kind else {
+        return None;
+    };
+    let [first, second] = children.as_slice() else {
+        return None;
+    };
+    let tested = |expr: &'_ BoundExpr| match &expr.kind {
+        BoundExprKind::Operator {
+            op: BoundOperator::IsNull,
+            children,
+        } => children.first().cloned(),
+        _ => None,
+    };
+    let (first, second) = (tested(first)?, tested(second)?);
+    let same = |a: &BoundExpr, b: &BoundExpr| expressions_equal(a, b);
+    let both = (same(&first, left) && same(&second, right)) || (same(&first, right) && same(&second, left));
+    both.then(|| BoundExprKind::Comparison {
+        op: ComparisonOp::NotDistinctFrom,
+        left: left.clone(),
+        right: right.clone(),
+    })
+}
+
+/// `DatePartSimplificationRule`: `date_part('year', x)` is `year(x)`.
+fn date_part_simplification(expr: &mut BoundExpr) -> bool {
+    let BoundExprKind::Function { function, children, .. } = &expr.kind else {
+        return false;
+    };
+    let [specifier, value] = children.as_slice() else {
+        return false;
+    };
+    let BoundExprKind::Constant(constant) = &specifier.kind else {
+        return false;
+    };
+    if function.name != "date_part" || constant.logical_type() != &LogicalType::VARCHAR {
+        return false;
+    }
+    if constant.is_null() {
+        expr.kind = BoundExprKind::Constant(Value::null(expr.return_type.clone()));
+        return true;
+    }
+    let Some(call) = constant
+        .try_to_string()
+        .ok()
+        .and_then(|name| date_part_call_of(&name, value.clone()))
+    else {
+        return false;
+    };
+    if call.return_type != expr.return_type {
+        return false;
+    }
+    expr.kind = call.kind;
+    true
 }
 
 /// `ConstantFoldingRule`. A value of another type than the expression's stays an expression: a

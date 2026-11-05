@@ -11,6 +11,7 @@ pub mod cast;
 pub mod cast_rules;
 pub mod combine_types;
 mod dates;
+pub use dates::date_part_call_of;
 pub mod generic;
 pub(crate) mod holistic;
 mod lists;
