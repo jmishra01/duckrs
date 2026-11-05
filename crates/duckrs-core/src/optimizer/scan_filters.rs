@@ -3,8 +3,9 @@
 //
 //! Moves filters on one column into the scan below them (`TableFilterSet`), where they run on each
 //! chunk as it is read. In-memory scans have no zone maps yet, so all this gains is that no
-//! operator is left to pass the rows on. It runs last, so that the passes before it see filters as
-//! operators, and only takes what can run ahead of the filters that stay: nothing that can fail.
+//! operator is left to pass the rows on, and that the columns only they read stay in the scan. It
+//! runs late, so that the passes before it see filters as operators, and only takes what can run
+//! ahead of the filters that stay: nothing that can fail.
 
 use super::rewriter::{can_throw, split_conjuncts};
 use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};

@@ -141,7 +141,10 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             children,
         )),
         LogicalOperatorKind::Window { windows, .. } => Box::new(window::PhysicalWindow::new(types, windows, children)),
-        LogicalOperatorKind::Order { orders } => Box::new(PhysicalOrder::new(orders, children.remove(0))),
+        LogicalOperatorKind::Order { orders } => Box::new(PhysicalOrder::new(orders, None, children.remove(0))),
+        LogicalOperatorKind::TopN { orders, limit, offset } => {
+            Box::new(PhysicalOrder::new(orders, Some((limit, offset)), children.remove(0)))
+        }
         LogicalOperatorKind::Limit { limit, offset } => Box::new(PhysicalLimit {
             types,
             children,

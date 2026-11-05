@@ -645,6 +645,7 @@ pub(crate) fn expressions_equal(a: &BoundExpr, b: &BoundExpr) -> bool {
 /// (`FunctionErrors::CAN_THROW_RUNTIME_ERROR`); the opposite is the safe side here, since an
 /// expression that can fail only stays where it is.
 const INFALLIBLE_FUNCTIONS: &[&str] = &[
+    "constant_or_null",
     "~~",
     "!~~",
     "~~*",

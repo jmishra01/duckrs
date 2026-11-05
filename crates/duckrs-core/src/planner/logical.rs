@@ -75,6 +75,12 @@ pub enum LogicalOperatorKind {
     },
     /// `LogicalOrder`: sorts by the expressions, in order.
     Order { orders: Vec<BoundOrderByNode> },
+    /// `LogicalTopN`: the rows `offset..offset + limit` of what `orders` sorts.
+    TopN {
+        orders: Vec<BoundOrderByNode>,
+        limit: u64,
+        offset: u64,
+    },
     /// `LogicalLimit` with constant values: skips `offset` rows, then keeps `limit` rows (all
     /// of them with `None`).
     Limit { limit: Option<u64>, offset: u64 },
@@ -436,6 +442,7 @@ impl LogicalOperator {
                 .collect(),
             LogicalOperatorKind::Filter { .. }
             | LogicalOperatorKind::Order { .. }
+            | LogicalOperatorKind::TopN { .. }
             | LogicalOperatorKind::Limit { .. }
             | LogicalOperatorKind::Sample { .. }
             | LogicalOperatorKind::LimitPercent { .. }
@@ -569,6 +576,7 @@ impl LogicalOperator {
             }
             LogicalOperatorKind::Filter { .. }
             | LogicalOperatorKind::Order { .. }
+            | LogicalOperatorKind::TopN { .. }
             | LogicalOperatorKind::Limit { .. }
             | LogicalOperatorKind::Sample { .. }
             | LogicalOperatorKind::LimitPercent { .. }
@@ -672,7 +680,9 @@ impl LogicalOperator {
             LogicalOperatorKind::LateralJoin {
                 correlated, predicate, ..
             } => correlated.iter_mut().chain(predicate.iter_mut()).collect(),
-            LogicalOperatorKind::Order { orders } => orders.iter_mut().map(|o| &mut o.expr).collect(),
+            LogicalOperatorKind::Order { orders } | LogicalOperatorKind::TopN { orders, .. } => {
+                orders.iter_mut().map(|o| &mut o.expr).collect()
+            }
             LogicalOperatorKind::Aggregate { groups, aggregates, .. } => groups
                 .iter_mut()
                 .chain(aggregates.iter_mut().flat_map(|a| {

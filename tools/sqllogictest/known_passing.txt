@@ -3,6 +3,7 @@
 #   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
 test/common/test_cast_hugeint.test
 test/fuzzer/afl/alter_if_exists.test
+test/fuzzer/afl/analyze_empty_table.test
 test/fuzzer/afl/decimal_string_roundtrip.test
 test/fuzzer/afl/generate_series_null.test
 test/fuzzer/afl/grouping_empty_table.test
@@ -142,6 +143,7 @@ test/fuzzer/pedro/test_truncate_heap_use_after_free.test
 test/fuzzer/pedro/test_window_function_nullptr.test
 test/fuzzer/pedro/update_join_bind_error.test
 test/fuzzer/pedro/update_join_statistics.test
+test/fuzzer/pedro/vacuum_unsupported_type.test
 test/fuzzer/pedro/verify_parallelism_batch_index.test
 test/fuzzer/pedro/window_function_timeout.test
 test/fuzzer/pedro/window_self_reference.test
@@ -239,6 +241,7 @@ test/issues/general/test_24442.test
 test/issues/general/test_24542.test
 test/issues/general/test_24710.test
 test/issues/general/test_24711.test
+test/issues/general/test_24806.test
 test/issues/general/test_24828.test
 test/issues/general/test_24829.test
 test/issues/general/test_2496.test
@@ -400,6 +403,7 @@ test/optimizer/joins/delim_join_with_in_has_correct_results.test
 test/optimizer/joins/delim_left_join_pushdown.test
 test/optimizer/joins/filter_on_subquery_with_aggregate.test
 test/optimizer/joins/join_bug.test
+test/optimizer/joins/join_filter_build_side.test
 test/optimizer/joins/join_on_doubles.test
 test/optimizer/joins/join_on_floats.test
 test/optimizer/joins/joins_with_correlated_subqueries.test
@@ -418,6 +422,7 @@ test/optimizer/joins/test_must_apply_residual_predicate.test
 test/optimizer/joins/test_tpcds_pushdown.test
 test/optimizer/joins/zero_column_filter_reconstruction.test
 test/optimizer/like_optimizer.test
+test/optimizer/limit_pushdown.test
 test/optimizer/materialized_cte_sibling_column_pruning.test
 test/optimizer/needle_optimizer.test
 test/optimizer/not_in_null.test
@@ -452,6 +457,8 @@ test/optimizer/statistics/statistics_aggregate.test
 test/optimizer/statistics/statistics_between.test
 test/optimizer/statistics/statistics_case.test
 test/optimizer/statistics/statistics_coalesce.test
+test/optimizer/statistics/statistics_count_not_null_join_pruning.test
+test/optimizer/statistics/statistics_count_not_null_pruning.test
 test/optimizer/statistics/statistics_filter_multicolumn.test
 test/optimizer/statistics/statistics_join_always_matches_layout.test
 test/optimizer/statistics/statistics_join_arbitrary_condition.test
@@ -464,6 +471,7 @@ test/optimizer/statistics/statistics_varchar.test
 test/optimizer/stats_non_numeric_cast.test
 test/optimizer/table_in_out_unique_keys.test
 test/optimizer/test_try_cast_decimal.test
+test/optimizer/topn/topn_optimizer.test
 test/optimizer/topn_window_elimination_filter_above_null.test
 test/optimizer/topn_window_elimination_group_stats.test
 test/optimizer/union_exclude.test
@@ -633,6 +641,7 @@ test/sql/alter/rename_table/test_rename_table.test
 test/sql/alter/rename_table/test_rename_table_case.test
 test/sql/alter/rename_table/test_rename_table_constraints.test
 test/sql/alter/rename_table/test_rename_table_incorrect.test
+test/sql/alter/rename_table/test_rename_table_with_dependency_check.test
 test/sql/alter/rename_table/test_rename_table_with_insert_transaction.test
 test/sql/alter/rename_view/test_rename_view_incorrect.test
 test/sql/alter/rename_view/test_rename_view_table.test
@@ -1439,6 +1448,7 @@ test/sql/parser/numeric_literal_underscore_trailing_dot.test
 test/sql/parser/parser_rewrites_method_chain.test
 test/sql/parser/position_prepare.test
 test/sql/parser/reject_accidental_type_syntax.test
+test/sql/parser/reject_unknown_option_values.test
 test/sql/parser/test_columns_where.test
 test/sql/parser/test_deep_expression_nesting.test
 test/sql/parser/test_long_error.test
@@ -2182,6 +2192,7 @@ test/sql/upsert/upsert_set_expressions.test
 test/sql/upsert/upsert_shorthand.test
 test/sql/upsert/upsert_transaction.test
 test/sql/upsert/upsert_unique_null.test
+test/sql/vacuum/vacuum_nested_types.test
 test/sql/window/ntile_fallible.test
 test/sql/window/parallel_collection_combine.test
 test/sql/window/test_basic_window.test

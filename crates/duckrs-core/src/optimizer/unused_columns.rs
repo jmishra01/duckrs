@@ -72,6 +72,7 @@ fn visit(op: &mut LogicalOperator, by_position: bool, used: &mut HashSet<ColumnB
         K::Projection { .. } | K::Aggregate { .. } => false,
         K::Filter { .. }
         | K::Order { .. }
+        | K::TopN { .. }
         | K::Limit { .. }
         | K::Distinct { .. }
         | K::CrossProduct
@@ -85,7 +86,7 @@ fn visit(op: &mut LogicalOperator, by_position: bool, used: &mut HashSet<ColumnB
     // these copy the rows of their children, in contrast to operators that pass vectors on
     let copies = matches!(
         op.kind,
-        K::Join { .. } | K::DelimJoin { .. } | K::MarkJoin { .. } | K::CrossProduct | K::Order { .. }
+        K::Join { .. } | K::DelimJoin { .. } | K::MarkJoin { .. } | K::CrossProduct | K::Order { .. } | K::TopN { .. }
     );
     for child in &mut op.children {
         let read: Vec<ColumnBinding> = child

@@ -713,6 +713,11 @@ impl JoinOrderOptimizer {
                     distinct,
                 }
             }
+            K::TopN { limit, .. } => {
+                let child = self.stats(&op.children[0]);
+                let cardinality = child.cardinality.min(*limit as f64);
+                child.scaled(cardinality)
+            }
             K::Limit { limit, .. } => {
                 let child = self.stats(&op.children[0]);
                 let cardinality = limit.map_or(child.cardinality, |limit| child.cardinality.min(limit as f64));
@@ -811,7 +816,12 @@ impl JoinOrderOptimizer {
         let inherited = by_position
             && matches!(
                 op.kind,
-                K::Filter { .. } | K::Order { .. } | K::Limit { .. } | K::LimitPercent { .. } | K::Sample { .. }
+                K::Filter { .. }
+                    | K::Order { .. }
+                    | K::TopN { .. }
+                    | K::Limit { .. }
+                    | K::LimitPercent { .. }
+                    | K::Sample { .. }
             );
         let positional = inherited
             || matches!(

@@ -32,6 +32,7 @@ fn logical_name(op: &LogicalOperator) -> &'static str {
         K::Window { .. } => "WINDOW",
         K::Aggregate { .. } => "AGGREGATE",
         K::Order { .. } => "ORDER_BY",
+        K::TopN { .. } => "TOP_N",
         K::Limit { .. } | K::LimitPercent { .. } => "LIMIT",
         K::Sample { .. } => "SAMPLE",
         K::Distinct { .. } => "DISTINCT",
@@ -165,6 +166,14 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             info
         }
         K::Order { orders } => entry("Order By", order_text(orders)),
+        K::TopN { orders, limit, offset } => {
+            let mut info = entry("Top", limit.to_string());
+            if *offset > 0 {
+                info.extend(entry("Offset", offset.to_string()));
+            }
+            info.extend(entry("Order By", order_text(orders)));
+            info
+        }
         K::Limit { limit, offset } => {
             let mut info = Vec::new();
             if let Some(limit) = limit {

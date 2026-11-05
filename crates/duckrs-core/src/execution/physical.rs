@@ -1077,15 +1077,45 @@ pub(super) fn scan_collection(collection: &Mutex<ColumnDataCollection>, state: &
 pub struct PhysicalOrder {
     pub types: Vec<LogicalType>,
     pub orders: Vec<(usize, OrderModifiers)>,
+    /// `PhysicalTopN`: the limit and the offset of the rows it gives
+    pub top: Option<(u64, u64)>,
     pub children: Vec<Box<dyn PhysicalOperator>>,
     pub data: Mutex<ColumnDataCollection>,
 }
 
+/// A Top-N sorts what it has when it has twice what it needs, and at least this.
+const TOP_N_MIN_BUFFERED_ROWS: u64 = 1 << 16;
+
+/// The rows of a collection after the first `offset`, at most `count` of them.
+fn rows_of_collection(collection: &ColumnDataCollection, offset: u64, count: u64) -> ColumnDataCollection {
+    let mut result = ColumnDataCollection::new(collection.types().to_vec());
+    let (mut skip, mut left) = (offset as usize, usize::try_from(count).unwrap_or(usize::MAX));
+    for index in 0..collection.chunk_count() {
+        let chunk = collection.chunk(index);
+        if skip >= chunk.len() {
+            skip -= chunk.len();
+            continue;
+        }
+        let take = left.min(chunk.len() - skip);
+        if take == 0 {
+            break;
+        }
+        let mut rows = chunk.clone();
+        let selected: Vec<u32> = (skip..skip + take).map(|row| row as u32).collect();
+        rows.slice(&SelectionVector::from_vec(selected), take);
+        result.append(&rows);
+        skip = 0;
+        left -= take;
+    }
+    result
+}
+
 impl PhysicalOrder {
-    pub fn new(orders: Vec<BoundOrderByNode>, child: Box<dyn PhysicalOperator>) -> Self {
+    pub fn new(orders: Vec<BoundOrderByNode>, top: Option<(u64, u64)>, child: Box<dyn PhysicalOperator>) -> Self {
         let types = child.types().to_vec();
         Self {
             orders: orders.iter().map(|o| (reference_index(&o.expr), o.modifiers)).collect(),
+            top,
             data: Mutex::new(ColumnDataCollection::new(types.clone())),
             types,
             children: vec![child],
@@ -1095,7 +1125,7 @@ impl PhysicalOrder {
 
 impl PhysicalOperator for PhysicalOrder {
     fn name(&self) -> &'static str {
-        "ORDER_BY"
+        if self.top.is_some() { "TOP_N" } else { "ORDER_BY" }
     }
     fn types(&self) -> &[LogicalType] {
         &self.types
@@ -1109,11 +1139,21 @@ impl PhysicalOperator for PhysicalOrder {
     fn sink(&self, chunk: &DataChunk) -> Result<()> {
         let mut data = self.data.lock();
         data.append(chunk);
+        // what is behind the first rows now never gets back in, as the sort keeps ties in order
+        if let Some((limit, offset)) = self.top {
+            let keep = limit.saturating_add(offset);
+            if data.len() as u64 > keep.saturating_mul(2).max(TOP_N_MIN_BUFFERED_ROWS) {
+                *data = rows_of_collection(&sort_collection(&data, &self.orders)?, 0, keep);
+            }
+        }
         check_buffered(&data)
     }
     fn finalize(&self) -> Result<()> {
         let mut data = self.data.lock();
         *data = sort_collection(&data, &self.orders)?;
+        if let Some((limit, offset)) = self.top {
+            *data = rows_of_collection(&data, offset, limit);
+        }
         Ok(())
     }
     fn is_source(&self) -> bool {

@@ -332,6 +332,7 @@ impl ClientContext {
                 | Statement::Pragma(_)
                 | Statement::Create(_)
                 | Statement::Drop(_)
+                | Statement::Vacuum { .. }
         );
         if !client_statement {
             let mut binder = Binder::with_options(&self.db.catalog, self.bind_options());
@@ -647,6 +648,19 @@ impl ClientContext {
     /// `ClientContext::PendingStatementOrPreparedStatement` + `ExecutePendingQueryInternal`.
     fn execute_statement(&mut self, statement: &Statement) -> Result<MaterializedQueryResult> {
         match statement {
+            // statistics here are made when they are needed, and in-memory tables have nothing to
+            // compact, so this only says whether there is such a table
+            Statement::Vacuum { table, .. } => {
+                if let Some(table) = table
+                    && let duckrs_parser::ast::TableRefKind::BaseTable { name, .. } = &table.kind
+                {
+                    let schema = crate::planner::binder::schema_of(name)?;
+                    if let crate::catalog::TableOrView::View(_) = self.db.catalog.get_entry(schema, None, &name.name)? {
+                        return Err(Error::new(ErrorKind::Binder, "Can only vacuum or analyze base tables"));
+                    }
+                }
+                return Ok(Self::success());
+            }
             Statement::SetVariable { name, value, scope } if *scope == duckrs_parser::ast::SetScope::Variable => {
                 // a query, because the value can be a subquery
                 let query = duckrs_parser::parse_ast(&format!("SELECT {value}"))?.remove(0);
@@ -2987,7 +3001,8 @@ mod tests {
             "Join Type: INNER",
             "Conditions: x = y",
             "Order By: x ASC",
-            "Limit: 10",
+            "Top N",
+            "Top: 10",
             "Seq Scan",
             "Table: a",
             "Type: Sequential Scan",
@@ -3244,6 +3259,93 @@ mod tests {
             run(&mut context, "SELECT count(*) FROM t WHERE x >= 491520"),
             [["8481"]]
         );
+    }
+
+    #[test]
+    fn top_n_gives_the_rows_of_a_sort() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        run(&mut context, "SET explain_output = 'OPTIMIZED_ONLY'");
+        run(
+            &mut context,
+            "CREATE TABLE t AS SELECT i, i % 7 AS g, CASE WHEN i % 5 = 0 THEN NULL ELSE i END AS n FROM range(200000) t(i)",
+        );
+        let plan = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let sorted = |context: &mut ClientContext, order: &str, limit: usize, offset: usize| {
+            let rows = run(context, &format!("SELECT i FROM t ORDER BY {order}"));
+            rows[offset.min(rows.len())..(offset + limit).min(rows.len())].to_vec()
+        };
+        // what is limited comes out as from a sort, ties in input order included
+        for (order, limit, offset) in [
+            ("g, i DESC", 5, 0),
+            ("g DESC", 5, 3),
+            ("n DESC NULLS FIRST, i", 4, 2),
+            ("n NULLS LAST, i", 3, 39990),
+            ("g", 3, 199998),
+            ("g", 3, 300000),
+        ] {
+            let sql = format!("SELECT i FROM t ORDER BY {order} LIMIT {limit} OFFSET {offset}");
+            assert_eq!(plan(&mut context, &sql).contains("Top N"), offset < 5000, "{sql}");
+            assert_eq!(
+                run(&mut context, &sql),
+                sorted(&mut context, order, limit, offset),
+                "{sql}"
+            );
+        }
+        // more rows than it buffers at once, with the first ones arriving last
+        let sql = "SELECT i FROM t ORDER BY i DESC LIMIT 2 OFFSET 1";
+        assert_eq!(run(&mut context, sql), [["199998"], ["199997"]]);
+        // it goes through projections, also of a subquery
+        let sql = "SELECT i + 1 FROM (SELECT i, g FROM t ORDER BY i) LIMIT 2";
+        assert!(plan(&mut context, sql).contains("Top N"));
+        assert_eq!(run(&mut context, sql), [["1"], ["2"]]);
+        // these are no Top-N: without a limit, without an order, and a limit too large to gain
+        let sql = "SELECT i FROM t ORDER BY i OFFSET 3";
+        assert!(!plan(&mut context, sql).contains("Top N"));
+        assert!(!plan(&mut context, "SELECT i FROM t LIMIT 3").contains("Top N"));
+        assert!(!plan(&mut context, "SELECT i FROM t ORDER BY i LIMIT 100000").contains("Top N"));
+        assert_eq!(
+            run(&mut context, "SELECT i FROM t ORDER BY i LIMIT 0"),
+            Vec::<Vec<String>>::new()
+        );
+        // a small limit goes below a projection, unless an offset would skip what is volatile
+        let below = plan(&mut context, "SELECT i + 1 FROM t LIMIT 2");
+        assert!(below.find("Projection") < below.find("Limit"), "{below}");
+        let above = plan(&mut context, "SELECT random() FROM t LIMIT 2 OFFSET 1");
+        assert!(above.find("Limit") < above.find("Projection"), "{above}");
+        assert_eq!(
+            run(&mut context, "SELECT i + 1 FROM t LIMIT 2 OFFSET 1"),
+            [["2"], ["3"]]
+        );
+        // count of a column without NULLs reads no column, and with NULLs it still counts them
+        run(
+            &mut context,
+            "CREATE TABLE c (a INTEGER NOT NULL, b INTEGER, s VARCHAR)",
+        );
+        run(
+            &mut context,
+            "INSERT INTO c VALUES (1, NULL, 'x'), (2, 2, 'x'), (3, 3, 'y')",
+        );
+        let sql = "SELECT s, count(a), count(b) FROM c GROUP BY s ORDER BY s";
+        assert_eq!(run(&mut context, sql), [["x", "2", "1"], ["y", "1", "1"]]);
+        assert!(!plan(&mut context, "SELECT count(a) FROM c").contains("count(a)"));
+        let sql = "SELECT count(DISTINCT a), count(a) FILTER (WHERE a > 1) FROM c";
+        assert_eq!(run(&mut context, sql), [["3", "2"]]);
+        assert_eq!(run(&mut context, "SELECT count(b) FROM c WHERE b > 0"), [["2"]]);
+        let sql = "SELECT count(c2.a) FROM c c1 LEFT JOIN c c2 ON c1.a = c2.b";
+        assert_eq!(run(&mut context, sql), [["2"]]);
+    }
+
+    #[test]
+    fn analyze_checks_its_table() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        run(&mut context, "CREATE TABLE t (i INTEGER)");
+        run(&mut context, "CREATE VIEW v AS SELECT * FROM t");
+        for sql in ["ANALYZE", "VACUUM", "VACUUM ANALYZE", "ANALYZE t", "VACUUM t"] {
+            run(&mut context, sql);
+        }
+        assert!(context.query("ANALYZE missing").is_err());
+        let error = context.query("ANALYZE v").unwrap_err().to_string();
+        assert!(error.contains("Can only vacuum or analyze base tables"), "{error}");
     }
 
     #[test]

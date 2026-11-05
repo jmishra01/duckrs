@@ -123,6 +123,7 @@ fn base_table_column(op: &LogicalOperator, binding: ColumnBinding) -> Option<(Ar
         }
         LogicalOperatorKind::Limit { .. }
         | LogicalOperatorKind::Order { .. }
+        | LogicalOperatorKind::TopN { .. }
         | LogicalOperatorKind::Distinct { .. }
         | LogicalOperatorKind::Filter { .. }
         | LogicalOperatorKind::Sample { .. }

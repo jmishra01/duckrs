@@ -1019,10 +1019,39 @@ impl StatisticsPropagator {
     }
 
     /// `PropagateStatistics` of an operator, children first.
+    /// `count(x)` of a column without NULLs counts rows, and does not have to read it.
+    fn count_valid_as_count_star(&mut self, op: &mut LogicalOperator) {
+        let K::Aggregate { aggregates, .. } = &mut op.kind else {
+            return;
+        };
+        for aggregate in aggregates {
+            let [
+                BoundExpr {
+                    kind: BoundExprKind::ColumnRef { binding, depth: 0 },
+                    ..
+                },
+            ] = aggregate.children.as_slice()
+            else {
+                continue;
+            };
+            if aggregate.function.name != "count" || aggregate.distinct || self.lookup(*binding).can_be_null {
+                continue;
+            }
+            let Some(count_star) = BuiltinFunctions::get().aggregate("count_star") else {
+                continue;
+            };
+            let Ok(rewritten) = bind_aggregate_function(count_star, Vec::new(), aggregate.filter.clone(), false) else {
+                continue;
+            };
+            *aggregate = rewritten;
+        }
+    }
+
     fn visit(&mut self, op: &mut LogicalOperator) {
         for child in &mut op.children {
             self.visit(child);
         }
+        self.count_valid_as_count_star(op);
         match &mut op.kind {
             K::Get {
                 table,

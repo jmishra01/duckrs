@@ -247,6 +247,11 @@ while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` 
   plan it came from wherever the shapes line up, as resolved expressions have lost their names.
   `~N rows` comes from the join order's statistics, per operator, so an estimate is only as good
   as those.
+- **Limits** below 8192 go below projections, and a limit over an ORDER BY is a **Top-N**
+  (`optimizer/top_n.rs`) unless it is more than 5000 rows and 0.7% of the input. The Top-N is
+  `PhysicalOrder` with a limit, which cuts its rows whenever it holds twice what it needs.
+- `count(x)` of a column without NULLs is `count_star()`, which reads no column. ANALYZE and VACUUM
+  only check that the table exists, as statistics are made when needed.
 - **Unused columns** of a projection become typed NULL constants instead of going away, which
   keeps column bindings stable: subquery plans refer to outer columns by binding. A scan keeps its
   `column_ids` and bindings, and `projection` says which it outputs, so a column that only its
@@ -281,7 +286,7 @@ deduplicating and deciding constants, transitive filters, MoveConstants of float
 `x * 0`,
 pushdown through outer, right, ASOF and window operators, SEMI and ANTI delim joins,
 and flattening of the cases above, the extremum rewrite of `> ANY` among them. MARK joins with a
-predicate check each pair of a key's rows, where C++ hashes on the comparison. The gate is not met: `test/optimizer` is at 44.4% against 80%, and TPC-DS does
+predicate check each pair of a key's rows, where C++ hashes on the comparison. The gate is not met: `test/optimizer` is at 46.5% against 80%, and TPC-DS does
 not run yet.
 
 ## Testing
