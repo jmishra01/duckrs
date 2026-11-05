@@ -276,7 +276,12 @@ until Phase 9; the others want statistics per function (`contains`, `substr`, `l
 TPC-H gives all 22 answers right at SF 0.01, 0.1 and 1, with `examples/tpch.rs` against DuckDB's
 answer files. Data comes from `tools/tpch/build_dbgen.sh`, which builds DuckDB's generators with text
 output. At SF 1 it is 6.5 times slower than DuckDB on one thread, by the geometric mean, and no
-query is more than 15 times slower. Phase 8 brings parallelism. TPC-DS does not run yet.
+query is more than 15 times slower. Phase 8 brings parallelism.
+
+TPC-DS gives all 99 answers right at SF 0.01 and 1, with `examples/tpcds.rs` against DuckDB's
+answer files, within a relative tolerance of 1e-9. Data comes from `tools/tpcds/build_dsdgen.sh`,
+which builds DuckDB's generator with text output. At SF 1 the 99 queries take 82 s, and loading
+takes 26 minutes through INSERT, as there is no COPY yet.
 
 Not ported yet: the box rendering of EXPLAIN, moving LEFT joins in the join order, and SEMI and ANTI joins that read several
 relations (those stay on top of the tree), the estimator's caps for composite keys, estimated rows in EXPLAIN, flipping
@@ -286,8 +291,7 @@ deduplicating and deciding constants, transitive filters, MoveConstants of float
 `x * 0`,
 pushdown through outer, right, ASOF and window operators, SEMI and ANTI delim joins,
 and flattening of the cases above, the extremum rewrite of `> ANY` among them. MARK joins with a
-predicate check each pair of a key's rows, where C++ hashes on the comparison. The gate is not met: `test/optimizer` is at 46.5% against 80%, and TPC-DS does
-not run yet.
+predicate check each pair of a key's rows, where C++ hashes on the comparison. The gate is not met: `test/optimizer` is at 46.5% against 80%.
 
 ## Testing
 

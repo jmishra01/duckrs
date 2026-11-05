@@ -351,6 +351,19 @@ impl AggregateFunction {
         rows: &[(usize, usize)],
         states: &mut [AggregateState],
     ) -> Result<()> {
+        self.update_keyed(input, count, rows, states, None)
+    }
+
+    /// `update`, with the `value_keys` of `input` when the caller has them. A window updates one
+    /// state many times from the same input, so `min`/`max` must not encode all of it each time.
+    pub fn update_keyed(
+        &self,
+        input: Option<&Vector>,
+        count: usize,
+        rows: &[(usize, usize)],
+        states: &mut [AggregateState],
+        keys: Option<&[Vec<u8>]>,
+    ) -> Result<()> {
         use AggregateKind::*;
         let Some(input) = input else {
             // count_star counts rows, whatever they hold
@@ -426,7 +439,14 @@ impl AggregateFunction {
                 }
             }
             Min | Max => {
-                let keys = value_keys(input, count)?;
+                let encoded;
+                let keys = match keys {
+                    Some(keys) => keys,
+                    None => {
+                        encoded = value_keys(input, count)?;
+                        &encoded
+                    }
+                };
                 let u = input.to_unified(count);
                 for &(row, group) in rows {
                     if !u.is_valid(row) {

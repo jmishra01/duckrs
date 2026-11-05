@@ -8,7 +8,7 @@
 
 use super::expression_executor::{evaluate_scalar, execute};
 use super::physical::{PhysicalOperator, SourceState, scan_collection};
-use crate::function::aggregates::value_keys;
+use crate::function::aggregates::{AggregateKind, value_keys};
 use crate::planner::expression::{BoundExpr, BoundWindow, WindowFunction};
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::{OrderModifiers, create_sort_keys};
@@ -222,6 +222,10 @@ struct Evaluation<'a> {
     sorted: &'a Sorted,
     /// by child, by position
     children: Vec<Vec<Value>>,
+    /// an aggregate's argument, by position: partitions share it, so it is built once
+    input: Option<Vector>,
+    /// `value_keys` of `input`, for what compares it: DISTINCT, `min` and `max`
+    input_keys: Option<Vec<Vec<u8>>>,
     /// by position: whether FILTER lets the row in
     filtered_in: Vec<bool>,
     arg_keys: Option<Vec<Vec<u8>>>,
@@ -239,6 +243,25 @@ impl<'a> Evaluation<'a> {
         for child in &window.children {
             children.push(by_position(evaluate(child, chunks)?));
         }
+        let input = match (&window.aggregate, window.children.first()) {
+            (Some(_), Some(child)) => {
+                let mut vector = Vector::new(child.return_type.clone(), count.max(1));
+                for (position, value) in children[0].iter().enumerate() {
+                    vector.set_value(position, value)?;
+                }
+                Some(vector)
+            }
+            _ => None,
+        };
+        let compares = window.distinct
+            || window
+                .aggregate
+                .as_ref()
+                .is_some_and(|f| matches!(f.kind, AggregateKind::Min | AggregateKind::Max));
+        let input_keys = match &input {
+            Some(input) if compares => Some(value_keys(input, count)?),
+            _ => None,
+        };
         let filtered_in = match &window.filter {
             Some(filter) => by_position(evaluate(filter, chunks)?)
                 .iter()
@@ -291,6 +314,8 @@ impl<'a> Evaluation<'a> {
             window,
             sorted,
             children,
+            input,
+            input_keys,
             filtered_in,
             arg_keys,
             start,
@@ -647,21 +672,9 @@ impl<'a> Evaluation<'a> {
         let window = self.window;
         let function = window.aggregate.as_ref().expect("an aggregate window has a function");
         let count = self.sorted.rows.len();
-        let input = match window.children.first() {
-            Some(child) => {
-                let mut vector = Vector::new(child.return_type.clone(), count.max(1));
-                for (position, value) in self.children[0].iter().enumerate() {
-                    vector.set_value(position, value)?;
-                }
-                Some(vector)
-            }
-            None => None,
-        };
+        let input = self.input.as_ref();
         let input_type = window.children.first().map(|c| &c.return_type);
-        let distinct_keys = match (&input, window.distinct) {
-            (Some(input), true) => Some(value_keys(input, count)?),
-            _ => None,
-        };
+        let keys = self.input_keys.as_deref();
         let incremental = window.exclude == WindowExclude::NoOther && !window.distinct && self.arg_keys.is_none();
         let mut states = [function.kind.initial_state()];
         let mut previous: Option<(usize, usize)> = None;
@@ -689,14 +702,14 @@ impl<'a> Evaluation<'a> {
                     .into_iter()
                     .map(|p| (p, 0))
                     .collect();
-                if let Some(keys) = &distinct_keys {
+                if let Some(keys) = keys.filter(|_| window.distinct) {
                     let mut seen = HashSet::new();
                     let is_null = |p: usize| self.children[0][p].is_null();
                     rows.retain(|(p, _)| !is_null(*p) && seen.insert(&keys[*p]));
                 }
             }
             if !rows.is_empty() {
-                function.update(input.as_ref(), count, &rows, &mut states)?;
+                function.update_keyed(input, count, &rows, &mut states, keys)?;
             }
             result.push(function.finalize(&states[0], &window.return_type, input_type)?);
         }

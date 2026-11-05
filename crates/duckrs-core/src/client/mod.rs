@@ -3262,6 +3262,47 @@ mod tests {
     }
 
     #[test]
+    fn running_min_and_max_take_time_of_the_order_of_their_rows() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        // encoding all of the input for each frame would never get through this many rows
+        let rows = run(
+            &mut context,
+            "SELECT count(*), min(lo), max(hi), count(s) FROM (
+                SELECT min(n) OVER w AS lo, max(n) OVER w AS hi, max(s) OVER w AS s FROM (
+                    SELECT i, CASE WHEN i % 5 = 0 THEN NULL ELSE i END AS n,
+                           CASE WHEN i < 3 THEN NULL ELSE i::VARCHAR END AS s
+                    FROM range(200000) t(i)
+                ) WINDOW w AS (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW))",
+        );
+        assert_eq!(rows, [["200000", "1", "199999", "199997"]]);
+        // nor could each of many partitions encode all of the input
+        let rows = run(
+            &mut context,
+            "SELECT count(*), sum(hi), count(DISTINCT n) FROM (
+                SELECT max(i) OVER w AS hi, count(DISTINCT i % 3) OVER w AS n FROM range(200000) t(i)
+                WINDOW w AS (PARTITION BY i // 2 ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW))",
+        );
+        assert_eq!(rows, [["200000", "19999900000", "2"]]);
+        // a frame that moves still gets the extreme of its own rows, NULLs left out
+        let rows = run(
+            &mut context,
+            "SELECT i, min(n) OVER w, max(n) OVER w, max(n) FILTER (WHERE n < 3) OVER w
+             FROM (VALUES (0, 5), (1, NULL), (2, 1), (3, 9), (4, NULL)) t(i, n)
+             WINDOW w AS (ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) ORDER BY i",
+        );
+        assert_eq!(
+            rows,
+            [
+                ["0", "5", "5", "NULL"],
+                ["1", "5", "5", "NULL"],
+                ["2", "1", "1", "1"],
+                ["3", "1", "9", "1"],
+                ["4", "9", "9", "NULL"],
+            ]
+        );
+    }
+
+    #[test]
     fn top_n_gives_the_rows_of_a_sort() {
         let mut context = ClientContext::new(DatabaseInstance::new());
         run(&mut context, "SET explain_output = 'OPTIMIZED_ONLY'");
