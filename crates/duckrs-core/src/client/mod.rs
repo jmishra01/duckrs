@@ -4,6 +4,7 @@
 //! Databases and client contexts (DuckDB's `src/main`): running SQL text statement by statement through the
 //! parser, binder, planner and executor.
 
+mod explain;
 pub mod settings;
 mod settings_table;
 
@@ -13,15 +14,15 @@ use crate::catalog::{
 };
 use crate::execution::alter::{execute_alter, execute_create_index};
 use crate::execution::expression_executor::evaluate_scalar;
-use crate::execution::physical::{PhysicalOperator, PhysicalResultCollector};
+use crate::execution::physical::PhysicalResultCollector;
 use crate::execution::{create_plan, execute_plan};
+use crate::optimizer::join_order::estimate_plan;
 use crate::optimizer::{OptimizerOptions, optimize};
 use crate::planner::binder::{
     BindOptions, Binder, DefaultNullOrder, ParameterValues, bind_constant_expression, schema_of,
 };
 use crate::planner::binder::{SessionValues, ShowBehavior, enum_type_from, is_builtin_type};
 use crate::planner::column_binding_resolver::resolve_column_bindings;
-use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::OrderType;
 use duckrs_common::types::LogicalType;
@@ -550,7 +551,12 @@ impl ClientContext {
     }
 
     /// `PhysicalExplain`: the plan in text form, as a key and a value per plan.
-    fn explain(&mut self, statement: &Statement, explain_type: ExplainType) -> Result<MaterializedQueryResult> {
+    fn explain(
+        &mut self,
+        statement: &Statement,
+        explain_type: ExplainType,
+        format: &str,
+    ) -> Result<MaterializedQueryResult> {
         if explain_type == ExplainType::Sql {
             return Err(crate::unported("EXPLAIN (SQL)"));
         }
@@ -558,11 +564,20 @@ impl ClientContext {
         binder.parameters = self.parameters.clone();
         binder.session = Some(self.session_values());
         let bound = binder.bind(statement)?;
-        let logical = explain_logical(&bound.plan);
+        let upper = self
+            .setting_text("profiling_renderer_settings")
+            .to_lowercase()
+            .replace(['\'', ' '], "")
+            .contains("operator_casing=upper");
+        let logical = explain::render(&explain::logical_tree(&bound.plan, None), format, upper);
         let mut plan = optimize(bound.plan, self.optimizer_options());
-        let logical_optimized = explain_logical(&plan);
+        let optimized = plan.clone();
+        let estimate = estimate_plan(&plan);
+        let logical_optimized = explain::render(&explain::logical_tree(&plan, Some(&estimate)), format, upper);
         resolve_column_bindings(&mut plan)?;
-        let physical = explain_physical(create_plan(plan).as_ref());
+        let physical_plan = create_plan(plan);
+        let physical = explain::physical_tree(physical_plan.as_ref(), Some(&optimized), Some(&estimate));
+        let physical = explain::render(&physical, format, upper);
         if explain_type == ExplainType::Analyze {
             self.execute_statement(statement)?;
         }
@@ -696,8 +711,8 @@ impl ClientContext {
             Statement::Explain {
                 statement,
                 explain_type,
-                ..
-            } => return self.explain(statement, *explain_type),
+                format,
+            } => return self.explain(statement, *explain_type, format),
             Statement::Alter(info) => {
                 let mut binder = Binder::new(&self.db.catalog);
                 let alter = binder.bind_alter(info)?;
@@ -811,105 +826,6 @@ fn pragma_argument(argument: &Expr) -> String {
         _ => argument.to_string(),
     };
     format!("'{}'", text.replace('\'', "''"))
-}
-
-/// The operators of a physical plan, each with its children below it. Not the box rendering of
-/// `TextTreeRenderer`: tests of plans look for operator names and join details.
-fn explain_physical(op: &dyn PhysicalOperator) -> String {
-    fn visit(op: &dyn PhysicalOperator, depth: usize, out: &mut String) {
-        let indent = "  ".repeat(depth);
-        out.push_str(&indent);
-        out.push_str(op.name());
-        out.push('\n');
-        for line in op.explain_details() {
-            out.push_str(&indent);
-            out.push_str("  ");
-            out.push_str(&line);
-            out.push('\n');
-        }
-        for child in op.children() {
-            visit(child.as_ref(), depth + 1, out);
-        }
-    }
-    let mut out = String::new();
-    visit(op, 0, &mut out);
-    out
-}
-
-/// The operators of a logical plan, by the names of `LogicalOperatorToString`.
-fn explain_logical(op: &LogicalOperator) -> String {
-    fn name(op: &LogicalOperator) -> String {
-        use LogicalOperatorKind as K;
-        match &op.kind {
-            K::Get { .. } | K::Range { .. } | K::ExpressionGet { .. } => "SEQ_SCAN".to_string(),
-            K::EmptyResult { .. } => "EMPTY_RESULT".to_string(),
-            K::DummyScan { .. } => "DUMMY_SCAN".to_string(),
-            K::Filter { .. } => "FILTER".to_string(),
-            K::Window { .. } => "WINDOW".to_string(),
-            K::Aggregate { .. } => "AGGREGATE".to_string(),
-            K::Order { .. } => "ORDER_BY".to_string(),
-            K::Limit { .. } | K::LimitPercent { .. } => "LIMIT".to_string(),
-            K::Sample { .. } => "SAMPLE".to_string(),
-            K::Distinct { .. } => "DISTINCT".to_string(),
-            K::Unnest { .. } => "UNNEST".to_string(),
-            K::Union { .. } => "UNION".to_string(),
-            K::ExceptIntersect { except: true, .. } => "EXCEPT".to_string(),
-            K::ExceptIntersect { .. } => "INTERSECT".to_string(),
-            K::RecursiveCte { .. } => "REC_CTE".to_string(),
-            K::WorkingTable { .. } => "CTE_SCAN".to_string(),
-            K::DelimGet { .. } => "DELIM_GET".to_string(),
-            K::DelimJoin { join_type, .. } => format!("DELIM_JOIN {}", join_type.name()),
-            K::LateralJoin { .. } => "DEPENDENT_JOIN".to_string(),
-            K::Projection { .. } => "PROJECTION".to_string(),
-            K::CrossProduct => "CROSS_PRODUCT".to_string(),
-            K::AsOfJoin { .. } => "ASOF_JOIN".to_string(),
-            K::PositionalJoin => "POSITIONAL_JOIN".to_string(),
-            K::MarkJoin { .. } => "COMPARISON_JOIN MARK".to_string(),
-            K::Join { join_type, .. } => format!("COMPARISON_JOIN {}", join_type.name()),
-            K::Insert { .. } => "INSERT".to_string(),
-            K::Delete { .. } => "DELETE".to_string(),
-            K::Update { .. } => "UPDATE".to_string(),
-            K::MergeInto { .. } => "MERGE_INTO".to_string(),
-            K::CreateTableAs { .. } | K::CreateTable { .. } => "CREATE_TABLE".to_string(),
-        }
-    }
-    /// What `LogicalOperator::ParamsToString` shows.
-    fn details(op: &LogicalOperator) -> Vec<String> {
-        use LogicalOperatorKind as K;
-        match &op.kind {
-            K::Get { table, .. } => vec![table.name.clone()],
-            K::Filter { expressions } | K::Projection { expressions, .. } => {
-                expressions.iter().map(|e| e.to_string()).collect()
-            }
-            K::Join {
-                conditions, predicate, ..
-            }
-            | K::DelimJoin {
-                conditions, predicate, ..
-            } => conditions
-                .iter()
-                .map(|c| format!("{} = {}", c.left, c.right))
-                .chain(predicate.iter().map(|p| p.to_string()))
-                .collect(),
-            _ => Vec::new(),
-        }
-    }
-    fn visit(op: &LogicalOperator, depth: usize, out: &mut String) {
-        out.push_str(&"  ".repeat(depth));
-        out.push_str(&name(op));
-        out.push('\n');
-        for line in details(op) {
-            out.push_str(&"  ".repeat(depth + 1));
-            out.push_str(&line);
-            out.push('\n');
-        }
-        for child in &op.children {
-            visit(child, depth + 1, out);
-        }
-    }
-    let mut out = String::new();
-    visit(op, 0, &mut out);
-    out
 }
 
 fn on_create_conflict(conflict: AstConflict) -> OnCreateConflict {
@@ -3057,6 +2973,64 @@ mod tests {
     }
 
     #[test]
+    fn explain_matches_duckdb() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        run(&mut context, "CREATE TABLE a AS SELECT i AS x FROM range(1000) t(i)");
+        run(&mut context, "CREATE TABLE b AS SELECT i AS y FROM range(1000) t(i)");
+        let explain = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let query = "SELECT x FROM a, b WHERE x = y ORDER BY x LIMIT 10";
+        // operators are in title case, with their details and estimates
+        let plan = explain(&mut context, query);
+        for expected in [
+            "Hash Join",
+            "Join Type: INNER",
+            "Conditions: x = y",
+            "Order By: x ASC",
+            "Limit: 10",
+            "Seq Scan",
+            "Table: a",
+            "Type: Sequential Scan",
+            "~1,000 rows",
+        ] {
+            assert!(plan.contains(expected), "{expected} in {plan}");
+        }
+        assert!(!plan.contains("HASH_JOIN"), "{plan}");
+        // one row is no plural
+        assert!(explain(&mut context, "SELECT count(*) FROM a").contains("~1 row\n"));
+        // the setting asks for the names as they are
+        run(
+            &mut context,
+            "SET profiling_renderer_settings = MAP {'operator_casing': 'upper'}",
+        );
+        let plan = explain(&mut context, query);
+        assert!(plan.contains("HASH_JOIN") && plan.contains("SEQ_SCAN"), "{plan}");
+        // JSON has the names as they are, in any case, and a list for what has several lines
+        run(&mut context, "RESET profiling_renderer_settings");
+        let plan = explain(&mut context, &format!("(FORMAT JSON) {query}"));
+        for expected in [
+            "\"name\": \"HASH_JOIN\"",
+            "\"Join Type\": \"INNER\"",
+            "\"Estimated Cardinality\": \"1000\"",
+            "\"children\": []",
+        ] {
+            assert!(plan.contains(expected), "{expected} in {plan}");
+        }
+        assert!(plan.starts_with('[') && plan.ends_with(']'), "{plan}");
+        let plan = explain(&mut context, "(FORMAT JSON) SELECT x, x + 1 FROM a");
+        assert!(plan.contains("\"Projections\": [\"x\", \"(x + 1)\"]"), "{plan}");
+        // the estimates in the logical plan
+        run(&mut context, "SET explain_output = 'OPTIMIZED_ONLY'");
+        let plan = explain(&mut context, query);
+        assert!(
+            plan.contains("Comparison Join") && plan.contains("~1,000 rows"),
+            "{plan}"
+        );
+        // what fails in a statement is not the renderer's: DML runs through it as well
+        run(&mut context, "EXPLAIN DELETE FROM a WHERE x = 1");
+        assert_eq!(run(&mut context, "SELECT count(*) FROM a"), [["1000"]]);
+    }
+
+    #[test]
     fn in_subqueries_match_duckdb() {
         let mut context = ClientContext::new(DatabaseInstance::new());
         run(&mut context, "SET explain_output = 'OPTIMIZED_ONLY'");
@@ -3082,7 +3056,7 @@ mod tests {
         // a filter on the marker only is a SEMI join, which drops false and NULL alike
         let sql = "SELECT i FROM l WHERE i IN (SELECT j FROM n)";
         let plan = explain(&mut context, sql);
-        assert!(plan.contains("COMPARISON_JOIN SEMI"), "{plan}");
+        assert!(plan.contains("Join Type: SEMI"), "{plan}");
         assert_eq!(run(&mut context, sql), [["1"]]);
         // NOT IN needs the NULLs, so stays MARK
         let sql = "SELECT i FROM l WHERE i NOT IN (SELECT j FROM n)";
@@ -3137,13 +3111,14 @@ mod tests {
         run(&mut context, "CREATE TABLE small AS SELECT i AS id FROM range(20) t(i)");
         let explain = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
         let at = |plan: &str, table: &str| {
-            let line = plan.lines().position(|line| line.trim() == table);
+            let line = format!("Table: {table}");
+            let line = plan.lines().position(|text| text.trim() == line);
             line.unwrap_or_else(|| panic!("{table} in {plan}"))
         };
         // written with the cross product first; the smaller tables are built, with no cross product
         let query = "FROM small, mid, big WHERE big.mid_id = mid.id AND big.small_id = small.id";
         let plan = explain(&mut context, &format!("SELECT count(*) {query}"));
-        assert!(!plan.contains("CROSS_PRODUCT"), "{plan}");
+        assert!(!plan.contains("Cross Product"), "{plan}");
         assert!(
             at(&plan, "big") < at(&plan, "mid") && at(&plan, "big") < at(&plan, "small"),
             "{plan}"
@@ -3185,13 +3160,13 @@ mod tests {
         // a SEMI join goes down to what it reads; on both sides of the join it stays on top
         let sql = "SELECT count(*) FROM big, mid WHERE big.mid_id = mid.id AND mid.id IN (SELECT id FROM small)";
         let plan = explain(&mut context, sql);
-        let joins: Vec<&str> = plan.lines().filter(|l| l.contains("COMPARISON_JOIN")).collect();
+        let joins: Vec<&str> = plan.lines().filter(|l| l.contains("Join Type")).collect();
         assert!(joins[0].contains("INNER") && joins[1].contains("SEMI"), "{plan}");
         assert_eq!(run(&mut context, sql), [["800"]]);
         let sql =
             "SELECT count(*) FROM big b1, mid WHERE b1.mid_id = mid.id AND b1.id + mid.id IN (SELECT id FROM small)";
         let plan = explain(&mut context, sql);
-        let joins: Vec<&str> = plan.lines().filter(|l| l.contains("COMPARISON_JOIN")).collect();
+        let joins: Vec<&str> = plan.lines().filter(|l| l.contains("Join Type")).collect();
         assert!(joins[0].contains("SEMI") && joins[1].contains("INNER"), "{plan}");
         // over the limit of the exact search, and without anything to connect two of them
         let many = (0..14).map(|i| format!("small s{i}")).collect::<Vec<_>>().join(", ");
@@ -3204,7 +3179,7 @@ mod tests {
             [["20"]]
         );
         let plan = explain(&mut context, "SELECT * FROM l, r, mid WHERE a = b");
-        assert!(plan.contains("CROSS_PRODUCT"), "{plan}");
+        assert!(plan.contains("Cross Product"), "{plan}");
         // off under the name DuckDB has for it: the query stays as it is written
         run(&mut context, "SET disabled_optimizers = 'join_order'");
         let plan = explain(&mut context, "SELECT count(*) FROM mid, big WHERE big.mid_id = mid.id");
@@ -3214,6 +3189,10 @@ mod tests {
     #[test]
     fn statistics_match_duckdb() {
         let mut context = ClientContext::new(DatabaseInstance::new());
+        run(
+            &mut context,
+            "SET profiling_renderer_settings = MAP {'operator_casing': 'upper'}",
+        );
         run(&mut context, "SET explain_output = 'OPTIMIZED_ONLY'");
         run(&mut context, "CREATE TABLE s (i INTEGER)");
         run(&mut context, "INSERT INTO s VALUES (1), (2), (3)");
@@ -3282,6 +3261,10 @@ mod tests {
     #[test]
     fn flattened_subqueries_match_duckdb() {
         let mut context = ClientContext::new(DatabaseInstance::new());
+        run(
+            &mut context,
+            "SET profiling_renderer_settings = MAP {'operator_casing': 'upper'}",
+        );
         run(&mut context, "CREATE TABLE a (x INTEGER, k INTEGER)");
         run(&mut context, "CREATE TABLE b (y INTEGER, k INTEGER)");
         run(&mut context, "INSERT INTO a VALUES (1, 1), (2, 1), (3, 2), (NULL, 3)");
@@ -4289,6 +4272,10 @@ mod tests {
     #[test]
     fn explain_names_the_operators() {
         let mut c = ClientContext::new(DatabaseInstance::new());
+        run(
+            &mut c,
+            "SET profiling_renderer_settings = MAP {'operator_casing': 'upper'}",
+        );
         run(&mut c, "CREATE TABLE t(a INT)");
         let plan = run(&mut c, "EXPLAIN SELECT a FROM t ORDER BY a");
         assert_eq!(plan[0][0], "physical_plan");

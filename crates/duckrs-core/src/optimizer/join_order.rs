@@ -200,34 +200,17 @@ impl Estimator {
             if predicate.set.count_ones() < 2 {
                 continue;
             }
-            if let BoundExprKind::Comparison { op, left, right } = &predicate.expr.kind {
-                let domain = [domain_of(left), domain_of(right)]
-                    .into_iter()
-                    .flatten()
-                    .reduce(f64::max)
-                    .unwrap_or(1.0);
-                match op {
-                    ComparisonOp::Equal | ComparisonOp::NotDistinctFrom => {
-                        if let (Some(l), Some(r)) = (bare_column(left), bare_column(right))
-                            && relation_of.contains_key(&l)
-                            && relation_of.contains_key(&r)
-                        {
-                            let (l, r) = (find(&mut parents, l), find(&mut parents, r));
-                            parents.insert(l, r);
-                        } else {
-                            denominators.push((predicate.set, domain));
-                        }
-                    }
-                    ComparisonOp::NotEqual | ComparisonOp::DistinctFrom => {
-                        if domain > 1.0 {
-                            denominators.push((predicate.set, domain / (domain - 1.0)));
-                        }
-                    }
-                    _ => denominators.push((predicate.set, domain.powf(2.0 / 3.0))),
-                }
-            } else {
-                denominators.push((predicate.set, 1.0 / DEFAULT_SELECTIVITY));
+            if let BoundExprKind::Comparison { op, left, right } = &predicate.expr.kind
+                && matches!(op, ComparisonOp::Equal | ComparisonOp::NotDistinctFrom)
+                && let (Some(l), Some(r)) = (bare_column(left), bare_column(right))
+                && relation_of.contains_key(&l)
+                && relation_of.contains_key(&r)
+            {
+                let (l, r) = (find(&mut parents, l), find(&mut parents, r));
+                parents.insert(l, r);
+                continue;
             }
+            denominators.push((predicate.set, predicate_denominator(&predicate.expr, &domain_of)));
         }
         let mut classes: HashMap<ColumnBinding, (u64, f64)> = HashMap::new();
         for binding in parents.keys().copied().collect::<Vec<_>>() {
@@ -272,6 +255,29 @@ impl Estimator {
         let estimate = numerator / denominator;
         self.estimates.insert(set, estimate);
         estimate
+    }
+}
+
+/// What `conjunct`, on a join, divides its size by (`ApplyComparisonRatio`).
+fn predicate_denominator(conjunct: &BoundExpr, domain_of: &dyn Fn(&BoundExpr) -> Option<f64>) -> f64 {
+    let BoundExprKind::Comparison { op, left, right } = &conjunct.kind else {
+        return 1.0 / DEFAULT_SELECTIVITY;
+    };
+    let domain = [domain_of(left), domain_of(right)]
+        .into_iter()
+        .flatten()
+        .reduce(f64::max)
+        .unwrap_or(1.0);
+    match op {
+        ComparisonOp::Equal | ComparisonOp::NotDistinctFrom => domain,
+        ComparisonOp::NotEqual | ComparisonOp::DistinctFrom => {
+            if domain > 1.0 {
+                domain / (domain - 1.0)
+            } else {
+                1.0
+            }
+        }
+        _ => domain.powf(2.0 / 3.0),
     }
 }
 
@@ -654,19 +660,45 @@ impl JoinOrderOptimizer {
                 left.distinct.extend(right.distinct);
                 left
             }
-            K::Join { join_type, .. } => {
+            K::Join {
+                join_type,
+                conditions,
+                predicate,
+            } => {
                 let (mut left, right) = (self.stats(&op.children[0]), self.stats(&op.children[1]));
-                match join_type {
-                    JoinType::Semi | JoinType::Anti => {
-                        let cardinality = left.cardinality * DEFAULT_SELECTIVITY;
-                        left.scaled(cardinality)
-                    }
-                    _ => {
-                        left.cardinality = left.cardinality.max(right.cardinality);
-                        left.distinct.extend(right.distinct);
-                        left
+                if matches!(join_type, JoinType::Semi | JoinType::Anti) {
+                    let cardinality = left.cardinality * DEFAULT_SELECTIVITY;
+                    return left.scaled(cardinality);
+                }
+                let (left_rows, right_rows) = (left.cardinality, right.cardinality);
+                left.distinct.extend(right.distinct);
+                let domain_of = |expr: &BoundExpr| {
+                    let mut columns = Vec::new();
+                    expression_columns(expr, &mut columns);
+                    let distinct = columns.iter().filter_map(|c| left.distinct.get(c).copied());
+                    distinct.reduce(f64::max)
+                };
+                let mut denominator = 1.0;
+                for condition in conditions {
+                    let sides = [domain_of(&condition.left), domain_of(&condition.right)];
+                    let domain = sides.into_iter().flatten().reduce(f64::max);
+                    denominator *= domain.unwrap_or(left_rows.max(right_rows)).max(1.0);
+                }
+                if let Some(predicate) = predicate {
+                    let mut conjuncts = Vec::new();
+                    split_conjuncts(predicate.clone(), &mut conjuncts);
+                    for conjunct in &conjuncts {
+                        denominator *= predicate_denominator(conjunct, &domain_of);
                     }
                 }
+                let inner = left_rows * right_rows / denominator;
+                let cardinality = match join_type {
+                    JoinType::Inner => inner,
+                    JoinType::Left => inner.max(left_rows),
+                    JoinType::Right => inner.max(right_rows),
+                    _ => inner.max(left_rows).max(right_rows),
+                };
+                left.scaled(cardinality)
             }
             _ if !op.children.is_empty() => self.stats(&op.children[0]),
             _ => RelationStats {
@@ -674,6 +706,20 @@ impl JoinOrderOptimizer {
                 distinct: HashMap::new(),
             },
         }
+    }
+
+    /// Remembers the size of what `DelimGet`s of a `DelimJoin` read, once its left side is known.
+    fn note_delim(&mut self, op: &LogicalOperator) {
+        let K::DelimJoin { delim, conditions, .. } = &op.kind else {
+            return;
+        };
+        let stats = self.stats(&op.children[0]);
+        let keys = conditions
+            .iter()
+            .filter_map(|c| stats.distinct.get(&bare_column(&c.left)?).copied())
+            .fold(1.0, f64::max)
+            .min(stats.cardinality);
+        self.delim.insert(Arc::as_ptr(delim) as *const () as usize, keys);
     }
 
     /// `JoinOrderOptimizer::Optimize` for a plan. With `by_position` something above reads the
@@ -708,20 +754,14 @@ impl JoinOrderOptimizer {
                     | K::CreateTableAs { .. }
                     | K::Distinct { .. }
             );
-        if let K::DelimJoin { delim, conditions, .. } = &op.kind {
-            let key = Arc::as_ptr(delim) as *const () as usize;
-            let conditions: Vec<BoundExpr> = conditions.iter().map(|c| c.left.clone()).collect();
-            let mut children = std::mem::take(&mut op.children).into_iter();
-            let left = self.optimize(children.next().expect("a join has two sides"), false);
-            let stats = self.stats(&left);
-            let keys = conditions
-                .iter()
-                .filter_map(|c| stats.distinct.get(&bare_column(c)?).copied())
-                .fold(1.0, f64::max)
-                .min(stats.cardinality);
-            self.delim.insert(key, keys);
-            let right = self.optimize(children.next().expect("a join has two sides"), false);
-            op.children = vec![left, right];
+        if matches!(op.kind, K::DelimJoin { .. }) {
+            let right = op.children.pop().expect("a join has two sides");
+            let left = op.children.pop().expect("a join has two sides");
+            op.children.push(self.optimize(left, false));
+            op.children.push(right);
+            self.note_delim(&op);
+            let right = op.children.pop().expect("a join has two sides");
+            op.children.push(self.optimize(right, false));
             return op;
         }
         op.children = std::mem::take(&mut op.children)
@@ -906,6 +946,32 @@ fn filter_cardinality(expressions: &[BoundExpr], child: &RelationStats) -> f64 {
         cardinality *= DEFAULT_SELECTIVITY;
     }
     cardinality
+}
+
+/// The estimated rows of each operator of a plan, for EXPLAIN (`estimated_cardinality`).
+#[derive(Debug)]
+pub struct PlanEstimate {
+    pub cardinality: u64,
+    pub children: Vec<PlanEstimate>,
+}
+
+fn estimate(op: &LogicalOperator, optimizer: &mut JoinOrderOptimizer) -> PlanEstimate {
+    let mut children = Vec::with_capacity(op.children.len());
+    for (at, child) in op.children.iter().enumerate() {
+        children.push(estimate(child, optimizer));
+        if at == 0 {
+            optimizer.note_delim(op);
+        }
+    }
+    PlanEstimate {
+        cardinality: optimizer.stats(op).cardinality.max(0.0).round() as u64,
+        children,
+    }
+}
+
+/// `LogicalOperator::EstimateCardinality` for all operators of a plan.
+pub fn estimate_plan(op: &LogicalOperator) -> PlanEstimate {
+    estimate(op, &mut JoinOrderOptimizer::default())
 }
 
 /// Reorders the trees of joins of `plan`, whose output stays in order at the top.

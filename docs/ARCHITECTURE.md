@@ -217,6 +217,12 @@ while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` 
   own after filter pushdown, which counts the reads, where C++ flags the joins up front. `NOT IN`
   stays MARK, since a NULL on either side changes its answer. In a tree of joins, a SEMI or ANTI
   join that reads one relation goes down to it.
+- **EXPLAIN** (`client::explain`) turns a plan into a tree that renders as text or JSON. Names are
+  in title case unless `operator_casing` says `upper`, and JSON keeps them as they are. The text is
+  one line per fact, not boxes. A physical plan takes its details and estimates from the logical
+  plan it came from wherever the shapes line up, as resolved expressions have lost their names.
+  `~N rows` comes from the join order's statistics, per operator, so an estimate is only as good
+  as those: scans show the table's rows, as filters are not pushed into scans yet.
 - **Unused columns** become typed NULL constants instead of going away, which keeps column
   bindings stable: subquery plans refer to outer columns by binding. Scans keep all their columns,
   because in-memory scans clone `Arc`s and pruning them would gain nothing.
@@ -225,7 +231,7 @@ A filter stays above a projection or an aggregate if it, or an entry it would be
 can fail: below, `a::int < b::int` would run ahead of the filter that guards those casts.
 `can_throw` allows only what is known not to fail, so some filters stay higher than they do in C++.
 
-Not ported yet: moving LEFT joins in the join order, and SEMI and ANTI joins that read several
+Not ported yet: the box rendering of EXPLAIN, `Projections` of scans, moving LEFT joins in the join order, and SEMI and ANTI joins that read several
 relations (those stay on top of the tree), the estimator's caps for composite keys, estimated rows in EXPLAIN, flipping
 LEFT to RIGHT joins for the build side, statistics per row group or for functions (`stats()`, `length`, `abs`,
 `greatest`, `lower`, ...), aggregates and windows, `ANALYZE`, `FilterCombiner` beyond splitting,
