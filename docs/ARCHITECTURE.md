@@ -250,8 +250,10 @@ while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` 
 - **Unused columns** of a projection become typed NULL constants instead of going away, which
   keeps column bindings stable: subquery plans refer to outer columns by binding. A scan keeps its
   `column_ids` and bindings, and `projection` says which it outputs, so a column that only its
-  filters read stays behind and joins do not copy what nothing above reads. Columns that a join or
-  a `Filter` above a scan read for themselves still go up through it.
+  filters read stays behind and joins do not copy what nothing above reads. Before an operator that
+  copies rows, `ColumnSelect` drops what only the operators below read, as projection maps do in
+  C++, and it stays out of EXPLAIN. A projection does not compute what it drops. A join still
+  copies its own right key to its output, since that happens inside of it.
 
 A filter stays above a projection or an aggregate if it, or an entry it would be substituted with,
 can fail: below, `a::int < b::int` would run ahead of the filter that guards those casts.
@@ -268,7 +270,7 @@ until Phase 9; the others want statistics per function (`contains`, `substr`, `l
 
 TPC-H gives all 22 answers right at SF 0.01, 0.1 and 1, with `examples/tpch.rs` against DuckDB's
 answer files. Data comes from `tools/tpch/build_dbgen.sh`, which builds DuckDB's generators with text
-output. At SF 1 it is 7 times slower than DuckDB on one thread, by the geometric mean, and no
+output. At SF 1 it is 6.5 times slower than DuckDB on one thread, by the geometric mean, and no
 query is more than 15 times slower. Phase 8 brings parallelism. TPC-DS does not run yet.
 
 Not ported yet: the box rendering of EXPLAIN, moving LEFT joins in the join order, and SEMI and ANTI joins that read several

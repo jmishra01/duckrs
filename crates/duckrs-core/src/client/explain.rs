@@ -44,7 +44,7 @@ fn logical_name(op: &LogicalOperator) -> &'static str {
         K::DelimGet { .. } => "DELIM_GET",
         K::DelimJoin { .. } => "DELIM_JOIN",
         K::LateralJoin { .. } => "DEPENDENT_JOIN",
-        K::Projection { .. } => "PROJECTION",
+        K::Projection { .. } | K::ColumnSelect { .. } => "PROJECTION",
         K::CrossProduct => "CROSS_PRODUCT",
         K::AsOfJoin { .. } => "ASOF_JOIN",
         K::PositionalJoin => "POSITIONAL_JOIN",
@@ -205,6 +205,10 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
 /// The tree of a logical plan.
 pub(super) fn logical_tree(op: &LogicalOperator, estimate: Option<&PlanEstimate>) -> ExplainNode {
     let aligned = estimate.filter(|e| e.children.len() == op.children.len());
+    // C++ has this inside of the operators, so plans do not show it
+    if matches!(op.kind, K::ColumnSelect { .. }) {
+        return logical_tree(&op.children[0], aligned.map(|e| &e.children[0]));
+    }
     ExplainNode {
         name: logical_name(op).to_string(),
         info: operator_info(op, false),
@@ -228,6 +232,14 @@ pub(super) fn physical_tree(
     let children = op.children();
     let logical = logical.filter(|l| l.children.len() == children.len());
     let estimate = estimate.filter(|e| e.children.len() == children.len());
+    if op.name() == "COLUMN_SELECT" {
+        return physical_tree(
+            children[0].as_ref(),
+            logical.map(|l| &l.children[0]),
+            estimate.map(|e| &e.children[0]),
+            analyze,
+        );
+    }
     let name = match logical.map(|l| &l.kind) {
         Some(K::Get { .. }) => "SEQ_SCAN".to_string(),
         _ => op.name().to_string(),

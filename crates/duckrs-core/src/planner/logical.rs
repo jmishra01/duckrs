@@ -154,6 +154,9 @@ pub enum LogicalOperatorKind {
         /// reads both sides
         predicate: Option<BoundExpr>,
     },
+    /// The columns `keep` of its child, under the bindings they have there, so that an operator that
+    /// keeps rows does not copy what nothing reads. C++ has projection maps in those operators.
+    ColumnSelect { keep: Vec<ColumnBinding> },
     /// `LogicalProjection`.
     Projection {
         table_index: usize,
@@ -401,6 +404,15 @@ impl LogicalOperator {
                     None => column_ids.iter().map(type_of).collect(),
                 }
             }
+            LogicalOperatorKind::ColumnSelect { keep } => {
+                let (bindings, types) = (self.children[0].column_bindings(), self.children[0].types());
+                keep.iter()
+                    .map(|binding| {
+                        let position = bindings.iter().position(|b| b == binding);
+                        types[position.expect("a column of the child")].clone()
+                    })
+                    .collect()
+            }
             LogicalOperatorKind::Range { .. } => vec![LogicalType::BIGINT],
             LogicalOperatorKind::EmptyResult { types, .. } => types.clone(),
             // the dummy scan's single column is never read
@@ -531,6 +543,7 @@ impl LogicalOperator {
                 None => numbered(*table_index, column_ids.len()),
             },
             LogicalOperatorKind::EmptyResult { bindings, .. } => bindings.clone(),
+            LogicalOperatorKind::ColumnSelect { keep } => keep.clone(),
             LogicalOperatorKind::DummyScan { table_index } | LogicalOperatorKind::Range { table_index, .. } => {
                 numbered(*table_index, 1)
             }

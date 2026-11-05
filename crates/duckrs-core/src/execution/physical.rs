@@ -1028,6 +1028,30 @@ impl PhysicalOperator for PhysicalProjection {
     }
 }
 
+/// `LogicalOperatorKind::ColumnSelect`.
+#[derive(Debug)]
+pub struct PhysicalColumnSelect {
+    pub types: Vec<LogicalType>,
+    pub positions: Vec<usize>,
+    pub children: Vec<Box<dyn PhysicalOperator>>,
+}
+
+impl PhysicalOperator for PhysicalColumnSelect {
+    fn name(&self) -> &'static str {
+        "COLUMN_SELECT"
+    }
+    fn types(&self) -> &[LogicalType] {
+        &self.types
+    }
+    fn children(&self) -> &[Box<dyn PhysicalOperator>] {
+        &self.children
+    }
+    fn execute(&self, input: DataChunk) -> Result<DataChunk> {
+        let columns = self.positions.iter().map(|&p| input.column(p).clone()).collect();
+        Ok(DataChunk::from_columns(columns, input.len()))
+    }
+}
+
 /// The input column a resolved ORDER BY or DISTINCT expression reads.
 fn reference_index(expr: &BoundExpr) -> usize {
     match expr.kind {

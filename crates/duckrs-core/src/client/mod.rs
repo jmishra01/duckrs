@@ -3316,6 +3316,30 @@ mod tests {
             [["1", "11"], ["3", "30"]]
         );
         assert_eq!(run(&mut context, "SELECT count(*) FROM c"), [["2"]]);
+        // columns that a join or a filter read for themselves go before what copies rows next
+        run(&mut context, "CREATE TABLE d (y INTEGER, z INTEGER)");
+        run(&mut context, "INSERT INTO d VALUES (5, 50), (7, 70), (8, 80)");
+        let sql = "SELECT a.x, d.z FROM a JOIN b ON a.k = b.k JOIN d ON b.y = d.y ORDER BY d.z";
+        assert_eq!(run(&mut context, sql), [["11", "50"]]);
+        let sql = "SELECT b.k FROM b JOIN d ON b.y = d.y WHERE b.y + d.z > 60 AND b.k < d.z ORDER BY 1";
+        assert_eq!(run(&mut context, sql), [["2"]]);
+        let sql = "SELECT b.k FROM b WHERE b.y + 3 > b.k * 7 AND EXISTS (SELECT * FROM d WHERE d.y = b.y) ORDER BY 1";
+        assert_eq!(run(&mut context, sql), [["1"]]);
+        let sql = "SELECT k FROM b WHERE y <> k ORDER BY spare";
+        assert_eq!(run(&mut context, sql), [["2"], ["1"], ["1"]]);
+        let sql = "SELECT b.k, (SELECT max(z) FROM d WHERE d.y = b.y) FROM b WHERE y > k ORDER BY b.y";
+        assert_eq!(run(&mut context, sql), [["1", "50"], ["1", "NULL"], ["2", "70"]]);
+        let sql = "SELECT count(*) FROM (SELECT y + 1 AS v, z FROM d) WHERE z > 60";
+        assert_eq!(run(&mut context, sql), [["2"]]);
+        let sql = "SELECT count(*) FROM (SELECT 1 / 0 AS v, z FROM d)";
+        assert_eq!(run(&mut context, sql), [["3"]]);
+        // the operator that does this stays out of plans, and it shows in the result only
+        let sql = "EXPLAIN ANALYZE SELECT a.x FROM a JOIN b ON a.k = b.k JOIN d ON b.y = d.y";
+        let analyzed = run(&mut context, sql)[0][1].clone();
+        assert!(
+            !analyzed.contains("COLUMN_SELECT") && !analyzed.contains("Column Select"),
+            "{analyzed}"
+        );
         // off, a scan outputs everything
         run(&mut context, "SET disabled_optimizers = 'unused_columns'");
         let sql = "SELECT a.x FROM a JOIN b ON a.k = b.k";

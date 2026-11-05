@@ -25,8 +25,39 @@ mod special_joins;
 mod upsert;
 mod window;
 
+/// A projection does not compute what is dropped right after it.
+fn create_column_select(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
+    let types = op.types();
+    let LogicalOperatorKind::ColumnSelect { keep } = &op.kind else {
+        unreachable!("the caller checked")
+    };
+    let mut child = op.children.remove(0);
+    let bindings = child.column_bindings();
+    let positions: Vec<usize> = keep
+        .iter()
+        .map(|binding| {
+            bindings
+                .iter()
+                .position(|b| b == binding)
+                .expect("a column of the child")
+        })
+        .collect();
+    if let LogicalOperatorKind::Projection { expressions, .. } = &mut child.kind {
+        *expressions = positions.iter().map(|&p| expressions[p].clone()).collect();
+        return create_plan(child);
+    }
+    Box::new(PhysicalColumnSelect {
+        types,
+        positions,
+        children: vec![create_plan(child)],
+    })
+}
+
 /// `PhysicalPlanGenerator::CreatePlan`.
 pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
+    if matches!(op.kind, LogicalOperatorKind::ColumnSelect { .. }) {
+        return create_column_select(op);
+    }
     let types = op.types();
     let mut children: Vec<Box<dyn PhysicalOperator>> = op.children.into_iter().map(create_plan).collect();
     match op.kind {
@@ -212,6 +243,7 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             expressions,
             children,
         }),
+        LogicalOperatorKind::ColumnSelect { .. } => unreachable!("create_column_select"),
         LogicalOperatorKind::Projection { expressions, .. } => Box::new(PhysicalProjection {
             types,
             expressions,
