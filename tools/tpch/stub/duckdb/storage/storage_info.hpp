@@ -1,0 +1,2 @@
+#pragma once
+#define DEFAULT_BLOCK_ALLOC_SIZE 262144ULL
