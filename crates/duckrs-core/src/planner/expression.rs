@@ -477,6 +477,30 @@ impl fmt::Display for BoundExpr {
                     write!(f, "{}({})", function.name, args.join(", "))
                 }
             },
+            BoundExprKind::Conjunction { and, children } => {
+                let parts: Vec<String> = children.iter().map(|c| c.to_string()).collect();
+                write!(f, "({})", parts.join(if *and { " AND " } else { " OR " }))
+            }
+            BoundExprKind::Operator { op, children } => {
+                let parts: Vec<String> = children.iter().map(|c| c.to_string()).collect();
+                let all = parts.join(", ");
+                match op {
+                    BoundOperator::Not => write!(f, "(NOT {all})"),
+                    BoundOperator::IsNull => write!(f, "({all} IS NULL)"),
+                    BoundOperator::IsNotNull => write!(f, "({all} IS NOT NULL)"),
+                    BoundOperator::Coalesce => write!(f, "COALESCE({all})"),
+                    BoundOperator::Try => write!(f, "TRY({all})"),
+                }
+            }
+            BoundExprKind::Between { input, lower, upper } => write!(f, "({input} BETWEEN {lower} AND {upper})"),
+            BoundExprKind::Case { checks, else_expr } => {
+                f.write_str("CASE")?;
+                for (when, then) in checks {
+                    write!(f, " WHEN {when} THEN {then}")?;
+                }
+                write!(f, " ELSE {else_expr} END")
+            }
+            BoundExprKind::Subquery { .. } => f.write_str("SUBQUERY"),
             _ => write!(f, "{:?}", self.kind),
         }
     }

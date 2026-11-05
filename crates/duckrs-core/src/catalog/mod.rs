@@ -89,6 +89,27 @@ pub struct TableCatalogEntry {
     /// the rows last moved. Whoever rewrites `storage` must reset this.
     pub unique_keys: Mutex<Option<Vec<UniqueKeys>>>,
     pub indexes: RwLock<Vec<Arc<IndexCatalogEntry>>>,
+    /// Of `columns`, when somebody needed them since the rows last changed.
+    pub statistics: Mutex<TableStatistics>,
+}
+
+/// The statistics of a table's columns, if they are up to date. Working them out takes a scan, and
+/// `version` tells whether the rows changed in the meantime, as then they must not end up here.
+#[derive(Debug, Default)]
+pub struct TableStatistics {
+    pub version: u64,
+    pub columns: Option<Arc<Vec<ColumnStatistics>>>,
+}
+
+/// What is known about the values of a column (`BaseStatistics`).
+#[derive(Debug, Clone)]
+pub struct ColumnStatistics {
+    /// the bounds of its values that are not NULL, if known
+    pub min: Option<duckrs_common::value::Value>,
+    pub max: Option<duckrs_common::value::Value>,
+    pub can_be_null: bool,
+    /// whether there can be values that are not NULL
+    pub can_be_valid: bool,
 }
 
 /// `DuckIndexEntry`. Nothing reads a table through an index until Phase 10 brings ART: the
@@ -179,7 +200,18 @@ impl TableCatalogEntry {
             referenced_by: Mutex::default(),
             unique_keys: Mutex::default(),
             indexes: RwLock::default(),
+            statistics: Mutex::default(),
         }
+    }
+
+    /// The rows, to change them. A scan that starts after this sees the change, as it waits for
+    /// the lock, and one that started before it has an old `version`.
+    pub fn write_storage(&self) -> parking_lot::RwLockWriteGuard<'_, ColumnDataCollection> {
+        let storage = self.storage.write();
+        let mut statistics = self.statistics.lock();
+        statistics.version += 1;
+        statistics.columns = None;
+        storage
     }
 
     /// What `unique_keys` holds the keys of, in that order.
@@ -249,7 +281,7 @@ impl TableCatalogEntry {
 
     /// Drops the rows from `rows` on, which a statement that failed added.
     pub fn truncate(&self, rows: usize) {
-        self.storage.write().truncate(rows);
+        self.write_storage().truncate(rows);
         *self.unique_keys.lock() = None;
     }
 
@@ -947,7 +979,7 @@ impl Catalog {
             *saved.schema.types.write() = saved.types;
         }
         for (table, rows, indexes) in snapshot.table_rows {
-            *table.storage.write() = rows;
+            *table.write_storage() = rows;
             *table.indexes.write() = indexes;
             *table.unique_keys.lock() = None;
         }

@@ -873,10 +873,36 @@ fn explain_logical(op: &LogicalOperator) -> String {
             K::CreateTableAs { .. } | K::CreateTable { .. } => "CREATE_TABLE".to_string(),
         }
     }
+    /// What `LogicalOperator::ParamsToString` shows.
+    fn details(op: &LogicalOperator) -> Vec<String> {
+        use LogicalOperatorKind as K;
+        match &op.kind {
+            K::Get { table, .. } => vec![table.name.clone()],
+            K::Filter { expressions } | K::Projection { expressions, .. } => {
+                expressions.iter().map(|e| e.to_string()).collect()
+            }
+            K::Join {
+                conditions, predicate, ..
+            }
+            | K::DelimJoin {
+                conditions, predicate, ..
+            } => conditions
+                .iter()
+                .map(|c| format!("{} = {}", c.left, c.right))
+                .chain(predicate.iter().map(|p| p.to_string()))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
     fn visit(op: &LogicalOperator, depth: usize, out: &mut String) {
         out.push_str(&"  ".repeat(depth));
         out.push_str(&name(op));
         out.push('\n');
+        for line in details(op) {
+            out.push_str(&"  ".repeat(depth + 1));
+            out.push_str(&line);
+            out.push('\n');
+        }
         for child in &op.children {
             visit(child, depth + 1, out);
         }
@@ -3028,6 +3054,74 @@ mod tests {
             err(&mut context, "SELECT (SELECT nope FROM b) FROM a"),
             "Binder Error: Referenced column \"nope\" not found in FROM clause!\nCandidate bindings: \"y\""
         );
+    }
+
+    #[test]
+    fn statistics_match_duckdb() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        run(&mut context, "SET explain_output = 'OPTIMIZED_ONLY'");
+        run(&mut context, "CREATE TABLE s (i INTEGER)");
+        run(&mut context, "INSERT INTO s VALUES (1), (2), (3)");
+        let explain = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let plan = explain(&mut context, "SELECT * FROM s WHERE i > 10");
+        assert!(plan.contains("EMPTY_RESULT"), "{plan}");
+        assert_eq!(run(&mut context, "SELECT count(*) FROM s WHERE i > 10"), [["0"]]);
+        let plan = explain(&mut context, "SELECT * FROM s WHERE i <= 3");
+        assert!(!plan.contains("FILTER"), "{plan}");
+        // what a statement writes shows in the next plan
+        run(&mut context, "INSERT INTO s VALUES (20)");
+        assert_eq!(run(&mut context, "SELECT count(*) FROM s WHERE i > 10"), [["1"]]);
+        run(&mut context, "UPDATE s SET i = 100 WHERE i = 1");
+        assert_eq!(run(&mut context, "SELECT count(*) FROM s WHERE i >= 100"), [["1"]]);
+        run(&mut context, "DELETE FROM s WHERE i = 100");
+        assert_eq!(run(&mut context, "SELECT count(*) FROM s WHERE i >= 100"), [["0"]]);
+        run(&mut context, "BEGIN");
+        run(&mut context, "INSERT INTO s VALUES (500)");
+        assert_eq!(run(&mut context, "SELECT count(*) FROM s WHERE i >= 500"), [["1"]]);
+        run(&mut context, "ROLLBACK");
+        assert_eq!(run(&mut context, "SELECT count(*) FROM s WHERE i >= 500"), [["0"]]);
+        // a NULL stays NULL where the comparison is decided, but does not pass a filter
+        run(&mut context, "CREATE TABLE n (i INTEGER, l INTEGER, u INTEGER)");
+        run(
+            &mut context,
+            "INSERT INTO n VALUES (1, 5, NULL), (2, NULL, 9), (NULL, 5, 9)",
+        );
+        assert_eq!(run(&mut context, "SELECT i > 0 FROM n"), [["true"], ["true"], ["NULL"]]);
+        assert_eq!(run(&mut context, "SELECT count(*) FROM n WHERE i > 0"), [["2"]]);
+        assert_eq!(run(&mut context, "SELECT count(*) FROM n WHERE i < 0"), [["0"]]);
+        assert_eq!(run(&mut context, "SELECT count(*) FROM n WHERE i IS NULL"), [["1"]]);
+        // FALSE AND NULL is FALSE
+        assert_eq!(
+            run(&mut context, "SELECT i BETWEEN l AND u FROM n"),
+            [["false"], ["NULL"], ["NULL"]]
+        );
+        // an outer join puts NULLs in a column that has none, and TRY_CAST too
+        run(&mut context, "CREATE TABLE t (i INTEGER)");
+        run(&mut context, "INSERT INTO t VALUES (1), (2)");
+        run(&mut context, "CREATE TABLE r (i INTEGER)");
+        run(&mut context, "INSERT INTO r VALUES (2)");
+        assert_eq!(
+            run(
+                &mut context,
+                "SELECT t.i, r.i IS NULL FROM t LEFT JOIN r ON t.i = r.i ORDER BY 1"
+            ),
+            [["1", "true"], ["2", "false"]]
+        );
+        assert_eq!(
+            run(
+                &mut context,
+                "SELECT t.i, r.i IS NULL FROM r RIGHT JOIN t ON t.i = r.i ORDER BY 1"
+            ),
+            [["1", "true"], ["2", "false"]]
+        );
+        run(&mut context, "CREATE TABLE big (i INTEGER)");
+        run(&mut context, "INSERT INTO big VALUES (1000)");
+        assert_eq!(
+            run(&mut context, "SELECT TRY_CAST(i AS TINYINT) IS NULL FROM big"),
+            [["true"]]
+        );
+        // a failing expression keeps failing
+        assert!(context.query("SELECT 1 FROM big WHERE (i::TINYINT) IS NULL").is_err());
     }
 
     #[test]

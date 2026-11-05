@@ -25,6 +25,7 @@ pub mod test_all_types;
 pub(crate) mod time_casts;
 pub mod variant;
 
+use crate::planner::expression::{BoundExpr, BoundExprKind};
 use duckrs_common::Result;
 use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::Value;
@@ -130,6 +131,71 @@ fn sequence_functions() -> Vec<ScalarFunctionSet> {
     sets
 }
 
+/// `constant_or_null`: the first argument, or NULL where one of the others is.
+fn constant_or_null_function() -> ScalarFunctionSet {
+    fn resolve(function: &ScalarFunction, arguments: &[LogicalType]) -> Result<ScalarFunction> {
+        Ok(ScalarFunction::new(
+            function.name.clone(),
+            arguments.to_vec(),
+            arguments[0].clone(),
+            function.function,
+        ))
+    }
+    let mut set = ScalarFunctionSet::new("constant_or_null");
+    for count in 2..=5 {
+        let arguments = vec![LogicalType::new(LogicalTypeId::Any); count];
+        let function = ScalarFunction::new(
+            "constant_or_null",
+            arguments,
+            LogicalType::BOOLEAN,
+            run_constant_or_null,
+        );
+        set.add(function.with_resolve_types(resolve));
+    }
+    set
+}
+
+fn run_constant_or_null(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let count = args.len();
+    let columns = args.columns();
+    let null = Value::null(result.logical_type().clone());
+    let formats: Vec<_> = columns[1..].iter().map(|c| c.to_unified(count)).collect();
+    result.prepare_flat(count.max(1));
+    for row in 0..count {
+        if formats.iter().all(|format| format.is_valid(row)) {
+            result.set_value(row, &columns[0].get_value(row))?;
+        } else {
+            result.set_value(row, &null)?;
+        }
+    }
+    Ok(())
+}
+
+/// A call of `constant_or_null` with these arguments, of which there are at most five.
+pub fn constant_or_null(children: Vec<BoundExpr>) -> BoundExpr {
+    let arguments: Vec<LogicalType> = children.iter().map(|c| c.return_type.clone()).collect();
+    let return_type = arguments[0].clone();
+    let function = ScalarFunction::new("constant_or_null", arguments, return_type.clone(), run_constant_or_null);
+    BoundExpr::new(
+        BoundExprKind::Function {
+            function: Arc::new(function),
+            children,
+            is_operator: false,
+        },
+        return_type,
+    )
+}
+
+/// A call of `prefix`, `suffix` or `contains` of strings.
+pub fn string_needle_call(name: &str, text: BoundExpr, needle: BoundExpr) -> BoundExpr {
+    let children = vec![text, needle];
+    let callback = match BuiltinFunctions::get().scalar(name) {
+        Some(set) if name != "contains" => set.functions[0].function,
+        _ => generic::contains,
+    };
+    nested::bound_function(name, children, LogicalType::BOOLEAN, callback)
+}
+
 /// `typeof`: the binder replaces it with a constant ([`typeof_constant`]), so its signature only
 /// has to resolve.
 fn typeof_function() -> ScalarFunctionSet {
@@ -223,6 +289,8 @@ impl BuiltinFunctions {
                     },
                 );
             }
+            let set = constant_or_null_function();
+            functions.scalar.insert(set.name.clone(), set);
             let typeof_set = typeof_function();
             functions.scalar.insert(typeof_set.name.clone(), typeof_set);
             for set in aggregates::aggregate_functions() {

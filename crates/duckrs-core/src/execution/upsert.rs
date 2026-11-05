@@ -29,7 +29,7 @@ pub fn upsert(
     input: &ColumnDataCollection,
     returning: bool,
 ) -> Result<(u64, ColumnDataCollection)> {
-    let mut storage = table.storage.write();
+    let mut storage = table.write_storage();
     let input_chunks: Vec<&DataChunk> = input.chunks().collect();
     let (matched, inserts) = split_input(table, action, &storage, &input_chunks)?;
 

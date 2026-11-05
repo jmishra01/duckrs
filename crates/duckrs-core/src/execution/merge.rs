@@ -176,7 +176,7 @@ impl PhysicalMergeInto {
     fn apply_changes(&self, changes: MergeChanges) -> Result<()> {
         let table = &self.table;
         let types = table.types();
-        let mut storage = table.storage.write();
+        let mut storage = table.write_storage();
         let has_keys = !table.indexes.read().is_empty()
             || !table.referenced_by.lock().is_empty()
             || table

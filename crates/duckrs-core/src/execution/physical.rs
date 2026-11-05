@@ -345,6 +345,9 @@ pub struct PhysicalFilter {
 }
 
 impl PhysicalOperator for PhysicalFilter {
+    fn explain_details(&self) -> Vec<String> {
+        vec![self.condition.to_string()]
+    }
     fn name(&self) -> &'static str {
         "FILTER"
     }
@@ -1744,7 +1747,7 @@ impl PhysicalOperator for PhysicalDelete {
     }
     fn finalize(&self) -> Result<()> {
         let ids = self.row_ids.lock();
-        let mut storage = self.table.storage.write();
+        let mut storage = self.table.write_storage();
         let mut kept = ColumnDataCollection::new(storage.types().to_vec());
         let mut deleted = ColumnDataCollection::new(storage.types().to_vec());
         for (index, chunk) in storage.chunks().enumerate() {
@@ -1853,7 +1856,7 @@ impl PhysicalOperator for PhysicalUpdate {
     }
     fn finalize(&self) -> Result<()> {
         let updates = self.updates.lock();
-        let mut storage = self.table.storage.write();
+        let mut storage = self.table.write_storage();
         let mut rewritten = ColumnDataCollection::new(storage.types().to_vec());
         let mut changed = ColumnDataCollection::new(storage.types().to_vec());
         // C++ turns an UPDATE of indexed columns into a DELETE and an INSERT, which moves the rows
@@ -1992,7 +1995,7 @@ impl PhysicalOperator for PhysicalInsert {
             return Ok(());
         }
         constraints::verify_not_null(&self.table, &row)?;
-        let mut storage = self.table.storage.write();
+        let mut storage = self.table.write_storage();
         let first_new_row = *self.first_new_row.lock().get_or_insert(storage.len());
         constraints::verify_append(&self.table, &storage, &row, first_new_row)?;
         storage.append(&row);
@@ -2086,7 +2089,7 @@ impl PhysicalOperator for PhysicalCreateTableAs {
         )?;
         if let Some(table) = table {
             let data = self.data.lock();
-            let mut storage = table.storage.write();
+            let mut storage = table.write_storage();
             for chunk in data.chunks() {
                 storage.append(chunk);
             }

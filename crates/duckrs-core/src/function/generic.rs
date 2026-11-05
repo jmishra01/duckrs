@@ -387,7 +387,7 @@ fn chr(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
-fn contains(args: &DataChunk, result: &mut Vector) -> Result<()> {
+pub(super) fn contains(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
         Ok(Value::boolean(
             row[0].try_to_string()?.contains(&row[1].try_to_string()?),

@@ -1,11 +1,12 @@
 // Ported from duckdb/src/optimizer/expression_rewriter.cpp and duckdb/src/optimizer/rule/
 // {constant_folding,conjunction_simplification,arithmetic_simplification,case_simplification,
+// constant_order_normalization,empty_needle_removal,like_optimizations,move_constants,
 // comparison_simplification,distributivity,not_comparison_simplification,
 // not_conjunction_simplification}.cpp @ rust-port-baseline
 //
 //! `ExpressionRewriter`: rules that simplify expressions without changing the plan's shape. C++
 //! has a matcher per rule; here each rule is a function that looks at the expression's kind. Rules
-//! that need something the engine lacks, like `constant_or_null` for `x * 0`, are left out.
+//! that need something the engine lacks are left out.
 
 use super::conjunction_of;
 use crate::execution::expression_executor::try_evaluate_scalar;
@@ -86,6 +87,10 @@ fn apply_rules(expr: &mut BoundExpr, in_filter: bool) -> bool {
     constant_folding(expr)
         || distributivity(expr)
         || arithmetic_simplification(expr)
+        || constant_order_normalization(expr)
+        || like_optimizations(expr)
+        || empty_needle_removal(expr)
+        || move_constants(expr)
         || case_simplification(expr)
         || conjunction_simplification(expr, in_filter)
         || comparison_simplification(expr)
@@ -529,6 +534,270 @@ fn cast_can_throw(source: &LogicalType, target: &LogicalType) -> bool {
         (Some(from), id) => width(id).is_none_or(|to| from > to),
         (None, _) => true,
     }
+}
+
+fn integer_of(value: &Value) -> Option<i128> {
+    value.try_to_string().ok()?.parse().ok()
+}
+
+/// `n` as a value of the integer type `ty`, if it fits.
+fn integer_value(n: i128, ty: &LogicalType) -> Option<Value> {
+    let cast = BoundExpr::constant(Value::varchar(n.to_string())).cast_to(ty, false);
+    try_evaluate_scalar(&cast).filter(|value| value.logical_type() == ty)
+}
+
+fn integer_constant(expr: &BoundExpr) -> Option<i128> {
+    match &expr.kind {
+        BoundExprKind::Constant(value) if expr.return_type.is_integral() && !value.is_null() => integer_of(value),
+        _ => None,
+    }
+}
+
+/// `MoveConstantsRule`: `x + 1 = 10` becomes `x = 9`, for integers.
+fn move_constants(expr: &mut BoundExpr) -> bool {
+    let BoundExprKind::Comparison { op, left, right } = &mut expr.kind else {
+        return false;
+    };
+    let (constant, arithmetic) = if matches!(left.kind, BoundExprKind::Constant(_)) {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    let Some(outer) = integer_constant(constant) else {
+        return false;
+    };
+    let BoundExprKind::Function {
+        function,
+        children,
+        is_operator: true,
+    } = &arithmetic.kind
+    else {
+        return false;
+    };
+    if !arithmetic.return_type.is_integral() {
+        return false;
+    }
+    // `-x < -5` is `x > 5`
+    if let ("-", [child]) = (function.name.as_str(), children.as_slice()) {
+        let Some(value) = outer
+            .checked_neg()
+            .and_then(|n| integer_value(n, &constant.return_type))
+        else {
+            return false;
+        };
+        let child = child.clone();
+        **constant = BoundExpr::constant(value);
+        **arithmetic = child;
+        *op = super::statistics::flip(*op);
+        return true;
+    }
+    if children.len() != 2 {
+        return false;
+    }
+    let (inner, column) = match (integer_constant(&children[0]), integer_constant(&children[1])) {
+        (Some(inner), None) => (inner, 1),
+        (None, Some(inner)) => (inner, 0),
+        _ => return false,
+    };
+    let is_equal = *op == ComparisonOp::Equal;
+    let is_not_equal = *op == ComparisonOp::NotEqual;
+    let mut flip = false;
+    let (moved, unequal) = match (function.name.as_str(), column) {
+        ("+", _) => (outer.checked_sub(inner), is_equal),
+        ("-", 0) => (outer.checked_add(inner), is_equal),
+        ("-", _) => {
+            flip = true;
+            (inner.checked_sub(outer), is_equal)
+        }
+        ("*", _) if inner == 0 => return false,
+        ("*", _) if outer.checked_rem(inner) != Some(0) => {
+            if !is_equal && !is_not_equal {
+                return false;
+            }
+            let child = children[column].clone();
+            let answer = BoundExpr::constant(Value::boolean(is_not_equal));
+            *expr = crate::function::constant_or_null(vec![answer, child]);
+            return true;
+        }
+        ("*", _) => {
+            flip = inner < 0;
+            (outer.checked_div(inner), is_equal || is_not_equal)
+        }
+        _ => return false,
+    };
+    let Some(moved) = moved else {
+        return false;
+    };
+    let Some(value) = integer_value(moved, &constant.return_type) else {
+        // no value of the type is equal to it
+        if !unequal {
+            return false;
+        }
+        let child = children[column].clone();
+        let answer = BoundExpr::constant(Value::boolean(is_not_equal));
+        *expr = crate::function::constant_or_null(vec![answer, child]);
+        return true;
+    };
+    let child = children[column].clone();
+    **constant = BoundExpr::constant(value);
+    **arithmetic = child;
+    if flip {
+        *op = super::statistics::flip(*op);
+    }
+    true
+}
+
+/// `ConstantOrderNormalizationRule`: the constants of a chain of `+` or `*` of integers go in
+/// front, so that they fold, and a single constant of a `*` goes last.
+fn constant_order_normalization(expr: &mut BoundExpr) -> bool {
+    fn leaves<'a>(expr: &'a BoundExpr, name: &str, ty: &LogicalType, result: &mut Vec<&'a BoundExpr>) {
+        if let BoundExprKind::Function { function, children, .. } = &expr.kind
+            && function.name == name
+            && children.len() == 2
+            && &expr.return_type == ty
+        {
+            leaves(&children[0], name, ty, result);
+            leaves(&children[1], name, ty, result);
+        } else {
+            result.push(expr);
+        }
+    }
+    let BoundExprKind::Function {
+        function,
+        children,
+        is_operator: true,
+    } = &expr.kind
+    else {
+        return false;
+    };
+    let name = function.name.as_str();
+    if !matches!(name, "+" | "*") || children.len() != 2 || !expr.return_type.is_integral() {
+        return false;
+    }
+    let mut all = Vec::new();
+    leaves(expr, name, &expr.return_type, &mut all);
+    let last = all.iter().rposition(|leaf| leaf.is_foldable());
+    let (constants, others): (Vec<&BoundExpr>, Vec<&BoundExpr>) = all.iter().partition(|leaf| leaf.is_foldable());
+    let Some(last) = last else {
+        return false;
+    };
+    let order: Vec<&BoundExpr> = if constants.len() == 1 {
+        if name != "*" || last == all.len() - 1 {
+            return false;
+        }
+        others.iter().chain(&constants).copied().collect()
+    } else {
+        if last == constants.len() - 1 {
+            return false;
+        }
+        constants.iter().chain(&others).copied().collect()
+    };
+    let (function, ty, alias) = (function.clone(), expr.return_type.clone(), expr.alias.clone());
+    let mut leaves = order.into_iter().cloned();
+    let first = leaves.next().expect("a chain has leaves");
+    let rebuilt = leaves.fold(first, |left, right| {
+        BoundExpr::new(
+            BoundExprKind::Function {
+                function: function.clone(),
+                children: vec![left, right],
+                is_operator: true,
+            },
+            ty.clone(),
+        )
+    });
+    *expr = rebuilt.with_alias(alias);
+    true
+}
+
+/// `LikeOptimizationRule`: a LIKE pattern with only wildcards at its ends is a plain comparison.
+fn like_optimizations(expr: &mut BoundExpr) -> bool {
+    let BoundExprKind::Function { function, children, .. } = &expr.kind else {
+        return false;
+    };
+    let negated = match function.name.as_str() {
+        "~~" => false,
+        "!~~" => true,
+        _ => return false,
+    };
+    let [input, pattern] = children.as_slice() else {
+        return false;
+    };
+    let BoundExprKind::Constant(pattern) = &pattern.kind else {
+        return false;
+    };
+    if pattern.is_null() || pattern.logical_type() != &LogicalType::VARCHAR {
+        return false;
+    }
+    let Ok(pattern) = pattern.try_to_string() else {
+        return false;
+    };
+    let needle = pattern.trim_matches('%');
+    if needle.contains(['%', '_']) {
+        return false;
+    }
+    let needle_expr = BoundExpr::constant(Value::varchar(needle));
+    let (leading, trailing) = (pattern.starts_with('%'), pattern.ends_with('%'));
+    let input = input.clone();
+    let matcher = match (leading, trailing) {
+        (false, false) => {
+            let op = if negated {
+                ComparisonOp::NotEqual
+            } else {
+                ComparisonOp::Equal
+            };
+            *expr = BoundExpr::new(
+                BoundExprKind::Comparison {
+                    op,
+                    left: Box::new(input),
+                    right: Box::new(needle_expr),
+                },
+                LogicalType::BOOLEAN,
+            );
+            return true;
+        }
+        (false, true) => "prefix",
+        (true, false) => "suffix",
+        (true, true) => "contains",
+    };
+    let call = crate::function::string_needle_call(matcher, input, needle_expr);
+    *expr = if negated {
+        BoundExpr::new(
+            BoundExprKind::Operator {
+                op: BoundOperator::Not,
+                children: vec![call],
+            },
+            LogicalType::BOOLEAN,
+        )
+    } else {
+        call
+    };
+    true
+}
+
+/// `EmptyNeedleRemovalRule`: every string starts with, ends with and contains the empty string.
+fn empty_needle_removal(expr: &mut BoundExpr) -> bool {
+    let BoundExprKind::Function { function, children, .. } = &expr.kind else {
+        return false;
+    };
+    if !matches!(function.name.as_str(), "prefix" | "suffix" | "contains") || children.len() != 2 {
+        return false;
+    }
+    if !children[1].is_foldable() || children[1].return_type != LogicalType::VARCHAR {
+        return false;
+    }
+    let Some(needle) = try_evaluate_scalar(&children[1]) else {
+        return false;
+    };
+    if needle.is_null() {
+        *expr = BoundExpr::constant(Value::null(LogicalType::BOOLEAN));
+        return true;
+    }
+    if needle.try_to_string().ok().as_deref() != Some("") {
+        return false;
+    }
+    let input = children[0].clone();
+    *expr = crate::function::constant_or_null(vec![BoundExpr::constant(Value::boolean(true)), input]);
+    true
 }
 
 #[cfg(test)]

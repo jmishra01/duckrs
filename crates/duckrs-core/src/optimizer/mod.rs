@@ -10,6 +10,7 @@
 pub mod empty_result_pullup;
 pub mod filter_pushdown;
 pub mod rewriter;
+pub mod statistics;
 pub mod unused_columns;
 
 use crate::planner::expression::{BoundExpr, BoundExprKind};
@@ -21,6 +22,7 @@ use duckrs_common::types::LogicalType;
 pub struct OptimizerOptions {
     pub expression_rewriter: bool,
     pub filter_pushdown: bool,
+    pub statistics_propagation: bool,
     pub empty_result_pullup: bool,
     pub unused_columns: bool,
 }
@@ -30,6 +32,7 @@ impl Default for OptimizerOptions {
         Self {
             expression_rewriter: true,
             filter_pushdown: true,
+            statistics_propagation: true,
             empty_result_pullup: true,
             unused_columns: true,
         }
@@ -42,6 +45,7 @@ impl OptimizerOptions {
         Self {
             expression_rewriter: false,
             filter_pushdown: false,
+            statistics_propagation: false,
             empty_result_pullup: false,
             unused_columns: false,
         }
@@ -53,6 +57,7 @@ impl OptimizerOptions {
         Self {
             expression_rewriter: !off("expression_rewriter"),
             filter_pushdown: !off("filter_pushdown"),
+            statistics_propagation: !off("statistics_propagation"),
             empty_result_pullup: !off("empty_result_pullup"),
             unused_columns: !off("unused_columns"),
         }
@@ -66,6 +71,9 @@ pub fn optimize(mut plan: LogicalOperator, options: OptimizerOptions) -> Logical
     }
     if options.filter_pushdown {
         plan = filter_pushdown::push_down(plan);
+    }
+    if options.statistics_propagation {
+        statistics::propagate_statistics(&mut plan);
     }
     if options.empty_result_pullup {
         plan = empty_result_pullup::pull_up(plan);

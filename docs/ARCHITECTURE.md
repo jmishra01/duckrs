@@ -179,7 +179,9 @@ while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` 
 `disabled_optimizers` turns off single passes.
 
 - **Expression rewriter:** constant folding, distributivity, arithmetic, CASE, conjunction,
-  comparison with NULL, NOT over comparisons and conjunctions.
+  comparison with NULL, NOT over comparisons and conjunctions, moving integer constants across
+  comparisons, constant order, LIKE as a comparison or `prefix`, `suffix`, `contains`, and empty
+  needles.
 - **Filter pushdown:** through aggregates, cross products (which become joins), inner, left, semi
   and anti joins, projections, set operations, DISTINCT and UNNEST. A filter that is always false
   empties the plan, and **empty result pull-up** carries that upward.
@@ -193,6 +195,13 @@ while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` 
   column of a query further out, and plans with an operator `push` has no rule for (VALUES with
   correlated columns, FULL joins, grouping sets with an empty set, LIMIT with a percentage, SAMPLE,
   ASOF, recursive CTEs). C++ decorrelates nearly all of those. LATERAL joins are not flattened yet.
+- **Statistics** (`optimizer/statistics.rs`) follow C++ in what they decide, not in where they come
+  from. Each table has min, max and whether it has NULLs per column, not per row group, worked out
+  with aggregates when a plan first needs them after a write, and thrown away by
+  `TableCatalogEntry::write_storage`. A version keeps a scan that overlaps a write from storing what
+  it saw. Plans do not outlive a statement, so what they fold cannot go stale. A plan in which a
+  table index appears twice is left alone, as narrowing one use of a binding would apply to all.
+  Decided comparisons become constants, or `constant_or_null` where a side can be NULL.
 - **Unused columns** become typed NULL constants instead of going away, which keeps column
   bindings stable: subquery plans refer to outer columns by binding. Scans keep all their columns,
   because in-memory scans clone `Arc`s and pruning them would gain nothing.
@@ -201,8 +210,10 @@ A filter stays above a projection or an aggregate if it, or an entry it would be
 can fail: below, `a::int < b::int` would run ahead of the filter that guards those casts.
 `can_throw` allows only what is known not to fail, so some filters stay higher than they do in C++.
 
-Not ported yet: join order, statistics, `FilterCombiner` beyond splitting, deduplicating and
-deciding constants, transitive filters, MoveConstants, ConstantOrderNormalization, `x * 0`,
+Not ported yet: join order, statistics per row group or for functions (`stats()`, `length`, `abs`,
+`greatest`, `lower`, ...), aggregates and windows, `ANALYZE`, `FilterCombiner` beyond splitting,
+deduplicating and deciding constants, transitive filters, MoveConstants of floats and DECIMALs,
+`x * 0`,
 pushdown through outer, right, mark, ASOF and window operators, CheckMarkToSemi, the deliminator,
 and flattening of the cases above, the extremum rewrite of `> ANY` among them. MARK joins with a
 predicate check each pair of a key's rows, where C++ hashes on the comparison. The gate is not met: `test/optimizer` is at 41.3% against 80%, and TPC-H and TPC-DS do

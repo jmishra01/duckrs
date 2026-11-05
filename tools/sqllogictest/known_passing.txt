@@ -381,6 +381,7 @@ test/optimizer/constant_argument_errors_case.test
 test/optimizer/constant_argument_errors_like_regex.test
 test/optimizer/constant_folding.test
 test/optimizer/constant_order_normalization.test
+test/optimizer/cte_statistics_propagation.test
 test/optimizer/disjunctive_join_rewriter_nested.test
 test/optimizer/distributivity_rule.test
 test/optimizer/expression_rewriter/ordered_aggregate_incorrectly_remove_order.test
@@ -411,7 +412,6 @@ test/optimizer/joins/test_tpcds_pushdown.test
 test/optimizer/joins/zero_column_filter_reconstruction.test
 test/optimizer/like_optimizer.test
 test/optimizer/materialized_cte_sibling_column_pruning.test
-test/optimizer/move_constants.test
 test/optimizer/needle_optimizer.test
 test/optimizer/optimize_unsigned_vs_signed_ints.test
 test/optimizer/ordered_aggregate.test
@@ -423,6 +423,7 @@ test/optimizer/projection_pullup_projection_map.test
 test/optimizer/pullup_join_expression.test
 test/optimizer/pullup_join_expression_errors.test
 test/optimizer/pushdown/distinct_from_pushdown.test
+test/optimizer/pushdown/filter_cannot_pushdown.test
 test/optimizer/pushdown/filters_on_limit_optimizer.test
 test/optimizer/pushdown/issue_16863.test
 test/optimizer/pushdown/join_filter_pushdown_sample.test
@@ -435,11 +436,19 @@ test/optimizer/regex_to_like_optimizer.test
 test/optimizer/remove_duplicate_groups_with_stats.test
 test/optimizer/reported_bugs/in_vs_where.test
 test/optimizer/row_number_virtual_column_local.test
+test/optimizer/statistics/statistics_aggregate.test
+test/optimizer/statistics/statistics_between.test
+test/optimizer/statistics/statistics_case.test
+test/optimizer/statistics/statistics_coalesce.test
 test/optimizer/statistics/statistics_count_not_null_join_pruning.test
+test/optimizer/statistics/statistics_filter_multicolumn.test
 test/optimizer/statistics/statistics_join_always_matches_layout.test
 test/optimizer/statistics/statistics_join_arbitrary_condition.test
+test/optimizer/statistics/statistics_join_multicolumn.test
+test/optimizer/statistics/statistics_join_null.test
 test/optimizer/statistics/statistics_join_ungrouped_aggregate_limit.test
 test/optimizer/statistics/statistics_root_replaced.test
+test/optimizer/statistics/statistics_unsigned_cast.test
 test/optimizer/statistics/statistics_varchar.test
 test/optimizer/stats_non_numeric_cast.test
 test/optimizer/table_in_out_unique_keys.test
@@ -918,6 +927,7 @@ test/sql/function/generic/case_varchar.test
 test/sql/function/generic/case_when_comparison.test
 test/sql/function/generic/case_when_list.test
 test/sql/function/generic/constant_argument_errors.test
+test/sql/function/generic/constant_or_null.test
 test/sql/function/generic/error.test
 test/sql/function/generic/hash_func.test
 test/sql/function/generic/least_greatest_enum.test
@@ -1341,6 +1351,7 @@ test/sql/optimizer/test_common_subplan_overlapping_columns.test
 test/sql/optimizer/test_common_subplan_projection_maps.test
 test/sql/optimizer/test_common_subplan_scan_filters.test
 test/sql/optimizer/test_common_subplan_self_join.test
+test/sql/optimizer/test_not_comparison_simplification.test
 test/sql/optimizer/test_rollup_column_pruning.test
 test/sql/optimizer/test_rowid_pushdown_deletes.test
 test/sql/optimizer/topn_window_elimination_argument_order.test
@@ -2013,7 +2024,6 @@ test/sql/types/struct/struct_named_cast.test
 test/sql/types/struct/struct_null_members.test
 test/sql/types/struct/struct_operations.test
 test/sql/types/struct/struct_pack_list.test
-test/sql/types/struct/struct_projection_pushdown_in_storage.test
 test/sql/types/struct/struct_projection_pushdown_optimizer_bug.test
 test/sql/types/struct/struct_projection_pushdown_unnamed.test
 test/sql/types/struct/struct_subquery.test
