@@ -238,6 +238,15 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             rows: Mutex::default(),
             position: Mutex::default(),
         }),
+        LogicalOperatorKind::MarkJoin {
+            conditions, predicate, ..
+        } if !conditions.is_empty() => Box::new(join::PhysicalJoin::new(
+            types,
+            duckrs_parser::ast::JoinType::Mark,
+            conditions,
+            predicate,
+            children,
+        )),
         LogicalOperatorKind::MarkJoin { predicate, .. } => Box::new(special_joins::PhysicalMarkJoin {
             types,
             predicate,

@@ -15,7 +15,7 @@ use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{JoinCondition, LogicalOperator, LogicalOperatorKind};
 use duckrs_common::value::Value;
 use duckrs_parser::ast::{ComparisonOp, JoinType};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 /// `LogicalOperatorKind::EmptyResult` in place of `op`.
 pub(crate) fn empty_result(op: &LogicalOperator) -> LogicalOperator {
@@ -148,7 +148,9 @@ impl FilterPushdown {
                 JoinType::Semi | JoinType::Anti => self.pushdown_semi_anti_join(op),
                 _ => self.finish_pushdown(op),
             },
-            LogicalOperatorKind::DelimJoin { .. } => self.pushdown_delim_join(op),
+            LogicalOperatorKind::DelimJoin { .. } | LogicalOperatorKind::MarkJoin { .. } => {
+                self.pushdown_delim_join(op)
+            }
             LogicalOperatorKind::Projection { .. } => self.pushdown_projection(op),
             LogicalOperatorKind::Union { .. } | LogicalOperatorKind::ExceptIntersect { .. } => {
                 self.pushdown_set_operation(op)
@@ -542,6 +544,60 @@ fn extract_join_conditions(
         predicates.push(expr);
     }
     (conditions, predicates)
+}
+
+/// How many times the expressions of a plan read each column.
+fn count_columns(plan: &mut LogicalOperator, reads: &mut HashMap<ColumnBinding, usize>) {
+    plan.visit_expressions(&mut |e| {
+        if let BoundExprKind::ColumnRef { binding, depth: 0 } = e.kind {
+            *reads.entry(binding).or_default() += 1;
+        }
+    });
+}
+
+/// `PushdownMarkJoin`: a filter on only the marker of a MARK join makes it a SEMI join, as false
+/// and NULL both lose the row. `CheckMarkToSemi`: that takes the marker away, so nothing else may
+/// read it.
+pub(super) fn convert_mark_joins(plan: &mut LogicalOperator) {
+    let mut reads = HashMap::new();
+    count_columns(plan, &mut reads);
+    mark_to_semi(plan, &reads);
+}
+
+fn mark_to_semi(op: &mut LogicalOperator, reads: &HashMap<ColumnBinding, usize>) {
+    for child in &mut op.children {
+        mark_to_semi(child, reads);
+    }
+    if let LogicalOperatorKind::LateralJoin { right, .. } = &mut op.kind {
+        mark_to_semi(right, reads);
+    }
+    let LogicalOperatorKind::Filter { expressions } = &mut op.kind else {
+        return;
+    };
+    let LogicalOperatorKind::MarkJoin {
+        table_index,
+        conditions,
+        predicate: None,
+    } = &mut op.children[0].kind
+    else {
+        return;
+    };
+    let marker = ColumnBinding::new(*table_index, 0);
+    let is_marker =
+        |e: &BoundExpr| matches!(e.kind, BoundExprKind::ColumnRef { binding, depth: 0 } if binding == marker);
+    if conditions.is_empty() || reads.get(&marker) != Some(&1) || !expressions.iter().any(is_marker) {
+        return;
+    }
+    let conditions = std::mem::take(conditions);
+    expressions.retain(|e| !is_marker(e));
+    op.children[0].kind = LogicalOperatorKind::Join {
+        join_type: JoinType::Semi,
+        conditions,
+        predicate: None,
+    };
+    if expressions.is_empty() {
+        *op = op.children.remove(0);
+    }
 }
 
 /// `FilterRemovesNull`: whether a filter is false or NULL for a row whose right side is NULL.

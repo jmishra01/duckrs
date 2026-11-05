@@ -8,9 +8,10 @@
 //! is the estimated size of its result on top of that of its inputs. With many relations, or
 //! when that takes too many steps, Greedy Operator Ordering takes over.
 //!
-//! LEFT, SEMI and ANTI joins are relations here, with their sides optimized apart, where DuckDB
-//! also moves them with conflict detection. The cardinality estimator is reduced to total domains
-//! per equivalence class and DuckDB's selectivities, without the caps for composite keys.
+//! A SEMI or ANTI join on a tree goes down to the one relation it reads, and stays on top of the
+//! tree's other joins otherwise. LEFT joins are relations, with their sides optimized apart, where
+//! DuckDB also moves them with conflict detection. The cardinality estimator is reduced to total
+//! domains per equivalence class and DuckDB's selectivities, without the caps for composite keys.
 
 use super::conjunction_of;
 use super::filter_pushdown::condition_expression;
@@ -63,17 +64,63 @@ fn is_binary_tree(op: &LogicalOperator) -> bool {
     }
 }
 
+/// What a SEMI or ANTI join reads of its left side.
+fn left_columns(op: &LogicalOperator) -> Vec<ColumnBinding> {
+    let K::Join {
+        conditions, predicate, ..
+    } = &op.kind
+    else {
+        return Vec::new();
+    };
+    let mut columns = Vec::new();
+    for condition in conditions {
+        expression_columns(&condition.left, &mut columns);
+    }
+    if let Some(predicate) = predicate {
+        expression_columns(predicate, &mut columns);
+    }
+    let right = op.children[1].column_bindings();
+    columns.retain(|column| !right.contains(column));
+    columns
+}
+
+/// Whether `op` is a SEMI or ANTI join that can go down to one relation of the tree on its left.
+/// Below the joins of the tree it removes the same rows, as it reads only that relation.
+fn is_movable_semi(op: &LogicalOperator) -> bool {
+    let K::Join {
+        join_type: JoinType::Semi | JoinType::Anti,
+        predicate,
+        ..
+    } = &op.kind
+    else {
+        return false;
+    };
+    if predicate.as_ref().is_some_and(BoundExpr::is_volatile) || !is_tree(&op.children[0]) {
+        return false;
+    }
+    let columns = left_columns(op);
+    let mut relations = Vec::new();
+    leaves(&op.children[0], &mut relations);
+    !columns.is_empty()
+        && relations.iter().any(|relation| {
+            let bindings = relation.column_bindings();
+            columns.iter().all(|column| bindings.contains(column))
+        })
+}
+
 /// Whether `op` is an operator of a tree of joins, or filters on such a tree.
 fn is_tree(op: &LogicalOperator) -> bool {
     match &op.kind {
         K::Filter { expressions } => !expressions.iter().any(BoundExpr::is_volatile) && is_tree(&op.children[0]),
-        _ => is_binary_tree(op),
+        _ => is_binary_tree(op) || is_movable_semi(op),
     }
 }
 
 /// The relations of a tree, whose operators `is_tree` accepts.
 fn leaves<'a>(op: &'a LogicalOperator, result: &mut Vec<&'a LogicalOperator>) {
-    if is_tree(op) {
+    if is_movable_semi(op) {
+        leaves(&op.children[0], result);
+    } else if is_tree(op) {
         for child in &op.children {
             leaves(child, result);
         }
@@ -688,10 +735,26 @@ impl JoinOrderOptimizer {
         op
     }
 
-    /// Takes the operators of a tree off its relations, gathering the conjuncts on them.
-    fn extract(&mut self, op: LogicalOperator, relations: &mut Vec<LogicalOperator>, conjuncts: &mut Vec<BoundExpr>) {
+    /// Takes the operators of a tree off its relations, gathering the conjuncts on them and the
+    /// SEMI and ANTI joins, which keep their right side.
+    fn extract(
+        &mut self,
+        mut op: LogicalOperator,
+        relations: &mut Vec<LogicalOperator>,
+        conjuncts: &mut Vec<BoundExpr>,
+        semis: &mut Vec<(Vec<ColumnBinding>, LogicalOperator)>,
+    ) {
         if !is_tree(&op) {
             relations.push(self.optimize(op, false));
+            return;
+        }
+        if is_movable_semi(&op) {
+            let columns = left_columns(&op);
+            let right = op.children.pop().expect("a join has two sides");
+            let left = op.children.pop().expect("a join has two sides");
+            op.children.push(self.optimize(right, false));
+            semis.push((columns, op));
+            self.extract(left, relations, conjuncts, semis);
             return;
         }
         match op.kind {
@@ -711,14 +774,15 @@ impl JoinOrderOptimizer {
             _ => {}
         }
         for child in op.children {
-            self.extract(child, relations, conjuncts);
+            self.extract(child, relations, conjuncts, semis);
         }
     }
 
     fn reorder(&mut self, op: LogicalOperator) -> LogicalOperator {
         let mut relations = Vec::new();
         let mut conjuncts = Vec::new();
-        self.extract(op, &mut relations, &mut conjuncts);
+        let mut semis = Vec::new();
+        self.extract(op, &mut relations, &mut conjuncts, &mut semis);
         let mut relation_of = HashMap::new();
         for (at, relation) in relations.iter().enumerate() {
             for binding in relation.column_bindings() {
@@ -751,7 +815,7 @@ impl JoinOrderOptimizer {
                 predicates.push(Predicate { expr, set, sides });
             }
         }
-        let relations: Vec<LogicalOperator> = relations
+        let mut relations: Vec<LogicalOperator> = relations
             .into_iter()
             .zip(on_relation)
             .map(|(relation, expressions)| {
@@ -762,6 +826,13 @@ impl JoinOrderOptimizer {
                 }
             })
             .collect();
+        // innermost first, as they were
+        for (columns, mut semi) in semis.into_iter().rev() {
+            let at = relation_of[&columns[0]];
+            let relation = std::mem::replace(&mut relations[at], LogicalOperator::new(K::CrossProduct, Vec::new()));
+            semi.children.insert(0, relation);
+            relations[at] = semi;
+        }
         let stats: Vec<RelationStats> = relations.iter().map(|r| self.stats(r)).collect();
         let mut estimator = Estimator::new(&stats, &predicates, &relation_of);
         let mut edges = Vec::new();

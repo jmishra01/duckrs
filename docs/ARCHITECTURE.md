@@ -211,6 +211,12 @@ while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` 
   Estimates use the total domain of each equivalence class and DuckDB's selectivities, from
   `approx_count_distinct` on the first 100,000 rows of a table, per state of its rows. Those counts
   only steer the order, so being stale or uncommitted can make a plan slower but not wrong.
+- **`x IN (subquery)`** without correlated columns becomes a MARK join in `planner::subquery`, on a
+  hash of the one key; the other uncorrelated subqueries stay expressions, which run once. A filter
+  on only the marker makes it a SEMI join, if nothing else reads the marker. That is a pass of its
+  own after filter pushdown, which counts the reads, where C++ flags the joins up front. `NOT IN`
+  stays MARK, since a NULL on either side changes its answer. In a tree of joins, a SEMI or ANTI
+  join that reads one relation goes down to it.
 - **Unused columns** become typed NULL constants instead of going away, which keeps column
   bindings stable: subquery plans refer to outer columns by binding. Scans keep all their columns,
   because in-memory scans clone `Arc`s and pruning them would gain nothing.
@@ -219,13 +225,13 @@ A filter stays above a projection or an aggregate if it, or an entry it would be
 can fail: below, `a::int < b::int` would run ahead of the filter that guards those casts.
 `can_throw` allows only what is known not to fail, so some filters stay higher than they do in C++.
 
-Not ported yet: moving LEFT, SEMI and ANTI joins in the join order (they are relations, with their
-sides ordered apart), the estimator's caps for composite keys, estimated rows in EXPLAIN, flipping
+Not ported yet: moving LEFT joins in the join order, and SEMI and ANTI joins that read several
+relations (those stay on top of the tree), the estimator's caps for composite keys, estimated rows in EXPLAIN, flipping
 LEFT to RIGHT joins for the build side, statistics per row group or for functions (`stats()`, `length`, `abs`,
 `greatest`, `lower`, ...), aggregates and windows, `ANALYZE`, `FilterCombiner` beyond splitting,
 deduplicating and deciding constants, transitive filters, MoveConstants of floats and DECIMALs,
 `x * 0`,
-pushdown through outer, right, mark, ASOF and window operators, CheckMarkToSemi, the deliminator,
+pushdown through outer, right, ASOF and window operators, the deliminator,
 and flattening of the cases above, the extremum rewrite of `> ANY` among them. MARK joins with a
 predicate check each pair of a key's rows, where C++ hashes on the comparison. The gate is not met: `test/optimizer` is at 41.3% against 80%, and TPC-H and TPC-DS do
 not run yet.

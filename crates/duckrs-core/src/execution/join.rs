@@ -149,6 +149,8 @@ pub struct JoinBuild {
     rows: Vec<Vec<u32>>,
     /// whether each build row found a match
     matched: Vec<bool>,
+    /// whether a key that is not null-safe was NULL
+    has_null_key: bool,
 }
 
 /// Where probing the current input chunk is.
@@ -186,6 +188,7 @@ impl PhysicalJoin {
             groups: HashMap::new(),
             rows: Vec::new(),
             matched: Vec::new(),
+            has_null_key: false,
         };
         Self {
             types,
@@ -407,7 +410,10 @@ impl PhysicalOperator for PhysicalJoin {
         build.count += chunk.len();
         check_buffered_rows(self.children[1].types(), build.count)?;
         for (row, key) in keys.into_iter().enumerate() {
-            let Some(key) = key else { continue };
+            let Some(key) = key else {
+                build.has_null_key = true;
+                continue;
+            };
             let next = build.rows.len();
             let group = *build.groups.entry(key).or_insert(next);
             if group == next {
@@ -435,10 +441,17 @@ impl PhysicalOperator for PhysicalJoin {
         let probe = match state {
             Some(probe) => probe,
             None => {
+                let mut nulls = vec![false; input.len()];
                 let groups = if self.conditions.is_empty() {
                     Vec::new()
                 } else {
                     let keys = self.keys(input, |c| &c.left)?;
+                    // a comparison with NULL is NULL, but there is no comparison without right rows
+                    if self.join_type == JoinType::Mark && build.count > 0 {
+                        for (null, key) in nulls.iter_mut().zip(&keys) {
+                            *null = key.is_none() || build.has_null_key;
+                        }
+                    }
                     keys.iter()
                         .map(|key| key.as_ref().and_then(|key| build.groups.get(key).copied()))
                         .collect()
@@ -448,7 +461,7 @@ impl PhysicalOperator for PhysicalJoin {
                     row: 0,
                     candidate: 0,
                     found: vec![false; input.len()],
-                    nulls: vec![false; input.len()],
+                    nulls,
                     single: vec![None; input.len()],
                 })
             }

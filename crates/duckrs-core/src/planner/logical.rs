@@ -175,9 +175,12 @@ pub enum LogicalOperatorKind {
     },
     /// `LogicalPositionalJoin`: the rows of its children side by side.
     PositionalJoin,
-    /// A MARK join: the left rows with a BOOLEAN for whether `predicate` finds a right row.
+    /// A MARK join: the left rows with a BOOLEAN for whether `predicate` finds a right row. With
+    /// `conditions` it is whether a right row equals the left one, which is NULL where no right
+    /// row does but there are right rows and a key of the comparison is NULL.
     MarkJoin {
         table_index: usize,
+        conditions: Vec<JoinCondition>,
         predicate: Option<BoundExpr>,
     },
     /// `LogicalInsert`: appends its child's rows to `table`. `column_index_map[i]` is the child
@@ -304,7 +307,9 @@ impl LogicalOperator {
             expr.substitute_columns(columns);
         }
         match &mut self.kind {
-            LogicalOperatorKind::Join { conditions, .. } | LogicalOperatorKind::DelimJoin { conditions, .. } => {
+            LogicalOperatorKind::Join { conditions, .. }
+            | LogicalOperatorKind::DelimJoin { conditions, .. }
+            | LogicalOperatorKind::MarkJoin { conditions, .. } => {
                 for condition in conditions {
                     condition.left.substitute_columns(columns);
                     condition.right.substitute_columns(columns);
@@ -333,6 +338,7 @@ impl LogicalOperator {
         match &mut self.kind {
             LogicalOperatorKind::Join { conditions, .. }
             | LogicalOperatorKind::DelimJoin { conditions, .. }
+            | LogicalOperatorKind::MarkJoin { conditions, .. }
             | LogicalOperatorKind::AsOfJoin { conditions, .. } => {
                 for condition in conditions {
                     condition.left.walk_mut(f);

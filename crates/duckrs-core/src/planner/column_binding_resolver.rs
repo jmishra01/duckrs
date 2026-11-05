@@ -13,8 +13,9 @@ pub fn resolve_column_bindings(op: &mut LogicalOperator) -> Result<()> {
     for child in &mut op.children {
         resolve_column_bindings(child)?;
     }
-    if let LogicalOperatorKind::Join { conditions, .. } | LogicalOperatorKind::DelimJoin { conditions, .. } =
-        &mut op.kind
+    if let LogicalOperatorKind::Join { conditions, .. }
+    | LogicalOperatorKind::DelimJoin { conditions, .. }
+    | LogicalOperatorKind::MarkJoin { conditions, .. } = &mut op.kind
     {
         let left = op.children[0].column_bindings();
         let right = op.children[1].column_bindings();

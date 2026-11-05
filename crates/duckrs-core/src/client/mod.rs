@@ -3057,6 +3057,75 @@ mod tests {
     }
 
     #[test]
+    fn in_subqueries_match_duckdb() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        run(&mut context, "SET explain_output = 'OPTIMIZED_ONLY'");
+        run(&mut context, "CREATE TABLE l (i INTEGER)");
+        run(&mut context, "INSERT INTO l VALUES (1), (2), (NULL)");
+        run(&mut context, "CREATE TABLE r (j INTEGER)");
+        run(&mut context, "INSERT INTO r VALUES (1), (3)");
+        run(&mut context, "CREATE TABLE n (j INTEGER)");
+        run(&mut context, "INSERT INTO n VALUES (1), (NULL)");
+        run(&mut context, "CREATE TABLE e (j INTEGER)");
+        let explain = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        // three-valued: every combination of a NULL on the left, a NULL on the right and no rows
+        let marks = |context: &mut ClientContext, right: &str| {
+            let sql = format!("SELECT i IN (SELECT j FROM {right}), i NOT IN (SELECT j FROM {right}) FROM l");
+            run(context, &sql)
+        };
+        let rows = marks(&mut context, "r");
+        assert_eq!(rows, [["true", "false"], ["false", "true"], ["NULL", "NULL"]]);
+        let rows = marks(&mut context, "n");
+        assert_eq!(rows, [["true", "false"], ["NULL", "NULL"], ["NULL", "NULL"]]);
+        let rows = marks(&mut context, "e");
+        assert_eq!(rows, [["false", "true"], ["false", "true"], ["false", "true"]]);
+        // a filter on the marker only is a SEMI join, which drops false and NULL alike
+        let sql = "SELECT i FROM l WHERE i IN (SELECT j FROM n)";
+        let plan = explain(&mut context, sql);
+        assert!(plan.contains("COMPARISON_JOIN SEMI"), "{plan}");
+        assert_eq!(run(&mut context, sql), [["1"]]);
+        // NOT IN needs the NULLs, so stays MARK
+        let sql = "SELECT i FROM l WHERE i NOT IN (SELECT j FROM n)";
+        let plan = explain(&mut context, sql);
+        assert!(plan.contains("MARK"), "{plan}");
+        assert_eq!(run(&mut context, sql), Vec::<Vec<String>>::new());
+        assert_eq!(
+            run(&mut context, "SELECT i FROM l WHERE i NOT IN (SELECT j FROM r)"),
+            [["2"]]
+        );
+        // something else reads the marker: it has to stay
+        let sql = "SELECT i, m FROM (SELECT i, i IN (SELECT j FROM r) AS m FROM l) WHERE m";
+        let plan = explain(&mut context, sql);
+        assert!(!plan.contains("SEMI"), "{plan}");
+        assert_eq!(run(&mut context, sql), [["1", "true"]]);
+        // OR, CASE and DML go through the marker; positions stay for what reads them
+        let rows = run(
+            &mut context,
+            "SELECT i FROM l WHERE i IN (SELECT j FROM r) OR i IS NULL ORDER BY i NULLS LAST",
+        );
+        assert_eq!(rows, [["1"], ["NULL"]]);
+        let rows = run(
+            &mut context,
+            "SELECT * FROM l WHERE i IN (SELECT j FROM r) UNION ALL SELECT 7",
+        );
+        assert_eq!(rows, [["1"], ["7"]]);
+        run(&mut context, "DELETE FROM l WHERE i IN (SELECT j FROM r)");
+        assert_eq!(run(&mut context, "SELECT count(*) FROM l"), [["2"]]);
+        run(&mut context, "UPDATE l SET i = 10 WHERE i IN (SELECT 2)");
+        assert_eq!(
+            run(&mut context, "SELECT i FROM l ORDER BY i NULLS LAST"),
+            [["10"], ["NULL"]]
+        );
+        // nested, and the same value twice on the right does not double a row
+        let rows = run(
+            &mut context,
+            "SELECT count(*) FROM range(5) t(a) WHERE a IN (SELECT a2 FROM (VALUES (1), (1), (2)) v(a2) \
+             WHERE a2 IN (SELECT 1 UNION ALL SELECT 2))",
+        );
+        assert_eq!(rows, [["2"]]);
+    }
+
+    #[test]
     fn join_order_matches_duckdb() {
         let mut context = ClientContext::new(DatabaseInstance::new());
         run(&mut context, "SET explain_output = 'OPTIMIZED_ONLY'");
@@ -3113,6 +3182,17 @@ mod tests {
              WHERE b.small_id = s.id",
         );
         assert_eq!(rows, [["20000", "400"]]);
+        // a SEMI join goes down to what it reads; on both sides of the join it stays on top
+        let sql = "SELECT count(*) FROM big, mid WHERE big.mid_id = mid.id AND mid.id IN (SELECT id FROM small)";
+        let plan = explain(&mut context, sql);
+        let joins: Vec<&str> = plan.lines().filter(|l| l.contains("COMPARISON_JOIN")).collect();
+        assert!(joins[0].contains("INNER") && joins[1].contains("SEMI"), "{plan}");
+        assert_eq!(run(&mut context, sql), [["800"]]);
+        let sql =
+            "SELECT count(*) FROM big b1, mid WHERE b1.mid_id = mid.id AND b1.id + mid.id IN (SELECT id FROM small)";
+        let plan = explain(&mut context, sql);
+        let joins: Vec<&str> = plan.lines().filter(|l| l.contains("COMPARISON_JOIN")).collect();
+        assert!(joins[0].contains("SEMI") && joins[1].contains("INNER"), "{plan}");
         // over the limit of the exact search, and without anything to connect two of them
         let many = (0..14).map(|i| format!("small s{i}")).collect::<Vec<_>>().join(", ");
         let joins = (1..14)

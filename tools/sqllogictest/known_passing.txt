@@ -403,7 +403,9 @@ test/optimizer/joins/join_on_floats.test
 test/optimizer/joins/joins_with_correlated_subqueries.test
 test/optimizer/joins/lateral_cross_join.test
 test/optimizer/joins/left_join_reordering/non_inner_join_edge_constraints.test
+test/optimizer/joins/no_cross_product_reordering.test
 test/optimizer/joins/no_duplicate_elimination_join.test
+test/optimizer/joins/pushdown_semi_anti.test
 test/optimizer/joins/relation_statistics_bindings.test
 test/optimizer/joins/single_sided_predicate_reconstruction.test
 test/optimizer/joins/test_delim_join_with_cross_product_in_rhs.test
@@ -428,6 +430,7 @@ test/optimizer/pushdown/filters_on_limit_optimizer.test
 test/optimizer/pushdown/issue_16863.test
 test/optimizer/pushdown/join_filter_pushdown_sample.test
 test/optimizer/pushdown/lateral_projection_evaluation.test
+test/optimizer/pushdown/no_mark_to_semi_if_mark_index_is_projected.test
 test/optimizer/pushdown/prefix_pushdown_null_constant.test
 test/optimizer/pushdown/pushdown_window_decreasing_partition.test
 test/optimizer/pushdown/timestamp_to_date_infinity_pushdown.test

@@ -150,6 +150,53 @@ fn is_local(expr: &BoundExpr, bindings: &[ColumnBinding]) -> bool {
     }
 }
 
+/// `PlanUncorrelatedSubquery` for `x IN (...)`, the case that gains from a join: the other kinds
+/// run once as they are. A MARK join puts whether a right row equals `x` next to each left row.
+fn flatten_in(expr: &BoundExpr, left: &mut LogicalOperator, next_table_index: &mut usize) -> Flat<BoundExpr> {
+    let BoundExprKind::Subquery {
+        subquery,
+        child: Some(child),
+        ..
+    } = &expr.kind
+    else {
+        return Err(Unsupported);
+    };
+    let BoundSubquery {
+        kind: SubqueryKind::Any(ComparisonOp::Equal),
+        raw: Some(raw),
+        volatile: false,
+        ..
+    } = subquery.as_ref()
+    else {
+        return Err(Unsupported);
+    };
+    let left_bindings = left.column_bindings();
+    let right_bindings = raw.column_bindings();
+    if !is_local(child, &left_bindings)
+        || right_bindings.len() != 1
+        || right_bindings.iter().any(|b| left_bindings.contains(b))
+    {
+        return Err(Unsupported);
+    }
+    let table_index = take_index(next_table_index);
+    let condition = JoinCondition {
+        left: (**child).clone(),
+        right: BoundExpr::column_ref(right_bindings[0], raw.types()[0].clone(), ""),
+        null_safe: false,
+    };
+    let outer = std::mem::replace(left, LogicalOperator::new(K::CrossProduct, Vec::new()));
+    *left = LogicalOperator::new(
+        K::MarkJoin {
+            table_index,
+            conditions: vec![condition],
+            predicate: None,
+        },
+        vec![outer, raw.clone()],
+    );
+    let marker = BoundExpr::column_ref(ColumnBinding::new(table_index, 0), LogicalType::BOOLEAN, "");
+    Ok(marker.with_alias(expr.alias.clone()))
+}
+
 /// `PlanCorrelatedSubquery`: puts the join on top of `left`, and gives what stands in for `expr`.
 fn flatten_subquery(expr: &BoundExpr, left: &mut LogicalOperator, next_table_index: &mut usize) -> Flat<BoundExpr> {
     let BoundExprKind::Subquery {
@@ -172,10 +219,10 @@ fn flatten_subquery(expr: &BoundExpr, left: &mut LogicalOperator, next_table_ind
         return Err(Unsupported);
     };
     let left_bindings = left.column_bindings();
-    if correlated.is_empty()
-        || !correlated.iter().all(|c| is_local(c, &left_bindings))
-        || !child.iter().all(|c| is_local(c, &left_bindings))
-    {
+    if correlated.is_empty() {
+        return flatten_in(expr, left, next_table_index);
+    }
+    if !correlated.iter().all(|c| is_local(c, &left_bindings)) || !child.iter().all(|c| is_local(c, &left_bindings)) {
         return Err(Unsupported);
     }
     let mut right = raw.clone();

@@ -2,7 +2,7 @@
 
 An analytical SQL database engine: a port of [DuckDB](https://github.com/duckdb/duckdb) to Rust.
 
-**Status: 2226 files pass, 43.4% of the files that ran (35.9% of all 6,197).** The Phase 6 feature list is ported apart from data-modifying CTEs and a few binder corners, but its gates are not met yet; see "Phase 6" in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Phase 7 has started: expression rewriting, filter pushdown, empty result pull-up and unused column removal are in, correlated subqueries are flattened where the port covers them, table statistics decide comparisons ahead of time, and inner joins and cross products are reordered by estimated cost; see "Phase 7" there. Phase 4 (types and casts) has started: the scalar casts, the nested types (LIST, ARRAY, STRUCT, MAP, UNION), `CREATE TYPE`, ENUM, BIT, BIGNUM and VARIANT are in, the last in its own in-memory encoding until Phase 9. What is left of the phase is GEOMETRY, which the plan defers. A first batch of Phase 5's functions is in too, because the type tests need them: `unnest`, `TRY(...)`, list slicing, the `list` aggregate, LIKE, and common string, list, map and interval helpers. Nested casts and functions run row by row for now. The engine runs CREATE TABLE, CREATE VIEW, CREATE SEQUENCE, CREATE MACRO, INSERT, prepared statements
+**Status: 2229 files pass, 43.5% of the files that ran (36.0% of all 6,197).** The Phase 6 feature list is ported apart from data-modifying CTEs and a few binder corners, but its gates are not met yet; see "Phase 6" in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Phase 7 has started: expression rewriting, filter pushdown, empty result pull-up and unused column removal are in, correlated subqueries are flattened where the port covers them, table statistics decide comparisons ahead of time, and inner joins and cross products are reordered by estimated cost; see "Phase 7" there. Phase 4 (types and casts) has started: the scalar casts, the nested types (LIST, ARRAY, STRUCT, MAP, UNION), `CREATE TYPE`, ENUM, BIT, BIGNUM and VARIANT are in, the last in its own in-memory encoding until Phase 9. What is left of the phase is GEOMETRY, which the plan defers. A first batch of Phase 5's functions is in too, because the type tests need them: `unnest`, `TRY(...)`, list slicing, the `list` aggregate, LIKE, and common string, list, map and interval helpers. Nested casts and functions run row by row for now. The engine runs CREATE TABLE, CREATE VIEW, CREATE SEQUENCE, CREATE MACRO, INSERT, prepared statements
 and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in memory. What exists today:
 
 - `crates/duckrs-common`: the core building blocks every other crate uses:
@@ -60,7 +60,7 @@ and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in me
 - `crates/duckrs`: the public API (`Database`, `Connection`, `QueryResult`) over the engine.
   Databases live in memory; a database file is accepted but not written until Phase 9.
 - `tools/sqllogictest`: a port of DuckDB's sqllogictest runner. It runs the DuckDB `.test` corpus
-  against duckrs, or against the C++ DuckDB library as a reference. duckrs passes 2226 files so far
+  against duckrs, or against the C++ DuckDB library as a reference. duckrs passes 2229 files so far
   (`tools/sqllogictest/known_passing.txt`, a CI gate), among them
   `test/sql/projection/test_simple_projection.test`.
 

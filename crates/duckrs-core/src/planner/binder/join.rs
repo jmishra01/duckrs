@@ -370,6 +370,7 @@ impl Binder<'_> {
             return Ok(LogicalOperator::new(
                 LogicalOperatorKind::MarkJoin {
                     table_index,
+                    conditions: Vec::new(),
                     predicate: conjunction_of(predicates),
                 },
                 vec![left, right],

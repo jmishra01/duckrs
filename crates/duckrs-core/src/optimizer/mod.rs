@@ -76,6 +76,7 @@ pub fn optimize(mut plan: LogicalOperator, options: OptimizerOptions) -> Logical
     }
     if options.filter_pushdown {
         plan = filter_pushdown::push_down(plan);
+        filter_pushdown::convert_mark_joins(&mut plan);
     }
     if options.join_order {
         plan = join_order::reorder_joins(plan);
