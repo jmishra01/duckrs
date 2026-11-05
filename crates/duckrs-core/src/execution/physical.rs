@@ -12,6 +12,7 @@
 use super::constraints;
 use super::expression_executor::{execute, select};
 use super::upsert::upsert;
+use super::zone_map::{CHUNKS_PER_ROW_GROUP, groups_to_scan};
 use crate::catalog::{
     ColumnDefinition, GeneratedColumn, OnCreateConflict, SchemaCatalogEntry, TableCatalogEntry, TableConstraint,
 };
@@ -117,11 +118,24 @@ pub trait PhysicalOperator: fmt::Debug + Send + Sync {
         Ok(())
     }
 
+    /// How many of its row groups a table scan reads, of how many there are.
+    fn row_groups_scanned(&self) -> Option<(usize, usize)> {
+        None
+    }
+
     /// Whether a join has rows to emit through `get_data` after its input is done
     /// (`IsSource` of RIGHT and FULL joins).
     fn has_unmatched_source(&self) -> bool {
         false
     }
+}
+
+/// Where a table scan is.
+struct TableScanState {
+    next: usize,
+    remaining: usize,
+    /// per row group, whether its rows can pass the filter
+    groups: Vec<bool>,
 }
 
 /// `PhysicalTableScan` over a table's in-memory rows.
@@ -147,18 +161,37 @@ impl PhysicalOperator for PhysicalTableScan {
     /// The scan sees the rows the table had when it started, like a transaction's snapshot
     /// (so that `INSERT INTO t FROM t` ends): the next chunk and how many rows remain.
     fn source_state(&self) -> SourceState {
-        Box::new((0usize, self.table.storage.read().len()))
+        let remaining = self.table.storage.read().len();
+        let groups = groups_to_scan(&self.table, &self.column_ids, self.filter.as_ref(), remaining);
+        Box::new(TableScanState {
+            next: 0,
+            remaining,
+            groups,
+        })
+    }
+    fn row_groups_scanned(&self) -> Option<(usize, usize)> {
+        let rows = self.table.storage.read().len();
+        let groups = groups_to_scan(&self.table, &self.column_ids, self.filter.as_ref(), rows);
+        (!groups.is_empty()).then(|| (groups.iter().filter(|g| **g).count(), groups.len()))
     }
     fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
-        let (next, remaining) = state.downcast_mut::<(usize, usize)>().expect("table scan state");
+        let TableScanState {
+            next,
+            remaining,
+            groups,
+        } = state.downcast_mut().expect("table scan state");
         while *remaining > 0 {
             let storage = self.table.storage.read();
             let chunk = storage.chunk(*next);
             // all chunks but the last are full, so that a row's position gives its id
             let first_row = (*next * STANDARD_VECTOR_SIZE) as i64;
+            let wanted = groups.get(*next / CHUNKS_PER_ROW_GROUP).is_none_or(|g| *g);
             *next += 1;
             let count = chunk.len().min(*remaining);
             *remaining -= count;
+            if !wanted {
+                continue;
+            }
             let columns = self
                 .column_ids
                 .iter()
@@ -210,7 +243,7 @@ pub(super) fn check_buffered_rows(types: &[LogicalType], rows: usize) -> Result<
 }
 
 /// A key per row that is equal exactly for rows with equal values, NULLs included.
-pub(super) fn group_keys(columns: &[&Vector], count: usize) -> Result<Vec<Vec<u8>>> {
+pub(crate) fn group_keys(columns: &[&Vector], count: usize) -> Result<Vec<Vec<u8>>> {
     let modifiers = OrderModifiers {
         order: OrderType::Ascending,
         nulls: NullOrder::NullsLast,

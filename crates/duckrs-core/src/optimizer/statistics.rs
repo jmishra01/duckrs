@@ -40,7 +40,7 @@ fn unknown() -> Stats {
 }
 
 /// Whether min and max of values of this type say something about comparisons.
-fn has_ordered_statistics(ty: &LogicalType) -> bool {
+pub(crate) fn has_ordered_statistics(ty: &LogicalType) -> bool {
     use LogicalTypeId::*;
     ty.is_numeric()
         || matches!(
@@ -221,7 +221,7 @@ pub(super) fn table_distinct_counts(table: &Arc<TableCatalogEntry>) -> Option<Ar
 }
 
 /// `a op b` for two values of a type, if that can be told.
-fn compare_values(op: ComparisonOp, a: &Value, b: &Value) -> Option<bool> {
+pub(crate) fn compare_values(op: ComparisonOp, a: &Value, b: &Value) -> Option<bool> {
     if a.logical_type() != b.logical_type() {
         return None;
     }

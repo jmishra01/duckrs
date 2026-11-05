@@ -101,6 +101,19 @@ pub struct TableStatistics {
     pub columns: Option<Arc<Vec<ColumnStatistics>>>,
     /// The rows and each column's distinct values, for the join order.
     pub distinct: Option<Arc<TableDistinctCounts>>,
+    /// Per column that a filter asked about, a zone per row group.
+    pub zones: std::collections::HashMap<usize, Arc<Vec<ColumnZone>>>,
+}
+
+/// What a row group holds of a column (the zone map of `SegmentStatistics`).
+#[derive(Debug, Clone, Default)]
+pub struct ColumnZone {
+    /// the bounds of its values that are not NULL; `None` without any
+    pub min: Option<duckrs_common::value::Value>,
+    pub max: Option<duckrs_common::value::Value>,
+    pub has_null: bool,
+    /// the bounds could not be worked out
+    pub unknown: bool,
 }
 
 /// How many rows a table has and how many distinct values each column holds, approximately.
@@ -222,6 +235,7 @@ impl TableCatalogEntry {
         statistics.version += 1;
         statistics.columns = None;
         statistics.distinct = None;
+        statistics.zones.clear();
         storage
     }
 

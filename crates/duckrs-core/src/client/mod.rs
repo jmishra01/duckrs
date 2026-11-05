@@ -576,7 +576,8 @@ impl ClientContext {
         let logical_optimized = explain::render(&explain::logical_tree(&plan, Some(&estimate)), format, upper);
         resolve_column_bindings(&mut plan)?;
         let physical_plan = create_plan(plan);
-        let physical = explain::physical_tree(physical_plan.as_ref(), Some(&optimized), Some(&estimate));
+        let analyze = explain_type == ExplainType::Analyze;
+        let physical = explain::physical_tree(physical_plan.as_ref(), Some(&optimized), Some(&estimate), analyze);
         let physical = explain::render(&physical, format, upper);
         if explain_type == ExplainType::Analyze {
             self.execute_statement(statement)?;
@@ -3165,6 +3166,84 @@ mod tests {
             "{plan}"
         );
         assert_eq!(run(&mut context, sql), [["6"]]);
+    }
+
+    #[test]
+    fn zone_maps_match_duckdb() {
+        let mut context = ClientContext::new(DatabaseInstance::new());
+        // five row groups, with values that rise with the row
+        run(
+            &mut context,
+            "CREATE TABLE t AS SELECT i AS x, CASE WHEN i < 122880 THEN NULL ELSE i END AS n, \
+             'k' || lpad(i::VARCHAR, 7, '0') AS s, DATE '2000-01-01' + (i // 1000)::INTEGER AS d \
+             FROM range(500000) r(i)",
+        );
+        let scanned = |context: &mut ClientContext, filter: &str| {
+            let sql = format!("EXPLAIN ANALYZE SELECT sum(x) FROM t WHERE {filter}");
+            let plan = run(context, &sql)[0][1].clone();
+            let line = plan.lines().find(|line| line.contains("Row Groups Scanned"));
+            let line = line.unwrap_or_else(|| panic!("{sql}: {plan}"));
+            let count = |c: &mut ClientContext| run(c, &format!("SELECT count(*) FROM t WHERE {filter}"))[0][0].clone();
+            (line.trim().replace("Row Groups Scanned: ", ""), count(context))
+        };
+        // the rows are counted by hand; the groups by which of 122880 they fall in
+        for (filter, groups, rows) in [
+            ("x < 100", "1 / 5", "100"),
+            ("x >= 491520", "1 / 5", "8480"),
+            ("x = 250000", "1 / 5", "1"),
+            ("x BETWEEN 122880 AND 245759", "1 / 5", "122880"),
+            ("x BETWEEN 122879 AND 122880", "2 / 5", "2"),
+            ("x = 10 OR x = 400000", "2 / 5", "2"),
+            ("x IN (10, 11, 400000)", "2 / 5", "3"),
+            ("x > 100 AND x < 200", "1 / 5", "99"),
+            ("x <> 5", "5 / 5", "499999"),
+            ("x % 7 = 5 OR x = 6", "5 / 5", "71429"),
+            // strings, dates, NULLs and functions that keep the order
+            ("s = 'k0250000'", "1 / 5", "1"),
+            ("s < 'k0000100'", "1 / 5", "100"),
+            ("d = DATE '2000-01-02'", "1 / 5", "1000"),
+            ("n IS NULL", "1 / 5", "122880"),
+            ("n IS NOT NULL", "4 / 5", "377120"),
+            ("x::BIGINT > 499990", "1 / 5", "9"),
+            ("floor(x::DOUBLE) > 495000", "1 / 5", "4999"),
+            ("floor(x::DOUBLE) >= 245760", "3 / 5", "254240"),
+            ("year(d) > 2000", "3 / 5", "134000"),
+            ("year(d) = 2000", "3 / 5", "366000"),
+            ("rowid > 491520", "1 / 5", "8479"),
+        ] {
+            assert_eq!(
+                scanned(&mut context, filter),
+                (groups.to_string(), rows.to_string()),
+                "{filter}"
+            );
+        }
+        // a change shows at once, in the group it lands in and in the ones it leaves
+        run(&mut context, "UPDATE t SET x = -5 WHERE x = 300000");
+        assert_eq!(scanned(&mut context, "x < 0"), ("1 / 5".to_string(), "1".to_string()));
+        assert_eq!(
+            scanned(&mut context, "x = 300000"),
+            ("1 / 5".to_string(), "0".to_string())
+        );
+        run(&mut context, "INSERT INTO t VALUES (9999999, NULL, 'z', NULL)");
+        assert_eq!(
+            scanned(&mut context, "x = 9999999"),
+            ("1 / 5".to_string(), "1".to_string())
+        );
+        run(&mut context, "BEGIN");
+        run(&mut context, "UPDATE t SET x = 7777777 WHERE x = 5");
+        // the last group goes up to 9999999 now, so it may hold this value too
+        assert_eq!(
+            scanned(&mut context, "x = 7777777"),
+            ("2 / 5".to_string(), "1".to_string())
+        );
+        run(&mut context, "ROLLBACK");
+        assert_eq!(scanned(&mut context, "x = 7777777").1, "0");
+        assert_eq!(scanned(&mut context, "x = 5").1, "1");
+        run(&mut context, "DELETE FROM t WHERE x < 491520");
+        assert_eq!(
+            run(&mut context, "SELECT count(*) FROM t WHERE x >= 491520"),
+            [["8481"]]
+        );
     }
 
     #[test]

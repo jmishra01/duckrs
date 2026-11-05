@@ -219,7 +219,12 @@ while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` 
   join that reads one relation goes down to it.
 - **Scan filters** move a conjunct from a `FILTER` directly on a scan into it, if it reads one
   column of that scan, is not volatile and cannot fail. It runs last, so the other passes see plain
-  filters. With no zone maps yet it saves the operator, not the scan.
+  filters.
+- **Zone maps** (`execution::zone_map`) keep the bounds of a column per 122,880-row group. They are
+  worked out per column when a filter on a table of two groups or more first asks, and dropped by
+  `write_storage`. A scan skips a group only if no row of it can pass: comparisons with constants,
+  `BETWEEN`, NULL checks, AND, OR, and casts and functions that keep the order of values. Anything
+  else keeps the group. `EXPLAIN ANALYZE` works out `Row Groups Scanned` with the same check.
 - **EXPLAIN** (`client::explain`) turns a plan into a tree that renders as text or JSON. Names are
   in title case unless `operator_casing` says `upper`, and JSON keeps them as they are. The text is
   one line per fact, not boxes. A physical plan takes its details and estimates from the logical
@@ -237,6 +242,9 @@ can fail: below, `a::int < b::int` would run ahead of the filter that guards tho
 `EqualOrNullSimplification` runs only at the root of a filter, where NULL counts as false, and the
 conjuncts of a filter are split before rewriting so that each is such a root. `DatePartSimplificationRule`
 leaves `date_part` alone where the function would need a cast, as `TIMESTAMP_NS` to microseconds rounds.
+
+Most of DuckDB's pruning tests start with `ATTACH ... (ROW_GROUP_SIZE 2048)`, so they cannot run
+until Phase 9; the others want statistics per function (`contains`, `substr`, `length`, ...).
 
 Not ported yet: the box rendering of EXPLAIN, `Projections` of scans, moving LEFT joins in the join order, and SEMI and ANTI joins that read several
 relations (those stay on top of the tree), the estimator's caps for composite keys, estimated rows in EXPLAIN, flipping

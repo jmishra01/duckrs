@@ -208,6 +208,7 @@ pub(super) fn physical_tree(
     op: &dyn PhysicalOperator,
     logical: Option<&LogicalOperator>,
     estimate: Option<&PlanEstimate>,
+    analyze: bool,
 ) -> ExplainNode {
     let children = op.children();
     let logical = logical.filter(|l| l.children.len() == children.len());
@@ -216,10 +217,13 @@ pub(super) fn physical_tree(
         Some(K::Get { .. }) => "SEQ_SCAN".to_string(),
         _ => op.name().to_string(),
     };
-    let info = match logical {
+    let mut info: Vec<(String, String)> = match logical {
         Some(logical) => operator_info(logical, true),
         None => op.explain_details().into_iter().map(|d| (String::new(), d)).collect(),
     };
+    if analyze && let Some((scanned, total)) = op.row_groups_scanned() {
+        info.push(("Row Groups Scanned".to_string(), format!("{scanned} / {total}")));
+    }
     ExplainNode {
         name,
         info,
@@ -232,6 +236,7 @@ pub(super) fn physical_tree(
                     child.as_ref(),
                     logical.map(|l| &l.children[at]),
                     estimate.map(|e| &e.children[at]),
+                    analyze,
                 )
             })
             .collect(),

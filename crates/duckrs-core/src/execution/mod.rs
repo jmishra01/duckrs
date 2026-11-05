@@ -9,6 +9,7 @@
 pub mod expression_executor;
 pub mod join;
 pub mod physical;
+pub mod zone_map;
 
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
 use duckrs_common::Result;
