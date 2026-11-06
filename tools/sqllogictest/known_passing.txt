@@ -1693,6 +1693,7 @@ test/sql/storage/types/variant/variant_shredded_slice.test
 test/sql/storage/types/variant/variant_shredded_top_level_array_cast.test
 test/sql/storage/unzip.test
 test/sql/storage/update/dictionary_update_null.test
+test/sql/storage/wal/test_wal_bc.test
 test/sql/subquery/any_all/issue_2999.test
 test/sql/subquery/any_all/test_any_all.test
 test/sql/subquery/any_all/test_any_left_join_in_on_clause.test

@@ -326,6 +326,45 @@ pub mod enums {
         pub const BOUND_TABLE_REF: u64 = 13;
         pub const MATCH_RECOGNIZE: u64 = 14;
     }
+    pub mod vector_type {
+        pub const FLAT_VECTOR: u64 = 0;
+        pub const FSST_VECTOR: u64 = 1;
+        pub const CONSTANT_VECTOR: u64 = 2;
+        pub const DICTIONARY_VECTOR: u64 = 3;
+        pub const SEQUENCE_VECTOR: u64 = 4;
+        pub const SHREDDED_VECTOR: u64 = 5;
+    }
+    pub mod wal_type {
+        pub const INVALID: u64 = 0;
+        pub const CREATE_TABLE: u64 = 1;
+        pub const DROP_TABLE: u64 = 2;
+        pub const CREATE_SCHEMA: u64 = 3;
+        pub const DROP_SCHEMA: u64 = 4;
+        pub const CREATE_VIEW: u64 = 5;
+        pub const DROP_VIEW: u64 = 6;
+        pub const CREATE_SEQUENCE: u64 = 8;
+        pub const DROP_SEQUENCE: u64 = 9;
+        pub const SEQUENCE_VALUE: u64 = 10;
+        pub const CREATE_MACRO: u64 = 11;
+        pub const DROP_MACRO: u64 = 12;
+        pub const CREATE_TYPE: u64 = 13;
+        pub const DROP_TYPE: u64 = 14;
+        pub const ALTER_INFO: u64 = 20;
+        pub const CREATE_TABLE_MACRO: u64 = 21;
+        pub const DROP_TABLE_MACRO: u64 = 22;
+        pub const CREATE_INDEX: u64 = 23;
+        pub const DROP_INDEX: u64 = 24;
+        pub const USE_TABLE: u64 = 25;
+        pub const INSERT_TUPLE: u64 = 26;
+        pub const DELETE_TUPLE: u64 = 27;
+        pub const UPDATE_TUPLE: u64 = 28;
+        pub const ROW_GROUP_DATA: u64 = 29;
+        pub const CREATE_TRIGGER: u64 = 30;
+        pub const DROP_TRIGGER: u64 = 31;
+        pub const WAL_VERSION: u64 = 98;
+        pub const CHECKPOINT: u64 = 99;
+        pub const WAL_FLUSH: u64 = 100;
+    }
     pub mod window_boundary {
         pub const INVALID: u64 = 0;
         pub const UNBOUNDED_PRECEDING: u64 = 1;
@@ -493,6 +532,444 @@ impl BlockPointer {
 }
 
 impl Deserialize for BlockPointer {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WALCreateTable {
+    pub table: Option<Box<CreateInfo>>,
+}
+
+impl WALCreateTable {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let table = d.read_property_with_default::<Option<Box<CreateInfo>>>(101, "table")?;
+        Ok(Self { table })
+    }
+}
+
+impl Deserialize for WALCreateTable {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WALDropTable {
+    pub schema: String,
+    pub name: String,
+    pub qualified_name: Option<QualifiedName>,
+}
+
+impl WALDropTable {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let schema = d.read_property_with_default::<String>(101, "schema")?;
+        let name = d.read_property_with_default::<String>(102, "name")?;
+        let qualified_name = d.read_optional_property::<QualifiedName>(103, "qualified_name")?;
+        Ok(Self {
+            schema,
+            name,
+            qualified_name,
+        })
+    }
+}
+
+impl Deserialize for WALDropTable {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WALCreateSchema {
+    pub schema: String,
+    pub qualified_name: Option<QualifiedName>,
+}
+
+impl WALCreateSchema {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let schema = d.read_property_with_default::<String>(101, "schema")?;
+        let qualified_name = d.read_optional_property::<QualifiedName>(102, "qualified_name")?;
+        Ok(Self { schema, qualified_name })
+    }
+}
+
+impl Deserialize for WALCreateSchema {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WALDropSchema {
+    pub schema: String,
+    pub qualified_name: Option<QualifiedName>,
+}
+
+impl WALDropSchema {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let schema = d.read_property_with_default::<String>(101, "schema")?;
+        let qualified_name = d.read_optional_property::<QualifiedName>(102, "qualified_name")?;
+        Ok(Self { schema, qualified_name })
+    }
+}
+
+impl Deserialize for WALDropSchema {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WALCreateView {
+    pub view: Option<Box<CreateInfo>>,
+}
+
+impl WALCreateView {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let view = d.read_property_with_default::<Option<Box<CreateInfo>>>(101, "view")?;
+        Ok(Self { view })
+    }
+}
+
+impl Deserialize for WALCreateView {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WALDropView {
+    pub schema: String,
+    pub name: String,
+    pub qualified_name: Option<QualifiedName>,
+}
+
+impl WALDropView {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let schema = d.read_property_with_default::<String>(101, "schema")?;
+        let name = d.read_property_with_default::<String>(102, "name")?;
+        let qualified_name = d.read_optional_property::<QualifiedName>(103, "qualified_name")?;
+        Ok(Self {
+            schema,
+            name,
+            qualified_name,
+        })
+    }
+}
+
+impl Deserialize for WALDropView {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WALCreateSequence {
+    pub sequence: Option<Box<CreateInfo>>,
+}
+
+impl WALCreateSequence {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let sequence = d.read_property_with_default::<Option<Box<CreateInfo>>>(101, "sequence")?;
+        Ok(Self { sequence })
+    }
+}
+
+impl Deserialize for WALCreateSequence {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WALDropSequence {
+    pub schema: String,
+    pub name: String,
+    pub qualified_name: Option<QualifiedName>,
+}
+
+impl WALDropSequence {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let schema = d.read_property_with_default::<String>(101, "schema")?;
+        let name = d.read_property_with_default::<String>(102, "name")?;
+        let qualified_name = d.read_optional_property::<QualifiedName>(103, "qualified_name")?;
+        Ok(Self {
+            schema,
+            name,
+            qualified_name,
+        })
+    }
+}
+
+impl Deserialize for WALDropSequence {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WALSequenceValue {
+    pub schema: String,
+    pub name: String,
+    pub usage_count: Option<u64>,
+    pub counter: Option<i64>,
+    pub last_value: Option<i64>,
+    pub qualified_name: Option<QualifiedName>,
+}
+
+impl WALSequenceValue {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let schema = d.read_property_with_default::<String>(101, "schema")?;
+        let name = d.read_property_with_default::<String>(102, "name")?;
+        let usage_count = d.read_optional_property::<u64>(103, "usage_count")?;
+        let counter = d.read_optional_property::<i64>(104, "counter")?;
+        let last_value = d.read_property_with_default::<Option<i64>>(105, "last_value")?;
+        let qualified_name = d.read_optional_property::<QualifiedName>(106, "qualified_name")?;
+        Ok(Self {
+            schema,
+            name,
+            usage_count,
+            counter,
+            last_value,
+            qualified_name,
+        })
+    }
+}
+
+impl Deserialize for WALSequenceValue {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WALCreateMacro {
+    pub macro_: Option<Box<CreateInfo>>,
+}
+
+impl WALCreateMacro {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let macro_ = d.read_property_with_default::<Option<Box<CreateInfo>>>(101, "macro")?;
+        Ok(Self { macro_ })
+    }
+}
+
+impl Deserialize for WALCreateMacro {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WALDropMacro {
+    pub schema: String,
+    pub name: String,
+    pub qualified_name: Option<QualifiedName>,
+}
+
+impl WALDropMacro {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let schema = d.read_property_with_default::<String>(101, "schema")?;
+        let name = d.read_property_with_default::<String>(102, "name")?;
+        let qualified_name = d.read_optional_property::<QualifiedName>(103, "qualified_name")?;
+        Ok(Self {
+            schema,
+            name,
+            qualified_name,
+        })
+    }
+}
+
+impl Deserialize for WALDropMacro {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WALCreateTableMacro {
+    pub table_macro: Option<Box<CreateInfo>>,
+}
+
+impl WALCreateTableMacro {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let table_macro = d.read_property_with_default::<Option<Box<CreateInfo>>>(101, "table_macro")?;
+        Ok(Self { table_macro })
+    }
+}
+
+impl Deserialize for WALCreateTableMacro {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WALDropTableMacro {
+    pub schema: String,
+    pub name: String,
+    pub qualified_name: Option<QualifiedName>,
+}
+
+impl WALDropTableMacro {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let schema = d.read_property_with_default::<String>(101, "schema")?;
+        let name = d.read_property_with_default::<String>(102, "name")?;
+        let qualified_name = d.read_optional_property::<QualifiedName>(103, "qualified_name")?;
+        Ok(Self {
+            schema,
+            name,
+            qualified_name,
+        })
+    }
+}
+
+impl Deserialize for WALDropTableMacro {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WALCreateType {
+    pub type_: Option<Box<CreateInfo>>,
+}
+
+impl WALCreateType {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let type_ = d.read_property_with_default::<Option<Box<CreateInfo>>>(101, "type")?;
+        Ok(Self { type_ })
+    }
+}
+
+impl Deserialize for WALCreateType {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WALDropType {
+    pub schema: String,
+    pub name: String,
+    pub qualified_name: Option<QualifiedName>,
+}
+
+impl WALDropType {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let schema = d.read_property_with_default::<String>(101, "schema")?;
+        let name = d.read_property_with_default::<String>(102, "name")?;
+        let qualified_name = d.read_optional_property::<QualifiedName>(103, "qualified_name")?;
+        Ok(Self {
+            schema,
+            name,
+            qualified_name,
+        })
+    }
+}
+
+impl Deserialize for WALDropType {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WALCreateTrigger {
+    pub trigger: Option<Box<CreateInfo>>,
+}
+
+impl WALCreateTrigger {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let trigger = d.read_property_with_default::<Option<Box<CreateInfo>>>(101, "trigger")?;
+        Ok(Self { trigger })
+    }
+}
+
+impl Deserialize for WALCreateTrigger {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WALDropTrigger {
+    pub schema: String,
+    pub name: String,
+    pub table: String,
+    pub qualified_name: Option<QualifiedName>,
+}
+
+impl WALDropTrigger {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let schema = d.read_property_with_default::<String>(101, "schema")?;
+        let name = d.read_property_with_default::<String>(102, "name")?;
+        let table = d.read_property_with_default::<String>(103, "table")?;
+        let qualified_name = d.read_optional_property::<QualifiedName>(104, "qualified_name")?;
+        Ok(Self {
+            schema,
+            name,
+            table,
+            qualified_name,
+        })
+    }
+}
+
+impl Deserialize for WALDropTrigger {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WALDropIndex {
+    pub schema: String,
+    pub name: String,
+    pub qualified_name: Option<QualifiedName>,
+}
+
+impl WALDropIndex {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let schema = d.read_property_with_default::<String>(101, "schema")?;
+        let name = d.read_property_with_default::<String>(102, "name")?;
+        let qualified_name = d.read_optional_property::<QualifiedName>(103, "qualified_name")?;
+        Ok(Self {
+            schema,
+            name,
+            qualified_name,
+        })
+    }
+}
+
+impl Deserialize for WALDropIndex {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WALUseTable {
+    pub schema: String,
+    pub table: String,
+    pub qualified_name: Option<QualifiedName>,
+}
+
+impl WALUseTable {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let schema = d.read_property_with_default::<String>(101, "schema")?;
+        let table = d.read_property_with_default::<String>(102, "table")?;
+        let qualified_name = d.read_optional_property::<QualifiedName>(103, "qualified_name")?;
+        Ok(Self {
+            schema,
+            table,
+            qualified_name,
+        })
+    }
+}
+
+impl Deserialize for WALUseTable {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
     }

@@ -242,6 +242,123 @@ fn constraints_count_as_indexes() {
     }
 }
 
+const LOGGED_FILES: [&str; 3] = ["wal_v100.db", "wal_v150.db", "wal_v200.db"];
+
+fn expected_rows(name: &str) -> Vec<String> {
+    let bytes = std::fs::read_to_string(fixture(&format!("{name}.expected"))).unwrap();
+    bytes.lines().map(String::from).collect()
+}
+
+/// The tables as DuckDB has them after it replays the same log: inserts, deletes and updates, large
+/// inserts that went to the file ahead of the commit, and every column type.
+#[test]
+fn write_ahead_logs_are_replayed() {
+    for file in LOGGED_FILES {
+        let mut connection = connect(file);
+        for (table, name) in [
+            ("kept", "wal_kept"),
+            ("logged_schema.fresh", "wal_logged_schema_fresh"),
+            ("constants", "wal_constants"),
+            ("repeated", "wal_repeated"),
+            ("bulk", "wal_bulk"),
+            ("logged_view", "wal_logged_view"),
+        ] {
+            let expected = expected_rows(name);
+            let actual = rows(&mut connection, table);
+            assert_eq!(actual.len(), expected.len(), "{file}: rows of {table}");
+            let first = actual.iter().zip(&expected).position(|(a, e)| a != e);
+            assert_eq!(first, None, "{file}: {table}");
+        }
+    }
+}
+
+#[test]
+fn logged_catalog_changes_are_replayed() {
+    for file in LOGGED_FILES {
+        let mut connection = connect(file);
+        for missing in ["doomed", "doomed_view"] {
+            assert!(connection.query(&format!("SELECT * FROM {missing}")).is_err(), "{file}");
+        }
+        assert!(connection.query("SELECT doomed_macro(1)").is_err(), "{file}");
+        assert_eq!(column(&mut connection, "SELECT logged_macro(2)"), ["6"], "{file}");
+        assert_eq!(
+            column(&mut connection, "SELECT * FROM logged_table_macro()"),
+            ["1"],
+            "{file}"
+        );
+        assert_eq!(column(&mut connection, "SELECT 'x'::logged_type"), ["x"], "{file}");
+        let sql = "SELECT table_name, index_count FROM duckdb_tables() WHERE index_count > 0";
+        assert_eq!(column(&mut connection, sql), ["kept|1"], "{file}");
+    }
+}
+
+/// The sequences go on from what the log says of them, and from what the file says of the others.
+#[test]
+fn logged_sequence_values_are_replayed() {
+    for file in LOGGED_FILES {
+        let db = Database::open(fixture(file), false).unwrap();
+        let mut connection = db.connect().unwrap();
+        assert_eq!(column(&mut connection, "SELECT nextval('counter')"), ["16"], "{file}");
+        assert!(connection.query("SELECT nextval('doomed_sequence')").is_err(), "{file}");
+    }
+}
+
+/// A copy of the file and its log, in a directory of its own, whose log `change` changes.
+fn with_changed_log(name: &str, change: impl FnOnce(Vec<u8>) -> Vec<u8>) -> PathBuf {
+    let directory = std::env::temp_dir().join(format!("duckrs-wal-{}-{name}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("wal_v150.db");
+    std::fs::copy(fixture("wal_v150.db"), &path).unwrap();
+    let log = std::fs::read(fixture("wal_v150.db.wal")).unwrap();
+    std::fs::write(directory.join("wal_v150.db.wal"), change(log)).unwrap();
+    path
+}
+
+/// A crash leaves part of the last transaction: what was committed before it is what counts.
+#[test]
+fn a_torn_log_keeps_what_was_committed() {
+    let path = with_changed_log("torn", |mut log| {
+        log.truncate(log.len() - 3);
+        log
+    });
+    let db = Database::open(&path, true).unwrap();
+    let mut connection = db.connect().unwrap();
+    assert_eq!(column(&mut connection, "SELECT count(*) FROM bulk"), ["299995"]);
+    assert_eq!(
+        column(&mut connection, "SELECT nextval('counter') FROM range(0)"),
+        Vec::<String>::new()
+    );
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn a_damaged_log_is_an_error() {
+    let path = with_changed_log("damaged", |mut log| {
+        let middle = log.len() / 2;
+        log[middle] ^= 1;
+        log
+    });
+    let error = Database::open(&path, true).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::DataCorruption, "{error}");
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn a_log_of_another_database_is_an_error() {
+    // logs for versions before v1.3.0 don't say which database they are of
+    let path = with_changed_log("other", |_| std::fs::read(fixture("wal_v200.db.wal")).unwrap());
+    let error = Database::open(&path, true).unwrap_err();
+    assert_eq!(error.to_string(), "IO Error: WAL does not match database file.");
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn replaying_leaves_the_log_alone() {
+    let before = std::fs::read(fixture("wal_v150.db.wal")).unwrap();
+    let _ = connect("wal_v150.db");
+    assert_eq!(std::fs::read(fixture("wal_v150.db.wal")).unwrap(), before);
+}
+
 #[test]
 fn a_read_only_file_takes_no_writes() {
     let mut connection = connect("compatible.db");

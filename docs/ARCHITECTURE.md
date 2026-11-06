@@ -341,9 +341,9 @@ or lose data:
 - triggers;
 - `CREATE TABLE ... AS` queries, partition and sort keys, table options, and schemas with options;
 - in a stored query: INSERT, UPDATE, DELETE, MERGE, COPY, SHOW and MATCH_RECOGNIZE;
-- a write-ahead log that waits to be replayed, encrypted files.
+- `ALTER` and updates of a field of a STRUCT in a write-ahead log, encrypted files and logs.
 
-Next, in order: WAL replay; scanning row groups in place through the buffer manager; then
+Next, in order: scanning row groups in place through the buffer manager; then
 checkpoints, for which the block layer is ready. `ATTACH` follows from there. ZSTD takes a new
 dependency, and Chimp and Patas are only in old files.
 
@@ -354,6 +354,22 @@ as the engine keeps its keys unique from the rows (`TableCatalogEntry::unique_ke
 needed) until Phase 10 ports the ART. A `CREATE INDEX` entry goes through `bind_create_index` and
 joins the table without a scan, as the file has these rows under the index already. An index of a
 type that isn't ART came with an extension; as nothing here reads it, it is treated like the others.
+
+**Write-ahead log** (`wal`): all records of a log are read before any is applied, which is what the
+first pass of C++ does. What follows the last WAL_FLUSH was never committed and a log that stops
+inside an entry is what a crash leaves, so neither is an error; a wrong checksum is, and so is a log
+of another database or checkpoint. Files are only opened read-only, so this is the read-only path
+of C++: the log and the file stay as they are, and a checkpoint that didn't finish is read around, with
+`.wal.checkpoint` if there is one. Records go through what loads a checkpoint.
+
+Records name rows by row id, and rows that were deleted before the last checkpoint leave gaps, so
+`LiveTable` keeps the id of each position while a log is replayed. Deletes and updates are collected
+and the tables they touch are rewritten at the end. C++ logs an update twice, the values and a
+validity update on the path `[column, 0]`, as the value of a NULL is whatever the vector held; a
+cell keeps both. Large inserts write row groups to the file ahead of the commit, past the blocks the
+last checkpoint knows of, and the log says where (`ROW_GROUP_DATA`).
+
+`ALTER` is an error for now: it takes the `ParseInfo` specs, and replaying it has to change rows.
 
 **Parsed objects** (`serialization`): `tools/generate_serialization.py` is the counterpart of
 DuckDB's generator. It reads the JSON specs and the enums of the C++ headers and writes
@@ -381,9 +397,9 @@ bytes of a block and fixes its checksum, to get past that to the decoders. Layou
 exactly and not just bounds: an FSST symbol table in the wrong place is corruption even if it is in
 bounds, as otherwise strings decode to garbage without an error.
 
-Of the 25 database files under DuckDB's `data` and `test`, 11 open. The rest fail on Patas and Chimp
-(3), encryption (2) and a WAL (1), and 8 are refused as DuckDB refuses them: damaged, of another
-vector size, or too old.
+Of the 25 database files under DuckDB's `data` and `test`, 12 open. The rest fail on Patas and Chimp
+(3) and encryption (2), and 8 are refused as DuckDB refuses them: damaged, of another vector size, or
+too old.
 
 `stored_queries.txt` is one query per line, stored as a view in files for v1.0.0, v1.5.0 and v2.0.0.
 Every view gives the rows that DuckDB gives, and on the v1.5.0 file `duckdb_views()` renders each
@@ -391,6 +407,11 @@ query as DuckDB does, apart from the differences between the `ToString` of the 1
 the fixtures and the baseline, which the test lists. The v2.0.0 file comes from the reference engine
 of the test runner, as the CLI is too old for it; its rendering isn't compared. Writes aren't ported, so
 `storage::tests` looks at the catalog for keys, foreign keys and indexes.
+
+`wal_checkpointed.sql` and `wal_logged.sql` make files whose changes are partly only in a log, for
+the same three versions, and every table has to come out as DuckDB has it after replaying that log.
+Replay only needs a log, so these are `.wal` files in `tests/fixtures`, which `.gitignore` lets through.
+DuckDB 1.5.6 can't replay a logged index read-only, so `generate.sh` has it read a copy.
 
 The tests compare every column as the text that DuckDB prints, FLOAT and DOUBLE included.
 

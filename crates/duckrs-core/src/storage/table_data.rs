@@ -61,7 +61,7 @@ fn read_data_pointer(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>) -
 }
 
 /// `PersistentColumnData`.
-struct PersistentColumn {
+pub(super) struct PersistentColumn {
     pointers: Vec<DataPointer>,
     validity: Option<Box<PersistentColumn>>,
     /// Of a LIST or ARRAY, one; of a STRUCT, its fields.
@@ -119,7 +119,7 @@ fn read_persistent_column(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalTyp
 }
 
 /// `GetTypeIdSize`.
-fn fixed_width(physical: PhysicalType) -> Option<usize> {
+pub(super) fn fixed_width(physical: PhysicalType) -> Option<usize> {
     Some(match physical {
         PhysicalType::Bool | PhysicalType::Int8 | PhysicalType::UInt8 => 1,
         PhysicalType::Int16 | PhysicalType::UInt16 => 2,
@@ -237,7 +237,7 @@ fn fill<T: NativeType, const N: usize>(vector: &mut Vector, data: &[u8], read: i
     }
 }
 
-fn fill_vector(vector: &mut Vector, data: &[u8]) -> Result<()> {
+pub(super) fn fill_vector(vector: &mut Vector, data: &[u8]) -> Result<()> {
     match vector.physical_type() {
         // anything but 0 and 1 would be undefined behavior as a `bool`
         PhysicalType::Bool => fill::<bool, 1>(vector, data, |b| b[0] != 0),
@@ -457,6 +457,7 @@ fn read_row_group(
     row_group: &RowGroupPointer,
     types: &[LogicalType],
     result: &mut ColumnDataCollection,
+    row_ids: Option<&mut Vec<u64>>,
 ) -> Result<()> {
     if row_group.data_pointers.len() != table.columns.len() {
         return Err(corrupt("a row group does not have the columns of its table"));
@@ -473,11 +474,17 @@ fn read_row_group(
     }
     // only the first pointer leads anywhere: the others say which blocks that takes
     let Some(&deletes) = row_group.deletes_pointers.first() else {
+        if let Some(row_ids) = row_ids {
+            row_ids.extend(row_group.row_start..row_group.row_start + rows as u64);
+        }
         result.append(&DataChunk::from_columns(columns, rows));
         return Ok(());
     };
     let deleted = read_deletes(buffer, chains, deletes, rows)?;
     let alive: Vec<u32> = (0..rows as u32).filter(|&row| !deleted[row as usize]).collect();
+    if let Some(row_ids) = row_ids {
+        row_ids.extend(alive.iter().map(|&row| row_group.row_start + u64::from(row)));
+    }
     let alive_count = alive.len();
     let selection = SelectionVector::from_vec(alive);
     for column in &mut columns {
@@ -488,12 +495,67 @@ fn read_row_group(
 }
 
 /// All rows of a table.
-pub fn read_table(buffer: &BufferManager, table: &StoredTable) -> Result<ColumnDataCollection> {
+pub fn read_table(
+    buffer: &BufferManager,
+    table: &StoredTable,
+    mut row_ids: Option<&mut Vec<u64>>,
+) -> Result<ColumnDataCollection> {
     let types: Vec<LogicalType> = table.columns.iter().map(|c| c.ty.clone()).collect();
     let mut result = ColumnDataCollection::new(types.clone());
     let mut chains = MetadataChains::default();
     for row_group in &table.row_groups {
-        read_row_group(buffer, &mut chains, table, row_group, &types, &mut result)?;
+        read_row_group(
+            buffer,
+            &mut chains,
+            table,
+            row_group,
+            &types,
+            &mut result,
+            row_ids.as_deref_mut(),
+        )?;
     }
     Ok(result)
+}
+
+/// `PersistentRowGroupData`: rows that a large insert wrote to the file ahead of its commit.
+pub(super) struct PersistentRowGroup {
+    types: Vec<LogicalType>,
+    columns: Vec<PersistentColumn>,
+    count: u64,
+}
+
+/// `PersistentCollectionData::Deserialize`.
+pub(super) fn read_collection_data(d: &mut BinaryDeserializer<'_>, field_id: u16) -> Result<Vec<PersistentRowGroup>> {
+    d.read_object(field_id, "row_group_data", |d| {
+        d.read_list(100, "row_groups", |d| {
+            d.read_object_value(|d| {
+                let types: Vec<LogicalType> = d.read_property(100, "types")?;
+                let mut types_left = types.iter();
+                let columns = d.read_list(101, "columns", |d| {
+                    let ty = types_left
+                        .next()
+                        .ok_or_else(|| corrupt("a row group has too many columns"))?;
+                    read_persistent_column(d, Some(ty))
+                })?;
+                d.read_property::<u64>(102, "start")?;
+                let count = d.read_property(103, "count")?;
+                Ok(PersistentRowGroup { types, columns, count })
+            })
+        })
+    })
+}
+
+/// The rows of a row group of a log.
+pub(super) fn scan_row_group(buffer: &BufferManager, row_group: &PersistentRowGroup) -> Result<DataChunk> {
+    if row_group.count > MAX_ROW_GROUP_SIZE || row_group.columns.len() != row_group.types.len() {
+        return Err(corrupt("a row group of a log is not what it says"));
+    }
+    let rows = row_group.count as usize;
+    let columns = row_group
+        .types
+        .iter()
+        .zip(&row_group.columns)
+        .map(|(ty, column)| scan_column(buffer, column, ty, rows))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(DataChunk::from_columns(columns, rows))
 }

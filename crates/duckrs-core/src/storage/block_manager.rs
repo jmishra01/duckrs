@@ -38,6 +38,10 @@ pub const INVALID_BLOCK: u64 = u64::MAX;
 /// `SerializationVersion` 1 goes with. Nothing newer has to be written yet.
 const NEW_FILE_VERSION_NUMBER: u64 = 64;
 const NEW_FILE_SERIALIZATION_VERSION: u64 = 1;
+/// `MainHeader::DB_IDENTIFIER_LEN`.
+pub const DB_IDENTIFIER_LEN: usize = 16;
+/// `MainHeader::ENCRYPTION_METADATA_LEN`.
+const ENCRYPTION_METADATA_LEN: usize = 8;
 
 pub(super) fn corrupt(message: impl std::fmt::Display) -> Error {
     Error::new(ErrorKind::DataCorruption, format!("Corrupt database file: {message}"))
@@ -68,6 +72,8 @@ pub struct MainHeader {
     pub flags: [u64; FLAG_COUNT],
     pub library_git_desc: String,
     pub library_git_hash: String,
+    /// Tells a write-ahead log of this file from those of others.
+    pub db_identifier: [u8; DB_IDENTIFIER_LEN],
 }
 
 impl MainHeader {
@@ -94,11 +100,15 @@ impl MainHeader {
             String::from_utf8_lossy(&bytes[..end]).into_owned()
         };
         let desc_at = 12 + FLAG_COUNT * 8;
+        let identifier_at = desc_at + 2 * MAX_VERSION_SIZE + ENCRYPTION_METADATA_LEN;
         Ok(Self {
             version_number,
             flags,
             library_git_desc: text(desc_at),
             library_git_hash: text(desc_at + MAX_VERSION_SIZE),
+            db_identifier: data[identifier_at..identifier_at + DB_IDENTIFIER_LEN]
+                .try_into()
+                .expect("the length of the slice"),
         })
     }
 
@@ -308,6 +318,22 @@ impl SingleFileBlockManager {
         let mut state = self.state.lock();
         state.free_list = free_list;
         state.multi_use_blocks = multi_use_blocks;
+    }
+
+    /// Large inserts write their blocks ahead of the commit, past the blocks that the last checkpoint
+    /// knows of, and name them in the log. `MarkBlockAsUsed` of each comes down to this when nothing
+    /// is going to be written.
+    pub fn include_blocks_past_checkpoint(&self) -> Result<()> {
+        let length = self
+            .file
+            .lock()
+            .metadata()
+            .map_err(|error| io_error(&self.path, error))?
+            .len();
+        let mut state = self.state.lock();
+        let blocks = length.saturating_sub(BLOCK_START) / state.header.block_alloc_size;
+        state.header.block_count = state.header.block_count.max(blocks);
+        Ok(())
     }
 
     fn location(&self, block_id: u64) -> Result<u64> {

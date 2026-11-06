@@ -22,7 +22,7 @@ ROWS="SELECT
   ('blob' || (i % 9))::BLOB
   FROM range(COUNT_ROWS) r(i)"
 
-rm -f compatible.db compressed.db bitpacked.db floats.db modern.db nested.db deletes.db parsed_*.db *.expected
+rm -f compatible.db compressed.db bitpacked.db floats.db modern.db nested.db deletes.db parsed_*.db wal_v*.db* *.expected
 "$DUCKDB" <<SQL
 ATTACH 'compatible.db' (BLOCK_SIZE 16384);
 USE compatible;
@@ -229,4 +229,44 @@ rm -f parsed_v200.db
   printf 'statement ok\nCHECKPOINT\n\nstatement ok\nUSE memory\n\nstatement ok\nDETACH parsed_v200\n'
 } > "$scratch/test/v200.test"
 "$runner" --engine reference --duckdb-root "$scratch" test/v200.test
+rm -rf "$scratch"
+
+# Changes that are only in a write-ahead log. Opening a file for writing replays its log and
+# removes it, and 1.5.6 can't replay a logged index read-only, so DuckDB reads a copy. What it reads
+# is what duckrs has to read from all three files.
+wal_tables="kept logged_schema.fresh constants repeated bulk logged_view"
+for version in v1.0.0 v1.5.0; do
+  file=wal_$(echo $version | tr -d .).db
+  rm -f "$file" "$file.wal"
+  {
+    echo "ATTACH '$file' (BLOCK_SIZE 16384, STORAGE_VERSION '$version');"
+    echo "USE ${file%.db};"
+    cat wal_checkpointed.sql wal_logged.sql
+  } | "$DUCKDB" > /dev/null
+  scratch=$(mktemp -d)
+  cp "$file" "$file.wal" "$scratch"
+  for table in $wal_tables; do
+    columns=$("$DUCKDB" -noheader -list "$scratch/$file" \
+        -c "SELECT string_agg('\"' || column_name || '\"::VARCHAR', ', ' ORDER BY column_index)
+            FROM duckdb_columns() WHERE schema_name || '.' || table_name = '$table' OR table_name = '$table'")
+    "$DUCKDB" -noheader -list -separator '|' -nullvalue NULL "$scratch/$file" \
+        -c "SELECT $columns FROM $table" > "wal_$(echo "$table" | tr . _).expected"
+  done
+  rm -rf "$scratch"
+done
+
+# v2.0.0 through the reference engine, as for `parsed_v200.db`.
+scratch=$(mktemp -d)
+mkdir "$scratch/test"
+rm -f wal_v200.db wal_v200.db.wal
+{
+  echo "statement ok"
+  echo "ATTACH '$PWD/wal_v200.db' (BLOCK_SIZE 16384, STORAGE_VERSION 'v2.0.0')"
+  echo
+  echo "statement ok"
+  echo "USE wal_v200"
+  echo
+  cat wal_checkpointed.sql wal_logged.sql | awk 'BEGIN { RS = ""; ORS = "\n\n" } { print "statement ok\n" $0 }'
+} > "$scratch/test/wal_v200.test"
+"$runner" --engine reference --duckdb-root "$scratch" test/wal_v200.test
 rm -rf "$scratch"

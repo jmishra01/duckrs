@@ -309,6 +309,29 @@ impl<'a> BinaryDeserializer<'a> {
         Ok(result as i64)
     }
 
+    /// How much of the data was read. Between objects that is where the next one starts.
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
+    /// `ReadDataPtr`: bytes with their length in front.
+    pub fn read_blob(&mut self) -> Result<&'a [u8]> {
+        let length = self.read_varint_unsigned(64)?;
+        let length = usize::try_from(length).map_err(|_| serialization_error("Failed to deserialize: a huge blob"))?;
+        self.read_raw(length)
+    }
+
+    /// `ReadProperty(field_id, tag, ptr, count)`.
+    pub fn read_blob_property(&mut self, field_id: u16) -> Result<&'a [u8]> {
+        let field = self.next_field()?;
+        if field != field_id {
+            return Err(serialization_error(format!(
+                "Failed to deserialize: field id mismatch, expected: {field_id}, got: {field}"
+            )));
+        }
+        self.read_blob()
+    }
+
     /// `CanDeserializeProperty`: whether the next field is `field_id`.
     pub fn has_property(&mut self, field_id: u16) -> Result<bool> {
         Ok(self.peek_field()? == field_id)

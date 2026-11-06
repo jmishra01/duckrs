@@ -30,9 +30,11 @@ SPECS = [
     "nodes",
     "dependency",
     "storage",
+    "wal",
 ]
 
 # Where the generated readers start.
+# The records of the WAL other than `WALCheckpoint`, which `wal.rs` reads, come from `wal.json`.
 ROOTS = ["CreateInfo", "FunctionArgument", "IndexStorageInfo", "BlockPointer"]
 
 # C++ deserializes these by hand. They are written by hand in `custom.rs` too.
@@ -76,11 +78,28 @@ ENUMS = [
     "SetOperationType",
     "SubqueryType",
     "TableColumnType",
+    "VectorType",
+    "WALType",
     "WindowBoundary",
     "WindowExcludeMode",
 ]
 
-KEYWORDS = {"type", "match", "as", "ref", "final", "in", "where", "use", "fn", "move", "box", "enum", "struct"}
+KEYWORDS = {
+    "as",
+    "box",
+    "enum",
+    "final",
+    "fn",
+    "in",
+    "macro",
+    "match",
+    "move",
+    "ref",
+    "struct",
+    "type",
+    "use",
+    "where",
+}
 
 # Types that are a plain number in the file.
 NUMBERS = {
@@ -326,7 +345,8 @@ class Generator:
 
     def generate(self):
         body = ""
-        for root in ROOTS:
+        records = json.loads((self.spec_dir / "wal.json").read_text())
+        for root in ROOTS + [r["class"] for r in records if r["class"] != "WALCheckpoint"]:
             self.visit(root)
         index = 0
         while index < len(self.seen):

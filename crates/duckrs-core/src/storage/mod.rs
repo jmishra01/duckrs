@@ -10,14 +10,12 @@ pub mod metadata;
 pub mod serialization;
 pub mod statistics;
 pub mod table_data;
+mod wal;
 
-use crate::catalog::{Catalog, OnCreateConflict, SequenceData};
-use crate::planner::binder::Binder;
-use crate::planner::logical::LogicalOperatorKind;
+use crate::catalog::Catalog;
 use block_manager::SingleFileBlockManager;
 use buffer_manager::BufferManager;
-use checkpoint::{StoredEntry, StoredTable};
-use duckrs_common::{Error, Result};
+use duckrs_common::Result;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -30,96 +28,19 @@ pub fn is_database_file(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| m.len() > 0)
 }
 
-/// Whether a write-ahead log waits to be replayed: without it the file is out of date.
-fn check_write_ahead_log(path: &Path) -> Result<()> {
-    let mut wal = path.as_os_str().to_owned();
-    wal.push(".wal");
-    if std::fs::metadata(wal).is_ok_and(|m| m.len() > 0) {
-        return Err(Error::not_implemented(
-            "replaying the write-ahead log of a database file is not yet ported to duckrs",
-        ));
-    }
-    Ok(())
-}
-
-/// Puts what the last checkpoint of the file at `path` left into `catalog`. The file is opened
-/// read-only: it stays as it is.
+/// Puts what the last checkpoint of the file at `path` left into `catalog`, with what its write-ahead
+/// log committed since. The file is opened read-only: it and the log stay as they are.
 pub fn load_database(path: &Path, catalog: &Catalog) -> Result<()> {
-    check_write_ahead_log(path)?;
     let blocks = Arc::new(SingleFileBlockManager::open(path, true)?);
     let buffer = BufferManager::new(blocks, LOAD_BUFFER_MEMORY);
     metadata::load_free_list(&buffer)?;
+    let records = wal::read_records(path, &buffer)?;
     let stored = checkpoint::read_catalog(&buffer)?;
+    let mut replay = wal::Replay::new(&buffer, catalog, !records.is_empty());
     for entry in stored.entries {
-        match entry {
-            StoredEntry::Schema(name) => catalog.create_schema(&name, OnCreateConflict::Ignore)?,
-            StoredEntry::Table(table) => load_table(&buffer, catalog, &table)?,
-            StoredEntry::View {
-                schema,
-                name,
-                query,
-                aliases,
-            } => {
-                let schema = catalog.schema_for(Some(&schema))?;
-                schema.create_view(&name, *query, aliases, OnCreateConflict::Error)?;
-            }
-            StoredEntry::Macro {
-                schema,
-                name,
-                table_macro,
-                macros,
-            } => {
-                let schema = catalog.schema_for(Some(&schema))?;
-                schema.create_macro(&name, table_macro, macros, OnCreateConflict::Error)?;
-            }
-            StoredEntry::Sequence { schema, name, data } => {
-                let data = SequenceData {
-                    counter: data.counter,
-                    last_value: data.last_value,
-                    increment: data.increment,
-                    min_value: data.min_value,
-                    max_value: data.max_value,
-                    cycle: data.cycle,
-                };
-                let schema = catalog.schema_for(Some(&schema))?;
-                schema.create_sequence(&name, data, OnCreateConflict::Error)?;
-            }
-            StoredEntry::Type { schema, name, ty } => {
-                let schema = catalog.schema_for(Some(&schema))?;
-                schema.create_type(&name, ty, OnCreateConflict::Error)?;
-            }
-            StoredEntry::Index(info) => {
-                // the file has these rows under the index already, so they aren't checked again
-                if let Some((table, index)) = Binder::new(catalog).bind_create_index(&info)? {
-                    table.indexes.write().push(Arc::new(index));
-                }
-            }
-        }
+        replay.add_entry(entry)?;
     }
-    Ok(())
-}
-
-/// Binds the definition of a table as `CREATE TABLE` does, for its defaults, generated columns and
-/// constraints, and copies its rows in.
-fn load_table(buffer: &BufferManager, catalog: &Catalog, table: &StoredTable) -> Result<()> {
-    let plan = Binder::new(catalog).bind_stored_table(&table.definition, &table.schema)?;
-    let LogicalOperatorKind::CreateTable {
-        schema,
-        name,
-        columns,
-        generated,
-        constraints,
-        on_conflict,
-    } = plan.kind
-    else {
-        unreachable!("CREATE TABLE without a query binds to CreateTable");
-    };
-    let rows = table_data::read_table(buffer, table)?;
-    let entry = schema
-        .create_table(&name, columns, generated, constraints, on_conflict)?
-        .expect("OnCreateConflict::Error fails or creates");
-    *entry.write_storage() = rows;
-    Ok(())
+    replay.replay(records)
 }
 
 #[cfg(test)]

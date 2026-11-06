@@ -387,6 +387,29 @@ pub struct SequenceCatalogEntry {
 }
 
 impl SequenceCatalogEntry {
+    /// The state that a write-ahead log recorded (`ReplayValue`).
+    pub fn replay_value(&self, counter: i64, last_value: Option<i64>) {
+        let mut data = self.data.lock();
+        data.counter = counter;
+        data.last_value = last_value;
+    }
+
+    /// `DeriveLastValue`: storage versions before v2.0.0 only have the counter. The caller knows that
+    /// the sequence was used.
+    pub fn derive_last_value(&self) {
+        let mut data = self.data.lock();
+        if data.last_value.is_some() {
+            return;
+        }
+        let Some(last_value) = data.counter.checked_sub(data.increment) else {
+            return;
+        };
+        // a counter that wrapped around in a cycle does not tell
+        if (data.min_value..=data.max_value).contains(&last_value) {
+            data.last_value = Some(last_value);
+        }
+    }
+
     /// `SequenceCatalogEntry::CurrentValue`.
     pub fn current_value(&self) -> Result<i64> {
         self.data.lock().last_value.ok_or_else(|| {

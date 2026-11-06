@@ -5,7 +5,7 @@
 //! A serialized object can't be skipped, so what is not ported (indexes and so on) stops the whole
 //! load with an error instead of going missing silently.
 
-use super::block_manager::corrupt;
+use super::block_manager::{DatabaseHeader, corrupt};
 use super::buffer_manager::BufferManager;
 use super::metadata::{MetaBlockPointer, MetadataChains};
 use super::serialization::convert;
@@ -19,6 +19,17 @@ use duckrs_parser::ast;
 
 /// `StorageVersion::V2_0_0`. Older files have a smaller number here.
 const STORAGE_VERSION_V2_0_0: u64 = 69;
+
+pub(super) fn is_before_v2(header: &DatabaseHeader) -> bool {
+    header.storage_compatibility < STORAGE_VERSION_V2_0_0
+}
+
+/// For what a file holds of its catalog, in its checkpoints and logs.
+pub(super) fn catalog_deserializer(data: &[u8], before_v2: bool) -> BinaryDeserializer<'_> {
+    BinaryDeserializer::new(data)
+        .with_type_expressions(read_type_expression)
+        .from_before_v2(before_v2)
+}
 
 fn not_ported_entry(entry_type: u64) -> Error {
     not_ported(match entry_type {
@@ -73,11 +84,14 @@ pub struct StoredTable {
     pub columns: Vec<StoredColumn>,
     pub total_rows: u64,
     pub row_groups: Vec<RowGroupPointer>,
+    /// The id of the next row, past the gaps that a vacuum leaves.
+    pub next_row_id: u64,
 }
 
 /// `CreateSequenceInfo`, which is what C++ checkpoints of a sequence.
 #[derive(Debug, Clone)]
 pub struct StoredSequence {
+    pub usage_count: u64,
     pub counter: i64,
     pub last_value: Option<i64>,
     pub increment: i64,
@@ -210,9 +224,7 @@ pub fn read_catalog(buffer: &BufferManager) -> Result<StoredCatalog> {
     let mut chains = MetadataChains::default();
     // the tables need `chains` for more of the file, so the entries are taken first
     let root_bytes = chains.at(buffer, root)?.to_vec();
-    let mut d = BinaryDeserializer::new(&root_bytes)
-        .with_type_expressions(read_type_expression)
-        .from_before_v2(buffer.block_manager().header().storage_compatibility < STORAGE_VERSION_V2_0_0);
+    let mut d = catalog_deserializer(&root_bytes, is_before_v2(&buffer.block_manager().header()));
     let mut pending = Vec::new();
     d.read_object_value(|d| {
         d.read_list(100, "catalog_entries", |d| d.read_object_value(read_entry))
@@ -221,10 +233,9 @@ pub fn read_catalog(buffer: &BufferManager) -> Result<StoredCatalog> {
     for entry in pending {
         catalog.entries.push(match entry {
             Pending::Done(entry) => entry,
-            Pending::Table(table, pointer) => {
-                let mut table = *table;
+            Pending::Table(mut table, pointer) => {
                 table.row_groups = read_row_groups(buffer, &mut chains, pointer, &table.columns)?;
-                StoredEntry::Table(Box::new(table))
+                StoredEntry::Table(table)
             }
         });
     }
@@ -259,6 +270,38 @@ fn read_entry(d: &mut BinaryDeserializer<'_>) -> Result<Pending> {
     if info.type_ != entry_type {
         return Err(corrupt("catalog entry type mismatch"));
     }
+    let is_index = matches!(info.kind, g::CreateInfoKind::CreateIndexInfo(_));
+    let converted = convert_entry(info)?;
+    if is_index {
+        // where the ART is in files from before there were `index_storage_infos`
+        d.read_optional_property::<g::BlockPointer>(101, "root_block_pointer")?;
+    }
+    match converted {
+        Converted::Entry(entry) => Ok(Pending::Done(entry)),
+        Converted::Table(mut table) => {
+            let pointer = d.read_property(101, "table_pointer")?;
+            table.total_rows = d.read_property(102, "total_rows")?;
+            // the ART of each index, which only lookups and writes need: C++ doesn't read them at
+            // load either, and the rows are all that `duckrs` keeps keys unique from
+            d.read_property_with_default::<Vec<g::BlockPointer>>(103, "index_pointers")?;
+            d.read_property_with_default::<Vec<g::IndexStorageInfo>>(104, "index_storage_infos")?;
+            table.next_row_id = d
+                .read_optional_property(105, "next_row_id")?
+                .unwrap_or(table.total_rows);
+            Ok(Pending::Table(table, pointer))
+        }
+    }
+}
+
+/// An entry of a checkpoint or a log. Where the rows of a table are is for the caller to find out.
+pub(super) enum Converted {
+    Entry(StoredEntry),
+    Table(Box<StoredTable>),
+}
+
+/// What a `CreateInfo` says, in the terms of the engine.
+pub(super) fn convert_entry(info: g::CreateInfo) -> Result<Converted> {
+    let entry_type = info.type_;
     // the path of a schema is its name and an empty name for the entry (`SchemaCatalogEntry::GetInfo`)
     if let g::CreateInfoKind::CreateSchemaInfo(stored) = &info.kind {
         if !stored.options.is_empty() {
@@ -266,37 +309,28 @@ fn read_entry(d: &mut BinaryDeserializer<'_>) -> Result<Pending> {
         }
         let path = info.qualified_name.map(|name| name.path).unwrap_or_default();
         return match <[String; 2]>::try_from(path) {
-            Ok([name, _]) => Ok(Pending::Done(StoredEntry::Schema(name))),
-            Err(path) if path.is_empty() => Ok(Pending::Done(StoredEntry::Schema(info.schema))),
+            Ok([name, _]) => Ok(Converted::Entry(StoredEntry::Schema(name))),
+            Err(path) if path.is_empty() => Ok(Converted::Entry(StoredEntry::Schema(info.schema))),
             Err(_) => Err(not_ported("a nested schema")),
         };
     }
     let schema = schema_of(&info)?;
-    Ok(Pending::Done(match info.kind {
+    Ok(Converted::Entry(match info.kind {
         g::CreateInfoKind::CreateSchemaInfo(_) => unreachable!("returned above"),
         g::CreateInfoKind::CreateTableInfo(stored) => {
             let name = stored.table.clone();
             let (definition, columns) = table_definition(&schema, stored)?;
-            let pointer = d.read_property(101, "table_pointer")?;
-            let total_rows = d.read_property(102, "total_rows")?;
-            // the ART of each index, which only lookups and writes need: C++ doesn't read them at
-            // load either, and the rows are all that `duckrs` keeps keys unique from
-            d.read_property_with_default::<Vec<g::BlockPointer>>(103, "index_pointers")?;
-            d.read_property_with_default::<Vec<g::IndexStorageInfo>>(104, "index_storage_infos")?;
-            d.read_optional_property::<u64>(105, "next_row_id")?;
-            let table = StoredTable {
+            return Ok(Converted::Table(Box::new(StoredTable {
                 schema,
                 name,
                 definition,
                 columns,
-                total_rows,
+                total_rows: 0,
                 row_groups: Vec::new(),
-            };
-            return Ok(Pending::Table(Box::new(table), pointer));
+                next_row_id: 0,
+            })));
         }
         g::CreateInfoKind::CreateIndexInfo(stored) => {
-            // where the ART is in files from before there were `index_storage_infos`
-            d.read_optional_property::<g::BlockPointer>(101, "root_block_pointer")?;
             StoredEntry::Index(Box::new(convert::create_index(&schema, stored)?))
         }
         g::CreateInfoKind::CreateViewInfo(stored) => StoredEntry::View {
@@ -322,6 +356,7 @@ fn read_entry(d: &mut BinaryDeserializer<'_>) -> Result<Pending> {
             schema,
             name: stored.name,
             data: StoredSequence {
+                usage_count: stored.usage_count,
                 counter: stored.start_value,
                 last_value: stored.last_value,
                 increment: stored.increment,
