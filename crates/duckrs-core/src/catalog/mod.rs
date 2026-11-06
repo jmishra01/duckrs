@@ -91,8 +91,9 @@ pub trait TableSource: std::fmt::Debug + Send + Sync {
     fn column_statistics(&self) -> Option<Vec<ColumnStatistics>>;
     /// What the file says about a column per group, without reading its values.
     fn zones(&self, column: usize) -> Result<Vec<ColumnZone>>;
-    /// `pragma_storage_info`: the segments, in the order that C++ lists them.
-    fn segments(&self) -> Result<Vec<SegmentInfo>>;
+    /// `pragma_storage_info`: the segments, in the order that C++ lists them. Reading what fills
+    /// `segment_info` takes their blocks, so that is only done on request.
+    fn segments(&self, include_info: bool) -> Result<Vec<SegmentInfo>>;
 }
 
 /// A row of `pragma_storage_info`.
@@ -108,6 +109,27 @@ pub struct SegmentInfo {
     pub compression: &'static str,
     pub block_id: i64,
     pub block_offset: u64,
+    /// `get_segment_info`, for the codecs that have one and if it was asked for.
+    pub info: Option<String>,
+}
+
+/// A database as `duckdb_databases()` and `pragma_database_size()` list it.
+#[derive(Debug, Clone)]
+pub struct DatabaseListing {
+    pub name: String,
+    pub path: Option<String>,
+    pub read_only: bool,
+    pub block_size: u64,
+    pub total_blocks: u64,
+    pub free_blocks: u64,
+    pub wal_size: u64,
+}
+
+/// What knows of all databases of a connection, as a catalog only knows of itself.
+pub trait DatabaseList: Send + Sync + std::fmt::Debug {
+    fn databases(&self) -> Vec<DatabaseListing>;
+    /// Hands over the catalog of the database of that name, if there is one.
+    fn with_catalog(&self, name: &str, use_it: &mut dyn FnMut(&Catalog));
 }
 
 /// Reads a `TableSource` chunk by chunk, numbered as those of a table in memory: all but the last
@@ -1227,6 +1249,7 @@ impl SchemaCatalogEntry {
 pub struct Catalog {
     pub name: String,
     schemas: RwLock<BTreeMap<String, Arc<SchemaCatalogEntry>>>,
+    database_list: RwLock<Option<std::sync::Weak<dyn DatabaseList>>>,
 }
 
 /// What a catalog holds at a moment, to go back to on ROLLBACK, until the undo buffer of Phase 10.
@@ -1258,6 +1281,25 @@ struct SchemaEntries {
 }
 
 impl Catalog {
+    /// Says who lists the databases that this one is among.
+    pub fn set_database_list(&self, list: std::sync::Weak<dyn DatabaseList>) {
+        *self.database_list.write() = Some(list);
+    }
+
+    /// All databases, or none if this one is on its own.
+    pub fn databases(&self) -> Vec<DatabaseListing> {
+        let list = self.database_list.read().as_ref().and_then(std::sync::Weak::upgrade);
+        list.map_or_else(Vec::new, |list| list.databases())
+    }
+
+    /// `use_it` with the catalog of the database called `name`, if there is one.
+    pub fn with_database(&self, name: &str, use_it: &mut dyn FnMut(&Catalog)) {
+        let list = self.database_list.read().as_ref().and_then(std::sync::Weak::upgrade);
+        if let Some(list) = list {
+            list.with_catalog(name, use_it);
+        }
+    }
+
     /// A snapshot to [`Catalog::restore`] later.
     pub fn snapshot(&self) -> CatalogSnapshot {
         let schemas = self.schemas.read().clone();
@@ -1324,6 +1366,7 @@ impl Catalog {
         let catalog = Self {
             name: name.to_string(),
             schemas: RwLock::new(BTreeMap::new()),
+            database_list: RwLock::new(None),
         };
         catalog
             .schemas

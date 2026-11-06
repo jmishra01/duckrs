@@ -331,6 +331,11 @@ impl std::fmt::Debug for WriteAheadLog {
     }
 }
 
+/// How much the log of the file at `path` holds, which is nothing if there is none.
+pub fn log_size(path: &Path) -> u64 {
+    std::fs::metadata(log_path(path)).map_or(0, |metadata| metadata.len())
+}
+
 fn log_path(path: &Path) -> PathBuf {
     let mut result = path.as_os_str().to_owned();
     result.push(".wal");

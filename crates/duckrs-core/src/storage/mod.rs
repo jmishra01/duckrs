@@ -7,6 +7,7 @@ pub mod checkpoint;
 pub mod checksum;
 pub mod compression;
 pub mod encode;
+mod fsst;
 pub mod log_writer;
 pub mod metadata;
 pub mod serialization;

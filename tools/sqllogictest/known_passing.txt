@@ -93,6 +93,7 @@ test/fuzzer/pedro/hash_finalize_race.test
 test/fuzzer/pedro/having_query_wrong_result.test
 test/fuzzer/pedro/in_clause_optimization_error.test
 test/fuzzer/pedro/in_clause_setop_rewrite.test
+test/fuzzer/pedro/incomplete_checkpoint.test
 test/fuzzer/pedro/incorrect_offset_result.test
 test/fuzzer/pedro/index_insert_from_union.test
 test/fuzzer/pedro/index_not_updated_returning.test
@@ -469,6 +470,7 @@ test/optimizer/statistics/statistics_join_multicolumn.test
 test/optimizer/statistics/statistics_join_null.test
 test/optimizer/statistics/statistics_join_ungrouped_aggregate_limit.test
 test/optimizer/statistics/statistics_root_replaced.test
+test/optimizer/statistics/statistics_unsigned_arithmetic_pruning.test
 test/optimizer/statistics/statistics_unsigned_cast.test
 test/optimizer/statistics/statistics_varchar.test
 test/optimizer/stats_non_numeric_cast.test
@@ -654,6 +656,7 @@ test/sql/alter/test_alter_if_exists.test
 test/sql/attach/attach_conflicting_options.test
 test/sql/attach/attach_create_index.test
 test/sql/attach/attach_cross_catalog.test
+test/sql/attach/attach_database_size.test
 test/sql/attach/attach_defaults.test
 test/sql/attach/attach_different_alias.test
 test/sql/attach/attach_foreign_key.test
@@ -1253,6 +1256,7 @@ test/sql/join/full_outer/test_full_outer_join_issue_4252.test
 test/sql/join/full_outer/test_full_outer_join_range.test
 test/sql/join/full_outer/test_zero_column_materialized_join.test
 test/sql/join/hash_join/hash_join_bucket_boundaries.test
+test/sql/join/hash_join/hash_join_dict_surviving.test
 test/sql/join/hash_join/hash_join_dict_surviving_computed_build.test
 test/sql/join/hash_join/hash_join_dict_surviving_cte.test
 test/sql/join/hash_join/hash_join_dict_surviving_outer_build.test
@@ -1670,6 +1674,7 @@ test/sql/storage/alter/alter_add_col_defaultexpr_sequence.test
 test/sql/storage/alter/alter_based_on_unfinished_insert_fails.test
 test/sql/storage/alter/alter_lazy_metadata_load.test
 test/sql/storage/append_strings_to_persistent.test
+test/sql/storage/attach/attach_invalidation_default_db.test
 test/sql/storage/bc/test_broken_view_v092.test
 test/sql/storage/bc/test_view_v092.test
 test/sql/storage/catalog/generated_columns/virtual/basic.test
@@ -1692,10 +1697,12 @@ test/sql/storage/catalog/test_store_rename_table.test
 test/sql/storage/catalog/test_store_rename_view.test
 test/sql/storage/catalog/test_store_sequences.test
 test/sql/storage/catalog/test_view_storage_no_view_dependencies.test
+test/sql/storage/checkpoint/checkpoint_without_transactions.test
 test/sql/storage/checkpointed_self_append.test
 test/sql/storage/checkpointed_self_append_tinyint.test
 test/sql/storage/compact_block_size/compact_block_size.test
 test/sql/storage/compact_block_size/default_block_size.test
+test/sql/storage/compact_block_size/ensure_bitpacking.test
 test/sql/storage/compact_block_size/mixed_block_sizes.test
 test/sql/storage/compression/alp/alp_corrupt_count.test
 test/sql/storage/compression/alp/alp_corrupt_exception_position.test
@@ -1739,6 +1746,8 @@ test/sql/storage/compression/alprd/alprd_simple.test
 test/sql/storage/compression/alprd/alprd_simple_float.test
 test/sql/storage/compression/alprd/alprd_zeros.test
 test/sql/storage/compression/bitpacking/bitpacking_bool_modes.test
+test/sql/storage/compression/bitpacking/bitpacking_corrupt_count.test
+test/sql/storage/compression/bitpacking/bitpacking_corrupt_group_offset.test
 test/sql/storage/compression/bitpacking/bitpacking_corrupt_metadata_underflow.test
 test/sql/storage/compression/bitpacking/bitpacking_corrupt_width.test
 test/sql/storage/compression/bitpacking/bitpacking_delta_for.test
@@ -1752,9 +1761,13 @@ test/sql/storage/compression/compression_selection_dict_fsst.test
 test/sql/storage/compression/constant/constant_negative_zero.test
 test/sql/storage/compression/default_storage_dict_fsst.test
 test/sql/storage/compression/dict_fsst/dict_fsst_column_data_collection.test
+test/sql/storage/compression/dict_fsst/dict_fsst_corrupt_dict_count.test
+test/sql/storage/compression/dict_fsst/dict_fsst_corrupt_dict_count_boundary.test
+test/sql/storage/compression/dict_fsst/dict_fsst_corrupt_dict_count_lengths.test
 test/sql/storage/compression/dict_fsst/dict_fsst_corrupt_dictionary_index.test
 test/sql/storage/compression/dict_fsst/dict_fsst_corrupt_encoded_dictionary_index.test
 test/sql/storage/compression/dict_fsst/dict_fsst_corrupt_fsst_only_dict_count.test
+test/sql/storage/compression/dict_fsst/dict_fsst_corrupt_indices_width.test
 test/sql/storage/compression/dict_fsst/dict_fsst_corrupt_mode.test
 test/sql/storage/compression/dict_fsst/dict_fsst_corrupt_string_length.test
 test/sql/storage/compression/dict_fsst/dict_fsst_test.test
@@ -1770,6 +1783,7 @@ test/sql/storage/compression/dictionary/dict_corrupted_offset.test
 test/sql/storage/compression/dictionary/dictionary_corrupt_count.test
 test/sql/storage/compression/dictionary/dictionary_corrupt_count_consistent.test
 test/sql/storage/compression/dictionary/dictionary_corrupt_null_index.test
+test/sql/storage/compression/fsst/fsst_corrupt_decoded_length.test
 test/sql/storage/compression/fsst/fsst_corrupt_escape_symbol_index.test
 test/sql/storage/compression/fsst/invalid_fsst_bitpacking_width.test
 test/sql/storage/compression/fsst/issue_5759.test
@@ -1801,7 +1815,15 @@ test/sql/storage/compression/roaring/roaring_bool_inverted_run_simple.test
 test/sql/storage/compression/roaring/roaring_bool_run_simple.test
 test/sql/storage/compression/roaring/roaring_bool_run_simple_w_null.test
 test/sql/storage/compression/roaring/roaring_bool_smaller_than_vector.test
+test/sql/storage/compression/roaring/roaring_corrupt_boolean_metadata_offset.test
+test/sql/storage/compression/roaring/roaring_corrupt_container_count.test
+test/sql/storage/compression/roaring/roaring_corrupt_container_type.test
+test/sql/storage/compression/roaring/roaring_corrupt_metadata_offset.test
+test/sql/storage/compression/roaring/roaring_corrupt_metadata_offset_rejected.test
+test/sql/storage/compression/roaring/roaring_corrupt_metadata_truncated.test
 test/sql/storage/compression/roaring/roaring_corrupt_null_block.test
+test/sql/storage/compression/roaring/roaring_corrupt_run_segment_counts.test
+test/sql/storage/compression/roaring/roaring_corrupted_file.test
 test/sql/storage/compression/roaring/roaring_inverted_array_simple.test
 test/sql/storage/compression/roaring/roaring_inverted_run_simple.test
 test/sql/storage/compression/roaring/roaring_run_boundaries.test
@@ -1816,7 +1838,11 @@ test/sql/storage/compression/string/string_corrupt_offset_nonmonotonic.test
 test/sql/storage/compression/string/string_corrupt_overflow_offset.test
 test/sql/storage/compression/string/string_corrupt_overflow_transient_block.test
 test/sql/storage/compression/string/string_scan_batch_boundaries.test
+test/sql/storage/compression/uncompressed/uncompressed_count.test
+test/sql/storage/compression/uncompressed/uncompressed_count_boundary.test
 test/sql/storage/compression/uncompressed/uncompressed_offset.test
+test/sql/storage/compression/uncompressed/validity_corrupt_count.test
+test/sql/storage/compression/uncompressed/validity_corrupt_count_boundary.test
 test/sql/storage/compression/uncompressed/validity_corrupt_offset.test
 test/sql/storage/compression/zstd/fetch_row.test
 test/sql/storage/compression/zstd/nulls.test
@@ -1827,6 +1853,7 @@ test/sql/storage/constraints/foreignkey/foreign_key_persistent_memory_limit.test
 test/sql/storage/corrupt/block_alloc_size_dos.test
 test/sql/storage/corrupt/block_alloc_size_max.test
 test/sql/storage/corrupt/block_alloc_size_underflow.test
+test/sql/storage/corrupt/corrupt_catalog_entry.test
 test/sql/storage/corrupt/corrupt_encoding_overflow.test
 test/sql/storage/delete/load_delete_modify.test
 test/sql/storage/delete/repeated_deletes.test
@@ -1843,6 +1870,7 @@ test/sql/storage/lazy_load/lazy_load_limit.test
 test/sql/storage/many_self_append.test
 test/sql/storage/metadata/full_table_metadata_reuse.test
 test/sql/storage/metadata/multi_table_metadata_reuse.test
+test/sql/storage/metadata/partial_column_metadata_reuse_drop_column.test
 test/sql/storage/metadata/partial_column_metadata_reuse_small_block.test
 test/sql/storage/metadata/partial_table_metadata_reuse.test
 test/sql/storage/mix/test_update_delete_string.test
@@ -1850,13 +1878,20 @@ test/sql/storage/mix/updates_deletes_big_table.test
 test/sql/storage/mix/updates_deletes_persistent_segments.test
 test/sql/storage/nested/struct_of_lists_unaligned.test
 test/sql/storage/optimistic_write/optimistic_write_alter_then_append.test
+test/sql/storage/optimistic_write/optimistic_write_batch_insert_sub_rowgroup.test
 test/sql/storage/optimistic_write/optimistic_write_cyclic_scan_single_thread.test
 test/sql/storage/optimistic_write/optimistic_write_delete.test
+test/sql/storage/optimistic_write/optimistic_write_temp_table.test
 test/sql/storage/optimistic_write/optimistic_write_update.test
 test/sql/storage/partial_blocks/many_columns_drop_table.test
+test/sql/storage/partial_blocks/many_columns_rle.test
+test/sql/storage/partial_blocks/many_columns_storage.test
+test/sql/storage/partial_blocks/many_columns_strings.test
+test/sql/storage/partial_blocks/many_columns_validity.test
 test/sql/storage/partial_blocks/partial_block_tail_memory.test
 test/sql/storage/prefetch/async_native_scan_positional.test
 test/sql/storage/prefetch/async_native_scan_read_ahead_concurrent.test
+test/sql/storage/revert_append_nested_list.test
 test/sql/storage/row_group_fetch_bulk.test
 test/sql/storage/shutdown_running_transaction.test
 test/sql/storage/shutdown_running_transaction_updates.test
@@ -1910,6 +1945,7 @@ test/sql/storage/wal/wal_check_constraint.test
 test/sql/storage/wal/wal_create_insert_drop.test
 test/sql/storage/wal/wal_drop_table.test
 test/sql/storage/wal/wal_empty_table.test
+test/sql/storage/wal/wal_fsync_failure.test
 test/sql/storage/wal/wal_hugeint_storage.test
 test/sql/storage/wal/wal_interval_storage.test
 test/sql/storage/wal/wal_list_storage.test
@@ -2031,6 +2067,7 @@ test/sql/table_function/range_function_different_iterators.test
 test/sql/table_function/test_repeat_function.test
 test/sql/table_function/test_table_function.test
 test/sql/topn/test_top_n.test
+test/sql/topn/test_top_n_distinct_row_group_pruner.test
 test/sql/topn/test_top_n_lists.test
 test/sql/topn/test_top_n_medium.test
 test/sql/topn/test_top_n_nulls_first.test
@@ -2038,6 +2075,7 @@ test/sql/topn/test_top_n_nulls_row_group_pruner.test
 test/sql/topn/test_top_n_nulls_small.test
 test/sql/topn/test_top_n_offset_no_limit_pruner.test
 test/sql/topn/test_top_n_structs.test
+test/sql/topn/test_top_n_window_row_group_pruner.test
 test/sql/transactions/delete_and_drop_in_same_transaction.test
 test/sql/transactions/rollback_drop.test
 test/sql/transactions/statement-preprocessor/multistatement_is_transactional_after_BEGIN.test
@@ -2166,6 +2204,7 @@ test/sql/types/float/nan_aggregates.test
 test/sql/types/float/nan_arithmetic.test
 test/sql/types/float/nan_cast.test
 test/sql/types/float/nan_join.test
+test/sql/types/float/nan_minmax_order.test
 test/sql/types/float/nan_ordering.test
 test/sql/types/float/nan_test.test
 test/sql/types/float/nan_window.test

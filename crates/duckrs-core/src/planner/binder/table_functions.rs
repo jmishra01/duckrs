@@ -21,7 +21,7 @@ use duckrs_parser::parse_ast;
 
 /// The "hack to make named parameters work" of `Binder::BindTableFunctionParameters`: `a = 1`
 /// names a parameter as `a := 1` does.
-fn named_argument(argument: &FunctionArgument) -> FunctionArgument {
+pub(super) fn named_argument(argument: &FunctionArgument) -> FunctionArgument {
     if argument.name.is_empty()
         && let ExprKind::Comparison {
             op: ComparisonOp::Equal,

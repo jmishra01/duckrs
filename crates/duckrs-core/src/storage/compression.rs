@@ -88,8 +88,9 @@ fn u64_at(data: &[u8], offset: usize, what: &str) -> Result<u64> {
 
 /// `FixedSizeScan`.
 pub fn scan_uncompressed(segment: &[u8], count: usize, width: usize, out: &mut Vec<u8>) -> Result<()> {
-    let size = count.checked_mul(width).ok_or_else(|| out_of_bounds("a segment"))?;
-    out.extend_from_slice(bytes(segment, 0, size, "an uncompressed segment")?);
+    let past_the_end = || corrupted("Corrupted fixed-size segment: array count extends past the end of the segment");
+    let size = count.checked_mul(width).ok_or_else(past_the_end)?;
+    out.extend_from_slice(segment.get(..size).ok_or_else(past_the_end)?);
     Ok(())
 }
 
@@ -106,7 +107,9 @@ pub fn scan_constant(stats: &BaseStatistics, count: usize, width: usize, out: &m
 
 /// `ValidityScan`: a set bit means a value.
 pub fn scan_validity(segment: &[u8], count: usize, out: &mut Vec<bool>) -> Result<()> {
-    let words = bytes(segment, 0, count.div_ceil(64) * 8, "a validity segment")?;
+    let words = segment
+        .get(..count.div_ceil(64) * 8)
+        .ok_or_else(|| corrupted("Corrupted validity segment: array count extends past the end of the segment"))?;
     for i in 0..count {
         out.push(words[i / 8] >> (i % 8) & 1 != 0);
     }
@@ -219,7 +222,9 @@ pub fn scan_bitpacking(segment: &[u8], count: usize, width: usize, out: &mut Vec
             table_start
         };
         if offset < HEADER_SIZE || offset > end || end > table_start {
-            return Err(out_of_bounds("a bitpacking group"));
+            return Err(corrupted(
+                "Corrupted bitpacking segment: group offsets do not describe a range in the data region",
+            ));
         }
         let data = &segment[offset..end];
         let rows = METADATA_GROUP_SIZE.min(count - index * METADATA_GROUP_SIZE);
@@ -473,6 +478,16 @@ impl FsstDecoder {
     }
 }
 
+/// What `compressed` is, through a table that `export` wrote.
+#[cfg(test)]
+pub fn fsst_roundtrip(table: &[u8], compressed: &[u8]) -> Vec<u8> {
+    let decoder = fsst_import(table).unwrap().unwrap();
+    decoder.decompress(compressed).unwrap()
+}
+
+/// `DEFAULT_STRING_BLOCK_LIMIT`, the most `StringUncompressed::GetStringBlockLimit` gives.
+const STRING_BLOCK_LIMIT: usize = 4096;
+
 /// `ThrowInvalidFSSTSegment`.
 fn invalid_fsst(message: &str) -> Error {
     Error::new(
@@ -517,9 +532,46 @@ pub fn scan_fsst(segment: &[u8], count: usize, out: &mut Vec<Vec<u8>>) -> Result
             .len()
             .checked_sub(offset)
             .ok_or_else(|| out_of_bounds("an FSST string"))?;
-        out.push(decoder.decompress(&dictionary[from..from + length])?);
+        let string = decoder.decompress(&dictionary[from..from + length])?;
+        // what's longer goes to overflow blocks, so no valid segment has one of these
+        if string.len() > STRING_BLOCK_LIMIT {
+            return Err(corrupted(
+                "Failed to decompress FSST string - decoded size exceeds the output buffer",
+            ));
+        }
+        out.push(string);
     }
     Ok(())
+}
+
+/// `get_segment_info`: `DictFSSTGetSegmentInfo` and `BitpackingGetSegmentInfo`.
+pub fn segment_info(compression: u8, segment: &[u8], count: usize) -> Result<Option<String>> {
+    match compression {
+        COMPRESSION_DICT_FSST => {
+            let mode = bytes(segment, 8, 1, "a DICT_FSST segment")?[0];
+            let name = ["DICTIONARY", "DICT_FSST", "FSST_ONLY"]
+                .get(usize::from(mode))
+                .ok_or_else(|| corrupt(format!("unrecognized DICT_FSST compression mode {mode}")))?;
+            Ok(Some(format!("{name}: {count}")))
+        }
+        COMPRESSION_BITPACKING => {
+            let groups = count.div_ceil(METADATA_GROUP_SIZE);
+            let what = "the metadata of a bitpacked segment";
+            let end = u64_at(segment, 0, what)? as usize;
+            let start = end.checked_sub(groups * 4).ok_or_else(|| out_of_bounds(what))?;
+            let mut counts = [0usize; 6];
+            for group in bytes(segment, start, groups * 4, what)?.chunks_exact(4) {
+                if let Some(mode) = counts.get_mut(usize::from(group[3])) {
+                    *mode += 1;
+                }
+            }
+            let names = [(2, "CONSTANT"), (3, "CONSTANT_DELTA"), (4, "DELTA_FOR"), (5, "FOR")];
+            let modes = names.iter().filter(|(mode, _)| counts[*mode] > 0);
+            let info: Vec<String> = modes.map(|(mode, name)| format!("{name}: {}", counts[*mode])).collect();
+            Ok(Some(info.join(", ")))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// `AlpConstants::ALP_VECTOR_SIZE`.
@@ -566,6 +618,13 @@ fn alp_vectors<'a>(
     }))
 }
 
+/// `CompressionSegmentReader::ThrowForwardReadOutOfBounds`.
+fn read_past(context: &str) -> Error {
+    corrupted(&format!(
+        "Corrupted {context}: attempted to read past the end of the segment"
+    ))
+}
+
 /// `Corrupted ALP segment: ...`, from the checks in alp.cpp and alprd.cpp.
 fn alp_corrupt(codec: &str, message: &str) -> Error {
     corrupted(&format!("Corrupted {codec} segment: {message}"))
@@ -590,13 +649,9 @@ fn alp_metadata_end(segment: &[u8], header: usize, codec: &str) -> Result<usize>
     Ok(end)
 }
 
-/// Takes `size` bytes off the front of `data`, a vector of the `codec`.
-fn advance<'a>(data: &mut &'a [u8], size: usize, codec: &str) -> Result<&'a [u8]> {
-    let (head, tail) = data.split_at_checked(size).ok_or_else(|| {
-        corrupted(&format!(
-            "Corrupted {codec} vector: attempted to read past the end of the segment"
-        ))
-    })?;
+/// Takes `size` bytes off the front of `data`, which `context` names as C++ does.
+fn advance<'a>(data: &mut &'a [u8], size: usize, context: &str) -> Result<&'a [u8]> {
+    let (head, tail) = data.split_at_checked(size).ok_or_else(|| read_past(context))?;
     *data = tail;
     Ok(head)
 }
@@ -615,8 +670,9 @@ fn alp_exceptions<'a>(
             &format!("exception count {count} exceeds vector size {rows}"),
         ));
     }
-    let values = advance(vector, count * width, codec)?;
-    let positions = advance(vector, count * 2, codec)?
+    let context = format!("{codec} vector");
+    let values = advance(vector, count * width, &context)?;
+    let positions = advance(vector, count * 2, &context)?
         .chunks_exact(2)
         .map(|b| usize::from(u16::from_le_bytes(b.try_into().expect("2 bytes"))))
         .collect::<Vec<_>>();
@@ -673,12 +729,13 @@ pub const ALP_FRAC_F32: [f32; 11] = [
 pub fn scan_alp(segment: &[u8], count: usize, width: usize, out: &mut Vec<u8>) -> Result<()> {
     const UNCOMPRESSED_MODE: u8 = 255;
     const CODEC: &str = "ALP";
+    const VECTOR: &str = "ALP vector";
     let max_exponent = if width == 8 { 18 } else { 10 };
     for vector in alp_vectors(segment, count, 4, CODEC)? {
         let (rows, mut vector) = vector?;
-        let exponent = advance(&mut vector, 1, CODEC)?[0];
+        let exponent = advance(&mut vector, 1, VECTOR)?[0];
         if exponent == UNCOMPRESSED_MODE {
-            out.extend_from_slice(advance(&mut vector, rows * width, CODEC)?);
+            out.extend_from_slice(advance(&mut vector, rows * width, VECTOR)?);
             continue;
         }
         if exponent > max_exponent {
@@ -687,8 +744,8 @@ pub fn scan_alp(segment: &[u8], count: usize, width: usize, out: &mut Vec<u8>) -
                 &format!("exponent {exponent} exceeds the maximum {max_exponent}"),
             ));
         }
-        let factor = advance(&mut vector, 1, CODEC)?[0];
-        let exceptions = u16::from_le_bytes(advance(&mut vector, 2, CODEC)?.try_into().expect("2 bytes"));
+        let factor = advance(&mut vector, 1, VECTOR)?[0];
+        let exceptions = u16::from_le_bytes(advance(&mut vector, 2, VECTOR)?.try_into().expect("2 bytes"));
         if usize::from(exceptions) > rows {
             return Err(alp_corrupt(
                 CODEC,
@@ -701,15 +758,15 @@ pub fn scan_alp(segment: &[u8], count: usize, width: usize, out: &mut Vec<u8>) -
                 &format!("factor {factor} exceeds exponent {exponent}"),
             ));
         }
-        let frame = u64::from_le_bytes(advance(&mut vector, 8, CODEC)?.try_into().expect("8 bytes"));
-        let bit_width = usize::from(advance(&mut vector, 1, CODEC)?[0]);
+        let frame = u64::from_le_bytes(advance(&mut vector, 8, VECTOR)?.try_into().expect("8 bytes"));
+        let bit_width = usize::from(advance(&mut vector, 1, VECTOR)?[0]);
         if bit_width > ALP_MAX_BIT_WIDTH {
             return Err(alp_corrupt(
                 CODEC,
                 &format!("bit width {bit_width} exceeds {ALP_MAX_BIT_WIDTH}"),
             ));
         }
-        let packed = advance(&mut vector, packed_size(rows, bit_width), CODEC)?;
+        let packed = advance(&mut vector, packed_size(rows, bit_width), VECTOR)?;
         let (values, positions) = alp_exceptions(&mut vector, usize::from(exceptions), width, rows, CODEC)?;
 
         let start = out.len();
@@ -738,6 +795,7 @@ pub fn scan_alprd(segment: &[u8], count: usize, width: usize, out: &mut Vec<u8>)
     const MAX_DICTIONARY_SIZE: usize = 8;
     const MAX_LEFT_WIDTH: usize = 3;
     const CODEC: &str = "ALPRD";
+    const VECTOR: &str = "ALPRD vector";
     let what = "an ALPRD vector";
     alp_metadata_end(segment, ALPRD_HEADER, CODEC)?;
     let header = bytes(segment, 4, 3, "the header of an ALPRD segment")?;
@@ -768,9 +826,9 @@ pub fn scan_alprd(segment: &[u8], count: usize, width: usize, out: &mut Vec<u8>)
     }
     for vector in alp_vectors(segment, count, 7 + entries * 2, CODEC)? {
         let (rows, mut vector) = vector?;
-        let exceptions = u16::from_le_bytes(advance(&mut vector, 2, CODEC)?.try_into().expect("2 bytes"));
+        let exceptions = u16::from_le_bytes(advance(&mut vector, 2, VECTOR)?.try_into().expect("2 bytes"));
         if exceptions == UNCOMPRESSED_MODE {
-            out.extend_from_slice(advance(&mut vector, rows * width, CODEC)?);
+            out.extend_from_slice(advance(&mut vector, rows * width, VECTOR)?);
             continue;
         }
         if usize::from(exceptions) > rows {
@@ -779,9 +837,9 @@ pub fn scan_alprd(segment: &[u8], count: usize, width: usize, out: &mut Vec<u8>)
                 &format!("exception count {exceptions} exceeds vector size {rows}"),
             ));
         }
-        let left = advance(&mut vector, packed_size(rows, left_width), CODEC)?;
+        let left = advance(&mut vector, packed_size(rows, left_width), VECTOR)?;
         let left = unpack(left, rows, left_width, what)?;
-        let right = advance(&mut vector, packed_size(rows, right_width), CODEC)?;
+        let right = advance(&mut vector, packed_size(rows, right_width), VECTOR)?;
         let right = unpack(right, rows, right_width, what)?;
         let (values, positions) = alp_exceptions(&mut vector, usize::from(exceptions), 2, rows, CODEC)?;
 
@@ -859,18 +917,23 @@ fn align(position: usize, to: usize) -> usize {
 pub fn scan_roaring(segment: &[u8], count: usize, out: &mut Vec<bool>) -> Result<()> {
     const IS_RUN: u8 = 2;
     const IS_INVERTED: u8 = 1;
+    const METADATA: &str = "Roaring metadata";
+    const DATA: &str = "Roaring container data";
+    let invalid_run = || corrupted("Corrupted Roaring segment: invalid run bounds or ordering");
     let what = "a Roaring segment";
     let metadata_offset = u64_at(segment, 0, what)? as usize;
     let body = segment.get(8..).ok_or_else(|| out_of_bounds(what))?;
-    let mut metadata = body.get(metadata_offset..).ok_or_else(|| out_of_bounds(what))?;
+    let mut metadata = body
+        .get(metadata_offset..)
+        .ok_or_else(|| corrupted("Corrupted Roaring segment body: offset is outside the segment"))?;
 
     let containers = count.div_ceil(ROARING_CONTAINER_SIZE);
-    let types = advance(&mut metadata, packed_size(containers, 2), what)?;
+    let types = advance(&mut metadata, packed_size(containers, 2), METADATA)?;
     let types = unpack(types, containers, 2, what)?;
     let runs = types.iter().filter(|&&t| t as u8 & IS_RUN != 0).count();
-    let run_counts = advance(&mut metadata, packed_size(runs, 7), what)?;
+    let run_counts = advance(&mut metadata, packed_size(runs, 7), METADATA)?;
     let mut run_counts = unpack(run_counts, runs, 7, what)?.into_iter();
-    let mut cardinalities = advance(&mut metadata, containers - runs, what)?.iter();
+    let mut cardinalities = advance(&mut metadata, containers - runs, METADATA)?.iter();
 
     let mut position = 0;
     for (index, &container_type) in types.iter().enumerate() {
@@ -883,7 +946,7 @@ pub fn scan_roaring(segment: &[u8], count: usize, out: &mut Vec<bool>) -> Result
             if !compressed {
                 position = align(position, 4);
             }
-            let data = body.get(position..).ok_or_else(|| out_of_bounds(what))?;
+            let data = body.get(position..).ok_or_else(|| read_past(DATA))?;
             let values = compressed_positions(data, number * 2, compressed, 2)?;
             position += if compressed {
                 COMPRESSED_SEGMENT_COUNT + number * 2
@@ -896,13 +959,13 @@ pub fn scan_roaring(segment: &[u8], count: usize, out: &mut Vec<bool>) -> Result
                 // compressed runs store their end, the others their length less one
                 let end = if compressed { pair[1] } else { pair[0] + 1 + pair[1] };
                 if pair[0] < previous_end || end <= pair[0] {
-                    return Err(corrupt("an invalid run in a Roaring container"));
+                    return Err(invalid_run());
                 }
                 previous_end = end;
                 // finalizing can make the last run end one past the container
                 let end = end.min(size);
                 if pair[0] >= size {
-                    return Err(corrupt("an invalid run in a Roaring container"));
+                    return Err(invalid_run());
                 }
                 out[start + pair[0]..start + end].fill(false);
             }
@@ -912,8 +975,8 @@ pub fn scan_roaring(segment: &[u8], count: usize, out: &mut Vec<bool>) -> Result
         if cardinality == BITSET_CONTAINER_SENTINEL {
             position = align(position, 8);
             let stored = size.div_ceil(64) * 8;
-            let data = body.get(position..).ok_or_else(|| out_of_bounds(what))?;
-            scan_validity(data, size, out)?;
+            let data = body.get(position..).filter(|data| data.len() >= stored);
+            scan_validity(data.ok_or_else(|| read_past(DATA))?, size, out)?;
             position += stored;
             continue;
         }
@@ -921,7 +984,7 @@ pub fn scan_roaring(segment: &[u8], count: usize, out: &mut Vec<bool>) -> Result
         if !compressed {
             position = align(position, 2);
         }
-        let data = body.get(position..).ok_or_else(|| out_of_bounds(what))?;
+        let data = body.get(position..).ok_or_else(|| read_past(DATA))?;
         let values = compressed_positions(data, cardinality, compressed, 2)?;
         position += if compressed {
             COMPRESSED_SEGMENT_COUNT + cardinality
@@ -934,7 +997,8 @@ pub fn scan_roaring(segment: &[u8], count: usize, out: &mut Vec<bool>) -> Result
         for &value in &values {
             *out.get_mut(start + value)
                 .filter(|_| value < size)
-                .ok_or_else(|| corrupt("invalid array position in a Roaring container"))? = listed_valid;
+                .ok_or_else(|| corrupted("Corrupted Roaring segment: invalid array position or ordering"))? =
+                listed_valid;
         }
     }
     Ok(())
@@ -963,8 +1027,18 @@ pub fn scan_dict_fsst(segment: &[u8], count: usize, out: &mut Vec<Vec<u8>>, null
             "Corrupted DICT_FSST segment: dictionary index is out of range",
         ));
     }
-    if indices_width > 32 || lengths_width > 32 || (lengths_width == 0 && (mode != DICTIONARY || dict_count > 2)) {
-        return Err(corrupt("a DICT_FSST bitpacking width is invalid"));
+    let invalid_width = || {
+        corrupted(
+            "Failed to scan dictionary string - bitpacking width was invalid. Database file appears to be corrupted.",
+        )
+    };
+    if indices_width > 32 || lengths_width > 32 || (lengths_width == 0 && mode != DICTIONARY) {
+        return Err(invalid_width());
+    }
+    if lengths_width == 0 && dict_count > 2 {
+        return Err(corrupted(
+            "Corrupted DICT_FSST segment: zero-width lengths allow at most two dictionary entries",
+        ));
     }
     let mut position = HEADER_SIZE;
     let dictionary = bytes(segment, position, dict_size, what)?;
@@ -995,7 +1069,10 @@ pub fn scan_dict_fsst(segment: &[u8], count: usize, out: &mut Vec<Vec<u8>>, null
     let mut offset = 0usize;
     for &length in &lengths {
         let length = length as usize;
-        let entry = bytes(dictionary, offset, length, "a DICT_FSST string")?;
+        let entry = offset
+            .checked_add(length)
+            .and_then(|end| dictionary.get(offset..end))
+            .ok_or_else(|| corrupted("Corrupted DICT_FSST segment: string lengths exceed the dictionary size"))?;
         offset += length;
         strings.push(match &decoder {
             Some(decoder) => decoder.decompress(entry)?,

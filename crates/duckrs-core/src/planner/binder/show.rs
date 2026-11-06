@@ -135,9 +135,26 @@ fn base_table_column(op: &LogicalOperator, binding: ColumnBinding) -> Option<(Ar
     }
 }
 
+/// `StringUtil::BytesToHumanReadableString`.
+fn human_readable_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["bytes", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let mut parts = [bytes, 0, 0, 0, 0, 0];
+    for index in 1..parts.len() {
+        parts[index] = parts[index - 1] / 1024;
+        parts[index - 1] %= 1024;
+    }
+    for index in (1..parts.len()).rev() {
+        if parts[index] != 0 {
+            return format!("{}.{} {}", parts[index], parts[index - 1] * 10 / 1024, UNITS[index]);
+        }
+    }
+    format!("{bytes} {}", if bytes == 1 { "byte" } else { "bytes" })
+}
+
 const DESCRIBE_NAMES: [&str; 6] = ["column_name", "column_type", "null", "key", "default", "extra"];
 
-const SYSTEM_TABLES: [&str; 5] = [
+const SYSTEM_TABLES: [&str; 6] = [
+    "pragma_database_size",
     "duckdb_databases",
     "duckdb_schemas",
     "duckdb_tables",
@@ -598,22 +615,50 @@ impl Binder<'_> {
         call: &duckrs_parser::ast::FunctionExpr,
         table_ref: &TableRef,
     ) -> Result<LogicalOperator> {
-        // named options say what `segment_info` holds, which isn't filled in here
-        let mut positional = call.args.iter().filter(|argument| argument.name.is_empty());
+        let mut include_info = false;
+        let arguments: Vec<_> = call.args.iter().map(super::table_functions::named_argument).collect();
+        for argument in arguments.iter().filter(|argument| !argument.name.is_empty()) {
+            if !argument.name.eq_ignore_ascii_case("include_segment_info") {
+                return Err(binder_error(format!(
+                    "Invalid named parameter \"{}\" for function pragma_storage_info",
+                    argument.name
+                )));
+            }
+            let value = evaluate_scalar(&self.bind_expression(&argument.expr)?)?;
+            if value.is_null() {
+                return Err(duckrs_common::Error::new(
+                    duckrs_common::ErrorKind::InvalidInput,
+                    "Cannot use NULL as argument for include_segment_info",
+                ));
+            }
+            include_info = value.try_to_string()?.eq_ignore_ascii_case("true");
+        }
+        let mut positional = arguments.iter().filter(|argument| argument.name.is_empty());
         let (Some(argument), None) = (positional.next(), positional.next()) else {
             return Err(binder_error("pragma_storage_info takes the name of a table"));
         };
         let name = evaluate_scalar(&self.bind_expression(&argument.expr)?)?.try_to_string()?;
         let parts: Vec<&str> = name.split('.').collect();
-        let (schema, table) = match parts.as_slice() {
-            [table] => (None, *table),
-            [schema, table] => (Some(*schema), *table),
+        // a database comes first if there are three parts, or if no schema here has the name
+        let mut elsewhere = None;
+        if parts.len() == 3 || (parts.len() == 2 && self.catalog.get_schema(parts[0]).is_none()) {
+            let schema = (parts.len() == 3).then_some(parts[1]);
+            let table = parts[parts.len() - 1];
+            self.catalog.with_database(parts[0], &mut |catalog| {
+                elsewhere = Some(catalog.get_table(schema, table));
+            });
+        }
+        let table = match (elsewhere, parts.as_slice()) {
+            (Some(table), _) => table?,
+            (None, [table]) => self.catalog.get_table(None, table)?,
+            (None, [schema, table]) => self.catalog.get_table(Some(schema), table)?,
             _ => return Err(crate::unported("a table name of more than two parts")),
         };
-        let table = self.catalog.get_table(schema, table)?;
-        let segments = table.source().map_or(Ok(Vec::new()), |source| source.segments())?;
+        let segments = table
+            .source()
+            .map_or(Ok(Vec::new()), |source| source.segments(include_info))?;
         let (bigint, varchar, boolean) = (LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::BOOLEAN);
-        let columns = [
+        let mut columns = vec![
             ("row_group_id", bigint.clone()),
             ("column_name", varchar.clone()),
             ("column_id", bigint.clone()),
@@ -628,13 +673,16 @@ impl Binder<'_> {
             ("persistent", boolean),
             ("block_id", bigint.clone()),
             ("block_offset", bigint),
-            ("segment_info", varchar.clone()),
-            ("additional_block_ids", LogicalType::list(LogicalType::BIGINT)),
         ];
+        // only there if it was asked for
+        if include_info {
+            columns.push(("segment_info", varchar.clone()));
+        }
+        columns.push(("additional_block_ids", LogicalType::list(LogicalType::BIGINT)));
         let rows = segments
             .into_iter()
             .map(|s| {
-                vec![
+                let mut row = vec![
                     Value::bigint(s.row_group as i64),
                     Value::varchar(table.columns[s.column].name.clone()),
                     Value::bigint(s.column as i64),
@@ -649,9 +697,12 @@ impl Binder<'_> {
                     Value::boolean(true),
                     Value::bigint(s.block_id),
                     Value::bigint(s.block_offset as i64),
-                    Value::null(LogicalType::VARCHAR),
-                    Value::null(LogicalType::list(LogicalType::BIGINT)),
-                ]
+                ];
+                if include_info {
+                    row.push(Value::varchar(s.info.unwrap_or_default()));
+                }
+                row.push(Value::null(LogicalType::list(LogicalType::BIGINT)));
+                row
             })
             .collect();
         let (names, types) = columns.into_iter().map(|(n, t)| (n.to_string(), t)).unzip();
@@ -670,19 +721,64 @@ impl Binder<'_> {
         let integer = LogicalType::INTEGER;
         let tags = LogicalType::map(LogicalType::VARCHAR, LogicalType::VARCHAR);
         let (columns, rows): (Vec<(&str, LogicalType)>, Vec<Vec<Value>>) = match name.to_lowercase().as_str() {
+            "pragma_database_size" => {
+                let mut rows = Vec::new();
+                for database in self.catalog.databases() {
+                    let bytes = database.total_blocks * database.block_size;
+                    rows.push(vec![
+                        text(&database.name),
+                        text(&human_readable_bytes(bytes)),
+                        Value::bigint(database.block_size as i64),
+                        Value::bigint(database.total_blocks as i64),
+                        Value::bigint((database.total_blocks - database.free_blocks) as i64),
+                        Value::bigint(database.free_blocks as i64),
+                        text(&human_readable_bytes(database.wal_size)),
+                        // nothing here accounts for memory yet
+                        text(&human_readable_bytes(0)),
+                        text("Unlimited"),
+                    ]);
+                }
+                (
+                    vec![
+                        ("database_name", varchar.clone()),
+                        ("database_size", varchar.clone()),
+                        ("block_size", bigint.clone()),
+                        ("total_blocks", bigint.clone()),
+                        ("used_blocks", bigint.clone()),
+                        ("free_blocks", bigint.clone()),
+                        ("wal_size", varchar.clone()),
+                        ("memory_usage", varchar.clone()),
+                        ("memory_limit", varchar.clone()),
+                    ],
+                    rows,
+                )
+            }
             "duckdb_databases" => {
-                let database = |name: &str, oid: i64, internal: bool| {
+                let database = |name: &str, oid: i64, path: Option<&str>, internal: bool, read_only: bool| {
                     vec![
                         text(name),
                         Value::bigint(oid),
-                        null_text(),
+                        path.map_or_else(null_text, text),
                         null_text(),
                         Value::null(tags.clone()),
                         Value::boolean(internal),
                         text("duckdb"),
-                        Value::boolean(false),
+                        Value::boolean(read_only),
                     ]
                 };
+                let mut rows = vec![
+                    database("system", 2, None, true, false),
+                    database("temp", 3, None, true, false),
+                ];
+                let listed = self.catalog.databases();
+                if listed.is_empty() {
+                    rows.insert(0, database(&self.catalog.name, 1, None, false, false));
+                }
+                for (index, listed) in listed.iter().enumerate() {
+                    let oid = if index == 0 { 1 } else { index as i64 + 3 };
+                    let row = database(&listed.name, oid, listed.path.as_deref(), false, listed.read_only);
+                    rows.insert(index.min(rows.len()), row);
+                }
                 (
                     vec![
                         ("database_name", varchar.clone()),
@@ -694,11 +790,7 @@ impl Binder<'_> {
                         ("type", varchar.clone()),
                         ("readonly", boolean.clone()),
                     ],
-                    vec![
-                        database(&self.catalog.name, 1, false),
-                        database("system", 2, true),
-                        database("temp", 3, true),
-                    ],
+                    rows,
                 )
             }
             "duckdb_schemas" => {

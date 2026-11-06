@@ -350,9 +350,9 @@ These stop writes, or fail when they are made, as a file can't hold them yet:
 - VARIANT and GEOMETRY columns, and in a stored query what can't be read from one either. These fail
   at the commit, which leaves the database in memory as it is, until what can't be stored is dropped.
 
-Next, in order: FSST and the rest of the error messages of the decoders, which `test/sql/storage/compression` compares with those of C++; then keys in files, with
-the ART of Phase 10. ZSTD takes a new
-dependency, and Chimp and Patas are only in old files.
+Next: keys in files, with the ART of Phase 10, which about 90 of the files that fail need. VARIANT and
+writing older `STORAGE_VERSION`s are the largest of the rest. ZSTD takes a new dependency, and Chimp and
+Patas are only in old files.
 
 **Indexes**: the ART of each index is parsed past and not read, whichever way the file points to it
 (`index_storage_infos`, or `index_pointers` and `root_block_pointer` in old files). C++ doesn't read
@@ -370,15 +370,19 @@ are read through `TableCursor` as they are written, so that doesn't take them in
 Files are v2.0.0, where constants are literals and casts name parsed types, so the AST goes into a
 file nearly as it is. Each column of a row group takes the smallest of what `encode` has, unless
 `force_compression` says otherwise: RLE and BitPacking for numbers, ALP and ALPRD for floats, Roaring
-for validity, and the dictionary mode of DICT_FSST for strings. C++ picks with an analysis of its own, so its choice can
+for validity, and the modes of DICT_FSST for strings. `fsst` trains a table per row group on a sample
+of its distinct strings, in the rounds of `third_party/fsst`, and a dictionary with it competes on size
+with one without. A segment where nothing repeats and with no NULLs in the row group needs no indices
+(`FSST_ONLY`). There is no FSST segment on its own: v2.0.0 doesn't write those, in C++ either, and
+they are only read. C++ picks with an analysis of its own, so its choice can
 differ. A segment of one value is Constant, whatever was chosen, as in C++, except that one value here means
 its bits: DuckDB's statistics hold -0.0 and 0.0 as equal, which must not make a column of both one zero. BitPacking uses frames of
 reference and constants, not deltas, and not HUGEINT; Roaring uses arrays and bitsets, not runs. Those
 are smaller or faster at times, but what is written is valid either way. ALP takes five pairs of
 exponent and factor from a sample of the row group, and has each vector pick
 among them on 32 of its values; a value is an exception unless it decodes to the same bits. A row
-group has one ALPRD dictionary, so the vectors of its segments share it. FSST, ZSTD, Chimp and Patas
-are read and not written. Segments share blocks, as a block per column would make small tables
+group has one ALPRD dictionary, so the vectors of its segments share it. ZSTD, Chimp and Patas are read
+and not written. Segments share blocks, as a block per column would make small tables
 large, which DuckDB has to be told of in `multi_use_blocks`. After the free list a file has the list of
 metadata blocks with their free sub-blocks: nothing in `duckrs` reads it, but C++ doesn't find them
 otherwise. Numeric columns have bounds; strings say that nothing is known of them.
@@ -392,8 +396,21 @@ a statement that names one (`db.t`, `db.main.t`) is routed to it with that name 
 runs in one database, so one that reads two isn't ported, and subqueries in expressions aren't looked
 at for names. `STORAGE_VERSION` below v2.0.0 and `ROW_GROUP_SIZE` are refused, as is encryption.
 
-The gate is not met: `test/sql/storage` is at 50.1% against 85%. About 40 of the files that fail need
+The gate is not met: `test/sql/storage` is at 55.8% against 85%. About 40 of the files that fail need
 keys in a file, which can't come before Phase 10.
+
+**Failing on purpose.** `debug_checkpoint_abort` stops a checkpoint where a crash could (after the free
+list, before the header, before truncating), and `debug_force_commit_failure` and
+`debug_force_wal_fsync_failure` fail a commit, with `before_wal_flush` as the crash at a commit. A commit
+fails before anything of it reaches the log, so nothing is torn as in C++, only absent, which recovery
+treats the same way. Outside a transaction there is nothing to roll back to, so a snapshot is taken only
+while one of these is set. A failed CHECKPOINT invalidates the database (`ValidChecker`), or all of them
+if it is the one the connection was made to, and a database that is invalid neither runs anything nor
+checkpoints at the end, as after a crash. `before_moving_recovery` and
+`before_deleting_checkpoint_wal` have no point to stop at, as replay here has no recovery file.
+
+`ATTACH (ROW_GROUP_SIZE)` belongs to the attachment and isn't in the file, as in C++. It only decides
+how checkpoints cut rows, so rows that are in memory keep the groups of `execution::zone_map`.
 
 **Writing the log** (`log_writer`): the engine has no undo log and tables change by being rewritten,
 so a commit doesn't know what it did. It compares the catalog with what is durable, and writes the

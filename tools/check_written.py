@@ -172,7 +172,7 @@ if result.returncode != 0:
 floats = scratch / "floats"
 floats.mkdir()
 subprocess.run(
-    ["cargo", "test", "-q", "-p", "duckrs", "--test", "write_database_file", "floats_keep_their_bits"],
+    ["cargo", "test", "-q", "-p", "duckrs", "--test", "write_database_file", "--", "floats_keep_their_bits", "strings_can_go_through_fsst"],
     cwd=root,
     check=True,
     env={**os.environ, "DUCKRS_KEEP_FLOATS": str(floats)},
@@ -197,6 +197,31 @@ SELECT count(*) FROM uncompressed.t a JOIN {force}.t b USING (i) WHERE a.d::VARC
 # which has to be there before the first comparison
 test = test.replace(f"ATTACH '{floats}/uncompressed.db' AS uncompressed (READ_ONLY)", "SELECT 1", 1)
 test = f"statement ok\nATTACH '{floats}/uncompressed.db' AS uncompressed (READ_ONLY)\n\n" + test
+# strings through FSST, against the same strings as DuckDB makes them: nothing here comes from duckrs
+test += f"""statement ok
+ATTACH '{floats}/strings.db' AS strings (READ_ONLY)
+
+query I
+SELECT count(*) > 0 FROM pragma_storage_info('strings.u', include_segment_info = true) WHERE segment_type = 'VARCHAR' AND segment_info LIKE '%FSST_ONLY%'
+----
+true
+
+query I
+SELECT count(*) > 0 FROM pragma_storage_info('strings.r', include_segment_info = true) WHERE segment_type = 'VARCHAR' AND segment_info LIKE '%DICT_FSST%'
+----
+true
+
+query I
+SELECT count(*) FROM strings.u a JOIN (SELECT i, 'https://example.com/items/' || i AS s FROM range(50000) r(i)) b USING (i) WHERE a.s = b.s
+----
+50000
+
+query I
+SELECT count(*) FROM strings.r a JOIN (SELECT i, CASE WHEN i % 7 = 0 THEN NULL WHEN i % 11 = 0 THEN '' ELSE 'customer-segment-' || (i % 3000) || '-ünï' END AS s FROM range(50000) r(i)) b USING (i) WHERE a.s IS NOT DISTINCT FROM b.s
+----
+50000
+
+"""
 (scratch / "test/floats.test").write_text(test)
 result = subprocess.run(
     [root / "target/release/sqllogictest", "--engine", "reference", "--duckdb-root", scratch, "test/floats.test", "-v", "--continue-on-failure"],

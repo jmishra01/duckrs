@@ -20,6 +20,7 @@ use super::encode::{
     Encoded, encode_alp, encode_alprd, encode_bitpacking, encode_dictionary, encode_rle, encode_roaring, fill_nulls,
     is_signed, supports_bitpacking, supports_rle,
 };
+use super::fsst::SymbolTable;
 use super::metadata::{MetaBlockPointer, metadata_block_size};
 use super::serialization::generated::enums::{catalog_type, constraint_type, table_column_type};
 use super::serialization::generated::{self as g};
@@ -40,8 +41,28 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 
-/// `DEFAULT_ROW_GROUP_SIZE`, in chunks.
-const CHUNKS_PER_ROW_GROUP: usize = 60;
+/// What a database or a session asks of its checkpoints.
+#[derive(Debug, Clone, Copy)]
+pub struct CheckpointOptions<'a> {
+    pub force_compression: &'a str,
+    /// In rows: `ATTACH ... (ROW_GROUP_SIZE)` checks that it is whole vectors.
+    pub row_group_size: u64,
+    /// `debug_checkpoint_abort`, in lower case: where to stop as a crash would.
+    pub abort: &'a str,
+}
+
+/// `DEBUG_ABORT_*`: what was written so far stays, and the next open has to cope with it.
+fn check_abort(abort: &str, point: &str, message: &str) -> Result<()> {
+    if abort != point {
+        return Ok(());
+    }
+    let kind = if point.ends_with("non_fatal") {
+        ErrorKind::Io
+    } else {
+        ErrorKind::Fatal
+    };
+    Err(Error::new(kind, message))
+}
 /// `StringUncompressed::STRING_BLOCK_LIMIT`.
 const STRING_BLOCK_LIMIT: usize = 4096;
 const STRING_HEADER_SIZE: usize = 8;
@@ -550,10 +571,12 @@ struct Writer<'a> {
     tables: MetaStream,
     /// The setting, in lower case.
     force_compression: String,
+    chunks_per_row_group: usize,
+    abort: String,
 }
 
 impl<'a> Writer<'a> {
-    fn new(buffer: &'a BufferManager, catalog: &'a Catalog, name: String, force_compression: &str) -> Self {
+    fn new(buffer: &'a BufferManager, catalog: &'a Catalog, name: String, options: CheckpointOptions) -> Self {
         let blocks = buffer.block_manager();
         Self {
             buffer,
@@ -570,7 +593,9 @@ impl<'a> Writer<'a> {
             next_sub_block: None,
             reserved: VecDeque::new(),
             tables: MetaStream::default(),
-            force_compression: force_compression.to_lowercase(),
+            force_compression: options.force_compression.to_lowercase(),
+            chunks_per_row_group: options.row_group_size as usize / STANDARD_VECTOR_SIZE,
+            abort: options.abort.to_string(),
         }
     }
 
@@ -833,10 +858,12 @@ impl<'a> Writer<'a> {
         // the Dictionary of C++ isn't written any more: forcing it gives plain strings there too
         if force != "uncompressed" && force != "dictionary" && valid.iter().any(|v| *v) {
             let plain_size: usize = strings.iter().map(|string| string.len() + 4).sum();
-            let encoded = encode_dictionary(&strings, valid, self.block_size, limit);
-            let size = encoded
-                .as_ref()
-                .map(|segments| segments.iter().map(|(b, _)| b.len()).sum::<usize>());
+            let total = |segments: &Vec<Encoded>| segments.iter().map(|(bytes, _)| bytes.len()).sum::<usize>();
+            let plain = encode_dictionary(&strings, valid, self.block_size, limit, None);
+            let table = SymbolTable::train(&strings);
+            let compressed = table.and_then(|t| encode_dictionary(&strings, valid, self.block_size, limit, Some(&t)));
+            let encoded = [plain, compressed].into_iter().flatten().min_by_key(total);
+            let size = encoded.as_ref().map(total);
             if let Some(encoded) = encoded.filter(|_| force == "dict_fsst" || size < Some(plain_size)) {
                 let mut segments = Vec::with_capacity(encoded.len());
                 let mut row = 0;
@@ -1104,10 +1131,10 @@ impl<'a> Writer<'a> {
         let mut statistics: Vec<Option<Stats>> = vec![None; types.len()];
         let mut row_groups = Vec::new();
         let mut row_start = 0u64;
-        for first in (0..chunks).step_by(CHUNKS_PER_ROW_GROUP) {
+        for first in (0..chunks).step_by(self.chunks_per_row_group) {
             let mut parts: Vec<Vec<Part>> = columns.iter().map(|_| Vec::new()).collect();
             let mut rows = 0;
-            for index in first..chunks.min(first + CHUNKS_PER_ROW_GROUP) {
+            for index in first..chunks.min(first + self.chunks_per_row_group) {
                 let chunk = match (&mut cursor, &memory) {
                     (Some(cursor), _) => cursor.chunk(index)?,
                     (None, Some(memory)) => memory.chunk(index).clone(),
@@ -1264,6 +1291,22 @@ impl<'a> Writer<'a> {
         for (block, data) in &self.pages {
             blocks.write_block(*block, data)?;
         }
+        const FLAG: &str = "because of PRAGMA checkpoint_abort flag";
+        check_abort(
+            &self.abort,
+            "after_free_list_write",
+            &format!("Checkpoint aborted after free list write {FLAG}"),
+        )?;
+        check_abort(
+            &self.abort,
+            "before_header",
+            &format!("Checkpoint aborted before header write {FLAG}"),
+        )?;
+        check_abort(
+            &self.abort,
+            "before_header_non_fatal",
+            &format!("Checkpoint aborted before header write (non-fatal) {FLAG}"),
+        )?;
         blocks.write_header(DatabaseHeader {
             meta_block: root.block_pointer,
             free_list,
@@ -1272,6 +1315,13 @@ impl<'a> Writer<'a> {
             ..blocks.header()
         })?;
         blocks.set_free_list(free.into_iter().collect(), multi_use.into_iter().collect());
+        for point in ["before_truncate", "before_wal_finish"] {
+            check_abort(
+                &self.abort,
+                point,
+                &format!("Checkpoint aborted before truncate {FLAG}"),
+            )?;
+        }
         Ok(())
     }
 }
@@ -1295,10 +1345,10 @@ pub fn write_checkpoint(
     buffer: &Arc<BufferManager>,
     catalog: &Catalog,
     name: &str,
-    force_compression: &str,
+    options: CheckpointOptions,
     mark: &mut dyn FnMut(MetaBlockPointer) -> Result<()>,
 ) -> Result<()> {
-    let mut writer = Writer::new(buffer, catalog, name.to_string(), force_compression);
+    let mut writer = Writer::new(buffer, catalog, name.to_string(), options);
     let mut root = MetaStream::default();
     let pointer = writer.pointer(&mut root);
     mark(pointer)?;

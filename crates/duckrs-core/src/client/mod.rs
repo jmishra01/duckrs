@@ -12,6 +12,7 @@ use crate::catalog::{
     Catalog, CatalogSnapshot, DEFAULT_CATALOG, OnCreateConflict, SequenceData, TEMP_SCHEMA, TableConstraint,
     TableOrView, macro_type_name, missing_entry,
 };
+use crate::catalog::{DatabaseList, DatabaseListing};
 use crate::execution::alter::{execute_alter, execute_create_index};
 use crate::execution::expression_executor::evaluate_scalar;
 use crate::execution::physical::PhysicalResultCollector;
@@ -63,6 +64,10 @@ pub struct DatabaseInstance {
     changed: AtomicBool,
     /// `PRAGMA disable_checkpoint_on_shutdown` leaves it to the log.
     checkpoint_on_shutdown: AtomicBool,
+    /// `ValidChecker`: why this database takes nothing more until it is opened again.
+    invalid: Mutex<Option<String>>,
+    /// `WriteAheadLog::sync_failed`: pages may be gone, so the log can't be trusted until reopened.
+    log_sync_failed: AtomicBool,
     /// How `USE` and qualified names call this database.
     name: String,
     /// What `ATTACH` added to this database, which connections go to with `USE` or by name. A
@@ -75,6 +80,7 @@ pub struct DatabaseInstance {
 pub struct AttachOptions {
     pub read_only: bool,
     pub block_size: Option<u64>,
+    pub row_group_size: Option<u64>,
 }
 
 /// Where a checkpoint goes, and the log of what happened since the last one.
@@ -84,6 +90,8 @@ struct DatabaseFile {
     name: String,
     buffer: Arc<BufferManager>,
     log: Mutex<WriteAheadLog>,
+    /// What this attachment asked for: a file doesn't say.
+    row_group_size: u64,
 }
 
 /// Why a database that came from a file takes no writes.
@@ -116,6 +124,8 @@ impl DatabaseInstance {
             file: None,
             changed: AtomicBool::new(false),
             checkpoint_on_shutdown: AtomicBool::new(true),
+            invalid: Mutex::new(None),
+            log_sync_failed: AtomicBool::new(false),
             name: DEFAULT_CATALOG.to_string(),
             attached: RwLock::default(),
         }
@@ -131,6 +141,7 @@ impl DatabaseInstance {
         let options = AttachOptions {
             read_only,
             block_size: None,
+            row_group_size: None,
         };
         Self::open_with(path, &options)
     }
@@ -161,6 +172,9 @@ impl DatabaseInstance {
             name,
             buffer,
             log,
+            row_group_size: options
+                .row_group_size
+                .unwrap_or(crate::execution::zone_map::ROW_GROUP_SIZE as u64),
         });
         // a log that was replayed can end in anything a crash leaves, so it isn't added to: its
         // records go to the file, and the next commit starts a new one
@@ -176,7 +190,7 @@ impl DatabaseInstance {
 
     /// Makes a commit durable, in the log of the file, and checkpoints if the log has grown past
     /// `threshold` bytes and nobody is in the middle of a transaction.
-    fn log_commit(&self, threshold: u64) -> Result<()> {
+    fn log_commit(&self, threshold: u64, abort: &str) -> Result<()> {
         let Some(file) = self.file.as_ref().filter(|_| self.file_access.is_none()) else {
             return Ok(());
         };
@@ -197,9 +211,31 @@ impl DatabaseInstance {
         drop(log);
         if full && self.transactions.lock().open.is_empty() {
             let _writing = self.statements.write();
-            self.write_checkpoint()?;
+            self.write_checkpoint_with(abort)?;
         }
         Ok(())
+    }
+
+    /// `SingleFileStorageManager::GetDatabaseSize`: all zeros in memory.
+    fn listing(&self) -> DatabaseListing {
+        let mut listing = DatabaseListing {
+            name: self.name.clone(),
+            path: None,
+            read_only: self.file_access.is_some(),
+            block_size: 0,
+            total_blocks: 0,
+            free_blocks: 0,
+            wal_size: 0,
+        };
+        if let Some(file) = &self.file {
+            let blocks = file.buffer.block_manager();
+            listing.path = Some(file.path.display().to_string());
+            listing.block_size = blocks.block_alloc_size() as u64;
+            listing.total_blocks = blocks.header().block_count;
+            listing.free_blocks = blocks.free_list().len() as u64;
+            listing.wal_size = storage::log_writer::log_size(&file.path);
+        }
+        listing
     }
 
     /// Whether a table has what a checkpoint can't write until Phase 10 ports the ART.
@@ -220,6 +256,19 @@ impl DatabaseInstance {
 
     /// Writes all of the database to its file, if it has one that takes it.
     fn write_checkpoint(&self) -> Result<()> {
+        self.write_checkpoint_with("")
+    }
+
+    /// What is a crash in a test is one here too: nothing is undone, nor does anything run again.
+    fn invalidate(&self, reason: &str) {
+        self.invalid.lock().get_or_insert_with(|| reason.to_string());
+        for database in self.attached.read().values() {
+            database.invalidate(reason);
+        }
+    }
+
+    /// `abort` is `debug_checkpoint_abort`, which belongs to the session that asked.
+    fn write_checkpoint_with(&self, abort: &str) -> Result<()> {
         let Some(file) = self.file.as_ref().filter(|_| self.file_access.is_none()) else {
             return Ok(());
         };
@@ -235,12 +284,22 @@ impl DatabaseInstance {
         };
         let force = settings::current_value("force_compression", &self.settings.read(), &SettingValues::default());
         let force = force.and_then(|value| value.try_to_string().ok()).unwrap_or_default();
+        let options = storage::writer::CheckpointOptions {
+            force_compression: &force,
+            row_group_size: file.row_group_size,
+            abort,
+        };
         let result =
-            storage::writer::write_checkpoint(&file.path, &file.buffer, &self.catalog, &file.name, &force, &mut mark);
+            storage::writer::write_checkpoint(&file.path, &file.buffer, &self.catalog, &file.name, options, &mut mark);
         match result {
             Ok(()) => {
                 log.checkpointed(&self.catalog);
                 Ok(())
+            }
+            Err(error) if error.kind == ErrorKind::Fatal => {
+                drop(log);
+                self.invalidate(&error.message);
+                Err(error)
             }
             Err(error) => {
                 if let Some(size) = marked {
@@ -298,6 +357,7 @@ impl DatabaseInstance {
 /// Pragmas that only switch DuckDB's debug verification, profiling, progress output or
 /// checkpointing, none of which changes a result; duckrs runs them as no-ops.
 const NO_OP_PRAGMAS: &[&str] = &[
+    "force_checkpoint",
     "enable_verification",
     "disable_verification",
     "verify_external",
@@ -507,6 +567,8 @@ pub struct PreparedStatementData {
 
 impl ClientContext {
     pub fn new(db: Arc<DatabaseInstance>) -> Self {
+        let list: Arc<dyn DatabaseList> = db.clone();
+        db.catalog.set_database_list(Arc::downgrade(&list));
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         Self {
             home: db.clone(),
@@ -730,9 +792,16 @@ impl ClientContext {
                 };
                 // COMMIT of an invalidated transaction rolls it back
                 let rollback = transaction.invalidated;
+                if !rollback
+                    && transaction.snapshot.is_some()
+                    && let Some(error) = self.forced_commit_failure()
+                {
+                    self.end_transaction(transaction, true);
+                    return Err(error);
+                }
                 self.end_transaction(transaction, rollback);
                 if !rollback {
-                    self.db.log_commit(self.checkpoint_threshold())?;
+                    self.log_commit()?;
                 }
             }
             TransactionType::Rollback => {
@@ -743,6 +812,93 @@ impl ClientContext {
             }
         }
         Ok(Self::success())
+    }
+
+    /// A commit, as far as this connection can fail one.
+    fn log_commit(&self) -> Result<()> {
+        let abort = self.setting_text("debug_checkpoint_abort").to_lowercase();
+        self.db.log_commit(self.checkpoint_threshold(), &abort)
+    }
+
+    /// What `debug_force_commit_failure` and `debug_force_wal_fsync_failure` turn a commit into,
+    /// before anything of it reached the log.
+    fn forced_commit_failure(&self) -> Option<Error> {
+        if self
+            .setting_text("debug_force_commit_failure")
+            .eq_ignore_ascii_case("true")
+        {
+            return Some(Error::new(
+                ErrorKind::InvalidInput,
+                "Forced commit failure (debug_force_commit_failure)",
+            ));
+        }
+        let file = self.db.file.as_ref()?;
+        if self.db.log_sync_failed.load(AtomicOrdering::SeqCst) {
+            return Some(Error::new(
+                ErrorKind::Io,
+                format!(
+                    "Cannot sync WAL \"{}.wal\": a previous sync of this WAL has failed",
+                    file.path.display()
+                ),
+            ));
+        }
+        if self
+            .setting_text("debug_force_wal_fsync_failure")
+            .eq_ignore_ascii_case("true")
+        {
+            self.db.log_sync_failed.store(true, AtomicOrdering::SeqCst);
+            return Some(Error::new(
+                ErrorKind::Io,
+                "debug_force_wal_fsync_failure: injected WAL fsync failure",
+            ));
+        }
+        if self
+            .setting_text("debug_checkpoint_abort")
+            .eq_ignore_ascii_case("before_wal_flush")
+        {
+            const CRASH: &str = "Simulated crash before WAL_FLUSH write";
+            self.db.invalidate(CRASH);
+            return Some(Error::new(ErrorKind::Fatal, CRASH));
+        }
+        None
+    }
+
+    fn commit_may_fail(&self) -> bool {
+        self.db.log_sync_failed.load(AtomicOrdering::SeqCst)
+            || self
+                .setting_text("debug_force_commit_failure")
+                .eq_ignore_ascii_case("true")
+            || self
+                .setting_text("debug_force_wal_fsync_failure")
+                .eq_ignore_ascii_case("true")
+            || self
+                .setting_text("debug_checkpoint_abort")
+                .eq_ignore_ascii_case("before_wal_flush")
+    }
+
+    /// `ValidChecker`: a database that had a fatal error takes nothing more, and neither does what
+    /// else is attached if it was the one this connection was made to.
+    fn check_valid(&self, database: &DatabaseInstance) -> Result<()> {
+        if let Some(reason) = &*self.home.invalid.lock() {
+            return Err(Error::new(
+                ErrorKind::Fatal,
+                format!(
+                    "Failed: database has been invalidated because of a previous fatal error. The database must be \
+                     restarted prior to being used again.\nOriginal error: \"{reason}\""
+                ),
+            ));
+        }
+        if let Some(reason) = &*database.invalid.lock() {
+            return Err(Error::new(
+                ErrorKind::Io,
+                format!(
+                    "Database \"{}\" has been invalidated because checkpointing failed. Detach and reattach it before \
+                     using it again. Original error: {reason}",
+                    database.name
+                ),
+            ));
+        }
+        Ok(())
     }
 
     fn end_transaction(&self, transaction: ActiveTransaction, rollback: bool) {
@@ -804,6 +960,7 @@ impl ClientContext {
         if self.transaction.as_ref().is_some_and(|t| t.invalidated) {
             return Err(Error::new(ErrorKind::Transaction, INVALIDATED_TRANSACTION));
         }
+        self.check_valid(&self.db)?;
         let write = is_write(statement);
         if write {
             self.db.check_writable(statement)?;
@@ -839,6 +996,8 @@ impl ClientContext {
                 appending = Some((table, rows));
             }
         }
+        // outside of a transaction only a commit that is made to fail needs one of these
+        let undo = (write && self.transaction.is_none() && self.commit_may_fail()).then(|| self.db.catalog.snapshot());
         // until Phase 10 isolates connections, a statement that writes runs alone: UPDATE and
         // DELETE rewrite tables, which would pull the rows from under a scan
         let db = self.db.clone();
@@ -857,8 +1016,14 @@ impl ClientContext {
                 table.truncate(rows);
             }
         } else if self.transaction.is_none() {
+            if let Some(snapshot) = undo
+                && let Some(error) = self.forced_commit_failure()
+            {
+                self.db.catalog.restore(snapshot);
+                return Err(error);
+            }
             // also for a SELECT, as `nextval` is one
-            self.db.log_commit(self.checkpoint_threshold())?;
+            self.log_commit()?;
         }
         result
     }
@@ -937,6 +1102,27 @@ impl ClientContext {
                         .map_err(|_| Error::new(ErrorKind::InvalidInput, "BLOCK_SIZE is not a number"))?;
                     options.block_size = Some(size);
                 }
+                "row_group_size" => {
+                    let size: u64 = text
+                        .parse()
+                        .map_err(|_| Error::new(ErrorKind::InvalidInput, "ROW_GROUP_SIZE is not a number"))?;
+                    let wrong = |why: &str| {
+                        Error::new(
+                            ErrorKind::NotImplemented,
+                            format!("Invalid row group size: {size} - row group size must be {why}"),
+                        )
+                    };
+                    if size == 0 {
+                        return Err(wrong("bigger than 0"));
+                    }
+                    if !size.is_multiple_of(duckrs_common::STANDARD_VECTOR_SIZE as u64) {
+                        return Err(wrong(&format!(
+                            "divisible by the vector size ({})",
+                            duckrs_common::STANDARD_VECTOR_SIZE
+                        )));
+                    }
+                    options.row_group_size = Some(size);
+                }
                 other => return Err(crate::unported(format!("ATTACH with {other}"))),
             }
         }
@@ -978,8 +1164,14 @@ impl ClientContext {
             database.name.clone_from(&name);
             opened
         };
+        database.catalog.set_database_list(self.database_list());
         self.home.attached.write().insert(name.to_lowercase(), database);
         Ok(())
+    }
+
+    fn database_list(&self) -> std::sync::Weak<dyn DatabaseList> {
+        let list: Arc<dyn DatabaseList> = self.home.clone();
+        Arc::downgrade(&list)
     }
 
     /// `PhysicalDetach`.
@@ -1090,13 +1282,21 @@ impl ClientContext {
     /// `CheckpointFunction`. In memory there is nothing to write, so only its errors are left.
     fn checkpoint(&mut self, function: &Expr) -> Result<MaterializedQueryResult> {
         let (force, argument) = checkpoint_call(function).expect("checked by the caller");
+        let mut target = None;
         if let Some(argument) = argument {
             let database = evaluate_scalar(&bind_constant_expression(&self.db.catalog, argument)?)?;
             if database.is_null() {
                 return Err(Error::new(ErrorKind::Binder, "Database cannot be NULL"));
             }
             let database = database.try_to_string()?;
-            if database != DEFAULT_CATALOG {
+            if database.eq_ignore_ascii_case("system") || database.eq_ignore_ascii_case("temp") {
+                return Err(Error::new(
+                    ErrorKind::Binder,
+                    format!("Cannot checkpoint database {database}: it does not have storage"),
+                ));
+            }
+            target = self.find_database(&database);
+            if target.is_none() {
                 return Err(Error::new(
                     ErrorKind::Binder,
                     format!("Database \"{database}\" not found"),
@@ -1117,8 +1317,29 @@ impl ClientContext {
                 ));
             }
         }
-        self.db.write_checkpoint()?;
-        Ok(Self::success())
+        let database = target.unwrap_or_else(|| self.db.clone());
+        self.check_valid(&database)?;
+        let abort = self.setting_text("debug_checkpoint_abort").to_lowercase();
+        let result = database.write_checkpoint_with(&abort);
+        // whatever went wrong, what is on disk can't be vouched for now; only the database that a
+        // connection was made to takes everything down with it
+        let Err(error) = result else {
+            return Ok(Self::success());
+        };
+        database.invalidate(&error.message);
+        if Arc::ptr_eq(&database, &self.home) {
+            return Err(Error::new(
+                ErrorKind::Fatal,
+                format!("Failed to create checkpoint because of error: {}", error.message),
+            ));
+        }
+        Err(Error::new(
+            ErrorKind::Io,
+            format!(
+                "Checkpoint failed for database \"{}\". The database has been invalidated. Original error: {}",
+                database.name, error.message
+            ),
+        ))
     }
 
     /// `ClientContext::PendingStatementOrPreparedStatement` + `ExecutePendingQueryInternal`.
@@ -1348,10 +1569,28 @@ fn on_create_conflict(conflict: AstConflict) -> OnCreateConflict {
     }
 }
 
+impl DatabaseList for DatabaseInstance {
+    fn with_catalog(&self, name: &str, use_it: &mut dyn FnMut(&crate::catalog::Catalog)) {
+        if name.eq_ignore_ascii_case(&self.name) {
+            use_it(&self.catalog);
+        } else if let Some(database) = self.attached.read().get(&name.to_lowercase()) {
+            use_it(&database.catalog);
+        }
+    }
+
+    fn databases(&self) -> Vec<DatabaseListing> {
+        let attached = self.attached.read();
+        std::iter::once(self)
+            .chain(attached.values().map(Arc::as_ref))
+            .map(DatabaseInstance::listing)
+            .collect()
+    }
+}
+
 impl Drop for DatabaseInstance {
     /// `CheckpointOnShutdown`: leaves nothing for the next open to replay.
     fn drop(&mut self) {
-        if !self.checkpoint_on_shutdown.load(AtomicOrdering::SeqCst) {
+        if !self.checkpoint_on_shutdown.load(AtomicOrdering::SeqCst) || self.invalid.lock().is_some() {
             return;
         }
         if let Err(error) = self.write_checkpoint() {

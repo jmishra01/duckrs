@@ -652,37 +652,49 @@ impl TableSource for DiskTable {
             .collect()
     }
 
-    fn segments(&self) -> Result<Vec<SegmentInfo>> {
+    fn segments(&self, include_info: bool) -> Result<Vec<SegmentInfo>> {
         fn add(
+            buffer: Option<&BufferManager>,
             result: &mut Vec<SegmentInfo>,
             stored: &PersistentColumn,
             group: u64,
             column: usize,
             path: &[usize],
             ty: Option<&LogicalType>,
-        ) {
+        ) -> Result<()> {
             let type_name = ty.map_or_else(|| "VALIDITY".to_string(), ToString::to_string);
             let mut start = 0;
             let text = path.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
-            for (segment, pointer) in stored.pointers.iter().enumerate() {
+            for (index, pointer) in stored.pointers.iter().enumerate() {
                 result.push(SegmentInfo {
                     row_group: group,
                     column,
                     path: format!("[{text}]"),
-                    segment: segment as u64,
+                    segment: index as u64,
                     segment_type: type_name.clone(),
                     start,
                     count: pointer.tuple_count as u64,
                     compression: storage_name(pointer.compression),
                     block_id: pointer.block_id,
                     block_offset: pointer.offset as u64,
+                    info: match buffer {
+                        Some(buffer) if pointer.block_id >= 0 => {
+                            let handle = segment(buffer, pointer)?;
+                            super::compression::segment_info(
+                                pointer.compression,
+                                &handle[pointer.offset..],
+                                pointer.tuple_count,
+                            )?
+                        }
+                        _ => None,
+                    },
                 });
                 start += pointer.tuple_count as u64;
             }
             if let Some(validity) = &stored.validity {
                 let mut child = path.to_vec();
                 child.push(0);
-                add(result, validity, group, column, &child, None);
+                add(buffer, result, validity, group, column, &child, None)?;
             }
             for (index, inner) in stored.children.iter().enumerate() {
                 let mut child = path.to_vec();
@@ -691,15 +703,17 @@ impl TableSource for DiskTable {
                     Some(PhysicalType::Struct) => ty.map(|ty| &ty.struct_children()[index].1),
                     _ => ty.and_then(LogicalType::child_type),
                 };
-                add(result, inner, group, column, &child, name);
+                add(buffer, result, inner, group, column, &child, name)?;
             }
+            Ok(())
         }
         let mut result = Vec::new();
+        let buffer = include_info.then_some(&*self.buffer);
         for group in 0..self.table.row_groups.len() {
             for column in 0..self.table.columns.len() {
                 let stored = self.persistent_column(group, column)?;
                 let ty = &self.table.columns[column].ty;
-                add(&mut result, &stored, group as u64, column, &[column], Some(ty));
+                add(buffer, &mut result, &stored, group as u64, column, &[column], Some(ty))?;
             }
         }
         Ok(result)

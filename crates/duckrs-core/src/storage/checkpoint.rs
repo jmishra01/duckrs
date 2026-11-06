@@ -14,7 +14,7 @@ use super::serialization::{not_ported, read_type_expression};
 use super::statistics::{BaseStatistics, read_column_statistics, skip_table_sample};
 use duckrs_common::serializer::{BinaryDeserializer, Deserialize};
 use duckrs_common::types::LogicalType;
-use duckrs_common::{Error, Result};
+use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast;
 
 /// `StorageVersion::V2_0_0`. Older files have a smaller number here.
@@ -272,7 +272,17 @@ fn read_entry(d: &mut BinaryDeserializer<'_>) -> Result<Pending> {
         return Err(not_ported_entry(entry_type));
     }
     let info: Option<Box<g::CreateInfo>> = d.read_property(100, "info")?;
-    let info = *info.ok_or_else(|| corrupt("a catalog entry has no create info"))?;
+    let info = *info.ok_or_else(|| {
+        let name = if entry_type == catalog_type::SCHEMA_ENTRY {
+            "schema"
+        } else {
+            "catalog"
+        };
+        Error::new(
+            ErrorKind::DataCorruption,
+            format!("corrupt database file - {name} entry without create info"),
+        )
+    })?;
     if info.type_ != entry_type {
         return Err(corrupt("catalog entry type mismatch"));
     }

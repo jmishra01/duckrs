@@ -449,6 +449,45 @@ fn floats_keep_their_bits() {
     }
 }
 
+/// Strings go through FSST where that pays: on their own if none repeats, or else in a dictionary.
+#[test]
+fn strings_can_go_through_fsst() {
+    const UNIQUE: &str = "SELECT i, 'https://example.com/items/' || i AS s FROM range(50000) r(i)";
+    const REPEATED: &str = "SELECT i, CASE WHEN i % 7 = 0 THEN NULL WHEN i % 11 = 0 THEN '' \
+                            ELSE 'customer-segment-' || (i % 3000) || '-ünï' END AS s FROM range(50000) r(i)";
+    let mut blocks = Vec::new();
+    for force in ["uncompressed", "auto"] {
+        let file = path(&format!("fsst_{force}.db"));
+        let db = Database::open(&file, false).unwrap();
+        let mut connection = db.connect().unwrap();
+        run(&mut connection, &format!("SET force_compression = '{force}'"));
+        run(&mut connection, &format!("CREATE TABLE u AS {UNIQUE}"));
+        run(&mut connection, &format!("CREATE TABLE r AS {REPEATED}"));
+        let answers = |connection: &mut Connection| {
+            ["u", "r"].map(|table| {
+                let sql = format!("SELECT i, s FROM {table} ORDER BY i");
+                rows(connection, &sql)
+            })
+        };
+        let expected = answers(&mut connection);
+        run(&mut connection, "CHECKPOINT");
+        assert_eq!(answers(&mut connection), expected, "{force}");
+        let sql = "SELECT count(DISTINCT block_id) FROM pragma_storage_info('u') WHERE segment_type = 'VARCHAR'";
+        blocks.push(rows(&mut connection, sql)[0].parse::<usize>().unwrap());
+        if force == "auto" {
+            let sql = "SELECT DISTINCT compression FROM pragma_storage_info('u') WHERE segment_type = 'VARCHAR'";
+            assert_eq!(rows(&mut connection, sql), ["DICT_FSST"]);
+        }
+        // for `tools/check_written.py`
+        if let Some(target) = std::env::var_os("DUCKRS_KEEP_FLOATS").filter(|_| force == "auto") {
+            drop(connection);
+            drop(db);
+            std::fs::copy(&file, std::path::Path::new(&target).join("strings.db")).unwrap();
+        }
+    }
+    assert!(blocks[1] * 2 <= blocks[0], "{blocks:?}");
+}
+
 /// Decimals go to ALP and the rest of the floats to ALPRD, as neither is forced here.
 #[test]
 fn floats_take_the_codec_that_suits_them() {
