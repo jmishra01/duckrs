@@ -55,11 +55,12 @@ pub fn has_log(path: &Path) -> bool {
 }
 
 /// A new database file, for `load_database`.
-pub fn create_database(path: &Path) -> Result<()> {
+pub fn create_database(path: &Path, block_size: Option<u64>) -> Result<()> {
     if std::fs::metadata(path).is_ok() {
         std::fs::remove_file(path).map_err(|e| Error::new(ErrorKind::Io, format!("{}: {e}", path.display())))?;
     }
-    SingleFileBlockManager::create(path, block_manager::DEFAULT_BLOCK_ALLOC_SIZE).map(drop)
+    let block_size = block_size.unwrap_or(block_manager::DEFAULT_BLOCK_ALLOC_SIZE);
+    SingleFileBlockManager::create(path, block_size).map(drop)
 }
 
 /// Whether checkpoints can go into this file: they write v2.0.0, which an older file isn't.

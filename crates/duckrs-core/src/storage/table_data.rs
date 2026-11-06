@@ -9,7 +9,7 @@ use super::checkpoint::StoredTable;
 use super::compression::*;
 use super::metadata::{MetaBlockPointer, MetadataChains, take};
 use super::statistics::{BaseStatistics, read_statistics};
-use crate::catalog::{ColumnStatistics, ColumnZone, TableLog, TableSource};
+use crate::catalog::{ColumnStatistics, ColumnZone, SegmentInfo, TableLog, TableSource};
 use crate::optimizer::statistics::{compare_values, has_ordered_statistics};
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::serializer::{BinaryDeserializer, Deserialize};
@@ -643,6 +643,59 @@ impl TableSource for DiskTable {
                 })
             })
             .collect()
+    }
+
+    fn segments(&self) -> Result<Vec<SegmentInfo>> {
+        fn add(
+            result: &mut Vec<SegmentInfo>,
+            stored: &PersistentColumn,
+            group: u64,
+            column: usize,
+            path: &[usize],
+            ty: Option<&LogicalType>,
+        ) {
+            let type_name = ty.map_or_else(|| "VALIDITY".to_string(), ToString::to_string);
+            let mut start = 0;
+            let text = path.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
+            for (segment, pointer) in stored.pointers.iter().enumerate() {
+                result.push(SegmentInfo {
+                    row_group: group,
+                    column,
+                    path: format!("[{text}]"),
+                    segment: segment as u64,
+                    segment_type: type_name.clone(),
+                    start,
+                    count: pointer.tuple_count as u64,
+                    compression: storage_name(pointer.compression),
+                    block_id: pointer.block_id,
+                    block_offset: pointer.offset as u64,
+                });
+                start += pointer.tuple_count as u64;
+            }
+            if let Some(validity) = &stored.validity {
+                let mut child = path.to_vec();
+                child.push(0);
+                add(result, validity, group, column, &child, None);
+            }
+            for (index, inner) in stored.children.iter().enumerate() {
+                let mut child = path.to_vec();
+                child.push(index + 1);
+                let name = match ty.map(LogicalType::physical_type) {
+                    Some(PhysicalType::Struct) => ty.map(|ty| &ty.struct_children()[index].1),
+                    _ => ty.and_then(LogicalType::child_type),
+                };
+                add(result, inner, group, column, &child, name);
+            }
+        }
+        let mut result = Vec::new();
+        for group in 0..self.table.row_groups.len() {
+            for column in 0..self.table.columns.len() {
+                let stored = self.persistent_column(group, column)?;
+                let ty = &self.table.columns[column].ty;
+                add(&mut result, &stored, group as u64, column, &[column], Some(ty));
+            }
+        }
+        Ok(result)
     }
 
     fn zones(&self, column: usize) -> Result<Vec<ColumnZone>> {

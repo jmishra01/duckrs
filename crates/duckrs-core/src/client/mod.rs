@@ -39,7 +39,7 @@ use duckrs_parser::ast::{
 use duckrs_parser::ast::{TransactionModifier, TransactionType};
 use parking_lot::{Mutex, RwLock};
 use settings::SettingValues;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -63,6 +63,18 @@ pub struct DatabaseInstance {
     changed: AtomicBool,
     /// `PRAGMA disable_checkpoint_on_shutdown` leaves it to the log.
     checkpoint_on_shutdown: AtomicBool,
+    /// How `USE` and qualified names call this database.
+    name: String,
+    /// What `ATTACH` added to this database, which connections go to with `USE` or by name. A
+    /// query runs in one database, so one that reads two isn't ported.
+    attached: RwLock<BTreeMap<String, Arc<DatabaseInstance>>>,
+}
+
+/// What `ATTACH` can say of a file.
+#[derive(Debug, Default)]
+pub struct AttachOptions {
+    pub read_only: bool,
+    pub block_size: Option<u64>,
 }
 
 /// Where a checkpoint goes, and the log of what happened since the last one.
@@ -104,6 +116,8 @@ impl DatabaseInstance {
             file: None,
             changed: AtomicBool::new(false),
             checkpoint_on_shutdown: AtomicBool::new(true),
+            name: DEFAULT_CATALOG.to_string(),
+            attached: RwLock::default(),
         }
     }
 
@@ -114,14 +128,25 @@ impl DatabaseInstance {
     /// A database with what is in the file at `path`. Without a database there it stays in memory
     /// and goes away at the end, as all of them did before storage: a new file is not written yet.
     pub fn open_file(path: &Path, read_only: bool) -> Result<Arc<Self>> {
+        let options = AttachOptions {
+            read_only,
+            block_size: None,
+        };
+        Self::open_with(path, &options)
+    }
+
+    /// `open_file` with what `ATTACH` can ask for.
+    pub fn open_with(path: &Path, options: &AttachOptions) -> Result<Arc<Self>> {
+        let read_only = options.read_only;
         if read_only && !storage::is_database_file(path) {
             return Ok(Self::new());
         }
         if !storage::is_database_file(path) {
-            storage::create_database(path)?;
+            storage::create_database(path, options.block_size)?;
         }
         let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
         let mut db = Self::with_file_access(None);
+        db.name.clone_from(&name);
         let buffer = storage::load_database(path, &db.catalog, read_only)?;
         db.file_access = if read_only {
             Some(FileAccess::ReadOnly(name.clone()))
@@ -290,6 +315,66 @@ const NO_OP_PRAGMAS: &[&str] = &[
     "disable_object_cache",
 ];
 
+fn storage_version_at_least_v2(version: &str) -> bool {
+    version == "latest"
+        || version
+            .trim_start_matches('v')
+            .split('.')
+            .next()
+            .and_then(|m| m.parse::<u32>().ok())
+            >= Some(2)
+}
+
+/// The names of the tables and other entries that a statement refers to directly, for routing it
+/// to the database they are in. Subqueries in expressions aren't looked at.
+fn for_each_table_name(statement: &mut Statement, f: &mut impl FnMut(&mut QualifiedName)) {
+    fn in_table(table: &mut duckrs_parser::ast::TableRef, f: &mut impl FnMut(&mut QualifiedName)) {
+        use duckrs_parser::ast::TableRefKind as K;
+        match &mut table.kind {
+            K::BaseTable { name, .. } => f(name),
+            K::Join(join) => {
+                in_table(&mut join.left, f);
+                in_table(&mut join.right, f);
+            }
+            K::Subquery(query) => in_query(&mut query.node, f),
+            _ => {}
+        }
+    }
+    fn in_query(node: &mut duckrs_parser::ast::QueryNode, f: &mut impl FnMut(&mut QualifiedName)) {
+        use duckrs_parser::ast::QueryNodeKind as K;
+        for (_, cte) in &mut node.cte_map.0 {
+            in_query(&mut cte.query, f);
+        }
+        match &mut node.kind {
+            K::Select(select) => in_table(&mut select.from_table, f),
+            K::SetOperation(set) => set.children.iter_mut().for_each(|child| in_query(child, f)),
+            _ => {}
+        }
+    }
+    use duckrs_parser::ast::InsertValues;
+    match statement {
+        Statement::Select(select) => in_query(&mut select.node, f),
+        Statement::Insert(insert) => {
+            f(&mut insert.table);
+            if let InsertValues::Select(query) = &mut insert.values {
+                in_query(&mut query.node, f);
+            }
+        }
+        Statement::Update(update) => in_table(&mut update.table, f),
+        Statement::Delete(delete) => in_table(&mut delete.table, f),
+        Statement::CreateTable(info) => {
+            f(&mut info.name);
+            if let Some(query) = &mut info.query {
+                in_query(&mut query.node, f);
+            }
+        }
+        Statement::Create(info) => f(&mut info.name),
+        Statement::Drop(info) => f(&mut info.name),
+        Statement::Alter(info) => f(&mut info.name),
+        _ => {}
+    }
+}
+
 /// A fully materialized result (`MaterializedQueryResult`).
 #[derive(Debug)]
 pub struct MaterializedQueryResult {
@@ -317,6 +402,8 @@ impl MaterializedQueryResult {
 #[derive(Debug)]
 pub struct ClientContext {
     db: Arc<DatabaseInstance>,
+    /// What the connection was made to, which holds what is attached.
+    home: Arc<DatabaseInstance>,
     /// identifies the connection among the database's connections
     id: u64,
     /// the transaction BEGIN started (`TransactionContext`); without one, each statement is its
@@ -419,6 +506,7 @@ impl ClientContext {
     pub fn new(db: Arc<DatabaseInstance>) -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         Self {
+            home: db.clone(),
             db,
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             transaction: None,
@@ -685,6 +773,12 @@ impl ClientContext {
     /// Runs one statement within the current transaction, or as a transaction of its own
     /// (`ClientContext::PendingStatementOrPreparedStatementInternal` + `CleanupInternal`).
     fn run_statement(&mut self, statement: &Statement) -> Result<MaterializedQueryResult> {
+        if let Some((database, routed)) = self.route_to_database(statement) {
+            let previous = std::mem::replace(&mut self.db, database);
+            let result = self.run_statement(&routed);
+            self.db = previous;
+            return result;
+        }
         match statement {
             // the statements a PIVOT was rewritten into: the last one has the result
             Statement::Multi(statements) => {
@@ -764,6 +858,144 @@ impl ClientContext {
             self.db.log_commit(self.checkpoint_threshold())?;
         }
         result
+    }
+
+    /// The database of this name, among those this connection can reach.
+    fn find_database(&self, name: &str) -> Option<Arc<DatabaseInstance>> {
+        if name.eq_ignore_ascii_case(&self.home.name) {
+            return Some(self.home.clone());
+        }
+        if name.eq_ignore_ascii_case(&self.db.name) {
+            return Some(self.db.clone());
+        }
+        self.home.attached.read().get(&name.to_lowercase()).cloned()
+    }
+
+    /// A statement that names another database runs there, without that name. The first part of
+    /// `a.b` is a schema if this database has one, as in C++.
+    fn route_to_database(&self, statement: &Statement) -> Option<(Arc<DatabaseInstance>, Statement)> {
+        let mut names = Vec::new();
+        let mut routed = statement.clone();
+        for_each_table_name(&mut routed, &mut |name| names.push(name.clone()));
+        let database = names.iter().find_map(|name| {
+            let first = name.qualification.first()?;
+            let is_schema = name.qualification.len() == 1
+                && (self.db.catalog.get_schema(first).is_some() || first.eq_ignore_ascii_case(TEMP_SCHEMA));
+            if is_schema {
+                return None;
+            }
+            self.find_database(first)
+        })?;
+        let prefix = database.name.clone();
+        for_each_table_name(&mut routed, &mut |name| {
+            if name
+                .qualification
+                .first()
+                .is_some_and(|first| first.eq_ignore_ascii_case(&prefix))
+            {
+                name.qualification.remove(0);
+            }
+        });
+        Some((database, routed))
+    }
+
+    /// `USE`: the database, and a schema in it if it isn't the default one.
+    fn use_database(&mut self, target: &str) -> Result<bool> {
+        let parts: Vec<&str> = target.split('.').map(|part| part.trim_matches('"')).collect();
+        let Some(database) = self.find_database(parts[0]) else {
+            return Ok(false);
+        };
+        if parts.get(1).is_some_and(|schema| !schema.eq_ignore_ascii_case("main")) {
+            return Ok(false);
+        }
+        self.db = database;
+        Ok(true)
+    }
+
+    /// `PhysicalAttach`.
+    fn attach(&mut self, info: &duckrs_parser::ast::AttachInfo) -> Result<()> {
+        use duckrs_parser::ast::OnCreateConflict as Conflict;
+        if info.external_resource.is_some() {
+            return Err(crate::unported("ATTACH TO EXTERNAL RESOURCE"));
+        }
+        let path = evaluate_scalar(&bind_constant_expression(&self.db.catalog, &info.path)?)?.try_to_string()?;
+        let mut options = AttachOptions::default();
+        for (name, value) in &info.options {
+            let text = value.text.to_lowercase();
+            match name.to_lowercase().as_str() {
+                "readonly" | "read_only" => options.read_only = text != "false",
+                "readwrite" | "read_write" => options.read_only = text == "false",
+                "type" if text == "duckdb" => {}
+                // files are written as v2.0.0, and nothing else is: an older one has to be refused
+                "storage_version" if storage_version_at_least_v2(&text) => {}
+                "block_size" => {
+                    let size = text
+                        .parse()
+                        .map_err(|_| Error::new(ErrorKind::InvalidInput, "BLOCK_SIZE is not a number"))?;
+                    options.block_size = Some(size);
+                }
+                other => return Err(crate::unported(format!("ATTACH with {other}"))),
+            }
+        }
+        if !info.parsed_options.is_empty() {
+            let names: Vec<&str> = info.parsed_options.iter().map(|(name, _)| name.as_str()).collect();
+            return Err(crate::unported(format!("ATTACH with {}", names.join(", "))));
+        }
+        let in_memory = path.is_empty() || path == ":memory:";
+        let stem = Path::new(&path)
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let name = if !info.name.is_empty() {
+            info.name.clone()
+        } else if in_memory {
+            DEFAULT_CATALOG.to_string()
+        } else {
+            stem
+        };
+        if self.find_database(&name).is_some() {
+            if info.on_conflict == Conflict::Ignore {
+                return Ok(());
+            }
+            return Err(Error::new(
+                ErrorKind::Binder,
+                format!("Failed to attach database: database with name \"{name}\" already exists"),
+            ));
+        }
+        let database = if in_memory {
+            let mut database = DatabaseInstance::with_file_access(None);
+            database.name.clone_from(&name);
+            Arc::new(database)
+        } else {
+            let mut opened = DatabaseInstance::open_with(Path::new(&path), &options)?;
+            let Some(database) = Arc::get_mut(&mut opened) else {
+                return Err(Error::new(ErrorKind::Internal, "a new database is in use"));
+            };
+            database.name.clone_from(&name);
+            opened
+        };
+        self.home.attached.write().insert(name.to_lowercase(), database);
+        Ok(())
+    }
+
+    /// `PhysicalDetach`.
+    fn detach(&mut self, name: &str, if_exists: bool) -> Result<()> {
+        if name.eq_ignore_ascii_case(&self.db.name) {
+            return Err(Error::new(
+                ErrorKind::Binder,
+                format!(
+                    "Cannot detach database \"{name}\" because it is the default database. Select a different database using `USE` to allow detaching."
+                ),
+            ));
+        }
+        if self.home.attached.write().remove(&name.to_lowercase()).is_none() && !if_exists {
+            return Err(Error::new(
+                ErrorKind::Binder,
+                format!("Failed to detach database with name \"{name}\": database not found"),
+            ));
+        }
+        Ok(())
     }
 
     /// `checkpoint_threshold` in bytes: how large the log can get.
@@ -916,6 +1148,22 @@ impl ClientContext {
             }
             Statement::ResetVariable { name, scope } if *scope == duckrs_parser::ast::SetScope::Variable => {
                 self.variables.remove(&name.to_lowercase());
+                return Ok(Self::success());
+            }
+            Statement::SetVariable { name, value, .. }
+                if name.eq_ignore_ascii_case("schema")
+                    && let Ok(target) = evaluate_scalar(&bind_constant_expression(&self.db.catalog, value)?)
+                        .and_then(|value| value.try_to_string())
+                    && self.use_database(&target)? =>
+            {
+                return Ok(Self::success());
+            }
+            Statement::Attach(info) => {
+                self.attach(info)?;
+                return Ok(Self::success());
+            }
+            Statement::Detach { name, if_exists } => {
+                self.detach(name, *if_exists)?;
                 return Ok(Self::success());
             }
             Statement::SetVariable { name, value, scope } => {

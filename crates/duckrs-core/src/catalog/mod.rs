@@ -91,6 +91,23 @@ pub trait TableSource: std::fmt::Debug + Send + Sync {
     fn column_statistics(&self) -> Option<Vec<ColumnStatistics>>;
     /// What the file says about a column per group, without reading its values.
     fn zones(&self, column: usize) -> Result<Vec<ColumnZone>>;
+    /// `pragma_storage_info`: the segments, in the order that C++ lists them.
+    fn segments(&self) -> Result<Vec<SegmentInfo>>;
+}
+
+/// A row of `pragma_storage_info`.
+#[derive(Debug, Clone)]
+pub struct SegmentInfo {
+    pub row_group: u64,
+    pub column: usize,
+    pub path: String,
+    pub segment: u64,
+    pub segment_type: String,
+    pub start: u64,
+    pub count: u64,
+    pub compression: &'static str,
+    pub block_id: i64,
+    pub block_offset: u64,
 }
 
 /// Reads a `TableSource` chunk by chunk, numbered as those of a table in memory: all but the last

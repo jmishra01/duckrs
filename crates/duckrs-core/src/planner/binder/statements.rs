@@ -1639,6 +1639,9 @@ impl Binder<'_> {
             return Err(not_implemented("table functions"));
         };
         let name = call.name.name.to_lowercase();
+        if name == "pragma_storage_info" {
+            return self.bind_storage_info(call, table_ref);
+        }
         let generate_series = name == "generate_series";
         if !(generate_series || name == "range") || !call.name.qualification.is_empty() {
             return Err(not_implemented(&format!("the table function {name}")));

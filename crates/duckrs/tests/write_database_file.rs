@@ -273,6 +273,59 @@ fn a_commit_that_fails_loses_nothing_else() {
     );
 }
 
+#[test]
+fn attached_databases_keep_their_rows() {
+    let first = path("first.db");
+    let second = path("second.db");
+    let db = Database::open(&first, false).unwrap();
+    let mut connection = db.connect().unwrap();
+    run(&mut connection, "CREATE TABLE here (i INTEGER)");
+    run(&mut connection, &format!("ATTACH '{}' AS other", second.display()));
+    run(&mut connection, "CREATE TABLE other.there (i INTEGER)");
+    run(&mut connection, "INSERT INTO other.there VALUES (1), (2)");
+    assert!(connection.query("SELECT * FROM there").is_err());
+    assert_eq!(rows(&mut connection, "SELECT count(*) FROM other.there"), ["2"]);
+    assert_eq!(rows(&mut connection, "SELECT count(*) FROM other.main.there"), ["2"]);
+    run(&mut connection, "USE other");
+    assert_eq!(rows(&mut connection, "SELECT count(*) FROM there"), ["2"]);
+    assert!(
+        connection
+            .query("DETACH other")
+            .unwrap_err()
+            .to_string()
+            .contains("default database")
+    );
+    run(&mut connection, "USE first");
+    assert_eq!(rows(&mut connection, "SELECT count(*) FROM here"), ["0"]);
+    run(&mut connection, "DETACH other");
+    assert!(connection.query("SELECT * FROM other.there").is_err());
+    run(
+        &mut connection,
+        &format!("ATTACH '{}' AS back (READ_ONLY)", second.display()),
+    );
+    assert_eq!(rows(&mut connection, "SELECT sum(i) FROM back.there"), ["3"]);
+    assert!(connection.query("INSERT INTO back.there VALUES (3)").is_err());
+}
+
+#[test]
+fn storage_info_lists_what_is_in_the_file() {
+    let file = path("segments.db");
+    let db = Database::open(&file, false).unwrap();
+    let mut connection = db.connect().unwrap();
+    run(
+        &mut connection,
+        "CREATE TABLE t AS SELECT i, CASE WHEN i % 2 = 0 THEN 'x' END AS s FROM range(150000) r(i)",
+    );
+    run(&mut connection, "CHECKPOINT");
+    let sql = "SELECT count(DISTINCT row_group_id), sum(count) FILTER (WHERE column_path = '[0]') \
+               FROM pragma_storage_info('t')";
+    assert_eq!(rows(&mut connection, sql), ["2|150000"]);
+    let sql = "SELECT DISTINCT segment_type, compression FROM pragma_storage_info('t') ORDER BY 1, 2";
+    let segments = rows(&mut connection, sql);
+    assert!(segments.contains(&"BIGINT|Uncompressed".to_string()), "{segments:?}");
+    assert!(segments.contains(&"VALIDITY|Constant".to_string()), "{segments:?}");
+}
+
 const CRASH_FILE: &str = "DUCKRS_CRASH_FILE";
 
 /// Commits for as long as it lives, and says so after each. Run by `commits_survive_kill_9`.

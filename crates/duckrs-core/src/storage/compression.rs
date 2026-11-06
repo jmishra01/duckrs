@@ -36,6 +36,27 @@ pub fn compression_name(compression: u8) -> &'static str {
     }
 }
 
+/// `CompressionTypeToString`.
+pub fn storage_name(compression: u8) -> &'static str {
+    match compression {
+        COMPRESSION_UNCOMPRESSED => "Uncompressed",
+        COMPRESSION_CONSTANT => "Constant",
+        COMPRESSION_RLE => "RLE",
+        COMPRESSION_DICTIONARY => "Dictionary",
+        COMPRESSION_BITPACKING => "BitPacking",
+        COMPRESSION_FSST => "FSST",
+        8 => "Chimp",
+        9 => "Patas",
+        COMPRESSION_ALP => "ALP",
+        COMPRESSION_ALPRD => "ALPRD",
+        12 => "ZSTD",
+        COMPRESSION_ROARING => "Roaring",
+        COMPRESSION_EMPTY => "Empty Validity",
+        COMPRESSION_DICT_FSST => "DICT_FSST",
+        _ => "Unknown",
+    }
+}
+
 pub fn not_ported(compression: u8) -> Error {
     Error::not_implemented(format!(
         "reading {} compression from a database file is not yet ported to duckrs",

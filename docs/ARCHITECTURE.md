@@ -350,7 +350,9 @@ These stop writes, or fail when they are made, as a file can't hold them yet:
 - VARIANT and GEOMETRY columns, and in a stored query what can't be read from one either. These fail
   at the commit, which leaves the database in memory as it is, until what can't be stored is dropped.
 
-Next, in order: `ATTACH`. ZSTD takes a new
+Next, in order: compression when writing, one codec at a time, which most of the tests of
+`test/sql/storage/compression` look at through `pragma_storage_info`; then keys in files, with the ART
+of Phase 10. ZSTD takes a new
 dependency, and Chimp and Patas are only in old files.
 
 **Indexes**: the ART of each index is parsed past and not read, whichever way the file points to it
@@ -375,6 +377,15 @@ otherwise. Numeric columns have bounds; strings say that nothing is known of the
 
 `tools/check_written.py` has the v2.0.0 reference engine read a file from `write_database_file.rs`,
 and then write to it, so that it frees and reuses blocks by what the file says.
+
+**Attached databases**: each is a `DatabaseInstance` of its own, with its catalog, file and log, in
+`attached` of the one that a connection was made to. `USE` makes a connection run in another one, and
+a statement that names one (`db.t`, `db.main.t`) is routed to it with that name taken off. A statement
+runs in one database, so one that reads two isn't ported, and subqueries in expressions aren't looked
+at for names. `STORAGE_VERSION` below v2.0.0 and `ROW_GROUP_SIZE` are refused, as is encryption.
+
+The gate is not met: `test/sql/storage` is at 37.5% against 85%. Of what fails there, 161 files are in
+`compression`, and about 45 need keys in a file, which can't come before Phase 10.
 
 **Writing the log** (`log_writer`): the engine has no undo log and tables change by being rewritten,
 so a commit doesn't know what it did. It compares the catalog with what is durable, and writes the
@@ -482,9 +493,6 @@ Replay only needs a log, so these are `.wal` files in `tests/fixtures`, which `.
 DuckDB 1.5.6 can't replay a logged index read-only, so `generate.sh` has it read a copy.
 
 The tests compare every column as the text that DuckDB prints, FLOAT and DOUBLE included.
-
-The gate is not met: `test/sql/storage` is at 9.6% against 85%, and the corpus doesn't move until
-checkpoints, as nearly all of those tests write first.
 
 ## Testing
 

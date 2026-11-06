@@ -10,6 +10,7 @@
 use super::table_functions::parse_select;
 use super::{Binder, ShowBehavior, binder_error};
 use crate::catalog::{SchemaCatalogEntry, TEMP_SCHEMA, TableCatalogEntry, TableConstraint, TableOrView};
+use crate::execution::expression_executor::evaluate_scalar;
 use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{COLUMN_IDENTIFIER_ROW_ID, LogicalOperator, LogicalOperatorKind};
 use duckrs_common::types::LogicalType;
@@ -589,6 +590,70 @@ impl Binder<'_> {
             }
         }
         result
+    }
+
+    /// `pragma_storage_info`: the segments of a table in its file. Rows in memory have none.
+    pub(super) fn bind_storage_info(
+        &mut self,
+        call: &duckrs_parser::ast::FunctionExpr,
+        table_ref: &TableRef,
+    ) -> Result<LogicalOperator> {
+        let [argument] = call.args.as_slice() else {
+            return Err(binder_error("pragma_storage_info takes the name of a table"));
+        };
+        let name = evaluate_scalar(&self.bind_expression(&argument.expr)?)?.try_to_string()?;
+        let parts: Vec<&str> = name.split('.').collect();
+        let (schema, table) = match parts.as_slice() {
+            [table] => (None, *table),
+            [schema, table] => (Some(*schema), *table),
+            _ => return Err(crate::unported("a table name of more than two parts")),
+        };
+        let table = self.catalog.get_table(schema, table)?;
+        let segments = table.source().map_or(Ok(Vec::new()), |source| source.segments())?;
+        let (bigint, varchar, boolean) = (LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::BOOLEAN);
+        let columns = [
+            ("row_group_id", bigint.clone()),
+            ("column_name", varchar.clone()),
+            ("column_id", bigint.clone()),
+            ("column_path", varchar.clone()),
+            ("segment_id", bigint.clone()),
+            ("segment_type", varchar.clone()),
+            ("start", bigint.clone()),
+            ("count", bigint.clone()),
+            ("compression", varchar.clone()),
+            ("stats", varchar.clone()),
+            ("has_updates", boolean.clone()),
+            ("persistent", boolean),
+            ("block_id", bigint.clone()),
+            ("block_offset", bigint),
+            ("segment_info", varchar.clone()),
+            ("additional_block_ids", LogicalType::list(LogicalType::BIGINT)),
+        ];
+        let rows = segments
+            .into_iter()
+            .map(|s| {
+                vec![
+                    Value::bigint(s.row_group as i64),
+                    Value::varchar(table.columns[s.column].name.clone()),
+                    Value::bigint(s.column as i64),
+                    Value::varchar(s.path),
+                    Value::bigint(s.segment as i64),
+                    Value::varchar(s.segment_type),
+                    Value::bigint(s.start as i64),
+                    Value::bigint(s.count as i64),
+                    Value::varchar(s.compression.to_string()),
+                    Value::null(LogicalType::VARCHAR),
+                    Value::boolean(false),
+                    Value::boolean(true),
+                    Value::bigint(s.block_id),
+                    Value::bigint(s.block_offset as i64),
+                    Value::null(LogicalType::VARCHAR),
+                    Value::null(LogicalType::list(LogicalType::BIGINT)),
+                ]
+            })
+            .collect();
+        let (names, types) = columns.into_iter().map(|(n, t)| (n.to_string(), t)).unzip();
+        self.bind_rows(table_ref, "pragma_storage_info", names, types, rows)
     }
 
     pub(super) fn is_system_table(name: &str) -> bool {
