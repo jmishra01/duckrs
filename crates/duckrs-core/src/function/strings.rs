@@ -7,7 +7,8 @@
 use super::bit_functions::strict_rows;
 use super::nested::row_wise;
 use super::{ScalarCallback, ScalarFunction, ScalarFunctionSet};
-use duckrs_common::types::{LogicalType, LogicalTypeId};
+use duckrs_common::string_cast::{FloatFormat, FloatSpec, format_with_spec};
+use duckrs_common::types::LogicalType;
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, UnifiedFormat, Vector};
 use duckrs_common::{Error, ErrorKind, Result};
@@ -727,7 +728,16 @@ struct Spec {
     width: usize,
     precision: Option<usize>,
     conversion: char,
+    /// fmt only leaves a nan or an inf on the left when the alignment is not spelled out, and
+    /// `printf` always spells it out.
+    aligned: bool,
 }
+
+/// `specs.type` of a `format` specifier without one.
+const NO_TYPE: char = '\0';
+
+/// `basic_writer::write`: formatting is not interruptible and takes time linear in the precision.
+const MAX_FORMAT_PRECISION: usize = 1_000_000;
 
 fn pad_to(spec: &Spec, body: String, numeric: bool) -> String {
     let size = body.chars().count();
@@ -748,57 +758,66 @@ fn pad_to(spec: &Spec, body: String, numeric: bool) -> String {
     }
 }
 
-fn exponent_form(value: f64, precision: usize, upper: bool) -> String {
-    let text = format!("{value:.precision$e}");
-    let (mantissa, exponent) = text.split_once('e').expect("LowerExp has an e");
-    let exponent: i32 = exponent.parse().expect("an exponent");
-    let sign = if exponent < 0 { '-' } else { '+' };
-    let out = format!("{mantissa}e{sign}{:02}", exponent.abs());
-    if upper { out.to_uppercase() } else { out }
-}
-
-/// `%g`: `precision` significant digits, in the shorter of the fixed and exponent forms, without
-/// trailing zeros.
-fn general_form(value: f64, precision: usize, upper: bool) -> String {
-    if !value.is_finite() || value == 0.0 {
-        return format!("{value}");
-    }
-    let precision = precision.max(1);
-    let scientific = format!("{:.*e}", precision - 1, value);
-    let exponent: i32 = scientific
-        .split_once('e')
-        .expect("LowerExp has an e")
-        .1
-        .parse()
-        .expect("an exponent");
-    let strip = |text: &str| -> String {
-        if text.contains('.') {
-            text.trim_end_matches('0').trim_end_matches('.').to_string()
-        } else {
-            text.to_string()
-        }
+/// `basic_writer::write` for a double: the type of `spec`, the sign, the digits and the padding.
+fn format_double_spec(spec: &Spec, value: f64) -> Result<String> {
+    let (format, upper, default_trailing_zeros) = match spec.conversion {
+        NO_TYPE => (FloatFormat::General, false, true),
+        'g' | 'n' | 'l' | 'L' => (FloatFormat::General, false, false),
+        'G' => (FloatFormat::General, true, false),
+        'e' => (FloatFormat::Exp, false, true),
+        'E' => (FloatFormat::Exp, true, true),
+        'f' => (FloatFormat::Fixed, false, true),
+        'F' => (FloatFormat::Fixed, true, true),
+        other => return Err(invalid_type_specifier(other, "float")),
     };
-    if exponent < -4 || exponent >= precision as i32 {
-        let form = exponent_form(value, precision - 1, upper);
-        let at = form.find(['e', 'E']).expect("an exponent");
-        return format!("{}{}", strip(&form[..at]), &form[at..]);
+    let sign = if value.is_sign_negative() {
+        "-"
+    } else if spec.plus {
+        "+"
+    } else if spec.space {
+        " "
+    } else {
+        ""
+    };
+    if !value.is_finite() {
+        let body = match (value.is_nan(), upper) {
+            (true, false) => "nan",
+            (true, true) => "NAN",
+            (false, false) => "inf",
+            (false, true) => "INF",
+        };
+        let body = format!("{sign}{body}");
+        let padding = spec.width.saturating_sub(body.len());
+        return Ok(if spec.zero {
+            body + &"0".repeat(padding)
+        } else if spec.left || !spec.aligned {
+            body + &" ".repeat(padding)
+        } else {
+            " ".repeat(padding) + &body
+        });
     }
-    strip(&format!("{:.*}", (precision as i32 - 1 - exponent) as usize, value))
-}
-
-fn number_of(value: &Value) -> Result<f64> {
-    if value.logical_type().id() == LogicalTypeId::Decimal {
-        return value
-            .try_to_string()?
-            .parse()
-            .map_err(|_| invalid_input("Invalid format specifier for this argument type"));
+    let precision = spec.precision.or((spec.conversion != NO_TYPE).then_some(6));
+    if let Some(precision) = precision.filter(|p| *p > MAX_FORMAT_PRECISION) {
+        return Err(invalid_input(format!(
+            "Precision of {precision} is too large, the maximum is {MAX_FORMAT_PRECISION}"
+        )));
     }
-    Ok(match value.data() {
-        ValueData::Double(v) => *v,
-        _ => value
-            .as_i128()
-            .map(|v| v as f64)
-            .ok_or_else(|| invalid_input("Invalid format specifier for this argument type"))?,
+    let body = format_with_spec(
+        value.abs(),
+        FloatSpec {
+            format,
+            upper,
+            trailing_zeros: spec.alternate || (default_trailing_zeros && spec.precision != Some(0)),
+            precision,
+        },
+    );
+    let padding = spec.width.saturating_sub(sign.len() + body.len());
+    Ok(if spec.zero {
+        format!("{sign}{}{body}", "0".repeat(padding))
+    } else if spec.left {
+        format!("{sign}{body}{}", " ".repeat(padding))
+    } else {
+        format!("{}{sign}{body}", " ".repeat(padding))
     })
 }
 
@@ -814,7 +833,16 @@ fn signed(spec: &Spec, negative: bool, digits: String) -> String {
     }
 }
 
+fn invalid_type_specifier(conversion: char, type_name: &str) -> Error {
+    invalid_input(format!(
+        "Invalid type specifier \"{conversion}\" for formatting a value of type {type_name}"
+    ))
+}
+
 fn format_one(spec: &Spec, value: &Value) -> Result<String> {
+    if let ValueData::Double(number) = value.data() {
+        return format_double_spec(spec, *number);
+    }
     Ok(match spec.conversion {
         'd' | 'i' | 'u' => {
             let number = value
@@ -841,25 +869,9 @@ fn format_one(spec: &Spec, value: &Value) -> Result<String> {
             };
             pad_to(spec, format!("{prefix}{body}"), true)
         }
-        'f' | 'F' => {
-            let number = number_of(value)?;
-            let precision = spec.precision.unwrap_or(6);
-            pad_to(
-                spec,
-                signed(spec, number.is_sign_negative(), format!("{:.precision$}", number.abs())),
-                true,
-            )
-        }
-        'e' | 'E' => {
-            let number = number_of(value)?;
-            let precision = spec.precision.unwrap_or(6);
-            let body = exponent_form(number.abs(), precision, spec.conversion == 'E');
-            pad_to(spec, signed(spec, number.is_sign_negative(), body), true)
-        }
-        'g' | 'G' => {
-            let number = number_of(value)?;
-            let body = general_form(number.abs(), spec.precision.unwrap_or(6), spec.conversion == 'G');
-            pad_to(spec, signed(spec, number.is_sign_negative(), body), true)
+        conversion @ ('f' | 'F' | 'e' | 'E' | 'g' | 'G') => {
+            let type_name = if value.as_i128().is_some() { "int" } else { "string" };
+            return Err(invalid_type_specifier(conversion, type_name));
         }
         'c' => {
             let code = value
@@ -908,6 +920,7 @@ fn printf(args: &DataChunk, result: &mut Vector) -> Result<()> {
                 width: 0,
                 precision: None,
                 conversion: 's',
+                aligned: true,
             };
             while let Some(flag) = format.get(i) {
                 match flag {
@@ -1009,11 +1022,13 @@ fn format_fmt_argument(value: &Value, spec: &str) -> Result<String> {
         width: 0,
         precision: None,
         conversion: 's',
+        aligned: false,
     };
     let mut rest = spec;
     let align = spec.chars().next().filter(|c| matches!(c, '<' | '>' | '^'));
     if let Some(align) = align {
         printf_spec.left = align == '<';
+        printf_spec.aligned = true;
         rest = &rest[1..];
         chars = rest.chars().peekable();
     }
@@ -1038,20 +1053,15 @@ fn format_fmt_argument(value: &Value, spec: &str) -> Result<String> {
         Some(conversion) => printf_spec.conversion = conversion,
         None => {
             printf_spec.conversion = match value.data() {
-                ValueData::Double(_) if printf_spec.precision.is_some() => 'g',
-                _ if printf_spec.precision.is_some() && value.logical_type().id() == LogicalTypeId::Decimal => 'g',
+                ValueData::Double(_) => NO_TYPE,
                 ValueData::Bytes(_) => 's',
                 _ if value.as_i128().is_some() => 'd',
                 _ => 's',
             };
         }
     }
-    // a general format keeps the digits it was asked for, which the zero has none of
-    if printf_spec.conversion == 'g'
-        && let Some(precision) = printf_spec.precision.filter(|p| *p > 1)
-        && number_of(value).is_ok_and(|number| number == 0.0)
-    {
-        return Ok(format!("0.{}", "0".repeat(precision - 1)));
+    if printf_spec.precision.is_some() && value.as_i128().is_some() {
+        return Err(invalid_input("precision not allowed for this argument type"));
     }
     format_one(&printf_spec, value)
 }

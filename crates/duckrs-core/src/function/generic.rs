@@ -939,9 +939,9 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             }
             let mut children = children;
             children[0] = children[0].clone().cast_to(&LogicalType::VARCHAR, false);
-            // `PrintfResolveTypes`: a FLOAT argument is formatted as the DOUBLE it widens to
+            // `PrintfResolveTypes`: FLOAT and DECIMAL arguments are formatted as DOUBLE
             for child in &mut children[1..] {
-                if child.return_type == LogicalType::FLOAT {
+                if child.return_type == LogicalType::FLOAT || child.return_type.id() == LogicalTypeId::Decimal {
                     *child = child.clone().cast_to(&LogicalType::DOUBLE, false);
                 }
             }

@@ -2,6 +2,7 @@
 // types/blob.cpp (Blob::ToString) @ rust-port-baseline
 
 use crate::fmt_float::format_finite;
+pub use crate::fmt_float::{FloatFormat, FloatSpec, format_with_spec};
 
 /// Formats a DOUBLE like `duckdb_fmt::format("{}", value)`: fixed notation when the decimal exponent
 /// is in `-4..16` (with `.0` for integral values), otherwise scientific notation with a signed,

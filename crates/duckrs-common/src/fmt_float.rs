@@ -1,7 +1,7 @@
 // Ported from duckdb/third_party/fmt/include/fmt/format-inl.h and format.h (fmt 6.1.2 as DuckDB
 // bundles it) @ rust-port-baseline
 
-//! What `duckdb_fmt::format("{}", value)` prints for a finite FLOAT or DOUBLE.
+//! What `duckdb_fmt::format` prints for a finite FLOAT or DOUBLE.
 //!
 //! This is Grisu with fmt's quirks, kept on purpose, as these are the digits DuckDB prints:
 //!
@@ -14,6 +14,14 @@
 //!   from 2^53 up by the wrong amount (`denominator <<= 1` for a shift of 2).
 //! - `Bigint` is copied whole: a remainder of zero keeps its `exp`, and so compares as non-zero, and
 //!   a borrow does not move past a zero bigit.
+//!
+//! - With a precision, `FixedHandler` only checks the error at the last digit. The error is a `u64`
+//!   that is multiplied by 10 for each digit, so past some 300 digits it has wrapped to zero, and
+//!   the digits of a large number stop being exact: `format('{:.0f}', 1.7976931348623157e308)`
+//!   goes wrong from the twentieth digit on.
+//! - When Grisu gives up, `snprintf_digits` falls back to `snprintf`. A precision of 0 then means
+//!   the default of 6 in a general format (`format('{:.0}', 2.5)` is `2.5`), and with `#` the
+//!   decimal point lands in the digits and gets printed twice (`printf('%#.0f', 2.5)` is `2..`).
 //!
 //! Unsigned arithmetic wraps as in C++. The digits are bytes as they can run past `'9'`.
 
@@ -143,6 +151,90 @@ enum Step {
     Error,
 }
 
+/// What `grisu_gen_digits` does with the digits it generates.
+trait DigitHandler {
+    fn on_start(&mut self, divisor: u64, remainder: u64, error: u64, exp: i32) -> Step;
+    fn on_digit(&mut self, digit: u8, divisor: u64, remainder: u64, error: u64, exp: i32, integral: bool) -> Step;
+}
+
+/// `get_round_direction`: `None` if the error hides the direction, else whether to round up.
+fn round_up(divisor: u64, remainder: u64, error: u64) -> Option<bool> {
+    // Round down if (remainder + error) * 2 <= divisor.
+    if remainder <= divisor.wrapping_sub(remainder)
+        && error.wrapping_mul(2) <= divisor.wrapping_sub(remainder.wrapping_mul(2))
+    {
+        return Some(false);
+    }
+    // Round up if (remainder - error) * 2 >= divisor.
+    if remainder >= error && remainder - error >= divisor.wrapping_sub(remainder - error) {
+        return Some(true);
+    }
+    None
+}
+
+/// `fixed_handler`.
+struct FixedHandler {
+    buf: Vec<u8>,
+    precision: i32,
+    exp10: i32,
+    fixed: bool,
+}
+
+impl DigitHandler for FixedHandler {
+    fn on_start(&mut self, divisor: u64, remainder: u64, error: u64, exp: i32) -> Step {
+        // Non-fixed formats require at least one digit and no precision adjustment.
+        if !self.fixed {
+            return Step::More;
+        }
+        // Adjust the fixed precision by the exponent, as it is relative to the decimal point.
+        self.precision += exp + self.exp10;
+        // The precision may be satisfied by leading zeros alone: 0.001 with a precision of 2.
+        if self.precision > 0 {
+            return Step::More;
+        }
+        if self.precision < 0 {
+            return Step::Done;
+        }
+        match round_up(divisor, remainder, error) {
+            None => Step::Error,
+            Some(up) => {
+                self.buf.push(if up { b'1' } else { b'0' });
+                Step::Done
+            }
+        }
+    }
+
+    fn on_digit(&mut self, digit: u8, divisor: u64, remainder: u64, error: u64, _: i32, integral: bool) -> Step {
+        self.buf.push(digit);
+        if (self.buf.len() as i32) < self.precision {
+            return Step::More;
+        }
+        // Check if error * 2 < divisor with overflow prevention. The error is 1 in the integral part.
+        if !integral && (error >= divisor || error >= divisor - error) {
+            return Step::Error;
+        }
+        match round_up(divisor, remainder, error) {
+            None => return Step::Error,
+            Some(false) => return Step::Done,
+            Some(true) => {}
+        }
+        let buf = &mut self.buf;
+        let last = buf.len() - 1;
+        buf[last] += 1;
+        let mut i = last;
+        while i > 0 && buf[i] > b'9' {
+            buf[i] = b'0';
+            buf[i - 1] += 1;
+            i -= 1;
+        }
+        if buf[0] > b'9' {
+            buf[0] = b'1';
+            buf.push(b'0');
+        }
+        Step::Done
+    }
+}
+
 /// `grisu_shortest_handler`.
 struct ShortestHandler {
     buf: Vec<u8>,
@@ -162,6 +254,12 @@ impl ShortestHandler {
             *last = last.wrapping_sub(1);
             *remainder = remainder.wrapping_add(divisor);
         }
+    }
+}
+
+impl DigitHandler for ShortestHandler {
+    fn on_start(&mut self, _: u64, _: u64, _: u64, _: i32) -> Step {
+        Step::More
     }
 
     /// Grisu's round_weed.
@@ -191,7 +289,7 @@ impl ShortestHandler {
 
 /// `grisu_gen_digits`. `error` is the size of the region outside of which numbers definitely do
 /// not round to the value (Delta in Grisu3). `exp` is kappa in Grisu.
-fn grisu_gen_digits(value: Fp, mut error: u64, exp: &mut i32, handler: &mut ShortestHandler) -> Step {
+fn grisu_gen_digits(value: Fp, mut error: u64, exp: &mut i32, handler: &mut impl DigitHandler) -> Step {
     let shift = -value.e;
     let one = 1u64 << shift;
     // The integral part of the scaled value (p1 in Grisu), which fits as value.e is at least -60
@@ -200,6 +298,16 @@ fn grisu_gen_digits(value: Fp, mut error: u64, exp: &mut i32, handler: &mut Shor
     // The fractional part of the scaled value (p2 in Grisu).
     let mut fractional = value.f & (one - 1);
     *exp = integral.checked_ilog10().unwrap_or(0) as i32 + 1;
+    // Divide by 10 to prevent overflow.
+    let step = handler.on_start(
+        10u64.pow((*exp - 1) as u32) << shift,
+        value.f / 10,
+        error.wrapping_mul(10),
+        *exp,
+    );
+    if step != Step::More {
+        return step;
+    }
     // Digits of the integral part: up to 10.
     loop {
         let divisor = 10u32.pow((*exp - 1) as u32);
@@ -600,39 +708,183 @@ fn write_exponent(exp: i32, out: &mut String) {
     out.push_str(&format!("{:02}", exp.unsigned_abs()));
 }
 
-/// `float_writer::prettify` for the general format, without a precision but with trailing zeros.
-/// The value is `digits * 10^exp`.
-fn prettify(digits: &[u8], exp: i32, out: &mut String) {
+/// How `format_with_spec` writes a number: `float_specs` once fmt has parsed a format specifier.
+#[derive(Clone, Copy, Debug)]
+pub struct FloatSpec {
+    pub format: FloatFormat,
+    /// `E` rather than `e`.
+    pub upper: bool,
+    pub trailing_zeros: bool,
+    /// Without one, the digits are the shortest ones that round-trip.
+    pub precision: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FloatFormat {
+    General,
+    Exp,
+    Fixed,
+}
+
+/// `float_writer::prettify`. The value is `digits * 10^exp`.
+fn prettify(digits: &[u8], exp: i32, spec: FloatSpec, out: &mut String) {
     let push = |digits: &[u8], out: &mut String| out.extend(digits.iter().map(|d| *d as char));
+    let zeros = |count: i32, out: &mut String| out.extend(std::iter::repeat_n('0', count.max(0) as usize));
     let num_digits = digits.len() as i32;
+    let precision = spec.precision.map_or(-1, |p| p as i32);
     // pow(10, full_exp - 1) <= v <= pow(10, full_exp).
     let full_exp = num_digits + exp;
-    if !(-4 < full_exp && full_exp <= 16) {
-        // The default precision of 16 decides between the two forms.
+    let threshold = if precision > 0 { precision } else { 16 };
+    let scientific = spec.format == FloatFormat::Exp
+        || (spec.format == FloatFormat::General && !(-4 < full_exp && full_exp <= threshold));
+    if scientific {
+        // Insert a decimal point after the first digit and add an exponent.
         out.push(digits[0] as char);
-        if digits.len() > 1 {
+        let num_zeros = precision - num_digits;
+        let trailing_zeros = num_zeros > 0 && spec.trailing_zeros;
+        if digits.len() > 1 || trailing_zeros {
             out.push('.');
-            push(&digits[1..], out);
         }
-        out.push('e');
+        push(&digits[1..], out);
+        if trailing_zeros {
+            zeros(num_zeros, out);
+        }
+        out.push(if spec.upper { 'E' } else { 'e' });
         write_exponent(full_exp - 1, out);
     } else if num_digits <= full_exp {
-        // 1234e7 -> 12340000000.0
+        // 1234e7 -> 12340000000[.0+]
         push(digits, out);
-        out.extend(std::iter::repeat_n('0', (full_exp - num_digits) as usize));
-        out.push_str(".0");
+        zeros(full_exp - num_digits, out);
+        if spec.trailing_zeros {
+            out.push('.');
+            let num_zeros = precision - full_exp;
+            if num_zeros > 0 {
+                zeros(num_zeros, out);
+            } else if spec.format != FloatFormat::Fixed {
+                out.push('0');
+            }
+        }
     } else if full_exp > 0 {
-        // 1234e-2 -> 12.34
+        // 1234e-2 -> 12.34[0+]
         let (integral, fractional) = digits.split_at(full_exp as usize);
         push(integral, out);
-        out.push('.');
-        push(fractional, out);
+        if spec.trailing_zeros {
+            out.push('.');
+            push(fractional, out);
+            // Add trailing zeros.
+            zeros(precision - num_digits, out);
+        } else {
+            // Remove trailing zeros.
+            let kept = fractional.iter().rposition(|d| *d != b'0').map_or(0, |at| at + 1);
+            if kept != 0 {
+                out.push('.');
+                push(&fractional[..kept], out);
+            }
+        }
     } else {
         // 1234e-6 -> 0.001234
-        out.push_str("0.");
-        out.extend(std::iter::repeat_n('0', (-full_exp) as usize));
-        push(digits, out);
+        out.push('0');
+        let num_digits = if spec.trailing_zeros {
+            digits.len()
+        } else {
+            digits.iter().rposition(|d| *d != b'0').map_or(0, |at| at + 1)
+        };
+        let mut num_zeros = -full_exp;
+        if digits.is_empty() && precision >= 0 && precision < num_zeros {
+            num_zeros = precision;
+        }
+        if num_zeros != 0 || num_digits != 0 {
+            out.push('.');
+            zeros(num_zeros, out);
+            push(&digits[..num_digits], out);
+        }
     }
+}
+
+/// A double has fewer significant or fractional digits than this; all the rest are zeros.
+const MAX_EXACT_DIGITS: usize = 1100;
+
+/// `snprintf_float` without a hex format, where Rust stands in for the exactly rounded `snprintf`.
+fn snprintf_digits(value: f64, spec: FloatSpec, precision: usize) -> (Vec<u8>, i32) {
+    if spec.format == FloatFormat::Fixed {
+        let exact = precision.min(MAX_EXACT_DIGITS);
+        let text = format!("{value:.exact$}");
+        if precision == 0 {
+            // The buffer is kept as is, with the point that `#` asks for.
+            let point = if spec.trailing_zeros { "." } else { "" };
+            return (format!("{text}{point}").into_bytes(), 0);
+        }
+        let mut digits: Vec<u8> = text.bytes().filter(|b| *b != b'.').collect();
+        digits.resize(digits.len() + precision - exact, b'0');
+        return (digits, -(precision as i32));
+    }
+    // Without a precision, snprintf's `%e` has one of 6.
+    let fraction = precision.checked_sub(1).unwrap_or(6).min(MAX_EXACT_DIGITS);
+    let text = format!("{value:.fraction$e}");
+    let (mantissa, exponent) = text.split_once('e').expect("LowerExp has an e");
+    let mut digits: Vec<u8> = mantissa.bytes().filter(|b| *b != b'.').collect();
+    // Remove trailing zeros.
+    while digits.len() > 1 && digits.last() == Some(&b'0') {
+        digits.pop();
+    }
+    let exponent: i32 = exponent.parse().expect("an exponent");
+    let fraction_size = digits.len() as i32 - 1;
+    (digits, exponent - fraction_size)
+}
+
+/// `format_float` with a precision.
+fn precise_digits(value: f64, spec: FloatSpec, precision: usize) -> (Vec<u8>, i32) {
+    let fixed = spec.format == FloatFormat::Fixed;
+    if value <= 0.0 {
+        if precision == 0 || !fixed {
+            return (vec![b'0'], 0);
+        }
+        return (vec![b'0'; precision], -(precision as i32));
+    }
+    if precision > 17 {
+        return snprintf_digits(value, spec, precision);
+    }
+    const MIN_EXP: i32 = -60; // alpha in Grisu.
+    let normalized = normalize(assign(value).0, 0);
+    let (cached_pow, cached_exp10) = cached_power(MIN_EXP - (normalized.e + SIGNIFICAND_SIZE));
+    let scaled = Fp {
+        f: multiply(normalized.f, cached_pow.f),
+        e: normalized.e + cached_pow.e + SIGNIFICAND_SIZE,
+    };
+    let mut handler = FixedHandler {
+        buf: Vec::with_capacity(24),
+        precision: precision as i32,
+        exp10: -cached_exp10,
+        fixed,
+    };
+    let mut exp = 0;
+    if grisu_gen_digits(scaled, 1, &mut exp, &mut handler) == Step::Error {
+        return snprintf_digits(value, spec, precision);
+    }
+    let mut digits = handler.buf;
+    if !fixed {
+        // Remove trailing zeros.
+        while digits.last() == Some(&b'0') {
+            digits.pop();
+            exp += 1;
+        }
+    }
+    (digits, exp - cached_exp10)
+}
+
+/// `basic_writer::write` for a finite, non-negative `value`, before the sign and the padding.
+pub fn format_with_spec(value: f64, mut spec: FloatSpec) -> String {
+    let (digits, exp) = match spec.precision {
+        None => format_digits(value, false),
+        Some(precision) => {
+            let precision = precision + usize::from(spec.format == FloatFormat::Exp);
+            spec.precision = Some(precision);
+            precise_digits(value, spec, precision)
+        }
+    };
+    let mut out = String::with_capacity(digits.len() + 8);
+    prettify(&digits, exp, spec, &mut out);
+    out
 }
 
 /// `duckdb_fmt::format("{}", value)` for a finite `value`. A FLOAT comes promoted to a double, with
@@ -643,7 +895,13 @@ pub(crate) fn format_finite(value: f64, binary32: bool) -> String {
     if value.is_sign_negative() {
         out.push('-');
     }
-    prettify(&digits, exp, &mut out);
+    let spec = FloatSpec {
+        format: FloatFormat::General,
+        upper: false,
+        trailing_zeros: true,
+        precision: None,
+    };
+    prettify(&digits, exp, spec, &mut out);
     out
 }
 
