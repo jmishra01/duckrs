@@ -9,17 +9,20 @@
 
 use super::table_functions::parse_select;
 use super::{Binder, ShowBehavior, binder_error};
-use crate::catalog::{SchemaCatalogEntry, TEMP_SCHEMA, TableCatalogEntry, TableConstraint, TableOrView};
+use crate::catalog::{SchemaCatalogEntry, SegmentInfo, TEMP_SCHEMA, TableCatalogEntry, TableConstraint, TableOrView};
 use crate::execution::expression_executor::evaluate_scalar;
+use crate::execution::zone_map::ROW_GROUP_SIZE;
 use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{COLUMN_IDENTIFIER_ROW_ID, LogicalOperator, LogicalOperatorKind};
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
 use duckrs_common::{ErrorKind, Result};
 use duckrs_parser::ast::{
-    Expr, QualifiedName, QueryNode, SelectNode, SelectStatement, ShowRef, ShowType, TableRef, TableRefKind,
+    Expr, ExprKind, QualifiedName, QueryNode, SelectNode, SelectStatement, ShowRef, ShowType, TableRef, TableRefKind,
     sql_identifier,
 };
+use duckrs_parser::transformer::visit_expr_mut;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 fn text(value: &str) -> Value {
@@ -153,14 +156,51 @@ fn human_readable_bytes(bytes: u64) -> String {
 
 const DESCRIBE_NAMES: [&str; 6] = ["column_name", "column_type", "null", "key", "default", "extra"];
 
-const SYSTEM_TABLES: [&str; 6] = [
+const SYSTEM_TABLES: [&str; 8] = [
     "pragma_database_size",
     "duckdb_databases",
     "duckdb_schemas",
     "duckdb_tables",
     "duckdb_views",
     "duckdb_columns",
+    "duckdb_indexes",
+    "duckdb_constraints",
 ];
+
+/// What `pragma_storage_info` lists of rows that no checkpoint wrote: per row group each column and
+/// its validity, in one segment.
+fn memory_segments(table: &TableCatalogEntry) -> Vec<SegmentInfo> {
+    let rows = table.row_count() as u64;
+    let size = ROW_GROUP_SIZE as u64;
+    let mut segments = Vec::new();
+    for (group, start) in (0..rows).step_by(ROW_GROUP_SIZE).enumerate() {
+        for (column, definition) in table.columns.iter().enumerate() {
+            let parts = [
+                (format!("[{column}]"), definition.ty.to_string()),
+                (format!("[{column}, 0]"), "VALIDITY".to_string()),
+            ];
+            for (path, segment_type) in parts {
+                segments.push(SegmentInfo {
+                    row_group: group as u64,
+                    column,
+                    path,
+                    segment: 0,
+                    segment_type,
+                    start,
+                    count: size.min(rows - start),
+                    compression: "Uncompressed",
+                    block_id: -1,
+                    block_offset: 0,
+                    info: None,
+                });
+            }
+        }
+    }
+    segments
+}
+
+/// The columns and rows of a system table.
+type SystemRows = (Vec<(&'static str, LogicalType)>, Vec<Vec<Value>>);
 
 /// A table of the listing, with the ids the listings share.
 struct ListedEntry {
@@ -592,6 +632,184 @@ impl Binder<'_> {
     }
 
     /// Everything in the catalog, with stable ids.
+    /// `DuckDBConstraintsFunction`: per table the NOT NULLs and then the others, as the entry has them.
+    fn constraint_rows(&self) -> Result<SystemRows> {
+        let list = LogicalType::list(LogicalType::VARCHAR);
+        let indexes = LogicalType::list(LogicalType::BIGINT);
+        let mut rows = Vec::new();
+        let mut used = HashSet::new();
+        for listed in self.listed_entries() {
+            let TableOrView::Table(table) = &listed.entry else {
+                continue;
+            };
+            let names_of =
+                |columns: &[usize]| -> Vec<String> { columns.iter().map(|c| table.columns[*c].name.clone()).collect() };
+            let not_nulls = (0..table.columns.len()).filter(|c| table.columns[*c].not_null);
+            // type, text, expression, columns, referenced table and columns, the end of the name
+            type Row = (
+                &'static str,
+                String,
+                Option<String>,
+                Vec<usize>,
+                Option<String>,
+                Vec<String>,
+                &'static str,
+            );
+            let mut constraints: Vec<Row> = not_nulls
+                .map(|c| {
+                    let name = sql_identifier(&table.columns[c].name);
+                    (
+                        "NOT NULL",
+                        format!("{name} NOT NULL"),
+                        None,
+                        vec![c],
+                        None,
+                        Vec::new(),
+                        "not_null",
+                    )
+                })
+                .collect();
+            for constraint in &table.constraints {
+                let quoted = |columns: &[usize]| {
+                    columns
+                        .iter()
+                        .map(|c| sql_identifier(&table.columns[*c].name))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                constraints.push(match constraint {
+                    TableConstraint::Check { parsed, .. } => {
+                        let mut columns = Vec::new();
+                        visit_expr_mut(&mut parsed.clone(), &mut |e: &mut Expr| {
+                            if let ExprKind::ColumnRef(parts) = &e.kind {
+                                let at = usize::from(parts.len() > 1 && parts[0].eq_ignore_ascii_case(&table.name));
+                                columns.extend(parts.get(at).and_then(|name| table.column_index(name)));
+                            }
+                        });
+                        let text = format!("CHECK({parsed})");
+                        (
+                            "CHECK",
+                            text,
+                            Some(parsed.to_string()),
+                            columns,
+                            None,
+                            Vec::new(),
+                            "check",
+                        )
+                    }
+                    TableConstraint::Unique { columns, primary_key } => {
+                        let (kind, end) = if *primary_key {
+                            ("PRIMARY KEY", "pkey")
+                        } else {
+                            ("UNIQUE", "key")
+                        };
+                        (
+                            kind,
+                            format!("{kind}({})", quoted(columns)),
+                            None,
+                            columns.clone(),
+                            None,
+                            Vec::new(),
+                            end,
+                        )
+                    }
+                    TableConstraint::ForeignKey(key) => {
+                        let (parent, referenced) = match &key.referenced {
+                            Some(parent) => {
+                                let parent = parent.table();
+                                let columns = key.referenced_columns.iter();
+                                let names = columns.map(|c| parent.columns[*c].name.clone()).collect();
+                                (parent.name.clone(), names)
+                            }
+                            None => (table.name.clone(), names_of(&key.referenced_columns)),
+                        };
+                        let text = format!(
+                            "FOREIGN KEY ({}) REFERENCES {}({})",
+                            quoted(&key.columns),
+                            sql_identifier(&parent),
+                            referenced
+                                .iter()
+                                .map(|name| sql_identifier(name))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                        (
+                            "FOREIGN KEY",
+                            text,
+                            None,
+                            key.columns.clone(),
+                            Some(parent),
+                            referenced,
+                            "fkey",
+                        )
+                    }
+                });
+            }
+            for (kind, text, expression, columns, parent, referenced, end) in constraints {
+                let names = names_of(&columns);
+                let mut name = format!("{}_", table.name);
+                for column in names.iter().chain(&referenced) {
+                    name += &format!("{}_", column.to_lowercase());
+                }
+                name += end;
+                let base = name.clone();
+                let mut number = 2;
+                while !used.insert(name.clone()) {
+                    name = format!("{base}_{number}");
+                    number += 1;
+                }
+                let index = rows.len() as i64;
+                let temporary = listed.schema.name.eq_ignore_ascii_case(TEMP_SCHEMA);
+                let varchars = |names: Vec<String>| {
+                    Value::list(LogicalType::VARCHAR, names.into_iter().map(Value::varchar).collect())
+                };
+                rows.push(vec![
+                    Value::varchar(if temporary { "temp" } else { self.catalog.name.as_str() }),
+                    Value::bigint(if temporary { 3 } else { 1 }),
+                    Value::varchar(if temporary { "main" } else { listed.schema.name.as_str() }),
+                    Value::bigint(listed.schema_oid),
+                    Value::varchar(table.name.as_str()),
+                    Value::bigint(listed.oid),
+                    Value::bigint(index),
+                    Value::varchar(kind),
+                    Value::varchar(text),
+                    expression.map_or_else(|| Value::null(LogicalType::VARCHAR), Value::varchar),
+                    Value::list(
+                        LogicalType::BIGINT,
+                        columns.iter().map(|c| Value::bigint(*c as i64)).collect(),
+                    )?,
+                    varchars(names)?,
+                    Value::varchar(name),
+                    parent.map_or_else(|| Value::null(LogicalType::VARCHAR), Value::varchar),
+                    varchars(referenced)?,
+                    Value::varchar("DEFAULT"),
+                ]);
+            }
+        }
+        let (bigint, varchar) = (LogicalType::BIGINT, LogicalType::VARCHAR);
+        Ok((
+            vec![
+                ("database_name", varchar.clone()),
+                ("database_oid", bigint.clone()),
+                ("schema_name", varchar.clone()),
+                ("schema_oid", bigint.clone()),
+                ("table_name", varchar.clone()),
+                ("table_oid", bigint.clone()),
+                ("constraint_index", bigint),
+                ("constraint_type", varchar.clone()),
+                ("constraint_text", varchar.clone()),
+                ("expression", varchar.clone()),
+                ("constraint_column_indexes", indexes),
+                ("constraint_column_names", list.clone()),
+                ("constraint_name", varchar.clone()),
+                ("referenced_table", varchar.clone()),
+                ("referenced_column_names", list),
+                ("constraint_check_mode", varchar),
+            ],
+            rows,
+        ))
+    }
+
     fn listed_entries(&self) -> Vec<ListedEntry> {
         let mut result = Vec::new();
         let mut oid = 1000;
@@ -654,9 +872,12 @@ impl Binder<'_> {
             (None, [schema, table]) => self.catalog.get_table(Some(schema), table)?,
             _ => return Err(crate::unported("a table name of more than two parts")),
         };
-        let segments = table
-            .source()
-            .map_or(Ok(Vec::new()), |source| source.segments(include_info))?;
+        let stored = table.stored();
+        let persistent = stored.is_some();
+        let segments = match stored {
+            Some(source) => source.segments(include_info)?,
+            None => memory_segments(&table),
+        };
         let (bigint, varchar, boolean) = (LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::BOOLEAN);
         let mut columns = vec![
             ("row_group_id", bigint.clone()),
@@ -694,7 +915,7 @@ impl Binder<'_> {
                     Value::varchar(s.compression.to_string()),
                     Value::null(LogicalType::VARCHAR),
                     Value::boolean(false),
-                    Value::boolean(true),
+                    Value::boolean(persistent),
                     Value::bigint(s.block_id),
                     Value::bigint(s.block_offset as i64),
                 ];
@@ -885,6 +1106,53 @@ impl Binder<'_> {
                     rows,
                 )
             }
+            "duckdb_indexes" => {
+                let mut rows = Vec::new();
+                for listed in self.listed_entries() {
+                    let TableOrView::Table(table) = &listed.entry else {
+                        continue;
+                    };
+                    for (position, index) in table.indexes.read().iter().enumerate() {
+                        let temporary = listed.schema.name.eq_ignore_ascii_case(TEMP_SCHEMA);
+                        rows.push(vec![
+                            text(if temporary { "temp" } else { self.catalog.name.as_str() }),
+                            Value::bigint(if temporary { 3 } else { 1 }),
+                            text(if temporary { "main" } else { &listed.schema.name }),
+                            Value::bigint(listed.schema_oid),
+                            text(&index.name),
+                            Value::bigint(listed.oid * 1000 + position as i64),
+                            text(&table.name),
+                            Value::bigint(listed.oid),
+                            index.comment.as_deref().map_or_else(&null_text, &text),
+                            Value::null(tags.clone()),
+                            Value::boolean(index.unique),
+                            Value::boolean(false),
+                            text(&format!("[{}]", index.names.join(", "))),
+                            text(&index.sql),
+                        ]);
+                    }
+                }
+                (
+                    vec![
+                        ("database_name", varchar.clone()),
+                        ("database_oid", bigint.clone()),
+                        ("schema_name", varchar.clone()),
+                        ("schema_oid", bigint.clone()),
+                        ("index_name", varchar.clone()),
+                        ("index_oid", bigint.clone()),
+                        ("table_name", varchar.clone()),
+                        ("table_oid", bigint.clone()),
+                        ("comment", varchar.clone()),
+                        ("tags", tags.clone()),
+                        ("is_unique", boolean.clone()),
+                        ("is_primary", boolean.clone()),
+                        ("expressions", varchar.clone()),
+                        ("sql", varchar.clone()),
+                    ],
+                    rows,
+                )
+            }
+            "duckdb_constraints" => self.constraint_rows()?,
             "duckdb_views" => {
                 let mut rows = Vec::new();
                 for listed in self.listed_entries() {

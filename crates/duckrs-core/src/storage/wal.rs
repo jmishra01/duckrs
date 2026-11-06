@@ -18,7 +18,7 @@ use super::serialization::generated::enums::{vector_type, wal_type};
 use super::serialization::generated::{self as g};
 use super::serialization::not_ported;
 use super::table_data::{self, DiskTable, PersistentRowGroup, fill_vector, fixed_width};
-use crate::catalog::{Catalog, OnCreateConflict, SequenceData};
+use crate::catalog::{Catalog, OnCreateConflict, RowIds, SequenceData};
 use crate::planner::binder::Binder;
 use crate::planner::logical::LogicalOperatorKind;
 use duckrs_common::column_data::ColumnDataCollection;
@@ -770,7 +770,7 @@ impl<'a> Replay<'a> {
             .create_table(&name, columns, generated, constraints, on_conflict)?
             .expect("OnCreateConflict::Error fails or creates");
         entry.set_source(disk.clone());
-        *entry.log.lock() = disk.table_log();
+        entry.reset_log();
         self.disk.insert(table_key, disk);
         Ok(())
     }
@@ -846,9 +846,17 @@ impl<'a> Replay<'a> {
                 let schema = self.catalog.schema_for(Some(&schema))?;
                 schema.create_type(&name, ty, OnCreateConflict::Ignore)?;
             }
-            StoredEntry::Index(info) => {
+            StoredEntry::Index(mut info, comment) => {
+                let index_type = match &mut info.kind {
+                    duckrs_parser::ast::CreateKind::Index { index_type, .. } => {
+                        std::mem::replace(index_type, "ART".to_string())
+                    }
+                    _ => unreachable!("an index has the info of an index"),
+                };
                 // the file has these rows under the index already, so they aren't checked again
-                if let Some((table, index)) = Binder::new(self.catalog).bind_create_index(&info)? {
+                if let Some((table, mut index)) = Binder::new(self.catalog).bind_create_index(&info)? {
+                    index.index_type = index_type;
+                    index.comment = comment;
                     table.indexes.write().push(Arc::new(index));
                 }
             }
@@ -988,10 +996,16 @@ impl<'a> Replay<'a> {
     /// Rewrites the tables that a log deleted or updated rows of.
     fn finish(self) -> Result<()> {
         for ((schema, name), live) in self.tables {
+            let table = self.catalog.get_table(Some(&schema), &name)?;
+            let ids: Vec<u64> = (0..live.row_ids.len())
+                .filter(|position| !live.deleted.contains(position))
+                .map(|position| live.row_ids[position])
+                .collect();
+            table.set_row_ids(RowIds::of_list(&ids, live.next_row_id));
             if live.deleted.is_empty() && live.updates.is_empty() {
+                table.reset_log();
                 continue;
             }
-            let table = self.catalog.get_table(Some(&schema), &name)?;
             let mut storage = table.write_storage()?;
             let types = storage.types().to_vec();
             let mut result = ColumnDataCollection::new(types.clone());
@@ -1018,6 +1032,8 @@ impl<'a> Replay<'a> {
                 result.append(&chunk);
             }
             *storage = result;
+            drop(storage);
+            table.reset_log();
         }
         Ok(())
     }

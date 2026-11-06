@@ -187,7 +187,7 @@ fn identity(table: &TableCatalogEntry) -> Result<Vec<BoundExpr>> {
 impl Binder<'_> {
     /// `Binder::Bind(AlterStatement)` and `AlterEntry`.
     pub fn bind_alter(&mut self, info: &AlterInfo) -> Result<BoundAlter> {
-        let schema = match self.catalog.schema_for(schema_of(&info.name)?) {
+        let schema = match self.catalog.schema_with_entry(schema_of(&info.name)?, &info.name.name) {
             Ok(schema) => schema,
             Err(_) if info.if_exists => return Ok(BoundAlter::Nothing),
             Err(error) => return Err(error),
@@ -232,7 +232,15 @@ impl Binder<'_> {
         }
         // `DependencyManager::AlterObject`
         let has_dependents = schema.is_referenced(&table) || !table.indexes.read().is_empty();
-        if has_dependents && !matches!(info.kind, AlterKind::AddColumn { .. } | AlterKind::SetDefault { .. }) {
+        if has_dependents
+            && !matches!(
+                info.kind,
+                AlterKind::AddColumn { .. }
+                    | AlterKind::SetDefault { .. }
+                    | AlterKind::SetTableOptions(_)
+                    | AlterKind::ResetTableOptions(_)
+            )
+        {
             return Err(Error::new(
                 ErrorKind::Dependency,
                 format!(

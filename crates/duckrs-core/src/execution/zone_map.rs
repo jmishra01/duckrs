@@ -37,7 +37,7 @@ pub fn row_group_count(rows: usize) -> usize {
 const MONOTONE_FUNCTIONS: &[&str] = &["floor", "ceil", "ceiling", "year", "decade", "century", "millennium"];
 
 /// The zones of a column, by the keys in which its values sort as they do in a comparison.
-fn compute_zones(table: &TableCatalogEntry, column: usize) -> Vec<ColumnZone> {
+fn compute_zones(table: &TableCatalogEntry, column: usize, known: &[ColumnZone]) -> Vec<ColumnZone> {
     if !has_ordered_statistics(&table.columns[column].ty) {
         return Vec::new();
     }
@@ -45,8 +45,12 @@ fn compute_zones(table: &TableCatalogEntry, column: usize) -> Vec<ColumnZone> {
         // what the file knows of its row groups: a query need not read those that it doesn't want
         return source.zones(column).unwrap_or_default();
     }
-    let mut zones: Vec<ColumnZone> = Vec::new();
+    let mut zones = known.to_vec();
+    let first_chunk = known.len() * CHUNKS_PER_ROW_GROUP;
     let read = table.for_each_chunk(column, |index, vector, count| {
+        if index < first_chunk {
+            return;
+        }
         if index % CHUNKS_PER_ROW_GROUP == 0 {
             zones.push(ColumnZone::default());
         }
@@ -96,14 +100,19 @@ fn compute_zones(table: &TableCatalogEntry, column: usize) -> Vec<ColumnZone> {
 
 /// `compute_zones`, once per state of the rows.
 fn zones_of(table: &TableCatalogEntry, column: usize) -> Arc<Vec<ColumnZone>> {
-    let version = {
-        let cached = table.statistics.lock();
-        if let Some(zones) = cached.zones.get(&column) {
-            return zones.clone();
+    let groups = row_group_count(table.row_count());
+    let (version, known) = {
+        let mut cached = table.statistics.lock();
+        if cached.unreported {
+            cached.forget();
         }
-        cached.version
+        let known = cached.zones.get(&column).cloned().unwrap_or_default();
+        if known.len() == groups {
+            return known;
+        }
+        (cached.version, known)
     };
-    let zones = Arc::new(compute_zones(table, column));
+    let zones = Arc::new(compute_zones(table, column, &known));
     let mut cached = table.statistics.lock();
     if cached.version == version {
         cached.zones.insert(column, zones.clone());
@@ -134,9 +143,10 @@ impl Group<'_> {
         if column == COLUMN_IDENTIFIER_ROW_ID {
             let first = self.group * ROW_GROUP_SIZE;
             let last = (first + ROW_GROUP_SIZE).min(self.rows).checked_sub(1)?;
+            let ids = self.table.row_ids(self.rows);
             return Some(ColumnZone {
-                min: Some(Value::bigint(first as i64)),
-                max: Some(Value::bigint(last as i64)),
+                min: Some(Value::bigint(ids.id(first) as i64)),
+                max: Some(Value::bigint(ids.id(last) as i64)),
                 ..ColumnZone::default()
             });
         }

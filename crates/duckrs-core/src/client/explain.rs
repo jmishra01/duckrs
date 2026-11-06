@@ -257,6 +257,15 @@ pub(super) fn physical_tree(
         Some(logical) => operator_info(logical, true),
         None => op.explain_details().into_iter().map(|d| (String::new(), d)).collect(),
     };
+    // C++ only knows when the scan has started
+    if analyze
+        && let Some(K::Get {
+            index_rows: Some(_), ..
+        }) = logical.map(|l| &l.kind)
+        && let Some((_, kind)) = info.iter_mut().find(|(key, _)| key == "Type")
+    {
+        *kind = "Index Scan".to_string();
+    }
     if analyze && let Some((scanned, total)) = op.row_groups_scanned() {
         info.push(("Row Groups Scanned".to_string(), format!("{scanned} / {total}")));
     }

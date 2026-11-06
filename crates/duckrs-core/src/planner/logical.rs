@@ -32,6 +32,9 @@ pub enum LogicalOperatorKind {
         /// `projection_ids`: the positions in `column_ids` that it outputs, without one all of them.
         /// A column keeps its binding either way.
         projection: Option<Vec<usize>>,
+        /// `is_index_scan`: the rows that an ART found, by position, which is all that gets read.
+        /// The filters still run on them.
+        index_rows: Option<Arc<Vec<usize>>>,
     },
     /// The `range` and `generate_series` table functions: `count` integers from `start`.
     Range {

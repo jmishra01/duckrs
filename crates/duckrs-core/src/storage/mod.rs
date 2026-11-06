@@ -8,6 +8,7 @@ pub mod checksum;
 pub mod compression;
 pub mod encode;
 mod fsst;
+mod index_data;
 pub mod log_writer;
 pub mod metadata;
 pub mod serialization;
@@ -89,6 +90,122 @@ mod tests {
         catalog
     }
 
+    /// The bitmasks that C++ wrote have to mean what the allocator takes them to mean, at the
+    /// sizes C++ gave the segments, or nothing it writes could be read by DuckDB.
+    #[test]
+    fn stored_arts_are_laid_out_as_the_allocator_lays_them_out() {
+        use crate::execution::art::allocator::{FixedSizeAllocator, PREFIX_METADATA_SIZE, segment_sizes};
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../duckrs/tests/fixtures/parsed_v200.db");
+        let catalog = Catalog::new("test");
+        let buffer = load_database(&path, &catalog, true).unwrap();
+        let block_size = buffer.block_manager().block_size();
+        assert_eq!(block_size, 16_376);
+        let mut buffers = 0;
+        for entry in checkpoint::read_catalog(&buffer).unwrap().entries {
+            let checkpoint::StoredEntry::Table(table) = entry else {
+                continue;
+            };
+            for index in &table.indexes {
+                let allocators = &index.allocator_infos;
+                assert_eq!(allocators.len(), 9, "{}", index.name);
+                let prefix_count = allocators[0].segment_size as usize - PREFIX_METADATA_SIZE;
+                assert!((prefix_count + 1).is_multiple_of(8), "{}", index.name);
+                for (info, size) in allocators.iter().zip(segment_sizes(prefix_count)) {
+                    assert_eq!(info.segment_size as usize, size, "{}", index.name);
+                    let allocator = FixedSizeAllocator::new(size, block_size);
+                    for (pointer, count) in info.block_pointers.iter().zip(&info.segment_counts) {
+                        let block = buffer.block_manager().read_block(pointer.block_id as u64).unwrap();
+                        let stored = &block[pointer.offset as usize..];
+                        assert_eq!(allocator.taken_segments(stored), *count as usize, "{}", index.name);
+                        buffers += 1;
+                    }
+                }
+            }
+        }
+        assert!(buffers > 0, "the fixture has to have an ART to compare with");
+    }
+
+    /// An ART that DuckDB wrote, read by the tree as it is. `tools/check_art.py` makes the files.
+    #[test]
+    #[ignore = "needs the files of tools/check_art.py"]
+    fn an_art_that_duckdb_wrote_can_be_read() {
+        use crate::execution::art::allocator::FixedSizeAllocator;
+        use crate::execution::art::key::ArtKey;
+        use crate::execution::art::pointer::{IndexPointer, NodePtr};
+        use crate::execution::art::tree::{AppendMode, Art, Conflict};
+        const ROWS: i64 = 20_000;
+        let text = |row: i64| format!("https://example.com/items/{row}");
+        let files = std::env::var("DUCKRS_ART_FILES").expect("the files to read");
+        for file in files.split(':') {
+            let catalog = Catalog::new("test");
+            let buffer = load_database(Path::new(file), &catalog, true).unwrap();
+            let block_size = buffer.block_manager().block_size();
+            let tables = checkpoint::read_catalog(&buffer).unwrap().entries.into_iter();
+            let table = tables
+                .filter_map(|entry| match entry {
+                    checkpoint::StoredEntry::Table(table) => Some(table),
+                    _ => None,
+                })
+                .find(|table| table.name == "t")
+                .expect("the table of the script");
+            assert_eq!(table.indexes.len(), 4, "{file}");
+            for index in &table.indexes {
+                let mut allocators = Vec::new();
+                for info in &index.allocator_infos {
+                    let mut allocator = FixedSizeAllocator::new(info.segment_size as usize, block_size);
+                    for ((id, pointer), count) in info
+                        .buffer_ids
+                        .iter()
+                        .zip(&info.block_pointers)
+                        .zip(&info.segment_counts)
+                    {
+                        let block = buffer.block_manager().read_block(pointer.block_id as u64).unwrap();
+                        allocator.load_buffer(*id, &block[pointer.offset as usize..], *count as usize);
+                    }
+                    allocators.push(allocator);
+                }
+                let root = NodePtr(IndexPointer::from_bits(index.root));
+                let unique = !index.name.starts_with("idx_groups") && !index.name.starts_with("idx_pairs");
+                let mut art = Art::from_parts(allocators, root, unique);
+                let scanned = art.scan().unwrap();
+                let rows: usize = scanned.iter().map(|(_, rows)| rows.len()).sum();
+                assert_eq!(rows, ROWS as usize, "{file} {}", index.name);
+                assert!(scanned.windows(2).all(|pair| pair[0].0 < pair[1].0), "{}", index.name);
+                let key_of = |row: i64| -> ArtKey {
+                    match index.name.as_str() {
+                        name if name.starts_with("idx_groups") => ArtKey::of((row % 7) as i32),
+                        name if name.starts_with("idx_pairs") => {
+                            let mut key = ArtKey::of_string(format!("group-{}", row % 300).as_bytes());
+                            key.concat(&ArtKey::of(row % 11));
+                            key
+                        }
+                        name if name.starts_with("PRIMARY") => ArtKey::of(row as i32),
+                        _ => ArtKey::of_string(text(row).as_bytes()),
+                    }
+                };
+                for row in (0..ROWS).step_by(97) {
+                    assert!(
+                        art.lookup(&key_of(row)).unwrap().contains(&row),
+                        "{file} {} {row}",
+                        index.name
+                    );
+                }
+                // what it read has to be good for changing, too
+                for row in (0..ROWS).step_by(3) {
+                    assert!(art.erase(&key_of(row), row).unwrap(), "{file} {} {row}", index.name);
+                }
+                for row in (0..ROWS).step_by(3) {
+                    assert_eq!(
+                        art.insert(&key_of(row), row, AppendMode::Default).unwrap(),
+                        Conflict::None
+                    );
+                }
+                let again: usize = art.scan().unwrap().iter().map(|(_, rows)| rows.len()).sum();
+                assert_eq!(again, ROWS as usize, "{file} {}", index.name);
+            }
+        }
+    }
+
     fn keys(table: &TableCatalogEntry) -> Vec<(Vec<String>, bool)> {
         table
             .keys()
@@ -117,7 +234,7 @@ mod tests {
             // the keys come from the rows, as the file doesn't give them
             let rows = parent.rows().unwrap();
             let keys = current_keys(&parent, &rows).unwrap();
-            let sizes: Vec<usize> = keys.as_ref().unwrap().iter().map(|k| k.len()).collect();
+            let sizes: Vec<usize> = keys.as_ref().unwrap().iter().map(|k| k.len().unwrap()).collect();
             assert_eq!(sizes, [2, 2, 2], "{file}");
         }
     }

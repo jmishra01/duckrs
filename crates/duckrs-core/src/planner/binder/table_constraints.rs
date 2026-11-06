@@ -57,7 +57,7 @@ pub(super) fn check_key_types(columns: &[ColumnDefinition], key: &[usize]) -> Re
         let ty = &columns[*index].ty;
         if matches!(
             ty.physical_type(),
-            PhysicalType::List | PhysicalType::Array | PhysicalType::Struct
+            PhysicalType::List | PhysicalType::Array | PhysicalType::Struct | PhysicalType::Interval
         ) {
             return Err(Error::new(
                 ErrorKind::InvalidType,

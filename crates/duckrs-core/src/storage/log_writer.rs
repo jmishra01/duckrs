@@ -11,22 +11,26 @@
 
 use super::block_manager::DB_IDENTIFIER_LEN;
 use super::checksum::checksum;
+use super::index_data::TableIndex;
 use super::metadata::MetaBlockPointer;
 use super::serialization::custom::QualifiedName;
 use super::serialization::generated::enums::wal_type;
 use super::serialization::generated::{self as g};
 use super::serialization::to_stored::write_not_ported;
 use super::table_data::fixed_width;
-use super::writer::{macro_info, raw_bytes, schema_info, sequence_info, table_info, type_info, view_info};
-use crate::catalog::{
-    Catalog, MacroCatalogEntry, SchemaCatalogEntry, SequenceCatalogEntry, TEMP_SCHEMA, TableCatalogEntry, TableOrView,
-    ViewCatalogEntry,
+use super::writer::{
+    index_info, macro_info, parents_first, raw_bytes, schema_info, sequence_info, table_info, type_info, view_info,
 };
+use crate::catalog::{
+    Catalog, IndexCatalogEntry, MacroCatalogEntry, RowIds, SchemaCatalogEntry, SequenceCatalogEntry, TEMP_SCHEMA,
+    TableCatalogEntry, TableConstraint, TableLog, TableOrView, ViewCatalogEntry,
+};
+use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::serializer::{BinarySerializer, SerializationOptions, Serialize};
 use duckrs_common::types::{ListEntry, LogicalType, LogicalTypeId, PhysicalType, StringT};
 use duckrs_common::vector::{DataChunk, SelectionVector, Vector};
 use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -52,6 +56,8 @@ fn path_of((schema, name): &Key) -> Option<QualifiedName> {
 struct Durable {
     schemas: BTreeMap<String, String>,
     tables: BTreeMap<Key, (Key, Arc<TableCatalogEntry>)>,
+    /// Each with the table it is on, as a table that goes takes them along.
+    indexes: BTreeMap<Key, (Key, Arc<TableCatalogEntry>, Arc<IndexCatalogEntry>)>,
     views: BTreeMap<Key, (Key, Arc<ViewCatalogEntry>)>,
     macros: [BTreeMap<Key, (Key, Arc<MacroCatalogEntry>)>; 2],
     sequences: BTreeMap<Key, (Key, Arc<SequenceCatalogEntry>, u64)>,
@@ -71,6 +77,10 @@ impl Durable {
             for entry in schema.tables_and_views() {
                 match entry {
                     TableOrView::Table(table) => {
+                        for index in table.indexes.read().iter() {
+                            let entry = (named(&index.name), table.clone(), index.clone());
+                            result.indexes.insert(key(&schema.name, &index.name), entry);
+                        }
                         result
                             .tables
                             .insert(key(&schema.name, &table.name), (named(&table.name), table));
@@ -247,12 +257,16 @@ fn flat(vector: &Vector, count: usize) -> Vector {
     vector
 }
 
-/// `DataChunk::Serialize`.
 fn write_chunk(s: &mut BinarySerializer, chunk: &DataChunk) -> Result<()> {
+    write_chunk_as(s, 101, chunk)
+}
+
+/// `DataChunk::Serialize`.
+fn write_chunk_as(s: &mut BinarySerializer, field: u16, chunk: &DataChunk) -> Result<()> {
     let count = chunk.len();
     let types = chunk.types();
     let mut result = Ok(());
-    s.write_object(101, "chunk", |s| {
+    s.write_object(field, "chunk", |s| {
         s.write_property(100, "rows", &(count as u32));
         s.write_property(101, "types", &types);
         s.write_list(102, "columns", types.len(), |s, i| {
@@ -267,35 +281,105 @@ fn write_chunk(s: &mut BinarySerializer, chunk: &DataChunk) -> Result<()> {
     result
 }
 
+/// Rows by the ids that a replay gives them.
+fn log_deletes(records: &mut Records, ids: &[u64]) -> Result<()> {
+    for ids in ids.chunks(STANDARD_VECTOR_SIZE) {
+        let mut vector = Vector::new(LogicalType::BIGINT, ids.len());
+        for (target, id) in vector.data_mut::<i64>().iter_mut().zip(ids) {
+            *target = *id as i64;
+        }
+        let chunk = DataChunk::from_columns(vec![vector], ids.len());
+        let mut result = Ok(());
+        records.entry(wal_type::DELETE_TUPLE, |s| result = write_chunk(s, &chunk));
+        result?;
+    }
+    Ok(())
+}
+
+/// `WriteAheadLog::WriteUpdate` of a column for the rows at `positions`, in order, whose ids in a
+/// replay are `ids`.
+fn log_update(
+    records: &mut Records,
+    rows: &ColumnDataCollection,
+    column: usize,
+    positions: &[usize],
+    ids: &[u64],
+) -> Result<()> {
+    let mut done = 0;
+    for part in positions.chunk_by(|a, b| a / STANDARD_VECTOR_SIZE == b / STANDARD_VECTOR_SIZE) {
+        let chunk = rows.chunk(part[0] / STANDARD_VECTOR_SIZE);
+        let selection = part.iter().map(|at| (at % STANDARD_VECTOR_SIZE) as u32).collect();
+        let mut values = chunk.column(column).clone();
+        values.slice(&SelectionVector::from_vec(selection), part.len());
+        let mut row_ids = Vector::new(LogicalType::BIGINT, part.len());
+        for (target, id) in row_ids.data_mut::<i64>().iter_mut().zip(&ids[done..]) {
+            *target = *id as i64;
+        }
+        done += part.len();
+        let update = DataChunk::from_columns(vec![values, row_ids], part.len());
+        let mut result = Ok(());
+        records.entry(wal_type::UPDATE_TUPLE, |s| {
+            s.write_property(101, "column_indexes", &vec![column as u64]);
+            result = write_chunk_as(s, 102, &update);
+        });
+        result?;
+    }
+    Ok(())
+}
+
 /// What changed of the rows of a table, in records.
 fn log_rows(records: &mut Records, name: &Key, table: &TableCatalogEntry) -> Result<()> {
     let mut log = table.log.lock();
-    let rows = table.row_count();
-    if !log.rewritten && rows == log.logged_rows {
+    let count = table.row_count();
+    let ids = table.row_ids(count);
+    if Arc::ptr_eq(&ids, &log.logged) && log.updated.is_empty() {
         return Ok(());
     }
-    records.use_table(name);
-    if log.rewritten || rows < log.logged_rows {
-        let ids: Vec<u64> = log.old_ids.iter().copied().chain(log.first_id..log.next_id).collect();
-        for ids in ids.chunks(STANDARD_VECTOR_SIZE) {
-            let mut vector = Vector::new(LogicalType::BIGINT, ids.len());
-            for (target, id) in vector.data_mut::<i64>().iter_mut().zip(ids) {
-                *target = *id as i64;
-            }
-            let chunk = DataChunk::from_columns(vec![vector], ids.len());
-            let mut result = Ok(());
-            records.entry(wal_type::DELETE_TUPLE, |s| result = write_chunk(s, &chunk));
-            result?;
+    let first_new = ids.first_from(log.logged.next());
+    if first_new == log.logged.len() && first_new == count && log.updated.is_empty() {
+        let gone = log.logged.missing_from(&ids);
+        if gone.is_empty() {
+            log.logged = ids;
+            return Ok(());
         }
-        log.old_ids.clear();
-        log.first_id = log.next_id;
-        log.logged_rows = 0;
     }
+    records.use_table(name);
     let storage = table.rows()?;
-    let first = log.logged_rows;
-    let mut row = first / STANDARD_VECTOR_SIZE * STANDARD_VECTOR_SIZE;
-    for chunk in storage.chunks().skip(first / STANDARD_VECTOR_SIZE) {
-        let skip = first.saturating_sub(row);
+    let mut replayed = (*log.replayed).clone();
+    let columns: Vec<usize> = log.updated_columns.iter().copied().collect();
+    // a nested column takes more than a column in an update, and a replay sees it as a new row
+    let nested = columns
+        .iter()
+        .any(|c| table.columns[*c].ty.physical_type() == PhysicalType::Struct);
+    let first_written = if nested {
+        let all: Vec<u64> = replayed
+            .ranges()
+            .flat_map(|(id, count)| id..id + count as u64)
+            .collect();
+        log_deletes(records, &all)?;
+        replayed = RowIds::starting_at(replayed.next());
+        0
+    } else {
+        // rows that come after these go in with their new values anyway
+        let (positions, updated): (Vec<usize>, Vec<u64>) = log
+            .updated
+            .iter()
+            .filter_map(|id| Some((ids.position(id)?, log.replayed.id(log.logged.position(id)?))))
+            .unzip();
+        if !positions.is_empty() {
+            for column in &columns {
+                log_update(records, &storage, *column, &positions, &updated)?;
+            }
+        }
+        let gone = log.logged.missing_from(&ids);
+        let gone_ids: Vec<u64> = gone.iter().map(|at| log.replayed.id(*at)).collect();
+        log_deletes(records, &gone_ids)?;
+        replayed.remove(&gone);
+        first_new
+    };
+    let mut row = first_written / STANDARD_VECTOR_SIZE * STANDARD_VECTOR_SIZE;
+    for chunk in storage.chunks().skip(first_written / STANDARD_VECTOR_SIZE) {
+        let skip = first_written.saturating_sub(row);
         let mut chunk = chunk.clone();
         let count = chunk.len();
         row += count;
@@ -310,9 +394,43 @@ fn log_rows(records: &mut Records, name: &Key, table: &TableCatalogEntry) -> Res
         records.entry(wal_type::INSERT_TUPLE, |s| result = write_chunk(s, &chunk));
         result?;
     }
-    log.next_id += (rows - first) as u64;
-    log.logged_rows = rows;
-    log.rewritten = false;
+    replayed.fill(count);
+    log.replayed = Arc::new(replayed);
+    log.logged = ids;
+    log.updated.clear();
+    log.updated_columns.clear();
+    Ok(())
+}
+
+/// `SerializeIndex`: an index on what the log holds of its table, whose rows have the ids they get
+/// when the log is replayed.
+fn log_index(
+    records: &mut Records,
+    info: g::CreateInfo,
+    table: &TableCatalogEntry,
+    index: &Arc<IndexCatalogEntry>,
+    block_size: usize,
+) -> Result<()> {
+    let mut tree = TableIndex::of_index(table, index, block_size);
+    {
+        let log = table.log.lock();
+        let mut first = 0;
+        for chunk in table.rows()?.chunks() {
+            tree.add(chunk, |row| log.replayed.id(first + row) as i64)?;
+            first += chunk.len();
+        }
+    }
+    let (storage, buffers) = tree.storage_info_for_log()?;
+    records.entry(wal_type::CREATE_INDEX, |s| {
+        s.write_property(101, "index_catalog_entry", &Some(Box::new(info)));
+        s.write_property(102, "index_storage_info", &storage);
+        s.write_list(103, "index_storage", buffers.len(), |s, allocator| {
+            for buffer in &buffers[allocator] {
+                s.write_varint_unsigned(buffer.len() as u64);
+                s.write_raw(buffer);
+            }
+        });
+    });
     Ok(())
 }
 
@@ -438,8 +556,45 @@ impl WriteAheadLog {
         Ok(())
     }
 
+    /// The tables that go and come back: each that changed its entry, as there are no records for
+    /// ALTER, and what references one of those, as that keeps it from being dropped.
+    fn written_again(&self, current: &Durable) -> BTreeSet<Key> {
+        let changed = |k: &Key, table: &Arc<TableCatalogEntry>| {
+            current.tables.get(k).is_some_and(|(_, new)| !Arc::ptr_eq(new, table))
+        };
+        let mut again: BTreeSet<Key> = self
+            .durable
+            .tables
+            .iter()
+            .filter(|(k, (_, table))| changed(k, table))
+            .map(|(k, _)| k.clone())
+            .collect();
+        loop {
+            let referencing: Vec<Key> = current
+                .tables
+                .iter()
+                .filter(|(k, (_, table))| {
+                    !again.contains(*k)
+                        && self.durable.tables.contains_key(*k)
+                        && table.constraints.iter().any(|constraint| match constraint {
+                            TableConstraint::ForeignKey(foreign) => foreign
+                                .referenced
+                                .as_ref()
+                                .is_some_and(|parent| again.contains(&key(&table.schema, &parent.name))),
+                            _ => false,
+                        })
+                })
+                .map(|(k, _)| k.clone())
+                .collect();
+            if referencing.is_empty() {
+                return again;
+            }
+            again.extend(referencing);
+        }
+    }
+
     /// What differs from what is durable, in records. Drops go first, as a name can come back.
-    fn differences(&self, catalog: &Catalog, name: &str, current: &Durable) -> Result<Records> {
+    fn differences(&self, catalog: &Catalog, name: &str, current: &Durable, block_size: usize) -> Result<Records> {
         let mut records = Records(Vec::new());
         let schema_of = |key: &Key| -> Result<Arc<SchemaCatalogEntry>> { catalog.schema_for(Some(&key.0)) };
         let gone = |old_same: bool, new_exists: bool| !new_exists || !old_same;
@@ -459,9 +614,29 @@ impl WriteAheadLog {
                 }
             }
         }
-        for (k, (original, table)) in &self.durable.tables {
-            let same = current.tables.get(k).is_some_and(|(_, new)| Arc::ptr_eq(new, table));
-            if !same {
+        let again = self.written_again(current);
+        let same_table = |k: &Key, table: &Arc<TableCatalogEntry>, tables: &BTreeMap<Key, _>| {
+            let tables: &BTreeMap<Key, (Key, Arc<TableCatalogEntry>)> = tables;
+            !again.contains(k) && tables.get(k).is_some_and(|(_, other)| Arc::ptr_eq(other, table))
+        };
+        for (k, (original, table, index)) in &self.durable.indexes {
+            let same = current
+                .indexes
+                .get(k)
+                .is_some_and(|(_, _, new)| Arc::ptr_eq(new, index));
+            let table_key = key(&original.0, &table.name);
+            if !same && same_table(&table_key, table, &current.tables) {
+                records.drop_entry(wal_type::DROP_INDEX, original);
+            }
+        }
+        // those that have a foreign key go first, as what they reference can't go before them
+        let tables: Vec<_> = self.durable.tables.iter().collect();
+        for position in parents_first(tables.iter().map(|(_, (_, table))| table))
+            .into_iter()
+            .rev()
+        {
+            let (k, (original, table)) = tables[position];
+            if !same_table(k, table, &current.tables) {
                 records.drop_entry(wal_type::DROP_TABLE, original);
             }
         }
@@ -559,13 +734,14 @@ impl WriteAheadLog {
                 }
             }
         }
-        for (k, (original, table)) in &current.tables {
-            let same = self
-                .durable
-                .tables
-                .get(k)
-                .is_some_and(|(_, old)| Arc::ptr_eq(old, table));
-            if !same {
+        let tables: Vec<_> = current.tables.iter().collect();
+        for position in parents_first(tables.iter().map(|(_, (_, table))| table)) {
+            let (k, (original, table)) = tables[position];
+            if !same_table(k, table, &self.durable.tables) {
+                if again.contains(k) {
+                    // its rows go in again, under the ids of a new table
+                    *table.log.lock() = TableLog::default();
+                }
                 let info = table_info(name, &*schema_of(original)?, table)?;
                 let entry = g::WALCreateTable {
                     table: Some(Box::new(info)),
@@ -573,6 +749,18 @@ impl WriteAheadLog {
                 records.entry(wal_type::CREATE_TABLE, |s| entry.write_members(s));
             }
             log_rows(&mut records, original, table)?;
+        }
+        for (k, (original, table, index)) in &current.indexes {
+            let same = self
+                .durable
+                .indexes
+                .get(k)
+                .is_some_and(|(_, old_table, old)| Arc::ptr_eq(old, index) && Arc::ptr_eq(old_table, table))
+                && !again.contains(&key(&original.0, &table.name));
+            if !same {
+                let info = index_info(name, &*schema_of(original)?, table, index)?;
+                log_index(&mut records, info, table, index, block_size)?;
+            }
         }
         for (k, (original, view)) in &current.views {
             let same = self.durable.views.get(k).is_some_and(|(_, old)| Arc::ptr_eq(old, view));
@@ -595,10 +783,11 @@ impl WriteAheadLog {
         name: &str,
         identifier: &[u8; DB_IDENTIFIER_LEN],
         iteration: u64,
+        block_size: usize,
     ) -> Result<bool> {
         let current = Durable::of(catalog);
         self.check_storable(catalog, name, &current)?;
-        let mut records = self.differences(catalog, name, &current)?;
+        let mut records = self.differences(catalog, name, &current, block_size)?;
         self.durable = current;
         if records.0.is_empty() {
             return Ok(false);

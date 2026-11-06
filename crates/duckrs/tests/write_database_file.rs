@@ -178,22 +178,140 @@ fn checkpoints_replace_each_other() {
     );
 }
 
-/// What has no place in a file yet says so when it is made, and not when the file is written.
+/// Keys of every kind, whose tables sort before what they reference.
+const KEYS: &[&str] = &[
+    "CREATE TABLE parent (id INTEGER PRIMARY KEY, name VARCHAR UNIQUE, note VARCHAR NOT NULL, n INTEGER CHECK (n >= 0))",
+    "CREATE TABLE a_child (id BIGINT PRIMARY KEY, parent INTEGER REFERENCES parent (id), boss BIGINT, \
+     FOREIGN KEY (boss) REFERENCES a_child (id))",
+    "CREATE TABLE pairs (a INTEGER, b VARCHAR, c DOUBLE, PRIMARY KEY (a, b))",
+    "CREATE TABLE no_rows (i INTEGER PRIMARY KEY, j VARCHAR UNIQUE)",
+    "INSERT INTO parent SELECT i, 'https://example.com/items/' || i, 'note ' || (i % 7), i % 3 FROM range(20000) r(i)",
+    "INSERT INTO parent VALUES (-1, NULL, 'no name', 0)",
+    "INSERT INTO a_child SELECT i, i % 100, NULL FROM range(2500) r(i)",
+    "INSERT INTO a_child SELECT i + 5000, i % 100, i FROM range(2500) r(i)",
+    "INSERT INTO pairs SELECT i % 50, 'pair ' || i, i / 2.0 FROM range(3000) r(i)",
+    "CREATE INDEX by_note ON parent (note)",
+    "CREATE UNIQUE INDEX by_sum ON parent ((id + 1))",
+    "CREATE INDEX by_c ON pairs (c)",
+];
+
+fn refused(connection: &mut Connection, sql: &str, expected: &str) {
+    let error = connection.query(sql).unwrap_err().to_string();
+    assert!(error.contains(expected), "{sql}: {error}");
+}
+
+fn check_keys(connection: &mut Connection) {
+    refused(
+        connection,
+        "INSERT INTO parent VALUES (5, 'x', 'n', 0)",
+        "Duplicate key",
+    );
+    refused(
+        connection,
+        "INSERT INTO parent VALUES (500000, 'https://example.com/items/7', 'n', 0)",
+        "Duplicate key",
+    );
+    refused(
+        connection,
+        "INSERT INTO a_child VALUES (9999, 123456, NULL)",
+        "foreign key",
+    );
+    refused(
+        connection,
+        "INSERT INTO a_child VALUES (9999, 1, 123456)",
+        "foreign key",
+    );
+    refused(connection, "INSERT INTO pairs VALUES (1, 'pair 1', 0)", "Duplicate key");
+    refused(connection, "DELETE FROM parent WHERE id = 1", "still referenced");
+    assert_eq!(
+        rows(
+            connection,
+            "SELECT (SELECT count(*) FROM parent), (SELECT count(*) FROM a_child), (SELECT count(*) FROM pairs)"
+        ),
+        ["20001|5000|3000"]
+    );
+}
+
+/// A file with keys takes writes like any other, and comes back with what it holds them to.
 #[test]
-fn keys_are_refused_up_front() {
+fn keys_and_indexes_come_back() {
     let file = path("keys.db");
+    {
+        let db = Database::open(&file, false).unwrap();
+        let mut connection = db.connect().unwrap();
+        for sql in KEYS {
+            run(&mut connection, sql);
+        }
+        run(&mut connection, "CHECKPOINT");
+        check_keys(&mut connection);
+    }
+    // for `tools/check_written.py`: DuckDB holds the ART of each of these to their rows
+    if let Some(target) = std::env::var_os("DUCKRS_KEEP_KEYS") {
+        std::fs::copy(&file, target).unwrap();
+    }
+    {
+        let db = Database::open(&file, false).unwrap();
+        let mut connection = db.connect().unwrap();
+        check_keys(&mut connection);
+        run(&mut connection, "INSERT INTO parent VALUES (30000, 'new', 'note', 1)");
+        run(&mut connection, "DELETE FROM pairs WHERE a = 1");
+        run(&mut connection, "UPDATE pairs SET c = 0 WHERE a = 2");
+        run(&mut connection, "DROP INDEX by_c");
+        run(&mut connection, "CREATE INDEX by_a ON pairs (a)");
+    }
     let db = Database::open(&file, false).unwrap();
     let mut connection = db.connect().unwrap();
-    for sql in [
-        "CREATE TABLE a (i INTEGER PRIMARY KEY)",
-        "CREATE TABLE b (i INTEGER UNIQUE)",
-    ] {
-        let error = connection.query(sql).unwrap_err().to_string();
-        assert!(error.contains("not yet ported"), "{sql}: {error}");
+    refused(
+        &mut connection,
+        "INSERT INTO parent VALUES (30000, 'y', 'note', 1)",
+        "Duplicate key",
+    );
+    run(&mut connection, "DROP INDEX by_note");
+    run(&mut connection, "DROP INDEX by_a");
+    refused(&mut connection, "DROP INDEX by_c", "does not exist");
+    assert_eq!(rows(&mut connection, "SELECT count(*) FROM pairs"), ["2940"]);
+}
+
+/// Without a checkpoint the indexes are in the log, in the ids its rows get when it is replayed.
+#[test]
+fn a_log_brings_back_keys_and_indexes() {
+    let file = path("keys-logged.db");
+    {
+        let db = Database::open(&file, false).unwrap();
+        let mut connection = db.connect().unwrap();
+        run(&mut connection, "PRAGMA disable_checkpoint_on_shutdown");
+        for sql in KEYS {
+            run(&mut connection, sql);
+        }
+        run(&mut connection, "CHECKPOINT");
+        run(&mut connection, "INSERT INTO parent VALUES (30000, 'new', 'note', 1)");
+        run(&mut connection, "DELETE FROM pairs WHERE a = 1");
+        run(&mut connection, "UPDATE pairs SET c = 0 WHERE a = 2");
+        run(&mut connection, "UPDATE parent SET note = 'changed' WHERE id = 3");
+        run(&mut connection, "DROP INDEX by_c");
+        run(&mut connection, "CREATE INDEX by_a ON pairs (a)");
+        run(&mut connection, "CREATE TABLE later (i INTEGER PRIMARY KEY)");
+        run(&mut connection, "INSERT INTO later VALUES (1), (2)");
+        run(&mut connection, "CREATE UNIQUE INDEX later_i ON later (i)");
     }
-    run(&mut connection, "CREATE TEMP TABLE c (i INTEGER PRIMARY KEY)");
-    run(&mut connection, "CREATE TABLE d (i INTEGER)");
-    assert!(connection.query("CREATE INDEX e ON d (i)").is_err());
+    let mut log = file.clone().into_os_string();
+    log.push(".wal");
+    assert!(std::fs::metadata(&log).unwrap().len() > 0);
+    if let Some(target) = std::env::var_os("DUCKRS_KEEP_KEYS_LOGGED") {
+        std::fs::copy(&file, &target).unwrap();
+        let mut target_log = target;
+        target_log.push(".wal");
+        std::fs::copy(&log, target_log).unwrap();
+    }
+    let db = Database::open(&file, false).unwrap();
+    let mut connection = db.connect().unwrap();
+    refused(
+        &mut connection,
+        "INSERT INTO parent VALUES (30000, 'y', 'n', 1)",
+        "Duplicate key",
+    );
+    refused(&mut connection, "INSERT INTO later VALUES (2)", "Duplicate key");
+    assert_eq!(rows(&mut connection, "SELECT count(*) FROM pairs"), ["2940"]);
 }
 
 #[test]
@@ -616,4 +734,37 @@ fn commits_survive_kill_9() {
         acknowledged = state;
     }
     assert!(acknowledged > 30, "only {acknowledged} commits were tested");
+}
+
+/// A table that is referenced comes back as a new entry, with what references it in the way.
+#[test]
+fn a_referenced_table_can_change_in_the_log() {
+    let file = path("keys-altered.db");
+    {
+        let db = Database::open(&file, false).unwrap();
+        let mut connection = db.connect().unwrap();
+        run(&mut connection, "PRAGMA disable_checkpoint_on_shutdown");
+        run(&mut connection, "CREATE TABLE p (i INTEGER PRIMARY KEY)");
+        run(&mut connection, "CREATE TABLE c (i INTEGER REFERENCES p (i))");
+        run(&mut connection, "INSERT INTO p VALUES (1), (2)");
+        run(&mut connection, "INSERT INTO c VALUES (1)");
+        run(&mut connection, "CREATE INDEX c_i ON c (i)");
+        run(&mut connection, "CHECKPOINT");
+        run(&mut connection, "ALTER TABLE p ADD COLUMN j INTEGER");
+        run(&mut connection, "INSERT INTO p VALUES (3, 3)");
+    }
+    if let Some(target) = std::env::var_os("DUCKRS_KEEP_KEYS_ALTERED") {
+        let mut log = file.clone().into_os_string();
+        log.push(".wal");
+        std::fs::copy(&file, &target).unwrap();
+        let mut target_log = target;
+        target_log.push(".wal");
+        std::fs::copy(&log, target_log).unwrap();
+    }
+    let db = Database::open(&file, false).unwrap();
+    let mut connection = db.connect().unwrap();
+    assert_eq!(rows(&mut connection, "SELECT count(*), count(j) FROM p"), ["3|1"]);
+    refused(&mut connection, "INSERT INTO c VALUES (9)", "foreign key");
+    assert_eq!(rows(&mut connection, "SELECT count(*) FROM c"), ["1"]);
+    run(&mut connection, "DROP INDEX c_i");
 }

@@ -49,10 +49,12 @@ pub(crate) fn has_ordered_statistics(ty: &LogicalType) -> bool {
         )
 }
 
-/// The statistics of a table's columns, from its rows.
-fn compute_statistics(table: &Arc<TableCatalogEntry>) -> Option<Vec<Stats>> {
+/// The statistics of a table's columns, from its rows, or those at `positions`, in order.
+fn compute_statistics(table: &Arc<TableCatalogEntry>, positions: Option<Vec<usize>>) -> Option<Vec<Stats>> {
     // a file knows these already, and reading its rows for them would read the whole table
-    if let Some(statistics) = table.source().and_then(|source| source.column_statistics()) {
+    if positions.is_none()
+        && let Some(statistics) = table.source().and_then(|source| source.column_statistics())
+    {
         return Some(statistics);
     }
     let functions = BuiltinFunctions::get();
@@ -82,6 +84,7 @@ fn compute_statistics(table: &Arc<TableCatalogEntry>) -> Option<Vec<Stats>> {
             column_ids: (0..table.columns.len()).collect(),
             filters: Vec::new(),
             projection: None,
+            index_rows: positions.map(Arc::new),
         },
         Vec::new(),
     );
@@ -120,18 +123,60 @@ fn compute_statistics(table: &Arc<TableCatalogEntry>) -> Option<Vec<Stats>> {
     Some(statistics)
 }
 
+/// What is known of the columns of `table`. Reading all rows takes long, and a table that is written
+/// to would pay for that with each statement, so this goes on from what was known: new values add to
+/// it, and rows that went don't take anything away, as in C++.
 pub(super) fn table_statistics(table: &Arc<TableCatalogEntry>) -> Option<Arc<Vec<Stats>>> {
-    let version = {
-        let cached = table.statistics.lock();
-        if let Some(columns) = &cached.columns {
-            return Some(columns.clone());
+    let rows = table.row_count();
+    let (version, known, new_rows) = {
+        let mut cached = table.statistics.lock();
+        if cached.unreported {
+            cached.forget();
         }
-        cached.version
+        match cached.columns.clone() {
+            Some(columns) if cached.covered >= rows && cached.updated.is_empty() => return Some(columns),
+            Some(columns) => {
+                let mut positions = std::mem::take(&mut cached.updated);
+                positions.extend(cached.covered..rows);
+                positions.retain(|position| *position < rows);
+                positions.sort_unstable();
+                positions.dedup();
+                (cached.version, Some(columns), positions)
+            }
+            None => (cached.version, None, Vec::new()),
+        }
     };
-    let columns = Arc::new(compute_statistics(table)?);
+    let merged = match known {
+        Some(known) => {
+            let Some(new) = compute_statistics(table, Some(new_rows)) else {
+                table.statistics.lock().forget();
+                return None;
+            };
+            known.iter().cloned().zip(new).map(|(a, b)| union(a, b)).collect()
+        }
+        None => {
+            let mut columns = compute_statistics(table, None)?;
+            // C++ doesn't narrow them when rows go, so that it looks for such a key in an index, where
+            // it isn't, and reports an index scan rather than an empty result
+            if table.row_ids(rows).has_gaps() {
+                for key in table.scan_keys() {
+                    if let [column] = key.columns.as_slice() {
+                        columns[*column].min = None;
+                        columns[*column].max = None;
+                    }
+                }
+            }
+            columns
+        }
+    };
+    let columns = Arc::new(merged);
     let mut cached = table.statistics.lock();
     if cached.version == version {
         cached.columns = Some(columns.clone());
+        cached.covered = rows;
+    } else {
+        // it isn't known what these saw of what came since
+        cached.forget();
     }
     Some(columns)
 }
@@ -237,6 +282,7 @@ fn compute_distinct_counts(table: &Arc<TableCatalogEntry>) -> Option<TableDistin
             column_ids: (0..table.columns.len()).collect(),
             filters: Vec::new(),
             projection: None,
+            index_rows: None,
         },
         Vec::new(),
     );

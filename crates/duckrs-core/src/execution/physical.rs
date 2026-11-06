@@ -14,8 +14,8 @@ use super::expression_executor::{execute, select};
 use super::upsert::upsert;
 use super::zone_map::{CHUNKS_PER_ROW_GROUP, groups_to_scan};
 use crate::catalog::{
-    ColumnDefinition, GeneratedColumn, OnCreateConflict, SchemaCatalogEntry, TableCatalogEntry, TableConstraint,
-    TableCursor, TableSource,
+    ColumnDefinition, GeneratedColumn, OnCreateConflict, RowIds, SchemaCatalogEntry, TableCatalogEntry,
+    TableConstraint, TableCursor, TableSource,
 };
 use crate::execution::run_plan;
 use crate::function::aggregates::{AggregateState, value_keys};
@@ -136,12 +136,15 @@ pub trait PhysicalOperator: fmt::Debug + Send + Sync {
 
 /// Where a table scan is.
 struct TableScanState {
+    ids: Arc<RowIds>,
     next: usize,
     remaining: usize,
     /// per row group, whether its rows can pass the filter
     groups: Vec<bool>,
     /// Reads the table from its file, if its rows are still there.
     cursor: Option<FileScan>,
+    /// How far an index scan got in `index_rows`.
+    next_index_row: usize,
 }
 
 /// What a scan reads of a file. `column_ids` lists all columns for the filter and the projection to
@@ -162,9 +165,82 @@ pub struct PhysicalTableScan {
     pub types: Vec<LogicalType>,
     /// what rows must meet, on `column_ids`
     pub filter: Option<BoundExpr>,
+    /// the rows to read, in order, instead of all of them
+    pub index_rows: Option<Arc<Vec<usize>>>,
 }
 
 impl PhysicalTableScan {
+    /// What the columns of a scan are for rows of a chunk that starts at `first_row`.
+    fn scan_columns(
+        &self,
+        chunk: &DataChunk,
+        ids: &RowIds,
+        first_row: usize,
+        cursor: Option<&FileScan>,
+    ) -> Result<Vec<Vector>> {
+        self.column_ids
+            .iter()
+            .enumerate()
+            .map(|(position, &i)| {
+                if i == COLUMN_IDENTIFIER_ROW_ID {
+                    return ids.vector(first_row, chunk.len());
+                }
+                Ok(match cursor.map(|scan| &scan.columns[position]) {
+                    None => chunk.column(i).clone(),
+                    Some(Ok(at)) => chunk.column(*at).clone(),
+                    Some(Err(unread)) => unread.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// The filter, then the columns it may be the only one to read, of a chunk that was scanned.
+    fn finish_chunk(&self, mut result: DataChunk) -> Result<Option<DataChunk>> {
+        // the filter reads what it scans, so the columns go after that and before the slice
+        let mut selected = None;
+        if let Some(filter) = &self.filter {
+            let (sel, matched) = select(filter, &result)?;
+            if matched == 0 {
+                return Ok(None);
+            }
+            if matched != result.len() {
+                selected = Some((sel, matched));
+            }
+        }
+        if let Some(positions) = &self.projection {
+            let columns = positions.iter().map(|&p| result.column(p).clone()).collect();
+            result = DataChunk::from_columns(columns, result.len());
+        }
+        if let Some((sel, matched)) = selected {
+            result.slice(&sel, matched);
+        }
+        Ok(Some(result))
+    }
+
+    /// The next rows of an index scan that have any left after the filter: those of one chunk.
+    fn next_index_chunk(&self, rows: &[usize], next: &mut usize) -> Result<Option<DataChunk>> {
+        let storage = self.table.rows()?;
+        let ids = self.table.row_ids(storage.len());
+        while *next < rows.len() {
+            let index = rows[*next] / STANDARD_VECTOR_SIZE;
+            let first_row = index * STANDARD_VECTOR_SIZE;
+            let mut selected = Vec::new();
+            while let Some(row) = rows.get(*next).filter(|row| **row / STANDARD_VECTOR_SIZE == index) {
+                selected.push((*row - first_row) as u32);
+                *next += 1;
+            }
+            let chunk = storage.chunk(index);
+            let columns = self.scan_columns(chunk, &ids, first_row, None)?;
+            let mut result = DataChunk::from_columns(columns, chunk.len());
+            let count = selected.len();
+            result.slice(&SelectionVector::from_vec(selected), count);
+            if let Some(result) = self.finish_chunk(result)? {
+                return Ok(Some(result));
+            }
+        }
+        Ok(None)
+    }
+
     fn file_scan(&self, source: Arc<dyn TableSource>) -> FileScan {
         let mut used = vec![self.projection.is_none(); self.column_ids.len()];
         for &position in self.projection.iter().flatten() {
@@ -217,29 +293,40 @@ impl PhysicalOperator for PhysicalTableScan {
         let remaining = self.table.row_count();
         let groups = groups_to_scan(&self.table, &self.column_ids, self.filter.as_ref(), remaining);
         let cursor = self.table.source().map(|source| self.file_scan(source));
+        let ids = self.table.row_ids(remaining);
         Box::new(TableScanState {
+            ids,
             next: 0,
             remaining,
             groups,
             cursor,
+            next_index_row: 0,
         })
     }
     fn row_groups_scanned(&self) -> Option<(usize, usize)> {
+        if self.index_rows.is_some() {
+            return None;
+        }
         let rows = self.table.row_count();
         let groups = groups_to_scan(&self.table, &self.column_ids, self.filter.as_ref(), rows);
         (!groups.is_empty()).then(|| (groups.iter().filter(|g| **g).count(), groups.len()))
     }
     fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
         let TableScanState {
+            ids,
             next,
             remaining,
             groups,
             cursor,
+            next_index_row,
         } = state.downcast_mut().expect("table scan state");
+        if let Some(rows) = &self.index_rows {
+            return self.next_index_chunk(rows, next_index_row);
+        }
         while *remaining > 0 {
-            // all chunks but the last are full, so that a row's position gives its id
+            // all chunks but the last are full, so that a chunk tells where its rows are
             let index = *next;
-            let first_row = (index * STANDARD_VECTOR_SIZE) as i64;
+            let first_row = index * STANDARD_VECTOR_SIZE;
             let wanted = groups.get(index / CHUNKS_PER_ROW_GROUP).is_none_or(|g| *g);
             *next += 1;
             if !wanted {
@@ -256,44 +343,15 @@ impl PhysicalOperator for PhysicalTableScan {
             };
             let count = chunk.len().min(*remaining);
             *remaining -= count;
-            let columns = self
-                .column_ids
-                .iter()
-                .enumerate()
-                .map(|(position, &i)| {
-                    if i == COLUMN_IDENTIFIER_ROW_ID {
-                        return Vector::sequence(LogicalType::BIGINT, first_row, 1);
-                    }
-                    Ok(match cursor.as_ref().map(|scan| &scan.columns[position]) {
-                        None => chunk.column(i).clone(),
-                        Some(Ok(at)) => chunk.column(*at).clone(),
-                        Some(Err(unread)) => unread.clone(),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let columns = self.scan_columns(&chunk, ids, first_row, cursor.as_ref())?;
             let mut result = DataChunk::from_columns(columns, chunk.len());
             if count < chunk.len() {
                 result.slice(&SelectionVector::from_vec((0..count as u32).collect()), count);
             }
-            // the filter reads what it scans, so the columns go after that and before the slice
-            let mut selected = None;
-            if let Some(filter) = &self.filter {
-                let (sel, matched) = select(filter, &result)?;
-                if matched == 0 {
-                    continue;
-                }
-                if matched != result.len() {
-                    selected = Some((sel, matched));
-                }
+            match self.finish_chunk(result)? {
+                Some(result) => return Ok(Some(result)),
+                None => continue,
             }
-            if let Some(positions) = &self.projection {
-                let columns = positions.iter().map(|&p| result.column(p).clone()).collect();
-                result = DataChunk::from_columns(columns, result.len());
-            }
-            if let Some((sel, matched)) = selected {
-                result.slice(&sel, matched);
-            }
-            return Ok(Some(result));
         }
         Ok(None)
     }
@@ -1876,6 +1934,12 @@ fn changed_rows_output(
     output
 }
 
+/// Where the rows with these ids are, for those that are there.
+fn row_positions(table: &TableCatalogEntry, ids: impl Iterator<Item = i64>, count: usize) -> HashSet<usize> {
+    let row_ids = table.row_ids(count);
+    ids.filter_map(|id| row_ids.position(id as u64)).collect()
+}
+
 /// `PhysicalDelete`: gathers the ids of its input (sink), and removes those rows at the end, so
 /// that the statement reads the table as it was.
 #[derive(Debug)]
@@ -1930,14 +1994,16 @@ impl PhysicalOperator for PhysicalDelete {
         Ok(())
     }
     fn finalize(&self) -> Result<()> {
-        let ids = self.row_ids.lock();
+        let count = self.table.row_count();
+        let positions = row_positions(&self.table, self.row_ids.lock().iter().copied(), count);
+        self.table.claim_rows(positions.iter().copied(), count, false)?;
         let mut storage = self.table.write_storage()?;
         let mut kept = ColumnDataCollection::new(storage.types().to_vec());
         let mut deleted = ColumnDataCollection::new(storage.types().to_vec());
         for (index, chunk) in storage.chunks().enumerate() {
-            let first_row = (index * STANDARD_VECTOR_SIZE) as i64;
+            let first_row = index * STANDARD_VECTOR_SIZE;
             let (gone, stay): (Vec<u32>, Vec<u32>) =
-                (0..chunk.len() as u32).partition(|row| ids.contains(&(first_row + i64::from(*row))));
+                (0..chunk.len() as u32).partition(|row| positions.contains(&(first_row + *row as usize)));
             if gone.is_empty() {
                 kept.append(chunk);
                 continue;
@@ -1954,7 +2020,10 @@ impl PhysicalOperator for PhysicalDelete {
         constraints::verify_delete(&self.table, &storage, &deleted)?;
         *storage = kept;
         *self.table.unique_keys.lock() = None;
-        *self.output.lock() = changed_rows_output(&self.types, deleted, ids.len() as u64, self.returning);
+        let mut removed: Vec<usize> = positions.iter().copied().collect();
+        removed.sort_unstable();
+        self.table.rows_moved(&removed, count);
+        *self.output.lock() = changed_rows_output(&self.types, deleted, removed.len() as u64, self.returning);
         Ok(())
     }
     fn is_source(&self) -> bool {
@@ -2039,27 +2108,24 @@ impl PhysicalOperator for PhysicalUpdate {
         Ok(())
     }
     fn finalize(&self) -> Result<()> {
-        let updates = self.updates.lock();
+        let count = self.table.row_count();
+        let ids = self.table.row_ids(count);
+        let by_id = self.updates.lock();
+        let updates: HashMap<usize, &Vec<Value>> = by_id
+            .iter()
+            .filter_map(|(id, values)| Some((ids.position(*id as u64)?, values)))
+            .collect();
+        let moves_rows = self.table.update_moves_rows(&self.columns);
+        self.table.claim_rows(updates.keys().copied(), count, !moves_rows)?;
         let mut storage = self.table.write_storage()?;
         let mut rewritten = ColumnDataCollection::new(storage.types().to_vec());
         let mut changed = ColumnDataCollection::new(storage.types().to_vec());
-        // C++ turns an UPDATE of indexed columns into a DELETE and an INSERT, which moves the rows
-        // to the end of the table
-        let moves_rows = self.table.constraints.iter().any(|constraint| match constraint {
-            TableConstraint::Check { .. } => false,
-            TableConstraint::Unique { columns, .. } => columns.iter().any(|c| self.columns.contains(c)),
-            TableConstraint::ForeignKey(key) => key.columns.iter().any(|c| self.columns.contains(c)),
-        }) || self
-            .table
-            .indexes
-            .read()
-            .iter()
-            .any(|index| index.columns.iter().any(|c| self.columns.contains(c)));
         let key_update = moves_rows || !self.table.referenced_by.lock().is_empty();
+        let mut batches = Vec::new();
         for (index, chunk) in storage.chunks().enumerate() {
-            let first_row = (index * STANDARD_VECTOR_SIZE) as i64;
+            let first_row = index * STANDARD_VECTOR_SIZE;
             let rows: Vec<(usize, &Vec<Value>)> = (0..chunk.len())
-                .filter_map(|row| Some((row, updates.get(&(first_row + row as i64))?)))
+                .filter_map(|row| Some((row, *updates.get(&(first_row + row))?)))
                 .collect();
             if rows.is_empty() {
                 rewritten.append(chunk);
@@ -2102,9 +2168,17 @@ impl PhysicalOperator for PhysicalUpdate {
                 let picked: Vec<u32> = rows.iter().map(|(row, _)| *row as u32).collect();
                 let count = picked.len();
                 let mut part = updated.clone();
-                part.slice(&SelectionVector::from_vec(picked), count);
+                part.slice(&SelectionVector::from_vec(picked.clone()), count);
                 changed.append(&part);
+                if self.returning && moves_rows {
+                    let mut old = chunk.clone();
+                    old.slice(&SelectionVector::from_vec(picked), count);
+                    batches.push((old, part));
+                }
             }
+        }
+        if !batches.is_empty() {
+            constraints::verify_chunked_key_update(&self.table, &storage, &batches)?;
         }
         if moves_rows {
             for chunk in changed.chunks() {
@@ -2115,6 +2189,15 @@ impl PhysicalOperator for PhysicalUpdate {
             constraints::verify_key_update(&self.table, &storage, &rewritten, &changed)?;
         }
         *storage = rewritten;
+        if moves_rows {
+            let mut removed: Vec<usize> = updates.keys().copied().collect();
+            removed.sort_unstable();
+            self.table.rows_moved(&removed, count);
+        } else {
+            self.table.rows_updated_in_place(updates.keys().copied());
+            drop(storage);
+            self.table.rows_updated(updates.keys().copied(), &self.columns, count);
+        }
         *self.output.lock() = changed_rows_output(&self.types, changed, updates.len() as u64, self.returning);
         Ok(())
     }

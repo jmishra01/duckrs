@@ -6,6 +6,7 @@
 //! (a source, streaming operators, a sink) and running the pipelines in dependency order on
 //! the calling thread.
 
+pub mod art;
 pub mod expression_executor;
 pub mod join;
 pub mod physical;
@@ -66,6 +67,7 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             column_ids,
             filters,
             projection,
+            index_rows,
             ..
         } => Box::new(PhysicalTableScan {
             table,
@@ -73,6 +75,7 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             projection,
             types,
             filter: (!filters.is_empty()).then(|| crate::optimizer::conjunction_of(filters)),
+            index_rows,
         }),
         LogicalOperatorKind::Range {
             start,

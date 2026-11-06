@@ -5,6 +5,7 @@
 //! INSERT ... ON CONFLICT. Rows with the same key in the input count once, the first of them;
 //! each of the others then updates the row it conflicts with, or goes in as a new row.
 
+use super::art::key::ArtKey;
 use super::constraints::{self, current_keys, index_of, keys_of};
 use super::expression_executor::execute;
 use super::physical::check_buffered;
@@ -62,6 +63,8 @@ pub fn upsert(
     }
     let inserted = new_rows.len() as u64;
     let updated = updates.len() as u64;
+    let moves_rows = table.update_moves_rows(&action.set_columns);
+    table.claim_rows(updates.keys().copied(), storage.len(), !moves_rows)?;
     if updates.is_empty() {
         let first_new_row = storage.len();
         for chunk in new_rows.chunks() {
@@ -70,10 +73,12 @@ pub fn upsert(
             storage.append(chunk);
             check_buffered(&storage)?;
         }
+        table.rows_appended(first_new_row);
     } else {
         let mut rewritten = ColumnDataCollection::new(types.clone());
         let mut changed = ColumnDataCollection::new(types.clone());
         let mut updated_chunk = DataChunk::new(&types);
+        let mut moved = ColumnDataCollection::new(types.clone());
         for (index, chunk) in storage.chunks().enumerate() {
             let first_row = index * STANDARD_VECTOR_SIZE;
             if !(0..chunk.len()).any(|row| updates.contains_key(&(first_row + row))) {
@@ -84,11 +89,14 @@ pub fn upsert(
             for row in 0..chunk.len() {
                 match updates.get(&(first_row + row)) {
                     Some(values) => {
-                        output.append_row(values)?;
+                        if !moves_rows {
+                            output.append_row(values)?;
+                        }
                         updated_chunk.append_row(values)?;
                         if updated_chunk.len() == STANDARD_VECTOR_SIZE {
                             verify_updated(table, &updated_chunk)?;
                             changed.append(&updated_chunk);
+                            moved.append(&updated_chunk);
                             updated_chunk = DataChunk::new(&types);
                         }
                     }
@@ -100,6 +108,12 @@ pub fn upsert(
         if !updated_chunk.is_empty() {
             verify_updated(table, &updated_chunk)?;
             changed.append(&updated_chunk);
+            moved.append(&updated_chunk);
+        }
+        if moves_rows {
+            for chunk in moved.chunks() {
+                rewritten.append(chunk);
+            }
         }
         for chunk in new_rows.chunks() {
             constraints::verify_not_null(table, chunk)?;
@@ -108,7 +122,18 @@ pub fn upsert(
             changed.append(chunk);
         }
         constraints::verify_key_update(table, &storage, &rewritten, &changed)?;
+        let count = storage.len();
         *storage = rewritten;
+        if moves_rows {
+            let mut removed: Vec<usize> = updates.keys().copied().collect();
+            removed.sort_unstable();
+            table.rows_moved(&removed, count);
+        } else {
+            table.rows_updated_in_place(updates.keys().copied());
+            // a commit that writes the log takes its lock first, and then the rows
+            drop(storage);
+            table.rows_updated(updates.keys().copied(), &action.set_columns, count);
+        }
     }
 
     let mut output = ColumnDataCollection::new(types.clone());
@@ -160,7 +185,7 @@ fn split_input(
     let indexes: Vec<usize> = action.targets.iter().map(|columns| index_of(table, columns)).collect();
     let table_keys = table.keys();
     let targets: Vec<&TableKey> = indexes.iter().map(|index| &table_keys[*index]).collect();
-    let mut seen = vec![HashSet::<Vec<u8>>::new(); targets.len()];
+    let mut seen = vec![HashSet::<ArtKey>::new(); targets.len()];
     let mut matched = Vec::new();
     let mut inserts = Vec::new();
     for (index, chunk) in input.iter().enumerate() {
@@ -169,7 +194,7 @@ fn split_input(
             .map(|key| keys_of(key, chunk))
             .collect::<Result<Vec<_>>>()?;
         for row in 0..chunk.len() {
-            let row_keys: Vec<Option<&Vec<u8>>> = chunk_keys
+            let row_keys: Vec<Option<&ArtKey>> = chunk_keys
                 .iter()
                 .map(|keys| keys.get(row).and_then(Option::as_ref))
                 .collect();
@@ -183,7 +208,9 @@ fn split_input(
             let mut position = None;
             for (t, (key, seen)) in row_keys.iter().zip(&mut seen).enumerate() {
                 if let Some(key) = key {
-                    position = position.or_else(|| keys[indexes[t]].get(*key).copied());
+                    if position.is_none() {
+                        position = keys[indexes[t]].get(key)?;
+                    }
                     seen.insert((*key).clone());
                 }
             }

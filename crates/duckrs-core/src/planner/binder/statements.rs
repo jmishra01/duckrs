@@ -1475,6 +1475,7 @@ impl Binder<'_> {
                         column_ids,
                         filters: Vec::new(),
                         projection: None,
+                        index_rows: None,
                     },
                     vec![],
                 ))
@@ -2229,8 +2230,26 @@ impl Binder<'_> {
     }
 
     pub(super) fn bind_create_table(&mut self, info: &CreateTableInfo) -> Result<BoundStatement> {
-        if !info.partition_keys.is_empty() || !info.sort_keys.is_empty() || !info.options.is_empty() {
+        if !info.options.is_empty() {
+            return Err(Error::new(
+                ErrorKind::Catalog,
+                "WITH clause is not supported for tables in a duckdb catalog",
+            ));
+        }
+        if !info.partition_keys.is_empty() || !info.sort_keys.is_empty() {
             return Err(not_implemented("table options"));
+        }
+        if !info.temporary
+            && info
+                .name
+                .qualification
+                .first()
+                .is_some_and(|first| first.eq_ignore_ascii_case(TEMP_SCHEMA))
+        {
+            return Err(Error::new(
+                ErrorKind::Parser,
+                format!("Only TEMPORARY table names can use the \"{TEMP_SCHEMA}\" catalog"),
+            ));
         }
         let schema = self.catalog.schema_for(
             info.temporary

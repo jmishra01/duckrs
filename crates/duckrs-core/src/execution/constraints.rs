@@ -1,16 +1,19 @@
 // Ported from the constraint checks of duckdb/src/storage/data_table.cpp and the error messages
 // of duckdb/src/execution/index/art/art.cpp @ rust-port-baseline
 //
-//! Checks that writes keep a table's constraints. PRIMARY KEY, UNIQUE and FOREIGN KEY need to
-//! look keys up, which C++ does with ART indexes. Those come with Phase 10; until then each
-//! table has hash maps of its keys, built when first needed and dropped when its rows move.
+//! Checks that writes keep a table's constraints. PRIMARY KEY, UNIQUE and FOREIGN KEY look keys up
+//! in an ART per key, whose row ids are positions in the table. Tables are rewritten when rows move,
+//! so these are built when first needed and dropped when that happens.
 
+use super::art::allocator::prefix_count;
+use super::art::key::{ArtKey, chunk_keys};
+use super::art::tree::{AppendMode, Art};
 use super::expression_executor::execute;
-use crate::catalog::{ForeignKey, TableCatalogEntry, TableConstraint, TableKey, UniqueKeys};
+use crate::catalog::{ForeignKey, IndexTree, TableCatalogEntry, TableConstraint, TableKey, UniqueKeys};
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::{OrderModifiers, create_sort_keys};
 use duckrs_common::vector::DataChunk;
-use duckrs_common::{Error, ErrorKind, Result};
+use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
 use duckrs_parser::ast::{sql_identifier, sql_quoted_identifier};
 use parking_lot::MutexGuard;
 use std::collections::HashSet;
@@ -59,16 +62,29 @@ fn key_name(
     Ok(parts.join(", "))
 }
 
-/// The key of each row for a key of the table.
-pub(super) fn keys_of(key: &TableKey, chunk: &DataChunk) -> Result<Vec<Option<Vec<u8>>>> {
-    match &key.expressions {
-        None => row_keys(chunk, &key.columns),
-        Some(_) => {
-            let values = key_values(key, chunk)?;
-            let columns: Vec<usize> = (0..values.columns().len()).collect();
-            row_keys(&values, &columns)
-        }
-    }
+/// The ART key of each row, for a key of the table.
+pub(crate) fn keys_of(key: &TableKey, chunk: &DataChunk) -> Result<Vec<Option<ArtKey>>> {
+    let values = key_values(key, chunk)?;
+    let columns: Vec<_> = values.columns().iter().collect();
+    chunk_keys(&columns, values.len())
+}
+
+/// An empty ART for a key of `table`.
+fn new_keys(table: &TableCatalogEntry, key: &TableKey) -> UniqueKeys {
+    UniqueKeys::new(key_prefix_count(table, key))
+}
+
+/// `ART::SetPrefixCount` for a key of `table`.
+pub(crate) fn key_prefix_count(table: &TableCatalogEntry, key: &TableKey) -> usize {
+    let types: Vec<_> = match &key.expressions {
+        None => key
+            .columns
+            .iter()
+            .map(|c| table.columns[*c].ty.physical_type())
+            .collect(),
+        Some(expressions) => expressions.iter().map(|e| e.return_type.physical_type()).collect(),
+    };
+    prefix_count(&types)
 }
 
 /// What the expressions of a key give for `chunk`.
@@ -179,12 +195,12 @@ pub fn verify_checks(table: &TableCatalogEntry, chunk: &DataChunk) -> Result<()>
 fn build_keys(table: &TableCatalogEntry, rows: &ColumnDataCollection, first_new_row: usize) -> Result<Vec<UniqueKeys>> {
     let mut indexes = Vec::new();
     for key in table.keys() {
-        let mut index = UniqueKeys::new();
+        let mut index = new_keys(table, &key);
         let mut position = 0;
         for chunk in rows.chunks() {
             for (row, row_key) in keys_of(&key, chunk)?.into_iter().enumerate() {
                 if let Some(row_key) = row_key
-                    && let Some(existing) = index.insert(row_key, position + row)
+                    && let Some(existing) = index.insert(&row_key, position + row)?
                 {
                     return Err(duplicate_key(&key, chunk, row, existing >= first_new_row)?);
                 }
@@ -196,6 +212,62 @@ fn build_keys(table: &TableCatalogEntry, rows: &ColumnDataCollection, first_new_
     Ok(indexes)
 }
 
+/// The tree of `key` over the rows of `table`, for a scan. It goes along with rows that are added.
+pub(crate) fn index_tree(table: &TableCatalogEntry, key: &TableKey) -> Result<IndexTree> {
+    let rows = table.rows()?;
+    if let Some(origin) = table.same_as_origin(rows.len()) {
+        let tree = index_tree(origin, key)?;
+        // it can only have been the same rows if they still are
+        if table.same_as_origin(rows.len()).is_some() {
+            return Ok(tree);
+        }
+    }
+    let name = format!(
+        "{:?} {:?}",
+        key.columns,
+        key.expressions
+            .as_ref()
+            .map(|expressions| expressions.iter().map(ToString::to_string).collect::<Vec<_>>())
+    );
+    let rewrites = table.rewrite_count();
+    let empty = || IndexTree {
+        rewrites,
+        frontier: 0,
+        rows: 0,
+        gone: 0,
+        tree: Arc::new(Art::new(key_prefix_count(table, key), UniqueKeys::BLOCK_SIZE, false)),
+    };
+    let ids = table.row_ids(rows.len());
+    let mut trees = table.index_trees.lock();
+    let entry = trees.entry(name).or_insert_with(empty);
+    if entry.rewrites != rewrites {
+        *entry = empty();
+    }
+    let known = ids.first_from(entry.frontier);
+    if known < rows.len() {
+        let tree = Arc::make_mut(&mut entry.tree);
+        let mut first_row = known / STANDARD_VECTOR_SIZE * STANDARD_VECTOR_SIZE;
+        for chunk in rows.chunks().skip(known / STANDARD_VECTOR_SIZE) {
+            for (row, row_key) in keys_of(key, chunk)?.into_iter().enumerate() {
+                if first_row + row >= known
+                    && let Some(row_key) = row_key
+                {
+                    tree.insert(&row_key, ids.id(first_row + row) as i64, AppendMode::Default)?;
+                }
+            }
+            first_row += chunk.len();
+        }
+        entry.rows += rows.len() - known;
+        entry.frontier = ids.next();
+    }
+    Ok(entry.clone())
+}
+
+/// Fails if `rows` break a key of `table`.
+pub(crate) fn check_all_keys(table: &TableCatalogEntry, rows: &ColumnDataCollection) -> Result<()> {
+    build_keys(table, rows, 0).map(drop)
+}
+
 /// The key maps of `table`, of which `rows` are the rows.
 pub(crate) fn current_keys<'a>(
     table: &'a TableCatalogEntry,
@@ -203,7 +275,10 @@ pub(crate) fn current_keys<'a>(
 ) -> Result<MutexGuard<'a, Option<Vec<UniqueKeys>>>> {
     let mut keys = table.unique_keys.lock();
     if keys.is_none() {
-        *keys = Some(build_keys(table, rows, usize::MAX)?);
+        *keys = match table.inherited_keys(rows.len()) {
+            Some(inherited) => Some(inherited),
+            None => Some(build_keys(table, rows, usize::MAX)?),
+        };
     }
     Ok(keys)
 }
@@ -224,8 +299,10 @@ fn verify_referenced(
     chunk: &DataChunk,
     parent: &TableCatalogEntry,
 ) -> Result<()> {
-    for (row, key) in row_keys(chunk, &foreign_key.columns)?.into_iter().enumerate() {
-        if key.is_some_and(|key| !keys.contains_key(&key)) {
+    let columns: Vec<_> = foreign_key.columns.iter().map(|c| chunk.column(*c)).collect();
+    for (row, key) in chunk_keys(&columns, chunk.len())?.into_iter().enumerate() {
+        let Some(key) = key else { continue };
+        if !keys.contains(&key)? {
             let name = key_name(
                 parent,
                 chunk,
@@ -284,7 +361,7 @@ pub fn verify_append(
         keys.as_mut().expect("just built"),
         chunk,
         next_row,
-        first_new_row,
+        table.first_local_row(first_new_row, next_row),
     );
     if result.is_err() {
         // it may have added the keys of the rows before the one that failed
@@ -305,7 +382,7 @@ fn append_keys(
     for (key, index) in table.keys().iter().zip(keys.iter_mut()) {
         for (row, row_key) in keys_of(key, chunk)?.into_iter().enumerate() {
             if let Some(row_key) = row_key
-                && let Some(existing) = index.insert(row_key, next_row + row)
+                && let Some(existing) = index.insert(&row_key, next_row + row)?
             {
                 return Err(duplicate_key(key, chunk, row, existing >= first_new_row)?);
             }
@@ -383,6 +460,35 @@ pub fn verify_delete(
 
 /// UPDATE of key columns, which C++ turns into a DELETE and an INSERT: `rewritten` replaces
 /// `rows`, with `changed` being the rows it updated.
+/// `UPDATE ... RETURNING` of a key takes the rows chunk by chunk, each deleting its old keys and then
+/// adding its new ones, so that a key that a later chunk gives up is still there. Postgres has the
+/// same limitation, and C++ makes a point of it in a test.
+pub fn verify_chunked_key_update(
+    table: &TableCatalogEntry,
+    rows: &ColumnDataCollection,
+    batches: &[(DataChunk, DataChunk)],
+) -> Result<()> {
+    for key in table.keys() {
+        let mut present = HashSet::new();
+        for chunk in rows.chunks() {
+            present.extend(keys_of(&key, chunk)?.into_iter().flatten());
+        }
+        for (old, new) in batches {
+            for gone in keys_of(&key, old)?.into_iter().flatten() {
+                present.remove(&gone);
+            }
+            for (row, value) in keys_of(&key, new)?.into_iter().enumerate() {
+                if let Some(value) = value
+                    && !present.insert(value)
+                {
+                    return Err(duplicate_key(&key, new, row, false)?);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn verify_key_update(
     table: &Arc<TableCatalogEntry>,
     rows: &ColumnDataCollection,

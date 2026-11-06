@@ -21,19 +21,24 @@ use super::encode::{
     is_signed, supports_bitpacking, supports_rle,
 };
 use super::fsst::SymbolTable;
+use super::index_data::TableIndex;
 use super::metadata::{MetaBlockPointer, metadata_block_size};
-use super::serialization::generated::enums::{catalog_type, constraint_type, table_column_type};
+use super::serialization::generated::enums::{
+    catalog_type, constraint_type, foreign_key_type, index_constraint_type, table_column_type,
+};
 use super::serialization::generated::{self as g};
 use super::serialization::to_stored::{self, write_not_ported};
-use super::table_data::{DiskTable, fixed_width};
+use super::table_data::{BITMASK, CONSTANT_INFO, DiskTable, VECTOR_INFO, fixed_width};
 use crate::catalog::{
-    Catalog, MacroCatalogEntry, SchemaCatalogEntry, SequenceCatalogEntry, TEMP_SCHEMA, TableCatalogEntry,
-    TableConstraint, TableCursor, ViewCatalogEntry,
+    Catalog, IndexCatalogEntry, MacroCatalogEntry, RowIds, SchemaCatalogEntry, SequenceCatalogEntry, TEMP_SCHEMA,
+    TableCatalogEntry, TableConstraint, TableCursor, ViewCatalogEntry,
 };
 use crate::planner::binder::Binder;
+use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::serializer::{BinarySerializer, SerializationOptions, Serialize};
 use duckrs_common::types::{Interval, ListEntry, LogicalType, LogicalTypeId, PhysicalType, StringT};
-use duckrs_common::vector::{SelectionVector, Vector};
+use duckrs_common::value::Value;
+use duckrs_common::vector::{DataChunk, SelectionVector, Vector};
 use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
 use duckrs_parser::ast::{self, Expr};
 use std::cmp::Ordering;
@@ -47,8 +52,13 @@ pub struct CheckpointOptions<'a> {
     pub force_compression: &'a str,
     /// In rows: `ATTACH ... (ROW_GROUP_SIZE)` checks that it is whole vectors.
     pub row_group_size: u64,
+    /// How many times row groups can come together, which gives their rows new ids. There is no
+    /// such thing while a transaction goes by the ids it knows (`InitializeVacuumState`).
+    pub vacuum_tasks: usize,
     /// `debug_checkpoint_abort`, in lower case: where to stop as a crash would.
     pub abort: &'a str,
+    /// Transactions are reading tables from the blocks they are in: those stay as they are.
+    pub keep_free_blocks: bool,
 }
 
 /// `DEBUG_ABORT_*`: what was written so far stays, and the next open has to cope with it.
@@ -469,9 +479,6 @@ pub(super) fn table_info(
     schema: &SchemaCatalogEntry,
     table: &TableCatalogEntry,
 ) -> Result<g::CreateInfo> {
-    if !table.indexes.read().is_empty() {
-        return Err(write_not_ported("indexes, which need the ART of Phase 10,"));
-    }
     let mut columns = Vec::with_capacity(table.columns.len());
     let mut constraints = Vec::new();
     let boxed = |constraint: g::Constraint| Some(Box::new(constraint));
@@ -515,7 +522,39 @@ pub(super) fn table_info(
                     expression: Some(Box::new(to_stored::expression(parsed)?)),
                 }),
             })),
-            _ => return Err(write_not_ported("keys, which need the ART of Phase 10,")),
+            TableConstraint::Unique { columns, primary_key } => constraints.push(boxed(g::Constraint {
+                type_: constraint_type::UNIQUE,
+                kind: g::ConstraintKind::UniqueConstraint(g::UniqueConstraint {
+                    is_primary_key: *primary_key,
+                    // `DConstants::INVALID_INDEX`: the columns are by name
+                    index: u64::MAX,
+                    columns: columns.iter().map(|c| table.columns[*c].name.clone()).collect(),
+                    check_mode: None,
+                }),
+            })),
+            TableConstraint::ForeignKey(key) => {
+                let parent = key.referenced.as_ref().map(|referenced| referenced.table());
+                let names = |table: &TableCatalogEntry, columns: &[usize]| -> Vec<String> {
+                    columns.iter().map(|c| table.columns[*c].name.clone()).collect()
+                };
+                constraints.push(boxed(g::Constraint {
+                    type_: constraint_type::FOREIGN_KEY,
+                    kind: g::ConstraintKind::ForeignKeyConstraint(g::ForeignKeyConstraint {
+                        pk_columns: names(parent.as_deref().unwrap_or(table), &key.referenced_columns),
+                        fk_columns: names(table, &key.columns),
+                        // the side that is referenced gets its constraint when C++ reads this one
+                        fk_type: if parent.is_some() {
+                            foreign_key_type::FK_TYPE_FOREIGN_KEY_TABLE
+                        } else {
+                            foreign_key_type::FK_TYPE_SELF_REFERENCE_TABLE
+                        },
+                        schema: schema.name.clone(),
+                        table: parent.as_deref().unwrap_or(table).name.clone(),
+                        pk_keys: key.referenced_columns.iter().map(|c| *c as u64).collect(),
+                        fk_keys: key.columns.iter().map(|c| *c as u64).collect(),
+                    }),
+                }));
+            }
         }
     }
     let kind = g::CreateInfoKind::CreateTableInfo(g::CreateTableInfo {
@@ -532,6 +571,73 @@ pub(super) fn table_info(
         entry_path(catalog, schema, &table.name),
         kind,
     ))
+}
+
+/// `IndexCatalogEntry::GetInfo`. An index that backs a constraint isn't an entry in C++ either.
+pub(super) fn index_info(
+    catalog: &str,
+    schema: &SchemaCatalogEntry,
+    table: &TableCatalogEntry,
+    index: &IndexCatalogEntry,
+) -> Result<g::CreateInfo> {
+    let parsed = index
+        .parsed
+        .iter()
+        .map(|expression| to_stored::expression(expression).map(|e| Some(Box::new(e))))
+        .collect::<Result<Vec<_>>>()?;
+    let mut scan_types: Vec<LogicalType> = index.columns.iter().map(|c| table.columns[*c].ty.clone()).collect();
+    scan_types.push(LogicalType::BIGINT); // the row id
+    let kind = g::CreateInfoKind::CreateIndexInfo(g::CreateIndexInfo {
+        name: index.name.clone(),
+        table: table.name.clone(),
+        constraint_type: if index.unique {
+            index_constraint_type::UNIQUE
+        } else {
+            index_constraint_type::NONE
+        },
+        parsed_expressions: parsed,
+        scan_types,
+        names: table.columns.iter().map(|c| c.name.clone()).collect(),
+        column_ids: index.columns.iter().map(|c| *c as u64).collect(),
+        options: Vec::new(),
+        index_type_name: index.index_type.clone(),
+    });
+    let mut info = to_stored::create_info(
+        catalog_type::INDEX_ENTRY,
+        entry_path(catalog, schema, &index.name),
+        kind,
+    );
+    info.sql.clone_from(&index.sql);
+    info.comment = index.comment.clone().map(Value::varchar);
+    Ok(info)
+}
+
+/// `ReorderTableEntries`: of the positions in `tables`, each table comes after those it references.
+pub(super) fn parents_first<'a>(tables: impl IntoIterator<Item = &'a Arc<TableCatalogEntry>>) -> Vec<usize> {
+    fn visit(table: usize, tables: &[&Arc<TableCatalogEntry>], seen: &mut [bool], order: &mut Vec<usize>) {
+        if std::mem::replace(&mut seen[table], true) {
+            return;
+        }
+        for constraint in &tables[table].constraints {
+            if let TableConstraint::ForeignKey(key) = constraint
+                && let Some(referenced) = &key.referenced
+                && let Some(parent) = tables.iter().position(|other| {
+                    other.schema.eq_ignore_ascii_case(&tables[table].schema)
+                        && other.name.eq_ignore_ascii_case(&referenced.name)
+                })
+            {
+                visit(parent, tables, seen, order);
+            }
+        }
+        order.push(table);
+    }
+    let tables: Vec<_> = tables.into_iter().collect();
+    let mut seen = vec![false; tables.len()];
+    let mut order = Vec::with_capacity(tables.len());
+    for table in 0..tables.len() {
+        visit(table, &tables, &mut seen, &mut order);
+    }
+    order
 }
 
 /// A piece of a column: a flat vector and how many rows it has.
@@ -572,7 +678,164 @@ struct Writer<'a> {
     /// The setting, in lower case.
     force_compression: String,
     chunks_per_row_group: usize,
+    vacuum_tasks: usize,
     abort: String,
+}
+
+/// A row group that a table is written as. Its rows have the ids from `row_start` on, and those
+/// with no row are deleted, as there are no gaps in a row group.
+#[derive(Debug, PartialEq, Eq)]
+struct PlannedGroup {
+    row_start: u64,
+    rows: usize,
+    first_position: usize,
+    live: usize,
+    /// It takes rows of groups before it, so that its rows have new ids, without gaps.
+    merged: bool,
+}
+
+/// `MAX_MERGE_COUNT`.
+const MAX_MERGE_COUNT: usize = 3;
+
+/// `ScheduleVacuumTasks`: `groups` as they are written, some of them together where that makes for
+/// fewer row groups.
+fn vacuum_groups(groups: Vec<PlannedGroup>, size: usize, tasks: usize) -> Vec<PlannedGroup> {
+    let mut result = Vec::with_capacity(groups.len());
+    let mut at = 0;
+    let mut merges = 0;
+    while at < groups.len() {
+        let mut planned = None;
+        for target in (1..=MAX_MERGE_COUNT).filter(|_| merges < tasks) {
+            let mut next = at;
+            let mut rows = 0;
+            while next < groups.len() && rows + groups[next].live <= target * size {
+                rows += groups[next].live;
+                next += 1;
+            }
+            // what is appended would otherwise rewrite the last row group each time
+            if next == groups.len() {
+                let least = (groups[at].live * 2).min(size) * target;
+                if rows >= STANDARD_VECTOR_SIZE && rows < least {
+                    continue;
+                }
+            }
+            if target < next - at {
+                planned = Some((target, next, rows));
+                break;
+            }
+        }
+        let Some((target, next, rows)) = planned else {
+            result.push(PlannedGroup {
+                row_start: groups[at].row_start,
+                rows: groups[at].rows,
+                first_position: groups[at].first_position,
+                live: groups[at].live,
+                merged: groups[at].merged,
+            });
+            at += 1;
+            continue;
+        };
+        merges += 1;
+        let (mut row_start, mut first_position) = (groups[at].row_start, groups[at].first_position);
+        let mut left = rows;
+        for _ in 0..target {
+            let count = left.min(size);
+            if count > 0 {
+                result.push(PlannedGroup {
+                    row_start,
+                    rows: count,
+                    first_position,
+                    live: count,
+                    merged: true,
+                });
+            }
+            row_start += count as u64;
+            first_position += count;
+            left -= count;
+        }
+        at = next;
+    }
+    result
+}
+
+/// The row groups of rows with these ids: those that a file has, without the ones whose rows all
+/// went, and new ones of `size` for what came after them.
+fn plan_groups(ids: &RowIds, size: usize, vacuum_tasks: usize) -> Vec<PlannedGroup> {
+    let mut groups: Vec<PlannedGroup> = Vec::new();
+    let mut add = |row_start: u64, rows: usize| {
+        let first_position = ids.first_from(row_start);
+        let live = ids.first_from(row_start + rows as u64) - first_position;
+        if live > 0 {
+            groups.push(PlannedGroup {
+                row_start,
+                rows,
+                first_position,
+                live,
+                merged: false,
+            });
+        }
+    };
+    let mut end = 0;
+    for &(row_start, rows) in ids.stored_groups() {
+        add(row_start, rows);
+        end = row_start + rows as u64;
+    }
+    // ids that nothing has, in front of new rows, are of rows that went before a checkpoint
+    while end < ids.next() {
+        let rows = (ids.next() - end).min(size as u64);
+        add(end, rows as usize);
+        end += rows;
+    }
+    vacuum_groups(groups, size, vacuum_tasks)
+}
+
+/// `RowVersionManager::Checkpoint`: which rows of a row group are deleted. `kept` has its rows.
+fn deletes_of(kept: &[bool]) -> Vec<u8> {
+    let vectors: Vec<(usize, &[bool])> = kept
+        .chunks(STANDARD_VECTOR_SIZE)
+        .enumerate()
+        .filter(|(_, rows)| rows.iter().any(|kept| !kept))
+        .collect();
+    let mut out = (vectors.len() as u64).to_le_bytes().to_vec();
+    for (index, rows) in vectors {
+        out.extend_from_slice(&(index as u64).to_le_bytes());
+        let start = (index * STANDARD_VECTOR_SIZE) as u64;
+        if rows.len() == STANDARD_VECTOR_SIZE && rows.iter().all(|kept| !kept) {
+            out.push(CONSTANT_INFO);
+            out.extend_from_slice(&start.to_le_bytes());
+            continue;
+        }
+        out.push(VECTOR_INFO);
+        out.extend_from_slice(&start.to_le_bytes());
+        out.push(BITMASK);
+        let mut words = [0u64; STANDARD_VECTOR_SIZE / 64];
+        for (row, kept) in rows.iter().enumerate() {
+            words[row / 64] |= u64::from(!kept) << (row % 64);
+        }
+        words.iter().for_each(|word| out.extend_from_slice(&word.to_le_bytes()));
+    }
+    out
+}
+
+/// The rows of a table in order of position, as they come from its file or from memory.
+struct PositionedRows<'a> {
+    cursor: Option<TableCursor>,
+    memory: Option<parking_lot::RwLockReadGuard<'a, ColumnDataCollection>>,
+    at: Option<(usize, DataChunk)>,
+}
+
+impl PositionedRows<'_> {
+    fn chunk(&mut self, index: usize) -> Result<&DataChunk> {
+        if self.at.as_ref().is_none_or(|(at, _)| *at != index) {
+            let chunk = match (&mut self.cursor, &self.memory) {
+                (Some(cursor), _) => cursor.chunk(index)?,
+                (None, Some(memory)) => memory.chunk(index).clone(),
+                (None, None) => unreachable!("one of the two is set"),
+            };
+            self.at = Some((index, chunk));
+        }
+        Ok(&self.at.as_ref().expect("just set").1)
+    }
 }
 
 impl<'a> Writer<'a> {
@@ -583,7 +846,11 @@ impl<'a> Writer<'a> {
             catalog,
             name,
             block_size: blocks.block_size(),
-            free: blocks.free_list().into_iter().collect(),
+            free: if options.keep_free_blocks {
+                BTreeSet::new()
+            } else {
+                blocks.free_list().into_iter().collect()
+            },
             next_block: blocks.header().block_count,
             used: BTreeSet::new(),
             segments_in_block: HashMap::new(),
@@ -595,6 +862,7 @@ impl<'a> Writer<'a> {
             tables: MetaStream::default(),
             force_compression: options.force_compression.to_lowercase(),
             chunks_per_row_group: options.row_group_size as usize / STANDARD_VECTOR_SIZE,
+            vacuum_tasks: options.vacuum_tasks,
             abort: options.abort.to_string(),
         }
     }
@@ -1090,6 +1358,7 @@ impl<'a> Writer<'a> {
         parts: Vec<Vec<Part>>,
         row_start: u64,
         rows: usize,
+        deletes: Option<&[u8]>,
         statistics: &mut [Option<Stats>],
     ) -> Result<Vec<u8>> {
         let mut tables = std::mem::take(&mut self.tables);
@@ -1106,47 +1375,132 @@ impl<'a> Writer<'a> {
             pointers.push(self.pointer(&mut tables));
             self.write_metadata(&mut tables, &s.into_bytes());
         }
+        // one pointer per block that they take
+        let size = metadata_block_size(self.block_size);
+        let mut delete_pointers = Vec::new();
+        let mut left = deletes.unwrap_or_default();
+        while !left.is_empty() {
+            delete_pointers.push(self.pointer(&mut tables));
+            let (now, rest) = left.split_at(left.len().min(size - tables.offset));
+            self.write_metadata(&mut tables, now);
+            left = rest;
+        }
         self.tables = tables;
         let mut s = BinarySerializer::new(SerializationOptions::default());
         s.write_object_value(|s| {
             s.write_property(100, "row_start", &row_start);
             s.write_property(101, "tuple_count", &(rows as u64));
             s.write_property(102, "data_pointers", &pointers);
-            s.write_property(103, "delete_pointers", &Vec::<MetaBlockPointer>::new());
+            s.write_property(103, "delete_pointers", &delete_pointers);
             s.write_property(104, "has_metadata_blocks", &false);
         });
         Ok(s.into_bytes())
     }
 
-    /// `SingleFileTableDataWriter::FinalizeTable`: where the rows of a table are, and how many.
-    fn write_table_data(&mut self, table: &TableCatalogEntry) -> Result<(MetaBlockPointer, u64)> {
+    /// The vectors of a row group, with what indexes have to know. Rows that are deleted are NULL.
+    fn write_group(
+        &mut self,
+        table: &TableCatalogEntry,
+        group: &PlannedGroup,
+        ids: &RowIds,
+        rows: &mut PositionedRows<'_>,
+        indexes: &mut [TableIndex],
+        statistics: &mut [Option<Stats>],
+    ) -> Result<(Vec<u8>, usize)> {
+        let types = table.types();
+        let mut parts: Vec<Vec<Part>> = types.iter().map(|_| Vec::new()).collect();
+        let mut kept = Vec::with_capacity(group.rows);
+        let row_id = |offset: usize| group.row_start + offset as u64;
+        let position_of = |offset: usize| {
+            if group.merged {
+                Some(group.first_position + offset)
+            } else {
+                ids.position(row_id(offset))
+            }
+        };
+        for first in (0..group.rows).step_by(STANDARD_VECTOR_SIZE) {
+            let count = STANDARD_VECTOR_SIZE.min(group.rows - first);
+            let start = position_of(first);
+            let in_place = start.is_some_and(|start| {
+                start % STANDARD_VECTOR_SIZE == 0 && (0..count).all(|row| position_of(first + row) == Some(start + row))
+            });
+            let mut live_ids = Vec::with_capacity(count);
+            let (chunk, live) = if let (true, Some(start)) = (in_place, start) {
+                let mut chunk = rows.chunk(start / STANDARD_VECTOR_SIZE)?.clone();
+                if count < chunk.len() {
+                    chunk.slice(&SelectionVector::from_vec((0..count as u32).collect()), count);
+                }
+                live_ids.extend((0..count).map(|row| row_id(first + row) as i64));
+                kept.resize(kept.len() + count, true);
+                (chunk.clone(), chunk)
+            } else {
+                let nulls: Vec<Value> = types.iter().map(|ty| Value::null(ty.clone())).collect();
+                let mut chunk = DataChunk::new(&types);
+                let mut live = DataChunk::new(&types);
+                for offset in first..first + count {
+                    let Some(position) = position_of(offset) else {
+                        chunk.append_row(&nulls)?;
+                        kept.push(false);
+                        continue;
+                    };
+                    let source = rows.chunk(position / STANDARD_VECTOR_SIZE)?;
+                    let row = position % STANDARD_VECTOR_SIZE;
+                    let values: Vec<Value> = (0..types.len()).map(|c| source.column(c).get_value(row)).collect();
+                    chunk.append_row(&values)?;
+                    live.append_row(&values)?;
+                    live_ids.push(row_id(offset) as i64);
+                    kept.push(true);
+                }
+                (chunk, live)
+            };
+            for index in indexes.iter_mut() {
+                index.add(&live, |row| live_ids[row])?;
+            }
+            for (column, parts) in parts.iter_mut().enumerate() {
+                parts.push(Part::new(chunk.column(column), count));
+            }
+        }
+        let deletes = (kept.iter().any(|kept| !kept)).then(|| deletes_of(&kept));
+        let written = self.write_row_group(
+            table,
+            parts,
+            group.row_start,
+            group.rows,
+            deletes.as_deref(),
+            statistics,
+        )?;
+        Ok((written, group.row_start as usize + group.rows))
+    }
+
+    /// `SingleFileTableDataWriter::FinalizeTable`: where the rows of a table are, how many rows its
+    /// row groups have, and the id of the row after them.
+    fn write_table_data(
+        &mut self,
+        table: &TableCatalogEntry,
+        indexes: &mut [TableIndex],
+    ) -> Result<(MetaBlockPointer, u64, u64)> {
         let types = table.types();
         let columns: Vec<usize> = (0..types.len()).collect();
         let total = table.row_count();
-        let chunks = total.div_ceil(STANDARD_VECTOR_SIZE);
-        let mut cursor = table
+        let ids = table.row_ids(total);
+        let cursor = table
             .source()
             .map(|source| TableCursor::new(source, columns.clone(), types.clone()));
         let memory = if cursor.is_none() { Some(table.rows()?) } else { None };
+        let mut rows = PositionedRows {
+            cursor,
+            memory,
+            at: None,
+        };
         let mut statistics: Vec<Option<Stats>> = vec![None; types.len()];
         let mut row_groups = Vec::new();
-        let mut row_start = 0u64;
-        for first in (0..chunks).step_by(self.chunks_per_row_group) {
-            let mut parts: Vec<Vec<Part>> = columns.iter().map(|_| Vec::new()).collect();
-            let mut rows = 0;
-            for index in first..chunks.min(first + self.chunks_per_row_group) {
-                let chunk = match (&mut cursor, &memory) {
-                    (Some(cursor), _) => cursor.chunk(index)?,
-                    (None, Some(memory)) => memory.chunk(index).clone(),
-                    (None, None) => unreachable!("one of the two is set"),
-                };
-                rows += chunk.len();
-                for (column, parts) in parts.iter_mut().enumerate() {
-                    parts.push(Part::new(chunk.column(column), chunk.len()));
-                }
-            }
-            row_groups.push(self.write_row_group(table, parts, row_start, rows, &mut statistics)?);
-            row_start += rows as u64;
+        let size = self.chunks_per_row_group * STANDARD_VECTOR_SIZE;
+        let (mut stored_rows, mut next_row_id) = (0u64, 0u64);
+        for group in plan_groups(&ids, size, self.vacuum_tasks) {
+            let (written, end) = self.write_group(table, &group, &ids, &mut rows, indexes, &mut statistics)?;
+            row_groups.push(written);
+            stored_rows += group.rows as u64;
+            next_row_id = next_row_id.max(end as u64);
         }
         let mut s = BinarySerializer::new(SerializationOptions::default());
         s.write_object_value(|s| {
@@ -1166,7 +1520,7 @@ impl<'a> Writer<'a> {
             self.write_metadata(&mut tables, row_group);
         }
         self.tables = tables;
-        Ok((pointer, total as u64))
+        Ok((pointer, stored_rows, next_row_id))
     }
 
     /// The entries of a schema, in an order in which each can be read: tables can use macros and
@@ -1199,26 +1553,45 @@ impl<'a> Writer<'a> {
             }
         }
         let mut views = Vec::new();
+        let mut tables = Vec::new();
         for entry in schema.tables_and_views() {
             match entry {
                 crate::catalog::TableOrView::View(view) => views.push(view),
-                crate::catalog::TableOrView::Table(table) => {
-                    let info = table_info(&name, schema, &table)?;
-                    let (pointer, rows) = self.write_table_data(&table)?;
-                    let mut s = BinarySerializer::new(SerializationOptions::default());
-                    s.write_object_value(|s| {
-                        s.write_property(99, "type", &catalog_type::TABLE_ENTRY);
-                        s.write_property(100, "info", &Some(Box::new(info)));
-                        s.write_property(101, "table_pointer", &pointer);
-                        s.write_property(102, "total_rows", &rows);
-                        s.write_property(105, "next_row_id", &rows);
-                    });
-                    entries.push(s.into_bytes());
-                }
+                crate::catalog::TableOrView::Table(table) => tables.push(table),
             }
+        }
+        for position in parents_first(&tables) {
+            let table = &tables[position];
+            let info = table_info(&name, schema, table)?;
+            let mut indexes = TableIndex::all_of(table, self.block_size);
+            let (pointer, rows, next_row_id) = self.write_table_data(table, &mut indexes)?;
+            let mut storage = Vec::with_capacity(indexes.len());
+            for index in &indexes {
+                storage.push(index.storage_info(|data| {
+                    let (block_id, offset) = self.place(data)?;
+                    Ok(g::BlockPointer { block_id, offset })
+                })?);
+            }
+            let mut s = BinarySerializer::new(SerializationOptions::default());
+            s.write_object_value(|s| {
+                s.write_property(99, "type", &catalog_type::TABLE_ENTRY);
+                s.write_property(100, "info", &Some(Box::new(info)));
+                s.write_property(101, "table_pointer", &pointer);
+                s.write_property(102, "total_rows", &rows);
+                s.write_property(103, "index_pointers", &Vec::<g::BlockPointer>::new());
+                s.write_property(104, "index_storage_infos", &storage);
+                s.write_property(105, "next_row_id", &next_row_id);
+            });
+            entries.push(s.into_bytes());
         }
         for view in views {
             entries.push(simple(catalog_type::VIEW_ENTRY, view_info(&name, schema, &view)?));
+        }
+        for table in &tables {
+            for index in table.indexes.read().iter() {
+                let info = index_info(&name, schema, table, index)?;
+                entries.push(simple(catalog_type::INDEX_ENTRY, info));
+            }
         }
         Ok(())
     }
@@ -1326,7 +1699,7 @@ impl<'a> Writer<'a> {
     }
 }
 
-pub(super) fn parse_expression(text: &str) -> Result<Expr> {
+pub(crate) fn parse_expression(text: &str) -> Result<Expr> {
     let statements = duckrs_parser::parse_ast(&format!("SELECT {text}"))?;
     if let [ast::Statement::Select(select)] = statements.as_slice()
         && let ast::QueryNodeKind::Select(node) = &select.node.kind

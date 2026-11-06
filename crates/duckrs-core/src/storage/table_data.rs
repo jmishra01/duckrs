@@ -9,7 +9,7 @@ use super::checkpoint::StoredTable;
 use super::compression::*;
 use super::metadata::{MetaBlockPointer, MetadataChains, take};
 use super::statistics::{BaseStatistics, read_statistics};
-use crate::catalog::{ColumnStatistics, ColumnZone, SegmentInfo, TableLog, TableSource};
+use crate::catalog::{ColumnStatistics, ColumnZone, RowIds, SegmentInfo, TableSource};
 use crate::optimizer::statistics::{compare_values, has_ordered_statistics};
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::serializer::{BinaryDeserializer, Deserialize};
@@ -389,11 +389,11 @@ fn scan_column(buffer: &BufferManager, column: &PersistentColumn, ty: &LogicalTy
 }
 
 /// `ChunkInfoType`.
-const CONSTANT_INFO: u8 = 0;
-const VECTOR_INFO: u8 = 1;
+pub(super) const CONSTANT_INFO: u8 = 0;
+pub(super) const VECTOR_INFO: u8 = 1;
 const EMPTY_INFO: u8 = 2;
 /// `ValiditySerialization`.
-const BITMASK: u8 = 0;
+pub(super) const BITMASK: u8 = 0;
 const VALID_VALUES: u8 = 1;
 const INVALID_VALUES: u8 = 2;
 
@@ -516,36 +516,6 @@ impl DiskTable {
         self.table.next_row_id
     }
 
-    /// What a log has to know of the rows, whose ids have gaps in a file with deletes.
-    pub fn table_log(&self) -> TableLog {
-        let next_id = self.table.next_row_id;
-        let contiguous = self.alive.iter().all(Option::is_none)
-            && self.rows as u64 == next_id
-            && self
-                .table
-                .row_groups
-                .iter()
-                .try_fold(0, |at, group| (group.row_start == at).then_some(at + group.tuple_count))
-                == Some(next_id);
-        let mut log = TableLog {
-            logged_rows: self.rows,
-            next_id,
-            ..TableLog::default()
-        };
-        if contiguous {
-            return log;
-        }
-        log.first_id = next_id;
-        for (row_group, alive) in self.table.row_groups.iter().zip(&self.alive) {
-            let first = row_group.row_start;
-            match alive {
-                Some(alive) => log.old_ids.extend(alive.iter().map(|&row| first + u64::from(row))),
-                None => log.old_ids.extend(first..first + row_group.tuple_count),
-            }
-        }
-        log
-    }
-
     fn persistent_column(&self, group: usize, column: usize) -> Result<PersistentColumn> {
         let pointer = self.table.row_groups[group].data_pointers[column];
         let mut chains = self.chains.lock();
@@ -587,6 +557,21 @@ impl DiskTable {
 impl TableSource for DiskTable {
     fn row_count(&self) -> usize {
         self.rows
+    }
+    fn row_ids(&self) -> RowIds {
+        let mut ranges = Vec::new();
+        for (row_group, alive) in self.table.row_groups.iter().zip(&self.alive) {
+            let first = row_group.row_start;
+            match alive {
+                Some(alive) => ranges.extend(alive.iter().map(|&row| (first + u64::from(row), 1))),
+                None => ranges.push((first, row_group.tuple_count as usize)),
+            }
+        }
+        let groups = self.table.row_groups.iter();
+        let groups = groups
+            .map(|group| (group.row_start, group.tuple_count as usize))
+            .collect();
+        RowIds::of_ranges(ranges, self.table.next_row_id).with_stored_groups(groups)
     }
 
     fn group_count(&self) -> usize {

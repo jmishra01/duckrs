@@ -88,6 +88,8 @@ pub struct StoredTable {
     pub column_statistics: Vec<Option<BaseStatistics>>,
     /// The id of the next row, past the gaps that a vacuum leaves.
     pub next_row_id: u64,
+    /// Where the ART of each index is, for what reads one.
+    pub indexes: Vec<g::IndexStorageInfo>,
 }
 
 /// `CreateSequenceInfo`, which is what C++ checkpoints of a sequence.
@@ -130,7 +132,8 @@ pub enum StoredEntry {
         name: String,
         ty: LogicalType,
     },
-    Index(Box<ast::CreateInfo>),
+    /// With what `COMMENT ON INDEX` said.
+    Index(Box<ast::CreateInfo>, Option<String>),
 }
 
 /// The catalog of a file.
@@ -300,7 +303,7 @@ fn read_entry(d: &mut BinaryDeserializer<'_>) -> Result<Pending> {
             // the ART of each index, which only lookups and writes need: C++ doesn't read them at
             // load either, and the rows are all that `duckrs` keeps keys unique from
             d.read_property_with_default::<Vec<g::BlockPointer>>(103, "index_pointers")?;
-            d.read_property_with_default::<Vec<g::IndexStorageInfo>>(104, "index_storage_infos")?;
+            table.indexes = d.read_property_with_default(104, "index_storage_infos")?;
             table.next_row_id = d
                 .read_optional_property(105, "next_row_id")?
                 .unwrap_or(table.total_rows);
@@ -318,6 +321,7 @@ pub(super) enum Converted {
 /// What a `CreateInfo` says, in the terms of the engine.
 pub(super) fn convert_entry(info: g::CreateInfo) -> Result<Converted> {
     let entry_type = info.type_;
+    let comment = info.comment.clone();
     // the path of a schema is its name and an empty name for the entry (`SchemaCatalogEntry::GetInfo`)
     if let g::CreateInfoKind::CreateSchemaInfo(stored) = &info.kind {
         if !stored.options.is_empty() {
@@ -345,10 +349,13 @@ pub(super) fn convert_entry(info: g::CreateInfo) -> Result<Converted> {
                 row_groups: Vec::new(),
                 column_statistics: Vec::new(),
                 next_row_id: 0,
+                indexes: Vec::new(),
             })));
         }
         g::CreateInfoKind::CreateIndexInfo(stored) => {
-            StoredEntry::Index(Box::new(convert::create_index(&schema, stored)?))
+            let comment = comment.filter(|value| !value.is_null());
+            let comment = comment.map(|value| value.try_to_string()).transpose()?;
+            StoredEntry::Index(Box::new(convert::create_index(&schema, stored)?), comment)
         }
         g::CreateInfoKind::CreateViewInfo(stored) => StoredEntry::View {
             schema,

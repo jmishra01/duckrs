@@ -177,6 +177,17 @@ impl PhysicalMergeInto {
         let table = &self.table;
         let types = table.types();
         let mut storage = table.write_storage()?;
+        let count = storage.len();
+        let row_ids = table.row_ids(count);
+        let position = |id: i64| row_ids.position(id as u64);
+        let deletes: HashSet<usize> = changes.deletes.iter().filter_map(|id| position(*id)).collect();
+        let updates: HashMap<usize, _> = changes
+            .updates
+            .iter()
+            .filter_map(|(id, update)| Some((position(*id)?, update)))
+            .collect();
+        table.claim_rows(deletes.iter().copied(), count, false)?;
+        table.claim_rows(updates.keys().copied(), count, true)?;
         let has_keys = !table.indexes.read().is_empty()
             || !table.referenced_by.lock().is_empty()
             || table
@@ -189,9 +200,9 @@ impl PhysicalMergeInto {
         let mut returned: Vec<(Vec<Value>, &'static str)> = Vec::new();
         let mut moved = Vec::new();
         for (index, chunk) in storage.chunks().enumerate() {
-            let first_row = (index * STANDARD_VECTOR_SIZE) as i64;
-            let touched = (0..chunk.len() as i64)
-                .any(|r| changes.updates.contains_key(&(first_row + r)) || changes.deletes.contains(&(first_row + r)));
+            let first_row = index * STANDARD_VECTOR_SIZE;
+            let touched =
+                (0..chunk.len()).any(|r| updates.contains_key(&(first_row + r)) || deletes.contains(&(first_row + r)));
             if !touched {
                 rewritten.append(chunk);
                 continue;
@@ -199,15 +210,15 @@ impl PhysicalMergeInto {
             let mut output = DataChunk::new(&types);
             let mut gone = DataChunk::new(&types);
             for row in 0..chunk.len() {
-                let id = first_row + row as i64;
+                let id = first_row + row;
                 let mut values: Vec<Value> = (0..types.len()).map(|c| chunk.column(c).get_value(row)).collect();
-                if changes.deletes.contains(&id) {
+                if deletes.contains(&id) {
                     gone.append_row(&values)?;
                     returned.push((values, "DELETE"));
                     continue;
                 }
-                if let Some(update) = changes.updates.get(&id) {
-                    for (column, value) in update {
+                if let Some(update) = updates.get(&id) {
+                    for (column, value) in update.iter() {
                         values[*column] = value.clone();
                     }
                     returned.push((values.clone(), "UPDATE"));
@@ -242,7 +253,22 @@ impl PhysicalMergeInto {
         *storage = rewritten;
         check_buffered(&storage)?;
         *table.unique_keys.lock() = None;
+        let updated = updates.keys().filter(|_| has_keys);
+        let mut removed: Vec<usize> = deletes.iter().chain(updated).copied().collect();
+        removed.sort_unstable();
+        removed.dedup();
+        table.rows_moved(&removed, count);
+        if !has_keys {
+            table.rows_updated_in_place(updates.keys().copied());
+        }
         drop(storage);
+        if !has_keys {
+            let columns: Vec<usize> = updates
+                .values()
+                .flat_map(|update| update.iter().map(|(c, _)| *c))
+                .collect();
+            table.rows_updated(updates.keys().copied(), &columns, count);
+        }
 
         let mut output = self.output.lock();
         if self.returning {

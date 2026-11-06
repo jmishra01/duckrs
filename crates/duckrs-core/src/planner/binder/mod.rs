@@ -505,6 +505,8 @@ impl std::fmt::Debug for SessionValues {
 /// The settings that change how statements bind.
 #[derive(Debug, Clone, Copy)]
 pub struct BindOptions {
+    /// `txid_current`
+    pub transaction_id: u64,
     /// `default_order`
     pub default_order: OrderType,
     /// `default_null_order`
@@ -532,6 +534,7 @@ pub enum ShowBehavior {
 impl Default for BindOptions {
     fn default() -> Self {
         Self {
+            transaction_id: 0,
             default_order: OrderType::Ascending,
             default_null_order: DefaultNullOrder::NullsLast,
             single_arrow_lambdas: false,

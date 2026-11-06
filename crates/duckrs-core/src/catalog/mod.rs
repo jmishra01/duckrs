@@ -4,8 +4,7 @@
 // duckdb/src/common/exception/catalog_exception.cpp @ rust-port-baseline
 //
 //! The catalog: schemas with their tables and views, in memory. Names are case-insensitive and keep the
-//! case they were created with. There are no transactions yet, so changes are visible at once;
-//! MVCC visibility arrives with Phase 10, and table storage moves to `DataTable` with Phase 9.
+//! case they were created with. A transaction works on a copy of all of it: see `fork`.
 
 use crate::planner::expression::{BoundExpr, BoundExprKind};
 use duckrs_common::STANDARD_VECTOR_SIZE;
@@ -16,15 +15,20 @@ use duckrs_common::vector::{DataChunk, Vector};
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast::{Expr, MacroFunction, SelectStatement, sql_identifier, sql_quoted_identifier};
 use parking_lot::{Mutex, RwLock};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Weak};
+
+mod fork;
+mod row_ids;
+pub use fork::{CatalogVersions, Fork, RowVersions, TableOrigin, tick};
+pub use row_ids::{IdSet, MAX_ROW_ID, RowIds};
 
 /// The name of the in-memory database's catalog.
 pub const DEFAULT_CATALOG: &str = "memory";
 /// The schema used when a name is not qualified (`DEFAULT_SCHEMA`).
 pub const DEFAULT_SCHEMA: &str = "main";
 /// Where temporary objects live, ahead of the other schemas on the search path. DuckDB has a
-/// `temp` catalog per connection; here it is one schema until Phase 10 isolates connections.
+/// `temp` catalog per connection; here it is one schema, which connections share.
 pub const TEMP_SCHEMA: &str = "temp";
 /// `DEFAULT_ROW_GROUP_SIZE`.
 const ROW_GROUP_ROWS: usize = 122_880;
@@ -80,6 +84,8 @@ impl ColumnDefinition {
 pub trait TableSource: std::fmt::Debug + Send + Sync {
     /// Its rows that aren't deleted.
     fn row_count(&self) -> usize;
+    /// Their ids.
+    fn row_ids(&self) -> RowIds;
     fn group_count(&self) -> usize;
     /// The rows of a group that aren't deleted.
     fn group_rows(&self, group: usize) -> usize;
@@ -191,12 +197,15 @@ impl TableCursor {
             if self.next_group == self.source.group_count() {
                 return Err(Error::new(ErrorKind::Internal, "a table scan ran past its rows"));
             }
-            // what the chunks before this one held isn't needed any more
+            // what the chunks before this one held isn't needed any more, but a chunk that isn't
+            // full goes on in the next group, even if a scan skips that one
+            let full = chunks - usize::from(chunks > 0 && self.buffer.chunk(chunks - 1).len() < STANDARD_VECTOR_SIZE);
+            let skipped = local.min(full);
             let mut kept = ColumnDataCollection::new(self.types.clone());
-            for chunk in self.buffer.chunks().skip(local) {
+            for chunk in self.buffer.chunks().skip(skipped) {
                 kept.append(chunk);
             }
-            self.first_chunk += local.min(chunks);
+            self.first_chunk += skipped;
             kept.append(&self.source.read_group(self.next_group, &self.columns)?);
             self.buffer = kept;
             self.next_group += 1;
@@ -205,16 +214,17 @@ impl TableCursor {
 }
 
 /// What is durable of the rows of a table, for the next commit to log the difference. Records name
-/// rows by id, and ids stay when rows go: the rows that are durable have `old_ids`, of a file with
-/// deletes, and then the ids from `first_id` up to `next_id`.
+/// rows by the ids that they get when the log is replayed, which are the ids that they have here
+/// unless the table had to go into the log again, as replaying that leaves no gaps.
 #[derive(Debug, Default)]
 pub struct TableLog {
-    pub logged_rows: usize,
-    pub old_ids: Vec<u64>,
-    pub first_id: u64,
-    pub next_id: u64,
-    /// Rows changed in place, which the engine does by rewriting the table.
-    pub rewritten: bool,
+    /// The rows that are durable.
+    pub logged: Arc<RowIds>,
+    /// The same rows, as a replay numbers them.
+    pub replayed: Arc<RowIds>,
+    /// Those that changed in place since, by id here, and which columns did.
+    pub updated: IdSet,
+    pub updated_columns: BTreeSet<usize>,
 }
 
 /// A table (`TableCatalogEntry`) and its rows.
@@ -230,6 +240,8 @@ pub struct TableCatalogEntry {
     storage: RwLock<ColumnDataCollection>,
     /// Where the rows are if they are in a database file and nothing needed all of them so far.
     source: RwLock<Option<Arc<dyn TableSource>>>,
+    /// Where they still are too if they were only read from there, for what looks at the file.
+    read_from: RwLock<Option<Arc<dyn TableSource>>>,
     /// Beyond the NOT NULLs, which are in `columns`.
     pub constraints: Vec<TableConstraint>,
     /// What the write-ahead log knows of the rows.
@@ -242,6 +254,15 @@ pub struct TableCatalogEntry {
     pub indexes: RwLock<Vec<Arc<IndexCatalogEntry>>>,
     /// Of `columns`, when somebody needed them since the rows last changed.
     pub statistics: Mutex<TableStatistics>,
+    /// The tree of each key that a scan used, as `index_trees` left it.
+    pub index_trees: Mutex<HashMap<String, IndexTree>>,
+    /// How often rows changed places in a way that a tree can't follow.
+    rewrites: std::sync::atomic::AtomicU64,
+    /// What this is a copy of, for a transaction.
+    origin: Option<TableOrigin>,
+    /// Which row is which. Rows added at the end are in here once somebody asks.
+    row_ids: Mutex<Arc<RowIds>>,
+    versions: Arc<Mutex<RowVersions>>,
 }
 
 /// The statistics of a table's columns, if they are up to date. Working them out takes a scan, and
@@ -252,8 +273,53 @@ pub struct TableStatistics {
     pub columns: Option<Arc<Vec<ColumnStatistics>>>,
     /// The rows and each column's distinct values, for the join order.
     pub distinct: Option<Arc<TableDistinctCounts>>,
-    /// Per column that a filter asked about, a zone per row group.
+    /// Per column that a filter asked about, a zone per row group, as far as rows stayed the same.
     pub zones: std::collections::HashMap<usize, Arc<Vec<ColumnZone>>>,
+    /// How many rows at the start `columns` covers. As in C++ rows that go leave it as it is, and
+    /// it only says what values can be.
+    pub covered: usize,
+    /// Rows that changed in place since, which it doesn't cover, in no particular order.
+    pub updated: Vec<usize>,
+    /// Rows were written, and nobody said which yet. If nobody does that was all of them.
+    pub unreported: bool,
+}
+
+impl TableStatistics {
+    /// Nothing that was known holds any more.
+    pub fn forget(&mut self) {
+        self.columns = None;
+        self.covered = 0;
+        self.updated.clear();
+        self.zones.clear();
+        self.unreported = false;
+    }
+
+    /// Rows from this one on aren't what zones were made of.
+    fn rows_changed_from(&mut self, position: usize) {
+        self.distinct = None;
+        let groups = position / crate::execution::zone_map::ROW_GROUP_SIZE;
+        for zones in self.zones.values_mut() {
+            if zones.len() > groups {
+                Arc::make_mut(zones).truncate(groups);
+            }
+        }
+    }
+
+    /// `removed`, in order, are gone.
+    fn rows_removed(&mut self, removed: &[usize]) {
+        self.unreported = false;
+        let Some(first) = removed.first() else { return };
+        self.rows_changed_from(*first);
+        self.covered -= removed.partition_point(|position| *position < self.covered);
+        self.updated
+            .retain_mut(|position| match removed.binary_search(position) {
+                Ok(_) => false,
+                Err(before) => {
+                    *position -= before;
+                    true
+                }
+            });
+    }
 }
 
 /// What a row group holds of a column (the zone map of `SegmentStatistics`).
@@ -286,9 +352,9 @@ pub struct ColumnStatistics {
     pub can_be_valid: bool,
 }
 
-/// `DuckIndexEntry`. Nothing reads a table through an index until Phase 10 brings ART: the
-/// UNIQUE ones are checked through `TableCatalogEntry::unique_keys`, the others only exist.
-#[derive(Debug)]
+/// `DuckIndexEntry`. Scans read a table through one with `constraints::index_tree`, and the UNIQUE
+/// ones are checked through `TableCatalogEntry::unique_keys`.
+#[derive(Debug, Clone)]
 pub struct IndexCatalogEntry {
     pub name: String,
     pub unique: bool,
@@ -298,6 +364,40 @@ pub struct IndexCatalogEntry {
     pub names: Vec<String>,
     /// The columns the expressions read.
     pub columns: Vec<usize>,
+    /// The expressions as they were written, which is what a file holds.
+    pub parsed: Vec<Expr>,
+    /// `ART`, or what an extension added, which only a file can bring along.
+    pub index_type: String,
+    pub sql: String,
+    /// `COMMENT ON INDEX`, which makes a new entry, for a transaction that rolls back to lose it.
+    pub comment: Option<String>,
+}
+
+/// The tree of a key, for scans.
+#[derive(Debug, Clone)]
+pub struct IndexTree {
+    /// `TableCatalogEntry::rewrite_count` when it was built.
+    pub rewrites: u64,
+    /// All rows with a lower id are in the tree, or were.
+    pub frontier: u64,
+    /// How many rows it has, of which `gone` have left the table since.
+    pub rows: usize,
+    pub gone: usize,
+    pub tree: Arc<crate::execution::art::tree::Art>,
+}
+
+impl IndexTree {
+    /// Rows go by here so that a tree needn't be built again for each DELETE.
+    const MOST_GONE: usize = 4;
+
+    /// Rows that it may have went: `false` if the tree has too many that are no more.
+    fn rows_gone(&mut self, ids: &RowIds, removed: &[usize]) -> bool {
+        self.gone += removed
+            .iter()
+            .filter(|position| ids.id(**position) < self.frontier)
+            .count();
+        self.gone * Self::MOST_GONE <= self.rows
+    }
 }
 
 /// A key that has to be unique: of a PRIMARY KEY, a UNIQUE or a UNIQUE index.
@@ -310,8 +410,7 @@ pub struct TableKey {
     pub primary_key: bool,
 }
 
-/// The keys of one UNIQUE or PRIMARY KEY, with the position of their rows.
-pub type UniqueKeys = HashMap<Vec<u8>, usize>;
+pub use crate::execution::art::tree::UniqueKeys;
 
 /// A bound constraint of a table (`BoundConstraint`).
 #[derive(Debug, Clone)]
@@ -371,12 +470,18 @@ impl TableCatalogEntry {
             generated: Vec::new(),
             storage: RwLock::new(rows),
             source: RwLock::default(),
+            read_from: RwLock::default(),
             log: Mutex::default(),
             constraints,
             referenced_by: Mutex::default(),
             unique_keys: Mutex::default(),
             indexes: RwLock::default(),
             statistics: Mutex::default(),
+            index_trees: Mutex::default(),
+            rewrites: Default::default(),
+            origin: None,
+            row_ids: Mutex::default(),
+            versions: Arc::default(),
         }
     }
 
@@ -396,7 +501,13 @@ impl TableCatalogEntry {
     }
 
     /// Leaves the rows in a file until something needs them all.
+    /// What is in the file, with the rows being the same.
+    pub fn stored(&self) -> Option<Arc<dyn TableSource>> {
+        self.source().or_else(|| self.read_from.read().clone())
+    }
+
     pub fn set_source(&self, source: Arc<dyn TableSource>) {
+        self.set_row_ids(source.row_ids());
         *self.source.write() = Some(source);
     }
 
@@ -421,8 +532,15 @@ impl TableCatalogEntry {
     /// A checkpoint put the rows in a file: what is in memory of them goes.
     pub fn leave_in_file(&self, source: Arc<dyn TableSource>) {
         let types = self.types();
+        let ids = source.row_ids();
+        let old = self.row_ids(self.row_count());
+        if ids.next() != old.next() || !ids.ranges().eq(old.ranges()) {
+            self.rows_rewritten();
+        }
+        self.set_row_ids(ids);
         *self.write_loaded_storage() = ColumnDataCollection::new(types);
         *self.source.write() = Some(source);
+        self.statistics.lock().forget();
     }
 
     /// Reads rows that are still in a file into memory.
@@ -433,7 +551,7 @@ impl TableCatalogEntry {
         let mut source = self.source.write();
         if let Some(rows) = source.as_ref() {
             *self.storage.write() = rows.read_all()?;
-            *source = None;
+            *self.read_from.write() = source.take();
         }
         Ok(())
     }
@@ -444,44 +562,149 @@ impl TableCatalogEntry {
         Ok(self.storage.read())
     }
 
+    /// The ids of the rows, of which there are `count`.
+    pub fn row_ids(&self, count: usize) -> Arc<RowIds> {
+        let mut ids = self.row_ids.lock();
+        if ids.len() < count {
+            Arc::make_mut(&mut ids).fill(count);
+        }
+        ids.clone()
+    }
+
+    pub fn set_row_ids(&self, ids: RowIds) {
+        *self.row_ids.lock() = Arc::new(ids);
+    }
+
+    /// Rows are somewhere else now, in a way that `rows_moved` doesn't say.
+    pub fn rows_rewritten(&self) {
+        self.rewrites.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Changes each time that rows go or move.
+    pub fn rewrite_count(&self) -> u64 {
+        self.rewrites.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// All that can have a tree, in the order that a scan tries them: the keys of constraints and
+    /// then the indexes, as `TableIndexList` has them.
+    pub fn scan_keys(&self) -> Vec<TableKey> {
+        let mut keys: Vec<TableKey> = self
+            .constraints
+            .iter()
+            .filter_map(|constraint| {
+                let columns = match constraint {
+                    TableConstraint::Unique { columns, .. } => columns,
+                    TableConstraint::ForeignKey(foreign) => &foreign.columns,
+                    TableConstraint::Check { .. } => return None,
+                };
+                Some(TableKey {
+                    columns: columns.clone(),
+                    expressions: None,
+                    names: columns.iter().map(|c| self.columns[*c].name.clone()).collect(),
+                    primary_key: false,
+                })
+            })
+            .collect();
+        keys.extend(self.indexes.read().iter().map(|index| TableKey {
+            columns: index.columns.clone(),
+            expressions: Some(index.expressions.clone()),
+            names: index.names.clone(),
+            primary_key: false,
+        }));
+        keys
+    }
+
     /// Replaces rows that were in a file, which the caller has read.
     pub fn set_rows(&self, rows: ColumnDataCollection) {
+        self.rows_rewritten();
         *self.source.write() = None;
         *self.storage.write() = rows;
+        self.statistics.lock().forget();
     }
 
     /// Whoever writes to `storage` comes through here, so that nothing goes on using statistics of
     /// other rows.
     pub fn write_storage(&self) -> Result<parking_lot::RwLockWriteGuard<'_, ColumnDataCollection>> {
         self.load_rows()?;
-        self.log.lock().rewritten = true;
         Ok(self.write_loaded_storage())
     }
 
-    /// `write_storage` for what only adds rows at the end, which the log doesn't have to repeat.
+    /// `write_storage` for what only adds rows at the end.
     pub fn append_storage(&self) -> Result<parking_lot::RwLockWriteGuard<'_, ColumnDataCollection>> {
-        self.load_rows()?;
-        Ok(self.write_loaded_storage())
+        let storage = self.write_storage()?;
+        self.rows_appended(storage.len());
+        Ok(storage)
     }
 
-    /// All rows are durable, in a file that numbers them from 0.
+    /// All rows are durable as they are, in a file or in a log that was replayed.
     pub fn reset_log(&self) {
-        let rows = self.row_count();
+        let ids = self.row_ids(self.row_count());
         *self.log.lock() = TableLog {
-            logged_rows: rows,
-            next_id: rows as u64,
+            logged: ids.clone(),
+            replayed: ids,
             ..TableLog::default()
         };
     }
 
+    /// Whether an UPDATE of `columns` is a DELETE and an INSERT, which gives the rows new ids and
+    /// moves them to the end (`LogicalUpdate::BindExtraColumns`).
+    pub fn update_moves_rows(&self, columns: &[usize]) -> bool {
+        fn regular(ty: &LogicalType) -> bool {
+            match ty.id() {
+                LogicalTypeId::List
+                | LogicalTypeId::Array
+                | LogicalTypeId::Map
+                | LogicalTypeId::Union
+                | LogicalTypeId::Variant
+                | LogicalTypeId::Geometry => false,
+                LogicalTypeId::Struct => ty.struct_children().iter().all(|(_, ty)| regular(ty)),
+                _ => true,
+            }
+        }
+        let keyed = self.constraints.iter().any(|constraint| match constraint {
+            TableConstraint::Check { .. } => false,
+            TableConstraint::Unique { columns: keys, .. } => keys.iter().any(|c| columns.contains(c)),
+            TableConstraint::ForeignKey(key) => key.columns.iter().any(|c| columns.contains(c)),
+        });
+        keyed
+            || self
+                .indexes
+                .read()
+                .iter()
+                .any(|index| index.columns.iter().any(|c| columns.contains(c)))
+            || columns.iter().any(|c| !regular(&self.columns[*c].ty))
+    }
+
     fn write_loaded_storage(&self) -> parking_lot::RwLockWriteGuard<'_, ColumnDataCollection> {
         let storage = self.storage.write();
+        *self.read_from.write() = None;
         let mut statistics = self.statistics.lock();
         statistics.version += 1;
-        statistics.columns = None;
+        statistics.unreported = true;
         statistics.distinct = None;
-        statistics.zones.clear();
         storage
+    }
+
+    /// Whoever calls `write_storage` says what became of the rows, for what is known of them to
+    /// stay: the rows at these positions changed, and only their values.
+    pub fn rows_updated_in_place(&self, positions: impl IntoIterator<Item = usize>) {
+        let mut statistics = self.statistics.lock();
+        statistics.unreported = false;
+        let positions: Vec<usize> = positions.into_iter().collect();
+        if let Some(first) = positions.iter().min() {
+            statistics.rows_changed_from(*first);
+        }
+        // without any statistics they'd only pile up
+        if statistics.columns.is_some() {
+            statistics.updated.extend(positions);
+        }
+    }
+
+    /// All that happened is that rows were added at the end, of which there were `first_new_row`.
+    pub fn rows_appended(&self, first_new_row: usize) {
+        let mut statistics = self.statistics.lock();
+        statistics.unreported = false;
+        statistics.rows_changed_from(first_new_row);
     }
 
     /// What `unique_keys` holds the keys of, in that order.
@@ -555,7 +778,17 @@ impl TableCatalogEntry {
         if self.source.read().is_some() {
             return;
         }
-        self.write_loaded_storage().truncate(rows);
+        self.rows_rewritten();
+        {
+            let mut storage = self.write_loaded_storage();
+            storage.truncate(rows);
+            let mut statistics = self.statistics.lock();
+            statistics.unreported = false;
+            statistics.rows_changed_from(rows);
+            statistics.covered = statistics.covered.min(rows);
+            statistics.updated.retain(|position| *position < rows);
+        }
+        Arc::make_mut(&mut self.row_ids.lock()).truncate(rows);
         *self.unique_keys.lock() = None;
     }
 
@@ -1169,6 +1402,28 @@ impl SchemaCatalogEntry {
         users
     }
 
+    /// An index whose expressions call the macro `name`, which keeps it from going
+    /// (`DependencyManager`).
+    pub fn index_using_macro(&self, name: &str) -> Option<String> {
+        for entry in self.tables.read().values() {
+            let TableOrView::Table(table) = entry else { continue };
+            for index in table.indexes.read().iter() {
+                let mut found = false;
+                for expression in &index.parsed {
+                    duckrs_parser::transformer::visit_expr_mut(&mut expression.clone(), &mut |e: &mut Expr| {
+                        if let duckrs_parser::ast::ExprKind::Function(function) = &e.kind {
+                            found |= function.name.name.eq_ignore_ascii_case(name);
+                        }
+                    });
+                }
+                if found {
+                    return Some(index.name.clone());
+                }
+            }
+        }
+        None
+    }
+
     /// The tables with a column of the ENUM `name`, however deep in a nested type. A column does
     /// not remember the name of its type, so an ENUM is known by its type, and other user types
     /// are not tracked yet.
@@ -1250,9 +1505,37 @@ pub struct Catalog {
     pub name: String,
     schemas: RwLock<BTreeMap<String, Arc<SchemaCatalogEntry>>>,
     database_list: RwLock<Option<std::sync::Weak<dyn DatabaseList>>>,
+    versions: Mutex<CatalogVersions>,
+    /// Whether this is the copy of a transaction, which has temporary objects of its own already.
+    forked: bool,
 }
 
-/// What a catalog holds at a moment, to go back to on ROLLBACK, until the undo buffer of Phase 10.
+thread_local! {
+    /// The temporary objects of the connection that this thread is running a statement of.
+    static SESSION_TEMP: std::cell::RefCell<Option<Arc<SchemaCatalogEntry>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// For as long as it lives, statements on this thread have these temporary objects: as in C++ they
+/// are the connection's, whereas the catalog is shared by all of them.
+pub struct SessionTemp(Option<Arc<SchemaCatalogEntry>>);
+
+impl SessionTemp {
+    pub fn enter(temp: &Arc<SchemaCatalogEntry>) -> Self {
+        Self(SESSION_TEMP.with_borrow_mut(|current| current.replace(temp.clone())))
+    }
+
+    pub fn new_schema() -> Arc<SchemaCatalogEntry> {
+        Arc::new(SchemaCatalogEntry::new(TEMP_SCHEMA))
+    }
+}
+
+impl Drop for SessionTemp {
+    fn drop(&mut self) {
+        SESSION_TEMP.with_borrow_mut(|current| *current = self.0.take());
+    }
+}
+
+/// What a catalog holds at a moment, to go back to when a statement turns out to conflict.
 #[derive(Debug)]
 pub struct CatalogSnapshot {
     schemas: BTreeMap<String, Arc<SchemaCatalogEntry>>,
@@ -1268,6 +1551,7 @@ struct TableRows {
     rows: ColumnDataCollection,
     source: Option<Arc<dyn TableSource>>,
     indexes: Vec<Arc<IndexCatalogEntry>>,
+    ids: Arc<RowIds>,
 }
 
 /// The contents of a schema in a [`CatalogSnapshot`].
@@ -1302,7 +1586,7 @@ impl Catalog {
 
     /// A snapshot to [`Catalog::restore`] later.
     pub fn snapshot(&self) -> CatalogSnapshot {
-        let schemas = self.schemas.read().clone();
+        let schemas = self.schema_map();
         let mut entries = Vec::with_capacity(schemas.len());
         let mut table_rows = Vec::new();
         for schema in schemas.values() {
@@ -1318,6 +1602,7 @@ impl Catalog {
                         rows,
                         source,
                         indexes,
+                        ids: table.row_ids.lock().clone(),
                     });
                 }
             }
@@ -1338,7 +1623,13 @@ impl Catalog {
 
     /// Goes back to a snapshot: what was created since is gone, and what was dropped is back.
     pub fn restore(&self, snapshot: CatalogSnapshot) {
-        *self.schemas.write() = snapshot.schemas;
+        let mut schemas = snapshot.schemas;
+        if self.session_temp().is_some()
+            && let Some(shared) = self.schemas.read().get(TEMP_SCHEMA)
+        {
+            schemas.insert(key(TEMP_SCHEMA), shared.clone());
+        }
+        *self.schemas.write() = schemas;
         for saved in snapshot.entries {
             *saved.schema.tables.write() = saved.tables;
             *saved.schema.sequences.write() = saved.sequences;
@@ -1352,11 +1643,14 @@ impl Catalog {
             rows,
             source,
             indexes,
+            ids,
         } in snapshot.table_rows
         {
+            table.rows_rewritten();
             *table.write_loaded_storage() = rows;
             *table.source.write() = source;
             *table.indexes.write() = indexes;
+            *table.row_ids.lock() = ids;
             *table.unique_keys.lock() = None;
         }
     }
@@ -1367,6 +1661,8 @@ impl Catalog {
             name: name.to_string(),
             schemas: RwLock::new(BTreeMap::new()),
             database_list: RwLock::new(None),
+            versions: Mutex::default(),
+            forked: false,
         };
         catalog
             .schemas
@@ -1423,17 +1719,47 @@ impl Catalog {
 
     /// All the schemas, by name.
     pub fn schemas(&self) -> Vec<Arc<SchemaCatalogEntry>> {
-        self.schemas.read().values().cloned().collect()
+        self.schema_map().into_values().collect()
     }
 
     pub fn get_schema(&self, name: &str) -> Option<Arc<SchemaCatalogEntry>> {
-        self.schemas.read().get(&key(name)).cloned()
+        let name = key(name);
+        if name == TEMP_SCHEMA
+            && let Some(temp) = self.session_temp()
+        {
+            return Some(temp);
+        }
+        self.schemas.read().get(&name).cloned()
+    }
+
+    fn session_temp(&self) -> Option<Arc<SchemaCatalogEntry>> {
+        if self.forked {
+            return None;
+        }
+        SESSION_TEMP.with_borrow(Clone::clone)
+    }
+
+    /// The schemas as the connection on this thread sees them.
+    fn schema_map(&self) -> BTreeMap<String, Arc<SchemaCatalogEntry>> {
+        let mut schemas = self.schemas.read().clone();
+        if let Some(temp) = self.session_temp() {
+            schemas.insert(key(TEMP_SCHEMA), temp);
+        }
+        schemas
     }
 
     /// The schema an object qualified with `schema` (or not, with `None`) lives in.
     pub fn schema_for(&self, schema: Option<&str>) -> Result<Arc<SchemaCatalogEntry>> {
         let name = schema.unwrap_or(DEFAULT_SCHEMA);
         self.get_schema(name).ok_or_else(|| missing_entry("Schema", name))
+    }
+
+    /// `schema_for`, of what is called `name`: without a schema that can be a temporary one.
+    pub fn schema_with_entry(&self, schema: Option<&str>, name: &str) -> Result<Arc<SchemaCatalogEntry>> {
+        let temporary = self
+            .get_schema(TEMP_SCHEMA)
+            .filter(|temporary| schema.is_none() && temporary.get_entry(name).is_some());
+        temporary.map_or_else(|| self.schema_for(schema), Ok)
     }
 
     /// `Catalog::GetEntry`: looks the name up in `schema`, or without one along the search path:
@@ -1472,7 +1798,7 @@ impl Catalog {
                 .chain([DEFAULT_SCHEMA])
                 .collect(),
         };
-        let schemas: Vec<Arc<SchemaCatalogEntry>> = self.schemas.read().values().cloned().collect();
+        let schemas = self.schemas();
         let mut seen: Option<(f64, String)> = None;
         let mut unseen: Vec<(f64, String)> = Vec::new();
         for entry in &schemas {

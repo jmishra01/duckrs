@@ -8,6 +8,19 @@ fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
 }
 
+/// A copy of a file and its log, for what opens it to write: a checkpoint would change the fixture.
+fn writable_copy(file: &str) -> PathBuf {
+    let directory = std::env::temp_dir().join(format!("duckrs-read-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(file);
+    std::fs::copy(fixture(file), &path).unwrap();
+    let log = format!("{file}.wal");
+    if fixture(&log).exists() {
+        std::fs::copy(fixture(&log), directory.join(log)).unwrap();
+    }
+    path
+}
+
 fn connect(file: &str) -> Connection {
     Database::open(fixture(file), true).unwrap().connect().unwrap()
 }
@@ -218,7 +231,7 @@ fn defaults_and_generated_columns_come_along() {
 #[test]
 fn sequences_keep_their_state() {
     for file in ["parsed_v100.db", "parsed_v150.db", "parsed_v200.db"] {
-        let db = Database::open(fixture(file), false).unwrap();
+        let db = Database::open(writable_copy(file), false).unwrap();
         let mut connection = db.connect().unwrap();
         let sql = "SELECT nextval('counter'), nextval('other_schema.spent')";
         assert_eq!(column(&mut connection, sql), ["14|6"], "{file}");
@@ -322,7 +335,7 @@ fn logged_catalog_changes_are_replayed() {
 #[test]
 fn logged_sequence_values_are_replayed() {
     for file in LOGGED_FILES {
-        let db = Database::open(fixture(file), false).unwrap();
+        let db = Database::open(writable_copy(file), false).unwrap();
         let mut connection = db.connect().unwrap();
         assert_eq!(column(&mut connection, "SELECT nextval('counter')"), ["16"], "{file}");
         assert!(connection.query("SELECT nextval('doomed_sequence')").is_err(), "{file}");
@@ -398,7 +411,7 @@ fn a_read_only_file_takes_no_writes() {
 
 #[test]
 fn writes_to_a_file_fail_instead_of_getting_lost() {
-    let db = Database::open(fixture("compatible.db"), false).unwrap();
+    let db = Database::open(writable_copy("compatible.db"), false).unwrap();
     let mut connection = db.connect().unwrap();
     let error: Error = connection.query("DROP TABLE other.t").unwrap_err();
     assert_eq!(error.kind, ErrorKind::NotImplemented);

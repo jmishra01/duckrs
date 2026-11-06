@@ -264,6 +264,16 @@ fn type_parameter_type(expr: &Expr) -> &'static str {
     }
 }
 
+/// `ColumnQualifier::SQLValueFunctionName`: what these words call when no column has their name.
+fn sql_value_function(name: &str) -> Option<&'static str> {
+    match name.to_lowercase().as_str() {
+        "current_timestamp" => Some("get_current_timestamp"),
+        "current_date" => Some("current_date"),
+        "current_time" => Some("get_current_time"),
+        _ => None,
+    }
+}
+
 impl Binder<'_> {
     /// `Binder::BindLogicalType` for the types slice 1 executes: the scalar types without
     /// parameters, `VARCHAR(n)` and `DECIMAL(width, scale)`.
@@ -741,6 +751,15 @@ impl Binder<'_> {
                     bound = bind_nested_function("struct_extract", vec![String::new(); 2], children)?;
                 }
                 bound.with_alias(names.last().expect("a name").clone())
+            }
+            ExprKind::ColumnRef(names)
+                if names.len() == 1
+                    && sql_value_function(&names[0]).is_some()
+                    && self.bind_context.bind_column_ref(names).is_err() =>
+            {
+                let function = sql_value_function(&names[0]).expect("just checked");
+                let call = crate::storage::writer::parse_expression(&format!("{function}()"))?;
+                return self.bind_expression(&call);
             }
             ExprKind::ColumnRef(names) => {
                 let mode = self
@@ -1269,6 +1288,9 @@ impl Binder<'_> {
         let name = function.name.name.to_lowercase();
         if name == "current_schema" && function.args.is_empty() {
             return Ok(Some(BoundExpr::constant(Value::varchar("main"))));
+        }
+        if matches!(name.as_str(), "txid_current" | "current_transaction_id") && function.args.is_empty() {
+            return Ok(Some(BoundExpr::constant(Value::ubigint(self.options.transaction_id))));
         }
         if !matches!(name.as_str(), "getvariable" | "current_setting") {
             return Ok(None);

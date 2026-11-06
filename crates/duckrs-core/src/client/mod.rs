@@ -9,8 +9,8 @@ pub mod settings;
 mod settings_table;
 
 use crate::catalog::{
-    Catalog, CatalogSnapshot, DEFAULT_CATALOG, OnCreateConflict, SequenceData, TEMP_SCHEMA, TableConstraint,
-    TableOrView, macro_type_name, missing_entry,
+    Catalog, DEFAULT_CATALOG, Fork, IndexCatalogEntry, OnCreateConflict, SchemaCatalogEntry, SequenceData, SessionTemp,
+    TEMP_SCHEMA, TableOrView, macro_type_name, missing_entry, tick,
 };
 use crate::catalog::{DatabaseList, DatabaseListing};
 use crate::execution::alter::{execute_alter, execute_create_index};
@@ -34,8 +34,8 @@ use duckrs_common::value::Value;
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ParserOptions;
 use duckrs_parser::ast::{
-    CreateInfo, CreateKind, CreateTypeKind, DropInfo, ExplainType, Expr, ExprKind, OnCreateConflict as AstConflict,
-    PragmaInfo, QualifiedName, Statement, sql_quoted_identifier,
+    AlterInfo, AlterKind, CreateInfo, CreateKind, CreateTypeKind, DropInfo, ExplainType, Expr, ExprKind, LiteralKind,
+    OnCreateConflict as AstConflict, PragmaInfo, QualifiedName, Statement, sql_quoted_identifier,
 };
 use duckrs_parser::ast::{TransactionModifier, TransactionType};
 use parking_lot::{Mutex, RwLock};
@@ -51,8 +51,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// storage.
 #[derive(Debug)]
 pub struct DatabaseInstance {
-    pub catalog: Catalog,
-    settings: RwLock<SettingValues>,
+    pub catalog: Arc<Catalog>,
+    /// Shared with the databases that are attached to this one.
+    settings: Arc<RwLock<SettingValues>>,
     transactions: Mutex<OpenTransactions>,
     /// held to read while a SELECT runs, and to write while anything else does
     statements: RwLock<()>,
@@ -81,6 +82,8 @@ pub struct AttachOptions {
     pub read_only: bool,
     pub block_size: Option<u64>,
     pub row_group_size: Option<u64>,
+    /// Those of the database that it is attached to, as a log is replayed with them.
+    settings: Option<Arc<RwLock<SettingValues>>>,
 }
 
 /// Where a checkpoint goes, and the log of what happened since the last one.
@@ -103,21 +106,17 @@ enum FileAccess {
     WritesNotPorted,
 }
 
-/// Which connections have a transaction open. There is no MVCC until Phase 10, so transactions
-/// do not isolate connections from each other: what would need that fails as not yet ported
-/// rather than show one connection's uncommitted changes to another.
+/// Which connections have a transaction open.
 #[derive(Debug, Default)]
 struct OpenTransactions {
     open: HashSet<u64>,
-    /// the connection whose transaction has uncommitted changes
-    writer: Option<u64>,
 }
 
 impl DatabaseInstance {
     fn with_file_access(file_access: Option<FileAccess>) -> Self {
         Self {
-            catalog: Catalog::new(DEFAULT_CATALOG),
-            settings: RwLock::new(SettingValues::default()),
+            catalog: Arc::new(Catalog::new(DEFAULT_CATALOG)),
+            settings: Arc::default(),
             transactions: Mutex::new(OpenTransactions::default()),
             statements: RwLock::new(()),
             file_access,
@@ -142,6 +141,7 @@ impl DatabaseInstance {
             read_only,
             block_size: None,
             row_group_size: None,
+            settings: None,
         };
         Self::open_with(path, &options)
     }
@@ -158,10 +158,13 @@ impl DatabaseInstance {
         let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
         let mut db = Self::with_file_access(None);
         db.name.clone_from(&name);
+        if let Some(settings) = &options.settings {
+            db.settings = settings.clone();
+        }
         let buffer = storage::load_database(path, &db.catalog, read_only)?;
         db.file_access = if read_only {
             Some(FileAccess::ReadOnly(name.clone()))
-        } else if !storage::takes_checkpoints(&buffer) || db.has_keys() {
+        } else if !storage::takes_checkpoints(&buffer) || db.has_foreign_indexes() {
             Some(FileAccess::WritesNotPorted)
         } else {
             None
@@ -194,6 +197,8 @@ impl DatabaseInstance {
         let Some(file) = self.file.as_ref().filter(|_| self.file_access.is_none()) else {
             return Ok(());
         };
+        // what a statement is in the middle of isn't committed, nor are its rows all there
+        let reading = self.statements.read();
         let blocks = file.buffer.block_manager();
         let mut log = file.log.lock();
         let identifier = blocks.main_header().db_identifier;
@@ -203,12 +208,14 @@ impl DatabaseInstance {
             &file.name,
             &identifier,
             blocks.header().iteration,
+            blocks.block_size(),
         )? {
             return Ok(());
         }
         self.changed.store(true, AtomicOrdering::SeqCst);
         let full = log.size() >= threshold;
         drop(log);
+        drop(reading);
         if full && self.transactions.lock().open.is_empty() {
             let _writing = self.statements.write();
             self.write_checkpoint_with(abort)?;
@@ -238,17 +245,11 @@ impl DatabaseInstance {
         listing
     }
 
-    /// Whether a table has what a checkpoint can't write until Phase 10 ports the ART.
-    fn has_keys(&self) -> bool {
+    /// Whether an index came with an extension, as only that can build it again.
+    fn has_foreign_indexes(&self) -> bool {
         self.catalog.schemas().iter().any(|schema| {
             schema.tables_and_views().iter().any(|entry| match entry {
-                TableOrView::Table(table) => {
-                    !table.indexes.read().is_empty()
-                        || table
-                            .constraints
-                            .iter()
-                            .any(|c| !matches!(c, TableConstraint::Check { .. }))
-                }
+                TableOrView::Table(table) => table.indexes.read().iter().any(|index| index.index_type != "ART"),
                 TableOrView::View(_) => false,
             })
         })
@@ -284,9 +285,16 @@ impl DatabaseInstance {
         };
         let force = settings::current_value("force_compression", &self.settings.read(), &SettingValues::default());
         let force = force.and_then(|value| value.try_to_string().ok()).unwrap_or_default();
+        let vacuum_tasks =
+            settings::current_value("max_vacuum_tasks", &self.settings.read(), &SettingValues::default());
+        let vacuum_tasks = vacuum_tasks
+            .and_then(|value| value.as_i128())
+            .map_or(100, |tasks| tasks as usize);
         let options = storage::writer::CheckpointOptions {
+            keep_free_blocks: self.catalog.has_forks(),
             force_compression: &force,
             row_group_size: file.row_group_size,
+            vacuum_tasks: if self.catalog.has_forks() { 0 } else { vacuum_tasks },
             abort,
         };
         let result =
@@ -311,30 +319,11 @@ impl DatabaseInstance {
         }
     }
 
-    /// What a file can't hold yet has to fail when it is made: at a checkpoint it would be too late.
-    fn check_storable(&self, statement: &Statement) -> Result<()> {
-        use duckrs_parser::ast::{AlterKind, Constraint};
-        let is_key = |c: &Constraint| matches!(c, Constraint::Unique { .. } | Constraint::ForeignKey { .. });
-        let unstorable = match statement {
-            Statement::CreateTable(info) => !info.temporary && info.constraints.iter().any(is_key),
-            Statement::Create(info) => matches!(info.kind, CreateKind::Index { .. }),
-            Statement::Alter(info) => matches!(&info.kind, AlterKind::AddConstraint(c) if is_key(c)),
-            _ => false,
-        };
-        if unstorable {
-            return Err(Error::not_implemented(
-                "keys and indexes in a database file need the ART of Phase 10, which is not yet ported to duckrs",
-            ));
-        }
-        Ok(())
-    }
-
     /// Fails if this database takes no writes.
     fn check_writable(&self, statement: &Statement) -> Result<()> {
         match &self.file_access {
             None => {
                 if self.file.is_some() {
-                    self.check_storable(statement)?;
                     self.changed.store(true, AtomicOrdering::SeqCst);
                 }
                 Ok(())
@@ -348,7 +337,7 @@ impl DatabaseInstance {
             )),
             Some(FileAccess::WritesNotPorted) => Err(Error::not_implemented(
                 "writing to this database file is not yet ported to duckrs: it is from a version before \
-                 v2.0.0, or it has keys or indexes",
+                 v2.0.0, or it has an index of an extension",
             )),
         }
     }
@@ -388,6 +377,19 @@ fn storage_version_at_least_v2(version: &str) -> bool {
             >= Some(2)
 }
 
+/// Fails if an index depends on the macro `name`.
+fn macro_is_free(schema: &SchemaCatalogEntry, name: &str) -> Result<()> {
+    match schema.index_using_macro(name) {
+        Some(index) => Err(Error::new(
+            ErrorKind::Dependency,
+            format!(
+                "Cannot drop entry \"{name}\" because there are entries that depend on it.\nindex \"{index}\" depends on macro function \"{name}\"."
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
 /// The names of the tables and other entries that a statement refers to directly, for routing it
 /// to the database they are in. Subqueries in expressions aren't looked at.
 fn for_each_table_name(statement: &mut Statement, f: &mut impl FnMut(&mut QualifiedName)) {
@@ -413,6 +415,13 @@ fn for_each_table_name(statement: &mut Statement, f: &mut impl FnMut(&mut Qualif
             K::SetOperation(set) => set.children.iter_mut().for_each(|child| in_query(child, f)),
             _ => {}
         }
+        duckrs_parser::transformer::visit_query_node_exprs_mut(node, &mut |e: &mut Expr| in_expression(e, f));
+    }
+    /// The subquery of `e`, whose parts go by anyway.
+    fn in_expression(e: &mut Expr, f: &mut impl FnMut(&mut QualifiedName)) {
+        if let ExprKind::Subquery { subquery, .. } = &mut e.kind {
+            in_query(&mut subquery.node, f);
+        }
     }
     use duckrs_parser::ast::InsertValues;
     match statement {
@@ -434,6 +443,41 @@ fn for_each_table_name(statement: &mut Statement, f: &mut impl FnMut(&mut Qualif
         Statement::Create(info) => f(&mut info.name),
         Statement::Drop(info) => f(&mut info.name),
         Statement::Alter(info) => f(&mut info.name),
+        Statement::Explain { statement, .. } => for_each_table_name(statement, f),
+        Statement::Vacuum { table: Some(table), .. } => in_table(table, f),
+        _ => {}
+    }
+}
+
+/// A column named with its database, which a statement that runs there doesn't have any more.
+fn strip_database(statement: &mut Statement, database: &str) {
+    let mut strip = |e: &mut Expr| {
+        if let ExprKind::ColumnRef(parts) = &mut e.kind
+            && parts.len() > 2
+            && parts[0].eq_ignore_ascii_case(database)
+        {
+            parts.remove(0);
+        }
+    };
+    let mut visit = |e: &mut Expr| duckrs_parser::transformer::visit_expr_mut(e, &mut strip);
+    match statement {
+        Statement::Select(select) => {
+            duckrs_parser::transformer::visit_query_node_exprs_mut(&mut select.node, &mut |e: &mut Expr| {
+                visit(e);
+            });
+        }
+        Statement::Insert(insert) => {
+            if let Some(info) = insert
+                .on_conflict
+                .as_mut()
+                .and_then(|conflict| conflict.set_info.as_mut())
+            {
+                info.expressions.iter_mut().for_each(&mut visit);
+                info.condition.iter_mut().for_each(|e| visit(e));
+            }
+        }
+        Statement::Update(update) => update.set_info.expressions.iter_mut().for_each(&mut visit),
+        Statement::Delete(delete) => delete.condition.iter_mut().for_each(|e| visit(e)),
         _ => {}
     }
 }
@@ -480,18 +524,22 @@ pub struct ClientContext {
     parameters: Option<Arc<ParameterValues>>,
     /// what SET VARIABLE set (`ClientConfig::user_variables`), by lower-case name
     variables: HashMap<String, Value>,
+    /// its temporary objects, which the `temp` catalog holds in C++
+    temp: Arc<SchemaCatalogEntry>,
 }
 
 /// A transaction started with BEGIN.
 #[derive(Debug)]
 struct ActiveTransaction {
+    /// What `txid_current` says.
+    id: u64,
     read_only: bool,
     /// a statement failed in a way that leaves only ROLLBACK (`ValidChecker`)
     invalidated: bool,
     /// the transaction's `TransactionInvalidationPolicy`
     invalidation_policy: String,
-    /// what ROLLBACK goes back to, from before the transaction's first write
-    snapshot: Option<CatalogSnapshot>,
+    /// What it sees of each database it touched. Going away is what rolls it back.
+    forks: Vec<(Arc<DatabaseInstance>, Fork)>,
 }
 
 impl ActiveTransaction {
@@ -579,12 +627,13 @@ impl ClientContext {
             prepared_statements: HashMap::new(),
             parameters: None,
             variables: HashMap::new(),
+            temp: SessionTemp::new_schema(),
         }
     }
 
     /// The current value of a setting (`Settings::Get` / `current_setting`).
     pub fn setting(&self, name: &str) -> Option<Value> {
-        settings::current_value(name, &self.db.settings.read(), &self.settings)
+        settings::current_value(name, &self.home.settings.read(), &self.settings)
     }
 
     fn setting_text(&self, name: &str) -> String {
@@ -595,7 +644,7 @@ impl ClientContext {
 
     /// What `current_setting` and `getvariable` read.
     fn session_values(&self) -> Arc<SessionValues> {
-        let db = self.db.clone();
+        let db = self.home.clone();
         let session = self.settings.clone();
         Arc::new(SessionValues {
             variables: self.variables.clone(),
@@ -606,15 +655,29 @@ impl ClientContext {
     /// The settings the binder needs.
     /// `enable_optimizer` and `disabled_optimizers`.
     fn optimizer_options(&self) -> OptimizerOptions {
-        if self.setting_text("enable_optimizer") == "false" {
+        let mut options = if self.setting_text("enable_optimizer") == "false" {
             OptimizerOptions::none()
         } else {
             OptimizerOptions::from_disabled(&self.setting_text("disabled_optimizers"))
+        };
+        if let Ok(percentage) = self.setting_text("index_scan_percentage").parse() {
+            options.index_scan_percentage = percentage;
         }
+        if let Ok(count) = self.setting_text("index_scan_max_count").parse() {
+            options.index_scan_max_count = count;
+        }
+        if let Ok(threshold) = self.setting_text("dynamic_or_filter_threshold").parse() {
+            options.dynamic_or_filter_threshold = threshold;
+        }
+        options
     }
 
     fn bind_options(&self) -> BindOptions {
         BindOptions {
+            transaction_id: self
+                .transaction
+                .as_ref()
+                .map_or_else(tick, |transaction| transaction.id),
             default_order: if self.setting_text("default_order") == "DESC" {
                 OrderType::Descending
             } else {
@@ -649,6 +712,7 @@ impl ClientContext {
 
     /// `ClientContext::Query`: runs every statement in `sql` and returns the last result.
     pub fn query(&mut self, sql: &str) -> Result<MaterializedQueryResult> {
+        let _temp = SessionTemp::enter(&self.temp);
         let statements = match duckrs_parser::parse_ast_with(sql, &self.parser_options()) {
             Ok(statements) => statements,
             Err(error) => {
@@ -671,6 +735,7 @@ impl ClientContext {
 
     /// `ClientContext::Prepare`: checks one statement and keeps it to run later.
     pub fn prepare(&mut self, sql: &str) -> Result<Arc<PreparedStatementData>> {
+        let _temp = SessionTemp::enter(&self.temp);
         let mut statements = duckrs_parser::parse_ast_with(sql, &self.parser_options())?;
         if statements.len() != 1 {
             return Err(Error::new(
@@ -694,7 +759,8 @@ impl ClientContext {
                 | Statement::Vacuum { .. }
         );
         if !client_statement {
-            let mut binder = Binder::with_options(&self.db.catalog, self.bind_options());
+            let catalog = self.catalog();
+            let mut binder = Binder::with_options(&catalog, self.bind_options());
             binder.parameters = Some(parameters.clone());
             binder.bind(&statement)?;
         }
@@ -711,6 +777,7 @@ impl ClientContext {
         prepared: &PreparedStatementData,
         values: &[Value],
     ) -> Result<MaterializedQueryResult> {
+        let _temp = SessionTemp::enter(&self.temp);
         let named = values
             .iter()
             .enumerate()
@@ -780,11 +847,18 @@ impl ClientContext {
                 }
                 self.db.transactions.lock().open.insert(self.id);
                 self.transaction = Some(ActiveTransaction {
+                    id: tick(),
                     read_only: modifier == TransactionModifier::ReadOnly,
                     invalidated: false,
                     invalidation_policy: self.setting_text("default_transaction_invalidation_policy"),
-                    snapshot: None,
+                    forks: Vec::new(),
                 });
+                if self
+                    .setting_text("immediate_transaction_mode")
+                    .eq_ignore_ascii_case("true")
+                {
+                    self.start_on_database();
+                }
             }
             TransactionType::Commit => {
                 let Some(transaction) = self.transaction.take() else {
@@ -793,22 +867,40 @@ impl ClientContext {
                 // COMMIT of an invalidated transaction rolls it back
                 let rollback = transaction.invalidated;
                 if !rollback
-                    && transaction.snapshot.is_some()
+                    && transaction.forks.iter().any(|(_, fork)| fork.dirty)
                     && let Some(error) = self.forced_commit_failure()
                 {
-                    self.end_transaction(transaction, true);
+                    self.end_transaction(transaction);
                     return Err(error);
                 }
-                self.end_transaction(transaction, rollback);
                 if !rollback {
-                    self.log_commit()?;
+                    for (database, fork) in &transaction.forks {
+                        let _writing = database.statements.write();
+                        if let Err(error) = fork.commit() {
+                            drop(_writing);
+                            self.end_transaction(transaction);
+                            return Err(error);
+                        }
+                    }
+                }
+                let databases: Vec<_> = transaction.forks.iter().map(|(database, _)| database.clone()).collect();
+                self.end_transaction(transaction);
+                if !rollback {
+                    let current = self.db.clone();
+                    let mut result = Ok(());
+                    for database in databases {
+                        self.db = database;
+                        result = result.and(self.log_commit());
+                    }
+                    self.db = current;
+                    result?;
                 }
             }
             TransactionType::Rollback => {
                 let Some(transaction) = self.transaction.take() else {
                     return Err(error("cannot rollback - no transaction is active"));
                 };
-                self.end_transaction(transaction, true);
+                self.end_transaction(transaction);
             }
         }
         Ok(Self::success())
@@ -827,6 +919,14 @@ impl ClientContext {
             .setting_text("debug_force_commit_failure")
             .eq_ignore_ascii_case("true")
         {
+            // what can't be reverted leaves nothing to go on with
+            if self
+                .setting_text("debug_force_commit_revert_failure")
+                .eq_ignore_ascii_case("true")
+            {
+                self.db
+                    .invalidate("Forced RevertCommit failure (debug_force_commit_revert_failure)");
+            }
             return Some(Error::new(
                 ErrorKind::InvalidInput,
                 "Forced commit failure (debug_force_commit_failure)",
@@ -901,32 +1001,69 @@ impl ClientContext {
         Ok(())
     }
 
-    fn end_transaction(&self, transaction: ActiveTransaction, rollback: bool) {
-        if rollback && let Some(snapshot) = transaction.snapshot {
-            self.db.catalog.restore(snapshot);
+    fn end_transaction(&self, transaction: ActiveTransaction) {
+        for (database, _) in &transaction.forks {
+            database.transactions.lock().open.remove(&self.id);
         }
-        let mut transactions = self.db.transactions.lock();
-        transactions.open.remove(&self.id);
-        if transactions.writer == Some(self.id) {
-            transactions.writer = None;
-        }
+        self.db.transactions.lock().open.remove(&self.id);
     }
 
-    /// Fails for what would need other connections to be isolated from this one, or the other
-    /// way around.
-    fn check_other_connections(&self, write: bool) -> Result<()> {
-        let transactions = self.db.transactions.lock();
-        if transactions.writer.is_some_and(|writer| writer != self.id) {
-            return Err(crate::unported(
-                "running a statement while another connection has uncommitted changes",
-            ));
+    /// The catalog that statements of this connection use: the fork of the transaction, or the
+    /// database's own.
+    fn catalog(&self) -> Arc<Catalog> {
+        self.fork()
+            .map_or_else(|| self.db.catalog.clone(), |fork| fork.catalog.clone())
+    }
+
+    fn fork(&self) -> Option<&Fork> {
+        let forks = &self.transaction.as_ref()?.forks;
+        forks
+            .iter()
+            .map(|(_, fork)| fork)
+            .find(|fork| fork.is_of(&self.db.catalog))
+    }
+
+    /// Whether the table that `statement` writes to is one that is private to the connection.
+    fn writes_temporary_table(&self, statement: &Statement) -> bool {
+        let table_of = |table: &duckrs_parser::ast::TableRef| match &table.kind {
+            duckrs_parser::ast::TableRefKind::BaseTable { name, .. } => Some(name.clone()),
+            _ => None,
+        };
+        let name = match statement {
+            Statement::Insert(insert) => Some(insert.table.clone()),
+            Statement::Update(update) => table_of(&update.table),
+            Statement::Delete(delete) => table_of(&delete.table),
+            Statement::Alter(info) => Some(info.name.clone()),
+            Statement::Create(info) => match &info.kind {
+                CreateKind::Index { table, .. } => Some(duckrs_parser::ast::QualifiedName {
+                    qualification: info.name.qualification.clone(),
+                    name: table.clone(),
+                }),
+                _ => None,
+            },
+            _ => None,
+        };
+        name.is_some_and(|name| {
+            self.catalog()
+                .get_table(schema_of(&name).ok().flatten(), &name.name)
+                .is_ok_and(|table| table.schema.eq_ignore_ascii_case(TEMP_SCHEMA))
+        })
+    }
+
+    /// `MetaTransaction::GetTransaction`: a transaction starts on a database when it first uses it.
+    fn start_on_database(&mut self) {
+        if self.fork().is_some() {
+            return;
         }
-        if write && transactions.open.iter().any(|id| *id != self.id) {
-            return Err(crate::unported(
-                "changing the database while another connection has a transaction open",
-            ));
+        let db = self.db.clone();
+        if let Some(transaction) = &mut self.transaction {
+            let fork = {
+                let _reading = db.statements.read();
+                db.catalog.fork()
+            };
+            db.transactions.lock().open.insert(self.id);
+            transaction.forks.push((db, fork));
         }
-        Ok(())
     }
 
     /// Runs one statement within the current transaction, or as a transaction of its own
@@ -941,11 +1078,27 @@ impl ClientContext {
         match statement {
             // the statements a PIVOT was rewritten into: the last one has the result
             Statement::Multi(statements) => {
-                let mut result = Self::success();
-                for statement in statements {
-                    result = self.run_statement(statement)?;
+                // they are one statement, so they go together or not at all
+                let implicit = self.transaction.is_none();
+                if implicit {
+                    self.run_transaction_statement(TransactionType::Begin, TransactionModifier::Default)?;
                 }
-                return Ok(result);
+                let mut result = Ok(Self::success());
+                for statement in statements {
+                    result = self.run_statement(statement);
+                    if result.is_err() {
+                        break;
+                    }
+                }
+                if implicit {
+                    let end = if result.is_ok() {
+                        TransactionType::Commit
+                    } else {
+                        TransactionType::Rollback
+                    };
+                    self.run_transaction_statement(end, TransactionModifier::Default)?;
+                }
+                return result;
             }
             Statement::Transaction {
                 transaction_type,
@@ -958,6 +1111,13 @@ impl ClientContext {
             _ => {}
         }
         if self.transaction.as_ref().is_some_and(|t| t.invalidated) {
+            // `CheckIfPreparedStatementIsExecutable` comes after binding
+            if matches!(
+                statement,
+                Statement::Select(_) | Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+            ) {
+                self.prepare_statement(statement.clone())?;
+            }
             return Err(Error::new(ErrorKind::Transaction, INVALIDATED_TRANSACTION));
         }
         self.check_valid(&self.db)?;
@@ -965,13 +1125,19 @@ impl ClientContext {
         if write {
             self.db.check_writable(statement)?;
         }
-        self.check_other_connections(write)?;
+        self.start_on_database();
+        let writes_temporary_table = self.writes_temporary_table(statement);
         // what a failed statement outside of a transaction undoes: INSERT is the one that can
         // fail halfway through
         let mut appending = None;
+        let stops_checkpoints = match statement {
+            Statement::Delete(_) => false,
+            Statement::Insert(insert) => insert.on_conflict.as_ref().is_some_and(|c| c.set_info.is_some()),
+            _ => true,
+        };
         if write {
             match &mut self.transaction {
-                Some(transaction) if transaction.read_only => {
+                Some(transaction) if transaction.read_only && !writes_temporary_table => {
                     return Err(Error::new(
                         ErrorKind::Transaction,
                         format!(
@@ -980,46 +1146,89 @@ impl ClientContext {
                         ),
                     ));
                 }
-                Some(transaction) if transaction.snapshot.is_none() => {
-                    transaction.snapshot = Some(self.db.catalog.snapshot());
-                    self.db.transactions.lock().writer = Some(self.id);
+                Some(transaction) => {
+                    let forks = transaction.forks.iter_mut().map(|(_, fork)| fork);
+                    if let Some(fork) = forks.into_iter().find(|fork| fork.is_of(&self.db.catalog)) {
+                        fork.mark_dirty(stops_checkpoints);
+                    }
                 }
-                _ => {}
+                None => {}
             }
             if let Statement::Insert(insert) = statement
                 && let Ok(table) = self
-                    .db
-                    .catalog
+                    .catalog()
                     .get_table(schema_of(&insert.table).ok().flatten(), &insert.table.name)
             {
-                let rows = table.row_count();
-                appending = Some((table, rows));
+                appending = Some(table);
             }
         }
         // outside of a transaction only a commit that is made to fail needs one of these
-        let undo = (write && self.transaction.is_none() && self.commit_may_fail()).then(|| self.db.catalog.snapshot());
-        // until Phase 10 isolates connections, a statement that writes runs alone: UPDATE and
-        // DELETE rewrite tables, which would pull the rows from under a scan
+        let undo = (write && self.transaction.is_none() && self.commit_may_fail()).then(|| self.catalog().snapshot());
+        // what isn't a change to rows can conflict with what transactions did to the catalog
+        let changes_entries = write
+            && !matches!(
+                statement,
+                Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) | Statement::Merge(_)
+            );
         let db = self.db.clone();
-        let result = if matches!(statement, Statement::Select(_)) {
+        let result = if self.transaction.is_some() {
+            // on a fork of its own, which nobody else writes to
+            let before = changes_entries.then(|| self.catalog().snapshot());
+            let rows = appending.as_ref().map(|table| table.row_count());
+            let result = self.execute_statement(statement);
+            if result.is_err()
+                && let (Some(table), Some(rows)) = (&appending, rows)
+            {
+                table.truncate(rows);
+            }
+            match (result, before) {
+                (Ok(result), Some(before)) => match self.fork().expect("started above").claim_changes() {
+                    Ok(()) => Ok(result),
+                    Err(error) => {
+                        self.catalog().restore(before);
+                        Err(error)
+                    }
+                },
+                (result, _) => result,
+            }
+        } else if matches!(statement, Statement::Select(_)) {
             let _reading = db.statements.read();
             self.execute_statement(statement)
-        } else {
-            let _writing = db.statements.write();
+        } else if matches!(statement, Statement::Call(function) if checkpoint_call(function).is_some()) {
+            // which takes the lock of the database that it is about
             self.execute_statement(statement)
+        } else {
+            // UPDATE and DELETE rewrite tables, which would pull the rows from under a scan
+            let _writing = db.statements.write();
+            let before = (changes_entries && db.catalog.has_forks()).then(|| db.catalog.snapshot());
+            // what others added stays: this is only known for sure while nobody else can write
+            let rows = appending.as_ref().map(|table| table.row_count());
+            let result = self.execute_statement(statement);
+            if result.is_err()
+                && let (Some(table), Some(rows)) = (&appending, rows)
+            {
+                table.truncate(rows);
+            }
+            match (result, before) {
+                (Ok(result), Some(before)) => match db.catalog.claim_changes(&before) {
+                    Ok(()) => Ok(result),
+                    Err(error) => {
+                        db.catalog.restore(before);
+                        Err(error)
+                    }
+                },
+                (result, _) => result,
+            }
         };
         if let Err(error) = &result {
             if let Some(transaction) = &mut self.transaction {
                 transaction.apply_invalidation_policy(error.kind);
             }
-            if let Some((table, rows)) = appending {
-                table.truncate(rows);
-            }
         } else if self.transaction.is_none() {
             if let Some(snapshot) = undo
                 && let Some(error) = self.forced_commit_failure()
             {
-                self.db.catalog.restore(snapshot);
+                self.catalog().restore(snapshot);
                 return Err(error);
             }
             // also for a SELECT, as `nextval` is one
@@ -1048,7 +1257,7 @@ impl ClientContext {
         let database = names.iter().find_map(|name| {
             let first = name.qualification.first()?;
             let is_schema = name.qualification.len() == 1
-                && (self.db.catalog.get_schema(first).is_some() || first.eq_ignore_ascii_case(TEMP_SCHEMA));
+                && (self.catalog().get_schema(first).is_some() || first.eq_ignore_ascii_case(TEMP_SCHEMA));
             if is_schema {
                 return None;
             }
@@ -1064,6 +1273,7 @@ impl ClientContext {
                 name.qualification.remove(0);
             }
         });
+        strip_database(&mut routed, &prefix);
         Some((database, routed))
     }
 
@@ -1086,7 +1296,7 @@ impl ClientContext {
         if info.external_resource.is_some() {
             return Err(crate::unported("ATTACH TO EXTERNAL RESOURCE"));
         }
-        let path = evaluate_scalar(&bind_constant_expression(&self.db.catalog, &info.path)?)?.try_to_string()?;
+        let path = evaluate_scalar(&bind_constant_expression(&self.catalog(), &info.path)?)?.try_to_string()?;
         let mut options = AttachOptions::default();
         for (name, value) in &info.options {
             let text = value.text.to_lowercase();
@@ -1155,8 +1365,10 @@ impl ClientContext {
         let database = if in_memory {
             let mut database = DatabaseInstance::with_file_access(None);
             database.name.clone_from(&name);
+            database.settings = self.home.settings.clone();
             Arc::new(database)
         } else {
+            options.settings = Some(self.home.settings.clone());
             let mut opened = DatabaseInstance::open_with(Path::new(&path), &options)?;
             let Some(database) = Arc::get_mut(&mut opened) else {
                 return Err(Error::new(ErrorKind::Internal, "a new database is in use"));
@@ -1220,6 +1432,52 @@ impl ClientContext {
     }
 
     /// `PhysicalExplain`: the plan in text form, as a key and a value per plan.
+    /// What `EXECUTE` names, and the values it gives.
+    fn bound_execute(
+        &self,
+        name: &str,
+        values: &[(String, Expr)],
+    ) -> Result<(Arc<PreparedStatementData>, HashMap<String, Value>)> {
+        let Some(prepared) = self.prepared_statements.get(&name.to_lowercase()).cloned() else {
+            return Err(Error::new(
+                ErrorKind::Binder,
+                format!("Prepared statement {} does not exist", sql_quoted_identifier(name)),
+            ));
+        };
+        let mut bound = HashMap::with_capacity(values.len());
+        for (parameter, value) in values {
+            let value = evaluate_scalar(&bind_constant_expression(&self.catalog(), value)?)?;
+            bound.insert(parameter.to_lowercase(), value);
+        }
+        Ok((prepared, bound))
+    }
+
+    /// `COMMENT ON INDEX`: a table of a transaction gets an entry of its own.
+    fn comment_on_index(&self, info: &AlterInfo) -> Result<MaterializedQueryResult> {
+        let AlterKind::SetComment { value, .. } = &info.kind else {
+            unreachable!("checked by the caller");
+        };
+        let catalog = self.catalog();
+        let schema = catalog.schema_for(schema_of(&info.name)?)?;
+        let Some((table, index)) = schema.get_index(&info.name.name) else {
+            return Err(missing_entry("Index", &info.name.name));
+        };
+        let comment = (!matches!(value.kind, LiteralKind::Null)).then(|| value.text.clone());
+        let changed = Arc::new(IndexCatalogEntry {
+            comment,
+            ..(*index).clone()
+        });
+        for entry in table
+            .indexes
+            .write()
+            .iter_mut()
+            .filter(|entry| Arc::ptr_eq(entry, &index))
+        {
+            *entry = changed.clone();
+        }
+        Ok(Self::success())
+    }
+
     fn explain(
         &mut self,
         statement: &Statement,
@@ -1229,7 +1487,8 @@ impl ClientContext {
         if explain_type == ExplainType::Sql {
             return Err(crate::unported("EXPLAIN (SQL)"));
         }
-        let mut binder = Binder::with_options(&self.db.catalog, self.bind_options());
+        let catalog = self.catalog();
+        let mut binder = Binder::with_options(&catalog, self.bind_options());
         binder.parameters = self.parameters.clone();
         binder.session = Some(self.session_values());
         let bound = binder.bind(statement)?;
@@ -1284,7 +1543,7 @@ impl ClientContext {
         let (force, argument) = checkpoint_call(function).expect("checked by the caller");
         let mut target = None;
         if let Some(argument) = argument {
-            let database = evaluate_scalar(&bind_constant_expression(&self.db.catalog, argument)?)?;
+            let database = evaluate_scalar(&bind_constant_expression(&self.catalog(), argument)?)?;
             if database.is_null() {
                 return Err(Error::new(ErrorKind::Binder, "Database cannot be NULL"));
             }
@@ -1310,7 +1569,7 @@ impl ClientContext {
                     "Cannot FORCE CHECKPOINT: the current transaction has been started for this database",
                 ));
             }
-            if transaction.snapshot.is_some() {
+            if transaction.forks.iter().any(|(_, fork)| fork.dirty) {
                 return Err(Error::new(
                     ErrorKind::Transaction,
                     "Cannot CHECKPOINT: the current transaction has transaction local changes",
@@ -1320,7 +1579,22 @@ impl ClientContext {
         let database = target.unwrap_or_else(|| self.db.clone());
         self.check_valid(&database)?;
         let abort = self.setting_text("debug_checkpoint_abort").to_lowercase();
+        let mut writing = database.statements.write();
+        while database.catalog.has_writers() {
+            if !force {
+                return Err(Error::new(
+                    ErrorKind::Transaction,
+                    "Cannot CHECKPOINT: there are other write transactions active. Try using FORCE CHECKPOINT to \
+                     wait until all active transactions are finished",
+                ));
+            }
+            // they need this lock to finish
+            drop(writing);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            writing = database.statements.write();
+        }
         let result = database.write_checkpoint_with(&abort);
+        drop(writing);
         // whatever went wrong, what is on disk can't be vouched for now; only the database that a
         // connection was made to takes everything down with it
         let Err(error) = result else {
@@ -1352,7 +1626,7 @@ impl ClientContext {
                     && let duckrs_parser::ast::TableRefKind::BaseTable { name, .. } = &table.kind
                 {
                     let schema = crate::planner::binder::schema_of(name)?;
-                    if let crate::catalog::TableOrView::View(_) = self.db.catalog.get_entry(schema, None, &name.name)? {
+                    if let crate::catalog::TableOrView::View(_) = self.catalog().get_entry(schema, None, &name.name)? {
                         return Err(Error::new(ErrorKind::Binder, "Can only vacuum or analyze base tables"));
                     }
                 }
@@ -1376,7 +1650,7 @@ impl ClientContext {
             }
             Statement::SetVariable { name, value, .. }
                 if name.eq_ignore_ascii_case("schema")
-                    && let Ok(target) = evaluate_scalar(&bind_constant_expression(&self.db.catalog, value)?)
+                    && let Ok(target) = evaluate_scalar(&bind_constant_expression(&self.catalog(), value)?)
                         .and_then(|value| value.try_to_string())
                     && self.use_database(&target)? =>
             {
@@ -1392,18 +1666,18 @@ impl ClientContext {
             }
             Statement::SetVariable { name, value, scope } => {
                 // `Binder::Bind(SetVariableStatement)` + `PhysicalSet`
-                let value = evaluate_scalar(&bind_constant_expression(&self.db.catalog, value)?)?;
+                let value = evaluate_scalar(&bind_constant_expression(&self.catalog(), value)?)?;
                 if name.eq_ignore_ascii_case("current_transaction_invalidation_policy")
                     && let Some(transaction) = &mut self.transaction
                 {
                     transaction.invalidation_policy = value.try_to_string()?.to_uppercase();
                 }
-                let mut global = self.db.settings.write();
+                let mut global = self.home.settings.write();
                 settings::set_variable(name, *scope, &value, &mut global, &mut self.settings)?;
                 return Ok(Self::success());
             }
             Statement::ResetVariable { name, scope } => {
-                let mut global = self.db.settings.write();
+                let mut global = self.home.settings.write();
                 settings::reset_variable(name, *scope, &mut global, &mut self.settings)?;
                 return Ok(Self::success());
             }
@@ -1445,9 +1719,27 @@ impl ClientContext {
                 statement,
                 explain_type,
                 format,
-            } => return self.explain(statement, *explain_type, format),
+            } => {
+                let Statement::Execute { name, values } = &**statement else {
+                    return self.explain(statement, *explain_type, format);
+                };
+                let (prepared, values) = self.bound_execute(name, values)?;
+                let parameters = ParameterValues {
+                    values: Some(values),
+                    ..ParameterValues::default()
+                };
+                let saved = self.parameters.replace(Arc::new(parameters));
+                let result = self.explain(&prepared.statement, *explain_type, format);
+                self.parameters = saved;
+                return result;
+            }
+            Statement::Alter(info) if matches!(&info.kind, AlterKind::SetComment { entry_type, .. } if *entry_type == "INDEX") =>
+            {
+                return self.comment_on_index(info);
+            }
             Statement::Alter(info) => {
-                let mut binder = Binder::new(&self.db.catalog);
+                let catalog = self.catalog();
+                let mut binder = Binder::new(&catalog);
                 let alter = binder.bind_alter(info)?;
                 execute_alter(alter)?;
                 return Ok(Self::success());
@@ -1461,17 +1753,7 @@ impl ClientContext {
                 return Ok(Self::success());
             }
             Statement::Execute { name, values } => {
-                let Some(prepared) = self.prepared_statements.get(&name.to_lowercase()).cloned() else {
-                    return Err(Error::new(
-                        ErrorKind::Binder,
-                        format!("Prepared statement {} does not exist", sql_quoted_identifier(name)),
-                    ));
-                };
-                let mut bound = HashMap::with_capacity(values.len());
-                for (parameter, value) in values {
-                    let value = evaluate_scalar(&bind_constant_expression(&self.db.catalog, value)?)?;
-                    bound.insert(parameter.to_lowercase(), value);
-                }
+                let (prepared, bound) = self.bound_execute(name, values)?;
                 return self.execute_with(&prepared, bound);
             }
             Statement::Deallocate(name) => {
@@ -1487,7 +1769,8 @@ impl ClientContext {
                 return Ok(Self::success());
             }
             Statement::Create(info) if matches!(info.kind, CreateKind::Index { .. }) => {
-                let mut binder = Binder::new(&self.db.catalog);
+                let catalog = self.catalog();
+                let mut binder = Binder::new(&catalog);
                 if let Some((table, index)) = binder.bind_create_index(info)? {
                     execute_create_index(&table, index)?;
                 }
@@ -1505,11 +1788,19 @@ impl ClientContext {
                 let CreateKind::Schema { options } = &info.kind else {
                     return Err(crate::unported(create_kind_name(&info.kind)));
                 };
-                if !options.is_empty() || info.temporary || !catalog_qualifier_only(&info.name.qualification) {
+                if info.temporary {
+                    return Err(Error::new(ErrorKind::Binder, "Temporary schemas are not supported"));
+                }
+                if !options.is_empty() {
+                    return Err(Error::new(
+                        ErrorKind::Catalog,
+                        "WITH clause is not supported for schemas",
+                    ));
+                }
+                if !catalog_qualifier_only(&info.name.qualification) {
                     return Err(crate::unported("this form of CREATE SCHEMA"));
                 }
-                self.db
-                    .catalog
+                self.catalog()
                     .create_schema(&info.name.name, on_create_conflict(info.on_conflict))?;
                 return Ok(Self::success());
             }
@@ -1519,7 +1810,8 @@ impl ClientContext {
             }
             _ => {}
         }
-        let mut binder = Binder::with_options(&self.db.catalog, self.bind_options());
+        let catalog = self.catalog();
+        let mut binder = Binder::with_options(&catalog, self.bind_options());
         binder.parameters = self.parameters.clone();
         binder.session = Some(self.session_values());
         let bound = binder.bind(statement)?;
@@ -1603,7 +1895,7 @@ impl Drop for ClientContext {
     /// A connection that goes away rolls back what it did not commit.
     fn drop(&mut self) {
         if let Some(transaction) = self.transaction.take() {
-            self.end_transaction(transaction, true);
+            self.end_transaction(transaction);
         }
     }
 }
@@ -1653,14 +1945,14 @@ impl ClientContext {
         if self.setting_text("enable_view_dependencies") == "true" {
             return Err(crate::unported("view dependencies"));
         }
-        let catalog = &self.db.catalog;
+        let catalog = self.catalog();
         let schema = catalog.schema_for(create_schema_of(info)?)?;
         let on_conflict = on_create_conflict(info.on_conflict);
         // IF NOT EXISTS for a view that exists does not look at the query
         let exists = matches!(schema.get_entry(&info.name.name), Some(TableOrView::View(_)));
         let skip_binding = *defer_binding || (on_conflict == OnCreateConflict::Ignore && exists);
         if !skip_binding {
-            let mut binder = Binder::with_options(catalog, self.bind_options());
+            let mut binder = Binder::with_options(&catalog, self.bind_options());
             binder.bind_create_view(query, aliases, &schema.name)?;
         }
         schema.create_view(&info.name.name, (**query).clone(), aliases.clone(), on_conflict)
@@ -1674,10 +1966,13 @@ impl ClientContext {
         if self.setting_text("enable_macro_dependencies") == "true" {
             return Err(crate::unported("macro dependencies"));
         }
-        let catalog = &self.db.catalog;
+        let catalog = self.catalog();
         let schema = catalog.schema_for(create_schema_of(info)?)?;
-        let mut binder = Binder::with_options(catalog, self.bind_options());
+        let mut binder = Binder::with_options(&catalog, self.bind_options());
         binder.bind_create_macro(&info.name.name, macros, *table_macro, &schema.name)?;
+        if on_create_conflict(info.on_conflict) == OnCreateConflict::Replace {
+            macro_is_free(&schema, &info.name.name)?;
+        }
         schema.create_macro(
             &info.name.name,
             *table_macro,
@@ -1712,11 +2007,12 @@ impl ClientContext {
                 enum_type_from(values)?
             }
             CreateTypeKind::Alias(target) => {
-                let binder = Binder::with_options(&self.db.catalog, self.bind_options());
+                let catalog = self.catalog();
+                let binder = Binder::with_options(&catalog, self.bind_options());
                 binder.bind_type(target)?
             }
         };
-        let schema = self.db.catalog.schema_for(create_schema_of(info)?)?;
+        let schema = self.catalog().schema_for(create_schema_of(info)?)?;
         if is_builtin_type(&info.name.name) {
             return Err(Error::new(
                 ErrorKind::Catalog,
@@ -1747,13 +2043,13 @@ impl ClientContext {
             max_value,
             cycle,
         };
-        let schema = self.db.catalog.schema_for(create_schema_of(info)?)?;
+        let schema = self.catalog().schema_for(create_schema_of(info)?)?;
         schema.create_sequence(&info.name.name, data, on_create_conflict(info.on_conflict))
     }
 
     /// `DROP TABLE`, `VIEW`, `SEQUENCE`, `MACRO` and `SCHEMA` (`Catalog::DropEntry`).
     fn drop_entry(&mut self, info: &DropInfo) -> Result<()> {
-        let catalog = &self.db.catalog;
+        let catalog = self.catalog();
         let temporary = catalog.schema_for(Some(TEMP_SCHEMA))?;
         let in_temp = info.name.qualification.is_empty()
             && match info.entry_type {
@@ -1799,6 +2095,7 @@ impl ClientContext {
                 let dropped = match catalog.schema_for(schema) {
                     // DROP MACRO also drops a table macro, if there is no scalar one
                     Ok(schema) => {
+                        macro_is_free(&schema, &info.name.name)?;
                         schema.drop_macro(&info.name.name, table_macro)
                             || (!table_macro && schema.drop_macro(&info.name.name, true))
                     }
@@ -2601,15 +2898,17 @@ mod tests {
         run(&mut c, "BEGIN TRANSACTION READ ONLY");
         assert!(error(&mut c, "INSERT INTO t VALUES (9)").contains("transaction is launched in read-only mode"));
         run(&mut c, "COMMIT");
-        // without isolation, what would need it says so instead of showing uncommitted rows
+        // a transaction sees what was there when it started, and others don't see what it did
         let mut other = ClientContext::new(db.clone());
         run(&mut c, "BEGIN");
         assert_eq!(run(&mut other, "SELECT count(*) FROM t"), rows(&[&["3"]]));
-        assert!(error(&mut other, "INSERT INTO t VALUES (9)").contains("not yet ported"));
         run(&mut c, "INSERT INTO t VALUES (10)");
-        assert!(error(&mut other, "SELECT * FROM t").contains("not yet ported"));
+        assert_eq!(run(&mut other, "SELECT count(*) FROM t"), rows(&[&["3"]]));
+        run(&mut other, "INSERT INTO t VALUES (9)");
+        assert_eq!(run(&mut c, "SELECT count(*) FROM t"), rows(&[&["4"]]));
         run(&mut c, "COMMIT");
-        assert_eq!(run(&mut other, "SELECT count(*) FROM t"), rows(&[&["4"]]));
+        assert_eq!(run(&mut other, "SELECT count(*) FROM t"), rows(&[&["5"]]));
+        run(&mut other, "DELETE FROM t WHERE i = 9");
         // a connection that goes away rolls back
         run(&mut other, "BEGIN");
         run(&mut other, "INSERT INTO t VALUES (11)");

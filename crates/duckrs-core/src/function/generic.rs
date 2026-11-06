@@ -512,6 +512,20 @@ fn random(args: &DataChunk, result: &mut Vector) -> Result<()> {
     Ok(())
 }
 
+/// `SleepFunction`, which doesn't care for NULL.
+fn sleep_ms(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    for row in 0..args.len() {
+        let value = args.column(0).get_value(row);
+        if let Some(time) = value.as_i128() {
+            std::thread::sleep(std::time::Duration::from_millis(
+                time.clamp(0, i128::from(u64::MAX)) as u64
+            ));
+        }
+        result.set_value(row, &Value::sql_null())?;
+    }
+    Ok(())
+}
+
 fn setseed(args: &DataChunk, result: &mut Vector) -> Result<()> {
     for row in 0..args.len() {
         let value = args.column(0).get_value(row);
@@ -640,6 +654,7 @@ pub fn is_generic_function(name: &str) -> bool {
                 | "least"
                 | "signbit"
                 | "random"
+                | "sleep_ms"
                 | "setseed"
                 | "uuid"
                 | "gen_random_uuid"
@@ -922,6 +937,10 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
                 return Err(no_match("random", &children));
             }
             Ok(bound_function("random", children, LogicalType::DOUBLE, random))
+        }
+        "sleep_ms" => {
+            let child = single(&children)?.cast_to(&LogicalType::BIGINT, false);
+            Ok(bound_function("sleep_ms", vec![child], LogicalType::SQLNULL, sleep_ms))
         }
         "setseed" => {
             let child = single(&children)?.cast_to(&LogicalType::DOUBLE, false);

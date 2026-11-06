@@ -168,6 +168,305 @@ print(result.stdout[-4000:])
 if result.returncode != 0:
     sys.exit(result.returncode)
 
+# ids: DuckDB reads rows with gaps by the ids they have here, and replays a log that names them
+gaps = scratch / "gaps.db"
+subprocess.run(
+    ["cargo", "test", "-q", "-p", "duckrs", "--test", "row_ids", "gaps_for_duckdb"],
+    cwd=root,
+    check=True,
+    env={**os.environ, "DUCKRS_KEEP_GAPS": str(gaps)},
+)
+replayed = Path(f"{gaps}.expected").read_text().splitlines()[1]
+(scratch / "test/gaps.test").write_text(f"""statement ok
+ATTACH '{gaps}' AS gaps
+
+query TTTTTT
+SELECT count(*), min(rowid), max(rowid), sum(rowid), sum(i), count(*) FILTER (s = 'changed') FROM gaps.gaps
+----
+{replayed}
+
+query I
+SELECT count(*) FROM gaps.gaps WHERE rowid BETWEEN 2048 AND 4095
+----
+0
+
+query T
+SELECT DISTINCT s = 'row ' || i OR s IN ('changed', 'added') OR i >= 1000000 FROM gaps.gaps
+----
+true
+
+query I
+SELECT count(*) FROM gaps.gaps a JOIN gaps.gaps b ON a.rowid = b.rowid WHERE a.i = 5002
+----
+1
+
+statement ok
+INSERT INTO gaps.gaps VALUES (-5, 'more', [])
+
+query T
+SELECT rowid > 12287 FROM gaps.gaps WHERE i = -5
+----
+true
+
+statement error
+INSERT INTO gaps.gaps VALUES (5002, 'again', [])
+----
+Duplicate key
+
+statement ok
+CHECKPOINT gaps
+
+statement ok
+DETACH gaps
+""")
+result = subprocess.run(
+    [root / "target/release/sqllogictest", "--engine", "reference", "--duckdb-root", scratch, "test/gaps.test"],
+    capture_output=True,
+    text=True,
+)
+print(result.stdout[-4000:])
+if result.returncode != 0:
+    sys.exit(result.returncode)
+
+# keys and indexes: DuckDB finds every key in the ART that duckrs wrote, and goes on changing them
+keyed = scratch / "keyed.db"
+logged_keys = scratch / "keyed_log.db"
+subprocess.run(
+    ["cargo", "test", "-q", "-p", "duckrs", "--test", "write_database_file", "keys_and_indexes"],
+    cwd=root,
+    check=True,
+    env={**os.environ, "DUCKRS_KEEP_KEYS": str(keyed), "DUCKRS_KEEP_KEYS_LOGGED": str(logged_keys)},
+)
+altered = scratch / "altered.db"
+subprocess.run(
+    ["cargo", "test", "-q", "-p", "duckrs", "--test", "write_database_file", "a_referenced_table"],
+    cwd=root,
+    check=True,
+    env={**os.environ, "DUCKRS_KEEP_KEYS_ALTERED": str(altered)},
+)
+
+
+def key_checks(name, parents, pairs):
+    return f"""query II
+SELECT count(*), count(DISTINCT id) FROM {name}.parent
+----
+{parents}\t{parents}
+
+statement error
+INSERT INTO {name}.parent VALUES (5, 'x', 'n', 0)
+----
+Duplicate key
+
+statement error
+INSERT INTO {name}.parent VALUES (500000, 'https://example.com/items/7', 'n', 0)
+----
+Duplicate key
+
+statement error
+INSERT INTO {name}.a_child VALUES (9999, 123456, NULL)
+----
+foreign key
+
+statement error
+INSERT INTO {name}.a_child VALUES (9999, 1, 123456)
+----
+foreign key
+
+statement error
+DELETE FROM {name}.parent WHERE id = 1
+----
+still referenced
+
+statement ok
+INSERT OR IGNORE INTO {name}.parent SELECT i, 'by id ' || i, 'x', 0 FROM range(20000) r(i)
+
+statement ok
+INSERT OR IGNORE INTO {name}.parent SELECT i + 100000, 'https://example.com/items/' || i, 'x', 0 FROM range(20000) r(i)
+
+query I
+SELECT count(*) FROM {name}.parent
+----
+{parents}
+
+query T
+SELECT name FROM {name}.parent WHERE id = 12345
+----
+https://example.com/items/12345
+
+query I
+SELECT id FROM {name}.parent WHERE name = 'https://example.com/items/777'
+----
+777
+
+query I
+SELECT count(*) FROM {name}.pairs
+----
+{pairs}
+
+statement error
+INSERT INTO {name}.pairs VALUES (3, 'pair 3', 0)
+----
+Duplicate key
+
+"""
+
+
+(scratch / "test/keys.test").write_text(f"""statement ok
+ATTACH '{keyed}' AS keyed
+
+{key_checks("keyed", 20001, 3000)}
+query I
+SELECT id + 1 FROM keyed.parent WHERE id + 1 = 100
+----
+100
+
+statement error
+INSERT INTO keyed.parent VALUES (-5, 'other', 'n', 0), (-5, 'another', 'n', 0)
+----
+duplicate key
+
+query I
+SELECT count(*) FROM keyed.parent WHERE note = 'note 3'
+----
+2857
+
+query I
+SELECT count(*) FROM duckdb_indexes() WHERE database_name = 'keyed'
+----
+3
+
+statement ok
+INSERT INTO keyed.parent VALUES (40000, 'added', 'note 3', 2)
+
+statement ok
+DELETE FROM keyed.pairs WHERE a = 1
+
+statement ok
+UPDATE keyed.pairs SET c = 0 WHERE a = 2
+
+statement ok
+INSERT INTO keyed.pairs SELECT 1, 'pair ' || i, 0 FROM range(60) r(i)
+
+statement ok
+CHECKPOINT keyed
+
+statement error
+INSERT INTO keyed.parent VALUES (40000, 'x', 'n', 0)
+----
+Duplicate key
+
+statement ok
+DETACH keyed
+
+statement ok
+ATTACH '{keyed}' AS keyed
+
+statement error
+INSERT INTO keyed.pairs VALUES (1, 'pair 7', 0)
+----
+Duplicate key
+
+statement ok
+DROP TABLE keyed.a_child
+
+statement ok
+DROP TABLE keyed.parent
+
+statement ok
+CHECKPOINT keyed
+
+statement ok
+DETACH keyed
+
+statement ok
+ATTACH '{keyed}' AS keyed (READ_ONLY)
+
+query I
+SELECT count(*) FROM keyed.pairs
+----
+3000
+
+""")
+(scratch / "test/keys_log.test").write_text(f"""statement ok
+ATTACH '{logged_keys}' AS logged_keys
+
+{key_checks("logged_keys", 20002, 2940)}
+query T
+SELECT note FROM logged_keys.parent WHERE id = 3
+----
+changed
+
+statement error
+INSERT INTO logged_keys.later VALUES (2)
+----
+Duplicate key
+
+query I
+SELECT index_name FROM duckdb_indexes() WHERE database_name = 'logged_keys' ORDER BY 1
+----
+by_a
+by_note
+by_sum
+later_i
+
+statement ok
+CHECKPOINT logged_keys
+
+statement ok
+DETACH logged_keys
+
+statement ok
+ATTACH '{logged_keys}' AS logged_keys (READ_ONLY)
+
+query I
+SELECT count(*) FROM logged_keys.pairs
+----
+2940
+""")
+(scratch / "test/keys_altered.test").write_text(f"""statement ok
+ATTACH '{altered}' AS altered
+
+query II
+SELECT count(*), count(j) FROM altered.p
+----
+3\t1
+
+statement error
+INSERT INTO altered.c VALUES (9)
+----
+foreign key
+
+statement error
+DELETE FROM altered.p WHERE i = 1
+----
+still referenced
+
+statement error
+INSERT INTO altered.p VALUES (3, 0)
+----
+Duplicate key
+
+query I
+SELECT index_name FROM duckdb_indexes() WHERE database_name = 'altered'
+----
+c_i
+
+statement ok
+INSERT INTO altered.c VALUES (3)
+
+statement ok
+CHECKPOINT altered
+""")
+result = subprocess.run(
+    [root / "target/release/sqllogictest", "--engine", "reference", "--duckdb-root", scratch, "test/keys.test", "test/keys_log.test", "test/keys_altered.test", "-v", "--continue-on-failure"],
+    capture_output=True,
+    text=True,
+)
+print(result.stdout[-6000:])
+print(result.stderr[-2000:])
+if result.returncode != 0:
+    sys.exit(result.returncode)
+
 # floats in each of their codecs, forced, as otherwise the smallest wins
 floats = scratch / "floats"
 floats.mkdir()

@@ -6,7 +6,7 @@
 
 use super::constraints;
 use super::expression_executor::execute;
-use crate::catalog::{IndexCatalogEntry, TableCatalogEntry};
+use crate::catalog::{IndexCatalogEntry, RowIds, TableCatalogEntry};
 use crate::planner::binder::{BoundAlter, BoundTableAlter};
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::vector::DataChunk;
@@ -25,6 +25,8 @@ fn execute_table_alter(alter: BoundTableAlter) -> Result<()> {
     let old = alter.table;
     let adding_key = alter.constraints.len() > old.constraints.len();
     let source = old.rows()?;
+    let row_ids = old.row_ids(source.len());
+    let before: Vec<_> = old.types();
     let rows = match &alter.projection {
         Some(projection) => {
             let types: Vec<_> = alter.columns.iter().map(|c| c.ty.clone()).collect();
@@ -44,6 +46,15 @@ fn execute_table_alter(alter: BoundTableAlter) -> Result<()> {
     let mut table = TableCatalogEntry::new(old.schema.clone(), alter.name, alter.columns, rows, alter.constraints);
     table.generated = alter.generated;
     let table = Arc::new(table);
+    // C++ writes a column of a new type to new row groups, without the gaps
+    let retyped =
+        before.len() == table.columns.len() && table.columns.iter().zip(&before).any(|(new, old)| new.ty != *old);
+    table.set_row_ids(if retyped {
+        let rows = table.row_count();
+        RowIds::of_ranges([(0, rows)], rows as u64)
+    } else {
+        (*row_ids).clone()
+    });
     if alter.verify {
         let rows = table.rows()?;
         for chunk in rows.chunks() {
@@ -69,6 +80,12 @@ fn execute_table_alter(alter: BoundTableAlter) -> Result<()> {
 
 /// `PhysicalCreateARTIndex`: the keys of the rows have to be unique for a UNIQUE index.
 pub fn execute_create_index(table: &Arc<TableCatalogEntry>, index: IndexCatalogEntry) -> Result<()> {
+    if table.has_outstanding_updates() {
+        return Err(Error::new(
+            ErrorKind::Transaction,
+            "Cannot create index with outstanding updates",
+        ));
+    }
     let index = Arc::new(index);
     table.indexes.write().push(index.clone());
     *table.unique_keys.lock() = None;

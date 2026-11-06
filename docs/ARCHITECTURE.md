@@ -108,10 +108,9 @@ A statement goes `parse_ast` → `Binder` (bound expressions, `LogicalOperator` 
 - **Physical operators** implement a trait with DuckDB's source/operator/sink roles. Pipelines
   are built from those roles as in `PhysicalOperator::BuildPipelines` and run in dependency order
   on the calling thread; the task scheduler and parallelism arrive with Phase 8.
-- **The catalog** is in memory and has no transactions yet: tables hold their rows in a
-  `ColumnDataCollection` until storage (Phase 9) and MVCC (Phase 10) land. In place of a
-  transaction's snapshot, a table scan reads the rows the table had when it started, so
-  `INSERT INTO t FROM t` ends.
+- **The catalog** is in memory, and tables hold their rows in a `ColumnDataCollection`. A table
+  scan reads the rows the table had when it started, so `INSERT INTO t FROM t` ends. Transactions
+  run on a copy of it, see "Transactions".
 - **Result modifiers** bind like `BindSelectNode`: ORDER BY and DISTINCT targets resolve to
   select list entries (by position, alias, unaliased column name or equal expression, after
   qualifying column names), entries ORDER BY needs are appended and pruned by a final
@@ -145,7 +144,7 @@ error passes because a feature is missing.
 ## Phase 6
 
 - **Temporary objects** live in a `temp` schema ahead of the search path. DuckDB has a `temp`
-  catalog per connection; this one is shared until Phase 10 isolates connections.
+  catalog per connection; this one is shared, so connections see each other's.
 - **PIVOT** is always a set of filtered aggregates. C++ switches to a `PhysicalPivot` over `list()`
   past `pivot_filter_threshold` values, which is only faster. **UNPIVOT** is `unpivot_list` and
   `unnest`, as in C++.
@@ -343,24 +342,118 @@ or lose data:
 
 These stop writes, or fail when they are made, as a file can't hold them yet:
 
-- keys and indexes in a file: C++ keeps the ART of each in the file, and with none it takes the table
-  for one without data and stops enforcing the keys. That has to wait for Phase 10. A file that has
-  them can be read, and takes no writes;
+- indexes of an extension: a file that has them can be read, and takes no writes;
 - files from before v2.0.0, which can be read but not checkpointed into, as checkpoints write v2.0.0;
 - VARIANT and GEOMETRY columns, and in a stored query what can't be read from one either. These fail
   at the commit, which leaves the database in memory as it is, until what can't be stored is dropped.
 
-Next: keys in files, with the ART of Phase 10, which about 90 of the files that fail need. VARIANT and
-writing older `STORAGE_VERSION`s are the largest of the rest. ZSTD takes a new dependency, and Chimp and
+Next: VARIANT and writing older `STORAGE_VERSION`s are the largest of the rest. ZSTD takes a new dependency, and Chimp and
 Patas are only in old files.
 
-**Indexes**: the ART of each index is parsed past and not read, whichever way the file points to it
-(`index_storage_infos`, or `index_pointers` and `root_block_pointer` in old files). C++ doesn't read
-it at load either: an `UnboundIndex` holds on to it until something needs it. Here nothing ever does,
-as the engine keeps its keys unique from the rows (`TableCatalogEntry::unique_keys`, built when first
-needed) until Phase 10 ports the ART. A `CREATE INDEX` entry goes through `bind_create_index` and
-joins the table without a scan, as the file has these rows under the index already. An index of a
-type that isn't ART came with an extension; as nothing here reads it, it is treated like the others.
+**Indexes**: the ART of each index in a file is parsed past and not read, whichever way the file
+points to it (`index_storage_infos`, or `index_pointers` and `root_block_pointer` in old files). C++
+doesn't read it at load either: an `UnboundIndex` holds on to it until something needs it. Here nothing
+ever does, as keys are checked through an ART built from the rows (`TableCatalogEntry::unique_keys`,
+built when first needed and dropped when rows move, with positions in the table for row ids). A
+`CREATE INDEX` entry goes through `bind_create_index` and joins the table without a scan, as the file
+has these rows under the index already. An index of a type that isn't ART came with an extension: it
+can be read, but only the extension can build it again, so its file takes no writes.
+
+Scans use them too (`optimizer/index_scan.rs`). C++ tries this when a scan starts: a key on the one
+column that has filters, and it gives up if more rows match than `index_scan_max_count` or
+`index_scan_percentage` allow. Planning and running a statement are one step here, so the pass
+does the same and leaves the rows in the plan, with filters that still run on them: all it has to
+do is find every row that matches. `EXPLAIN ANALYZE` shows "Index Scan". Like C++ this handles one
+column, one expression: constants, `IN`, `IS NOT DISTINCT FROM`, and a range with a bound on each side.
+With values to look up, whatever else the filters say of the column is left to them.
+
+These trees (`constraints::index_tree`) are not `unique_keys`, which only has the keys that have to be
+unique. They grow with rows added at the end. Rows that go don't take them down: a tree has rows by
+id, and `RowIds` says where an id is now, if anywhere. Past a quarter of them gone it is built again,
+as it is when ids stop meaning what they did (`rows_rewritten`). In-place updates change neither, as
+they don't touch a key: an update of a key, or of a column that isn't updated in place, is a delete
+and an insert, for UPDATE and `ON CONFLICT DO UPDATE` alike (`update_moves_rows`). A tree needs the rows in memory, so the first use reads a table that is still in a file.
+
+C++ also makes a filter of the keys of a small build side when a join runs, which an ART can answer
+(`dynamic_or_filter_threshold`). Here that is decided when planning, as for filters: the other side
+runs ahead of the statement if it reads little and gives the same rows twice (`scan_join_keys`). The
+join still does the matching. Only INNER and SEMI joins do this, as the rest keep rows without a match.
+`test_art_internal_issue_4742` can't pass anyway: its answers depend on the sampler of C++.
+
+Statistics of a key are unknown when they are worked out for a table that lost rows (`table_statistics`). C++ doesn't narrow them
+on delete, so it goes to the index for a key that is gone; here that would be proven empty first,
+with the same result but another plan. Indexes are catalog entries for conflicts too: a transaction
+that creates or drops one holds its name (`changed_entries`). What a key calls can't depend on the
+session, and a macro can't go while a key calls it (`index_using_macro`). `COMMENT ON INDEX` makes a
+new entry, for a rollback to lose it, and goes to the log as dropping the index and creating it.
+
+What goes into a file is for C++, which enforces keys through these trees and stops doing so without
+them. `index_data` builds one for each PRIMARY KEY, UNIQUE, FOREIGN KEY and index from the rows that
+a checkpoint writes, by the ids they have in the file, and its buffers go through `place` like segments
+do. The tree is built anew each time, as tables change by being rewritten, so a checkpoint costs
+as much per key as inserting it. Constraints are named as in `GetIndexInfo`, though C++ takes those by
+position; indexes it takes by name. Only the side of a foreign key that has it is written: reading it
+gives the referenced table its side.
+
+The log has `CREATE_INDEX` with the buffers in it, built from the rows with the ids that they get when
+it is replayed (`TableLog`). There are no records for ALTER, so a table with a new entry goes and
+comes back, and with it what references it, which would keep it from being dropped. A replay numbers
+those rows without gaps, which is why `TableLog` has the ids of both: records keep working, and only
+after a crash do those rows have other ids. Updates of a STRUCT column do the same, as there is no
+update record for one yet: the table goes in again.
+
+**Transactions** (`catalog/fork.rs`): C++ keeps versions in rows and catalog sets, with an undo buffer
+to get back. Tables here change by being rewritten, so a transaction gets its own copy of the catalog
+instead, a `Fork`, whose tables share their buffers with those of the database. It starts when a
+transaction first uses a database, or at BEGIN with `immediate_transaction_mode`. Whatever binds or
+runs a statement is only given that catalog, which is all the isolation there is to it, and ROLLBACK
+is dropping the fork. A statement outside of a transaction still works on the database itself, under
+`statements`, so that nothing costs more without transactions.
+
+Conflicts are found as they happen, as in C++, by row id. `RowVersions`, shared by a table and its
+forks, says who holds which row and when each last changed. The four places that
+rewrite rows (`PhysicalDelete`, `PhysicalUpdate`, `upsert`, `merge`) tell it what they do. A row
+that someone else holds, or that changed after the transaction started, fails with "Conflict on
+update!" or "Conflict on tuple deletion!". A conflict is on the row, whichever columns change. Catalog
+entries do the same through `CatalogVersions`: a statement that may have changed entries looks at
+what differs afterwards, and goes back to a snapshot if it lost.
+
+A commit takes `statements`, and brings over what the fork changed. If nobody else changed a table
+that is the rows of the fork, or just the rows it added at the end. Otherwise they are merged by id
+into what is there now, and the keys are checked over the result, which is how two transactions
+that add the same key find out ("Failed to commit: ..."). What can fail comes first, for a commit to
+do all or nothing, and the log then writes the difference as for any other statement. With no forks
+left all of this goes away again.
+
+**Statistics** of a table (`table_statistics`) only get wider once they exist, as in C++: rows that go
+leave them as they are, and new values are added by reading only rows that are new or changed
+(`TableStatistics::covered`, `updated`). Whoever calls `write_storage` says what became of the rows
+(`rows_removed`, `rows_appended`, `rows_updated_in_place`), and what nobody reports counts as all of
+them. Zones stay for the row groups before the first row that changed.
+
+**Temporary objects** are a connection's: each has a schema of its own, which `Catalog::get_schema`
+finds through a thread local for as long as a statement of that connection runs (`SessionTemp`).
+
+**Row ids** (`catalog/row_ids.rs`): `rowid` is what a row keeps until it goes, as in C++, not where it
+is. `RowIds` lists runs of rows whose ids and positions go up together, with the id of the next row,
+so a table without deletes has one run, and ids are given out as somebody asks for them (`fill`):
+what is added at the end needs no one to say so. What a statement adds and takes back gives its ids
+back (`RevertAppend`). Rows of a transaction count from `MAX_ROW_ID` until the commit numbers them.
+
+A CHECKPOINT next to open transactions leaves free blocks alone, as those read tables from the blocks
+they were in. Rows that a transaction added or deleted go along with one: they are in the fork, and
+their ids stay as no row groups come together then. One is refused next to a transaction that updated
+rows or changed the catalog, and next to one that doesn't see an update, as in C++
+(`ModifyDatabase`). FORCE CHECKPOINT waits for those.
+
+A commit doesn't check foreign keys again. C++ doesn't either: a child row added in a transaction
+stays when another one deletes its parent first, which was tried on the real thing.
+
+What isn't there: the commit checks keys but not foreign keys against what others did since. Reads
+don't take `statements`, as nothing writes to a fork from elsewhere, but `SELECT` outside of a
+transaction still excludes writers. A transaction that writes to two databases commits them one after
+the other, so a crash in between keeps one (C++ refuses this). The cost is per table at the start of a
+transaction, and a table's keys are copied the first time it needs them.
 
 **Checkpoints** (`writer`, `to_stored`): the whole database goes into blocks that the last checkpoint
 doesn't use, and a new header makes it count, so that a crash leaves the last checkpoint as it was.
@@ -396,7 +489,7 @@ a statement that names one (`db.t`, `db.main.t`) is routed to it with that name 
 runs in one database, so one that reads two isn't ported, and subqueries in expressions aren't looked
 at for names. `STORAGE_VERSION` below v2.0.0 and `ROW_GROUP_SIZE` are refused, as is encryption.
 
-The gate is not met: `test/sql/storage` is at 55.8% against 85%. About 40 of the files that fail need
+The gate is not met: `test/sql/storage` is at 62.2% against 85%. About 40 of the files that fail need
 keys in a file, which can't come before Phase 10.
 
 **Failing on purpose.** `debug_checkpoint_abort` stops a checkpoint where a crash could (after the free
@@ -418,9 +511,10 @@ difference as the records of C++: `Arc`s tell which entries are new, and `TableL
 the rows of a table. That comes to the same few records for all statements, and what a transaction undid
 never shows up. Everything that can fail is checked before any of it is written, as `TableLog` moves on.
 
-Adding rows logs those rows. Anything else that changes a table logs the deletion of all its rows and
-inserts them again, so a small UPDATE of a large table writes all of it to the log. Ids stay when rows
-go, so `TableLog` keeps what they are; rows that came from a file with deletes have ids with gaps.
+Adding rows logs those rows, and rows that went are `DELETE_TUPLE`s of the ids that aren't there any
+more. What changed in place the table keeps a list of (`TableLog::updated`), which goes out as
+`UPDATE_TUPLE`s of the columns that changed, for all those rows. A STRUCT takes more than one update
+record, so such a table goes into the log again, which is how a table with a new entry goes in too.
 
 A log that exists when a file is opened for writing goes into the file first: it can end in anything
 a crash leaves, so nothing is added to it. A checkpoint writes a marker with its root to the log first.
@@ -450,8 +544,16 @@ after deletes, which is safe as they are only used to rule rows out.
 The engine numbers chunks as in memory: all but the last are full, and 60 of them make a group. When a
 file's groups match that, a scan jumps to the group it wants. Otherwise (deletes, or another
 `ROW_GROUP_SIZE`) `TableCursor` goes through the groups in order and a buffer makes up the chunks, so
-zone maps come from reading the column. Row ids are positions, as they were in memory: after deletes
-that isn't the id in C++.
+zone maps come from reading the column. Ids come from `row_start` and the deletes of each group.
+
+A checkpoint writes the row groups that the file has, new ones of `ROW_GROUP_SIZE` for what came
+after them, and none for one whose rows all went: that is the gap that `next_row_id` is there for.
+Rows that went from a row group that stays are NULL with a delete vector (`deletes_of`), as the
+engine doesn't have them any more where C++ keeps writing them. `vacuum_groups` is
+`ScheduleVacuumTasks`: row groups that fit in fewer come together, whose rows get new ids from the
+first one's start, and indexes follow as they are built from what is written. Never with a transaction
+open, which goes by the ids it knows. Only v2.0.0 files are written, so what C++ does for storage
+that can't hold gaps isn't here.
 
 **Write-ahead log** (`wal`): all records of a log are read before any is applied, which is what the
 first pass of C++ does. What follows the last WAL_FLUSH was never committed and a log that stops

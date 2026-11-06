@@ -796,8 +796,8 @@ pub fn constraint(stored: g::Constraint) -> Result<Option<ast::Constraint>> {
 }
 
 /// `CREATE INDEX`, for the binder. An index of a type that isn't ART came with an extension, which C++
-/// doesn't need to read the table either, so here it is an index like any other: `duckrs` doesn't
-/// use indexes to answer queries, only to keep keys unique.
+/// doesn't need to read the table either, so here it can be read like any other. Only rewriting it
+/// takes the extension (see `DatabaseInstance::has_foreign_indexes`).
 pub fn create_index(schema: &str, stored: g::CreateIndexInfo) -> Result<ast::CreateInfo> {
     use enums::index_constraint_type::*;
     Ok(ast::CreateInfo {
@@ -810,7 +810,11 @@ pub fn create_index(schema: &str, stored: g::CreateIndexInfo) -> Result<ast::Cre
         kind: ast::CreateKind::Index {
             table: stored.table,
             unique: matches!(stored.constraint_type, UNIQUE | PRIMARY),
-            index_type: "ART".to_string(),
+            index_type: if stored.index_type_name.is_empty() {
+                "ART".to_string()
+            } else {
+                stored.index_type_name
+            },
             expressions: expressions(stored.parsed_expressions)?,
             options: Vec::new(),
         },
