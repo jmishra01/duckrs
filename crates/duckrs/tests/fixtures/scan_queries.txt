@@ -1,0 +1,56 @@
+SELECT count(*) FROM big
+SELECT count(i), count(some_null), count(all_null), sum(i), min(f), max(f) FROM big
+SELECT * FROM big WHERE i = 129999
+SELECT i, s FROM big WHERE i BETWEEN 122870 AND 122890 ORDER BY i
+SELECT count(*) FROM big WHERE i >= 129990
+SELECT count(*) FROM big WHERE i < 0
+SELECT count(*) FROM big WHERE i > 200000
+SELECT count(*) FROM big WHERE all_null IS NULL
+SELECT count(*) FROM big WHERE all_null IS NOT NULL
+SELECT count(*) FROM big WHERE all_null = 1
+SELECT count(*) FROM big WHERE some_null IS NULL
+SELECT count(*) FROM big WHERE some_null IS NOT NULL AND some_null < 1000
+SELECT count(*) FROM big WHERE f = 1.5
+SELECT count(*) FROM big WHERE f > 1940.0
+SELECT count(*) FROM big WHERE tiny = 99
+SELECT count(*) FROM big WHERE tiny > 99
+SELECT count(*) FROM big WHERE ui >= 129999
+SELECT count(*) FROM big WHERE fl = 123.0
+SELECT count(*) FROM big WHERE h = 129999000000000000
+SELECT count(*) FROM big WHERE h > 129999000000000000
+SELECT count(*) FROM big WHERE dec = 12999.0000
+SELECT count(*) FROM big WHERE dec > 12999.0000
+SELECT count(*) FROM big WHERE d = DATE '2003-07-24'
+SELECT count(*) FROM big WHERE d > DATE '2003-07-24'
+SELECT count(*) FROM big WHERE ts = TIMESTAMP '2000-01-02 12:06:39'
+SELECT count(*) FROM big WHERE ts > TIMESTAMP '2000-01-02 12:06:39'
+SELECT count(*) FROM big WHERE t > TIME '23:59:58'
+SELECT count(*) FROM big WHERE b
+SELECT count(*) FROM big WHERE NOT b
+SELECT count(*) FROM big WHERE s = 'value 9'
+SELECT count(*) FROM big WHERE s > 'value 8'
+SELECT tiny, count(*), min(i), max(i) FROM big GROUP BY tiny ORDER BY tiny LIMIT 5
+SELECT i FROM big ORDER BY i DESC LIMIT 3
+SELECT i, s FROM big LIMIT 3 OFFSET 122000
+SELECT a.i, b.s FROM big a JOIN holes b ON a.i = b.i WHERE a.i BETWEEN 29990 AND 50010 ORDER BY 1
+SELECT count(*) FROM big a JOIN holes b ON a.i = b.i
+SELECT count(*) FROM holes
+SELECT min(i), max(i), count(s) FROM holes
+SELECT * FROM holes WHERE i BETWEEN 29995 AND 50010 ORDER BY i
+SELECT * FROM holes ORDER BY i LIMIT 3 OFFSET 90000
+SELECT count(*) FROM holes WHERE i % 5 = 0
+SELECT count(*) FROM holes WHERE i >= 129990
+SELECT count(*) FROM odd_floats WHERE f = 'NaN'::DOUBLE
+SELECT count(*) FROM odd_floats WHERE f > 2000
+SELECT count(*) FROM odd_floats WHERE f = 'Infinity'::DOUBLE
+SELECT count(*) FROM odd_floats WHERE f < 0
+SELECT count(*) FROM odd_floats WHERE f >= 'NaN'::DOUBLE
+SELECT count(*) FROM odd_floats WHERE r = 'NaN'::FLOAT
+SELECT count(*) FROM odd_floats WHERE r > 1299
+SELECT count(*) FROM odd_floats WHERE isnan(f)
+SELECT count(*) FROM gone
+SELECT count(i), min(i) FROM gone
+SELECT count(*) FROM gone WHERE i = 5
+SELECT count(*) FROM sorted_strings WHERE s = '00012500'
+SELECT count(*) FROM sorted_strings WHERE s >= '00012990'
+SELECT s FROM sorted_strings WHERE i = 7

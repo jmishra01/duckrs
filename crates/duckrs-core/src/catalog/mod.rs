@@ -8,9 +8,11 @@
 //! MVCC visibility arrives with Phase 10, and table storage moves to `DataTable` with Phase 9.
 
 use crate::planner::expression::{BoundExpr, BoundExprKind};
+use duckrs_common::STANDARD_VECTOR_SIZE;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::string_util::similarity_rating;
 use duckrs_common::types::{LogicalType, LogicalTypeId};
+use duckrs_common::vector::{DataChunk, Vector};
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast::{Expr, MacroFunction, SelectStatement, sql_identifier, sql_quoted_identifier};
 use parking_lot::{Mutex, RwLock};
@@ -24,6 +26,8 @@ pub const DEFAULT_SCHEMA: &str = "main";
 /// Where temporary objects live, ahead of the other schemas on the search path. DuckDB has a
 /// `temp` catalog per connection; here it is one schema until Phase 10 isolates connections.
 pub const TEMP_SCHEMA: &str = "temp";
+/// `DEFAULT_ROW_GROUP_SIZE`.
+const ROW_GROUP_ROWS: usize = 122_880;
 
 /// A column of a table (`ColumnDefinition`).
 #[derive(Debug, Clone)]
@@ -71,6 +75,96 @@ impl ColumnDefinition {
     }
 }
 
+/// The rows of a table that stay in a database file: row groups that can be read one at a time,
+/// and only the columns that are needed.
+pub trait TableSource: std::fmt::Debug + Send + Sync {
+    /// Its rows that aren't deleted.
+    fn row_count(&self) -> usize;
+    fn group_count(&self) -> usize;
+    /// The rows of a group that aren't deleted.
+    fn group_rows(&self, group: usize) -> usize;
+    /// The rows of a group, with `columns` of the table in that order.
+    fn read_group(&self, group: usize, columns: &[usize]) -> Result<DataChunk>;
+    /// All of it.
+    fn read_all(&self) -> Result<ColumnDataCollection>;
+    /// What the file says about the values of the table's columns, without reading them.
+    fn column_statistics(&self) -> Option<Vec<ColumnStatistics>>;
+    /// What the file says about a column per group, without reading its values.
+    fn zones(&self, column: usize) -> Result<Vec<ColumnZone>>;
+}
+
+/// Reads a `TableSource` chunk by chunk, numbered as those of a table in memory: all but the last
+/// are full. That isn't how a file has them when groups are small or rows deleted, so groups go
+/// through a buffer that holds what the next chunk needs and no more.
+#[derive(Debug)]
+pub struct TableCursor {
+    source: Arc<dyn TableSource>,
+    columns: Vec<usize>,
+    types: Vec<LogicalType>,
+    next_group: usize,
+    /// Whether groups and chunks line up, which lets a scan skip the groups it needn't read.
+    aligned: bool,
+    buffer: ColumnDataCollection,
+    /// The number of the first chunk of `buffer`.
+    first_chunk: usize,
+}
+
+impl TableCursor {
+    pub fn new(source: Arc<dyn TableSource>, columns: Vec<usize>, types: Vec<LogicalType>) -> Self {
+        let aligned = Self::is_aligned(&*source);
+        let buffer = ColumnDataCollection::new(types.clone());
+        Self {
+            source,
+            columns,
+            types,
+            next_group: 0,
+            aligned,
+            buffer,
+            first_chunk: 0,
+        }
+    }
+
+    /// Whether the groups of a source are the groups of a table in memory.
+    pub fn is_aligned(source: &dyn TableSource) -> bool {
+        let groups = source.group_count();
+        (0..groups).all(|g| {
+            let rows = source.group_rows(g);
+            rows == ROW_GROUP_ROWS || (g + 1 == groups && rows <= ROW_GROUP_ROWS)
+        })
+    }
+
+    /// Chunk `index`, of chunks asked for in order.
+    pub fn chunk(&mut self, index: usize) -> Result<DataChunk> {
+        let group = index / (ROW_GROUP_ROWS / STANDARD_VECTOR_SIZE);
+        if self.aligned && group >= self.next_group {
+            self.buffer = ColumnDataCollection::new(self.types.clone());
+            self.next_group = group;
+            self.first_chunk = group * (ROW_GROUP_ROWS / STANDARD_VECTOR_SIZE);
+        }
+        loop {
+            let local = index - self.first_chunk;
+            let chunks = self.buffer.chunk_count();
+            let complete =
+                local + 1 < chunks || (local < chunks && self.buffer.chunk(local).len() == STANDARD_VECTOR_SIZE);
+            if complete || (self.next_group == self.source.group_count() && local < chunks) {
+                return Ok(self.buffer.chunk(local).clone());
+            }
+            if self.next_group == self.source.group_count() {
+                return Err(Error::new(ErrorKind::Internal, "a table scan ran past its rows"));
+            }
+            // what the chunks before this one held isn't needed any more
+            let mut kept = ColumnDataCollection::new(self.types.clone());
+            for chunk in self.buffer.chunks().skip(local) {
+                kept.append(chunk);
+            }
+            self.first_chunk += local.min(chunks);
+            kept.append(&self.source.read_group(self.next_group, &self.columns)?);
+            self.buffer = kept;
+            self.next_group += 1;
+        }
+    }
+}
+
 /// A table (`TableCatalogEntry`) and its rows.
 #[derive(Debug)]
 pub struct TableCatalogEntry {
@@ -80,7 +174,10 @@ pub struct TableCatalogEntry {
     pub columns: Vec<ColumnDefinition>,
     /// The columns that are not, in order of `position`.
     pub generated: Vec<GeneratedColumn>,
-    pub storage: RwLock<ColumnDataCollection>,
+    /// Empty while the rows are still in `source`: go through `rows` and `write_storage`.
+    storage: RwLock<ColumnDataCollection>,
+    /// Where the rows are if they are in a database file and nothing needed all of them so far.
+    source: RwLock<Option<Arc<dyn TableSource>>>,
     /// Beyond the NOT NULLs, which are in `columns`.
     pub constraints: Vec<TableConstraint>,
     /// The tables with a foreign key to this one.
@@ -219,6 +316,7 @@ impl TableCatalogEntry {
             columns,
             generated: Vec::new(),
             storage: RwLock::new(rows),
+            source: RwLock::default(),
             constraints,
             referenced_by: Mutex::default(),
             unique_keys: Mutex::default(),
@@ -229,7 +327,75 @@ impl TableCatalogEntry {
 
     /// The rows, to change them. A scan that starts after this sees the change, as it waits for
     /// the lock, and one that started before it has an old `version`.
-    pub fn write_storage(&self) -> parking_lot::RwLockWriteGuard<'_, ColumnDataCollection> {
+    /// How many rows there are, which takes no reading.
+    pub fn row_count(&self) -> usize {
+        match &*self.source.read() {
+            Some(source) => source.row_count(),
+            None => self.storage.read().len(),
+        }
+    }
+
+    /// Where the rows are, if they are still in a file.
+    pub fn source(&self) -> Option<Arc<dyn TableSource>> {
+        self.source.read().clone()
+    }
+
+    /// Leaves the rows in a file until something needs them all.
+    pub fn set_source(&self, source: Arc<dyn TableSource>) {
+        *self.source.write() = Some(source);
+    }
+
+    /// One column of each chunk in turn, of rows in memory or in a file, which stay there.
+    pub fn for_each_chunk(&self, column: usize, mut body: impl FnMut(usize, &Vector, usize)) -> Result<()> {
+        if let Some(source) = self.source() {
+            let ty = self.columns[column].ty.clone();
+            let chunks = self.row_count().div_ceil(STANDARD_VECTOR_SIZE);
+            let mut cursor = TableCursor::new(source, vec![column], vec![ty]);
+            for index in 0..chunks {
+                let chunk = cursor.chunk(index)?;
+                body(index, chunk.column(0), chunk.len());
+            }
+            return Ok(());
+        }
+        for (index, chunk) in self.storage.read().chunks().enumerate() {
+            body(index, chunk.column(column), chunk.len());
+        }
+        Ok(())
+    }
+
+    /// Reads rows that are still in a file into memory.
+    fn load_rows(&self) -> Result<()> {
+        if self.source.read().is_none() {
+            return Ok(());
+        }
+        let mut source = self.source.write();
+        if let Some(rows) = source.as_ref() {
+            *self.storage.write() = rows.read_all()?;
+            *source = None;
+        }
+        Ok(())
+    }
+
+    /// All rows, in memory. Scans don't need this: they read `source` as they go.
+    pub fn rows(&self) -> Result<parking_lot::RwLockReadGuard<'_, ColumnDataCollection>> {
+        self.load_rows()?;
+        Ok(self.storage.read())
+    }
+
+    /// Replaces rows that were in a file, which the caller has read.
+    pub fn set_rows(&self, rows: ColumnDataCollection) {
+        *self.source.write() = None;
+        *self.storage.write() = rows;
+    }
+
+    /// Whoever writes to `storage` comes through here, so that nothing goes on using statistics of
+    /// other rows.
+    pub fn write_storage(&self) -> Result<parking_lot::RwLockWriteGuard<'_, ColumnDataCollection>> {
+        self.load_rows()?;
+        Ok(self.write_loaded_storage())
+    }
+
+    fn write_loaded_storage(&self) -> parking_lot::RwLockWriteGuard<'_, ColumnDataCollection> {
         let storage = self.storage.write();
         let mut statistics = self.statistics.lock();
         statistics.version += 1;
@@ -306,7 +472,11 @@ impl TableCatalogEntry {
 
     /// Drops the rows from `rows` on, which a statement that failed added.
     pub fn truncate(&self, rows: usize) {
-        self.write_storage().truncate(rows);
+        // rows that are still in a file weren't added to
+        if self.source.read().is_some() {
+            return;
+        }
+        self.write_loaded_storage().truncate(rows);
         *self.unique_keys.lock() = None;
     }
 
@@ -985,11 +1155,16 @@ pub struct CatalogSnapshot {
     schemas: BTreeMap<String, Arc<SchemaCatalogEntry>>,
     entries: Vec<SchemaEntries>,
     /// sharing their buffers with the tables, whose writes copy what they change
-    table_rows: Vec<(
-        Arc<TableCatalogEntry>,
-        ColumnDataCollection,
-        Vec<Arc<IndexCatalogEntry>>,
-    )>,
+    table_rows: Vec<TableRows>,
+}
+
+/// The rows and indexes of a table in a [`CatalogSnapshot`].
+#[derive(Debug)]
+struct TableRows {
+    table: Arc<TableCatalogEntry>,
+    rows: ColumnDataCollection,
+    source: Option<Arc<dyn TableSource>>,
+    indexes: Vec<Arc<IndexCatalogEntry>>,
 }
 
 /// The contents of a schema in a [`CatalogSnapshot`].
@@ -1012,9 +1187,16 @@ impl Catalog {
             let tables = schema.tables.read().clone();
             for entry in tables.values() {
                 if let TableOrView::Table(table) = entry {
+                    // a table that is still in a file comes back as it is, without reading it
                     let rows = table.storage.read().clone();
+                    let source = table.source();
                     let indexes = table.indexes.read().clone();
-                    table_rows.push((table.clone(), rows, indexes));
+                    table_rows.push(TableRows {
+                        table: table.clone(),
+                        rows,
+                        source,
+                        indexes,
+                    });
                 }
             }
             entries.push(SchemaEntries {
@@ -1043,8 +1225,15 @@ impl Catalog {
             *saved.schema.macros[1].write() = table;
             *saved.schema.types.write() = saved.types;
         }
-        for (table, rows, indexes) in snapshot.table_rows {
-            *table.write_storage() = rows;
+        for TableRows {
+            table,
+            rows,
+            source,
+            indexes,
+        } in snapshot.table_rows
+        {
+            *table.write_loaded_storage() = rows;
+            *table.source.write() = source;
             *table.indexes.write() = indexes;
             *table.unique_keys.lock() = None;
         }

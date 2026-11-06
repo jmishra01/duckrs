@@ -11,7 +11,7 @@ use super::metadata::{MetaBlockPointer, MetadataChains};
 use super::serialization::convert;
 use super::serialization::generated::{self as g, enums::catalog_type};
 use super::serialization::{not_ported, read_type_expression};
-use super::statistics::{read_column_statistics, skip_table_sample};
+use super::statistics::{BaseStatistics, read_column_statistics, skip_table_sample};
 use duckrs_common::serializer::{BinaryDeserializer, Deserialize};
 use duckrs_common::types::LogicalType;
 use duckrs_common::{Error, Result};
@@ -84,6 +84,8 @@ pub struct StoredTable {
     pub columns: Vec<StoredColumn>,
     pub total_rows: u64,
     pub row_groups: Vec<RowGroupPointer>,
+    /// What the last checkpoint knew of each column.
+    pub column_statistics: Vec<Option<BaseStatistics>>,
     /// The id of the next row, past the gaps that a vacuum leaves.
     pub next_row_id: u64,
 }
@@ -195,11 +197,11 @@ fn read_row_groups(
     chains: &mut MetadataChains,
     pointer: MetaBlockPointer,
     columns: &[StoredColumn],
-) -> Result<Vec<RowGroupPointer>> {
+) -> Result<(Vec<RowGroupPointer>, Vec<Option<BaseStatistics>>)> {
     let mut d = BinaryDeserializer::new(chains.at(buffer, pointer)?);
-    d.read_object_value(|d| {
+    let statistics = d.read_object_value(|d| {
         let mut column = columns.iter();
-        d.read_list(100, "column_stats", |d| {
+        let statistics = d.read_list(100, "column_stats", |d| {
             let column = column
                 .next()
                 .ok_or_else(|| corrupt("a table has more statistics than columns"))?;
@@ -208,10 +210,13 @@ fn read_row_groups(
         if d.has_property(101)? {
             d.read_object_field(101, "table_sample", skip_table_sample)?;
         }
-        Ok(())
+        Ok(statistics)
     })?;
     let count = u64::from_le_bytes(d.read_raw(8)?.try_into().expect("8 bytes"));
-    (0..count).map(|_| RowGroupPointer::read_value(&mut d)).collect()
+    let row_groups = (0..count)
+        .map(|_| RowGroupPointer::read_value(&mut d))
+        .collect::<Result<_>>()?;
+    Ok((row_groups, statistics))
 }
 
 /// `CheckpointReader::LoadCheckpoint`.
@@ -234,7 +239,8 @@ pub fn read_catalog(buffer: &BufferManager) -> Result<StoredCatalog> {
         catalog.entries.push(match entry {
             Pending::Done(entry) => entry,
             Pending::Table(mut table, pointer) => {
-                table.row_groups = read_row_groups(buffer, &mut chains, pointer, &table.columns)?;
+                (table.row_groups, table.column_statistics) =
+                    read_row_groups(buffer, &mut chains, pointer, &table.columns)?;
                 StoredEntry::Table(table)
             }
         });
@@ -327,6 +333,7 @@ pub(super) fn convert_entry(info: g::CreateInfo) -> Result<Converted> {
                 columns,
                 total_rows: 0,
                 row_groups: Vec::new(),
+                column_statistics: Vec::new(),
                 next_row_id: 0,
             })));
         }

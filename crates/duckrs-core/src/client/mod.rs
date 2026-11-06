@@ -594,7 +594,7 @@ impl ClientContext {
                     .catalog
                     .get_table(schema_of(&insert.table).ok().flatten(), &insert.table.name)
             {
-                let rows = table.storage.read().len();
+                let rows = table.row_count();
                 appending = Some((table, rows));
             }
         }

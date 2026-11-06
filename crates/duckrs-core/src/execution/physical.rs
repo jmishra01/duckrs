@@ -15,10 +15,11 @@ use super::upsert::upsert;
 use super::zone_map::{CHUNKS_PER_ROW_GROUP, groups_to_scan};
 use crate::catalog::{
     ColumnDefinition, GeneratedColumn, OnCreateConflict, SchemaCatalogEntry, TableCatalogEntry, TableConstraint,
+    TableCursor, TableSource,
 };
 use crate::execution::run_plan;
 use crate::function::aggregates::{AggregateState, value_keys};
-use crate::planner::expression::{BoundAggregate, BoundExpr, ColumnBinding};
+use crate::planner::expression::{BoundAggregate, BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, CteKeyColumn, LogicalOperator, OnConflict};
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::{
@@ -31,6 +32,7 @@ use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
 use duckrs_parser::ast::{JoinType, SampleMethod, SampleOptions, sql_identifier};
 use parking_lot::Mutex;
 use std::any::Any;
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
@@ -138,6 +140,16 @@ struct TableScanState {
     remaining: usize,
     /// per row group, whether its rows can pass the filter
     groups: Vec<bool>,
+    /// Reads the table from its file, if its rows are still there.
+    cursor: Option<FileScan>,
+}
+
+/// What a scan reads of a file. `column_ids` lists all columns for the filter and the projection to
+/// refer to by position, and what neither of them refers to isn't read.
+struct FileScan {
+    cursor: TableCursor,
+    /// Per entry of `column_ids`, where the chunks of `cursor` have it, or a vector that nothing reads.
+    columns: Vec<Result<usize, Vector>>,
 }
 
 /// `PhysicalTableScan` over a table's in-memory rows.
@@ -150,6 +162,43 @@ pub struct PhysicalTableScan {
     pub types: Vec<LogicalType>,
     /// what rows must meet, on `column_ids`
     pub filter: Option<BoundExpr>,
+}
+
+impl PhysicalTableScan {
+    fn file_scan(&self, source: Arc<dyn TableSource>) -> FileScan {
+        let mut used = vec![self.projection.is_none(); self.column_ids.len()];
+        for &position in self.projection.iter().flatten() {
+            used[position] = true;
+        }
+        if let Some(filter) = &self.filter {
+            filter.clone().walk_mut(&mut |e| {
+                if let BoundExprKind::Reference(position) = e.kind {
+                    used[position] = true;
+                }
+            });
+        }
+        let mut read = Vec::new();
+        let mut columns = Vec::with_capacity(self.column_ids.len());
+        for (position, &column) in self.column_ids.iter().enumerate() {
+            if column == COLUMN_IDENTIFIER_ROW_ID {
+                // stands for the sequence that `get_data` makes
+                columns.push(Ok(usize::MAX));
+            } else if used[position] {
+                read.push(column);
+                columns.push(Ok(read.len() - 1));
+            } else {
+                columns.push(Err(Vector::new(
+                    self.table.columns[column].ty.clone(),
+                    STANDARD_VECTOR_SIZE,
+                )));
+            }
+        }
+        let types = read.iter().map(|&c| self.table.columns[c].ty.clone()).collect();
+        FileScan {
+            cursor: TableCursor::new(source, read, types),
+            columns,
+        }
+    }
 }
 
 impl PhysicalOperator for PhysicalTableScan {
@@ -165,16 +214,18 @@ impl PhysicalOperator for PhysicalTableScan {
     /// The scan sees the rows the table had when it started, like a transaction's snapshot
     /// (so that `INSERT INTO t FROM t` ends): the next chunk and how many rows remain.
     fn source_state(&self) -> SourceState {
-        let remaining = self.table.storage.read().len();
+        let remaining = self.table.row_count();
         let groups = groups_to_scan(&self.table, &self.column_ids, self.filter.as_ref(), remaining);
+        let cursor = self.table.source().map(|source| self.file_scan(source));
         Box::new(TableScanState {
             next: 0,
             remaining,
             groups,
+            cursor,
         })
     }
     fn row_groups_scanned(&self) -> Option<(usize, usize)> {
-        let rows = self.table.storage.read().len();
+        let rows = self.table.row_count();
         let groups = groups_to_scan(&self.table, &self.column_ids, self.filter.as_ref(), rows);
         (!groups.is_empty()).then(|| (groups.iter().filter(|g| **g).count(), groups.len()))
     }
@@ -183,28 +234,41 @@ impl PhysicalOperator for PhysicalTableScan {
             next,
             remaining,
             groups,
+            cursor,
         } = state.downcast_mut().expect("table scan state");
         while *remaining > 0 {
-            let storage = self.table.storage.read();
-            let chunk = storage.chunk(*next);
             // all chunks but the last are full, so that a row's position gives its id
-            let first_row = (*next * STANDARD_VECTOR_SIZE) as i64;
-            let wanted = groups.get(*next / CHUNKS_PER_ROW_GROUP).is_none_or(|g| *g);
+            let index = *next;
+            let first_row = (index * STANDARD_VECTOR_SIZE) as i64;
+            let wanted = groups.get(index / CHUNKS_PER_ROW_GROUP).is_none_or(|g| *g);
             *next += 1;
-            let count = chunk.len().min(*remaining);
-            *remaining -= count;
             if !wanted {
+                *remaining -= STANDARD_VECTOR_SIZE.min(*remaining);
                 continue;
             }
+            let storage;
+            let chunk = match cursor {
+                Some(scan) => Cow::Owned(scan.cursor.chunk(index)?),
+                None => {
+                    storage = self.table.rows()?;
+                    Cow::Borrowed(storage.chunk(index))
+                }
+            };
+            let count = chunk.len().min(*remaining);
+            *remaining -= count;
             let columns = self
                 .column_ids
                 .iter()
-                .map(|&i| {
+                .enumerate()
+                .map(|(position, &i)| {
                     if i == COLUMN_IDENTIFIER_ROW_ID {
-                        Vector::sequence(LogicalType::BIGINT, first_row, 1)
-                    } else {
-                        Ok(chunk.column(i).clone())
+                        return Vector::sequence(LogicalType::BIGINT, first_row, 1);
                     }
+                    Ok(match cursor.as_ref().map(|scan| &scan.columns[position]) {
+                        None => chunk.column(i).clone(),
+                        Some(Ok(at)) => chunk.column(*at).clone(),
+                        Some(Err(unread)) => unread.clone(),
+                    })
                 })
                 .collect::<Result<Vec<_>>>()?;
             let mut result = DataChunk::from_columns(columns, chunk.len());
@@ -1867,7 +1931,7 @@ impl PhysicalOperator for PhysicalDelete {
     }
     fn finalize(&self) -> Result<()> {
         let ids = self.row_ids.lock();
-        let mut storage = self.table.write_storage();
+        let mut storage = self.table.write_storage()?;
         let mut kept = ColumnDataCollection::new(storage.types().to_vec());
         let mut deleted = ColumnDataCollection::new(storage.types().to_vec());
         for (index, chunk) in storage.chunks().enumerate() {
@@ -1976,7 +2040,7 @@ impl PhysicalOperator for PhysicalUpdate {
     }
     fn finalize(&self) -> Result<()> {
         let updates = self.updates.lock();
-        let mut storage = self.table.write_storage();
+        let mut storage = self.table.write_storage()?;
         let mut rewritten = ColumnDataCollection::new(storage.types().to_vec());
         let mut changed = ColumnDataCollection::new(storage.types().to_vec());
         // C++ turns an UPDATE of indexed columns into a DELETE and an INSERT, which moves the rows
@@ -2115,7 +2179,7 @@ impl PhysicalOperator for PhysicalInsert {
             return Ok(());
         }
         constraints::verify_not_null(&self.table, &row)?;
-        let mut storage = self.table.write_storage();
+        let mut storage = self.table.write_storage()?;
         let first_new_row = *self.first_new_row.lock().get_or_insert(storage.len());
         constraints::verify_append(&self.table, &storage, &row, first_new_row)?;
         storage.append(&row);
@@ -2209,7 +2273,7 @@ impl PhysicalOperator for PhysicalCreateTableAs {
         )?;
         if let Some(table) = table {
             let data = self.data.lock();
-            let mut storage = table.write_storage();
+            let mut storage = table.write_storage()?;
             for chunk in data.chunks() {
                 storage.append(chunk);
             }

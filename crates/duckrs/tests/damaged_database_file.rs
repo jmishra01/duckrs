@@ -65,9 +65,26 @@ fn fuzz(fixture: &str, seed: u64, rounds: usize) {
 
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             if let Ok(database) = Database::open(&target, true) {
-                // what opens has to work too
+                // rows are read when something asks: errors are fine, panics aren't
                 let mut connection = database.connect().unwrap();
                 let _ = connection.query("SELECT 1");
+                let tables = "SELECT schema_name, table_name FROM duckdb_tables()";
+                let names: Vec<String> = connection.query(tables).map_or_else(
+                    |_| Vec::new(),
+                    |result| {
+                        (0..result.row_count())
+                            .map(|row| {
+                                let values = result.collection.row(row);
+                                let schema = values[0].try_to_string().unwrap_or_default();
+                                let name = values[1].try_to_string().unwrap_or_default();
+                                format!("\"{schema}\".\"{name}\"")
+                            })
+                            .collect()
+                    },
+                );
+                for table in names {
+                    let _ = connection.query(&format!("SELECT * FROM {table}"));
+                }
             }
         }));
         assert!(

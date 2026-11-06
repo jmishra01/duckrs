@@ -2,16 +2,16 @@
 // duckdb/src/planner/filter/expression_filter.cpp (CheckStatistics) @ rust-port-baseline
 //
 //! Zone maps: the smallest and largest value of a column per row group, which tell a scan with
-//! filters which groups it need not read. DuckDB keeps them in its storage. Here the rows live in
-//! memory and only the catalog knows when they change, so they are worked out per column when a
-//! filter first needs them, and thrown away by `TableCatalogEntry::write_storage`.
+//! filters which groups it need not read. A table in a database file has them in its metadata.
+//! Rows in memory change and only the catalog knows when, so for those they are worked out per
+//! column when a filter first needs them, and thrown away by `TableCatalogEntry::write_storage`.
 //!
 //! A group is skipped only if no row of it can pass, so anything not understood keeps it. C++ also
 //! prunes through many functions with statistics of their own (`contains`, `substr`, ...); here it
 //! is comparisons, `BETWEEN`, NULL checks, AND, OR and functions that keep the order of values.
 
 use super::physical::group_keys;
-use crate::catalog::{ColumnZone, TableCatalogEntry};
+use crate::catalog::{ColumnZone, TableCatalogEntry, TableCursor};
 use crate::execution::expression_executor::try_evaluate_scalar;
 use crate::optimizer::statistics::{compare_values, has_ordered_statistics};
 use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator};
@@ -41,18 +41,19 @@ fn compute_zones(table: &TableCatalogEntry, column: usize) -> Vec<ColumnZone> {
     if !has_ordered_statistics(&table.columns[column].ty) {
         return Vec::new();
     }
-    let storage = table.storage.read();
+    if let Some(source) = table.source().filter(|source| TableCursor::is_aligned(&**source)) {
+        // what the file knows of its row groups: a query need not read those that it doesn't want
+        return source.zones(column).unwrap_or_default();
+    }
     let mut zones: Vec<ColumnZone> = Vec::new();
-    for (index, chunk) in storage.chunks().enumerate() {
+    let read = table.for_each_chunk(column, |index, vector, count| {
         if index % CHUNKS_PER_ROW_GROUP == 0 {
             zones.push(ColumnZone::default());
         }
         let zone = zones.last_mut().expect("just pushed one");
-        let vector = chunk.column(column);
-        let count = chunk.len();
         let Ok(keys) = group_keys(&[vector], count) else {
             zone.unknown = true;
-            continue;
+            return;
         };
         let validity = vector.to_unified(count);
         let (mut smallest, mut largest): (Option<usize>, Option<usize>) = (None, None);
@@ -85,6 +86,10 @@ fn compute_zones(table: &TableCatalogEntry, column: usize) -> Vec<ColumnZone> {
         };
         merge(&mut zone.min, smallest, Ordering::Less);
         merge(&mut zone.max, largest, Ordering::Greater);
+    });
+    // with what can't be read there is nothing to go by, which means reading every group
+    if read.is_err() {
+        return Vec::new();
     }
     zones
 }

@@ -5,15 +5,21 @@
 
 use super::block_manager::corrupt;
 use super::buffer_manager::BufferManager;
-use super::checkpoint::{RowGroupPointer, StoredTable};
+use super::checkpoint::StoredTable;
 use super::compression::*;
 use super::metadata::{MetaBlockPointer, MetadataChains, take};
 use super::statistics::{BaseStatistics, read_statistics};
+use crate::catalog::{ColumnStatistics, ColumnZone, TableSource};
+use crate::optimizer::statistics::{compare_values, has_ordered_statistics};
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::serializer::{BinaryDeserializer, Deserialize};
 use duckrs_common::types::{Interval, ListEntry, LogicalType, NativeType, PhysicalType};
+use duckrs_common::value::Value;
 use duckrs_common::vector::{DataChunk, SelectionVector, Vector};
 use duckrs_common::{Error, Result};
+use duckrs_parser::ast::ComparisonOp;
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 const STANDARD_VECTOR_SIZE: usize = 2048;
 /// `Storage::MAX_ROW_GROUP_SIZE`.
@@ -450,71 +456,203 @@ fn read_deletes(
     Ok(deleted)
 }
 
-fn read_row_group(
-    buffer: &BufferManager,
-    chains: &mut MetadataChains,
-    table: &StoredTable,
-    row_group: &RowGroupPointer,
-    types: &[LogicalType],
-    result: &mut ColumnDataCollection,
-    row_ids: Option<&mut Vec<u64>>,
-) -> Result<()> {
-    if row_group.data_pointers.len() != table.columns.len() {
-        return Err(corrupt("a row group does not have the columns of its table"));
-    }
-    if row_group.tuple_count > MAX_ROW_GROUP_SIZE {
-        return Err(corrupt("a row group is too large"));
-    }
-    let rows = row_group.tuple_count as usize;
-    let mut columns = Vec::with_capacity(types.len());
-    for (ty, &pointer) in types.iter().zip(&row_group.data_pointers) {
-        let mut d = BinaryDeserializer::new(chains.at(buffer, pointer)?);
-        let column = read_persistent_column(&mut d, Some(ty))?;
-        columns.push(scan_column(buffer, &column, ty, rows)?);
-    }
-    // only the first pointer leads anywhere: the others say which blocks that takes
-    let Some(&deletes) = row_group.deletes_pointers.first() else {
-        if let Some(row_ids) = row_ids {
-            row_ids.extend(row_group.row_start..row_group.row_start + rows as u64);
-        }
-        result.append(&DataChunk::from_columns(columns, rows));
-        return Ok(());
-    };
-    let deleted = read_deletes(buffer, chains, deletes, rows)?;
-    let alive: Vec<u32> = (0..rows as u32).filter(|&row| !deleted[row as usize]).collect();
-    if let Some(row_ids) = row_ids {
-        row_ids.extend(alive.iter().map(|&row| row_group.row_start + u64::from(row)));
-    }
-    let alive_count = alive.len();
-    let selection = SelectionVector::from_vec(alive);
-    for column in &mut columns {
-        column.slice(&selection, alive_count);
-    }
-    result.append(&DataChunk::from_columns(columns, alive_count));
-    Ok(())
+/// The rows of a table in a file. They stay there, and are read a group and a column at a time.
+#[derive(Debug)]
+pub struct DiskTable {
+    buffer: Arc<BufferManager>,
+    table: StoredTable,
+    chains: Mutex<MetadataChains>,
+    /// Per group with deletes, its rows that are left. Those aren't many bytes, and the number of
+    /// rows of a table is known without reading any.
+    alive: Vec<Option<Vec<u32>>>,
+    rows: usize,
 }
 
-/// All rows of a table.
-pub fn read_table(
-    buffer: &BufferManager,
-    table: &StoredTable,
-    mut row_ids: Option<&mut Vec<u64>>,
-) -> Result<ColumnDataCollection> {
-    let types: Vec<LogicalType> = table.columns.iter().map(|c| c.ty.clone()).collect();
-    let mut result = ColumnDataCollection::new(types.clone());
-    let mut chains = MetadataChains::default();
-    for row_group in &table.row_groups {
-        read_row_group(
+impl DiskTable {
+    pub fn new(buffer: Arc<BufferManager>, table: StoredTable) -> Result<Self> {
+        let mut chains = MetadataChains::default();
+        let mut alive = Vec::with_capacity(table.row_groups.len());
+        let mut count = 0;
+        for row_group in &table.row_groups {
+            if row_group.data_pointers.len() != table.columns.len() {
+                return Err(corrupt("a row group does not have the columns of its table"));
+            }
+            if row_group.tuple_count > MAX_ROW_GROUP_SIZE {
+                return Err(corrupt("a row group is too large"));
+            }
+            let rows = row_group.tuple_count as usize;
+            // only the first pointer leads anywhere: the others say which blocks that takes
+            let left = match row_group.deletes_pointers.first() {
+                None => None,
+                Some(&deletes) => {
+                    let deleted = read_deletes(&buffer, &mut chains, deletes, rows)?;
+                    Some(
+                        (0..rows as u32)
+                            .filter(|&row| !deleted[row as usize])
+                            .collect::<Vec<_>>(),
+                    )
+                }
+            };
+            count += left.as_ref().map_or(rows, Vec::len);
+            alive.push(left);
+        }
+        Ok(Self {
             buffer,
-            &mut chains,
             table,
-            row_group,
-            &types,
-            &mut result,
-            row_ids.as_deref_mut(),
-        )?;
+            chains: Mutex::new(chains),
+            alive,
+            rows: count,
+        })
     }
-    Ok(result)
+
+    pub fn next_row_id(&self) -> u64 {
+        self.table.next_row_id
+    }
+
+    fn persistent_column(&self, group: usize, column: usize) -> Result<PersistentColumn> {
+        let pointer = self.table.row_groups[group].data_pointers[column];
+        let mut chains = self.chains.lock();
+        let mut d = BinaryDeserializer::new(chains.at(&self.buffer, pointer)?);
+        read_persistent_column(&mut d, Some(&self.table.columns[column].ty))
+    }
+
+    /// All rows, with the id of each if the caller wants them.
+    pub fn read_rows(&self, mut row_ids: Option<&mut Vec<u64>>) -> Result<ColumnDataCollection> {
+        let columns: Vec<usize> = (0..self.table.columns.len()).collect();
+        let types = self.table.columns.iter().map(|c| c.ty.clone()).collect();
+        let mut result = ColumnDataCollection::new(types);
+        for (group, row_group) in self.table.row_groups.iter().enumerate() {
+            result.append(&self.read_group(group, &columns)?);
+            if let Some(row_ids) = row_ids.as_deref_mut() {
+                let first = row_group.row_start;
+                match &self.alive[group] {
+                    Some(alive) => row_ids.extend(alive.iter().map(|&row| first + u64::from(row))),
+                    None => row_ids.extend(first..first + row_group.tuple_count),
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// A bound of a column as a value of its type.
+    fn bound(&self, column: usize, bytes: Option<&[u8; 16]>) -> Result<Option<Value>> {
+        let ty = &self.table.columns[column].ty;
+        let width = fixed_width(ty.physical_type());
+        let (Some(bytes), Some(width)) = (bytes, width.filter(|_| has_ordered_statistics(ty))) else {
+            return Ok(None);
+        };
+        let mut vector = Vector::new(ty.clone(), 1);
+        fill_vector(&mut vector, &bytes[..width])?;
+        Ok(Some(vector.get_value(0)))
+    }
+}
+
+impl TableSource for DiskTable {
+    fn row_count(&self) -> usize {
+        self.rows
+    }
+
+    fn group_count(&self) -> usize {
+        self.table.row_groups.len()
+    }
+
+    fn group_rows(&self, group: usize) -> usize {
+        match &self.alive[group] {
+            Some(alive) => alive.len(),
+            None => self.table.row_groups[group].tuple_count as usize,
+        }
+    }
+
+    fn read_group(&self, group: usize, columns: &[usize]) -> Result<DataChunk> {
+        let rows = self.table.row_groups[group].tuple_count as usize;
+        let mut vectors = Vec::with_capacity(columns.len());
+        for &column in columns {
+            let stored = self.persistent_column(group, column)?;
+            vectors.push(scan_column(
+                &self.buffer,
+                &stored,
+                &self.table.columns[column].ty,
+                rows,
+            )?);
+        }
+        let Some(alive) = &self.alive[group] else {
+            return Ok(DataChunk::from_columns(vectors, rows));
+        };
+        let selection = SelectionVector::from_vec(alive.clone());
+        for vector in &mut vectors {
+            vector.slice(&selection, alive.len());
+        }
+        Ok(DataChunk::from_columns(vectors, alive.len()))
+    }
+
+    fn read_all(&self) -> Result<ColumnDataCollection> {
+        self.read_rows(None)
+    }
+
+    fn column_statistics(&self) -> Option<Vec<ColumnStatistics>> {
+        if self.table.column_statistics.len() != self.table.columns.len() {
+            return None;
+        }
+        let statistics = self.table.column_statistics.iter().enumerate();
+        statistics
+            .map(|(column, stored)| {
+                let unknown = ColumnStatistics {
+                    min: None,
+                    max: None,
+                    can_be_null: true,
+                    can_be_valid: true,
+                };
+                let Some(stored) = stored else {
+                    return Some(unknown);
+                };
+                Some(ColumnStatistics {
+                    min: self.bound(column, stored.min.as_ref()).ok()?,
+                    max: self.bound(column, stored.max.as_ref()).ok()?,
+                    can_be_null: stored.has_null,
+                    can_be_valid: stored.has_no_null,
+                })
+            })
+            .collect()
+    }
+
+    fn zones(&self, column: usize) -> Result<Vec<ColumnZone>> {
+        let mut zones = Vec::with_capacity(self.table.row_groups.len());
+        for group in 0..self.table.row_groups.len() {
+            let stored = self.persistent_column(group, column)?;
+            // nulls are in the validity column, so any group might have some
+            let mut zone = ColumnZone {
+                has_null: true,
+                ..ColumnZone::default()
+            };
+            for pointer in &stored.pointers {
+                let (min, max) = (
+                    self.bound(column, pointer.statistics.min.as_ref())?,
+                    self.bound(column, pointer.statistics.max.as_ref())?,
+                );
+                let (Some(min), Some(max)) = (min, max) else {
+                    zone.unknown = true;
+                    break;
+                };
+                if zone
+                    .min
+                    .as_ref()
+                    .is_none_or(|old| compare_values(ComparisonOp::LessThan, &min, old) == Some(true))
+                {
+                    zone.min = Some(min);
+                }
+                if zone
+                    .max
+                    .as_ref()
+                    .is_none_or(|old| compare_values(ComparisonOp::GreaterThan, &max, old) == Some(true))
+                {
+                    zone.max = Some(max);
+                }
+            }
+            zone.unknown |= zone.min.is_none();
+            zones.push(zone);
+        }
+        Ok(zones)
+    }
 }
 
 /// `PersistentRowGroupData`: rows that a large insert wrote to the file ahead of its commit.

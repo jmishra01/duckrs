@@ -24,7 +24,7 @@ pub fn execute_alter(alter: BoundAlter) -> Result<()> {
 fn execute_table_alter(alter: BoundTableAlter) -> Result<()> {
     let old = alter.table;
     let adding_key = alter.constraints.len() > old.constraints.len();
-    let source = old.storage.read();
+    let source = old.rows()?;
     let rows = match &alter.projection {
         Some(projection) => {
             let types: Vec<_> = alter.columns.iter().map(|c| c.ty.clone()).collect();
@@ -45,7 +45,7 @@ fn execute_table_alter(alter: BoundTableAlter) -> Result<()> {
     table.generated = alter.generated;
     let table = Arc::new(table);
     if alter.verify {
-        let rows = table.storage.read();
+        let rows = table.rows()?;
         for chunk in rows.chunks() {
             constraints::verify_not_null(&table, chunk)?;
         }
@@ -72,7 +72,7 @@ pub fn execute_create_index(table: &Arc<TableCatalogEntry>, index: IndexCatalogE
     let index = Arc::new(index);
     table.indexes.write().push(index.clone());
     *table.unique_keys.lock() = None;
-    let rows = table.storage.read();
+    let rows = table.rows()?;
     let result = constraints::current_keys(table, &rows).map(drop);
     drop(rows);
     result.map_err(|error| {

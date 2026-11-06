@@ -696,7 +696,7 @@ impl Binder<'_> {
                         Value::boolean(false),
                         Value::boolean(temporary),
                         Value::boolean(primary),
-                        Value::bigint(table.storage.read().len() as i64),
+                        Value::bigint(table.row_count() as i64),
                         Value::bigint(table.logical_columns().len() as i64),
                         // C++ backs each UNIQUE, PRIMARY KEY and FOREIGN KEY with an index
                         Value::bigint((table.indexes.read().len() + backing_indexes) as i64),

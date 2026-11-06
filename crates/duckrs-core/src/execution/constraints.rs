@@ -252,7 +252,7 @@ fn check_foreign_keys(table: &Arc<TableCatalogEntry>, chunk: &DataChunk, own: &[
             Some(reference) => {
                 let parent = reference.table();
                 let parent = &parent;
-                let rows = parent.storage.read();
+                let rows = parent.rows()?;
                 let mut keys = parent.unique_keys.lock();
                 if keys.is_none() {
                     *keys = Some(build_keys(parent, &rows, usize::MAX)?);
@@ -350,7 +350,7 @@ fn referencing_keys(table: &Arc<TableCatalogEntry>, rows: &ColumnDataCollection)
                     .as_ref()
                     .is_some_and(|parent| parent.name.eq_ignore_ascii_case(&table.name))
             {
-                let child_rows = child.storage.read();
+                let child_rows = child.rows()?;
                 gather(child, foreign_key, &child_rows)?;
             }
         }

@@ -242,6 +242,32 @@ fn constraints_count_as_indexes() {
     }
 }
 
+const SCAN_QUERIES: &str = include_str!("fixtures/scan_queries.txt");
+
+/// Scans read these tables in place, with what the file says about them: the row groups that a filter
+/// skips, the statistics that decide comparisons, and rows that don't line up with chunks.
+#[test]
+fn scans_of_tables_in_place_answer_as_in_duckdb() {
+    let mut failures = Vec::new();
+    for (file, size) in [("scan_v122880.db", 122880), ("scan_v4096.db", 4096)] {
+        let mut connection = connect(file);
+        for (n, query) in SCAN_QUERIES.lines().enumerate() {
+            let expected = expected_rows(&format!("scan_{size}_{}", n + 1));
+            let actual = match connection.query(query) {
+                Ok(_) => column(&mut connection, query),
+                Err(error) => {
+                    failures.push(format!("{file}: {query}: {error}"));
+                    continue;
+                }
+            };
+            if actual != expected {
+                failures.push(format!("{file}: {query}\n  duckrs: {actual:?}\n  DuckDB: {expected:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 const LOGGED_FILES: [&str; 3] = ["wal_v100.db", "wal_v150.db", "wal_v200.db"];
 
 fn expected_rows(name: &str) -> Vec<String> {

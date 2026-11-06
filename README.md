@@ -58,7 +58,7 @@ and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in me
   run yet fails with an error saying it `is not yet ported to duckrs`; the sqllogictest runner
   never counts that error as the one a test expects.
 - `crates/duckrs`: the public API (`Database`, `Connection`, `QueryResult`) over the engine.
-  Phase 9 has started: `Database::open` reads files written by DuckDB into memory: tables of scalar and
+  Phase 9 has started: `Database::open` reads files written by DuckDB and scans their tables in place: tables of scalar and
   nested types, with deleted rows, in all compression but ZSTD and the old Chimp and Patas. Such a
   database takes no writes. Views, macros, sequences, types, defaults, generated columns, constraints and indexes come along, what a write-ahead log committed is replayed, and what isn't ported yet is an error; see "Phase 9" in
   [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Without a file a database lives in memory, and

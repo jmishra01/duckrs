@@ -19,9 +19,9 @@ use duckrs_common::Result;
 use std::path::Path;
 use std::sync::Arc;
 
-/// What of the file stays in memory while it loads. Rows are copied out, so this only bounds the
-/// blocks read ahead of that.
-const LOAD_BUFFER_MEMORY: usize = 256 << 20;
+/// The blocks of a file that stay in memory. Rows stay in the file, and a scan decodes one row group
+/// at a time, so this is what bounds the memory that a large file takes.
+const BUFFER_MEMORY: usize = 256 << 20;
 
 /// Whether there is a database in the file: a new database starts as a missing or empty file.
 pub fn is_database_file(path: &Path) -> bool {
@@ -32,11 +32,11 @@ pub fn is_database_file(path: &Path) -> bool {
 /// log committed since. The file is opened read-only: it and the log stay as they are.
 pub fn load_database(path: &Path, catalog: &Catalog) -> Result<()> {
     let blocks = Arc::new(SingleFileBlockManager::open(path, true)?);
-    let buffer = BufferManager::new(blocks, LOAD_BUFFER_MEMORY);
+    let buffer = Arc::new(BufferManager::new(blocks, BUFFER_MEMORY));
     metadata::load_free_list(&buffer)?;
     let records = wal::read_records(path, &buffer)?;
     let stored = checkpoint::read_catalog(&buffer)?;
-    let mut replay = wal::Replay::new(&buffer, catalog, !records.is_empty());
+    let mut replay = wal::Replay::new(buffer, catalog);
     for entry in stored.entries {
         replay.add_entry(entry)?;
     }
@@ -47,6 +47,7 @@ pub fn load_database(path: &Path, catalog: &Catalog) -> Result<()> {
 mod tests {
     use super::*;
     use crate::catalog::{TableCatalogEntry, TableConstraint};
+    use crate::client::{ClientContext, DatabaseInstance};
     use crate::execution::constraints::current_keys;
 
     const FILES: [&str; 3] = ["parsed_v100.db", "parsed_v150.db", "parsed_v200.db"];
@@ -86,7 +87,7 @@ mod tests {
             assert_eq!(keys(&compound), [names(&["x", "y"], true)], "{file}");
             assert!(parent.columns[0].not_null, "{file}");
             // the keys come from the rows, as the file doesn't give them
-            let rows = parent.storage.read();
+            let rows = parent.rows().unwrap();
             let keys = current_keys(&parent, &rows).unwrap();
             let sizes: Vec<usize> = keys.as_ref().unwrap().iter().map(|k| k.len()).collect();
             assert_eq!(sizes, [2, 2, 2], "{file}");
@@ -116,6 +117,62 @@ mod tests {
             let referenced = catalog.get_table(None, "parent").unwrap();
             assert_eq!(referenced.referenced_by.lock().len(), 1, "{file}");
         }
+    }
+
+    /// A query reads what it needs of a file: all of this runs without the rows in memory.
+    #[test]
+    fn tables_stay_in_the_file() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../duckrs/tests/fixtures/scan_v122880.db");
+        let db = DatabaseInstance::open_file(&path, true).unwrap();
+        let mut context = ClientContext::new(db.clone());
+        let in_file = |table: &str| db.catalog.get_table(None, table).unwrap().source().is_some();
+        for sql in [
+            "SELECT count(*) FROM big",
+            "SELECT i, s FROM big WHERE i = 7",
+            "SELECT tiny, sum(i) FROM big GROUP BY tiny",
+            "SELECT count(*) FROM big a JOIN holes b ON a.i = b.i",
+            "SELECT * FROM big ORDER BY i LIMIT 5",
+            "BEGIN",
+            "SELECT count(*) FROM holes",
+            "ROLLBACK",
+            "DESCRIBE big",
+            "SELECT * FROM duckdb_tables()",
+        ] {
+            context.query(sql).unwrap();
+            assert!(in_file("big"), "{sql}");
+            assert!(in_file("holes"), "{sql}");
+        }
+    }
+
+    /// The row groups a filter skips come from the metadata, so skipping them takes no reading.
+    #[test]
+    fn filters_skip_row_groups_of_a_file() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../duckrs/tests/fixtures/scan_v122880.db");
+        let mut context = ClientContext::new(DatabaseInstance::open_file(&path, true).unwrap());
+        for (filter, groups) in [("i < 100", "1 / 2"), ("i >= 125000", "1 / 2"), ("i >= 100", "2 / 2")] {
+            let sql = format!("EXPLAIN ANALYZE SELECT count(*) FROM big WHERE {filter}");
+            let plan = context.query(&sql).unwrap().value(1, 0).try_to_string().unwrap();
+            let line = plan
+                .lines()
+                .find(|line| line.contains("Row Groups Scanned"))
+                .unwrap_or(&plan);
+            assert!(line.contains(groups), "{filter}: {plan}");
+        }
+    }
+
+    /// Only the columns that a scan reads are decoded.
+    #[test]
+    fn a_group_is_read_a_column_at_a_time() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../duckrs/tests/fixtures/scan_v122880.db");
+        let catalog = Catalog::new("test");
+        load_database(&path, &catalog).unwrap();
+        let table = catalog.get_table(None, "big").unwrap();
+        let source = table.source().unwrap();
+        let chunk = source.read_group(1, &[0]).unwrap();
+        assert_eq!(chunk.column_count(), 1);
+        assert_eq!(chunk.len(), 130_000 - 122_880);
+        assert_eq!(table.row_count(), 130_000);
+        assert!(table.source().is_some());
     }
 
     #[test]

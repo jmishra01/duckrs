@@ -327,9 +327,8 @@ sequences and types; tables are not scanned in place yet and nothing but the blo
 What is read comes from outside, so it is bounds-checked, and damage is an error, never a panic.
 Segment counts must add up to their column's rows before anything is decoded or allocated.
 
-A file opened read-only stays as it is, and the file is only ever opened read-only for now. Rows
-are copied into each table's `ColumnDataCollection`, so a database has to fit in memory, and its
-tables have the 2 GiB cap of Phase 3. A database opened for writing fails on any write, as storing it
+A file opened read-only stays as it is, and the file is only ever opened read-only for now. A database
+opened for writing fails on any write, as storing it
 is not ported and the change would get lost at the end. A file that does not exist is an in-memory
 database as before: new files are not written, which the corpus relies on until checkpoints work.
 
@@ -343,8 +342,7 @@ or lose data:
 - in a stored query: INSERT, UPDATE, DELETE, MERGE, COPY, SHOW and MATCH_RECOGNIZE;
 - `ALTER` and updates of a field of a STRUCT in a write-ahead log, encrypted files and logs.
 
-Next, in order: scanning row groups in place through the buffer manager; then
-checkpoints, for which the block layer is ready. `ATTACH` follows from there. ZSTD takes a new
+Next, in order: checkpoints, for which the block layer is ready. `ATTACH` follows from there. ZSTD takes a new
 dependency, and Chimp and Patas are only in old files.
 
 **Indexes**: the ART of each index is parsed past and not read, whichever way the file points to it
@@ -355,6 +353,27 @@ needed) until Phase 10 ports the ART. A `CREATE INDEX` entry goes through `bind_
 joins the table without a scan, as the file has these rows under the index already. An index of a
 type that isn't ART came with an extension; as nothing here reads it, it is treated like the others.
 
+**Tables in place** (`DiskTable`, `TableCursor`): rows stay in the file, and `TableSource` is how the
+engine reaches them without knowing about files. A scan decodes the row group it is at, only the
+columns that its projection and filter refer to, through the buffer manager, which keeps 256 MiB of
+blocks whatever `memory_limit` says for now. Metadata is read at open, as are deletes, as the number
+of rows has to be known. Decoding is what fails on damage or ZSTD, so those errors come from the
+query that reads the rows and not from opening the file; bad metadata still fails the open.
+
+`storage` of a table is private, so what wants all rows goes through `rows` and `write_storage`,
+which read them into memory for good: a write, or a log that changes the table. A snapshot for ROLLBACK
+keeps the source and reads nothing. Everything else stays in the file, with what it knows: statistics
+of the table for the optimizer and those of each row group as zone maps, so that a filter skips a
+group without reading it. Those are the bounds of numeric and temporal columns. A file only has a
+prefix of strings, so VARCHAR columns have no zones here, and the bounds can be wider than the values,
+after deletes, which is safe as they are only used to rule rows out.
+
+The engine numbers chunks as in memory: all but the last are full, and 60 of them make a group. When a
+file's groups match that, a scan jumps to the group it wants. Otherwise (deletes, or another
+`ROW_GROUP_SIZE`) `TableCursor` goes through the groups in order and a buffer makes up the chunks, so
+zone maps come from reading the column. Row ids are positions, as they were in memory: after deletes
+that isn't the id in C++.
+
 **Write-ahead log** (`wal`): all records of a log are read before any is applied, which is what the
 first pass of C++ does. What follows the last WAL_FLUSH was never committed and a log that stops
 inside an entry is what a crash leaves, so neither is an error; a wrong checksum is, and so is a log
@@ -363,7 +382,8 @@ of C++: the log and the file stay as they are, and a checkpoint that didn't fini
 `.wal.checkpoint` if there is one. Records go through what loads a checkpoint.
 
 Records name rows by row id, and rows that were deleted before the last checkpoint leave gaps, so
-`LiveTable` keeps the id of each position while a log is replayed. Deletes and updates are collected
+`LiveTable` keeps the id of each position while a log is replayed. Only a table that a log changes is
+read into memory for that. Deletes and updates are collected
 and the tables they touch are rewritten at the end. C++ logs an update twice, the values and a
 validity update on the path `[column, 0]`, as the value of a NULL is whatever the vector held; a
 cell keeps both. Large inserts write row groups to the file ahead of the commit, past the blocks the
@@ -407,6 +427,11 @@ query as DuckDB does, apart from the differences between the `ToString` of the 1
 the fixtures and the baseline, which the test lists. The v2.0.0 file comes from the reference engine
 of the test runner, as the CLI is too old for it; its rendering isn't compared. Writes aren't ported, so
 `storage::tests` looks at the catalog for keys, foreign keys and indexes.
+
+`scan_tables.sql` makes tables of two row groups, or of many small ones, and `scan_queries.txt` asks
+what zone maps and statistics could get wrong: every type of bound, NULLs, NaN, empty tables and
+deleted rows. On a file of 1.1 GB, 40 million rows of four columns, `sum` of an integer column took
+0.7 s and 180 MB of memory, and a filter on the first column 5 ms and 13 MB.
 
 `wal_checkpointed.sql` and `wal_logged.sql` make files whose changes are partly only in a log, for
 the same three versions, and every table has to come out as DuckDB has it after replaying that log.

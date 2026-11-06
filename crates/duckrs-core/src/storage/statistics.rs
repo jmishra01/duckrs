@@ -23,8 +23,9 @@ impl Deserialize for RawBytes {
 pub struct BaseStatistics {
     pub has_null: bool,
     pub has_no_null: bool,
-    /// The minimum of a numeric column as it is in a vector, in little-endian bytes.
+    /// The bounds of a numeric column as they are in a vector, in little-endian bytes.
     pub min: Option<[u8; 16]>,
+    pub max: Option<[u8; 16]>,
 }
 
 fn numeric_value(d: &mut BinaryDeserializer<'_>, physical: PhysicalType) -> Result<Option<[u8; 16]>> {
@@ -91,16 +92,20 @@ pub fn read_statistics(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>)
         let has_null = d.read_property(100, "has_null")?;
         let has_no_null = d.read_property(101, "has_no_null")?;
         d.read_property::<u64>(102, "distinct_count")?;
-        let min = d.read_object(103, "type_stats", |d| read_type_stats(d, ty))?;
+        let bounds = d.read_object(103, "type_stats", |d| read_type_stats(d, ty))?;
         Ok(BaseStatistics {
             has_null,
             has_no_null,
-            min,
+            min: bounds.map(|(min, _)| min),
+            max: bounds.and_then(|(_, max)| max),
         })
     })
 }
 
-fn read_type_stats(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>) -> Result<Option<[u8; 16]>> {
+/// The bounds of the values, of the types that have numeric statistics.
+type Bounds = Option<([u8; 16], Option<[u8; 16]>)>;
+
+fn read_type_stats(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>) -> Result<Bounds> {
     let Some(ty) = ty.filter(|ty| ty.id() != LogicalTypeId::SqlNull) else {
         return Ok(None);
     };
@@ -137,8 +142,8 @@ fn read_type_stats(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>) -> 
                 return Ok(None);
             }
             let min = d.read_object(200, "min", |d| numeric_value(d, physical))?;
-            d.read_object(201, "max", |d| numeric_value(d, physical))?;
-            Ok(min)
+            let max = d.read_object(201, "max", |d| numeric_value(d, physical))?;
+            Ok(min.map(|min| (min, max)))
         }
     }
 }
@@ -171,14 +176,14 @@ impl Deserialize for DistinctStatistics {
 }
 
 /// `ColumnStatistics::Deserialize`, of an element of a list of pointers, which can be null.
-pub fn read_column_statistics(d: &mut BinaryDeserializer<'_>, ty: &LogicalType) -> Result<()> {
+pub fn read_column_statistics(d: &mut BinaryDeserializer<'_>, ty: &LogicalType) -> Result<Option<BaseStatistics>> {
     if !bool::read_value(d)? {
-        return Ok(());
+        return Ok(None);
     }
     d.read_object_value(|d| {
-        d.read_object_field(100, "statistics", |d| read_statistics(d, Some(ty)))?;
+        let statistics = d.read_object_field(100, "statistics", |d| read_statistics(d, Some(ty)))?;
         d.read_optional_property::<Option<DistinctStatistics>>(101, "distinct")?;
-        Ok(())
+        Ok(Some(statistics))
     })
 }
 

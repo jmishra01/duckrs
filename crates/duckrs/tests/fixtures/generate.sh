@@ -22,7 +22,7 @@ ROWS="SELECT
   ('blob' || (i % 9))::BLOB
   FROM range(COUNT_ROWS) r(i)"
 
-rm -f compatible.db compressed.db bitpacked.db floats.db modern.db nested.db deletes.db parsed_*.db wal_v*.db* *.expected
+rm -f compatible.db compressed.db bitpacked.db floats.db modern.db nested.db deletes.db parsed_*.db wal_v*.db* scan_v*.db *.expected
 "$DUCKDB" <<SQL
 ATTACH 'compatible.db' (BLOCK_SIZE 16384);
 USE compatible;
@@ -270,3 +270,25 @@ rm -f wal_v200.db wal_v200.db.wal
 } > "$scratch/test/wal_v200.test"
 "$runner" --engine reference --duckdb-root "$scratch" test/wal_v200.test
 rm -rf "$scratch"
+
+# Tables that scans read in place: two row groups, with what statistics can get wrong. The second
+# file has fewer rows in small row groups, which don't line up with the chunks of a table in memory.
+for row_group_size in 122880 4096; do
+  file=scan_v$row_group_size.db
+  rm -f "$file"
+  {
+    echo "ATTACH '$file' (BLOCK_SIZE 16384, ROW_GROUP_SIZE $row_group_size);"
+    echo "USE ${file%.db};"
+    if [ "$row_group_size" = 4096 ]; then
+      sed 's/range(130000)/range(30000)/' scan_tables.sql
+    else
+      cat scan_tables.sql
+    fi
+  } | "$DUCKDB" > /dev/null
+  n=0
+  while IFS= read -r query; do
+    n=$((n + 1))
+    "$DUCKDB" -readonly -noheader -list -separator '|' -nullvalue NULL "$file" -c "$query" \
+        > "scan_${row_group_size}_$n.expected"
+  done < scan_queries.txt
+done

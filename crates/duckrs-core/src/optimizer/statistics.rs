@@ -51,6 +51,10 @@ pub(crate) fn has_ordered_statistics(ty: &LogicalType) -> bool {
 
 /// The statistics of a table's columns, from its rows.
 fn compute_statistics(table: &Arc<TableCatalogEntry>) -> Option<Vec<Stats>> {
+    // a file knows these already, and reading its rows for them would read the whole table
+    if let Some(statistics) = table.source().and_then(|source| source.column_statistics()) {
+        return Some(statistics);
+    }
     let functions = BuiltinFunctions::get();
     let aggregate = |name: &str, column: BoundExpr| {
         bind_aggregate_function(functions.aggregate(name)?, vec![column], None, false).ok()
@@ -184,26 +188,25 @@ impl DistinctSketch {
 fn key_column_distinct(table: &TableCatalogEntry, column: usize) -> Option<u64> {
     let mut sketch = DistinctSketch::new();
     let id = table.columns[column].ty.id();
-    let storage = table.storage.read();
-    for chunk in storage.chunks() {
-        let count = chunk.len();
-        let unified = chunk.column(column).to_unified(count);
-        match id {
-            LogicalTypeId::BigInt => {
+    if !matches!(id, LogicalTypeId::BigInt | LogicalTypeId::Integer | LogicalTypeId::Date) {
+        return None;
+    }
+    table
+        .for_each_chunk(column, |_, vector, count| {
+            let unified = vector.to_unified(count);
+            if id == LogicalTypeId::BigInt {
                 let data = unified.data::<i64>();
                 for row in (0..count).filter(|&row| unified.is_valid(row)) {
                     sketch.add(data[unified.sel.get(row)] as u64);
                 }
-            }
-            LogicalTypeId::Integer | LogicalTypeId::Date => {
+            } else {
                 let data = unified.data::<i32>();
                 for row in (0..count).filter(|&row| unified.is_valid(row)) {
                     sketch.add(data[unified.sel.get(row)] as u64);
                 }
             }
-            _ => return None,
-        }
-    }
+        })
+        .ok()?;
     Some(sketch.estimate())
 }
 
@@ -237,7 +240,7 @@ fn compute_distinct_counts(table: &Arc<TableCatalogEntry>) -> Option<TableDistin
         },
         Vec::new(),
     );
-    let rows = table.storage.read().len() as u64;
+    let rows = table.row_count() as u64;
     let scan = if rows > DISTINCT_SAMPLE_ROWS {
         let limit = K::Limit {
             limit: Some(DISTINCT_SAMPLE_ROWS),

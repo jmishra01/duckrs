@@ -17,7 +17,7 @@ use super::serialization::custom::QualifiedName;
 use super::serialization::generated::enums::{vector_type, wal_type};
 use super::serialization::generated::{self as g};
 use super::serialization::not_ported;
-use super::table_data::{self, PersistentRowGroup, fill_vector, fixed_width};
+use super::table_data::{self, DiskTable, PersistentRowGroup, fill_vector, fixed_width};
 use crate::catalog::{Catalog, OnCreateConflict, SequenceData};
 use crate::planner::binder::Binder;
 use crate::planner::logical::LogicalOperatorKind;
@@ -725,23 +725,24 @@ fn key(name: &EntryName) -> EntryName {
 
 /// Puts entries in the catalog: those of a checkpoint, then those of a log.
 pub(super) struct Replay<'a> {
-    buffer: &'a BufferManager,
+    buffer: Arc<BufferManager>,
     catalog: &'a Catalog,
-    /// Whether a log follows, as only that needs the row ids.
-    track_rows: bool,
     before_v2: bool,
+    /// The tables of the file, of which only those that a log changes get read.
+    disk: HashMap<EntryName, Arc<DiskTable>>,
     tables: HashMap<EntryName, LiveTable>,
     sequence_usage: HashMap<EntryName, u64>,
     current: Option<EntryName>,
 }
 
 impl<'a> Replay<'a> {
-    pub(super) fn new(buffer: &'a BufferManager, catalog: &'a Catalog, track_rows: bool) -> Self {
+    pub(super) fn new(buffer: Arc<BufferManager>, catalog: &'a Catalog) -> Self {
+        let before_v2 = checkpoint::is_before_v2(&buffer.block_manager().header());
         Self {
             buffer,
             catalog,
-            track_rows,
-            before_v2: checkpoint::is_before_v2(&buffer.block_manager().header()),
+            before_v2,
+            disk: HashMap::new(),
             tables: HashMap::new(),
             sequence_usage: HashMap::new(),
             current: None,
@@ -749,8 +750,8 @@ impl<'a> Replay<'a> {
     }
 
     /// Binds the definition of a table as `CREATE TABLE` does, for its defaults, generated columns
-    /// and constraints, and copies its rows in.
-    fn load_table(&mut self, table: &StoredTable) -> Result<()> {
+    /// and constraints. Its rows stay in the file.
+    fn load_table(&mut self, table: StoredTable) -> Result<()> {
         let plan = Binder::new(self.catalog).bind_stored_table(&table.definition, &table.schema)?;
         let LogicalOperatorKind::CreateTable {
             schema,
@@ -763,22 +764,35 @@ impl<'a> Replay<'a> {
         else {
             unreachable!("CREATE TABLE without a query binds to CreateTable");
         };
-        let mut row_ids = self.track_rows.then(Vec::new);
-        let rows = table_data::read_table(self.buffer, table, row_ids.as_mut())?;
+        let table_key = key(&(table.schema.clone(), table.name.clone()));
+        let disk = Arc::new(DiskTable::new(self.buffer.clone(), table)?);
         let entry = schema
             .create_table(&name, columns, generated, constraints, on_conflict)?
             .expect("OnCreateConflict::Error fails or creates");
-        *entry.write_storage() = rows;
-        if let Some(row_ids) = row_ids {
+        entry.set_source(disk.clone());
+        self.disk.insert(table_key, disk);
+        Ok(())
+    }
+
+    /// A table that a log changes, whose rows that takes in memory.
+    fn live_table(&mut self, name: &EntryName) -> Result<&mut LiveTable> {
+        let table_key = key(name);
+        if !self.tables.contains_key(&table_key) {
+            let disk = self
+                .disk
+                .get(&table_key)
+                .ok_or_else(|| corrupt("a log names a table that does not exist"))?;
+            let mut row_ids = Vec::new();
+            let rows = disk.read_rows(Some(&mut row_ids))?;
             let live = LiveTable {
                 row_ids,
-                next_row_id: table.next_row_id,
+                next_row_id: disk.next_row_id(),
                 ..LiveTable::default()
             };
-            self.tables
-                .insert(key(&(table.schema.clone(), table.name.clone())), live);
+            self.catalog.get_table(Some(&name.0), &name.1)?.set_rows(rows);
+            self.tables.insert(table_key.clone(), live);
         }
-        Ok(())
+        Ok(self.tables.get_mut(&table_key).expect("just ensured"))
     }
 
     fn create_sequence(&mut self, schema: &str, name: &str, stored: StoredSequence) -> Result<()> {
@@ -805,7 +819,7 @@ impl<'a> Replay<'a> {
     pub(super) fn add_entry(&mut self, entry: StoredEntry) -> Result<()> {
         match entry {
             StoredEntry::Schema(name) => self.catalog.create_schema(&name, OnCreateConflict::Ignore)?,
-            StoredEntry::Table(table) => self.load_table(&table)?,
+            StoredEntry::Table(table) => self.load_table(*table)?,
             StoredEntry::View {
                 schema,
                 name,
@@ -844,7 +858,9 @@ impl<'a> Replay<'a> {
         let entry = self.catalog.schema_for(Some(schema))?;
         let dropped = match kind {
             DropKind::Table => {
-                self.tables.remove(&key(&(schema.clone(), name.clone())));
+                let table_key = key(&(schema.clone(), name.clone()));
+                self.tables.remove(&table_key);
+                self.disk.remove(&table_key);
                 entry.drop_entry(name, "Table")?
             }
             DropKind::View => entry.drop_entry(name, "View")?,
@@ -885,23 +901,22 @@ impl<'a> Replay<'a> {
     }
 
     fn current_table(&mut self) -> Result<&mut LiveTable> {
-        self.current
-            .as_ref()
-            .and_then(|name| self.tables.get_mut(&key(name)))
-            .ok_or_else(|| corrupt("a log changes rows without a table"))
+        let name = self
+            .current
+            .clone()
+            .ok_or_else(|| corrupt("a log changes rows without a table"))?;
+        self.live_table(&name)
     }
 
     fn append(&mut self, chunk: &DataChunk) -> Result<()> {
-        let (schema, name) = self
-            .current
-            .clone()
-            .ok_or_else(|| corrupt("a log inserts without a table"))?;
-        let table = self.catalog.get_table(Some(&schema), &name)?;
+        let live = self.current_table()?;
+        live.add_rows(chunk.len());
+        let (schema, name) = self.current.as_ref().expect("the table above");
+        let table = self.catalog.get_table(Some(schema), name)?;
         if chunk.types() != table.types() {
             return Err(corrupt("a log inserts rows of other types"));
         }
-        table.write_storage().append(chunk);
-        self.current_table()?.add_rows(chunk.len());
+        table.write_storage()?.append(chunk);
         Ok(())
     }
 
@@ -925,7 +940,7 @@ impl<'a> Replay<'a> {
                 last_value,
             } => self.sequence_value(&name, usage_count, counter, last_value),
             Record::UseTable(name) => {
-                if !self.tables.contains_key(&key(&name)) {
+                if !self.disk.contains_key(&key(&name)) {
                     return Err(corrupt("a log uses a table that does not exist"));
                 }
                 self.current = Some(name);
@@ -934,7 +949,7 @@ impl<'a> Replay<'a> {
             Record::Insert(chunk) => self.append(&chunk),
             Record::RowGroups(row_groups) => {
                 for row_group in &row_groups {
-                    let chunk = table_data::scan_row_group(self.buffer, row_group)?;
+                    let chunk = table_data::scan_row_group(&self.buffer, row_group)?;
                     self.append(&chunk)?;
                 }
                 Ok(())
@@ -975,7 +990,7 @@ impl<'a> Replay<'a> {
                 continue;
             }
             let table = self.catalog.get_table(Some(&schema), &name)?;
-            let mut storage = table.write_storage();
+            let mut storage = table.write_storage()?;
             let types = storage.types().to_vec();
             let mut result = ColumnDataCollection::new(types.clone());
             let mut chunk = DataChunk::new(&types);
