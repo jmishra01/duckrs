@@ -350,9 +350,9 @@ These stop writes, or fail when they are made, as a file can't hold them yet:
 - VARIANT and GEOMETRY columns, and in a stored query what can't be read from one either. These fail
   at the commit, which leaves the database in memory as it is, until what can't be stored is dropped.
 
-Next, in order: compression when writing, one codec at a time, which most of the tests of
-`test/sql/storage/compression` look at through `pragma_storage_info`; then keys in files, with the ART
-of Phase 10. ZSTD takes a new
+Next, in order: ALP and ALPRD when writing, then FSST and the rest of the error messages of the
+decoders, which `test/sql/storage/compression` compares with those of C++; then keys in files, with
+the ART of Phase 10. ZSTD takes a new
 dependency, and Chimp and Patas are only in old files.
 
 **Indexes**: the ART of each index is parsed past and not read, whichever way the file points to it
@@ -369,8 +369,13 @@ Afterwards every table is back in the file, and the blocks of the last checkpoin
 are read through `TableCursor` as they are written, so that doesn't take them into memory either.
 
 Files are v2.0.0, where constants are literals and casts name parsed types, so the AST goes into a
-file nearly as it is. Everything is uncompressed, as compression is the analysis of each codec and
-changes nothing about the format. Segments share blocks, as a block per column would make small tables
+file nearly as it is. Each column of a row group takes the smallest of what `encode` has, unless
+`force_compression` says otherwise: RLE and BitPacking for numbers, Roaring for validity, and the
+dictionary mode of DICT_FSST for strings. C++ picks with an analysis of its own, so its choice can
+differ. A segment of one value is Constant, whatever was chosen, as in C++. BitPacking uses frames of
+reference and constants, not deltas, and not HUGEINT; Roaring uses arrays and bitsets, not runs. Those
+are smaller or faster at times, but what is written is valid either way. ALP, ALPRD, FSST, ZSTD,
+Chimp and Patas are read and not written. Segments share blocks, as a block per column would make small tables
 large, which DuckDB has to be told of in `multi_use_blocks`. After the free list a file has the list of
 metadata blocks with their free sub-blocks: nothing in `duckrs` reads it, but C++ doesn't find them
 otherwise. Numeric columns have bounds; strings say that nothing is known of them.
@@ -384,8 +389,8 @@ a statement that names one (`db.t`, `db.main.t`) is routed to it with that name 
 runs in one database, so one that reads two isn't ported, and subqueries in expressions aren't looked
 at for names. `STORAGE_VERSION` below v2.0.0 and `ROW_GROUP_SIZE` are refused, as is encryption.
 
-The gate is not met: `test/sql/storage` is at 37.5% against 85%. Of what fails there, 161 files are in
-`compression`, and about 45 need keys in a file, which can't come before Phase 10.
+The gate is not met: `test/sql/storage` is at 45.8% against 85%. About 40 of the files that fail need
+keys in a file, which can't come before Phase 10.
 
 **Writing the log** (`log_writer`): the engine has no undo log and tables change by being rewritten,
 so a commit doesn't know what it did. It compares the catalog with what is durable, and writes the

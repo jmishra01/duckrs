@@ -47,6 +47,11 @@ pub(super) fn corrupt(message: impl std::fmt::Display) -> Error {
     Error::new(ErrorKind::DataCorruption, format!("Corrupt database file: {message}"))
 }
 
+/// Damage that C++ words in full itself.
+pub(super) fn corrupted(message: &str) -> Error {
+    Error::new(ErrorKind::DataCorruption, message)
+}
+
 fn io_error(path: &Path, error: std::io::Error) -> Error {
     Error::new(ErrorKind::Io, format!("{}: {error}", path.display()))
 }

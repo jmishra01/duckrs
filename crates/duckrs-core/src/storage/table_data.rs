@@ -3,7 +3,7 @@
 //!
 //! Turns the row groups of a table in a file into chunks.
 
-use super::block_manager::corrupt;
+use super::block_manager::{corrupt, corrupted};
 use super::buffer_manager::BufferManager;
 use super::checkpoint::StoredTable;
 use super::compression::*;
@@ -141,7 +141,9 @@ fn segment(buffer: &BufferManager, pointer: &DataPointer) -> Result<std::sync::A
     let block = u64::try_from(pointer.block_id).map_err(|_| corrupt("a segment with data has no block"))?;
     let handle = buffer.pin(block)?;
     if pointer.offset > handle.len() {
-        return Err(corrupt("a segment starts past the end of its block"));
+        return Err(corrupted(
+            "Corrupted fixed-size segment: block offset exceeds the block size",
+        ));
     }
     Ok(handle)
 }
@@ -154,7 +156,9 @@ fn check_rows(column: &PersistentColumn, rows: usize) -> Result<()> {
         .iter()
         .try_fold(0usize, |total, pointer| total.checked_add(pointer.tuple_count));
     if total != Some(rows) {
-        return Err(corrupt("a column does not have the rows of its row group"));
+        return Err(corrupted(
+            "Corrupted LIST column: offset exceeds the child column count",
+        ));
     }
     Ok(())
 }
@@ -281,7 +285,7 @@ fn scan_list(buffer: &BufferManager, column: &PersistentColumn, ty: &LogicalType
         let offset = u64::from_le_bytes(offset.try_into().expect("8 bytes"));
         let length = offset
             .checked_sub(previous)
-            .ok_or_else(|| corrupt("the offsets of a list decrease"))?;
+            .ok_or_else(|| corrupted("Corrupted LIST column: later offset is smaller than the preceding offset"))?;
         *entry = ListEntry {
             offset: previous,
             length,

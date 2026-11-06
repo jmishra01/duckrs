@@ -5,7 +5,7 @@
 //! These decode a whole segment. Scanning part of one, and doing so vectorized, comes with
 //! scanning tables in place.
 
-use super::block_manager::corrupt;
+use super::block_manager::{corrupt, corrupted};
 use super::statistics::BaseStatistics;
 use duckrs_common::{Error, ErrorKind, Result};
 
@@ -128,7 +128,9 @@ pub fn scan_rle(segment: &[u8], count: usize, width: usize, out: &mut Vec<u8>) -
     let mut entry = 0;
     while remaining > 0 {
         if entry >= entries {
-            return Err(corrupt("RLE runs end before the rows of the segment"));
+            return Err(corrupted(
+                "Corrupted RLE segment: run counts do not cover the segment row count",
+            ));
         }
         let run = bytes(segment, counts_at + entry * 2, 2, "an RLE run count")?;
         let run = usize::from(u16::from_le_bytes(run.try_into().expect("2 bytes")));
@@ -185,7 +187,7 @@ pub fn scan_bitpacking(segment: &[u8], count: usize, width: usize, out: &mut Vec
     let table_start = metadata_end
         .checked_sub(group_count * 4)
         .filter(|&start| start >= HEADER_SIZE)
-        .ok_or_else(|| out_of_bounds("the metadata of a bitpacked segment"))?;
+        .ok_or_else(|| corrupted("Corrupted bitpacking segment: offset is outside the segment"))?;
     bytes(
         segment,
         table_start,
@@ -239,7 +241,9 @@ pub fn scan_bitpacking(segment: &[u8], count: usize, width: usize, out: &mut Vec
                 let frame = number(data, 0)?;
                 let packed_width = number(data, width)? as usize;
                 if packed_width > bits {
-                    return Err(out_of_bounds("a bitpacking width"));
+                    return Err(corrupted(
+                        "Corrupted bitpacking segment: bit width exceeds the physical type width",
+                    ));
                 }
                 let (mut carry, header) = if mode == DELTA_FOR {
                     (number(data, width * 2)?, width * 3)
@@ -355,7 +359,9 @@ pub fn scan_dictionary(segment: &[u8], count: usize, out: &mut Vec<Vec<u8>>) -> 
         return Err(corrupt("the bitpacking width of a dictionary segment is invalid"));
     }
     if index_offset - HEADER_SIZE != packed_size(count, width) {
-        return Err(out_of_bounds("the selections of a dictionary segment"));
+        return Err(corrupted(
+            "Failed to scan dictionary string - selection buffer was out of range",
+        ));
     }
     let table = bytes(segment, index_offset, index_count * 4, "a dictionary offset table")?;
     if dict_size > dict_end || dict_end - dict_size < index_offset + index_count * 4 {
@@ -384,14 +390,14 @@ pub fn scan_dictionary(segment: &[u8], count: usize, out: &mut Vec<Vec<u8>>) -> 
         let (&current, &previous) = table
             .get(index)
             .zip(table.get(index - 1))
-            .ok_or_else(|| out_of_bounds("a dictionary index"))?;
+            .ok_or_else(|| corrupted("Failed to scan dictionary string - dictionary index was out of range"))?;
         let length = current
             .checked_sub(previous)
             .ok_or_else(|| corrupt("dictionary offsets decrease"))?;
         let from = dictionary
             .len()
             .checked_sub(current as usize)
-            .ok_or_else(|| out_of_bounds("a dictionary offset"))?;
+            .ok_or_else(|| corrupted("Failed to scan dictionary string - dictionary offset was out of range. Database file appears to be corrupted."))?;
         out.push(bytes(dictionary, from, length as usize, "a dictionary string")?.to_vec());
     }
     Ok(())
@@ -456,7 +462,7 @@ impl FsstDecoder {
             if code == ESCAPE {
                 let &literal = bytes
                     .next()
-                    .ok_or_else(|| corrupt("an FSST string ends in an escape"))?;
+                    .ok_or_else(|| corrupted("Failed to decompress FSST string - escape code has no following byte"))?;
                 result.push(literal);
             } else {
                 let code = usize::from(code);
@@ -680,7 +686,9 @@ pub fn scan_alprd(segment: &[u8], count: usize, width: usize, out: &mut Vec<u8>)
     let header = bytes(segment, 4, 3, "the header of an ALPRD segment")?;
     let (right_width, left_width, entries) = (usize::from(header[0]), usize::from(header[1]), usize::from(header[2]));
     if right_width >= width * 8 || left_width > 3 || entries > MAX_DICTIONARY_SIZE {
-        return Err(corrupt("the header of an ALPRD segment is invalid"));
+        return Err(corrupted(
+            "Corrupt database file: ALPRD dictionary size exceeds maximum",
+        ));
     }
     let stored = bytes(segment, 7, entries * 2, "the dictionary of an ALPRD segment")?;
     // an index past the stored entries reads zero, which exceptions rely on
@@ -875,7 +883,9 @@ pub fn scan_dict_fsst(segment: &[u8], count: usize, out: &mut Vec<Vec<u8>>, null
         return Err(corrupt(format!("unrecognized DICT_FSST compression mode {mode}")));
     }
     if dict_count == 0 || (mode == FSST_ONLY && count > dict_count - 1) {
-        return Err(corrupt("a DICT_FSST dictionary is out of range"));
+        return Err(corrupted(
+            "Corrupted DICT_FSST segment: dictionary index is out of range",
+        ));
     }
     if indices_width > 32 || lengths_width > 32 || (lengths_width == 0 && (mode != DICTIONARY || dict_count > 2)) {
         return Err(corrupt("a DICT_FSST bitpacking width is invalid"));
@@ -896,10 +906,12 @@ pub fn scan_dict_fsst(segment: &[u8], count: usize, out: &mut Vec<Vec<u8>>, null
     };
 
     if lengths[0] != 0 {
-        return Err(corrupt("the NULL entry of a DICT_FSST dictionary has a length"));
+        return Err(corrupted(
+            "Corrupted DICT_FSST segment: string lengths exceed the dictionary size",
+        ));
     }
     let decoder = if mode == DICT_FSST || mode == FSST_ONLY {
-        Some(fsst_import(table)?.ok_or_else(|| corrupt("an invalid FSST symbol table"))?)
+        Some(fsst_import(table)?.ok_or_else(|| corrupted("Failed to scan DICT_FSST string segment: invalid FSST symbol table. Database file appears to be corrupted."))?)
     } else {
         None
     };
@@ -925,7 +937,7 @@ pub fn scan_dict_fsst(segment: &[u8], count: usize, out: &mut Vec<Vec<u8>>, null
         let string = strings.get(index as usize);
         out.push(
             string
-                .ok_or_else(|| corrupt("a DICT_FSST dictionary index is out of range"))?
+                .ok_or_else(|| corrupted("Corrupted DICT_FSST segment: dictionary index is out of range"))?
                 .clone(),
         );
     }

@@ -598,7 +598,9 @@ impl Binder<'_> {
         call: &duckrs_parser::ast::FunctionExpr,
         table_ref: &TableRef,
     ) -> Result<LogicalOperator> {
-        let [argument] = call.args.as_slice() else {
+        // named options say what `segment_info` holds, which isn't filled in here
+        let mut positional = call.args.iter().filter(|argument| argument.name.is_empty());
+        let (Some(argument), None) = (positional.next(), positional.next()) else {
             return Err(binder_error("pragma_storage_info takes the name of a table"));
         };
         let name = evaluate_scalar(&self.bind_expression(&argument.expr)?)?.try_to_string()?;

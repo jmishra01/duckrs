@@ -6,6 +6,7 @@ pub mod buffer_manager;
 pub mod checkpoint;
 pub mod checksum;
 pub mod compression;
+pub mod encode;
 pub mod log_writer;
 pub mod metadata;
 pub mod serialization;

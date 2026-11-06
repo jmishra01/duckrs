@@ -60,6 +60,15 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE empty_table (i INTEGER, s VARCHAR)",
     "CREATE TABLE other.t (x INTEGER NOT NULL, y INTEGER DEFAULT 5, z INTEGER GENERATED ALWAYS AS (x + y), CHECK (x > 0))",
     "INSERT INTO other.t (x) VALUES (1), (2)",
+    "CREATE TABLE sorted AS SELECT i::INTEGER AS i, (i * 3)::BIGINT AS l, (i % 200)::SMALLINT AS s, \
+     CASE WHEN i % 5 = 0 THEN NULL ELSE i END AS n FROM range(130000) r(i)",
+    "CREATE TABLE runs AS SELECT (i // 1000)::INTEGER AS i, (i // 2000 % 2 = 0) AS b, (i // 500)::DOUBLE AS d, \
+     7 AS same, CASE WHEN i // 1000 % 2 = 0 THEN NULL ELSE 1.5::DOUBLE END AS some_null FROM range(130000) r(i)",
+    "CREATE TABLE words AS SELECT 'word ' || (i % 50) AS w, CASE WHEN i % 3 = 0 THEN NULL ELSE 'sometimes ' || (i % 7) END AS n, \
+     CASE WHEN i % 2 = 0 THEN '' ELSE 'x' END AS e FROM range(130000) r(i)",
+    "CREATE TABLE nulls AS SELECT i, CASE WHEN i % 1000 = 0 THEN NULL ELSE i END AS few, \
+     CASE WHEN i % 1000 = 0 THEN i END AS rare, CASE WHEN i % 17 = 0 THEN NULL ELSE i END AS many, \
+     CASE WHEN i % 10 < 8 THEN NULL ELSE i END AS most FROM range(9000) r(i)",
     "CREATE VIEW v AS SELECT i, count(*) AS c FROM big WHERE i < 10 GROUP BY i ORDER BY i",
     "CREATE MACRO twice(x) AS x * 2",
     "CREATE MACRO add_default(a, b := 1) AS a + b",
@@ -78,6 +87,13 @@ const QUERIES: &[&str] = &[
     "SELECT twice(4), add_default(1), add_default(1, b := 5)",
     "SELECT * FROM evens()",
     "SELECT 'c'::mood",
+    "SELECT count(*), count(n), min(w), max(w), min(n), max(n), count(DISTINCT w), count(DISTINCT n), min(e), max(e) FROM words",
+    "SELECT w, n, e FROM words LIMIT 4 OFFSET 122879",
+    "SELECT count(few), count(rare), count(many), count(most), sum(few), sum(rare), sum(many), sum(most) FROM nulls",
+    "SELECT count(*), sum(i), sum(l), sum(s), sum(n), count(n), min(n), max(n) FROM sorted",
+    "SELECT * FROM sorted WHERE i BETWEEN 2046 AND 2050 ORDER BY i",
+    "SELECT count(*), sum(i), count(*) FILTER (WHERE b), sum(d), sum(same), count(some_null) FROM runs",
+    "SELECT * FROM runs WHERE i = 129 ORDER BY d, b LIMIT 2",
 ];
 
 fn answers(connection: &mut Connection) -> Vec<Vec<String>> {
@@ -322,8 +338,76 @@ fn storage_info_lists_what_is_in_the_file() {
     assert_eq!(rows(&mut connection, sql), ["2|150000"]);
     let sql = "SELECT DISTINCT segment_type, compression FROM pragma_storage_info('t') ORDER BY 1, 2";
     let segments = rows(&mut connection, sql);
-    assert!(segments.contains(&"BIGINT|Uncompressed".to_string()), "{segments:?}");
+    assert!(segments.contains(&"BIGINT|BitPacking".to_string()), "{segments:?}");
     assert!(segments.contains(&"VALIDITY|Constant".to_string()), "{segments:?}");
+}
+
+/// What `force_compression` asks for ends up in the file, and comes back.
+#[test]
+fn codecs_can_be_forced() {
+    for (force, column, expected) in [
+        ("rle", "[0]", "RLE"),
+        ("bitpacking", "[0]", "BitPacking"),
+        ("uncompressed", "[0]", "Uncompressed"),
+        ("roaring", "[1]", "Roaring"),
+    ] {
+        let file = path(&format!("forced_{force}.db"));
+        let db = Database::open(&file, false).unwrap();
+        let mut connection = db.connect().unwrap();
+        run(&mut connection, &format!("SET force_compression = '{force}'"));
+        run(
+            &mut connection,
+            "CREATE TABLE t AS SELECT i::BIGINT AS i, i % 3 = 0 AS b FROM range(5000) r(i)",
+        );
+        run(&mut connection, "CHECKPOINT");
+        let sql = format!("SELECT DISTINCT compression FROM pragma_storage_info('t') WHERE column_path = '{column}'");
+        assert_eq!(rows(&mut connection, &sql), [expected], "{force}");
+        let sum = "SELECT sum(i), count(*) FILTER (WHERE b) FROM t";
+        assert_eq!(rows(&mut connection, sum), ["12497500|1667"], "{force}");
+    }
+}
+
+#[test]
+fn strings_can_go_to_a_dictionary() {
+    let file = path("dictionary.db");
+    let db = Database::open(&file, false).unwrap();
+    let mut connection = db.connect().unwrap();
+    run(&mut connection, "SET force_compression = 'dict_fsst'");
+    run(
+        &mut connection,
+        "CREATE TABLE t AS SELECT 'row ' || (i % 9) AS s FROM range(5000) r(i)",
+    );
+    run(&mut connection, "CHECKPOINT");
+    let sql = "SELECT DISTINCT compression FROM pragma_storage_info('t') WHERE column_path = '[0]'";
+    assert_eq!(rows(&mut connection, sql), ["DICT_FSST"]);
+    assert_eq!(
+        rows(&mut connection, "SELECT count(DISTINCT s), min(s), max(s) FROM t"),
+        ["9|row 0|row 8"]
+    );
+}
+
+/// Without a setting the smallest one wins, and a value that doesn't change needs no block at all.
+#[test]
+fn the_smallest_codec_is_chosen() {
+    let file = path("chosen.db");
+    let db = Database::open(&file, false).unwrap();
+    let mut connection = db.connect().unwrap();
+    for sql in SCHEMA
+        .iter()
+        .filter(|sql| sql.contains("TABLE sorted") || sql.contains("TABLE runs"))
+    {
+        run(&mut connection, sql);
+    }
+    run(&mut connection, "CHECKPOINT");
+    let compression = |connection: &mut Connection, table: &str, path: &str| {
+        let sql = format!(
+            "SELECT DISTINCT compression FROM pragma_storage_info('{table}') WHERE column_path = '{path}' ORDER BY 1"
+        );
+        rows(connection, &sql)
+    };
+    assert_eq!(compression(&mut connection, "sorted", "[0]"), ["BitPacking"]);
+    assert_eq!(compression(&mut connection, "runs", "[0]"), ["RLE"]);
+    assert_eq!(compression(&mut connection, "runs", "[3]"), ["Constant"]);
 }
 
 const CRASH_FILE: &str = "DUCKRS_CRASH_FILE";

@@ -12,7 +12,14 @@
 use super::block_manager::{DatabaseHeader, INVALID_BLOCK};
 use super::buffer_manager::BufferManager;
 use super::checkpoint::{self, STORAGE_VERSION_V2_0_0, StoredEntry};
-use super::compression::{COMPRESSION_CONSTANT, COMPRESSION_UNCOMPRESSED};
+use super::compression::{
+    COMPRESSION_BITPACKING, COMPRESSION_CONSTANT, COMPRESSION_DICT_FSST, COMPRESSION_RLE, COMPRESSION_ROARING,
+    COMPRESSION_UNCOMPRESSED,
+};
+use super::encode::{
+    Encoded, encode_bitpacking, encode_dictionary, encode_rle, encode_roaring, fill_nulls, is_signed,
+    supports_bitpacking, supports_rle,
+};
 use super::metadata::{MetaBlockPointer, metadata_block_size};
 use super::serialization::generated::enums::{catalog_type, constraint_type, table_column_type};
 use super::serialization::generated::{self as g};
@@ -541,10 +548,12 @@ struct Writer<'a> {
     /// Sub-blocks that were put aside for what comes next.
     reserved: VecDeque<(usize, usize)>,
     tables: MetaStream,
+    /// The setting, in lower case.
+    force_compression: String,
 }
 
 impl<'a> Writer<'a> {
-    fn new(buffer: &'a BufferManager, catalog: &'a Catalog, name: String) -> Self {
+    fn new(buffer: &'a BufferManager, catalog: &'a Catalog, name: String, force_compression: &str) -> Self {
         let blocks = buffer.block_manager();
         Self {
             buffer,
@@ -561,6 +570,7 @@ impl<'a> Writer<'a> {
             next_sub_block: None,
             reserved: VecDeque::new(),
             tables: MetaStream::default(),
+            force_compression: force_compression.to_lowercase(),
         }
     }
 
@@ -658,6 +668,56 @@ impl<'a> Writer<'a> {
         }
     }
 
+    /// `ColumnDataCheckpointer::DetectBestCompressionMethod`: what `force_compression` asks for if
+    /// it applies, and the smallest otherwise.
+    fn encode_fixed(&self, physical: PhysicalType, data: &[u8], width: usize) -> (Vec<Encoded>, u8) {
+        let rle = || (encode_rle(data, width, self.block_size), COMPRESSION_RLE);
+        let packed = || {
+            let signed = is_signed(physical);
+            (
+                encode_bitpacking(data, width, signed, self.block_size),
+                COMPRESSION_BITPACKING,
+            )
+        };
+        let plain = || {
+            let rows = self.block_size / width;
+            let segments = data
+                .chunks(rows * width)
+                .map(|d| (d.to_vec(), d.len() / width))
+                .collect();
+            (segments, COMPRESSION_UNCOMPRESSED)
+        };
+        let force = self.force_compression.as_str();
+        if force == "uncompressed" {
+            return plain();
+        }
+        if force == "roaring" && physical == PhysicalType::Bool {
+            let bits: Vec<bool> = data.iter().map(|byte| *byte != 0).collect();
+            return (encode_roaring(&bits, self.block_size), COMPRESSION_ROARING);
+        }
+        if force == "rle" && supports_rle(physical) {
+            return rle();
+        }
+        if force == "bitpacking" && supports_bitpacking(physical) {
+            return packed();
+        }
+        let size = |segments: &[Encoded]| segments.iter().map(|(bytes, _)| bytes.len()).sum::<usize>();
+        let mut best = plain();
+        if supports_rle(physical) {
+            let candidate = rle();
+            if size(&candidate.0) < size(&best.0) {
+                best = candidate;
+            }
+        }
+        if supports_bitpacking(physical) {
+            let candidate = packed();
+            if size(&candidate.0) < size(&best.0) {
+                best = candidate;
+            }
+        }
+        best
+    }
+
     fn write_fixed(&mut self, ty: &LogicalType, parts: &[Part], valid: &[bool]) -> Result<Vec<SegmentOut>> {
         let physical = ty.physical_type();
         let width = fixed_width(physical).ok_or_else(|| write_not_ported(&format!("a column of type {ty}")))?;
@@ -665,20 +725,39 @@ impl<'a> Writer<'a> {
         for part in parts {
             data.extend_from_slice(&raw_bytes(&part.vector, part.count)?);
         }
-        let rows_per_segment = self.block_size / width;
-        let mut segments = Vec::new();
-        for (bytes, valid) in data
-            .chunks(rows_per_segment * width)
-            .zip(valid.chunks(rows_per_segment))
-        {
-            let (block_id, offset) = self.place(bytes)?;
-            let mut stats = Stats::of_validity(valid);
-            stats.bounds = bounds(physical, bytes, width, valid);
+        let stored = if valid.iter().all(|v| *v) {
+            data
+        } else {
+            let mut filled = data;
+            fill_nulls(&mut filled, width, valid);
+            filled
+        };
+        let (encoded, compression) = self.encode_fixed(physical, &stored, width);
+        let mut segments = Vec::with_capacity(encoded.len());
+        let mut row = 0;
+        for (bytes, rows) in encoded {
+            let (values, valid_rows) = (&stored[row * width..(row + rows) * width], &valid[row..row + rows]);
+            row += rows;
+            let mut stats = Stats::of_validity(valid_rows);
+            stats.bounds = bounds(physical, values, width, valid_rows);
+            // `IsConstant`: a value that is the same throughout is in the statistics, with no block
+            if stats.bounds.is_some_and(|(min, max)| min == max) && physical != PhysicalType::Interval {
+                segments.push(SegmentOut {
+                    tuple_count: rows,
+                    block_id: -1,
+                    offset: 0,
+                    compression: COMPRESSION_CONSTANT,
+                    stats,
+                    overflow_blocks: Vec::new(),
+                });
+                continue;
+            }
+            let (block_id, offset) = self.place(&bytes)?;
             segments.push(SegmentOut {
-                tuple_count: valid.len(),
+                tuple_count: rows,
                 block_id,
                 offset,
-                compression: COMPRESSION_UNCOMPRESSED,
+                compression,
                 stats,
                 overflow_blocks: Vec::new(),
             });
@@ -726,6 +805,32 @@ impl<'a> Writer<'a> {
                 } else {
                     &[]
                 });
+            }
+        }
+        let force = self.force_compression.as_str();
+        // the Dictionary of C++ isn't written any more: forcing it gives plain strings there too
+        if force != "uncompressed" && force != "dictionary" && valid.iter().any(|v| *v) {
+            let plain_size: usize = strings.iter().map(|string| string.len() + 4).sum();
+            let encoded = encode_dictionary(&strings, valid, self.block_size, limit);
+            let size = encoded
+                .as_ref()
+                .map(|segments| segments.iter().map(|(b, _)| b.len()).sum::<usize>());
+            if let Some(encoded) = encoded.filter(|_| force == "dict_fsst" || size < Some(plain_size)) {
+                let mut segments = Vec::with_capacity(encoded.len());
+                let mut row = 0;
+                for (bytes, rows) in encoded {
+                    let (block_id, offset) = self.place(&bytes)?;
+                    segments.push(SegmentOut {
+                        tuple_count: rows,
+                        block_id,
+                        offset,
+                        compression: COMPRESSION_DICT_FSST,
+                        stats: Stats::of_validity(&valid[row..row + rows]),
+                        overflow_blocks: Vec::new(),
+                    });
+                    row += rows;
+                }
+                return Ok(segments);
             }
         }
         let mut segments = Vec::new();
@@ -800,20 +905,40 @@ impl<'a> Writer<'a> {
                 overflow_blocks: Vec::new(),
             });
         } else {
-            for valid in valid.chunks(self.block_size / 8 * 64) {
-                let mut words = vec![0u8; valid.len().div_ceil(64) * 8];
-                for (row, _) in valid.iter().enumerate().filter(|(_, valid)| **valid) {
-                    words[row / 8] |= 1 << (row % 8);
-                }
-                let (block_id, offset) = self.place(&words)?;
+            let roaring = encode_roaring(valid, self.block_size);
+            let roaring_size: usize = roaring.iter().map(|(bytes, _)| bytes.len()).sum();
+            let plain_size = valid.len().div_ceil(64) * 8;
+            let force = self.force_compression.as_str();
+            let use_roaring = force == "roaring" || (force != "uncompressed" && roaring_size < plain_size);
+            let encoded: Vec<(Vec<u8>, usize, u8)> = if use_roaring {
+                roaring
+                    .into_iter()
+                    .map(|(bytes, rows)| (bytes, rows, COMPRESSION_ROARING))
+                    .collect()
+            } else {
+                valid
+                    .chunks(self.block_size / 8 * 64)
+                    .map(|valid| {
+                        let mut words = vec![0u8; valid.len().div_ceil(64) * 8];
+                        for (row, _) in valid.iter().enumerate().filter(|(_, valid)| **valid) {
+                            words[row / 8] |= 1 << (row % 8);
+                        }
+                        (words, valid.len(), COMPRESSION_UNCOMPRESSED)
+                    })
+                    .collect()
+            };
+            let mut row = 0;
+            for (bytes, rows, compression) in encoded {
+                let (block_id, offset) = self.place(&bytes)?;
                 segments.push(SegmentOut {
-                    tuple_count: valid.len(),
+                    tuple_count: rows,
                     block_id,
                     offset,
-                    compression: COMPRESSION_UNCOMPRESSED,
-                    stats: Stats::of_validity(valid),
+                    compression,
+                    stats: Stats::of_validity(&valid[row..row + rows]),
                     overflow_blocks: Vec::new(),
                 });
+                row += rows;
             }
         }
         Ok(ColumnOut {
@@ -1148,9 +1273,10 @@ pub fn write_checkpoint(
     buffer: &Arc<BufferManager>,
     catalog: &Catalog,
     name: &str,
+    force_compression: &str,
     mark: &mut dyn FnMut(MetaBlockPointer) -> Result<()>,
 ) -> Result<()> {
-    let mut writer = Writer::new(buffer, catalog, name.to_string());
+    let mut writer = Writer::new(buffer, catalog, name.to_string(), force_compression);
     let mut root = MetaStream::default();
     let pointer = writer.pointer(&mut root);
     mark(pointer)?;

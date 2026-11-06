@@ -233,7 +233,10 @@ impl DatabaseInstance {
             marked = Some(log_ref.mark_checkpoint(&file.path, root)?);
             Ok(())
         };
-        let result = storage::writer::write_checkpoint(&file.path, &file.buffer, &self.catalog, &file.name, &mut mark);
+        let force = settings::current_value("force_compression", &self.settings.read(), &SettingValues::default());
+        let force = force.and_then(|value| value.try_to_string().ok()).unwrap_or_default();
+        let result =
+            storage::writer::write_checkpoint(&file.path, &file.buffer, &self.catalog, &file.name, &force, &mut mark);
         match result {
             Ok(()) => {
                 log.checkpointed(&self.catalog);
