@@ -1,7 +1,10 @@
-//! Writes files and reads them back. `tools/check_written.py` has the real DuckDB read one of them.
+//! Writes files and logs, reads them back, and kills what writes them. `tools/check_written.py` has the real DuckDB read one of them.
 
 use duckrs::{Connection, Database};
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 fn path(name: &str) -> PathBuf {
     let directory = std::env::temp_dir().join(format!("duckrs-write-{}", std::process::id()));
@@ -180,4 +183,190 @@ fn nothing_changed_writes_nothing() {
         run(&mut db.connect().unwrap(), "SELECT 1");
     }
     assert_eq!(std::fs::read(&file).unwrap(), before);
+}
+
+/// Without a checkpoint on shutdown all of it comes back from the log alone.
+#[test]
+fn a_log_brings_back_what_no_checkpoint_saw() {
+    let file = path("logged.db");
+    let expected = {
+        let db = Database::open(&file, false).unwrap();
+        let mut connection = db.connect().unwrap();
+        run(&mut connection, "PRAGMA disable_checkpoint_on_shutdown");
+        for sql in SCHEMA {
+            run(&mut connection, sql);
+        }
+        run(&mut connection, "UPDATE big SET s = 'updated' WHERE i % 5 = 0");
+        run(&mut connection, "DELETE FROM big WHERE i % 7 = 0");
+        run(&mut connection, "SELECT nextval('counter')");
+        run(&mut connection, "CREATE TABLE gone (i INTEGER)");
+        run(&mut connection, "DROP TABLE gone");
+        run(&mut connection, "BEGIN");
+        run(&mut connection, "INSERT INTO empty_table VALUES (1, 'rolled back')");
+        run(&mut connection, "ROLLBACK");
+        answers(&mut connection)
+    };
+    let mut log = file.clone().into_os_string();
+    log.push(".wal");
+    assert!(std::fs::metadata(&log).unwrap().len() > 0);
+    // for `tools/check_written.py`: a file and a log that only replaying makes sense of
+    if let Some(target) = std::env::var_os("DUCKRS_KEEP_LOGGED") {
+        std::fs::copy(&file, &target).unwrap();
+        let mut target_log = target;
+        target_log.push(".wal");
+        std::fs::copy(&log, target_log).unwrap();
+    }
+    let db = Database::open(&file, true).unwrap();
+    let mut connection = db.connect().unwrap();
+    assert_eq!(answers(&mut connection), expected);
+    assert_eq!(rows(&mut connection, "SELECT count(*) FROM empty_table"), ["0"]);
+    drop(connection);
+    drop(db);
+    assert!(
+        std::fs::metadata(&log).unwrap().len() > 0,
+        "reading leaves the log alone"
+    );
+    // writing starts by putting the log in the file
+    let db = Database::open(&file, false).unwrap();
+    let mut connection = db.connect().unwrap();
+    assert!(std::fs::metadata(&log).is_err());
+    assert_eq!(answers(&mut connection), expected);
+    assert_eq!(rows(&mut connection, "SELECT nextval('counter')"), ["12"]);
+}
+
+/// The log is put in the file when it has grown enough.
+#[test]
+fn a_large_log_turns_into_a_checkpoint() {
+    let file = path("auto.db");
+    let db = Database::open(&file, false).unwrap();
+    let mut connection = db.connect().unwrap();
+    run(&mut connection, "SET checkpoint_threshold = '1MB'");
+    run(
+        &mut connection,
+        "CREATE TABLE t AS SELECT i, 'row ' || i AS s FROM range(100000) r(i)",
+    );
+    let mut log = file.into_os_string();
+    log.push(".wal");
+    assert!(std::fs::metadata(&log).is_err());
+}
+
+/// A commit that can't be logged must not lose the commits around it.
+#[test]
+fn a_commit_that_fails_loses_nothing_else() {
+    let file = path("failed_commit.db");
+    let db = Database::open(&file, false).unwrap();
+    let mut connection = db.connect().unwrap();
+    run(&mut connection, "PRAGMA disable_checkpoint_on_shutdown");
+    run(&mut connection, "CREATE TABLE kept (i INTEGER)");
+    run(&mut connection, "BEGIN");
+    run(&mut connection, "INSERT INTO kept VALUES (1)");
+    run(&mut connection, "CREATE TABLE unstorable (v VARIANT)");
+    assert!(connection.query("COMMIT").is_err());
+    run(&mut connection, "DROP TABLE unstorable");
+    run(&mut connection, "INSERT INTO kept VALUES (2)");
+    drop(connection);
+    drop(db);
+    let db = Database::open(&file, true).unwrap();
+    assert_eq!(
+        rows(&mut db.connect().unwrap(), "SELECT count(*), sum(i) FROM kept"),
+        ["2|3"]
+    );
+}
+
+const CRASH_FILE: &str = "DUCKRS_CRASH_FILE";
+
+/// Commits for as long as it lives, and says so after each. Run by `commits_survive_kill_9`.
+#[test]
+#[ignore = "it never ends: commits_survive_kill_9 runs it and kills it"]
+fn crash_child() {
+    let Some(file) = std::env::var_os(CRASH_FILE) else {
+        return;
+    };
+    let db = Database::open(&file, false).unwrap();
+    let mut connection = db.connect().unwrap();
+    run(&mut connection, "CREATE TABLE IF NOT EXISTS log (n INTEGER, s VARCHAR)");
+    run(&mut connection, "CREATE TABLE IF NOT EXISTS state (n INTEGER)");
+    run(&mut connection, "CREATE SEQUENCE IF NOT EXISTS ticks");
+    if rows(&mut connection, "SELECT count(*) FROM state") == ["0"] {
+        run(&mut connection, "INSERT INTO state VALUES (0)");
+    }
+    let mut n: u64 = rows(&mut connection, "SELECT n FROM state")[0].parse().unwrap();
+    loop {
+        n += 1;
+        run(&mut connection, "BEGIN");
+        for part in 0..3 {
+            run(
+                &mut connection,
+                &format!("INSERT INTO log VALUES ({n}, 'part {part} of commit {n}')"),
+            );
+        }
+        run(&mut connection, &format!("UPDATE state SET n = {n}"));
+        run(&mut connection, "SELECT nextval('ticks')");
+        run(&mut connection, "COMMIT");
+        println!("committed {n}");
+        if n.is_multiple_of(7) {
+            run(&mut connection, "CHECKPOINT");
+        }
+        if n.is_multiple_of(11) {
+            run(&mut connection, &format!("CREATE TABLE extra_{n} AS SELECT {n} AS n"));
+        }
+    }
+}
+
+/// What was acknowledged is there, what wasn't is there in full or not at all, and the file opens,
+/// whenever the process dies, the checkpoints it does included.
+#[test]
+fn commits_survive_kill_9() {
+    let file = path("crash.db");
+    let mut delay = 37u64;
+    let mut acknowledged = 0u64;
+    for round in 0..30 {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "crash_child", "--ignored", "--nocapture"])
+            .env(CRASH_FILE, &file)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let reader = BufReader::new(child.stdout.take().unwrap());
+        let reading = std::thread::spawn(move || {
+            let mut last = 0u64;
+            for line in reader.lines().map_while(std::result::Result::ok) {
+                // libtest can print in front of what the test prints
+                if let Some((_, n)) = line.split_once("committed ") {
+                    last = last.max(n.trim().parse().unwrap_or(0));
+                }
+            }
+            last
+        });
+        delay = (delay * 31 + 17) % 251 + 40;
+        let start = Instant::now();
+        std::thread::sleep(Duration::from_millis(delay));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        acknowledged = acknowledged.max(reading.join().unwrap());
+        let elapsed = start.elapsed();
+
+        let db = Database::open(&file, true).unwrap_or_else(|error| panic!("round {round}: {error}"));
+        let mut connection = db.connect().unwrap();
+        if connection.query("SELECT 1 FROM log LIMIT 0").is_err() {
+            // killed before the first table
+            assert_eq!(acknowledged, 0, "round {round}");
+            continue;
+        }
+        let state: u64 = rows(&mut connection, "SELECT n FROM state")[0].parse().unwrap();
+        assert!(
+            state >= acknowledged,
+            "round {round} after {elapsed:?}: {acknowledged} were acknowledged, {state} are there"
+        );
+        assert!(
+            state <= acknowledged + 1,
+            "round {round}: {acknowledged} acknowledged, {state} there"
+        );
+        let total = format!("{}|{}", state * 3, state);
+        let sql = "SELECT count(*), count(DISTINCT n) FROM log";
+        assert_eq!(rows(&mut connection, sql), [total], "round {round}");
+        acknowledged = state;
+    }
+    assert!(acknowledged > 30, "only {acknowledged} commits were tested");
 }

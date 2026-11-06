@@ -165,6 +165,19 @@ impl TableCursor {
     }
 }
 
+/// What is durable of the rows of a table, for the next commit to log the difference. Records name
+/// rows by id, and ids stay when rows go: the rows that are durable have `old_ids`, of a file with
+/// deletes, and then the ids from `first_id` up to `next_id`.
+#[derive(Debug, Default)]
+pub struct TableLog {
+    pub logged_rows: usize,
+    pub old_ids: Vec<u64>,
+    pub first_id: u64,
+    pub next_id: u64,
+    /// Rows changed in place, which the engine does by rewriting the table.
+    pub rewritten: bool,
+}
+
 /// A table (`TableCatalogEntry`) and its rows.
 #[derive(Debug)]
 pub struct TableCatalogEntry {
@@ -180,6 +193,8 @@ pub struct TableCatalogEntry {
     source: RwLock<Option<Arc<dyn TableSource>>>,
     /// Beyond the NOT NULLs, which are in `columns`.
     pub constraints: Vec<TableConstraint>,
+    /// What the write-ahead log knows of the rows.
+    pub log: Mutex<TableLog>,
     /// The tables with a foreign key to this one.
     pub referenced_by: Mutex<Vec<Weak<TableCatalogEntry>>>,
     /// The keys of each `TableConstraint::Unique`, in order, when somebody needed them since
@@ -317,6 +332,7 @@ impl TableCatalogEntry {
             generated: Vec::new(),
             storage: RwLock::new(rows),
             source: RwLock::default(),
+            log: Mutex::default(),
             constraints,
             referenced_by: Mutex::default(),
             unique_keys: Mutex::default(),
@@ -399,7 +415,24 @@ impl TableCatalogEntry {
     /// other rows.
     pub fn write_storage(&self) -> Result<parking_lot::RwLockWriteGuard<'_, ColumnDataCollection>> {
         self.load_rows()?;
+        self.log.lock().rewritten = true;
         Ok(self.write_loaded_storage())
+    }
+
+    /// `write_storage` for what only adds rows at the end, which the log doesn't have to repeat.
+    pub fn append_storage(&self) -> Result<parking_lot::RwLockWriteGuard<'_, ColumnDataCollection>> {
+        self.load_rows()?;
+        Ok(self.write_loaded_storage())
+    }
+
+    /// All rows are durable, in a file that numbers them from 0.
+    pub fn reset_log(&self) {
+        let rows = self.row_count();
+        *self.log.lock() = TableLog {
+            logged_rows: rows,
+            next_id: rows as u64,
+            ..TableLog::default()
+        };
     }
 
     fn write_loaded_storage(&self) -> parking_lot::RwLockWriteGuard<'_, ColumnDataCollection> {
@@ -547,6 +580,8 @@ pub fn macro_type_name(table_macro: bool) -> &'static str {
 /// The state of a sequence (`SequenceData`).
 #[derive(Debug, Clone)]
 pub struct SequenceData {
+    /// How often it was used, by which logs tell the last state.
+    pub usage_count: u64,
     /// the value `nextval` returns next
     pub counter: i64,
     pub last_value: Option<i64>,
@@ -570,8 +605,9 @@ impl SequenceCatalogEntry {
     }
 
     /// The state that a write-ahead log recorded (`ReplayValue`).
-    pub fn replay_value(&self, counter: i64, last_value: Option<i64>) {
+    pub fn replay_value(&self, usage_count: u64, counter: i64, last_value: Option<i64>) {
         let mut data = self.data.lock();
+        data.usage_count = usage_count;
         data.counter = counter;
         data.last_value = last_value;
     }
@@ -647,6 +683,7 @@ impl SequenceCatalogEntry {
         };
         data.counter = next_counter;
         data.last_value = Some(result);
+        data.usage_count += 1;
         Ok(result)
     }
 
@@ -666,6 +703,7 @@ impl SequenceCatalogEntry {
                 ));
             }
             data.counter = value;
+            data.usage_count += 1;
             if !is_called {
                 return Ok(value);
             }

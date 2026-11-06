@@ -18,7 +18,10 @@ use super::serialization::generated::enums::{catalog_type, constraint_type, tabl
 use super::serialization::generated::{self as g};
 use super::serialization::to_stored::{self, write_not_ported};
 use super::table_data::{DiskTable, fixed_width};
-use crate::catalog::{Catalog, SchemaCatalogEntry, TEMP_SCHEMA, TableCatalogEntry, TableConstraint, TableCursor};
+use crate::catalog::{
+    Catalog, MacroCatalogEntry, SchemaCatalogEntry, SequenceCatalogEntry, TEMP_SCHEMA, TableCatalogEntry,
+    TableConstraint, TableCursor, ViewCatalogEntry,
+};
 use crate::planner::binder::Binder;
 use duckrs_common::serializer::{BinarySerializer, SerializationOptions, Serialize};
 use duckrs_common::types::{Interval, ListEntry, LogicalType, LogicalTypeId, PhysicalType, StringT};
@@ -144,7 +147,7 @@ fn compare(physical: PhysicalType, a: &[u8; 16], b: &[u8; 16]) -> Ordering {
 }
 
 /// The values of a flat vector as a segment has them.
-fn raw_bytes(vector: &Vector, count: usize) -> Result<Vec<u8>> {
+pub(super) fn raw_bytes(vector: &Vector, count: usize) -> Result<Vec<u8>> {
     macro_rules! plain {
         ($t:ty) => {
             vector.data::<$t>()[..count]
@@ -337,6 +340,170 @@ fn write_column(s: &mut BinarySerializer, column: &ColumnOut, ty: Option<&Logica
         }
         _ => {}
     }
+}
+
+fn entry_path(catalog: &str, schema: &SchemaCatalogEntry, name: &str) -> Vec<String> {
+    vec![catalog.to_string(), schema.name.clone(), name.to_string()]
+}
+
+pub(super) fn schema_info(name: &str) -> g::CreateInfo {
+    to_stored::create_info(
+        catalog_type::SCHEMA_ENTRY,
+        vec![name.to_string(), String::new()],
+        g::CreateInfoKind::CreateSchemaInfo(g::CreateSchemaInfo { options: Vec::new() }),
+    )
+}
+
+pub(super) fn type_info(
+    catalog: &str,
+    schema: &SchemaCatalogEntry,
+    name: String,
+    logical_type: LogicalType,
+) -> g::CreateInfo {
+    let path = entry_path(catalog, schema, &name);
+    let kind = g::CreateInfoKind::CreateTypeInfo(g::CreateTypeInfo { name, logical_type });
+    to_stored::create_info(catalog_type::TYPE_ENTRY, path, kind)
+}
+
+pub(super) fn sequence_info(
+    catalog: &str,
+    schema: &SchemaCatalogEntry,
+    sequence: &SequenceCatalogEntry,
+) -> g::CreateInfo {
+    let data = sequence.data();
+    let kind = g::CreateInfoKind::CreateSequenceInfo(g::CreateSequenceInfo {
+        name: sequence.name.clone(),
+        usage_count: data.usage_count,
+        increment: data.increment,
+        min_value: data.min_value,
+        max_value: data.max_value,
+        start_value: data.counter,
+        cycle: data.cycle,
+        last_value: data.last_value,
+    });
+    let path = entry_path(catalog, schema, &sequence.name);
+    to_stored::create_info(catalog_type::SEQUENCE_ENTRY, path, kind)
+}
+
+pub(super) fn macro_info(
+    catalog: &str,
+    schema: &SchemaCatalogEntry,
+    entry: &MacroCatalogEntry,
+    types: &Catalog,
+) -> Result<g::CreateInfo> {
+    let binder = Binder::new(types);
+    let bind = |ty: &ast::CastType| binder.bind_type(ty);
+    let mut macros = entry
+        .macros
+        .iter()
+        .map(|function| to_stored::macro_function(function, &bind));
+    let function = macros.next().ok_or_else(|| internal("a macro has no function"))??;
+    let extra_functions = macros
+        .map(|function| function.map(|f| Some(Box::new(f))))
+        .collect::<Result<_>>()?;
+    let entry_type = if entry.table_macro {
+        catalog_type::TABLE_MACRO_ENTRY
+    } else {
+        catalog_type::MACRO_ENTRY
+    };
+    let kind = g::CreateInfoKind::CreateMacroInfo(g::CreateMacroInfo {
+        name: entry.name.clone(),
+        function: Some(Box::new(function)),
+        extra_functions,
+    });
+    Ok(to_stored::create_info(
+        entry_type,
+        entry_path(catalog, schema, &entry.name),
+        kind,
+    ))
+}
+
+pub(super) fn view_info(catalog: &str, schema: &SchemaCatalogEntry, view: &ViewCatalogEntry) -> Result<g::CreateInfo> {
+    let kind = g::CreateInfoKind::CreateViewInfo(g::CreateViewInfo {
+        view_name: view.name.clone(),
+        aliases: view.aliases.clone(),
+        types: Vec::new(),
+        query: Some(Box::new(to_stored::select_statement(&view.query)?)),
+        names: Vec::new(),
+        column_comments: Vec::new(),
+        column_comments_map: Vec::new(),
+        security_type: None,
+    });
+    Ok(to_stored::create_info(
+        catalog_type::VIEW_ENTRY,
+        entry_path(catalog, schema, &view.name),
+        kind,
+    ))
+}
+
+pub(super) fn table_info(
+    catalog: &str,
+    schema: &SchemaCatalogEntry,
+    table: &TableCatalogEntry,
+) -> Result<g::CreateInfo> {
+    if !table.indexes.read().is_empty() {
+        return Err(write_not_ported("indexes, which need the ART of Phase 10,"));
+    }
+    let mut columns = Vec::with_capacity(table.columns.len());
+    let mut constraints = Vec::new();
+    let boxed = |constraint: g::Constraint| Some(Box::new(constraint));
+    for (index, column) in table.logical_columns().iter().enumerate() {
+        let expression = match (
+            column.generated,
+            column.definition.and_then(|d| d.default_text.as_deref()),
+        ) {
+            (Some(expr), _) => Some(expr.clone()),
+            (None, Some(text)) => Some(parse_expression(text)?),
+            (None, None) => None,
+        };
+        columns.push(g::ColumnDefinition {
+            name: column.name.to_string(),
+            type_: column.ty.clone(),
+            expression: expression
+                .as_ref()
+                .map(|expr| to_stored::expression(expr).map(Box::new))
+                .transpose()?,
+            category: if column.generated.is_some() {
+                table_column_type::GENERATED
+            } else {
+                table_column_type::STANDARD
+            },
+            compression_type: COMPRESSION_AUTO,
+            comment: None,
+            tags: Vec::new(),
+        });
+        if column.definition.is_some_and(|d| d.not_null) {
+            constraints.push(boxed(g::Constraint {
+                type_: constraint_type::NOT_NULL,
+                kind: g::ConstraintKind::NotNullConstraint(g::NotNullConstraint { index: index as u64 }),
+            }));
+        }
+    }
+    for constraint in &table.constraints {
+        match constraint {
+            TableConstraint::Check { parsed, .. } => constraints.push(boxed(g::Constraint {
+                type_: constraint_type::CHECK,
+                kind: g::ConstraintKind::CheckConstraint(g::CheckConstraint {
+                    expression: Some(Box::new(to_stored::expression(parsed)?)),
+                }),
+            })),
+            _ => return Err(write_not_ported("keys, which need the ART of Phase 10,")),
+        }
+    }
+    let kind = g::CreateInfoKind::CreateTableInfo(g::CreateTableInfo {
+        table: table.name.clone(),
+        columns: g::ColumnList { columns },
+        constraints,
+        query: None,
+        partition_keys: Vec::new(),
+        sort_keys: Vec::new(),
+        options: Vec::new(),
+    });
+    Ok(to_stored::create_info(
+        catalog_type::TABLE_ENTRY,
+        entry_path(catalog, schema, &table.name),
+        kind,
+    ))
 }
 
 /// A piece of a column: a flat vector and how many rows it has.
@@ -828,68 +995,6 @@ impl<'a> Writer<'a> {
         Ok((pointer, total as u64))
     }
 
-    fn entry_path(&self, schema: &SchemaCatalogEntry, name: &str) -> Vec<String> {
-        vec![self.name.clone(), schema.name.clone(), name.to_string()]
-    }
-
-    fn create_table_info(&self, table: &TableCatalogEntry) -> Result<g::CreateTableInfo> {
-        let mut columns = Vec::with_capacity(table.columns.len());
-        let mut constraints = Vec::new();
-        let boxed = |constraint: g::Constraint| Some(Box::new(constraint));
-        for (index, column) in table.logical_columns().iter().enumerate() {
-            let expression = match (
-                column.generated,
-                column.definition.and_then(|d| d.default_text.as_deref()),
-            ) {
-                (Some(expr), _) => Some(expr.clone()),
-                (None, Some(text)) => Some(parse_expression(text)?),
-                (None, None) => None,
-            };
-            columns.push(g::ColumnDefinition {
-                name: column.name.to_string(),
-                type_: column.ty.clone(),
-                expression: expression
-                    .as_ref()
-                    .map(|expr| to_stored::expression(expr).map(Box::new))
-                    .transpose()?,
-                category: if column.generated.is_some() {
-                    table_column_type::GENERATED
-                } else {
-                    table_column_type::STANDARD
-                },
-                compression_type: COMPRESSION_AUTO,
-                comment: None,
-                tags: Vec::new(),
-            });
-            if column.definition.is_some_and(|d| d.not_null) {
-                constraints.push(boxed(g::Constraint {
-                    type_: constraint_type::NOT_NULL,
-                    kind: g::ConstraintKind::NotNullConstraint(g::NotNullConstraint { index: index as u64 }),
-                }));
-            }
-        }
-        for constraint in &table.constraints {
-            match constraint {
-                TableConstraint::Check { parsed, .. } => constraints.push(boxed(g::Constraint {
-                    type_: constraint_type::CHECK,
-                    kind: g::ConstraintKind::CheckConstraint(g::CheckConstraint {
-                        expression: Some(Box::new(to_stored::expression(parsed)?)),
-                    }),
-                })),
-                _ => return Err(write_not_ported("keys, which need the ART of Phase 10,")),
-            }
-        }
-        Ok(g::CreateTableInfo {
-            table: table.name.clone(),
-            columns: g::ColumnList { columns },
-            constraints,
-            query: None,
-            partition_keys: Vec::new(),
-            sort_keys: Vec::new(),
-            options: Vec::new(),
-        })
-    }
-
     /// The entries of a schema, in an order in which each can be read: tables can use macros and
     /// sequences in their defaults, and C++ doesn't bind macros or views when it reads them.
     fn write_schema(&mut self, schema: &Arc<SchemaCatalogEntry>, entries: &mut Vec<Vec<u8>>) -> Result<()> {
@@ -901,62 +1006,22 @@ impl<'a> Writer<'a> {
             });
             s.into_bytes()
         };
-        let info = to_stored::create_info(
-            catalog_type::SCHEMA_ENTRY,
-            vec![schema.name.clone(), String::new()],
-            g::CreateInfoKind::CreateSchemaInfo(g::CreateSchemaInfo { options: Vec::new() }),
-        );
-        entries.push(simple(catalog_type::SCHEMA_ENTRY, info));
-        for (name, logical_type) in schema.type_entries() {
-            let path = self.entry_path(schema, &name);
-            let kind = g::CreateInfoKind::CreateTypeInfo(g::CreateTypeInfo { name, logical_type });
-            entries.push(simple(
-                catalog_type::TYPE_ENTRY,
-                to_stored::create_info(catalog_type::TYPE_ENTRY, path, kind),
-            ));
+        let name = self.name.clone();
+        entries.push(simple(catalog_type::SCHEMA_ENTRY, schema_info(&schema.name)));
+        for (type_name, logical_type) in schema.type_entries() {
+            let info = type_info(&name, schema, type_name, logical_type);
+            entries.push(simple(catalog_type::TYPE_ENTRY, info));
         }
         for sequence in schema.sequence_entries() {
-            let data = sequence.data();
-            let kind = g::CreateInfoKind::CreateSequenceInfo(g::CreateSequenceInfo {
-                name: sequence.name.clone(),
-                usage_count: u64::from(data.last_value.is_some()),
-                increment: data.increment,
-                min_value: data.min_value,
-                max_value: data.max_value,
-                start_value: data.counter,
-                cycle: data.cycle,
-                last_value: data.last_value,
-            });
-            let path = self.entry_path(schema, &sequence.name);
             entries.push(simple(
                 catalog_type::SEQUENCE_ENTRY,
-                to_stored::create_info(catalog_type::SEQUENCE_ENTRY, path, kind),
+                sequence_info(&name, schema, &sequence),
             ));
         }
-        let binder = Binder::new(self.catalog);
         for table_macro in [false, true] {
-            let entry_type = if table_macro {
-                catalog_type::TABLE_MACRO_ENTRY
-            } else {
-                catalog_type::MACRO_ENTRY
-            };
             for entry in schema.macro_entries(table_macro) {
-                let bind = |ty: &ast::CastType| binder.bind_type(ty);
-                let mut macros = entry
-                    .macros
-                    .iter()
-                    .map(|function| to_stored::macro_function(function, &bind));
-                let function = macros.next().ok_or_else(|| internal("a macro has no function"))??;
-                let extra_functions = macros
-                    .map(|function| function.map(|f| Some(Box::new(f))))
-                    .collect::<Result<_>>()?;
-                let kind = g::CreateInfoKind::CreateMacroInfo(g::CreateMacroInfo {
-                    name: entry.name.clone(),
-                    function: Some(Box::new(function)),
-                    extra_functions,
-                });
-                let path = self.entry_path(schema, &entry.name);
-                entries.push(simple(entry_type, to_stored::create_info(entry_type, path, kind)));
+                let info = macro_info(&name, schema, &entry, self.catalog)?;
+                entries.push(simple(info.type_, info));
             }
         }
         let mut views = Vec::new();
@@ -964,16 +1029,8 @@ impl<'a> Writer<'a> {
             match entry {
                 crate::catalog::TableOrView::View(view) => views.push(view),
                 crate::catalog::TableOrView::Table(table) => {
-                    if !table.indexes.read().is_empty() {
-                        return Err(write_not_ported("indexes, which need the ART of Phase 10,"));
-                    }
-                    let info = self.create_table_info(&table)?;
+                    let info = table_info(&name, schema, &table)?;
                     let (pointer, rows) = self.write_table_data(&table)?;
-                    let info = to_stored::create_info(
-                        catalog_type::TABLE_ENTRY,
-                        self.entry_path(schema, &table.name),
-                        g::CreateInfoKind::CreateTableInfo(info),
-                    );
                     let mut s = BinarySerializer::new(SerializationOptions::default());
                     s.write_object_value(|s| {
                         s.write_property(99, "type", &catalog_type::TABLE_ENTRY);
@@ -987,21 +1044,7 @@ impl<'a> Writer<'a> {
             }
         }
         for view in views {
-            let kind = g::CreateInfoKind::CreateViewInfo(g::CreateViewInfo {
-                view_name: view.name.clone(),
-                aliases: view.aliases.clone(),
-                types: Vec::new(),
-                query: Some(Box::new(to_stored::select_statement(&view.query)?)),
-                names: Vec::new(),
-                column_comments: Vec::new(),
-                column_comments_map: Vec::new(),
-                security_type: None,
-            });
-            let path = self.entry_path(schema, &view.name);
-            entries.push(simple(
-                catalog_type::VIEW_ENTRY,
-                to_stored::create_info(catalog_type::VIEW_ENTRY, path, kind),
-            ));
+            entries.push(simple(catalog_type::VIEW_ENTRY, view_info(&name, schema, &view)?));
         }
         Ok(())
     }
@@ -1086,7 +1129,7 @@ impl<'a> Writer<'a> {
     }
 }
 
-fn parse_expression(text: &str) -> Result<Expr> {
+pub(super) fn parse_expression(text: &str) -> Result<Expr> {
     let statements = duckrs_parser::parse_ast(&format!("SELECT {text}"))?;
     if let [ast::Statement::Select(select)] = statements.as_slice()
         && let ast::QueryNodeKind::Select(node) = &select.node.kind
@@ -1098,9 +1141,19 @@ fn parse_expression(text: &str) -> Result<Expr> {
 }
 
 /// `SingleFileCheckpointWriter::CreateCheckpoint`: makes the file at `path` hold what is in
-/// `catalog`, and leaves the tables of the catalog in it.
-pub fn write_checkpoint(path: &Path, buffer: &Arc<BufferManager>, catalog: &Catalog, name: &str) -> Result<()> {
+/// `catalog`, and leaves the tables of the catalog in it. `mark` gets the root of the checkpoint
+/// before any of it is written, for the log to say what a crash can be told by.
+pub fn write_checkpoint(
+    path: &Path,
+    buffer: &Arc<BufferManager>,
+    catalog: &Catalog,
+    name: &str,
+    mark: &mut dyn FnMut(MetaBlockPointer) -> Result<()>,
+) -> Result<()> {
     let mut writer = Writer::new(buffer, catalog, name.to_string());
+    let mut root = MetaStream::default();
+    let pointer = writer.pointer(&mut root);
+    mark(pointer)?;
     let mut entries = Vec::new();
     for schema in catalog.schemas() {
         if !schema.name.eq_ignore_ascii_case(TEMP_SCHEMA) {
@@ -1111,8 +1164,6 @@ pub fn write_checkpoint(path: &Path, buffer: &Arc<BufferManager>, catalog: &Cata
     s.write_object_value(|s| {
         s.write_list(100, "catalog_entries", entries.len(), |s, i| s.write_raw(&entries[i]));
     });
-    let mut root = MetaStream::default();
-    let pointer = writer.pointer(&mut root);
     writer.write_metadata(&mut root, &s.into_bytes());
     writer.finish(pointer)?;
     // what the log held is in the file now
@@ -1130,7 +1181,9 @@ pub fn write_checkpoint(path: &Path, buffer: &Arc<BufferManager>, catalog: &Cata
             let schema = table.schema.clone();
             let name = table.name.clone();
             let disk = Arc::new(DiskTable::new(buffer.clone(), *table)?);
-            catalog.get_table(Some(&schema), &name)?.leave_in_file(disk);
+            let table = catalog.get_table(Some(&schema), &name)?;
+            table.leave_in_file(disk);
+            table.reset_log();
         }
     }
     Ok(())

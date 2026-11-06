@@ -31,8 +31,8 @@ impl Database {
     }
 
     /// Opens a database file, or makes it if there is none and `read_only` isn't set. Tables stay in
-    /// the file. What changes is written to it on `CHECKPOINT` and when the database goes away;
-    /// there is no write-ahead log yet, so a crash loses what was written since the last checkpoint.
+    /// the file. A commit goes to its write-ahead log, which survives a crash, and the log goes
+    /// into the file on `CHECKPOINT`, when it gets large and when the database goes away.
     pub fn open(path: impl AsRef<Path>, read_only: bool) -> Result<Self> {
         Ok(Self {
             instance: DatabaseInstance::open_file(path.as_ref(), read_only)?,

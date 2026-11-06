@@ -2179,7 +2179,7 @@ impl PhysicalOperator for PhysicalInsert {
             return Ok(());
         }
         constraints::verify_not_null(&self.table, &row)?;
-        let mut storage = self.table.write_storage()?;
+        let mut storage = self.table.append_storage()?;
         let first_new_row = *self.first_new_row.lock().get_or_insert(storage.len());
         constraints::verify_append(&self.table, &storage, &row, first_new_row)?;
         storage.append(&row);
@@ -2273,7 +2273,7 @@ impl PhysicalOperator for PhysicalCreateTableAs {
         )?;
         if let Some(table) = table {
             let data = self.data.lock();
-            let mut storage = table.write_storage()?;
+            let mut storage = table.append_storage()?;
             for chunk in data.chunks() {
                 storage.append(chunk);
             }

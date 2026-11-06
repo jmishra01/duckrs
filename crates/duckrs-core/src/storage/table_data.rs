@@ -9,7 +9,7 @@ use super::checkpoint::StoredTable;
 use super::compression::*;
 use super::metadata::{MetaBlockPointer, MetadataChains, take};
 use super::statistics::{BaseStatistics, read_statistics};
-use crate::catalog::{ColumnStatistics, ColumnZone, TableSource};
+use crate::catalog::{ColumnStatistics, ColumnZone, TableLog, TableSource};
 use crate::optimizer::statistics::{compare_values, has_ordered_statistics};
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::serializer::{BinaryDeserializer, Deserialize};
@@ -507,6 +507,36 @@ impl DiskTable {
 
     pub fn next_row_id(&self) -> u64 {
         self.table.next_row_id
+    }
+
+    /// What a log has to know of the rows, whose ids have gaps in a file with deletes.
+    pub fn table_log(&self) -> TableLog {
+        let next_id = self.table.next_row_id;
+        let contiguous = self.alive.iter().all(Option::is_none)
+            && self.rows as u64 == next_id
+            && self
+                .table
+                .row_groups
+                .iter()
+                .try_fold(0, |at, group| (group.row_start == at).then_some(at + group.tuple_count))
+                == Some(next_id);
+        let mut log = TableLog {
+            logged_rows: self.rows,
+            next_id,
+            ..TableLog::default()
+        };
+        if contiguous {
+            return log;
+        }
+        log.first_id = next_id;
+        for (row_group, alive) in self.table.row_groups.iter().zip(&self.alive) {
+            let first = row_group.row_start;
+            match alive {
+                Some(alive) => log.old_ids.extend(alive.iter().map(|&row| first + u64::from(row))),
+                None => log.old_ids.extend(first..first + row_group.tuple_count),
+            }
+        }
+        log
     }
 
     fn persistent_column(&self, group: usize, column: usize) -> Result<PersistentColumn> {

@@ -328,7 +328,8 @@ What is read comes from outside, so it is bounds-checked, and damage is an error
 Segment counts must add up to their column's rows before anything is decoded or allocated.
 
 A file opened read-only stays as it is. A file opened for writing, or made because there was none,
-takes writes, which go to it with `CHECKPOINT` and when the database goes away.
+takes writes, which go to its log at each commit and to the file with `CHECKPOINT`, when the log
+passes `checkpoint_threshold` and when the database goes away.
 
 These fail with an error that says they are not ported, because going on would give wrong answers
 or lose data:
@@ -347,12 +348,9 @@ These stop writes, or fail when they are made, as a file can't hold them yet:
   them can be read, and takes no writes;
 - files from before v2.0.0, which can be read but not checkpointed into, as checkpoints write v2.0.0;
 - VARIANT and GEOMETRY columns, and in a stored query what can't be read from one either. These fail
-  at the checkpoint and not before, so on closing the database they are a message on stderr.
+  at the commit, which leaves the database in memory as it is, until what can't be stored is dropped.
 
-A statement that commits is only in memory until the next checkpoint: writing the log is not ported,
-so a crash loses what came after it.
-
-Next, in order: `ATTACH`, then writing the log. ZSTD takes a new
+Next, in order: `ATTACH`. ZSTD takes a new
 dependency, and Chimp and Patas are only in old files.
 
 **Indexes**: the ART of each index is parsed past and not read, whichever way the file points to it
@@ -377,6 +375,26 @@ otherwise. Numeric columns have bounds; strings say that nothing is known of the
 
 `tools/check_written.py` has the v2.0.0 reference engine read a file from `write_database_file.rs`,
 and then write to it, so that it frees and reuses blocks by what the file says.
+
+**Writing the log** (`log_writer`): the engine has no undo log and tables change by being rewritten,
+so a commit doesn't know what it did. It compares the catalog with what is durable, and writes the
+difference as the records of C++: `Arc`s tell which entries are new, and `TableLog` what is durable of
+the rows of a table. That comes to the same few records for all statements, and what a transaction undid
+never shows up. Everything that can fail is checked before any of it is written, as `TableLog` moves on.
+
+Adding rows logs those rows. Anything else that changes a table logs the deletion of all its rows and
+inserts them again, so a small UPDATE of a large table writes all of it to the log. Ids stay when rows
+go, so `TableLog` keeps what they are; rows that came from a file with deletes have ids with gaps.
+
+A log that exists when a file is opened for writing goes into the file first: it can end in anything
+a crash leaves, so nothing is added to it. A checkpoint writes a marker with its root to the log first.
+A crash after the new header then leaves a log that replaying knows to skip, and without the marker
+it would be replayed onto a file that has it all.
+
+`commits_survive_kill_9` kills a process that commits and checkpoints at random moments, and reopens
+the file: what was acknowledged is there, and of a transaction all or nothing is. It writes to a real
+file with `fsync`, but it can't lose what the operating system holds, as a power failure could.
+`tools/check_written.py` has the reference engine replay a log too.
 
 **Tables in place** (`DiskTable`, `TableCursor`): rows stay in the file, and `TableSource` is how the
 engine reaches them without knowing about files. A scan decodes the row group it is at, only the

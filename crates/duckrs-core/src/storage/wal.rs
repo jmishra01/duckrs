@@ -770,6 +770,7 @@ impl<'a> Replay<'a> {
             .create_table(&name, columns, generated, constraints, on_conflict)?
             .expect("OnCreateConflict::Error fails or creates");
         entry.set_source(disk.clone());
+        *entry.log.lock() = disk.table_log();
         self.disk.insert(table_key, disk);
         Ok(())
     }
@@ -797,6 +798,7 @@ impl<'a> Replay<'a> {
 
     fn create_sequence(&mut self, schema: &str, name: &str, stored: StoredSequence) -> Result<()> {
         let data = SequenceData {
+            usage_count: stored.usage_count,
             counter: stored.counter,
             last_value: stored.last_value,
             increment: stored.increment,
@@ -892,7 +894,7 @@ impl<'a> Replay<'a> {
         let usage = self.sequence_usage.entry(key(name)).or_default();
         if usage_count > *usage {
             *usage = usage_count;
-            sequence.replay_value(counter, last_value);
+            sequence.replay_value(usage_count, counter, last_value);
         }
         if self.before_v2 {
             sequence.derive_last_value();

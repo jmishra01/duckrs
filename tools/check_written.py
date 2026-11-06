@@ -99,4 +99,70 @@ result = subprocess.run(
     text=True,
 )
 print(result.stdout[-4000:])
+if result.returncode != 0:
+    sys.exit(result.returncode)
+
+# a file and a log: what the database holds is only there if DuckDB replays the log
+logged = scratch / "logged.db"
+subprocess.run(
+    ["cargo", "test", "-q", "-p", "duckrs", "--test", "write_database_file", "a_log_brings_back"],
+    cwd=root,
+    check=True,
+    env={**os.environ, "DUCKRS_KEEP_LOGGED": str(logged)},
+)
+(scratch / "test/log.test").write_text(f"""statement ok
+ATTACH '{logged}' AS logged
+
+query I
+SELECT count(*) FROM logged.big
+----
+214285
+
+query I
+SELECT count(*) FROM logged.big WHERE s = 'updated'
+----
+42857
+
+query I
+SELECT sum(i) FROM logged.big WHERE i < 10
+----
+38
+
+query I
+SELECT count(*) FROM logged.types
+----
+3
+
+query II
+SELECT x, z FROM logged.other.t ORDER BY x
+----
+1	6
+2	7
+
+query I
+SELECT logged.main.twice(4)
+----
+8
+
+query I
+SELECT count(*) FROM logged.empty_table
+----
+0
+
+statement error
+SELECT * FROM logged.gone
+----
+does not exist
+
+query I
+SELECT nextval('logged.counter')
+----
+12
+""")
+result = subprocess.run(
+    [root / "target/release/sqllogictest", "--engine", "reference", "--duckdb-root", scratch, "test/log.test", "-v", "--continue-on-failure"],
+    capture_output=True,
+    text=True,
+)
+print(result.stdout[-4000:])
 sys.exit(result.returncode)

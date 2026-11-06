@@ -25,6 +25,7 @@ use crate::planner::binder::{SessionValues, ShowBehavior, enum_type_from, is_bui
 use crate::planner::column_binding_resolver::resolve_column_bindings;
 use crate::storage;
 use crate::storage::buffer_manager::BufferManager;
+use crate::storage::log_writer::WriteAheadLog;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::OrderType;
 use duckrs_common::types::LogicalType;
@@ -60,14 +61,17 @@ pub struct DatabaseInstance {
     file: Option<DatabaseFile>,
     /// Whether anything changed since the last checkpoint.
     changed: AtomicBool,
+    /// `PRAGMA disable_checkpoint_on_shutdown` leaves it to the log.
+    checkpoint_on_shutdown: AtomicBool,
 }
 
-/// Where a checkpoint goes. Without a write-ahead log, what isn't checkpointed is only in memory.
+/// Where a checkpoint goes, and the log of what happened since the last one.
 #[derive(Debug)]
 struct DatabaseFile {
     path: PathBuf,
     name: String,
     buffer: Arc<BufferManager>,
+    log: Mutex<WriteAheadLog>,
 }
 
 /// Why a database that came from a file takes no writes.
@@ -99,6 +103,7 @@ impl DatabaseInstance {
             file_access,
             file: None,
             changed: AtomicBool::new(false),
+            checkpoint_on_shutdown: AtomicBool::new(true),
         }
     }
 
@@ -125,12 +130,51 @@ impl DatabaseInstance {
         } else {
             None
         };
+        let log = Mutex::new(WriteAheadLog::new(&db.catalog));
         db.file = Some(DatabaseFile {
             path: path.to_path_buf(),
             name,
             buffer,
+            log,
         });
+        // a log that was replayed can end in anything a crash leaves, so it isn't added to: its
+        // records go to the file, and the next commit starts a new one
+        if db.file_access.is_none() && storage::has_log(path) {
+            db.changed.store(true, AtomicOrdering::SeqCst);
+            if db.write_checkpoint().is_err() {
+                db.changed.store(false, AtomicOrdering::SeqCst);
+                db.file_access = Some(FileAccess::WritesNotPorted);
+            }
+        }
         Ok(Arc::new(db))
+    }
+
+    /// Makes a commit durable, in the log of the file, and checkpoints if the log has grown past
+    /// `threshold` bytes and nobody is in the middle of a transaction.
+    fn log_commit(&self, threshold: u64) -> Result<()> {
+        let Some(file) = self.file.as_ref().filter(|_| self.file_access.is_none()) else {
+            return Ok(());
+        };
+        let blocks = file.buffer.block_manager();
+        let mut log = file.log.lock();
+        let identifier = blocks.main_header().db_identifier;
+        if !log.commit(
+            &file.path,
+            &self.catalog,
+            &file.name,
+            &identifier,
+            blocks.header().iteration,
+        )? {
+            return Ok(());
+        }
+        self.changed.store(true, AtomicOrdering::SeqCst);
+        let full = log.size() >= threshold;
+        drop(log);
+        if full && self.transactions.lock().open.is_empty() {
+            let _writing = self.statements.write();
+            self.write_checkpoint()?;
+        }
+        Ok(())
     }
 
     /// Whether a table has what a checkpoint can't write until Phase 10 ports the ART.
@@ -157,9 +201,27 @@ impl DatabaseInstance {
         if !self.changed.swap(false, AtomicOrdering::SeqCst) {
             return Ok(());
         }
-        storage::writer::write_checkpoint(&file.path, &file.buffer, &self.catalog, &file.name).inspect_err(|_| {
-            self.changed.store(true, AtomicOrdering::SeqCst);
-        })
+        let mut log = file.log.lock();
+        let mut marked = None;
+        let log_ref = &mut *log;
+        let mut mark = |root: storage::metadata::MetaBlockPointer| {
+            marked = Some(log_ref.mark_checkpoint(&file.path, root)?);
+            Ok(())
+        };
+        let result = storage::writer::write_checkpoint(&file.path, &file.buffer, &self.catalog, &file.name, &mut mark);
+        match result {
+            Ok(()) => {
+                log.checkpointed(&self.catalog);
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(size) = marked {
+                    log.unmark_checkpoint(&file.path, size)?;
+                }
+                self.changed.store(true, AtomicOrdering::SeqCst);
+                Err(error)
+            }
+        }
     }
 
     /// What a file can't hold yet has to fail when it is made: at a checkpoint it would be too late.
@@ -226,8 +288,6 @@ const NO_OP_PRAGMAS: &[&str] = &[
     "disable_print_progress_bar",
     "enable_object_cache",
     "disable_object_cache",
-    "enable_checkpoint_on_shutdown",
-    "disable_checkpoint_on_shutdown",
 ];
 
 /// A fully materialized result (`MaterializedQueryResult`).
@@ -580,6 +640,9 @@ impl ClientContext {
                 // COMMIT of an invalidated transaction rolls it back
                 let rollback = transaction.invalidated;
                 self.end_transaction(transaction, rollback);
+                if !rollback {
+                    self.db.log_commit(self.checkpoint_threshold())?;
+                }
             }
             TransactionType::Rollback => {
                 let Some(transaction) = self.transaction.take() else {
@@ -696,8 +759,37 @@ impl ClientContext {
             if let Some((table, rows)) = appending {
                 table.truncate(rows);
             }
+        } else if self.transaction.is_none() {
+            // also for a SELECT, as `nextval` is one
+            self.db.log_commit(self.checkpoint_threshold())?;
         }
         result
+    }
+
+    /// `checkpoint_threshold` in bytes: how large the log can get.
+    fn checkpoint_threshold(&self) -> u64 {
+        const DEFAULT: u64 = 16 << 20;
+        let text = self.setting_text("checkpoint_threshold");
+        let text = text.trim();
+        let digits = text
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(text.len());
+        let Ok(number) = text[..digits].parse::<f64>() else {
+            return DEFAULT;
+        };
+        let unit: u64 = match text[digits..].trim().to_lowercase().as_str() {
+            "" | "b" | "bytes" => 1,
+            "kb" | "kilobytes" => 1000,
+            "mb" | "megabytes" => 1000 * 1000,
+            "gb" | "gigabytes" => 1000 * 1000 * 1000,
+            "tb" | "terabytes" => 1000 * 1000 * 1000 * 1000,
+            "kib" => 1 << 10,
+            "mib" => 1 << 20,
+            "gib" => 1 << 30,
+            "tib" => 1 << 40,
+            _ => return DEFAULT,
+        };
+        (number * unit as f64) as u64
     }
 
     /// `PhysicalExplain`: the plan in text form, as a key and a value per plan.
@@ -855,6 +947,11 @@ impl ClientContext {
                     return Ok(Self::success());
                 }
                 let lower = name.to_lowercase();
+                if parameters.is_empty() && lower.ends_with("_checkpoint_on_shutdown") {
+                    let enable = lower == "enable_checkpoint_on_shutdown";
+                    self.db.checkpoint_on_shutdown.store(enable, AtomicOrdering::SeqCst);
+                    return Ok(Self::success());
+                }
                 let sql = match (lower.as_str(), parameters.as_slice()) {
                     ("enable_optimizer", []) => Some("SET enable_optimizer = true".to_string()),
                     ("disable_optimizer", []) => Some("SET enable_optimizer = false".to_string()),
@@ -1001,9 +1098,11 @@ fn on_create_conflict(conflict: AstConflict) -> OnCreateConflict {
 }
 
 impl Drop for DatabaseInstance {
-    /// `CheckpointOnShutdown`: there is no log yet, so what was written since the last checkpoint
-    /// has nowhere else to go.
+    /// `CheckpointOnShutdown`: leaves nothing for the next open to replay.
     fn drop(&mut self) {
+        if !self.checkpoint_on_shutdown.load(AtomicOrdering::SeqCst) {
+            return;
+        }
         if let Err(error) = self.write_checkpoint() {
             eprintln!("duckrs: failed to write to the database file: {error}");
         }
@@ -1150,6 +1249,7 @@ impl ClientContext {
             unreachable!("checked by the caller");
         };
         let data = SequenceData {
+            usage_count: 0,
             counter: start_value,
             last_value: None,
             increment,

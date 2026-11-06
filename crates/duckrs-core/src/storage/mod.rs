@@ -6,6 +6,7 @@ pub mod buffer_manager;
 pub mod checkpoint;
 pub mod checksum;
 pub mod compression;
+pub mod log_writer;
 pub mod metadata;
 pub mod serialization;
 pub mod statistics;
@@ -44,6 +45,13 @@ pub fn load_database(path: &Path, catalog: &Catalog, read_only: bool) -> Result<
     }
     replay.replay(records)?;
     Ok(buffer)
+}
+
+/// Whether a write-ahead log is next to the file at `path`.
+pub fn has_log(path: &Path) -> bool {
+    let mut log = path.as_os_str().to_owned();
+    log.push(".wal");
+    std::fs::metadata(log).is_ok()
 }
 
 /// A new database file, for `load_database`.

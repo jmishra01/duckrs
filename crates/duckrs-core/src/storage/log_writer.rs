@@ -1,0 +1,633 @@
+//! Ported from duckdb/src/storage/write_ahead_log.cpp and the `Serialize` of duckdb/src/common/types/
+//! {data_chunk,vector}.cpp @ rust-port-baseline.
+//!
+//! Makes commits durable. The engine has no undo log, so a commit looks at how the catalog differs
+//! from what is durable and writes that, in the records of C++, which replays them too. This way
+//! whatever a statement does comes to the same few records, and what a transaction undid never
+//! shows up.
+//!
+//! Tables change by being rewritten, which says nothing of which rows changed. So a commit that
+//! did more than add rows deletes all rows of the table and inserts them again.
+
+use super::block_manager::DB_IDENTIFIER_LEN;
+use super::checksum::checksum;
+use super::metadata::MetaBlockPointer;
+use super::serialization::custom::QualifiedName;
+use super::serialization::generated::enums::wal_type;
+use super::serialization::generated::{self as g};
+use super::serialization::to_stored::write_not_ported;
+use super::table_data::fixed_width;
+use super::writer::{macro_info, raw_bytes, schema_info, sequence_info, table_info, type_info, view_info};
+use crate::catalog::{
+    Catalog, MacroCatalogEntry, SchemaCatalogEntry, SequenceCatalogEntry, TEMP_SCHEMA, TableCatalogEntry, TableOrView,
+    ViewCatalogEntry,
+};
+use duckrs_common::serializer::{BinarySerializer, SerializationOptions, Serialize};
+use duckrs_common::types::{ListEntry, LogicalType, LogicalTypeId, PhysicalType, StringT};
+use duckrs_common::vector::{DataChunk, SelectionVector, Vector};
+use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
+use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+/// `WAL_VERSION_NUMBER`.
+const WAL_VERSION: u64 = 2;
+
+type Key = (String, String);
+
+fn key(schema: &str, name: &str) -> Key {
+    (schema.to_lowercase(), name.to_lowercase())
+}
+
+fn path_of((schema, name): &Key) -> Option<QualifiedName> {
+    Some(QualifiedName {
+        path: vec![schema.clone(), name.clone()],
+    })
+}
+
+/// The entries that are durable, each with its original name.
+#[derive(Default)]
+struct Durable {
+    schemas: BTreeMap<String, String>,
+    tables: BTreeMap<Key, (Key, Arc<TableCatalogEntry>)>,
+    views: BTreeMap<Key, (Key, Arc<ViewCatalogEntry>)>,
+    macros: [BTreeMap<Key, (Key, Arc<MacroCatalogEntry>)>; 2],
+    sequences: BTreeMap<Key, (Key, Arc<SequenceCatalogEntry>, u64)>,
+    types: BTreeMap<Key, (Key, LogicalType)>,
+}
+
+impl Durable {
+    fn of(catalog: &Catalog) -> Self {
+        let mut result = Self::default();
+        for schema in catalog
+            .schemas()
+            .iter()
+            .filter(|s| !s.name.eq_ignore_ascii_case(TEMP_SCHEMA))
+        {
+            let named = |name: &str| (schema.name.clone(), name.to_string());
+            result.schemas.insert(schema.name.to_lowercase(), schema.name.clone());
+            for entry in schema.tables_and_views() {
+                match entry {
+                    TableOrView::Table(table) => {
+                        result
+                            .tables
+                            .insert(key(&schema.name, &table.name), (named(&table.name), table));
+                    }
+                    TableOrView::View(view) => {
+                        result
+                            .views
+                            .insert(key(&schema.name, &view.name), (named(&view.name), view));
+                    }
+                }
+            }
+            for table_macro in [false, true] {
+                for entry in schema.macro_entries(table_macro) {
+                    let name = named(&entry.name);
+                    result.macros[usize::from(table_macro)].insert(key(&schema.name, &entry.name), (name, entry));
+                }
+            }
+            for sequence in schema.sequence_entries() {
+                let usage = sequence.data().usage_count;
+                let name = named(&sequence.name);
+                result
+                    .sequences
+                    .insert(key(&schema.name, &sequence.name), (name, sequence, usage));
+            }
+            for (name, ty) in schema.type_entries() {
+                result.types.insert(key(&schema.name, &name), (named(&name), ty));
+            }
+        }
+        result
+    }
+}
+
+/// The records of one commit.
+struct Records(Vec<u8>);
+
+impl Records {
+    fn entry(&mut self, wal: u64, body: impl FnOnce(&mut BinarySerializer)) {
+        let mut s = BinarySerializer::new(SerializationOptions::default());
+        s.write_object_value(|s| {
+            s.write_property(100, "wal_type", &wal);
+            body(s);
+        });
+        let payload = s.into_bytes();
+        self.0.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        self.0.extend_from_slice(&checksum(&payload).to_le_bytes());
+        self.0.extend_from_slice(&payload);
+    }
+
+    /// DROP of a kind that all have the same fields.
+    fn drop_entry(&mut self, wal: u64, name: &Key) {
+        self.entry(wal, |s| {
+            s.write_property(103, "qualified_name", &path_of(name).expect("a path"))
+        });
+    }
+
+    fn use_table(&mut self, name: &Key) {
+        self.entry(wal_type::USE_TABLE, |s| {
+            g::WALUseTable {
+                schema: String::new(),
+                table: String::new(),
+                qualified_name: path_of(name),
+            }
+            .write_members(s);
+        });
+    }
+}
+
+fn write_validity(s: &mut BinarySerializer, vector: &Vector, count: usize) -> bool {
+    let has_mask = (0..count).any(|row| !vector.is_valid(row));
+    s.write_property(100, "has_validity_mask", &has_mask);
+    if has_mask {
+        let mut mask = vec![0u8; count.div_ceil(64) * 8];
+        for row in (0..count).filter(|&row| vector.is_valid(row)) {
+            mask[row / 8] |= 1 << (row % 8);
+        }
+        s.write_property(101, "validity", mask.as_slice());
+    }
+    has_mask
+}
+
+/// `Vector::Serialize`, of a flat vector, as v2.0.0 has it.
+fn write_vector(s: &mut BinarySerializer, vector: &Vector, ty: &LogicalType, count: usize) -> Result<()> {
+    if matches!(ty.id(), LogicalTypeId::Geometry | LogicalTypeId::Variant) {
+        return Err(write_not_ported(&format!("a {} column", ty.id().name())));
+    }
+    write_validity(s, vector, count);
+    match ty.physical_type() {
+        PhysicalType::Varchar => {
+            let data = vector.data::<StringT>();
+            let mut lengths = Vec::with_capacity(count * 4);
+            let mut bytes = Vec::new();
+            for (row, string) in data.iter().enumerate().take(count) {
+                let string: &[u8] = if vector.is_valid(row) {
+                    // SAFETY: the row is valid, so its string lives in the heap of the vector
+                    unsafe { string.as_bytes() }
+                } else {
+                    &[]
+                };
+                lengths.extend_from_slice(&(string.len() as u32).to_le_bytes());
+                bytes.extend_from_slice(string);
+            }
+            s.write_property(107, "byte_data_length", &(bytes.len() as u64));
+            s.write_property(108, "length_data", lengths.as_slice());
+            s.write_property(109, "byte_data", bytes.as_slice());
+        }
+        PhysicalType::Struct => {
+            let fields = ty.struct_children();
+            let mut result = Ok(());
+            s.write_list(103, "children", fields.len(), |s, i| {
+                let child = flat(&vector.struct_children()[i], count);
+                s.write_object_value(|s| {
+                    if result.is_ok() {
+                        result = write_vector(s, &child, &fields[i].1, count);
+                    }
+                });
+            });
+            result?;
+        }
+        PhysicalType::List => {
+            // the children of the rows, in order and nothing else: a chunk can have more
+            let mut selection = Vec::new();
+            let mut entries = Vec::with_capacity(count);
+            for (row, entry) in vector.data::<ListEntry>().iter().enumerate().take(count) {
+                let offset = selection.len() as u64;
+                if vector.is_valid(row) {
+                    selection.extend((entry.offset..entry.offset + entry.length).map(|i| i as u32));
+                    entries.push((offset, entry.length));
+                } else {
+                    entries.push((offset, 0));
+                }
+            }
+            let list_size = selection.len();
+            s.write_property(104, "list_size", &(list_size as u64));
+            s.write_list(105, "entries", count, |s, row| {
+                s.write_object_value(|s| {
+                    s.write_property(100, "offset", &entries[row].0);
+                    s.write_property(101, "length", &entries[row].1);
+                });
+            });
+            let mut child = vector.list_child().clone();
+            child.slice(&SelectionVector::from_vec(selection), list_size);
+            child.flatten(list_size);
+            let child_type = ty.child_type().expect("a list has a child type");
+            let mut result = Ok(());
+            s.write_object(106, "child", |s| {
+                result = write_vector(s, &child, child_type, list_size)
+            });
+            result?;
+        }
+        PhysicalType::Array => {
+            let size = ty.array_size().expect("an array has a size") as usize;
+            s.write_property(103, "array_size", &(size as u64));
+            let child = flat(vector.array_child(), size * count);
+            let child_type = ty.child_type().expect("an array has a child type");
+            let mut result = Ok(());
+            s.write_object(104, "child", |s| {
+                result = write_vector(s, &child, child_type, size * count)
+            });
+            result?;
+        }
+        physical => {
+            if fixed_width(physical).is_none() {
+                return Err(write_not_ported(&format!("a column of type {ty}")));
+            }
+            s.write_property(102, "data", raw_bytes(vector, count)?.as_slice());
+        }
+    }
+    Ok(())
+}
+
+fn flat(vector: &Vector, count: usize) -> Vector {
+    let mut vector = vector.clone();
+    vector.flatten(count);
+    vector
+}
+
+/// `DataChunk::Serialize`.
+fn write_chunk(s: &mut BinarySerializer, chunk: &DataChunk) -> Result<()> {
+    let count = chunk.len();
+    let types = chunk.types();
+    let mut result = Ok(());
+    s.write_object(101, "chunk", |s| {
+        s.write_property(100, "rows", &(count as u32));
+        s.write_property(101, "types", &types);
+        s.write_list(102, "columns", types.len(), |s, i| {
+            let vector = flat(chunk.column(i), count);
+            s.write_object_value(|s| {
+                if result.is_ok() {
+                    result = write_vector(s, &vector, &types[i], count);
+                }
+            });
+        });
+    });
+    result
+}
+
+/// What changed of the rows of a table, in records.
+fn log_rows(records: &mut Records, name: &Key, table: &TableCatalogEntry) -> Result<()> {
+    let mut log = table.log.lock();
+    let rows = table.row_count();
+    if !log.rewritten && rows == log.logged_rows {
+        return Ok(());
+    }
+    records.use_table(name);
+    if log.rewritten || rows < log.logged_rows {
+        let ids: Vec<u64> = log.old_ids.iter().copied().chain(log.first_id..log.next_id).collect();
+        for ids in ids.chunks(STANDARD_VECTOR_SIZE) {
+            let mut vector = Vector::new(LogicalType::BIGINT, ids.len());
+            for (target, id) in vector.data_mut::<i64>().iter_mut().zip(ids) {
+                *target = *id as i64;
+            }
+            let chunk = DataChunk::from_columns(vec![vector], ids.len());
+            let mut result = Ok(());
+            records.entry(wal_type::DELETE_TUPLE, |s| result = write_chunk(s, &chunk));
+            result?;
+        }
+        log.old_ids.clear();
+        log.first_id = log.next_id;
+        log.logged_rows = 0;
+    }
+    let storage = table.rows()?;
+    let first = log.logged_rows;
+    let mut row = first / STANDARD_VECTOR_SIZE * STANDARD_VECTOR_SIZE;
+    for chunk in storage.chunks().skip(first / STANDARD_VECTOR_SIZE) {
+        let skip = first.saturating_sub(row);
+        let mut chunk = chunk.clone();
+        let count = chunk.len();
+        row += count;
+        if skip >= count {
+            continue;
+        }
+        if skip > 0 {
+            let selection = SelectionVector::from_vec((skip as u32..count as u32).collect());
+            chunk.slice(&selection, count - skip);
+        }
+        let mut result = Ok(());
+        records.entry(wal_type::INSERT_TUPLE, |s| result = write_chunk(s, &chunk));
+        result?;
+    }
+    log.next_id += (rows - first) as u64;
+    log.logged_rows = rows;
+    log.rewritten = false;
+    Ok(())
+}
+
+/// The log of a database file.
+#[derive(Default)]
+pub struct WriteAheadLog {
+    durable: Durable,
+    file: Option<File>,
+    /// What is in the file.
+    size: u64,
+}
+
+impl std::fmt::Debug for WriteAheadLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriteAheadLog").field("size", &self.size).finish()
+    }
+}
+
+fn log_path(path: &Path) -> PathBuf {
+    let mut result = path.as_os_str().to_owned();
+    result.push(".wal");
+    result.into()
+}
+
+fn io_error(path: &Path, error: std::io::Error) -> Error {
+    Error::new(ErrorKind::Io, format!("{}: {error}", path.display()))
+}
+
+impl WriteAheadLog {
+    /// All of `catalog` is durable.
+    pub fn new(catalog: &Catalog) -> Self {
+        Self {
+            durable: Durable::of(catalog),
+            ..Self::default()
+        }
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// `WriteVersion`: starts a log, the only part of it without a checksum.
+    fn open(&mut self, path: &Path, identifier: &[u8; DB_IDENTIFIER_LEN], iteration: u64) -> Result<()> {
+        if self.file.is_some() {
+            return Ok(());
+        }
+        let wal = log_path(path);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&wal)
+            .map_err(|error| io_error(&wal, error))?;
+        let mut s = BinarySerializer::new(SerializationOptions::default());
+        s.write_object_value(|s| {
+            s.write_property(100, "wal_type", &wal_type::WAL_VERSION);
+            s.write_property(101, "version", &WAL_VERSION);
+            s.write_list(102, "db_identifier", DB_IDENTIFIER_LEN, |s, i| {
+                identifier[i].write_value(s)
+            });
+            s.write_property(103, "checkpoint_iteration", &iteration);
+        });
+        let header = s.into_bytes();
+        file.write_all(&header).map_err(|error| io_error(&wal, error))?;
+        self.size = header.len() as u64;
+        self.file = Some(file);
+        Ok(())
+    }
+
+    fn append(&mut self, path: &Path, data: &[u8]) -> Result<()> {
+        let wal = log_path(path);
+        let file = self.file.as_mut().expect("opened first");
+        file.write_all(data).map_err(|error| io_error(&wal, error))?;
+        file.sync_data().map_err(|error| io_error(&wal, error))?;
+        self.size += data.len() as u64;
+        Ok(())
+    }
+
+    /// Fails for what can't be logged. This comes first, as `log_rows` moves on what is durable of a
+    /// table: with one that fails after that, the rows of the others would never reach the log.
+    fn check_storable(&self, catalog: &Catalog, name: &str, current: &Durable) -> Result<()> {
+        fn check_type(ty: &LogicalType) -> Result<()> {
+            if matches!(ty.id(), LogicalTypeId::Geometry | LogicalTypeId::Variant) {
+                return Err(write_not_ported(&format!("a {} column", ty.id().name())));
+            }
+            match ty.physical_type() {
+                PhysicalType::Struct => ty.struct_children().iter().try_for_each(|(_, child)| check_type(child)),
+                PhysicalType::List | PhysicalType::Array => ty.child_type().map_or(Ok(()), check_type),
+                _ => Ok(()),
+            }
+        }
+        for (k, (original, table)) in &current.tables {
+            table.types().iter().try_for_each(check_type)?;
+            if !self
+                .durable
+                .tables
+                .get(k)
+                .is_some_and(|(_, old)| Arc::ptr_eq(old, table))
+            {
+                table_info(name, &*catalog.schema_for(Some(&original.0))?, table)?;
+            }
+        }
+        for (k, (original, view)) in &current.views {
+            if !self.durable.views.get(k).is_some_and(|(_, old)| Arc::ptr_eq(old, view)) {
+                view_info(name, &*catalog.schema_for(Some(&original.0))?, view)?;
+            }
+        }
+        for table_macro in [0, 1] {
+            for (k, (original, entry)) in &current.macros[table_macro] {
+                if !self.durable.macros[table_macro]
+                    .get(k)
+                    .is_some_and(|(_, old)| Arc::ptr_eq(old, entry))
+                {
+                    macro_info(name, &*catalog.schema_for(Some(&original.0))?, entry, catalog)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// What differs from what is durable, in records. Drops go first, as a name can come back.
+    fn differences(&self, catalog: &Catalog, name: &str, current: &Durable) -> Result<Records> {
+        let mut records = Records(Vec::new());
+        let schema_of = |key: &Key| -> Result<Arc<SchemaCatalogEntry>> { catalog.schema_for(Some(&key.0)) };
+        let gone = |old_same: bool, new_exists: bool| !new_exists || !old_same;
+        for (k, (original, view)) in &self.durable.views {
+            let same = current.views.get(k).is_some_and(|(_, new)| Arc::ptr_eq(new, view));
+            if gone(same, current.views.contains_key(k)) {
+                records.drop_entry(wal_type::DROP_VIEW, original);
+            }
+        }
+        for (table_macro, wal) in [(0, wal_type::DROP_MACRO), (1, wal_type::DROP_TABLE_MACRO)] {
+            for (k, (original, entry)) in &self.durable.macros[table_macro] {
+                let same = current.macros[table_macro]
+                    .get(k)
+                    .is_some_and(|(_, new)| Arc::ptr_eq(new, entry));
+                if !same {
+                    records.drop_entry(wal, original);
+                }
+            }
+        }
+        for (k, (original, table)) in &self.durable.tables {
+            let same = current.tables.get(k).is_some_and(|(_, new)| Arc::ptr_eq(new, table));
+            if !same {
+                records.drop_entry(wal_type::DROP_TABLE, original);
+            }
+        }
+        for (k, (original, sequence, _)) in &self.durable.sequences {
+            let same = current
+                .sequences
+                .get(k)
+                .is_some_and(|(_, new, _)| Arc::ptr_eq(new, sequence));
+            if !same {
+                records.drop_entry(wal_type::DROP_SEQUENCE, original);
+            }
+        }
+        for (k, (original, ty)) in &self.durable.types {
+            if current.types.get(k).is_none_or(|(_, new)| new != ty) {
+                records.drop_entry(wal_type::DROP_TYPE, original);
+            }
+        }
+        for (k, original) in &self.durable.schemas {
+            if !current.schemas.contains_key(k) {
+                records.entry(wal_type::DROP_SCHEMA, |s| {
+                    s.write_property(
+                        102,
+                        "qualified_name",
+                        &QualifiedName {
+                            path: vec![original.clone()],
+                        },
+                    );
+                });
+            }
+        }
+        for (k, original) in &current.schemas {
+            if !self.durable.schemas.contains_key(k) {
+                let info = schema_info(original);
+                debug_assert!(matches!(info.kind, g::CreateInfoKind::CreateSchemaInfo(_)));
+                records.entry(wal_type::CREATE_SCHEMA, |s| {
+                    s.write_property(
+                        102,
+                        "qualified_name",
+                        &QualifiedName {
+                            path: vec![original.clone()],
+                        },
+                    );
+                });
+            }
+        }
+        for (k, (original, ty)) in &current.types {
+            if self.durable.types.get(k).is_none_or(|(_, old)| old != ty) {
+                let info = type_info(name, &*schema_of(original)?, original.1.clone(), ty.clone());
+                let entry = g::WALCreateType {
+                    type_: Some(Box::new(info)),
+                };
+                records.entry(wal_type::CREATE_TYPE, |s| entry.write_members(s));
+            }
+        }
+        for (k, (original, sequence, usage)) in &current.sequences {
+            match self.durable.sequences.get(k) {
+                Some((_, old, old_usage)) if Arc::ptr_eq(old, sequence) => {
+                    if usage != old_usage {
+                        let data = sequence.data();
+                        let entry = g::WALSequenceValue {
+                            schema: String::new(),
+                            name: String::new(),
+                            usage_count: Some(data.usage_count),
+                            counter: Some(data.counter),
+                            last_value: data.last_value,
+                            qualified_name: path_of(original),
+                        };
+                        records.entry(wal_type::SEQUENCE_VALUE, |s| entry.write_members(s));
+                    }
+                }
+                _ => {
+                    let info = sequence_info(name, &*schema_of(original)?, sequence);
+                    let entry = g::WALCreateSequence {
+                        sequence: Some(Box::new(info)),
+                    };
+                    records.entry(wal_type::CREATE_SEQUENCE, |s| entry.write_members(s));
+                }
+            }
+        }
+        for table_macro in [0, 1] {
+            for (k, (original, entry)) in &current.macros[table_macro] {
+                let same = self.durable.macros[table_macro]
+                    .get(k)
+                    .is_some_and(|(_, old)| Arc::ptr_eq(old, entry));
+                if same {
+                    continue;
+                }
+                let info = Some(Box::new(macro_info(name, &*schema_of(original)?, entry, catalog)?));
+                if table_macro == 1 {
+                    let entry = g::WALCreateTableMacro { table_macro: info };
+                    records.entry(wal_type::CREATE_TABLE_MACRO, |s| entry.write_members(s));
+                } else {
+                    let entry = g::WALCreateMacro { macro_: info };
+                    records.entry(wal_type::CREATE_MACRO, |s| entry.write_members(s));
+                }
+            }
+        }
+        for (k, (original, table)) in &current.tables {
+            let same = self
+                .durable
+                .tables
+                .get(k)
+                .is_some_and(|(_, old)| Arc::ptr_eq(old, table));
+            if !same {
+                let info = table_info(name, &*schema_of(original)?, table)?;
+                let entry = g::WALCreateTable {
+                    table: Some(Box::new(info)),
+                };
+                records.entry(wal_type::CREATE_TABLE, |s| entry.write_members(s));
+            }
+            log_rows(&mut records, original, table)?;
+        }
+        for (k, (original, view)) in &current.views {
+            let same = self.durable.views.get(k).is_some_and(|(_, old)| Arc::ptr_eq(old, view));
+            if !same {
+                let info = view_info(name, &*schema_of(original)?, view)?;
+                let entry = g::WALCreateView {
+                    view: Some(Box::new(info)),
+                };
+                records.entry(wal_type::CREATE_VIEW, |s| entry.write_members(s));
+            }
+        }
+        Ok(records)
+    }
+
+    /// Makes what `catalog` holds durable: whether there was anything to do.
+    pub fn commit(
+        &mut self,
+        path: &Path,
+        catalog: &Catalog,
+        name: &str,
+        identifier: &[u8; DB_IDENTIFIER_LEN],
+        iteration: u64,
+    ) -> Result<bool> {
+        let current = Durable::of(catalog);
+        self.check_storable(catalog, name, &current)?;
+        let mut records = self.differences(catalog, name, &current)?;
+        self.durable = current;
+        if records.0.is_empty() {
+            return Ok(false);
+        }
+        records.entry(wal_type::WAL_FLUSH, |_| {});
+        self.open(path, identifier, iteration)?;
+        self.append(path, &records.0)?;
+        Ok(true)
+    }
+
+    /// `WriteCheckpoint`: before a checkpoint, for a crash during it to be told from one after it.
+    /// Returns what the log held, to go back to if the checkpoint fails.
+    pub fn mark_checkpoint(&mut self, path: &Path, root: MetaBlockPointer) -> Result<u64> {
+        let size = self.size;
+        if self.file.is_some() {
+            let mut records = Records(Vec::new());
+            records.entry(wal_type::CHECKPOINT, |s| s.write_property(101, "meta_block", &root));
+            records.entry(wal_type::WAL_FLUSH, |_| {});
+            self.append(path, &records.0)?;
+        }
+        Ok(size)
+    }
+
+    /// A checkpoint that failed leaves no marker behind, which only makes sense at the end.
+    pub fn unmark_checkpoint(&mut self, path: &Path, size: u64) -> Result<()> {
+        if let Some(file) = &self.file {
+            file.set_len(size).map_err(|error| io_error(&log_path(path), error))?;
+            self.size = size;
+        }
+        Ok(())
+    }
+
+    /// All of `catalog` is in the file now, and the log file is gone.
+    pub fn checkpointed(&mut self, catalog: &Catalog) {
+        *self = Self::new(catalog);
+    }
+}
