@@ -6,7 +6,7 @@
 use super::custom::{CastExpression, FunctionExpression, LambdaExpression, QualifiedName, WindowExpression};
 use super::{not_ported, unknown};
 use duckrs_common::Result;
-use duckrs_common::serializer::{BinaryDeserializer, Deserialize};
+use duckrs_common::serializer::{BinaryDeserializer, BinarySerializer, Deserialize, Serialize};
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
 
@@ -460,11 +460,45 @@ impl CreateInfo {
             kind,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(100, "type", &self.type_);
+        s.write_property_with_default(103, "temporary", &self.temporary);
+        s.write_property_with_default(104, "internal", &self.internal);
+        s.write_property(105, "on_conflict", &self.on_conflict);
+        s.write_property_with_default(106, "sql", &self.sql);
+        if let Some(value) = &self.comment {
+            s.write_property(107, "comment", value);
+        }
+        s.write_property_with_default(108, "tags", &self.tags);
+        if let Some(value) = &self.dependencies {
+            s.write_property(109, "dependencies", value);
+        }
+        s.write_property_with_default(110, "extension_name", &self.extension_name);
+        if let Some(value) = &self.qualified_name {
+            s.write_property(111, "qualified_name", value);
+        }
+        match &self.kind {
+            CreateInfoKind::CreateIndexInfo(value) => value.write_members(s),
+            CreateInfoKind::CreateTableInfo(value) => value.write_members(s),
+            CreateInfoKind::CreateSchemaInfo(value) => value.write_members(s),
+            CreateInfoKind::CreateViewInfo(value) => value.write_members(s),
+            CreateInfoKind::CreateTypeInfo(value) => value.write_members(s),
+            CreateInfoKind::CreateMacroInfo(value) => value.write_members(s),
+            CreateInfoKind::CreateSequenceInfo(value) => value.write_members(s),
+        }
+    }
 }
 
 impl Deserialize for CreateInfo {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for CreateInfo {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -480,11 +514,22 @@ impl FunctionArgument {
         let expression = d.read_property_with_default::<Option<Box<ParsedExpression>>>(101, "expression")?;
         Ok(Self { name, expression })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(100, "name", &self.name);
+        s.write_property_with_default(101, "expression", &self.expression);
+    }
 }
 
 impl Deserialize for FunctionArgument {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for FunctionArgument {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -509,11 +554,24 @@ impl IndexStorageInfo {
             options,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(100, "name", &self.name);
+        s.write_property_with_default(101, "root", &self.root);
+        s.write_property_with_default(102, "allocator_infos", &self.allocator_infos);
+        s.write_property_with_default(103, "options", &self.options);
+    }
 }
 
 impl Deserialize for IndexStorageInfo {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for IndexStorageInfo {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -529,11 +587,22 @@ impl BlockPointer {
         let offset = d.read_property_with_default::<u32>(101, "offset")?;
         Ok(Self { block_id, offset })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(100, "block_id", &self.block_id);
+        s.write_property_with_default(101, "offset", &self.offset);
+    }
 }
 
 impl Deserialize for BlockPointer {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for BlockPointer {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -547,11 +616,21 @@ impl WALCreateTable {
         let table = d.read_property_with_default::<Option<Box<CreateInfo>>>(101, "table")?;
         Ok(Self { table })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(101, "table", &self.table);
+    }
 }
 
 impl Deserialize for WALCreateTable {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for WALCreateTable {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -573,11 +652,23 @@ impl WALDropTable {
             qualified_name,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        if let Some(value) = &self.qualified_name {
+            s.write_property(103, "qualified_name", value);
+        }
+    }
 }
 
 impl Deserialize for WALDropTable {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for WALDropTable {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -593,11 +684,23 @@ impl WALCreateSchema {
         let qualified_name = d.read_optional_property::<QualifiedName>(102, "qualified_name")?;
         Ok(Self { schema, qualified_name })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        if let Some(value) = &self.qualified_name {
+            s.write_property(102, "qualified_name", value);
+        }
+    }
 }
 
 impl Deserialize for WALCreateSchema {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for WALCreateSchema {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -613,11 +716,23 @@ impl WALDropSchema {
         let qualified_name = d.read_optional_property::<QualifiedName>(102, "qualified_name")?;
         Ok(Self { schema, qualified_name })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        if let Some(value) = &self.qualified_name {
+            s.write_property(102, "qualified_name", value);
+        }
+    }
 }
 
 impl Deserialize for WALDropSchema {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for WALDropSchema {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -631,11 +746,21 @@ impl WALCreateView {
         let view = d.read_property_with_default::<Option<Box<CreateInfo>>>(101, "view")?;
         Ok(Self { view })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(101, "view", &self.view);
+    }
 }
 
 impl Deserialize for WALCreateView {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for WALCreateView {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -657,11 +782,23 @@ impl WALDropView {
             qualified_name,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        if let Some(value) = &self.qualified_name {
+            s.write_property(103, "qualified_name", value);
+        }
+    }
 }
 
 impl Deserialize for WALDropView {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for WALDropView {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -675,11 +812,21 @@ impl WALCreateSequence {
         let sequence = d.read_property_with_default::<Option<Box<CreateInfo>>>(101, "sequence")?;
         Ok(Self { sequence })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(101, "sequence", &self.sequence);
+    }
 }
 
 impl Deserialize for WALCreateSequence {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for WALCreateSequence {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -701,11 +848,23 @@ impl WALDropSequence {
             qualified_name,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        if let Some(value) = &self.qualified_name {
+            s.write_property(103, "qualified_name", value);
+        }
+    }
 }
 
 impl Deserialize for WALDropSequence {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for WALDropSequence {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -736,11 +895,30 @@ impl WALSequenceValue {
             qualified_name,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        if let Some(value) = &self.usage_count {
+            s.write_property(103, "usage_count", value);
+        }
+        if let Some(value) = &self.counter {
+            s.write_property(104, "counter", value);
+        }
+        s.write_property_with_default(105, "last_value", &self.last_value);
+        if let Some(value) = &self.qualified_name {
+            s.write_property(106, "qualified_name", value);
+        }
+    }
 }
 
 impl Deserialize for WALSequenceValue {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for WALSequenceValue {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -754,11 +932,21 @@ impl WALCreateMacro {
         let macro_ = d.read_property_with_default::<Option<Box<CreateInfo>>>(101, "macro")?;
         Ok(Self { macro_ })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(101, "macro", &self.macro_);
+    }
 }
 
 impl Deserialize for WALCreateMacro {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for WALCreateMacro {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -780,11 +968,23 @@ impl WALDropMacro {
             qualified_name,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        if let Some(value) = &self.qualified_name {
+            s.write_property(103, "qualified_name", value);
+        }
+    }
 }
 
 impl Deserialize for WALDropMacro {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for WALDropMacro {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -798,11 +998,21 @@ impl WALCreateTableMacro {
         let table_macro = d.read_property_with_default::<Option<Box<CreateInfo>>>(101, "table_macro")?;
         Ok(Self { table_macro })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(101, "table_macro", &self.table_macro);
+    }
 }
 
 impl Deserialize for WALCreateTableMacro {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for WALCreateTableMacro {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -824,11 +1034,23 @@ impl WALDropTableMacro {
             qualified_name,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        if let Some(value) = &self.qualified_name {
+            s.write_property(103, "qualified_name", value);
+        }
+    }
 }
 
 impl Deserialize for WALDropTableMacro {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for WALDropTableMacro {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -842,11 +1064,21 @@ impl WALCreateType {
         let type_ = d.read_property_with_default::<Option<Box<CreateInfo>>>(101, "type")?;
         Ok(Self { type_ })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(101, "type", &self.type_);
+    }
 }
 
 impl Deserialize for WALCreateType {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for WALCreateType {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -868,11 +1100,23 @@ impl WALDropType {
             qualified_name,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        if let Some(value) = &self.qualified_name {
+            s.write_property(103, "qualified_name", value);
+        }
+    }
 }
 
 impl Deserialize for WALDropType {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for WALDropType {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -886,11 +1130,21 @@ impl WALCreateTrigger {
         let trigger = d.read_property_with_default::<Option<Box<CreateInfo>>>(101, "trigger")?;
         Ok(Self { trigger })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(101, "trigger", &self.trigger);
+    }
 }
 
 impl Deserialize for WALCreateTrigger {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for WALCreateTrigger {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -915,11 +1169,24 @@ impl WALDropTrigger {
             qualified_name,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(103, "table", &self.table);
+        if let Some(value) = &self.qualified_name {
+            s.write_property(104, "qualified_name", value);
+        }
+    }
 }
 
 impl Deserialize for WALDropTrigger {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for WALDropTrigger {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -941,11 +1208,23 @@ impl WALDropIndex {
             qualified_name,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        if let Some(value) = &self.qualified_name {
+            s.write_property(103, "qualified_name", value);
+        }
+    }
 }
 
 impl Deserialize for WALDropIndex {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for WALDropIndex {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -967,11 +1246,23 @@ impl WALUseTable {
             qualified_name,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        if let Some(value) = &self.qualified_name {
+            s.write_property(103, "qualified_name", value);
+        }
+    }
 }
 
 impl Deserialize for WALUseTable {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for WALUseTable {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -1013,6 +1304,18 @@ impl CreateIndexInfo {
             index_type_name,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "name", &self.name);
+        s.write_property_with_default(201, "table", &self.table);
+        s.write_property(203, "constraint_type", &self.constraint_type);
+        s.write_property_with_default(204, "parsed_expressions", &self.parsed_expressions);
+        s.write_property_with_default(205, "scan_types", &self.scan_types);
+        s.write_property_with_default(206, "names", &self.names);
+        s.write_property_with_default(207, "column_ids", &self.column_ids);
+        s.write_property_with_default(208, "options", &self.options);
+        s.write_property_with_default(209, "index_type_name", &self.index_type_name);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1046,6 +1349,16 @@ impl CreateTableInfo {
             options,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "table", &self.table);
+        s.write_property(201, "columns", &self.columns);
+        s.write_property_with_default(202, "constraints", &self.constraints);
+        s.write_property_with_default(203, "query", &self.query);
+        s.write_property_with_default(204, "partition_keys", &self.partition_keys);
+        s.write_property_with_default(205, "sort_keys", &self.sort_keys);
+        s.write_property_with_default(206, "options", &self.options);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1057,6 +1370,10 @@ impl CreateSchemaInfo {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         let options = d.read_property_with_default::<Vec<(String, Option<Box<ParsedExpression>>)>>(200, "options")?;
         Ok(Self { options })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "options", &self.options);
     }
 }
 
@@ -1093,6 +1410,18 @@ impl CreateViewInfo {
             security_type,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "view_name", &self.view_name);
+        s.write_property_with_default(201, "aliases", &self.aliases);
+        s.write_property_with_default(202, "types", &self.types);
+        s.write_property_with_default(203, "query", &self.query);
+        s.write_property_with_default(204, "names", &self.names);
+        s.write_property_with_default(206, "column_comments_map", &self.column_comments_map);
+        if let Some(value) = &self.security_type {
+            s.write_property(207, "security_type", value);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1106,6 +1435,11 @@ impl CreateTypeInfo {
         let name = d.read_property_with_default::<String>(200, "name")?;
         let logical_type = d.read_property::<LogicalType>(201, "logical_type")?;
         Ok(Self { name, logical_type })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "name", &self.name);
+        s.write_property(201, "logical_type", &self.logical_type);
     }
 }
 
@@ -1127,6 +1461,12 @@ impl CreateMacroInfo {
             function,
             extra_functions,
         })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "name", &self.name);
+        s.write_property_with_default(201, "function", &self.function);
+        s.write_property_with_default(202, "extra_functions", &self.extra_functions);
     }
 }
 
@@ -1163,6 +1503,17 @@ impl CreateSequenceInfo {
             last_value,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "name", &self.name);
+        s.write_property_with_default(201, "usage_count", &self.usage_count);
+        s.write_property_with_default(202, "increment", &self.increment);
+        s.write_property_with_default(203, "min_value", &self.min_value);
+        s.write_property_with_default(204, "max_value", &self.max_value);
+        s.write_property_with_default(205, "start_value", &self.start_value);
+        s.write_property_with_default(206, "cycle", &self.cycle);
+        s.write_property_with_default(207, "last_value", &self.last_value);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1175,11 +1526,21 @@ impl LogicalDependencyList {
         let set = d.read_property::<Vec<LogicalDependency>>(100, "set")?;
         Ok(Self { set })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(100, "set", &self.set);
+    }
 }
 
 impl Deserialize for LogicalDependencyList {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for LogicalDependencyList {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -1285,11 +1646,50 @@ impl ParsedExpression {
             kind,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(100, "class", &self.class);
+        s.write_property(101, "type", &self.type_);
+        s.write_property_with_default(102, "alias", &self.alias);
+        if let Some(value) = &self.query_location {
+            s.write_property(103, "query_location", value);
+        }
+        if let Some(value) = &self.query_location_length {
+            s.write_property(104, "query_location_length", value);
+        }
+        match &self.kind {
+            ParsedExpressionKind::BetweenExpression(value) => value.write_members(s),
+            ParsedExpressionKind::CaseExpression(value) => value.write_members(s),
+            ParsedExpressionKind::CastExpression(value) => value.write_members(s),
+            ParsedExpressionKind::CollateExpression(value) => value.write_members(s),
+            ParsedExpressionKind::ColumnRefExpression(value) => value.write_members(s),
+            ParsedExpressionKind::LambdaRefExpression(value) => value.write_members(s),
+            ParsedExpressionKind::ComparisonExpression(value) => value.write_members(s),
+            ParsedExpressionKind::ConjunctionExpression(value) => value.write_members(s),
+            ParsedExpressionKind::ConstantExpression(value) => value.write_members(s),
+            ParsedExpressionKind::DefaultExpression(value) => value.write_members(s),
+            ParsedExpressionKind::FunctionExpression(value) => value.write_members(s),
+            ParsedExpressionKind::LambdaExpression(value) => value.write_members(s),
+            ParsedExpressionKind::OperatorExpression(value) => value.write_members(s),
+            ParsedExpressionKind::ParameterExpression(value) => value.write_members(s),
+            ParsedExpressionKind::PositionalReferenceExpression(value) => value.write_members(s),
+            ParsedExpressionKind::StarExpression(value) => value.write_members(s),
+            ParsedExpressionKind::SubqueryExpression(value) => value.write_members(s),
+            ParsedExpressionKind::WindowExpression(value) => value.write_members(s),
+            ParsedExpressionKind::TypeExpression(value) => value.write_members(s),
+        }
+    }
 }
 
 impl Deserialize for ParsedExpression {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for ParsedExpression {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -1320,11 +1720,26 @@ impl FixedSizeAllocatorInfo {
             buffers_with_free_space,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(100, "segment_size", &self.segment_size);
+        s.write_property_with_default(101, "buffer_ids", &self.buffer_ids);
+        s.write_property_with_default(102, "block_pointers", &self.block_pointers);
+        s.write_property_with_default(103, "segment_counts", &self.segment_counts);
+        s.write_property_with_default(104, "allocation_sizes", &self.allocation_sizes);
+        s.write_property_with_default(105, "buffers_with_free_space", &self.buffers_with_free_space);
+    }
 }
 
 impl Deserialize for FixedSizeAllocatorInfo {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for FixedSizeAllocatorInfo {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -1338,11 +1753,21 @@ impl ColumnList {
         let columns = d.read_property_with_default::<Vec<ColumnDefinition>>(100, "columns")?;
         Ok(Self { columns })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(100, "columns", &self.columns);
+    }
 }
 
 impl Deserialize for ColumnList {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for ColumnList {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -1374,11 +1799,27 @@ impl Constraint {
         };
         Ok(Self { type_, kind })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(100, "type", &self.type_);
+        match &self.kind {
+            ConstraintKind::NotNullConstraint(value) => value.write_members(s),
+            ConstraintKind::CheckConstraint(value) => value.write_members(s),
+            ConstraintKind::ForeignKeyConstraint(value) => value.write_members(s),
+            ConstraintKind::UniqueConstraint(value) => value.write_members(s),
+        }
+    }
 }
 
 impl Deserialize for Constraint {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for Constraint {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -1394,11 +1835,22 @@ impl SelectStatement {
         let named_param_map = d.read_property_with_default::<Vec<(String, u64)>>(101, "named_param_map")?;
         Ok(Self { node, named_param_map })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(100, "node", &self.node);
+        s.write_property_with_default(101, "named_param_map", &self.named_param_map);
+    }
 }
 
 impl Deserialize for SelectStatement {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for SelectStatement {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -1444,11 +1896,31 @@ impl MacroFunction {
             kind,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(100, "type", &self.type_);
+        s.write_property_with_default(101, "parameters", &self.parameters);
+        s.write_property_with_default(102, "default_parameters", &self.default_parameters);
+        s.write_property_with_default(103, "types", &self.types);
+        if let Some(value) = &self.return_type {
+            s.write_property(104, "return_type", value);
+        }
+        match &self.kind {
+            MacroFunctionKind::ScalarMacroFunction(value) => value.write_members(s),
+            MacroFunctionKind::TableMacroFunction(value) => value.write_members(s),
+        }
+    }
 }
 
 impl Deserialize for MacroFunction {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for MacroFunction {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -1466,11 +1938,25 @@ impl LogicalDependency {
         let flags = d.read_optional_property::<DependencyDependentFlags>(102, "flags")?;
         Ok(Self { entry, catalog, flags })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(100, "entry", &self.entry);
+        s.write_property_with_default(101, "catalog", &self.catalog);
+        if let Some(value) = &self.flags {
+            s.write_property(102, "flags", value);
+        }
+    }
 }
 
 impl Deserialize for LogicalDependency {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for LogicalDependency {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -1488,6 +1974,12 @@ impl BetweenExpression {
         let upper = d.read_property_with_default::<Option<Box<ParsedExpression>>>(202, "upper")?;
         Ok(Self { input, lower, upper })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "input", &self.input);
+        s.write_property_with_default(201, "lower", &self.lower);
+        s.write_property_with_default(202, "upper", &self.upper);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1501,6 +1993,11 @@ impl CaseExpression {
         let case_checks = d.read_property_with_default::<Vec<CaseCheck>>(200, "case_checks")?;
         let else_expr = d.read_property_with_default::<Option<Box<ParsedExpression>>>(201, "else_expr")?;
         Ok(Self { case_checks, else_expr })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "case_checks", &self.case_checks);
+        s.write_property_with_default(201, "else_expr", &self.else_expr);
     }
 }
 
@@ -1516,6 +2013,11 @@ impl CollateExpression {
         let collation = d.read_property_with_default::<String>(201, "collation")?;
         Ok(Self { child, collation })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "child", &self.child);
+        s.write_property_with_default(201, "collation", &self.collation);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1527,6 +2029,10 @@ impl ColumnRefExpression {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         let column_names = d.read_property_with_default::<Vec<String>>(200, "column_names")?;
         Ok(Self { column_names })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "column_names", &self.column_names);
     }
 }
 
@@ -1545,6 +2051,11 @@ impl LambdaRefExpression {
             column_name,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "lambda_idx", &self.lambda_idx);
+        s.write_property_with_default(201, "column_name", &self.column_name);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1559,6 +2070,11 @@ impl ComparisonExpression {
         let right = d.read_property_with_default::<Option<Box<ParsedExpression>>>(201, "right")?;
         Ok(Self { left, right })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "left", &self.left);
+        s.write_property_with_default(201, "right", &self.right);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1570,6 +2086,10 @@ impl ConjunctionExpression {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         let children = d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(200, "children")?;
         Ok(Self { children })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "children", &self.children);
     }
 }
 
@@ -1585,6 +2105,12 @@ impl ConstantExpression {
         let literal = d.read_optional_property::<Literal>(201, "literal")?;
         Ok(Self { value, literal })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        if let Some(value) = &self.literal {
+            s.write_property(201, "literal", value);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1594,6 +2120,8 @@ impl DefaultExpression {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         Ok(Self {})
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {}
 }
 
 #[derive(Debug, Clone)]
@@ -1605,6 +2133,10 @@ impl OperatorExpression {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         let children = d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(200, "children")?;
         Ok(Self { children })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "children", &self.children);
     }
 }
 
@@ -1618,6 +2150,10 @@ impl ParameterExpression {
         let identifier = d.read_property_with_default::<String>(200, "identifier")?;
         Ok(Self { identifier })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "identifier", &self.identifier);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1629,6 +2165,10 @@ impl PositionalReferenceExpression {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         let index = d.read_property_with_default::<u64>(200, "index")?;
         Ok(Self { index })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "index", &self.index);
     }
 }
 
@@ -1667,6 +2207,18 @@ impl StarExpression {
             rename_list,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "relation_name", &self.relation_name);
+        s.write_property_with_default(201, "exclude_list", &self.exclude_list);
+        s.write_property_with_default(202, "replace_list", &self.replace_list);
+        s.write_property_with_default(203, "columns", &self.columns);
+        s.write_property_with_default(204, "expr", &self.expr);
+        if let Some(value) = &self.qualified_exclude_list {
+            s.write_property(206, "qualified_exclude_list", value);
+        }
+        s.write_property_with_default(207, "rename_list", &self.rename_list);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1689,6 +2241,13 @@ impl SubqueryExpression {
             child,
             comparison_type,
         })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(200, "subquery_type", &self.subquery_type);
+        s.write_property_with_default(201, "subquery", &self.subquery);
+        s.write_property_with_default(202, "child", &self.child);
+        s.write_property(203, "comparison_type", &self.comparison_type);
     }
 }
 
@@ -1715,6 +2274,16 @@ impl TypeExpression {
             children,
             qualified_name,
         })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "catalog", &self.catalog);
+        s.write_property_with_default(201, "schema", &self.schema);
+        s.write_property_with_default(202, "type_name", &self.type_name);
+        s.write_property_with_default(203, "children", &self.children);
+        if let Some(value) = &self.qualified_name {
+            s.write_property(204, "qualified_name", value);
+        }
     }
 }
 
@@ -1748,11 +2317,29 @@ impl ColumnDefinition {
             tags,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(100, "name", &self.name);
+        s.write_property(101, "type", &self.type_);
+        s.write_property_with_default(102, "expression", &self.expression);
+        s.write_property(103, "category", &self.category);
+        s.write_property(104, "compression_type", &self.compression_type);
+        if let Some(value) = &self.comment {
+            s.write_property(105, "comment", value);
+        }
+        s.write_property_with_default(106, "tags", &self.tags);
+    }
 }
 
 impl Deserialize for ColumnDefinition {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for ColumnDefinition {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -1766,6 +2353,10 @@ impl NotNullConstraint {
         let index = d.read_property::<u64>(200, "index")?;
         Ok(Self { index })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(200, "index", &self.index);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1777,6 +2368,10 @@ impl CheckConstraint {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         let expression = d.read_property_with_default::<Option<Box<ParsedExpression>>>(200, "expression")?;
         Ok(Self { expression })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "expression", &self.expression);
     }
 }
 
@@ -1810,6 +2405,16 @@ impl ForeignKeyConstraint {
             fk_keys,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "pk_columns", &self.pk_columns);
+        s.write_property_with_default(201, "fk_columns", &self.fk_columns);
+        s.write_property(202, "fk_type", &self.fk_type);
+        s.write_property_with_default(203, "schema", &self.schema);
+        s.write_property_with_default(204, "table", &self.table);
+        s.write_property_with_default(205, "pk_keys", &self.pk_keys);
+        s.write_property_with_default(206, "fk_keys", &self.fk_keys);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1832,6 +2437,15 @@ impl UniqueConstraint {
             columns,
             check_mode,
         })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "is_primary_key", &self.is_primary_key);
+        s.write_property(201, "index", &self.index);
+        s.write_property_with_default(202, "columns", &self.columns);
+        if let Some(value) = &self.check_mode {
+            s.write_property(203, "check_mode", value);
+        }
     }
 }
 
@@ -1879,11 +2493,29 @@ impl QueryNode {
             kind,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(100, "type", &self.type_);
+        s.write_property_with_default(101, "modifiers", &self.modifiers);
+        s.write_property(102, "cte_map", &self.cte_map);
+        match &self.kind {
+            QueryNodeKind::SelectNode(value) => value.write_members(s),
+            QueryNodeKind::SetOperationNode(value) => value.write_members(s),
+            QueryNodeKind::RecursiveCTENode(value) => value.write_members(s),
+            QueryNodeKind::CTENode(value) => value.write_members(s),
+        }
+    }
 }
 
 impl Deserialize for QueryNode {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for QueryNode {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -1897,6 +2529,10 @@ impl ScalarMacroFunction {
         let expression = d.read_property_with_default::<Option<Box<ParsedExpression>>>(200, "expression")?;
         Ok(Self { expression })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "expression", &self.expression);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1908,6 +2544,10 @@ impl TableMacroFunction {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         let query_node = d.read_property_with_default::<Option<Box<QueryNode>>>(200, "query_node")?;
         Ok(Self { query_node })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "query_node", &self.query_node);
     }
 }
 
@@ -1935,11 +2575,26 @@ impl CatalogEntryInfo {
             table,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(100, "type", &self.type_);
+        s.write_property_with_default(102, "name", &self.name);
+        s.write_property_with_default(103, "schema_path", &self.schema_path);
+        if let Some(value) = &self.table {
+            s.write_property(104, "table", value);
+        }
+    }
 }
 
 impl Deserialize for CatalogEntryInfo {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for CatalogEntryInfo {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -1953,11 +2608,21 @@ impl DependencyDependentFlags {
         let value = d.read_property_with_default::<u8>(100, "value")?;
         Ok(Self { value })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(100, "value", &self.value);
+    }
 }
 
 impl Deserialize for DependencyDependentFlags {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for DependencyDependentFlags {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -1973,11 +2638,22 @@ impl CaseCheck {
         let then_expr = d.read_property_with_default::<Option<Box<ParsedExpression>>>(101, "then_expr")?;
         Ok(Self { when_expr, then_expr })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(100, "when_expr", &self.when_expr);
+        s.write_property_with_default(101, "then_expr", &self.then_expr);
+    }
 }
 
 impl Deserialize for CaseCheck {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for CaseCheck {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -1993,11 +2669,22 @@ impl Literal {
         let text = d.read_property_with_default::<String>(101, "text")?;
         Ok(Self { kind, text })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(100, "kind", &self.kind);
+        s.write_property_with_default(101, "text", &self.text);
+    }
 }
 
 impl Deserialize for Literal {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for Literal {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -2022,11 +2709,24 @@ impl QualifiedColumnName {
             column,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(100, "catalog", &self.catalog);
+        s.write_property_with_default(101, "schema", &self.schema);
+        s.write_property_with_default(102, "table", &self.table);
+        s.write_property_with_default(103, "column", &self.column);
+    }
 }
 
 impl Deserialize for QualifiedColumnName {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for QualifiedColumnName {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -2067,6 +2767,18 @@ impl SelectNode {
             qualify,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "select_list", &self.select_list);
+        s.write_property_with_default(201, "from_table", &self.from_table);
+        s.write_property_with_default(202, "where_clause", &self.where_clause);
+        s.write_property_with_default(203, "group_expressions", &self.group_expressions);
+        s.write_property_with_default(204, "group_sets", &self.group_sets);
+        s.write_property(205, "aggregate_handling", &self.aggregate_handling);
+        s.write_property_with_default(206, "having", &self.having);
+        s.write_property_with_default(207, "sample", &self.sample);
+        s.write_property_with_default(208, "qualify", &self.qualify);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2092,6 +2804,16 @@ impl SetOperationNode {
             setop_all,
             children,
         })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(200, "setop_type", &self.setop_type);
+        s.write_property_with_default(201, "left", &self.left);
+        s.write_property_with_default(202, "right", &self.right);
+        if let Some(value) = &self.setop_all {
+            s.write_property(203, "setop_all", value);
+        }
+        s.write_property_with_default(204, "children", &self.children);
     }
 }
 
@@ -2122,6 +2844,17 @@ impl RecursiveCTENode {
             key_targets,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "cte_name", &self.cte_name);
+        if let Some(value) = &self.union_all {
+            s.write_property(201, "union_all", value);
+        }
+        s.write_property_with_default(202, "left", &self.left);
+        s.write_property_with_default(203, "right", &self.right);
+        s.write_property_with_default(204, "aliases", &self.aliases);
+        s.write_property_with_default(205, "key_targets", &self.key_targets);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2147,6 +2880,16 @@ impl CTENode {
             aliases,
             materialized,
         })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "cte_name", &self.cte_name);
+        s.write_property_with_default(201, "query", &self.query);
+        s.write_property_with_default(202, "child", &self.child);
+        s.write_property_with_default(203, "aliases", &self.aliases);
+        if let Some(value) = &self.materialized {
+            s.write_property(204, "materialized", value);
+        }
     }
 }
 
@@ -2184,11 +2927,27 @@ impl ResultModifier {
         };
         Ok(Self { type_, kind })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(100, "type", &self.type_);
+        match &self.kind {
+            ResultModifierKind::LimitModifier(value) => value.write_members(s),
+            ResultModifierKind::DistinctModifier(value) => value.write_members(s),
+            ResultModifierKind::OrderModifier(value) => value.write_members(s),
+            ResultModifierKind::LegacyLimitPercentModifier(value) => value.write_members(s),
+        }
+    }
 }
 
 impl Deserialize for ResultModifier {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for ResultModifier {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -2202,11 +2961,21 @@ impl CommonTableExpressionMap {
         let map = d.read_property_with_default::<Vec<(String, Option<Box<CommonTableExpressionInfo>>)>>(100, "map")?;
         Ok(Self { map })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(100, "map", &self.map);
+    }
 }
 
 impl Deserialize for CommonTableExpressionMap {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for CommonTableExpressionMap {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -2264,11 +3033,38 @@ impl TableRef {
             kind,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(100, "type", &self.type_);
+        s.write_property_with_default(101, "alias", &self.alias);
+        s.write_property_with_default(102, "sample", &self.sample);
+        if let Some(value) = &self.query_location {
+            s.write_property(103, "query_location", value);
+        }
+        if let Some(value) = &self.query_location_length {
+            s.write_property(104, "query_location_length", value);
+        }
+        match &self.kind {
+            TableRefKind::BaseTableRef(value) => value.write_members(s),
+            TableRefKind::JoinRef(value) => value.write_members(s),
+            TableRefKind::SubqueryRef(value) => value.write_members(s),
+            TableRefKind::TableFunctionRef(value) => value.write_members(s),
+            TableRefKind::EmptyTableRef(value) => value.write_members(s),
+            TableRefKind::ExpressionListRef(value) => value.write_members(s),
+            TableRefKind::PivotRef(value) => value.write_members(s),
+        }
+    }
 }
 
 impl Deserialize for TableRef {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for TableRef {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -2299,11 +3095,28 @@ impl SampleOptions {
             sample_rate,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(100, "sample_size", &self.sample_size);
+        s.write_property_with_default(101, "is_percentage", &self.is_percentage);
+        s.write_property(102, "method", &self.method);
+        s.write_property_with_default(103, "seed", &self.seed);
+        s.write_property_with_default(104, "repeatable", &self.repeatable);
+        if let Some(value) = &self.sample_rate {
+            s.write_property(105, "sample_rate", value);
+        }
+    }
 }
 
 impl Deserialize for SampleOptions {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for SampleOptions {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -2325,6 +3138,14 @@ impl LimitModifier {
             limit_type,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "limit", &self.limit);
+        s.write_property_with_default(201, "offset", &self.offset);
+        if let Some(value) = &self.limit_type {
+            s.write_property(202, "limit_type", value);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2338,6 +3159,10 @@ impl DistinctModifier {
             d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(200, "distinct_on_targets")?;
         Ok(Self { distinct_on_targets })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "distinct_on_targets", &self.distinct_on_targets);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2349,6 +3174,10 @@ impl OrderModifier {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         let orders = d.read_property_with_default::<Vec<OrderByNode>>(200, "orders")?;
         Ok(Self { orders })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "orders", &self.orders);
     }
 }
 
@@ -2363,6 +3192,11 @@ impl LegacyLimitPercentModifier {
         let limit = d.read_property_with_default::<Option<Box<ParsedExpression>>>(200, "limit")?;
         let offset = d.read_property_with_default::<Option<Box<ParsedExpression>>>(201, "offset")?;
         Ok(Self { limit, offset })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "limit", &self.limit);
+        s.write_property_with_default(201, "offset", &self.offset);
     }
 }
 
@@ -2394,11 +3228,25 @@ impl CommonTableExpressionInfo {
             query_node,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(100, "aliases", &self.aliases);
+        s.write_property(102, "materialized", &self.materialized);
+        s.write_property_with_default(103, "key_targets", &self.key_targets);
+        s.write_property_with_default(104, "payload_aggregates", &self.payload_aggregates);
+        s.write_property_with_default(105, "query_node", &self.query_node);
+    }
 }
 
 impl Deserialize for CommonTableExpressionInfo {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for CommonTableExpressionInfo {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -2428,6 +3276,17 @@ impl BaseTableRef {
             at_clause,
             qualified_name,
         })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "schema_name", &self.schema_name);
+        s.write_property_with_default(201, "table_name", &self.table_name);
+        s.write_property_with_default(202, "column_name_alias", &self.column_name_alias);
+        s.write_property_with_default(203, "catalog_name", &self.catalog_name);
+        s.write_property_with_default(204, "at_clause", &self.at_clause);
+        if let Some(value) = &self.qualified_name {
+            s.write_property(205, "qualified_name", value);
+        }
     }
 }
 
@@ -2481,6 +3340,30 @@ impl JoinRef {
             nearest_approx,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "left", &self.left);
+        s.write_property_with_default(201, "right", &self.right);
+        s.write_property_with_default(202, "condition", &self.condition);
+        s.write_property(203, "join_type", &self.join_type);
+        s.write_property(204, "ref_type", &self.ref_type);
+        s.write_property_with_default(205, "using_columns", &self.using_columns);
+        s.write_property_with_default(206, "delim_flipped", &self.delim_flipped);
+        s.write_property_with_default(207, "duplicate_eliminated_columns", &self.duplicate_eliminated_columns);
+        if let Some(value) = &self.is_implicit {
+            s.write_property(208, "is_implicit", value);
+        }
+        s.write_property_with_default(209, "ranking_expression", &self.ranking_expression);
+        if let Some(value) = &self.nearest_count {
+            s.write_property(210, "nearest_count", value);
+        }
+        if let Some(value) = &self.nearest_order_type {
+            s.write_property(211, "nearest_order_type", value);
+        }
+        if let Some(value) = &self.nearest_approx {
+            s.write_property(212, "nearest_approx", value);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2497,6 +3380,11 @@ impl SubqueryRef {
             subquery,
             column_name_alias,
         })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "subquery", &self.subquery);
+        s.write_property_with_default(201, "column_name_alias", &self.column_name_alias);
     }
 }
 
@@ -2518,6 +3406,14 @@ impl TableFunctionRef {
             with_ordinality,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "function", &self.function);
+        s.write_property_with_default(201, "column_name_alias", &self.column_name_alias);
+        if let Some(value) = &self.with_ordinality {
+            s.write_property(202, "with_ordinality", value);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2527,6 +3423,8 @@ impl EmptyTableRef {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         Ok(Self {})
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {}
 }
 
 #[derive(Debug, Clone)]
@@ -2546,6 +3444,12 @@ impl ExpressionListRef {
             expected_types,
             values,
         })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "expected_names", &self.expected_names);
+        s.write_property_with_default(201, "expected_types", &self.expected_types);
+        s.write_property_with_default(202, "values", &self.values);
     }
 }
 
@@ -2579,6 +3483,16 @@ impl PivotRef {
             include_nulls,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "source", &self.source);
+        s.write_property_with_default(201, "aggregates", &self.aggregates);
+        s.write_property_with_default(202, "unpivot_names", &self.unpivot_names);
+        s.write_property_with_default(203, "pivots", &self.pivots);
+        s.write_property_with_default(204, "groups", &self.groups);
+        s.write_property_with_default(205, "column_name_alias", &self.column_name_alias);
+        s.write_property_with_default(206, "include_nulls", &self.include_nulls);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2599,11 +3513,23 @@ impl OrderByNode {
             expression,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(100, "type", &self.type_);
+        s.write_property(101, "null_order", &self.null_order);
+        s.write_property_with_default(102, "expression", &self.expression);
+    }
 }
 
 impl Deserialize for OrderByNode {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for OrderByNode {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -2619,11 +3545,22 @@ impl AtClause {
         let expr = d.read_property_with_default::<Option<Box<ParsedExpression>>>(2, "expr")?;
         Ok(Self { unit, expr })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(1, "unit", &self.unit);
+        s.write_property_with_default(2, "expr", &self.expr);
+    }
 }
 
 impl Deserialize for AtClause {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for AtClause {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -2649,11 +3586,24 @@ impl PivotColumn {
             pivot_enum,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(100, "pivot_expressions", &self.pivot_expressions);
+        s.write_property_with_default(101, "unpivot_names", &self.unpivot_names);
+        s.write_property_with_default(102, "entries", &self.entries);
+        s.write_property_with_default(103, "pivot_enum", &self.pivot_enum);
+    }
 }
 
 impl Deserialize for PivotColumn {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for PivotColumn {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -2675,10 +3625,22 @@ impl PivotColumnEntry {
             alias,
         })
     }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(100, "values", &self.values);
+        s.write_property_with_default(101, "star_expr", &self.star_expr);
+        s.write_property_with_default(102, "alias", &self.alias);
+    }
 }
 
 impl Deserialize for PivotColumnEntry {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for PivotColumnEntry {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }

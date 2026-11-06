@@ -34,10 +34,10 @@ const STANDARD_VECTOR_SIZE: u64 = 2048;
 /// `INVALID_BLOCK`.
 pub const INVALID_BLOCK: u64 = u64::MAX;
 
-/// The version a file made here says it has: v1.0.0's, the oldest that DuckDB still reads, which
-/// `SerializationVersion` 1 goes with. Nothing newer has to be written yet.
-const NEW_FILE_VERSION_NUMBER: u64 = 64;
-const NEW_FILE_SERIALIZATION_VERSION: u64 = 1;
+/// What a file made here says it is: v2.0.0, as checkpoints write it, where the main header gives
+/// up the version for the one in the database headers.
+const NEW_FILE_VERSION_NUMBER: u64 = DEPRECATED_VERSION_NUMBER;
+const NEW_FILE_SERIALIZATION_VERSION: u64 = 69;
 /// `MainHeader::DB_IDENTIFIER_LEN`.
 pub const DB_IDENTIFIER_LEN: usize = 16;
 /// `MainHeader::ENCRYPTION_METADATA_LEN`.
@@ -264,6 +264,8 @@ impl SingleFileBlockManager {
         let desc_at = 12 + FLAG_COUNT * 8;
         let version = concat!("duckrs ", env!("CARGO_PKG_VERSION")).as_bytes();
         data[desc_at..desc_at + version.len()].copy_from_slice(version);
+        let identifier_at = desc_at + 2 * MAX_VERSION_SIZE + ENCRYPTION_METADATA_LEN;
+        data[identifier_at..identifier_at + DB_IDENTIFIER_LEN].copy_from_slice(&new_db_identifier(path));
         write_checked(&mut file, path, 0, &mut buffer)?;
 
         let header = DatabaseHeader {
@@ -396,6 +398,19 @@ impl SingleFileBlockManager {
         state.header = header;
         Ok(())
     }
+}
+
+/// `GenerateDBIdentifier`: only has to tell files apart, for logs that end up with the wrong one.
+fn new_db_identifier(path: &Path) -> [u8; DB_IDENTIFIER_LEN] {
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let time = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |t| t.as_nanos());
+    let mut result = [0; DB_IDENTIFIER_LEN];
+    for (part, bytes) in result.chunks_exact_mut(8).enumerate() {
+        let hash = BuildHasherDefault::<DefaultHasher>::default().hash_one((part, time, std::process::id(), path));
+        bytes.copy_from_slice(&hash.to_le_bytes());
+    }
+    result
 }
 
 /// `ReadAndChecksum`.

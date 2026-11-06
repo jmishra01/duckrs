@@ -7,6 +7,7 @@
 pub mod convert;
 pub mod custom;
 pub mod generated;
+pub mod to_stored;
 
 use super::block_manager::corrupt;
 use duckrs_common::serializer::{BinaryDeserializer, Deserialize};

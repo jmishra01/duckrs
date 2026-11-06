@@ -30,9 +30,9 @@ impl Database {
         })
     }
 
-    /// Opens a database file. What is in the file is read into memory, and it takes no writes
-    /// until storing them is ported. If there is no file, the database lives in memory and
-    /// nothing is written to `path` yet.
+    /// Opens a database file, or makes it if there is none and `read_only` isn't set. Tables stay in
+    /// the file. What changes is written to it on `CHECKPOINT` and when the database goes away;
+    /// there is no write-ahead log yet, so a crash loses what was written since the last checkpoint.
     pub fn open(path: impl AsRef<Path>, read_only: bool) -> Result<Self> {
         Ok(Self {
             instance: DatabaseInstance::open_file(path.as_ref(), read_only)?,

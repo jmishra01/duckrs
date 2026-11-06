@@ -50,6 +50,13 @@ impl BufferManager {
         self.state.lock().used
     }
 
+    /// Forgets all blocks, after a checkpoint that changed what they hold.
+    pub fn clear(&self) {
+        let mut state = self.state.lock();
+        state.cached.clear();
+        state.used = 0;
+    }
+
     /// `Pin`: what the block holds.
     pub fn pin(&self, block_id: u64) -> Result<Arc<Vec<u8>>> {
         let mut state = self.state.lock();

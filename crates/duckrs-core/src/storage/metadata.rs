@@ -8,7 +8,7 @@
 use super::block_manager::{INVALID_BLOCK, corrupt};
 use super::buffer_manager::BufferManager;
 use duckrs_common::Result;
-use duckrs_common::serializer::{BinaryDeserializer, Deserialize};
+use duckrs_common::serializer::{BinaryDeserializer, BinarySerializer, Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// `METADATA_BLOCK_COUNT`.
@@ -49,6 +49,15 @@ impl Deserialize for MetaBlockPointer {
                 offset: d.read_property_with_default(101, "offset")?,
             })
         })
+    }
+}
+
+impl Serialize for MetaBlockPointer {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| {
+            s.write_property_with_default(100, "block_pointer", &self.block_pointer);
+            s.write_property_with_default(101, "offset", &self.offset);
+        });
     }
 }
 

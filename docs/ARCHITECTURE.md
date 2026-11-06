@@ -327,10 +327,8 @@ sequences and types; tables are not scanned in place yet and nothing but the blo
 What is read comes from outside, so it is bounds-checked, and damage is an error, never a panic.
 Segment counts must add up to their column's rows before anything is decoded or allocated.
 
-A file opened read-only stays as it is, and the file is only ever opened read-only for now. A database
-opened for writing fails on any write, as storing it
-is not ported and the change would get lost at the end. A file that does not exist is an in-memory
-database as before: new files are not written, which the corpus relies on until checkpoints work.
+A file opened read-only stays as it is. A file opened for writing, or made because there was none,
+takes writes, which go to it with `CHECKPOINT` and when the database goes away.
 
 These fail with an error that says they are not ported, because going on would give wrong answers
 or lose data:
@@ -342,7 +340,19 @@ or lose data:
 - in a stored query: INSERT, UPDATE, DELETE, MERGE, COPY, SHOW and MATCH_RECOGNIZE;
 - `ALTER` and updates of a field of a STRUCT in a write-ahead log, encrypted files and logs.
 
-Next, in order: checkpoints, for which the block layer is ready. `ATTACH` follows from there. ZSTD takes a new
+These stop writes, or fail when they are made, as a file can't hold them yet:
+
+- keys and indexes in a file: C++ keeps the ART of each in the file, and with none it takes the table
+  for one without data and stops enforcing the keys. That has to wait for Phase 10. A file that has
+  them can be read, and takes no writes;
+- files from before v2.0.0, which can be read but not checkpointed into, as checkpoints write v2.0.0;
+- VARIANT and GEOMETRY columns, and in a stored query what can't be read from one either. These fail
+  at the checkpoint and not before, so on closing the database they are a message on stderr.
+
+A statement that commits is only in memory until the next checkpoint: writing the log is not ported,
+so a crash loses what came after it.
+
+Next, in order: `ATTACH`, then writing the log. ZSTD takes a new
 dependency, and Chimp and Patas are only in old files.
 
 **Indexes**: the ART of each index is parsed past and not read, whichever way the file points to it
@@ -352,6 +362,21 @@ as the engine keeps its keys unique from the rows (`TableCatalogEntry::unique_ke
 needed) until Phase 10 ports the ART. A `CREATE INDEX` entry goes through `bind_create_index` and
 joins the table without a scan, as the file has these rows under the index already. An index of a
 type that isn't ART came with an extension; as nothing here reads it, it is treated like the others.
+
+**Checkpoints** (`writer`, `to_stored`): the whole database goes into blocks that the last checkpoint
+doesn't use, and a new header makes it count, so that a crash leaves the last checkpoint as it was.
+Afterwards every table is back in the file, and the blocks of the last checkpoint are free. Tables
+are read through `TableCursor` as they are written, so that doesn't take them into memory either.
+
+Files are v2.0.0, where constants are literals and casts name parsed types, so the AST goes into a
+file nearly as it is. Everything is uncompressed, as compression is the analysis of each codec and
+changes nothing about the format. Segments share blocks, as a block per column would make small tables
+large, which DuckDB has to be told of in `multi_use_blocks`. After the free list a file has the list of
+metadata blocks with their free sub-blocks: nothing in `duckrs` reads it, but C++ doesn't find them
+otherwise. Numeric columns have bounds; strings say that nothing is known of them.
+
+`tools/check_written.py` has the v2.0.0 reference engine read a file from `write_database_file.rs`,
+and then write to it, so that it frees and reuses blocks by what the file says.
 
 **Tables in place** (`DiskTable`, `TableCursor`): rows stay in the file, and `TableSource` is how the
 engine reaches them without knowing about files. A scan decodes the row group it is at, only the

@@ -11,11 +11,13 @@ pub mod serialization;
 pub mod statistics;
 pub mod table_data;
 mod wal;
+pub mod writer;
 
 use crate::catalog::Catalog;
 use block_manager::SingleFileBlockManager;
 use buffer_manager::BufferManager;
-use duckrs_common::Result;
+use duckrs_common::{Error, ErrorKind, Result};
+use metadata::MetaBlockPointer;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -29,18 +31,33 @@ pub fn is_database_file(path: &Path) -> bool {
 }
 
 /// Puts what the last checkpoint of the file at `path` left into `catalog`, with what its write-ahead
-/// log committed since. The file is opened read-only: it and the log stay as they are.
-pub fn load_database(path: &Path, catalog: &Catalog) -> Result<()> {
-    let blocks = Arc::new(SingleFileBlockManager::open(path, true)?);
+/// log committed since. The tables stay in the file, which is what the result reads them through.
+pub fn load_database(path: &Path, catalog: &Catalog, read_only: bool) -> Result<Arc<BufferManager>> {
+    let blocks = Arc::new(SingleFileBlockManager::open(path, read_only)?);
     let buffer = Arc::new(BufferManager::new(blocks, BUFFER_MEMORY));
     metadata::load_free_list(&buffer)?;
     let records = wal::read_records(path, &buffer)?;
     let stored = checkpoint::read_catalog(&buffer)?;
-    let mut replay = wal::Replay::new(buffer, catalog);
+    let mut replay = wal::Replay::new(buffer.clone(), catalog);
     for entry in stored.entries {
         replay.add_entry(entry)?;
     }
-    replay.replay(records)
+    replay.replay(records)?;
+    Ok(buffer)
+}
+
+/// A new database file, for `load_database`.
+pub fn create_database(path: &Path) -> Result<()> {
+    if std::fs::metadata(path).is_ok() {
+        std::fs::remove_file(path).map_err(|e| Error::new(ErrorKind::Io, format!("{}: {e}", path.display())))?;
+    }
+    SingleFileBlockManager::create(path, block_manager::DEFAULT_BLOCK_ALLOC_SIZE).map(drop)
+}
+
+/// Whether checkpoints can go into this file: they write v2.0.0, which an older file isn't.
+pub fn takes_checkpoints(buffer: &BufferManager) -> bool {
+    let header = buffer.block_manager().header();
+    !checkpoint::is_before_v2(&header) || !MetaBlockPointer::new(header.meta_block, 0).is_valid()
 }
 
 #[cfg(test)]
@@ -57,7 +74,7 @@ mod tests {
             .join("../duckrs/tests/fixtures")
             .join(file);
         let catalog = Catalog::new("test");
-        load_database(&path, &catalog).unwrap();
+        load_database(&path, &catalog, true).unwrap();
         catalog
     }
 
@@ -165,7 +182,7 @@ mod tests {
     fn a_group_is_read_a_column_at_a_time() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../duckrs/tests/fixtures/scan_v122880.db");
         let catalog = Catalog::new("test");
-        load_database(&path, &catalog).unwrap();
+        load_database(&path, &catalog, true).unwrap();
         let table = catalog.get_table(None, "big").unwrap();
         let source = table.source().unwrap();
         let chunk = source.read_group(1, &[0]).unwrap();

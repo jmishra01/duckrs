@@ -18,7 +18,7 @@ use duckrs_common::{Error, Result};
 use duckrs_parser::ast;
 
 /// `StorageVersion::V2_0_0`. Older files have a smaller number here.
-const STORAGE_VERSION_V2_0_0: u64 = 69;
+pub(super) const STORAGE_VERSION_V2_0_0: u64 = 69;
 
 pub(super) fn is_before_v2(header: &DatabaseHeader) -> bool {
     header.storage_compatibility < STORAGE_VERSION_V2_0_0

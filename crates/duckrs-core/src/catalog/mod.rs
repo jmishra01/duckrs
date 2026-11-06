@@ -363,6 +363,13 @@ impl TableCatalogEntry {
         Ok(())
     }
 
+    /// A checkpoint put the rows in a file: what is in memory of them goes.
+    pub fn leave_in_file(&self, source: Arc<dyn TableSource>) {
+        let types = self.types();
+        *self.write_loaded_storage() = ColumnDataCollection::new(types);
+        *self.source.write() = Some(source);
+    }
+
     /// Reads rows that are still in a file into memory.
     fn load_rows(&self) -> Result<()> {
         if self.source.read().is_none() {
@@ -557,6 +564,11 @@ pub struct SequenceCatalogEntry {
 }
 
 impl SequenceCatalogEntry {
+    /// Its state, for a checkpoint.
+    pub fn data(&self) -> SequenceData {
+        self.data.lock().clone()
+    }
+
     /// The state that a write-ahead log recorded (`ReplayValue`).
     pub fn replay_value(&self, counter: i64, last_value: Option<i64>) {
         let mut data = self.data.lock();
@@ -747,6 +759,19 @@ impl SchemaCatalogEntry {
     }
 
     /// Drops a type, returning whether it existed.
+    /// The custom types, by name.
+    pub fn type_entries(&self) -> Vec<(String, LogicalType)> {
+        self.types.read().iter().map(|(n, t)| (n.clone(), t.clone())).collect()
+    }
+
+    pub fn sequence_entries(&self) -> Vec<Arc<SequenceCatalogEntry>> {
+        self.sequences.read().values().cloned().collect()
+    }
+
+    pub fn macro_entries(&self, table_macro: bool) -> Vec<Arc<MacroCatalogEntry>> {
+        self.macros[usize::from(table_macro)].read().values().cloned().collect()
+    }
+
     pub fn drop_type(&self, name: &str) -> bool {
         self.types.write().remove(&key(name)).is_some()
     }

@@ -99,7 +99,8 @@ impl BinarySerializer {
         self.buf
     }
 
-    fn write_field(&mut self, field_id: u16) {
+    /// The id of a field, for a value that writes itself.
+    pub fn write_field(&mut self, field_id: u16) {
         self.buf.extend_from_slice(&field_id.to_le_bytes());
     }
 
@@ -646,6 +647,15 @@ impl<T: Deserialize> Deserialize for Option<T> {
     }
     fn default_value() -> Option<Self> {
         Some(None)
+    }
+}
+
+impl<T: Serialize> Serialize for Box<T> {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        (**self).write_value(s);
+    }
+    fn is_default(&self) -> bool {
+        (**self).is_default()
     }
 }
 

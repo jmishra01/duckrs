@@ -9,8 +9,8 @@ pub mod settings;
 mod settings_table;
 
 use crate::catalog::{
-    Catalog, CatalogSnapshot, DEFAULT_CATALOG, OnCreateConflict, SequenceData, TEMP_SCHEMA, TableOrView,
-    macro_type_name, missing_entry,
+    Catalog, CatalogSnapshot, DEFAULT_CATALOG, OnCreateConflict, SequenceData, TEMP_SCHEMA, TableConstraint,
+    TableOrView, macro_type_name, missing_entry,
 };
 use crate::execution::alter::{execute_alter, execute_create_index};
 use crate::execution::expression_executor::evaluate_scalar;
@@ -24,6 +24,7 @@ use crate::planner::binder::{
 use crate::planner::binder::{SessionValues, ShowBehavior, enum_type_from, is_builtin_type};
 use crate::planner::column_binding_resolver::resolve_column_bindings;
 use crate::storage;
+use crate::storage::buffer_manager::BufferManager;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::OrderType;
 use duckrs_common::types::LogicalType;
@@ -39,7 +40,9 @@ use parking_lot::{Mutex, RwLock};
 use settings::SettingValues;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A database (`DatabaseInstance`): its catalog, its global settings and, with Phase 9, its
@@ -51,8 +54,20 @@ pub struct DatabaseInstance {
     transactions: Mutex<OpenTransactions>,
     /// held to read while a SELECT runs, and to write while anything else does
     statements: RwLock<()>,
-    /// Set when this database came from a file, which nothing writes to yet.
+    /// Set when this database came from a file that takes no writes.
     file_access: Option<FileAccess>,
+    /// The file of this database, if it has one that checkpoints go to.
+    file: Option<DatabaseFile>,
+    /// Whether anything changed since the last checkpoint.
+    changed: AtomicBool,
+}
+
+/// Where a checkpoint goes. Without a write-ahead log, what isn't checkpointed is only in memory.
+#[derive(Debug)]
+struct DatabaseFile {
+    path: PathBuf,
+    name: String,
+    buffer: Arc<BufferManager>,
 }
 
 /// Why a database that came from a file takes no writes.
@@ -82,6 +97,8 @@ impl DatabaseInstance {
             transactions: Mutex::new(OpenTransactions::default()),
             statements: RwLock::new(()),
             file_access,
+            file: None,
+            changed: AtomicBool::new(false),
         }
     }
 
@@ -92,24 +109,87 @@ impl DatabaseInstance {
     /// A database with what is in the file at `path`. Without a database there it stays in memory
     /// and goes away at the end, as all of them did before storage: a new file is not written yet.
     pub fn open_file(path: &Path, read_only: bool) -> Result<Arc<Self>> {
-        if !storage::is_database_file(path) {
+        if read_only && !storage::is_database_file(path) {
             return Ok(Self::new());
         }
+        if !storage::is_database_file(path) {
+            storage::create_database(path)?;
+        }
         let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
-        let access = if read_only {
-            FileAccess::ReadOnly(name)
+        let mut db = Self::with_file_access(None);
+        let buffer = storage::load_database(path, &db.catalog, read_only)?;
+        db.file_access = if read_only {
+            Some(FileAccess::ReadOnly(name.clone()))
+        } else if !storage::takes_checkpoints(&buffer) || db.has_keys() {
+            Some(FileAccess::WritesNotPorted)
         } else {
-            FileAccess::WritesNotPorted
+            None
         };
-        let db = Self::with_file_access(Some(access));
-        storage::load_database(path, &db.catalog)?;
+        db.file = Some(DatabaseFile {
+            path: path.to_path_buf(),
+            name,
+            buffer,
+        });
         Ok(Arc::new(db))
+    }
+
+    /// Whether a table has what a checkpoint can't write until Phase 10 ports the ART.
+    fn has_keys(&self) -> bool {
+        self.catalog.schemas().iter().any(|schema| {
+            schema.tables_and_views().iter().any(|entry| match entry {
+                TableOrView::Table(table) => {
+                    !table.indexes.read().is_empty()
+                        || table
+                            .constraints
+                            .iter()
+                            .any(|c| !matches!(c, TableConstraint::Check { .. }))
+                }
+                TableOrView::View(_) => false,
+            })
+        })
+    }
+
+    /// Writes all of the database to its file, if it has one that takes it.
+    fn write_checkpoint(&self) -> Result<()> {
+        let Some(file) = self.file.as_ref().filter(|_| self.file_access.is_none()) else {
+            return Ok(());
+        };
+        if !self.changed.swap(false, AtomicOrdering::SeqCst) {
+            return Ok(());
+        }
+        storage::writer::write_checkpoint(&file.path, &file.buffer, &self.catalog, &file.name).inspect_err(|_| {
+            self.changed.store(true, AtomicOrdering::SeqCst);
+        })
+    }
+
+    /// What a file can't hold yet has to fail when it is made: at a checkpoint it would be too late.
+    fn check_storable(&self, statement: &Statement) -> Result<()> {
+        use duckrs_parser::ast::{AlterKind, Constraint};
+        let is_key = |c: &Constraint| matches!(c, Constraint::Unique { .. } | Constraint::ForeignKey { .. });
+        let unstorable = match statement {
+            Statement::CreateTable(info) => !info.temporary && info.constraints.iter().any(is_key),
+            Statement::Create(info) => matches!(info.kind, CreateKind::Index { .. }),
+            Statement::Alter(info) => matches!(&info.kind, AlterKind::AddConstraint(c) if is_key(c)),
+            _ => false,
+        };
+        if unstorable {
+            return Err(Error::not_implemented(
+                "keys and indexes in a database file need the ART of Phase 10, which is not yet ported to duckrs",
+            ));
+        }
+        Ok(())
     }
 
     /// Fails if this database takes no writes.
     fn check_writable(&self, statement: &Statement) -> Result<()> {
         match &self.file_access {
-            None => Ok(()),
+            None => {
+                if self.file.is_some() {
+                    self.check_storable(statement)?;
+                    self.changed.store(true, AtomicOrdering::SeqCst);
+                }
+                Ok(())
+            }
             Some(FileAccess::ReadOnly(name)) => Err(Error::new(
                 ErrorKind::InvalidInput,
                 format!(
@@ -118,7 +198,8 @@ impl DatabaseInstance {
                 ),
             )),
             Some(FileAccess::WritesNotPorted) => Err(Error::not_implemented(
-                "writing to a database file is not yet ported to duckrs",
+                "writing to this database file is not yet ported to duckrs: it is from a version before \
+                 v2.0.0, or it has keys or indexes",
             )),
         }
     }
@@ -679,8 +760,7 @@ impl ClientContext {
         })
     }
 
-    /// `CheckpointFunction`. In memory there is nothing to write, so only its errors are left;
-    /// Phase 12 brings the rest with the storage.
+    /// `CheckpointFunction`. In memory there is nothing to write, so only its errors are left.
     fn checkpoint(&mut self, function: &Expr) -> Result<MaterializedQueryResult> {
         let (force, argument) = checkpoint_call(function).expect("checked by the caller");
         if let Some(argument) = argument {
@@ -710,6 +790,7 @@ impl ClientContext {
                 ));
             }
         }
+        self.db.write_checkpoint()?;
         Ok(Self::success())
     }
 
@@ -916,6 +997,16 @@ fn on_create_conflict(conflict: AstConflict) -> OnCreateConflict {
         AstConflict::Error => OnCreateConflict::Error,
         AstConflict::Ignore => OnCreateConflict::Ignore,
         AstConflict::Replace => OnCreateConflict::Replace,
+    }
+}
+
+impl Drop for DatabaseInstance {
+    /// `CheckpointOnShutdown`: there is no log yet, so what was written since the last checkpoint
+    /// has nowhere else to go.
+    fn drop(&mut self) {
+        if let Err(error) = self.write_checkpoint() {
+            eprintln!("duckrs: failed to write to the database file: {error}");
+        }
     }
 }
 

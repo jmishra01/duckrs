@@ -6,8 +6,8 @@ enums in the C++ headers, and writes readers that follow them field by field, so
 format stays in step with upstream mechanically.
 
 C++ deserializes into the classes of its parser. The AST of duckrs has a shape of its own, so this
-writes structs that mirror the specs, and `serialization/convert.rs` turns those into the AST by
-hand. Only reading is generated: nothing writes these objects yet.
+writes structs that mirror the specs, and `serialization/convert.rs` and `to_stored.rs` turn those
+into the AST and back by hand. Objects are read as any version wrote them and written as v2.0.0.
 
     python3 tools/generate_serialization.py [--duckdb-root ../duckdb]
 """
@@ -260,6 +260,18 @@ class Generator:
         class_type = entry["class_type"]
         return next(m for m in entry["members"] if class_type in (m["name"], m.get("property")))
 
+    def field_write(self, member):
+        """The write of a member as v2.0.0 has it. Fields of older versions stay out."""
+        if member.get("status") in ("deleted", "read_only") or member.get("serialize_until") == "v2.0.0":
+            return ""
+        name = self.field_name(member)
+        field, tag = member["id"], member["name"]
+        if self.is_option(member):
+            return f'        if let Some(value) = &self.{name} {{ s.write_property({field}, "{tag}", value); }}\n'
+        if self.has_natural_default(member):
+            return f'        s.write_property_with_default({field}, "{tag}", &self.{name});\n'
+        return f'        s.write_property({field}, "{tag}", &self.{name});\n'
+
     def generate_plain(self, entry, members):
         """The struct of a class, and `read_members`, for its properties without the object around them."""
         name = entry["class"]
@@ -269,7 +281,10 @@ class Generator:
         out += f"impl {name} {{\n    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {{\n"
         out += "".join(map(self.field_read, members))
         fields = ", ".join(self.field_name(m) for m in members if m.get("status") != "deleted")
-        out += f"        Ok(Self {{ {fields} }})\n    }}\n}}\n\n"
+        out += f"        Ok(Self {{ {fields} }})\n    }}\n\n"
+        out += "    pub fn write_members(&self, s: &mut BinarySerializer) {\n"
+        out += "".join(map(self.field_write, members))
+        out += "    }\n}\n\n"
         return out
 
     @staticmethod
@@ -278,6 +293,10 @@ class Generator:
             f"impl Deserialize for {name} {{\n"
             "    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {\n"
             "        d.read_object_value(Self::read_members)\n"
+            "    }\n}\n\n"
+            f"impl Serialize for {name} {{\n"
+            "    fn write_value(&self, s: &mut BinarySerializer) {\n"
+            "        s.write_object_value(|s| self.write_members(s));\n"
             "    }\n}\n\n"
         )
 
@@ -309,7 +328,14 @@ class Generator:
         out += f"        let kind = match u64::from({self.field_name(discriminant)}) {{\n{arms}"
         out += f'            other => return Err(unknown("{name}", other)),\n        }};\n'
         fields = ", ".join(self.field_name(m) for m in members if m.get("status") != "deleted")
-        out += f"        Ok(Self {{ {fields}, kind }})\n    }}\n}}\n\n"
+        out += f"        Ok(Self {{ {fields}, kind }})\n    }}\n\n"
+        out += "    pub fn write_members(&self, s: &mut BinarySerializer) {\n"
+        out += "".join(map(self.field_write, members))
+        out += "        match &self.kind {\n"
+        for sub in self.bases[name]:
+            if sub["class"] not in NOT_PORTED:
+                out += f"            {name}Kind::{sub['class']}(value) => value.write_members(s),\n"
+        out += "        }\n    }\n}\n\n"
         return out + self.object_impl(name)
 
     def generate_class(self, name):
@@ -372,7 +398,7 @@ HEADER = """\
 use super::custom::{CastExpression, FunctionExpression, LambdaExpression, QualifiedName, WindowExpression};
 use super::{not_ported, unknown};
 use duckrs_common::Result;
-use duckrs_common::serializer::{BinaryDeserializer, Deserialize};
+use duckrs_common::serializer::{BinaryDeserializer, BinarySerializer, Deserialize, Serialize};
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
 
