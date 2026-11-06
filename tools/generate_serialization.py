@@ -29,10 +29,11 @@ SPECS = [
     "create_info",
     "nodes",
     "dependency",
+    "storage",
 ]
 
 # Where the generated readers start.
-ROOTS = ["CreateInfo", "FunctionArgument"]
+ROOTS = ["CreateInfo", "FunctionArgument", "IndexStorageInfo", "BlockPointer"]
 
 # C++ deserializes these by hand. They are written by hand in `custom.rs` too.
 CUSTOM = {"CastExpression", "FunctionExpression", "LambdaExpression", "WindowExpression", "QualifiedName"}
@@ -50,7 +51,6 @@ NOT_PORTED = {
     "InsertQueryNode": "INSERT in a stored query",
     "MergeQueryNode": "MERGE in a stored query",
     "CopyQueryNode": "COPY in a stored query",
-    "CreateIndexInfo": "indexes",
     "CreateTriggerInfo": "triggers",
 }
 
@@ -62,6 +62,7 @@ ENUMS = [
     "ConstraintCheckMode",
     "ExpressionType",
     "ForeignKeyType",
+    "IndexConstraintType",
     "JoinRefType",
     "JoinType",
     "LambdaSyntaxType",
@@ -93,6 +94,7 @@ NUMBERS = {
     "uint32_t": "u32",
     "uint64_t": "u64",
     "idx_t": "u64",
+    "block_id_t": "i64",
     "column_t": "u64",
     "double": "f64",
     "float": "f32",

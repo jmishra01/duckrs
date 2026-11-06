@@ -338,15 +338,22 @@ or lose data:
 
 - ZSTD, Chimp and Patas;
 - VARIANT and GEOMETRY columns;
-- indexes (of a table, or the ones that PRIMARY KEY, UNIQUE and FOREIGN KEY constraints come with),
-  and triggers;
+- triggers;
 - `CREATE TABLE ... AS` queries, partition and sort keys, table options, and schemas with options;
 - in a stored query: INSERT, UPDATE, DELETE, MERGE, COPY, SHOW and MATCH_RECOGNIZE;
 - a write-ahead log that waits to be replayed, encrypted files.
 
-Next, in order: indexes; WAL replay; scanning row groups in place through the buffer manager; then
+Next, in order: WAL replay; scanning row groups in place through the buffer manager; then
 checkpoints, for which the block layer is ready. `ATTACH` follows from there. ZSTD takes a new
 dependency, and Chimp and Patas are only in old files.
+
+**Indexes**: the ART of each index is parsed past and not read, whichever way the file points to it
+(`index_storage_infos`, or `index_pointers` and `root_block_pointer` in old files). C++ doesn't read
+it at load either: an `UnboundIndex` holds on to it until something needs it. Here nothing ever does,
+as the engine keeps its keys unique from the rows (`TableCatalogEntry::unique_keys`, built when first
+needed) until Phase 10 ports the ART. A `CREATE INDEX` entry goes through `bind_create_index` and
+joins the table without a scan, as the file has these rows under the index already. An index of a
+type that isn't ART came with an extension; as nothing here reads it, it is treated like the others.
 
 **Parsed objects** (`serialization`): `tools/generate_serialization.py` is the counterpart of
 DuckDB's generator. It reads the JSON specs and the enums of the C++ headers and writes
@@ -374,8 +381,7 @@ bytes of a block and fixes its checksum, to get past that to the decoders. Layou
 exactly and not just bounds: an FSST symbol table in the wrong place is corruption even if it is in
 bounds, as otherwise strings decode to garbage without an error.
 
-Of the 25 database files under DuckDB's `data` and `test`, 7 open. None fails on views, macros, types,
-constraints or dependencies between entries any more. The rest fail on indexes (4), Patas and Chimp
+Of the 25 database files under DuckDB's `data` and `test`, 11 open. The rest fail on Patas and Chimp
 (3), encryption (2) and a WAL (1), and 8 are refused as DuckDB refuses them: damaged, of another
 vector size, or too old.
 
@@ -383,8 +389,8 @@ vector size, or too old.
 Every view gives the rows that DuckDB gives, and on the v1.5.0 file `duckdb_views()` renders each
 query as DuckDB does, apart from the differences between the `ToString` of the 1.5.6 CLI that writes
 the fixtures and the baseline, which the test lists. The v2.0.0 file comes from the reference engine
-of the test runner, as the CLI is too old for it; its rendering isn't compared. PRIMARY KEY, UNIQUE
-and FOREIGN KEY constraints are converted but can't be tested until indexes are read.
+of the test runner, as the CLI is too old for it; its rendering isn't compared. Writes aren't ported, so
+`storage::tests` looks at the catalog for keys, foreign keys and indexes.
 
 The tests compare every column as the text that DuckDB prints, FLOAT and DOUBLE included.
 

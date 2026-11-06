@@ -37,3 +37,33 @@ CREATE MACRO twice(x) AS x * 2;
 CREATE MACRO add_default(a, b := 1) AS a + b;
 
 CREATE MACRO evens() AS TABLE SELECT i FROM base WHERE i % 2 = 0;
+
+CREATE TABLE parent (id INTEGER PRIMARY KEY, code VARCHAR UNIQUE, a INTEGER, b INTEGER, UNIQUE (a, b));
+
+INSERT INTO parent VALUES (1, 'one', 1, 1), (2, 'two', 1, 2);
+
+CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent (id), manager INTEGER REFERENCES child (id));
+
+INSERT INTO child VALUES (1, 1, NULL);
+
+INSERT INTO child VALUES (2, 2, 1);
+
+CREATE TABLE compound (x INTEGER, y VARCHAR, PRIMARY KEY (x, y));
+
+INSERT INTO compound VALUES (1, 'a'), (1, 'b');
+
+CREATE TABLE indexed (i INTEGER, s VARCHAR);
+
+INSERT INTO indexed VALUES (1, 'a'), (2, 'B'), (2, 'c');
+
+CREATE INDEX plain_index ON indexed (i);
+
+CREATE UNIQUE INDEX unique_index ON indexed (s);
+
+CREATE INDEX expression_index ON indexed (lower(s), (i + 1));
+
+CREATE TABLE other_schema.keyed (k INTEGER PRIMARY KEY);
+
+INSERT INTO other_schema.keyed VALUES (1);
+
+CREATE INDEX other_index ON other_schema.keyed (k);

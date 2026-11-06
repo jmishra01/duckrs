@@ -795,6 +795,28 @@ pub fn constraint(stored: g::Constraint) -> Result<Option<ast::Constraint>> {
     }))
 }
 
+/// `CREATE INDEX`, for the binder. An index of a type that isn't ART came with an extension, which C++
+/// doesn't need to read the table either, so here it is an index like any other: `duckrs` doesn't
+/// use indexes to answer queries, only to keep keys unique.
+pub fn create_index(schema: &str, stored: g::CreateIndexInfo) -> Result<ast::CreateInfo> {
+    use enums::index_constraint_type::*;
+    Ok(ast::CreateInfo {
+        name: ast::QualifiedName {
+            qualification: vec![schema.to_string()],
+            name: stored.name,
+        },
+        on_conflict: ast::OnCreateConflict::Error,
+        temporary: false,
+        kind: ast::CreateKind::Index {
+            table: stored.table,
+            unique: matches!(stored.constraint_type, UNIQUE | PRIMARY),
+            index_type: "ART".to_string(),
+            expressions: expressions(stored.parsed_expressions)?,
+            options: Vec::new(),
+        },
+    })
+}
+
 /// A column of a table: its definition and, if it is stored, its name and type.
 pub fn column(stored: g::ColumnDefinition) -> Result<(ast::ColumnDefinition, Option<(String, LogicalType)>)> {
     let expression = optional(stored.expression)?;

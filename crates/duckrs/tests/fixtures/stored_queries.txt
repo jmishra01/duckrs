@@ -43,3 +43,8 @@ SELECT * FROM evens() ORDER BY 1
 SELECT 'b'::mood AS m, i FROM base ORDER BY i
 SELECT i, doubled, label FROM with_everything ORDER BY i
 SELECT * FROM other_schema.t ORDER BY 1
+SELECT * FROM parent ORDER BY id
+SELECT * FROM child ORDER BY id
+SELECT * FROM compound ORDER BY 1, 2
+SELECT * FROM indexed ORDER BY 1, 2
+SELECT * FROM other_schema.keyed ORDER BY 1

@@ -22,19 +22,9 @@ const STORAGE_VERSION_V2_0_0: u64 = 69;
 
 fn not_ported_entry(entry_type: u64) -> Error {
     not_ported(match entry_type {
-        catalog_type::INDEX_ENTRY => "indexes",
         catalog_type::TRIGGER_ENTRY => "triggers",
         _ => "this kind of catalog entry",
     })
-}
-
-/// An index of a table, which fails the load if a file has one.
-struct IndexNotPorted;
-
-impl Deserialize for IndexNotPorted {
-    fn read_value(_: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        Err(not_ported("indexes"))
-    }
 }
 
 /// A stored column of a table in a file.
@@ -124,6 +114,7 @@ pub enum StoredEntry {
         name: String,
         ty: LogicalType,
     },
+    Index(Box<ast::CreateInfo>),
 }
 
 /// The catalog of a file.
@@ -255,6 +246,7 @@ fn read_entry(d: &mut BinaryDeserializer<'_>) -> Result<Pending> {
         catalog_type::VIEW_ENTRY,
         catalog_type::SEQUENCE_ENTRY,
         catalog_type::TYPE_ENTRY,
+        catalog_type::INDEX_ENTRY,
         catalog_type::MACRO_ENTRY,
         catalog_type::TABLE_MACRO_ENTRY,
     ]
@@ -287,8 +279,10 @@ fn read_entry(d: &mut BinaryDeserializer<'_>) -> Result<Pending> {
             let (definition, columns) = table_definition(&schema, stored)?;
             let pointer = d.read_property(101, "table_pointer")?;
             let total_rows = d.read_property(102, "total_rows")?;
-            d.read_property_with_default::<Vec<IndexNotPorted>>(103, "index_pointers")?;
-            d.read_property_with_default::<Vec<IndexNotPorted>>(104, "index_storage_infos")?;
+            // the ART of each index, which only lookups and writes need: C++ doesn't read them at
+            // load either, and the rows are all that `duckrs` keeps keys unique from
+            d.read_property_with_default::<Vec<g::BlockPointer>>(103, "index_pointers")?;
+            d.read_property_with_default::<Vec<g::IndexStorageInfo>>(104, "index_storage_infos")?;
             d.read_optional_property::<u64>(105, "next_row_id")?;
             let table = StoredTable {
                 schema,
@@ -299,6 +293,11 @@ fn read_entry(d: &mut BinaryDeserializer<'_>) -> Result<Pending> {
                 row_groups: Vec::new(),
             };
             return Ok(Pending::Table(Box::new(table), pointer));
+        }
+        g::CreateInfoKind::CreateIndexInfo(stored) => {
+            // where the ART is in files from before there were `index_storage_infos`
+            d.read_optional_property::<g::BlockPointer>(101, "root_block_pointer")?;
+            StoredEntry::Index(Box::new(convert::create_index(&schema, stored)?))
         }
         g::CreateInfoKind::CreateViewInfo(stored) => StoredEntry::View {
             schema,

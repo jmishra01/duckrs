@@ -233,6 +233,16 @@ fn a_check_constraint_comes_along() {
 }
 
 #[test]
+fn constraints_count_as_indexes() {
+    let expected = ["child|3", "compound|1", "indexed|3", "keyed|2", "parent|3"];
+    for file in ["parsed_v100.db", "parsed_v150.db", "parsed_v200.db"] {
+        let sql = "SELECT table_name, index_count FROM duckdb_tables()
+                   WHERE index_count > 0 ORDER BY table_name";
+        assert_eq!(column(&mut connect(file), sql), expected, "{file}");
+    }
+}
+
+#[test]
 fn a_read_only_file_takes_no_writes() {
     let mut connection = connect("compatible.db");
     let error = connection.query("INSERT INTO other.t VALUES (3, 'x')").unwrap_err();

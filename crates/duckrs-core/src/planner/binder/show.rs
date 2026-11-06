@@ -679,6 +679,11 @@ impl Binder<'_> {
                         .iter()
                         .filter(|c| matches!(c, TableConstraint::Check { .. }))
                         .count();
+                    let backing_indexes = table
+                        .constraints
+                        .iter()
+                        .filter(|c| matches!(c, TableConstraint::Unique { .. } | TableConstraint::ForeignKey(_)))
+                        .count();
                     rows.push(vec![
                         text(if temporary { "temp" } else { self.catalog.name.as_str() }),
                         Value::bigint(if temporary { 3 } else { 1 }),
@@ -693,7 +698,8 @@ impl Binder<'_> {
                         Value::boolean(primary),
                         Value::bigint(table.storage.read().len() as i64),
                         Value::bigint(table.logical_columns().len() as i64),
-                        Value::bigint(table.indexes.read().len() as i64),
+                        // C++ backs each UNIQUE, PRIMARY KEY and FOREIGN KEY with an index
+                        Value::bigint((table.indexes.read().len() + backing_indexes) as i64),
                         Value::bigint(checks as i64),
                         null_text(),
                     ]);

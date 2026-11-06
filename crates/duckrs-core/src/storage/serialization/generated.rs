@@ -192,6 +192,12 @@ pub mod enums {
         pub const FK_TYPE_FOREIGN_KEY_TABLE: u64 = 1;
         pub const FK_TYPE_SELF_REFERENCE_TABLE: u64 = 2;
     }
+    pub mod index_constraint_type {
+        pub const NONE: u64 = 0;
+        pub const UNIQUE: u64 = 1;
+        pub const PRIMARY: u64 = 2;
+        pub const FOREIGN: u64 = 3;
+    }
     pub mod join_ref_type {
         pub const REGULAR: u64 = 0;
         pub const NATURAL: u64 = 1;
@@ -361,6 +367,7 @@ pub struct CreateInfo {
 
 #[derive(Debug, Clone)]
 pub enum CreateInfoKind {
+    CreateIndexInfo(CreateIndexInfo),
     CreateTableInfo(CreateTableInfo),
     CreateSchemaInfo(CreateSchemaInfo),
     CreateViewInfo(CreateViewInfo),
@@ -384,7 +391,7 @@ impl CreateInfo {
         let extension_name = d.read_property_with_default::<String>(110, "extension_name")?;
         let qualified_name = d.read_optional_property::<QualifiedName>(111, "qualified_name")?;
         let kind = match u64::from(type_) {
-            enums::catalog_type::INDEX_ENTRY => return Err(not_ported("indexes")),
+            enums::catalog_type::INDEX_ENTRY => CreateInfoKind::CreateIndexInfo(CreateIndexInfo::read_members(d)?),
             enums::catalog_type::TABLE_ENTRY => CreateInfoKind::CreateTableInfo(CreateTableInfo::read_members(d)?),
             enums::catalog_type::SCHEMA_ENTRY => CreateInfoKind::CreateSchemaInfo(CreateSchemaInfo::read_members(d)?),
             enums::catalog_type::VIEW_ENTRY => CreateInfoKind::CreateViewInfo(CreateViewInfo::read_members(d)?),
@@ -439,6 +446,95 @@ impl FunctionArgument {
 impl Deserialize for FunctionArgument {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexStorageInfo {
+    pub name: String,
+    pub root: u64,
+    pub allocator_infos: Vec<FixedSizeAllocatorInfo>,
+    pub options: Vec<(String, Value)>,
+}
+
+impl IndexStorageInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let name = d.read_property_with_default::<String>(100, "name")?;
+        let root = d.read_property_with_default::<u64>(101, "root")?;
+        let allocator_infos = d.read_property_with_default::<Vec<FixedSizeAllocatorInfo>>(102, "allocator_infos")?;
+        let options = d.read_property_with_default::<Vec<(String, Value)>>(103, "options")?;
+        Ok(Self {
+            name,
+            root,
+            allocator_infos,
+            options,
+        })
+    }
+}
+
+impl Deserialize for IndexStorageInfo {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockPointer {
+    pub block_id: i64,
+    pub offset: u32,
+}
+
+impl BlockPointer {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let block_id = d.read_property::<i64>(100, "block_id")?;
+        let offset = d.read_property_with_default::<u32>(101, "offset")?;
+        Ok(Self { block_id, offset })
+    }
+}
+
+impl Deserialize for BlockPointer {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateIndexInfo {
+    pub name: String,
+    pub table: String,
+    pub constraint_type: u64,
+    pub parsed_expressions: Vec<Option<Box<ParsedExpression>>>,
+    pub scan_types: Vec<LogicalType>,
+    pub names: Vec<String>,
+    pub column_ids: Vec<u64>,
+    pub options: Vec<(String, Value)>,
+    pub index_type_name: String,
+}
+
+impl CreateIndexInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let name = d.read_property_with_default::<String>(200, "name")?;
+        let table = d.read_property_with_default::<String>(201, "table")?;
+        d.read_deleted_property::<u64>(202, "index_type")?;
+        let constraint_type = d.read_property::<u64>(203, "constraint_type")?;
+        let parsed_expressions =
+            d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(204, "parsed_expressions")?;
+        let scan_types = d.read_property_with_default::<Vec<LogicalType>>(205, "scan_types")?;
+        let names = d.read_property_with_default::<Vec<String>>(206, "names")?;
+        let column_ids = d.read_property_with_default::<Vec<u64>>(207, "column_ids")?;
+        let options = d.read_property_with_default::<Vec<(String, Value)>>(208, "options")?;
+        let index_type_name = d.read_property_with_default::<String>(209, "index_type_name")?;
+        Ok(Self {
+            name,
+            table,
+            constraint_type,
+            parsed_expressions,
+            scan_types,
+            names,
+            column_ids,
+            options,
+            index_type_name,
+        })
     }
 }
 
@@ -715,6 +811,41 @@ impl ParsedExpression {
 }
 
 impl Deserialize for ParsedExpression {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FixedSizeAllocatorInfo {
+    pub segment_size: u64,
+    pub buffer_ids: Vec<u64>,
+    pub block_pointers: Vec<BlockPointer>,
+    pub segment_counts: Vec<u64>,
+    pub allocation_sizes: Vec<u64>,
+    pub buffers_with_free_space: Vec<u64>,
+}
+
+impl FixedSizeAllocatorInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let segment_size = d.read_property_with_default::<u64>(100, "segment_size")?;
+        let buffer_ids = d.read_property_with_default::<Vec<u64>>(101, "buffer_ids")?;
+        let block_pointers = d.read_property_with_default::<Vec<BlockPointer>>(102, "block_pointers")?;
+        let segment_counts = d.read_property_with_default::<Vec<u64>>(103, "segment_counts")?;
+        let allocation_sizes = d.read_property_with_default::<Vec<u64>>(104, "allocation_sizes")?;
+        let buffers_with_free_space = d.read_property_with_default::<Vec<u64>>(105, "buffers_with_free_space")?;
+        Ok(Self {
+            segment_size,
+            buffer_ids,
+            block_pointers,
+            segment_counts,
+            allocation_sizes,
+            buffers_with_free_space,
+        })
+    }
+}
+
+impl Deserialize for FixedSizeAllocatorInfo {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
     }

@@ -197,7 +197,7 @@ fn build_keys(table: &TableCatalogEntry, rows: &ColumnDataCollection, first_new_
 }
 
 /// The key maps of `table`, of which `rows` are the rows.
-pub(super) fn current_keys<'a>(
+pub(crate) fn current_keys<'a>(
     table: &'a TableCatalogEntry,
     rows: &ColumnDataCollection,
 ) -> Result<MutexGuard<'a, Option<Vec<UniqueKeys>>>> {

@@ -88,6 +88,12 @@ pub fn load_database(path: &Path, catalog: &Catalog) -> Result<()> {
                 let schema = catalog.schema_for(Some(&schema))?;
                 schema.create_type(&name, ty, OnCreateConflict::Error)?;
             }
+            StoredEntry::Index(info) => {
+                // the file has these rows under the index already, so they aren't checked again
+                if let Some((table, index)) = Binder::new(catalog).bind_create_index(&info)? {
+                    table.indexes.write().push(Arc::new(index));
+                }
+            }
         }
     }
     Ok(())
@@ -114,4 +120,101 @@ fn load_table(buffer: &BufferManager, catalog: &Catalog, table: &StoredTable) ->
         .expect("OnCreateConflict::Error fails or creates");
     *entry.write_storage() = rows;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{TableCatalogEntry, TableConstraint};
+    use crate::execution::constraints::current_keys;
+
+    const FILES: [&str; 3] = ["parsed_v100.db", "parsed_v150.db", "parsed_v200.db"];
+
+    fn load(file: &str) -> Catalog {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../duckrs/tests/fixtures")
+            .join(file);
+        let catalog = Catalog::new("test");
+        load_database(&path, &catalog).unwrap();
+        catalog
+    }
+
+    fn keys(table: &TableCatalogEntry) -> Vec<(Vec<String>, bool)> {
+        table
+            .keys()
+            .into_iter()
+            .map(|key| (key.names, key.primary_key))
+            .collect()
+    }
+
+    fn names(names: &[&str], primary_key: bool) -> (Vec<String>, bool) {
+        (names.iter().map(ToString::to_string).collect(), primary_key)
+    }
+
+    #[test]
+    fn primary_keys_and_unique_constraints_come_along() {
+        for file in FILES {
+            let catalog = load(file);
+            let parent = catalog.get_table(None, "parent").unwrap();
+            assert_eq!(
+                keys(&parent),
+                [names(&["id"], true), names(&["code"], false), names(&["a", "b"], false)],
+                "{file}"
+            );
+            let compound = catalog.get_table(None, "compound").unwrap();
+            assert_eq!(keys(&compound), [names(&["x", "y"], true)], "{file}");
+            assert!(parent.columns[0].not_null, "{file}");
+            // the keys come from the rows, as the file doesn't give them
+            let rows = parent.storage.read();
+            let keys = current_keys(&parent, &rows).unwrap();
+            let sizes: Vec<usize> = keys.as_ref().unwrap().iter().map(|k| k.len()).collect();
+            assert_eq!(sizes, [2, 2, 2], "{file}");
+        }
+    }
+
+    #[test]
+    fn foreign_keys_come_along() {
+        for file in FILES {
+            let catalog = load(file);
+            let child = catalog.get_table(None, "child").unwrap();
+            let foreign: Vec<_> = child
+                .constraints
+                .iter()
+                .filter_map(|constraint| match constraint {
+                    TableConstraint::ForeignKey(key) => Some(key),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(foreign.len(), 2, "{file}");
+            let parent = foreign[0].referenced.as_ref().expect("another table");
+            assert_eq!(parent.name, "parent", "{file}");
+            assert!(
+                foreign[1].referenced.is_none(),
+                "{file}: a table that references itself"
+            );
+            let referenced = catalog.get_table(None, "parent").unwrap();
+            assert_eq!(referenced.referenced_by.lock().len(), 1, "{file}");
+        }
+    }
+
+    #[test]
+    fn indexes_come_along() {
+        for file in FILES {
+            let catalog = load(file);
+            let table = catalog.get_table(None, "indexed").unwrap();
+            let indexes = table.indexes.read();
+            let found: Vec<(&str, bool)> = indexes.iter().map(|i| (i.name.as_str(), i.unique)).collect();
+            assert_eq!(
+                found,
+                [
+                    ("expression_index", false),
+                    ("plain_index", false),
+                    ("unique_index", true)
+                ],
+                "{file}"
+            );
+            let schema = catalog.schema_for(Some("other_schema")).unwrap();
+            assert!(schema.get_index("other_index").is_some(), "{file}");
+        }
+    }
 }
