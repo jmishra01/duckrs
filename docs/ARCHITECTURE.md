@@ -297,8 +297,8 @@ predicate check each pair of a key's rows, where C++ hashes on the comparison. T
 
 Files stay byte-compatible with DuckDB, the choice the plan recommends: `storage` reads what DuckDB
 writes, and block-level files that it makes open in DuckDB, which went on to store and checkpoint a
-table in one. What exists so far reads a database into memory at open; tables are not scanned in
-place yet and nothing but the block layer writes.
+table in one. What exists so far reads a database into memory at open, with its views, macros,
+sequences and types; tables are not scanned in place yet and nothing but the block layer writes.
 
 - **Block file** (`block_manager`): the main header, the two database headers (the higher iteration
   wins), checksums and blocks of 16 to 256 KiB. `write_header` syncs the blocks first, so a crash
@@ -338,14 +338,35 @@ or lose data:
 
 - ZSTD, Chimp and Patas;
 - VARIANT and GEOMETRY columns;
-- views, macros, sequences, indexes, custom types, triggers, and default values, generated columns,
-  CHECK, UNIQUE and FOREIGN KEY constraints, which take the serialized parsed expressions;
+- indexes (of a table, or the ones that PRIMARY KEY, UNIQUE and FOREIGN KEY constraints come with),
+  and triggers;
+- `CREATE TABLE ... AS` queries, partition and sort keys, table options, and schemas with options;
+- in a stored query: INSERT, UPDATE, DELETE, MERGE, COPY, SHOW and MATCH_RECOGNIZE;
 - a write-ahead log that waits to be replayed, encrypted files.
 
-Next, in order: the parsed expression serializer (ported through the generator, as the plan says)
-for defaults, views and macros, which most real files need; indexes; WAL replay; scanning row
-groups in place through the buffer manager; then checkpoints, for which the block layer is ready.
-`ATTACH` follows from there. ZSTD takes a new dependency, and Chimp and Patas are only in old files.
+Next, in order: indexes; WAL replay; scanning row groups in place through the buffer manager; then
+checkpoints, for which the block layer is ready. `ATTACH` follows from there. ZSTD takes a new
+dependency, and Chimp and Patas are only in old files.
+
+**Parsed objects** (`serialization`): `tools/generate_serialization.py` is the counterpart of
+DuckDB's generator. It reads the JSON specs and the enums of the C++ headers and writes
+`generated.rs`, so field ids stay in step with upstream by running it again. C++ deserializes into
+the classes of its parser, but the AST here has a shape of its own, so the generated structs mirror
+the specs and `convert.rs` turns them into the AST by hand. `custom.rs` has what C++ reads by hand
+too: casts, functions and windows, which read the fields of older versions, and lambdas, whose
+syntax depends on the version of the file. Only reading is generated.
+
+Entries stay in the order of the file, in which each comes after what it depends on. A table goes
+through the binder like `CREATE TABLE`, for its defaults, generated columns and constraints; views
+and macros aren't bound until they are used, as nothing in a file needs that. Types that a file has
+already are `CastType::Resolved`. A type that is only named, like a cast to a type of the catalog,
+is `LogicalType::unbound`, which keeps the SQL of the name and is resolved when bound. Parsed
+expressions are beyond `duckrs-common`, so reading one inside a `LogicalType` goes through
+`BinaryDeserializer::with_type_expressions`.
+
+Where this differs from C++: `lead` and `lag` from before v2.0.0 keep their offset and default,
+which the C++ reader drops. A constant from before v2.0.0 is a value and not text, so a type that
+no literal reads back as, like DOUBLE, becomes a cast of its text.
 
 `crates/duckrs/tests/read_database_file.rs` compares every row of files from the real DuckDB with what
 DuckDB reads from them; `tests/fixtures/generate.sh` makes both. `damaged_database_file.rs` changes
@@ -353,11 +374,17 @@ bytes of a block and fixes its checksum, to get past that to the decoders. Layou
 exactly and not just bounds: an FSST symbol table in the wrong place is corruption even if it is in
 bounds, as otherwise strings decode to garbage without an error.
 
-Of the 34 database files in DuckDB's `data/storage`, 14 open. The rest fail on views (6), indexes (3),
-dependencies between entries (2), macros, constraints and types (3), and Patas (1), and 5 are
-refused as DuckDB refuses them: damaged, or of another vector size. A file whose test used to pass
-because it was ignored can now fail: `test/sql/storage/bc/test_broken_view_v092.test` left
-`known_passing.txt`, as it needs views.
+Of the 25 database files under DuckDB's `data` and `test`, 7 open. None fails on views, macros, types,
+constraints or dependencies between entries any more. The rest fail on indexes (4), Patas and Chimp
+(3), encryption (2) and a WAL (1), and 8 are refused as DuckDB refuses them: damaged, of another
+vector size, or too old.
+
+`stored_queries.txt` is one query per line, stored as a view in files for v1.0.0, v1.5.0 and v2.0.0.
+Every view gives the rows that DuckDB gives, and on the v1.5.0 file `duckdb_views()` renders each
+query as DuckDB does, apart from the differences between the `ToString` of the 1.5.6 CLI that writes
+the fixtures and the baseline, which the test lists. The v2.0.0 file comes from the reference engine
+of the test runner, as the CLI is too old for it; its rendering isn't compared. PRIMARY KEY, UNIQUE
+and FOREIGN KEY constraints are converted but can't be tested until indexes are read.
 
 The tests compare every column as the text that DuckDB prints, FLOAT and DOUBLE included.
 

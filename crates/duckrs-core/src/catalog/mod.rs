@@ -12,7 +12,7 @@ use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::string_util::similarity_rating;
 use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::{Error, ErrorKind, Result};
-use duckrs_parser::ast::{Expr, MacroFunction, SelectStatement, sql_quoted_identifier};
+use duckrs_parser::ast::{Expr, MacroFunction, SelectStatement, sql_identifier, sql_quoted_identifier};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Weak};
@@ -324,6 +324,23 @@ pub struct ViewCatalogEntry {
     pub query: SelectStatement,
     /// the names listed in `CREATE VIEW v (a, b)`
     pub aliases: Vec<String>,
+}
+
+impl ViewCatalogEntry {
+    /// `ViewCatalogEntry::ToSQL`.
+    pub fn to_sql(&self) -> String {
+        let mut sql = String::from("CREATE VIEW ");
+        if !self.schema.eq_ignore_ascii_case(DEFAULT_SCHEMA) {
+            sql += &sql_identifier(&self.schema);
+            sql.push('.');
+        }
+        sql += &sql_identifier(&self.name);
+        if !self.aliases.is_empty() {
+            let aliases: Vec<String> = self.aliases.iter().map(|a| sql_identifier(a)).collect();
+            sql += &format!(" ({})", aliases.join(", "));
+        }
+        format!("{sql} AS {};", self.query)
+    }
 }
 
 /// A macro with its overloads (`ScalarMacroCatalogEntry`, `TableMacroCatalogEntry`).

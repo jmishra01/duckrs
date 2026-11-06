@@ -2218,6 +2218,13 @@ impl Binder<'_> {
     }
 
     /// `Binder::BindCreateTableInfo`.
+    /// Binds a table of a database file, whose types are known. `search_schema` is where its names
+    /// are looked up, as C++ binds them in the schema of the table.
+    pub fn bind_stored_table(&mut self, info: &CreateTableInfo, search_schema: &str) -> Result<LogicalOperator> {
+        self.search_schema = Some(search_schema.to_string());
+        self.bind_create_table(info).map(|bound| bound.plan)
+    }
+
     pub(super) fn bind_create_table(&mut self, info: &CreateTableInfo) -> Result<BoundStatement> {
         if !info.partition_keys.is_empty() || !info.sort_keys.is_empty() || !info.options.is_empty() {
             return Err(not_implemented("table options"));

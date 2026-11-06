@@ -336,6 +336,8 @@ enum Params {
         size: u32,
     },
     Enum(Arc<[String]>),
+    /// UNBOUND: a type that is known by name, as the SQL that names it (`UnboundTypeInfo`).
+    Unbound(Arc<str>),
     /// INTEGER_LITERAL: the constant's own integral type and its value (`IntegerLiteralTypeInfo`).
     /// A UHUGEINT above `i128::MAX` keeps `value == i128::MAX` with `beyond_i128` set.
     IntegerLiteral {
@@ -450,6 +452,22 @@ impl LogicalType {
         children.push((String::new(), LogicalType::UTINYINT));
         children.extend(members);
         Self::with_params(LogicalTypeId::Union, Params::Struct(children))
+    }
+
+    /// A type that a database file refers to by name: `sql` is that name, as a query writes it.
+    pub fn unbound(sql: impl Into<Arc<str>>) -> Self {
+        Self::with_params(LogicalTypeId::Unbound, Params::Unbound(sql.into()))
+    }
+
+    /// Whether this type or one inside it is still a name that the catalog has to resolve.
+    pub fn contains_unbound(&self) -> bool {
+        match self.params() {
+            Params::Unbound(_) => true,
+            Params::List(child) => child.contains_unbound(),
+            Params::Array { child, .. } => child.contains_unbound(),
+            Params::Struct(children) => children.iter().any(|(_, ty)| ty.contains_unbound()),
+            _ => false,
+        }
     }
 
     pub fn enum_type(values: Vec<String>) -> Self {
@@ -675,6 +693,7 @@ impl fmt::Display for LogicalType {
                 }
                 f.write_str(")")
             }
+            (LogicalTypeId::Unbound, Params::Unbound(sql)) => f.write_str(sql),
             (LogicalTypeId::SqlNull, _) => f.write_str("\"NULL\""),
             (LogicalTypeId::Template, _) => f.write_str("T"),
             (id, _) => f.write_str(id.name()),

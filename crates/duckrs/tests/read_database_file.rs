@@ -102,6 +102,136 @@ fn not_null_comes_along() {
     assert_eq!(result.collection.row(1)[0].try_to_string().unwrap(), "YES");
 }
 
+const QUERIES: &str = include_str!("fixtures/stored_queries.txt");
+
+/// Views run through the binder, so the query that a file stores has to come out as it went in.
+#[test]
+fn views_answer_as_they_do_in_duckdb() {
+    let mut failures = Vec::new();
+    for file in ["parsed_v100.db", "parsed_v150.db", "parsed_v200.db"] {
+        let mut connection = connect(file);
+        for (n, query) in QUERIES.lines().enumerate() {
+            let view = format!("q{}", n + 1);
+            let bytes = std::fs::read(fixture(&format!("{view}.expected"))).unwrap();
+            let expected: Vec<&str> = std::str::from_utf8(&bytes).unwrap().lines().collect();
+            if let Err(error) = connection.query(&format!("SELECT * FROM {view} LIMIT 0")) {
+                failures.push(format!("{file} {view}: {error}\n  {query}"));
+                continue;
+            }
+            let actual = rows(&mut connection, &view);
+            if actual != expected {
+                failures.push(format!("{file} {view}: {actual:?} != {expected:?}\n  {query}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+fn column(connection: &mut Connection, sql: &str) -> Vec<String> {
+    let result = connection.query(sql).unwrap();
+    (0..result.row_count())
+        .map(|row| {
+            let values = result.collection.row(row);
+            let fields: Vec<String> = values
+                .iter()
+                .map(|v| {
+                    if v.is_null() {
+                        "NULL".into()
+                    } else {
+                        v.try_to_string().unwrap()
+                    }
+                })
+                .collect();
+            fields.join("|")
+        })
+        .collect()
+}
+
+/// What `duckdb_views()` says is the query rendered from what the file holds. DuckDB renders that
+/// from its own reading of the file, so the two agree only if the trees do. Files for v1.0.0 don't
+/// say all of what this compares, such as which joins are explicit or the syntax of a lambda.
+#[test]
+fn stored_queries_render_as_in_duckdb() {
+    // the CLI that writes the fixtures is older than the baseline, whose `ToString` differs here
+    const RENDERING: [(&str, &str); 10] = [
+        ("\"DATE\"", "DATE"),
+        ("\"mood\"", "mood"),
+        (")SELECT", ") SELECT"),
+        ("UNION  ALL", "UNION ALL"),
+        (" -(i) AS e", " (-(i)) AS e"),
+        (
+            "FROM base AS a INNER JOIN base AS b ON ((a.i = (b.i + 1)))",
+            "FROM (base AS a INNER JOIN base AS b ON ((a.i = (b.i + 1))))",
+        ),
+        (
+            "FROM base AS a LEFT JOIN base AS b USING (i)",
+            "FROM (base AS a LEFT JOIN base AS b USING (i))",
+        ),
+        (
+            "FROM base AS a CROSS JOIN base AS b",
+            "FROM (base AS a CROSS JOIN base AS b)",
+        ),
+        (
+            "FROM base AS a NATURAL INNER JOIN other",
+            "FROM (base AS a NATURAL INNER JOIN other)",
+        ),
+        // a DOUBLE constant has no literal that reads back as one
+        (" 1000.0 AS e", " CAST('1000.0' AS DOUBLE) AS e"),
+    ];
+    let bytes = std::fs::read_to_string(fixture("views_sql.expected")).unwrap();
+    let expected: Vec<String> = bytes
+        .lines()
+        .map(|line| {
+            RENDERING
+                .iter()
+                .fold(line.to_string(), |l, (from, to)| l.replace(from, to))
+        })
+        .collect();
+    let actual = column(
+        &mut connect("parsed_v150.db"),
+        "SELECT sql FROM duckdb_views() WHERE NOT internal ORDER BY view_name",
+    );
+    let differences: Vec<String> = actual
+        .iter()
+        .zip(&expected)
+        .filter(|(a, e)| a != e)
+        .map(|(a, e)| format!("duckrs: {a}\nDuckDB: {e}"))
+        .collect();
+    assert!(differences.is_empty(), "{}", differences.join("\n"));
+    assert_eq!(actual.len(), expected.len());
+}
+
+#[test]
+fn defaults_and_generated_columns_come_along() {
+    let bytes = std::fs::read_to_string(fixture("with_everything_columns.expected")).unwrap();
+    let expected: Vec<&str> = bytes.lines().collect();
+    for file in ["parsed_v100.db", "parsed_v150.db", "parsed_v200.db"] {
+        let actual = column(
+            &mut connect(file),
+            "SELECT column_name, column_type, \"null\", \"default\" FROM (DESCRIBE with_everything)",
+        );
+        assert_eq!(actual, expected, "{file}");
+    }
+}
+
+/// A sequence goes on from where it was.
+#[test]
+fn sequences_keep_their_state() {
+    for file in ["parsed_v100.db", "parsed_v150.db", "parsed_v200.db"] {
+        let db = Database::open(fixture(file), false).unwrap();
+        let mut connection = db.connect().unwrap();
+        let sql = "SELECT nextval('counter'), nextval('other_schema.spent')";
+        assert_eq!(column(&mut connection, sql), ["14|6"], "{file}");
+    }
+}
+
+#[test]
+fn a_check_constraint_comes_along() {
+    let mut connection = connect("parsed_v150.db");
+    let sql = "SELECT check_constraint_count FROM duckdb_tables() WHERE table_name = 'with_everything'";
+    assert_eq!(column(&mut connection, sql), ["1"]);
+}
+
 #[test]
 fn a_read_only_file_takes_no_writes() {
     let mut connection = connect("compatible.db");

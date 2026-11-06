@@ -22,7 +22,7 @@ ROWS="SELECT
   ('blob' || (i % 9))::BLOB
   FROM range(COUNT_ROWS) r(i)"
 
-rm -f compatible.db compressed.db bitpacked.db floats.db modern.db nested.db deletes.db *.expected
+rm -f compatible.db compressed.db bitpacked.db floats.db modern.db nested.db deletes.db parsed_*.db *.expected
 "$DUCKDB" <<SQL
 ATTACH 'compatible.db' (BLOCK_SIZE 16384);
 USE compatible;
@@ -172,3 +172,61 @@ expected floats.db alp alprd
 expected modern.db validity dict_fsst
 expected nested.db lists empty_lists structs arrays maps
 expected deletes.db deletes
+
+# Objects that are stored as parsed SQL: one view per line of stored_queries.txt, in two storage
+# versions, which write constants and casts differently. (Hex literals are left out: 1.5.6 reads
+# X'AB' as a string, and v2.0.0 as a blob.)
+for version in v1.0.0 v1.5.0; do
+  file=parsed_$(echo $version | tr -d .).db
+  rm -f "$file"
+  {
+    cat <<SQL
+ATTACH '$file' (BLOCK_SIZE 16384, STORAGE_VERSION '$version');
+USE ${file%.db};
+SQL
+    cat stored_schema.sql
+    n=0
+    while IFS= read -r query; do
+      n=$((n + 1))
+      echo "CREATE VIEW q$n AS $query;"
+    done < stored_queries.txt
+    echo "CREATE VIEW aliased (first_name, second_name) AS SELECT 1 AS a, 2 AS b;"
+    echo "CHECKPOINT;"
+  } | "$DUCKDB"
+  # the files of both versions hold the same rows, so that one set of expected rows does for both
+  n=0
+  while IFS= read -r query; do
+    n=$((n + 1))
+    columns=$("$DUCKDB" -readonly -noheader -list "$file" \
+        -c "SELECT string_agg('\"' || column_name || '\"::VARCHAR', ', ' ORDER BY column_index)
+            FROM duckdb_columns() WHERE table_name = 'q$n'")
+    "$DUCKDB" -readonly -noheader -list -separator '|' -nullvalue NULL "$file" \
+        -c "SET lambda_syntax = 'ENABLE_SINGLE_ARROW'; SELECT $columns FROM q$n" > "q$n.expected"
+  done < stored_queries.txt
+  "$DUCKDB" -readonly -noheader -list -separator '|' -nullvalue NULL "$file" \
+      -c "SELECT sql FROM duckdb_views() WHERE NOT internal ORDER BY view_name" > views_sql.expected
+  "$DUCKDB" -readonly -noheader -list -separator '|' -nullvalue NULL "$file" \
+      -c "SELECT column_name, column_type, \"null\", \"default\" FROM (DESCRIBE with_everything)" > with_everything_columns.expected
+done
+
+# The CLI is too old for v2.0.0, where constants are literals and casts name parsed types. The
+# reference engine of the test runner can write it (`cargo build --release -p sqllogictest --features
+# reference`). Arrow lambdas stop binding from v2.0.0 on, so its file has the keyword.
+runner=../../../../target/release/sqllogictest
+scratch=$(mktemp -d)
+mkdir "$scratch/test"
+rm -f parsed_v200.db
+{
+  echo "statement ok"
+  echo "ATTACH '$PWD/parsed_v200.db' (BLOCK_SIZE 16384, STORAGE_VERSION 'v2.0.0')"
+  echo
+  echo "statement ok"
+  echo "USE parsed_v200"
+  echo
+  awk 'BEGIN { RS = ""; ORS = "\n\n" } { print "statement ok\n" $0 }' stored_schema.sql
+  awk '{ gsub(/x -> x \+ 1/, "lambda x: x + 1"); print "statement ok\nCREATE VIEW q" NR " AS " $0 "\n" }' stored_queries.txt
+  printf 'statement ok\nCREATE VIEW aliased (first_name, second_name) AS SELECT 1 AS a, 2 AS b\n\n'
+  printf 'statement ok\nCHECKPOINT\n\nstatement ok\nUSE memory\n\nstatement ok\nDETACH parsed_v200\n'
+} > "$scratch/test/v200.test"
+"$runner" --engine reference --duckdb-root "$scratch" test/v200.test
+rm -rf "$scratch"

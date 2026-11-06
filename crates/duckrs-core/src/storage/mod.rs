@@ -7,12 +7,16 @@ pub mod checkpoint;
 pub mod checksum;
 pub mod compression;
 pub mod metadata;
+pub mod serialization;
 pub mod statistics;
 pub mod table_data;
 
-use crate::catalog::{Catalog, ColumnDefinition, OnCreateConflict};
+use crate::catalog::{Catalog, OnCreateConflict, SequenceData};
+use crate::planner::binder::Binder;
+use crate::planner::logical::LogicalOperatorKind;
 use block_manager::SingleFileBlockManager;
 use buffer_manager::BufferManager;
+use checkpoint::{StoredEntry, StoredTable};
 use duckrs_common::{Error, Result};
 use std::path::Path;
 use std::sync::Arc;
@@ -46,25 +50,68 @@ pub fn load_database(path: &Path, catalog: &Catalog) -> Result<()> {
     let buffer = BufferManager::new(blocks, LOAD_BUFFER_MEMORY);
     metadata::load_free_list(&buffer)?;
     let stored = checkpoint::read_catalog(&buffer)?;
-    for schema in &stored.schemas {
-        catalog.create_schema(schema, OnCreateConflict::Ignore)?;
+    for entry in stored.entries {
+        match entry {
+            StoredEntry::Schema(name) => catalog.create_schema(&name, OnCreateConflict::Ignore)?,
+            StoredEntry::Table(table) => load_table(&buffer, catalog, &table)?,
+            StoredEntry::View {
+                schema,
+                name,
+                query,
+                aliases,
+            } => {
+                let schema = catalog.schema_for(Some(&schema))?;
+                schema.create_view(&name, *query, aliases, OnCreateConflict::Error)?;
+            }
+            StoredEntry::Macro {
+                schema,
+                name,
+                table_macro,
+                macros,
+            } => {
+                let schema = catalog.schema_for(Some(&schema))?;
+                schema.create_macro(&name, table_macro, macros, OnCreateConflict::Error)?;
+            }
+            StoredEntry::Sequence { schema, name, data } => {
+                let data = SequenceData {
+                    counter: data.counter,
+                    last_value: data.last_value,
+                    increment: data.increment,
+                    min_value: data.min_value,
+                    max_value: data.max_value,
+                    cycle: data.cycle,
+                };
+                let schema = catalog.schema_for(Some(&schema))?;
+                schema.create_sequence(&name, data, OnCreateConflict::Error)?;
+            }
+            StoredEntry::Type { schema, name, ty } => {
+                let schema = catalog.schema_for(Some(&schema))?;
+                schema.create_type(&name, ty, OnCreateConflict::Error)?;
+            }
+        }
     }
-    for table in &stored.tables {
-        let schema = catalog.schema_for(Some(&table.schema))?;
-        let columns = table
-            .columns
-            .iter()
-            .map(|column| {
-                let mut definition = ColumnDefinition::new(column.name.clone(), column.ty.clone());
-                definition.not_null = column.not_null;
-                definition
-            })
-            .collect();
-        let rows = table_data::read_table(&buffer, table)?;
-        let entry = schema
-            .create_table(&table.name, columns, Vec::new(), Vec::new(), OnCreateConflict::Error)?
-            .expect("OnCreateConflict::Error fails or creates");
-        *entry.write_storage() = rows;
-    }
+    Ok(())
+}
+
+/// Binds the definition of a table as `CREATE TABLE` does, for its defaults, generated columns and
+/// constraints, and copies its rows in.
+fn load_table(buffer: &BufferManager, catalog: &Catalog, table: &StoredTable) -> Result<()> {
+    let plan = Binder::new(catalog).bind_stored_table(&table.definition, &table.schema)?;
+    let LogicalOperatorKind::CreateTable {
+        schema,
+        name,
+        columns,
+        generated,
+        constraints,
+        on_conflict,
+    } = plan.kind
+    else {
+        unreachable!("CREATE TABLE without a query binds to CreateTable");
+    };
+    let rows = table_data::read_table(buffer, table)?;
+    let entry = schema
+        .create_table(&name, columns, generated, constraints, on_conflict)?
+        .expect("OnCreateConflict::Error fails or creates");
+    *entry.write_storage() = rows;
     Ok(())
 }

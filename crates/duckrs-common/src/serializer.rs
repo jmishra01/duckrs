@@ -187,7 +187,13 @@ pub struct BinaryDeserializer<'a> {
     data: &'a [u8],
     pos: usize,
     peeked: Option<u16>,
+    type_expression: Option<TypeExpressionReader>,
+    from_before_v2: bool,
 }
+
+/// Reads a parsed expression that names a type, and gives its SQL. Parsed expressions are beyond
+/// this crate, so what reads them passes this in.
+pub type TypeExpressionReader = fn(&mut BinaryDeserializer<'_>) -> Result<String>;
 
 fn serialization_error(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::Serialization, message)
@@ -199,7 +205,26 @@ impl<'a> BinaryDeserializer<'a> {
             data,
             pos: 0,
             peeked: None,
+            type_expression: None,
+            from_before_v2: false,
         }
+    }
+
+    /// For data of a database file written for a storage version before v2.0.0.
+    pub fn from_before_v2(mut self, before: bool) -> Self {
+        self.from_before_v2 = before;
+        self
+    }
+
+    /// `StorageManager::GetStorageVersion() < StorageVersion::V2_0_0`.
+    pub fn is_from_before_v2(&self) -> bool {
+        self.from_before_v2
+    }
+
+    /// For data that can hold a type that is named by a parsed expression.
+    pub fn with_type_expressions(mut self, reader: TypeExpressionReader) -> Self {
+        self.type_expression = Some(reader);
+        self
     }
 
     /// Reads a top-level object.
@@ -601,6 +626,12 @@ impl<T: Deserialize> Deserialize for Option<T> {
     }
 }
 
+impl<T: Deserialize> Deserialize for Box<T> {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        T::read_value(d).map(Box::new)
+    }
+}
+
 /// A pair is an object with properties `0: first` and `1: second`.
 impl<A: Serialize, B: Serialize> Serialize for (A, B) {
     fn write_value(&self, s: &mut BinarySerializer) {
@@ -648,6 +679,7 @@ mod type_info {
     pub const LIST: u8 = 4;
     pub const STRUCT: u8 = 5;
     pub const ENUM: u8 = 6;
+    pub const UNBOUND: u8 = 7;
     pub const ARRAY: u8 = 9;
 }
 
@@ -846,6 +878,7 @@ impl Deserialize for LogicalType {
                         let values = d.read_list(201, "values", String::read_value)?;
                         LogicalType::enum_type(values)
                     }
+                    type_info::UNBOUND => read_unbound_type(d)?,
                     other => {
                         return Err(Error::not_implemented(format!(
                             "deserializing type info {other} is not supported yet"
@@ -856,6 +889,42 @@ impl Deserialize for LogicalType {
             })
         })
     }
+}
+
+/// `UnboundTypeInfo::Deserialize`: a parsed expression, or the name of a "USER" type before v1.5.0.
+fn read_unbound_type(d: &mut BinaryDeserializer<'_>) -> Result<LogicalType> {
+    if d.has_property(204)? {
+        let Some(reader) = d.type_expression else {
+            return Err(Error::not_implemented(
+                "deserializing a type expression here is not supported yet",
+            ));
+        };
+        return d
+            .read_object_field(204, "expr", |d| {
+                if !bool::read_value(d)? {
+                    return Err(serialization_error(
+                        "Failed to deserialize: a type expression is missing",
+                    ));
+                }
+                reader(d)
+            })
+            .map(LogicalType::unbound);
+    }
+    let name: String = d.read_property_with_default(200, "name")?;
+    let catalog: String = d.read_property_with_default(201, "catalog")?;
+    let schema: String = d.read_property_with_default(202, "schema")?;
+    let modifiers: Vec<Value> = d.read_property_with_default(203, "user_type_modifiers")?;
+    let mut sql = String::new();
+    for part in [&catalog, &schema].into_iter().filter(|part| !part.is_empty()) {
+        sql += &crate::types::sql_identifier(part);
+        sql.push('.');
+    }
+    sql += &crate::types::sql_identifier(&name);
+    if !modifiers.is_empty() {
+        let modifiers = modifiers.iter().map(Value::try_to_string).collect::<Result<Vec<_>>>()?;
+        sql += &format!("({})", modifiers.join(", "));
+    }
+    Ok(LogicalType::unbound(sql))
 }
 
 impl Serialize for Value {

@@ -49,7 +49,7 @@ fn read_data_pointer(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>) -
                 Ok(())
             })?;
         }
-        d.read_optional_property::<u32>(106, "byte_size")?;
+        d.read_property_with_default::<Option<u32>>(106, "byte_size")?;
         Ok(DataPointer {
             tuple_count: tuple_count as usize,
             block_id,

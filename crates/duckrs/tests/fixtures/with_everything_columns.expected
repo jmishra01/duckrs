@@ -1,0 +1,6 @@
+i|INTEGER|NO|NULL
+n|INTEGER|YES|nextval('counter')
+s|VARCHAR|YES|'it''s'
+m|ENUM('a', 'b', 'c')|YES|'b'
+doubled|INTEGER|YES|NULL
+label|VARCHAR|YES|NULL

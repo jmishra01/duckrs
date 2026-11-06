@@ -727,7 +727,8 @@ impl Binder<'_> {
                         continue;
                     };
                     let temporary = listed.schema.name.eq_ignore_ascii_case(TEMP_SCHEMA);
-                    let (names, types) = self.view_columns(view)?;
+                    // a view that doesn't bind is still listed, without columns
+                    let (names, types) = self.view_columns(view).unwrap_or_default();
                     rows.push(vec![
                         text(if temporary { "temp" } else { self.catalog.name.as_str() }),
                         Value::bigint(if temporary { 3 } else { 1 }),
@@ -745,7 +746,7 @@ impl Binder<'_> {
                             LogicalType::VARCHAR,
                             types.iter().map(|t| Value::varchar(t.to_string())).collect(),
                         )?,
-                        null_text(),
+                        text(&view.to_sql()),
                     ]);
                 }
                 let list = LogicalType::list(LogicalType::VARCHAR);
@@ -773,7 +774,7 @@ impl Binder<'_> {
                 let mut rows = Vec::new();
                 for listed in self.listed_entries() {
                     let temporary = listed.schema.name.eq_ignore_ascii_case(TEMP_SCHEMA);
-                    let table_columns: Vec<(String, LogicalType, bool, Value, Value, bool)> = match &listed.entry {
+                    let table_columns: Vec<(Value, LogicalType, bool, Value, Value, bool)> = match &listed.entry {
                         TableOrView::Table(table) => table
                             .logical_columns()
                             .iter()
@@ -785,7 +786,7 @@ impl Binder<'_> {
                                     .and_then(|d| d.default_text.as_deref())
                                     .map_or_else(|| expression.clone(), text);
                                 (
-                                    c.name.to_string(),
+                                    text(c.name),
                                     c.ty.clone(),
                                     not_null,
                                     default,
@@ -794,14 +795,22 @@ impl Binder<'_> {
                                 )
                             })
                             .collect(),
-                        TableOrView::View(view) => {
-                            let (names, types) = self.view_columns(view)?;
-                            names
+                        TableOrView::View(view) => match self.view_columns(view) {
+                            Ok((names, types)) => names
                                 .into_iter()
                                 .zip(types)
-                                .map(|(n, t)| (n, t, false, null_text(), null_text(), false))
-                                .collect()
-                        }
+                                .map(|(n, t)| (Value::varchar(n), t, false, null_text(), null_text(), false))
+                                .collect(),
+                            // `ViewColumnHelper`: a view that doesn't bind has a placeholder column
+                            Err(_) => vec![(
+                                null_text(),
+                                LogicalType::INVALID,
+                                false,
+                                null_text(),
+                                null_text(),
+                                false,
+                            )],
+                        },
                     };
                     for (index, (column, ty, not_null, default, expression, generated)) in
                         table_columns.into_iter().enumerate()
@@ -813,7 +822,7 @@ impl Binder<'_> {
                             Value::bigint(listed.schema_oid),
                             text(listed.entry.name()),
                             Value::bigint(listed.oid),
-                            Value::varchar(column),
+                            column,
                             Value::integer(index as i32 + 1),
                             null_text(),
                             Value::boolean(false),

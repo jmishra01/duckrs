@@ -1,0 +1,5 @@
+true|false|true|row 1|NULL
+true|true|false|row 2|2
+false|true|false|none|3
+false|true|false|row 4|4
+false|true|false|5|5

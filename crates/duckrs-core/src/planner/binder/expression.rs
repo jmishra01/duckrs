@@ -267,8 +267,28 @@ fn type_parameter_type(expr: &Expr) -> &'static str {
 impl Binder<'_> {
     /// `Binder::BindLogicalType` for the types slice 1 executes: the scalar types without
     /// parameters, `VARCHAR(n)` and `DECIMAL(width, scale)`.
+    /// A type of a database file that names a type of the catalog: its SQL is what would name it
+    /// in a query.
+    fn bind_named_type(&self, ty: &LogicalType) -> Result<LogicalType> {
+        let statements = duckrs_parser::parse_ast(&format!("SELECT CAST(NULL AS {ty})"))?;
+        if let [ast::Statement::Select(select)] = statements.as_slice()
+            && let ast::QueryNodeKind::Select(node) = &select.node.kind
+            && let [
+                Expr {
+                    kind: ExprKind::Cast { target, .. },
+                    ..
+                },
+            ] = node.select_list.as_slice()
+        {
+            return self.bind_type(target);
+        }
+        Err(crate::unported(format!("the type {ty}")))
+    }
+
     pub fn bind_type(&self, target: &CastType) -> Result<LogicalType> {
         let (original, children): (&str, &[Expr]) = match target {
+            CastType::Resolved(ty) if ty.contains_unbound() => return self.bind_named_type(ty),
+            CastType::Resolved(ty) => return Ok(ty.clone()),
             CastType::Builtin(name) => (&**name, &[]),
             CastType::Parsed(expr) => match &expr.kind {
                 ExprKind::Type(TypeExpr { name, children }) => {

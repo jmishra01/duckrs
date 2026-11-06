@@ -5,6 +5,7 @@
 //! rendering a statement and parsing it again yields the same tree.
 
 use crate::keywords;
+use duckrs_common::types::LogicalType;
 use std::collections::BTreeSet;
 use std::fmt::{self, Display, Formatter, Write};
 
@@ -275,6 +276,8 @@ pub enum SubqueryType {
 pub enum LambdaSyntax {
     Arrow,
     Keyword,
+    /// An arrow in a database file from before v2.0.0, which binds whatever `lambda_syntax` says.
+    StoredArrow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -471,11 +474,13 @@ pub struct TypeExpr {
     pub children: Vec<Expr>,
 }
 
-/// The target type of a cast: a built-in type the transformer chose, or a parsed type.
+/// The target type of a cast: a built-in type the transformer chose, a parsed type, or a type that
+/// is known already, as in a database file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CastType {
     Builtin(&'static str),
     Parsed(Box<Expr>),
+    Resolved(LogicalType),
 }
 
 impl Display for CastType {
@@ -484,6 +489,7 @@ impl Display for CastType {
             CastType::Builtin(name) => f.write_str(name),
             CastType::Parsed(expr) if matches!(expr.kind, ExprKind::Type(_)) => write!(f, "{expr}"),
             CastType::Parsed(expr) => write!(f, "({expr})"),
+            CastType::Resolved(ty) => write!(f, "{ty}"),
         }
     }
 }
@@ -991,7 +997,7 @@ impl Display for Expr {
                 SubqueryType::Scalar => write!(f, "({subquery})"),
             },
             ExprKind::Lambda { lhs, expr, syntax } => match syntax {
-                LambdaSyntax::Arrow => write!(f, "({lhs} -> {expr})"),
+                LambdaSyntax::Arrow | LambdaSyntax::StoredArrow => write!(f, "({lhs} -> {expr})"),
                 LambdaSyntax::Keyword => {
                     let params = match &lhs.kind {
                         ExprKind::Function(func) => join(&func.args, ", ", |a| a.expr.to_string()),

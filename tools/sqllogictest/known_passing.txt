@@ -762,6 +762,7 @@ test/sql/catalog/view/test_view_alias.test
 test/sql/catalog/view/test_view_delete_update.test
 test/sql/catalog/view/test_view_duplicate_columns.test
 test/sql/catalog/view/test_view_schema_change.test
+test/sql/catalog/view/test_view_sql.test
 test/sql/catalog/view/view_if_not_exists.test
 test/sql/conjunction/or_between.test
 test/sql/conjunction/or_comparison.test
@@ -998,6 +999,7 @@ test/sql/function/list/lambdas/reduce_captured_columns.test
 test/sql/function/list/lambdas/reduce_try_empty.test
 test/sql/function/list/lambdas/reduce_volatile.test
 test/sql/function/list/lambdas/rhs_parameters.test
+test/sql/function/list/lambdas/test_lambda_storage.test
 test/sql/function/list/lambdas/transform.test
 test/sql/function/list/lambdas/transform_with_index.test
 test/sql/function/list/list_distinct.test
@@ -1434,6 +1436,7 @@ test/sql/parser/columns_aliases.test
 test/sql/parser/columns_issue9867.test
 test/sql/parser/columns_unpacked_empty.test
 test/sql/parser/create_macro_tostring.test
+test/sql/parser/cte_printing.test
 test/sql/parser/division_operator_precedence.test
 test/sql/parser/dollar_quotes_internal_issue2224.test
 test/sql/parser/empty_quoted_identifier.test
@@ -1633,6 +1636,8 @@ test/sql/sql_export/sql_export_join_scopes.test
 test/sql/sql_export/sql_export_quantiles.test
 test/sql/sql_export/table_row_number_sql_export.test
 test/sql/sql_export/union_value.test
+test/sql/storage/bc/test_broken_view_v092.test
+test/sql/storage/bc/test_view_v092.test
 test/sql/storage/checkpointed_self_append.test
 test/sql/storage/checkpointed_self_append_tinyint.test
 test/sql/storage/compression/alp/alp_inf_null_nan.test
