@@ -165,4 +165,43 @@ result = subprocess.run(
     text=True,
 )
 print(result.stdout[-4000:])
+if result.returncode != 0:
+    sys.exit(result.returncode)
+
+# floats in each of their codecs, forced, as otherwise the smallest wins
+floats = scratch / "floats"
+floats.mkdir()
+subprocess.run(
+    ["cargo", "test", "-q", "-p", "duckrs", "--test", "write_database_file", "floats_keep_their_bits"],
+    cwd=root,
+    check=True,
+    env={**os.environ, "DUCKRS_KEEP_FLOATS": str(floats)},
+)
+test = "".join(
+    f"""statement ok
+ATTACH '{floats}/{force}.db' AS {force} (READ_ONLY)
+
+query I
+SELECT DISTINCT compression FROM pragma_storage_info('{force}.t') WHERE column_path IN ('[1]', '[2]') AND segment_type <> 'VALIDITY'
+----
+{name}
+
+query I
+SELECT count(*) FROM uncompressed.t a JOIN {force}.t b USING (i) WHERE a.d::VARCHAR = b.d::VARCHAR AND a.f::VARCHAR = b.f::VARCHAR
+----
+6000
+
+"""
+    for force, name in [("uncompressed", "Uncompressed"), ("alp", "ALP"), ("alprd", "ALPRD")]
+)
+# which has to be there before the first comparison
+test = test.replace(f"ATTACH '{floats}/uncompressed.db' AS uncompressed (READ_ONLY)", "SELECT 1", 1)
+test = f"statement ok\nATTACH '{floats}/uncompressed.db' AS uncompressed (READ_ONLY)\n\n" + test
+(scratch / "test/floats.test").write_text(test)
+result = subprocess.run(
+    [root / "target/release/sqllogictest", "--engine", "reference", "--duckdb-root", scratch, "test/floats.test", "-v", "--continue-on-failure"],
+    capture_output=True,
+    text=True,
+)
+print(result.stdout[-4000:])
 sys.exit(result.returncode)

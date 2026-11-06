@@ -13,12 +13,12 @@ use super::block_manager::{DatabaseHeader, INVALID_BLOCK};
 use super::buffer_manager::BufferManager;
 use super::checkpoint::{self, STORAGE_VERSION_V2_0_0, StoredEntry};
 use super::compression::{
-    COMPRESSION_BITPACKING, COMPRESSION_CONSTANT, COMPRESSION_DICT_FSST, COMPRESSION_RLE, COMPRESSION_ROARING,
-    COMPRESSION_UNCOMPRESSED,
+    COMPRESSION_ALP, COMPRESSION_ALPRD, COMPRESSION_BITPACKING, COMPRESSION_CONSTANT, COMPRESSION_DICT_FSST,
+    COMPRESSION_RLE, COMPRESSION_ROARING, COMPRESSION_UNCOMPRESSED,
 };
 use super::encode::{
-    Encoded, encode_bitpacking, encode_dictionary, encode_rle, encode_roaring, fill_nulls, is_signed,
-    supports_bitpacking, supports_rle,
+    Encoded, encode_alp, encode_alprd, encode_bitpacking, encode_dictionary, encode_rle, encode_roaring, fill_nulls,
+    is_signed, supports_bitpacking, supports_rle,
 };
 use super::metadata::{MetaBlockPointer, metadata_block_size};
 use super::serialization::generated::enums::{catalog_type, constraint_type, table_column_type};
@@ -701,6 +701,15 @@ impl<'a> Writer<'a> {
         if force == "bitpacking" && supports_bitpacking(physical) {
             return packed();
         }
+        let float = matches!(physical, PhysicalType::Float | PhysicalType::Double);
+        let alp = || (encode_alp(data, width, self.block_size), COMPRESSION_ALP);
+        let alprd = || (encode_alprd(data, width, self.block_size), COMPRESSION_ALPRD);
+        if force == "alp" && float {
+            return alp();
+        }
+        if force == "alprd" && float {
+            return alprd();
+        }
         let size = |segments: &[Encoded]| segments.iter().map(|(bytes, _)| bytes.len()).sum::<usize>();
         let mut best = plain();
         if supports_rle(physical) {
@@ -713,6 +722,13 @@ impl<'a> Writer<'a> {
             let candidate = packed();
             if size(&candidate.0) < size(&best.0) {
                 best = candidate;
+            }
+        }
+        if float {
+            for candidate in [alp(), alprd()] {
+                if size(&candidate.0) < size(&best.0) {
+                    best = candidate;
+                }
             }
         }
         best
@@ -741,7 +757,13 @@ impl<'a> Writer<'a> {
             let mut stats = Stats::of_validity(valid_rows);
             stats.bounds = bounds(physical, values, width, valid_rows);
             // `IsConstant`: a value that is the same throughout is in the statistics, with no block
-            if stats.bounds.is_some_and(|(min, max)| min == max) && physical != PhysicalType::Interval {
+            // and throughout means its bits: -0.0 and 0.0 compare as equal
+            let same_bits = || {
+                let mut valid = values.chunks_exact(width).zip(valid_rows).filter(|(_, valid)| **valid);
+                let first = valid.next().map(|(value, _)| value);
+                valid.all(|(value, _)| Some(value) == first)
+            };
+            if stats.bounds.is_some_and(|(min, max)| min == max) && physical != PhysicalType::Interval && same_bits() {
                 segments.push(SegmentOut {
                     tuple_count: rows,
                     block_id: -1,

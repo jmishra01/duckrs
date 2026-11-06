@@ -138,7 +138,10 @@ pub(super) fn fixed_width(physical: PhysicalType) -> Option<usize> {
 
 /// The bytes from a segment's start to the end of its block.
 fn segment(buffer: &BufferManager, pointer: &DataPointer) -> Result<std::sync::Arc<Vec<u8>>> {
-    let block = u64::try_from(pointer.block_id).map_err(|_| corrupt("a segment with data has no block"))?;
+    let block = u64::try_from(pointer.block_id).map_err(|_| {
+        let name = storage_name(pointer.compression);
+        corrupted(&format!("Persistent {name} segment is missing its data block"))
+    })?;
     let handle = buffer.pin(block)?;
     if pointer.offset > handle.len() {
         return Err(corrupted(

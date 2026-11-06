@@ -64,6 +64,10 @@ const SCHEMA: &[&str] = &[
      CASE WHEN i % 5 = 0 THEN NULL ELSE i END AS n FROM range(130000) r(i)",
     "CREATE TABLE runs AS SELECT (i // 1000)::INTEGER AS i, (i // 2000 % 2 = 0) AS b, (i // 500)::DOUBLE AS d, \
      7 AS same, CASE WHEN i // 1000 % 2 = 0 THEN NULL ELSE 1.5::DOUBLE END AS some_null FROM range(130000) r(i)",
+    "CREATE TABLE decimals AS SELECT (i % 100000) / 100.0::DOUBLE AS d, (i % 1000) / 10.0::FLOAT AS f, \
+     sin(i::DOUBLE) AS irregular, sqrt(i::FLOAT) AS root, \
+     CASE WHEN i % 500 = 0 THEN 'NaN'::DOUBLE WHEN i % 501 = 0 THEN 'Infinity'::DOUBLE WHEN i % 502 = 0 THEN -0.0::DOUBLE \
+     WHEN i % 7 = 0 THEN NULL ELSE i * 0.25 END AS odd FROM range(130000) r(i)",
     "CREATE TABLE words AS SELECT 'word ' || (i % 50) AS w, CASE WHEN i % 3 = 0 THEN NULL ELSE 'sometimes ' || (i % 7) END AS n, \
      CASE WHEN i % 2 = 0 THEN '' ELSE 'x' END AS e FROM range(130000) r(i)",
     "CREATE TABLE nulls AS SELECT i, CASE WHEN i % 1000 = 0 THEN NULL ELSE i END AS few, \
@@ -89,6 +93,9 @@ const QUERIES: &[&str] = &[
     "SELECT 'c'::mood",
     "SELECT count(*), count(n), min(w), max(w), min(n), max(n), count(DISTINCT w), count(DISTINCT n), min(e), max(e) FROM words",
     "SELECT w, n, e FROM words LIMIT 4 OFFSET 122879",
+    "SELECT count(*), sum(d), sum(f), sum(irregular), sum(root), count(odd), count(*) FILTER (WHERE isnan(odd)), \
+     count(*) FILTER (WHERE isinf(odd)), count(*) FILTER (WHERE odd = 0 AND signbit(odd)) FROM decimals",
+    "SELECT d, f, irregular, root, odd FROM decimals WHERE d = 1.23 ORDER BY root LIMIT 3",
     "SELECT count(few), count(rare), count(many), count(most), sum(few), sum(rare), sum(many), sum(most) FROM nulls",
     "SELECT count(*), sum(i), sum(l), sum(s), sum(n), count(n), min(n), max(n) FROM sorted",
     "SELECT * FROM sorted WHERE i BETWEEN 2046 AND 2050 ORDER BY i",
@@ -350,6 +357,8 @@ fn codecs_can_be_forced() {
         ("bitpacking", "[0]", "BitPacking"),
         ("uncompressed", "[0]", "Uncompressed"),
         ("roaring", "[1]", "Roaring"),
+        ("alp", "[2]", "ALP"),
+        ("alprd", "[2]", "ALPRD"),
     ] {
         let file = path(&format!("forced_{force}.db"));
         let db = Database::open(&file, false).unwrap();
@@ -357,13 +366,13 @@ fn codecs_can_be_forced() {
         run(&mut connection, &format!("SET force_compression = '{force}'"));
         run(
             &mut connection,
-            "CREATE TABLE t AS SELECT i::BIGINT AS i, i % 3 = 0 AS b FROM range(5000) r(i)",
+            "CREATE TABLE t AS SELECT i::BIGINT AS i, i % 3 = 0 AS b, sin(i::DOUBLE) AS f FROM range(5000) r(i)",
         );
         run(&mut connection, "CHECKPOINT");
         let sql = format!("SELECT DISTINCT compression FROM pragma_storage_info('t') WHERE column_path = '{column}'");
         assert_eq!(rows(&mut connection, &sql), [expected], "{force}");
-        let sum = "SELECT sum(i), count(*) FILTER (WHERE b) FROM t";
-        assert_eq!(rows(&mut connection, sum), ["12497500|1667"], "{force}");
+        let sum = "SELECT sum(i), count(*) FILTER (WHERE b), count(f) FROM t";
+        assert_eq!(rows(&mut connection, sum), ["12497500|1667|5000"], "{force}");
     }
 }
 
@@ -408,6 +417,68 @@ fn the_smallest_codec_is_chosen() {
     assert_eq!(compression(&mut connection, "sorted", "[0]"), ["BitPacking"]);
     assert_eq!(compression(&mut connection, "runs", "[0]"), ["RLE"]);
     assert_eq!(compression(&mut connection, "runs", "[3]"), ["Constant"]);
+}
+
+/// Floats come back bit for bit, in each codec, whatever they are: as text, -0.0 isn't 0.0.
+#[test]
+fn floats_keep_their_bits() {
+    let values = "CASE WHEN i % 5 = 0 THEN i / 100.0::DOUBLE WHEN i % 5 = 1 THEN sin(i::DOUBLE) \
+                  WHEN i % 5 = 2 THEN -0.0::DOUBLE WHEN i = 3 THEN 'NaN'::DOUBLE WHEN i = 8 THEN '-Infinity'::DOUBLE \
+                  WHEN i % 5 = 3 THEN 0.0::DOUBLE ELSE 1e30 * i END";
+    let check = "SELECT d::VARCHAR, f::VARCHAR FROM t ORDER BY i";
+    let mut expected = None;
+    for force in ["uncompressed", "alp", "alprd"] {
+        let file = path(&format!("float_bits_{force}.db"));
+        let db = Database::open(&file, false).unwrap();
+        let mut connection = db.connect().unwrap();
+        run(&mut connection, &format!("SET force_compression = '{force}'"));
+        let sql = format!(
+            "CREATE TABLE t AS SELECT i, d, d::FLOAT AS f FROM (SELECT i, {values} AS d FROM range(6000) r(i))"
+        );
+        run(&mut connection, &sql);
+        run(&mut connection, "CHECKPOINT");
+        let answer = rows(&mut connection, check);
+        assert_eq!(answer.iter().filter(|row| row.starts_with("-0.0|")).count(), 1200);
+        assert_eq!(*expected.get_or_insert(answer.clone()), answer, "{force}");
+        // for `tools/check_written.py`
+        if let Some(target) = std::env::var_os("DUCKRS_KEEP_FLOATS") {
+            drop(connection);
+            drop(db);
+            std::fs::copy(&file, std::path::Path::new(&target).join(format!("{force}.db"))).unwrap();
+        }
+    }
+}
+
+/// Decimals go to ALP and the rest of the floats to ALPRD, as neither is forced here.
+#[test]
+fn floats_take_the_codec_that_suits_them() {
+    let file = path("float_codecs.db");
+    let db = Database::open(&file, false).unwrap();
+    let mut connection = db.connect().unwrap();
+    let sql = "CREATE TABLE t AS SELECT (hash(i) % 100000)::BIGINT / 100.0::DOUBLE AS price, sin(i::DOUBLE) AS wave \
+               FROM range(100000) r(i)";
+    run(&mut connection, sql);
+    run(&mut connection, "CHECKPOINT");
+    let compression = |connection: &mut Connection, path: &str| {
+        let sql = format!("SELECT DISTINCT compression FROM pragma_storage_info('t') WHERE column_path = '{path}'");
+        rows(connection, &sql)
+    };
+    assert_eq!(compression(&mut connection, "[0]"), ["ALP"]);
+    assert_eq!(compression(&mut connection, "[1]"), ["ALPRD"]);
+}
+
+/// Zeros of both signs are one value to the statistics, and two to the file.
+#[test]
+fn a_column_of_both_zeros_is_not_constant() {
+    let file = path("both_zeros.db");
+    let db = Database::open(&file, false).unwrap();
+    let mut connection = db.connect().unwrap();
+    let sql = "CREATE TABLE t AS SELECT i, CASE WHEN i % 2 = 0 THEN -0.0::DOUBLE ELSE 0.0::DOUBLE END AS d, \
+               CASE WHEN i % 2 = 0 THEN 'NaN'::DOUBLE ELSE 'NaN'::DOUBLE END AS n FROM range(3000) r(i)";
+    run(&mut connection, sql);
+    run(&mut connection, "CHECKPOINT");
+    let sql = "SELECT d::VARCHAR, count(*), count(*) FILTER (WHERE isnan(n)) FROM t GROUP BY 1 ORDER BY 1";
+    assert_eq!(rows(&mut connection, sql), ["-0.0|1500|1500", "0.0|1500|1500"]);
 }
 
 const CRASH_FILE: &str = "DUCKRS_CRASH_FILE";

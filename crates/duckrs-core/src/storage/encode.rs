@@ -3,7 +3,9 @@
 //! The encoders of the codecs that `compression.rs` decodes. Each takes the fixed-size values of
 //! rows and makes segments that fit in a block, with how many rows each holds.
 
+use super::compression::{ALP_FRAC_F32, ALP_FRAC_F64};
 use duckrs_common::types::PhysicalType;
+use std::collections::HashMap;
 
 /// `BITPACKING_METADATA_GROUP_SIZE`.
 const GROUP_ROWS: usize = 2048;
@@ -244,7 +246,6 @@ fn bit_width(value: u64) -> usize {
 /// it is, where 0 is NULL. FSST on top of that takes a symbol table, which this doesn't train.
 /// `None` for strings that are too long, which go to overflow blocks instead.
 pub fn encode_dictionary(strings: &[&[u8]], valid: &[bool], block_size: usize, limit: usize) -> Option<Vec<Encoded>> {
-    use std::collections::HashMap;
     const HEADER: usize = 16;
     let packed = |rows: usize, bits: usize| (rows.next_multiple_of(PACKING_ROWS) * bits).div_ceil(8);
     let size = |dictionary: usize, count: usize, longest: usize, rows: usize| {
@@ -307,6 +308,283 @@ pub fn encode_dictionary(strings: &[&[u8]], valid: &[bool], block_size: usize, l
         start = row;
     }
     Some(segments)
+}
+
+/// `AlpConstants::ALP_VECTOR_SIZE`.
+const ALP_VECTOR_ROWS: usize = 1024;
+/// How many values of a vector decide which of the candidates it takes.
+const ALP_SAMPLES: usize = 32;
+/// How many pairs of exponent and factor a row group keeps.
+const ALP_CANDIDATES: usize = 5;
+
+/// The floats of a column, as bits that don't lose anything.
+trait AlpFloat: Copy {
+    const WIDTH: usize;
+    const MAX_EXPONENT: u8;
+    fn read(bytes: &[u8]) -> Self;
+    /// `AlpCompression::EncodeValue`, if the value has a chance.
+    fn encode(self, exponent: u8, factor: u8) -> Option<i64>;
+    /// As `scan_alp` does it: what comes back has to be this value, bit for bit.
+    fn decode(encoded: i64, exponent: u8, factor: u8) -> Self;
+    fn same_bits(self, other: Self) -> bool;
+}
+
+macro_rules! alp_float {
+    ($t:ty, $width:expr, $max:expr, $frac:expr) => {
+        impl AlpFloat for $t {
+            const WIDTH: usize = $width;
+            const MAX_EXPONENT: u8 = $max;
+            fn read(bytes: &[u8]) -> Self {
+                <$t>::from_le_bytes(bytes.try_into().expect("the width of the type"))
+            }
+            fn encode(self, exponent: u8, factor: u8) -> Option<i64> {
+                let scaled = f64::from(self) * 10f64.powi(i32::from(exponent)) * 10f64.powi(-i32::from(factor));
+                if !scaled.is_finite() || scaled.abs() >= 9.0e18 {
+                    return None;
+                }
+                Some(scaled.round() as i64)
+            }
+            fn decode(encoded: i64, exponent: u8, factor: u8) -> Self {
+                let factor = 10i64.wrapping_pow(u32::from(factor));
+                encoded as $t * factor as $t * $frac[usize::from(exponent)]
+            }
+            fn same_bits(self, other: Self) -> bool {
+                self.to_bits() == other.to_bits()
+            }
+        }
+    };
+}
+alp_float!(f64, 8, 18, ALP_FRAC_F64);
+alp_float!(f32, 4, 10, ALP_FRAC_F32);
+
+/// What a pair of exponent and factor makes of some values: the integers, or `None` for exceptions.
+fn alp_try<T: AlpFloat>(values: &[T], exponent: u8, factor: u8) -> Vec<Option<i64>> {
+    values
+        .iter()
+        .map(|&value| {
+            value
+                .encode(exponent, factor)
+                .filter(|&encoded| T::decode(encoded, exponent, factor).same_bits(value))
+        })
+        .collect()
+}
+
+/// The size in bits of values, with what doesn't encode as exceptions.
+fn alp_cost<T: AlpFloat>(encoded: &[Option<i64>]) -> usize {
+    let mut range: Option<(i64, i64)> = None;
+    let mut exceptions = 0;
+    for value in encoded {
+        match value {
+            Some(value) => {
+                let (low, high) = range.unwrap_or((*value, *value));
+                range = Some((low.min(*value), high.max(*value)));
+            }
+            None => exceptions += 1,
+        }
+    }
+    let bits = range.map_or(0, |(low, high)| bit_width(high.wrapping_sub(low) as u64));
+    bits * encoded.len() + exceptions * (T::WIDTH + 2) * 8
+}
+
+/// `AlpCompression::FindTopKCombinations`: over a sample of the values.
+fn alp_candidates<T: AlpFloat>(values: &[T]) -> Vec<(u8, u8)> {
+    let step = (values.len() / 512).max(1);
+    let sample: Vec<T> = values.iter().copied().step_by(step).collect();
+    let mut scored = Vec::new();
+    for exponent in 0..=T::MAX_EXPONENT {
+        for factor in 0..=exponent {
+            scored.push((alp_cost::<T>(&alp_try(&sample, exponent, factor)), exponent, factor));
+        }
+    }
+    // for the same cost the larger exponent and factor, as C++ prefers
+    scored.sort_by_key(|&(cost, exponent, factor)| (cost, std::cmp::Reverse((exponent, factor))));
+    scored.truncate(ALP_CANDIDATES);
+    scored
+        .into_iter()
+        .map(|(_, exponent, factor)| (exponent, factor))
+        .collect()
+}
+
+fn alp_vector<T: AlpFloat>(values: &[T], raw: &[u8], candidates: &[(u8, u8)]) -> Vec<u8> {
+    const UNCOMPRESSED: u8 = 255;
+    let step = (values.len() / ALP_SAMPLES).max(1);
+    let sample: Vec<T> = values.iter().copied().step_by(step).collect();
+    let &(exponent, factor) = candidates
+        .iter()
+        .min_by_key(|&&(exponent, factor)| alp_cost::<T>(&alp_try(&sample, exponent, factor)))
+        .expect("a row group has candidates");
+    let encoded = alp_try(values, exponent, factor);
+    let filler = encoded.iter().flatten().next().copied().unwrap_or(0);
+    let low = encoded.iter().flatten().copied().min().unwrap_or(0);
+    let high = encoded.iter().flatten().copied().max().unwrap_or(0);
+    let bits = bit_width(high.wrapping_sub(low) as u64);
+    let differences: Vec<u128> = encoded
+        .iter()
+        .map(|value| u128::from(value.unwrap_or(filler).wrapping_sub(low) as u64))
+        .collect();
+    let exceptions: Vec<usize> = (0..values.len()).filter(|&row| encoded[row].is_none()).collect();
+    let mut vector = vec![exponent, factor];
+    vector.extend_from_slice(&(exceptions.len() as u16).to_le_bytes());
+    vector.extend_from_slice(&low.to_le_bytes());
+    vector.push(bits as u8);
+    vector.extend_from_slice(&pack(&differences, bits));
+    for &row in &exceptions {
+        vector.extend_from_slice(&raw[row * T::WIDTH..(row + 1) * T::WIDTH]);
+    }
+    for &row in &exceptions {
+        vector.extend_from_slice(&(row as u16).to_le_bytes());
+    }
+    if vector.len() > raw.len() {
+        let mut plain = vec![UNCOMPRESSED];
+        plain.extend_from_slice(raw);
+        return plain;
+    }
+    vector
+}
+
+/// Vectors, and at the end of the segment, from the back, where each starts. `header` comes first.
+fn alp_segments(header: &[u8], vectors: Vec<(Vec<u8>, usize)>, block_size: usize) -> Vec<Encoded> {
+    let mut segments = Vec::new();
+    let mut body = header.to_vec();
+    let mut offsets: Vec<u32> = Vec::new();
+    let mut rows = 0;
+    let finish = |body: &mut Vec<u8>, offsets: &mut Vec<u32>, rows: &mut usize, segments: &mut Vec<Encoded>| {
+        if *rows == 0 {
+            return;
+        }
+        body.resize(body.len().next_multiple_of(8), 0);
+        for offset in offsets.iter().rev() {
+            body.extend_from_slice(&offset.to_le_bytes());
+        }
+        let end = body.len() as u32;
+        body[..4].copy_from_slice(&end.to_le_bytes());
+        segments.push((std::mem::replace(body, header.to_vec()), *rows));
+        offsets.clear();
+        *rows = 0;
+    };
+    for (vector, vector_rows) in vectors {
+        let at = body.len().next_multiple_of(8);
+        if (at + vector.len()).next_multiple_of(8) + (offsets.len() + 1) * 4 > block_size {
+            finish(&mut body, &mut offsets, &mut rows, &mut segments);
+        }
+        let at = body.len().next_multiple_of(8);
+        body.resize(at, 0);
+        offsets.push(at as u32);
+        body.extend_from_slice(&vector);
+        rows += vector_rows;
+    }
+    finish(&mut body, &mut offsets, &mut rows, &mut segments);
+    segments
+}
+
+fn encode_alp_typed<T: AlpFloat>(data: &[u8], block_size: usize) -> Vec<Encoded> {
+    let values: Vec<T> = data.chunks_exact(T::WIDTH).map(T::read).collect();
+    let candidates = alp_candidates(&values);
+    let vectors = values
+        .chunks(ALP_VECTOR_ROWS)
+        .zip(data.chunks(ALP_VECTOR_ROWS * T::WIDTH))
+        .map(|(values, raw)| (alp_vector(values, raw, &candidates), values.len()))
+        .collect();
+    alp_segments(&[0; 4], vectors, block_size)
+}
+
+/// `AlpCompressionState`: floats that are decimals, as integers with an exponent and a factor.
+pub fn encode_alp(data: &[u8], width: usize, block_size: usize) -> Vec<Encoded> {
+    if width == 8 {
+        encode_alp_typed::<f64>(data, block_size)
+    } else {
+        encode_alp_typed::<f32>(data, block_size)
+    }
+}
+
+/// The left parts that are most common, for this cut of the bits.
+fn alprd_dictionary(values: &[u64], right: usize) -> Vec<u16> {
+    const DICTIONARY_SIZE: usize = 8;
+    let mut counts: HashMap<u16, usize> = HashMap::new();
+    for value in values {
+        *counts.entry((value >> right) as u16).or_default() += 1;
+    }
+    let mut common: Vec<(u16, usize)> = counts.into_iter().collect();
+    common.sort_by_key(|&(left, count)| (std::cmp::Reverse(count), left));
+    common.truncate(DICTIONARY_SIZE);
+    common.into_iter().map(|(left, _)| left).collect()
+}
+
+/// `AlpRDCompressionState`: the low bits as they are, and the high bits through a dictionary, which
+/// suits floats that aren't decimals. A value whose high bits aren't in it is an exception.
+pub fn encode_alprd(data: &[u8], width: usize, block_size: usize) -> Vec<Encoded> {
+    /// `AlpRDConstants::CUTTING_LIMIT`.
+    const CUTTING_LIMIT: usize = 16;
+    const UNCOMPRESSED: u16 = u16::MAX;
+    let bits = width * 8;
+    let values: Vec<u64> = data
+        .chunks_exact(width)
+        .map(|value| {
+            let mut bytes = [0; 8];
+            bytes[..width].copy_from_slice(value);
+            u64::from_le_bytes(bytes)
+        })
+        .collect();
+    let sample: Vec<u64> = values.iter().copied().step_by((values.len() / 1024).max(1)).collect();
+    let cost = |right: usize| {
+        let dictionary = alprd_dictionary(&sample, right);
+        let misses = sample
+            .iter()
+            .filter(|value| !dictionary.contains(&((*value >> right) as u16)))
+            .count();
+        right * sample.len() + misses * 32 + bit_width(dictionary.len() as u64 - 1) * sample.len()
+    };
+    let right = ((bits - CUTTING_LIMIT)..bits)
+        .min_by_key(|&right| cost(right))
+        .expect("a range of cuts");
+    let dictionary = alprd_dictionary(&values, right);
+    let left_bits = bit_width(dictionary.len() as u64 - 1);
+    let positions: HashMap<u16, usize> = dictionary
+        .iter()
+        .enumerate()
+        .map(|(index, &left)| (left, index))
+        .collect();
+    let mut header = vec![0; 4];
+    header.extend_from_slice(&[right as u8, left_bits as u8, dictionary.len() as u8]);
+    for entry in &dictionary {
+        header.extend_from_slice(&entry.to_le_bytes());
+    }
+    let right_mask = (1u64 << right) - 1;
+    let vectors = values
+        .chunks(ALP_VECTOR_ROWS)
+        .zip(data.chunks(ALP_VECTOR_ROWS * width))
+        .map(|(values, raw)| {
+            let mut lefts = Vec::with_capacity(values.len());
+            let mut rights = Vec::with_capacity(values.len());
+            let mut exceptions = Vec::new();
+            for (row, value) in values.iter().enumerate() {
+                let left = (value >> right) as u16;
+                match positions.get(&left) {
+                    Some(&index) => lefts.push(index as u128),
+                    None => {
+                        lefts.push(0);
+                        exceptions.push((row, left));
+                    }
+                }
+                rights.push(u128::from(value & right_mask));
+            }
+            let mut vector = (exceptions.len() as u16).to_le_bytes().to_vec();
+            vector.extend_from_slice(&pack(&lefts, left_bits));
+            vector.extend_from_slice(&pack(&rights, right));
+            for (_, left) in &exceptions {
+                vector.extend_from_slice(&left.to_le_bytes());
+            }
+            for (row, _) in &exceptions {
+                vector.extend_from_slice(&(*row as u16).to_le_bytes());
+            }
+            if vector.len() > raw.len() + 1 {
+                vector = UNCOMPRESSED.to_le_bytes().to_vec();
+                vector.extend_from_slice(raw);
+            }
+            (vector, values.len())
+        })
+        .collect();
+    alp_segments(&header, vectors, block_size)
 }
 
 /// What each of these can hold. C++ also packs HUGEINT, by a packer of its own.

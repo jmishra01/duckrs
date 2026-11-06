@@ -523,25 +523,27 @@ pub fn scan_fsst(segment: &[u8], count: usize, out: &mut Vec<Vec<u8>>) -> Result
 }
 
 /// `AlpConstants::ALP_VECTOR_SIZE`.
+/// The fixed part of an ALPRD segment.
+const ALPRD_HEADER: usize = 7;
 const ALP_VECTOR_SIZE: usize = 1024;
 /// `AlpConstants::MAX_BIT_WIDTH`: the encoded values are 64 bits wide.
 const ALP_MAX_BIT_WIDTH: usize = 64;
 
 /// The table at the end of an ALP or ALPRD segment: where each vector starts, last vector first.
-/// Yields the bytes of each vector.
+/// Yields the bytes of each vector. `codec` names it in what's reported, as DuckDB does.
 fn alp_vectors<'a>(
     segment: &'a [u8],
     count: usize,
     data_start: usize,
+    codec: &'static str,
 ) -> Result<impl Iterator<Item = Result<(usize, &'a [u8])>> + 'a> {
-    let what = "the metadata of an ALP segment";
-    let metadata_end = u32_at(segment, 0, what)? as usize;
+    let metadata_end = alp_metadata_end(segment, data_start.min(ALPRD_HEADER), codec)?;
     let vector_count = count.div_ceil(ALP_VECTOR_SIZE);
     let metadata_start = metadata_end
         .checked_sub(vector_count * 4)
         .filter(|&start| start >= data_start)
-        .ok_or_else(|| out_of_bounds(what))?;
-    let table = bytes(segment, metadata_start, vector_count * 4, what)?;
+        .ok_or_else(|| alp_corrupt(codec, "metadata offset table exceeds the segment"))?;
+    let table = &segment[metadata_start..metadata_end];
     let offset = move |index: usize| {
         let at = (vector_count - 1 - index) * 4;
         u32::from_le_bytes(table[at..at + 4].try_into().expect("4 bytes")) as usize
@@ -553,18 +555,49 @@ fn alp_vectors<'a>(
         } else {
             metadata_start
         };
-        if start < data_start || start > end || end > metadata_start {
-            return Err(out_of_bounds("a vector of an ALP segment"));
+        if start < data_start || end < data_start {
+            return Err(alp_corrupt(codec, "vector offset is outside the data region"));
+        }
+        if start > end || end > metadata_start {
+            return Err(alp_corrupt(codec, "vector offsets do not describe a data range"));
         }
         let rows = ALP_VECTOR_SIZE.min(count - index * ALP_VECTOR_SIZE);
         Ok((rows, &segment[start..end]))
     }))
 }
 
-/// Takes `size` bytes off the front of `data`.
-fn advance<'a>(data: &mut &'a [u8], size: usize, what: &str) -> Result<&'a [u8]> {
-    let head = bytes(data, 0, size, what)?;
-    *data = &data[size..];
+/// `Corrupted ALP segment: ...`, from the checks in alp.cpp and alprd.cpp.
+fn alp_corrupt(codec: &str, message: &str) -> Error {
+    corrupted(&format!("Corrupted {codec} segment: {message}"))
+}
+
+/// Where the metadata of a segment ends, which is the end of what's in it.
+fn alp_metadata_end(segment: &[u8], header: usize, codec: &str) -> Result<usize> {
+    const READ_PAST: &str = "attempted to read past the end of the segment";
+    let end = segment
+        .first_chunk::<4>()
+        .ok_or_else(|| alp_corrupt(codec, READ_PAST))?;
+    let end = u32::from_le_bytes(*end) as usize;
+    if end < header {
+        return Err(alp_corrupt(codec, "metadata ends before the segment header"));
+    }
+    if end > segment.len() {
+        return Err(alp_corrupt(
+            codec,
+            "requested range extends past the end of the segment",
+        ));
+    }
+    Ok(end)
+}
+
+/// Takes `size` bytes off the front of `data`, a vector of the `codec`.
+fn advance<'a>(data: &mut &'a [u8], size: usize, codec: &str) -> Result<&'a [u8]> {
+    let (head, tail) = data.split_at_checked(size).ok_or_else(|| {
+        corrupted(&format!(
+            "Corrupted {codec} vector: attempted to read past the end of the segment"
+        ))
+    })?;
+    *data = tail;
     Ok(head)
 }
 
@@ -574,24 +607,30 @@ fn alp_exceptions<'a>(
     count: usize,
     width: usize,
     rows: usize,
+    codec: &str,
 ) -> Result<(&'a [u8], Vec<usize>)> {
-    let what = "the exceptions of an ALP vector";
     if count > rows {
-        return Err(corrupt("an ALP vector has more exceptions than rows"));
+        return Err(alp_corrupt(
+            codec,
+            &format!("exception count {count} exceeds vector size {rows}"),
+        ));
     }
-    let values = advance(vector, count * width, what)?;
-    let positions = advance(vector, count * 2, what)?
+    let values = advance(vector, count * width, codec)?;
+    let positions = advance(vector, count * 2, codec)?
         .chunks_exact(2)
         .map(|b| usize::from(u16::from_le_bytes(b.try_into().expect("2 bytes"))))
         .collect::<Vec<_>>();
-    if positions.iter().any(|&position| position >= rows) {
-        return Err(corrupt("the position of an ALP exception is out of range"));
+    if let Some(position) = positions.iter().find(|&&position| position >= rows) {
+        return Err(alp_corrupt(
+            codec,
+            &format!("exception position {position} is outside vector size {rows}"),
+        ));
     }
     Ok((values, positions))
 }
 
 /// `AlpTypedConstants<double>::FRAC_ARR`.
-const ALP_FRAC_F64: [f64; 21] = [
+pub const ALP_FRAC_F64: [f64; 21] = [
     1.0,
     0.1,
     0.01,
@@ -615,7 +654,7 @@ const ALP_FRAC_F64: [f64; 21] = [
     0.00000000000000000001,
 ];
 /// `AlpTypedConstants<float>::FRAC_ARR`.
-const ALP_FRAC_F32: [f32; 11] = [
+pub const ALP_FRAC_F32: [f32; 11] = [
     1.0,
     0.1,
     0.01,
@@ -633,34 +672,49 @@ const ALP_FRAC_F32: [f32; 11] = [
 /// and packed integers with a frame of reference; what doesn't round trip is an exception.
 pub fn scan_alp(segment: &[u8], count: usize, width: usize, out: &mut Vec<u8>) -> Result<()> {
     const UNCOMPRESSED_MODE: u8 = 255;
-    let what = "an ALP vector";
+    const CODEC: &str = "ALP";
     let max_exponent = if width == 8 { 18 } else { 10 };
-    for vector in alp_vectors(segment, count, 4)? {
+    for vector in alp_vectors(segment, count, 4, CODEC)? {
         let (rows, mut vector) = vector?;
-        let exponent = advance(&mut vector, 1, what)?[0];
+        let exponent = advance(&mut vector, 1, CODEC)?[0];
         if exponent == UNCOMPRESSED_MODE {
-            out.extend_from_slice(bytes(vector, 0, rows * width, what)?);
+            out.extend_from_slice(advance(&mut vector, rows * width, CODEC)?);
             continue;
         }
         if exponent > max_exponent {
-            return Err(corrupt(format!("ALP exponent {exponent} is out of range")));
+            return Err(alp_corrupt(
+                CODEC,
+                &format!("exponent {exponent} exceeds the maximum {max_exponent}"),
+            ));
         }
-        let factor = advance(&mut vector, 1, what)?[0];
+        let factor = advance(&mut vector, 1, CODEC)?[0];
+        let exceptions = u16::from_le_bytes(advance(&mut vector, 2, CODEC)?.try_into().expect("2 bytes"));
+        if usize::from(exceptions) > rows {
+            return Err(alp_corrupt(
+                CODEC,
+                &format!("exception count {exceptions} exceeds vector size {rows}"),
+            ));
+        }
         if factor > exponent {
-            return Err(corrupt(format!("ALP factor {factor} is out of range")));
+            return Err(alp_corrupt(
+                CODEC,
+                &format!("factor {factor} exceeds exponent {exponent}"),
+            ));
         }
-        let exceptions = u16::from_le_bytes(advance(&mut vector, 2, what)?.try_into().expect("2 bytes"));
-        let frame = u64::from_le_bytes(advance(&mut vector, 8, what)?.try_into().expect("8 bytes"));
-        let bit_width = usize::from(advance(&mut vector, 1, what)?[0]);
+        let frame = u64::from_le_bytes(advance(&mut vector, 8, CODEC)?.try_into().expect("8 bytes"));
+        let bit_width = usize::from(advance(&mut vector, 1, CODEC)?[0]);
         if bit_width > ALP_MAX_BIT_WIDTH {
-            return Err(corrupt(format!("ALP bit width {bit_width} is out of range")));
+            return Err(alp_corrupt(
+                CODEC,
+                &format!("bit width {bit_width} exceeds {ALP_MAX_BIT_WIDTH}"),
+            ));
         }
-        let packed = advance(&mut vector, packed_size(rows, bit_width), what)?;
-        let (values, positions) = alp_exceptions(&mut vector, usize::from(exceptions), width, rows)?;
+        let packed = advance(&mut vector, packed_size(rows, bit_width), CODEC)?;
+        let (values, positions) = alp_exceptions(&mut vector, usize::from(exceptions), width, rows, CODEC)?;
 
         let start = out.len();
         let factor = 10i64.wrapping_pow(u32::from(factor));
-        for encoded in unpack(packed, rows, bit_width, what)? {
+        for encoded in unpack(packed, rows, bit_width, "an ALP vector")? {
             let encoded = (encoded as u64).wrapping_add(frame) as i64;
             // the order of the operations is part of the format, as they round
             if width == 8 {
@@ -682,10 +736,26 @@ pub fn scan_alp(segment: &[u8], count: usize, width: usize, out: &mut Vec<u8>) -
 pub fn scan_alprd(segment: &[u8], count: usize, width: usize, out: &mut Vec<u8>) -> Result<()> {
     const UNCOMPRESSED_MODE: u16 = u16::MAX;
     const MAX_DICTIONARY_SIZE: usize = 8;
+    const MAX_LEFT_WIDTH: usize = 3;
+    const CODEC: &str = "ALPRD";
     let what = "an ALPRD vector";
+    alp_metadata_end(segment, ALPRD_HEADER, CODEC)?;
     let header = bytes(segment, 4, 3, "the header of an ALPRD segment")?;
     let (right_width, left_width, entries) = (usize::from(header[0]), usize::from(header[1]), usize::from(header[2]));
-    if right_width >= width * 8 || left_width > 3 || entries > MAX_DICTIONARY_SIZE {
+    let max_right_width = width * 8 - 1;
+    if right_width > max_right_width {
+        return Err(alp_corrupt(
+            CODEC,
+            &format!("right bit width {right_width} exceeds {max_right_width}"),
+        ));
+    }
+    if left_width > MAX_LEFT_WIDTH {
+        return Err(alp_corrupt(
+            CODEC,
+            &format!("left bit width {left_width} exceeds {MAX_LEFT_WIDTH}"),
+        ));
+    }
+    if entries > MAX_DICTIONARY_SIZE {
         return Err(corrupted(
             "Corrupt database file: ALPRD dictionary size exceeds maximum",
         ));
@@ -696,18 +766,24 @@ pub fn scan_alprd(segment: &[u8], count: usize, width: usize, out: &mut Vec<u8>)
     for (entry, b) in dictionary.iter_mut().zip(stored.chunks_exact(2)) {
         *entry = u16::from_le_bytes(b.try_into().expect("2 bytes"));
     }
-    for vector in alp_vectors(segment, count, 7 + entries * 2)? {
+    for vector in alp_vectors(segment, count, 7 + entries * 2, CODEC)? {
         let (rows, mut vector) = vector?;
-        let exceptions = u16::from_le_bytes(advance(&mut vector, 2, what)?.try_into().expect("2 bytes"));
+        let exceptions = u16::from_le_bytes(advance(&mut vector, 2, CODEC)?.try_into().expect("2 bytes"));
         if exceptions == UNCOMPRESSED_MODE {
-            out.extend_from_slice(bytes(vector, 0, rows * width, what)?);
+            out.extend_from_slice(advance(&mut vector, rows * width, CODEC)?);
             continue;
         }
-        let left = advance(&mut vector, packed_size(rows, left_width), what)?;
+        if usize::from(exceptions) > rows {
+            return Err(alp_corrupt(
+                CODEC,
+                &format!("exception count {exceptions} exceeds vector size {rows}"),
+            ));
+        }
+        let left = advance(&mut vector, packed_size(rows, left_width), CODEC)?;
         let left = unpack(left, rows, left_width, what)?;
-        let right = advance(&mut vector, packed_size(rows, right_width), what)?;
+        let right = advance(&mut vector, packed_size(rows, right_width), CODEC)?;
         let right = unpack(right, rows, right_width, what)?;
-        let (values, positions) = alp_exceptions(&mut vector, usize::from(exceptions), 2, rows)?;
+        let (values, positions) = alp_exceptions(&mut vector, usize::from(exceptions), 2, rows, CODEC)?;
 
         let mut decoded: Vec<u64> = left
             .iter()
