@@ -717,6 +717,9 @@ pub struct FloatSpec {
     pub trailing_zeros: bool,
     /// Without one, the digits are the shortest ones that round-trip.
     pub precision: Option<usize>,
+    /// `0` without one.
+    pub thousand_sep: u8,
+    pub decimal_point: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -732,6 +735,8 @@ fn prettify(digits: &[u8], exp: i32, spec: FloatSpec, out: &mut String) {
     let zeros = |count: i32, out: &mut String| out.extend(std::iter::repeat_n('0', count.max(0) as usize));
     let num_digits = digits.len() as i32;
     let precision = spec.precision.map_or(-1, |p| p as i32);
+    let point = spec.decimal_point as char;
+    let separator = spec.thousand_sep as char;
     // pow(10, full_exp - 1) <= v <= pow(10, full_exp).
     let full_exp = num_digits + exp;
     let threshold = if precision > 0 { precision } else { 16 };
@@ -743,7 +748,7 @@ fn prettify(digits: &[u8], exp: i32, spec: FloatSpec, out: &mut String) {
         let num_zeros = precision - num_digits;
         let trailing_zeros = num_zeros > 0 && spec.trailing_zeros;
         if digits.len() > 1 || trailing_zeros {
-            out.push('.');
+            out.push(point);
         }
         push(&digits[1..], out);
         if trailing_zeros {
@@ -753,10 +758,29 @@ fn prettify(digits: &[u8], exp: i32, spec: FloatSpec, out: &mut String) {
         write_exponent(full_exp - 1, out);
     } else if num_digits <= full_exp {
         // 1234e7 -> 12340000000[.0+]
-        push(digits, out);
-        zeros(full_exp - num_digits, out);
+        if spec.thousand_sep != 0 && full_exp > 3 {
+            let mut digit_count = if full_exp % 3 == 0 { 3 } else { full_exp % 3 };
+            let mut i = 0;
+            while i < full_exp {
+                if i > 0 {
+                    out.push(separator);
+                }
+                if i < num_digits {
+                    let write_count = (num_digits - i).min(digit_count);
+                    push(&digits[i as usize..(i + write_count) as usize], out);
+                    zeros(digit_count - write_count, out);
+                } else {
+                    zeros(digit_count, out);
+                }
+                i += digit_count;
+                digit_count = 3;
+            }
+        } else {
+            push(digits, out);
+            zeros(full_exp - num_digits, out);
+        }
         if spec.trailing_zeros {
-            out.push('.');
+            out.push(point);
             let num_zeros = precision - full_exp;
             if num_zeros > 0 {
                 zeros(num_zeros, out);
@@ -767,9 +791,22 @@ fn prettify(digits: &[u8], exp: i32, spec: FloatSpec, out: &mut String) {
     } else if full_exp > 0 {
         // 1234e-2 -> 12.34[0+]
         let (integral, fractional) = digits.split_at(full_exp as usize);
-        push(integral, out);
+        if spec.thousand_sep != 0 && full_exp > 3 {
+            let mut digit_count = if full_exp % 3 == 0 { 3 } else { full_exp % 3 };
+            let mut i = 0;
+            while i < full_exp {
+                if i > 0 {
+                    out.push(separator);
+                }
+                push(&digits[i as usize..(i + digit_count) as usize], out);
+                i += digit_count;
+                digit_count = 3;
+            }
+        } else {
+            push(integral, out);
+        }
         if spec.trailing_zeros {
-            out.push('.');
+            out.push(point);
             push(fractional, out);
             // Add trailing zeros.
             zeros(precision - num_digits, out);
@@ -777,7 +814,7 @@ fn prettify(digits: &[u8], exp: i32, spec: FloatSpec, out: &mut String) {
             // Remove trailing zeros.
             let kept = fractional.iter().rposition(|d| *d != b'0').map_or(0, |at| at + 1);
             if kept != 0 {
-                out.push('.');
+                out.push(point);
                 push(&fractional[..kept], out);
             }
         }
@@ -794,7 +831,7 @@ fn prettify(digits: &[u8], exp: i32, spec: FloatSpec, out: &mut String) {
             num_zeros = precision;
         }
         if num_zeros != 0 || num_digits != 0 {
-            out.push('.');
+            out.push(point);
             zeros(num_zeros, out);
             push(&digits[..num_digits], out);
         }
@@ -887,6 +924,63 @@ pub fn format_with_spec(value: f64, mut spec: FloatSpec) -> String {
     out
 }
 
+/// `%a` for a finite, non-negative `value`, as `snprintf` writes it on macOS. This depends on the
+/// C library: glibc writes a subnormal as `0x0.…p-1022`, and rounds a tie to even.
+pub fn format_hex_float(value: f64, precision: Option<usize>, upper: bool, alt: bool) -> String {
+    const FRACTION_DIGITS: usize = (DOUBLE_SIGNIFICAND_SIZE / 4) as usize;
+    let (mut significand, mut exponent) = if value == 0.0 {
+        (0, 0)
+    } else {
+        let (fp, _) = assign(value);
+        (fp.f, fp.e + DOUBLE_SIGNIFICAND_SIZE)
+    };
+    while value != 0.0 && significand & IMPLICIT_BIT == 0 {
+        significand <<= 1;
+        exponent -= 1;
+    }
+    let mut extra_zeros = 0;
+    let (lead, fraction) = match precision {
+        None => {
+            let fraction = format!("{:013x}", significand & (IMPLICIT_BIT - 1));
+            (
+                significand >> DOUBLE_SIGNIFICAND_SIZE,
+                fraction.trim_end_matches('0').to_string(),
+            )
+        }
+        Some(precision) if precision >= FRACTION_DIGITS => {
+            extra_zeros = precision - FRACTION_DIGITS;
+            let fraction = format!("{:013x}", significand & (IMPLICIT_BIT - 1));
+            (significand >> DOUBLE_SIGNIFICAND_SIZE, fraction)
+        }
+        Some(precision) => {
+            // `dorounding`: an 8 only rounds up if the digit after it is odd.
+            let shift = (FRACTION_DIGITS - precision) * 4;
+            let mut kept = significand >> shift;
+            let first = (significand >> (shift - 4)) & 0xF;
+            let second = if shift >= 8 {
+                (significand >> (shift - 8)) & 0xF
+            } else {
+                0
+            };
+            if first > 8 || (first == 8 && second & 1 == 1) {
+                kept += 1;
+            }
+            let fraction_bits = precision * 4;
+            let fraction = if precision == 0 {
+                String::new()
+            } else {
+                format!("{:0precision$x}", kept & ((1u64 << fraction_bits) - 1))
+            };
+            (kept >> fraction_bits, fraction)
+        }
+    };
+    let point = if !fraction.is_empty() || alt { "." } else { "" };
+    let sign = if exponent < 0 { '-' } else { '+' };
+    let zeros = "0".repeat(extra_zeros);
+    let out = format!("0x{lead}{point}{fraction}{zeros}p{sign}{}", exponent.abs());
+    if upper { out.to_uppercase() } else { out }
+}
+
 /// `duckdb_fmt::format("{}", value)` for a finite `value`. A FLOAT comes promoted to a double, with
 /// `binary32` set.
 pub(crate) fn format_finite(value: f64, binary32: bool) -> String {
@@ -900,6 +994,8 @@ pub(crate) fn format_finite(value: f64, binary32: bool) -> String {
         upper: false,
         trailing_zeros: true,
         precision: None,
+        thousand_sep: 0,
+        decimal_point: b'.',
     };
     prettify(&digits, exp, spec, &mut out);
     out

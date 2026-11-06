@@ -19,6 +19,7 @@ pub(crate) mod math;
 pub mod nested;
 mod nested_casts;
 pub(crate) mod operators;
+mod printf;
 mod regexp;
 mod string_nested;
 mod strings;

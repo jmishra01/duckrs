@@ -1038,6 +1038,7 @@ test/sql/function/operator/test_comparison.test
 test/sql/function/operator/test_conjunction_nulls.test
 test/sql/function/operator/test_division_overflow.test
 test/sql/function/operator/test_in_empty_table.test
+test/sql/function/string/format_large_precision.test
 test/sql/function/string/like_unicode.test
 test/sql/function/string/regex_escape.test
 test/sql/function/string/regex_filter_pushdown.test
@@ -1050,6 +1051,8 @@ test/sql/function/string/test_concat_ws.test
 test/sql/function/string/test_contains.test
 test/sql/function/string/test_contains_long_almost_matching_needle.test
 test/sql/function/string/test_contains_utf8.test
+test/sql/function/string/test_format.test
+test/sql/function/string/test_format_extensions.test
 test/sql/function/string/test_glob.test
 test/sql/function/string/test_glob_utf8.test
 test/sql/function/string/test_ilike.test

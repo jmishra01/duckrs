@@ -13,7 +13,7 @@ use super::combine_types::normalize_type;
 use super::dates::{bind_date_function, is_date_function};
 use super::lists::{bind_list_function, is_list_function};
 use super::nested::{bind_nested_function, bound_function, row_wise};
-use super::strings::format_callback;
+use super::printf::format_callback;
 use super::{ScalarCallback, ScalarFunction, ScalarFunctionSet};
 use crate::planner::binder::range_parameters;
 use crate::planner::expression::{BoundExpr, BoundExprKind};
@@ -939,10 +939,9 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             }
             let mut children = children;
             children[0] = children[0].clone().cast_to(&LogicalType::VARCHAR, false);
-            // `PrintfResolveTypes`: FLOAT and DECIMAL arguments are formatted as DOUBLE
             for child in &mut children[1..] {
-                if child.return_type == LogicalType::FLOAT || child.return_type.id() == LogicalTypeId::Decimal {
-                    *child = child.clone().cast_to(&LogicalType::DOUBLE, false);
+                if let Some(target) = printf_argument_type(&child.return_type) {
+                    *child = child.clone().cast_to(&target, false);
                 }
             }
             Ok(bound_function(
@@ -954,6 +953,21 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
         }
         other => unreachable!("{other} is not a generic function"),
     }
+}
+
+/// `PrintfResolveTypes`. A parameter is left alone, to be bound later.
+fn printf_argument_type(ty: &LogicalType) -> Option<LogicalType> {
+    use LogicalTypeId as Id;
+    Some(match ty.id() {
+        Id::Unknown => return None,
+        Id::Boolean => LogicalType::BOOLEAN,
+        Id::TinyInt | Id::SmallInt | Id::Integer | Id::BigInt => LogicalType::BIGINT,
+        Id::UTinyInt | Id::USmallInt | Id::UInteger | Id::UBigInt => LogicalType::UBIGINT,
+        Id::HugeInt => LogicalType::HUGEINT,
+        Id::UHugeInt => LogicalType::UHUGEINT,
+        Id::Float | Id::Double | Id::Decimal => LogicalType::DOUBLE,
+        _ => LogicalType::VARCHAR,
+    })
 }
 
 fn cardinality(args: &DataChunk, result: &mut Vector) -> Result<()> {
