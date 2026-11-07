@@ -6,24 +6,42 @@
 //! child's chunks stream through the join (operator). RIGHT and FULL joins emit the build rows
 //! nothing matched once the left child is done (source).
 //!
-//! Execution is single-threaded and in memory for now. The build side is looked up by the sort
-//! key of its join keys, like grouping; `JoinHashTable` over the row format replaces that when
-//! performance gets its turn (Phase 13).
+//! Execution is in memory. Threads can sink the build side at once, each keeping its chunks and
+//! their keys until it is done. The keys go into partitions by their hash, and threads look up
+//! the keys of each partition in a table of its own once all of them are there
+//! (`JoinHashTable::Finalize` over radix partitions). Then threads probe the finished build side
+//! at once: it no longer changes, apart from the flags of the build rows that found a match,
+//! which are atomic.
+//!
+//! A hash join past `memory_limit` spills (`JoinHashTable` with external partitions): the largest
+//! partitions of the build side go to temporary files, and so do their rows that come later. A
+//! probe row whose key is in a spilled partition goes to a file of its partition too. Once the
+//! probe is done, the join is a source: each spilled partition is read back and joined on its own,
+//! the same way, with the build rows nothing matched for RIGHT and FULL joins. The rows of spilled
+//! partitions come after the others, and a spilled partition is joined in memory whatever its size.
+//! The build side is looked up by the sort key of its join keys, like grouping; `JoinHashTable`
+//! over the row format replaces that when performance gets its turn (Phase 13).
 
 use super::expression_executor::{MULTIPLE_ROWS, execute, select};
 use super::physical::{
-    OperatorResult, OperatorState, PhysicalOperator, SourceState, check_buffered, check_buffered_rows,
+    LocalSinkState, OperatorResult, OperatorState, PhysicalOperator, SourceState, check_buffered, check_buffered_rows,
+    parallel_expression,
 };
+use super::temporary::{PartitionedSpill, SpillFile, current, estimated_bytes};
 use crate::planner::expression::BoundExpr;
 use crate::planner::logical::JoinCondition;
+use crate::storage::log_writer::can_serialize;
 use duckrs_common::column_data::ColumnDataCollection;
-use duckrs_common::sort_key::{RowKey, RowKeyMap, create_row_keys};
+use duckrs_common::sort_key::{KeyHasher, RowKey, RowKeyMap, create_row_keys};
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, SelectionVector, StringCopy, Vector};
 use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
 use duckrs_parser::ast::JoinType;
 use parking_lot::Mutex;
+use std::hash::{Hash, Hasher};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// A chunk without rows, for when an operator has nothing to output this time.
 fn empty_chunk() -> DataChunk {
@@ -132,31 +150,206 @@ pub struct PhysicalJoin {
     pub predicate: Option<BoundExpr>,
     pub children: Vec<Box<dyn PhysicalOperator>>,
     pub build: Mutex<JoinBuild>,
+    /// the build side once all of it is there
+    finished: OnceLock<FinishedBuild>,
+    /// how many threads sank the build side
+    builders: AtomicUsize,
     /// SINGLE: a left row with two matches fails, instead of taking the first one
     pub error_on_multiple_rows: bool,
+    /// where the partitions of a hash join past the memory limit go
+    spill: Option<JoinSpill>,
 }
 
-/// The build side.
+/// The temporary files of a hash join past the memory limit.
+#[derive(Debug)]
+struct JoinSpill {
+    build: PartitionedSpill,
+    probe: PartitionedSpill,
+    /// the build rows of each spilled partition, once the build side is done
+    build_files: Mutex<Vec<Option<SpillFile>>>,
+}
+
+/// A build side has at least this many rows in memory before it spills.
+const MIN_SPILL_ROWS: usize = 16 * STANDARD_VECTOR_SIZE;
+
+/// Roughly what a build row takes besides its values: its key, and its place in a chain.
+const BYTES_PER_KEY: usize = 48;
+
+/// A thread of the build side adds its rows once it has this many chunks, so that what threads
+/// hold apart stays small next to the memory limit.
+const LOCAL_BUILD_CHUNKS: usize = 64;
+
+/// How many partitions the keys of the build side go into.
+const PARTITIONS: usize = 64;
+
+/// How many build rows it takes to look up their keys on more than one thread.
+const MIN_PARALLEL_BUILD_ROWS: usize = 100_000;
+
+/// The partition of a key. The tables read the low and the high bits of the hash, so the
+/// partition is in the middle ones.
+fn partition_of(key: &RowKey) -> usize {
+    let mut hasher = KeyHasher::default();
+    key.hash(&mut hasher);
+    (hasher.finish() >> 32) as usize % PARTITIONS
+}
+
+/// A key of the build side, with its partition (always 0 when one thread sinks), or `None` when a key that is not null-safe is NULL.
+type BuildKey = Option<(usize, RowKey)>;
+
+/// The build side, while it comes in.
 #[derive(Debug)]
 pub struct JoinBuild {
-    /// the build rows, in one chunk once they are all there
+    /// the build rows
     columns: Vec<Vector>,
     count: usize,
-    data: Option<DataChunk>,
-    /// key -> index in `rows`; rows with a NULL key that is not null-safe are not in there
+    /// per partition, the keys of the build rows and their rows, in the order they came in;
+    /// rows with a NULL key that is not null-safe are not in there
+    keys: Vec<Vec<(RowKey, u32)>>,
+    /// whether a key that is not null-safe was NULL
+    has_null_key: bool,
+    /// whether the keys are in the partitions of their hash: threads put them there, and so does
+    /// spilling
+    partitioned: bool,
+    /// the partitions whose rows are in a file
+    spilled: Vec<bool>,
+    /// how many rows went to files
+    spilled_rows: usize,
+    /// what the rows in memory took of the memory limit
+    reserved: usize,
+}
+
+impl JoinBuild {
+    fn new(types: &[LogicalType]) -> Self {
+        Self {
+            columns: types
+                .iter()
+                .map(|t| Vector::new(t.clone(), STANDARD_VECTOR_SIZE))
+                .collect(),
+            count: 0,
+            keys: (0..PARTITIONS).map(|_| Vec::new()).collect(),
+            has_null_key: false,
+            partitioned: false,
+            spilled: vec![false; PARTITIONS],
+            spilled_rows: 0,
+            reserved: 0,
+        }
+    }
+
+    /// The build rows listed in `rows`, as a chunk of their own.
+    fn rows_of(&self, rows: &[u32]) -> DataChunk {
+        let sel = SelectionVector::from_vec(rows.to_vec());
+        let columns = self
+            .columns
+            .iter()
+            .map(|source| {
+                let mut column = Vector::new(source.logical_type().clone(), rows.len().max(1));
+                column.copy_from(source, &sel, rows.len(), 0, StringCopy::Deep);
+                column
+            })
+            .collect();
+        DataChunk::from_columns(columns, rows.len())
+    }
+}
+
+/// The keys of a partition of the build side.
+#[derive(Debug, Default)]
+struct Partition {
+    /// key -> index in `rows`
     groups: RowKeyMap<usize>,
     /// the build rows of each key
     rows: Vec<Vec<u32>>,
-    /// whether each build row found a match
-    matched: Vec<bool>,
-    /// whether a key that is not null-safe was NULL
+}
+
+impl Partition {
+    fn new(keys: Vec<(RowKey, u32)>) -> Self {
+        let mut partition = Self::default();
+        for (key, row) in keys {
+            let next = partition.rows.len();
+            let group = *partition.groups.entry(key).or_insert(next);
+            if group == next {
+                partition.rows.push(Vec::new());
+            }
+            partition.rows[group].push(row);
+        }
+        partition
+    }
+}
+
+/// The build side once all of it is there, which threads probe at once.
+#[derive(Debug)]
+struct FinishedBuild {
+    /// the build rows, in one chunk
+    data: DataChunk,
+    count: usize,
+    partitions: Vec<Partition>,
+    /// whether the keys are in the partitions of their hash, which threads sinking does
+    partitioned: bool,
     has_null_key: bool,
+    /// whether each build row found a match
+    matched: Vec<AtomicBool>,
+    /// the partitions whose rows are in a file, which probe rows of theirs go to as well
+    spilled: Vec<bool>,
+    /// the build rows, those in files included
+    total_count: usize,
+}
+
+impl FinishedBuild {
+    /// The partition and the group of `key`, if a build row has it.
+    fn find(&self, key: &RowKey) -> Option<(usize, usize)> {
+        // one thread puts every key in the first partition, and then hashing twice is waste
+        let partition = if self.partitioned { partition_of(key) } else { 0 };
+        self.partitions[partition]
+            .groups
+            .get(key)
+            .map(|&group| (partition, group))
+    }
+
+    fn set_matched(&self, row: u32) {
+        let flag = &self.matched[row as usize];
+        // a load first, so that threads do not keep writing the same cache line
+        if !flag.load(Ordering::Relaxed) {
+            flag.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// What a thread sinks into the build side: its chunks and their keys.
+type LocalBuild = Vec<(DataChunk, Vec<BuildKey>)>;
+
+/// What a thread probing a join keeps between calls.
+#[derive(Default)]
+struct JoinProbeState {
+    probe: Option<Probe>,
+    /// the rows of the input chunk that are probed now, when others went to a file
+    input: Option<DataChunk>,
+}
+
+/// Where the join is as a source.
+#[derive(Default)]
+struct JoinSource {
+    /// the next build row in memory to look at for being unmatched
+    next: usize,
+    /// whether the build rows in memory are done
+    memory_done: bool,
+    /// the spilled partitions still to join: their build rows and probe rows
+    pending: Option<Vec<(SpillFile, Option<SpillFile>)>>,
+    active: Option<ActivePartition>,
+}
+
+/// A spilled partition being joined.
+struct ActivePartition {
+    build: FinishedBuild,
+    probe: Option<super::temporary::SpillReader>,
+    input: Option<DataChunk>,
+    state: JoinProbeState,
+    /// the next build row to look at for being unmatched
+    next: usize,
 }
 
 /// Where probing the current input chunk is.
 struct Probe {
-    /// per input row, the index in `JoinBuild::rows` of its key (empty without keys)
-    groups: Vec<Option<usize>>,
+    /// per input row, the partition and the group of its key (empty without keys)
+    groups: Vec<Option<(usize, usize)>>,
     row: usize,
     /// the next candidate of `row`
     candidate: usize,
@@ -176,20 +369,19 @@ impl PhysicalJoin {
         predicate: Option<BoundExpr>,
         children: Vec<Box<dyn PhysicalOperator>>,
     ) -> Self {
-        let columns = children[1]
-            .types()
-            .iter()
-            .map(|t| Vector::new(t.clone(), STANDARD_VECTOR_SIZE))
-            .collect();
-        let build = JoinBuild {
-            columns,
-            count: 0,
-            data: None,
-            groups: RowKeyMap::default(),
-            rows: Vec::new(),
-            matched: Vec::new(),
-            has_null_key: false,
-        };
+        let build = JoinBuild::new(children[1].types());
+        // the keys are computed again for rows that come back from a file
+        let spill = (!conditions.is_empty()
+            && conditions
+                .iter()
+                .all(|c| parallel_expression(&c.left) && parallel_expression(&c.right))
+            && can_serialize(children[0].types())
+            && can_serialize(children[1].types()))
+        .then(|| JoinSpill {
+            build: PartitionedSpill::new(PARTITIONS),
+            probe: PartitionedSpill::new(PARTITIONS),
+            build_files: Mutex::default(),
+        });
         Self {
             types,
             join_type,
@@ -197,7 +389,287 @@ impl PhysicalJoin {
             predicate,
             children,
             build: Mutex::new(build),
+            finished: OnceLock::new(),
+            builders: AtomicUsize::new(0),
             error_on_multiple_rows: false,
+            spill,
+        }
+    }
+
+    /// Whether the join emits build rows after the probe: those nothing matched, or for RIGHT
+    /// SEMI those something did.
+    fn emits_build_rows(&self) -> bool {
+        matches!(
+            self.join_type,
+            JoinType::Right | JoinType::Outer | JoinType::RightSemi | JoinType::RightAnti
+        )
+    }
+
+    fn finished(&self) -> &FinishedBuild {
+        self.finished.get().expect("the build side is finished")
+    }
+
+    /// The keys of the build rows of `chunk`.
+    fn build_keys(&self, chunk: &DataChunk, partitioned: bool) -> Result<Vec<BuildKey>> {
+        if self.conditions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys = self.keys(chunk, |c| &c.right)?;
+        let partition = |key: &RowKey| if partitioned { partition_of(key) } else { 0 };
+        Ok(keys
+            .into_iter()
+            .map(|key| key.map(|key| (partition(&key), key)))
+            .collect())
+    }
+
+    /// Adds `chunk`, whose keys are `keys`, to the build side: in partitions of their hash if
+    /// `partitioned`. Past the memory limit, partitions go to files.
+    fn append(
+        &self,
+        build: &mut JoinBuild,
+        chunk: &DataChunk,
+        mut keys: Vec<BuildKey>,
+        partitioned: bool,
+    ) -> Result<()> {
+        if build.partitioned && !partitioned {
+            for (partition, key) in keys.iter_mut().flatten() {
+                *partition = partition_of(key);
+            }
+        }
+        let Some(spill) = &self.spill else {
+            Self::append_rows(build, chunk, keys);
+            return check_buffered_rows(self.children[1].types(), build.count);
+        };
+        let mut kept = None;
+        if build.spilled.iter().any(|&spilled| spilled) {
+            // the rows of spilled partitions go to their files
+            let mut spilled: Vec<Vec<u32>> = vec![Vec::new(); PARTITIONS];
+            let mut stay = Vec::new();
+            let mut stay_keys = Vec::new();
+            for (row, key) in keys.into_iter().enumerate() {
+                match key {
+                    Some((partition, _)) if build.spilled[partition] => spilled[partition].push(row as u32),
+                    key => {
+                        stay.push(row as u32);
+                        stay_keys.push(key);
+                    }
+                }
+            }
+            for (partition, rows) in spilled.into_iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
+                build.spilled_rows += rows.len();
+                spill.build.write(partition, &Self::rows_of(chunk, rows))?;
+            }
+            keys = stay_keys;
+            kept = Some(Self::rows_of(chunk, stay));
+        }
+        let chunk = kept.as_ref().unwrap_or(chunk);
+        let bytes = estimated_bytes(chunk) + chunk.len() * BYTES_PER_KEY;
+        Self::append_rows(build, chunk, keys);
+        if current().try_reserve(bytes) {
+            build.reserved += bytes;
+        } else if build.count >= MIN_SPILL_ROWS {
+            self.spill_partitions(build, spill)?;
+        }
+        Ok(())
+    }
+
+    /// Adds `chunk` to the build rows in memory.
+    fn append_rows(build: &mut JoinBuild, chunk: &DataChunk, keys: Vec<BuildKey>) {
+        let offset = build.count;
+        let sel = SelectionVector::from_vec((0..chunk.len() as u32).collect());
+        for (target, source) in build.columns.iter_mut().zip(chunk.columns()) {
+            target.copy_from(source, &sel, chunk.len(), offset, StringCopy::Deep);
+        }
+        build.count += chunk.len();
+        for (row, key) in keys.into_iter().enumerate() {
+            match key {
+                Some((partition, key)) => build.keys[partition].push((key, (offset + row) as u32)),
+                None => build.has_null_key = true,
+            }
+        }
+    }
+
+    /// Writes the largest partitions in memory to their files, about half of the rows with keys,
+    /// and keeps the rest of the build rows in their order.
+    fn spill_partitions(&self, build: &mut JoinBuild, spill: &JoinSpill) -> Result<()> {
+        if !build.partitioned {
+            for (key, row) in std::mem::take(&mut build.keys[0]) {
+                build.keys[partition_of(&key)].push((key, row));
+            }
+            build.partitioned = true;
+        }
+        let keyed: usize = build.keys.iter().map(Vec::len).sum();
+        let mut order: Vec<usize> = (0..PARTITIONS)
+            .filter(|&p| !build.spilled[p] && !build.keys[p].is_empty())
+            .collect();
+        order.sort_by_key(|&p| std::cmp::Reverse(build.keys[p].len()));
+        let mut dead = vec![false; build.count];
+        let mut moved = 0;
+        for partition in order {
+            if moved * 2 >= keyed {
+                break;
+            }
+            let keys = std::mem::take(&mut build.keys[partition]);
+            let rows: Vec<u32> = keys.iter().map(|(_, row)| *row).collect();
+            for part in rows.chunks(STANDARD_VECTOR_SIZE) {
+                spill.build.write(partition, &build.rows_of(part))?;
+            }
+            for &row in &rows {
+                dead[row as usize] = true;
+            }
+            moved += rows.len();
+            build.spilled[partition] = true;
+            build.spilled_rows += rows.len();
+        }
+        if moved == 0 {
+            return Ok(());
+        }
+        // what is left, in its order, with the rows of the keys moved to match
+        let live: Vec<u32> = (0..build.count as u32).filter(|&row| !dead[row as usize]).collect();
+        let mut new_row = vec![0u32; build.count];
+        for (new, &old) in live.iter().enumerate() {
+            new_row[old as usize] = new as u32;
+        }
+        let old_count = build.count;
+        let mut columns = build.rows_of(&live).columns().to_vec();
+        for column in &mut columns {
+            // more rows come in after these
+            let mut grown = Vector::new(column.logical_type().clone(), live.len().max(STANDARD_VECTOR_SIZE));
+            let sel = SelectionVector::from_vec((0..live.len() as u32).collect());
+            grown.copy_from(column, &sel, live.len(), 0, StringCopy::Deep);
+            *column = grown;
+        }
+        build.columns = columns;
+        build.count = live.len();
+        for keys in &mut build.keys {
+            for (_, row) in keys.iter_mut() {
+                *row = new_row[*row as usize];
+            }
+        }
+        let keep = (build.reserved as u128 * live.len() as u128 / old_count.max(1) as u128) as usize;
+        current().release(build.reserved - keep);
+        build.reserved = keep;
+        Ok(())
+    }
+
+    /// The build side, done.
+    fn finish_build(build: &mut JoinBuild, threads: usize, total_count: usize, has_null_key: bool) -> FinishedBuild {
+        let count = build.count;
+        FinishedBuild {
+            data: DataChunk::from_columns(std::mem::take(&mut build.columns), count),
+            count,
+            partitions: Self::partitions(std::mem::take(&mut build.keys), threads),
+            partitioned: build.partitioned,
+            has_null_key,
+            matched: (0..count).map(|_| AtomicBool::new(false)).collect(),
+            spilled: std::mem::take(&mut build.spilled),
+            total_count,
+        }
+    }
+
+    /// The build side of a spilled partition, from its file.
+    fn load_partition(&self, file: SpillFile) -> Result<FinishedBuild> {
+        let mut build = JoinBuild::new(self.children[1].types());
+        let mut reader = file.into_reader()?;
+        while let Some(chunk) = reader.next_chunk()? {
+            let keys = self.build_keys(&chunk, false)?;
+            Self::append_rows(&mut build, &chunk, keys);
+        }
+        let main = self.finished();
+        let mut finished = Self::finish_build(&mut build, 1, main.total_count, main.has_null_key);
+        finished.spilled = vec![false; PARTITIONS];
+        Ok(finished)
+    }
+
+    /// The next build rows of `build` to emit after the probe from row `next` on: those nothing
+    /// matched, or for RIGHT SEMI those something did.
+    fn build_rows_chunk(&self, build: &FinishedBuild, next: &mut usize) -> Option<DataChunk> {
+        let wanted = self.join_type == JoinType::RightSemi;
+        let mut rows = Vec::new();
+        while *next < build.count && rows.len() < STANDARD_VECTOR_SIZE {
+            if build.matched[*next].load(Ordering::Relaxed) == wanted {
+                rows.push(*next as u32);
+            }
+            *next += 1;
+        }
+        if rows.is_empty() {
+            return None;
+        }
+        let count = rows.len();
+        let right = Self::rows_of(&build.data, rows);
+        if matches!(self.join_type, JoinType::RightSemi | JoinType::RightAnti) {
+            return Some(right);
+        }
+        let mut columns: Vec<Vector> = self.children[0]
+            .types()
+            .iter()
+            .map(|t| Vector::constant_null(t.clone()))
+            .collect();
+        columns.extend_from_slice(right.columns());
+        Some(DataChunk::from_columns(columns, count))
+    }
+
+    /// The next output of the spilled partitions.
+    fn next_spilled(&self, source: &mut JoinSource) -> Result<Option<DataChunk>> {
+        let Some(spill) = &self.spill else {
+            return Ok(None);
+        };
+        loop {
+            if source.active.is_none() {
+                let pending = match &mut source.pending {
+                    Some(pending) => pending,
+                    None => {
+                        let builds = std::mem::take(&mut *spill.build_files.lock());
+                        let mut probes = spill.probe.take()?;
+                        let mut pending = Vec::new();
+                        for (partition, build) in builds.into_iter().enumerate() {
+                            if let Some(build) = build {
+                                pending.push((build, probes[partition].take()));
+                            }
+                        }
+                        // popped from the back, so the first partition goes first
+                        pending.reverse();
+                        source.pending.insert(pending)
+                    }
+                };
+                let Some((build, probe)) = pending.pop() else {
+                    return Ok(None);
+                };
+                if probe.is_none() && !self.emits_build_rows() {
+                    continue;
+                }
+                source.active = Some(ActivePartition {
+                    build: self.load_partition(build)?,
+                    probe: probe.map(SpillFile::into_reader).transpose()?,
+                    input: None,
+                    state: JoinProbeState::default(),
+                    next: 0,
+                });
+            }
+            let active = source.active.as_mut().expect("just set");
+            if let Some(input) = &active.input {
+                let (chunk, result) = self.probe_with(&active.build, input, &mut active.state, false)?;
+                if result == OperatorResult::NeedMoreInput {
+                    active.input = None;
+                }
+                if !chunk.is_empty() {
+                    return Ok(Some(chunk));
+                }
+                continue;
+            }
+            if let Some(reader) = &mut active.probe {
+                match reader.next_chunk()? {
+                    Some(chunk) => active.input = Some(chunk),
+                    None => active.probe = None,
+                }
+                continue;
+            }
+            if self.emits_build_rows()
+                && let Some(chunk) = self.build_rows_chunk(&active.build, &mut active.next)
+            {
+                return Ok(Some(chunk));
+            }
+            source.active = None;
         }
     }
 
@@ -225,6 +697,165 @@ impl PhysicalJoin {
             .collect())
     }
 
+    /// Probes `build` with `input`: `PhysicalJoin::ExecuteInternal`. With `defer`, the rows whose
+    /// keys are in spilled partitions go to the files of their partitions instead.
+    fn probe_with(
+        &self,
+        build: &FinishedBuild,
+        input: &DataChunk,
+        state: &mut JoinProbeState,
+        defer: bool,
+    ) -> Result<(DataChunk, OperatorResult)> {
+        let JoinProbeState {
+            probe: slot,
+            input: kept,
+        } = state;
+        let probe = match slot {
+            Some(probe) => probe,
+            None => {
+                let mut nulls = vec![false; input.len()];
+                let groups = if self.conditions.is_empty() {
+                    Vec::new()
+                } else {
+                    let mut keys = self.keys(input, |c| &c.left)?;
+                    if defer && build.spilled.iter().any(|&spilled| spilled) {
+                        keys = self.defer_rows(build, input, keys, kept, &mut nulls)?;
+                    }
+                    // a comparison with NULL is NULL, but there is no comparison without right rows
+                    if self.join_type == JoinType::Mark && build.total_count > 0 {
+                        for (null, key) in nulls.iter_mut().zip(&keys) {
+                            *null = key.is_none() || build.has_null_key;
+                        }
+                    }
+                    keys.iter()
+                        .map(|key| key.as_ref().and_then(|key| build.find(key)))
+                        .collect()
+                };
+                let count = kept.as_ref().map_or(input.len(), DataChunk::len);
+                slot.insert(Probe {
+                    groups,
+                    row: 0,
+                    candidate: 0,
+                    found: vec![false; count],
+                    nulls,
+                    single: vec![None; count],
+                })
+            }
+        };
+        let input = kept.as_ref().unwrap_or(input);
+        let data = &build.data;
+        let emit_pairs = matches!(
+            self.join_type,
+            JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Outer
+        );
+        loop {
+            let (left, right) = if self.conditions.is_empty() {
+                self.next_pairs(build, probe)
+            } else {
+                self.next_key_pairs(build, probe)
+            };
+            if left.is_empty() {
+                let result = self.finish_probe(input, probe, data)?;
+                *slot = None;
+                *kept = None;
+                return Ok((result, OperatorResult::NeedMoreInput));
+            }
+            let count = left.len();
+            let mut columns = Self::rows_of(input, left.clone()).columns().to_vec();
+            columns.extend_from_slice(Self::rows_of(data, right.clone()).columns());
+            let mut pairs = DataChunk::from_columns(columns, count);
+            let matches = match &self.predicate {
+                Some(predicate) if self.join_type == JoinType::Mark => {
+                    let result = execute(predicate, &pairs)?;
+                    let mut selected = Vec::new();
+                    for (row, left) in left.iter().enumerate() {
+                        match result.get_value(row).data() {
+                            ValueData::Bool(true) => selected.push(row as u32),
+                            ValueData::Bool(false) => {}
+                            _ => probe.nulls[*left as usize] = true,
+                        }
+                    }
+                    let matched = selected.len();
+                    Some((SelectionVector::from_vec(selected), matched))
+                }
+                Some(predicate) => {
+                    let (sel, matched) = select(predicate, &pairs)?;
+                    (matched != count).then_some((sel, matched))
+                }
+                None => None,
+            };
+            match &matches {
+                Some((sel, matched)) => {
+                    for i in 0..*matched {
+                        probe.found[left[sel.get(i)] as usize] = true;
+                        build.set_matched(right[sel.get(i)]);
+                    }
+                }
+                None => {
+                    for (left, right) in left.iter().zip(&right) {
+                        probe.found[*left as usize] = true;
+                        build.set_matched(*right);
+                    }
+                }
+            }
+            if self.join_type == JoinType::Single {
+                let pairs_found: Vec<(u32, u32)> = match &matches {
+                    Some((sel, matched)) => (0..*matched).map(|i| (left[sel.get(i)], right[sel.get(i)])).collect(),
+                    None => left.iter().copied().zip(right.iter().copied()).collect(),
+                };
+                for (left, right) in pairs_found {
+                    let slot = &mut probe.single[left as usize];
+                    if slot.is_none() {
+                        *slot = Some(right);
+                    } else if self.error_on_multiple_rows {
+                        return Err(Error::new(ErrorKind::InvalidInput, MULTIPLE_ROWS));
+                    }
+                }
+            }
+            if !emit_pairs {
+                continue;
+            }
+            if let Some((sel, matched)) = matches {
+                pairs.slice(&sel, matched);
+            }
+            return Ok((pairs, OperatorResult::HaveMoreOutput));
+        }
+    }
+
+    /// Writes the rows of `input` whose keys are in spilled partitions to the files of their
+    /// partitions, and keeps the others in `kept`. Gives the keys of those that stay.
+    fn defer_rows(
+        &self,
+        build: &FinishedBuild,
+        input: &DataChunk,
+        keys: Vec<Option<RowKey>>,
+        kept: &mut Option<DataChunk>,
+        nulls: &mut Vec<bool>,
+    ) -> Result<Vec<Option<RowKey>>> {
+        let spill = self.spill.as_ref().expect("spilled partitions come from spilling");
+        let mut deferred: Vec<Vec<u32>> = vec![Vec::new(); PARTITIONS];
+        let mut stay = Vec::new();
+        let mut stay_keys = Vec::new();
+        for (row, key) in keys.into_iter().enumerate() {
+            match key {
+                Some(key) if build.spilled[partition_of(&key)] => deferred[partition_of(&key)].push(row as u32),
+                key => {
+                    stay.push(row as u32);
+                    stay_keys.push(key);
+                }
+            }
+        }
+        if stay.len() == input.len() {
+            return Ok(stay_keys);
+        }
+        for (partition, rows) in deferred.into_iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
+            spill.probe.write(partition, &Self::rows_of(input, rows))?;
+        }
+        nulls.truncate(stay.len());
+        *kept = Some(Self::rows_of(input, stay));
+        Ok(stay_keys)
+    }
+
     /// Whether a left row is done at its first match.
     fn first_match_only(&self) -> bool {
         match self.join_type {
@@ -234,14 +865,40 @@ impl PhysicalJoin {
         }
     }
 
+    /// Looks up the keys of each partition, on up to `threads` threads.
+    fn partitions(keys: Vec<Vec<(RowKey, u32)>>, threads: usize) -> Vec<Partition> {
+        if threads < 2 {
+            return keys.into_iter().map(Partition::new).collect();
+        }
+        let keys: Vec<Mutex<Vec<(RowKey, u32)>>> = keys.into_iter().map(Mutex::new).collect();
+        let partitions: Vec<Mutex<Partition>> = (0..keys.len()).map(|_| Mutex::default()).collect();
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..threads.min(keys.len()) {
+                scope.spawn(|| {
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(keys) = keys.get(index) else {
+                            break;
+                        };
+                        *partitions[index].lock() = Partition::new(std::mem::take(&mut *keys.lock()));
+                    }
+                });
+            }
+        });
+        partitions.into_iter().map(Mutex::into_inner).collect()
+    }
+
     /// The next pairs of a left and a build row with equal keys, at most a vector of them.
-    fn next_key_pairs(&self, build: &JoinBuild, probe: &mut Probe) -> (Vec<u32>, Vec<u32>) {
+    fn next_key_pairs(&self, build: &FinishedBuild, probe: &mut Probe) -> (Vec<u32>, Vec<u32>) {
         let mut left = Vec::new();
         let mut right = Vec::new();
         while left.len() < STANDARD_VECTOR_SIZE && probe.row < probe.found.len() {
             let row = probe.row;
             let chain: &[u32] = match probe.groups[row] {
-                Some(group) if !(self.first_match_only() && probe.found[row]) => &build.rows[group],
+                Some((partition, group)) if !(self.first_match_only() && probe.found[row]) => {
+                    &build.partitions[partition].rows[group]
+                }
                 _ => &[],
             };
             let take = chain
@@ -264,7 +921,7 @@ impl PhysicalJoin {
     /// The next pairs without join keys. They come in the order of `CrossProductExecutor`, which
     /// `PhysicalBlockwiseNLJoin` runs on: per vector of the build side, a row of the smaller
     /// chunk against all of the larger one. `probe.row` counts those vectors.
-    fn next_pairs(&self, build: &JoinBuild, probe: &mut Probe) -> (Vec<u32>, Vec<u32>) {
+    fn next_pairs(&self, build: &FinishedBuild, probe: &mut Probe) -> (Vec<u32>, Vec<u32>) {
         let input_count = probe.found.len();
         loop {
             let start = probe.row * STANDARD_VECTOR_SIZE;
@@ -395,189 +1052,86 @@ impl PhysicalOperator for PhysicalJoin {
         1
     }
     fn sink(&self, chunk: &DataChunk) -> Result<()> {
-        let keys = if self.conditions.is_empty() {
-            Vec::new()
-        } else {
-            self.keys(chunk, |c| &c.right)?
-        };
-        let mut build = self.build.lock();
-        let build = &mut *build;
-        let offset = build.count;
-        let sel = SelectionVector::from_vec((0..chunk.len() as u32).collect());
-        for (target, source) in build.columns.iter_mut().zip(chunk.columns()) {
-            target.copy_from(source, &sel, chunk.len(), offset, StringCopy::Deep);
-        }
-        build.count += chunk.len();
-        check_buffered_rows(self.children[1].types(), build.count)?;
-        for (row, key) in keys.into_iter().enumerate() {
-            let Some(key) = key else {
-                build.has_null_key = true;
-                continue;
-            };
-            let next = build.rows.len();
-            let group = *build.groups.entry(key).or_insert(next);
-            if group == next {
-                build.rows.push(Vec::new());
+        let keys = self.build_keys(chunk, false)?;
+        self.append(&mut self.build.lock(), chunk, keys, false)
+    }
+    fn parallel_sink(&self) -> bool {
+        self.conditions.iter().all(|c| parallel_expression(&c.right))
+    }
+    fn local_sink_state(&self) -> LocalSinkState {
+        self.builders.fetch_add(1, Ordering::Relaxed);
+        self.build.lock().partitioned = true;
+        Box::new(LocalBuild::new())
+    }
+    fn sink_local(&self, local: &mut LocalSinkState, _batch: usize, chunk: &DataChunk) -> Result<()> {
+        let keys = self.build_keys(chunk, true)?;
+        let local: &mut LocalBuild = local.downcast_mut().expect("join local state");
+        local.push((chunk.clone(), keys));
+        // a join that can spill counts its rows only once they are in, so they come in often
+        if self.spill.is_some() && local.len() >= LOCAL_BUILD_CHUNKS {
+            let mut build = self.build.lock();
+            for (chunk, keys) in local.drain(..) {
+                self.append(&mut build, &chunk, keys, true)?;
             }
-            build.rows[group].push((offset + row) as u32);
+        }
+        Ok(())
+    }
+    fn combine_local(&self, local: LocalSinkState) -> Result<()> {
+        let local = *local.downcast::<LocalBuild>().expect("join local state");
+        let mut build = self.build.lock();
+        for (chunk, keys) in local {
+            self.append(&mut build, &chunk, keys, true)?;
         }
         Ok(())
     }
     fn finalize(&self) -> Result<()> {
         let mut build = self.build.lock();
-        let columns = std::mem::take(&mut build.columns);
-        let count = build.count;
-        build.data = Some(DataChunk::from_columns(columns, count));
-        build.matched = vec![false; count];
-        Ok(())
+        let builders = self.builders.load(Ordering::Relaxed);
+        let threads = if build.count < MIN_PARALLEL_BUILD_ROWS {
+            1
+        } else {
+            builders
+        };
+        let total_count = build.count + build.spilled_rows;
+        let has_null_key = build.has_null_key;
+        if let Some(spill) = &self.spill {
+            *spill.build_files.lock() = spill.build.take()?;
+        }
+        let finished = Self::finish_build(&mut build, threads, total_count, has_null_key);
+        self.finished
+            .set(finished)
+            .map_err(|_| Error::new(ErrorKind::Internal, "a join build side was finished twice"))
+    }
+    fn parallel_operator(&self) -> bool {
+        self.conditions.iter().all(|c| parallel_expression(&c.left))
+            && self.predicate.as_ref().is_none_or(parallel_expression)
     }
     fn operator_state(&self) -> OperatorState {
-        Box::new(None::<Probe>)
+        Box::new(JoinProbeState::default())
     }
     fn execute_stateful(&self, input: &DataChunk, state: &mut OperatorState) -> Result<(DataChunk, OperatorResult)> {
-        let state = state.downcast_mut::<Option<Probe>>().expect("join state");
-        let mut build = self.build.lock();
-        let build = &mut *build;
-        let probe = match state {
-            Some(probe) => probe,
-            None => {
-                let mut nulls = vec![false; input.len()];
-                let groups = if self.conditions.is_empty() {
-                    Vec::new()
-                } else {
-                    let keys = self.keys(input, |c| &c.left)?;
-                    // a comparison with NULL is NULL, but there is no comparison without right rows
-                    if self.join_type == JoinType::Mark && build.count > 0 {
-                        for (null, key) in nulls.iter_mut().zip(&keys) {
-                            *null = key.is_none() || build.has_null_key;
-                        }
-                    }
-                    keys.iter()
-                        .map(|key| key.as_ref().and_then(|key| build.groups.get(key).copied()))
-                        .collect()
-                };
-                state.insert(Probe {
-                    groups,
-                    row: 0,
-                    candidate: 0,
-                    found: vec![false; input.len()],
-                    nulls,
-                    single: vec![None; input.len()],
-                })
-            }
-        };
-        let data = build.data.as_ref().expect("the build side is finished");
-        let emit_pairs = matches!(
-            self.join_type,
-            JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Outer
-        );
-        loop {
-            let (left, right) = if self.conditions.is_empty() {
-                self.next_pairs(build, probe)
-            } else {
-                self.next_key_pairs(build, probe)
-            };
-            if left.is_empty() {
-                let result = self.finish_probe(input, probe, data)?;
-                *state = None;
-                return Ok((result, OperatorResult::NeedMoreInput));
-            }
-            let count = left.len();
-            let mut columns = Self::rows_of(input, left.clone()).columns().to_vec();
-            columns.extend_from_slice(Self::rows_of(data, right.clone()).columns());
-            let mut pairs = DataChunk::from_columns(columns, count);
-            let matches = match &self.predicate {
-                Some(predicate) if self.join_type == JoinType::Mark => {
-                    let result = execute(predicate, &pairs)?;
-                    let mut selected = Vec::new();
-                    for (row, left) in left.iter().enumerate() {
-                        match result.get_value(row).data() {
-                            ValueData::Bool(true) => selected.push(row as u32),
-                            ValueData::Bool(false) => {}
-                            _ => probe.nulls[*left as usize] = true,
-                        }
-                    }
-                    let matched = selected.len();
-                    Some((SelectionVector::from_vec(selected), matched))
-                }
-                Some(predicate) => {
-                    let (sel, matched) = select(predicate, &pairs)?;
-                    (matched != count).then_some((sel, matched))
-                }
-                None => None,
-            };
-            match &matches {
-                Some((sel, matched)) => {
-                    for i in 0..*matched {
-                        probe.found[left[sel.get(i)] as usize] = true;
-                        build.matched[right[sel.get(i)] as usize] = true;
-                    }
-                }
-                None => {
-                    for (left, right) in left.iter().zip(&right) {
-                        probe.found[*left as usize] = true;
-                        build.matched[*right as usize] = true;
-                    }
-                }
-            }
-            if self.join_type == JoinType::Single {
-                let pairs_found: Vec<(u32, u32)> = match &matches {
-                    Some((sel, matched)) => (0..*matched).map(|i| (left[sel.get(i)], right[sel.get(i)])).collect(),
-                    None => left.iter().copied().zip(right.iter().copied()).collect(),
-                };
-                for (left, right) in pairs_found {
-                    let slot = &mut probe.single[left as usize];
-                    if slot.is_none() {
-                        *slot = Some(right);
-                    } else if self.error_on_multiple_rows {
-                        return Err(Error::new(ErrorKind::InvalidInput, MULTIPLE_ROWS));
-                    }
-                }
-            }
-            if !emit_pairs {
-                continue;
-            }
-            if let Some((sel, matched)) = matches {
-                pairs.slice(&sel, matched);
-            }
-            return Ok((pairs, OperatorResult::HaveMoreOutput));
-        }
+        let state = state.downcast_mut::<JoinProbeState>().expect("join state");
+        self.probe_with(self.finished(), input, state, true)
     }
     fn has_unmatched_source(&self) -> bool {
-        matches!(
-            self.join_type,
-            JoinType::Right | JoinType::Outer | JoinType::RightSemi | JoinType::RightAnti
-        )
+        // a join that can spill may have partitions to join after the probe
+        self.emits_build_rows() || self.spill.is_some()
     }
     fn source_state(&self) -> SourceState {
-        Box::new(0usize)
+        Box::new(JoinSource::default())
     }
-    /// The build rows nothing matched, or for RIGHT SEMI the ones something did.
+    /// The build rows nothing matched, or for RIGHT SEMI the ones something did, and then what
+    /// the spilled partitions give.
     fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
-        let next = state.downcast_mut::<usize>().expect("join source state");
-        let build = self.build.lock();
-        let wanted = self.join_type == JoinType::RightSemi;
-        let mut rows = Vec::new();
-        while *next < build.count && rows.len() < STANDARD_VECTOR_SIZE {
-            if build.matched[*next] == wanted {
-                rows.push(*next as u32);
+        let source = state.downcast_mut::<JoinSource>().expect("join source state");
+        if !source.memory_done {
+            if self.emits_build_rows()
+                && let Some(chunk) = self.build_rows_chunk(self.finished(), &mut source.next)
+            {
+                return Ok(Some(chunk));
             }
-            *next += 1;
+            source.memory_done = true;
         }
-        if rows.is_empty() {
-            return Ok(None);
-        }
-        let count = rows.len();
-        let right = Self::rows_of(build.data.as_ref().expect("the build side is finished"), rows);
-        if matches!(self.join_type, JoinType::RightSemi | JoinType::RightAnti) {
-            return Ok(Some(right));
-        }
-        let mut columns: Vec<Vector> = self.children[0]
-            .types()
-            .iter()
-            .map(|t| Vector::constant_null(t.clone()))
-            .collect();
-        columns.extend_from_slice(right.columns());
-        Ok(Some(DataChunk::from_columns(columns, count)))
+        self.next_spilled(source)
     }
 }

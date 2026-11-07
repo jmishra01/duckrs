@@ -752,6 +752,7 @@ dependencies = [
  "duckrs-common",
  "duckrs-parser",
  "flate2",
+ "libc",
  "libm",
  "parking_lot",
  "parquet",

@@ -11,11 +11,13 @@ pub mod csv;
 pub mod csv_sniffer;
 pub mod csv_state_machine;
 pub mod expression_executor;
+pub mod external_sort;
 pub mod file_system;
 pub mod join;
 pub mod json_scan;
 pub mod parquet;
 pub mod physical;
+pub mod temporary;
 pub mod zone_map;
 
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
@@ -24,6 +26,8 @@ use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::vector::DataChunk;
 use parking_lot::Mutex;
 use physical::*;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub mod alter;
 pub mod constraints;
@@ -376,15 +380,28 @@ impl Pipeline<'_> {
     /// Pushes `chunk` through the operators from `index` on, into the sink, as many times as
     /// each operator has output for it (`PipelineExecutor::Execute`).
     fn push(&self, chunk: DataChunk, index: usize, states: &mut [OperatorState]) -> Result<()> {
+        self.push_into(chunk, index, states, &mut |chunk| {
+            self.sink.sink_input(self.input, chunk)
+        })
+    }
+
+    /// [`Self::push`], to wherever `sink` puts a chunk.
+    fn push_into(
+        &self,
+        chunk: DataChunk,
+        index: usize,
+        states: &mut [OperatorState],
+        sink: &mut dyn FnMut(&DataChunk) -> Result<()>,
+    ) -> Result<()> {
         if chunk.is_empty() {
             return Ok(());
         }
         let Some(op) = self.operators.get(index) else {
-            return self.sink.sink_input(self.input, &chunk);
+            return sink(&chunk);
         };
         loop {
             let (output, result) = op.execute_stateful(&chunk, &mut states[index])?;
-            self.push(output, index + 1, states)?;
+            self.push_into(output, index + 1, states, sink)?;
             // A finished operator wants no more input, which only stops what feeds it: the
             // operators above it still emit the output of the rows it already passed on.
             let finished = self.operators[index + 1..].iter().any(|op| op.is_finished());
@@ -398,14 +415,65 @@ impl Pipeline<'_> {
         self.operators.iter().any(|op| op.is_finished())
     }
 
+    /// What threads can read, if the whole pipeline can run on them.
+    fn parallel_source(&self, threads: usize) -> Option<(SharedSourceState, usize)> {
+        if threads < 2
+            || self.sink.sink_children().len() != 1
+            || !self.sink.parallel_sink()
+            || !self.operators.iter().all(|op| op.parallel_operator())
+        {
+            return None;
+        }
+        self.source.parallel_source()
+    }
+
+    /// `TaskScheduler`: threads claim morsels of the source, and each sinks on its own.
+    fn run_parallel(&self, threads: usize, shared: SharedSourceState, morsels: usize) -> Result<()> {
+        let next = AtomicUsize::new(0);
+        let failed = AtomicBool::new(false);
+        let error = Mutex::new(None);
+        let memory = temporary::current();
+        let worker = || -> Result<()> {
+            let mut local = self.sink.local_sink_state();
+            let mut states: Vec<OperatorState> = self.operators.iter().map(|op| op.operator_state()).collect();
+            while !failed.load(Ordering::Relaxed) {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                if index >= morsels {
+                    break;
+                }
+                if let Some(chunk) = self.source.parallel_chunk(&shared, index)? {
+                    self.push_into(chunk, 0, &mut states, &mut |chunk| {
+                        self.sink.sink_local(&mut local, index, chunk)
+                    })?;
+                }
+            }
+            self.sink.combine_local(local)
+        };
+        std::thread::scope(|scope| {
+            for _ in 0..threads.min(morsels) {
+                scope.spawn(|| {
+                    if let Err(failure) = temporary::with_memory(Arc::clone(&memory), worker) {
+                        failed.store(true, Ordering::Relaxed);
+                        error.lock().get_or_insert(failure);
+                    }
+                });
+            }
+        });
+        error.into_inner().map_or(Ok(()), Err)
+    }
+
     /// `PipelineExecutor::Execute` + `PipelineFinishEvent`.
-    fn run(&self) -> Result<()> {
-        let mut state = self.source.source_state();
-        let mut operator_states: Vec<OperatorState> = self.operators.iter().map(|op| op.operator_state()).collect();
-        while let Some(chunk) = self.source.get_data(&mut state)? {
-            self.push(chunk, 0, &mut operator_states)?;
-            if self.is_finished() {
-                break;
+    fn run(&self, threads: usize) -> Result<()> {
+        if let Some((shared, morsels)) = self.parallel_source(threads) {
+            self.run_parallel(threads, shared, morsels)?;
+        } else {
+            let mut state = self.source.source_state();
+            let mut operator_states: Vec<OperatorState> = self.operators.iter().map(|op| op.operator_state()).collect();
+            while let Some(chunk) = self.source.get_data(&mut state)? {
+                self.push(chunk, 0, &mut operator_states)?;
+                if self.is_finished() {
+                    break;
+                }
             }
         }
         if self.finish_input {
@@ -475,10 +543,15 @@ pub fn run_plan(plan: LogicalOperator) -> Result<ColumnDataCollection> {
 
 /// `Executor::Initialize` + `Execute`: runs a plan whose root is a sink.
 pub fn execute_plan(root: &dyn PhysicalOperator) -> Result<()> {
+    execute_plan_with(root, 1)
+}
+
+/// [`execute_plan`], with up to `threads` threads for each pipeline that can use them.
+pub fn execute_plan_with(root: &dyn PhysicalOperator, threads: usize) -> Result<()> {
     let mut pipelines = Vec::new();
     build_pipelines(root, &mut pipelines);
     for pipeline in &pipelines {
-        pipeline.run()?;
+        pipeline.run(threads)?;
     }
     Ok(())
 }

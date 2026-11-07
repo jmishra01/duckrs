@@ -205,6 +205,47 @@ fn on_set(setting: &SettingDefinition, value: Value) -> Result<Value> {
                 }
             })
         }
+        // `MaxMemorySetting::SetGlobal` and `GetSetting`: a size, shown as one
+        "max_memory" => {
+            use crate::execution::temporary::{format_bytes, parse_memory_limit, physical_memory};
+            let input = value.try_to_string()?;
+            let bytes = match input.strip_suffix('%') {
+                Some(percentage) => {
+                    let percentage: f64 = percentage
+                        .trim()
+                        .parse()
+                        .ok()
+                        .filter(|p| (0.0..=100.0).contains(p))
+                        .ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::InvalidInput,
+                                format!("Unable to parse valid percentage (input: {input})"),
+                            )
+                        })?;
+                    let memory = physical_memory().unwrap_or(u64::MAX) as f64;
+                    // C++ rounds a tiny percentage down to whole bytes, but never to none
+                    ((percentage * memory / 100.0) as u64).max(1)
+                }
+                None => parse_memory_limit(&input)?.unwrap_or(u64::MAX),
+            };
+            Value::varchar(format_bytes(bytes))
+        }
+        // `MaxTempDirectorySizeSetting::SetGlobal`
+        "max_temp_directory_size" => {
+            use crate::execution::temporary::{format_bytes, parse_memory_limit};
+            if value.is_null() {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "max_temp_directory_size setting cannot be NULL",
+                ));
+            }
+            let input = value.try_to_string()?;
+            if input == crate::execution::temporary::DEFAULT_TEMP_DIRECTORY_SIZE {
+                value
+            } else {
+                Value::varchar(format_bytes(parse_memory_limit(&input)?.unwrap_or(u64::MAX)))
+            }
+        }
         _ => value,
     })
 }

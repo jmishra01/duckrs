@@ -11,6 +11,7 @@ repository = "https://github.com/jmishra01/duckrs"
 
 [workspace.dependencies]
 libm = "0.2"
+libc = "0.2"
 sha1 = "0.10"
 sha2 = "0.10"
 arrow = { version = "60", default-features = false }

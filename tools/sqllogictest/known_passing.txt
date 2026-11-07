@@ -533,7 +533,9 @@ test/sql/aggregate/aggregate_state_export/vector_minmax_export_state.test
 test/sql/aggregate/aggregates/approx_quantile_decimal_scalar.test
 test/sql/aggregate/aggregates/approx_quantile_parallel_finalize.test
 test/sql/aggregate/aggregates/bitagg_fallible.test
+test/sql/aggregate/aggregates/bitagg_memory_limit.test
 test/sql/aggregate/aggregates/bitstring_agg_empty.test
+test/sql/aggregate/aggregates/bitstring_agg_memory_limit.test
 test/sql/aggregate/aggregates/first_last_alloc_reuse.test
 test/sql/aggregate/aggregates/mode_rewrite_memory.test
 test/sql/aggregate/aggregates/quantile_fallible.test
@@ -2227,6 +2229,7 @@ test/sql/setops/union_pipeline.test
 test/sql/setops/union_shared_scan.test
 test/sql/setops/value_union.test
 test/sql/settings/connection_local_settings.test
+test/sql/settings/max_memory_percentage.test
 test/sql/settings/reset/reset_threads.test
 test/sql/settings/setting_null_order.test
 test/sql/settings/setting_order.test
@@ -2532,6 +2535,7 @@ test/sql/storage/storage_exceeds_single_block_types.test
 test/sql/storage/storage_types.test
 test/sql/storage/store_group_order_all.test
 test/sql/storage/temp_directory/max_swap_space_explicit.test
+test/sql/storage/temp_directory/max_swap_space_unlimited.test
 test/sql/storage/temp_directory/test_default_temp_directory.test
 test/sql/storage/test_empty_shutdown.test
 test/sql/storage/test_empty_table.test

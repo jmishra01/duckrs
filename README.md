@@ -41,12 +41,12 @@ and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in me
   settle: an in-memory catalog (`catalog`); scalar functions, the implicit cast cost rules, type
   unification (`MaxLogicalType`), overload resolution and vector casts (`function`); the binder,
   bound expressions, logical operators and column binding resolution (`planner`); the expression
-  executor, physical operators and single-threaded pipelines (`execution`); and the client
+  executor, physical operators and pipelines, on threads for large aggregates and joins (`execution`); and the client
   context and settings (`client`, DuckDB's `src/main`). It runs CREATE TABLE (with AS, NOT NULL and
   DEFAULT), CREATE VIEW, CREATE SEQUENCE (with `nextval`, `currval`, `setval`), CREATE MACRO (scalar and table, with overloads, defaults and named arguments), CREATE SCHEMA, DROP, INSERT (VALUES or a query) and SELECT over tables,
   views, VALUES lists, subqueries, `range`/`generate_series` and joins of those (CROSS, INNER, LEFT, RIGHT,
   FULL, SEMI, ANTI and their RIGHT forms, with ON, USING or NATURAL; hash joins for equality
-  conditions and nested loops otherwise, single-threaded and in memory) with WHERE, GROUP BY (with aliases,
+  conditions and nested loops otherwise, in memory) with WHERE, GROUP BY (with aliases,
   positions, ALL, GROUPING SETS, ROLLUP and CUBE, and `GROUPING()`), HAVING, aggregates (`count`, `sum`, `avg`, `min`, `max`, `first`, `last`,
   `any_value`, with DISTINCT and FILTER), ORDER BY (positions, aliases, expressions, ORDER BY
   ALL, NULLS FIRST/LAST), LIMIT/OFFSET and DISTINCT; expressions with comparisons, AND/OR/NOT,
@@ -63,13 +63,13 @@ and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in me
   database takes no writes. Views, macros, sequences, types, defaults, generated columns, constraints and indexes come along, what a write-ahead log committed is replayed, and what isn't ported yet is an error. Files can be written too, in a format that DuckDB reads: commits go to a write-ahead log, and `CHECKPOINT` and closing the database write all of it, compressed with RLE, BitPacking, Roaring and dictionaries, apart from keys and indexes, which wait for Phase 10; see "Phase 9" in
   [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 - `tools/sqllogictest`: a port of DuckDB's sqllogictest runner. It runs the DuckDB `.test` corpus
-  against duckrs, or against the C++ DuckDB library as a reference. duckrs passes 3318 files so far
+  against duckrs, or against the C++ DuckDB library as a reference. duckrs passes 3322 files so far
   (`tools/sqllogictest/known_passing.txt`, a CI gate), among them
   `test/sql/projection/test_simple_projection.test`.
 
-Deferred to later phases by design: sorting is in-memory (external merge sort comes with Phase
-8), and `ColumnDataCollection` and `TupleDataCollection` are in-memory (spilling comes with the
-buffer manager in Phase 9). The row format stores LIST/ARRAY values in a per-column side store
+ORDER BY, GROUP BY and hash joins spill to `temp_directory` past `memory_limit` (Phase 8); windows
+and the other blocking operators are still in memory, and `ColumnDataCollection` and
+`TupleDataCollection` are in-memory (spilling them comes with the buffer manager). The row format stores LIST/ARRAY values in a per-column side store
 rather than C++'s row heap; it is never persisted, so only its behavior has to match.
 
 The full roadmap is in [`../RUST_PORT_PLAN.md`](../RUST_PORT_PLAN.md).

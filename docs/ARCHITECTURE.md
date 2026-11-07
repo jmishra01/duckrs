@@ -292,6 +292,92 @@ pushdown through outer, right, ASOF and window operators, SEMI and ANTI delim jo
 and flattening of the cases above, the extremum rewrite of `> ANY` among them. MARK joins with a
 predicate check each pair of a key's rows, where C++ hashes on the comparison. The gate is not met: `test/optimizer` is at 46.5% against 80%.
 
+## Phase 8
+
+Threads for aggregates and joins, and spilling for sorts, aggregates and hash joins. A pipeline runs on the `threads` setting's threads,
+all of the machine's by default, when it has all of these:
+
+- a source of morsels: a table in memory of at least 2 row groups, so that small tables stay in order and their
+  floating point sums the same on each run. A table still in its file does not qualify;
+- operators that any thread can run in any order: filters, projections, column selections, and the probe of a hash or
+  blockwise nested loop join (`PhysicalJoin`). Once its build side is finished it does not change, apart from the flags
+  of the build rows that found a match, which are atomic, so threads probe it without a lock;
+- a sink with a state per thread:
+  - `PhysicalAggregate` with one grouping set, no DISTINCT or ORDER BY, and aggregates that `is_order_independent`:
+    `count`, `sum`, `avg`, `min` and `max`. `first` and `list` depend on the order, and the aggregates that keep their
+    rows do their work at the end, where threads only add merging (`median` got slower);
+  - the build side of `PhysicalJoin`. Each thread keeps its chunks with their keys, and the hash of a key puts it in
+    one of 64 partitions. `finalize` looks up the keys of each partition in a table of its own, on as many threads as
+    sank, once there are 100,000 build rows. Threads cut the time of a large build side most, as looking up keys takes
+    nearly all of it. One thread puts all keys in one partition, so that probing does not hash a key twice;
+  - `PhysicalResultCollector`, as `PhysicalBatchCollector`: `sink_local` is told the morsel of each chunk, and the
+    rows of each morsel go into the result in morsel order, which is the order of one thread.
+
+Expressions that are volatile or run a subquery keep a pipeline on one thread. Threads are `std::thread::scope` per
+pipeline, not a scheduler, and there are no events or blocked tasks. `examples/parallel_aggregate.rs` gives 2.9x to 5.5x on
+8 threads, once a query has been warmed: its first run builds what later ones find cached, and that is single threaded.
+`examples/parallel_join.rs` gives 3.4x to 5.4x on joins of 10 million rows with 1 million and with 1,000.
+
+Floating point sums over large tables can differ in their last digits between runs, as they do in C++. Groups come out
+in another order, which SQL allows, and so do the matches of a key in the build side of a join, as threads add their
+rows in the order they finish. Not ported: cross products, AsOf, IEJoin and the other special joins on threads, sort
+and window on threads, parallel CSV and `InterruptState`.
+
+### Spilling
+
+C++ keeps the data of operators in blocks of the buffer manager, which evicts what is not pinned, so any operator can
+go past `memory_limit`. The data of operators here is not in blocks, so spilling is up to the operator
+(`execution/temporary`):
+
+- `QueryMemory` holds a query's limit and what has been taken of it. A spilling operator asks for the bytes it is about
+  to hold (`estimated_bytes`: fixed-size values, strings, a guess for nested values, and for an aggregate what its map
+  and states take for each group), and spills when it gets a no. Tables, the query result and the operators that do not
+  spill are not counted, so the limit bounds what spilling operators hold, not the process. It reaches each thread of
+  a query through a thread-local that the threads of a pipeline inherit.
+- `SpillFile` writes chunks in the format of `DataChunk::Serialize` from the log, to `temp_directory`: `.tmp`, or the
+  database file's path with `.tmp`. The directory is made with the first file and removed after the query if it was
+  made for it, and a file is removed once nothing reads it. `max_temp_directory_size` errors as in C++ when the files
+  would pass it; by default there is no limit. GEOMETRY and VARIANT can't be written, so rows with them do not spill.
+- `memory_limit` (`max_memory`) defaults to 80% of the machine's memory, takes the sizes and percentages of
+  `ParseMemoryLimit`, and shows as `BytesToHumanReadableString` does. The default shows as NULL, not as a size.
+
+What spills:
+
+- **ORDER BY** (`external_sort`): rows past the limit are sorted into a run that goes to a file, of at least 16 vectors
+  however little memory there is. The runs and what is left in memory are merged on the way out, the smallest key first
+  and of equal keys the one of the earlier run, so ties keep their order as in memory. More than 32 runs are merged into
+  fewer first. A Top-N keeps few rows and does not spill.
+- **GROUP BY** (`PhysicalAggregate`): once the groups in memory are at the limit, the rows of groups that are not
+  there go to one of 64 files by the hash of their group. The groups in memory are output first, then each partition is
+  aggregated on its own, and partitioned again with other bits of the hash if it is too large too, three levels deep.
+  With one thread a group is either in memory or in a partition, so the rows of a group stay in order for `first`,
+  `list` and ORDER BY in an aggregate. Threads can each have a group, so then the groups in memory join their
+  partition. This needs one grouping set, groups to group on, and groups that come out the same when computed again.
+- **Hash joins** (`PhysicalJoin`, a grace hash join): once the build side is at the limit, the largest of its 64
+  partitions, about half its rows with keys, go to files, the rows left in memory are compacted in their order, and the
+  later rows of spilled partitions go to their files. One thread keeps all keys in one partition until then, and they
+  are split by hash when it first spills. A probe row whose key is in a spilled partition goes to a file of that
+  partition too, from any thread. A join that can spill is a source after the probe, as RIGHT and FULL joins are: once
+  its own unmatched build rows are out, it reads back each spilled partition, builds it in memory, probes it with its
+  rows, and emits its unmatched build rows, with the same code for every join type. MARK joins look at whether the
+  whole build side, files included, has rows and NULL keys. The rows of spilled partitions come after the others, and
+  a spilled partition is joined in memory whatever its size: a key with very many rows is not split further. This needs
+  join keys that come out the same when computed again; nested loop joins do not spill.
+
+`examples/out_of_core.rs` sorts and groups 10 million rows with and without `memory_limit='100MB'`: the answers are
+the same, and the time is 0.7x to 1.4x. The process takes about 1.5 GB for a sort that takes 2.2 GB without the limit,
+and 1.6 GB for an aggregate of 10 million groups that takes 3.5 GB, of which the table is 0.7 GB. Most of the rest is
+memory the allocator keeps after the partitions are done: running the query again in the same process takes no more.
+Joining 10 million rows with 5 million takes 1.3 GB instead of 1.7 GB, and the joins are 2.6x to 3.4x faster with the
+limit, as each partition's table is small enough to stay in the cache.
+
+Operators that spill no longer stop at 2 GiB, so a query that failed there now runs to `memory_limit`.
+`test/sql/optimizer/plan/test_filter_pushdown_large.test` builds a hash table of a 100 million row cross product that
+way, and passes in about 7 minutes, past the runner's timeout: building one large table is slow (Phase 13).
+
+Not ported: spilling windows, nested loop joins, the other blocking operators and the query result, which keep the
+2 GiB cap, and the `outofcore` tests, which need TPC-H's `dbgen`.
+
 ## Phase 9
 
 Files stay byte-compatible with DuckDB, the choice the plan recommends: `storage` reads what DuckDB

@@ -14,7 +14,7 @@ pub mod metadata;
 pub mod serialization;
 pub mod statistics;
 pub mod table_data;
-mod wal;
+pub(crate) mod wal;
 pub mod writer;
 
 use crate::catalog::Catalog;

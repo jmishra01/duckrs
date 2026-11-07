@@ -338,6 +338,11 @@ fn read_flat_vector(d: &mut BinaryDeserializer<'_>, ty: &LogicalType, count: usi
     Ok(vector)
 }
 
+/// A chunk from the bytes of [`super::log_writer::serialize_chunk`].
+pub(crate) fn deserialize_chunk(bytes: &[u8]) -> Result<DataChunk> {
+    read_chunk(&mut BinaryDeserializer::new(bytes), 100)
+}
+
 /// `DataChunk::Deserialize`.
 fn read_chunk(d: &mut BinaryDeserializer<'_>, field_id: u16) -> Result<DataChunk> {
     d.read_object(field_id, "chunk", |d| {

@@ -16,7 +16,7 @@ use crate::catalog::{DatabaseList, DatabaseListing};
 use crate::execution::alter::{execute_alter, execute_create_index};
 use crate::execution::expression_executor::evaluate_scalar;
 use crate::execution::physical::PhysicalResultCollector;
-use crate::execution::{create_plan, execute_plan};
+use crate::execution::{create_plan, execute_plan_with};
 use crate::optimizer::join_order::estimate_plan;
 use crate::optimizer::{OptimizerOptions, optimize};
 use crate::planner::binder::{
@@ -636,6 +636,41 @@ impl ClientContext {
     /// The current value of a setting (`Settings::Get` / `current_setting`).
     pub fn setting(&self, name: &str) -> Option<Value> {
         settings::current_value(name, &self.home.settings.read(), &self.settings)
+    }
+
+    /// What spilling operators may hold, from `memory_limit`, and where they spill to, from
+    /// `temp_directory` (by default `.tmp`, or next to the database file) and `max_temp_directory_size`.
+    fn query_memory(&self) -> Result<Arc<crate::execution::temporary::QueryMemory>> {
+        use crate::execution::temporary::{QueryMemory, default_memory_limit, parse_setting_bytes};
+        let text = |name: &str| {
+            self.setting(name)
+                .filter(|v| !v.is_null())
+                .and_then(|v| v.try_to_string().ok())
+        };
+        let limit = match text("max_memory") {
+            Some(limit) => parse_setting_bytes(&limit)?.map_or(usize::MAX, |bytes| bytes as usize),
+            None => default_memory_limit(),
+        };
+        let directory = match text("temp_directory") {
+            Some(directory) => PathBuf::from(directory),
+            None => match &self.db.file {
+                Some(file) => PathBuf::from(format!("{}.tmp", file.path.display())),
+                None => PathBuf::from(".tmp"),
+            },
+        };
+        let max_temp_size = match text("max_temp_directory_size") {
+            Some(size) => parse_setting_bytes(&size)?,
+            None => None,
+        };
+        Ok(QueryMemory::new(limit, directory, max_temp_size))
+    }
+
+    /// The `threads` setting: all the machine has, unless someone said otherwise.
+    fn thread_count(&self) -> usize {
+        self.setting("threads").and_then(|value| value.as_i128()).map_or_else(
+            || std::thread::available_parallelism().map_or(1, usize::from),
+            |threads| threads.max(1) as usize,
+        )
     }
 
     fn setting_text(&self, name: &str) -> String {
@@ -1832,7 +1867,8 @@ impl ClientContext {
         resolve_column_bindings(&mut plan)?;
         let plan = create_plan(plan);
         let collector = PhysicalResultCollector::new(plan);
-        execute_plan(&collector)?;
+        let threads = self.thread_count();
+        crate::execution::temporary::with_memory(self.query_memory()?, || execute_plan_with(&collector, threads))?;
         let collection = collector.result.into_inner();
         // the result has the statement's types, which a collector of e.g. CREATE TABLE lacks
         let collection = if collection.types() == bound.types.as_slice() {
@@ -2193,6 +2229,160 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn threads_give_the_answers_of_one_thread() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        run(
+            &mut c,
+            "CREATE TABLE t AS SELECT i AS a, i % 7 AS g, i % 2 = 0 AS even FROM range(400000) r(i)",
+        );
+        let queries = [
+            "SELECT sum(a), count(*), min(a), max(a), avg(a) FROM t",
+            "SELECT g, sum(a), count(*), max(a) FROM t GROUP BY g ORDER BY g",
+            "SELECT sum(a * 2) FROM t WHERE even",
+            "SELECT count(*) FROM t WHERE a < 0",
+            "SELECT g, count(*) FILTER (WHERE even) FROM t GROUP BY g ORDER BY g",
+        ];
+        for query in queries {
+            run(&mut c, "SET threads=1");
+            let one = run(&mut c, query);
+            run(&mut c, "SET threads=4");
+            assert_eq!(run(&mut c, query), one, "{query}");
+        }
+    }
+
+    #[test]
+    fn threads_keep_the_order_of_rows() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        run(
+            &mut c,
+            "CREATE TABLE t AS SELECT i AS a, i % 1000 AS k FROM range(400000) r(i)",
+        );
+        run(
+            &mut c,
+            "CREATE TABLE d AS SELECT i AS k, i * 3 AS v FROM range(1000) r(i)",
+        );
+        let queries = [
+            "SELECT a FROM t WHERE a % 7 = 0",
+            "SELECT t.a, d.v FROM t JOIN d ON t.k = d.k WHERE t.a % 5 = 0",
+            "SELECT t.a, d.v FROM t LEFT JOIN d ON t.a = d.k WHERE t.a % 3 = 0",
+            "SELECT a FROM t WHERE k IN (SELECT k FROM d WHERE v % 2 = 0)",
+        ];
+        for query in queries {
+            run(&mut c, "SET threads=1");
+            let one = run(&mut c, query);
+            run(&mut c, "SET threads=4");
+            assert_eq!(run(&mut c, query), one, "{query}");
+        }
+    }
+
+    /// A directory of its own for the temporary files of a test.
+    fn temp_directory(c: &mut ClientContext, test: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!("duckrs_{test}_{}", std::process::id()));
+        run(c, &format!("SET temp_directory='{}'", directory.display()));
+        directory
+    }
+
+    #[test]
+    fn a_sort_past_the_memory_limit_spills() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        // more than 32 runs of the smallest size, so that runs are merged into fewer first
+        run(
+            &mut c,
+            "CREATE TABLE t AS SELECT (i * 7919) % 1000 AS k, i AS a, 'row ' || i AS s FROM range(1100000) r(i)",
+        );
+        let query = "SELECT k, a, s FROM t ORDER BY k DESC, s";
+        let ties = "SELECT a FROM t ORDER BY k";
+        let expected = run(&mut c, query);
+        let expected_ties = run(&mut c, ties);
+        let directory = temp_directory(&mut c, "sort_spill");
+        run(&mut c, "SET memory_limit='1MB'");
+        run(&mut c, "SET threads=4");
+        assert_eq!(run(&mut c, query), expected);
+        // equal keys keep the order they came in
+        assert_eq!(run(&mut c, ties), expected_ties);
+        assert!(!directory.exists(), "the temporary directory is removed");
+    }
+
+    #[test]
+    fn an_aggregate_past_the_memory_limit_spills() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        run(
+            &mut c,
+            "CREATE TABLE t AS SELECT (i * 7919) % 300000 AS k, i AS a, 'v' || (i % 13) AS s FROM range(1000000) r(i)",
+        );
+        let queries = [
+            "SELECT k, sum(a), count(*), min(s), max(a) FROM t GROUP BY k ORDER BY k",
+            // these depend on the order of the rows of each group
+            "SELECT k, list(a), first(s), string_agg(s, ',') FROM t WHERE k % 7 = 0 GROUP BY k ORDER BY k",
+            "SELECT k, count(DISTINCT s), list(a ORDER BY a DESC) FROM t GROUP BY k ORDER BY k LIMIT 1000",
+            "SELECT s, count(*), sum(k) FROM t GROUP BY s ORDER BY s",
+        ];
+        let expected: Vec<_> = queries.iter().map(|q| run(&mut c, q)).collect();
+        let directory = temp_directory(&mut c, "aggregate_spill");
+        run(&mut c, "SET memory_limit='1MB'");
+        for threads in [1, 4] {
+            run(&mut c, &format!("SET threads={threads}"));
+            for (query, expected) in queries.iter().zip(&expected) {
+                assert_eq!(&run(&mut c, query), expected, "{threads} threads: {query}");
+            }
+        }
+        assert!(!directory.exists(), "the temporary directory is removed");
+    }
+
+    #[test]
+    fn a_join_past_the_memory_limit_spills() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        // keys repeat on both sides, some are NULL, and some match nothing
+        run(
+            &mut c,
+            "CREATE TABLE l AS SELECT CASE WHEN i % 97 = 0 THEN NULL ELSE (i * 7919) % 250000 END AS k, i AS a, \
+             'l' || i AS s FROM range(400000) r(i)",
+        );
+        run(
+            &mut c,
+            "CREATE TABLE r AS SELECT CASE WHEN i % 89 = 0 THEN NULL ELSE (i * 31) % 300000 END AS k, i AS b, \
+             'r' || i AS t FROM range(350000) r(i)",
+        );
+        let queries = [
+            "SELECT count(*), sum(a), sum(b), max(s), max(t) FROM l JOIN r USING (k)",
+            "SELECT l.k, a, b, t FROM l JOIN r ON l.k = r.k AND a % 3 <> b % 3 ORDER BY ALL LIMIT 2000",
+            "SELECT count(*), count(b), sum(a) FROM l LEFT JOIN r ON l.k = r.k",
+            "SELECT count(*), count(a), count(b), sum(b) FROM l RIGHT JOIN r ON l.k = r.k",
+            "SELECT count(*), count(a), count(b) FROM l FULL JOIN r ON l.k = r.k",
+            "SELECT * FROM l FULL JOIN r ON l.k = r.k ORDER BY a, b LIMIT 1000 OFFSET 200000",
+            "SELECT count(*), sum(a) FROM l WHERE k IN (SELECT k FROM r)",
+            "SELECT count(*), sum(a) FROM l WHERE k NOT IN (SELECT k FROM r WHERE b % 5 = 0)",
+            "SELECT count(*), sum(a) FROM l WHERE NOT EXISTS (SELECT 1 FROM r WHERE r.k = l.k)",
+            "SELECT count(*), sum(b) FROM r WHERE EXISTS (SELECT 1 FROM l WHERE r.k = l.k)",
+            "SELECT count(*), count(*) FILTER (WHERE m) FROM (SELECT k IN (SELECT k FROM r) AS m FROM l)",
+        ];
+        let expected: Vec<_> = queries.iter().map(|q| run(&mut c, q)).collect();
+        let directory = temp_directory(&mut c, "join_spill");
+        run(&mut c, "SET memory_limit='1MB'");
+        for threads in [1, 4] {
+            run(&mut c, &format!("SET threads={threads}"));
+            for (query, expected) in queries.iter().zip(&expected) {
+                assert_eq!(&run(&mut c, query), expected, "{threads} threads: {query}");
+            }
+        }
+        assert!(!directory.exists(), "the temporary directory is removed");
+    }
+
+    #[test]
+    fn an_error_on_a_thread_stops_the_query() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        run(
+            &mut c,
+            "CREATE TABLE t AS SELECT CASE WHEN i = 300000 THEN 'x' ELSE i::VARCHAR END AS s FROM range(400000) r(i)",
+        );
+        run(&mut c, "SET threads=4");
+        let error = c.query("SELECT sum(s::BIGINT) FROM t").unwrap_err().to_string();
+        assert!(error.contains("Could not convert"), "{error}");
+        // the connection goes on
+        assert_eq!(run(&mut c, "SELECT count(*) FROM t"), vec![vec!["400000".to_string()]]);
     }
 
     #[test]

@@ -257,6 +257,23 @@ fn flat(vector: &Vector, count: usize) -> Vector {
     vector
 }
 
+/// A chunk in the bytes of `DataChunk::Serialize`, for temporary files.
+pub(crate) fn serialize_chunk(chunk: &DataChunk) -> Result<Vec<u8>> {
+    let mut s = BinarySerializer::new(SerializationOptions::default());
+    write_chunk_as(&mut s, 100, chunk)?;
+    Ok(s.into_bytes())
+}
+
+/// Whether a chunk of these types can be serialized.
+pub(crate) fn can_serialize(types: &[LogicalType]) -> bool {
+    fn can(ty: &LogicalType) -> bool {
+        !matches!(ty.id(), LogicalTypeId::Geometry | LogicalTypeId::Variant)
+            && ty.child_type().is_none_or(can)
+            && ty.struct_children().iter().all(|(_, child)| can(child))
+    }
+    types.iter().all(can)
+}
+
 fn write_chunk(s: &mut BinarySerializer, chunk: &DataChunk) -> Result<()> {
     write_chunk_as(s, 101, chunk)
 }

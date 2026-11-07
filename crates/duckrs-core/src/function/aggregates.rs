@@ -332,6 +332,17 @@ pub enum AggregateState {
 }
 
 impl AggregateKind {
+    /// Whether threads gain from seeing the rows in parts: the result can't depend on their order,
+    /// as `first` and `list` do, and the work is done on the way in. The aggregates that keep their
+    /// rows do theirs at the end, so threads would only add merging.
+    pub fn is_order_independent(self) -> bool {
+        use AggregateKind::*;
+        matches!(
+            self,
+            CountStar | Count | SumInteger | SumDouble | SumDecimal | AvgInteger | AvgDouble | AvgDecimal | Min | Max
+        )
+    }
+
     /// `StateInitialize`.
     pub fn initial_state(self) -> AggregateState {
         use AggregateKind::*;
@@ -427,7 +438,7 @@ fn decode_state(bytes: &[u8]) -> Result<AggregateState> {
 }
 
 /// `StateCombine`
-fn combine_states(kind: AggregateKind, left: AggregateState, right: AggregateState) -> Result<AggregateState> {
+pub fn combine_states(kind: AggregateKind, left: AggregateState, right: AggregateState) -> Result<AggregateState> {
     use AggregateState as S;
     let overflow = || Error::new(ErrorKind::OutOfRange, "Overflow in aggregate state combine");
     Ok(match (left, right) {

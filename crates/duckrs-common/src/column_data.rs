@@ -100,9 +100,15 @@ impl ColumnDataCollection {
         }
     }
 
-    /// Moves the chunks of `other` to the end of this collection without copying (`Combine`).
+    /// Moves the chunks of `other` to the end of this collection (`Combine`). Every chunk but the
+    /// last one is full, which finding a row relies on, so they are copied unless this
+    /// collection ends on a full chunk.
     pub fn combine(&mut self, other: ColumnDataCollection) {
         assert_eq!(other.types, self.types, "combined collections have different types");
+        if !self.count.is_multiple_of(STANDARD_VECTOR_SIZE) {
+            self.append_collection(&other);
+            return;
+        }
         self.count += other.count;
         self.chunks.extend(other.chunks);
     }
@@ -220,6 +226,23 @@ mod tests {
             chunk.append_row(&[Value::integer(v), text]).unwrap();
         }
         chunk
+    }
+
+    #[test]
+    fn combine_keeps_rows_findable() {
+        let types = vec![LogicalType::INTEGER, LogicalType::VARCHAR];
+        let mut cdc = ColumnDataCollection::new(types.clone());
+        let mut start = 0;
+        for n in [1000, STANDARD_VECTOR_SIZE, 3000, 7] {
+            let mut part = ColumnDataCollection::new(types.clone());
+            part.append(&chunk_of(start, n));
+            cdc.combine(part);
+            start += n as i32;
+        }
+        assert_eq!(cdc.len(), start as usize);
+        for row in 0..cdc.len() {
+            assert_eq!(cdc.get_value(0, row), Value::integer(row as i32));
+        }
     }
 
     #[test]

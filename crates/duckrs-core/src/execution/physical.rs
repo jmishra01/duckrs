@@ -17,13 +17,17 @@ use crate::catalog::{
     ColumnDefinition, GeneratedColumn, OnCreateConflict, RowIds, SchemaCatalogEntry, TableCatalogEntry,
     TableConstraint, TableCursor, TableSource,
 };
+use crate::execution::external_sort::SortSpill;
 use crate::execution::run_plan;
-use crate::function::aggregates::{AggregateState, value_keys};
+use crate::execution::temporary::{self, PartitionedSpill, SpillFile};
+use crate::function::aggregates::{AggregateState, combine_states, value_keys};
 use crate::planner::expression::{BoundAggregate, BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, CteKeyColumn, LogicalOperator, OnConflict};
+use crate::storage::log_writer::can_serialize;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::{
-    NullOrder, OrderModifiers, OrderType, RowKeyMap, RowKeySet, create_row_keys, create_sort_keys, sort_collection,
+    NullOrder, OrderModifiers, OrderType, RowKey, RowKeyMap, RowKeySet, create_row_keys, create_sort_keys,
+    sort_collection,
 };
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::{Value, ValueData};
@@ -36,9 +40,16 @@ use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// The state a source keeps between `get_data` calls (`GlobalSourceState`).
 pub type SourceState = Box<dyn Any + Send>;
+
+/// What the threads of a parallel source share (`GlobalSourceState`).
+pub type SharedSourceState = Box<dyn Any + Send + Sync>;
+
+/// What a thread of a parallel sink gathers on its own (`LocalSinkState`).
+pub type LocalSinkState = Box<dyn Any + Send>;
 
 /// The state an operator keeps while it works through an input chunk (`OperatorState`).
 pub type OperatorState = Box<dyn Any + Send>;
@@ -74,6 +85,16 @@ pub trait PhysicalOperator: fmt::Debug + Send + Sync {
         unreachable!("{} is not a source", self.name())
     }
 
+    /// A source that threads can read at once: what they share, and how many morsels it has.
+    /// Morsels can be claimed in any order, so only an order-independent sink may read it.
+    fn parallel_source(&self) -> Option<(SharedSourceState, usize)> {
+        None
+    }
+    /// Morsel `index` of [`Self::parallel_source`]; `None` if it has no rows left.
+    fn parallel_chunk(&self, _state: &SharedSourceState, _index: usize) -> Result<Option<DataChunk>> {
+        unreachable!("{} is not a parallel source", self.name())
+    }
+
     // Operator interface: one input chunk becomes one output chunk
     fn execute(&self, _input: DataChunk) -> Result<DataChunk> {
         unreachable!("{} is not an operator", self.name())
@@ -81,6 +102,11 @@ pub trait PhysicalOperator: fmt::Debug + Send + Sync {
 
     fn operator_state(&self) -> OperatorState {
         Box::new(())
+    }
+
+    /// Whether threads can run it at once on chunks in any order (`ParallelOperator`).
+    fn parallel_operator(&self) -> bool {
+        false
     }
 
     /// Like `execute`, for an operator that can turn one input chunk into many.
@@ -102,6 +128,22 @@ pub trait PhysicalOperator: fmt::Debug + Send + Sync {
     }
     fn finalize(&self) -> Result<()> {
         Ok(())
+    }
+    /// Whether threads can sink at once, each into a state of its own, in any order
+    /// (`ParallelSink`). The states come together in `combine_local`. `sink_local` is told
+    /// which morsel of the source a chunk comes from (its batch index), for a sink that keeps
+    /// the order of its input.
+    fn parallel_sink(&self) -> bool {
+        false
+    }
+    fn local_sink_state(&self) -> LocalSinkState {
+        unreachable!("{} is not a parallel sink", self.name())
+    }
+    fn sink_local(&self, _local: &mut LocalSinkState, _batch: usize, _chunk: &DataChunk) -> Result<()> {
+        unreachable!("{} is not a parallel sink", self.name())
+    }
+    fn combine_local(&self, _local: LocalSinkState) -> Result<()> {
+        unreachable!("{} is not a parallel sink", self.name())
     }
     /// Which child feeds the sink. Joins are sinks for their right child, and the left child
     /// streams through them.
@@ -277,9 +319,52 @@ impl PhysicalTableScan {
     }
 }
 
+/// What the threads of a [`PhysicalTableScan`] share.
+struct ParallelTableScan {
+    ids: Arc<RowIds>,
+    rows: usize,
+    groups: Vec<bool>,
+}
+
+/// Fewer row groups than this aren't worth threads, and stay as they are: in order, and with
+/// floating point sums that come out the same each time.
+const MIN_PARALLEL_ROW_GROUPS: usize = 2;
+
 impl PhysicalOperator for PhysicalTableScan {
     fn name(&self) -> &'static str {
         "TABLE_SCAN"
+    }
+    fn parallel_source(&self) -> Option<(SharedSourceState, usize)> {
+        if self.index_rows.is_some() || self.table.source().is_some() {
+            return None;
+        }
+        if !self.filter.as_ref().is_none_or(parallel_expression) {
+            return None;
+        }
+        let rows = self.table.row_count();
+        let chunks = rows.div_ceil(STANDARD_VECTOR_SIZE);
+        if chunks < MIN_PARALLEL_ROW_GROUPS * CHUNKS_PER_ROW_GROUP {
+            return None;
+        }
+        let groups = groups_to_scan(&self.table, &self.column_ids, self.filter.as_ref(), rows);
+        let ids = self.table.row_ids(rows);
+        Some((Box::new(ParallelTableScan { ids, rows, groups }), chunks))
+    }
+    fn parallel_chunk(&self, state: &SharedSourceState, index: usize) -> Result<Option<DataChunk>> {
+        let state: &ParallelTableScan = state.downcast_ref().expect("parallel scan state");
+        if !state.groups.get(index / CHUNKS_PER_ROW_GROUP).is_none_or(|g| *g) {
+            return Ok(None);
+        }
+        let first_row = index * STANDARD_VECTOR_SIZE;
+        let storage = self.table.rows()?;
+        let chunk = storage.chunk(index);
+        let count = chunk.len().min(state.rows.saturating_sub(first_row));
+        let columns = self.scan_columns(chunk, &state.ids, first_row, None)?;
+        let mut result = DataChunk::from_columns(columns, chunk.len());
+        if count < chunk.len() {
+            result.slice(&SelectionVector::from_vec((0..count as u32).collect()), count);
+        }
+        self.finish_chunk(result)
     }
     fn types(&self) -> &[LogicalType] {
         &self.types
@@ -357,9 +442,19 @@ impl PhysicalOperator for PhysicalTableScan {
     }
 }
 
-/// How much a blocking operator or table may hold, roughly. Everything lives in memory until
-/// out-of-core operators (Phase 8) and storage (Phase 9) arrive, so more than this fails
-/// instead of exhausting the machine.
+/// Whether threads can evaluate `expr` at once. What is volatile gives other results in another
+/// order, and what runs a plan of its own is not known to be safe from several threads.
+pub(super) fn parallel_expression(expr: &BoundExpr) -> bool {
+    use crate::planner::expression::BoundExprKind;
+    fn has_subquery(expr: &BoundExpr) -> bool {
+        matches!(expr.kind, BoundExprKind::Subquery { .. }) || expr.children().into_iter().any(has_subquery)
+    }
+    !expr.is_volatile() && !has_subquery(expr)
+}
+
+/// How much a blocking operator or table may hold, roughly, unless it spills: then `memory_limit`
+/// bounds it (see "Spilling" in `docs/ARCHITECTURE.md`). More than this fails instead of
+/// exhausting the machine.
 const MAX_BUFFERED_BYTES: usize = 2 << 30;
 
 pub(super) fn check_buffered(collection: &ColumnDataCollection) -> Result<()> {
@@ -695,6 +790,9 @@ impl PhysicalOperator for PhysicalFilter {
     }
     fn children(&self) -> &[Box<dyn PhysicalOperator>] {
         &self.children
+    }
+    fn parallel_operator(&self) -> bool {
+        parallel_expression(&self.condition)
     }
     fn execute(&self, mut input: DataChunk) -> Result<DataChunk> {
         let (sel, count) = select(&self.condition, &input)?;
@@ -1300,6 +1398,9 @@ impl PhysicalOperator for PhysicalProjection {
     fn children(&self) -> &[Box<dyn PhysicalOperator>] {
         &self.children
     }
+    fn parallel_operator(&self) -> bool {
+        self.expressions.iter().all(parallel_expression)
+    }
     fn execute(&self, input: DataChunk) -> Result<DataChunk> {
         let columns = self
             .expressions
@@ -1327,6 +1428,9 @@ impl PhysicalOperator for PhysicalColumnSelect {
     }
     fn children(&self) -> &[Box<dyn PhysicalOperator>] {
         &self.children
+    }
+    fn parallel_operator(&self) -> bool {
+        true
     }
     fn execute(&self, input: DataChunk) -> Result<DataChunk> {
         let columns = self.positions.iter().map(|&p| input.column(p).clone()).collect();
@@ -1363,6 +1467,8 @@ pub struct PhysicalOrder {
     pub top: Option<(u64, u64)>,
     pub children: Vec<Box<dyn PhysicalOperator>>,
     pub data: Mutex<ColumnDataCollection>,
+    /// the runs of a sort past the memory limit; a Top-N keeps few rows and does not spill
+    spill: Option<Mutex<SortSpill>>,
 }
 
 /// A Top-N sorts what it has when it has twice what it needs, and at least this.
@@ -1399,6 +1505,7 @@ impl PhysicalOrder {
             orders: orders.iter().map(|o| (reference_index(&o.expr), o.modifiers)).collect(),
             top,
             data: Mutex::new(ColumnDataCollection::new(types.clone())),
+            spill: (top.is_none() && SortSpill::can_spill(&types)).then(Mutex::default),
             types,
             children: vec![child],
         }
@@ -1421,6 +1528,9 @@ impl PhysicalOperator for PhysicalOrder {
     fn sink(&self, chunk: &DataChunk) -> Result<()> {
         let mut data = self.data.lock();
         data.append(chunk);
+        if let Some(spill) = &self.spill {
+            return spill.lock().sink(&mut data, chunk, &self.orders);
+        }
         // what is behind the first rows now never gets back in, as the sort keeps ties in order
         if let Some((limit, offset)) = self.top {
             let keep = limit.saturating_add(offset);
@@ -1432,6 +1542,13 @@ impl PhysicalOperator for PhysicalOrder {
     }
     fn finalize(&self) -> Result<()> {
         let mut data = self.data.lock();
+        if let Some(spill) = &self.spill {
+            let mut spill = spill.lock();
+            if spill.spilled() {
+                let rows = std::mem::replace(&mut *data, ColumnDataCollection::new(self.types.clone()));
+                return spill.finish(rows, &self.orders);
+            }
+        }
         *data = sort_collection(&data, &self.orders)?;
         if let Some((limit, offset)) = self.top {
             *data = rows_of_collection(&data, offset, limit);
@@ -1445,6 +1562,12 @@ impl PhysicalOperator for PhysicalOrder {
         Box::new(0usize)
     }
     fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
+        if let Some(spill) = &self.spill {
+            let mut spill = spill.lock();
+            if spill.spilled() {
+                return spill.next_chunk();
+            }
+        }
         Ok(scan_collection(&self.data, state))
     }
 }
@@ -1741,6 +1864,74 @@ pub struct PhysicalAggregate {
     grouping_sets: Vec<GroupingSet>,
     state: Mutex<Vec<AggregateSinkState>>,
     output: Mutex<Vec<DataChunk>>,
+    /// where rows go past the memory limit, for an aggregate that can spill
+    spill: Option<AggregateSpill>,
+}
+
+/// How many partitions the rows of an aggregate past the memory limit go into.
+const AGGREGATE_PARTITIONS: usize = 64;
+
+/// How many times a partition that is still too large is partitioned again.
+const MAX_AGGREGATE_SPILL_LEVEL: u32 = 3;
+
+/// What an aggregate past the memory limit spills: the input rows of the groups that it does not
+/// hold, by the hash of their group, into a file per partition. Each partition is aggregated on its
+/// own once the groups in memory are out (`RadixPartitionedHashTable` with external partitions).
+/// A group is either in memory or in a partition when one thread aggregates, so its rows stay in
+/// order; threads can each have a group, and then those in memory join their partition.
+#[derive(Debug)]
+struct AggregateSpill {
+    target: SpillTarget,
+    /// whether threads sank, so that groups in memory may also be in a partition
+    threads: AtomicBool,
+    /// whether any rows spilled
+    spilled: AtomicBool,
+    /// what states took of the memory limit
+    reserved: AtomicUsize,
+    /// the partitions to aggregate, with the groups in memory that belong to them
+    pending: Mutex<Vec<PendingPartition>>,
+}
+
+/// The partition files of one level of spilling.
+#[derive(Debug)]
+struct SpillTarget {
+    level: u32,
+    files: PartitionedSpill,
+}
+
+impl SpillTarget {
+    fn new(level: u32) -> Self {
+        Self {
+            level,
+            files: PartitionedSpill::new(AGGREGATE_PARTITIONS),
+        }
+    }
+
+    fn partition(&self, key: &RowKey) -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = duckrs_common::sort_key::KeyHasher::default();
+        self.level.hash(&mut hasher);
+        key.hash(&mut hasher);
+        (hasher.finish() >> 32) as usize % AGGREGATE_PARTITIONS
+    }
+
+    fn write(&self, partition: usize, chunk: &DataChunk) -> Result<()> {
+        self.files.write(partition, chunk)
+    }
+
+    /// The files that rows went to, by partition.
+    fn take(&self) -> Result<Vec<Option<SpillFile>>> {
+        self.files.take()
+    }
+}
+
+/// A partition of spilled rows still to aggregate.
+#[derive(Debug)]
+struct PendingPartition {
+    file: SpillFile,
+    level: u32,
+    /// the groups in memory of this partition
+    groups: Option<AggregateSinkState>,
 }
 
 /// A grouping set of a [`PhysicalAggregate`] (`HashAggregateGroupingData`).
@@ -1783,6 +1974,11 @@ struct AggregateSinkState {
     distinct_seen: Vec<std::collections::HashSet<(usize, Vec<u8>)>>,
     /// per aggregate with ORDER BY, its rows, which it sees once they can be put in order
     ordered: Vec<Vec<OrderedRow>>,
+    /// roughly what the groups and states hold, and what of that the memory limit gave them
+    bytes: usize,
+    reserved: usize,
+    /// whether the memory limit gave no more, so that the rows of new groups spill
+    full: bool,
 }
 
 impl AggregateSinkState {
@@ -1799,6 +1995,9 @@ impl AggregateSinkState {
                 .collect(),
             distinct_seen: vec![std::collections::HashSet::new(); aggregates.len()],
             ordered: aggregates.iter().map(|_| Vec::new()).collect(),
+            bytes: 0,
+            reserved: 0,
+            full: false,
         }
     }
 }
@@ -1851,10 +2050,242 @@ impl PhysicalAggregate {
             groups,
             aggregates,
             children,
+            spill: None,
             grouping_sets: sets,
             state: Mutex::new(state),
             output: Mutex::default(),
         }
+        .with_spill()
+    }
+
+    /// Spilling needs one grouping set with groups, groups that are the same when computed again,
+    /// and input that can go to a file.
+    fn with_spill(mut self) -> Self {
+        let can_spill = self.grouping_sets.len() == 1
+            && !self.grouping_sets[0].groups.is_empty()
+            && self.groups.iter().all(parallel_expression)
+            && can_serialize(self.children[0].types());
+        if can_spill {
+            self.spill = Some(AggregateSpill {
+                target: SpillTarget::new(0),
+                threads: AtomicBool::new(false),
+                spilled: AtomicBool::new(false),
+                reserved: AtomicUsize::new(0),
+                pending: Mutex::default(),
+            });
+        }
+        self
+    }
+
+    /// Roughly what a group takes besides its values: its key and entry in the map, which has
+    /// room to grow, and its states, whose vectors do too, with what a state may keep apart.
+    fn bytes_per_group(&self) -> usize {
+        let key = std::mem::size_of::<RowKey>() + std::mem::size_of::<usize>();
+        2 * key + self.aggregates.len() * (2 * std::mem::size_of::<AggregateState>() + 32)
+    }
+
+    /// Roughly what the states hold for each input row, besides the groups: rows that an
+    /// aggregate keeps, the values DISTINCT has seen, and the rows ORDER BY holds back.
+    fn bytes_per_row(&self) -> usize {
+        self.aggregates
+            .iter()
+            .filter(|a| a.distinct || !a.order_by.is_empty() || !a.function.kind.is_order_independent())
+            .count()
+            * 32
+    }
+
+    /// Sinks `chunk` into `states`. Past the memory limit, the rows of groups the state does not
+    /// have go to `target` instead.
+    fn sink_chunk(
+        &self,
+        chunk: &DataChunk,
+        states: &mut [AggregateSinkState],
+        target: Option<&SpillTarget>,
+    ) -> Result<()> {
+        let Some(target) = target else {
+            let inputs = self.sink_inputs(chunk)?;
+            return self.sink_into(chunk, &inputs, states);
+        };
+        let mut known = chunk.clone();
+        if states[0].full {
+            let vectors = self.grouping_sets[0]
+                .groups
+                .iter()
+                .map(|&g| execute(&self.groups[g], chunk))
+                .collect::<Result<Vec<_>>>()?;
+            let columns: Vec<&Vector> = vectors.iter().collect();
+            let keys = create_row_keys(&columns, chunk.len())?;
+            let mut known_rows = Vec::new();
+            let mut spilled: Vec<Vec<u32>> = vec![Vec::new(); AGGREGATE_PARTITIONS];
+            for (row, key) in keys.iter().enumerate() {
+                if states[0].group_ids.contains_key(key) {
+                    known_rows.push(row as u32);
+                } else {
+                    spilled[target.partition(key)].push(row as u32);
+                }
+            }
+            for (partition, rows) in spilled.into_iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
+                let mut rows_of = chunk.clone();
+                let count = rows.len();
+                rows_of.slice(&SelectionVector::from_vec(rows), count);
+                target.write(partition, &rows_of)?;
+            }
+            if known_rows.is_empty() {
+                return Ok(());
+            }
+            if known_rows.len() < chunk.len() {
+                let count = known_rows.len();
+                known.slice(&SelectionVector::from_vec(known_rows), count);
+            }
+        }
+        let inputs = self.sink_inputs(&known)?;
+        self.sink_into(&known, &inputs, states)?;
+        let state = &mut states[0];
+        if !state.full {
+            state.bytes += known.len() * self.bytes_per_row();
+            let more = state.bytes.saturating_sub(state.reserved);
+            if temporary::current().try_reserve(more) {
+                state.reserved += more;
+                if let Some(spill) = &self.spill {
+                    spill.reserved.fetch_add(more, Ordering::Relaxed);
+                }
+            } else {
+                state.full = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// Takes the groups of the partitions in `wanted` out of `state`, into a state per partition.
+    fn take_partitions(
+        &self,
+        state: &mut AggregateSinkState,
+        target: &SpillTarget,
+        wanted: &[bool],
+    ) -> Vec<Option<AggregateSinkState>> {
+        let types = state.group_values.types().to_vec();
+        let new_state = || AggregateSinkState::new(types.clone(), &self.aggregates);
+        let mut taken: Vec<Option<AggregateSinkState>> = (0..AGGREGATE_PARTITIONS).map(|_| None).collect();
+        if !wanted.iter().any(|&w| w) {
+            return taken;
+        }
+        let old = std::mem::replace(state, new_state());
+        state.full = old.full;
+        let mut keys: Vec<Option<RowKey>> = vec![None; old.group_count];
+        for (key, id) in old.group_ids {
+            keys[id] = Some(key);
+        }
+        let mut old_states = old.states;
+        let mut first = 0;
+        for chunk in old.group_values.chunks() {
+            // per destination (a partition, or what stays at the end), the rows of this chunk
+            let mut rows: Vec<Vec<u32>> = vec![Vec::new(); AGGREGATE_PARTITIONS + 1];
+            for row in 0..chunk.len() {
+                let id = first + row;
+                let key = keys[id].take().expect("a key per group");
+                let partition = target.partition(&key);
+                let destination = if wanted[partition] {
+                    partition
+                } else {
+                    AGGREGATE_PARTITIONS
+                };
+                let into = if destination == AGGREGATE_PARTITIONS {
+                    &mut *state
+                } else {
+                    taken[destination].get_or_insert_with(new_state)
+                };
+                into.group_ids.insert(key, into.group_count);
+                into.group_count += 1;
+                for ((states, old), aggregate) in
+                    into.states.iter_mut().zip(old_states.iter_mut()).zip(&self.aggregates)
+                {
+                    states.push(std::mem::replace(&mut old[id], aggregate.function.kind.initial_state()));
+                }
+                rows[destination].push(row as u32);
+            }
+            for (destination, rows) in rows.into_iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
+                let into = if destination == AGGREGATE_PARTITIONS {
+                    &mut *state
+                } else {
+                    taken[destination].as_mut().expect("made above")
+                };
+                let mut values = chunk.clone();
+                let count = rows.len();
+                values.slice(&SelectionVector::from_vec(rows), count);
+                into.group_values.append(&values);
+            }
+            first += chunk.len();
+        }
+        taken
+    }
+
+    /// What ORDER BY held back goes in now, a row at a time, in order (stably, like DuckDB).
+    fn finish_ordered(&self, state: &mut AggregateSinkState) -> Result<()> {
+        for (i, aggregate) in self.aggregates.iter().enumerate() {
+            let mut rows = std::mem::take(&mut state.ordered[i]);
+            rows.sort_by(|a, b| a.key.cmp(&b.key));
+            for row in rows {
+                let input = row.value.as_ref().map(Vector::constant);
+                aggregate
+                    .function
+                    .update(input.as_ref(), 1, &[(0, row.group)], &mut state.states[i])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The partitions that rows spilled to at `target`, each with its groups in memory when
+    /// threads may have put them there too.
+    fn pending_partitions(
+        &self,
+        state: &mut AggregateSinkState,
+        target: &SpillTarget,
+        threads: bool,
+    ) -> Result<Vec<PendingPartition>> {
+        let files = target.take()?;
+        let wanted: Vec<bool> = files.iter().map(|file| threads && file.is_some()).collect();
+        let mut groups = self.take_partitions(state, target, &wanted);
+        Ok(files
+            .into_iter()
+            .enumerate()
+            .filter_map(|(partition, file)| {
+                file.map(|file| PendingPartition {
+                    file,
+                    level: target.level + 1,
+                    groups: groups[partition].take(),
+                })
+            })
+            .collect())
+    }
+
+    /// Aggregates a spilled partition, whose own spills join `pending`.
+    fn aggregate_partition(
+        &self,
+        partition: PendingPartition,
+        pending: &mut Vec<PendingPartition>,
+    ) -> Result<Vec<DataChunk>> {
+        let set = &self.grouping_sets[0];
+        let types = set.groups.iter().map(|&g| self.groups[g].return_type.clone()).collect();
+        let mut states = vec![
+            partition
+                .groups
+                .unwrap_or_else(|| AggregateSinkState::new(types, &self.aggregates)),
+        ];
+        let target = (partition.level <= MAX_AGGREGATE_SPILL_LEVEL).then(|| SpillTarget::new(partition.level));
+        let mut reader = partition.file.into_reader()?;
+        while let Some(chunk) = reader.next_chunk()? {
+            self.sink_chunk(&chunk, &mut states, target.as_ref())?;
+        }
+        drop(reader);
+        let mut state = states.pop().expect("one state");
+        if let Some(target) = &target {
+            pending.extend(self.pending_partitions(&mut state, target, false)?);
+        }
+        temporary::current().release(state.reserved);
+        self.finish_ordered(&mut state)?;
+        let mut output = Vec::new();
+        self.set_output(set, &state, &mut output)?;
+        Ok(output)
     }
 
     /// The group of each row of the chunk the `vectors` of the groups come from, creating
@@ -1887,8 +2318,11 @@ impl PhysicalAggregate {
             let columns = set.groups.iter().map(|&g| vectors[g].clone()).collect();
             let mut values = DataChunk::from_columns(columns, count);
             values.slice(&SelectionVector::from_vec(new_rows), new_count);
+            state.bytes += temporary::estimated_bytes(&values) + new_count * self.bytes_per_group();
             state.group_values.append(&values);
-            check_buffered(&state.group_values)?;
+            if self.spill.is_none() {
+                check_buffered(&state.group_values)?;
+            }
             for (states, aggregate) in state.states.iter_mut().zip(&self.aggregates) {
                 states.resize(state.group_count, aggregate.function.kind.initial_state());
             }
@@ -1999,6 +2433,115 @@ impl PhysicalOperator for PhysicalAggregate {
         true
     }
     fn sink(&self, chunk: &DataChunk) -> Result<()> {
+        if self.spill.is_some() {
+            let mut states = self.state.lock();
+            return self.sink_chunk(chunk, &mut states, self.spill.as_ref().map(|s| &s.target));
+        }
+        let inputs = self.sink_inputs(chunk)?;
+        let mut states = self.state.lock();
+        self.sink_into(chunk, &inputs, &mut states)
+    }
+    fn parallel_sink(&self) -> bool {
+        self.grouping_sets.len() == 1
+            && self.groups.iter().all(parallel_expression)
+            && self.aggregates.iter().all(|a| {
+                !a.distinct
+                    && a.order_by.is_empty()
+                    && a.function.kind.is_order_independent()
+                    && a.children.iter().all(parallel_expression)
+                    && a.filter.as_ref().is_none_or(parallel_expression)
+            })
+    }
+    fn local_sink_state(&self) -> LocalSinkState {
+        let states: Vec<AggregateSinkState> = self
+            .grouping_sets
+            .iter()
+            .map(|set| {
+                let types = set.groups.iter().map(|&g| self.groups[g].return_type.clone()).collect();
+                AggregateSinkState::new(types, &self.aggregates)
+            })
+            .collect();
+        if let Some(spill) = &self.spill {
+            spill.threads.store(true, Ordering::Relaxed);
+        }
+        Box::new(states)
+    }
+    fn sink_local(&self, local: &mut LocalSinkState, _batch: usize, chunk: &DataChunk) -> Result<()> {
+        let states: &mut Vec<AggregateSinkState> = local.downcast_mut().expect("aggregate local state");
+        self.sink_chunk(chunk, states, self.spill.as_ref().map(|s| &s.target))
+    }
+    fn combine_local(&self, local: LocalSinkState) -> Result<()> {
+        let local = *local
+            .downcast::<Vec<AggregateSinkState>>()
+            .expect("aggregate local state");
+        let mut states = self.state.lock();
+        for (state, local) in states.iter_mut().zip(local) {
+            self.merge_groups(state, local)?;
+        }
+        Ok(())
+    }
+    fn finalize(&self) -> Result<()> {
+        let mut states = self.state.lock();
+        let mut output = Vec::new();
+        if let Some(spill) = &self.spill {
+            let threads = spill.threads.load(Ordering::Relaxed);
+            let pending = self.pending_partitions(&mut states[0], &spill.target, threads)?;
+            spill.spilled.store(!pending.is_empty(), Ordering::Relaxed);
+            *spill.pending.lock() = pending;
+            temporary::current().release(spill.reserved.swap(0, Ordering::Relaxed));
+        }
+        for (set, state) in self.grouping_sets.iter().zip(states.iter_mut()) {
+            self.finish_ordered(state)?;
+            self.set_output(set, state, &mut output)?;
+            if self.spill.is_some() {
+                // the output has what it held, and the partitions need the room
+                let types = state.group_values.types().to_vec();
+                *state = AggregateSinkState::new(types, &self.aggregates);
+            }
+        }
+        *self.output.lock() = output;
+        Ok(())
+    }
+    fn is_source(&self) -> bool {
+        true
+    }
+    fn source_state(&self) -> SourceState {
+        Box::new(0usize)
+    }
+    fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
+        let next = state.downcast_mut::<usize>().expect("aggregate scan state");
+        let mut output = self.output.lock();
+        let Some(spill) = self
+            .spill
+            .as_ref()
+            .filter(|spill| spill.spilled.load(Ordering::Relaxed))
+        else {
+            let chunk = output.get(*next).cloned();
+            *next += 1;
+            return Ok(chunk);
+        };
+        // spilled output is taken as it goes, so that it is not all in memory at once
+        loop {
+            if *next < output.len() {
+                *next += 1;
+                return Ok(Some(std::mem::replace(
+                    &mut output[*next - 1],
+                    DataChunk::from_columns(Vec::new(), 0),
+                )));
+            }
+            let mut pending = spill.pending.lock();
+            let Some(partition) = pending.pop() else {
+                return Ok(None);
+            };
+            let chunks = self.aggregate_partition(partition, &mut pending)?;
+            output.extend(chunks);
+        }
+    }
+}
+
+impl PhysicalAggregate {
+    /// What a chunk gives the groups and the aggregates: the part threads need no lock for.
+    fn sink_inputs(&self, chunk: &DataChunk) -> Result<(Vec<Vector>, Vec<AggregateInput>)> {
         let vectors = self
             .groups
             .iter()
@@ -2009,10 +2552,73 @@ impl PhysicalOperator for PhysicalAggregate {
             .iter()
             .map(|a| Self::aggregate_input(a, chunk))
             .collect::<Result<Vec<_>>>()?;
-        let mut states = self.state.lock();
+        Ok((vectors, inputs))
+    }
+
+    /// `CombineStates`: the groups of a thread go into `state`.
+    fn merge_groups(&self, state: &mut AggregateSinkState, local: AggregateSinkState) -> Result<()> {
+        let AggregateSinkState {
+            group_ids,
+            group_values,
+            group_count,
+            states,
+            ..
+        } = local;
+        // a set without groups has its one group on both sides
+        let mut targets = vec![0; group_count];
+        if !group_ids.is_empty() {
+            let mut keys: Vec<Option<RowKey>> = vec![None; group_count];
+            for (key, id) in group_ids {
+                keys[id] = Some(key);
+            }
+            let mut first = 0;
+            for chunk in group_values.chunks() {
+                let mut new_rows = Vec::new();
+                for row in 0..chunk.len() {
+                    let key = keys[first + row].take().expect("a key per group");
+                    let next = state.group_count;
+                    let id = *state.group_ids.entry(key).or_insert(next);
+                    if id == next {
+                        state.group_count += 1;
+                        new_rows.push(row as u32);
+                    }
+                    targets[first + row] = id;
+                }
+                if !new_rows.is_empty() {
+                    let new_count = new_rows.len();
+                    let mut values = chunk.clone();
+                    values.slice(&SelectionVector::from_vec(new_rows), new_count);
+                    state.group_values.append(&values);
+                }
+                first += chunk.len();
+            }
+            if self.spill.is_none() {
+                check_buffered(&state.group_values)?;
+            }
+        }
+        for (i, (aggregate, sourced)) in self.aggregates.iter().zip(states).enumerate() {
+            let kind = aggregate.function.kind;
+            let merged = &mut state.states[i];
+            merged.resize(state.group_count, kind.initial_state());
+            for (group, source) in sourced.into_iter().enumerate() {
+                let slot = &mut merged[targets[group]];
+                let current = std::mem::replace(slot, kind.initial_state());
+                *slot = combine_states(kind, current, source)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Takes what [`Self::sink_inputs`] made of a chunk into `states`.
+    fn sink_into(
+        &self,
+        chunk: &DataChunk,
+        (vectors, inputs): &(Vec<Vector>, Vec<AggregateInput>),
+        states: &mut [AggregateSinkState],
+    ) -> Result<()> {
         for (set, state) in self.grouping_sets.iter().zip(states.iter_mut()) {
-            let ids = self.find_groups(set, &vectors, chunk.len(), state)?;
-            for (i, (aggregate, input)) in self.aggregates.iter().zip(&inputs).enumerate() {
+            let ids = self.find_groups(set, vectors, chunk.len(), state)?;
+            for (i, (aggregate, input)) in self.aggregates.iter().zip(inputs).enumerate() {
                 let mut rows: Vec<(usize, usize)> = match &input.filtered {
                     Some(filtered) => filtered.iter().map(|&row| (row, ids[row])).collect(),
                     None => ids.iter().copied().enumerate().collect(),
@@ -2042,38 +2648,6 @@ impl PhysicalOperator for PhysicalAggregate {
             }
         }
         Ok(())
-    }
-    fn finalize(&self) -> Result<()> {
-        let mut states = self.state.lock();
-        let mut output = Vec::new();
-        for (set, state) in self.grouping_sets.iter().zip(states.iter_mut()) {
-            // what ORDER BY held back goes in now, a row at a time, in order (stably, like DuckDB)
-            for (i, aggregate) in self.aggregates.iter().enumerate() {
-                let mut rows = std::mem::take(&mut state.ordered[i]);
-                rows.sort_by(|a, b| a.key.cmp(&b.key));
-                for row in rows {
-                    let input = row.value.as_ref().map(Vector::constant);
-                    aggregate
-                        .function
-                        .update(input.as_ref(), 1, &[(0, row.group)], &mut state.states[i])?;
-                }
-            }
-            self.set_output(set, state, &mut output)?;
-        }
-        *self.output.lock() = output;
-        Ok(())
-    }
-    fn is_source(&self) -> bool {
-        true
-    }
-    fn source_state(&self) -> SourceState {
-        Box::new(0usize)
-    }
-    fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
-        let next = state.downcast_mut::<usize>().expect("aggregate scan state");
-        let chunk = self.output.lock().get(*next).cloned();
-        *next += 1;
-        Ok(chunk)
     }
 }
 
@@ -2575,13 +3149,22 @@ impl PhysicalOperator for PhysicalCreateTable {
     }
 }
 
-/// `PhysicalMaterializedCollector`: gathers the query result.
+/// `PhysicalMaterializedCollector`, and `PhysicalBatchCollector` when threads gather the query
+/// result: each keeps the rows of a morsel together, and they go into the result in the order
+/// of the morsels, which is the order one thread would have given them.
 #[derive(Debug)]
 pub struct PhysicalResultCollector {
     pub types: Vec<LogicalType>,
     pub children: Vec<Box<dyn PhysicalOperator>>,
     pub result: Mutex<ColumnDataCollection>,
+    /// the rows of each morsel, from threads
+    batches: Mutex<Vec<(usize, ColumnDataCollection)>>,
+    /// how many rows threads gathered
+    parallel_rows: AtomicUsize,
 }
+
+/// The rows of each morsel a thread gathered, in the order it gathered them.
+type LocalBatches = Vec<(usize, ColumnDataCollection)>;
 
 impl PhysicalResultCollector {
     pub fn new(child: Box<dyn PhysicalOperator>) -> Self {
@@ -2590,6 +3173,8 @@ impl PhysicalResultCollector {
             result: Mutex::new(ColumnDataCollection::new(types.clone())),
             types,
             children: vec![child],
+            batches: Mutex::default(),
+            parallel_rows: AtomicUsize::new(0),
         }
     }
 }
@@ -2611,5 +3196,34 @@ impl PhysicalOperator for PhysicalResultCollector {
         let mut result = self.result.lock();
         result.append(chunk);
         check_buffered(&result)
+    }
+    fn parallel_sink(&self) -> bool {
+        true
+    }
+    fn local_sink_state(&self) -> LocalSinkState {
+        Box::new(LocalBatches::new())
+    }
+    fn sink_local(&self, local: &mut LocalSinkState, batch: usize, chunk: &DataChunk) -> Result<()> {
+        let local: &mut LocalBatches = local.downcast_mut().expect("collector local state");
+        if local.last().is_none_or(|(last, _)| *last != batch) {
+            local.push((batch, ColumnDataCollection::new(self.types.clone())));
+        }
+        local.last_mut().expect("just pushed").1.append(chunk);
+        let rows = self.parallel_rows.fetch_add(chunk.len(), Ordering::Relaxed) + chunk.len();
+        check_buffered_rows(&self.types, rows)
+    }
+    fn combine_local(&self, local: LocalSinkState) -> Result<()> {
+        let local = *local.downcast::<LocalBatches>().expect("collector local state");
+        self.batches.lock().extend(local);
+        Ok(())
+    }
+    fn finalize(&self) -> Result<()> {
+        let mut batches = std::mem::take(&mut *self.batches.lock());
+        batches.sort_by_key(|(batch, _)| *batch);
+        let mut result = self.result.lock();
+        for (_, rows) in batches {
+            result.combine(rows);
+        }
+        Ok(())
     }
 }
