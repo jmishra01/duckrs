@@ -621,6 +621,88 @@ DuckDB 1.5.6 can't replay a logged index read-only, so `generate.sh` has it read
 
 The tests compare every column as the text that DuckDB prints, FLOAT and DOUBLE included.
 
+## Phase 11
+
+CSV is in, on one thread: C++'s state machine and sniffer are ported, its buffers and parallel scan are not.
+Parquet is in as the plan's v1, through the `parquet` crate. JSON has a first slice. EXPORT and IMPORT have not started.
+
+- **Files** (`execution::file_system`): globbing with `*`, `?`, `[...]` and `**`, and reading a whole
+  file. Compressed files fail as not ported, by extension or by magic number, instead of reading as garbage.
+  Gzip goes through `flate2`, read and written, by extension or `compression`. Zstd is not ported.
+- **The state machine** (`execution::csv_state_machine`) is C++'s transition table, byte by byte: quotes,
+  escapes, comments, multi-byte delimiters, strict mode and all three newlines. `Machine::process` is
+  `BaseScanner::Process` over a `Sink`, so `ColumnCountScanner`, `SkipScanner` and `ValueScanner` get the same
+  events in the same order as in C++. A file is in memory whole, so there are no boundaries between buffers.
+- **The sniffer** (`execution::csv_sniffer`) follows `CSVSniffer` step by step: the search space of dialects and
+  `AnalyzeDialectCandidate`, refinement over `sample_size` rows, date and timestamp formats, type candidates and
+  how they fall back, header detection, `normalize_names`. Its error messages are C++'s.
+- **read_csv** (`execution::csv`, `binder::copy`): rows come from `ValueScanner`, and are typed a chunk at a time
+  through casts, a date format, `thousands` or `decimal_separator`. Errors carry C++'s text: the line, the fixes and
+  `CSVReaderOptions::ToString`. `read_csv_auto` is the same function. A file named like a table (`FROM 'a.csv'`)
+  scans it once the name is a file, and `glob()` is in. `encoding` takes utf-8, latin-1 and utf-16, by converting
+  the whole file.
+- **Several files**: the first gives the schema. Each later file is sniffed as it opens, with its columns found by
+  name, and a column it misses is a schema mismatch unless both lack a header. Extra columns are dropped.
+  `union_by_name` sniffs every file while binding. `filename` adds a column. `hive_partitioning`, which is detected
+  when all files have the same `key=value` directories, adds DATE, TIMESTAMP, BIGINT or VARCHAR columns after it.
+- **COPY FROM** is an INSERT from `read_csv`, with the table's columns fixed, as C++ plans it.
+  **COPY TO** is `PhysicalCopyToFile`, which opens the file with its first row or at the end, so that
+  planning (EXPLAIN) leaves it alone. It writes a header unless told not to, and TSV is CSV with tabs.
+  `dateformat` and `timestampformat` go through `strftime`.
+- **sniff_csv** reports what the sniffer found, as a row of constants with the `Prompt` of C++.
+- **store_rejects** fills temporary `reject_scans` and `reject_errors` tables when the scan ends, one
+  row per failed value, missing column or extra column.
+- **A name given to a table function** binds as its text, as in `TableFunctionBinder`: `read_csv("a.csv")`,
+  `types=[INT]`.
+
+Not like C++: scans are single threaded, so `buffer_size` only caps a line's length; the rows a rejected line
+reports can differ where C++ finds several errors on one line; `max_line_size` is measured from the start of a row.
+
+Not ported, each an error and never ignored: `hive_types`, partitioned, per-thread and size-limited writes,
+`read_text`, the `blob` format.
+
+**Parquet** (`execution::parquet`, `binder::parquet`) reads and writes through the crate's Arrow reader and
+writer, and `LOAD parquet` is a no-op. Rows pass as `Value`s between Arrow and vectors, so it is complete rather
+than fast, and neither filters nor projections reach the file, so every column of every row group is decoded.
+
+- **read_parquet**, `parquet_scan` and `FROM 'a.parquet'` take `binary_as_string`, `filename`, `file_row_number`,
+  `hive_partitioning` and `union_by_name`. Later files are matched by name and cast to the first file's types.
+- **COPY** with FORMAT PARQUET takes `compression`, `compression_level`, `row_group_size`, `parquet_version`,
+  `kv_metadata`, `data_page_size_limit`, the bloom filter options and `PARTITION_BY`, with `overwrite`,
+  `overwrite_or_ignore`, `write_partition_columns`, `filename_pattern` and `file_extension`. HUGEINT goes out as
+  DOUBLE as in C++. TIME WITH TIME ZONE and BIGNUM go out as text, which is not what C++ writes.
+- **parquet_metadata**, `parquet_schema`, `parquet_file_metadata` and `parquet_kv_metadata` are rows of constants.
+  Their geometry, encoding stats and page index columns are not ported.
+- **Corrupt files**: the crate panics on some, so its calls run in `catch_unwind` and a panic is that query's error.
+  The panic still prints to stderr, because a library must not change the process's panic hook.
+
+Not like C++: the crate picks page encodings and row group boundaries, so tests of `parquet_metadata` that name
+encodings fail, and the checks of corrupt files are the crate's rather than C++'s, so some bad files read without
+an error. Not ported, each an error: VARIANT, GEOMETRY, INTERVAL writes, `field_ids`, encryption, `bound_schema`,
+`schema`, `order_by`, `return_stats`, `parquet_bloom_probe`, virtual columns (`filename` without the option),
+CSV `PARTITION_BY`, and a directory as a path.
+
+**JSON** (`function::json`, `execution::json_scan`, `binder::json`) is a first slice. The type is VARCHAR with the
+alias `JSON`, as in C++, and `LOAD json` is a no-op. Text is parsed per row into `Json` by a parser of our own that
+takes yyjson's flags, instead of yyjson.
+
+- **Functions**: `json_extract` and `->`, `json_extract_string` and `->>`, `json_value`, `json_exists`, `json_type`,
+  `json_valid`, `json_keys`, `json_array_length`, `json_contains`, `json_structure`, `json_transform` and its strict
+  form, `to_json`, `json_object`, `json_array`, `json_merge_patch`, `json_pretty`, `json_strip_nulls`, `json_set`,
+  `json_insert`, `json_replace`, `json_remove`, `json_group_array`, `json_group_object` and `json_group_structure`.
+  They bind by name rather than through overloads, so a wrong argument type fails late or not at all, and they are
+  not in `duckdb_functions()`. `a -> b` outside a function that takes a lambda is the JSON operator. `j.a` extracts.
+- **read_json**, `read_ndjson`, `read_json_objects`, their `_auto` forms and `FROM 'a.json'` read a file whole. The
+  format is decided from the file, and types from a sample: objects become STRUCT, or MAP past
+  `map_inference_threshold`, and strings become DATE, TIMESTAMP, TIMESTAMP WITH TIME ZONE or UUID if they all fit.
+- **COPY**: TO writes one object per line, or an array with ARRAY. FROM is an INSERT from `read_json`.
+
+Not ported: `json_serialize_sql` and its kin, `json_serialize_plan`, GeoJSON, `json_deep_merge`, `json_normalize`,
+`json_merge_patch_diff`, `field_appearance_threshold`, `hive_types`, `PARTITION_BY` for JSON. Nesting is limited to
+4096 levels, which C++ doesn't limit, and the parser recurses.
+
+The gate is not met: `test/sql/copy` is at about 51% against 85%, now that the Parquet tests in it run.
+
 ## Testing
 
 The DuckDB sqllogictest corpus is the acceptance oracle. `tools/sqllogictest` runs it against

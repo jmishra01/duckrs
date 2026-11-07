@@ -9,8 +9,12 @@ license.workspace = true
 [dependencies]
 duckrs-common.workspace = true
 duckrs-parser.workspace = true
+flate2.workspace = true
 parking_lot.workspace = true
+arrow.workspace = true
+parquet.workspace = true
 regex.workspace = true
+unicode-normalization.workspace = true
 unicode-segmentation.workspace = true
 
 [dev-dependencies]

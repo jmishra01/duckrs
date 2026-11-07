@@ -149,7 +149,7 @@ impl Transformer<'_> {
             };
             let option = self.generic_option(name, value)?;
             if check_duplicates && options.iter().any(|o| o.name.eq_ignore_ascii_case(&option.name)) {
-                return Err(parser_error(format!("Unexpected duplicate option {}", option.name)));
+                return Err(parser_error(format!("Unexpected duplicate option \"{}\"", option.name)));
             }
             options.push(option);
         }
@@ -287,7 +287,7 @@ impl Transformer<'_> {
                 option.name = "partition_by".into();
             }
             if seen.iter().any(|n| n.eq_ignore_ascii_case(&option.name)) {
-                return Err(parser_error(format!("Unexpected duplicate option {}", option.name)));
+                return Err(parser_error(format!("Unexpected duplicate option \"{}\"", option.name)));
             }
             seen.push(option.name.clone());
             let lower = option.name.to_lowercase();

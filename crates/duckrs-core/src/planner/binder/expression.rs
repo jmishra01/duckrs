@@ -320,6 +320,9 @@ impl Binder<'_> {
         if let Some(ty) = self.catalog.get_type(None, self.search_schema.as_deref(), &name)? {
             return Ok(ty);
         }
+        if name == "json" {
+            return Ok(crate::function::json::json_type());
+        }
         let Some(id) = builtin_type(&name) else {
             let closest = BUILTIN_TYPE_NAMES
                 .iter()
@@ -724,8 +727,34 @@ impl Binder<'_> {
         {
             return self.bind_macro(function, &entry);
         }
+        if let ExprKind::Function(function) = &expr.kind
+            && function.name.name.to_ascii_lowercase().starts_with("json_group_")
+        {
+            let args: Vec<String> = function.args.iter().map(|a| format!("({})", a.expr)).collect();
+            if let Some(text) = crate::function::json::macro_text(&function.name.name, &args) {
+                let select = super::table_functions::parse_select(&format!("SELECT {text}"), "Expected an expression")?;
+                if let ast::QueryNodeKind::Select(node) = &select.node.kind
+                    && let Some(body) = node.select_list.first()
+                {
+                    return self.bind_expression(body);
+                }
+            }
+        }
         let bound = match &expr.kind {
             ExprKind::Constant(literal) => BoundExpr::constant(literal_to_value(literal)?),
+            // outside of a function that takes a lambda, `a -> b` is the JSON operator
+            ExprKind::Lambda {
+                lhs,
+                expr,
+                syntax: ast::LambdaSyntax::Arrow | ast::LambdaSyntax::StoredArrow,
+            } => {
+                let children = vec![self.bind_expression(lhs)?, self.bind_expression(expr)?];
+                let types = std::cell::RefCell::new(self.child_binder());
+                return crate::function::json::bind_function("->", children, &|name| types.borrow_mut().csv_type(name));
+            }
+            ExprKind::ColumnRef(names) if self.table_function_argument => {
+                BoundExpr::constant(Value::varchar(names.join(".")))
+            }
             ExprKind::ColumnRef(names) if !self.lambda_scopes.is_empty() && self.is_lambda_parameter(names) => {
                 return Ok(self.bind_lambda_parameter(names)?.expect("just checked"));
             }
@@ -996,6 +1025,17 @@ impl Binder<'_> {
                         .map(|a| self.bind_expression(&a.expr))
                         .collect::<Result<Vec<_>>>()?;
                     return bind_variant_function(&function.name.name, children);
+                }
+                if crate::function::json::is_json_function(&function.name.name) {
+                    let children = function
+                        .args
+                        .iter()
+                        .map(|a| self.bind_expression(&a.expr))
+                        .collect::<Result<Vec<_>>>()?;
+                    let types = std::cell::RefCell::new(self.child_binder());
+                    return crate::function::json::bind_function(&function.name.name, children, &|name| {
+                        types.borrow_mut().csv_type(name)
+                    });
                 }
                 if is_nested_function(&function.name.name) {
                     let names = function.args.iter().map(|a| a.name.clone()).collect();

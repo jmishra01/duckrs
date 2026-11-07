@@ -407,6 +407,166 @@ impl PhysicalOperator for PhysicalEmptyResult {
     }
 }
 
+/// The `read_csv` table function.
+#[derive(Debug)]
+pub struct PhysicalCsvScan {
+    pub types: Vec<LogicalType>,
+    pub scan: Arc<super::csv::CsvScanData>,
+}
+
+impl PhysicalOperator for PhysicalCsvScan {
+    fn name(&self) -> &'static str {
+        "READ_CSV"
+    }
+    fn types(&self) -> &[LogicalType] {
+        &self.types
+    }
+    fn is_source(&self) -> bool {
+        true
+    }
+    fn source_state(&self) -> SourceState {
+        Box::new(super::csv::CsvScanState::default())
+    }
+    fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
+        let state = state.downcast_mut().expect("csv scan state");
+        super::csv::scan_chunk(&self.scan, state)
+    }
+}
+
+/// The file of a COPY TO, compressed or not.
+#[derive(Debug)]
+enum CopyWriter {
+    Plain(std::io::BufWriter<std::fs::File>),
+    Gzip(Box<flate2::write::GzEncoder<std::io::BufWriter<std::fs::File>>>),
+}
+
+impl std::io::Write for CopyWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(writer) => writer.write(bytes),
+            Self::Gzip(writer) => writer.write(bytes),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(writer) => writer.flush(),
+            Self::Gzip(writer) => writer.flush(),
+        }
+    }
+}
+
+/// `PhysicalCopyToFile`: writes the rows of its child, and reports how many there were.
+#[derive(Debug)]
+pub struct PhysicalCopyToFile {
+    types: Vec<LogicalType>,
+    options: super::csv::CsvWriteOptions,
+    children: Vec<Box<dyn PhysicalOperator>>,
+    path: String,
+    names: Vec<String>,
+    /// opened by the first row or at the end, so that planning alone (EXPLAIN) leaves the file be
+    writer: Mutex<Option<CopyWriter>>,
+    gzip: bool,
+    rows: std::sync::atomic::AtomicU64,
+}
+
+impl PhysicalCopyToFile {
+    pub fn new(
+        types: Vec<LogicalType>,
+        path: String,
+        names: Vec<String>,
+        options: super::csv::CsvWriteOptions,
+        children: Vec<Box<dyn PhysicalOperator>>,
+        gzip: bool,
+    ) -> Self {
+        Self {
+            types,
+            options,
+            children,
+            path,
+            names,
+            writer: Mutex::new(None),
+            gzip,
+            rows: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn with_writer(&self, f: impl FnOnce(&mut CopyWriter) -> Result<()>) -> Result<()> {
+        let mut writer = self.writer.lock();
+        if writer.is_none() {
+            let file = std::fs::File::create(&self.path)
+                .map_err(|e| Error::new(ErrorKind::Io, format!("Cannot open file \"{}\": {e}", self.path)))?;
+            let file = std::io::BufWriter::new(file);
+            let mut opened = if self.gzip {
+                CopyWriter::Gzip(Box::new(flate2::write::GzEncoder::new(
+                    file,
+                    flate2::Compression::default(),
+                )))
+            } else {
+                CopyWriter::Plain(file)
+            };
+            let mut header = Vec::new();
+            self.options.write_header(&mut header, &self.names);
+            write_all(&mut opened, &header)?;
+            *writer = Some(opened);
+        }
+        f(writer.as_mut().expect("just opened"))
+    }
+}
+
+fn write_all(writer: &mut impl std::io::Write, bytes: &[u8]) -> Result<()> {
+    writer
+        .write_all(bytes)
+        .map_err(|e| Error::new(ErrorKind::Io, format!("Could not write file: {e}")))
+}
+
+impl PhysicalOperator for PhysicalCopyToFile {
+    fn name(&self) -> &'static str {
+        "COPY_TO_FILE"
+    }
+    fn types(&self) -> &[LogicalType] {
+        &self.types
+    }
+    fn children(&self) -> &[Box<dyn PhysicalOperator>] {
+        &self.children
+    }
+    fn is_sink(&self) -> bool {
+        true
+    }
+    fn sink(&self, chunk: &DataChunk) -> Result<()> {
+        let mut out = Vec::new();
+        self.options.write_chunk(&mut out, chunk)?;
+        self.with_writer(|writer| write_all(writer, &out))?;
+        self.rows
+            .fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+    fn finalize(&self) -> Result<()> {
+        self.with_writer(|writer| write_all(writer, self.options.suffix.as_bytes()))?;
+        let finished = match self.writer.lock().take().expect("just opened") {
+            CopyWriter::Plain(mut writer) => std::io::Write::flush(&mut writer),
+            CopyWriter::Gzip(writer) => writer.finish().and_then(|mut file| std::io::Write::flush(&mut file)),
+        };
+        finished.map_err(|e| Error::new(ErrorKind::Io, format!("Could not write file: {e}")))
+    }
+    fn is_source(&self) -> bool {
+        true
+    }
+    fn source_state(&self) -> SourceState {
+        Box::new(false)
+    }
+    fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
+        let done = state.downcast_mut::<bool>().expect("copy state");
+        if *done {
+            return Ok(None);
+        }
+        *done = true;
+        let rows = self.rows.load(std::sync::atomic::Ordering::Relaxed);
+        let mut column = Vector::new(LogicalType::BIGINT, 1);
+        column.data_mut::<i64>()[0] = rows as i64;
+        Ok(Some(DataChunk::from_columns(vec![column], 1)))
+    }
+}
+
 /// The `range` and `generate_series` table functions.
 #[derive(Debug)]
 pub struct PhysicalRange {

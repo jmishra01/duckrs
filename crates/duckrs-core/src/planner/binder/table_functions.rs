@@ -85,6 +85,7 @@ impl Binder<'_> {
     /// A table function's argument, which C++ evaluates when binding.
     pub(super) fn constant_argument(&mut self, expr: &Expr) -> Result<Value> {
         let mut binder = self.child_binder();
+        binder.table_function_argument = true;
         let bound = binder.bind_expression(expr);
         self.next_table_index = binder.next_table_index;
         let bound = bound?;
@@ -192,6 +193,18 @@ impl Binder<'_> {
                 let query = union_tables_query(&tables, by_name)?;
                 let select = parse_select(&query, "Expected a table or a list with tables as input")?;
                 return self.bind_rewritten(&select, table_ref, &name).map(Some);
+            }
+            // `GlobFunction`
+            "glob" => {
+                let [pattern] = args.as_slice() else {
+                    return Err(binder_error("glob requires a pattern"));
+                };
+                let pattern = self.constant_argument(&pattern.expr)?.try_to_string()?;
+                let files: Vec<String> = crate::execution::file_system::glob(&pattern)
+                    .iter()
+                    .map(|file| format!("'{}'", file.replace('\'', "''")))
+                    .collect();
+                format!("SELECT unnest([{}]::VARCHAR[]) AS file", files.join(", "))
             }
             "test_all_types" => return self.bind_test_all_types(&args, table_ref).map(Some),
             _ => return Ok(None),

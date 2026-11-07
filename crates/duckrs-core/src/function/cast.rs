@@ -1003,6 +1003,11 @@ pub fn cast_vector(source: &Vector, result: &mut Vector, count: usize, mode: Cas
         *result = Vector::constant_null(to);
         return Ok(());
     }
+    if super::json::is_json_type(&to)
+        || (super::json::is_json_type(&from) && to.alias().is_none() && to != LogicalType::VARCHAR)
+    {
+        return super::json::json_cast(source, result, count, mode);
+    }
     if to.id() == LogicalTypeId::Varchar {
         return to_varchar(source, result, count);
     }

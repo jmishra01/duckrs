@@ -55,6 +55,10 @@ fn logical_name(op: &LogicalOperator) -> &'static str {
         K::Update { .. } => "UPDATE",
         K::MergeInto { .. } => "MERGE_INTO",
         K::CreateTableAs { .. } | K::CreateTable { .. } => "CREATE_TABLE",
+        K::CsvScan { .. } => "READ_CSV",
+        K::ParquetScan { .. } => "READ_PARQUET",
+        K::JsonScan { .. } => "READ_JSON",
+        K::CopyToFile { .. } | K::CopyToParquet { .. } => "COPY_TO_FILE",
     }
 }
 

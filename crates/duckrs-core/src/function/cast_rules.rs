@@ -182,6 +182,17 @@ pub fn implicit_cast(from: &LogicalType, to: &LogicalType) -> i64 {
         // in any other case we use the casting rules of the preferred type of the literal
         return implicit_cast(&literal_type, to);
     }
+    if from.alias() == Some("JSON") && to.id() == Varchar && to.alias().is_none() {
+        return 1;
+    }
+    if to.alias() == Some("JSON") && to.id() == Varchar && from.alias().is_none() {
+        // `RegisterJSONCastFunctions`: a parse, so one more than a cast to STRUCT
+        return match from.id() {
+            Varchar => implicit_cast(&LogicalType::SQLNULL, &LogicalType::new(Struct)) + 1,
+            SqlNull => implicit_cast(&LogicalType::SQLNULL, &LogicalType::VARCHAR) + 1,
+            _ => -1,
+        };
+    }
     if from.alias() != to.alias() {
         // if aliases are different, an implicit cast is not possible, except to a union with the type as member
         if to.id() == Union {

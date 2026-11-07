@@ -604,7 +604,7 @@ fn renders_utility_statements_like_duckdb() {
     let errors = [
         (
             "COPY t TO 'x' (A 1, a 2)",
-            "Parser Error: Unexpected duplicate option a",
+            "Parser Error: Unexpected duplicate option \"a\"",
         ),
         (
             "COPY t TO 'x' (FORMAT)",

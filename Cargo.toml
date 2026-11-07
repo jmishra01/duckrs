@@ -10,6 +10,8 @@ license = "MIT"
 repository = "https://github.com/jmishra01/duckrs"
 
 [workspace.dependencies]
+arrow = { version = "60", default-features = false }
+parquet = { version = "60", features = ["arrow_canonical_extension_types"] }
 duckrs = { path = "crates/duckrs" }
 duckrs-common = { path = "crates/duckrs-common" }
 duckrs-core = { path = "crates/duckrs-core" }
@@ -18,8 +20,10 @@ parking_lot = "0.13"
 proptest = "1.12"
 criterion = "0.8"
 clap = { version = "4.6", features = ["derive"] }
+flate2 = "1.1"
 md-5 = "0.11"
 regex = "1.13"
+unicode-normalization = "0.1"
 unicode-segmentation = "1.13"
 walkdir = "2.5"
 libduckdb-sys = { version = "1.20000.1", features = ["bundled", "parquet", "json"] }

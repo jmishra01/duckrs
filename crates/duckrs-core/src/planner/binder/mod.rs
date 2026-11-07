@@ -4,14 +4,17 @@
 //! expressions and plans it as a tree of logical operators.
 
 mod alter;
+mod copy;
 mod create_index;
 mod expression;
 mod generated;
 mod join;
+mod json;
 mod lambda;
 mod macros;
 mod merge;
 mod on_conflict;
+mod parquet;
 mod pivot;
 mod show;
 mod star;
@@ -620,6 +623,10 @@ pub struct Binder<'a> {
     pub options: BindOptions,
     bind_context: BindContext,
     next_table_index: usize,
+    /// The COPY being bound is about JSON.
+    copy_json: bool,
+    /// Binding what a table function was given: `TableFunctionBinder` reads a name as its text.
+    table_function_argument: bool,
     /// Numbers the subqueries in FROM without an alias.
     unnamed_subquery_index: usize,
     /// The grouping of the select node being bound; `None` where aggregates are not allowed.
@@ -698,6 +705,8 @@ impl<'a> Binder<'a> {
             options,
             bind_context: BindContext::default(),
             next_table_index: 0,
+            copy_json: false,
+            table_function_argument: false,
             unnamed_subquery_index: 1,
             aggregates: None,
             aggregate_error: "Aggregate functions are not supported here",
@@ -792,6 +801,7 @@ impl<'a> Binder<'a> {
             Statement::Update(update) => self.bind_update(update),
             Statement::Merge(merge) => self.bind_merge(merge),
             Statement::CreateTable(info) => self.bind_create_table(info),
+            Statement::Copy(info) => self.bind_copy(info),
             // `Binder::Bind(CallStatement)`
             Statement::Call(function) => {
                 let select = duckrs_parser::parse_ast(&format!("SELECT * FROM {function}"))?.remove(0);

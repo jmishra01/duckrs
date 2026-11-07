@@ -7,8 +7,14 @@
 //! the calling thread.
 
 pub mod art;
+pub mod csv;
+pub mod csv_sniffer;
+pub mod csv_state_machine;
 pub mod expression_executor;
+pub mod file_system;
 pub mod join;
+pub mod json_scan;
+pub mod parquet;
 pub mod physical;
 pub mod zone_map;
 
@@ -77,6 +83,18 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             filter: (!filters.is_empty()).then(|| crate::optimizer::conjunction_of(filters)),
             index_rows,
         }),
+        LogicalOperatorKind::CsvScan { scan, .. } => Box::new(PhysicalCsvScan { types, scan }),
+        LogicalOperatorKind::JsonScan { scan, .. } => Box::new(json_scan::PhysicalJsonScan { types, scan }),
+        LogicalOperatorKind::ParquetScan { scan, .. } => Box::new(parquet::PhysicalParquetScan { types, scan }),
+        LogicalOperatorKind::CopyToParquet { path, names, options } => Box::new(parquet::PhysicalCopyToParquet::new(
+            types, path, names, options, children,
+        )),
+        LogicalOperatorKind::CopyToFile {
+            path,
+            names,
+            options,
+            gzip,
+        } => Box::new(PhysicalCopyToFile::new(types, path, names, options, children, gzip)),
         LogicalOperatorKind::Range {
             start,
             increment,

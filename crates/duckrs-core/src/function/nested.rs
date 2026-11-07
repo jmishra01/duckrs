@@ -27,29 +27,30 @@ fn invalid_input(message: &str) -> Error {
 
 /// Whether [`bind_nested_function`] binds the function `name`.
 pub fn is_nested_function(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "list_value"
-            | "list_pack"
-            | "unpivot_list"
-            | "array_value"
-            | "row"
-            | "struct_pack"
-            | "map"
-            | "struct_extract"
-            | "struct_extract_at"
-            | "list_extract"
-            | "list_element"
-            | "array_extract"
-            | "union_extract"
-            | "union_value"
-            | "union_tag"
-            | "enum_first"
-            | "enum_last"
-            | "enum_range"
-            | "enum_code"
-            | "enum_range_boundary"
-    )
+    super::json::is_json_function(name)
+        || matches!(
+            name.to_ascii_lowercase().as_str(),
+            "list_value"
+                | "list_pack"
+                | "unpivot_list"
+                | "array_value"
+                | "row"
+                | "struct_pack"
+                | "map"
+                | "struct_extract"
+                | "struct_extract_at"
+                | "list_extract"
+                | "list_element"
+                | "array_extract"
+                | "union_extract"
+                | "union_value"
+                | "union_tag"
+                | "enum_first"
+                | "enum_last"
+                | "enum_range"
+                | "enum_code"
+                | "enum_range_boundary"
+        )
 }
 
 /// Runs `f` on the arguments of each row.
@@ -553,6 +554,9 @@ fn bind_struct_extract(child: BoundExpr, key: BoundExpr) -> Result<BoundExpr> {
     }
     if ty.id() == LogicalTypeId::Variant {
         return super::variant::bind_extract(child, key);
+    }
+    if super::json::is_json_type(&ty) {
+        return super::json::bind_function("json_extract", vec![child, key], &|_| Ok(LogicalType::VARCHAR));
     }
     if !matches!(ty.id(), LogicalTypeId::Struct | LogicalTypeId::Tuple) {
         return Err(binder_error(format!(

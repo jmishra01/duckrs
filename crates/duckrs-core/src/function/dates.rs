@@ -1103,7 +1103,7 @@ fn interval_divided(args: &DataChunk, result: &mut Vector) -> Result<()> {
 }
 
 /// `StrfTimeFormat`.
-fn strftime_text(format: &str, days: i32, time: i64, zoned: bool) -> Result<String> {
+pub(crate) fn strftime_text(format: &str, days: i32, time: i64, zoned: bool) -> Result<String> {
     let (year, month, day) = Date(days).to_ymd();
     let hour = time / MICROS_PER_HOUR;
     let minute = (time / MICROS_PER_MINUTE) % 60;
@@ -1207,7 +1207,16 @@ fn strftime(args: &DataChunk, result: &mut Vector) -> Result<()> {
 }
 
 /// `StrpTimeFormat::Parse`.
-fn strptime_micros(input: &str, format: &str) -> std::result::Result<i64, String> {
+pub(crate) fn strptime_micros(input: &str, format: &str) -> std::result::Result<i64, String> {
+    strptime_parse(input, format, false)
+}
+
+/// `StrpTimeFormat::Parse` with `strict`: a year of one digit is no year.
+pub(crate) fn strptime_strict(input: &str, format: &str) -> bool {
+    strptime_parse(input, format, true).is_ok()
+}
+
+fn strptime_parse(input: &str, format: &str, strict: bool) -> std::result::Result<i64, String> {
     let chars: Vec<char> = input.chars().collect();
     let mut at = 0;
     let (mut year, mut month, mut day) = (1900i64, 1i64, 1i64);
@@ -1268,13 +1277,21 @@ fn strptime_micros(input: &str, format: &str) -> std::result::Result<i64, String
                     && following
                         .next()
                         .is_some_and(|next| matches!(next, 'd' | 'e' | 'm' | 'H' | 'I' | 'M' | 'S' | 'y' | 'j'));
+                let start = at;
                 year = number(&mut at, if adjacent { 4 } else { 7 }).ok_or_else(|| bad("a number"))?;
+                if strict && at - start < 2 {
+                    return Err(bad("a year of two digits"));
+                }
                 if negative {
                     year = -year;
                 }
             }
             'y' => {
+                let start = at;
                 let short = number(&mut at, 2).ok_or_else(|| bad("a number"))?;
+                if strict && at - start < 2 {
+                    return Err(bad("a year of two digits"));
+                }
                 year = if short < 69 { 2000 + short } else { 1900 + short };
             }
             'm' => month = number(&mut at, 2).ok_or_else(|| bad("a number"))?,

@@ -1390,6 +1390,57 @@ impl Binder<'_> {
                 if at_clause.is_some() {
                     return Err(not_implemented("AT clauses"));
                 }
+                // `ReplacementScan`: a file named like a table, once the catalog has no such table
+                let lower = name.name.to_lowercase();
+                if name.qualification.is_empty()
+                    && [".csv", ".tsv", ".csv.gz", ".tsv.gz"]
+                        .iter()
+                        .any(|end| lower.ends_with(end))
+                    && !crate::execution::file_system::glob(&name.name).is_empty()
+                {
+                    let call = ast::FunctionExpr::new(
+                        "read_csv_auto",
+                        vec![Expr::constant(ast::Literal::string(name.name.clone()))],
+                    );
+                    let mut file_ref = table_ref.clone();
+                    if file_ref.alias.is_empty() {
+                        let file = name.name.rsplit('/').next().unwrap_or(&name.name);
+                        file_ref.alias = file.split('.').next().unwrap_or(file).to_string();
+                    }
+                    return self.bind_read_csv(&call, &file_ref);
+                }
+                if name.qualification.is_empty()
+                    && [".json", ".jsonl", ".ndjson", ".json.gz", ".jsonl.gz", ".ndjson.gz"]
+                        .iter()
+                        .any(|end| lower.ends_with(end))
+                    && !crate::execution::file_system::glob(&name.name).is_empty()
+                {
+                    let call = ast::FunctionExpr::new(
+                        "read_json_auto",
+                        vec![Expr::constant(ast::Literal::string(name.name.clone()))],
+                    );
+                    let mut file_ref = table_ref.clone();
+                    if file_ref.alias.is_empty() {
+                        let file = name.name.rsplit('/').next().unwrap_or(&name.name);
+                        file_ref.alias = file.split('.').next().unwrap_or(file).to_string();
+                    }
+                    return self.bind_read_json(&call, &file_ref);
+                }
+                if name.qualification.is_empty()
+                    && lower.ends_with(".parquet")
+                    && !crate::execution::file_system::glob(&name.name).is_empty()
+                {
+                    let call = ast::FunctionExpr::new(
+                        "read_parquet",
+                        vec![Expr::constant(ast::Literal::string(name.name.clone()))],
+                    );
+                    let mut file_ref = table_ref.clone();
+                    if file_ref.alias.is_empty() {
+                        let file = name.name.rsplit('/').next().unwrap_or(&name.name);
+                        file_ref.alias = file.split('.').next().unwrap_or(file).to_string();
+                    }
+                    return self.bind_read_parquet(&call, &file_ref);
+                }
                 let recurring = matches!(name.qualification.as_slice(), [q] if q.eq_ignore_ascii_case("recurring"));
                 if (name.qualification.is_empty() || recurring)
                     && let Some(working) = self
@@ -1539,6 +1590,48 @@ impl Binder<'_> {
                     && let Some(entry) = self.find_macro(&call.name, true)?
                 {
                     return self.bind_table_macro(table_ref, call, entry);
+                }
+                if let ExprKind::Function(call) = &function.kind
+                    && call.name.qualification.is_empty()
+                    && matches!(call.name.name.to_lowercase().as_str(), "read_csv" | "read_csv_auto")
+                {
+                    return self.bind_read_csv(call, table_ref);
+                }
+                if let ExprKind::Function(call) = &function.kind
+                    && call.name.qualification.is_empty()
+                    && matches!(
+                        call.name.name.to_lowercase().as_str(),
+                        "read_json"
+                            | "read_json_auto"
+                            | "read_ndjson"
+                            | "read_ndjson_auto"
+                            | "read_json_objects"
+                            | "read_json_objects_auto"
+                            | "read_ndjson_objects"
+                    )
+                {
+                    return self.bind_read_json(call, table_ref);
+                }
+                if let ExprKind::Function(call) = &function.kind
+                    && call.name.qualification.is_empty()
+                    && matches!(call.name.name.to_lowercase().as_str(), "read_parquet" | "parquet_scan")
+                {
+                    return self.bind_read_parquet(call, table_ref);
+                }
+                if let ExprKind::Function(call) = &function.kind
+                    && call.name.qualification.is_empty()
+                    && matches!(
+                        call.name.name.to_lowercase().as_str(),
+                        "parquet_metadata" | "parquet_schema" | "parquet_kv_metadata" | "parquet_file_metadata"
+                    )
+                {
+                    return self.bind_parquet_metadata(call, table_ref);
+                }
+                if let ExprKind::Function(call) = &function.kind
+                    && call.name.qualification.is_empty()
+                    && call.name.name.eq_ignore_ascii_case("sniff_csv")
+                {
+                    return self.bind_sniff_csv(call, table_ref);
                 }
                 if let ExprKind::Function(call) = &function.kind
                     && let Some(plan) = self.bind_rewritten_function(function, call, table_ref)?

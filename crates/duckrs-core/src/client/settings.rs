@@ -67,6 +67,7 @@ const UNHONORED: &[&str] = &[
     "lock_configuration",
     "old_implicit_casting",
     "order_by_non_integer_literal",
+    "binary_as_string",
     "preserve_identifier_case",
     "regex_match_operator_semantics",
     "schema",
@@ -74,17 +75,49 @@ const UNHONORED: &[&str] = &[
     "table_function_identifier_conversion",
 ];
 
+/// `config.AddExtensionOption` of the Parquet extension, which is compiled in.
+static EXTENSION_SETTINGS: [SettingDefinition; 7] = [
+    extension_setting("binary_as_string", "BOOLEAN", Some("false")),
+    extension_setting("disable_parquet_prefetching", "BOOLEAN", Some("false")),
+    extension_setting("prefetch_all_parquet_files", "BOOLEAN", Some("false")),
+    extension_setting("parquet_prefetch_column_gap", "UBIGINT", None),
+    extension_setting("parquet_metadata_cache", "BOOLEAN", Some("false")),
+    extension_setting("parquet_use_page_index", "BOOLEAN", Some("true")),
+    extension_setting("enable_geoparquet_conversion", "BOOLEAN", Some("true")),
+];
+
+const fn extension_setting(
+    name: &'static str,
+    input_type: &'static str,
+    default_value: Option<&'static str>,
+) -> SettingDefinition {
+    SettingDefinition {
+        name,
+        aliases: &[],
+        input_type,
+        scope: SettingScope::GlobalDefault,
+        default_value,
+        enum_name: None,
+        enum_values: &[],
+    }
+}
+
 /// `DBConfig::GetOptionByName`: a setting by its name or an alias, case-insensitively.
 pub fn find_setting(name: &str) -> Option<(usize, &'static SettingDefinition)> {
     SETTINGS
         .iter()
+        .chain(&EXTENSION_SETTINGS)
         .enumerate()
         .find(|(_, s)| s.name.eq_ignore_ascii_case(name) || s.aliases.iter().any(|a| a.eq_ignore_ascii_case(name)))
 }
 
 /// `Catalog::UnrecognizedConfigurationError`.
 fn unrecognized(name: &str) -> Error {
-    let mut names: Vec<String> = SETTINGS.iter().map(|s| s.name.to_string()).collect();
+    let mut names: Vec<String> = SETTINGS
+        .iter()
+        .chain(&EXTENSION_SETTINGS)
+        .map(|s| s.name.to_string())
+        .collect();
     names.extend(SETTINGS.iter().flat_map(|s| s.aliases.iter().map(|a| a.to_string())));
     Error::new(
         ErrorKind::Catalog,

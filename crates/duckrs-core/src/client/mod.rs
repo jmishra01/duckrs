@@ -584,6 +584,7 @@ fn is_write(statement: &Statement) -> bool {
         | Statement::Merge(_)
         | Statement::Drop(_)
         | Statement::Alter(_) => true,
+        Statement::Copy(info) => info.is_from,
         // temporary objects are private to the connection
         Statement::CreateTable(info) => !info.temporary,
         Statement::Create(info) => !info.temporary,
@@ -600,6 +601,7 @@ fn statement_type_name(statement: &Statement) -> &'static str {
         Statement::Merge(_) => "MERGE_INTO",
         Statement::Drop(_) => "DROP",
         Statement::Alter(_) => "ALTER",
+        Statement::Copy(_) => "COPY",
         _ => "CREATE",
     }
 }
@@ -1755,6 +1757,17 @@ impl ClientContext {
             Statement::Execute { name, values } => {
                 let (prepared, bound) = self.bound_execute(name, values)?;
                 return self.execute_with(&prepared, bound);
+            }
+            // what is compiled in needs no loading
+            Statement::Load(info)
+                if matches!(
+                    info.load_type,
+                    duckrs_parser::ast::LoadType::Load | duckrs_parser::ast::LoadType::Install
+                ) && ["parquet", "json"]
+                    .iter()
+                    .any(|name| info.filename.eq_ignore_ascii_case(name)) =>
+            {
+                return Ok(Self::success());
             }
             Statement::Deallocate(name) => {
                 self.prepared_statements.remove(&name.to_lowercase());

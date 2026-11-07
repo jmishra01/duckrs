@@ -1732,7 +1732,7 @@ impl Catalog {
         self.schemas.read().get(&name).cloned()
     }
 
-    fn session_temp(&self) -> Option<Arc<SchemaCatalogEntry>> {
+    pub(crate) fn session_temp(&self) -> Option<Arc<SchemaCatalogEntry>> {
         if self.forked {
             return None;
         }

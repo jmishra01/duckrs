@@ -115,8 +115,9 @@ impl Connection for DuckrsConnection {
         })
     }
 
-    fn load_extension(&mut self, _name: &str) -> bool {
-        false
+    fn load_extension(&mut self, name: &str) -> bool {
+        // what duckrs has compiled in
+        matches!(name, "parquet" | "json")
     }
 }
 

@@ -1,0 +1,1420 @@
+// Ported from duckdb/src/planner/binder/statement/bind_copy.cpp,
+// duckdb/src/function/table/copy_csv.cpp and duckdb/src/function/table/read_csv.cpp
+// @ rust-port-baseline
+//
+//! `read_csv` and `COPY`. COPY FROM is an INSERT from `read_csv`, as C++ plans it. Only CSV is here
+//! so far; other formats, and options that aren't, fail as not ported rather than being ignored.
+
+use super::expression::enum_type_from;
+use super::table_functions::{named_argument, parse_select};
+use super::{Binder, Binding, BoundStatement, StatementReturnType, binder_error, schema_of};
+use crate::catalog::{ColumnDefinition, OnCreateConflict, TableCatalogEntry, TableOrView};
+use crate::execution::csv::{
+    CsvFile, CsvReadOptions, CsvRejects, CsvScanData, CsvWriteOptions, hive_parts, new_line_identifier, read_csv_file,
+};
+use crate::execution::csv_sniffer::{Parsing, Sniffed, can_cast, sniff};
+use crate::execution::csv_state_machine::NewLine;
+use crate::execution::file_system::{self, Compression};
+use crate::function::combine_types::force_max_logical_type;
+use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
+use duckrs_common::types::{LogicalType, LogicalTypeId};
+use duckrs_common::value::{Value, ValueData};
+use duckrs_common::{Error, ErrorKind, Result};
+use duckrs_parser::ast::{
+    CopyInfo, Expr, FunctionExpr, InsertStatement, InsertValues, SelectStatement, TableRef, sql_identifier,
+};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+pub(super) fn is_true(value: &Value, name: &str) -> Result<bool> {
+    match value.data() {
+        ValueData::Bool(flag) => Ok(*flag),
+        _ if value.is_null() => Err(binder_error(format!("{name} cannot be NULL"))),
+        _ => match value.try_to_string()?.to_lowercase().as_str() {
+            "1" | "true" | "on" => Ok(true),
+            "0" | "false" | "off" => Ok(false),
+            _ => Err(binder_error(format!("\"{name}\" expected an argument of type BOOLEAN"))),
+        },
+    }
+}
+
+fn text(value: &Value) -> Result<String> {
+    value.try_to_string()
+}
+
+/// One byte, or none for the empty string.
+fn single_byte(value: &Value, name: &str) -> Result<Option<u8>> {
+    let text = if value.is_null() { String::new() } else { text(value)? };
+    match text.as_bytes() {
+        [] => Ok(None),
+        [byte] => Ok(Some(*byte)),
+        _ => Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("The {name} option cannot exceed a size of 1 byte."),
+        )),
+    }
+}
+
+/// `BaseCSVData::Finalize`: what must not be part of what else.
+fn csv_finalize(options: &CsvReadOptions) -> Result<()> {
+    let conflict =
+        |a: &str, b: &str| binder_error(format!("{a} must not appear in the {b} specification and vice versa"));
+    let delimiter = options.delimiter.clone().unwrap_or_default();
+    let quote = options.quote.flatten();
+    let escape = options.escape.flatten();
+    let comment = options.comment.flatten();
+    let inside = |byte: Option<u8>, text: &[u8]| byte.is_some_and(|b| text.contains(&b));
+    if options.quote.is_some() && inside(quote, &delimiter) {
+        return Err(conflict("QUOTE", "DELIMITER"));
+    }
+    if options.escape.is_some() && inside(escape, &delimiter) {
+        return Err(conflict("ESCAPE", "DELIMITER"));
+    }
+    if inside(comment, &delimiter) {
+        return Err(conflict("COMMENT", "DELIMITER"));
+    }
+    if comment.is_some() && comment == quote {
+        return Err(conflict("COMMENT", "QUOTE"));
+    }
+    if options.thousands.is_some() && options.thousands == Some(options.decimal_separator) {
+        return Err(conflict("THOUSANDS", "DECIMAL_SEPARATOR"));
+    }
+    for null in options.null_strs.iter().filter(|n| !n.is_empty()) {
+        let bytes = null.as_bytes();
+        if !delimiter.is_empty() && bytes.windows(delimiter.len()).any(|w| w == delimiter.as_slice()) {
+            return Err(conflict("DELIMITER", "NULL"));
+        }
+        if inside(quote, bytes) {
+            return Err(conflict("QUOTE", "NULL"));
+        }
+        if !options.strict_mode && bytes.len() == 2 && Some(bytes[0]) == escape {
+            continue;
+        }
+        if inside(escape, bytes) {
+            return Err(conflict("ESCAPE", "NULL"));
+        }
+    }
+    Ok(())
+}
+
+/// `CSVReaderOptions::SetDelimiter`
+fn read_delimiter(value: &Value) -> Result<Vec<u8>> {
+    let result = delimiter(value)?;
+    if result.len() > 4 {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "The delimiter option cannot exceed a size of 4 bytes.",
+        ));
+    }
+    Ok(result)
+}
+
+fn delimiter(value: &Value) -> Result<Vec<u8>> {
+    let text = if value.is_null() { String::new() } else { text(value)? };
+    let text = if text == "\\t" { "\t".to_string() } else { text };
+    if text.is_empty() {
+        return Ok(vec![0]);
+    }
+    Ok(text.into_bytes())
+}
+
+pub(super) fn strings(value: &Value) -> Result<Vec<String>> {
+    match value.data() {
+        ValueData::List(items) | ValueData::Struct(items) => items.iter().map(text).collect(),
+        _ => Ok(vec![text(value)?]),
+    }
+}
+
+/// A newline as C++'s `TransformNewLine` reads it.
+fn new_line(value: &str) -> Result<String> {
+    match value.to_lowercase().as_str() {
+        "\\n" | "\n" | "lf" => Ok("\n".to_string()),
+        "\\r\\n" | "\r\n" | "crlf" => Ok("\r\n".to_string()),
+        "\\r" | "\r" | "cr" => Ok("\r".to_string()),
+        _ => Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("Version {value} is not a valid value for new_line"),
+        )),
+    }
+}
+
+/// The arguments of `read_csv`.
+#[derive(Default)]
+struct CsvArguments {
+    files: Vec<String>,
+    options: CsvReadOptions,
+    auto_detect: Option<bool>,
+    columns: Option<Vec<(String, LogicalType)>>,
+    names: Option<Vec<String>>,
+    types_by_name: Vec<(String, LogicalType)>,
+    types_by_position: Vec<LogicalType>,
+    union_by_name: bool,
+    allow_empty: bool,
+    hive_partitioning: Option<bool>,
+    filename: Option<String>,
+    store_rejects: Option<bool>,
+    storing: bool,
+    rejects_table: Option<String>,
+    rejects_scan: Option<String>,
+    rejects_limit: usize,
+    rejects_line_size_limit: usize,
+    /// `user_defined_parameters`: name and SQL text, as `sniff_csv` shows them
+    user_arguments: Vec<(String, String)>,
+}
+
+impl Binder<'_> {
+    /// The type that `name` spells, resolved as a cast to it would be.
+    pub(super) fn csv_type(&mut self, name: &str) -> Result<LogicalType> {
+        if name.eq_ignore_ascii_case("null") {
+            return Ok(LogicalType::SQLNULL);
+        }
+        let select = parse_select(&format!("SELECT NULL::{name}"), "Expected a type")?;
+        let bound = self.child_binder().bind_select_statement(&select)?;
+        bound
+            .types
+            .into_iter()
+            .next()
+            .ok_or_else(|| binder_error("Expected a type"))
+    }
+
+    fn csv_fields(&mut self, value: &Value, name: &str) -> Result<Vec<(String, LogicalType)>> {
+        let ValueData::Struct(fields) = value.data() else {
+            return Err(binder_error(format!("{name} requires a struct as input.")));
+        };
+        let keys = value.logical_type().struct_children().to_vec();
+        let mut result = Vec::with_capacity(fields.len());
+        let quoted = if name == "columns" {
+            name.to_string()
+        } else {
+            format!("\"{name}\"")
+        };
+        for ((key, _), field) in keys.iter().zip(fields) {
+            if field.is_null() {
+                return Err(binder_error(format!("read_csv {quoted} cannot have a NULL type")));
+            }
+            if field.logical_type().id() != LogicalTypeId::Varchar {
+                return Err(binder_error("read_csv requires a type specification as string"));
+            }
+            result.push((key.clone(), self.csv_type(&text(field)?)?));
+        }
+        Ok(result)
+    }
+
+    /// `auto_type_candidates`: VARCHAR and the given types, from the least specific.
+    fn csv_type_candidates(&mut self, names: &[String]) -> Result<Vec<LogicalType>> {
+        // `type_id_to_specificity`
+        let specificity = |ty: &LogicalType| match ty.id() {
+            LogicalTypeId::Varchar => Some(0),
+            LogicalTypeId::Double => Some(1),
+            LogicalTypeId::Float => Some(2),
+            LogicalTypeId::Decimal => Some(3),
+            LogicalTypeId::Bignum => Some(4),
+            LogicalTypeId::HugeInt => Some(5),
+            LogicalTypeId::BigInt => Some(6),
+            LogicalTypeId::Integer => Some(7),
+            LogicalTypeId::SmallInt => Some(8),
+            LogicalTypeId::TinyInt => Some(9),
+            LogicalTypeId::TimestampTz => Some(10),
+            LogicalTypeId::Timestamp => Some(11),
+            LogicalTypeId::Date => Some(12),
+            LogicalTypeId::Time => Some(13),
+            LogicalTypeId::Boolean => Some(14),
+            LogicalTypeId::SqlNull => Some(15),
+            _ => None,
+        };
+        let mut found = std::collections::BTreeMap::new();
+        found.insert(0, LogicalType::VARCHAR);
+        found.insert(15, LogicalType::SQLNULL);
+        for name in names {
+            let ty = self.csv_type(name)?;
+            let Some(rank) = specificity(&ty) else {
+                let shown = ty.to_string();
+                let shown = shown.split('(').next().unwrap_or_default();
+                return Err(binder_error(format!(
+                    "Auto Type Candidate of type {shown} is not accepted as a valid input"
+                )));
+            };
+            found.insert(rank, ty);
+        }
+        Ok(found.into_values().collect())
+    }
+
+    /// `CSVReaderOptions::FromNamedParameters`.
+    fn csv_arguments(&mut self, name: &str, call: &FunctionExpr) -> Result<CsvArguments> {
+        let args: Vec<_> = call.args.iter().map(named_argument).collect();
+        let mut result = CsvArguments::default();
+        let mut paths = None;
+        let mut ignore_given = None;
+        for argument in &args {
+            let value = self.constant_argument(&argument.expr)?;
+            if argument.name.is_empty() {
+                if paths.is_some() {
+                    return Err(binder_error(format!("{name} takes one positional parameter")));
+                }
+                paths = Some(strings(&value)?);
+                continue;
+            }
+            let option = argument.name.to_lowercase();
+            let options = &mut result.options;
+            let mut shown = true;
+            match option.as_str() {
+                "delim" | "sep" | "delimiter" => {
+                    if options.delimiter.is_some() {
+                        return Err(binder_error(
+                            "CSV Reader function option delim and sep are aliases, only one can be supplied",
+                        ));
+                    }
+                    options.delimiter = Some(read_delimiter(&value)?);
+                }
+                "quote" => options.quote = Some(single_byte(&value, "quote")?),
+                "escape" => options.escape = Some(single_byte(&value, "escape")?),
+                "comment" => options.comment = Some(single_byte(&value, "comment")?),
+                "header" => options.header = Some(is_true(&value, &option)?),
+                "skip" => {
+                    let skip: i64 = text(&value)?
+                        .parse()
+                        .map_err(|_| binder_error("skip must be an integer"))?;
+                    if skip < 0 {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            "skip_rows option from read_csv scanner, must be equal or higher than 0",
+                        ));
+                    }
+                    options.skip = Some(skip as usize);
+                }
+                "nullstr" | "null" => {
+                    let ty = value.logical_type().id();
+                    if !matches!(
+                        ty,
+                        LogicalTypeId::List | LogicalTypeId::Varchar | LogicalTypeId::SqlNull
+                    ) {
+                        return Err(binder_error(format!(
+                            "CSV Reader function option \"{option}\" requires a string or a list as input"
+                        )));
+                    }
+                    options.null_strs = strings(&value)?;
+                    if ty == LogicalTypeId::List && options.null_strs.is_empty() {
+                        return Err(binder_error(format!(
+                            "CSV Reader function option \"{option}\" requires a non-empty list of possible null \
+                             strings (varchar) as input"
+                        )));
+                    }
+                }
+                "auto_detect" => {
+                    shown = false;
+                    result.auto_detect = Some(is_true(&value, &option)?);
+                }
+                "all_varchar" => options.all_varchar = is_true(&value, &option)?,
+                "ignore_errors" => options.ignore_errors = is_true(&value, &option)?,
+                "null_padding" => options.null_padding = is_true(&value, &option)?,
+                "allow_quoted_nulls" => options.allow_quoted_nulls = is_true(&value, &option)?,
+                "sample_size" => {
+                    let size: i64 = text(&value)?
+                        .parse()
+                        .map_err(|_| binder_error("sample_size must be an integer"))?;
+                    if size < 1 && size != -1 {
+                        return Err(binder_error(
+                            "Unsupported parameter for SAMPLE_SIZE: cannot be smaller than 1",
+                        ));
+                    }
+                    options.sample_size = if size < 0 { usize::MAX } else { size as usize };
+                }
+                // how C++ reads, not what it reads
+                "parallel" => {}
+                "buffer_size" => {
+                    let size: i64 = text(&value)?
+                        .parse()
+                        .map_err(|_| binder_error("buffer_size must be an integer"))?;
+                    if size < 0 {
+                        return Err(binder_error(
+                            "Invalid value for BUFFER_SIZE parameter: it cannot be smaller than 0",
+                        ));
+                    }
+                    options.buffer_size = Some(size as usize);
+                }
+                "maximum_line_size" | "max_line_size" => {
+                    let size: i64 = text(&value)?
+                        .parse()
+                        .map_err(|_| binder_error("max_line_size must be an integer"))?;
+                    if size < 0 {
+                        return Err(binder_error(
+                            "Invalid value for MAX_LINE_SIZE parameter: it cannot be smaller than 0",
+                        ));
+                    }
+                    options.max_line_size = Some(size as usize);
+                }
+                "strict_mode" => options.strict_mode = is_true(&value, &option)?,
+                "new_line" => {
+                    options.new_line = Some(match text(&value)?.as_str() {
+                        "\\n" => NewLine::SingleN,
+                        "\\r" => NewLine::SingleR,
+                        "\\r\\n" => NewLine::CarryOn,
+                        other => {
+                            return Err(Error::new(
+                                ErrorKind::InvalidInput,
+                                format!("This is not accepted as a newline: {other}"),
+                            ));
+                        }
+                    });
+                }
+                "dateformat" | "date_format" => {
+                    let format = text(&value)?;
+                    if !format.eq_ignore_ascii_case("auto") {
+                        options.date_format = Some(format);
+                    }
+                }
+                "timestampformat" | "timestamp_format" => {
+                    let format = text(&value)?;
+                    if !format.eq_ignore_ascii_case("auto") {
+                        options.timestamp_format = Some(format);
+                    }
+                }
+                "decimal_separator" => {
+                    let separator = text(&value)?;
+                    if !matches!(separator.as_str(), "." | ",") {
+                        return Err(binder_error(
+                            "Unsupported parameter for DECIMAL_SEPARATOR: should be '.' or ','",
+                        ));
+                    }
+                    options.decimal_separator = separator.as_bytes()[0];
+                }
+                "thousands" => {
+                    let separator = if value.is_null() { String::new() } else { text(&value)? };
+                    if separator.len() > 1 {
+                        return Err(binder_error(
+                            "Unsupported parameter for THOUSANDS: should be max one character",
+                        ));
+                    }
+                    options.thousands = separator.bytes().next();
+                }
+                "normalize_names" => options.normalize_names = is_true(&value, &option)?,
+                "auto_type_candidates" => {
+                    shown = false;
+                    if value.logical_type().id() != LogicalTypeId::List {
+                        return Err(binder_error("read_csv auto_types requires a list as input"));
+                    }
+                    if value.is_null() {
+                        return Err(binder_error("auto_type_candidates cannot be NULL"));
+                    }
+                    let names = strings(&value)?;
+                    if names.is_empty() {
+                        return Err(binder_error("auto_type_candidates requires at least one type"));
+                    }
+                    if matches!(value.data(), ValueData::List(items) if items.iter().any(Value::is_null)) {
+                        return Err(binder_error("auto_type_candidates cannot contain NULL types"));
+                    }
+                    options.auto_type_candidates = Some(self.csv_type_candidates(&names)?);
+                }
+                "force_not_null" => options.force_not_null = strings(&value)?,
+                "encoding" => options.encoding = Some(text(&value)?),
+                "files_to_sniff" => {
+                    let files: i64 = text(&value)?
+                        .parse()
+                        .map_err(|_| binder_error("files_to_sniff must be an integer"))?;
+                    if files < 1 && files != -1 {
+                        return Err(binder_error(
+                            "Unsupported parameter for files_to_sniff: value must be -1 for all files or higher than \
+                             one.",
+                        ));
+                    }
+                }
+                "allow_empty" => {
+                    shown = false;
+                    result.allow_empty = is_true(&value, &option)?;
+                }
+                "hive_partitioning" => {
+                    shown = false;
+                    result.hive_partitioning = Some(is_true(&value, &option)?);
+                }
+                "compression" => options.compression = Compression::parse(&text(&value)?)?,
+                "columns" => {
+                    shown = false;
+                    if result.names.is_some() {
+                        return Err(binder_error("read_csv column_names/names can only be supplied once"));
+                    }
+                    if value.logical_type().id() != LogicalTypeId::Struct {
+                        return Err(binder_error("read_csv columns requires a struct as input"));
+                    }
+                    if value.is_null() {
+                        return Err(binder_error("read_csv columns cannot be NULL"));
+                    }
+                    result.columns = Some(self.csv_fields(&value, "columns")?);
+                }
+                "names" | "column_names" => {
+                    shown = false;
+                    if result.names.is_some() || result.columns.is_some() {
+                        return Err(binder_error("read_csv column_names/names can only be supplied once"));
+                    }
+                    if value.is_null() {
+                        return Err(binder_error(format!("read_csv \"{option}\" cannot be NULL")));
+                    }
+                    let names = strings(&value)?;
+                    let mut seen = std::collections::HashSet::new();
+                    for name in &names {
+                        if name.trim().is_empty() {
+                            return Err(binder_error(format!(
+                                "read_csv \"{option}\" cannot have empty (or all whitespace) value"
+                            )));
+                        }
+                        if !seen.insert(name.to_lowercase()) {
+                            return Err(binder_error(format!(
+                                "read_csv \"{option}\" must have unique values. {name} is repeated."
+                            )));
+                        }
+                    }
+                    result.names = Some(names);
+                }
+                "types" | "dtypes" | "column_types" => {
+                    shown = false;
+                    let id = value.logical_type().id();
+                    if !matches!(id, LogicalTypeId::Struct | LogicalTypeId::List) {
+                        return Err(binder_error(format!(
+                            "read_csv \"{option}\" requires a struct or list as input"
+                        )));
+                    }
+                    if !result.types_by_name.is_empty() || !result.types_by_position.is_empty() {
+                        return Err(binder_error(
+                            "read_csv column_types/types/dtypes can only be supplied once",
+                        ));
+                    }
+                    if value.is_null() {
+                        return Err(binder_error(format!("read_csv \"{option}\" cannot be NULL")));
+                    }
+                    if id == LogicalTypeId::Struct {
+                        result.types_by_name = self.csv_fields(&value, &option)?;
+                    } else {
+                        let ValueData::List(items) = value.data() else {
+                            return Err(binder_error(format!(
+                                "read_csv \"{option}\" requires a list of types (varchar) as input"
+                            )));
+                        };
+                        let mut types = Vec::with_capacity(items.len());
+                        for item in items {
+                            if item.is_null() {
+                                return Err(binder_error(format!("read_csv \"{option}\" cannot have a NULL type")));
+                            }
+                            if item.logical_type().id() != LogicalTypeId::Varchar {
+                                return Err(binder_error(format!(
+                                    "read_csv \"{option}\" requires a list of types (varchar) as input"
+                                )));
+                            }
+                            types.push(self.csv_type(&text(item)?)?);
+                        }
+                        result.types_by_position = types;
+                    }
+                }
+                "union_by_name" => {
+                    result.union_by_name = is_true(&value, &option)?;
+                    shown = false;
+                }
+                "filename" => {
+                    shown = false;
+                    result.filename = match value.data() {
+                        ValueData::Bool(true) => Some("filename".to_string()),
+                        ValueData::Bool(false) => None,
+                        _ => Some(text(&value)?),
+                    };
+                }
+                "force_match" if name == "sniff_csv" => shown = false,
+                "store_rejects" => result.store_rejects = Some(is_true(&value, &option)?),
+                "rejects_table" => {
+                    let table = text(&value)?;
+                    if table.is_empty() {
+                        return Err(binder_error("REJECTS_TABLE option cannot be empty"));
+                    }
+                    result.rejects_table = Some(table);
+                }
+                "rejects_scan" => {
+                    let table = text(&value)?;
+                    if table.is_empty() {
+                        return Err(binder_error("rejects_scan option cannot be empty"));
+                    }
+                    result.rejects_scan = Some(table);
+                }
+                "rejects_line_size_limit" => {
+                    result.rejects_line_size_limit = text(&value)?
+                        .parse()
+                        .map_err(|_| binder_error("rejects_line_size_limit must be a non-negative integer"))?;
+                }
+                "rejects_limit" => {
+                    let limit: i64 = text(&value)?
+                        .parse()
+                        .map_err(|_| binder_error("rejects_limit must be an integer"))?;
+                    if limit < 0 {
+                        return Err(binder_error(
+                            "Unsupported parameter for REJECTS_LIMIT: cannot be negative",
+                        ));
+                    }
+                    result.rejects_limit = limit as usize;
+                }
+                _ => return Err(crate::unported(format!("the {name} option {option}"))),
+            }
+            if option == "ignore_errors" {
+                ignore_given = Some(result.options.ignore_errors);
+            }
+            if shown {
+                result.user_arguments.push((option, value_literal(&value)?));
+            }
+        }
+        csv_finalize(&result.options)?;
+        // `CSVReaderOptions::SetRejectsOptions`
+        let named = result.rejects_table.is_some() || result.rejects_scan.is_some();
+        if named && result.store_rejects == Some(false) {
+            return Err(binder_error(if result.rejects_table.is_some() {
+                "REJECTS_TABLE option is only supported when store_rejects is not manually set to false"
+            } else {
+                "REJECTS_SCAN option is only supported when store_rejects is not manually set to false"
+            }));
+        }
+        result.storing = result.store_rejects.unwrap_or(named);
+        if result.storing {
+            if ignore_given == Some(false) {
+                return Err(binder_error(
+                    "STORE_REJECTS option is only supported when IGNORE_ERRORS is not manually set to false",
+                ));
+            }
+            result.options.ignore_errors = true;
+            if result.union_by_name {
+                return Err(binder_error(
+                    "REJECTS_TABLE option is not supported when UNION_BY_NAME is set to true",
+                ));
+            }
+        }
+        if result.rejects_limit != 0 && !result.storing {
+            return Err(binder_error(
+                "REJECTS_LIMIT option is only supported when REJECTS_TABLE is set to a table name",
+            ));
+        }
+        let patterns = paths.ok_or_else(|| binder_error(format!("{name} requires a file name")))?;
+        for pattern in &patterns {
+            let found = file_system::glob(pattern);
+            if found.is_empty() && !result.allow_empty {
+                return Err(Error::new(
+                    ErrorKind::Io,
+                    format!("No files found that match the pattern \"{pattern}\""),
+                ));
+            }
+            result.files.extend(found);
+        }
+        result.options.auto_detect = result.auto_detect.unwrap_or(true);
+        Ok(result)
+    }
+
+    /// What sniffing says of a file, with what the user decided put over it.
+    fn csv_sniff(arguments: &CsvArguments, path: &str) -> Result<(Sniffed, Vec<u8>)> {
+        let data = read_csv_file(path, &arguments.options)?;
+        let fixed: Option<(Vec<String>, Vec<LogicalType>)> = arguments
+            .columns
+            .as_ref()
+            .map(|columns| columns.iter().cloned().unzip());
+        let mut sniffed = sniff(
+            &data,
+            path,
+            &arguments.options,
+            fixed
+                .as_ref()
+                .map(|(names, types)| (names.as_slice(), types.as_slice())),
+        )?;
+        if let Some(names) = &arguments.names {
+            if names.len() > sniffed.names.len() {
+                return Err(binder_error(
+                    "read_csv: names has more entries than the file has columns",
+                ));
+            }
+            sniffed.names[..names.len()].clone_from_slice(names);
+        }
+        for (i, ty) in arguments.types_by_position.iter().enumerate() {
+            match sniffed.types.get_mut(i) {
+                Some(slot) => *slot = ty.clone(),
+                None => {
+                    return Err(binder_error(format!(
+                        "read_csv: {} types were provided, but CSV file only has {} columns",
+                        arguments.types_by_position.len(),
+                        sniffed.names.len()
+                    )));
+                }
+            }
+        }
+        for (column, ty) in &arguments.types_by_name {
+            let Some(i) = sniffed.names.iter().position(|n| n.eq_ignore_ascii_case(column)) else {
+                return Err(binder_error(format!(
+                    "COLUMN_TYPES error: Columns with names: \"{column}\" do not exist in the CSV File"
+                )));
+            };
+            sniffed.types[i] = ty.clone();
+        }
+        // `SetResultOptions`
+        if !sniffed.types.iter().any(|ty| ty.id() == LogicalTypeId::Date) {
+            sniffed.date_format = arguments.options.date_format.clone();
+        }
+        if !sniffed.types.iter().any(|ty| ty.id() == LogicalTypeId::Timestamp) {
+            sniffed.timestamp_format = arguments.options.timestamp_format.clone();
+        }
+        // a column nothing says anything of, `ReadSingleCSVFileBind`
+        if !arguments.union_by_name {
+            for ty in &mut sniffed.types {
+                if ty.id() == LogicalTypeId::SqlNull {
+                    *ty = LogicalType::VARCHAR;
+                }
+            }
+        }
+        Ok((sniffed, data))
+    }
+
+    /// `ReadCSVBind`.
+    pub(super) fn bind_read_csv(&mut self, call: &FunctionExpr, table_ref: &TableRef) -> Result<LogicalOperator> {
+        let name = call.name.name.to_lowercase();
+        let arguments = self.csv_arguments(&name, call)?;
+        if arguments.files.is_empty() {
+            return self.bind_empty_csv(table_ref, &name, arguments);
+        }
+        let (first, _) = Self::csv_sniff(&arguments, &arguments.files[0])?;
+        let (mut names, mut types) = (first.names.clone(), first.types.clone());
+        let first_formats = (first.date_format.clone(), first.timestamp_format.clone());
+        let first_mismatch = first.mismatch.clone();
+        let mut files = Vec::with_capacity(arguments.files.len());
+        if arguments.union_by_name {
+            // `UnionByName::UnionCols`: all the columns, each with a type all its files fit
+            let mut sniffed = vec![first];
+            for path in &arguments.files[1..] {
+                let (file, _) = Self::csv_sniff(&arguments, path)?;
+                for (column, ty) in file.names.iter().zip(&file.types) {
+                    match names.iter().position(|n| n.eq_ignore_ascii_case(column)) {
+                        Some(i) => types[i] = force_max_logical_type(&types[i], ty),
+                        None => {
+                            names.push(column.clone());
+                            types.push(ty.clone());
+                        }
+                    }
+                }
+                sniffed.push(file);
+            }
+            for ty in &mut types {
+                if ty.id() == LogicalTypeId::SqlNull {
+                    *ty = LogicalType::VARCHAR;
+                }
+            }
+            for (path, file) in arguments.files.iter().zip(sniffed) {
+                let mapping = names
+                    .iter()
+                    .map(|column| file.names.iter().position(|n| n.eq_ignore_ascii_case(column)))
+                    .collect();
+                files.push(CsvFile {
+                    path: path.clone(),
+                    columns: file.names.len(),
+                    dialect: file.dialect,
+                    header: file.header,
+                    skip: file.skip,
+                    rows_until_header: file.rows_until_header,
+                    mapping,
+                });
+            }
+        } else {
+            for path in &arguments.files {
+                files.push(CsvFile {
+                    path: path.clone(),
+                    dialect: first.dialect.clone(),
+                    header: first.header,
+                    skip: first.skip,
+                    rows_until_header: first.rows_until_header,
+                    columns: types.len(),
+                    mapping: (0..types.len()).map(Some).collect(),
+                });
+            }
+        }
+        let mut output_names = names.clone();
+        let mut output_types = types.clone();
+        if let Some(column) = &arguments.filename {
+            output_names.push(column.clone());
+            output_types.push(LogicalType::VARCHAR);
+        }
+        let hive = hive_columns(&arguments.files, arguments.hive_partitioning, &names)?;
+        for (key, ty) in &hive {
+            output_names.push(key.clone());
+            output_types.push(ty.clone());
+        }
+        let alias = if table_ref.alias.is_empty() {
+            name.clone()
+        } else {
+            table_ref.alias.clone()
+        };
+        let output_names = Self::alias_columns(table_ref, &alias, output_names)?;
+        let table_index = self.generate_table_index();
+        self.bind_context.add_binding(Binding {
+            alias,
+            schema: None,
+            table_index,
+            names: output_names,
+            types: output_types,
+            row_id: None,
+            generated: Vec::new(),
+        });
+        let wanted = &arguments.options.force_not_null;
+        for column in wanted {
+            if !names.iter().any(|n| n.eq_ignore_ascii_case(column)) {
+                return Err(binder_error(format!(
+                    "\"force_not_null\" expected to find {column}, but it was not found in the table"
+                )));
+            }
+        }
+        let force_not_null: Vec<bool> = names
+            .iter()
+            .map(|name| wanted.iter().any(|n| n.eq_ignore_ascii_case(name)))
+            .collect();
+        let manual_types: Vec<bool> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                arguments.columns.is_some()
+                    || i < arguments.types_by_position.len()
+                    || arguments
+                        .types_by_name
+                        .iter()
+                        .any(|(n, _)| n.eq_ignore_ascii_case(name))
+            })
+            .collect();
+        let rejects = if arguments.storing {
+            Some(self.csv_rejects(&arguments)?)
+        } else {
+            None
+        };
+        let scan = CsvScanData {
+            files,
+            rejects,
+            hive,
+            force_not_null,
+            manual_types,
+            columns_set: arguments.columns.is_some(),
+            mismatch: first_mismatch,
+            union_by_name: arguments.union_by_name,
+            parsing: Parsing {
+                date_format: first_formats.0,
+                timestamp_format: first_formats.1,
+                decimal_separator: arguments.options.decimal_separator,
+                thousands: arguments.options.thousands,
+            },
+            options: arguments.options,
+            names,
+            types,
+            filename: arguments.filename.is_some(),
+        };
+        Ok(LogicalOperator::new(
+            LogicalOperatorKind::CsvScan {
+                table_index,
+                scan: Arc::new(scan),
+            },
+            vec![],
+        ))
+    }
+
+    /// `allow_empty` and no file: one column, and nothing in it.
+    fn bind_empty_csv(&mut self, table_ref: &TableRef, name: &str, arguments: CsvArguments) -> Result<LogicalOperator> {
+        let (names, types) = match arguments.columns {
+            Some(columns) => columns.into_iter().unzip(),
+            None => (vec!["empty".to_string()], vec![LogicalType::BOOLEAN]),
+        };
+        let alias = if table_ref.alias.is_empty() {
+            name.to_string()
+        } else {
+            table_ref.alias.clone()
+        };
+        let output_names = Self::alias_columns(table_ref, &alias, names.clone())?;
+        let table_index = self.generate_table_index();
+        self.bind_context.add_binding(Binding {
+            alias,
+            schema: None,
+            table_index,
+            names: output_names,
+            types: types.clone(),
+            row_id: None,
+            generated: Vec::new(),
+        });
+        let scan = CsvScanData {
+            files: Vec::new(),
+            options: arguments.options,
+            names,
+            types,
+            parsing: Parsing::default(),
+            hive: Vec::new(),
+            force_not_null: Vec::new(),
+            manual_types: Vec::new(),
+            columns_set: false,
+            mismatch: String::new(),
+            union_by_name: false,
+            filename: false,
+            rejects: None,
+        };
+        Ok(LogicalOperator::new(
+            LogicalOperatorKind::CsvScan {
+                table_index,
+                scan: Arc::new(scan),
+            },
+            vec![],
+        ))
+    }
+
+    /// `CSVRejectsTable::GetOrCreate` and `InitializeTable`: the temporary tables of rejects.
+    fn csv_rejects(&self, arguments: &CsvArguments) -> Result<CsvRejects> {
+        static SCANS: AtomicU64 = AtomicU64::new(0);
+        let scans_name = arguments.rejects_scan.as_deref().unwrap_or("reject_scans");
+        let errors_name = arguments.rejects_table.as_deref().unwrap_or("reject_errors");
+        if scans_name.eq_ignore_ascii_case(errors_name) {
+            return Err(binder_error(
+                "The names of the rejects scan and rejects error tables can't be the same. Use different names for \
+                 these tables.",
+            ));
+        }
+        let temp = self
+            .catalog
+            .session_temp()
+            .ok_or_else(|| crate::unported("store_rejects outside of a connection"))?;
+        let table = |name: &str| match temp.get_entry(name) {
+            Some(TableOrView::Table(table)) => Some(table),
+            _ => None,
+        };
+        let ours = |entry: &Option<Arc<TableCatalogEntry>>, column: &str| {
+            entry.as_ref().is_none_or(|table| table.column_index(column).is_some())
+        };
+        let (scans, errors) = (table(scans_name), table(errors_name));
+        let (scans_ok, errors_ok) = (ours(&scans, "file_path"), ours(&errors, "error_message"));
+        if !scans_ok || !errors_ok {
+            let mut message = String::new();
+            if scans.is_some() {
+                message += &format!("Reject Scan Table name \"{scans_name}\" is already in use. ");
+            }
+            if errors.is_some() {
+                message += &format!("Reject Error Table name \"{errors_name}\" is already in use. ");
+            }
+            message += "Either drop the used name(s), or give other name options in the CSV Reader function.\n";
+            return Err(binder_error(message));
+        }
+        let column = ColumnDefinition::new;
+        let (big, text) = (LogicalType::UBIGINT, LogicalType::VARCHAR);
+        let error_type = enum_type_from(
+            [
+                "CAST",
+                "MISSING COLUMNS",
+                "TOO MANY COLUMNS",
+                "UNQUOTED VALUE",
+                "LINE SIZE OVER MAXIMUM",
+                "INVALID ENCODING",
+                "INVALID STATE",
+            ]
+            .map(str::to_string)
+            .to_vec(),
+        )?;
+        let create = |name: &str, columns: Vec<ColumnDefinition>| -> Result<Arc<TableCatalogEntry>> {
+            temp.create_table(name, columns, Vec::new(), Vec::new(), OnCreateConflict::Ignore)?;
+            table(name).ok_or_else(|| binder_error("The rejects tables could not be created"))
+        };
+        let scans = create(
+            scans_name,
+            vec![
+                column("scan_id".to_string(), big.clone()),
+                column("file_id".to_string(), big.clone()),
+                column("file_path".to_string(), text.clone()),
+                column("delimiter".to_string(), text.clone()),
+                column("quote".to_string(), text.clone()),
+                column("escape".to_string(), text.clone()),
+                column("newline_delimiter".to_string(), text.clone()),
+                column("skip_rows".to_string(), LogicalType::UINTEGER),
+                column("has_header".to_string(), LogicalType::BOOLEAN),
+                column("columns".to_string(), text.clone()),
+                column("date_format".to_string(), text.clone()),
+                column("timestamp_format".to_string(), text.clone()),
+                column("user_arguments".to_string(), text.clone()),
+            ],
+        )?;
+        let errors = create(
+            errors_name,
+            vec![
+                column("scan_id".to_string(), big.clone()),
+                column("file_id".to_string(), big.clone()),
+                column("line".to_string(), big.clone()),
+                column("line_byte_position".to_string(), big.clone()),
+                column("byte_position".to_string(), big.clone()),
+                column("column_idx".to_string(), big),
+                column("column_name".to_string(), text.clone()),
+                column("error_type".to_string(), error_type),
+                column("csv_line".to_string(), text.clone()),
+                column("error_message".to_string(), text),
+            ],
+        )?;
+        let user: Vec<String> = arguments
+            .user_arguments
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect();
+        Ok(CsvRejects {
+            errors,
+            scans,
+            limit: arguments.rejects_limit,
+            line_size_limit: arguments.rejects_line_size_limit,
+            scan_id: SCANS.fetch_add(1, Ordering::Relaxed),
+            user_arguments: (!user.is_empty()).then(|| user.join(", ")),
+        })
+    }
+
+    /// `CSVSniffFunction`, as one row of constants.
+    pub(super) fn bind_sniff_csv(&mut self, call: &FunctionExpr, table_ref: &TableRef) -> Result<LogicalOperator> {
+        if call.args.first().is_some_and(
+            |argument| matches!(self.constant_argument(&named_argument(argument).expr), Ok(v) if v.is_null()),
+        ) {
+            return Err(binder_error("sniff_csv cannot take NULL as a file path parameter"));
+        }
+        let arguments = self.csv_arguments("sniff_csv", call)?;
+        if arguments.auto_detect == Some(false) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "sniff_csv function does not accept auto_detect variable set to false",
+            ));
+        }
+        let path = &arguments.files[0];
+        let (sniffed, _) = Self::csv_sniff(&arguments, path)?;
+        let dialect = &sniffed.dialect;
+        let new_line = new_line_identifier(&sniffed.dialect);
+        let shown = |byte: Option<u8>| byte.map_or("(empty)".to_string(), |b| char::from(b).to_string());
+        let quoted = |byte: Option<u8>| byte.map_or(String::new(), |b| char::from(b).to_string().replace('\'', "''"));
+        let delimiter = String::from_utf8_lossy(&dialect.delimiter).into_owned();
+        let structs: Vec<String> = sniffed
+            .names
+            .iter()
+            .zip(&sniffed.types)
+            .map(|(name, ty)| {
+                format!(
+                    "{{'name': {}, 'type': {}}}",
+                    string_literal(name),
+                    string_literal(&ty.to_string())
+                )
+            })
+            .collect();
+        let columns: Vec<String> = sniffed
+            .names
+            .iter()
+            .zip(&sniffed.types)
+            .map(|(name, ty)| format!("{}: {}", string_literal(name), string_literal(&ty.to_string())))
+            .collect();
+        let has_date = sniffed.types.iter().any(|ty| ty.id() == LogicalTypeId::Date);
+        let has_timestamp = sniffed.types.iter().any(|ty| ty.id() == LogicalTypeId::Timestamp);
+        let date_format = has_date.then(|| sniffed.date_format.clone().unwrap_or_else(|| "%Y-%m-%d".to_string()));
+        let timestamp_format = if has_timestamp {
+            sniffed.timestamp_format.clone()
+        } else {
+            None
+        };
+        let given = |names: &[&str]| {
+            arguments
+                .user_arguments
+                .iter()
+                .any(|(n, _)| names.contains(&n.as_str()))
+        };
+        let mut prompt = format!("FROM read_csv({}, auto_detect=false, ", string_literal(path));
+        if !given(&["delim", "sep", "delimiter"]) {
+            prompt += &format!("delim='{}', ", delimiter.replace('\'', "''"));
+        }
+        if !given(&["quote"]) {
+            prompt += &format!("quote='{}', ", quoted(dialect.quote));
+        }
+        if !given(&["escape"]) {
+            prompt += &format!("escape='{}', ", quoted(dialect.escape));
+        }
+        if !given(&["new_line"]) {
+            prompt += &format!("new_line='{new_line}', ");
+        }
+        if !given(&["skip"]) {
+            prompt += &format!("skip={}, ", sniffed.skip);
+        }
+        if !given(&["comment"]) {
+            prompt += &format!("comment='{}', ", quoted(dialect.comment));
+        }
+        if !given(&["header"]) {
+            prompt += &format!("header={}, ", sniffed.header);
+        }
+        prompt += &format!("columns={{{}}}", columns.join(", "));
+        if let Some(format) = &date_format
+            && !given(&["dateformat", "date_format"])
+        {
+            prompt += &format!(", dateformat='{format}'");
+        }
+        if let Some(format) = &timestamp_format
+            && !given(&["timestampformat", "timestamp_format"])
+        {
+            prompt += &format!(", timestampformat='{format}'");
+        }
+        let user: Vec<String> = arguments
+            .user_arguments
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect();
+        if !user.is_empty() {
+            prompt += &format!(", {}", user.join(", "));
+        }
+        prompt += ");";
+        let optional = |text: Option<String>| text.map_or("NULL::VARCHAR".to_string(), |t| string_literal(&t));
+        let sql = format!(
+            "SELECT {} AS \"Delimiter\", {} AS \"Quote\", {} AS \"Escape\", {} AS \"NewLineDelimiter\", \
+             {} AS \"Comment\", {}::UBIGINT AS \"SkipRows\", {} AS \"HasHeader\", [{}] AS \"Columns\", \
+             {} AS \"DateFormat\", {} AS \"TimestampFormat\", {} AS \"UserArguments\", {} AS \"Prompt\"",
+            string_literal(&delimiter),
+            string_literal(&shown(dialect.quote)),
+            string_literal(&shown(dialect.escape)),
+            string_literal(new_line),
+            string_literal(&shown(dialect.comment)),
+            sniffed.skip,
+            sniffed.header,
+            structs.join(", "),
+            optional(date_format.clone()),
+            optional(timestamp_format.clone()),
+            optional((!user.is_empty()).then(|| user.join(", "))),
+            string_literal(&prompt),
+        );
+        let select = parse_select(&sql, "Expected a single SELECT statement")?;
+        self.bind_rewritten(&select, table_ref, "sniff_csv")
+    }
+
+    /// The file a COPY names, with its format.
+    fn copy_target(&mut self, info: &CopyInfo) -> Result<(String, bool)> {
+        let path = match &info.file_path_expression {
+            Some(expression) => text(&self.constant_argument(expression)?)?,
+            None => info.file_path.clone(),
+        };
+        let format = if info.format.is_empty() {
+            let lower = path.to_lowercase();
+            ["parquet", "json", "ndjson", "jsonl"]
+                .into_iter()
+                .find(|extension| lower.ends_with(&format!(".{extension}")))
+                .unwrap_or("csv")
+                .to_string()
+        } else {
+            info.format.to_lowercase()
+        };
+        if !matches!(format.as_str(), "csv" | "tsv" | "auto" | "json" | "ndjson" | "jsonl") {
+            return Err(crate::unported(format!("COPY with the format {format}")));
+        }
+        if matches!(path.as_str(), "/dev/stdin" | "/dev/stdout" | "/dev/stderr") {
+            return Err(crate::unported("COPY to and from standard streams"));
+        }
+        self.copy_json = matches!(format.as_str(), "json" | "ndjson" | "jsonl");
+        Ok((path, format == "tsv"))
+    }
+
+    /// `CopyOptionMode`, and that options of text are text.
+    fn check_copy_options(options: &[(String, Value)], reading: bool) -> Result<()> {
+        const READ_ONLY: [&str; 18] = [
+            "auto_detect",
+            "sample_size",
+            "skip",
+            "max_line_size",
+            "maximum_line_size",
+            "ignore_errors",
+            "buffer_size",
+            "decimal_separator",
+            "null_padding",
+            "parallel",
+            "allow_quoted_nulls",
+            "store_rejects",
+            "force_not_null",
+            "rejects_table",
+            "rejects_scan",
+            "rejects_limit",
+            "encoding",
+            "thousands",
+        ];
+        const WRITE_ONLY: [&str; 3] = ["force_quote", "prefix", "suffix"];
+        for (name, value) in options {
+            if !reading && READ_ONLY.contains(&name.as_str()) {
+                return Err(binder_error(format!("Option \"{name}\" is not supported for writing")));
+            }
+            if reading && WRITE_ONLY.contains(&name.as_str()) {
+                return Err(binder_error(format!("Option \"{name}\" is not supported for reading")));
+            }
+            if matches!(
+                name.as_str(),
+                "delim" | "delimiter" | "sep" | "separator" | "quote" | "escape" | "comment" | "new_line"
+            ) && !matches!(
+                value.logical_type().id(),
+                LogicalTypeId::Varchar | LogicalTypeId::SqlNull
+            ) {
+                return Err(binder_error(format!("\"{name}\" requires an argument of type VARCHAR")));
+            }
+        }
+        Ok(())
+    }
+
+    /// The options of a COPY, as `(name, value)`; a flag without a value is true.
+    pub(super) fn copy_options(&mut self, info: &CopyInfo) -> Result<Vec<(String, Value)>> {
+        let mut result = Vec::new();
+        for (name, expression) in &info.parsed_options {
+            let value = match expression {
+                Some(expression) if expression.is_empty_star() => Value::varchar("*"),
+                Some(expression) => self.constant_argument(expression)?,
+                None => Value::boolean(true),
+            };
+            result.push((name.to_lowercase(), value));
+        }
+        for (name, literals) in &info.options {
+            let value = match literals.as_slice() {
+                [] => Value::boolean(true),
+                [literal] => self.constant_argument(&Expr::constant(literal.clone()))?,
+                _ => return Err(crate::unported(format!("the COPY option {name} with several values"))),
+            };
+            result.push((name.to_lowercase(), value));
+        }
+        Ok(result)
+    }
+
+    pub(super) fn bind_copy(&mut self, info: &CopyInfo) -> Result<BoundStatement> {
+        if let Some(path) = self.parquet_copy_path(info)? {
+            return if info.is_from {
+                self.bind_copy_from_parquet(info, &path)
+            } else {
+                self.bind_copy_to_parquet(info, path)
+            };
+        }
+        let (path, tsv) = self.copy_target(info)?;
+        if info.is_from {
+            self.bind_copy_from(info, &path, tsv)
+        } else {
+            self.bind_copy_to(info, path, tsv)
+        }
+    }
+
+    /// `Binder::BindCopyFrom`.
+    fn bind_copy_from(&mut self, info: &CopyInfo, path: &str, tsv: bool) -> Result<BoundStatement> {
+        let table = self.catalog.get_table(schema_of(&info.table)?, &info.table.name)?;
+        let columns: Vec<String> = if info.select_list.is_empty() {
+            table.columns.iter().map(|c| c.name.clone()).collect()
+        } else {
+            info.select_list.clone()
+        };
+        let mut fields = Vec::with_capacity(columns.len());
+        for column in &columns {
+            let Some(index) = table.column_index(column) else {
+                return Err(binder_error(format!(
+                    "Table \"{}\" does not have a column with name \"{column}\"",
+                    table.name
+                )));
+            };
+            let ty = &table.columns[index].ty;
+            fields.push(format!(
+                "{}: '{}'",
+                string_literal(column),
+                ty.to_string().replace('\'', "''")
+            ));
+        }
+        let mut arguments = vec![string_literal(path), format!("columns := {{{}}}", fields.join(", "))];
+        let options = self.copy_options(info)?;
+        Self::check_copy_options(&options, true)?;
+        if !options.iter().any(|(name, _)| name == "auto_detect") {
+            arguments.push("auto_detect := true".to_string());
+        }
+        let delimiter_given = options
+            .iter()
+            .any(|(name, _)| matches!(name.as_str(), "delim" | "sep" | "delimiter"));
+        if tsv && !delimiter_given {
+            arguments.push("delimiter := '\t'".to_string());
+        }
+        for (name, value) in options {
+            if name == "format" {
+                continue;
+            }
+            arguments.push(format!("{} := {}", sql_identifier(&name), value_literal(&value)?));
+        }
+        let reader = if self.copy_json { "read_json" } else { "read_csv" };
+        if self.copy_json {
+            arguments.retain(|argument| !argument.starts_with("auto_detect"));
+        }
+        let select = parse_select(
+            &format!("SELECT * FROM {reader}({})", arguments.join(", ")),
+            "Expected a single SELECT statement",
+        )?;
+        self.bind_insert(&InsertStatement {
+            cte_map: Default::default(),
+            table: info.table.clone(),
+            table_alias: None,
+            by_name: false,
+            columns,
+            values: InsertValues::Select(Box::new(select)),
+            on_conflict: None,
+            returning: Vec::new(),
+        })
+    }
+
+    /// `Binder::BindCopyTo`.
+    fn bind_copy_to(&mut self, info: &CopyInfo, path: String, tsv: bool) -> Result<BoundStatement> {
+        let select = match &info.select {
+            Some(query) => SelectStatement {
+                node: (**query).clone(),
+            },
+            None => {
+                let columns = if info.select_list.is_empty() {
+                    "*".to_string()
+                } else {
+                    let names: Vec<_> = info.select_list.iter().map(|c| sql_identifier(c)).collect();
+                    names.join(", ")
+                };
+                parse_select(&format!("SELECT {columns} FROM {}", info.table), "Expected a table")?
+            }
+        };
+        let mut options = CsvWriteOptions::default();
+        if tsv {
+            options.delimiter = b"\t".to_vec();
+        }
+        let mut escape_given = false;
+        let mut header_given = false;
+        let mut force_quote = Vec::new();
+        let mut compression = Compression::Auto;
+        let bound = self.bind_select_statement(&select)?;
+        let copy_options = self.copy_options(info)?;
+        Self::check_copy_options(&copy_options, false)?;
+        if self.copy_json {
+            options.json_names = Some(bound.names.clone());
+            options.header = false;
+            options.new_line = "\n".to_string();
+            options.suffix = "\n".to_string();
+        }
+        for (name, value) in copy_options {
+            match name.as_str() {
+                "format" => {}
+                "array" if self.copy_json => {
+                    if is_true(&value, &name)? {
+                        options.prefix = "[\n\t".to_string();
+                        options.new_line = ",\n\t".to_string();
+                        options.suffix = "\n]\n".to_string();
+                    }
+                }
+                "dateformat" | "date_format" => options.date_format = Some(text(&value)?),
+                "timestampformat" | "timestamp_format" => options.timestamp_format = Some(text(&value)?),
+                "delim" | "sep" | "delimiter" => options.delimiter = delimiter(&value)?,
+                "quote" => options.quote = single_byte(&value, "quote")?,
+                "escape" => {
+                    options.escape = single_byte(&value, "escape")?;
+                    escape_given = true;
+                }
+                "comment" => options.comment = single_byte(&value, "comment")?,
+                "header" => {
+                    options.header = is_true(&value, &name)?;
+                    header_given = options.header;
+                }
+                "null" | "nullstr" => options.null_str = text(&value)?,
+                "new_line" => options.new_line = new_line(&text(&value)?)?,
+                "prefix" => options.prefix = text(&value)?,
+                "suffix" => options.suffix = text(&value)?,
+                "force_quote" => force_quote = quoted_columns(&value, &bound.names)?,
+                "compression" => compression = Compression::parse(&text(&value)?)?,
+                // the file ends up the same, unless a write fails half way
+                "use_tmp_file" => {}
+                _ => return Err(crate::unported(format!("the COPY option {name}"))),
+            }
+        }
+        if !escape_given {
+            options.escape = options.quote;
+        }
+        if !self.copy_json && options.prefix.is_empty() != options.suffix.is_empty() {
+            return Err(binder_error(
+                "COPY ... (FORMAT CSV) must have both PREFIX and SUFFIX, or none at all",
+            ));
+        }
+        if !options.prefix.is_empty() && header_given {
+            return Err(binder_error(
+                "COPY ... (FORMAT CSV)'s HEADER cannot be combined with PREFIX/SUFFIX",
+            ));
+        }
+        options.force_quote = force_quote;
+        let compression = compression.for_path(&path);
+        if compression == Compression::Zstd {
+            return Err(crate::unported("writing zstd files"));
+        }
+        let plan = LogicalOperator::new(
+            LogicalOperatorKind::CopyToFile {
+                path,
+                names: bound.names.clone(),
+                options,
+                gzip: compression == Compression::Gzip,
+            },
+            vec![bound.plan],
+        );
+        Ok(BoundStatement {
+            plan,
+            names: vec!["Count".to_string()],
+            types: vec![LogicalType::BIGINT],
+            column_aliases: Vec::new(),
+            return_type: StatementReturnType::ChangedRows,
+        })
+    }
+}
+
+/// `AutoDetectHivePartitioning`: every file says the same keys. What the file has itself stays.
+pub(super) fn hive_columns(
+    files: &[String],
+    wanted: Option<bool>,
+    names: &[String],
+) -> Result<Vec<(String, LogicalType)>> {
+    let parts: Vec<_> = files.iter().map(|path| hive_parts(path)).collect();
+    let Some(first) = parts.first() else {
+        return Ok(Vec::new());
+    };
+    let keys: Vec<String> = first.iter().map(|(key, _)| key.clone()).collect();
+    let consistent = parts
+        .iter()
+        .all(|file| file.len() == keys.len() && file.iter().zip(&keys).all(|((key, _), k)| key == k));
+    if wanted == Some(true) && !consistent {
+        return Err(binder_error(
+            "Hive partition mismatch between files: the files must have the same partition keys",
+        ));
+    }
+    let mut hive = Vec::new();
+    if wanted.unwrap_or(consistent) && consistent {
+        let parsing = Parsing {
+            decimal_separator: b'.',
+            ..Parsing::default()
+        };
+        for (column, key) in keys.iter().enumerate() {
+            if names.iter().any(|n| n.eq_ignore_ascii_case(key)) {
+                continue;
+            }
+            let values: Vec<&str> = parts.iter().filter_map(|file| file[column].1.as_deref()).collect();
+            let ty = [LogicalType::DATE, LogicalType::TIMESTAMP, LogicalType::BIGINT]
+                .into_iter()
+                .find(|ty| values.iter().all(|value| can_cast(value, ty, &parsing)))
+                .unwrap_or(LogicalType::VARCHAR);
+            hive.push((key.clone(), ty));
+        }
+    }
+    Ok(hive)
+}
+
+pub(super) fn string_literal(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "''"))
+}
+
+fn value_literal(value: &Value) -> Result<String> {
+    if let ValueData::List(items) | ValueData::Struct(items) = value.data() {
+        let items: Vec<String> = items.iter().map(value_literal).collect::<Result<_>>()?;
+        return Ok(format!("[{}]", items.join(", ")));
+    }
+    match value.logical_type().id() {
+        LogicalTypeId::Boolean | LogicalTypeId::Integer | LogicalTypeId::BigInt => value.try_to_string(),
+        _ if value.is_null() => Ok("NULL".to_string()),
+        _ => Ok(string_literal(&value.try_to_string()?)),
+    }
+}
+
+/// FORCE_QUOTE: `*`, or the columns that `row(...)` names.
+fn quoted_columns(value: &Value, names: &[String]) -> Result<Vec<bool>> {
+    let listed = strings(value)?;
+    let mut result = vec![false; names.len()];
+    for name in &listed {
+        if name == "*" {
+            result.fill(true);
+            continue;
+        }
+        let Some(position) = names.iter().position(|n| n.eq_ignore_ascii_case(name)) else {
+            return Err(binder_error(format!(
+                "\"force_quote\" expected to find {name}, but it was not found in the table"
+            )));
+        };
+        result[position] = true;
+    }
+    Ok(result)
+}

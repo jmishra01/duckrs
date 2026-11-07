@@ -43,6 +43,34 @@ pub enum LogicalOperatorKind {
         increment: i128,
         count: u64,
     },
+    /// The `read_csv` table function.
+    CsvScan {
+        table_index: usize,
+        scan: Arc<crate::execution::csv::CsvScanData>,
+    },
+    /// The `read_json` table function.
+    JsonScan {
+        table_index: usize,
+        scan: Arc<crate::execution::json_scan::JsonScanData>,
+    },
+    /// The `read_parquet` table function.
+    ParquetScan {
+        table_index: usize,
+        scan: Arc<crate::execution::parquet::ParquetScanData>,
+    },
+    /// `LogicalCopyToFile` with FORMAT PARQUET.
+    CopyToParquet {
+        path: String,
+        names: Vec<String>,
+        options: crate::execution::parquet::ParquetWriteOptions,
+    },
+    /// `LogicalCopyToFile`: writes the rows of its child to a CSV file.
+    CopyToFile {
+        path: String,
+        names: Vec<String>,
+        options: crate::execution::csv::CsvWriteOptions,
+        gzip: bool,
+    },
     /// `LogicalEmptyResult`: no rows, with the columns of the plan it replaced.
     EmptyResult {
         types: Vec<LogicalType>,
@@ -422,7 +450,12 @@ impl LogicalOperator {
                     })
                     .collect()
             }
-            LogicalOperatorKind::Range { .. } => vec![LogicalType::BIGINT],
+            LogicalOperatorKind::CopyToParquet { .. }
+            | LogicalOperatorKind::Range { .. }
+            | LogicalOperatorKind::CopyToFile { .. } => vec![LogicalType::BIGINT],
+            LogicalOperatorKind::JsonScan { scan, .. } => scan.output_types(),
+            LogicalOperatorKind::ParquetScan { scan, .. } => scan.output_types(),
+            LogicalOperatorKind::CsvScan { scan, .. } => scan.output_types(),
             LogicalOperatorKind::EmptyResult { types, .. } => types.clone(),
             // the dummy scan's single column is never read
             LogicalOperatorKind::DummyScan { .. } => vec![LogicalType::INTEGER],
@@ -558,6 +591,9 @@ impl LogicalOperator {
                 numbered(*table_index, 1)
             }
             LogicalOperatorKind::ExpressionGet { table_index, types, .. } => numbered(*table_index, types.len()),
+            LogicalOperatorKind::JsonScan { table_index, scan } => numbered(*table_index, scan.output_types().len()),
+            LogicalOperatorKind::ParquetScan { table_index, scan } => numbered(*table_index, scan.output_types().len()),
+            LogicalOperatorKind::CsvScan { table_index, scan } => numbered(*table_index, scan.output_types().len()),
             LogicalOperatorKind::Window { table_index, windows } => {
                 let mut bindings = self.children[0].column_bindings();
                 bindings.extend(numbered(*table_index, windows.len()));
@@ -646,7 +682,10 @@ impl LogicalOperator {
             | LogicalOperatorKind::Join { .. }
             | LogicalOperatorKind::AsOfJoin { .. }
             | LogicalOperatorKind::PositionalJoin => self.join_output(|child| child.column_bindings()),
-            LogicalOperatorKind::CreateTable { .. } | LogicalOperatorKind::CreateTableAs { .. } => numbered(0, 1),
+            LogicalOperatorKind::CreateTable { .. }
+            | LogicalOperatorKind::CreateTableAs { .. }
+            | LogicalOperatorKind::CopyToParquet { .. }
+            | LogicalOperatorKind::CopyToFile { .. } => numbered(0, 1),
         }
     }
 
