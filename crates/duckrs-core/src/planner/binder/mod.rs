@@ -492,10 +492,15 @@ pub enum DefaultNullOrder {
 pub struct SessionValues {
     pub variables: HashMap<String, Value>,
     pub setting: SettingLookup,
+    /// `duckdb_settings()`
+    pub settings: SettingList,
 }
 
 /// `current_setting`.
 pub type SettingLookup = Box<dyn Fn(&str) -> Result<Value> + Send + Sync>;
+
+/// `duckdb_settings()`.
+pub type SettingList = Box<dyn Fn() -> Vec<crate::client::settings::SettingRow> + Send + Sync>;
 
 impl std::fmt::Debug for SessionValues {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

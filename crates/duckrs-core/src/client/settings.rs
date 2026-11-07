@@ -45,6 +45,9 @@ pub struct SettingDefinition {
     /// The enum a value must name (`EnumUtil::FromString`), if the setting is checked that way.
     pub enum_name: Option<&'static str>,
     pub enum_values: &'static [&'static str],
+    pub description: &'static str,
+    pub is_debug: bool,
+    pub is_deprecated: bool,
 }
 
 /// Settings that change query results or how SQL is read, whose effect duckrs does not
@@ -53,6 +56,9 @@ const UNHONORED: &[&str] = &[
     "access_mode",
     "active_grammar_extensions",
     "allow_parser_override_extension",
+    // they restrict file access, which duckrs does not check yet
+    "allowed_directories",
+    "allowed_paths",
     "current_dialect",
     "default_collation",
     "dialect_compatibility_mode",
@@ -76,20 +82,57 @@ const UNHONORED: &[&str] = &[
 ];
 
 /// `config.AddExtensionOption` of the Parquet extension, which is compiled in.
+/// The descriptions are those of `ParquetExtension::Load`.
 static EXTENSION_SETTINGS: [SettingDefinition; 7] = [
-    extension_setting("binary_as_string", "BOOLEAN", Some("false")),
-    extension_setting("disable_parquet_prefetching", "BOOLEAN", Some("false")),
-    extension_setting("prefetch_all_parquet_files", "BOOLEAN", Some("false")),
-    extension_setting("parquet_prefetch_column_gap", "UBIGINT", None),
-    extension_setting("parquet_metadata_cache", "BOOLEAN", Some("false")),
-    extension_setting("parquet_use_page_index", "BOOLEAN", Some("true")),
-    extension_setting("enable_geoparquet_conversion", "BOOLEAN", Some("true")),
+    extension_setting(
+        "binary_as_string",
+        "BOOLEAN",
+        Some("false"),
+        "In Parquet files, interpret binary data as a string.",
+    ),
+    extension_setting(
+        "disable_parquet_prefetching",
+        "BOOLEAN",
+        Some("false"),
+        "Disable the prefetching mechanism in Parquet",
+    ),
+    extension_setting(
+        "prefetch_all_parquet_files",
+        "BOOLEAN",
+        Some("false"),
+        "(deprecated) Parquet files are now always prefetched, this setting has no effect",
+    ),
+    extension_setting(
+        "parquet_prefetch_column_gap",
+        "UBIGINT",
+        None,
+        "Byte gap under which Parquet prefetch I/O ranges are coalesced (NULL lets the cost model adapt it)",
+    ),
+    extension_setting(
+        "parquet_metadata_cache",
+        "BOOLEAN",
+        Some("false"),
+        "Cache Parquet metadata - useful when reading the same files multiple times",
+    ),
+    extension_setting(
+        "parquet_use_page_index",
+        "BOOLEAN",
+        Some("true"),
+        "Use the page index (ColumnIndex and OffsetIndex) of Parquet files to skip the pages that cannot contain rows matching the filters",
+    ),
+    extension_setting(
+        "enable_geoparquet_conversion",
+        "BOOLEAN",
+        Some("true"),
+        "Attempt to decode/encode geometry data in/as GeoParquet files if the spatial extension is present.",
+    ),
 ];
 
 const fn extension_setting(
     name: &'static str,
     input_type: &'static str,
     default_value: Option<&'static str>,
+    description: &'static str,
 ) -> SettingDefinition {
     SettingDefinition {
         name,
@@ -99,6 +142,9 @@ const fn extension_setting(
         default_value,
         enum_name: None,
         enum_values: &[],
+        description,
+        is_debug: false,
+        is_deprecated: false,
     }
 }
 
@@ -136,13 +182,14 @@ fn input_type(setting: &SettingDefinition) -> Result<LogicalType> {
         "UBIGINT" => LogicalType::UBIGINT,
         "BIGINT" => LogicalType::BIGINT,
         "DOUBLE" => LogicalType::DOUBLE,
+        "VARCHAR[]" => LogicalType::list(LogicalType::VARCHAR),
         "MAP(VARCHAR, VARCHAR)" => LogicalType::map(LogicalType::VARCHAR, LogicalType::VARCHAR),
         other => return Err(crate::unported(format!("settings of type {other}"))),
     })
 }
 
 /// `Value::CastAs`.
-fn cast_value(value: &Value, target: &LogicalType) -> Result<Value> {
+pub(crate) fn cast_value(value: &Value, target: &LogicalType) -> Result<Value> {
     if value.logical_type() == target {
         return Ok(value.clone());
     }
@@ -346,9 +393,112 @@ pub fn current_value(name: &str, global: &SettingValues, session: &SettingValues
         .or_else(|| default_value(setting))
 }
 
+/// A row of `duckdb_settings()`.
+#[derive(Debug, Clone)]
+pub struct SettingRow {
+    pub name: &'static str,
+    pub value: Option<Value>,
+    pub description: &'static str,
+    pub input_type: &'static str,
+    /// `GLOBAL` or `LOCAL`
+    pub scope: &'static str,
+    pub aliases: &'static [&'static str],
+    pub is_debug: bool,
+    pub is_deprecated: bool,
+}
+
+/// `DuckDBSettingsInit`: every setting with its current value, each alias as a row of its
+/// own, sorted by name.
+pub fn list_settings(global: &SettingValues, session: &SettingValues) -> Vec<SettingRow> {
+    let mut rows = Vec::new();
+    for (index, setting) in SETTINGS.iter().chain(&EXTENSION_SETTINGS).enumerate() {
+        let extension = index >= SETTINGS.len();
+        let mut scope = if extension || setting.scope != SettingScope::LocalOnly {
+            "GLOBAL"
+        } else {
+            "LOCAL"
+        };
+        let value = if let Some(value) = session.0.get(&index) {
+            scope = "LOCAL";
+            Some(value.clone())
+        } else if let Some(value) = global.0.get(&index) {
+            scope = "GLOBAL";
+            Some(value.clone())
+        } else {
+            default_value(setting)
+        };
+        let row = SettingRow {
+            name: setting.name,
+            value,
+            description: setting.description,
+            input_type: setting.input_type,
+            scope,
+            aliases: setting.aliases,
+            is_debug: setting.is_debug,
+            is_deprecated: setting.is_deprecated,
+        };
+        for alias in setting.aliases {
+            rows.push(SettingRow {
+                name: alias,
+                aliases: &[],
+                ..row.clone()
+            });
+        }
+        rows.push(row);
+    }
+    rows.sort_by(|a, b| a.name.cmp(b.name));
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_settings_rows() {
+        let (mut global, mut session) = (SettingValues::default(), SettingValues::default());
+        let rows = list_settings(&global, &session);
+        assert!(rows.windows(2).all(|w| w[0].name <= w[1].name));
+        // an alias is a row of its own, without aliases
+        let alias = rows.iter().find(|r| r.name == "null_order").unwrap();
+        assert!(alias.aliases.is_empty());
+        let row = rows.iter().find(|r| r.name == "default_null_order").unwrap();
+        assert_eq!(row.aliases, &["null_order"]);
+        assert_eq!(row.value, Some(Value::varchar("NULLS_LAST")));
+        assert!(!row.description.is_empty());
+        set_variable(
+            "default_null_order",
+            SetScope::Session,
+            &Value::varchar("first"),
+            &mut global,
+            &mut session,
+        )
+        .unwrap();
+        let rows = list_settings(&global, &session);
+        let row = rows.iter().find(|r| r.name == "default_null_order").unwrap();
+        assert_eq!(
+            (row.scope, row.value.clone()),
+            ("LOCAL", Some(Value::varchar("NULLS_FIRST")))
+        );
+        // VARCHAR[] settings can be stored, and those that restrict file access fail as unported
+        set_variable(
+            "extension_directories",
+            SetScope::Automatic,
+            &Value::list(LogicalType::VARCHAR, vec![Value::varchar("/tmp")]).unwrap(),
+            &mut global,
+            &mut session,
+        )
+        .unwrap();
+        let err = set_variable(
+            "allowed_directories",
+            SetScope::Automatic,
+            &Value::list(LogicalType::VARCHAR, vec![Value::varchar("/tmp")]).unwrap(),
+            &mut global,
+            &mut session,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("is not yet ported"), "{err}");
+    }
 
     #[test]
     fn set_and_reset() {

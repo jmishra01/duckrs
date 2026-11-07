@@ -2146,6 +2146,8 @@ test/sql/pivot/unpivot_non_aligned_columns.test
 test/sql/pivot/unpivot_types.test
 test/sql/pivot/unpivot_unnamed_subquery.test
 test/sql/pivot/unpivot_view.test
+test/sql/pragma/profiling/test_custom_profiling_errors.test
+test/sql/pragma/profiling/test_no_reset_setting.test
 test/sql/prepared/invalid_prepare.test
 test/sql/prepared/parameter_order_subquery.test
 test/sql/prepared/parameter_variants.test
@@ -2229,8 +2231,10 @@ test/sql/setops/union_pipeline.test
 test/sql/setops/union_shared_scan.test
 test/sql/setops/value_union.test
 test/sql/settings/connection_local_settings.test
+test/sql/settings/debug_deprecated_settings.test
 test/sql/settings/max_memory_percentage.test
 test/sql/settings/reset/reset_threads.test
+test/sql/settings/setting_alias.test
 test/sql/settings/setting_null_order.test
 test/sql/settings/setting_order.test
 test/sql/show_select/describe_case_alias.test
@@ -2721,6 +2725,7 @@ test/sql/subquery/table/test_unnamed_subquery.test
 test/sql/subquery/test_neumann.test
 test/sql/table_function/database_oid.test
 test/sql/table_function/duckdb_constraints_issue11284.test
+test/sql/table_function/duckdb_settings_extension.test
 test/sql/table_function/glob_prepared.test
 test/sql/table_function/information_schema_types.test
 test/sql/table_function/range_cardinality_extremes.test

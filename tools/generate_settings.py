@@ -82,6 +82,9 @@ def main():
             f"        default_value: {'None' if default is None else 'Some(' + rust_string(str(default)) + ')'},",
             f"        enum_name: {'None' if enum is None else 'Some(' + rust_string(enum[0]) + ')'},",
             f"        enum_values: &[{'' if enum is None else ', '.join(rust_string(v) for v in enum[1])}],",
+            f"        description: {rust_string(s['description'])},",
+            f"        is_debug: {'true' if s.get('is_debug') else 'false'},",
+            f"        is_deprecated: {'true' if s.get('is_deprecated') else 'false'},",
             "    },",
         ]
     lines.append("];")
