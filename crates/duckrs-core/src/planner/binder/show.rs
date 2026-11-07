@@ -845,6 +845,7 @@ impl Binder<'_> {
                         "denormalized_table cannot be NULL",
                     ));
                 }
+                let value = crate::client::settings::cast_value(&value, &LogicalType::BOOLEAN)?;
                 denormalized = value.try_to_string()? == "true";
             } else if argument.name.is_empty() {
                 return Err(binder_error(format!("{name} takes no positional arguments")));
@@ -869,6 +870,39 @@ impl Binder<'_> {
         let Some(session) = self.session.clone() else {
             return Err(crate::unported(format!("{name} here")));
         };
+        // `FileLogStorage::BindReplace`: the files are read as CSV; the lock is let go first, as
+        // the query reads the log again
+        let file_sql = {
+            use crate::logging::LogTable;
+            let mut manager = session.log_manager.lock().expect("the log manager is not poisoned");
+            if manager.is_file_storage() {
+                let table = match (name, denormalized) {
+                    ("duckdb_log_contexts", _) => LogTable::Contexts,
+                    (_, true) => LogTable::All,
+                    _ => LogTable::Entries,
+                };
+                match manager.file_scan_sql(table)? {
+                    Some(sql) => Some(sql),
+                    None if table == LogTable::All => Some(crate::logging::DENORMALIZED_JOIN.to_string()),
+                    None => {
+                        return Err(duckrs_common::Error::new(
+                            ErrorKind::InvalidConfiguration,
+                            format!(
+                                "Log storage '{}' does not support this query. Select a queryable storage, such as \
+                                 'memory' or 'file', before generating logs.",
+                                manager.config().storage
+                            ),
+                        ));
+                    }
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(sql) = file_sql {
+            let select = parse_select(&sql, "Expected a single SELECT statement")?;
+            return self.bind_rewritten(&select, table_ref, name);
+        }
         let (ubigint, varchar) = (LogicalType::UBIGINT, LogicalType::VARCHAR);
         let context_columns = vec![
             ("context_id", ubigint.clone()),

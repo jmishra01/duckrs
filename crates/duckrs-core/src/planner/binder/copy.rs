@@ -668,7 +668,7 @@ impl Binder<'_> {
         if arguments.files.is_empty() {
             return self.bind_empty_csv(table_ref, &name, arguments);
         }
-        let (first, _) = Self::csv_sniff(&arguments, &arguments.files[0])?;
+        let (first, first_data) = Self::csv_sniff(&arguments, &arguments.files[0])?;
         let (mut names, mut types) = (first.names.clone(), first.types.clone());
         let first_formats = (first.date_format.clone(), first.timestamp_format.clone());
         let first_mismatch = first.mismatch.clone();
@@ -797,6 +797,7 @@ impl Binder<'_> {
             names,
             types,
             filename: arguments.filename.is_some(),
+            first_data: std::sync::Mutex::new(Some(first_data)),
         };
         Ok(LogicalOperator::new(
             LogicalOperatorKind::CsvScan {
@@ -843,6 +844,7 @@ impl Binder<'_> {
             union_by_name: false,
             filename: false,
             rejects: None,
+            first_data: std::sync::Mutex::new(None),
         };
         Ok(LogicalOperator::new(
             LogicalOperatorKind::CsvScan {

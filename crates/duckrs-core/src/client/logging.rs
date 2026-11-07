@@ -135,7 +135,7 @@ impl ClientContext {
         self.query_id = query_id;
         let logger = {
             let mut manager = self.log_manager();
-            manager.flush();
+            manager.flush()?;
             let mut context = LoggingContext::new(LogScope::Connection);
             context.connection_id = Some(self.id);
             context.transaction_id = Some(transaction_id);
@@ -153,7 +153,8 @@ impl ClientContext {
     pub(super) fn end_statement_logging(&mut self) {
         let logger = {
             let mut manager = self.log_manager();
-            manager.flush();
+            // C++ throws from the end of a query too; a statement's own error comes first here
+            let _ = manager.flush();
             let mut context = LoggingContext::new(LogScope::Connection);
             context.connection_id = Some(self.id);
             manager.create_logger(context)
@@ -229,7 +230,7 @@ impl ClientContext {
                     .enable_logging(call.config, &call.types, &call.storage_config)?;
             }
             "disable_logging" => self.log_manager().set_enabled(false),
-            _ => self.log_manager().truncate(),
+            _ => self.log_manager().truncate()?,
         }
         self.sync_logging_settings();
         Ok(Self::success())
@@ -241,7 +242,11 @@ impl ClientContext {
             unreachable!("a function call");
         };
         let catalog = self.catalog();
-        let constant = |expr: &Expr| evaluate_scalar(&bind_constant_expression(&catalog, expr)?);
+        // `TableFunctionBinder::BindColumnReference`: a column name is the text of the name
+        let constant = |expr: &Expr| match &expr.kind {
+            ExprKind::ColumnRef(names) if names.len() == 1 => Ok(Value::varchar(names[0].clone())),
+            _ => evaluate_scalar(&bind_constant_expression(&catalog, expr)?),
+        };
         let arguments: Vec<_> = call.args.iter().map(crate::planner::binder::named_argument).collect();
         let positional: Vec<&Expr> = arguments
             .iter()
@@ -290,10 +295,13 @@ impl ClientContext {
                 "storage_path" => set_option("path", value),
                 "storage_normalize" => set_option("normalize", value),
                 "storage_buffer_size" => set_option("buffer_size", value),
-                other => {
+                _ => {
                     return Err(Error::new(
-                        ErrorKind::InvalidInput,
-                        format!("EnableLogging: unknown named parameter: {other}"),
+                        ErrorKind::Binder,
+                        format!(
+                            "Invalid named parameter \"{}\" for function enable_logging",
+                            argument.name
+                        ),
                     ));
                 }
             }
@@ -304,6 +312,19 @@ impl ClientContext {
             None if storage_config.iter().any(|(k, _)| k.eq_ignore_ascii_case("path")) => FILE_STORAGE.into(),
             None => current.storage.clone(),
         };
+        // `SetLogStorageInternal`
+        if config.storage.eq_ignore_ascii_case(FILE_STORAGE)
+            && current.storage != FILE_STORAGE
+            && self
+                .setting_text("disabled_filesystems")
+                .split(',')
+                .any(|f| f.trim() == "LocalFileSystem")
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidConfiguration,
+                "Can not enable file logging with the LocalFileSystem disabled",
+            ));
+        }
         // `VerifyFileStoragePath`
         if config.storage.eq_ignore_ascii_case(FILE_STORAGE) && current.storage != FILE_STORAGE {
             let usable = storage_config.iter().any(|(k, v)| {

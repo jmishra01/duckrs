@@ -176,6 +176,10 @@ impl Compression {
 /// All of a file, decompressed.
 pub fn read_file(path: &str, compression: Compression) -> Result<Vec<u8>> {
     let data = std::fs::read(path).map_err(|e| io_error(format!("Cannot open file \"{path}\": {e}")))?;
+    // the file is read at once: one READ of all of it
+    crate::logging::log_file_system(path, "OPEN", None);
+    crate::logging::log_file_system(path, "READ", Some((data.len() as i64, 0)));
+    crate::logging::log_file_system(path, "CLOSE", None);
     match compression.for_path(path) {
         Compression::Gzip => {
             if !data.starts_with(&[0x1f, 0x8b]) {

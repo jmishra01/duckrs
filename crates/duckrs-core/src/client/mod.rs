@@ -798,7 +798,8 @@ impl ClientContext {
         };
         for (statement, text) in &statements {
             self.begin_statement_logging(text)?;
-            let outcome = self.run_statement(statement);
+            let target = self.log_target.clone();
+            let outcome = crate::logging::with_file_logging(&target, || self.run_statement(statement));
             self.end_statement_logging();
             result = outcome?;
         }
@@ -6018,13 +6019,22 @@ mod tests {
         run(&mut c, "CALL truncate_duckdb_logs()");
         run(&mut c, "CALL enable_logging('QueryLog', level = 'debug')");
         assert_eq!(
-            run(&mut c, "SELECT current_setting('logging_mode'), current_setting('enabled_log_types')"),
+            run(
+                &mut c,
+                "SELECT current_setting('logging_mode'), current_setting('enabled_log_types')"
+            ),
             [["ENABLE_SELECTED", "QueryLog"]]
         );
         run(&mut c, "CALL enable_logging()");
-        run(&mut c, "SELECT write_log('hello', log_type := 'mine', level := 'warning', return_value := 42)");
+        run(
+            &mut c,
+            "SELECT write_log('hello', log_type := 'mine', level := 'warning', return_value := 42)",
+        );
         assert_eq!(
-            run(&mut c, "SELECT type, log_level, message FROM duckdb_logs WHERE type = 'mine'"),
+            run(
+                &mut c,
+                "SELECT type, log_level, message FROM duckdb_logs WHERE type = 'mine'"
+            ),
             [["mine", "WARNING", "hello"]]
         );
         assert_eq!(

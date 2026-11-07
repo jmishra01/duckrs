@@ -698,7 +698,13 @@ impl Binder<'_> {
 
     fn bind_select_node(&mut self, node: &SelectNode, modifiers: &[ResultModifier]) -> Result<BoundStatement> {
         let mut plan = self.bind_table_ref(&node.from_table)?;
-        let mut select_list = self.expand_star_expressions(&node.select_list)?;
+        let mut select_list = Vec::new();
+        for expr in self.expand_star_expressions(&node.select_list)? {
+            match self.struct_unnest_fields(&expr) {
+                Some(fields) => select_list.extend(fields),
+                None => select_list.push(expr),
+            }
+        }
         if select_list.is_empty() {
             return Err(binder_error("SELECT list is empty after resolving * expressions!"));
         }
@@ -1219,6 +1225,46 @@ impl Binder<'_> {
         state.projection_map.push((key, index));
         select_list.push(qualified);
         Ok(index)
+    }
+
+    /// The `BoundExpandedExpression` of `BindSelectNode`: an UNNEST of a STRUCT in the select list
+    /// stands for a column per field of the struct.
+    fn struct_unnest_fields(&mut self, expr: &Expr) -> Option<Vec<Expr>> {
+        let ExprKind::Function(call) = &expr.kind else {
+            return None;
+        };
+        if !crate::function::generic::is_unnest(&call.name.name)
+            || !call.name.qualification.is_empty()
+            || call.args.len() != 1
+            || !call.args[0].name.is_empty()
+        {
+            return None;
+        }
+        let argument = &call.args[0].expr;
+        let bound = self.bind_expression(argument).ok()?;
+        if bound.return_type.id() != LogicalTypeId::Struct {
+            return None;
+        }
+        let fields = bound.return_type.struct_children();
+        if fields.is_empty() {
+            return None;
+        }
+        Some(
+            fields
+                .iter()
+                .map(|(name, _)| {
+                    let mut extract = call.clone();
+                    extract.name.name = "struct_extract".into();
+                    extract.args = vec![
+                        ast::FunctionArgument::positional(argument.clone()),
+                        ast::FunctionArgument::positional(Expr::constant(ast::Literal::string(name.clone()))),
+                    ];
+                    let mut field = Expr::from(ExprKind::Function(extract));
+                    field.alias = name.clone();
+                    field
+                })
+                .collect(),
+        )
     }
 
     /// `BindContext::GenerateAllColumnExpressions`: replaces `*` and `t.*` with the columns of

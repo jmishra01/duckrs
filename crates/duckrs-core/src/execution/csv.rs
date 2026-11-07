@@ -194,6 +194,9 @@ pub struct CsvScanData {
     pub filename: bool,
     /// where rejected rows go (`store_rejects`)
     pub rejects: Option<CsvRejects>,
+    /// the bytes of the first file that sniffing read, for the first scan (the CSV reader keeps
+    /// the handle it sniffed with)
+    pub first_data: std::sync::Mutex<Option<Vec<u8>>>,
 }
 
 /// The tables that `store_rejects` fills (`CSVRejectsTable`).
@@ -360,7 +363,15 @@ pub fn scan_chunk(scan: &CsvScanData, state: &mut CsvScanState) -> Result<Option
             return Ok(None);
         };
         if state.data.is_none() {
-            let data = read_csv_file(&file.path, &scan.options)?;
+            let cached = if state.file == 0 {
+                scan.first_data.lock().expect("not poisoned").take()
+            } else {
+                None
+            };
+            let data = match cached {
+                Some(data) => data,
+                None => read_csv_file(&file.path, &scan.options)?,
+            };
             let bom = if data.starts_with(&[0xef, 0xbb, 0xbf]) { 3 } else { 0 };
             state.current = if state.file > 0 && scan.options.auto_detect && !scan.union_by_name {
                 Some(sniff_next_file(scan, file, &data)?)

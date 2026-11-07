@@ -528,11 +528,44 @@ impl PhysicalOperator for PhysicalCsvScan {
     }
 }
 
+/// A file being written that logs its writes, and its closing when it goes away
+/// (`DUCKDB_LOG_FILE_SYSTEM_WRITE` and `_CLOSE` of `LocalFileSystem`).
+#[derive(Debug)]
+struct LoggedFile {
+    file: std::fs::File,
+    path: String,
+    position: u64,
+    logger: Option<Arc<crate::logging::LogTarget>>,
+}
+
+impl std::io::Write for LoggedFile {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.file.write(bytes)?;
+        crate::logging::log_file_system_to(
+            self.logger.as_ref(),
+            &self.path,
+            "WRITE",
+            Some((written as i64, self.position)),
+        );
+        self.position += written as u64;
+        Ok(written)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl Drop for LoggedFile {
+    fn drop(&mut self) {
+        crate::logging::log_file_system_to(self.logger.as_ref(), &self.path, "CLOSE", None);
+    }
+}
+
 /// The file of a COPY TO, compressed or not.
 #[derive(Debug)]
 enum CopyWriter {
-    Plain(std::io::BufWriter<std::fs::File>),
-    Gzip(Box<flate2::write::GzEncoder<std::io::BufWriter<std::fs::File>>>),
+    Plain(std::io::BufWriter<LoggedFile>),
+    Gzip(Box<flate2::write::GzEncoder<std::io::BufWriter<LoggedFile>>>),
 }
 
 impl std::io::Write for CopyWriter {
@@ -562,6 +595,8 @@ pub struct PhysicalCopyToFile {
     writer: Mutex<Option<CopyWriter>>,
     gzip: bool,
     rows: std::sync::atomic::AtomicU64,
+    /// the logger of the statement, for the file it writes
+    logger: Option<Arc<crate::logging::LogTarget>>,
 }
 
 impl PhysicalCopyToFile {
@@ -582,6 +617,7 @@ impl PhysicalCopyToFile {
             writer: Mutex::new(None),
             gzip,
             rows: std::sync::atomic::AtomicU64::new(0),
+            logger: crate::logging::current_file_logger(),
         }
     }
 
@@ -590,7 +626,13 @@ impl PhysicalCopyToFile {
         if writer.is_none() {
             let file = std::fs::File::create(&self.path)
                 .map_err(|e| Error::new(ErrorKind::Io, format!("Cannot open file \"{}\": {e}", self.path)))?;
-            let file = std::io::BufWriter::new(file);
+            crate::logging::log_file_system_to(self.logger.as_ref(), &self.path, "OPEN", None);
+            let file = std::io::BufWriter::new(LoggedFile {
+                file,
+                path: self.path.clone(),
+                position: 0,
+                logger: self.logger.clone(),
+            });
             let mut opened = if self.gzip {
                 CopyWriter::Gzip(Box::new(flate2::write::GzEncoder::new(
                     file,

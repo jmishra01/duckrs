@@ -1044,6 +1044,11 @@ impl Binder<'_> {
                 if function.name.name.eq_ignore_ascii_case("write_log") && function.name.qualification.is_empty() {
                     return self.bind_write_log(function);
                 }
+                if function.name.name.eq_ignore_ascii_case("parse_duckdb_log_message")
+                    && function.name.qualification.is_empty()
+                {
+                    return self.bind_parse_log_message(function);
+                }
                 if function.name.name.eq_ignore_ascii_case("to_aggregate_state") {
                     let children = function
                         .args
@@ -1757,6 +1762,52 @@ fn switch_varchar_comparison(ty: &LogicalType) -> bool {
             | TimeTz
             | IntegerLiteral
     )
+}
+
+// Ported from duckdb/src/function/scalar/system/parse_log_message.cpp @ rust-port-baseline
+impl Binder<'_> {
+    /// `parse_duckdb_log_message(log_type, message)`: the message of a structured log type as its
+    /// STRUCT (a cast of its text), and of the others as `{'message': ...}`.
+    fn bind_parse_log_message(&mut self, function: &ast::FunctionExpr) -> Result<BoundExpr> {
+        let binder = |message: &str| Error::new(ErrorKind::Binder, message);
+        let [log_type, message] = function.args.as_slice() else {
+            return Err(binder("structured_log_schema: expects 1 argument"));
+        };
+        let bound = self.bind_expression(&log_type.expr)?;
+        if !matches!(
+            bound.return_type.id(),
+            LogicalTypeId::Varchar | LogicalTypeId::StringLiteral
+        ) || !bound.is_foldable()
+        {
+            return Err(binder("structured_log_schema: 'log_type' argument must be a string"));
+        }
+        let name = crate::execution::expression_executor::evaluate_scalar(&bound)?.try_to_string()?;
+        let Some((name, _)) = crate::logging::lookup_log_type(&name) else {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("structured_log_schema: '{name}' not found"),
+            ));
+        };
+        let text = self
+            .bind_expression(&message.expr)?
+            .cast_to(&LogicalType::VARCHAR, false);
+        match crate::logging::log_type_schema(name) {
+            Some(schema) => {
+                let ty = self.bind_named_type(&LogicalType::unbound(schema.to_string()))?;
+                Ok(text.cast_to(&ty, false))
+            }
+            None => {
+                let mut pack = function.clone();
+                pack.name.name = "struct_pack".into();
+                pack.args = vec![ast::FunctionArgument {
+                    name: "message".into(),
+                    expr: message.expr.clone(),
+                }];
+                let _ = text;
+                self.bind_expression(&Expr::from(ExprKind::Function(pack)))
+            }
+        }
+    }
 }
 
 // Ported from `WriteLogResolveTypes` and `WriteLogBind` of

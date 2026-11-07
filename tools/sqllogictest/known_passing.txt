@@ -1950,9 +1950,18 @@ test/sql/limit/streaming_limit_pipeline_flush2.test
 test/sql/limit/test_batch_limit_filters.test
 test/sql/limit/test_limit0.test
 test/sql/limit/test_preserve_insertion_order.test
+test/sql/logging/enable_logging_file_no_path.test
 test/sql/logging/logging.test
+test/sql/logging/logging_branch_coverage.test
+test/sql/logging/logging_buffer_size.test
+test/sql/logging/logging_call_functions.test
 test/sql/logging/logging_context_ids.test
+test/sql/logging/logging_csv.test
+test/sql/logging/logging_file_bind_replace.test
+test/sql/logging/logging_file_persistence.test
+test/sql/logging/logging_file_truncate_rewrite.test
 test/sql/logging/logging_non_queryable_storage.test
+test/sql/logging/logging_types.test
 test/sql/logging/test_logging_function.test
 test/sql/merge/merge_into_bind_matching_columns.test
 test/sql/merge/merge_into_by_source.test
@@ -2050,6 +2059,7 @@ test/sql/order/test_nulls_first.test
 test/sql/order/test_order_large.test
 test/sql/order/test_order_pragma.test
 test/sql/order/test_order_range_mapping.test
+test/sql/order/test_order_unnest.test
 test/sql/order/top_n_issue_21623.test
 test/sql/order/top_n_limit_zero.test
 test/sql/order/top_n_nulls.test
@@ -3001,6 +3011,7 @@ test/sql/types/list/nested_comparison_validity.test
 test/sql/types/list/nested_list_extract.test
 test/sql/types/list/nested_list_slice.test
 test/sql/types/list/nested_list_updates.test
+test/sql/types/list/unnest_complex_types.test
 test/sql/types/list/unnest_having_qualify.test
 test/sql/types/list/unnest_null_empty.test
 test/sql/types/list/unnest_types.test

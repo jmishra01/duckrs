@@ -130,6 +130,17 @@ impl Binder<'_> {
         let args: Vec<FunctionArgument> = call.args.iter().map(named_argument).collect();
         let sql = match name.as_str() {
             "unnest" => format!("SELECT {function} AS unnest"),
+            // the table macro of `default_table_functions.cpp`
+            "duckdb_logs_parsed" => {
+                let [log_type] = args.as_slice() else {
+                    return Err(binder_error("duckdb_logs_parsed takes a log type"));
+                };
+                let t = &log_type.expr;
+                format!(
+                    "SELECT * EXCLUDE (message), UNNEST(CASE WHEN type ILIKE {t} THEN parse_duckdb_log_message({t}, \
+                     message) END) FROM duckdb_logs(denormalized_table=1) WHERE type ILIKE {t}"
+                )
+            }
             "repeat" => {
                 let [value, count] = args.as_slice() else {
                     return Err(binder_error("repeat requires a value and a number of repetitions"));

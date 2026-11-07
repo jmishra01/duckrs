@@ -132,6 +132,40 @@ const LOG_TYPES: [(&str, LogLevel); 12] = [
     ("ProgressVerification", LogLevel::Info),
 ];
 
+/// The `GetLogType` of the structured log types, as SQL: what `parse_duckdb_log_message` makes
+/// of their messages. The others are plain text.
+pub fn log_type_schema(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "FileSystem" => "STRUCT(fs VARCHAR, path VARCHAR, op VARCHAR, bytes BIGINT, pos BIGINT)",
+        "HTTP" => {
+            "STRUCT(request STRUCT(type VARCHAR, url VARCHAR, start_time TIMESTAMP WITH TIME ZONE, duration_ms \
+             BIGINT, duration_us BIGINT, request_body_length UBIGINT, headers MAP(VARCHAR, VARCHAR)), response \
+             STRUCT(status VARCHAR, reason VARCHAR, headers MAP(VARCHAR, VARCHAR)))"
+        }
+        "PhysicalOperator" => {
+            "STRUCT(operator_type VARCHAR, parameters MAP(VARCHAR, VARCHAR), class VARCHAR, event VARCHAR, info \
+             MAP(VARCHAR, VARCHAR))"
+        }
+        "Metrics" => {
+            "STRUCT(metric VARCHAR, value VARCHAR, start_time TIMESTAMP WITH TIME ZONE, end_time TIMESTAMP WITH \
+             TIME ZONE)"
+        }
+        "AdaptiveFilter" => "STRUCT(event VARCHAR, file_path VARCHAR, permutation VARCHAR, info MAP(VARCHAR, VARCHAR))",
+        "ParquetPrefetch" => {
+            "STRUCT(file_path VARCHAR, row_group_id BIGINT, fully_filtered BOOLEAN, strategy VARCHAR, \
+             prefetch_groups VARCHAR[][], minimal_filters VARCHAR[], accepted_column_gap UBIGINT)"
+        }
+        "AsyncTaskSchedule" => "STRUCT(pool VARCHAR, task_count BIGINT)",
+        "ReadAheadBudget" => "STRUCT(pending_bytes UBIGINT, budget_bytes UBIGINT, active_jobs UBIGINT)",
+        "ProgressVerification" => "STRUCT(invariant VARCHAR, operator VARCHAR, pipeline VARCHAR, detail VARCHAR)",
+        "ExternalResource" => {
+            "STRUCT(resource_type VARCHAR, resource_name VARCHAR, operation VARCHAR, outcome VARCHAR, error \
+             VARCHAR, extra_info MAP(VARCHAR, VARCHAR))"
+        }
+        _ => return None,
+    })
+}
+
 /// `LogManager::LookupLogType`, case-insensitively: the type's name and level.
 pub fn lookup_log_type(name: &str) -> Option<(&'static str, LogLevel)> {
     LOG_TYPES.iter().copied().find(|(n, _)| n.eq_ignore_ascii_case(name))
@@ -368,29 +402,395 @@ fn unsigned_option(value: &Value) -> Result<u64> {
 
 /// `StdOutLogStorage`: every entry, with its context, printed as a tab-separated line.
 fn print_entry(entry: &LogEntry, context: &RegisteredContext) {
-    let mut fields: Vec<String> = context_values(context)
+    let fields: Vec<String> = context_values(context)
         .iter()
         .chain(&entry.values()[1..])
-        .map(|value| {
-            if value.is_null() {
-                String::new()
-            } else {
-                value.try_to_string().unwrap_or_default()
-            }
-        })
+        .map(csv_field)
         .collect();
-    for field in &mut fields {
-        if field.contains(['\t', '"', '\n', '\r']) {
-            *field = format!("\"{}\"", field.replace('"', "\"\""));
-        }
-    }
     println!("{}", fields.join("\t"));
 }
+
+/// `LoggingTargetTable`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LogTable {
+    Entries,
+    Contexts,
+    All,
+}
+
+const ENTRY_COLUMNS: [&str; 5] = ["context_id", "timestamp", "type", "log_level", "message"];
+const CONTEXT_COLUMNS: [&str; 6] = [
+    "context_id",
+    "scope",
+    "connection_id",
+    "transaction_id",
+    "query_id",
+    "thread_id",
+];
+
+impl LogTable {
+    /// `LogStorage::GetColumnNames`.
+    fn columns(self) -> Vec<&'static str> {
+        match self {
+            LogTable::Entries => ENTRY_COLUMNS.to_vec(),
+            LogTable::Contexts => CONTEXT_COLUMNS.to_vec(),
+            LogTable::All => CONTEXT_COLUMNS.iter().chain(&ENTRY_COLUMNS[1..]).copied().collect(),
+        }
+    }
+}
+
+/// `CSVWriter::WriteQuotedString` with `"` as quote and escape: a field quoted when it is empty
+/// (as NULL is written as nothing) or holds a comma, a quote or a line break. The characters
+/// that need quotes are those of the default `,` delimiter: the log storages work them out
+/// before they set their own delimiter (`CSVWriterOptions` of `CSVLogStorage`).
+fn csv_field(value: &Value) -> String {
+    if value.is_null() {
+        return String::new();
+    }
+    let text = value.try_to_string().unwrap_or_default();
+    if text.is_empty() || text.contains([',', '"', '\n', '\r']) {
+        return format!("\"{}\"", text.replace('"', "\"\""));
+    }
+    text
+}
+
+/// A file of the file storage (`FileLogStorage::TableWriter`).
+#[derive(Debug, Default)]
+struct TableFile {
+    path: String,
+    initialized: bool,
+}
+
+/// `FileLogStorage`: the buffering of [`MemoryStorage`], flushed to CSV files: one for the
+/// entries and one for the contexts (`normalize`), or one with both.
+#[derive(Debug)]
+struct FileStorage {
+    normalize: bool,
+    buffer_limit: usize,
+    only_flush_on_full_buffer: bool,
+    base_path: String,
+    delimiter: String,
+    entries: Vec<LogEntry>,
+    contexts: Vec<RegisteredContext>,
+    all: Vec<(LogEntry, RegisteredContext)>,
+    registered: HashSet<u64>,
+    flush_contexts_on_next_entry_flush: bool,
+    files: HashMap<LogTable, TableFile>,
+}
+
+fn io_error(path: &str, error: std::io::Error) -> Error {
+    Error::new(ErrorKind::Io, format!("Could not write log file \"{path}\": {error}"))
+}
+
+impl FileStorage {
+    fn new() -> Self {
+        Self {
+            normalize: true,
+            buffer_limit: DEFAULT_BUFFER_SIZE,
+            only_flush_on_full_buffer: false,
+            base_path: String::new(),
+            delimiter: ",".into(),
+            entries: Vec::new(),
+            contexts: Vec::new(),
+            all: Vec::new(),
+            registered: HashSet::new(),
+            flush_contexts_on_next_entry_flush: false,
+            files: [LogTable::Entries, LogTable::Contexts, LogTable::All]
+                .into_iter()
+                .map(|t| (t, TableFile::default()))
+                .collect(),
+        }
+    }
+
+    /// `BufferingLogStorage::IsEnabledInternal`.
+    fn is_enabled(&self, table: LogTable) -> bool {
+        if self.normalize {
+            matches!(table, LogTable::Entries | LogTable::Contexts)
+        } else {
+            table == LogTable::All
+        }
+    }
+
+    fn write(&mut self, entry: LogEntry, context: &RegisteredContext) -> Result<()> {
+        let size = if self.normalize {
+            self.entries.len()
+        } else {
+            self.all.len()
+        };
+        if size >= self.buffer_limit && self.buffer_limit != 0 {
+            return Err(Error::new(
+                ErrorKind::Internal,
+                "Log buffer limit exceeded: code should have flushed before",
+            ));
+        }
+        if self.registered.insert(context.id) {
+            if self.normalize {
+                if self.contexts.len() + 1 > self.buffer_limit {
+                    self.flush(LogTable::Contexts)?;
+                }
+                self.contexts.push(*context);
+            }
+            self.flush_contexts_on_next_entry_flush = true;
+        }
+        if self.normalize {
+            self.entries.push(entry);
+        } else {
+            self.all.push((entry, *context));
+        }
+        if size + 1 >= self.buffer_limit {
+            if self.normalize {
+                self.flush(LogTable::Entries)?;
+                if self.flush_contexts_on_next_entry_flush {
+                    self.flush(LogTable::Contexts)?;
+                    self.flush_contexts_on_next_entry_flush = false;
+                }
+            } else {
+                self.flush(LogTable::All)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_all(&mut self) -> Result<()> {
+        if self.only_flush_on_full_buffer {
+            return Ok(());
+        }
+        if self.normalize {
+            self.flush(LogTable::Entries)?;
+            self.flush(LogTable::Contexts)
+        } else {
+            self.flush(LogTable::All)
+        }
+    }
+
+    /// `FileLogStorage::InitializeFile`: the file, made with its header if it is new or empty.
+    fn initialize(&mut self, table: LogTable) -> Result<()> {
+        let delimiter = self.delimiter.clone();
+        let file = self.files.get_mut(&table).expect("every table has a file");
+        if file.initialized {
+            return Ok(());
+        }
+        if file.path.is_empty() {
+            return Err(Error::new(
+                ErrorKind::InvalidConfiguration,
+                "Failed to initialize file log storage table, path wasn't set",
+            ));
+        }
+        let path = file.path.clone();
+        if let Some(parent) = std::path::Path::new(&path).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| io_error(&path, e))?;
+        }
+        let empty = std::fs::metadata(&path).map_or(true, |m| m.len() == 0);
+        let mut handle = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| io_error(&path, e))?;
+        if empty {
+            std::io::Write::write_all(&mut handle, table.columns().join(&delimiter).as_bytes())
+                .map_err(|e| io_error(&path, e))?;
+        }
+        file.initialized = true;
+        Ok(())
+    }
+
+    /// `CSVLogStorage::FlushChunk`: the buffered rows of `table`, appended to its file, each
+    /// after a line break (`CSVNewLineMode::WRITE_BEFORE`).
+    fn flush(&mut self, table: LogTable) -> Result<()> {
+        if !self.is_enabled(table) {
+            return Err(Error::new(
+                ErrorKind::InvalidConfiguration,
+                "Cannot flush disabled logging target",
+            ));
+        }
+        self.initialize(table)?;
+        let rows: Vec<Vec<Value>> = match table {
+            LogTable::Entries => self.entries.drain(..).map(|e| e.values()).collect(),
+            LogTable::Contexts => self.contexts.drain(..).map(|c| context_values(&c)).collect(),
+            LogTable::All => self
+                .all
+                .drain(..)
+                .map(|(entry, context)| {
+                    let mut row = context_values(&context);
+                    row.extend(entry.values().into_iter().skip(1));
+                    row
+                })
+                .collect(),
+        };
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut text = String::new();
+        for row in rows {
+            text.push('\n');
+            let fields: Vec<String> = row.iter().map(csv_field).collect();
+            text.push_str(&fields.join(&self.delimiter));
+        }
+        let path = &self.files[&table].path;
+        let mut handle = std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .map_err(|e| io_error(path, e))?;
+        std::io::Write::write_all(&mut handle, text.as_bytes()).map_err(|e| io_error(path, e))
+    }
+
+    fn reset_buffers(&mut self) {
+        self.entries.clear();
+        self.contexts.clear();
+        self.all.clear();
+        self.registered.clear();
+    }
+
+    /// `FileLogStorage::Truncate`: the files keep only their headers.
+    fn truncate(&mut self) -> Result<()> {
+        self.reset_buffers();
+        for (table, file) in &self.files {
+            if !file.initialized {
+                continue;
+            }
+            std::fs::write(&file.path, table.columns().join(&self.delimiter)).map_err(|e| io_error(&file.path, e))?;
+        }
+        Ok(())
+    }
+
+    /// `FileLogStorage::SetPaths`.
+    fn set_paths(&mut self, base: &str) {
+        for file in self.files.values_mut() {
+            file.path.clear();
+        }
+        let join = |name: &str| std::path::Path::new(base).join(name).to_string_lossy().into_owned();
+        let mut set = |table: LogTable, path: String| {
+            self.files.get_mut(&table).expect("every table has a file").path = path;
+        };
+        if self.normalize {
+            set(LogTable::Contexts, join("duckdb_log_contexts.csv"));
+            set(LogTable::Entries, join("duckdb_log_entries.csv"));
+        } else if base.ends_with(".csv") {
+            set(LogTable::All, base.to_string());
+        } else {
+            set(LogTable::Entries, join("duckdb_log_entries.csv"));
+        }
+    }
+
+    /// `FileLogStorage::UpdateConfigInternal`.
+    fn update_config(&mut self, config: &[(String, Value)]) -> Result<()> {
+        let mut new_path = String::new();
+        let mut normalize = self.normalize;
+        let mut normalize_set = false;
+        let mut reinitialize = false;
+        let mut rest = Vec::new();
+        for (key, value) in config {
+            match key.to_lowercase().as_str() {
+                "path" => {
+                    let path = if value.is_null() {
+                        String::new()
+                    } else {
+                        value.try_to_string()?
+                    };
+                    if !normalize_set && path.ends_with(".csv") {
+                        normalize = false;
+                    }
+                    new_path = path;
+                }
+                "normalize" => {
+                    normalize_set = true;
+                    normalize = value.try_to_string()?.eq_ignore_ascii_case("true");
+                }
+                "delim" => {
+                    reinitialize = true;
+                    self.delimiter = value.try_to_string()?;
+                }
+                _ => rest.push((key.clone(), value.clone())),
+            }
+        }
+        if new_path.ends_with(".csv") && normalize {
+            return Err(Error::new(
+                ErrorKind::InvalidConfiguration,
+                format!(
+                    "Can not set path to '{new_path}' while normalize is true. Normalize will make DuckDB write \
+                     multiple log files to more efficiently store log entries. Please specify a directory path \
+                     instead of a csv file path, or set normalize to false."
+                ),
+            ));
+        }
+        if self.files.values().any(|f| f.initialized) {
+            self.flush_all()?;
+        }
+        reinitialize |= self.normalize != normalize;
+        self.normalize = normalize;
+        if reinitialize {
+            self.reset_buffers();
+            for file in self.files.values_mut() {
+                file.initialized = false;
+            }
+        }
+        if new_path != self.base_path {
+            self.base_path.clone_from(&new_path);
+            self.set_paths(&new_path);
+            // the files are opened anew where the path now says
+            for file in self.files.values_mut() {
+                file.initialized = false;
+            }
+        }
+        for (key, value) in rest {
+            if key.eq_ignore_ascii_case("buffer_size") {
+                self.buffer_limit = unsigned_option(&value)? as usize;
+                self.reset_buffers();
+            } else if key.eq_ignore_ascii_case("only_flush_on_full_buffer") {
+                self.only_flush_on_full_buffer = value.try_to_string()?.eq_ignore_ascii_case("true");
+            } else {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("Unrecognized log storage config option for storage: 'FileLogStorage': '{key}'"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `FileLogStorage::BindReplace`: the SQL that reads `table` from its file, after flushing
+    /// it, or `None` if the storage does not keep that table.
+    fn scan_sql(&mut self, table: LogTable) -> Result<Option<String>> {
+        if !self.is_enabled(table) {
+            return Ok(None);
+        }
+        self.flush(table)?;
+        let path = self.files[&table].path.replace('\'', "''");
+        let entries = "'context_id': 'UBIGINT', 'timestamp': 'TIMESTAMP WITH TIME ZONE', 'type': 'VARCHAR', \
+                       'log_level': 'VARCHAR' , 'message': 'VARCHAR'";
+        let contexts = "'context_id': 'UBIGINT', 'scope': 'VARCHAR', 'connection_id': 'UBIGINT', \
+                        'transaction_id': 'UBIGINT', 'query_id': 'UBIGINT', 'thread_id': 'UBIGINT'";
+        let (select, columns) = match table {
+            LogTable::Entries => ("SELECT *".to_string(), entries.to_string()),
+            LogTable::Contexts => ("SELECT *".to_string(), contexts.to_string()),
+            LogTable::All => (
+                "SELECT context_id, scope, connection_id, transaction_id, query_id, thread_id, timestamp, type, \
+                 log_level, message "
+                    .to_string(),
+                format!(
+                    "{contexts}, 'timestamp': 'TIMESTAMP WITH TIME ZONE', 'type': 'VARCHAR', 'log_level': \
+                     'VARCHAR' , 'message': 'VARCHAR'"
+                ),
+            ),
+        };
+        Ok(Some(format!(
+            "{select} FROM read_csv_auto('{path}', columns={{{columns}}})"
+        )))
+    }
+}
+
+/// The join of `DuckDBLogBindReplace` for a storage that keeps entries and contexts apart.
+pub const DENORMALIZED_JOIN: &str = "SELECT l.context_id, scope, connection_id, transaction_id, query_id, thread_id, \
+     timestamp, type, log_level, message FROM (SELECT row_number() OVER () AS rowid, * FROM duckdb_logs()) as l \
+     JOIN duckdb_log_contexts() as c ON l.context_id=c.context_id order by timestamp, l.rowid;";
 
 #[derive(Debug)]
 enum Storage {
     Memory(MemoryStorage),
     Stdout,
+    File(FileStorage),
 }
 
 impl Storage {
@@ -398,18 +798,11 @@ impl Storage {
         match name {
             MEMORY_STORAGE => Ok(Storage::Memory(MemoryStorage::new())),
             STDOUT_STORAGE => Ok(Storage::Stdout),
-            FILE_STORAGE => Err(crate::unported("the 'file' log storage")),
+            FILE_STORAGE => Ok(Storage::File(FileStorage::new())),
             _ => Err(Error::new(
                 ErrorKind::InvalidInput,
                 format!("Log storage '{name}' is not yet registered"),
             )),
-        }
-    }
-
-    fn name(&self) -> &'static str {
-        match self {
-            Storage::Memory(_) => "InMemoryLogStorage",
-            Storage::Stdout => "StdOutLogStorage",
         }
     }
 }
@@ -489,6 +882,7 @@ impl LogManager {
         };
         match &mut self.storage {
             Storage::Memory(storage) => storage.write(entry, context),
+            Storage::File(storage) => storage.write(entry, context),
             Storage::Stdout => {
                 print_entry(&entry, context);
                 Ok(())
@@ -511,10 +905,14 @@ impl LogManager {
         self.write_entry(log_type, level, message, &context, warnings_as_errors)
     }
 
-    pub fn flush(&mut self) {
-        if let Storage::Memory(storage) = &mut self.storage {
-            storage.flush_all();
+    /// `LogManager::Flush`.
+    pub fn flush(&mut self) -> Result<()> {
+        match &mut self.storage {
+            Storage::Memory(storage) => storage.flush_all(),
+            Storage::File(storage) => storage.flush_all()?,
+            Storage::Stdout => {}
         }
+        Ok(())
     }
 
     /// `LogManager::SetLogStorage` (`SET logging_storage`).
@@ -546,7 +944,7 @@ impl LogManager {
                 error
             }
         })?;
-        self.flush();
+        self.flush()?;
         self.storage = storage;
         self.config.storage = lower;
         Ok(())
@@ -621,7 +1019,7 @@ impl LogManager {
                     error
                 }
             })?;
-            self.flush();
+            self.flush()?;
             previous_storage = Some(std::mem::replace(&mut self.storage, storage));
         }
         self.config = LogConfig {
@@ -651,26 +1049,54 @@ impl LogManager {
     pub fn update_storage_config(&mut self, config: &[(String, Value)]) -> Result<()> {
         match &mut self.storage {
             Storage::Memory(storage) => storage.update_config(config),
-            other if !config.is_empty() => Err(Error::new(
-                ErrorKind::InvalidInput,
-                format!("Log storage '{}' does not support passing configuration", other.name()),
-            )),
-            _ => Ok(()),
+            Storage::File(storage) => storage.update_config(config),
+            // `CSVLogStorage::UpdateConfigInternal`: what the printed lines look like and when
+            // they are written out, which a line per entry makes moot here
+            Storage::Stdout => {
+                for (key, _) in config {
+                    if !["delim", "buffer_size", "only_flush_on_full_buffer"]
+                        .iter()
+                        .any(|k| k.eq_ignore_ascii_case(key))
+                    {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            format!("Unrecognized log storage config option for storage: 'StdOutLogStorage': '{key}'"),
+                        ));
+                    }
+                }
+                Ok(())
+            }
         }
     }
 
     /// `LogManager::TruncateLogStorage`.
-    pub fn truncate(&mut self) {
-        if let Storage::Memory(storage) = &mut self.storage {
-            storage.reset();
+    pub fn truncate(&mut self) -> Result<()> {
+        match &mut self.storage {
+            Storage::Memory(storage) => storage.reset(),
+            Storage::File(storage) => storage.truncate()?,
+            Storage::Stdout => {}
         }
+        Ok(())
+    }
+
+    /// The SQL that reads `table` of the file storage, `Ok(None)` for another storage or a table
+    /// the file storage does not keep.
+    pub fn file_scan_sql(&mut self, table: LogTable) -> Result<Option<String>> {
+        match &mut self.storage {
+            Storage::File(storage) => storage.scan_sql(table),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn is_file_storage(&self) -> bool {
+        matches!(self.storage, Storage::File(_))
     }
 
     /// `DuckDBLogInit` and `DuckDBLogContextInit`: what a scan sees, if the storage can be scanned.
     pub fn scan(&self) -> Result<(&[LogEntry], &[RegisteredContext])> {
         match &self.storage {
             Storage::Memory(storage) => Ok((&storage.flushed_entries, &storage.flushed_contexts)),
-            Storage::Stdout => Err(Error::new(
+            Storage::Stdout | Storage::File(_) => Err(Error::new(
                 ErrorKind::InvalidConfiguration,
                 format!(
                     "Log storage '{}' does not support this query. Select a queryable storage, such as 'memory' or \
@@ -813,9 +1239,110 @@ pub fn write_log(args: &duckrs_common::vector::DataChunk, result: &mut duckrs_co
     Ok(())
 }
 
+thread_local! {
+    /// The logger of the statement this thread runs, for the file system (`FileHandle::logger`).
+    static FILE_LOGGER: std::cell::RefCell<Option<Arc<LogTarget>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` with `target` as the logger of the files it opens.
+pub fn with_file_logging<R>(target: &Arc<LogTarget>, f: impl FnOnce() -> R) -> R {
+    let previous = FILE_LOGGER.with(|logger| logger.replace(Some(target.clone())));
+    let result = f();
+    FILE_LOGGER.with(|logger| *logger.borrow_mut() = previous);
+    result
+}
+
+/// `FileSystemLogType::ConstructLogMessage`.
+fn file_system_message(path: &str, op: &str, bytes: Option<(i64, u64)>) -> String {
+    match bytes {
+        Some((bytes, pos)) => format!(
+            "{{\"fs\":\"LocalFileSystem\",\"path\":\"{path}\",\"op\":\"{op}\",\"bytes\":\"{bytes}\",\"pos\":\"{pos}\"}}"
+        ),
+        None => format!("{{\"fs\":\"LocalFileSystem\",\"path\":\"{path}\",\"op\":\"{op}\"}}"),
+    }
+}
+
+/// `DUCKDB_LOG_FILE_SYSTEM`: logs `op` on the file `path` with the logger of the statement, or
+/// the database's (`FileHandle::TryAddLogger`). Errors of logging do not fail the file access.
+pub fn log_file_system(path: &str, op: &str, bytes: Option<(i64, u64)>) {
+    log_file_system_to(current_file_logger().as_ref(), path, op, bytes);
+}
+
+/// The logger the files this thread opens now log to, to keep for a file that is opened later
+/// on another thread.
+pub fn current_file_logger() -> Option<Arc<LogTarget>> {
+    FILE_LOGGER.with(|logger| logger.borrow().clone())
+}
+
+/// [`log_file_system`] with the logger kept for the file.
+pub fn log_file_system_to(target: Option<&Arc<LogTarget>>, path: &str, op: &str, bytes: Option<(i64, u64)>) {
+    let Some(target) = target else {
+        return;
+    };
+    let (name, level) = ("FileSystem", LogLevel::Trace);
+    let logger = target.logger.lock().expect("not poisoned").clone();
+    let message = file_system_message(path, op, bytes);
+    if logger.should_log(name, level) {
+        let _ = logger.log(&target.manager, name, level, &message, false);
+        return;
+    }
+    let mut manager = target.manager.lock().expect("not poisoned");
+    let _ = manager.write_global(name, level, &message, false);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_storage_writes_csv() {
+        let directory = std::env::temp_dir().join(format!("duckrs-log-test-{}", std::process::id()));
+        let path = directory.join("log.csv").to_string_lossy().into_owned();
+        let mut storage = FileStorage::new();
+        storage
+            .update_config(&[("path".into(), Value::varchar(path.clone()))])
+            .unwrap();
+        let context = RegisteredContext {
+            id: 3,
+            context: LoggingContext::new(LogScope::Connection),
+        };
+        let entry = LogEntry {
+            context_id: 3,
+            timestamp: 0,
+            log_type: "QueryLog".into(),
+            level: LogLevel::Info,
+            message: "SELECT 'a,b'".into(),
+        };
+        storage.write(entry, &context).unwrap();
+        storage.flush_all().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut lines = text.lines();
+        assert_eq!(
+            lines.next(),
+            Some("context_id,scope,connection_id,transaction_id,query_id,thread_id,timestamp,type,log_level,message")
+        );
+        let row = lines.next().unwrap();
+        assert!(row.starts_with("3,CONNECTION,,,,,"), "{row}");
+        assert!(row.ends_with(",QueryLog,INFO,\"SELECT 'a,b'\""), "{row}");
+        assert!(
+            storage
+                .scan_sql(LogTable::All)
+                .unwrap()
+                .unwrap()
+                .contains("read_csv_auto")
+        );
+        assert!(storage.scan_sql(LogTable::Entries).unwrap().is_none());
+        storage.truncate().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
+        let err = storage
+            .update_config(&[
+                ("path".into(), Value::varchar(path.clone())),
+                ("normalize".into(), Value::boolean(true)),
+            ])
+            .unwrap_err();
+        assert!(err.to_string().contains("while normalize is true"), "{err}");
+        let _ = std::fs::remove_dir_all(directory);
+    }
 
     #[test]
     fn entries_show_after_a_flush() {
@@ -834,7 +1361,7 @@ mod tests {
             .log(&manager, "FileSystem", LogLevel::Trace, "hidden", false)
             .unwrap();
         assert!(manager.lock().unwrap().scan().unwrap().0.is_empty());
-        manager.lock().unwrap().flush();
+        manager.lock().unwrap().flush().unwrap();
         let rows = manager.lock().unwrap().denormalized_rows().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][1], Value::varchar("CONNECTION"));
