@@ -804,6 +804,8 @@ impl Serialize for LogicalType {
             };
             s.write_property(100, "id", &id);
             let info_type = match self.id() {
+                // `StringTypeInfo`: a VARCHAR's collation
+                LogicalTypeId::Varchar if self.collation().is_some() => Some(type_info::STRING),
                 _ if !self.has_params() && self.alias().is_none() => None,
                 LogicalTypeId::Decimal => Some(type_info::DECIMAL),
                 LogicalTypeId::List | LogicalTypeId::Map => Some(type_info::LIST),
@@ -837,6 +839,9 @@ impl Serialize for LogicalType {
                         let children: Vec<(String, LogicalType)> = self.struct_children().to_vec();
                         s.write_property_with_default(200, "child_types", &children);
                     }
+                    type_info::STRING if self.collation().is_some() => {
+                        s.write_property_with_default(200, "collation", self.collation().unwrap_or(""));
+                    }
                     type_info::ENUM => {
                         let values = self.enum_values();
                         s.write_property(200, "values_count", &(values.len() as u64));
@@ -864,12 +869,17 @@ impl Deserialize for LogicalType {
                 d.read_deleted_property::<Vec<Value>>(102, "modifiers")?;
                 let base = match info_type {
                     type_info::GENERIC | type_info::STRING => {
-                        let _collation: String = if info_type == type_info::STRING {
+                        let collation: String = if info_type == type_info::STRING {
                             d.read_property_with_default(200, "collation")?
                         } else {
                             String::new()
                         };
-                        LogicalType::new(id)
+                        let ty = LogicalType::new(id);
+                        if id == LogicalTypeId::Varchar && !collation.is_empty() {
+                            ty.with_collation(Some(&collation))
+                        } else {
+                            ty
+                        }
                     }
                     type_info::DECIMAL => {
                         let w: u8 = d.read_property_with_default(200, "width")?;

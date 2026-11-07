@@ -131,6 +131,7 @@ test/fuzzer/pedro/offset_query_allocator_assertion.test
 test/fuzzer/pedro/order_by_all_with_union.test
 test/fuzzer/pedro/overflow_parsing_interval.test
 test/fuzzer/pedro/overflow_varchar_decimal_cast.test
+test/fuzzer/pedro/parser_roundtrip.test
 test/fuzzer/pedro/prepared_statement_recursive_cte.test
 test/fuzzer/pedro/pushdown_assertion_error.test
 test/fuzzer/pedro/pushdown_error.test
@@ -285,6 +286,7 @@ test/issues/general/test_3127.test
 test/issues/general/test_3140.test
 test/issues/general/test_3518.test
 test/issues/general/test_3611.test
+test/issues/general/test_3821.test
 test/issues/general/test_3822.test
 test/issues/general/test_3878.test
 test/issues/general/test_3997.test
@@ -320,6 +322,7 @@ test/issues/monetdb/test_outerjoin_project.test
 test/issues/monetdb/test_round_bug.test
 test/issues/monetdb/test_simple_round.test
 test/issues/rigger/big_sum_cast_bug.test
+test/issues/rigger/collate_union.test
 test/issues/rigger/date_get_value.test
 test/issues/rigger/decimal_int_between.test
 test/issues/rigger/delete_empty_result.test
@@ -379,6 +382,7 @@ test/issues/rigger/test_581.test
 test/issues/rigger/test_583.test
 test/issues/rigger/test_584.test
 test/issues/rigger/test_585.test
+test/issues/rigger/test_586.test
 test/issues/rigger/test_587.test
 test/issues/rigger/test_588.test
 test/issues/rigger/test_589.test
@@ -386,6 +390,8 @@ test/issues/rigger/test_590.test
 test/issues/rigger/test_591.test
 test/issues/rigger/test_592.test
 test/issues/rigger/test_599.test
+test/issues/rigger/test_602.test
+test/issues/rigger/test_603.test
 test/issues/rigger/test_609.test
 test/issues/rigger/test_618.test
 test/issues/rigger/test_619.test
@@ -783,6 +789,7 @@ test/sql/binder/string_literal_binding.test
 test/sql/binder/table_alias_single_quotes.test
 test/sql/binder/table_view_alias.test
 test/sql/binder/test_having_alias.test
+test/sql/binder/test_in_with_collate.test
 test/sql/binder/test_string_alias.test
 test/sql/cast/array_to_varchar_quoting.test
 test/sql/cast/boolean_autocast.test
@@ -903,6 +910,22 @@ test/sql/catalog/view/test_view_duplicate_columns.test
 test/sql/catalog/view/test_view_schema_change.test
 test/sql/catalog/view/test_view_sql.test
 test/sql/catalog/view/view_if_not_exists.test
+test/sql/collate/collate_filter_pushdown.test
+test/sql/collate/collate_group_subquery.test
+test/sql/collate/collate_json_ordered_aggregate.test
+test/sql/collate/collate_non_varchar.test
+test/sql/collate/collate_ordered_aggregate.test
+test/sql/collate/collate_string_col.test
+test/sql/collate/collate_subquery.test
+test/sql/collate/test_collate_accent_insensitive.test
+test/sql/collate/test_collate_between.test
+test/sql/collate/test_collate_case_insensitive.test
+test/sql/collate/test_collate_expression.test
+test/sql/collate/test_collate_null_constant.test
+test/sql/collate/test_collate_pivot.test
+test/sql/collate/test_combined_collation.test
+test/sql/collate/test_default_collations.test
+test/sql/collate/test_unsupported_collations.test
 test/sql/conjunction/or_between.test
 test/sql/conjunction/or_comparison.test
 test/sql/conjunction/or_select_order.test
@@ -1129,6 +1152,8 @@ test/sql/copy/csv/test_missing_row.test
 test/sql/copy/csv/test_mixed_line_endings.test
 test/sql/copy/csv/test_mixed_new_line.test
 test/sql/copy/csv/test_ncvoter.test
+test/sql/copy/csv/test_nfc.test
+test/sql/copy/csv/test_nfc_suite.test
 test/sql/copy/csv/test_null_padding_union.test
 test/sql/copy/csv/test_ontime.test
 test/sql/copy/csv/test_prefix_suffix.test
@@ -1570,6 +1595,7 @@ test/sql/function/string/test_issue_1812.test
 test/sql/function/string/test_jaccard.test
 test/sql/function/string/test_left.test
 test/sql/function/string/test_levenshtein.test
+test/sql/function/string/test_like.test
 test/sql/function/string/test_like_many_wildcards.test
 test/sql/function/string/test_mismatches.test
 test/sql/function/string/test_pad.test
@@ -1615,6 +1641,7 @@ test/sql/generated_columns/virtual/ambiguity.test
 test/sql/generated_columns/virtual/casting.test
 test/sql/generated_columns/virtual/check.test
 test/sql/generated_columns/virtual/circular_dependency_stresstest.test
+test/sql/generated_columns/virtual/collate.test
 test/sql/generated_columns/virtual/default.test
 test/sql/generated_columns/virtual/drop.test
 test/sql/generated_columns/virtual/drop_dependency.test
@@ -1776,6 +1803,7 @@ test/sql/insert/test_insert_type.test
 test/sql/insert/unaligned_interleaved_appends.test
 test/sql/join/asof/test_asof_empty_right.test
 test/sql/join/asof/test_asof_join.test
+test/sql/join/asof/test_asof_join_collation_loop_join.test
 test/sql/join/asof/test_asof_join_doubles.test
 test/sql/join/asof/test_asof_join_filter_pushdown.test
 test/sql/join/asof/test_asof_join_inequalities.test
@@ -1985,6 +2013,7 @@ test/sql/merge/merge_into_too_few_columns.test
 test/sql/merge/merge_multi_match_error.test
 test/sql/merge/merge_not_matched_by_source_join_order.test
 test/sql/optimizer/anti_join_empty_rhs_projection_map.test
+test/sql/optimizer/any_extremum_rewrite.test
 test/sql/optimizer/distinct_sibling_column_pruning.test
 test/sql/optimizer/distinctness_statistics.test
 test/sql/optimizer/expression/date_trunc_non_interval_parts.test
@@ -2264,12 +2293,14 @@ test/sql/setops/union_all_projection_pushdown.test
 test/sql/setops/union_limit.test
 test/sql/setops/union_pipeline.test
 test/sql/setops/union_shared_scan.test
+test/sql/setops/union_single_dedup.test
 test/sql/setops/value_union.test
 test/sql/settings/connection_local_settings.test
 test/sql/settings/debug_deprecated_settings.test
 test/sql/settings/max_memory_percentage.test
 test/sql/settings/reset/reset_threads.test
 test/sql/settings/setting_alias.test
+test/sql/settings/setting_collation.test
 test/sql/settings/setting_null_order.test
 test/sql/settings/setting_order.test
 test/sql/show_select/describe_case_alias.test
@@ -2287,11 +2318,13 @@ test/sql/sql_export/composition_q1.test
 test/sql/sql_export/compressed_materialization_sql_export.test
 test/sql/sql_export/correlated_sql_export.test
 test/sql/sql_export/cte_names.test
+test/sql/sql_export/grouped_mark_roundtrip.test
 test/sql/sql_export/json_ordering.test
 test/sql/sql_export/legacy_source_serialization.test
 test/sql/sql_export/mark_condition_shapes.test
 test/sql/sql_export/nested_values.test
 test/sql/sql_export/numbered_scan_results.test
+test/sql/sql_export/plain_scope_results.test
 test/sql/sql_export/plan_reconstruction_coverage.test
 test/sql/sql_export/pruned_offset.test
 test/sql/sql_export/pure_values_input.test
@@ -2315,6 +2348,7 @@ test/sql/storage/bc/test_broken_view_v092.test
 test/sql/storage/bc/test_view_v092.test
 test/sql/storage/catalog/generated_columns/virtual/basic.test
 test/sql/storage/catalog/generated_columns/virtual/constraints.test
+test/sql/storage/catalog/store_collate.test
 test/sql/storage/catalog/test_check_constraint.test
 test/sql/storage/catalog/test_drop_table.test
 test/sql/storage/catalog/test_macro_storage.test
@@ -2695,6 +2729,7 @@ test/sql/subquery/any_all/test_simple_not_in.test
 test/sql/subquery/any_all/test_some_subquery.test
 test/sql/subquery/any_all/test_uncorrelated_all_subquery.test
 test/sql/subquery/any_all/test_uncorrelated_any_subquery.test
+test/sql/subquery/any_all_variant_extremum.test
 test/sql/subquery/complex/complex_correlated_subquery_issue.test
 test/sql/subquery/complex/correlated_list_any_join.test
 test/sql/subquery/complex/nested_unnest_subquery.test
@@ -3140,6 +3175,7 @@ test/sql/types/struct/struct_updates.test
 test/sql/types/struct/unnamed_struct_casts.test
 test/sql/types/struct/unnamed_struct_comparison.test
 test/sql/types/struct/unnamed_struct_mix.test
+test/sql/types/struct/unnest_struct_distinct.test
 test/sql/types/struct/update_empty_row.test
 test/sql/types/test_date_cast.test
 test/sql/types/test_typeof.test
@@ -3358,6 +3394,7 @@ test/sql/window/test_window_distinct.test
 test/sql/window/test_window_finalize_race.test
 test/sql/window/test_window_fusion.test
 test/sql/window/test_window_interval.test
+test/sql/window/test_window_order_collate.test
 test/sql/window/test_window_rows.test
 test/sql/window/test_window_segment_tree_error.test
 test/sql/window/test_window_string_agg.test

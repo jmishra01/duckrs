@@ -355,12 +355,38 @@ enum Params {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 struct TypeInfo {
     params: Params,
     alias: Option<String>,
     /// for an `AGGREGATE_STATE` (the `ExtensionTypeInfo` of C++): which aggregate the state is of
     state: Option<StateInfo>,
+    /// the collation of a VARCHAR (`StringTypeInfo`), which types compare equal without
+    /// (`StringTypeInfo::EqualsInternal`)
+    collation: Option<Arc<str>>,
+}
+
+impl TypeInfo {
+    /// Whether this says nothing but (perhaps) a collation, which is as good as no info.
+    fn is_plain(&self) -> bool {
+        self.params == Params::None && self.alias.is_none() && self.state.is_none()
+    }
+}
+
+impl PartialEq for TypeInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.params == other.params && self.alias == other.alias && self.state == other.state
+    }
+}
+
+impl Eq for TypeInfo {}
+
+impl std::hash::Hash for TypeInfo {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.params.hash(state);
+        self.alias.hash(state);
+        self.state.hash(state);
+    }
 }
 
 /// Which aggregate an `AGGREGATE_STATE` is of: the function's name, its overload, what it was
@@ -374,10 +400,32 @@ struct StateInfo {
 }
 
 /// A SQL type. Cheap to clone: parameters live behind an `Arc`.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone)]
 pub struct LogicalType {
     id: LogicalTypeId,
     info: Option<Arc<TypeInfo>>,
+}
+
+impl LogicalType {
+    /// The info that equality looks at: none if all there is is a collation.
+    fn significant_info(&self) -> Option<&TypeInfo> {
+        self.info.as_deref().filter(|info| !info.is_plain())
+    }
+}
+
+impl PartialEq for LogicalType {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.significant_info() == other.significant_info()
+    }
+}
+
+impl Eq for LogicalType {}
+
+impl std::hash::Hash for LogicalType {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.significant_info().hash(state);
+    }
 }
 
 impl fmt::Debug for LogicalType {
@@ -397,6 +445,39 @@ impl LogicalType {
         Self { id, info: None }
     }
 
+    /// `LogicalType::VARCHAR_COLLATION`.
+    pub fn varchar_collation(collation: &str) -> Self {
+        Self::VARCHAR.with_collation(Some(collation))
+    }
+
+    /// `StringType::GetCollation`: the collation of a VARCHAR, if it has one.
+    pub fn collation(&self) -> Option<&str> {
+        if self.id != LogicalTypeId::Varchar {
+            return None;
+        }
+        self.info.as_ref()?.collation.as_deref().filter(|c| !c.is_empty())
+    }
+
+    /// This type with `collation` (or without any).
+    pub fn with_collation(&self, collation: Option<&str>) -> Self {
+        let mut info = self.info.as_deref().cloned().unwrap_or(TypeInfo {
+            params: Params::None,
+            alias: None,
+            state: None,
+            collation: None,
+        });
+        info.collation = collation.map(Into::into);
+        Self {
+            id: self.id,
+            info: (!info.is_plain() || info.collation.is_some()).then(|| Arc::new(info)),
+        }
+    }
+
+    /// `LogicalType::EqualsIncludingCollation`, at the top level.
+    pub fn equals_including_collation(&self, other: &Self) -> bool {
+        self == other && self.collation() == other.collation()
+    }
+
     fn with_params(id: LogicalTypeId, params: Params) -> Self {
         Self {
             id,
@@ -404,6 +485,7 @@ impl LogicalType {
                 params,
                 alias: None,
                 state: None,
+                collation: None,
             })),
         }
     }
@@ -531,7 +613,7 @@ impl LogicalType {
         info.state = None;
         Self {
             id: self.id,
-            info: (info.params != Params::None).then(|| Arc::new(info)),
+            info: (info.params != Params::None || info.collation.is_some()).then(|| Arc::new(info)),
         }
     }
 
@@ -595,6 +677,7 @@ impl LogicalType {
             params: Params::None,
             alias: None,
             state: None,
+            collation: None,
         });
         info.alias = Some(alias.into());
         Self {
@@ -739,6 +822,10 @@ impl fmt::Display for LogicalType {
         }
         if self.id == LogicalTypeId::LegacyAggregateState {
             return f.write_str("AGGREGATE_STATE");
+        }
+        // a collated VARCHAR renders in its constructor form, so that SQL keeps the collation
+        if let Some(collation) = self.collation() {
+            return write!(f, "VARCHAR({})", sql_string(collation));
         }
         match (self.id, self.params()) {
             (LogicalTypeId::Struct | LogicalTypeId::Tuple, Params::Struct(children)) if !children.is_empty() => {

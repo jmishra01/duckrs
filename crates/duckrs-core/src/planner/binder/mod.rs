@@ -499,6 +499,8 @@ pub struct SessionValues {
     /// `current_connection_id()` and `current_query_id()`
     pub connection_id: u64,
     pub query_id: u64,
+    /// `default_collation`: the collation of a VARCHAR that has none
+    pub default_collation: String,
     /// `duckdb_settings()`
     pub settings: SettingList,
 }
@@ -627,6 +629,9 @@ struct AggregateBindState {
     bound_aggregate: bool,
     /// `GROUP BY ALL`
     force_aggregates: bool,
+    /// the groups that are collated, with the `first(x)` aggregate that gives their value as it
+    /// was (`collated_groups`)
+    collated_groups: Vec<(usize, usize)>,
 }
 
 /// Binds statements (`Binder`).
@@ -838,4 +843,49 @@ fn statement_kind(statement: &Statement) -> String {
 pub fn bind_constant_expression(catalog: &Catalog, expr: &duckrs_parser::ast::Expr) -> Result<BoundExpr> {
     let mut binder = Binder::new(catalog);
     binder.bind_expression(expr)
+}
+
+// Ported from `ExpressionBinder::PushCollation` and the collation handling of
+// `BoundComparisonExpression::TryBindComparison` @ rust-port-baseline
+impl Binder<'_> {
+    /// The `default_collation` of the session.
+    pub(crate) fn default_collation(&self) -> String {
+        self.session
+            .as_ref()
+            .map(|s| s.default_collation.clone())
+            .unwrap_or_default()
+    }
+
+    /// `expr` with the collation of `ty` applied (`PushCollation`).
+    pub(crate) fn collate(&self, expr: BoundExpr, ty: &LogicalType) -> Result<BoundExpr> {
+        let default = self.default_collation();
+        Ok(crate::planner::collation::push_collation(
+            expr,
+            ty,
+            &default,
+            crate::planner::collation::CollationType::AllCollations,
+        )?
+        .0)
+    }
+
+    /// The VARCHARs `exprs`, compared with each other, with the collation of their types
+    /// (`originals`, before the casts) applied; an error if two of them disagree.
+    pub(crate) fn collate_compared(&self, originals: &[LogicalType], exprs: Vec<BoundExpr>) -> Result<Vec<BoundExpr>> {
+        if exprs
+            .iter()
+            .any(|e| e.return_type.id() != duckrs_common::types::LogicalTypeId::Varchar)
+        {
+            return Ok(exprs);
+        }
+        let mut collation: Option<String> = None;
+        for ty in originals {
+            let combined = crate::planner::collation::combined_collation(
+                &LogicalType::VARCHAR.with_collation(collation.as_deref()),
+                ty,
+            )?;
+            collation = combined;
+        }
+        let ty = LogicalType::VARCHAR.with_collation(collation.as_deref());
+        exprs.into_iter().map(|e| self.collate(e, &ty)).collect()
+    }
 }

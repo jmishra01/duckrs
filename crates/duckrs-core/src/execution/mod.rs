@@ -64,6 +64,74 @@ fn create_column_select(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
     })
 }
 
+/// `targets` as columns of the operator returned: `child`, under a projection that adds the
+/// targets that are not its columns (the collated keys of an ORDER BY or DISTINCT), with the
+/// number of columns `child` had when one was added.
+fn computed_targets(
+    child: Box<dyn PhysicalOperator>,
+    targets: Vec<crate::planner::expression::BoundExpr>,
+) -> (
+    Box<dyn PhysicalOperator>,
+    Vec<crate::planner::expression::BoundExpr>,
+    Option<usize>,
+) {
+    use crate::planner::expression::{BoundExpr, BoundExprKind};
+    if targets.iter().all(|t| matches!(t.kind, BoundExprKind::Reference(_))) {
+        return (child, targets, None);
+    }
+    let input = child.types().to_vec();
+    let mut expressions: Vec<BoundExpr> = input
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| BoundExpr::new(BoundExprKind::Reference(i), ty.clone()))
+        .collect();
+    let mut keys = Vec::with_capacity(targets.len());
+    for target in targets {
+        if matches!(target.kind, BoundExprKind::Reference(_)) {
+            keys.push(target);
+        } else {
+            let ty = target.return_type.clone();
+            keys.push(BoundExpr::new(BoundExprKind::Reference(expressions.len()), ty));
+            expressions.push(target);
+        }
+    }
+    let types = expressions.iter().map(|e| e.return_type.clone()).collect();
+    let projection = Box::new(PhysicalProjection {
+        types,
+        expressions,
+        children: vec![child],
+    });
+    (projection, keys, Some(input.len()))
+}
+
+/// `op` without the columns [`computed_targets`] added.
+fn drop_computed(op: Box<dyn PhysicalOperator>, columns: Option<usize>) -> Box<dyn PhysicalOperator> {
+    let Some(columns) = columns else {
+        return op;
+    };
+    Box::new(PhysicalColumnSelect {
+        types: op.types()[..columns].to_vec(),
+        positions: (0..columns).collect(),
+        children: vec![op],
+    })
+}
+
+/// An ORDER BY (or TopN) whose keys may be expressions of its input.
+fn order_plan(
+    orders: Vec<crate::planner::logical::BoundOrderByNode>,
+    top: Option<(u64, u64)>,
+    child: Box<dyn PhysicalOperator>,
+) -> Box<dyn PhysicalOperator> {
+    let modifiers: Vec<_> = orders.iter().map(|o| o.modifiers).collect();
+    let (child, keys, columns) = computed_targets(child, orders.into_iter().map(|o| o.expr).collect());
+    let orders = keys
+        .into_iter()
+        .zip(modifiers)
+        .map(|(expr, modifiers)| crate::planner::logical::BoundOrderByNode { modifiers, expr })
+        .collect();
+    drop_computed(Box::new(PhysicalOrder::new(orders, top, child)), columns)
+}
+
 /// `PhysicalPlanGenerator::CreatePlan`.
 pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
     if matches!(op.kind, LogicalOperatorKind::ColumnSelect { .. }) {
@@ -167,9 +235,9 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             children,
         )),
         LogicalOperatorKind::Window { windows, .. } => Box::new(window::PhysicalWindow::new(types, windows, children)),
-        LogicalOperatorKind::Order { orders } => Box::new(PhysicalOrder::new(orders, None, children.remove(0))),
+        LogicalOperatorKind::Order { orders } => order_plan(orders, None, children.remove(0)),
         LogicalOperatorKind::TopN { orders, limit, offset } => {
-            Box::new(PhysicalOrder::new(orders, Some((limit, offset)), children.remove(0)))
+            order_plan(orders, Some((limit, offset)), children.remove(0))
         }
         LogicalOperatorKind::Limit { limit, offset } => Box::new(PhysicalLimit {
             types,
@@ -187,7 +255,10 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             })
         }
         LogicalOperatorKind::Sample { options } => Box::new(PhysicalSample::new(options, children.remove(0))),
-        LogicalOperatorKind::Distinct { targets } => Box::new(PhysicalDistinct::new(&targets, children.remove(0))),
+        LogicalOperatorKind::Distinct { targets } => {
+            let (child, keys, columns) = computed_targets(children.remove(0), targets);
+            drop_computed(Box::new(PhysicalDistinct::new(&keys, child)), columns)
+        }
         LogicalOperatorKind::Delete { table, returning, .. } => {
             Box::new(PhysicalDelete::new(types, children, table, returning))
         }

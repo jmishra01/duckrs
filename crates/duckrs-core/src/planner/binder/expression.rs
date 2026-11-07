@@ -369,13 +369,14 @@ impl Binder<'_> {
                 }
                 Ok(LogicalType::decimal(width as u8, scale as u8))
             }
-            // a string parameter is a collation
+            // a string parameter is a collation (`VARCHAR COLLATE x` reads as `VARCHAR('x')`)
             LogicalTypeId::Varchar
-                if children
-                    .iter()
-                    .any(|c| matches!(&c.kind, ExprKind::Constant(l) if l.kind == LiteralKind::String)) =>
+                if let [child] = children
+                    && let ExprKind::Constant(literal) = &child.kind
+                    && literal.kind == LiteralKind::String =>
             {
-                Err(crate::unported("COLLATE"))
+                crate::planner::collation::test_collation(&literal.text)?;
+                Ok(LogicalType::varchar_collation(&literal.text))
             }
             // the width of a VARCHAR is accepted and ignored
             LogicalTypeId::Varchar if children.len() <= 1 => Ok(LogicalType::VARCHAR),
@@ -673,7 +674,20 @@ impl Binder<'_> {
                 };
                 let compare_type = normalize_type(&compare_type);
                 let child = checked_cast(child, &compare_type)?;
-                let plan = self.cast_plan(bound, std::slice::from_ref(&compare_type), vec![Some(0)]);
+                let mut plan = self.cast_plan(bound, std::slice::from_ref(&compare_type), vec![Some(0)]);
+                // both sides compare with the collation of the type they compare in (`PlanSubqueries`)
+                let child = self.collate(child, &compare_type)?;
+                let column = BoundExpr::column_ref(plan.column_bindings()[0], compare_type.clone(), String::new());
+                let collated = self.collate(column, &compare_type)?;
+                if !matches!(collated.kind, BoundExprKind::ColumnRef { .. }) {
+                    plan = crate::planner::logical::LogicalOperator::new(
+                        crate::planner::logical::LogicalOperatorKind::Projection {
+                            table_index: self.generate_table_index(),
+                            expressions: vec![collated],
+                        },
+                        vec![plan],
+                    );
+                }
                 (
                     SubqueryKind::Any(comparison),
                     LogicalType::BOOLEAN,
@@ -859,7 +873,31 @@ impl Binder<'_> {
             ExprKind::Comparison { op, left, right } => {
                 let left = self.bind_expression(left)?;
                 let right = self.bind_expression(right)?;
-                bind_comparison(*op, left, right)?
+                let originals = [left.return_type.clone(), right.return_type.clone()];
+                let mut bound = bind_comparison(*op, left, right)?;
+                if let BoundExprKind::Comparison { left, right, .. } = &mut bound.kind {
+                    let sides = vec![(**left).clone(), (**right).clone()];
+                    let [l, r]: [BoundExpr; 2] =
+                        self.collate_compared(&originals, sides)?.try_into().expect("two sides");
+                    (**left, **right) = (l, r);
+                }
+                bound
+            }
+            // `BindExpression(CollateExpression)`
+            ExprKind::Collate { child, collation } => {
+                let child = self.bind_expression(child)?;
+                let child = if child.return_type.id() == LogicalTypeId::StringLiteral {
+                    child.cast_to(&LogicalType::VARCHAR, false)
+                } else {
+                    child
+                };
+                if child.return_type.id() != LogicalTypeId::Varchar || child.return_type.alias().is_some() {
+                    return Err(binder_error("collations are only supported for type varchar"));
+                }
+                crate::planner::collation::test_collation(collation)?;
+                let mut child = child;
+                child.return_type = LogicalType::varchar_collation(collation);
+                child
             }
             ExprKind::Case { checks, else_expr } => self.bind_case(checks, else_expr)?,
             ExprKind::Between { input, lower, upper } => self.bind_between(input, lower, upper)?,
@@ -1273,6 +1311,13 @@ impl Binder<'_> {
     pub(super) fn try_bind_group(&self, expr: &Expr) -> Option<BoundExpr> {
         let group = self.find_group(expr)?;
         let state = self.aggregates.as_ref()?;
+        if let Some((_, aggregate)) = state.collated_groups.iter().find(|(g, _)| *g == group) {
+            return Some(BoundExpr::column_ref(
+                ColumnBinding::new(state.aggregate_index, *aggregate),
+                state.aggregates[*aggregate].return_type.clone(),
+                expr.alias.clone(),
+            ));
+        }
         Some(BoundExpr::column_ref(
             ColumnBinding::new(state.group_index, group),
             state.groups[group].return_type.clone(),
@@ -1494,8 +1539,27 @@ impl Binder<'_> {
                 "In a DISTINCT aggregate, ORDER BY expressions must appear in the argument list",
             ));
         }
+        // `FunctionBinder::BindAggregateFunction`: a DISTINCT count counts collated values
+        let children = if function.distinct && set.name == "count" {
+            children
+                .into_iter()
+                .map(|child| {
+                    let ty = child.return_type.clone();
+                    self.collate(child, &ty)
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            children
+        };
         let mut aggregate = bind_aggregate_function(set, children, filter, function.distinct)?;
-        aggregate.order_by = order_by;
+        // `BindAggregate`: the rows are ordered as the collation of their sort keys says
+        aggregate.order_by = order_by
+            .into_iter()
+            .map(|(expr, modifiers)| {
+                let ty = expr.return_type.clone();
+                Ok((self.collate(expr, &ty)?, modifiers))
+            })
+            .collect::<Result<Vec<_>>>()?;
         if function.export_state {
             let arguments: Vec<LogicalType> = aggregate.children.iter().map(|c| c.return_type.clone()).collect();
             let (exported, ty) =
@@ -1647,11 +1711,25 @@ impl Binder<'_> {
         let first =
             try_comparison_type(&input_type, &lower_type, false).ok_or_else(|| mix(&input_type, &lower_type))?;
         let target = try_comparison_type(&first, &upper_type, false).ok_or_else(|| mix(&first, &upper_type))?;
+        let originals = [
+            input.return_type.clone(),
+            lower.return_type.clone(),
+            upper.return_type.clone(),
+        ];
+        let sides = vec![
+            checked_cast(input, &target)?,
+            checked_cast(lower, &target)?,
+            checked_cast(upper, &target)?,
+        ];
+        let [input, lower, upper]: [BoundExpr; 3] = self
+            .collate_compared(&originals, sides)?
+            .try_into()
+            .expect("three sides");
         Ok(BoundExpr::new(
             BoundExprKind::Between {
-                input: Box::new(checked_cast(input, &target)?),
-                lower: Box::new(checked_cast(lower, &target)?),
-                upper: Box::new(checked_cast(upper, &target)?),
+                input: Box::new(input),
+                lower: Box::new(lower),
+                upper: Box::new(upper),
             },
             LogicalType::BOOLEAN,
         ))
@@ -1695,7 +1773,12 @@ impl Binder<'_> {
     /// `x IN (a, b)` as `x = a OR x = b`, which has its three-valued logic.
     fn bind_in(&mut self, children: &[Expr], negated: bool) -> Result<BoundExpr> {
         let name = if negated { "NOT IN" } else { "IN" };
-        let (mut bound, _) = self.resolve_coalesce_type(children, Some(name))?;
+        let (bound, max_type) = self.resolve_coalesce_type(children, Some(name))?;
+        // `BindExpression(OperatorExpression)`: the children compare with the collation of their type
+        let mut bound = bound
+            .into_iter()
+            .map(|child| self.collate(child, &max_type))
+            .collect::<Result<Vec<_>>>()?;
         let input = bound.remove(0);
         let comparisons = bound
             .into_iter()

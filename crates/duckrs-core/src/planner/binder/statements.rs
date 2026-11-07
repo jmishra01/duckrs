@@ -600,6 +600,14 @@ impl Binder<'_> {
         {
             prepared.swap(distinct, order);
         }
+        // ORDER BY and DISTINCT see the values as their collation does
+        let default_collation = self.default_collation();
+        let column = |i: usize| -> Result<BoundExpr> {
+            let expr = column(i)?;
+            let ty = expr.return_type.clone();
+            let kind = crate::planner::collation::CollationType::AllCollations;
+            Ok(crate::planner::collation::push_collation(expr, &ty, &default_collation, kind)?.0)
+        };
         for modifier in prepared {
             let kind = match modifier {
                 PreparedModifier::Distinct => LogicalOperatorKind::Distinct {
@@ -740,6 +748,7 @@ impl Binder<'_> {
             bound_columns: Vec::new(),
             bound_aggregate: false,
             force_aggregates: node.force_aggregates,
+            collated_groups: Vec::new(),
         };
         let mut group_expressions = node.groups.group_expressions.clone();
         let mut used_select_entries = Vec::new();
@@ -806,7 +815,28 @@ impl Binder<'_> {
                      GROUP BY"
                 )));
             }
-            aggregates.groups.push(self.bind_expression(group)?);
+            let bound = self.bind_expression(group)?;
+            // a collated group groups by its collated value, and a `first(x)` gives x as it was
+            let ty = bound.return_type.clone();
+            let (collated, requires_collation) = crate::planner::collation::push_collation(
+                bound.clone(),
+                &ty,
+                &self.default_collation(),
+                crate::planner::collation::CollationType::AllCollations,
+            )?;
+            if requires_collation {
+                let set = crate::function::BuiltinFunctions::get()
+                    .aggregate("first")
+                    .expect("first is an aggregate");
+                let first = crate::function::binder::bind_aggregate_function(set, vec![bound], None, false)?;
+                let index = aggregates.aggregates.len();
+                aggregates
+                    .aggregate_keys
+                    .push(format!("collated group {}", aggregates.groups.len()));
+                aggregates.aggregates.push(first);
+                aggregates.collated_groups.push((aggregates.groups.len(), index));
+            }
+            aggregates.groups.push(collated);
         }
         self.aggregates = Some(aggregates);
         let window_index = self.generate_table_index();
@@ -1211,7 +1241,6 @@ impl Binder<'_> {
                     "Parameter not supported in ORDER BY clause",
                 ));
             }
-            ExprKind::Collate { .. } => return Err(not_implemented("COLLATE")),
             _ => {}
         }
         // the general case: an expression of the select list, or a new entry

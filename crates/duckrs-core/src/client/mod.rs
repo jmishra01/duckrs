@@ -715,6 +715,7 @@ impl ClientContext {
             log_target: self.log_target_id,
             connection_id: self.id,
             query_id: self.query_id,
+            default_collation: self.setting_text("default_collation"),
             variables: self.variables.clone(),
             setting: Box::new(move |name| settings::get_setting(name, &db.settings.read(), &session)),
             settings: Box::new(move || settings::list_settings(&list_db.settings.read(), &list_session)),
@@ -3596,11 +3597,9 @@ mod tests {
             ["1,3", "2,2"]
         );
         assert_eq!(rows(&mut context, "SELECT '1e308'::FLOAT"), ["inf"]);
-        let err = context
-            .query("CREATE TABLE c (s VARCHAR COLLATE nocase)")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("is not yet ported"), "{err}");
+        context.query("CREATE TABLE c (s VARCHAR COLLATE nocase)").unwrap();
+        context.query("INSERT INTO c VALUES ('Hello'), ('hello')").unwrap();
+        assert_eq!(rows(&mut context, "SELECT count(*) FROM c WHERE s = 'HELLO'"), ["2"]);
         let err = |context: &mut ClientContext, sql: &str| context.query(sql).unwrap_err().to_string();
         assert_eq!(
             err(&mut context, "SELECT v, sum(v) FROM t"),

@@ -238,6 +238,23 @@ impl Binder<'_> {
             };
             children.push(along.clone());
         }
+        // "Restore any collation expressions": the window partitions and sorts by collated values
+        let collate = |binder: &Self, expr: BoundExpr| {
+            let ty = expr.return_type.clone();
+            binder.collate(expr, &ty)
+        };
+        let partitions = partitions
+            .into_iter()
+            .map(|p| collate(self, p))
+            .collect::<Result<Vec<_>>>()?;
+        let orders = orders
+            .into_iter()
+            .map(|(o, m)| Ok((collate(self, o)?, m)))
+            .collect::<Result<Vec<_>>>()?;
+        let arg_orders = arg_orders
+            .into_iter()
+            .map(|(o, m)| Ok((collate(self, o)?, m)))
+            .collect::<Result<Vec<_>>>()?;
         Ok(BoundWindow {
             function,
             aggregate,

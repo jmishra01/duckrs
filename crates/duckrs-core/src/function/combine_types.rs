@@ -200,8 +200,8 @@ fn combine_rules(force: bool, left: &LogicalType, right: &LogicalType) -> Option
         } else {
             LogicalType::VARCHAR
         }),
-        // collations are not supported yet, so both sides are plain VARCHAR
-        Varchar => Some(left.clone()),
+        // varchar: use the type that has a collation, if any
+        Varchar => Some(if right.collation().is_none() { left } else { right }.clone()),
         Decimal => {
             // unify the width/scale so that the resulting decimal always fits
             let (lw, ls) = left.decimal_properties().unwrap();

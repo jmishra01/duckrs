@@ -60,7 +60,6 @@ const UNHONORED: &[&str] = &[
     "allowed_directories",
     "allowed_paths",
     "current_dialect",
-    "default_collation",
     "dialect_compatibility_mode",
     "disable_timestamptz_casts",
     "error_on_division_by_zero",
@@ -219,6 +218,11 @@ fn on_set(setting: &SettingDefinition, value: Value) -> Result<Value> {
         }
     }
     Ok(match setting.name {
+        // `DefaultCollationSetting::OnSet`: the collation has to exist
+        "default_collation" => {
+            crate::planner::collation::test_collation(&value.try_to_string()?)?;
+            value
+        }
         "default_null_order" => {
             let parameter = text()?;
             Value::varchar(match parameter.as_str() {
