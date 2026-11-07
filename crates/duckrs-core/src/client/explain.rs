@@ -25,7 +25,7 @@ pub(super) struct ExplainNode {
 /// `LogicalOperatorToString`.
 fn logical_name(op: &LogicalOperator) -> &'static str {
     match &op.kind {
-        K::Get { .. } | K::Range { .. } | K::ExpressionGet { .. } => "SEQ_SCAN",
+        K::Get { .. } | K::Range { .. } | K::ExpressionGet { .. } | K::ChunkGet { .. } => "SEQ_SCAN",
         K::EmptyResult { .. } => "EMPTY_RESULT",
         K::DummyScan { .. } => "DUMMY_SCAN",
         K::Filter { .. } => "FILTER",

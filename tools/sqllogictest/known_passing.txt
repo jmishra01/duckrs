@@ -35,6 +35,7 @@ test/fuzzer/duckfuzz/hash_constant.test
 test/fuzzer/duckfuzz/hugeint_negate_underflow.test
 test/fuzzer/duckfuzz/invalid_make_time.test
 test/fuzzer/duckfuzz/json_extract_string_null.test
+test/fuzzer/duckfuzz/julian_overflow.test
 test/fuzzer/duckfuzz/late_materialization_filter.test
 test/fuzzer/duckfuzz/limit_percent_subquery.test
 test/fuzzer/duckfuzz/list_try_cast.test
@@ -47,6 +48,8 @@ test/fuzzer/duckfuzz/regex_syntax_2889.test
 test/fuzzer/duckfuzz/repeat_wrong_number.test
 test/fuzzer/duckfuzz/string_to_nested_cast_sample.test
 test/fuzzer/duckfuzz/strptime_const_arg.test
+test/fuzzer/duckfuzz/temporal_avg.test
+test/fuzzer/duckfuzz/test_vector_types_double_3.test
 test/fuzzer/duckfuzz/union_dict_tag.test
 test/fuzzer/duckfuzz/unpivot_multiple_in.test
 test/fuzzer/duckfuzz/visit_operator_expressions_in_column_lifetime_analyzer.test
@@ -559,6 +562,7 @@ test/sql/aggregate/aggregates/test_bitstring_agg_small_types.test
 test/sql/aggregate/aggregates/test_bool.test
 test/sql/aggregate/aggregates/test_corr.test
 test/sql/aggregate/aggregates/test_count.test
+test/sql/aggregate/aggregates/test_count_all_types.test
 test/sql/aggregate/aggregates/test_count_star.test
 test/sql/aggregate/aggregates/test_covar.test
 test/sql/aggregate/aggregates/test_empty_aggregate.test
@@ -1413,6 +1417,7 @@ test/sql/function/enum/test_enum_last.test
 test/sql/function/enum/test_enum_range.test
 test/sql/function/generic/can_cast_implicitly.test
 test/sql/function/generic/case_condition.test
+test/sql/function/generic/case_null_fill.test
 test/sql/function/generic/case_varchar.test
 test/sql/function/generic/case_when_comparison.test
 test/sql/function/generic/case_when_list.test
@@ -1476,19 +1481,23 @@ test/sql/function/list/lambdas/storage.test
 test/sql/function/list/lambdas/test_lambda_storage.test
 test/sql/function/list/lambdas/transform.test
 test/sql/function/list/lambdas/transform_with_index.test
+test/sql/function/list/lambdas/vector_types.test
 test/sql/function/list/list_distinct.test
 test/sql/function/list/list_position.test
 test/sql/function/list/list_position_nan.test
 test/sql/function/list/list_position_null_needle.test
 test/sql/function/list/list_resize_error.test
+test/sql/function/list/list_resize_vector_types.test
 test/sql/function/list/list_select.test
 test/sql/function/list/list_slice_min_step.test
 test/sql/function/list/list_sort_having.test
+test/sql/function/list/list_sort_vector_types.test
 test/sql/function/list/list_unique.test
 test/sql/function/list/list_value_arrays.test
 test/sql/function/list/list_value_nested_lists.test
 test/sql/function/list/list_value_structs.test
 test/sql/function/list/list_zip.test
+test/sql/function/list/repeat_list.test
 test/sql/function/nested/test_issue_5437.test
 test/sql/function/numeric/abs.test
 test/sql/function/numeric/bit_count_hugeint.test
@@ -2842,6 +2851,7 @@ test/sql/types/bignum/test_bignum_implicit_cast.test
 test/sql/types/bignum/test_bignum_large_varchar.test
 test/sql/types/bignum/test_bignum_multiply.test
 test/sql/types/bignum/test_bignum_not_cast.test
+test/sql/types/bignum/test_bignum_subtract.test
 test/sql/types/bignum/test_bignum_sum.test
 test/sql/types/bignum/test_bignum_to_double_overflow.test
 test/sql/types/bignum/test_bignum_to_integer_range.test
@@ -3002,6 +3012,7 @@ test/sql/types/nested/array/array_simple.test
 test/sql/types/nested/array/array_storage_3.test
 test/sql/types/nested/array/array_summarize.test
 test/sql/types/nested/array/array_try_cast.test
+test/sql/types/nested/array/array_try_cast_vector_types.test
 test/sql/types/nested/array/array_tupleformat.test
 test/sql/types/nested/array/array_unnest.test
 test/sql/types/nested/array/array_value_comparison.test
@@ -3038,8 +3049,10 @@ test/sql/types/nested/map/test_map_entries.test
 test/sql/types/nested/map/test_map_keys.test
 test/sql/types/nested/map/test_map_nested_keys.test
 test/sql/types/nested/map/test_map_subscript_from_column.test
+test/sql/types/nested/map/test_map_subscript_vector_types.test
 test/sql/types/nested/map/test_map_subscript_where.test
 test/sql/types/nested/map/test_map_values.test
+test/sql/types/nested/map/test_map_vector_types.test
 test/sql/types/nested/nested_constant_comparison.test
 test/sql/types/nested/nested_nested_types.test
 test/sql/types/nested/struct/struct_aggregates.test
@@ -3054,6 +3067,7 @@ test/sql/types/null/test_boolean_null.test
 test/sql/types/null/test_is_null.test
 test/sql/types/null/test_null_aggr.test
 test/sql/types/null/test_null_cast.test
+test/sql/types/numeric/arithmetic_vector_types.test
 test/sql/types/numeric/bigint_try_cast.test
 test/sql/types/numeric/bool_casts.test
 test/sql/types/numeric/combinations/decimal_combinations.test
@@ -3256,6 +3270,8 @@ test/sql/upsert/upsert_shorthand.test
 test/sql/upsert/upsert_transaction.test
 test/sql/upsert/upsert_unique_null.test
 test/sql/vacuum/vacuum_nested_types.test
+test/sql/vector_types/list_vector_types.test
+test/sql/vector_types/vector_types_errors.test
 test/sql/window/ntile_fallible.test
 test/sql/window/parallel_collection_combine.test
 test/sql/window/segment_tree_leaf_batches.test

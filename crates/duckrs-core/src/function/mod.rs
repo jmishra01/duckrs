@@ -26,6 +26,7 @@ mod regexp;
 mod string_nested;
 mod strings;
 pub mod test_all_types;
+pub mod test_vector_types;
 pub(crate) mod time_casts;
 pub mod variant;
 

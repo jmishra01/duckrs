@@ -207,10 +207,76 @@ impl Binder<'_> {
                 format!("SELECT unnest([{}]::VARCHAR[]) AS file", files.join(", "))
             }
             "test_all_types" => return self.bind_test_all_types(&args, table_ref).map(Some),
+            "test_vector_types" => return self.bind_test_vector_types(&args, table_ref).map(Some),
             _ => return Ok(None),
         };
         let select = parse_select(&sql, "Expected a single SELECT statement")?;
         self.bind_rewritten(&select, table_ref, &name).map(Some)
+    }
+
+    /// `TestVectorTypesBind` and `TestVectorTypesInit`: a column `test_vector`, `test_vector2`, ...
+    /// of the type of each argument, in chunks of each kind of vector.
+    fn bind_test_vector_types(&mut self, args: &[FunctionArgument], table_ref: &TableRef) -> Result<LogicalOperator> {
+        let mut types = Vec::new();
+        let mut all_flat = false;
+        for argument in args {
+            if argument.name.is_empty() {
+                let ty = self.constant_argument(&argument.expr)?.logical_type().clone();
+                crate::function::test_vector_types::check_type(&ty)?;
+                types.push(ty);
+            } else if argument.name.eq_ignore_ascii_case("all_flat") {
+                let value = self.constant_argument(&argument.expr)?;
+                if value.is_null() {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        "Cannot use NULL as argument for all_flat",
+                    ));
+                }
+                all_flat = matches!(value.data(), ValueData::Bool(true));
+            } else {
+                return Err(binder_error(format!(
+                    "Invalid named parameter \"{}\" for function test_vector_types",
+                    argument.name
+                )));
+            }
+        }
+        if types.is_empty() {
+            return Err(binder_error("test_vector_types requires at least one column"));
+        }
+        let chunks = crate::function::test_vector_types::test_vector_chunks(&types, all_flat)?;
+        let alias = if table_ref.alias.is_empty() {
+            "test_vector_types".to_string()
+        } else {
+            table_ref.alias.clone()
+        };
+        let names = (0..types.len())
+            .map(|i| {
+                if i == 0 {
+                    "test_vector".to_string()
+                } else {
+                    format!("test_vector{}", i + 1)
+                }
+            })
+            .collect();
+        let names = Self::alias_columns(table_ref, &alias, names)?;
+        let table_index = self.generate_table_index();
+        self.bind_context.add_binding(super::Binding {
+            alias,
+            schema: None,
+            table_index,
+            names,
+            types: types.clone(),
+            row_id: None,
+            generated: Vec::new(),
+        });
+        Ok(LogicalOperator::new(
+            LogicalOperatorKind::ChunkGet {
+                table_index,
+                types,
+                chunks: std::sync::Arc::new(chunks),
+            },
+            vec![],
+        ))
     }
 
     /// `TestAllTypesBind`: a row of minimums, one of maximums and one of NULLs.

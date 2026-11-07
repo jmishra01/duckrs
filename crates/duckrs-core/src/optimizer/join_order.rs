@@ -650,6 +650,10 @@ impl JoinOrderOptimizer {
                 cardinality: 1.0,
                 distinct: HashMap::new(),
             },
+            K::ChunkGet { chunks, .. } => RelationStats {
+                cardinality: chunks.iter().map(|c| c.len()).sum::<usize>() as f64,
+                distinct: HashMap::new(),
+            },
             K::ExpressionGet { expressions, .. } => RelationStats {
                 cardinality: expressions.len() as f64,
                 distinct: HashMap::new(),

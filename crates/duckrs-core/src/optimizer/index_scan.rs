@@ -270,6 +270,7 @@ fn can_run_ahead(op: &LogicalOperator, rows: &mut usize) -> bool {
         | K::Range { .. }
         | K::DummyScan { .. }
         | K::ExpressionGet { .. }
+        | K::ChunkGet { .. }
         | K::Filter { .. }
         | K::Projection { .. }
         | K::ColumnSelect { .. }

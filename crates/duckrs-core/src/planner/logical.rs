@@ -78,6 +78,13 @@ pub enum LogicalOperatorKind {
     },
     /// `LogicalDummyScan`: a single row with no columns, for a SELECT without FROM.
     DummyScan { table_index: usize },
+    /// `LogicalColumnDataGet`: rows that are there already, as chunks whose vectors keep their
+    /// kind (constant, dictionary, sequence).
+    ChunkGet {
+        table_index: usize,
+        types: Vec<LogicalType>,
+        chunks: Arc<Vec<duckrs_common::vector::DataChunk>>,
+    },
     /// `LogicalExpressionGet`: rows of expressions (VALUES), evaluated once per row.
     ExpressionGet {
         table_index: usize,
@@ -459,7 +466,9 @@ impl LogicalOperator {
             LogicalOperatorKind::EmptyResult { types, .. } => types.clone(),
             // the dummy scan's single column is never read
             LogicalOperatorKind::DummyScan { .. } => vec![LogicalType::INTEGER],
-            LogicalOperatorKind::ExpressionGet { types, .. } => types.clone(),
+            LogicalOperatorKind::ExpressionGet { types, .. } | LogicalOperatorKind::ChunkGet { types, .. } => {
+                types.clone()
+            }
             LogicalOperatorKind::Window { windows, .. } => {
                 let mut types = self.children[0].types();
                 types.extend(windows.iter().map(|w| w.return_type.clone()));
@@ -590,7 +599,8 @@ impl LogicalOperator {
             LogicalOperatorKind::DummyScan { table_index } | LogicalOperatorKind::Range { table_index, .. } => {
                 numbered(*table_index, 1)
             }
-            LogicalOperatorKind::ExpressionGet { table_index, types, .. } => numbered(*table_index, types.len()),
+            LogicalOperatorKind::ExpressionGet { table_index, types, .. }
+            | LogicalOperatorKind::ChunkGet { table_index, types, .. } => numbered(*table_index, types.len()),
             LogicalOperatorKind::JsonScan { table_index, scan } => numbered(*table_index, scan.output_types().len()),
             LogicalOperatorKind::ParquetScan { table_index, scan } => numbered(*table_index, scan.output_types().len()),
             LogicalOperatorKind::CsvScan { table_index, scan } => numbered(*table_index, scan.output_types().len()),

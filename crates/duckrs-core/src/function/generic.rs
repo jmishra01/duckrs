@@ -364,11 +364,42 @@ fn hash_function(args: &DataChunk, result: &mut Vector) -> Result<()> {
     Ok(())
 }
 
+/// `DConstants::MAX_VECTOR_SIZE`: the most rows a vector can grow to (`VectorBuffer::GetReserveSize`).
+const MAX_VECTOR_SIZE: u64 = 1 << 37;
+
+/// `RepeatListFunction`.
 fn repeat_list(args: &DataChunk, result: &mut Vector) -> Result<()> {
     let ty = result.logical_type().clone();
+    // the entries of the result's child so far (`ListVector::GetListSize`)
+    let child_size = std::cell::Cell::new(0u64);
     strict_rows(args, result, |row| {
-        let times = row[1].as_i128().unwrap_or(0).max(0) as usize;
         let items = items_of(&row[0]);
+        let times = row[1].as_i128().unwrap_or(0);
+        let times = if times <= 0 || items.is_empty() {
+            0
+        } else {
+            times as u64
+        };
+        let length = items.len() as u64;
+        let total = length.checked_mul(times).ok_or_else(|| {
+            Error::new(
+                ErrorKind::OutOfRange,
+                format!("Cannot create a list of size: '{length}' * '{times}', the result is too large"),
+            )
+        })?;
+        // `ListVector::Reserve`
+        let required = child_size.get().saturating_add(total);
+        if required > MAX_VECTOR_SIZE {
+            return Err(Error::new(
+                ErrorKind::OutOfRange,
+                format!(
+                    "Cannot resize vector to {required} rows: maximum allowed vector size is {}",
+                    crate::execution::temporary::format_bytes(MAX_VECTOR_SIZE)
+                ),
+            ));
+        }
+        child_size.set(required);
+        let (items, times) = (items, times as usize);
         let mut out = Vec::with_capacity(items.len() * times);
         for _ in 0..times {
             out.extend_from_slice(items);

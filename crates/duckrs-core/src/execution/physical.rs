@@ -730,6 +730,34 @@ impl PhysicalOperator for PhysicalDummyScan {
     }
 }
 
+/// `PhysicalColumnDataScan`: chunks that are there already, as they are.
+#[derive(Debug)]
+pub struct PhysicalChunkScan {
+    pub types: Vec<LogicalType>,
+    pub chunks: Arc<Vec<DataChunk>>,
+}
+
+impl PhysicalOperator for PhysicalChunkScan {
+    fn name(&self) -> &'static str {
+        "COLUMN_DATA_SCAN"
+    }
+    fn types(&self) -> &[LogicalType] {
+        &self.types
+    }
+    fn is_source(&self) -> bool {
+        true
+    }
+    fn source_state(&self) -> SourceState {
+        Box::new(0usize)
+    }
+    fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
+        let next = state.downcast_mut::<usize>().expect("chunk scan state");
+        let chunk = self.chunks.get(*next).cloned();
+        *next += 1;
+        Ok(chunk)
+    }
+}
+
 /// `PhysicalExpressionScan`: the rows of a VALUES list, evaluated in order.
 #[derive(Debug)]
 pub struct PhysicalExpressionScan {

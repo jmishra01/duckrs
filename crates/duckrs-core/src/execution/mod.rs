@@ -129,6 +129,7 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
         }
         LogicalOperatorKind::EmptyResult { .. } => Box::new(PhysicalEmptyResult { types }),
         LogicalOperatorKind::DummyScan { .. } => Box::new(PhysicalDummyScan { types }),
+        LogicalOperatorKind::ChunkGet { chunks, .. } => Box::new(PhysicalChunkScan { types, chunks }),
         LogicalOperatorKind::ExpressionGet { expressions, .. } => {
             Box::new(PhysicalExpressionScan { types, expressions })
         }
