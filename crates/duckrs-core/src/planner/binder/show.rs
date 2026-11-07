@@ -156,7 +156,9 @@ fn human_readable_bytes(bytes: u64) -> String {
 
 const DESCRIBE_NAMES: [&str; 6] = ["column_name", "column_type", "null", "key", "default", "extra"];
 
-const SYSTEM_TABLES: [&str; 8] = [
+const SYSTEM_TABLES: [&str; 10] = [
+    "duckdb_sequences",
+    "duckdb_optimizers",
     "pragma_database_size",
     "duckdb_databases",
     "duckdb_schemas",
@@ -198,6 +200,60 @@ fn memory_segments(table: &TableCatalogEntry) -> Vec<SegmentInfo> {
     }
     segments
 }
+
+/// `internal_optimizer_types` of duckdb/src/common/enums/optimizer_type.cpp: what
+/// `duckdb_optimizers()` lists (`ListAllOptimizers`).
+const OPTIMIZERS: [&str; 49] = [
+    "expression_rewriter",
+    "filter_pullup",
+    "filter_pushdown",
+    "empty_result_pullup",
+    "cte_filter_pusher",
+    "regex_range",
+    "in_clause",
+    "join_order",
+    "deliminator",
+    "unnest_rewriter",
+    "unused_columns",
+    "statistics_propagation",
+    "common_subexpressions",
+    "common_aggregate",
+    "column_lifetime",
+    "limit_pushdown",
+    "row_group_pruner",
+    "top_n",
+    "top_n_window_elimination",
+    "build_side_probe_side",
+    "compressed_materialization",
+    "duplicate_groups",
+    "reorder_filter",
+    "sampling_pushdown",
+    "join_filter_pushdown",
+    "extension",
+    "materialized_cte",
+    "aggregate_function_rewriter",
+    "late_materialization",
+    "cte_inlining",
+    "common_subplan",
+    "join_elimination",
+    "window_self_join",
+    "window_join_pushdown",
+    "projection_pullup",
+    "outer_join_simplification",
+    "window_rewriter",
+    "partitioned_execution",
+    "partial_aggregate_pushdown",
+    "remote_pushdown",
+    "grouping_sets",
+    "type_pushdown",
+    "scalar_fn_pushdown",
+    "distinct_aggregate_rewrite",
+    "aggregate_reuse",
+    "projection_placement",
+    "redundant_order_keys",
+    "disjunctive_join_rewriter",
+    "redundant_order",
+];
 
 /// The columns and rows of a system table.
 type SystemRows = (Vec<(&'static str, LogicalType)>, Vec<Vec<Value>>);
@@ -1143,6 +1199,76 @@ impl Binder<'_> {
         let integer = LogicalType::INTEGER;
         let tags = LogicalType::map(LogicalType::VARCHAR, LogicalType::VARCHAR);
         let (columns, rows): (Vec<(&str, LogicalType)>, Vec<Vec<Value>>) = match name.to_lowercase().as_str() {
+            // `DuckDBOptimizersFunction`
+            "duckdb_optimizers" => (
+                vec![("name", varchar.clone())],
+                OPTIMIZERS.iter().map(|name| vec![text(name)]).collect(),
+            ),
+            // `DuckDBSequencesFunction`
+            "duckdb_sequences" => {
+                let mut rows = Vec::new();
+                let mut oid = 2000;
+                for (schema_oid, schema) in self.catalog.schemas().iter().enumerate() {
+                    let temporary = schema.name.eq_ignore_ascii_case(TEMP_SCHEMA);
+                    for sequence in schema.sequences() {
+                        oid += 1;
+                        let data = sequence.data();
+                        let last_value = match data.last_value {
+                            Some(value) if data.usage_count > 0 => Value::bigint(value),
+                            _ => Value::null(bigint.clone()),
+                        };
+                        // `SequenceCatalogEntry::ToSQL`
+                        let sql = format!(
+                            "CREATE SEQUENCE {} INCREMENT BY {} MINVALUE {} MAXVALUE {} START {} {};",
+                            sequence.name,
+                            data.increment,
+                            data.min_value,
+                            data.max_value,
+                            data.counter,
+                            if data.cycle { "CYCLE" } else { "NO CYCLE" }
+                        );
+                        rows.push(vec![
+                            text(if temporary { "temp" } else { self.catalog.name.as_str() }),
+                            Value::bigint(if temporary { 3 } else { 1 }),
+                            text(if temporary { "main" } else { &schema.name }),
+                            Value::bigint(schema_oid as i64 + 1),
+                            text(&sequence.name),
+                            Value::bigint(oid),
+                            null_text(),
+                            Value::null(tags.clone()),
+                            Value::boolean(temporary),
+                            Value::bigint(data.start_value),
+                            Value::bigint(data.min_value),
+                            Value::bigint(data.max_value),
+                            Value::bigint(data.increment),
+                            Value::boolean(data.cycle),
+                            last_value,
+                            text(&sql),
+                        ]);
+                    }
+                }
+                (
+                    vec![
+                        ("database_name", varchar.clone()),
+                        ("database_oid", bigint.clone()),
+                        ("schema_name", varchar.clone()),
+                        ("schema_oid", bigint.clone()),
+                        ("sequence_name", varchar.clone()),
+                        ("sequence_oid", bigint.clone()),
+                        ("comment", varchar.clone()),
+                        ("tags", tags.clone()),
+                        ("temporary", boolean.clone()),
+                        ("start_value", bigint.clone()),
+                        ("min_value", bigint.clone()),
+                        ("max_value", bigint.clone()),
+                        ("increment_by", bigint.clone()),
+                        ("cycle", boolean.clone()),
+                        ("last_value", bigint.clone()),
+                        ("sql", varchar.clone()),
+                    ],
+                    rows,
+                )
+            }
             "pragma_database_size" => {
                 let mut rows = Vec::new();
                 for database in self.catalog.databases() {

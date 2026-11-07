@@ -2161,6 +2161,7 @@ impl ClientContext {
             min_value,
             max_value,
             cycle,
+            start_value,
         };
         let schema = self.catalog().schema_for(create_schema_of(info)?)?;
         schema.create_sequence(&info.name.name, data, on_create_conflict(info.on_conflict))

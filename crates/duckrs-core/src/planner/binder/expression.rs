@@ -267,9 +267,17 @@ fn type_parameter_type(expr: &Expr) -> &'static str {
 /// `ColumnQualifier::SQLValueFunctionName`: what these words call when no column has their name.
 fn sql_value_function(name: &str) -> Option<&'static str> {
     match name.to_lowercase().as_str() {
-        "current_timestamp" => Some("get_current_timestamp"),
+        "current_catalog" => Some("current_catalog"),
         "current_date" => Some("current_date"),
+        "current_schema" => Some("current_schema"),
+        "current_role" => Some("current_role"),
         "current_time" => Some("get_current_time"),
+        "current_timestamp" => Some("get_current_timestamp"),
+        "current_user" => Some("current_user"),
+        "localtime" => Some("current_localtime"),
+        "localtimestamp" => Some("current_localtimestamp"),
+        "session_user" => Some("session_user"),
+        "user" => Some("user"),
         _ => None,
     }
 }
@@ -1176,6 +1184,19 @@ impl Binder<'_> {
                         .collect::<Result<Vec<_>>>()?;
                     return bind_nested_function(&function.name.name, names, children);
                 }
+                // the macros of the system catalog (`DefaultFunctionGenerator`), where no function has
+                // the name
+                if BuiltinFunctions::get().scalar(&function.name.name).is_none() {
+                    let schema = function
+                        .name
+                        .qualification
+                        .iter()
+                        .rfind(|q| !q.is_empty())
+                        .map(String::as_str);
+                    if let Some(entry) = crate::catalog::defaults::default_macro(schema, &function.name.name, false) {
+                        return self.bind_macro(function, &entry);
+                    }
+                }
                 if function.args.iter().any(|a| !a.name.is_empty()) {
                     return Err(crate::unported("named function arguments"));
                 }
@@ -1463,6 +1484,10 @@ impl Binder<'_> {
     /// The functions that are constants of the session.
     fn bind_session_function(&mut self, function: &FunctionExpr) -> Result<Option<BoundExpr>> {
         let name = function.name.name.to_lowercase();
+        // `CurrentDatabaseFunction`: the database the connection uses
+        if name == "current_database" && function.args.is_empty() {
+            return Ok(Some(BoundExpr::constant(Value::varchar(self.catalog.name.clone()))));
+        }
         if name == "current_schema" && function.args.is_empty() {
             return Ok(Some(BoundExpr::constant(Value::varchar("main"))));
         }

@@ -810,6 +810,7 @@ impl<'a> Replay<'a> {
             min_value: stored.min_value,
             max_value: stored.max_value,
             cycle: stored.cycle,
+            start_value: stored.counter,
         };
         let entry = self.catalog.schema_for(Some(schema))?;
         entry.create_sequence(name, data, OnCreateConflict::Error)?;

@@ -18,6 +18,8 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Weak};
 
+pub mod defaults;
+mod defaults_table;
 mod fork;
 mod row_ids;
 pub use fork::{CatalogVersions, Fork, RowVersions, TableOrigin, tick};
@@ -861,6 +863,8 @@ pub struct SequenceData {
     pub min_value: i64,
     pub max_value: i64,
     pub cycle: bool,
+    /// what it started from (`start_value`); a file keeps the counter as that
+    pub start_value: i64,
 }
 
 /// A sequence (`SequenceCatalogEntry`). Its values are not transactional, as in DuckDB.
@@ -1088,6 +1092,11 @@ impl SchemaCatalogEntry {
 
     /// The table or view with this name.
     /// All the tables and views, by name.
+    /// The sequences of the schema, by name.
+    pub fn sequences(&self) -> Vec<Arc<SequenceCatalogEntry>> {
+        self.sequences.read().values().cloned().collect()
+    }
+
     pub fn tables_and_views(&self) -> Vec<TableOrView> {
         self.tables.read().values().cloned().collect()
     }

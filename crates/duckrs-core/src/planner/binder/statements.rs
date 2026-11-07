@@ -1646,6 +1646,26 @@ impl Binder<'_> {
                 if entry.is_err() && name.qualification.is_empty() && name.name.eq_ignore_ascii_case("duckdb_logs") {
                     return self.bind_log_table("duckdb_logs", true, table_ref);
                 }
+                // the other views of the system catalog (`DefaultViewGenerator`), by their query
+                if entry.is_err() {
+                    let parts: Vec<&String> = name.qualification.iter().filter(|q| !q.is_empty()).collect();
+                    let schema = match parts.as_slice() {
+                        [] => Some(None),
+                        [schema] => Some(Some(schema.as_str())),
+                        [catalog, schema] if catalog.eq_ignore_ascii_case("system") => Some(Some(schema.as_str())),
+                        _ => None,
+                    };
+                    if let Some(schema) = schema
+                        && let Some(sql) = crate::catalog::defaults::default_view(schema, &name.name)
+                    {
+                        let select = super::table_functions::parse_select(sql, "Expected a single SELECT statement")?;
+                        let mut table_ref = table_ref.clone();
+                        if table_ref.alias.is_empty() {
+                            table_ref.alias = name.name.clone();
+                        }
+                        return self.bind_rewritten(&select, &table_ref, &name.name);
+                    }
+                }
                 let table = match entry? {
                     TableOrView::Table(table) => table,
                     TableOrView::View(view) => return self.bind_view(table_ref, view),
@@ -1888,6 +1908,16 @@ impl Binder<'_> {
         }
         let generate_series = name == "generate_series";
         if !(generate_series || name == "range") || !call.name.qualification.is_empty() {
+            // the table macros of the system catalog (`DefaultTableFunctionGenerator`)
+            let schema = call
+                .name
+                .qualification
+                .iter()
+                .rfind(|q| !q.is_empty())
+                .map(String::as_str);
+            if let Some(entry) = crate::catalog::defaults::default_macro(schema, &call.name.name, true) {
+                return self.bind_table_macro(table_ref, call, entry);
+            }
             return Err(not_implemented(&format!("the table function {name}")));
         }
         if call.args.is_empty() || call.args.len() > 3 || call.args.iter().any(|a| !a.name.is_empty()) {
