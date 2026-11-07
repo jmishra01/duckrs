@@ -335,8 +335,8 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             predicate,
             results: Mutex::default(),
         }),
-        LogicalOperatorKind::ExceptIntersect { except, all, .. } => {
-            Box::new(PhysicalExceptIntersect::new(types, children, except, all))
+        LogicalOperatorKind::ExceptIntersect { except, all, keys, .. } => {
+            Box::new(PhysicalExceptIntersect::new(types, children, except, all, keys))
         }
         LogicalOperatorKind::Unnest { expressions, .. } => Box::new(PhysicalUnnest {
             types,

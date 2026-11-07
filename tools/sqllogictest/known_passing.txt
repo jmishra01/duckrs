@@ -631,6 +631,7 @@ test/sql/aggregate/flat_binary_validity_bits.test
 test/sql/aggregate/group/aggregate_combine_grow_arena.test
 test/sql/aggregate/group/aggregate_combine_row_append.test
 test/sql/aggregate/group/group_by_all.test
+test/sql/aggregate/group/group_by_all_collation.test
 test/sql/aggregate/group/group_by_all_having.test
 test/sql/aggregate/group/group_by_all_order.test
 test/sql/aggregate/group/group_by_limits.test
@@ -912,8 +913,11 @@ test/sql/catalog/view/test_view_sql.test
 test/sql/catalog/view/view_if_not_exists.test
 test/sql/collate/collate_filter_pushdown.test
 test/sql/collate/collate_group_subquery.test
+test/sql/collate/collate_in_subquery.test
 test/sql/collate/collate_json_ordered_aggregate.test
+test/sql/collate/collate_like.test
 test/sql/collate/collate_non_varchar.test
+test/sql/collate/collate_order_by_alias.test
 test/sql/collate/collate_ordered_aggregate.test
 test/sql/collate/collate_string_col.test
 test/sql/collate/collate_subquery.test
@@ -922,9 +926,12 @@ test/sql/collate/test_collate_between.test
 test/sql/collate/test_collate_case_insensitive.test
 test/sql/collate/test_collate_expression.test
 test/sql/collate/test_collate_null_constant.test
+test/sql/collate/test_collate_orderby_column_number.test
 test/sql/collate/test_collate_pivot.test
+test/sql/collate/test_collation_propagation.test
 test/sql/collate/test_combined_collation.test
 test/sql/collate/test_default_collations.test
+test/sql/collate/test_strpos_collate.test
 test/sql/collate/test_unsupported_collations.test
 test/sql/conjunction/or_between.test
 test/sql/conjunction/or_comparison.test
@@ -2278,7 +2285,9 @@ test/sql/select/test_select_locking.test
 test/sql/select/test_select_qualified_view.test
 test/sql/serialization/function_argument_names.test
 test/sql/setops/ambiguous_order_by.test
+test/sql/setops/except_intersect_collation.test
 test/sql/setops/setops_pushdown.test
+test/sql/setops/test_except.test
 test/sql/setops/test_full_outer_join_union.test
 test/sql/setops/test_nested_except.test
 test/sql/setops/test_pg_union.test
@@ -2314,6 +2323,7 @@ test/sql/show_select/test_describe_quoted.test
 test/sql/show_select/test_show_select.test
 test/sql/show_select/test_summarize_quoted.test
 test/sql/sql_export/basic_plan_shapes.test
+test/sql/sql_export/collation_results.test
 test/sql/sql_export/composition_q1.test
 test/sql/sql_export/compressed_materialization_sql_export.test
 test/sql/sql_export/correlated_sql_export.test
@@ -2321,7 +2331,9 @@ test/sql/sql_export/cte_names.test
 test/sql/sql_export/grouped_mark_roundtrip.test
 test/sql/sql_export/json_ordering.test
 test/sql/sql_export/legacy_source_serialization.test
+test/sql/sql_export/mark_collation.test
 test/sql/sql_export/mark_condition_shapes.test
+test/sql/sql_export/mark_results.test
 test/sql/sql_export/nested_values.test
 test/sql/sql_export/numbered_scan_results.test
 test/sql/sql_export/plain_scope_results.test

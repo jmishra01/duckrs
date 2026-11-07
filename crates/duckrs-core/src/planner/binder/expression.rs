@@ -733,6 +733,57 @@ impl Binder<'_> {
 
     /// `ExpressionBinder::Bind`.
     pub(super) fn bind_expression(&mut self, expr: &Expr) -> Result<BoundExpr> {
+        let bound = self.bind_expression_inner(expr)?;
+        if matches!(expr.kind, ExprKind::Function(_) | ExprKind::Operator { .. })
+            && matches!(bound.kind, BoundExprKind::Function { .. })
+        {
+            return self.function_collations(bound);
+        }
+        Ok(bound)
+    }
+
+    /// `PushArgumentCollations` and `PropagateReturnCollation` of `FunctionBinder`: the
+    /// functions that compare their arguments (LIKE, `contains`, ...) see them with their
+    /// combinable collations; the others give a VARCHAR with the collation of their arguments.
+    fn function_collations(&self, mut bound: BoundExpr) -> Result<BoundExpr> {
+        use crate::planner::collation::{CollationType, push_collation};
+        let BoundExprKind::Function { function, children, .. } = &mut bound.kind else {
+            return Ok(bound);
+        };
+        let pushes = PUSH_COMBINABLE_COLLATIONS.contains(&function.name.to_lowercase().as_str());
+        let varchar = |ty: &LogicalType| ty.id() == LogicalTypeId::Varchar && ty.alias().is_none();
+        let mut collation: Option<String> = None;
+        for child in children.iter().filter(|c| varchar(&c.return_type)) {
+            match (&collation, child.return_type.collation()) {
+                (Some(c), Some(other)) if c != other => {
+                    return Err(binder_error(if pushes {
+                        "Cannot combine types with different collation"
+                    } else {
+                        "Cannot combine types with different collation!"
+                    }));
+                }
+                (None, Some(other)) => collation = Some(other.to_string()),
+                _ => {}
+            }
+        }
+        if pushes {
+            let ty = LogicalType::VARCHAR.with_collation(collation.as_deref());
+            let default = self.default_collation();
+            for child in children.iter_mut() {
+                if varchar(&child.return_type) {
+                    let taken = std::mem::replace(child, BoundExpr::constant(Value::sql_null()));
+                    *child = push_collation(taken, &ty, &default, CollationType::CombinableCollations)?.0;
+                }
+            }
+        } else if varchar(&bound.return_type)
+            && let Some(collation) = collation
+        {
+            bound.return_type = bound.return_type.with_collation(Some(&collation));
+        }
+        Ok(bound)
+    }
+
+    fn bind_expression_inner(&mut self, expr: &Expr) -> Result<BoundExpr> {
         if let Some(group) = self.try_bind_group(expr) {
             return Ok(group);
         }
@@ -1539,6 +1590,30 @@ impl Binder<'_> {
                 "In a DISTINCT aggregate, ORDER BY expressions must appear in the argument list",
             ));
         }
+        // `BindMinMax`: min and max of a collated VARCHAR are arg_min and arg_max of the value
+        // by its collated value
+        let mut set = set;
+        let mut children = children;
+        if matches!(set.name.as_str(), "min" | "max")
+            && let [child] = children.as_slice()
+            && child.return_type.id() == LogicalTypeId::Varchar
+            && !function.export_state
+        {
+            let ty = child.return_type.clone();
+            let (collated, pushed) = crate::planner::collation::push_collation(
+                child.clone(),
+                &ty,
+                &self.default_collation(),
+                crate::planner::collation::CollationType::AllCollations,
+            )?;
+            if pushed {
+                let name = if set.name == "min" { "arg_min" } else { "arg_max" };
+                set = crate::function::BuiltinFunctions::get()
+                    .aggregate(name)
+                    .expect("arg_min and arg_max are aggregates");
+                children.push(collated);
+            }
+        }
         // `FunctionBinder::BindAggregateFunction`: a DISTINCT count counts collated values
         let children = if function.distinct && set.name == "count" {
             children
@@ -1813,6 +1888,41 @@ impl Binder<'_> {
         })
     }
 }
+
+/// The functions with `FunctionCollationHandling::PUSH_COMBINABLE_COLLATIONS`, by every name.
+const PUSH_COMBINABLE_COLLATIONS: [&str; 31] = [
+    "~~",
+    "!~~",
+    "~~~",
+    "~~*",
+    "!~~*",
+    "like_escape",
+    "not_like_escape",
+    "ilike_escape",
+    "not_ilike_escape",
+    "contains",
+    "starts_with",
+    "^@",
+    "instr",
+    "strpos",
+    "position",
+    "hash",
+    "list_contains",
+    "array_contains",
+    "list_has",
+    "array_has",
+    "list_position",
+    "list_indexof",
+    "array_position",
+    "array_indexof",
+    "list_has_any",
+    "array_has_any",
+    "&&",
+    "list_has_all",
+    "array_has_all",
+    "@>",
+    "<@",
+];
 
 /// `SwitchVarcharComparison`: types a string is cast to when compared with them.
 fn switch_varchar_comparison(ty: &LogicalType) -> bool {

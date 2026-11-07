@@ -1359,10 +1359,18 @@ pub struct PhysicalExceptIntersect {
     data: Mutex<ColumnDataCollection>,
     /// how often each row of the second child occurs
     counts: Mutex<std::collections::HashMap<Vec<u8>, usize>>,
+    /// what rows match by (their collated columns); empty for the rows themselves
+    keys: Vec<BoundExpr>,
 }
 
 impl PhysicalExceptIntersect {
-    pub fn new(types: Vec<LogicalType>, children: Vec<Box<dyn PhysicalOperator>>, except: bool, all: bool) -> Self {
+    pub fn new(
+        types: Vec<LogicalType>,
+        children: Vec<Box<dyn PhysicalOperator>>,
+        except: bool,
+        all: bool,
+        keys: Vec<BoundExpr>,
+    ) -> Self {
         let data = Mutex::new(ColumnDataCollection::new(types.clone()));
         Self {
             types,
@@ -1371,7 +1379,23 @@ impl PhysicalExceptIntersect {
             all,
             data,
             counts: Mutex::default(),
+            keys,
         }
+    }
+
+    /// The match keys of the rows of `chunk`.
+    fn row_keys(&self, chunk: &DataChunk) -> Result<Vec<Vec<u8>>> {
+        if self.keys.is_empty() {
+            let columns: Vec<&Vector> = chunk.columns().iter().collect();
+            return group_keys(&columns, chunk.len());
+        }
+        let vectors = self
+            .keys
+            .iter()
+            .map(|key| super::expression_executor::execute(key, chunk))
+            .collect::<Result<Vec<_>>>()?;
+        let columns: Vec<&Vector> = vectors.iter().collect();
+        group_keys(&columns, chunk.len())
     }
 }
 
@@ -1400,9 +1424,9 @@ impl PhysicalOperator for PhysicalExceptIntersect {
             data.append(chunk);
             return check_buffered(&data);
         }
-        let columns: Vec<&Vector> = chunk.columns().iter().collect();
+        let keys = self.row_keys(chunk)?;
         let mut counts = self.counts.lock();
-        for key in group_keys(&columns, chunk.len())? {
+        for key in keys {
             *counts.entry(key).or_default() += 1;
         }
         Ok(())
@@ -1413,8 +1437,7 @@ impl PhysicalOperator for PhysicalExceptIntersect {
         let mut result = ColumnDataCollection::new(self.types.clone());
         for index in 0..data.chunk_count() {
             let mut chunk = data.chunk(index).clone();
-            let columns: Vec<&Vector> = chunk.columns().iter().collect();
-            let keys = group_keys(&columns, chunk.len())?;
+            let keys = self.row_keys(&chunk)?;
             let mut keep = Vec::new();
             for (row, key) in keys.iter().enumerate() {
                 let found = match counts.get_mut(key) {

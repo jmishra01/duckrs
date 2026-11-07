@@ -146,6 +146,9 @@ pub enum LogicalOperatorKind {
         types: Vec<LogicalType>,
         except: bool,
         all: bool,
+        /// what rows are matched by, as expressions of the columns of a row by position: their
+        /// collated values (the join conditions of `PlanSetOperation`); empty to match whole rows
+        keys: Vec<BoundExpr>,
     },
     /// `LogicalRecursiveCTE`: the rows of its child, then those of `recursive`, run over and over
     /// on the rows of the last round in `working`, until a round adds nothing.

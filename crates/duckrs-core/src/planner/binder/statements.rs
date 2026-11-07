@@ -455,12 +455,29 @@ impl Binder<'_> {
                 table_index,
                 types: types.clone(),
             },
-            operation => LogicalOperatorKind::ExceptIntersect {
-                table_index,
-                types: types.clone(),
-                except: operation == SetOpType::Except,
-                all: node.setop_all,
-            },
+            operation => {
+                // the rows match as the collations of their columns say
+                let mut keys = Vec::with_capacity(types.len());
+                let mut collated = false;
+                for (i, ty) in types.iter().enumerate() {
+                    let column = BoundExpr::new(BoundExprKind::Reference(i), ty.clone());
+                    let (key, pushed) = crate::planner::collation::push_collation(
+                        column,
+                        ty,
+                        &self.default_collation(),
+                        crate::planner::collation::CollationType::AllCollations,
+                    )?;
+                    collated |= pushed;
+                    keys.push(key);
+                }
+                LogicalOperatorKind::ExceptIntersect {
+                    table_index,
+                    types: types.clone(),
+                    except: operation == SetOpType::Except,
+                    all: node.setop_all,
+                    keys: if collated { keys } else { Vec::new() },
+                }
+            }
         };
         let plan = LogicalOperator::new(kind, plans);
         let mut prepared = Vec::with_capacity(modifiers.len() + 1);
@@ -871,14 +888,36 @@ impl Binder<'_> {
             }
         }
         {
+            let default_collation = self.default_collation();
             let aggregates = self.aggregates.as_mut().expect("set above");
             for i in group_by_all {
                 let ty = expressions[i].return_type.clone();
                 let group = aggregates.groups.len();
-                let reference = BoundExpr::column_ref(ColumnBinding::new(group_index, group), ty, names[i].clone());
-                aggregates
-                    .groups
-                    .push(std::mem::replace(&mut expressions[i], reference));
+                let reference =
+                    BoundExpr::column_ref(ColumnBinding::new(group_index, group), ty.clone(), names[i].clone());
+                let original = std::mem::replace(&mut expressions[i], reference);
+                // a collated group: grouped by the collated value, selected as `first(x)`
+                let (collated, requires_collation) = crate::planner::collation::push_collation(
+                    original.clone(),
+                    &ty,
+                    &default_collation,
+                    crate::planner::collation::CollationType::AllCollations,
+                )?;
+                if requires_collation {
+                    let set = crate::function::BuiltinFunctions::get()
+                        .aggregate("first")
+                        .expect("first is an aggregate");
+                    let first = crate::function::binder::bind_aggregate_function(set, vec![original], None, false)?;
+                    let index = aggregates.aggregates.len();
+                    aggregates.aggregate_keys.push(format!("collated group {group}"));
+                    aggregates.aggregates.push(first);
+                    aggregates.collated_groups.push((group, index));
+                    expressions[i] =
+                        BoundExpr::column_ref(ColumnBinding::new(aggregate_index, index), ty, names[i].clone());
+                    aggregates.groups.push(collated);
+                } else {
+                    aggregates.groups.push(original);
+                }
                 aggregates
                     .group_map
                     .push((without_aliases(&state.original_expressions[i]), group));
@@ -1196,6 +1235,32 @@ impl Binder<'_> {
         select_list: &mut Vec<Expr>,
         state: &mut SelectBindState,
     ) -> Result<usize> {
+        // `OrderBinder::Bind(CollateExpression)`: a collation over a position or alias applies to
+        // the select list entry it names, which is sorted by as a hidden entry
+        let rewritten;
+        let expr = match &expr.kind {
+            ExprKind::Collate { child, collation }
+                if matches!(
+                    &child.kind,
+                    ExprKind::Constant(_) | ExprKind::Positional(_) | ExprKind::ColumnRef(_)
+                ) =>
+            {
+                let index = self.bind_order_expression(child, select_list, state)?;
+                match state.original_expressions.get(index) {
+                    Some(entry) => {
+                        let mut target = entry.clone();
+                        target.alias.clear();
+                        rewritten = Expr::from(ExprKind::Collate {
+                            child: Box::new(target),
+                            collation: collation.clone(),
+                        });
+                        &rewritten
+                    }
+                    None => expr,
+                }
+            }
+            _ => expr,
+        };
         match &expr.kind {
             ExprKind::Constant(literal) => {
                 // ORDER BY an integer refers to a select list entry; other constants are an error

@@ -22,7 +22,8 @@ use std::sync::Arc;
 /// more cheaply than their own type.
 pub fn expression_return_type(expr: &BoundExpr) -> LogicalType {
     if let BoundExprKind::Constant(value) = &expr.kind {
-        if expr.return_type.id() == LogicalTypeId::Varchar {
+        // a collated string is not a literal: its collation counts (`GetExpressionReturnType`)
+        if expr.return_type.id() == LogicalTypeId::Varchar && expr.return_type.collation().is_none() {
             return LogicalType::new(LogicalTypeId::StringLiteral);
         }
         if expr.return_type.is_integral()
