@@ -621,6 +621,17 @@ DuckDB 1.5.6 can't replay a logged index read-only, so `generate.sh` has it read
 
 The tests compare every column as the text that DuckDB prints, FLOAT and DOUBLE included.
 
+## Phase 5
+
+The scalar functions that came last are in `function::extras`, and JSON's in `function::json`. They bind by name, as
+their types depend on their arguments, so they are not overloads and `duckdb_functions()` wouldn't know them. New
+aggregates are `Holistic`, which keep their rows: `approx_top_k` and `bitstring_agg` are exact, and `min(x, n)` sorts.
+Named arguments of aggregates are read by position.
+
+The gates are not met: see `docs/STATUS.md`. What holds the most files back is `EXPORT_STATE`, `finalize`, `combine` and
+`to_aggregate_state`, which need a state type of their own; the box rendering of EXPLAIN, which the `explain_value`
+tests read; `test_vector_types`; COLLATE; and VARIANT columns in database files.
+
 ## Phase 11
 
 CSV is in, on one thread: C++'s state machine and sniffer are ported, its buffers and parallel scan are not.

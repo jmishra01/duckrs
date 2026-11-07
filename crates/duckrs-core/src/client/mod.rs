@@ -2196,6 +2196,17 @@ mod tests {
     }
 
     #[test]
+    fn a_subquery_in_create_table_as_keeps_its_own_table_index() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        run(&mut c, "CREATE TABLE c AS SELECT TIMESTAMP '2023-01-01' s, 1::BIGINT y");
+        run(
+            &mut c,
+            "CREATE TABLE d AS (SELECT * FROM c WHERE y IN (SELECT y FROM c))",
+        );
+        assert_eq!(run(&mut c, "SELECT count(*) FROM d"), vec![vec!["1".to_string()]]);
+    }
+
+    #[test]
     fn single_arrow_lambdas_need_the_setting() {
         let mut c = ClientContext::new(DatabaseInstance::new());
         let error = |c: &mut ClientContext, sql: &str| c.query(sql).unwrap_err().to_string();

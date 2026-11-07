@@ -157,8 +157,9 @@ pub(super) fn aggregate_functions() -> Vec<AggregateFunctionSet> {
         AggregateFunctionSet::new("sum", sum()),
         AggregateFunctionSet::new("avg", avg()),
         AggregateFunctionSet::new("mean", avg()),
-        AggregateFunctionSet::new("min", unary(Min)),
-        AggregateFunctionSet::new("max", unary(Max)),
+        AggregateFunctionSet::new("sum_no_overflow", sum()),
+        AggregateFunctionSet::new("min", with_count(unary(Min), super::holistic::Holistic::MinN)),
+        AggregateFunctionSet::new("max", with_count(unary(Max), super::holistic::Holistic::MaxN)),
         AggregateFunctionSet::new("list", unary(List)),
         AggregateFunctionSet::new("array_agg", unary(List)),
         AggregateFunctionSet::new("first", unary(First)),
@@ -169,6 +170,16 @@ pub(super) fn aggregate_functions() -> Vec<AggregateFunctionSet> {
     .into_iter()
     .chain(holistic_functions())
     .collect()
+}
+
+/// `min(x, n)`: the overload beside `min(x)`.
+fn with_count(
+    mut overloads: Vec<(Vec<LogicalType>, LogicalType, AggregateKind)>,
+    kind: Holistic,
+) -> Vec<(Vec<LogicalType>, LogicalType, AggregateKind)> {
+    let any = || LogicalType::new(LogicalTypeId::Any);
+    overloads.push((vec![any(), LogicalType::BIGINT], any(), AggregateKind::Holistic(kind)));
+    overloads
 }
 
 fn holistic_functions() -> Vec<AggregateFunctionSet> {
@@ -216,15 +227,45 @@ fn holistic_functions() -> Vec<AggregateFunctionSet> {
         of(&["var_pop"], unary_double(VarPop)),
         of(&["skewness"], unary_double(Skewness)),
         of(&["kurtosis"], unary_double(Kurtosis)),
+        of(&["kurtosis_pop"], unary_double(KurtosisPop)),
+        of(&["weighted_avg", "wavg"], binary_double(WeightedAvg)),
         of(&["sem"], unary_double(Sem)),
         of(&["entropy"], vec![(vec![any()], d.clone(), kind(Entropy))]),
         of(
             &["arg_min", "argmin", "min_by"],
-            vec![(vec![any(), any()], any(), kind(ArgMin))],
+            vec![
+                (vec![any(), any()], any(), kind(ArgMin)),
+                (vec![any(), any(), any()], any(), kind(ArgMinN)),
+            ],
         ),
         of(
             &["arg_max", "argmax", "max_by"],
-            vec![(vec![any(), any()], any(), kind(ArgMax))],
+            vec![
+                (vec![any(), any()], any(), kind(ArgMax)),
+                (vec![any(), any(), any()], any(), kind(ArgMaxN)),
+            ],
+        ),
+        of(&["arg_min_null"], vec![(vec![any(), any()], any(), kind(ArgMinNull))]),
+        of(&["arg_max_null"], vec![(vec![any(), any()], any(), kind(ArgMaxNull))]),
+        of(
+            &["arg_min_nulls_last"],
+            vec![(vec![any(), any()], any(), kind(ArgMinNullsLast))],
+        ),
+        of(
+            &["arg_max_nulls_last"],
+            vec![(vec![any(), any()], any(), kind(ArgMaxNullsLast))],
+        ),
+        of(&["approx_top_k"], vec![(vec![any(), any()], any(), kind(ApproxTopK))]),
+        of(
+            &["bitstring_agg"],
+            vec![
+                (vec![any()], L::new(LogicalTypeId::Bit), kind(BitstringAgg)),
+                (
+                    vec![any(), any(), any()],
+                    L::new(LogicalTypeId::Bit),
+                    kind(BitstringAgg),
+                ),
+            ],
         ),
         of(
             &["count_if", "countif"],

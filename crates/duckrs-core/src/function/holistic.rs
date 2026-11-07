@@ -34,12 +34,27 @@ pub enum Holistic {
     VarPop,
     Skewness,
     Kurtosis,
+    KurtosisPop,
     Sem,
     AvgInterval,
     AvgTimestamp,
     Entropy,
     ArgMin,
     ArgMax,
+    /// `arg_min_null`: the row of the extreme, whether its value is NULL or not
+    ArgMinNull,
+    ArgMaxNull,
+    /// `arg_min_nulls_last`: NULL values only if nothing else
+    ArgMinNullsLast,
+    ArgMaxNullsLast,
+    /// `min(x, n)`
+    MinN,
+    MaxN,
+    ArgMinN,
+    ArgMaxN,
+    ApproxTopK,
+    BitstringAgg,
+    WeightedAvg,
     CountIf,
     Histogram,
     ApproxCountDistinct,
@@ -87,7 +102,12 @@ impl Holistic {
             (QuantileCont, Some(ty)) => quantile(interpolated_type(ty)),
             (QuantileDisc, Some(ty)) => quantile(ty.clone()),
             (Histogram, Some(ty)) => LogicalType::map(ty.clone(), LogicalType::UBIGINT),
-            (Mode | BitAnd | BitOr | BitXor | ArgMin | ArgMax | AvgTimestamp, Some(ty)) => ty.clone(),
+            (
+                Mode | BitAnd | BitOr | BitXor | ArgMin | ArgMax | ArgMinNull | ArgMaxNull | ArgMinNullsLast
+                | ArgMaxNullsLast | AvgTimestamp,
+                Some(ty),
+            ) => ty.clone(),
+            (MinN | MaxN | ArgMinN | ArgMaxN | ApproxTopK, Some(ty)) => LogicalType::list(ty.clone()),
             _ => declared.clone(),
         }
     }
@@ -466,6 +486,157 @@ fn arg_extreme(rows: &[Value], ty: &LogicalType, greatest: bool) -> Result<Value
     Ok(fields(chosen[best])[0].clone())
 }
 
+/// `arg_min_null` and `arg_min_nulls_last`: the rows with a key; the value may be NULL.
+fn arg_extreme_nulls(rows: &[Value], ty: &LogicalType, greatest: bool, nulls_last: bool) -> Result<Value> {
+    let chosen: Vec<&Value> = rows.iter().filter(|row| !fields(row)[1].is_null()).collect();
+    let Some(first) = chosen.first() else {
+        // NULL keys come last, so one of them is what is left
+        return Ok(match rows.first() {
+            Some(row) if nulls_last => fields(row)[0].clone(),
+            _ => Value::null(ty.clone()),
+        });
+    };
+    let by: Vec<Value> = chosen.iter().map(|row| fields(row)[1].clone()).collect();
+    let keys = sort_keys(&by, fields(first)[1].logical_type())?;
+    let mut best = 0;
+    for at in 1..keys.len() {
+        if (greatest && keys[at] > keys[best]) || (!greatest && keys[at] < keys[best]) {
+            best = at;
+        }
+    }
+    Ok(fields(chosen[best])[0].clone())
+}
+
+fn positive_n(value: &Value, name: &str) -> Result<usize> {
+    let n = value.as_i128().unwrap_or(0);
+    if n <= 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("Invalid input for {name}: n value must be > 0"),
+        ));
+    }
+    if n >= 1_000_000 {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("Invalid input for {name}: n value must be < 1000000"),
+        ));
+    }
+    Ok(n as usize)
+}
+
+/// `min(x, n)` and `arg_min(a, b, n)`: the `n` values with the smallest keys, smallest first.
+fn extremes(rows: &[Value], ty: &LogicalType, greatest: bool, value: usize, key: usize, count: usize) -> Result<Value> {
+    let chosen: Vec<&Value> = rows.iter().filter(|row| !fields(row)[key].is_null()).collect();
+    let Some(first) = chosen.first() else {
+        return Ok(Value::null(ty.clone()));
+    };
+    let name = if value == key { "MIN/MAX" } else { "arg_min/arg_max" };
+    let n = positive_n(&fields(first)[count], name)?;
+    let by: Vec<Value> = chosen.iter().map(|row| fields(row)[key].clone()).collect();
+    let keys = sort_keys(&by, fields(first)[key].logical_type())?;
+    let mut order: Vec<usize> = (0..keys.len()).collect();
+    order.sort_by(|a, b| {
+        if greatest {
+            keys[*b].cmp(&keys[*a])
+        } else {
+            keys[*a].cmp(&keys[*b])
+        }
+    });
+    let items = order
+        .into_iter()
+        .take(n)
+        .map(|at| fields(chosen[at])[value].clone())
+        .collect();
+    Value::new(ty.clone(), ValueData::List(items))
+}
+
+/// `approx_top_k`, exactly: the most frequent values.
+fn top_k(rows: &[Value], ty: &LogicalType) -> Result<Value> {
+    let chosen: Vec<&Value> = rows.iter().filter(|row| !fields(row)[0].is_null()).collect();
+    let Some(first) = chosen.first() else {
+        return Ok(Value::null(ty.clone()));
+    };
+    let Some(k) = fields(first)[1].as_i128() else {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "Invalid input for approx_top_k: k value cannot be NULL",
+        ));
+    };
+    if k <= 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "Invalid input for approx_top_k: k value must be > 0",
+        ));
+    }
+    if k >= 1_000_000 {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "Invalid input for approx_top_k: k value must be < 1000000",
+        ));
+    }
+    let values: Vec<Value> = chosen.iter().map(|row| fields(row)[0].clone()).collect();
+    let keys = sort_keys(&values, values[0].logical_type())?;
+    let mut counts: HashMap<&[u8], (usize, usize)> = HashMap::new();
+    for (at, key) in keys.iter().enumerate() {
+        counts.entry(key.as_slice()).or_insert((0, at)).0 += 1;
+    }
+    let mut ranked: Vec<(usize, usize)> = counts.into_values().collect();
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let items = ranked
+        .into_iter()
+        .take(k as usize)
+        .map(|(_, at)| values[at].clone())
+        .collect();
+    Value::new(ty.clone(), ValueData::List(items))
+}
+
+/// `bitstring_agg(x, min, max)`: a BIT with a bit set for each value, from `min` to `max`.
+fn bitstring(rows: &[Value], ty: &LogicalType) -> Result<Value> {
+    let numbers: Vec<(i128, Option<(i128, i128)>)> = rows
+        .iter()
+        .filter(|row| !fields(row)[0].is_null())
+        .map(|row| {
+            let parts = fields(row);
+            let range = match parts {
+                [_, low, high] => low.as_i128().zip(high.as_i128()),
+                _ => None,
+            };
+            (parts[0].as_i128().unwrap_or(0), range)
+        })
+        .collect();
+    let Some((_, given)) = numbers.first() else {
+        return Ok(Value::null(ty.clone()));
+    };
+    let (low, high) = match given {
+        Some(range) => *range,
+        None => (
+            numbers.iter().map(|n| n.0).min().unwrap_or(0),
+            numbers.iter().map(|n| n.0).max().unwrap_or(0),
+        ),
+    };
+    let size = high - low + 1;
+    if !(1..=100_000_000).contains(&size) {
+        return Err(out_of_range(format!(
+            "The range between min and max value ({low} <-> {high}) is too large for bitstring aggregation"
+        )));
+    }
+    let mut text = vec![b'0'; size as usize];
+    for (value, _) in &numbers {
+        if *value < low || *value > high {
+            return Err(out_of_range(format!(
+                "Value {value} is outside of provided min and max range ({low} <-> {high})"
+            )));
+        }
+        text[(*value - low) as usize] = b'1';
+    }
+    let text = String::from_utf8(text).unwrap_or_default();
+    let mut source = Vector::new(LogicalType::VARCHAR, 1);
+    source.set_value(0, &Value::varchar(text))?;
+    let mut target = Vector::new(ty.clone(), 1);
+    super::cast::cast_vector(&source, &mut target, 1, super::cast::CastMode::Strict)?;
+    Ok(target.get_value(0))
+}
+
 fn mode(rows: &[Value], ty: &LogicalType) -> Result<Value> {
     let values: Vec<Value> = rows.iter().filter(|v| !v.is_null()).cloned().collect();
     if values.is_empty() {
@@ -747,6 +918,42 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
         }
         ArgMin => arg_extreme(rows, ty, false)?,
         ArgMax => arg_extreme(rows, ty, true)?,
+        ArgMinNull => arg_extreme_nulls(rows, ty, false, false)?,
+        ArgMaxNull => arg_extreme_nulls(rows, ty, true, false)?,
+        ArgMinNullsLast => arg_extreme_nulls(rows, ty, false, true)?,
+        ArgMaxNullsLast => arg_extreme_nulls(rows, ty, true, true)?,
+        MinN => extremes(rows, ty, false, 0, 0, 1)?,
+        MaxN => extremes(rows, ty, true, 0, 0, 1)?,
+        ArgMinN => extremes(rows, ty, false, 0, 1, 2)?,
+        ArgMaxN => extremes(rows, ty, true, 0, 1, 2)?,
+        ApproxTopK => top_k(rows, ty)?,
+        BitstringAgg => bitstring(rows, ty)?,
+        WeightedAvg => {
+            let (mut sum, mut weights) = (0.0, 0.0);
+            for row in rows {
+                let parts = fields(row);
+                if let (Some(x), Some(w)) = (number(&parts[0]), number(&parts[1])) {
+                    sum += x * w;
+                    weights += w;
+                }
+            }
+            if weights == 0.0 {
+                null()
+            } else {
+                Value::double(sum / weights)
+            }
+        }
+        KurtosisPop => {
+            let values = numbers(rows);
+            if values.is_empty() {
+                return Ok(null());
+            }
+            let (n, _, square, _, fourth) = moments(&values);
+            if square == 0.0 {
+                return Ok(null());
+            }
+            checked("KURTOSIS", (fourth / n) / (square / n).powi(2) - 3.0)?
+        }
         CountIf if rows.is_empty() => null(),
         CountIf => {
             let count = rows

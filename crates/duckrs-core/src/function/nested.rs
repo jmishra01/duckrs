@@ -282,7 +282,7 @@ fn bind_array_value(children: Vec<BoundExpr>) -> Result<BoundExpr> {
     ))
 }
 
-pub(super) fn bind_struct_pack(names: Vec<String>, children: Vec<BoundExpr>) -> Result<BoundExpr> {
+pub fn bind_struct_pack(names: Vec<String>, children: Vec<BoundExpr>) -> Result<BoundExpr> {
     let mut fields: Vec<(String, LogicalType)> = Vec::with_capacity(children.len());
     for (name, child) in names.into_iter().zip(&children) {
         let name = if name.is_empty() { child.alias.clone() } else { name };

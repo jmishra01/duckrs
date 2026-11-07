@@ -852,6 +852,10 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             Ok(bound_function("repeat", vec![input, times], ty, repeat))
         }
         "range" | "generate_series" => {
+            let children = match super::extras::bind_temporal_range(&lower, children)? {
+                Ok(bound) => return Ok(bound),
+                Err(children) => children,
+            };
             if children.is_empty() || children.len() > 3 {
                 return Err(no_match(&lower, &children));
             }

@@ -1026,6 +1026,30 @@ impl Binder<'_> {
                         .collect::<Result<Vec<_>>>()?;
                     return bind_variant_function(&function.name.name, children);
                 }
+                if matches!(
+                    function.name.name.to_ascii_lowercase().as_str(),
+                    "list_reverse_sort" | "array_reverse_sort"
+                ) {
+                    let mut call = function.clone();
+                    call.name.name = "list_sort".to_string();
+                    call.args.insert(
+                        1,
+                        ast::FunctionArgument {
+                            name: String::new(),
+                            expr: Expr::constant(ast::Literal::string("DESC".to_string())),
+                        },
+                    );
+                    return self.bind_expression(&Expr::from(ExprKind::Function(call)));
+                }
+                if crate::function::extras::is_extra_function(&function.name.name) {
+                    let names: Vec<String> = function.args.iter().map(|a| a.name.clone()).collect();
+                    let children = function
+                        .args
+                        .iter()
+                        .map(|a| self.bind_expression(&a.expr))
+                        .collect::<Result<Vec<_>>>()?;
+                    return crate::function::extras::bind_function(&function.name.name, &names, children);
+                }
                 if crate::function::json::is_json_function(&function.name.name) {
                     let children = function
                         .args
@@ -1377,9 +1401,6 @@ impl Binder<'_> {
         };
         if state.inside_aggregate {
             return Err(binder_error("aggregate function calls cannot be nested"));
-        }
-        if function.args.iter().any(|a| !a.name.is_empty()) {
-            return Err(crate::unported("named function arguments"));
         }
         if function.export_state {
             return Err(crate::unported("EXPORT_STATE"));

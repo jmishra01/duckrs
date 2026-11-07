@@ -1750,16 +1750,14 @@ impl Binder<'_> {
             let bound = binder.bind_expression(&argument.expr);
             self.left_of_join = binder.left_of_join;
             let bound = bound?;
-            if !bound.is_foldable() {
-                // what depends on the row around it: a list per row that unnests
+            let integral = bound.return_type.is_integral() || bound.return_type.id() == LogicalTypeId::SqlNull;
+            if !bound.is_foldable() || !integral {
+                // what depends on the row around it, and dates: a list per row that unnests
                 let select = parse_ast(&format!("SELECT unnest({function}) AS {name}"))?.remove(0);
                 let ast::Statement::Select(select) = select else {
                     unreachable!("this text is a SELECT");
                 };
                 return self.bind_rewritten(&select, table_ref, &name);
-            }
-            if !bound.return_type.is_integral() && bound.return_type.id() != LogicalTypeId::SqlNull {
-                return Err(not_implemented("range over this type"));
             }
             let value = evaluate_scalar(&bound.cast_to(&LogicalType::BIGINT, false))?;
             values.push(value.as_i128());
@@ -2467,6 +2465,8 @@ impl Binder<'_> {
         }
         let mut binder = self.child_binder();
         let bound = binder.bind_select_statement(query)?;
+        // what flattens subqueries later takes its table indexes from here
+        self.next_table_index = binder.next_table_index;
         if info.columns.len() > bound.types.len() {
             return Err(binder_error("Target table has more column names than query result."));
         }

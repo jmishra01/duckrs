@@ -851,7 +851,7 @@ fn to_milliseconds(args: &DataChunk, result: &mut Vector) -> Result<()> {
 }
 
 /// `Interval::Add` for a timestamp.
-fn add_interval(micros: i64, interval: Interval) -> Result<i64> {
+pub(crate) fn add_interval(micros: i64, interval: Interval) -> Result<i64> {
     let overflow = || out_of_range("Overflow in interval addition");
     let mut micros = micros;
     if interval.months != 0 {
