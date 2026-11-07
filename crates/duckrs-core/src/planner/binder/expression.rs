@@ -1041,6 +1041,15 @@ impl Binder<'_> {
                     );
                     return self.bind_expression(&Expr::from(ExprKind::Function(call)));
                 }
+                if function.name.name.eq_ignore_ascii_case("to_aggregate_state") {
+                    let children = function
+                        .args
+                        .iter()
+                        .map(|a| self.bind_expression(&a.expr))
+                        .collect::<Result<Vec<_>>>()?;
+                    let resolve = |name: &str| self.bind_named_type(&LogicalType::unbound(name.to_string()));
+                    return crate::function::aggregates::bind_to_aggregate_state(children, &resolve);
+                }
                 if crate::function::extras::is_extra_function(&function.name.name) {
                     let names: Vec<String> = function.args.iter().map(|a| a.name.clone()).collect();
                     let children = function

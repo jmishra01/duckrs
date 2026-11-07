@@ -1114,6 +1114,10 @@ fn state_finalize(args: &DataChunk, result: &mut Vector) -> Result<()> {
 fn state_combine(args: &DataChunk, result: &mut Vector) -> Result<()> {
     let ty = args.column(0).logical_type().clone();
     row_wise(args, result, |row| {
+        // `AggregateStateCombine` combines the first state into the second
+        if ty.is_aggregate_state() {
+            return super::aggregates::combine_state_values(&row[1], &row[0], &ty);
+        }
         super::aggregates::combine_state_values(&row[0], &row[1], &ty)
     })
 }

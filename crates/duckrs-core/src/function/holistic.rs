@@ -932,11 +932,13 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
         ApproxTopK => top_k(rows, ty)?,
         BitstringAgg => bitstring(rows, ty)?,
         CombineAggr => {
-            let mut combined = null();
+            let mut combined = super::aggregates::empty_state_value(ty)?;
             for row in rows {
-                // a state counts as often as its multiplicity says
+                // a state counts as often as its multiplicity says; a state of C++'s layout can be a
+                // STRUCT itself, and is told apart by its type
+                let is_state = row.logical_type().aggregate_state_info().is_some();
                 let (state, times) = match row.data() {
-                    ValueData::Struct(parts) => (&parts[0], parts[1].as_i128().unwrap_or(0)),
+                    ValueData::Struct(parts) if !is_state => (&parts[0], parts[1].as_i128().unwrap_or(0)),
                     _ => (row, 1),
                 };
                 if times < 0 {

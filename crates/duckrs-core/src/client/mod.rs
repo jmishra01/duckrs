@@ -5892,6 +5892,46 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_states_of_cpp_layout() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT count(*) EXPORT_STATE, sum(i::SMALLINT) EXPORT_STATE, sum(i) EXPORT_STATE, \
+                 avg(i) EXPORT_STATE, min(i) EXPORT_STATE, first(i) EXPORT_STATE, list(i) EXPORT_STATE \
+                 FROM range(1, 4) t(i)"
+            ),
+            [[
+                "3",
+                "6",
+                "6",
+                "{'count': 3, 'value': 6}",
+                "1",
+                "{'value': 1}",
+                "[1, 2, 3]"
+            ]]
+        );
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT typeof(sum(1) EXPORT_STATE), sum(i) EXPORT_STATE, first(i) EXPORT_STATE, \
+                 any_value(NULL::INTEGER) EXPORT_STATE FROM range(0) t(i)"
+            ),
+            [["AGGREGATE_STATE", "NULL", "NULL", "NULL"]]
+        );
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT finalize(combine(to_aggregate_state([1, 2], 'list', ['INTEGER']), \
+                 to_aggregate_state([3], 'list', ['INTEGER']))), \
+                 finalize(to_aggregate_state({'count': 2, 'value': 5::HUGEINT}, 'avg', ['BIGINT']))"
+            ),
+            [["[3, 1, 2]", "2.5"]]
+        );
+        assert!(error(&mut c, "SELECT to_aggregate_state(1, 'nope', ['INTEGER'])").contains("nope does not exist"));
+    }
+
+    #[test]
     fn session_values() {
         let mut c = ClientContext::new(DatabaseInstance::new());
         run(

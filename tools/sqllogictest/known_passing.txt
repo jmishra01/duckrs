@@ -530,9 +530,16 @@ test/parquet/test_parquet_reader_compression.test
 test/parquet/time_millis.test
 test/parquet/union_by_name_nested_struct_extract.test
 test/planner/projection_binding.test
+test/sql/aggregate/aggregate_state_export/aggregate_state_union.test
+test/sql/aggregate/aggregate_state_export/finalize_null_fields.test
+test/sql/aggregate/aggregate_state_export/first_last_export_state.test
 test/sql/aggregate/aggregate_state_export/kahan_avg_export_state.test
+test/sql/aggregate/aggregate_state_export/list_export_state.test
+test/sql/aggregate/aggregate_state_export/minmax_export_state.test
 test/sql/aggregate/aggregate_state_export/ordered_export_empty_state.test
 test/sql/aggregate/aggregate_state_export/ordered_export_state_layout.test
+test/sql/aggregate/aggregate_state_export/state_export_parquet.test
+test/sql/aggregate/aggregate_state_export/to_aggregate_state_argument_types.test
 test/sql/aggregate/aggregate_state_export/vector_minmax_export_state.test
 test/sql/aggregate/aggregates/approx_quantile_decimal_scalar.test
 test/sql/aggregate/aggregates/approx_quantile_parallel_finalize.test
@@ -595,6 +602,7 @@ test/sql/aggregate/aggregates/test_simple_filter.test
 test/sql/aggregate/aggregates/test_skewness.test
 test/sql/aggregate/aggregates/test_string_agg_big.test
 test/sql/aggregate/aggregates/test_sum.test
+test/sql/aggregate/aggregates/test_sum_decimal_overflow.test
 test/sql/aggregate/aggregates/test_sum_fastpath.test
 test/sql/aggregate/count_execution_paths.test
 test/sql/aggregate/distinct/distinct_on_nulls.test

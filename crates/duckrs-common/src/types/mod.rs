@@ -359,6 +359,18 @@ enum Params {
 struct TypeInfo {
     params: Params,
     alias: Option<String>,
+    /// for an `AGGREGATE_STATE` (the `ExtensionTypeInfo` of C++): which aggregate the state is of
+    state: Option<StateInfo>,
+}
+
+/// Which aggregate an `AGGREGATE_STATE` is of: the function's name, its overload, what it was
+/// bound with and what it gives (the `function_name` and `parameters` of C++'s extension info).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StateInfo {
+    function: Arc<str>,
+    overload: u32,
+    arguments: Vec<LogicalType>,
+    result: LogicalType,
 }
 
 /// A SQL type. Cheap to clone: parameters live behind an `Arc`.
@@ -388,7 +400,11 @@ impl LogicalType {
     fn with_params(id: LogicalTypeId, params: Params) -> Self {
         Self {
             id,
-            info: Some(Arc::new(TypeInfo { params, alias: None })),
+            info: Some(Arc::new(TypeInfo {
+                params,
+                alias: None,
+                state: None,
+            })),
         }
     }
 
@@ -463,7 +479,27 @@ impl LogicalType {
         )
     }
 
-    /// What [`Self::aggregate_state`] was given.
+    /// `CreateAggregateStateType`: the state of an aggregate as values of `layout`, the type C++
+    /// gives the state (`GetStateType`), aliased to `AGGREGATE_STATE`.
+    pub fn aggregate_state_of(
+        layout: &LogicalType,
+        function: &str,
+        overload: u32,
+        arguments: Vec<LogicalType>,
+        result: LogicalType,
+    ) -> Self {
+        let mut ty = layout.with_alias("AGGREGATE_STATE");
+        let info = Arc::make_mut(ty.info.as_mut().expect("an aliased type has info"));
+        info.state = Some(StateInfo {
+            function: function.into(),
+            overload,
+            arguments,
+            result,
+        });
+        ty
+    }
+
+    /// What [`Self::aggregate_state`] or [`Self::aggregate_state_of`] was given.
     pub fn aggregate_state_info(&self) -> Option<(&str, u32, &[LogicalType], &LogicalType)> {
         match self.params() {
             Params::AggregateState {
@@ -472,7 +508,30 @@ impl LogicalType {
                 arguments,
                 result,
             } => Some((function, *overload, arguments, result)),
-            _ => None,
+            _ => self
+                .info
+                .as_ref()
+                .and_then(|info| info.state.as_ref())
+                .map(|s| (&*s.function, s.overload, s.arguments.as_slice(), &s.result)),
+        }
+    }
+
+    /// `LogicalType::IsAggregateState`: a state with C++'s layout ([`Self::aggregate_state_of`]).
+    pub fn is_aggregate_state(&self) -> bool {
+        self.info.as_ref().is_some_and(|info| info.state.is_some())
+    }
+
+    /// The type of the values of a state of [`Self::aggregate_state_of`], without the alias.
+    pub fn state_layout(&self) -> LogicalType {
+        let Some(info) = self.info.as_ref().filter(|info| info.state.is_some()) else {
+            return self.clone();
+        };
+        let mut info = (**info).clone();
+        info.alias = None;
+        info.state = None;
+        Self {
+            id: self.id,
+            info: (info.params != Params::None).then(|| Arc::new(info)),
         }
     }
 
@@ -535,6 +594,7 @@ impl LogicalType {
         let mut info = self.info.as_deref().cloned().unwrap_or(TypeInfo {
             params: Params::None,
             alias: None,
+            state: None,
         });
         info.alias = Some(alias.into());
         Self {

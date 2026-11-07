@@ -358,6 +358,181 @@ impl AggregateKind {
     }
 }
 
+// The state layouts below are ported from the `STATE_TYPE`s of duckdb/src/function/aggregate/
+// distributive/{count,minmax,first_last_any}.cpp, extension/core_functions/aggregate/
+// {distributive/sum.cpp,algebraic/avg.cpp} and duckdb/src/include/duckdb/function/aggregate/
+// list_aggregate.hpp, and the field rules of aggregate_state_layout.hpp @ rust-port-baseline
+
+/// Whether `sum` or `avg` of `argument` keeps an `int64_t` (`SumState<int64_t>`,
+/// `AvgState<int64_t>`) rather than a `hugeint_t`: for BOOLEAN and SMALLINT, and DECIMALs of
+/// a SMALLINT.
+fn narrow_sum(argument: Option<&LogicalType>) -> bool {
+    argument.is_some_and(|ty| match ty.id() {
+        LogicalTypeId::Boolean | LogicalTypeId::SmallInt => true,
+        LogicalTypeId::Decimal => ty.physical_type() == duckrs_common::types::PhysicalType::Int16,
+        _ => false,
+    })
+}
+
+/// `GetStateType`: the type C++ exports the state of the aggregate as, for the aggregates whose
+/// state duckrs keeps the way C++ does. The others (BIGNUM sums and the aggregates that keep
+/// their rows) export a state of their own ([`encode_state`]).
+pub fn state_layout(kind: AggregateKind, arguments: &[LogicalType], result: &LogicalType) -> Option<LogicalType> {
+    use AggregateKind::*;
+    let sum_type = || {
+        if narrow_sum(arguments.first()) {
+            LogicalType::BIGINT
+        } else {
+            LogicalType::HUGEINT
+        }
+    };
+    let avg = |value: LogicalType| {
+        LogicalType::struct_type(vec![("count".into(), LogicalType::UBIGINT), ("value".into(), value)])
+    };
+    Some(match kind {
+        // `int64_t`
+        CountStar | Count => LogicalType::BIGINT,
+        // `OptionalStateType<T>`
+        SumInteger | SumDecimal => sum_type(),
+        SumDouble => LogicalType::DOUBLE,
+        // `StructStateType<uint64_t, T>`
+        AvgInteger | AvgDecimal => avg(sum_type()),
+        AvgDouble => avg(LogicalType::DOUBLE),
+        // `OptionalStateType<StateTypedValue<T, StateReturnType>>`, or a sort key of it
+        Min | Max => result.clone(),
+        // `OptionalStateType<StructStateType<OptionalStateType<...>>>`
+        First | Last | AnyValue => LogicalType::struct_type(vec![("value".into(), result.clone())]),
+        // `StateListType<StateReturnType>`
+        List => result.clone(),
+        SumBignum | Holistic(_) => return None,
+    })
+}
+
+fn is_avg(kind: AggregateKind) -> bool {
+    matches!(
+        kind,
+        AggregateKind::AvgInteger | AggregateKind::AvgDecimal | AggregateKind::AvgDouble
+    )
+}
+
+/// `AggregateStateSerialization::SerializeStates`: a state as a value of its layout
+/// ([`state_layout`]); an unset optional state is NULL, and so is an empty list.
+fn state_to_value(kind: AggregateKind, state: &AggregateState, ty: &LogicalType) -> Result<Value> {
+    use AggregateState as S;
+    let layout = ty.state_layout();
+    let value = match state {
+        S::Count(n) => Value::bigint(*n),
+        S::Integer { sum, count } if is_avg(kind) => {
+            let value = layout.struct_children()[1].1.clone();
+            Value::struct_value(vec![
+                ("count".into(), Value::ubigint(*count)),
+                ("value".into(), integer_of(*sum, &value)?),
+            ])
+        }
+        S::Double { sum, count } if is_avg(kind) => Value::struct_value(vec![
+            ("count".into(), Value::ubigint(*count)),
+            ("value".into(), Value::double(*sum)),
+        ]),
+        S::Integer { count: 0, .. } | S::Double { count: 0, .. } => Value::null(layout.clone()),
+        S::Integer { sum, .. } => integer_of(*sum, &layout)?,
+        S::Double { sum, .. } => Value::double(*sum),
+        S::Extreme(Some((_, value))) => value.clone(),
+        // any_value skips NULLs, so its state is still unset after one
+        S::Value(Some(value)) if value.is_null() && kind == AggregateKind::AnyValue => Value::null(layout.clone()),
+        S::Value(Some(value)) => Value::struct_value(vec![("value".into(), value.clone())]),
+        S::List(Some(values)) if !values.is_empty() => Value::new(layout.clone(), ValueData::List(values.clone()))?,
+        S::Extreme(None) | S::Value(None) | S::List(_) => Value::null(layout.clone()),
+        S::Rows(_) => return Err(state_failure()),
+    };
+    if value.is_null() {
+        return Ok(Value::null(ty.clone()));
+    }
+    Value::new(ty.clone(), value.data().clone())
+}
+
+/// An integral state field of type `ty` (BIGINT or HUGEINT).
+fn integer_of(value: i128, ty: &LogicalType) -> Result<Value> {
+    if ty.id() == LogicalTypeId::BigInt {
+        let value = i64::try_from(value).map_err(|_| {
+            Error::new(
+                ErrorKind::OutOfRange,
+                format!("Overflow in aggregate state: {value} does not fit in a BIGINT"),
+            )
+        })?;
+        return Ok(Value::bigint(value));
+    }
+    Ok(Value::hugeint(value))
+}
+
+/// `AggregateStateSerialization::DeserializeStates`: the state a value of its layout holds. A
+/// NULL state, and a NULL field, leave the empty state as it is.
+fn value_to_state(kind: AggregateKind, value: &Value, ty: &LogicalType) -> Result<AggregateState> {
+    use AggregateKind::*;
+    use AggregateState as S;
+    let mut state = kind.initial_state();
+    if value.is_null() {
+        return Ok(state);
+    }
+    // the value of the state, as a value of its layout rather than of the state type
+    let value = &Value::new(ty.state_layout(), value.data().clone())?;
+    let integer = |value: &Value| value.as_i128().ok_or_else(state_failure);
+    let double = |value: &Value| match value.data() {
+        ValueData::Double(d) => Ok(*d),
+        _ => Err(state_failure()),
+    };
+    match (&mut state, value.data()) {
+        (S::Count(n), _) => *n = i64::try_from(integer(value)?).map_err(|_| state_failure())?,
+        (S::Integer { .. } | S::Double { .. }, ValueData::Struct(fields)) if is_avg(kind) => {
+            let [seen, total] = fields.as_slice() else {
+                return Err(state_failure());
+            };
+            let seen = if seen.is_null() {
+                0
+            } else {
+                u64::try_from(integer(seen)?).map_err(|_| state_failure())?
+            };
+            match &mut state {
+                S::Integer { sum, count } => {
+                    *count = seen;
+                    if !total.is_null() {
+                        *sum = integer(total)?;
+                    }
+                }
+                S::Double { sum, count } => {
+                    *count = seen;
+                    if !total.is_null() {
+                        *sum = double(total)?;
+                    }
+                }
+                _ => unreachable!("an average state"),
+            }
+        }
+        (S::Integer { sum, count }, _) => {
+            *sum = integer(value)?;
+            *count = 1;
+        }
+        (S::Double { sum, count }, _) => {
+            *sum = double(value)?;
+            *count = 1;
+        }
+        (S::Extreme(current), _) => {
+            let key = value_keys(&Vector::constant(value), 1)?
+                .pop()
+                .ok_or_else(state_failure)?;
+            *current = Some((key, value.clone()));
+        }
+        (S::Value(current), ValueData::Struct(fields)) if matches!(kind, First | Last | AnyValue) => {
+            let [inner] = fields.as_slice() else {
+                return Err(state_failure());
+            };
+            *current = Some(inner.clone());
+        }
+        (S::List(current), ValueData::List(items)) => *current = Some(items.clone()),
+        _ => return Err(state_failure()),
+    }
+    Ok(state)
+}
+
 /// A state as bytes, the value of an `AGGREGATE_STATE`: a tag and what the state holds.
 fn encode_state(state: &AggregateState) -> Result<Vec<u8>> {
     let (tag, first, second) = match state {
@@ -497,6 +672,24 @@ fn state_bytes(value: &Value) -> Result<&[u8]> {
     }
 }
 
+/// The state a value of the `AGGREGATE_STATE` type `ty` holds, in either form.
+fn read_state(kind: AggregateKind, value: &Value, ty: &LogicalType) -> Result<AggregateState> {
+    if ty.is_aggregate_state() {
+        value_to_state(kind, value, ty)
+    } else {
+        decode_state(state_bytes(value)?)
+    }
+}
+
+/// A state as a value of the `AGGREGATE_STATE` type `ty`, in its form.
+pub fn write_state(kind: AggregateKind, state: &AggregateState, ty: &LogicalType) -> Result<Value> {
+    if ty.is_aggregate_state() {
+        state_to_value(kind, state, ty)
+    } else {
+        Value::new(ty.clone(), ValueData::Bytes(encode_state(state)?))
+    }
+}
+
 /// `finalize`: the result of the aggregate from a state.
 pub fn finalize_state(value: &Value, ty: &LogicalType) -> Result<Value> {
     let (.., arguments, result) = ty.aggregate_state_info().ok_or_else(state_failure)?;
@@ -504,24 +697,35 @@ pub fn finalize_state(value: &Value, ty: &LogicalType) -> Result<Value> {
         return Ok(Value::null(result.clone()));
     }
     let function = state_function(ty)?;
-    function.finalize(&decode_state(state_bytes(value)?)?, result, arguments.first())
+    function.finalize(&read_state(function.kind, value, ty)?, result, arguments.first())
 }
 
 /// `combine` and `combine_aggr`: a state of the rows of two others.
 pub fn combine_state_values(left: &Value, right: &Value, ty: &LogicalType) -> Result<Value> {
-    if left.is_null() {
-        return Ok(right.clone());
-    }
-    if right.is_null() {
-        return Ok(left.clone());
+    // `AggregateStateCombine`: a NULL state is an empty one, and two of them stay NULL
+    if left.is_null() && right.is_null() {
+        return Ok(Value::null(ty.clone()));
     }
     let function = state_function(ty)?;
+    if !ty.is_aggregate_state() && (left.is_null() || right.is_null()) {
+        return Ok(if left.is_null() { right } else { left }.clone());
+    }
     let combined = combine_states(
         function.kind,
-        decode_state(state_bytes(left)?)?,
-        decode_state(state_bytes(right)?)?,
+        read_state(function.kind, left, ty)?,
+        read_state(function.kind, right, ty)?,
     )?;
-    Value::new(ty.clone(), ValueData::Bytes(encode_state(&combined)?))
+    write_state(function.kind, &combined, ty)
+}
+
+/// `CombineAggrFinalize` of a group no state was combined into: the empty state, which is NULL
+/// for the states of duckrs's own form.
+pub fn empty_state_value(ty: &LogicalType) -> Result<Value> {
+    if !ty.is_aggregate_state() {
+        return Ok(Value::null(ty.clone()));
+    }
+    let kind = state_function(ty)?.kind;
+    write_state(kind, &kind.initial_state(), ty)
 }
 
 /// A state combined with itself `times` times, by doubling. States that keep their rows can't
@@ -532,7 +736,8 @@ pub fn repeat_state(state: &Value, times: i128, ty: &LogicalType) -> Result<Valu
     if times == 0 || state.is_null() {
         return Ok(Value::null(ty.clone()));
     }
-    if let AggregateState::Rows(rows) = decode_state(state_bytes(state)?)?
+    let kind = state_function(ty)?.kind;
+    if let AggregateState::Rows(rows) = read_state(kind, state, ty)?
         && (rows.len() as u128).saturating_mul(times as u128) > MAX_REPEATED_ROWS
     {
         return Err(Error::new(ErrorKind::OutOfRange, "Overflow in aggregate state combine"));
@@ -572,7 +777,25 @@ pub fn export_state(
         .iter()
         .position(|f| f.kind == function.kind)
         .ok_or_else(not_exportable)?;
-    let ty = LogicalType::aggregate_state(&function.name, overload as u32, arguments.to_vec(), return_type.clone());
+    let ty = match state_layout(function.kind, arguments, return_type) {
+        // `EncodeStateParameters`: an argument the aggregate takes as ANY stays ANY
+        Some(layout) => {
+            let recorded = arguments
+                .iter()
+                .zip(&function.arguments)
+                .map(|(bound, declared)| {
+                    if declared.id() == LogicalTypeId::Any {
+                        declared
+                    } else {
+                        bound
+                    }
+                    .clone()
+                })
+                .collect();
+            LogicalType::aggregate_state_of(&layout, &function.name, overload as u32, recorded, return_type.clone())
+        }
+        None => LogicalType::aggregate_state(&function.name, overload as u32, arguments.to_vec(), return_type.clone()),
+    };
     let exported = AggregateFunction {
         name: function.name.clone(),
         arguments: function.arguments.clone(),
@@ -581,6 +804,174 @@ pub fn export_state(
         export: Some(ty.clone()),
     };
     Ok((exported, ty))
+}
+
+// Ported from `BindToAggregateState` and `BindExportedAggregate` of
+// duckdb/src/function/scalar/system/aggregate_export.cpp @ rust-port-baseline
+
+/// `to_aggregate_state(data, name, signature[, constant_parameters[, order_by]])`: `data` as a
+/// state of the aggregate `name` bound with the types of `signature`. `resolve_type` reads a
+/// type from its name.
+pub fn bind_to_aggregate_state(
+    mut children: Vec<crate::planner::expression::BoundExpr>,
+    resolve_type: &dyn Fn(&str) -> Result<LogicalType>,
+) -> Result<crate::planner::expression::BoundExpr> {
+    use crate::execution::expression_executor::evaluate_scalar;
+    use crate::planner::expression::BoundExpr;
+    let binder = |message: String| Error::new(ErrorKind::Binder, message);
+    if !(3..=5).contains(&children.len()) {
+        let types: Vec<String> = children.iter().map(|c| c.return_type.to_string()).collect();
+        return Err(binder(format!(
+            "No function matches the given name and argument types 'to_aggregate_state({})'. You might need to add \
+             explicit type casts.",
+            types.join(", ")
+        )));
+    }
+    for child in &children[1..] {
+        if !child.is_foldable() {
+            return Err(binder(
+                "to_aggregate_state: the aggregate name, signature and constant parameters must be constant".into(),
+            ));
+        }
+    }
+    let non_null = |child: &BoundExpr, what: &str| -> Result<Value> {
+        let value = evaluate_scalar(child)?;
+        if value.is_null() {
+            return Err(binder(format!("to_aggregate_state: the {what} cannot be NULL")));
+        }
+        Ok(value)
+    };
+    // the name may come as any type that casts to VARCHAR, a VARIANT among them
+    let name = non_null(
+        &children[1].clone().cast_to(&LogicalType::VARCHAR, false),
+        "aggregate name",
+    )?
+    .try_to_string()?;
+    let signature = non_null(&children[2], "signature")?;
+    let ValueData::List(entries) = signature.data() else {
+        if signature.logical_type().id() == LogicalTypeId::Variant {
+            return Err(binder(
+                "to_aggregate_state: the signature must be a list of types".into(),
+            ));
+        }
+        let types: Vec<String> = children.iter().map(|c| c.return_type.to_string()).collect();
+        return Err(binder(format!(
+            "No function matches the given name and argument types 'to_aggregate_state({})'. You might need to add \
+             explicit type casts.",
+            types.join(", ")
+        )));
+    };
+    // `ParseSignatureType`
+    let mut argument_types = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry.is_null() {
+            return Err(binder(
+                "to_aggregate_state: the signature cannot contain NULL values".into(),
+            ));
+        }
+        let ty = match entry.data() {
+            ValueData::Bytes(_) if entry.logical_type().id() == LogicalTypeId::Varchar => {
+                let name = entry.try_to_string()?;
+                if name.eq_ignore_ascii_case("ANY") {
+                    LogicalType::new(LogicalTypeId::Any)
+                } else {
+                    resolve_type(&name)?
+                }
+            }
+            _ => {
+                return Err(binder(
+                    "to_aggregate_state: the signature must be a list of types".into(),
+                ));
+            }
+        };
+        argument_types.push(ty);
+    }
+    if children.len() > 4 {
+        return Err(crate::unported("ordered aggregate states in to_aggregate_state"));
+    }
+    if children.len() > 3 {
+        let constants = evaluate_scalar(&children[3])?;
+        let bound = match constants.data() {
+            ValueData::List(items) => items.iter().any(|item| !item.is_null()),
+            _ => !constants.is_null(),
+        };
+        if bound {
+            return Err(crate::unported("constant parameters in to_aggregate_state"));
+        }
+    }
+    // `BindExportedAggregate`: the aggregate bound with NULLs of the signature's types
+    let set = super::BuiltinFunctions::get()
+        .aggregate(&name.to_lowercase())
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::Catalog,
+                format!("Aggregate Function with name {name} does not exist!"),
+            )
+        })?;
+    let placeholders = argument_types
+        .iter()
+        .map(|ty| {
+            let ty = if ty.id() == LogicalTypeId::Any {
+                LogicalType::SQLNULL
+            } else {
+                ty.clone()
+            };
+            BoundExpr::constant(Value::null(ty))
+        })
+        .collect();
+    let bound = super::binder::bind_aggregate_function(set, placeholders, None, false).map_err(|error| {
+        binder(format!(
+            "Could not re-bind exported aggregate {name}: {}",
+            error.message
+        ))
+    })?;
+    for (index, (requested, declared)) in argument_types.iter().zip(&bound.function.arguments).enumerate() {
+        if requested.id() == LogicalTypeId::Any && declared.id() != LogicalTypeId::Any {
+            return Err(binder(format!(
+                "Aggregate {name} requires a concrete type for signature argument {}",
+                index + 1
+            )));
+        }
+    }
+    let bound_arguments: Vec<LogicalType> = bound.children.iter().map(|c| c.return_type.clone()).collect();
+    let matches = bound_arguments.len() == argument_types.len()
+        && bound_arguments
+            .iter()
+            .zip(&argument_types)
+            .all(|(bound, requested)| requested.id() == LogicalTypeId::Any || bound == requested);
+    if !matches {
+        let list = |types: &[LogicalType]| types.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ");
+        return Err(binder(format!(
+            "Type mismatch for exported aggregate {name}: bound=[{}] requested=[{}]",
+            list(&bound_arguments),
+            list(&argument_types)
+        )));
+    }
+    if state_layout(bound.function.kind, &bound_arguments, &bound.return_type).is_none() {
+        return Err(crate::unported(format!(
+            "to_aggregate_state of {}",
+            bound.function.name
+        )));
+    }
+    let (_, state_type) = export_state(&bound.function, &bound.return_type, &bound_arguments)?;
+    let data = children.swap_remove(0).cast_to(&state_type.state_layout(), false);
+    Ok(super::nested::bound_function(
+        "to_aggregate_state",
+        vec![data],
+        state_type,
+        to_aggregate_state,
+    ))
+}
+
+/// `ToAggregateStateFunction`: the values, as states.
+fn to_aggregate_state(args: &duckrs_common::vector::DataChunk, result: &mut Vector) -> Result<()> {
+    let ty = result.logical_type().clone();
+    super::nested::row_wise(args, result, |row| {
+        if row[0].is_null() {
+            return Ok(Value::null(ty.clone()));
+        }
+        Value::new(ty.clone(), row[0].data().clone())
+    })
 }
 
 fn add_integers<T: NativeType + Into<i128>>(
@@ -784,7 +1175,7 @@ impl AggregateFunction {
     ) -> Result<Value> {
         use AggregateKind::*;
         if self.export.is_some() {
-            return Value::new(return_type.clone(), ValueData::Bytes(encode_state(state)?));
+            return write_state(self.kind, state, return_type);
         }
         let null = || Value::null(return_type.clone());
         Ok(match (self.kind, state) {

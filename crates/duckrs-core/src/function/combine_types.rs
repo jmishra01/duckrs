@@ -149,6 +149,10 @@ fn combine_rules(force: bool, left: &LogicalType, right: &LogicalType) -> Option
     let (l, r) = (left.id(), right.id());
     let either = |id: LogicalTypeId| l == id || r == id;
     if left.alias().is_some() || right.alias().is_some() {
+        // a plain value cannot implicitly become an aggregate state
+        if left.is_aggregate_state() != right.is_aggregate_state() {
+            return Some(None);
+        }
         // we always prefer aliased types
         return Some(Some(if left.alias().is_some() { left } else { right }.clone()));
     }
