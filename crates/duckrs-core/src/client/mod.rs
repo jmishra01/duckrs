@@ -5857,6 +5857,41 @@ mod tests {
     }
 
     #[test]
+    fn stats_function() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        run(
+            &mut c,
+            "CREATE TABLE t AS SELECT range i, CASE WHEN range % 2 = 0 THEN NULL ELSE range::DOUBLE END d FROM range(10)",
+        );
+        assert_eq!(
+            run(&mut c, "SELECT stats(i), stats(d) FROM t LIMIT 1"),
+            [[
+                "{'has_no_null': true, 'has_null': false, 'max': 9, 'min': 0}",
+                "{'has_no_null': true, 'has_null': true, 'max': 9.0, 'min': 1.0}"
+            ]]
+        );
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT s.min, s.max FROM (SELECT stats(i + 1) s FROM t WHERE i > 5 LIMIT 1)"
+            ),
+            [["6", "10"]]
+        );
+        assert_eq!(
+            run(&mut c, "SELECT stats(NULL), stats(42)"),
+            [[
+                "{'has_no_null': false, 'has_null': true}",
+                "{'has_no_null': true, 'has_null': false, 'max': 42, 'min': 42}"
+            ]]
+        );
+        // without the optimizer nothing works the statistics out
+        run(&mut c, "SET enable_optimizer = false");
+        assert_eq!(run(&mut c, "SELECT stats(i) FROM t LIMIT 1"), [["NULL"]]);
+        run(&mut c, "SET enable_optimizer = true");
+        assert!(error(&mut c, "SELECT stats('abc')").contains("stats() of a VARCHAR value is not yet ported"));
+    }
+
+    #[test]
     fn session_values() {
         let mut c = ClientContext::new(DatabaseInstance::new());
         run(

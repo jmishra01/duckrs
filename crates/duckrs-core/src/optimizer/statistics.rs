@@ -9,8 +9,8 @@
 //! kept up to date but worked out when a plan first reads them after a write to the table, with the
 //! `min`, `max` and `count` aggregates. Plans do not outlive a statement, so they cannot go stale.
 //!
-//! Not ported: what statistics do for the functions (`stats()` and overflow-free arithmetic among
-//! them), row groups, distinct counts, and the statistics of aggregates and windows. Those columns
+//! `stats()` shows what is known here. Not ported: what statistics do for the other functions
+//! (overflow-free arithmetic among them), row groups, distinct counts, and the statistics of aggregates and windows. Those columns
 //! count as unknown.
 
 use super::filter_pushdown::empty_result;
@@ -795,6 +795,17 @@ impl StatisticsPropagator {
             unreachable!()
         };
         let mut stats: Vec<Stats> = children.iter_mut().map(|c| self.expression(c, false)).collect();
+        // `StatsPropagateStats`: `stats()` gets the statistics of its argument as a constant
+        if function.name == "stats" && children.len() == 1 {
+            let argument = children[0].return_type.clone();
+            if crate::function::stats_supported(&argument)
+                && let Some(value) = stats_struct(&stats[0], &argument)
+            {
+                *function = Arc::new(crate::function::stats_with_value(argument));
+                children.push(BoundExpr::constant(value));
+            }
+            return unknown();
+        }
         if function.name == "constant_or_null" && stats[1..].iter().all(|s| !s.can_be_null) {
             let alias = expr.alias.clone();
             let value = children.swap_remove(0);
@@ -1175,6 +1186,25 @@ impl StatisticsPropagator {
 }
 
 /// The call of `function` with these two values.
+/// `BaseStatistics::ToStruct` of numeric statistics (`NumericStats::ToStruct`), as a VARIANT
+/// (`StatsPropagateStats`). duckrs keeps no distinct counts, so there is no `approx_unique`.
+fn stats_struct(stats: &Stats, ty: &LogicalType) -> Option<Value> {
+    let mut fields = Vec::new();
+    if let (Some(min), Some(max)) = (&stats.min, &stats.max)
+        && ty.id() != LogicalTypeId::SqlNull
+    {
+        fields.push(("min".to_string(), min.clone()));
+        fields.push(("max".to_string(), max.clone()));
+    }
+    fields.push(("has_null".to_string(), Value::boolean(stats.can_be_null)));
+    fields.push(("has_no_null".to_string(), Value::boolean(stats.can_be_valid)));
+    let variant = LogicalType::new(LogicalTypeId::Variant);
+    let source = duckrs_common::vector::Vector::constant(&Value::struct_value(fields));
+    let mut result = duckrs_common::vector::Vector::new(variant, 1);
+    crate::function::cast::cast_vector(&source, &mut result, 1, crate::function::cast::CastMode::Strict).ok()?;
+    Some(result.get_value(0))
+}
+
 fn expr_with_constants(
     function: &Arc<crate::function::ScalarFunction>,
     left: &Value,

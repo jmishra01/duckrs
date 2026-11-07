@@ -493,6 +493,7 @@ test/optimizer/statistics/statistics_case.test
 test/optimizer/statistics/statistics_coalesce.test
 test/optimizer/statistics/statistics_count_not_null_join_pruning.test
 test/optimizer/statistics/statistics_count_not_null_pruning.test
+test/optimizer/statistics/statistics_exp_libm.test
 test/optimizer/statistics/statistics_filter_multicolumn.test
 test/optimizer/statistics/statistics_join_always_matches_layout.test
 test/optimizer/statistics/statistics_join_arbitrary_condition.test
@@ -650,6 +651,7 @@ test/sql/alter/add_col/test_add_col_index.test
 test/sql/alter/add_col/test_add_col_index_rollback.test
 test/sql/alter/add_col/test_add_col_local_storage.test
 test/sql/alter/add_col/test_add_col_not_null.test
+test/sql/alter/add_col/test_add_col_stats.test
 test/sql/alter/add_col/test_add_col_unique.test
 test/sql/alter/add_pk/test_add_multi_column_pk.test
 test/sql/alter/add_pk/test_add_pk_alter_in_tx.test
@@ -678,6 +680,7 @@ test/sql/alter/alter_table_set_sorted_by.test
 test/sql/alter/alter_table_set_table_options.test
 test/sql/alter/alter_type/alter_type_failed_cast_keeps_table_usable.test
 test/sql/alter/alter_type/alter_type_struct.test
+test/sql/alter/alter_type/test_alter_type.test
 test/sql/alter/alter_type/test_alter_type_active_transaction_visibility.test
 test/sql/alter/alter_type/test_alter_type_check.test
 test/sql/alter/alter_type/test_alter_type_dependencies.test
@@ -2472,6 +2475,7 @@ test/sql/storage/delete/repeated_deletes.test
 test/sql/storage/delete/test_store_deletes.test
 test/sql/storage/delete/test_unchanged_deletes.test
 test/sql/storage/delete/test_unchanged_deletes_large.test
+test/sql/storage/distinct_statistics_storage.test
 test/sql/storage/extensions/extension_default.test
 test/sql/storage/extensions/extension_views.test
 test/sql/storage/filter_pushdown_struct.test

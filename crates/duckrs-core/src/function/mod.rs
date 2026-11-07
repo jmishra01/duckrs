@@ -221,6 +221,58 @@ pub fn typeof_constant(argument: &LogicalType) -> Value {
     Value::varchar(argument.to_string())
 }
 
+// Ported from duckdb/extension/core_functions/scalar/generic/stats.cpp and the `ToStruct` of
+// duckdb/src/storage/statistics/{base,numeric}_stats.cpp @ rust-port-baseline
+
+/// Whether `stats()` of a value of this type can be told: those whose statistics are the
+/// numeric ones (`NumericStats`), which is what duckrs keeps. The others (strings, nested
+/// types, VARIANT) have statistics of more kinds than duckrs works out.
+pub fn stats_supported(ty: &LogicalType) -> bool {
+    ty.id() == LogicalTypeId::SqlNull
+        || (crate::optimizer::statistics::has_ordered_statistics(ty) && ty.id() != LogicalTypeId::Varchar)
+}
+
+/// `stats(expression)`: the statistics of its argument, which the statistics propagator works
+/// out (`StatsPropagateStats`) and passes on as a second, constant argument
+/// ([`stats_with_value`]). Until then, as with the optimizer off, it is NULL.
+fn stats_function() -> ScalarFunctionSet {
+    fn unfilled(args: &DataChunk, result: &mut Vector) -> Result<()> {
+        let ty = args.columns()[0].logical_type();
+        if !stats_supported(ty) {
+            return Err(crate::unported(format!("stats() of a {ty} value")));
+        }
+        *result = Vector::constant_null(result.logical_type().clone());
+        Ok(())
+    }
+    fn resolve(function: &ScalarFunction, arguments: &[LogicalType]) -> Result<ScalarFunction> {
+        Ok(ScalarFunction::new(
+            function.name.clone(),
+            arguments.to_vec(),
+            function.return_type.clone(),
+            function.function,
+        ))
+    }
+    let mut set = ScalarFunctionSet::new("stats");
+    let function = ScalarFunction::new(
+        "stats",
+        vec![LogicalType::new(LogicalTypeId::Any)],
+        LogicalType::new(LogicalTypeId::Variant),
+        unfilled,
+    );
+    set.add(function.with_resolve_types(resolve));
+    set
+}
+
+/// The `stats` function once the propagator knows the statistics: they are its second argument.
+pub fn stats_with_value(argument: LogicalType) -> ScalarFunction {
+    fn filled(args: &DataChunk, result: &mut Vector) -> Result<()> {
+        *result = args.columns()[1].clone();
+        Ok(())
+    }
+    let variant = LogicalType::new(LogicalTypeId::Variant);
+    ScalarFunction::new("stats", vec![argument, variant.clone()], variant, filled)
+}
+
 /// The built-in functions by lowercase name. In DuckDB they are catalog entries of the system
 /// catalog; they move there when the catalog grows function entries.
 pub struct BuiltinFunctions {
@@ -297,6 +349,8 @@ impl BuiltinFunctions {
             functions.scalar.insert(set.name.clone(), set);
             let typeof_set = typeof_function();
             functions.scalar.insert(typeof_set.name.clone(), typeof_set);
+            let stats_set = stats_function();
+            functions.scalar.insert(stats_set.name.clone(), stats_set);
             for set in aggregates::aggregate_functions() {
                 functions.aggregate.insert(set.name.clone(), set);
             }

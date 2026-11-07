@@ -147,9 +147,16 @@ pub fn bind_scalar_function(
     // `FunctionNullHandling::SPECIAL_HANDLING`: the function decides what a NULL argument means
     let special_nulls = matches!(
         function.name.as_str(),
-        "string_split" | "str_split" | "string_to_array" | "split"
+        "string_split" | "str_split" | "string_to_array" | "split" | "stats"
     );
     if special_nulls {
+        let function = match function.resolve_types {
+            Some(resolve_types) => {
+                let types: Vec<LogicalType> = children.iter().map(|c| c.return_type.clone()).collect();
+                Arc::new(resolve_types(&function, &types)?)
+            }
+            None => function,
+        };
         let children = children
             .into_iter()
             .zip(&function.arguments)
