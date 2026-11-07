@@ -1041,6 +1041,9 @@ impl Binder<'_> {
                     );
                     return self.bind_expression(&Expr::from(ExprKind::Function(call)));
                 }
+                if function.name.name.eq_ignore_ascii_case("write_log") && function.name.qualification.is_empty() {
+                    return self.bind_write_log(function);
+                }
                 if function.name.name.eq_ignore_ascii_case("to_aggregate_state") {
                     let children = function
                         .args
@@ -1364,6 +1367,17 @@ impl Binder<'_> {
         }
         if matches!(name.as_str(), "txid_current" | "current_transaction_id") && function.args.is_empty() {
             return Ok(Some(BoundExpr::constant(Value::ubigint(self.options.transaction_id))));
+        }
+        if matches!(name.as_str(), "current_connection_id" | "current_query_id")
+            && function.args.is_empty()
+            && let Some(session) = &self.session
+        {
+            let id = if name == "current_query_id" {
+                session.query_id
+            } else {
+                session.connection_id
+            };
+            return Ok(Some(BoundExpr::constant(Value::ubigint(id))));
         }
         if !matches!(name.as_str(), "getvariable" | "current_setting") {
             return Ok(None);
@@ -1743,6 +1757,100 @@ fn switch_varchar_comparison(ty: &LogicalType) -> bool {
             | TimeTz
             | IntegerLiteral
     )
+}
+
+// Ported from `WriteLogResolveTypes` and `WriteLogBind` of
+// duckdb/src/function/scalar/system/write_log.cpp @ rust-port-baseline
+impl Binder<'_> {
+    /// `write_log(message, [level := ..., log_type := ..., scope := ..., disable_logging := ...,
+    /// return_value := ...])`: logs the message, and gives `return_value` or NULL.
+    fn bind_write_log(&mut self, function: &ast::FunctionExpr) -> Result<BoundExpr> {
+        let binder = |message: String| Error::new(ErrorKind::Binder, message);
+        let Some(first) = function.args.first() else {
+            return Err(binder("write_log takes at least one argument".into()));
+        };
+        let message = self.bind_expression(&first.expr)?;
+        if !matches!(
+            message.return_type.id(),
+            LogicalTypeId::Varchar | LogicalTypeId::StringLiteral
+        ) || message.return_type.alias().is_some()
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidType,
+                "write_log first argument must be a VARCHAR",
+            ));
+        }
+        let message = message.cast_to(&LogicalType::VARCHAR, false);
+        let (mut level, mut log_type, mut scope, mut disabled) =
+            ("INFO".to_string(), String::new(), String::new(), false);
+        let mut output = None;
+        for argument in &function.args[1..] {
+            let bound = self.bind_expression(&argument.expr)?;
+            let is = |id: LogicalTypeId| {
+                bound.return_type.id() == id
+                    || (id == LogicalTypeId::Varchar && bound.return_type.id() == LogicalTypeId::StringLiteral)
+            };
+            let text = |bound: &BoundExpr| -> Result<String> {
+                crate::execution::expression_executor::evaluate_scalar(bound)?.try_to_string()
+            };
+            match argument.name.as_str() {
+                "disable_logging" => {
+                    if !is(LogicalTypeId::Boolean) {
+                        return Err(binder("write_log: 'disable_logging' argument must be a boolean".into()));
+                    }
+                    disabled = text(&bound)? == "true";
+                }
+                "scope" => {
+                    if !is(LogicalTypeId::Varchar) {
+                        return Err(binder("write_log: 'scope' argument must be a string".into()));
+                    }
+                    scope = text(&bound)?;
+                }
+                "level" => {
+                    if !is(LogicalTypeId::Varchar) {
+                        return Err(binder("write_log: 'level' argument must be a string".into()));
+                    }
+                    level = crate::logging::LogLevel::parse(&text(&bound)?)?.name().to_string();
+                }
+                "log_type" => {
+                    if !is(LogicalTypeId::Varchar) {
+                        return Err(binder("write_log: 'log_type' argument must be a string".into()));
+                    }
+                    log_type = text(&bound)?;
+                }
+                "return_value" => output = Some(bound),
+                name => return Err(binder(format!("write_log: Unknown argument {name}"))),
+            }
+        }
+        let Some(session) = self.session.clone() else {
+            return Err(crate::unported("write_log here"));
+        };
+        let return_type = output.as_ref().map_or(LogicalType::VARCHAR, |o| o.return_type.clone());
+        let mut children = vec![
+            message,
+            BoundExpr::constant(Value::ubigint(session.log_target)),
+            BoundExpr::constant(Value::varchar(level)),
+            BoundExpr::constant(Value::varchar(log_type)),
+            BoundExpr::constant(Value::varchar(scope)),
+            BoundExpr::constant(Value::boolean(disabled)),
+        ];
+        children.extend(output);
+        let arguments = children.iter().map(|c| c.return_type.clone()).collect();
+        let scalar = crate::function::ScalarFunction::new(
+            "write_log",
+            arguments,
+            return_type.clone(),
+            crate::logging::write_log,
+        );
+        Ok(BoundExpr::new(
+            BoundExprKind::Function {
+                function: Arc::new(scalar),
+                children,
+                is_operator: false,
+            },
+            return_type,
+        ))
+    }
 }
 
 #[cfg(test)]

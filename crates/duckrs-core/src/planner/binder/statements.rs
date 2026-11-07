@@ -1502,6 +1502,10 @@ impl Binder<'_> {
                 if entry.is_err() && name.qualification.is_empty() && Self::is_system_table(&name.name) {
                     return self.bind_system_table(table_ref, &name.name);
                 }
+                // the `duckdb_logs` view of `default_views.cpp`
+                if entry.is_err() && name.qualification.is_empty() && name.name.eq_ignore_ascii_case("duckdb_logs") {
+                    return self.bind_log_table("duckdb_logs", true, table_ref);
+                }
                 let table = match entry? {
                     TableOrView::Table(table) => table,
                     TableOrView::View(view) => return self.bind_view(table_ref, view),
@@ -1735,6 +1739,9 @@ impl Binder<'_> {
         let name = call.name.name.to_lowercase();
         if name == "duckdb_settings" {
             return self.bind_duckdb_settings(call, table_ref);
+        }
+        if name == "duckdb_logs" || name == "duckdb_log_contexts" {
+            return self.bind_duckdb_logs(&name, call, table_ref);
         }
         if name == "pragma_storage_info" {
             return self.bind_storage_info(call, table_ref);

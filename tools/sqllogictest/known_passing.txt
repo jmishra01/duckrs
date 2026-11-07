@@ -40,6 +40,7 @@ test/fuzzer/duckfuzz/late_materialization_filter.test
 test/fuzzer/duckfuzz/limit_percent_subquery.test
 test/fuzzer/duckfuzz/list_try_cast.test
 test/fuzzer/duckfuzz/list_zip_no_args.test
+test/fuzzer/duckfuzz/logger_null.test
 test/fuzzer/duckfuzz/null_checkpoint.test
 test/fuzzer/duckfuzz/ordagg_nargs.test
 test/fuzzer/duckfuzz/order_by_positional_reference.test
@@ -1949,6 +1950,10 @@ test/sql/limit/streaming_limit_pipeline_flush2.test
 test/sql/limit/test_batch_limit_filters.test
 test/sql/limit/test_limit0.test
 test/sql/limit/test_preserve_insertion_order.test
+test/sql/logging/logging.test
+test/sql/logging/logging_context_ids.test
+test/sql/logging/logging_non_queryable_storage.test
+test/sql/logging/test_logging_function.test
 test/sql/merge/merge_into_bind_matching_columns.test
 test/sql/merge/merge_into_by_source.test
 test/sql/merge/merge_into_constraint.test

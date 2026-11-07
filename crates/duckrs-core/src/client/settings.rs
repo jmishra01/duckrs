@@ -374,6 +374,14 @@ pub fn reset_variable(
     Ok(())
 }
 
+/// Stores `value` as the global value of `name`, as it is: for the settings whose value lives
+/// elsewhere and is read from there (`GetSetting`), such as the logging settings.
+pub fn store_global(name: &str, value: Value, global: &mut SettingValues) {
+    if let Some((index, _)) = find_setting(name) {
+        global.0.insert(index, value);
+    }
+}
+
 /// The current value of a setting: the session's, else the database's, else the default.
 /// `current_setting`.
 pub fn get_setting(name: &str, global: &SettingValues, session: &SettingValues) -> Result<Value> {

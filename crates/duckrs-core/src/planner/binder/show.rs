@@ -827,6 +827,87 @@ impl Binder<'_> {
         result
     }
 
+    /// `duckdb_logs()` (`DuckDBLogBindReplace`), and `duckdb_log_contexts()`: what the log
+    /// storage holds, the entries alone or, with `denormalized_table`, each with its context.
+    pub(super) fn bind_duckdb_logs(
+        &mut self,
+        name: &str,
+        call: &duckrs_parser::ast::FunctionExpr,
+        table_ref: &TableRef,
+    ) -> Result<LogicalOperator> {
+        let mut denormalized = false;
+        for argument in call.args.iter().map(super::table_functions::named_argument) {
+            if name == "duckdb_logs" && argument.name.eq_ignore_ascii_case("denormalized_table") {
+                let value = self.constant_argument(&argument.expr)?;
+                if value.is_null() {
+                    return Err(duckrs_common::Error::new(
+                        ErrorKind::InvalidInput,
+                        "denormalized_table cannot be NULL",
+                    ));
+                }
+                denormalized = value.try_to_string()? == "true";
+            } else if argument.name.is_empty() {
+                return Err(binder_error(format!("{name} takes no positional arguments")));
+            } else {
+                return Err(binder_error(format!(
+                    "Invalid named parameter \"{}\" for function {name}",
+                    argument.name
+                )));
+            }
+        }
+        self.bind_log_table(name, denormalized, table_ref)
+    }
+
+    /// The rows of `duckdb_logs()`, `duckdb_logs(denormalized_table = true)` (the `duckdb_logs`
+    /// view) or `duckdb_log_contexts()`.
+    pub(super) fn bind_log_table(
+        &mut self,
+        name: &str,
+        denormalized: bool,
+        table_ref: &TableRef,
+    ) -> Result<LogicalOperator> {
+        let Some(session) = self.session.clone() else {
+            return Err(crate::unported(format!("{name} here")));
+        };
+        let (ubigint, varchar) = (LogicalType::UBIGINT, LogicalType::VARCHAR);
+        let context_columns = vec![
+            ("context_id", ubigint.clone()),
+            ("scope", varchar.clone()),
+            ("connection_id", ubigint.clone()),
+            ("transaction_id", ubigint.clone()),
+            ("query_id", ubigint.clone()),
+            ("thread_id", ubigint.clone()),
+        ];
+        let entry_columns = vec![
+            ("context_id", ubigint),
+            (
+                "timestamp",
+                LogicalType::new(duckrs_common::types::LogicalTypeId::TimestampTz),
+            ),
+            ("type", varchar.clone()),
+            ("log_level", varchar.clone()),
+            ("message", varchar),
+        ];
+        let manager = session.log_manager.lock().expect("the log manager is not poisoned");
+        let (columns, rows) = if name == "duckdb_log_contexts" {
+            let (_, contexts) = manager.scan()?;
+            (
+                context_columns,
+                contexts.iter().map(crate::logging::context_values).collect(),
+            )
+        } else if denormalized {
+            let mut columns = context_columns;
+            columns.extend(entry_columns.into_iter().skip(1));
+            (columns, manager.denormalized_rows()?)
+        } else {
+            let (entries, _) = manager.scan()?;
+            (entry_columns, entries.iter().map(|e| e.values()).collect())
+        };
+        drop(manager);
+        let (names, types) = columns.into_iter().map(|(n, t)| (n.to_string(), t)).unzip();
+        self.bind_rows(table_ref, name, names, types, rows)
+    }
+
     /// `duckdb_settings()` (`DuckDBSettingsBind`, `DuckDBSettingsInit`): the settings, without
     /// the debug and deprecated ones unless asked for.
     pub(super) fn bind_duckdb_settings(

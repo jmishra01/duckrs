@@ -5,12 +5,13 @@
 //! parser, binder, planner and executor.
 
 mod explain;
+mod logging;
 pub mod settings;
 mod settings_table;
 
 use crate::catalog::{
     Catalog, DEFAULT_CATALOG, Fork, IndexCatalogEntry, OnCreateConflict, SchemaCatalogEntry, SequenceData, SessionTemp,
-    TEMP_SCHEMA, TableOrView, macro_type_name, missing_entry, tick,
+    TEMP_SCHEMA, TableOrView, macro_type_name, missing_entry,
 };
 use crate::catalog::{DatabaseList, DatabaseListing};
 use crate::execution::alter::{execute_alter, execute_create_index};
@@ -74,6 +75,12 @@ pub struct DatabaseInstance {
     /// What `ATTACH` added to this database, which connections go to with `USE` or by name. A
     /// query runs in one database, so one that reads two isn't ported.
     attached: RwLock<BTreeMap<String, Arc<DatabaseInstance>>>,
+    /// `DatabaseInstance::GetLogManager`
+    log_manager: crate::logging::SharedLogManager,
+    /// `DatabaseManager::GetNewQueryNumber`: the queries so far
+    query_number: AtomicU64,
+    /// `global_transaction_id`: the transactions so far, an auto-commit statement being one
+    transaction_number: AtomicU64,
 }
 
 /// What `ATTACH` can say of a file.
@@ -127,6 +134,9 @@ impl DatabaseInstance {
             log_sync_failed: AtomicBool::new(false),
             name: DEFAULT_CATALOG.to_string(),
             attached: RwLock::default(),
+            log_manager: Arc::default(),
+            query_number: AtomicU64::new(0),
+            transaction_number: AtomicU64::new(0),
         }
     }
 
@@ -526,13 +536,21 @@ pub struct ClientContext {
     variables: HashMap<String, Value>,
     /// its temporary objects, which the `temp` catalog holds in C++
     temp: Arc<SchemaCatalogEntry>,
+    /// the connection's logger (`ClientContext::logger`), which `write_log` finds by its id
+    log_target: Arc<crate::logging::LogTarget>,
+    log_target_id: u64,
+    /// the query running now (`TransactionContext::GetActiveQuery`)
+    query_id: u64,
+    /// the transaction number of the statement running now
+    statement_transaction: u64,
 }
 
 /// A transaction started with BEGIN.
 #[derive(Debug)]
 struct ActiveTransaction {
-    /// What `txid_current` says.
-    id: u64,
+    /// What `txid_current` says (`global_transaction_id`): the number of the BEGIN that started
+    /// it, which ran in a transaction of its own that became this one.
+    number: u64,
     read_only: bool,
     /// a statement failed in a way that leaves only ROLLBACK (`ValidChecker`)
     invalidated: bool,
@@ -620,17 +638,26 @@ impl ClientContext {
         let list: Arc<dyn DatabaseList> = db.clone();
         db.catalog.set_database_list(Arc::downgrade(&list));
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-        Self {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let log_target = Self::new_log_target(&db, id);
+        let log_target_id = crate::logging::register_target(&log_target);
+        let context = Self {
             home: db.clone(),
             db,
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            id,
             transaction: None,
             settings: SettingValues::default(),
             prepared_statements: HashMap::new(),
             parameters: None,
             variables: HashMap::new(),
             temp: SessionTemp::new_schema(),
-        }
+            log_target,
+            log_target_id,
+            query_id: 0,
+            statement_transaction: 0,
+        };
+        context.sync_logging_settings();
+        context
     }
 
     /// The current value of a setting (`Settings::Get` / `current_setting`).
@@ -684,6 +711,10 @@ impl ClientContext {
         let (db, session) = (self.home.clone(), self.settings.clone());
         let (list_db, list_session) = (self.home.clone(), self.settings.clone());
         Arc::new(SessionValues {
+            log_manager: self.home.log_manager.clone(),
+            log_target: self.log_target_id,
+            connection_id: self.id,
+            query_id: self.query_id,
             variables: self.variables.clone(),
             setting: Box::new(move |name| settings::get_setting(name, &db.settings.read(), &session)),
             settings: Box::new(move || settings::list_settings(&list_db.settings.read(), &list_session)),
@@ -715,7 +746,7 @@ impl ClientContext {
             transaction_id: self
                 .transaction
                 .as_ref()
-                .map_or_else(tick, |transaction| transaction.id),
+                .map_or(self.statement_transaction, |transaction| transaction.number),
             default_order: if self.setting_text("default_order") == "DESC" {
                 OrderType::Descending
             } else {
@@ -751,7 +782,7 @@ impl ClientContext {
     /// `ClientContext::Query`: runs every statement in `sql` and returns the last result.
     pub fn query(&mut self, sql: &str) -> Result<MaterializedQueryResult> {
         let _temp = SessionTemp::enter(&self.temp);
-        let statements = match duckrs_parser::parse_ast_with(sql, &self.parser_options()) {
+        let statements = match duckrs_parser::parse_ast_with_text(sql, &self.parser_options()) {
             Ok(statements) => statements,
             Err(error) => {
                 if let Some(transaction) = &mut self.transaction {
@@ -765,8 +796,11 @@ impl ClientContext {
             types: Vec::new(),
             collection: ColumnDataCollection::new(Vec::new()),
         };
-        for statement in &statements {
-            result = self.run_statement(statement)?;
+        for (statement, text) in &statements {
+            self.begin_statement_logging(text)?;
+            let outcome = self.run_statement(statement);
+            self.end_statement_logging();
+            result = outcome?;
         }
         Ok(result)
     }
@@ -885,7 +919,7 @@ impl ClientContext {
                 }
                 self.db.transactions.lock().open.insert(self.id);
                 self.transaction = Some(ActiveTransaction {
-                    id: tick(),
+                    number: self.statement_transaction,
                     read_only: modifier == TransactionModifier::ReadOnly,
                     invalidated: false,
                     invalidation_policy: self.setting_text("default_transaction_invalidation_policy"),
@@ -1711,11 +1745,27 @@ impl ClientContext {
                     transaction.invalidation_policy = value.try_to_string()?.to_uppercase();
                 }
                 let mut global = self.home.settings.write();
+                if let Some(setting) = logging::is_logging_setting(name) {
+                    // checked as for any setting, and then given to the log manager
+                    let (mut checked, mut session) = (global.clone(), self.settings.clone());
+                    settings::set_variable(name, *scope, &value, &mut checked, &mut session)?;
+                    let value = settings::current_value(setting, &checked, &session).unwrap_or_else(Value::sql_null);
+                    drop(global);
+                    self.set_logging_setting(setting, &value)?;
+                    return Ok(Self::success());
+                }
                 settings::set_variable(name, *scope, &value, &mut global, &mut self.settings)?;
                 return Ok(Self::success());
             }
             Statement::ResetVariable { name, scope } => {
                 let mut global = self.home.settings.write();
+                if let Some(setting) = logging::is_logging_setting(name) {
+                    let (mut checked, mut session) = (global.clone(), self.settings.clone());
+                    settings::reset_variable(name, *scope, &mut checked, &mut session)?;
+                    drop(global);
+                    self.reset_logging_setting(setting)?;
+                    return Ok(Self::success());
+                }
                 settings::reset_variable(name, *scope, &mut global, &mut self.settings)?;
                 return Ok(Self::success());
             }
@@ -1751,6 +1801,18 @@ impl ClientContext {
                     let query = duckrs_parser::parse_ast(&sql)?.remove(0);
                     return self.execute_statement(&query);
                 }
+                if ["enable_logging", "disable_logging", "truncate_duckdb_logs"]
+                    .iter()
+                    .any(|f| f.eq_ignore_ascii_case(name))
+                {
+                    return Err(Error::new(
+                        ErrorKind::Catalog,
+                        format!(
+                            "Pragma Function with name \"{name}\" does not exist, but a table function with the same \
+                             name exists, try `CALL \"{name}\"(...)`"
+                        ),
+                    ));
+                }
                 return Err(crate::unported(format!("PRAGMA {name}")));
             }
             Statement::Explain {
@@ -1784,6 +1846,9 @@ impl ClientContext {
             }
             Statement::Call(function) if checkpoint_call(function).is_some() => {
                 return self.checkpoint(function);
+            }
+            Statement::Call(function) if logging::logging_call(function).is_some() => {
+                return self.run_logging_call(function);
             }
             Statement::Prepare { name, statement } => {
                 let prepared = self.prepare_statement((**statement).clone())?;
@@ -2003,6 +2068,7 @@ impl ClientContext {
         let skip_binding = *defer_binding || (on_conflict == OnCreateConflict::Ignore && exists);
         if !skip_binding {
             let mut binder = Binder::with_options(&catalog, self.bind_options());
+            binder.session = Some(self.session_values());
             binder.bind_create_view(query, aliases, &schema.name)?;
         }
         schema.create_view(&info.name.name, (**query).clone(), aliases.clone(), on_conflict)
@@ -2019,6 +2085,7 @@ impl ClientContext {
         let catalog = self.catalog();
         let schema = catalog.schema_for(create_schema_of(info)?)?;
         let mut binder = Binder::with_options(&catalog, self.bind_options());
+        binder.session = Some(self.session_values());
         binder.bind_create_macro(&info.name.name, macros, *table_macro, &schema.name)?;
         if on_create_conflict(info.on_conflict) == OnCreateConflict::Replace {
             macro_is_free(&schema, &info.name.name)?;
@@ -5930,6 +5997,41 @@ mod tests {
             [["[3, 1, 2]", "2.5"]]
         );
         assert!(error(&mut c, "SELECT to_aggregate_state(1, 'nope', ['INTEGER'])").contains("nope does not exist"));
+    }
+
+    #[test]
+    fn logging() {
+        let mut c = ClientContext::new(DatabaseInstance::new());
+        let logs = "SELECT scope, type, log_level, message FROM duckdb_logs WHERE type = 'QueryLog'";
+        assert!(run(&mut c, "FROM duckdb_logs").is_empty());
+        run(&mut c, "SET enable_logging = true");
+        run(&mut c, "SELECT 1;");
+        // a statement does not see the entry of its own query
+        assert_eq!(run(&mut c, logs), [["CONNECTION", "QueryLog", "INFO", "SELECT 1;"]]);
+        run(&mut c, "SET enable_logging = false");
+        assert_eq!(run(&mut c, logs).len(), 3);
+        assert_eq!(
+            error(&mut c, "SET logging_storage = 'quack'"),
+            "Invalid Input Error: Log storage 'quack' is not yet registered"
+        );
+        assert_eq!(run(&mut c, "SELECT current_setting('enable_logging')"), [["0"]]);
+        run(&mut c, "CALL truncate_duckdb_logs()");
+        run(&mut c, "CALL enable_logging('QueryLog', level = 'debug')");
+        assert_eq!(
+            run(&mut c, "SELECT current_setting('logging_mode'), current_setting('enabled_log_types')"),
+            [["ENABLE_SELECTED", "QueryLog"]]
+        );
+        run(&mut c, "CALL enable_logging()");
+        run(&mut c, "SELECT write_log('hello', log_type := 'mine', level := 'warning', return_value := 42)");
+        assert_eq!(
+            run(&mut c, "SELECT type, log_level, message FROM duckdb_logs WHERE type = 'mine'"),
+            [["mine", "WARNING", "hello"]]
+        );
+        assert_eq!(
+            error(&mut c, "CALL enable_logging('nope')"),
+            "Invalid Input Error: Unknown log type: 'nope'"
+        );
+        assert!(error(&mut c, "PRAGMA enable_logging").contains("try `CALL \"enable_logging\"(...)`"));
     }
 
     #[test]

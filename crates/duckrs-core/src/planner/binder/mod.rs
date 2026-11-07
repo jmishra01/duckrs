@@ -21,6 +21,7 @@ mod star;
 mod statements;
 mod table_constraints;
 mod table_functions;
+pub(crate) use table_functions::named_argument;
 mod window;
 
 use crate::optimizer::OptimizerOptions;
@@ -492,6 +493,12 @@ pub enum DefaultNullOrder {
 pub struct SessionValues {
     pub variables: HashMap<String, Value>,
     pub setting: SettingLookup,
+    /// `duckdb_logs()`, and the connection's logger for `write_log`
+    pub log_manager: crate::logging::SharedLogManager,
+    pub log_target: u64,
+    /// `current_connection_id()` and `current_query_id()`
+    pub connection_id: u64,
+    pub query_id: u64,
     /// `duckdb_settings()`
     pub settings: SettingList,
 }

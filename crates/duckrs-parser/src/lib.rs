@@ -74,6 +74,27 @@ pub fn parse_ast_with(sql: &str, options: &ParserOptions) -> Result<Vec<ast::Sta
     })?
 }
 
+/// [`parse_ast_with`], with the text of each statement (`SQLStatement::query`): from where it
+/// starts to where the next one does, or to the end of the SQL for the last one.
+pub fn parse_ast_with_text(sql: &str, options: &ParserOptions) -> Result<Vec<(ast::Statement, String)>> {
+    let sql = sql.to_string();
+    let options = options.clone();
+    pool::run(move || {
+        let (text, _, trees, starts) = parse_statements(&sql, &options)?;
+        let mut transformer = transformer::Transformer::new(Grammar::duckdb());
+        transformer.max_expression_depth = options.max_expression_depth;
+        trees
+            .iter()
+            .enumerate()
+            .map(|(i, tree)| {
+                let end = starts.get(i + 1).copied().unwrap_or(text.len());
+                let statement = transformer.top_level_statement(tree)?;
+                Ok((statement, text[starts[i]..end].to_string()))
+            })
+            .collect()
+    })?
+}
+
 /// Parses on the current thread (which must have a large enough stack).
 pub fn parse_on_this_thread(sql: &str) -> Result<(Vec<Token>, Vec<Arc<ParseNode>>)> {
     parse_on_this_thread_with(sql, &ParserOptions::default())
@@ -81,18 +102,29 @@ pub fn parse_on_this_thread(sql: &str) -> Result<(Vec<Token>, Vec<Arc<ParseNode>
 
 /// [`parse_on_this_thread`] with explicit options.
 pub fn parse_on_this_thread_with(sql: &str, options: &ParserOptions) -> Result<(Vec<Token>, Vec<Arc<ParseNode>>)> {
+    let (_, tokens, statements, _) = parse_statements(sql, options)?;
+    Ok((tokens, statements))
+}
+
+/// The statements of `sql` and the offset each starts at, in the text they were parsed from.
+type ParsedStatements = (String, Vec<Token>, Vec<Arc<ParseNode>>, Vec<usize>);
+
+fn parse_statements(sql: &str, options: &ParserOptions) -> Result<ParsedStatements> {
     let stripped = unicode::strip_unicode_spaces(sql);
-    let tokens = tokenizer::tokenize(stripped.as_deref().unwrap_or(sql))?;
+    let text = stripped.unwrap_or_else(|| sql.to_string());
+    let tokens = tokenizer::tokenize(&text)?;
     let grammar = Grammar::duckdb();
     let statement = grammar.rule("Statement").expect("the grammar has a Statement rule");
     let mut matcher = Matcher::new(grammar, &tokens);
     let mut statements = Vec::new();
+    let mut starts = Vec::new();
     let mut pos = 0;
     // Program <- TopLevelStatement*;  TopLevelStatement <- Statement? (';'+ / EndOfInput)
     loop {
         let end = match matcher.match_rule(statement, pos) {
             Some((end, tree)) => {
                 statements.push(tree);
+                starts.push(tokens[pos].offset);
                 end
             }
             None => pos,
@@ -121,7 +153,7 @@ pub fn parse_on_this_thread_with(sql: &str, options: &ParserOptions) -> Result<(
             _ => return Err(syntax_error(&tokens, matcher.max_position.max(end))),
         }
     }
-    Ok((tokens, statements))
+    Ok((text, tokens, statements, starts))
 }
 
 /// `syntax error at or near "..."` at the furthest token the matcher reached.
