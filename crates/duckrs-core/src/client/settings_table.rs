@@ -12,6 +12,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: Some("AccessMode"),
         enum_values: &["UNDEFINED", "AUTOMATIC", "READ_ONLY", "READ_WRITE"],
+        description: "Access mode of the database (AUTOMATIC, READ_ONLY or READ_WRITE).",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "active_grammar_extensions",
@@ -21,6 +24,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "The grammar extensions used by the parser.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "allocator_background_threads",
@@ -30,6 +36,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Whether to enable the allocator background threads.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "allocator_bulk_deallocation_flush_threshold",
@@ -39,6 +48,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "If a bulk deallocation larger than this occurs, flush outstanding allocations.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "allocator_flush_threshold",
@@ -48,6 +60,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("134217728B"),
         enum_name: None,
         enum_values: &[],
+        description: "Peak allocation threshold at which to flush the allocator after completing a task.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "allow_community_extensions",
@@ -57,6 +72,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("true"),
         enum_name: None,
         enum_values: &[],
+        description: "Allow loading extensions build by the community.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "allow_extension_repositories",
@@ -66,6 +84,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("undecided"),
         enum_name: None,
         enum_values: &[],
+        description: "Whether custom trusted extension repositories are 'allowed', 'forbidden' (which also distrusts existing repositories) or 'undecided' (the default: blocks adding new repositories, but keeps trusting existing ones). While the database is running the setting can only move from 'undecided' to 'allowed' or 'forbidden', or from 'allowed' to 'forbidden'.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "allow_extensions_metadata_mismatch",
@@ -75,6 +96,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Allow to load extensions with no compatible metadata.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "allow_parser_override_extension",
@@ -84,6 +108,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("DEFAULT"),
         enum_name: Some("AllowParserOverride"),
         enum_values: &["DEFAULT", "FALLBACK", "STRICT"],
+        description: "Allow extensions to override the current parser.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "allow_persistent_secrets",
@@ -93,6 +120,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Allow the creation of persistent secrets that are stored and loaded on restarts.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "allow_unredacted_secrets",
@@ -102,6 +132,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Allow printing unredacted secrets.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "allow_unsigned_extensions",
@@ -111,6 +144,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Allow to load extensions with invalid or missing signatures.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "allowed_configs",
@@ -120,6 +156,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "List of configuration options that are ALWAYS allowed to be changed, even when lock_configuration is true.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "allowed_directories",
@@ -129,6 +168,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "List of directories, and directory prefixes, that are ALWAYS allowed to be queried, even when enable_external_access is false.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "allowed_paths",
@@ -138,6 +180,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "List of files that are ALWAYS allowed to be queried, even when enable_external_access is false.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "approximate_join_order_threshold",
@@ -147,6 +192,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("12"),
         enum_name: None,
         enum_values: &[],
+        description: "The minimum number of tables in a join to determine the optimal join order approximately instead of exactly.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "arrow_large_buffer_size",
@@ -156,6 +204,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Whether Arrow buffers for strings, blobs, UUIDs and bits should be exported using large buffers.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "arrow_lossless_conversion",
@@ -165,6 +216,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Whenever a DuckDB type does not have a clear native or canonical extension match in Arrow, export the types with a duckdb.type_name extension name.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "arrow_output_list_view",
@@ -174,6 +228,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Whether the export to the Arrow format should use ListView as the physical layout for LIST columns.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "arrow_output_version",
@@ -183,6 +240,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("1.0"),
         enum_name: Some("ArrowFormatVersion"),
         enum_values: &["1.0", "1.1", "1.2", "1.3", "1.4", "1.5"],
+        description: "Whether strings should be produced by DuckDB in Utf8View format instead of Utf8.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "asof_loop_join_threshold",
@@ -192,6 +252,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("64"),
         enum_name: None,
         enum_values: &[],
+        description: "The maximum number of rows we need on the left side of an ASOF join to use a nested loop join.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "async_threads",
@@ -201,6 +264,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "The number of total async threads used by the system for tasks like I/O.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "auto_checkpoint_skip_wal_threshold",
@@ -210,6 +276,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("100000"),
         enum_name: None,
         enum_values: &[],
+        description: "The estimated WAL write size at which point we will skip writing to the WAL and only checkpoint. Skipping writing to the WAL means concurrent commits are blocked while the checkpoint is happening.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "autoinstall_extension_repository",
@@ -219,6 +288,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some(""),
         enum_name: None,
         enum_values: &[],
+        description: "Overrides the custom endpoint for extension installation on autoloading. Falls back to custom_extension_repository, if not specified.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "autoinstall_known_extensions",
@@ -228,6 +300,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("true"),
         enum_name: None,
         enum_values: &[],
+        description: "Whether known extensions are allowed to be automatically installed when a query depends on them.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "autoload_known_extensions",
@@ -237,6 +312,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("true"),
         enum_name: None,
         enum_values: &[],
+        description: "Whether known extensions are allowed to be automatically loaded when a query depends on them.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "cache_local_files",
@@ -246,6 +324,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Whether the external file cache also caches local files. Remote files are always cached.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "catalog_error_max_schemas",
@@ -255,6 +336,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("100"),
         enum_name: None,
         enum_values: &[],
+        description: "The maximum number of schemas in the catalog that the system will scan to generate the \"did you mean...\" error message.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "checkpoint_on_detach",
@@ -264,6 +348,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("DEFAULT"),
         enum_name: Some("CheckpointOnDetach"),
         enum_values: &["DEFAULT", "ENABLED", "DISABLED"],
+        description: "Override checkpoint behavior when detaching a database. ENABLED requests a checkpoint, but the checkpoint does not occur if another connection still references the database. DISABLED never checkpoints, DEFAULT defers to the global checkpoint_on_shutdown setting.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "checkpoint_threshold",
@@ -273,6 +360,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "The WAL size threshold at which to automatically trigger a checkpoint, e.g. 1GB.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "current_dialect",
@@ -282,6 +372,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "The SQL dialect used by the parser.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "current_transaction_invalidation_policy",
@@ -291,6 +384,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("STANDARD_POLICY"),
         enum_name: None,
         enum_values: &[],
+        description: "Which types of exceptions invalidate the database for the current transaction.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "custom_extension_repository",
@@ -300,6 +396,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some(""),
         enum_name: None,
         enum_values: &[],
+        description: "Overrides the custom endpoint for extension installation.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "custom_user_agent",
@@ -309,6 +408,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "HTTP request metadata that can be set by callers/wrappers to tag their own traffic when DuckDB makes a request.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_abort_on_wal_failure",
@@ -318,6 +420,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Whether or not to abort if a serialization exception is thrown during WAL playback.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_asof_iejoin",
@@ -327,6 +432,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Force the use of an IEJoin to implement ASOF joins.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_checkpoint_abort",
@@ -347,6 +455,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
             "IN_MEMORY_CHECKPOINT",
             "BEFORE_WAL_FLUSH",
         ],
+        description: "Trigger an abort while checkpointing.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_checkpoint_scan_sleep_ms",
@@ -356,6 +467,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("0"),
         enum_name: None,
         enum_values: &[],
+        description: "DEBUG SETTING: time to sleep after a checkpoint has written a table's row groups, before it installs them",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_checkpoint_sleep_ms",
@@ -365,6 +479,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("0"),
         enum_name: None,
         enum_values: &[],
+        description: "Time to sleep before a checkpoint is invoked.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_delta_only_variant_encoding_enabled",
@@ -374,6 +491,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Enables the Parquet reader to identify a Variant structurally.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_disable_optimizer",
@@ -383,6 +503,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Disable running the optimizer.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_enable_caching_operators",
@@ -392,6 +515,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("true"),
         enum_name: None,
         enum_values: &[],
+        description: "Enables caching operators that cache intermediate results.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_eviction_queue_sleep_micro_seconds",
@@ -401,6 +527,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("0"),
         enum_name: None,
         enum_values: &[],
+        description: "Set a time for the eviction queue to sleep before acquiring the shared ownership of some block memory.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_file_descriptor_limit",
@@ -410,6 +539,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("0"),
         enum_name: None,
         enum_values: &[],
+        description: "Override the file descriptor limit that bounds how many files a scan opens ahead. 0 uses the limit of the process.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_force_bitpacking_mode",
@@ -419,6 +551,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("AUTO"),
         enum_name: Some("BitpackingMode"),
         enum_values: &["INVALID", "AUTO", "CONSTANT", "CONSTANT_DELTA", "DELTA_FOR", "FOR"],
+        description: "Forces a specific bitpacking mode.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_force_commit_failure",
@@ -428,6 +563,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Force transaction commit to fail after the undo buffer has been committed. Can be used for testing commit error recovery.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_force_commit_revert_failure",
@@ -437,6 +575,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Force RevertCommit to fail while recovering from a commit failure.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_force_external",
@@ -446,6 +587,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Force out-of-core computation for operators that support it.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_force_fetch_row",
@@ -455,6 +599,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Read the rows of scans through the fetch by row id.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_force_mbedtls_unsafe",
@@ -464,6 +611,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Enable mbedtls for encryption. Unsafe to use.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_force_no_cross_product",
@@ -473,6 +623,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Force disable cross product generation when the hyper graph isn't connected.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_force_update_to_del_and_insert",
@@ -482,6 +635,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Forces all updates to use the DELETE + INSERT code path instead of in-place updates.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_force_variant_shredding",
@@ -491,6 +647,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Forces the VARIANT shredding that happens during checkpointing to use the provided schema for the shredding.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_force_wal_fsync_failure",
@@ -500,6 +659,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "DEBUG SETTING: makes every WAL fsync fail, used for testing durability error handling",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_local_file_system_delay_ms",
@@ -509,6 +671,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("0"),
         enum_name: None,
         enum_values: &[],
+        description: "Time to sleep before local file system open/read/write operations.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_order_verification",
@@ -518,6 +683,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: Some("DebugOrderVerification"),
         enum_values: &["NONE", "CREATE_SORT_KEY", "VARIANT"],
+        description: "Verify ORDER BY results by rewriting the ordering (NONE, CREATE_SORT_KEY or VARIANT).",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_physical_table_scan_execution_strategy",
@@ -532,6 +700,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
             "SYNCHRONOUS",
             "TASK_EXECUTOR_BUT_FORCE_SYNC_CHECKS",
         ],
+        description: "Force the use of a given strategy for executing physical table scans.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_skip_checkpoint_on_commit",
@@ -541,6 +712,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Skip checkpointing on commit.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_verification_mode",
@@ -550,6 +724,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Toggle the verification mode.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_verification_projection",
@@ -559,6 +736,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Add internal verification projections to stress-test optimizers.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_verify_aggregate_state_export",
@@ -568,6 +748,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Enable verification of aggregate state export.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_verify_blocks",
@@ -577,6 +760,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Verify block metadata during checkpointing.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_verify_column_bindings",
@@ -586,6 +772,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Run extra internal verification of column bindings.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_verify_progress",
@@ -595,6 +784,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("NONE"),
         enum_name: Some("DebugProgressVerification"),
         enum_values: &["NONE", "LOG", "ERROR"],
+        description: "Verify that operators report well-formed, monotonic and complete progress during execution (NONE, LOG or ERROR).",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_verify_progress_ignore",
@@ -604,6 +796,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some(""),
         enum_name: None,
         enum_values: &[],
+        description: "Comma-separated list of progress violations to ignore, as INVARIANT or INVARIANT:OPERATOR (e.g. UNSUPPORTED_SOURCE:WINDOW).",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_verify_serializer",
@@ -613,6 +808,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Verify the logical plan serializer.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_verify_statement",
@@ -631,6 +829,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
             "EXPLAIN_SQL",
             "EXPLAIN_SQL_STRICT",
         ],
+        description: "Specify the type of statement verification to perform.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_verify_stats",
@@ -640,6 +841,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Verify that statistics are correct during execution.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_verify_vector",
@@ -658,6 +862,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
             "VARIANT_VECTOR",
             "SHREDDED_VECTOR",
         ],
+        description: "Enable a specific type of vector verification.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_wal_fsync_sleep_ms",
@@ -667,6 +874,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("0"),
         enum_name: None,
         enum_values: &[],
+        description: "DEBUG SETTING: time to sleep during each WAL fsync, emulating high-latency durable storage",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "debug_window_mode",
@@ -676,6 +886,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("WINDOW"),
         enum_name: Some("WindowAggregationMode"),
         enum_values: &["WINDOW", "COMBINE", "SEPARATE"],
+        description: "Switch the window mode being used.",
+        is_debug: true,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "default_block_size",
@@ -685,6 +898,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("262144"),
         enum_name: None,
         enum_values: &[],
+        description: "The default block size for new duckdb database files. New means that the file is being created and does not yet exist.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "default_collation",
@@ -694,6 +910,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some(""),
         enum_name: None,
         enum_values: &[],
+        description: "The collation setting used when none is specified.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "default_null_order",
@@ -703,6 +922,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("NULLS_LAST"),
         enum_name: None,
         enum_values: &[],
+        description: "The NULL ordering used when none is specified (NULLS_FIRST or NULLS_LAST).",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "default_order",
@@ -712,6 +934,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("ASCENDING"),
         enum_name: None,
         enum_values: &[],
+        description: "The order type used when none is specified (ASC or DESC).",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "default_secret_storage",
@@ -721,6 +946,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Allows switching the default storage for secrets.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "default_transaction_invalidation_policy",
@@ -734,6 +962,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
             "SYNTACTIC_ERRORS_DO_NOT_INVALIDATE",
             "ALL_ERRORS_INVALIDATE_TRANSACTION",
         ],
+        description: "When to invalidate transactions when errors occur. SYNTACTIC_ERRORS_DO_NOT_INVALIDATE means that parser and binder exceptions do not invalidate. ALL_ERRORS_INVALIDATE_TRANSACTION means all errors invalidate a transaction.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "delim_join_as_cte",
@@ -743,6 +974,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("true"),
         enum_name: None,
         enum_values: &[],
+        description: "Rewrite delim joins to materialized CTEs during dependent join flattening.",
+        is_debug: false,
+        is_deprecated: true,
     },
     SettingDefinition {
         name: "dialect_compatibility_mode",
@@ -752,6 +986,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("NONE"),
         enum_name: Some("DialectCompatibilityMode"),
         enum_values: &["NONE", "SPARK"],
+        description: "Enable SQL dialect compatibility for a certain engine, e.g. `SET dialect_compatibility_mode='spark'`.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "disable_database_invalidation",
@@ -761,6 +998,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Disables invalidating the database instance when encountering a fatal error. Should be used with great care, as DuckDB cannot guarantee correct behavior after a fatal error.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "disable_timestamptz_casts",
@@ -770,6 +1010,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Disable casting from timestamp to timestamptz.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "disabled_compression_methods",
@@ -779,6 +1022,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Disable a specific, comma-separated set of compression methods.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "disabled_filesystems",
@@ -788,6 +1034,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Disable specific file systems, thereby preventing their access, e.g. LocalFileSystem.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "disabled_log_types",
@@ -797,6 +1046,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Sets the list of disabled log types.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "disabled_optimizers",
@@ -806,6 +1058,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Disable a specific, comma-separated set of optimizers.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "duckdb_api",
@@ -815,6 +1070,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some(""),
         enum_name: None,
         enum_values: &[],
+        description: "Specifies which client API/binding opened the database connection, e.g. cpp, capi, cli. The value gets folded into the HTTP User-Agent string DuckDB sends on any HTTP request.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "dynamic_or_filter_threshold",
@@ -824,6 +1082,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("50"),
         enum_name: None,
         enum_values: &[],
+        description: "The maximum amount of OR filters that are generated dynamically from a hash join.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "enable_block_allocator",
@@ -833,6 +1094,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Enable new allocations from the fixed-size block pool (64-bit only; disabled by default on MinGW). Disabling preserves existing allocations and the virtual memory reservation.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "enable_external_access",
@@ -842,6 +1106,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("true"),
         enum_name: None,
         enum_values: &[],
+        description: "Allow the database to access external state, e.g. through loading/installing modules, COPY TO/FROM, CSV readers, pandas replacement scans, etc.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "enable_external_file_cache",
@@ -851,6 +1118,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("true"),
         enum_name: None,
         enum_values: &[],
+        description: "Allow the database to cache external files like Parquet in memory.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "enable_fsst_vectors",
@@ -860,6 +1130,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Allow scans on FSST compressed segments to emit compressed vectors to utilize late decompression.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "enable_http_metadata_cache",
@@ -869,6 +1142,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Whether or not the global http metadata is used to cache HTTP metadata.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "enable_logging",
@@ -878,6 +1154,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Enables the logger.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "enable_macro_dependencies",
@@ -887,6 +1166,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Enables created MACROs to create dependencies on the referenced objects, such as tables.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "enable_object_cache",
@@ -896,6 +1178,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Deprecated legacy setting, does nothing.",
+        is_debug: false,
+        is_deprecated: true,
     },
     SettingDefinition {
         name: "enable_optimistic_write",
@@ -905,6 +1190,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("true"),
         enum_name: None,
         enum_values: &[],
+        description: "Whether or not to optimistically write large appends to disk before committing. Disable this to keep bulk appends in memory, e.g. for in-memory benchmarks.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "enable_optimizer",
@@ -914,6 +1202,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("true"),
         enum_name: None,
         enum_values: &[],
+        description: "Whether the query optimizer is enabled.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "enable_profiling",
@@ -923,6 +1214,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Enables profiling and sets the output format, which can be JSON, QUERY_TREE, or QUERY_TREE_OPTIMIZER.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "enable_progress_bar",
@@ -932,6 +1226,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Enables the progress bar, which prints progress to the terminal during long queries.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "enable_progress_bar_print",
@@ -941,6 +1238,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Controls the printing of the progress bar and requires 'enable_progress_bar' to be true.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "enable_view_dependencies",
@@ -950,6 +1250,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Enable created VIEWs to create dependencies on the referenced objects, such as tables.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "enabled_log_types",
@@ -959,6 +1262,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Sets the list of enabled log types.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "error_on_division_by_zero",
@@ -968,6 +1274,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("true"),
         enum_name: None,
         enum_values: &[],
+        description: "Throw an error instead of returning NULL when dividing by zero.",
+        is_debug: false,
+        is_deprecated: true,
     },
     SettingDefinition {
         name: "errors_as_json",
@@ -977,6 +1286,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Output error messages as structured JSON instead of as a raw string.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "experimental_metadata_reuse",
@@ -986,6 +1298,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("true"),
         enum_name: None,
         enum_values: &[],
+        description: "EXPERIMENTAL: Re-use row group and table metadata when checkpointing.",
+        is_debug: false,
+        is_deprecated: true,
     },
     SettingDefinition {
         name: "explain_output",
@@ -995,6 +1310,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("PHYSICAL_ONLY"),
         enum_name: Some("ExplainOutputType"),
         enum_values: &["ALL", "OPTIMIZED_ONLY", "PHYSICAL_ONLY"],
+        description: "Configure the output of EXPLAIN statements (ALL, OPTIMIZED_ONLY, PHYSICAL_ONLY).",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "extension_directories",
@@ -1004,6 +1322,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Set the directories to store extensions in.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "extension_directory",
@@ -1013,6 +1334,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some(""),
         enum_name: None,
         enum_values: &[],
+        description: "Deprecated setting. Use extension_directories instead",
+        is_debug: false,
+        is_deprecated: true,
     },
     SettingDefinition {
         name: "extension_repository_directory",
@@ -1022,6 +1346,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some(""),
         enum_name: None,
         enum_values: &[],
+        description: "Set the directory in which trusted extension repositories are stored. This is the trust anchor for user-provided repositories, so while signature checking is enabled (allow_unsigned_extensions=false) it can only be set at startup, not while the database is running.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "external_file_cache_local_max_block_size",
@@ -1031,6 +1358,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("16384"),
         enum_name: None,
         enum_values: &[],
+        description: "Maximum size in bytes of an external file cache block for local (non-remote) files. Larger reads are split into blocks of this size, which are fetched in parallel.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "external_file_cache_remote_max_block_size",
@@ -1040,6 +1370,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("2097152"),
         enum_name: None,
         enum_values: &[],
+        description: "Maximum size in bytes of an external file cache block for remote files (e.g. HTTP/S3). Larger reads are split into blocks of this size, which are fetched in parallel.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "external_file_cache_remote_min_block_size",
@@ -1049,6 +1382,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("4096"),
         enum_name: None,
         enum_values: &[],
+        description: "Reads of remote files are rounded out to aligned blocks of this size, so tiny reads do not each cost a request.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "external_file_cache_request_sizing",
@@ -1058,6 +1394,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("AUTO"),
         enum_name: Some("ExternalFileCacheRequestSizing"),
         enum_values: &["AUTO", "GRID", "EXACT"],
+        description: "How reads of cached files are sized: AUTO lets each reader choose, GRID reads the aligned blocks of the cache block size around each read, EXACT reads exactly the requested bytes. Reads of files that are not cached are always exact.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "external_file_cache_spill",
@@ -1067,6 +1406,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Whether evicted external file cache blocks of remote files spill to the temporary directory instead of being dropped, so that they are re-read from there rather than re-fetched from the source.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "external_threads",
@@ -1076,6 +1418,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("1"),
         enum_name: None,
         enum_values: &[],
+        description: "The number of external threads that work on DuckDB tasks.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "file_search_path",
@@ -1085,6 +1430,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some(""),
         enum_name: None,
         enum_values: &[],
+        description: "A comma separated list of directories to search for input files.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "force_column_metadata_reuse",
@@ -1094,6 +1442,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Force re-use of row group metadata on a column-level when checkpointing on older storage versions 6 and 7. This breaks storage backward-compatibility with older DuckDB versions.",
+        is_debug: false,
+        is_deprecated: true,
     },
     SettingDefinition {
         name: "force_compression",
@@ -1103,6 +1454,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("auto"),
         enum_name: None,
         enum_values: &[],
+        description: "Forces the usage of a specific compression method.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "fsync_mode",
@@ -1112,6 +1466,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("STANDARD"),
         enum_name: Some("FileSyncMode"),
         enum_values: &["STANDARD", "NONE", "FULL"],
+        description: "How to synchronize database file changes to stable storage (STANDARD, NONE or FULL). NONE may cause database corruption after an operating system or hardware crash. FULL uses fullfsync on macOS.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "geometry_minimum_shredding_size",
@@ -1121,6 +1478,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("30000"),
         enum_name: None,
         enum_values: &[],
+        description: "Minimum size of a row group to enable GEOMETRY shredding. Set to -1 to disable shredding entirely. Defaults to 1/4th of a row group.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "home_directory",
@@ -1130,6 +1490,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some(""),
         enum_name: None,
         enum_values: &[],
+        description: "Sets the home directory of the database instance.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "http_client_pool_capacity",
@@ -1139,6 +1502,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "HTTP client pool capacity derived from CPU and async thread counts unless explicitly set",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "http_proxy",
@@ -1148,6 +1514,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "The HTTP proxy host. Defaults to the HTTP_PROXY environment variable.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "http_proxy_password",
@@ -1157,6 +1526,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some(""),
         enum_name: None,
         enum_values: &[],
+        description: "The password for the HTTP proxy.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "http_proxy_username",
@@ -1166,6 +1538,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some(""),
         enum_name: None,
         enum_values: &[],
+        description: "The username for the HTTP proxy.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "ieee_floating_point_ops",
@@ -1175,6 +1550,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("true"),
         enum_name: None,
         enum_values: &[],
+        description: "Use IEEE 754 behavior for supported floating point operations, returning NAN/INF instead of errors/NULL.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "ignore_unknown_crs",
@@ -1184,6 +1562,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Ignore unknown Coordinate Reference Systems (CRS) when creating geometry types or importing geospatial data.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "immediate_transaction_mode",
@@ -1193,6 +1574,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Whether transactions should be started lazily when needed, or immediately when BEGIN TRANSACTION is called.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "index_scan_max_count",
@@ -1202,6 +1586,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("2048"),
         enum_name: None,
         enum_values: &[],
+        description: "The maximum index scan count sets a threshold for index scans. If fewer than MAX(index_scan_max_count, index_scan_percentage * total_row_count) rows match, we perform an index scan instead of a table scan.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "index_scan_percentage",
@@ -1211,6 +1598,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("0.001"),
         enum_name: None,
         enum_values: &[],
+        description: "The index scan percentage sets a threshold for index scans. If fewer than MAX(index_scan_max_count, index_scan_percentage * total_row_count) rows match, we perform an index scan instead of a table scan.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "initial_column_segment_size",
@@ -1220,6 +1610,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("2048"),
         enum_name: None,
         enum_values: &[],
+        description: "The initial memory (in bytes) reserved for the first transient column segment. Must be a power of two. Internally, we subtract the block header size (typically 8 bytes) for segments with or exceeding 1024 bytes. Subsequent segments double in size until reaching the block size.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "integer_division",
@@ -1229,6 +1622,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Whether or not the / operator defaults to integer division, or to floating point division.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "lambda_syntax",
@@ -1238,6 +1634,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("DEFAULT"),
         enum_name: Some("LambdaSyntax"),
         enum_values: &["DEFAULT", "ENABLE_SINGLE_ARROW", "DISABLE_SINGLE_ARROW"],
+        description: "Deprecated setting. Configures the use of the deprecated single arrow operator (->) for lambda functions.",
+        is_debug: false,
+        is_deprecated: true,
     },
     SettingDefinition {
         name: "late_materialization_max_rows",
@@ -1247,6 +1646,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("50"),
         enum_name: None,
         enum_values: &[],
+        description: "The maximum amount of rows in the LIMIT/SAMPLE operator for which we trigger late materialization.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "legacy_disable_null_type",
@@ -1256,6 +1658,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "When enabled, prevent the NULL type from leaving the binder. This was the default behavior prior to DuckDB v2.0.",
+        is_debug: false,
+        is_deprecated: true,
     },
     SettingDefinition {
         name: "legacy_metrics_format",
@@ -1265,6 +1670,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Deprecated setting. When enabled, profiling output uses the legacy flat format instead of the current grouped format.",
+        is_debug: false,
+        is_deprecated: true,
     },
     SettingDefinition {
         name: "lock_configuration",
@@ -1274,6 +1682,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Whether configurations can be altered.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "log_query_path",
@@ -1283,6 +1694,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some(""),
         enum_name: None,
         enum_values: &[],
+        description: "Specifies the path to which queries should be logged. The default is NULL, meaning queries are not logged.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "logging_level",
@@ -1292,6 +1706,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Determines which 'severity' of log messages will be logged.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "logging_mode",
@@ -1301,6 +1718,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Determines which types of log messages are logged.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "logging_storage",
@@ -1310,6 +1730,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Set the logging storage, options are 'memory', 'stdout', 'file', '<custom>'.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "match_recognize_max_states",
@@ -1319,6 +1742,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("1000000"),
         enum_name: None,
         enum_values: &[],
+        description: "The maximum number of pattern states MATCH_RECOGNIZE explores for a single match, before it refuses the pattern (0 = no limit). A match is never refused below what matching the pattern without backtracking would take.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "max_execution_time",
@@ -1328,6 +1754,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("0"),
         enum_name: None,
         enum_values: &[],
+        description: "The maximum execution time per query in milliseconds (0 = no limit).",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "max_expression_depth",
@@ -1337,6 +1766,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("1000"),
         enum_name: None,
         enum_values: &[],
+        description: "The maximum expression depth limit in the parser. WARNING: increasing this setting and using very deep expressions might lead to stack overflow errors.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "max_memory",
@@ -1346,6 +1778,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "The maximum memory of the system (e.g. 1GB).",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "max_streaming_buffer_size",
@@ -1355,6 +1790,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "The maximum number of bytes a streaming query result buffers (e.g. 1GB). Queued output stays under this cap, and each engine thread may hold, beyond the queue, the units it is still building or handing over from its current chunk.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "max_temp_directory_size",
@@ -1364,6 +1802,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "The maximum amount of data stored inside the 'temp_directory' (when set) (e.g. 1GB).",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "max_vacuum_tasks",
@@ -1373,6 +1814,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("100"),
         enum_name: None,
         enum_values: &[],
+        description: "The maximum number of vacuum tasks to schedule during a checkpoint.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "merge_join_threshold",
@@ -1382,6 +1826,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("1000"),
         enum_name: None,
         enum_values: &[],
+        description: "The maximum number of rows on either table to choose a merge join.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "nested_loop_join_threshold",
@@ -1391,6 +1838,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("5"),
         enum_name: None,
         enum_values: &[],
+        description: "The maximum number of rows on either table to choose a nested loop join.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "old_implicit_casting",
@@ -1400,6 +1850,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Deprecated setting. Used for compatibility for the pre-0.10 implicit VARCHAR casting behavior.",
+        is_debug: false,
+        is_deprecated: true,
     },
     SettingDefinition {
         name: "operator_memory_limit",
@@ -1409,6 +1862,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "The maximum memory available for query intermediates (sorts, hash tables) per connection (e.g. 256MB).",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "order_by_non_integer_literal",
@@ -1418,6 +1874,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Allow ordering by non-integer literals. Ordering by such literals has no effect. Enabling this relaxes the check to a silent no-op instead of a binder error.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "ordered_aggregate_threshold",
@@ -1427,6 +1886,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("262144"),
         enum_name: None,
         enum_values: &[],
+        description: "The number of rows to accumulate before sorting.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "partitioned_write_flush_threshold",
@@ -1436,6 +1898,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("524288"),
         enum_name: None,
         enum_values: &[],
+        description: "The number of rows threshold after which a thread state is flushed when writing using PARTITION_BY.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "partitioned_write_max_open_files",
@@ -1445,6 +1910,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("100"),
         enum_name: None,
         enum_values: &[],
+        description: "The maximum amount of files the system can keep open before flushing to disk when writing using PARTITION_BY.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "password",
@@ -1454,6 +1922,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some(""),
         enum_name: None,
         enum_values: &[],
+        description: "The password to use. Kept for legacy compatibility.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "perfect_ht_threshold",
@@ -1463,6 +1934,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("12"),
         enum_name: None,
         enum_values: &[],
+        description: "Threshold in bytes for when to use a perfect hash table.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "pin_threads",
@@ -1472,6 +1946,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("auto"),
         enum_name: Some("ThreadPinMode"),
         enum_values: &["OFF", "ON", "AUTO"],
+        description: "Whether to pin threads to cores. Linux only, and the default is AUTO. AUTO means the setting is on when there are more than 64 cores.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "pivot_filter_threshold",
@@ -1481,6 +1958,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("20"),
         enum_name: None,
         enum_values: &[],
+        description: "The threshold determining when a dedicated pivot operator switches from using filtered aggregates to LIST.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "pivot_limit",
@@ -1490,6 +1970,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("100000"),
         enum_name: None,
         enum_values: &[],
+        description: "The maximum number of pivot columns in a pivot statement.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "prefer_range_joins",
@@ -1499,6 +1982,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Force the use of range joins with mixed predicates.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "preserve_identifier_case",
@@ -1508,6 +1994,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("preserve_case"),
         enum_name: None,
         enum_values: &[],
+        description: "How to fold non-quoted identifiers. 'preserve_case' keeps the case as written, 'lowercase' lowercases them, 'uppercase' uppercases them.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "preserve_insertion_order",
@@ -1517,6 +2006,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("true"),
         enum_name: None,
         enum_values: &[],
+        description: "Whether or not to preserve insertion order. If set to false, then the system is allowed to re-order any results that do not contain ORDER BY clauses.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "produce_arrow_string_view",
@@ -1526,6 +2018,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Deprecated setting. Controlled via enable_arrow_string_view.",
+        is_debug: false,
+        is_deprecated: true,
     },
     SettingDefinition {
         name: "profiling_coverage",
@@ -1535,6 +2030,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "The profiling coverage, either SELECT (only SELECT queries) or ALL (all queries are profiled).",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "profiling_mode",
@@ -1544,6 +2042,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Deprecated setting. Use enable_profiling and profiling_coverage instead.",
+        is_debug: false,
+        is_deprecated: true,
     },
     SettingDefinition {
         name: "profiling_output",
@@ -1553,6 +2054,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "The file to which profiler output is written. When empty, the output is printed to the terminal.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "profiling_renderer_settings",
@@ -1562,6 +2066,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "A map of settings passed to the renderer of the profiler output, e.g. {'max_extra_lines': 100}. Settings not recognized by the active renderer are ignored.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "progress_bar_time",
@@ -1571,6 +2078,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Configures how long (in milliseconds) a query needs to take before we start printing a progress bar.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "read_ahead_depth",
@@ -1580,6 +2090,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("-1"),
         enum_name: None,
         enum_values: &[],
+        description: "The number of scan jobs prefetched ahead of decoding. -1 = automatic, with the backlog being bound by a memory budget, 0 = disabled.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "redact_http_logs",
@@ -1589,6 +2102,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("true"),
         enum_name: None,
         enum_values: &[],
+        description: "Redact HTTP header values in logs unless their names are explicitly allowed.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "regex_match_operator_semantics",
@@ -1598,6 +2114,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("partial"),
         enum_name: None,
         enum_values: &[],
+        description: "Configures whether regex match operators use partial or full string matching.",
+        is_debug: false,
+        is_deprecated: true,
     },
     SettingDefinition {
         name: "scalar_subquery_error_on_multiple_rows",
@@ -1607,6 +2126,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("true"),
         enum_name: None,
         enum_values: &[],
+        description: "Deprecated setting. Throw an error when a scalar subquery returns more than one row. This will become the default behavior. When disabled, an arbitrary row is returned instead.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "scheduler_process_partial",
@@ -1616,6 +2138,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Partially process tasks before rescheduling. Enabling this allows for more scheduler fairness between separate queries.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "schema",
@@ -1625,6 +2150,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Sets the default search schema. Equivalent to setting search_path to a single value.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "search_path",
@@ -1634,6 +2162,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Sets the default catalog search path as a comma-separated list of values.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "secret_directory",
@@ -1643,6 +2174,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Set the directory in which persistent secrets are stored.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "show_behavior",
@@ -1652,6 +2186,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("AUTO"),
         enum_name: Some("ShowBehaviorType"),
         enum_values: &["AUTO", "SETTING", "TABLE"],
+        description: "Configures how SHOW resolves a bare identifier. 'auto' describes a table if one exists, else it describes a setting (deprecated). 'table' always describes a table, and 'setting' always describes a setting.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "standard_vector_size",
@@ -1661,6 +2198,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "The compiled-in STANDARD_VECTOR_SIZE (read-only).",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "storage_block_prefetch",
@@ -1670,6 +2210,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("REMOTE_ONLY"),
         enum_name: Some("StorageBlockPrefetch"),
         enum_values: &["REMOTE_ONLY", "NEVER", "ALWAYS_PREFETCH", "DEBUG_FORCE_ALWAYS"],
+        description: "Configures the scenario in which to use storage block prefetching.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "storage_compatibility_version",
@@ -1679,6 +2222,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Sets the DuckDB version for which data is serialized to the DuckDB file during checkpointing. Can differ from the version of the DuckDB instance.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "table_function_identifier_conversion",
@@ -1688,6 +2234,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("DEFAULT"),
         enum_name: None,
         enum_values: &[],
+        description: "Configures the use of deprecated implicit conversion of unbound identifiers to strings in table function arguments.",
+        is_debug: false,
+        is_deprecated: true,
     },
     SettingDefinition {
         name: "temp_directory",
@@ -1697,6 +2246,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "Set the directory to which temporary files are written.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "temp_file_encryption",
@@ -1706,6 +2258,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Encrypt all temporary files, if the database is encrypted.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "threads",
@@ -1715,6 +2270,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "The number of total background threads used by the system.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "tracked_metrics",
@@ -1724,6 +2282,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "A list of metric glob patterns to enable for collection, e.g. ['query.*', 'optimizer.*'].",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "username",
@@ -1733,6 +2294,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some(""),
         enum_name: None,
         enum_values: &[],
+        description: "The username to use. Kept for legacy compatibility.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "vacuum_rebuild_indexes",
@@ -1742,6 +2306,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("0"),
         enum_name: None,
         enum_values: &[],
+        description: "Deprecated compatibility setting: maximum table row count for rebuilding bound ART indexes when checkpoint vacuum cannot remap their row IDs. 0 disables the rebuild fallback but does not disable index remapping on v2.0 storage. The 'vacuum_rebuild_indexes' ATTACH option overrides this default per database.",
+        is_debug: false,
+        is_deprecated: true,
     },
     SettingDefinition {
         name: "validate_external_file_cache",
@@ -1751,6 +2318,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("VALIDATE_ALL"),
         enum_name: Some("CacheValidationMode"),
         enum_values: &["VALIDATE_ALL", "VALIDATE_REMOTE", "NO_VALIDATION"],
+        description: "The cache validation mode. VALIDATE_ALL is the default, it validates all cache entries., VALIDATE_REMOTE only validates remote cache entries. NO_VALIDATION disables cache validation.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "variant_minimum_shredding_size",
@@ -1760,6 +2330,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("30000"),
         enum_name: None,
         enum_values: &[],
+        description: "Minimum size of a row group to have VARIANT shredding enabled. Set to -1 to disable shredding entirely. Defaults to 1/4th of the row group size.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "wal_autocheckpoint_entries",
@@ -1769,6 +2342,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("0"),
         enum_name: None,
         enum_values: &[],
+        description: "Trigger automatic checkpoint when WAL entry count reaches or exceeds N (0 = disabled).",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "warnings_as_errors",
@@ -1778,6 +2354,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("false"),
         enum_name: None,
         enum_values: &[],
+        description: "Escalate all warnings to errors.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "write_buffer_row_group_count",
@@ -1787,6 +2366,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("5"),
         enum_name: None,
         enum_values: &[],
+        description: "The amount of row groups to buffer in bulk ingestion prior to flushing them together. Reducing this setting can reduce memory consumption.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "write_buffer_row_group_memory_limit",
@@ -1796,6 +2378,9 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: None,
         enum_name: None,
         enum_values: &[],
+        description: "The maximum data to buffer in row groups (in bytes) to buffer prior to flushing them together. When either this limit is reached, or write_buffer_row_group_count is reached, we flush the data to disk. Defaults to 20% of the memory limit divided by the thread count.",
+        is_debug: false,
+        is_deprecated: false,
     },
     SettingDefinition {
         name: "zstd_min_string_length",
@@ -1805,5 +2390,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         default_value: Some("4096"),
         enum_name: None,
         enum_values: &[],
+        description: "The (average) minimum length at which to enable ZSTD compression, defaults to 4096.",
+        is_debug: false,
+        is_deprecated: false,
     },
 ];

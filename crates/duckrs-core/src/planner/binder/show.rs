@@ -1,7 +1,7 @@
 // Ported from duckdb/src/planner/binder/tableref/bind_showref.cpp,
 // duckdb/src/planner/binder/statement/bind_summarize.cpp, the column information of
 // duckdb/src/function/table/system/pragma_table_info.cpp and the catalog listings of
-// duckdb/src/function/table/system/duckdb_{tables,views,columns,schemas,databases}.cpp
+// duckdb/src/function/table/system/duckdb_{tables,views,columns,schemas,databases,settings}.cpp
 // @ rust-port-baseline
 //
 //! SHOW, DESCRIBE, SUMMARIZE and the `duckdb_*` listings of the catalog. They are rows computed
@@ -825,6 +825,92 @@ impl Binder<'_> {
             }
         }
         result
+    }
+
+    /// `duckdb_settings()` (`DuckDBSettingsBind`, `DuckDBSettingsInit`): the settings, without
+    /// the debug and deprecated ones unless asked for.
+    pub(super) fn bind_duckdb_settings(
+        &mut self,
+        call: &duckrs_parser::ast::FunctionExpr,
+        table_ref: &TableRef,
+    ) -> Result<LogicalOperator> {
+        let (mut debug, mut deprecated, mut include_all) = (None, None, None);
+        for argument in call.args.iter().map(super::table_functions::named_argument) {
+            let name = argument.name.to_lowercase();
+            let target = match name.as_str() {
+                "debug" => &mut debug,
+                "deprecated" => &mut deprecated,
+                "include_all" => &mut include_all,
+                "" => return Err(binder_error("duckdb_settings takes no positional arguments")),
+                _ => {
+                    return Err(binder_error(format!(
+                        "Invalid named parameter \"{}\" for function duckdb_settings",
+                        argument.name
+                    )));
+                }
+            };
+            let value = self.constant_argument(&argument.expr)?;
+            if value.is_null() {
+                return Err(duckrs_common::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("Cannot use NULL as argument for {name}"),
+                ));
+            }
+            let value = crate::client::settings::cast_value(&value, &LogicalType::BOOLEAN)?;
+            *target = Some(value.try_to_string()? == "true");
+        }
+        if include_all == Some(true) && (debug.is_some() || deprecated.is_some()) {
+            return Err(duckrs_common::Error::new(
+                ErrorKind::InvalidInput,
+                "Cannot combine include_all := true with the debug or deprecated filters",
+            ));
+        }
+        let (debug, deprecated, include_all) = (
+            debug.unwrap_or(false),
+            deprecated.unwrap_or(false),
+            include_all.unwrap_or(false),
+        );
+        let Some(session) = self.session.clone() else {
+            return Err(crate::unported("duckdb_settings here"));
+        };
+        let variant = LogicalType::new(duckrs_common::types::LogicalTypeId::Variant);
+        let mut rows = Vec::new();
+        for setting in (session.settings)() {
+            if !include_all && (setting.is_debug != debug || setting.is_deprecated != deprecated) {
+                continue;
+            }
+            let (value, typed_value) = match &setting.value {
+                Some(value) if !value.is_null() => (
+                    crate::client::settings::cast_value(value, &LogicalType::VARCHAR)?,
+                    crate::client::settings::cast_value(value, &variant)?,
+                ),
+                _ => (null_text(), Value::null(variant.clone())),
+            };
+            rows.push(vec![
+                text(setting.name),
+                value,
+                text(setting.description),
+                text(setting.input_type),
+                text(setting.scope),
+                Value::list(
+                    LogicalType::VARCHAR,
+                    setting.aliases.iter().map(|alias| text(alias)).collect(),
+                )?,
+                typed_value,
+            ]);
+        }
+        let varchar = LogicalType::VARCHAR;
+        let columns = [
+            ("name", varchar.clone()),
+            ("value", varchar.clone()),
+            ("description", varchar.clone()),
+            ("input_type", varchar.clone()),
+            ("scope", varchar.clone()),
+            ("aliases", LogicalType::list(varchar)),
+            ("typed_value", variant),
+        ];
+        let (names, types) = columns.into_iter().map(|(n, t)| (n.to_string(), t)).unzip();
+        self.bind_rows(table_ref, "duckdb_settings", names, types, rows)
     }
 
     /// `pragma_storage_info`: the segments of a table in its file. Rows in memory have none.

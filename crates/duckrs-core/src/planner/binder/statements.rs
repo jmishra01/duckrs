@@ -1733,6 +1733,9 @@ impl Binder<'_> {
             return Err(not_implemented("table functions"));
         };
         let name = call.name.name.to_lowercase();
+        if name == "duckdb_settings" {
+            return self.bind_duckdb_settings(call, table_ref);
+        }
         if name == "pragma_storage_info" {
             return self.bind_storage_info(call, table_ref);
         }

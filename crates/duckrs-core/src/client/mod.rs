@@ -681,11 +681,12 @@ impl ClientContext {
 
     /// What `current_setting` and `getvariable` read.
     fn session_values(&self) -> Arc<SessionValues> {
-        let db = self.home.clone();
-        let session = self.settings.clone();
+        let (db, session) = (self.home.clone(), self.settings.clone());
+        let (list_db, list_session) = (self.home.clone(), self.settings.clone());
         Arc::new(SessionValues {
             variables: self.variables.clone(),
             setting: Box::new(move |name| settings::get_setting(name, &db.settings.read(), &session)),
+            settings: Box::new(move || settings::list_settings(&list_db.settings.read(), &list_session)),
         })
     }
 
@@ -5948,6 +5949,44 @@ mod tests {
         run(&mut c, "RESET VARIABLE v");
         assert_eq!(run(&mut c, "SELECT getvariable('v')"), [["NULL"]]);
         assert_eq!(run(&mut c, "SELECT current_setting('default_order')"), [["ASC"]]);
+        run(&mut c, "SET null_order = 'postgres'");
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT name, value, scope, aliases FROM duckdb_settings() WHERE name LIKE '%null_order' ORDER BY name"
+            ),
+            [
+                [
+                    "default_null_order",
+                    "NULLS_LAST_ON_ASC_FIRST_ON_DESC",
+                    "GLOBAL",
+                    "[null_order]"
+                ],
+                ["null_order", "NULLS_LAST_ON_ASC_FIRST_ON_DESC", "GLOBAL", "[]"]
+            ]
+        );
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT count(*) FROM duckdb_settings(debug := true) WHERE name = 'debug_enable_caching_operators'"
+            ),
+            [["1"]]
+        );
+        assert_eq!(
+            run(
+                &mut c,
+                "SELECT count(*) FROM duckdb_settings(include_all := true) WHERE name IN ('threads', 'debug_enable_caching_operators')"
+            ),
+            [["2"]]
+        );
+        assert_eq!(
+            error(&mut c, "FROM duckdb_settings(include_all := NULL)"),
+            "Invalid Input Error: Cannot use NULL as argument for include_all"
+        );
+        assert_eq!(
+            error(&mut c, "FROM duckdb_settings(include_all := true, debug := true)"),
+            "Invalid Input Error: Cannot combine include_all := true with the debug or deprecated filters"
+        );
         assert!(c.query("SELECT current_setting('nonsense')").is_err());
         assert_eq!(
             run(
