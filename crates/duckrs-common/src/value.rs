@@ -380,7 +380,7 @@ impl Value {
             (ValueData::Bytes(b), LogicalTypeId::Varchar | LogicalTypeId::Char | LogicalTypeId::Geometry) => {
                 String::from_utf8_lossy(b).into()
             }
-            (ValueData::Bytes(b), LogicalTypeId::Blob) => format_blob(b),
+            (ValueData::Bytes(b), LogicalTypeId::Blob | LogicalTypeId::LegacyAggregateState) => format_blob(b),
             (ValueData::Bytes(b), LogicalTypeId::Bit) => crate::types::bit::bit_to_string(b),
             (ValueData::Bytes(b), LogicalTypeId::Variant) => crate::variant::VariantNode::decode(b)?.render()?,
             (ValueData::Bytes(b), LogicalTypeId::Bignum) => crate::types::bignum::to_string(b),

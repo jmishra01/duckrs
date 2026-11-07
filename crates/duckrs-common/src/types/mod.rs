@@ -206,8 +206,9 @@ impl LogicalTypeId {
             | L::Unknown
             | L::StringLiteral
             | L::IntegerLiteral
-            | L::Template
-            | L::LegacyAggregateState => P::Invalid,
+            | L::Template => P::Invalid,
+            // the bytes of a state
+            L::LegacyAggregateState => P::Varchar,
         }
     }
 }
@@ -336,6 +337,13 @@ enum Params {
         size: u32,
     },
     Enum(Arc<[String]>),
+    /// AGGREGATE_STATE: which aggregate a state is of, and what it takes and gives.
+    AggregateState {
+        function: Arc<str>,
+        overload: u32,
+        arguments: Vec<LogicalType>,
+        result: LogicalType,
+    },
     /// UNBOUND: a type that is known by name, as the SQL that names it (`UnboundTypeInfo`).
     Unbound(Arc<str>),
     /// INTEGER_LITERAL: the constant's own integral type and its value (`IntegerLiteralTypeInfo`).
@@ -440,6 +448,32 @@ impl LogicalType {
     pub fn map(key: LogicalType, value: LogicalType) -> Self {
         let entry = Self::struct_type(vec![("key".into(), key), ("value".into(), value)]);
         Self::with_params(LogicalTypeId::Map, Params::List(entry))
+    }
+
+    /// `AGGREGATE_STATE`: a state of overload `overload` of the aggregate `function`.
+    pub fn aggregate_state(function: &str, overload: u32, arguments: Vec<LogicalType>, result: LogicalType) -> Self {
+        Self::with_params(
+            LogicalTypeId::LegacyAggregateState,
+            Params::AggregateState {
+                function: function.into(),
+                overload,
+                arguments,
+                result,
+            },
+        )
+    }
+
+    /// What [`Self::aggregate_state`] was given.
+    pub fn aggregate_state_info(&self) -> Option<(&str, u32, &[LogicalType], &LogicalType)> {
+        match self.params() {
+            Params::AggregateState {
+                function,
+                overload,
+                arguments,
+                result,
+            } => Some((function, *overload, arguments, result)),
+            _ => None,
+        }
     }
 
     pub fn array(child: LogicalType, size: u32) -> Self {
@@ -642,6 +676,9 @@ impl fmt::Display for LogicalType {
             && let Some(alias) = self.alias()
         {
             return f.write_str(alias);
+        }
+        if self.id == LogicalTypeId::LegacyAggregateState {
+            return f.write_str("AGGREGATE_STATE");
         }
         match (self.id, self.params()) {
             (LogicalTypeId::Struct | LogicalTypeId::Tuple, Params::Struct(children)) if !children.is_empty() => {

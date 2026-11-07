@@ -8,6 +8,7 @@
 
 use super::cast::{int_to_double, uhuge_to_double};
 use super::holistic::{Holistic, finish};
+use duckrs_common::serializer::{BinaryDeserializer, BinarySerializer, SerializationOptions};
 use duckrs_common::sort_key::{NullOrder, OrderModifiers, OrderType, create_sort_keys};
 use duckrs_common::types::{LogicalType, LogicalTypeId, NativeType, PhysicalType, bignum};
 use duckrs_common::value::{Value, ValueData};
@@ -44,6 +45,8 @@ pub struct AggregateFunction {
     pub arguments: Vec<LogicalType>,
     pub return_type: LogicalType,
     pub kind: AggregateKind,
+    /// `EXPORT_STATE`: the result is the state, of this type
+    pub export: Option<LogicalType>,
 }
 
 impl fmt::Display for AggregateFunction {
@@ -87,6 +90,7 @@ impl AggregateFunctionSet {
                     arguments,
                     return_type,
                     kind,
+                    export: None,
                 })
             })
             .collect();
@@ -255,6 +259,13 @@ fn holistic_functions() -> Vec<AggregateFunctionSet> {
             &["arg_max_nulls_last"],
             vec![(vec![any(), any()], any(), kind(ArgMaxNullsLast))],
         ),
+        of(
+            &["combine_aggr"],
+            vec![
+                (vec![any()], any(), kind(CombineAggr)),
+                (vec![any(), L::BIGINT], any(), kind(CombineAggr)),
+            ],
+        ),
         of(&["approx_top_k"], vec![(vec![any(), any()], any(), kind(ApproxTopK))]),
         of(
             &["bitstring_agg"],
@@ -334,6 +345,231 @@ impl AggregateKind {
             List => AggregateState::List(None),
         }
     }
+}
+
+/// A state as bytes, the value of an `AGGREGATE_STATE`: a tag and what the state holds.
+fn encode_state(state: &AggregateState) -> Result<Vec<u8>> {
+    let (tag, first, second) = match state {
+        AggregateState::Count(n) => (0, Value::bigint(*n), Value::sql_null()),
+        AggregateState::Integer { sum, count } => (1, Value::hugeint(*sum), Value::ubigint(*count)),
+        AggregateState::Double { sum, count } => (2, Value::double(*sum), Value::ubigint(*count)),
+        AggregateState::Extreme(Some((key, value))) => (3, Value::blob(key.clone()), value.clone()),
+        AggregateState::Extreme(None) => (4, Value::sql_null(), Value::sql_null()),
+        AggregateState::Value(Some(value)) => (5, value.clone(), Value::sql_null()),
+        AggregateState::Value(None) => (6, Value::sql_null(), Value::sql_null()),
+        AggregateState::List(Some(values)) => (7, values_list(values)?, Value::sql_null()),
+        AggregateState::List(None) => (8, Value::sql_null(), Value::sql_null()),
+        AggregateState::Rows(rows) => (9, values_list(rows)?, Value::sql_null()),
+    };
+    let fields = vec![
+        ("tag".to_string(), Value::utinyint(tag)),
+        ("first".to_string(), first),
+        ("second".to_string(), second),
+    ];
+    Ok(BinarySerializer::serialize(
+        &Value::struct_value(fields),
+        SerializationOptions::default(),
+    ))
+}
+
+fn values_list(values: &[Value]) -> Result<Value> {
+    let child = values
+        .first()
+        .map_or(LogicalType::SQLNULL, |v| v.logical_type().clone());
+    Value::list(child, values.to_vec())
+}
+
+fn state_failure() -> Error {
+    Error::new(ErrorKind::InvalidInput, "Invalid aggregate state")
+}
+
+/// The state that [`encode_state`] wrote.
+fn decode_state(bytes: &[u8]) -> Result<AggregateState> {
+    let value: Value = BinaryDeserializer::deserialize(bytes)?;
+    let ValueData::Struct(fields) = value.data() else {
+        return Err(state_failure());
+    };
+    let [tag, first, second] = fields.as_slice() else {
+        return Err(state_failure());
+    };
+    let list = |value: &Value| -> Result<Vec<Value>> {
+        match value.data() {
+            ValueData::List(items) => Ok(items.clone()),
+            _ => Err(state_failure()),
+        }
+    };
+    let count = || second.as_i128().unwrap_or(0) as u64;
+    Ok(match tag.as_i128() {
+        Some(0) => AggregateState::Count(first.as_i128().unwrap_or(0) as i64),
+        Some(1) => AggregateState::Integer {
+            sum: first.as_i128().unwrap_or(0),
+            count: count(),
+        },
+        Some(2) => AggregateState::Double {
+            sum: match first.data() {
+                ValueData::Double(sum) => *sum,
+                _ => return Err(state_failure()),
+            },
+            count: count(),
+        },
+        Some(3) => match first.data() {
+            ValueData::Bytes(key) => AggregateState::Extreme(Some((key.clone(), second.clone()))),
+            _ => return Err(state_failure()),
+        },
+        Some(4) => AggregateState::Extreme(None),
+        Some(5) => AggregateState::Value(Some(first.clone())),
+        Some(6) => AggregateState::Value(None),
+        Some(7) => AggregateState::List(Some(list(first)?)),
+        Some(8) => AggregateState::List(None),
+        Some(9) => AggregateState::Rows(list(first)?),
+        _ => return Err(state_failure()),
+    })
+}
+
+/// `StateCombine`
+fn combine_states(kind: AggregateKind, left: AggregateState, right: AggregateState) -> Result<AggregateState> {
+    use AggregateState as S;
+    let overflow = || Error::new(ErrorKind::OutOfRange, "Overflow in aggregate state combine");
+    Ok(match (left, right) {
+        (S::Count(a), S::Count(b)) => S::Count(a.checked_add(b).ok_or_else(overflow)?),
+        (S::Integer { sum: a, count: x }, S::Integer { sum: b, count: y }) => S::Integer {
+            sum: a.checked_add(b).ok_or_else(overflow)?,
+            count: x.checked_add(y).ok_or_else(overflow)?,
+        },
+        (S::Double { sum: a, count: x }, S::Double { sum: b, count: y }) => S::Double {
+            sum: a + b,
+            count: x.checked_add(y).ok_or_else(overflow)?,
+        },
+        (S::Extreme(None), other) | (other, S::Extreme(None)) => other,
+        (S::Extreme(Some(a)), S::Extreme(Some(b))) => {
+            let keep_left = if kind == AggregateKind::Min {
+                a.0 <= b.0
+            } else {
+                a.0 >= b.0
+            };
+            S::Extreme(Some(if keep_left { a } else { b }))
+        }
+        (S::Value(None), other) | (other, S::Value(None)) => other,
+        (S::Value(Some(a)), S::Value(Some(b))) => match kind {
+            AggregateKind::Last => S::Value(Some(b)),
+            AggregateKind::SumBignum => {
+                return Err(crate::unported("combining states of the sum of BIGNUMs"));
+            }
+            _ => S::Value(Some(a)),
+        },
+        (S::List(None), other) | (other, S::List(None)) => other,
+        (S::List(Some(mut a)), S::List(Some(b))) => {
+            a.extend(b);
+            S::List(Some(a))
+        }
+        (S::Rows(mut a), S::Rows(b)) => {
+            a.extend(b);
+            S::Rows(a)
+        }
+        _ => return Err(state_failure()),
+    })
+}
+
+/// The aggregate an `AGGREGATE_STATE` type is of.
+fn state_function(ty: &LogicalType) -> Result<Arc<AggregateFunction>> {
+    let (name, overload, ..) = ty.aggregate_state_info().ok_or_else(state_failure)?;
+    let set = super::BuiltinFunctions::get()
+        .aggregate(name)
+        .ok_or_else(state_failure)?;
+    set.functions.get(overload as usize).cloned().ok_or_else(state_failure)
+}
+
+fn state_bytes(value: &Value) -> Result<&[u8]> {
+    match value.data() {
+        ValueData::Bytes(bytes) => Ok(bytes),
+        _ => Err(state_failure()),
+    }
+}
+
+/// `finalize`: the result of the aggregate from a state.
+pub fn finalize_state(value: &Value, ty: &LogicalType) -> Result<Value> {
+    let (.., arguments, result) = ty.aggregate_state_info().ok_or_else(state_failure)?;
+    if value.is_null() {
+        return Ok(Value::null(result.clone()));
+    }
+    let function = state_function(ty)?;
+    function.finalize(&decode_state(state_bytes(value)?)?, result, arguments.first())
+}
+
+/// `combine` and `combine_aggr`: a state of the rows of two others.
+pub fn combine_state_values(left: &Value, right: &Value, ty: &LogicalType) -> Result<Value> {
+    if left.is_null() {
+        return Ok(right.clone());
+    }
+    if right.is_null() {
+        return Ok(left.clone());
+    }
+    let function = state_function(ty)?;
+    let combined = combine_states(
+        function.kind,
+        decode_state(state_bytes(left)?)?,
+        decode_state(state_bytes(right)?)?,
+    )?;
+    Value::new(ty.clone(), ValueData::Bytes(encode_state(&combined)?))
+}
+
+/// A state combined with itself `times` times, by doubling. States that keep their rows can't
+/// hold more than this many.
+const MAX_REPEATED_ROWS: u128 = 100_000_000;
+
+pub fn repeat_state(state: &Value, times: i128, ty: &LogicalType) -> Result<Value> {
+    if times == 0 || state.is_null() {
+        return Ok(Value::null(ty.clone()));
+    }
+    if let AggregateState::Rows(rows) = decode_state(state_bytes(state)?)?
+        && (rows.len() as u128).saturating_mul(times as u128) > MAX_REPEATED_ROWS
+    {
+        return Err(Error::new(ErrorKind::OutOfRange, "Overflow in aggregate state combine"));
+    }
+    let mut result = Value::null(ty.clone());
+    let mut power = state.clone();
+    let mut left = times;
+    while left > 0 {
+        if left & 1 == 1 {
+            result = combine_state_values(&result, &power, ty)?;
+        }
+        left >>= 1;
+        if left > 0 {
+            power = combine_state_values(&power, &power, ty)?;
+        }
+    }
+    Ok(result)
+}
+
+/// `ExportAggregateFunction::Bind`: the aggregate gives its state.
+pub fn export_state(
+    function: &AggregateFunction,
+    return_type: &LogicalType,
+    arguments: &[LogicalType],
+) -> Result<(AggregateFunction, LogicalType)> {
+    let not_exportable = || {
+        Error::new(
+            ErrorKind::Binder,
+            format!("Cannot use EXPORT_STATE for non-combinable function {}", function.name),
+        )
+    };
+    let set = super::BuiltinFunctions::get()
+        .aggregate(&function.name)
+        .ok_or_else(not_exportable)?;
+    let overload = set
+        .functions
+        .iter()
+        .position(|f| f.kind == function.kind)
+        .ok_or_else(not_exportable)?;
+    let ty = LogicalType::aggregate_state(&function.name, overload as u32, arguments.to_vec(), return_type.clone());
+    let exported = AggregateFunction {
+        name: function.name.clone(),
+        arguments: function.arguments.clone(),
+        return_type: ty.clone(),
+        kind: function.kind,
+        export: Some(ty.clone()),
+    };
+    Ok((exported, ty))
 }
 
 fn add_integers<T: NativeType + Into<i128>>(
@@ -536,6 +772,9 @@ impl AggregateFunction {
         input: Option<&LogicalType>,
     ) -> Result<Value> {
         use AggregateKind::*;
+        if self.export.is_some() {
+            return Value::new(return_type.clone(), ValueData::Bytes(encode_state(state)?));
+        }
         let null = || Value::null(return_type.clone());
         Ok(match (self.kind, state) {
             (Holistic(kind), AggregateState::Rows(rows)) => finish(kind, rows, return_type)?,

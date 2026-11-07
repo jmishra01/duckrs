@@ -57,7 +57,9 @@ const STRING_FUNCTIONS: [&str; 21] = [
     "path_join",
 ];
 
-const OTHER_FUNCTIONS: [&str; 43] = [
+const OTHER_FUNCTIONS: [&str; 45] = [
+    "finalize",
+    "combine",
     "gamma",
     "lgamma",
     "nextafter",
@@ -1104,6 +1106,18 @@ fn from_binary(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+fn state_finalize(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let ty = args.column(0).logical_type().clone();
+    row_wise(args, result, |row| super::aggregates::finalize_state(&row[0], &ty))
+}
+
+fn state_combine(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let ty = args.column(0).logical_type().clone();
+    row_wise(args, result, |row| {
+        super::aggregates::combine_state_values(&row[0], &row[1], &ty)
+    })
+}
+
 fn count_args(name: &str, children: &[BoundExpr], low: usize, high: usize) -> Result<()> {
     if children.len() < low || children.len() > high {
         return Err(binder_error(format!(
@@ -1333,6 +1347,32 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
                 return Err(binder_error("map_concat expects at least one argument"));
             };
             Ok(bound_function(&lower, casted(children, &ty), ty, map_concat))
+        }
+        "finalize" => {
+            count_args(&lower, &children, 1, 1)?;
+            let ty = children[0].return_type.clone();
+            let Some((.., result)) = ty.aggregate_state_info() else {
+                return Err(binder_error(format!("Can only finalize {ty}, not AGGREGATE_STATE")));
+            };
+            let result = result.clone();
+            Ok(bound_function(&lower, children, result, state_finalize))
+        }
+        "combine" => {
+            count_args(&lower, &children, 2, 2)?;
+            let ty = children[0].return_type.clone();
+            let other = children[1].return_type.clone();
+            if ty.aggregate_state_info().is_none() {
+                return Err(binder_error(format!("Can only combine {ty}, not AGGREGATE_STATE")));
+            }
+            if other.id() != LogicalTypeId::SqlNull && ty != other {
+                let name = |t: &LogicalType| t.aggregate_state_info().map_or(t.to_string(), |i| i.0.to_string());
+                return Err(binder_error(format!(
+                    "Cannot COMBINE aggregate states from different functions, {} <> {}",
+                    name(&ty),
+                    name(&other)
+                )));
+            }
+            Ok(bound_function(&lower, children, ty, state_combine))
         }
         "cast_to_type" => {
             count_args(&lower, &children, 2, 2)?;

@@ -1402,9 +1402,6 @@ impl Binder<'_> {
         if state.inside_aggregate {
             return Err(binder_error("aggregate function calls cannot be nested"));
         }
-        if function.export_state {
-            return Err(crate::unported("EXPORT_STATE"));
-        }
         state.bound_aggregate = true;
         state.inside_aggregate = true;
         let filter = match &function.filter {
@@ -1471,6 +1468,13 @@ impl Binder<'_> {
         }
         let mut aggregate = bind_aggregate_function(set, children, filter, function.distinct)?;
         aggregate.order_by = order_by;
+        if function.export_state {
+            let arguments: Vec<LogicalType> = aggregate.children.iter().map(|c| c.return_type.clone()).collect();
+            let (exported, ty) =
+                crate::function::aggregates::export_state(&aggregate.function, &aggregate.return_type, &arguments)?;
+            aggregate.function = Arc::new(exported);
+            aggregate.return_type = ty;
+        }
         let state = self.aggregates.as_mut().expect("still bound");
         state.inside_aggregate = false;
         // equal aggregates are computed once

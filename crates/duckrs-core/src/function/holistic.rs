@@ -55,6 +55,8 @@ pub enum Holistic {
     ApproxTopK,
     BitstringAgg,
     WeightedAvg,
+    /// `combine_aggr`: a state of the states of its rows
+    CombineAggr,
     CountIf,
     Histogram,
     ApproxCountDistinct,
@@ -107,6 +109,7 @@ impl Holistic {
                 | ArgMaxNullsLast | AvgTimestamp,
                 Some(ty),
             ) => ty.clone(),
+            (CombineAggr, Some(ty)) => ty.clone(),
             (MinN | MaxN | ArgMinN | ArgMaxN | ApproxTopK, Some(ty)) => LogicalType::list(ty.clone()),
             _ => declared.clone(),
         }
@@ -928,6 +931,25 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
         ArgMaxN => extremes(rows, ty, true, 0, 1, 2)?,
         ApproxTopK => top_k(rows, ty)?,
         BitstringAgg => bitstring(rows, ty)?,
+        CombineAggr => {
+            let mut combined = null();
+            for row in rows {
+                // a state counts as often as its multiplicity says
+                let (state, times) = match row.data() {
+                    ValueData::Struct(parts) => (&parts[0], parts[1].as_i128().unwrap_or(0)),
+                    _ => (row, 1),
+                };
+                if times < 0 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        "combine_aggr: the multiplicity must not be negative",
+                    ));
+                }
+                let scaled = super::aggregates::repeat_state(state, times, ty)?;
+                combined = super::aggregates::combine_state_values(&combined, &scaled, ty)?;
+            }
+            combined
+        }
         WeightedAvg => {
             let (mut sum, mut weights) = (0.0, 0.0);
             for row in rows {

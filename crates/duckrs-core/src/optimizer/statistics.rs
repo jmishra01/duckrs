@@ -1074,6 +1074,10 @@ impl StatisticsPropagator {
             return;
         };
         for aggregate in aggregates {
+            // an exported state says which aggregate it is of
+            if aggregate.function.export.is_some() {
+                continue;
+            }
             let [
                 BoundExpr {
                     kind: BoundExprKind::ColumnRef { binding, depth: 0 },

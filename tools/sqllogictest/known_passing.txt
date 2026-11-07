@@ -257,6 +257,7 @@ test/issues/general/test_2240.test
 test/issues/general/test_22624.test
 test/issues/general/test_23860.test
 test/issues/general/test_23940.test
+test/issues/general/test_24049.test
 test/issues/general/test_2407.test
 test/issues/general/test_24442.test
 test/issues/general/test_24542.test
@@ -525,6 +526,10 @@ test/parquet/test_parquet_reader_compression.test
 test/parquet/time_millis.test
 test/parquet/union_by_name_nested_struct_extract.test
 test/planner/projection_binding.test
+test/sql/aggregate/aggregate_state_export/kahan_avg_export_state.test
+test/sql/aggregate/aggregate_state_export/ordered_export_empty_state.test
+test/sql/aggregate/aggregate_state_export/ordered_export_state_layout.test
+test/sql/aggregate/aggregate_state_export/vector_minmax_export_state.test
 test/sql/aggregate/aggregates/approx_quantile_decimal_scalar.test
 test/sql/aggregate/aggregates/approx_quantile_parallel_finalize.test
 test/sql/aggregate/aggregates/bitagg_fallible.test
@@ -541,6 +546,7 @@ test/sql/aggregate/aggregates/test_aggregate_types.test
 test/sql/aggregate/aggregates/test_aggregate_types_scalar.test
 test/sql/aggregate/aggregates/test_any_value.test
 test/sql/aggregate/aggregates/test_any_value_noninlined.test
+test/sql/aggregate/aggregates/test_approx_quantile_decimal.test
 test/sql/aggregate/aggregates/test_approx_quantile_timestamp_infinity.test
 test/sql/aggregate/aggregates/test_arg_min_max_null.test
 test/sql/aggregate/aggregates/test_bit_and.test
@@ -560,6 +566,7 @@ test/sql/aggregate/aggregates/test_group_on_expression.test
 test/sql/aggregate/aggregates/test_histogram_3529.test
 test/sql/aggregate/aggregates/test_incorrect_aggregate.test
 test/sql/aggregate/aggregates/test_kahan_avg.test
+test/sql/aggregate/aggregates/test_kahan_combine.test
 test/sql/aggregate/aggregates/test_kahan_sum.test
 test/sql/aggregate/aggregates/test_last.test
 test/sql/aggregate/aggregates/test_last_noninlined.test

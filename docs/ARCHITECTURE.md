@@ -628,8 +628,15 @@ their types depend on their arguments, so they are not overloads and `duckdb_fun
 aggregates are `Holistic`, which keep their rows: `approx_top_k` and `bitstring_agg` are exact, and `min(x, n)` sorts.
 Named arguments of aggregates are read by position.
 
-The gates are not met: see `docs/STATUS.md`. What holds the most files back is `EXPORT_STATE`, `finalize`, `combine` and
-`to_aggregate_state`, which need a state type of their own; the box rendering of EXPLAIN, which the `explain_value`
+**EXPORT_STATE** gives an `AGGREGATE_STATE`: a type that names the aggregate, its arguments and its result, whose
+values are the bytes of an `AggregateState` (`LegacyAggregateState` is the id, as nothing else used it). `finalize`,
+`combine` and `combine_aggr` work on those, and a state survives a table. In C++ a state is a STRUCT with a layout per
+aggregate, and most of `test/sql/aggregate/aggregate_state_export` prints it or casts it. Those tests fail here, as does
+`to_aggregate_state`, which builds a state from that layout. The bytes are ours, so a state means nothing to C++, and
+a state with a sketch in C++ holds its rows here. Matching C++ means a state per aggregate: `Holistic` keeps rows, and
+can't turn into Welford's fields or a t-digest and back.
+
+The gates are not met: see `docs/STATUS.md`. What holds the most files back is that layout; the box rendering of EXPLAIN, which the `explain_value`
 tests read; `test_vector_types`; COLLATE; and VARIANT columns in database files.
 
 ## Phase 11
