@@ -461,13 +461,21 @@ fn for_each_table_name(statement: &mut Statement, f: &mut impl FnMut(&mut Qualif
 
 /// A column named with its database, which a statement that runs there doesn't have any more.
 fn strip_database(statement: &mut Statement, database: &str) {
-    let mut strip = |e: &mut Expr| {
-        if let ExprKind::ColumnRef(parts) = &mut e.kind
-            && parts.len() > 2
-            && parts[0].eq_ignore_ascii_case(database)
-        {
+    let mut strip = |e: &mut Expr| match &mut e.kind {
+        ExprKind::ColumnRef(parts) if parts.len() > 2 && parts[0].eq_ignore_ascii_case(database) => {
             parts.remove(0);
         }
+        // `db.f()` calls `f` of the database
+        ExprKind::Function(function)
+            if function
+                .name
+                .qualification
+                .first()
+                .is_some_and(|first| first.eq_ignore_ascii_case(database)) =>
+        {
+            function.name.qualification.remove(0);
+        }
+        _ => {}
     };
     let mut visit = |e: &mut Expr| duckrs_parser::transformer::visit_expr_mut(e, &mut strip);
     match statement {
@@ -1328,6 +1336,18 @@ impl ClientContext {
         let mut names = Vec::new();
         let mut routed = statement.clone();
         for_each_table_name(&mut routed, &mut |name| names.push(name.clone()));
+        // `BindSchemaOrCatalog`: a function qualified by an attached database only, as in `db.f()`
+        if let Statement::Select(select) = &mut routed {
+            duckrs_parser::transformer::visit_query_node_exprs_mut(&mut select.node, &mut |e: &mut Expr| {
+                duckrs_parser::transformer::visit_expr_mut(e, &mut |e| {
+                    if let ExprKind::Function(function) = &e.kind
+                        && function.name.qualification.len() == 1
+                    {
+                        names.push(function.name.clone());
+                    }
+                })
+            });
+        }
         let database = names.iter().find_map(|name| {
             let first = name.qualification.first()?;
             let is_schema = name.qualification.len() == 1
@@ -1913,11 +1933,38 @@ impl ClientContext {
                         "WITH clause is not supported for schemas",
                     ));
                 }
-                if !catalog_qualifier_only(&info.name.qualification) {
-                    return Err(crate::unported("this form of CREATE SCHEMA"));
-                }
-                self.catalog()
-                    .create_schema(&info.name.name, on_create_conflict(info.on_conflict))?;
+                let catalog = match info.name.qualification.as_slice() {
+                    [] => self.catalog(),
+                    // `PhysicalCreateSchema` and `CatalogSet::CreateEntry`
+                    [catalog] if catalog.eq_ignore_ascii_case("system") => {
+                        return Err(Error::new(ErrorKind::Binder, "Cannot create schema in system catalog"));
+                    }
+                    [catalog] if catalog.eq_ignore_ascii_case(TEMP_SCHEMA) => {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "Cannot create non-temporary entry \"{}\" in temporary catalog",
+                                info.name.name
+                            ),
+                        ));
+                    }
+                    [catalog] if catalog_qualifier_only(&info.name.qualification) => self.catalog(),
+                    // a schema of an attached database is created there
+                    [catalog]
+                        if self.catalog().get_schema(catalog).is_none()
+                            && let Some(database) = self.find_database(catalog) =>
+                    {
+                        let mut routed = info.clone();
+                        routed.name.qualification.clear();
+                        let previous = std::mem::replace(&mut self.db, database);
+                        let result = self.run_statement(&Statement::Create(routed));
+                        self.db = previous;
+                        return result;
+                    }
+                    // a schema in a schema
+                    _ => return Err(crate::unported("this form of CREATE SCHEMA")),
+                };
+                catalog.create_schema(&info.name.name, on_create_conflict(info.on_conflict))?;
                 return Ok(Self::success());
             }
             Statement::Drop(info) => {

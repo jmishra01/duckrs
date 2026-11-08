@@ -29,6 +29,11 @@ pub(super) struct LambdaScope {
     types: Vec<LogicalType>,
 }
 
+/// Whether `name` is a function that takes a lambda.
+pub(super) fn is_lambda_function(name: &str) -> bool {
+    lambda_kind(name).is_some()
+}
+
 fn lambda_kind(name: &str) -> Option<LambdaKind> {
     Some(match name.to_ascii_lowercase().as_str() {
         "list_transform" | "array_transform" | "list_apply" | "array_apply" | "apply" => LambdaKind::Transform,

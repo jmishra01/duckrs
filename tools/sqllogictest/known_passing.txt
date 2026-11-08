@@ -772,6 +772,7 @@ test/sql/attach/attach_huggingface_index.test
 test/sql/attach/attach_index.test
 test/sql/attach/attach_issue7711.test
 test/sql/attach/attach_issue_21491.test
+test/sql/attach/attach_macros.test
 test/sql/attach/attach_null.test
 test/sql/attach/attach_persistent.test
 test/sql/attach/attach_pragma_storage_info.test
@@ -784,6 +785,7 @@ test/sql/attach/in_memory_attach.test
 test/sql/binder/alias_error_10057.test
 test/sql/binder/column_value_alias_group.test
 test/sql/binder/duplicate_alias.test
+test/sql/binder/function_chaining_19035.test
 test/sql/binder/group_by_incremental_alias.test
 test/sql/binder/group_by_qualification.test
 test/sql/binder/integer_literal_binding.test
@@ -807,6 +809,7 @@ test/sql/cast/decimal_constexpr_limits.test
 test/sql/cast/decimal_float_cast.test
 test/sql/cast/decimal_hugeint_zero_to_double.test
 test/sql/cast/decimal_integer_cast.test
+test/sql/cast/dot_function_missing_error.test
 test/sql/cast/double_float_cast.test
 test/sql/cast/float_decimal_cast.test
 test/sql/cast/float_integer_cast.test
@@ -871,6 +874,7 @@ test/sql/catalog/drop_create_rollback.test
 test/sql/catalog/function/python_style_macro_parameters.test
 test/sql/catalog/function/test_cross_catalog_macros.test
 test/sql/catalog/function/test_macro_issue_13104.test
+test/sql/catalog/function/test_macro_issue_18927.test
 test/sql/catalog/function/test_macro_issue_19119.test
 test/sql/catalog/function/test_macro_overloads.test
 test/sql/catalog/function/test_macro_relpersistence_conflict.test
@@ -1066,6 +1070,7 @@ test/sql/copy/csv/csv_limit_copy.test
 test/sql/copy/csv/csv_multibyte_delimiter_escapes.test
 test/sql/copy/csv/csv_null_byte.test
 test/sql/copy/csv/csv_null_padding.test
+test/sql/copy/csv/csv_projection_pushdown.test
 test/sql/copy/csv/csv_quoted_buffer_boundary.test
 test/sql/copy/csv/csv_quoted_newline_after_boundary.test
 test/sql/copy/csv/csv_quoted_newline_incorrect.test
@@ -1524,6 +1529,7 @@ test/sql/function/list/lambdas/arrow/lambdas_and_functions_deprecated.test
 test/sql/function/list/lambdas/arrow/lambdas_and_group_by_deprecated.test
 test/sql/function/list/lambdas/arrow/list_comprehension_deprecated.test
 test/sql/function/list/lambdas/arrow/rhs_parameters_deprecated.test
+test/sql/function/list/lambdas/arrow/test_deprecated_lambda.test
 test/sql/function/list/lambdas/arrow/test_lambda_arrow_storage_deprecated.test
 test/sql/function/list/lambdas/arrow/transform_deprecated.test
 test/sql/function/list/lambdas/arrow/transform_with_index_deprecated.test
@@ -2157,6 +2163,7 @@ test/sql/parser/empty_quoted_identifier.test
 test/sql/parser/expression_depth_limit.test
 test/sql/parser/fetch_first.test
 test/sql/parser/from_first.test
+test/sql/parser/function_chaining.test
 test/sql/parser/hex_string_literal.test
 test/sql/parser/indirection.test
 test/sql/parser/invisible_spaces.test
@@ -3127,6 +3134,7 @@ test/sql/types/nested/array/array_lateral_unnest.test
 test/sql/types/nested/array/array_limit_offset.test
 test/sql/types/nested/array/array_list_agg.test
 test/sql/types/nested/array/array_list_aggregate.test
+test/sql/types/nested/array/array_misc.test
 test/sql/types/nested/array/array_roundtrip_csv.test
 test/sql/types/nested/array/array_roundtrip_json.test
 test/sql/types/nested/array/array_roundtrip_parquet.test
@@ -3150,6 +3158,7 @@ test/sql/types/nested/list/list_comparison_stale_positions.test
 test/sql/types/nested/list/list_subquery.test
 test/sql/types/nested/list/nested_comparison_null_children.test
 test/sql/types/nested/list/test_list_extract.test
+test/sql/types/nested/list/test_list_functions_with_null_structs.test
 test/sql/types/nested/list/test_list_index.test
 test/sql/types/nested/list/test_list_slice.test
 test/sql/types/nested/list/test_list_slice_negative_step.test

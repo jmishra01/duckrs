@@ -1083,7 +1083,31 @@ impl Binder<'_> {
             }
             ExprKind::Function(function) => {
                 if !builtin_qualification(&function.name.qualification) {
-                    return Err(crate::unported("qualified function names"));
+                    // `ColumnQualifier::QualifyFunction`: a system function with a qualification that
+                    // names no schema of it is a call on a column, "x.lower()" being "lower(x)"
+                    if !is_system_function(&function.name.name) {
+                        return Err(Error::new(
+                            ErrorKind::Catalog,
+                            format!("Scalar Function with name {} does not exist!", function.name.name),
+                        ));
+                    }
+                    let column: Vec<String> = function
+                        .name
+                        .qualification
+                        .iter()
+                        .filter(|q| !q.is_empty())
+                        .cloned()
+                        .collect();
+                    let mut call = function.clone();
+                    call.name.qualification.clear();
+                    call.args.insert(
+                        0,
+                        ast::FunctionArgument {
+                            name: String::new(),
+                            expr: Expr::from(ExprKind::ColumnRef(column)),
+                        },
+                    );
+                    return self.bind_expression(&Expr::from(ExprKind::Function(call)));
                 }
                 if let Some(bound) = self.bind_session_function(function)? {
                     return Ok(bound);
@@ -1280,6 +1304,42 @@ impl Binder<'_> {
 
 /// Whether a function's qualification can name a built-in function, which live in the `main`
 /// schema of the system catalog.
+/// Whether `name` is a function of the system catalog: one of the built-ins, however duckrs binds
+/// it, or a system macro.
+pub(super) fn is_system_function(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let functions = BuiltinFunctions::get();
+    functions.scalar(name).is_some()
+        || functions.aggregate(name).is_some()
+        || crate::catalog::defaults::default_macro(None, name, false).is_some()
+        || super::lambda::is_lambda_function(name)
+        || is_generic_function(name)
+        || is_unnest(name)
+        || is_variant_function(name)
+        || crate::function::extras::is_extra_function(name)
+        || crate::function::json::is_json_function(name)
+        || is_nested_function(name)
+        || lower.starts_with("json_group_")
+        || matches!(
+            lower.as_str(),
+            "nullif"
+                | "if"
+                | "list_reverse_sort"
+                | "array_reverse_sort"
+                | "write_log"
+                | "parse_duckdb_log_message"
+                | "to_aggregate_state"
+                | "current_database"
+                | "current_schema"
+                | "txid_current"
+                | "current_transaction_id"
+                | "current_connection_id"
+                | "current_query_id"
+                | "getvariable"
+                | "current_setting"
+        )
+}
+
 fn builtin_qualification(qualification: &[String]) -> bool {
     // an operator's qualification has an empty entry for what it does not name
     let parts: Vec<&String> = qualification.iter().filter(|q| !q.is_empty()).collect();

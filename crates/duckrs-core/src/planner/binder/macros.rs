@@ -33,8 +33,25 @@ const MAX_MACRO_DEPTH: usize = 32;
 /// like a parameter stays what it is.
 const PARAMETER_MARK: &str = "\0macro parameter";
 
-/// Turns the references to `parameters` into marked references to their position.
+/// Turns the references to `parameters` into marked references to their position. A call on a
+/// parameter, as in `p.lower()`, is a call with it (`ColumnQualifier::QualifyFunction`).
 fn mark_parameters(expr: &mut Expr, parameters: &[String]) {
+    if let ExprKind::Function(function) = &mut expr.kind
+        && let [name] = function.name.qualification.as_slice()
+        && let Some(i) = parameters.iter().position(|p| p.eq_ignore_ascii_case(name))
+        && super::expression::is_system_function(&function.name.name)
+    {
+        function.name.qualification.clear();
+        let marked = ExprKind::ColumnRef(vec![PARAMETER_MARK.to_string(), i.to_string()]);
+        function.args.insert(
+            0,
+            duckrs_parser::ast::FunctionArgument {
+                name: String::new(),
+                expr: marked.into(),
+            },
+        );
+        return;
+    }
     if let ExprKind::ColumnRef(names) = &expr.kind
         && let [name] = names.as_slice()
         && let Some(i) = parameters.iter().position(|p| p.eq_ignore_ascii_case(name))
