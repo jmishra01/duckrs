@@ -785,12 +785,14 @@ impl Transformer<'_> {
                 "MINVALUE ({min_value}) must be less than MAXVALUE ({max_value})"
             )));
         }
-        if start_value < min_value {
+        // a non cycling sequence can start outside its range, the exhausted state EXPORT DATABASE
+        // writes; a cycling one wraps and never exhausts, so its range still bounds its START
+        if cycle && start_value < min_value {
             return Err(parser_error(format!(
                 "START value ({start_value}) cannot be less than MINVALUE ({min_value})"
             )));
         }
-        if start_value > max_value {
+        if cycle && start_value > max_value {
             return Err(parser_error(format!(
                 "START value ({start_value}) cannot be greater than MAXVALUE ({max_value})"
             )));

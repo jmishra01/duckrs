@@ -192,6 +192,7 @@ enum PreparedModifier {
     Limit {
         limit: Option<u64>,
         offset: u64,
+        failure: Option<Error>,
     },
 }
 
@@ -682,7 +683,9 @@ impl Binder<'_> {
                     types: plan.types(),
                     bindings: plan.column_bindings(),
                 },
-                PreparedModifier::Limit { limit, offset } => LogicalOperatorKind::Limit { limit, offset },
+                PreparedModifier::Limit { limit, offset, failure } => {
+                    LogicalOperatorKind::Limit { limit, offset, failure }
+                }
             };
             let children = if matches!(kind, LogicalOperatorKind::EmptyResult { .. }) {
                 vec![]
@@ -1204,19 +1207,31 @@ impl Binder<'_> {
                         None => 0,
                     };
                     let Some(limit) = limit else {
-                        return Ok(PreparedModifier::Limit { limit: None, offset });
+                        return Ok(PreparedModifier::Limit {
+                            limit: None,
+                            offset,
+                            failure: None,
+                        });
                     };
                     return self.bind_limit_percent(limit, offset);
                 }
-                let limit = match limit {
-                    Some(limit) => self.bind_limit_value(limit, false)?,
-                    None => None,
+                // a LIMIT or OFFSET that fails to evaluate fails once a row reaches it
+                let mut failure = None;
+                let mut value = |expr: &Option<Box<Expr>>, is_offset: bool| -> Result<Option<u64>> {
+                    let Some(expr) = expr else {
+                        return Ok(None);
+                    };
+                    match self.bind_limit_value(expr, is_offset) {
+                        Err(error) if !matches!(error.kind, ErrorKind::Binder | ErrorKind::Parser) => {
+                            failure.get_or_insert(error);
+                            Ok(None)
+                        }
+                        result => result,
+                    }
                 };
-                let offset = match offset {
-                    Some(offset) => self.bind_limit_value(offset, true)?.unwrap_or(0),
-                    None => 0,
-                };
-                PreparedModifier::Limit { limit, offset }
+                let limit = value(limit, false)?;
+                let offset = value(offset, true)?.unwrap_or(0);
+                PreparedModifier::Limit { limit, offset, failure }
             }
         })
     }

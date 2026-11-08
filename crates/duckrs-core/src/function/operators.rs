@@ -38,11 +38,8 @@ macro_rules! integer_arithmetic {
                 self.checked_sub(other)
             }
             fn mul(self, other: Self) -> Option<Self> {
-                // `Hugeint::TryMultiply` works on magnitudes, so only -2^127 itself can make -2^127
-                let min = <$t>::MIN;
-                self.checked_mul(other).filter(|r| {
-                    <$t>::BITS != 128 || min == 0 || *r != min || self == min || other == min
-                })
+                // `Hugeint::TryMultiply` accepts a product equal to the minimum
+                self.checked_mul(other)
             }
             fn neg(self) -> Option<Self> {
                 (0 as $t).checked_sub(self)

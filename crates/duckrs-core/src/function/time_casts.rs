@@ -113,7 +113,7 @@ fn timestamp_cast_exists(from: LogicalTypeId, to: LogicalTypeId) -> bool {
             TimestampSec,
         ],
         TimestampTz => &[TimeTz, Timestamp, TimestampNs, TimestampTzNs, TimestampMs, TimestampSec],
-        TimestampTzNs => &[TimeTz, TimestampNs, TimestampTz, TimestampMs, TimestampSec],
+        TimestampTzNs => &[TimeTz, TimestampNs, TimestampTz, Timestamp, TimestampMs, TimestampSec],
         TimestampNs => &[Date, Time, TimeNs, Timestamp, TimestampTz, TimestampMs],
         TimestampMs => &[
             Date,

@@ -150,10 +150,63 @@ fn parse_statements(sql: &str, options: &ParserOptions) -> Result<ParsedStatemen
                     ),
                 ));
             }
-            _ => return Err(syntax_error(&tokens, matcher.max_position.max(end))),
+            _ => {
+                let position = matcher.max_position.max(end);
+                let position = missing_comma_position(&text, &tokens, pos, position);
+                return Err(syntax_error(&tokens, position));
+            }
         }
     }
     Ok((text, tokens, statements, starts))
+}
+
+/// Whether the statement at the start of `text` parses up to its end.
+fn statement_parses(text: &str) -> bool {
+    let Ok(tokens) = tokenizer::tokenize(text) else {
+        return false;
+    };
+    let grammar = Grammar::duckdb();
+    let statement = grammar.rule("Statement").expect("the grammar has a Statement rule");
+    let mut matcher = Matcher::new(grammar, &tokens);
+    matcher
+        .match_rule(statement, 0)
+        .is_some_and(|(end, _)| matches!(tokens[end].token_type, TokenType::Terminator | TokenType::EndOfInput))
+}
+
+/// `PEGSyntaxError::Create` / `FindMissingToken`: where a missing token is to be reported. A
+/// forgotten comma or closing bracket is the most common cause, so punctuation that repairs the
+/// statement at the failure keeps it there; a comma may also be missing one token earlier, when
+/// the word before the failure was taken as an alias.
+fn missing_comma_position(text: &str, tokens: &[Token], start: usize, error: usize) -> usize {
+    let Some(error_token) = tokens.get(error) else {
+        return error;
+    };
+    if error <= start || tokens[start].offset > error_token.offset {
+        return error;
+    }
+    let statement = &text[tokens[start].offset..];
+    let inserted = |at: usize, what: &str| {
+        let at = at - tokens[start].offset;
+        format!("{} {what} {}", &statement[..at], &statement[at..])
+    };
+    let error_offset = if error_token.token_type == TokenType::EndOfInput {
+        text.len()
+    } else {
+        error_token.offset
+    };
+    if [",", ")", "]", "}"]
+        .iter()
+        .any(|p| statement_parses(&inserted(error_offset, p)))
+    {
+        return error;
+    }
+    let previous = &tokens[error - 1];
+    let is_word = previous.token_type == TokenType::Identifier
+        || (previous.token_type == TokenType::Keyword && !keywords::is_keyword(&previous.text));
+    if is_word && statement_parses(&inserted(previous.offset, ",")) {
+        return error - 1;
+    }
+    error
 }
 
 /// `syntax error at or near "..."` at the furthest token the matcher reached.

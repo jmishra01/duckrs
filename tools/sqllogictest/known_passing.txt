@@ -7,6 +7,9 @@
 #   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
 # Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
 # stop passing. Regenerate with:
+#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
+# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
+# stop passing. Regenerate with:
 test/common/test_cast_hugeint.test
 test/fuzzer/afl/alter_if_exists.test
 test/fuzzer/afl/analyze_empty_table.test
@@ -482,6 +485,7 @@ test/optimizer/joins/no_cross_product_reordering.test
 test/optimizer/joins/no_duplicate_elimination_join.test
 test/optimizer/joins/not_equal_join_cardinality_estimation.test
 test/optimizer/joins/pushdown_semi_anti.test
+test/optimizer/joins/range_join_cardinality_estimation.test
 test/optimizer/joins/relation_statistics_bindings.test
 test/optimizer/joins/single_sided_predicate_reconstruction.test
 test/optimizer/joins/test_delim_join_with_cross_product_in_rhs.test
@@ -3214,6 +3218,7 @@ test/sql/types/hugeint/test_hugeint_conversion.test
 test/sql/types/hugeint/test_hugeint_functions.test
 test/sql/types/hugeint/test_hugeint_null_value.test
 test/sql/types/hugeint/test_hugeint_ops.test
+test/sql/types/hugeint/test_hugeint_to_floating_rounding.test
 test/sql/types/interval/frac_interval.test
 test/sql/types/interval/interval_colon_time_overflow.test
 test/sql/types/interval/interval_constants.test

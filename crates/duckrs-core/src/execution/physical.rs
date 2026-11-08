@@ -1846,6 +1846,8 @@ pub struct PhysicalLimit {
     pub children: Vec<Box<dyn PhysicalOperator>>,
     /// rows still to skip, and rows still to pass (`None`: all)
     pub remaining: Mutex<(u64, Option<u64>)>,
+    /// The error of a LIMIT or OFFSET that did not fold, for the first row that reaches it.
+    pub failure: Option<Error>,
 }
 
 impl PhysicalOperator for PhysicalLimit {
@@ -1859,6 +1861,11 @@ impl PhysicalOperator for PhysicalLimit {
         &self.children
     }
     fn execute(&self, mut input: DataChunk) -> Result<DataChunk> {
+        if let Some(failure) = &self.failure
+            && !input.is_empty()
+        {
+            return Err(failure.clone());
+        }
         let mut remaining = self.remaining.lock();
         let (offset, limit) = &mut *remaining;
         let len = input.len() as u64;

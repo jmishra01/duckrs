@@ -1117,29 +1117,9 @@ impl<'g> Transformer<'g> {
                     bounds.insert(0, expr);
                     Expr::operator(op, bounds)
                 }
-                Indirection::Method(mut f) => {
+                Indirection::Method(f) => {
                     previous_was_cast = false;
-                    f.args.insert(0, FunctionArgument::positional(expr));
-                    let lower = f.name.name.to_lowercase();
-                    let distinct = f.distinct;
-                    let has_order = !f.order_by.is_empty();
-                    match function_rewrite(&lower, &mut f.args, true)? {
-                        Some(rewritten) => {
-                            let upper = lower.to_uppercase();
-                            if distinct {
-                                return Err(parser_error(format!(
-                                    "DISTINCT is not supported in {upper} expressions"
-                                )));
-                            }
-                            if has_order {
-                                return Err(parser_error(format!(
-                                    "ORDER BY is not supported in {upper} expressions"
-                                )));
-                            }
-                            rewritten
-                        }
-                        None => f.into(),
-                    }
+                    method_call(expr, f)?
                 }
                 Indirection::Field(name) => {
                     previous_was_cast = false;
@@ -1597,7 +1577,15 @@ impl<'g> Transformer<'g> {
         if lower == "count" && args.args.is_empty() {
             lower = "count_star".into();
         }
-        if let Some(rewritten) = function_rewrite(&lower, &mut args.args, false)? {
+        // `x.ifnull(y)` parses as a call in schema x. The rewrites are not catalog functions, so for
+        // them a qualification other than main is the column the function is called on
+        let call_on_column = !name.qualification.is_empty()
+            && is_function_rewrite(&lower)
+            && !name
+                .qualification
+                .last()
+                .is_some_and(|s| s.eq_ignore_ascii_case("main"));
+        if !call_on_column && let Some(rewritten) = function_rewrite(&lower, &mut args.args, false)? {
             return Ok(rewritten);
         }
         if args.has_ignore_nulls {
@@ -1629,9 +1617,10 @@ impl<'g> Transformer<'g> {
                 }
             }
         }
-        Ok(FunctionExpr {
+        let column = call_on_column.then(|| name.qualification.clone());
+        let function = FunctionExpr {
             name: QualifiedName {
-                qualification: name.qualification,
+                qualification: if call_on_column { Vec::new() } else { name.qualification },
                 name: lower,
             },
             args: args.args,
@@ -1640,8 +1629,11 @@ impl<'g> Transformer<'g> {
             distinct: args.distinct,
             is_operator: false,
             export_state,
+        };
+        match column {
+            Some(column) => method_call(Expr::column(column), function),
+            None => Ok(function.into()),
         }
-        .into())
     }
 
     fn window_frame(&mut self, node: &ParseNode) -> Result<WindowExpr> {
@@ -3340,6 +3332,40 @@ fn regex_any_all(left: Expr, right: Expr, negated: bool, case_insensitive: bool,
         ],
         Some(Expr::constant(Literal::boolean(!is_any))),
     )
+}
+
+/// `GetParserFunctionRewrite`: whether the parser turns calls of `name` into a syntax node.
+fn is_function_rewrite(name: &str) -> bool {
+    matches!(
+        name,
+        "unpack" | "try" | "construct_array" | "ifnull" | "coalesce" | "date"
+    )
+}
+
+/// `TransformMethodCall`: a call on a value, as `x.f(y)`, is the call `f(x, y)` with the rewrites
+/// of a method call.
+fn method_call(value: Expr, mut function: FunctionExpr) -> Result<Expr> {
+    function.args.insert(0, FunctionArgument::positional(value));
+    let lower = function.name.name.to_lowercase();
+    let Some(rewritten) = function_rewrite(&lower, &mut function.args, true)? else {
+        return Ok(function.into());
+    };
+    // a rewrite yields a syntax node with nowhere to put the modifiers
+    let upper = lower.to_uppercase();
+    if function.distinct {
+        return Err(parser_error(format!(
+            "DISTINCT is not supported in {upper} expressions"
+        )));
+    }
+    if !function.order_by.is_empty() {
+        return Err(parser_error(format!(
+            "ORDER BY is not supported in {upper} expressions"
+        )));
+    }
+    if function.filter.is_some() {
+        return Err(parser_error(format!("FILTER is not supported in {upper} expressions")));
+    }
+    Ok(rewritten)
 }
 
 /// `TransformParserFunctionRewrite`: names the parser turns into syntax nodes.

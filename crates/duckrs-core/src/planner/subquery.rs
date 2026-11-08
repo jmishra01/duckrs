@@ -659,7 +659,7 @@ impl Flatten<'_> {
 
     /// `PushDownLimit`: LIMIT holds per domain value, which takes a row number per domain value.
     fn push_limit(&mut self, plan: &mut LogicalOperator) -> Flat<Vec<ColumnBinding>> {
-        let K::Limit { limit, offset } = plan.kind else {
+        let K::Limit { limit, offset, .. } = plan.kind else {
             unreachable!()
         };
         let mut child = plan.children.remove(0);

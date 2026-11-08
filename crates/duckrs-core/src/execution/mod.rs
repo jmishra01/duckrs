@@ -239,10 +239,11 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
         LogicalOperatorKind::TopN { orders, limit, offset } => {
             order_plan(orders, Some((limit, offset)), children.remove(0))
         }
-        LogicalOperatorKind::Limit { limit, offset } => Box::new(PhysicalLimit {
+        LogicalOperatorKind::Limit { limit, offset, failure } => Box::new(PhysicalLimit {
             types,
             children,
             remaining: Mutex::new((offset, limit)),
+            failure,
         }),
         LogicalOperatorKind::LimitPercent { percent, offset } => {
             let data = Mutex::new(ColumnDataCollection::new(types.clone()));

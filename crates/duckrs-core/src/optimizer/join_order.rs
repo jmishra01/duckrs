@@ -336,7 +336,11 @@ fn predicate_denominator(conjunct: &BoundExpr, domain_of: &dyn Fn(&BoundExpr) ->
                 1.0
             }
         }
-        _ => domain.powf(2.0 / 3.0),
+        // a strict range comparison keeps (d - 1) / (2 d) of the pairs for independent columns
+        // over a shared domain: half the cross product, so small domains can't make it look cheap
+        ComparisonOp::LessThan | ComparisonOp::GreaterThan => 2.0,
+        // a non-strict one also keeps the 1 / d of the pairs that are equal
+        ComparisonOp::LessThanOrEqual | ComparisonOp::GreaterThanOrEqual => 2.0 * domain / (domain + 1.0),
     }
 }
 
@@ -1023,35 +1027,96 @@ fn is_proven_not_null(filter: &BoundExpr, table: &Arc<TableCatalogEntry>, table_
     id.and_then(|id| statistics.get(id)).is_some_and(|s| !s.can_be_null)
 }
 
-/// How many rows filters leave of `child`: an equality with a constant keeps a value's worth of
-/// them, and anything else the default selectivity, once.
+/// `FilterFraction`: `fraction` of `cardinality`, at least one row and at most all of them.
+fn filter_fraction(cardinality: f64, fraction: f64) -> f64 {
+    if cardinality <= 0.0 {
+        return 0.0;
+    }
+    (cardinality * fraction).floor().clamp(1.0, cardinality)
+}
+
+/// `EstimateFilterRows` for one conjunct: the rows it keeps, and whether it is modeled.
+fn conjunct_rows(cardinality: f64, conjunct: &BoundExpr, child: &RelationStats) -> (f64, bool) {
+    match &conjunct.kind {
+        BoundExprKind::Constant(value) if conjunct.return_type.id() == duckrs_common::types::LogicalTypeId::Boolean => {
+            let keeps = *value == Value::boolean(true);
+            (if keeps { cardinality } else { 0.0 }, true)
+        }
+        // `EstimateNullCheckRows`
+        BoundExprKind::Operator {
+            op: op @ (BoundOperator::IsNull | BoundOperator::IsNotNull),
+            children,
+        } if children.len() == 1 && bare_column(&children[0]).is_some() => {
+            let fraction = if *op == BoundOperator::IsNull {
+                DEFAULT_SELECTIVITY
+            } else {
+                1.0 - DEFAULT_SELECTIVITY
+            };
+            (filter_fraction(cardinality, fraction), true)
+        }
+        // `EstimateEqualityRows`
+        BoundExprKind::Comparison {
+            op: op @ (ComparisonOp::Equal | ComparisonOp::NotEqual),
+            left,
+            right,
+        } => {
+            let column = match (&left.kind, &right.kind) {
+                (BoundExprKind::Constant(value), _) if !Value::is_null(value) => bare_column(right),
+                (_, BoundExprKind::Constant(value)) if !Value::is_null(value) => bare_column(left),
+                _ => None,
+            };
+            let Some(column) = column else {
+                return (cardinality, false);
+            };
+            let equal = *op == ComparisonOp::Equal;
+            if cardinality <= 0.0 {
+                return (0.0, true);
+            }
+            match child.distinct.get(&column) {
+                None => (
+                    filter_fraction(
+                        cardinality,
+                        if equal {
+                            DEFAULT_SELECTIVITY
+                        } else {
+                            1.0 - DEFAULT_SELECTIVITY
+                        },
+                    ),
+                    true,
+                ),
+                Some(distinct) => {
+                    let domain = distinct.min(cardinality);
+                    if domain <= 0.0 {
+                        return (cardinality, false);
+                    }
+                    if equal {
+                        ((cardinality / domain).ceil(), true)
+                    } else {
+                        (filter_fraction(cardinality, 1.0 - 1.0 / domain), true)
+                    }
+                }
+            }
+        }
+        _ => (cardinality, false),
+    }
+}
+
+/// How many rows filters leave of `child` (`EstimateFilterRows` and `ApplyFilterEstimate`): the
+/// smallest estimate of a conjunct, and the default selectivity when one is not modeled.
 fn filter_cardinality(expressions: &[BoundExpr], child: &RelationStats) -> f64 {
     let mut conjuncts = Vec::new();
     for expr in expressions {
         split_conjuncts(expr.clone(), &mut conjuncts);
     }
     let mut cardinality = child.cardinality;
-    let mut other = false;
+    let mut supported = true;
     for conjunct in &conjuncts {
-        let equal_constant = match &conjunct.kind {
-            BoundExprKind::Comparison {
-                op: ComparisonOp::Equal,
-                left,
-                right,
-            } => match (&left.kind, &right.kind) {
-                (BoundExprKind::Constant(value), _) if !Value::is_null(value) => bare_column(right),
-                (_, BoundExprKind::Constant(value)) if !Value::is_null(value) => bare_column(left),
-                _ => None,
-            },
-            _ => None,
-        };
-        match equal_constant.and_then(|column| child.distinct.get(&column)) {
-            Some(distinct) => cardinality /= distinct.max(1.0),
-            None => other = true,
-        }
+        let (rows, modeled) = conjunct_rows(child.cardinality, conjunct, child);
+        cardinality = cardinality.min(rows);
+        supported &= modeled;
     }
-    if other {
-        cardinality *= DEFAULT_SELECTIVITY;
+    if !supported {
+        cardinality = cardinality.min(filter_fraction(child.cardinality, DEFAULT_SELECTIVITY));
     }
     cardinality
 }

@@ -121,7 +121,13 @@ pub enum LogicalOperatorKind {
     },
     /// `LogicalLimit` with constant values: skips `offset` rows, then keeps `limit` rows (all
     /// of them with `None`).
-    Limit { limit: Option<u64>, offset: u64 },
+    /// `failure`: a LIMIT or OFFSET that failed to fold, which is the error once a row reaches it
+    /// (`BindLimitValue`, evaluated at runtime).
+    Limit {
+        limit: Option<u64>,
+        offset: u64,
+        failure: Option<duckrs_common::Error>,
+    },
     /// `LogicalLimit` with a percentage of the rows.
     LimitPercent { percent: f64, offset: u64 },
     /// `LogicalSample`: a random part of the child's rows.

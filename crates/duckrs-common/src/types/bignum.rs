@@ -53,7 +53,9 @@ pub fn from_f64(value: f64) -> Option<Vec<u8>> {
     if !value.is_finite() {
         return None;
     }
-    let mut rest = value.abs();
+    // round half to even like the casts to BIGINT and HUGEINT: the byte loop is only exact for
+    // whole numbers
+    let mut rest = value.round_ties_even().abs();
     if rest == 0.0 {
         return Some(from_i128(0));
     }

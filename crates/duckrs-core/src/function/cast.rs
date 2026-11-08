@@ -119,12 +119,9 @@ impl CastNumber for f32 {
     }
     fn from_number(n: Number) -> Option<Self> {
         match n {
-            // 64-bit integers convert directly, (U)HUGEINT through a double
-            Number::Int(v) => Some(match i64::try_from(v) {
-                Ok(v) => v as f32,
-                Err(_) => huge_to_double(v) as f32,
-            }),
-            Number::UHuge(v) => Some(uhuge_to_double(v) as f32),
+            // every integer rounds once
+            Number::Int(v) => Some(v as f32),
+            Number::UHuge(v) => Some(v as f32),
             Number::Float(v) => Some(v),
             Number::Double(v) => {
                 let result = v as f32;
@@ -155,21 +152,13 @@ impl CastNumber for f64 {
     }
 }
 
-/// `CastBigintToFloating`: a (U)HUGEINT as a double, the way DuckDB computes it (which rounds
-/// some values differently from a direct conversion).
+/// `CastBigintToFloating`: a (U)HUGEINT as a double, rounded once.
 fn huge_to_double(value: i128) -> f64 {
-    let lower = value as u64;
-    let upper = (value >> 64) as i64;
-    if upper == -1 {
-        // special case for upper = -1 to avoid rounding issues in small negative numbers
-        -((u64::MAX - lower) as f64) - 1.0
-    } else {
-        lower as f64 + upper as f64 * (u64::MAX as f64 + 1.0)
-    }
+    value as f64
 }
 
 pub(super) fn uhuge_to_double(value: u128) -> f64 {
-    (value as u64) as f64 + ((value >> 64) as u64) as f64 * (u64::MAX as f64 + 1.0)
+    value as f64
 }
 
 /// An integer as a double: 64-bit values convert directly, wider ones like `Hugeint::TryCast`.
@@ -1160,7 +1149,9 @@ mod tests {
         assert_eq!(i8::from_number(Number::Double(-128.4)), Some(-128));
         assert_eq!(i64::from_number(Number::Double(f64::NAN)), None);
         assert_eq!(f32::from_number(Number::Double(1e300)), None);
-        // (U)HUGEINT converts through a double, like DuckDB
-        assert_eq!(f32::from_number(Number::Int(18446743523953736704)), Some(2f32.powi(64)));
+        // (U)HUGEINT rounds to FLOAT once, like DuckDB: 2^64 - 2^40 + 1 is nearest to 2^64 - 2^40
+        let below = 18446742974197923840i128;
+        assert_eq!(f32::from_number(Number::Int(below + 1)), Some(below as f32));
+        assert_eq!(below as f32 as f64, 18446742974197923840.0);
     }
 }

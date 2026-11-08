@@ -178,7 +178,7 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             info.extend(entry("Order By", order_text(orders)));
             info
         }
-        K::Limit { limit, offset } => {
+        K::Limit { limit, offset, .. } => {
             let mut info = Vec::new();
             if let Some(limit) = limit {
                 info.extend(entry("Limit", limit.to_string()));

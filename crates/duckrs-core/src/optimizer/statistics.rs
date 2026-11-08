@@ -291,6 +291,7 @@ fn compute_distinct_counts(table: &Arc<TableCatalogEntry>) -> Option<TableDistin
         let limit = K::Limit {
             limit: Some(DISTINCT_SAMPLE_ROWS),
             offset: 0,
+            failure: None,
         };
         LogicalOperator::new(limit, vec![scan])
     } else {

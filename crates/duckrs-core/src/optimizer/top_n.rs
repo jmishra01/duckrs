@@ -30,6 +30,7 @@ fn can_push_limit(op: &LogicalOperator) -> bool {
     let K::Limit {
         limit: Some(limit),
         offset,
+        failure: None,
     } = op.kind
     else {
         return false;
@@ -47,6 +48,7 @@ pub fn top_n(op: &mut LogicalOperator) {
         let K::Limit {
             limit: Some(limit),
             offset,
+            ..
         } = op.kind
         else {
             unreachable!("checked")
@@ -79,6 +81,7 @@ fn can_make_top_n(op: &LogicalOperator) -> bool {
     let K::Limit {
         limit: Some(limit),
         offset,
+        failure: None,
     } = op.kind
     else {
         return false;
