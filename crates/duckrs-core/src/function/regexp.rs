@@ -395,3 +395,145 @@ pub fn regexp_functions() -> Vec<ScalarFunctionSet> {
     );
     sets
 }
+
+fn binder_error(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::Binder, message.into())
+}
+
+/// `regexp_extract(string, pattern, ['a', 'b'][, options])` and the same of
+/// `regexp_extract_all`: the groups as the fields of a STRUCT (`ParseGroupNameList`), of every
+/// match for `regexp_extract_all`.
+pub(crate) fn bind_regexp_struct(
+    name: &str,
+    children: Vec<crate::planner::expression::BoundExpr>,
+) -> Result<crate::planner::expression::BoundExpr> {
+    use crate::planner::expression::BoundExpr;
+    let all = name == "regexp_extract_all";
+    let fold = |expr: &BoundExpr| crate::execution::expression_executor::evaluate_scalar(expr);
+    // `TryParseConstantPattern`: a NULL is no constant pattern either
+    let pattern = if children[1].is_foldable() {
+        Some(fold(&children[1].clone().cast_to(&LogicalType::VARCHAR, false))?).filter(|p| !p.is_null())
+    } else {
+        None
+    };
+    let Some(pattern) = pattern else {
+        return Err(binder_error(if all {
+            format!("{name} with LIST requires a constant pattern")
+        } else {
+            format!("{name} with LIST of group names requires a constant pattern")
+        }));
+    };
+    let mut options = Options::default();
+    if let Some(given) = children.get(3) {
+        if !given.is_foldable() {
+            return Err(binder_error(format!(
+                "Argument #4 in function {name} must be a constant expression"
+            )));
+        }
+        let given = fold(given)?;
+        if given.is_null() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Regex options field must not be NULL",
+            ));
+        }
+        options = parse_options(&given.try_to_string()?)?;
+    }
+    if !children[2].is_foldable() {
+        return Err(binder_error(format!(
+            "Argument #3 in function {name} must be a constant expression"
+        )));
+    }
+    let list = fold(&children[2])?;
+    let ValueData::List(items) = list.data() else {
+        return Err(binder_error("Group specification must be a non-NULL LIST"));
+    };
+    if items.is_empty() {
+        return Err(binder_error("Group name list must be non-empty"));
+    }
+    let mut names: Vec<String> = Vec::with_capacity(items.len());
+    for item in items {
+        if item.is_null() {
+            return Err(binder_error(format!("NULL group name in {name}")));
+        }
+        let group = item.try_to_string()?;
+        if group.is_empty() {
+            return Err(binder_error(format!("Empty group name in {name}")));
+        }
+        if names.iter().any(|n| n.eq_ignore_ascii_case(&group)) {
+            return Err(binder_error(format!("Duplicate group name '{group}' in {name}")));
+        }
+        names.push(group);
+    }
+    let regex = compile(&text(&pattern), options, false)
+        .map_err(|e| binder_error(format!("Pattern failed to parse: {}", e.message)))?;
+    let groups = regex.captures_len() - 1;
+    if groups < names.len() {
+        return Err(binder_error(format!(
+            "Not enough capturing groups ({groups}) for provided names ({})",
+            names.len()
+        )));
+    }
+    let fields = LogicalType::struct_type(names.into_iter().map(|n| (n, LogicalType::VARCHAR)).collect());
+    let mut arguments = children;
+    arguments[0] = arguments[0].clone().cast_to(&LogicalType::VARCHAR, false);
+    arguments[1] = arguments[1].clone().cast_to(&LogicalType::VARCHAR, false);
+    Ok(if all {
+        super::nested::bound_function(name, arguments, LogicalType::list(fields), regexp_extract_all_struct)
+    } else {
+        super::nested::bound_function(name, arguments, fields, regexp_extract_struct)
+    })
+}
+
+/// `RegexExtractStructFunction`: the groups of the first match, empty without one.
+fn regexp_extract_struct(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let ty = result.logical_type().clone();
+    let count = ty.struct_children().len();
+    row_wise(args, result, |row| {
+        if row[0].is_null() || row[1].is_null() {
+            return Ok(Value::null(ty.clone()));
+        }
+        let regex = compile(&text(&row[1]), options_of(row, 3)?, false)?;
+        let input = text(&row[0]);
+        let captures = regex.captures(&input);
+        let fields = (1..=count)
+            .map(|i| Value::varchar(captures.as_ref().and_then(|c| c.get(i)).map_or("", |m| m.as_str())))
+            .collect();
+        Value::new(ty.clone(), ValueData::Struct(fields))
+    })
+}
+
+/// `ExtractStructAllSingleTuple`: the groups of every match, with an unmatched optional group
+/// NULL.
+fn regexp_extract_all_struct(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let ty = result.logical_type().clone();
+    let element = ty.child_type().expect("a list of structs").clone();
+    let count = element.struct_children().len();
+    row_wise(args, result, |row| {
+        if row[0].is_null() || row[1].is_null() {
+            return Ok(Value::null(ty.clone()));
+        }
+        let regex = compile(&text(&row[1]), options_of(row, 3)?, false)?;
+        let input = text(&row[0]);
+        let mut items = Vec::new();
+        let mut start = 0;
+        while start <= input.len() {
+            let Some(captures) = regex.captures_at(&input, start) else {
+                break;
+            };
+            let matched = captures.get(0).expect("the whole match");
+            let fields = (1..=count)
+                .map(|i| match captures.get(i) {
+                    Some(m) => Value::varchar(m.as_str()),
+                    None => Value::null(LogicalType::VARCHAR),
+                })
+                .collect();
+            items.push(Value::new(element.clone(), ValueData::Struct(fields))?);
+            start = matched.end();
+            if matched.is_empty() {
+                start += input[start..].chars().next().map_or(1, char::len_utf8);
+            }
+        }
+        Value::new(ty.clone(), ValueData::List(items))
+    })
+}

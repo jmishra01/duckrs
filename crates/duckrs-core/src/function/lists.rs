@@ -96,7 +96,10 @@ pub fn is_list_function(name: &str) -> bool {
 }
 
 pub(super) fn no_match(name: &str, children: &[BoundExpr]) -> Error {
-    let types: Vec<String> = children.iter().map(|c| c.return_type.to_string()).collect();
+    let types: Vec<String> = children
+        .iter()
+        .map(|c| super::binder::expression_return_type(c).to_string())
+        .collect();
     Error::new(
         ErrorKind::Binder,
         format!(

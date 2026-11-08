@@ -10,6 +10,9 @@
 #   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
 # Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
 # stop passing. Regenerate with:
+#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
+# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
+# stop passing. Regenerate with:
 test/common/test_cast_hugeint.test
 test/fuzzer/afl/alter_if_exists.test
 test/fuzzer/afl/analyze_empty_table.test
@@ -221,10 +224,12 @@ test/fuzzer/sqlsmith/struct_null_coalesce_assert.test
 test/fuzzer/sqlsmith/struct_verify_crash.test
 test/fuzzer/sqlsmith/subquery_binding_error.test
 test/fuzzer/sqlsmith/test_abs_overflow.test
+test/fuzzer/sqlsmith/timestamp_overflow.test
 test/fuzzer/sqlsmith/validity_mask_out_of_bounds.test
 test/fuzzer/sqlsmith/window-list-value.test
 test/fuzzer/sqlsmith/window-rows-overflow.test
 test/fuzzer/sqlsmith/window_function_error.test
+test/fuzzer/sqlsmith/window_scalar_range.test
 test/geoparquet/geoarrow.test
 test/issues/fuzz/argminmax_strings.test
 test/issues/fuzz/bitwise_shift_overflow.test
@@ -584,6 +589,7 @@ test/sql/aggregate/aggregate_state_export/state_export_parquet.test
 test/sql/aggregate/aggregate_state_export/to_aggregate_state_argument_types.test
 test/sql/aggregate/aggregate_state_export/vector_minmax_export_state.test
 test/sql/aggregate/aggregates/approx_quantile_decimal_scalar.test
+test/sql/aggregate/aggregates/approx_quantile_ns_infinity.test
 test/sql/aggregate/aggregates/approx_quantile_parallel_finalize.test
 test/sql/aggregate/aggregates/approx_top_k.test
 test/sql/aggregate/aggregates/bitagg_fallible.test
@@ -594,6 +600,7 @@ test/sql/aggregate/aggregates/first_last_alloc_reuse.test
 test/sql/aggregate/aggregates/mode_rewrite_memory.test
 test/sql/aggregate/aggregates/quantile_fallible.test
 test/sql/aggregate/aggregates/quantile_fallible_decimal_param.test
+test/sql/aggregate/aggregates/quantile_infinite_timestamp.test
 test/sql/aggregate/aggregates/skewness_fallible.test
 test/sql/aggregate/aggregates/string_agg_fallible.test
 test/sql/aggregate/aggregates/string_agg_union.test
@@ -605,6 +612,8 @@ test/sql/aggregate/aggregates/test_any_value_noninlined.test
 test/sql/aggregate/aggregates/test_approx_quantile_decimal.test
 test/sql/aggregate/aggregates/test_approx_quantile_timestamp_infinity.test
 test/sql/aggregate/aggregates/test_arg_min_max_null.test
+test/sql/aggregate/aggregates/test_avg.test
+test/sql/aggregate/aggregates/test_avg_timestamp_infinity.test
 test/sql/aggregate/aggregates/test_bit_and.test
 test/sql/aggregate/aggregates/test_bit_or.test
 test/sql/aggregate/aggregates/test_bit_xor.test
@@ -628,6 +637,7 @@ test/sql/aggregate/aggregates/test_kahan_sum.test
 test/sql/aggregate/aggregates/test_kurtosis.test
 test/sql/aggregate/aggregates/test_last.test
 test/sql/aggregate/aggregates/test_last_noninlined.test
+test/sql/aggregate/aggregates/test_mad.test
 test/sql/aggregate/aggregates/test_mad_hugeint_range.test
 test/sql/aggregate/aggregates/test_minmax.test
 test/sql/aggregate/aggregates/test_minmax_14145.test
@@ -845,6 +855,7 @@ test/sql/binder/string_literal_binding.test
 test/sql/binder/table_alias_single_quotes.test
 test/sql/binder/table_view_alias.test
 test/sql/binder/test_alias_map_in_subquery.test
+test/sql/binder/test_function_chaining_alias.test
 test/sql/binder/test_having_alias.test
 test/sql/binder/test_implicit_struct_pack.test
 test/sql/binder/test_in_with_collate.test
@@ -1528,6 +1539,7 @@ test/sql/filter/test_zonemap_segment.test
 test/sql/filter/transitive_filter_bounds.test
 test/sql/function/array/array_and_map.test
 test/sql/function/array/array_flatten.test
+test/sql/function/array/array_length.test
 test/sql/function/array/array_list_functions.test
 test/sql/function/array/array_size_mismatch_argument.test
 test/sql/function/array/array_value_size_mismatch.test
@@ -1576,6 +1588,7 @@ test/sql/function/generic/test_if_null.test
 test/sql/function/generic/test_in.test
 test/sql/function/generic/test_least_greatest.test
 test/sql/function/generic/test_null_if.test
+test/sql/function/interval/date_part_monotonicity.test
 test/sql/function/interval/test_extract.test
 test/sql/function/interval/test_interval_muldiv.test
 test/sql/function/list/aggregates/any_value.test
@@ -1591,6 +1604,7 @@ test/sql/function/list/aggregates/histogram.test
 test/sql/function/list/aggregates/hugeint.test
 test/sql/function/list/aggregates/kurtosis.test
 test/sql/function/list/aggregates/last.test
+test/sql/function/list/aggregates/mad.test
 test/sql/function/list/aggregates/max.test
 test/sql/function/list/aggregates/median.test
 test/sql/function/list/aggregates/min.test
@@ -1607,6 +1621,7 @@ test/sql/function/list/aggregates/sum_bool.test
 test/sql/function/list/aggregates/sum_no_overflow.test
 test/sql/function/list/aggregates/uhugeint.test
 test/sql/function/list/array_length.test
+test/sql/function/list/cardinality_list.test
 test/sql/function/list/generate_subscripts.test
 test/sql/function/list/lambda_constant_null.test
 test/sql/function/list/lambdas/arrow/filter_deprecated.test
@@ -1635,6 +1650,8 @@ test/sql/function/list/lambdas/test_lambda_storage.test
 test/sql/function/list/lambdas/transform.test
 test/sql/function/list/lambdas/transform_with_index.test
 test/sql/function/list/lambdas/vector_types.test
+test/sql/function/list/list_concat.test
+test/sql/function/list/list_concat_prepared_list_sort.test
 test/sql/function/list/list_contains.test
 test/sql/function/list/list_distinct.test
 test/sql/function/list/list_grade_up_ties.test
@@ -1648,6 +1665,7 @@ test/sql/function/list/list_reverse.test
 test/sql/function/list/list_select.test
 test/sql/function/list/list_slice_min_step.test
 test/sql/function/list/list_sort_having.test
+test/sql/function/list/list_sort_typed_null.test
 test/sql/function/list/list_sort_vector_types.test
 test/sql/function/list/list_unique.test
 test/sql/function/list/list_value_arrays.test
@@ -1684,14 +1702,20 @@ test/sql/function/operator/test_bitwise_ops.test
 test/sql/function/operator/test_bitwise_ops_types.test
 test/sql/function/operator/test_comparison.test
 test/sql/function/operator/test_conjunction_nulls.test
+test/sql/function/operator/test_date_arithmetic.test
 test/sql/function/operator/test_division_overflow.test
 test/sql/function/operator/test_in_empty_table.test
 test/sql/function/string/format_bytes.test
 test/sql/function/string/format_large_precision.test
+test/sql/function/string/hex.test
+test/sql/function/string/hex_bignum.test
 test/sql/function/string/like_unicode.test
 test/sql/function/string/null_byte.test
 test/sql/function/string/path_join.test
+test/sql/function/string/regex_capture.test
 test/sql/function/string/regex_escape.test
+test/sql/function/string/regex_extract_all_struct.test
+test/sql/function/string/regex_extract_empty_group_name.test
 test/sql/function/string/regex_filter_pushdown.test
 test/sql/function/string/regexp_split_to_table.test
 test/sql/function/string/sha1.test
@@ -1703,6 +1727,7 @@ test/sql/function/string/test_bar.test
 test/sql/function/string/test_caseconvert.test
 test/sql/function/string/test_complex_unicode.test
 test/sql/function/string/test_concat.test
+test/sql/function/string/test_concat_binding.test
 test/sql/function/string/test_concat_function.test
 test/sql/function/string/test_concat_ws.test
 test/sql/function/string/test_contains.test
@@ -1760,6 +1785,7 @@ test/sql/function/test_scalar_executor.test
 test/sql/function/time/epoch.test
 test/sql/function/time/make_time_nan.test
 test/sql/function/time/test_extract.test
+test/sql/function/timestamp/age.test
 test/sql/function/timestamp/date_sub_diff.test
 test/sql/function/timestamp/strptime_year_day_366.test
 test/sql/function/timestamp/test_date_diff_epoch.test
@@ -3111,7 +3137,9 @@ test/sql/types/bignum/test_big_bignum.test
 test/sql/types/bignum/test_bignum_boundaries.test
 test/sql/types/bignum/test_bignum_comparisons.test
 test/sql/types/bignum/test_bignum_double.test
+test/sql/types/bignum/test_bignum_float_combine.test
 test/sql/types/bignum/test_bignum_float_string_cast.test
+test/sql/types/bignum/test_bignum_from_double_rounding.test
 test/sql/types/bignum/test_bignum_from_non_finite.test
 test/sql/types/bignum/test_bignum_hugeint.test
 test/sql/types/bignum/test_bignum_implicit_cast.test
@@ -3222,9 +3250,11 @@ test/sql/types/hugeint/test_hugeint_to_floating_rounding.test
 test/sql/types/interval/frac_interval.test
 test/sql/types/interval/interval_colon_time_overflow.test
 test/sql/types/interval/interval_constants.test
+test/sql/types/interval/interval_epoch_overflow.test
 test/sql/types/interval/interval_multiply_overflow.test
 test/sql/types/interval/interval_ten_digit_hours.test
 test/sql/types/interval/interval_try_cast.test
+test/sql/types/interval/test_interval_addition.test
 test/sql/types/interval/test_interval_between.test
 test/sql/types/interval/test_interval_no_normalize_dedup.test
 test/sql/types/interval/test_interval_ops.test
@@ -3409,6 +3439,7 @@ test/sql/types/time/time_try_cast.test
 test/sql/types/timestamp/alternative_timestamp_casts.test
 test/sql/types/timestamp/bc_timestamp.test
 test/sql/types/timestamp/test_incorrect_timestamp.test
+test/sql/types/timestamp/test_infinite_time.test
 test/sql/types/timestamp/test_timestamp.test
 test/sql/types/timestamp/test_timestamp_2411.test
 test/sql/types/timestamp/test_timestamp_auto_casting.test

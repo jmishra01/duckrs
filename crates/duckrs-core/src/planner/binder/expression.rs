@@ -1418,6 +1418,20 @@ impl Binder<'_> {
                         let name = if set.name == "strftime" { "strftime" } else { "strptime" };
                         return Err(binder_error(format!("{name} format must be a constant")));
                     }
+                    // `RegexpExtractAllStruct` / `RegexExtractBind`: a list of group names makes a STRUCT
+                    ("regexp_extract" | "regexp_extract_all", [_, _, groups, ..])
+                        if children.len() <= 4 && groups.return_type.id() == LogicalTypeId::List =>
+                    {
+                        crate::function::regexp::bind_regexp_struct(&set.name, children)?
+                    }
+                    // `OperatorAddFun`: list_concat is an overload of `+`
+                    ("+", [left, right])
+                        if [left, right]
+                            .iter()
+                            .all(|c| matches!(c.return_type.id(), LogicalTypeId::List | LogicalTypeId::Array)) =>
+                    {
+                        crate::function::generic::bind_generic_function("list_concat", children)?
+                    }
                     (name, _) => match bind_decimal_round(name, &children)? {
                         Some(bound) => bound,
                         None => {

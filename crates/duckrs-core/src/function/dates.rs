@@ -332,6 +332,58 @@ fn epoch_ns(args: &DataChunk, result: &mut Vector) -> Result<()> {
     epoch_scaled(args, result, 1_000_000)
 }
 
+/// `EpochMillisOperator`, `EpochMicrosecondsOperator` and `EpochNanosecondsOperator` of an
+/// INTERVAL (`Interval::GetMilli`, `GetMicro`, `GetNanoseconds`) or a TIME.
+fn epoch_of_interval_or_time(value: &Value, unit: i64) -> Result<Value> {
+    if value.logical_type().id() == LogicalTypeId::Time {
+        let micros = value.as_i128().expect("a TIME") as i64;
+        return Ok(Value::bigint(match unit {
+            1 => micros / 1000,
+            1000 => micros,
+            _ => micros * 1000,
+        }));
+    }
+    let interval = interval_of(value);
+    Ok(Value::bigint(match unit {
+        1 => {
+            let failed = || conversion("Could not convert Interval to Milliseconds".to_string());
+            let months = i64::from(interval.months)
+                .checked_mul(Interval::DAYS_PER_MONTH * MICROS_PER_DAY / 1000)
+                .ok_or_else(failed)?;
+            let days = i64::from(interval.days)
+                .checked_mul(MICROS_PER_DAY / 1000)
+                .ok_or_else(failed)?;
+            (interval.micros / 1000)
+                .checked_add(months)
+                .and_then(|m| m.checked_add(days))
+                .ok_or_else(failed)?
+        }
+        1000 => super::holistic::interval_micros(&interval)?,
+        _ => super::holistic::interval_micros(&interval)?
+            .checked_mul(1000)
+            .ok_or_else(|| conversion("Could not convert Interval to Nanoseconds".to_string()))?,
+    }))
+}
+
+fn epoch_ms_of_interval(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| epoch_of_interval_or_time(&row[0], 1))
+}
+
+fn epoch_us_of_interval(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| epoch_of_interval_or_time(&row[0], 1000))
+}
+
+fn epoch_ns_of_interval(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| epoch_of_interval_or_time(&row[0], 1_000_000))
+}
+
+/// `MakeDateFromEpoch`: the days since 1970-01-01, as they are.
+fn make_date_from_epoch(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| {
+        Ok(date_value(row[0].as_i128().expect("an INTEGER") as i32))
+    })
+}
+
 fn epoch_ms_to_timestamp(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
         let millis = row[0].as_i128().expect("a BIGINT");
@@ -627,9 +679,19 @@ fn whole_months(start: i64, end: i64) -> i64 {
 
 /// `Interval::GetAge`.
 fn age(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    strict_rows(args, result, |row| {
-        let (Some(later), Some(earlier)) = (moment(&row[0]).and_then(micros_of), moment(&row[1]).and_then(micros_of))
-        else {
+    strict_rows(args, result, |row| age_of(&row[0], &row[1]))
+}
+
+/// `AgeFunctionStandard`: the age from today at midnight, NULL for an infinity.
+fn age_from_today(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let today = Value::timestamp(Timestamp((now_micros() / MICROS_PER_DAY) * MICROS_PER_DAY));
+    strict_rows(args, result, |row| age_of(&today, &row[0]))
+}
+
+/// `Interval::GetAge`.
+fn age_of(left: &Value, right: &Value) -> Result<Value> {
+    {
+        let (Some(later), Some(earlier)) = (moment(left).and_then(micros_of), moment(right).and_then(micros_of)) else {
             return Ok(Value::null(LogicalType::INTERVAL));
         };
         let (flip, later, earlier) = if later < earlier {
@@ -664,7 +726,7 @@ fn age(args: &DataChunk, result: &mut Vector) -> Result<()> {
             days: days * sign,
             micros: micros * i64::from(sign),
         }))
-    })
+    }
 }
 
 fn make_date(args: &DataChunk, result: &mut Vector) -> Result<()> {
@@ -895,6 +957,18 @@ fn interval_of(value: &Value) -> Interval {
 
 /// A moment moved by an interval, with infinities staying where they are.
 fn shifted(value: &Value, interval: Interval, ty: &LogicalType) -> Result<Value> {
+    // `Interval::Add(dtime_tz_t)`: the time moves, the offset stays
+    if ty.id() == LogicalTypeId::TimeTz {
+        let ValueData::Int64(bits) = value.data() else {
+            return Ok(Value::null(ty.clone()));
+        };
+        let value = duckrs_common::types::TimeTz(*bits as u64);
+        let moved = (value.time().0 + interval.micros).rem_euclid(MICROS_PER_DAY);
+        return Ok(Value::time_tz(duckrs_common::types::TimeTz::new(
+            Time(moved),
+            value.offset(),
+        )));
+    }
     if ty.id() == LogicalTypeId::Time {
         let time = value.as_i128().expect("a TIME") as i64;
         let moved = (time + interval.micros).rem_euclid(MICROS_PER_DAY);
@@ -973,26 +1047,65 @@ fn date_minus_date(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+/// `AddOperator::Operation(date_t, dtime_t)`: an infinite date stays infinite.
+fn date_and_time(date: &Value, time: &Value) -> Result<Value> {
+    let days = date.as_i128().expect("a DATE") as i32;
+    if days == Date::INFINITY.0 {
+        return Ok(Value::timestamp(Timestamp::INFINITY));
+    }
+    if days == Date::NINFINITY.0 {
+        return Ok(Value::timestamp(Timestamp::NINFINITY));
+    }
+    let time = time.as_i128().expect("a TIME") as i64;
+    i64::from(days)
+        .checked_mul(MICROS_PER_DAY)
+        .and_then(|m| m.checked_add(time))
+        .map(Timestamp)
+        .filter(|t| t.is_finite())
+        .map(Value::timestamp)
+        .ok_or_else(|| out_of_range("Timestamp out of range"))
+}
+
+/// `AddOperator::Operation(date_t, dtime_tz_t)`: the instant of the time at its offset that day.
+fn date_and_time_tz(date: &Value, time: &Value) -> Result<Value> {
+    let tz = LogicalType::new(LogicalTypeId::TimestampTz);
+    let days = date.as_i128().expect("a DATE") as i32;
+    if days == Date::INFINITY.0 || days == Date::NINFINITY.0 {
+        let infinity = if days > 0 {
+            Timestamp::INFINITY
+        } else {
+            Timestamp::NINFINITY
+        };
+        return Value::new(tz, ValueData::Int64(infinity.0));
+    }
+    let ValueData::Int64(bits) = time.data() else {
+        return Ok(Value::null(tz));
+    };
+    let time = duckrs_common::types::TimeTz(*bits as u64);
+    i64::from(days)
+        .checked_mul(MICROS_PER_DAY)
+        .and_then(|m| m.checked_add(time.time().0))
+        .and_then(|m| m.checked_sub(i64::from(time.offset()) * 1_000_000))
+        .filter(|m| Timestamp(*m).is_finite())
+        .map(|m| Value::new(tz, ValueData::Int64(m)))
+        .transpose()?
+        .ok_or_else(|| out_of_range("Timestamp with time zone out of range"))
+}
+
+fn date_plus_time_tz(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| date_and_time_tz(&row[0], &row[1]))
+}
+
+fn time_tz_plus_date(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| date_and_time_tz(&row[1], &row[0]))
+}
+
 fn date_plus_time(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    strict_rows(args, result, |row| {
-        let days = i64::from(row[0].as_i128().expect("a DATE") as i32);
-        let time = row[1].as_i128().expect("a TIME") as i64;
-        days.checked_mul(MICROS_PER_DAY)
-            .and_then(|m| m.checked_add(time))
-            .map(|m| Value::timestamp(Timestamp(m)))
-            .ok_or_else(|| out_of_range("Date out of range"))
-    })
+    strict_rows(args, result, |row| date_and_time(&row[0], &row[1]))
 }
 
 fn time_plus_date(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    strict_rows(args, result, |row| {
-        let time = row[0].as_i128().expect("a TIME") as i64;
-        let days = i64::from(row[1].as_i128().expect("a DATE") as i32);
-        days.checked_mul(MICROS_PER_DAY)
-            .and_then(|m| m.checked_add(time))
-            .map(|m| Value::timestamp(Timestamp(m)))
-            .ok_or_else(|| out_of_range("Date out of range"))
-    })
+    strict_rows(args, result, |row| date_and_time(&row[1], &row[0]))
 }
 
 fn timestamp_minus_timestamp(args: &DataChunk, result: &mut Vector) -> Result<()> {
@@ -1614,15 +1727,27 @@ pub fn date_functions() -> Vec<ScalarFunctionSet> {
         .map(|input| (vec![input.clone()], i.clone(), epoch_ms as ScalarCallback))
         .collect();
     epoch_overloads.push((vec![i.clone()], L::TIMESTAMP, epoch_ms_to_timestamp));
+    // `GetTimePartFunction`: INTERVAL and TIME too
+    for ty in [L::INTERVAL, L::TIME] {
+        epoch_overloads.push((vec![ty], i.clone(), epoch_ms_of_interval));
+    }
     add("epoch_ms", epoch_overloads);
-    for (name, callback) in [("epoch_us", epoch_us as ScalarCallback), ("epoch_ns", epoch_ns)] {
-        add(
-            name,
-            date_inputs
-                .iter()
-                .map(|input| (vec![input.clone()], i.clone(), callback))
-                .collect(),
-        );
+    for (name, callback, of_interval) in [
+        (
+            "epoch_us",
+            epoch_us as ScalarCallback,
+            epoch_us_of_interval as ScalarCallback,
+        ),
+        ("epoch_ns", epoch_ns, epoch_ns_of_interval),
+    ] {
+        let mut overloads: Vec<(Vec<LogicalType>, LogicalType, ScalarCallback)> = date_inputs
+            .iter()
+            .map(|input| (vec![input.clone()], i.clone(), callback))
+            .collect();
+        for ty in [L::INTERVAL, L::TIME] {
+            overloads.push((vec![ty], i.clone(), of_interval));
+        }
+        add(name, overloads);
     }
     for (name, callback, ty) in [
         ("last_day", last_day as ScalarCallback, L::DATE),
@@ -1654,16 +1779,20 @@ pub fn date_functions() -> Vec<ScalarFunctionSet> {
         "age",
         vec![
             (vec![L::TIMESTAMP, L::TIMESTAMP], L::INTERVAL, age as ScalarCallback),
+            (vec![L::TIMESTAMP], L::INTERVAL, age_from_today),
             (vec![tz.clone(), tz.clone()], L::INTERVAL, age),
         ],
     );
     add(
         "make_date",
-        vec![(
-            vec![i.clone(), i.clone(), i.clone()],
-            L::DATE,
-            make_date as ScalarCallback,
-        )],
+        vec![
+            (
+                vec![i.clone(), i.clone(), i.clone()],
+                L::DATE,
+                make_date as ScalarCallback,
+            ),
+            (vec![L::INTEGER], L::DATE, make_date_from_epoch),
+        ],
     );
     add(
         "make_time",
@@ -1744,6 +1873,7 @@ pub fn date_functions() -> Vec<ScalarFunctionSet> {
         ],
     );
     let ts = L::TIMESTAMP;
+    let time_tz = LogicalType::new(LogicalTypeId::TimeTz);
     add(
         "+",
         vec![
@@ -1760,6 +1890,18 @@ pub fn date_functions() -> Vec<ScalarFunctionSet> {
             (vec![L::INTERVAL, L::INTERVAL], L::INTERVAL, interval_plus_interval),
             (vec![L::DATE, L::TIME], ts.clone(), date_plus_time),
             (vec![L::TIME, L::DATE], ts.clone(), time_plus_date),
+            (
+                vec![time_tz.clone(), L::INTERVAL],
+                time_tz.clone(),
+                moment_plus_interval,
+            ),
+            (
+                vec![L::INTERVAL, time_tz.clone()],
+                time_tz.clone(),
+                interval_plus_moment,
+            ),
+            (vec![L::DATE, time_tz.clone()], tz.clone(), date_plus_time_tz),
+            (vec![time_tz.clone(), L::DATE], tz.clone(), time_tz_plus_date),
         ],
     );
     add(
@@ -1771,6 +1913,11 @@ pub fn date_functions() -> Vec<ScalarFunctionSet> {
             (vec![ts.clone(), L::INTERVAL], ts.clone(), moment_minus_interval),
             (vec![tz.clone(), L::INTERVAL], tz.clone(), moment_minus_interval),
             (vec![L::TIME, L::INTERVAL], L::TIME, moment_minus_interval),
+            (
+                vec![time_tz.clone(), L::INTERVAL],
+                time_tz.clone(),
+                moment_minus_interval,
+            ),
             (vec![L::INTERVAL, L::INTERVAL], L::INTERVAL, interval_minus_interval),
             (vec![ts.clone(), ts.clone()], L::INTERVAL, timestamp_minus_timestamp),
             (vec![tz.clone(), tz.clone()], L::INTERVAL, timestamp_minus_timestamp),

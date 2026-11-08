@@ -38,6 +38,8 @@ pub enum Holistic {
     Sem,
     AvgInterval,
     AvgTimestamp,
+    /// `TimeTZAverageOperation`: the average instant, at +00.
+    AvgTimeTz,
     Entropy,
     ArgMin,
     ArgMax,
@@ -105,7 +107,7 @@ impl Holistic {
             (Histogram, Some(ty)) => LogicalType::map(ty.clone(), LogicalType::UBIGINT),
             (
                 Mode | BitAnd | BitOr | BitXor | ArgMin | ArgMax | ArgMinNull | ArgMaxNull | ArgMinNullsLast
-                | ArgMaxNullsLast | AvgTimestamp,
+                | ArgMaxNullsLast | AvgTimestamp | AvgTimeTz,
                 Some(ty),
             ) => ty.clone(),
             (CombineAggr, Some(ty)) => ty.clone(),
@@ -175,7 +177,7 @@ fn interpolate_i64(lo: i64, d: f64, hi: i64) -> i64 {
 }
 
 /// `Interval::GetMicro`.
-fn interval_micros(interval: &Interval) -> Result<i64> {
+pub(super) fn interval_micros(interval: &Interval) -> Result<i64> {
     let per_day = Interval::MICROS_PER_DAY;
     let conversion = |from: &str| {
         Error::new(
@@ -418,6 +420,52 @@ fn quantiles(rows: &[Value], ty: &LogicalType, continuous: bool) -> Result<Value
         return Value::new(ty.clone(), ValueData::List(items));
     }
     quantile(&values, fractions[0], continuous, ty)
+}
+
+/// `MedianAbsoluteDeviationOperation` over DATE, TIMESTAMP and TIME: the median of the values,
+/// as `quantile_cont` has it, and the median of the deviations from it as INTERVALs
+/// (`MadAccessor`).
+fn temporal_mad(rows: &[Value]) -> Result<Value> {
+    // a TIME WITH TIME ZONE goes as the TIME its bits are (`dtime_t` over `dtime_tz_t`)
+    let values: Vec<Value> = rows
+        .iter()
+        .filter(|v| !v.is_null())
+        .map(|v| match (v.logical_type().id(), v.data()) {
+            (LogicalTypeId::TimeTz, ValueData::Int64(bits)) => Value::new(LogicalType::TIME, ValueData::Int64(*bits)),
+            _ => Ok(v.clone()),
+        })
+        .collect::<Result<_>>()?;
+    if values.is_empty() {
+        return Ok(Value::null(LogicalType::INTERVAL));
+    }
+    let median_type = interpolated_type(values[0].logical_type());
+    let values = sorted(values)?;
+    let median = quantile(&values, 0.5, true, &median_type)?;
+    let micros = |value: &Value| -> Result<i64> {
+        match cast(value.clone(), &median_type)?.data() {
+            ValueData::Int64(micros) => Ok(*micros),
+            _ => Err(Error::new(ErrorKind::Internal, "a temporal value")),
+        }
+    };
+    let center = micros(&median)?;
+    let mut deviations = Vec::with_capacity(values.len());
+    for value in &values {
+        let delta = micros(value)?
+            .checked_sub(center)
+            .ok_or_else(|| out_of_range("Overflow in timestamp subtraction"))?;
+        let delta = delta
+            .checked_abs()
+            .ok_or_else(|| out_of_range(format!("Overflow on abs({delta})")))?;
+        // `Interval::FromMicro`
+        let per_day = Interval::MICROS_PER_DAY;
+        deviations.push(Value::interval(Interval::new(
+            0,
+            (delta / per_day) as i32,
+            delta % per_day,
+        )));
+    }
+    let deviations = sorted(deviations)?;
+    quantile(&deviations, 0.5, true, &LogicalType::INTERVAL)
 }
 
 fn median_of(values: &mut [f64]) -> f64 {
@@ -841,6 +889,7 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
         Mode => mode(rows, ty)?,
         Median | QuantileCont => quantiles(rows, ty, true)?,
         QuantileDisc => quantiles(rows, ty, false)?,
+        Mad if ty.id() == LogicalTypeId::Interval => temporal_mad(rows)?,
         Mad => {
             let mut values = numbers(rows);
             if values.is_empty() {
@@ -923,6 +972,28 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
             };
             Value::new(ty.clone(), ValueData::Int64(average))?
         }
+        AvgTimeTz => {
+            use duckrs_common::types::{Time, TimeTz};
+            // `Time::NormalizeTimeTZ`: the time at +00, within the day
+            let micros: Vec<i128> = rows
+                .iter()
+                .filter_map(|row| match row.data() {
+                    ValueData::Int64(bits) => {
+                        let value = TimeTz(*bits as u64);
+                        let utc = value.time().0 - i64::from(value.offset()) * 1_000_000;
+                        Some(i128::from(utc.rem_euclid(Interval::MICROS_PER_DAY)))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if micros.is_empty() {
+                return Ok(null());
+            }
+            let sum: i128 = micros.iter().sum();
+            let count = micros.len() as i128;
+            let average = sum / count + i128::from(sum % count > count / 2);
+            Value::time_tz(TimeTz::new(Time(average as i64), 0))
+        }
         Skewness => {
             let values = numbers(rows);
             if values.len() <= 2 {
@@ -986,7 +1057,7 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
                 if times < 0 {
                     return Err(Error::new(
                         ErrorKind::InvalidInput,
-                        "combine_aggr: the multiplicity must not be negative",
+                        "combine_aggr multiplicity must be non-negative",
                     ));
                 }
                 let scaled = super::aggregates::repeat_state(state, times, ty)?;

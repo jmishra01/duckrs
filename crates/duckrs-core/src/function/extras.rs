@@ -833,6 +833,8 @@ fn time_bucket(args: &DataChunk, result: &mut Vector) -> Result<()> {
         let bucket = time_bucket_value(*width, micros, origin, offset)?;
         Ok(match ty.id() {
             LogicalTypeId::Date => Value::date(Date(bucket.div_euclid(MICROS_PER_DAY) as i32)),
+            // a TIME buckets as that time on 1970-01-01, and is the time of its bucket
+            LogicalTypeId::Time => Value::time(duckrs_common::types::Time(bucket.rem_euclid(MICROS_PER_DAY))),
             LogicalTypeId::TimestampTz => Value::timestamp_tz(Timestamp(bucket)),
             _ => Value::timestamp(Timestamp(bucket)),
         })
@@ -1357,7 +1359,7 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
             let ty = children[1].return_type.clone();
             if !matches!(
                 ty.id(),
-                LogicalTypeId::Date | LogicalTypeId::Timestamp | LogicalTypeId::TimestampTz
+                LogicalTypeId::Date | LogicalTypeId::Timestamp | LogicalTypeId::TimestampTz | LogicalTypeId::Time
             ) {
                 return Err(binder_error(format!(
                     "No function matches the given name and argument types 'time_bucket(INTERVAL, {ty})'."

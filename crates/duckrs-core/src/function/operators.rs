@@ -807,7 +807,39 @@ pub(super) fn arithmetic_operators() -> Vec<ScalarFunctionSet> {
         for ty in [LogicalType::FLOAT, LogicalType::DOUBLE] {
             set.add(ScalarFunction::new(name, vec![ty], LogicalType::BOOLEAN, check));
         }
+        // `IsInfiniteFun` and `IsFiniteFun` take DATE, TIMESTAMP and TIMESTAMPTZ too
+        if name != "isnan" {
+            let temporal: super::ScalarCallback = if name == "isinf" {
+                temporal_is_infinite
+            } else {
+                temporal_is_finite
+            };
+            for ty in [
+                LogicalType::DATE,
+                LogicalType::TIMESTAMP,
+                LogicalType::new(LogicalTypeId::TimestampTz),
+            ] {
+                set.add(ScalarFunction::new(name, vec![ty], LogicalType::BOOLEAN, temporal));
+            }
+        }
         sets.push(set);
     }
     sets
+}
+
+/// `Value::IsFinite` of a DATE or TIMESTAMP: not one of the infinities.
+fn temporal_finite(value: &Value) -> bool {
+    match value.data() {
+        ValueData::Int32(days) => days.abs() != i32::MAX,
+        ValueData::Int64(micros) => micros.abs() != i64::MAX,
+        _ => true,
+    }
+}
+
+fn temporal_is_finite(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    super::bit_functions::strict_rows(args, result, |row| Ok(Value::boolean(temporal_finite(&row[0]))))
+}
+
+fn temporal_is_infinite(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    super::bit_functions::strict_rows(args, result, |row| Ok(Value::boolean(!temporal_finite(&row[0]))))
 }

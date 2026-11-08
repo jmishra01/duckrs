@@ -7,7 +7,7 @@
 use super::bit_functions::strict_rows;
 use super::nested::row_wise;
 use super::{ScalarCallback, ScalarFunction, ScalarFunctionSet};
-use duckrs_common::types::LogicalType;
+use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, UnifiedFormat, Vector};
 use duckrs_common::{Error, ErrorKind, Result};
@@ -335,15 +335,76 @@ fn hex(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| Ok(Value::varchar(hex_text(bytes_of(&row[0])))))
 }
 
+/// `HexIntegralOperator` (BIGINT, UBIGINT) and `HexHugeIntOperator` (HUGEINT): a negative value
+/// prints as two's complement of the width of its type.
 fn hex_integer(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
-        let value = row[0].as_i128().expect("an integer");
-        Ok(Value::varchar(if value < 0 {
-            format!("{:X}", value as i64)
-        } else {
-            format!("{value:X}")
-        }))
+        let text = match row[0].data() {
+            ValueData::Int128(v) => format!("{:X}", *v as u128),
+            ValueData::UInt64(v) => format!("{v:X}"),
+            _ => format!("{:X}", row[0].as_i128().expect("an integer") as i64 as u64),
+        };
+        Ok(Value::varchar(text))
     })
+}
+
+fn hex_uhugeint(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| {
+        let ValueData::UInt128(value) = row[0].data() else {
+            unreachable!("a UHUGEINT")
+        };
+        Ok(Value::varchar(format!("{value:X}")))
+    })
+}
+
+fn bin_uhugeint(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| {
+        let ValueData::UInt128(value) = row[0].data() else {
+            unreachable!("a UHUGEINT")
+        };
+        Ok(Value::varchar(format!("{value:b}")))
+    })
+}
+
+/// `WriteBignumDigits`: a BIGNUM has no fixed width, so a negative value is a sign and its
+/// magnitude rather than two's complement.
+fn bignum_digits(value: &Value, bits_per_digit: u32) -> String {
+    use duckrs_common::types::bignum;
+    let bytes = bytes_of(value);
+    let magnitude = bignum::magnitude(bytes);
+    let Some(start) = magnitude.iter().position(|b| *b != 0) else {
+        return "0".to_string();
+    };
+    let mut out = String::new();
+    if bignum::is_negative(bytes) {
+        out.push('-');
+    }
+    let per_byte = 8 / bits_per_digit;
+    let mask = (1u8 << bits_per_digit) - 1;
+    for (i, byte) in magnitude[start..].iter().enumerate() {
+        let digits = if i == 0 {
+            (8 - byte.leading_zeros()).div_ceil(bits_per_digit)
+        } else {
+            per_byte
+        };
+        for d in (1..=digits).rev() {
+            let digit = (byte >> ((d - 1) * bits_per_digit)) & mask;
+            out.push(
+                char::from_digit(u32::from(digit), 16)
+                    .expect("a digit")
+                    .to_ascii_uppercase(),
+            );
+        }
+    }
+    out
+}
+
+fn hex_bignum(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| Ok(Value::varchar(bignum_digits(&row[0], 4))))
+}
+
+fn bin_bignum(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| Ok(Value::varchar(bignum_digits(&row[0], 1))))
 }
 
 fn bin(args: &DataChunk, result: &mut Vector) -> Result<()> {
@@ -355,12 +416,12 @@ fn bin(args: &DataChunk, result: &mut Vector) -> Result<()> {
 
 fn bin_integer(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
-        let value = row[0].as_i128().expect("an integer");
-        Ok(Value::varchar(if value < 0 {
-            format!("{:b}", value as i64)
-        } else {
-            format!("{value:b}")
-        }))
+        let text = match row[0].data() {
+            ValueData::Int128(v) => format!("{:b}", *v as u128),
+            ValueData::UInt64(v) => format!("{v:b}"),
+            _ => format!("{:b}", row[0].as_i128().expect("an integer") as i64 as u64),
+        };
+        Ok(Value::varchar(text))
     })
 }
 
@@ -823,7 +884,11 @@ pub fn string_functions() -> Vec<ScalarFunctionSet> {
             vec![
                 (vec![v.clone()], v.clone(), hex as ScalarCallback),
                 (vec![blob.clone()], v.clone(), hex),
+                (vec![LogicalType::BIGINT], v.clone(), hex_integer),
+                (vec![LogicalType::UBIGINT], v.clone(), hex_integer),
                 (vec![LogicalType::HUGEINT], v.clone(), hex_integer),
+                (vec![LogicalType::UHUGEINT], v.clone(), hex_uhugeint),
+                (vec![LogicalType::new(LogicalTypeId::Bignum)], v.clone(), hex_bignum),
             ],
         ));
     }
@@ -833,7 +898,11 @@ pub fn string_functions() -> Vec<ScalarFunctionSet> {
             vec![
                 (vec![v.clone()], v.clone(), bin as ScalarCallback),
                 (vec![blob.clone()], v.clone(), bin),
+                (vec![LogicalType::BIGINT], v.clone(), bin_integer),
+                (vec![LogicalType::UBIGINT], v.clone(), bin_integer),
                 (vec![LogicalType::HUGEINT], v.clone(), bin_integer),
+                (vec![LogicalType::UHUGEINT], v.clone(), bin_uhugeint),
+                (vec![LogicalType::new(LogicalTypeId::Bignum)], v.clone(), bin_bignum),
             ],
         ));
     }

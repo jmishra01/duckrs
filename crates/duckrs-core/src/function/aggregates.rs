@@ -139,13 +139,24 @@ pub(super) fn aggregate_functions() -> Vec<AggregateFunctionSet> {
             LogicalType::INTERVAL,
             AggregateKind::Holistic(super::holistic::Holistic::AvgInterval),
         ));
-        for ty in [LogicalType::TIMESTAMP, LogicalType::new(LogicalTypeId::TimestampTz)] {
+        // TIME averages like the timestamps (`DiscreteAverageOperation`), without infinities
+        for ty in [
+            LogicalType::TIMESTAMP,
+            LogicalType::new(LogicalTypeId::TimestampTz),
+            LogicalType::TIME,
+        ] {
             overloads.push((
                 vec![ty.clone()],
                 ty,
                 AggregateKind::Holistic(super::holistic::Holistic::AvgTimestamp),
             ));
         }
+        let time_tz = LogicalType::new(LogicalTypeId::TimeTz);
+        overloads.push((
+            vec![time_tz.clone()],
+            time_tz,
+            AggregateKind::Holistic(super::holistic::Holistic::AvgTimeTz),
+        ));
         overloads
     };
     let unary = |kind| vec![(vec![any()], any(), kind)];
@@ -224,7 +235,20 @@ fn holistic_functions() -> Vec<AggregateFunctionSet> {
             &["approx_quantile", "reservoir_quantile"],
             vec![(vec![any(), any()], any(), kind(QuantileDisc))],
         ),
-        of(&["mad"], unary_double(Mad)),
+        of(&["mad"], {
+            // `MadFun::GetFunctions`: the temporal types deviate by an INTERVAL
+            let mut overloads = unary_double(Mad);
+            for ty in [
+                L::DATE,
+                L::TIMESTAMP,
+                L::TIME,
+                LogicalType::new(LogicalTypeId::TimestampTz),
+                LogicalType::new(LogicalTypeId::TimeTz),
+            ] {
+                overloads.push((vec![ty], L::INTERVAL, kind(Mad)));
+            }
+            overloads
+        }),
         of(&["stddev_samp", "stddev"], unary_double(StddevSamp)),
         of(&["stddev_pop"], unary_double(StddevPop)),
         of(&["var_samp", "variance"], unary_double(VarSamp)),

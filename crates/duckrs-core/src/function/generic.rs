@@ -34,7 +34,10 @@ fn invalid_input(message: &str) -> Error {
 }
 
 fn no_match(name: &str, children: &[BoundExpr]) -> Error {
-    let types: Vec<String> = children.iter().map(|c| c.return_type.to_string()).collect();
+    let types: Vec<String> = children
+        .iter()
+        .map(|c| super::binder::expression_return_type(c).to_string())
+        .collect();
     binder_error(format!(
         "No function matches the given name and argument types '{name}({})'. You might need to add explicit type \
          casts.",
@@ -618,6 +621,25 @@ fn uuid_v7(args: &DataChunk, result: &mut Vector) -> Result<()> {
     Ok(())
 }
 
+/// `ArrayLengthBinaryFunction`: the size of a dimension of an ARRAY, which the third argument
+/// lists (`ArrayLengthBinaryFunctionData`).
+fn array_length_of_dimension(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| {
+        let ValueData::List(dimensions) = row[2].data() else {
+            unreachable!("the dimensions")
+        };
+        let dimension = row[1].as_i128().expect("a BIGINT");
+        let max = dimensions.len() as i128;
+        if dimension < 1 || dimension > max {
+            return Err(Error::new(
+                ErrorKind::OutOfRange,
+                format!("array_length dimension '{dimension}' out of range (min: '1', max: '{max}')"),
+            ));
+        }
+        Ok(dimensions[(dimension - 1) as usize].clone())
+    })
+}
+
 fn list_length_of_dimension(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
         if row[1].as_i128() != Some(1) {
@@ -742,6 +764,20 @@ pub fn is_generic_function(name: &str) -> bool {
 }
 
 /// Binds a function of [`is_generic_function`].
+/// `ResolveListConcatTypes`: a value that is not a list among lists.
+fn concatenate_error(children: &[BoundExpr]) -> Error {
+    let mut types = String::new();
+    for (i, c) in children.iter().enumerate() {
+        if i > 0 {
+            types += if i + 1 == children.len() { " and " } else { ", " };
+        }
+        types += &c.return_type.to_string();
+    }
+    binder_error(format!(
+        "Cannot concatenate types {types} - an explicit cast is required"
+    ))
+}
+
 pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<BoundExpr> {
     if is_date_function(name) {
         return bind_date_function(name, children);
@@ -780,6 +816,27 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
                 list_length_of_dimension,
             ))
         }
+        "array_length" if children.len() == 2 && children[0].return_type.id() == LogicalTypeId::Array => {
+            // `ArrayOrListLengthBinaryBind`: the dimensions of an ARRAY are its type's
+            let mut dimensions = Vec::new();
+            let mut ty = children[0].return_type.clone();
+            while ty.id() == LogicalTypeId::Array {
+                dimensions.push(Value::bigint(ty.array_size().unwrap_or(0) as i64));
+                ty = ty.child_type().expect("a child").clone();
+            }
+            let dimensions = Value::new(LogicalType::list(LogicalType::BIGINT), ValueData::List(dimensions))?;
+            let args = vec![
+                children[0].clone(),
+                children[1].clone().cast_to(&LogicalType::BIGINT, false),
+                BoundExpr::constant(dimensions),
+            ];
+            Ok(bound_function(
+                &lower,
+                args,
+                LogicalType::BIGINT,
+                array_length_of_dimension,
+            ))
+        }
         "len" | "array_length" | "length" => {
             let child = as_list(single(&children)?);
             let id = child.return_type.id();
@@ -794,9 +851,17 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             }
             Ok(bound_function(&lower, vec![child], LogicalType::BIGINT, value_length))
         }
+        // `CardinalityBind`: the entries of a MAP or LIST, and an ARRAY read as a list
         "cardinality" => {
-            let child = single(&children)?;
-            map_type_of(&child, &lower)?;
+            if children.len() != 1 {
+                return Err(binder_error("Cardinality must have exactly one arguments"));
+            }
+            let child = children[0].clone();
+            let child = match child.return_type.id() {
+                LogicalTypeId::Map | LogicalTypeId::List => child,
+                LogicalTypeId::Array => as_list(child),
+                _ => return Err(binder_error("Cardinality can only operate on MAPs, LISTs and ARRAYs")),
+            };
             Ok(bound_function(&lower, vec![child], LogicalType::UBIGINT, cardinality))
         }
         "concat" => {
@@ -804,6 +869,13 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
                 return Err(no_match(&lower, &children));
             }
             if children.iter().any(|c| is_list(&c.return_type)) {
+                // `ResolveListConcatTypes`: every argument is a list, or NULL
+                if children
+                    .iter()
+                    .any(|c| !is_list(&c.return_type) && c.return_type.id() != LogicalTypeId::SqlNull)
+                {
+                    return Err(concatenate_error(&children));
+                }
                 return bind_generic_function("list_concat", children);
             }
             // blob concat is only supported for the concat operator
@@ -844,6 +916,13 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
                         ))
                     })?;
                 } else if child.return_type.id() != LogicalTypeId::SqlNull {
+                    // `LIST(ANY)` takes what casts to a list, which `ResolveListConcatTypes` refuses
+                    if matches!(
+                        child.return_type.id(),
+                        LogicalTypeId::Varchar | LogicalTypeId::StringLiteral
+                    ) {
+                        return Err(concatenate_error(&children));
+                    }
                     return Err(no_match(&lower, &children));
                 }
             }
@@ -885,7 +964,12 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             let Some(first) = children.first().filter(|_| children.len() <= 3).cloned() else {
                 return Err(no_match(&lower, &children));
             };
-            let child = as_list(first);
+            // a NULL takes the `LIST(ANY)` parameter as a list of NULLs
+            let child = if first.return_type.id() == LogicalTypeId::SqlNull {
+                first.cast_to(&LogicalType::list(LogicalType::SQLNULL), false)
+            } else {
+                as_list(first)
+            };
             if child.return_type.id() != LogicalTypeId::List {
                 return Err(no_match(&lower, &children));
             }

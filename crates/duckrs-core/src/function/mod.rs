@@ -22,7 +22,7 @@ pub mod nested;
 mod nested_casts;
 pub(crate) mod operators;
 mod printf;
-mod regexp;
+pub(crate) mod regexp;
 mod string_nested;
 mod strings;
 pub mod test_all_types;
