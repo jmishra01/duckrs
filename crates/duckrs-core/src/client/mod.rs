@@ -1483,6 +1483,35 @@ impl ClientContext {
                 format!("Failed to attach database: database with name \"{name}\" already exists"),
             ));
         }
+        if in_memory && options.read_only {
+            return Err(Error::new(
+                ErrorKind::Catalog,
+                "Cannot launch in-memory database in read-only mode!",
+            ));
+        }
+        // `DatabaseFilePathManager::InsertDatabasePath`: one file, one read-write attachment
+        if !in_memory {
+            let canonical = std::fs::canonicalize(&path).ok();
+            let mut databases = vec![self.home.clone()];
+            databases.extend(self.home.attached.read().values().cloned());
+            for existing in databases {
+                let Some(file) = &existing.file else { continue };
+                let same = canonical.as_ref().map_or(file.path == Path::new(&path), |c| {
+                    std::fs::canonicalize(&file.path).is_ok_and(|p| p == *c)
+                });
+                let existing_read_only = matches!(existing.file_access, Some(FileAccess::ReadOnly(_)));
+                if same && !(options.read_only && existing_read_only) {
+                    return Err(Error::new(
+                        ErrorKind::ResourceInUse,
+                        format!(
+                            "Unique file handle conflict: Cannot attach {name} - the database file \"{path}\" is \
+                             already attached by database \"{}\"",
+                            existing.name
+                        ),
+                    ));
+                }
+            }
+        }
         let database = if in_memory {
             let mut database = DatabaseInstance::with_file_access(None);
             database.name.clone_from(&name);
@@ -1742,15 +1771,42 @@ impl ClientContext {
         match statement {
             // statistics here are made when they are needed, and in-memory tables have nothing to
             // compact, so this only says whether there is such a table
-            Statement::Vacuum { table, .. } => {
+            Statement::Vacuum { table, columns, .. } => {
                 if let Some(table) = table
                     && let duckrs_parser::ast::TableRefKind::BaseTable { name, .. } = &table.kind
                 {
                     let schema = crate::planner::binder::schema_of(name)?;
-                    if let crate::catalog::TableOrView::View(_) =
-                        self.catalog().get_entry(schema.as_deref(), None, &name.name)?
-                    {
-                        return Err(Error::new(ErrorKind::Binder, "Can only vacuum or analyze base tables"));
+                    let table = match self.catalog().get_entry(schema.as_deref(), None, &name.name)? {
+                        crate::catalog::TableOrView::View(_) => {
+                            return Err(Error::new(ErrorKind::Binder, "Can only vacuum or analyze base tables"));
+                        }
+                        crate::catalog::TableOrView::Table(table) => table,
+                    };
+                    // `Binder::BindVacuumTable`
+                    let mut seen = std::collections::HashSet::new();
+                    for column in columns {
+                        if !seen.insert(column.to_lowercase()) {
+                            return Err(Error::new(
+                                ErrorKind::Binder,
+                                "cannot vacuum or analyze the same column twice, i.e., there is a duplicate entry \
+                                 in the list of column names",
+                            ));
+                        }
+                        if table.is_generated(column) {
+                            return Err(Error::new(
+                                ErrorKind::Binder,
+                                format!(
+                                    "cannot vacuum or analyze generated column \"{column}\" - specify non-generated \
+                                     columns to vacuum or analyze"
+                                ),
+                            ));
+                        }
+                        if !table.columns.iter().any(|c| c.name.eq_ignore_ascii_case(column)) {
+                            return Err(Error::new(
+                                ErrorKind::Binder,
+                                format!("Column with name \"{column}\" does not exist"),
+                            ));
+                        }
                     }
                 }
                 return Ok(Self::success());

@@ -448,7 +448,7 @@ impl Binder<'_> {
                 ));
             }
             let expanded: Vec<Expr> = columns.iter().map(without_aliases).collect();
-            replace_unpacked(&mut expr, &expanded);
+            replace_unpacked(&mut expr, &expanded)?;
             result.push(expr);
             return Ok(());
         }
@@ -508,7 +508,7 @@ impl Binder<'_> {
 }
 
 /// `ReplaceUnpackedStarExpression`: `f(*COLUMNS(*))` passes every column.
-fn replace_unpacked(expr: &mut Expr, columns: &[Expr]) {
+fn replace_unpacked(expr: &mut Expr, columns: &[Expr]) -> Result<()> {
     fn is_unpack(expr: &Expr) -> bool {
         matches!(
             &expr.kind,
@@ -518,7 +518,31 @@ fn replace_unpacked(expr: &mut Expr, columns: &[Expr]) {
             }
         )
     }
+    let mut error = None;
     visit_expr_mut(expr, &mut |e| match &mut e.kind {
+        ExprKind::Operator { op, children }
+            if !matches!(
+                op,
+                OperatorType::Coalesce | OperatorType::In | OperatorType::NotIn | OperatorType::ArrayConstructor
+            ) && children.iter().any(is_unpack) =>
+        {
+            let name = match op {
+                OperatorType::Not => "OPERATOR_NOT",
+                OperatorType::IsNull => "OPERATOR_IS_NULL",
+                OperatorType::IsNotNull => "OPERATOR_IS_NOT_NULL",
+                OperatorType::Unpack => "OPERATOR_UNPACK",
+                OperatorType::Try => "OPERATOR_TRY",
+                OperatorType::ArrayExtract => "ARRAY_EXTRACT",
+                OperatorType::ArraySlice => "ARRAY_SLICE",
+                OperatorType::StructExtract => "STRUCT_EXTRACT",
+                _ => "GROUPING_FUNCTION",
+            };
+            error.get_or_insert_with(|| {
+                binder_error(format!(
+                    "*COLUMNS() can not be used together with the '{name}' operator"
+                ))
+            });
+        }
         ExprKind::Function(function) if function.args.iter().any(|a| is_unpack(&a.expr)) => {
             let mut args = Vec::new();
             for argument in std::mem::take(&mut function.args) {
@@ -549,6 +573,7 @@ fn replace_unpacked(expr: &mut Expr, columns: &[Expr]) {
         }
         _ => {}
     });
+    error.map_or(Ok(()), Err)
 }
 
 /// `QueryResult::DeduplicateColumns`: repeated names get `_1`, `_2`, ...

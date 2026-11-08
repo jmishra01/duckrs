@@ -1389,7 +1389,20 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
         }
         "list_intersect" | "array_intersect" => {
             count_args(&lower, &children, 2, 2)?;
-            let ty = children[0].return_type.clone();
+            // `LIST(T)` twice: the elements meet in one type
+            let elements: Vec<LogicalType> = children
+                .iter()
+                .map(|c| match c.return_type.id() {
+                    LogicalTypeId::List | LogicalTypeId::Array => c.return_type.child_type().cloned(),
+                    LogicalTypeId::SqlNull => Some(LogicalType::SQLNULL),
+                    _ => None,
+                })
+                .collect::<Option<_>>()
+                .ok_or_else(|| super::lists::no_match(&lower, &children))?;
+            let element = super::combine_types::try_max_logical_type(&elements[0], &elements[1])
+                .ok_or_else(|| super::lists::no_match(&lower, &children))?;
+            let ty = LogicalType::list(element);
+            let children = children.into_iter().map(|c| c.cast_to(&ty, false)).collect();
             Ok(bound_function(&lower, children, ty, list_intersect))
         }
         "list_cosine_similarity"
@@ -1452,6 +1465,12 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
             ))
         }
         "struct_concat" => {
+            if children.is_empty() {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "struct_concat: At least one argument is required",
+                ));
+            }
             let mut fields: Vec<(String, LogicalType)> = Vec::new();
             for child in &children {
                 if child.return_type.id() != LogicalTypeId::Struct {
@@ -1471,7 +1490,18 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
                 rebuild_struct,
             ))
         }
-        "struct_keys" => simple(1, 1, list_of_text, struct_keys, children),
+        "struct_keys" => {
+            if children
+                .first()
+                .is_some_and(|c| !matches!(c.return_type.id(), LogicalTypeId::Struct | LogicalTypeId::Unknown))
+            {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "struct_keys() expects a STRUCT argument",
+                ));
+            }
+            simple(1, 1, list_of_text, struct_keys, children)
+        }
         "struct_contains" | "struct_has" | "struct_position" | "struct_indexof" => {
             count_args(&lower, &children, 2, 2)?;
             let position = matches!(lower.as_str(), "struct_position" | "struct_indexof");

@@ -145,6 +145,7 @@ pub fn bind_scalar_function(
 ) -> Result<BoundExpr> {
     let arguments: Vec<LogicalType> = children.iter().map(expression_return_type).collect();
     let function = select_function(set, &arguments)?;
+    check_scalar_constant_parameters(&function.name, &children)?;
     // `FunctionNullHandling::SPECIAL_HANDLING`: the function decides what a NULL argument means
     let special_nulls = matches!(
         function.name.as_str(),
@@ -252,6 +253,25 @@ pub(super) fn constant_parameter(
     Ok(Some(value))
 }
 
+/// The bind callbacks of the scalar functions with a parameter that has to be constant.
+fn check_scalar_constant_parameters(name: &str, children: &[BoundExpr]) -> Result<()> {
+    // `ParseRegexOptions` on the options of the regex functions
+    let options = match (name, children.len()) {
+        ("regexp_matches" | "regexp_full_match", 3) => 2,
+        ("regexp_replace" | "regexp_extract" | "regexp_extract_all", 4) => 3,
+        _ => return Ok(()),
+    };
+    if let Some(value) = constant_parameter(name, &children[options], options, true)?
+        && value.is_null()
+    {
+        return Err(duckrs_common::Error::new(
+            duckrs_common::ErrorKind::InvalidInput,
+            "Regex options field must not be NULL",
+        ));
+    }
+    Ok(())
+}
+
 /// The bind callbacks of the aggregates with a parameter that has to be constant.
 fn check_constant_parameters(name: &str, children: &mut [BoundExpr]) -> Result<()> {
     match (name, children) {
@@ -259,6 +279,19 @@ fn check_constant_parameters(name: &str, children: &mut [BoundExpr]) -> Result<(
             if constant_parameter(name, separator, 1, true)?.is_some_and(|value| value.is_null()) {
                 *input = BoundExpr::constant(Value::null(LogicalType::VARCHAR));
             }
+            Ok(())
+        }
+        ("approx_top_k", [_, k]) => {
+            if k.return_type.id() != LogicalTypeId::Unknown && !k.is_foldable() {
+                return Err(binder_error(
+                    "The \"k\" argument in function \"approx_top_k\" must be a constant expression".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        ("bitstring_agg", [_, min, max]) => {
+            constant_parameter(name, min, 1, true)?;
+            constant_parameter(name, max, 2, true)?;
             Ok(())
         }
         ("quantile_cont" | "quantile_disc" | "quantile", [_]) => Err(binder_error(

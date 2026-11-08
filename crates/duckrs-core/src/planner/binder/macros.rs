@@ -32,6 +32,9 @@ const MAX_MACRO_DEPTH: usize = 32;
 /// like a parameter stays what it is.
 const PARAMETER_MARK: &str = "\0macro parameter";
 
+/// Marks a parameter of a macro being created, which the binder binds (`Binder::macro_binding`).
+pub(super) const CREATE_PARAMETER_MARK: &str = "\0created macro parameter";
+
 /// Turns the references to `parameters` into marked references to their position. A call on a
 /// parameter, as in `p.lower()`, is a call with it (`ColumnQualifier::QualifyFunction`).
 fn mark_parameters(expr: &mut Expr, parameters: &[String]) {
@@ -59,6 +62,54 @@ fn mark_parameters(expr: &mut Expr, parameters: &[String]) {
     }
 }
 
+/// Hides the parameters of the lambdas in `expr` that are named like a macro parameter, which
+/// they shadow in the lambda (`ColumnQualifier` binds lambda parameters first).
+const LAMBDA_MARK: char = '\u{3}';
+
+fn protect_lambda_parameters(expr: &mut Expr, parameters: &[String]) {
+    let ExprKind::Lambda { lhs, expr: body, .. } = &mut expr.kind else {
+        return;
+    };
+    let mut shadowed = Vec::new();
+    visit_expr_mut(lhs, &mut |e| {
+        if let ExprKind::ColumnRef(names) = &mut e.kind
+            && let [name] = names.as_mut_slice()
+            && parameters.iter().any(|p| p.eq_ignore_ascii_case(name))
+        {
+            shadowed.push(name.clone());
+            name.insert(0, LAMBDA_MARK);
+        }
+    });
+    visit_expr_mut(body, &mut |e| {
+        if let ExprKind::ColumnRef(names) = &mut e.kind
+            && let Some(first) = names.first_mut()
+            && shadowed.iter().any(|s| s.eq_ignore_ascii_case(first))
+        {
+            first.insert(0, LAMBDA_MARK);
+        }
+    });
+}
+
+fn unprotect_lambda_parameters(expr: &mut Expr) {
+    if let ExprKind::ColumnRef(names) = &mut expr.kind
+        && let Some(first) = names.first_mut()
+        && first.starts_with(LAMBDA_MARK)
+    {
+        first.remove(0);
+    }
+}
+
+/// [`mark_parameters`] over `expr` and the subqueries in it, but not over lambda parameters.
+fn mark_all(expr: &mut Expr, parameters: &[String]) {
+    visit_expr_mut(expr, &mut |e| {
+        into_subqueries(e, &mut |e| protect_lambda_parameters(e, parameters))
+    });
+    visit_expr_mut(expr, &mut |e| {
+        into_subqueries(e, &mut |e| mark_parameters(e, parameters))
+    });
+    visit_expr_mut(expr, &mut |e| into_subqueries(e, &mut unprotect_lambda_parameters));
+}
+
 /// Puts the arguments in place of the marked references (`DummyBinding::ParamToArg`).
 fn replace_marked(expr: &mut Expr, arguments: &[Expr]) {
     if let ExprKind::ColumnRef(names) = &expr.kind
@@ -82,17 +133,13 @@ fn into_subqueries(expr: &mut Expr, op: &mut dyn FnMut(&mut Expr)) {
 
 /// `ExpressionBinder::ReplaceMacroParameters` over a scalar macro's body.
 fn replace_in_expr(body: &mut Expr, parameters: &[String], arguments: &[Expr]) {
-    visit_expr_mut(body, &mut |e| {
-        into_subqueries(e, &mut |e| mark_parameters(e, parameters))
-    });
+    mark_all(body, parameters);
     visit_expr_mut(body, &mut |e| into_subqueries(e, &mut |e| replace_marked(e, arguments)));
 }
 
 /// `ExpressionBinder::ReplaceMacroParameters` over a table macro's query.
 fn replace_in_query(body: &mut QueryNode, parameters: &[String], arguments: &[Expr]) {
-    visit_query_node_exprs_mut(body, &mut |e| {
-        into_subqueries(e, &mut |e| mark_parameters(e, parameters))
-    });
+    visit_query_node_exprs_mut(body, &mut |e| mark_all(e, parameters));
     visit_query_node_exprs_mut(body, &mut |e| into_subqueries(e, &mut |e| replace_marked(e, arguments)));
 }
 
@@ -428,7 +475,18 @@ impl Binder<'_> {
                         return Err(binder_error("Parameter expressions within macro's are not supported!"));
                     }
                     let mut body = (**body).clone();
-                    replace_in_expr(&mut body, &parameters, &nulls);
+                    mark_all(&mut body, &parameters);
+                    visit_expr_mut(&mut body, &mut |e| {
+                        into_subqueries(e, &mut |e| {
+                            if let ExprKind::ColumnRef(names) = &mut e.kind
+                                && names.len() == 2
+                                && names[0] == PARAMETER_MARK
+                            {
+                                names[0] = CREATE_PARAMETER_MARK.to_string();
+                            }
+                        })
+                    });
+                    binder.macro_arguments = parameters.iter().cloned().zip(nulls.iter().cloned()).collect();
                     // a macro's body may aggregate, and whether that fits shows where it is used
                     binder.aggregate_error = MACRO_AGGREGATE;
                     match binder.bind_expression(&body) {

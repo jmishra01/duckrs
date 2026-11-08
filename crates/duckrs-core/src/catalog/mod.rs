@@ -1444,6 +1444,15 @@ impl SchemaCatalogEntry {
                     }
                 });
             }
+            for constraint in &table.constraints {
+                if let TableConstraint::Check { expression, .. } = constraint {
+                    expression.clone().walk_mut(&mut |e| {
+                        if let BoundExprKind::Sequence { sequence, .. } = &e.kind {
+                            uses |= Arc::ptr_eq(sequence, &current);
+                        }
+                    });
+                }
+            }
             if uses {
                 users.push(table.name.clone());
             }
@@ -1477,19 +1486,23 @@ impl SchemaCatalogEntry {
     /// not remember the name of its type, so an ENUM is known by its type, and other user types
     /// are not tracked yet.
     fn tables_using_type(&self, name: &str) -> Vec<String> {
-        fn mentions(ty: &LogicalType, target: &LogicalType) -> bool {
-            ty == target
-                || ty.child_type().is_some_and(|child| mentions(child, target))
-                || ty.struct_children().iter().any(|(_, child)| mentions(child, target))
+        fn mentions(ty: &LogicalType, target: &LogicalType, name: &str) -> bool {
+            (target.id() == LogicalTypeId::Enum && ty == target)
+                || ty.alias().is_some_and(|alias| alias.eq_ignore_ascii_case(name))
+                || ty.child_type().is_some_and(|child| mentions(child, target, name))
+                || ty
+                    .struct_children()
+                    .iter()
+                    .any(|(_, child)| mentions(child, target, name))
         }
-        let Some(target) = self.get_type(name).filter(|ty| ty.id() == LogicalTypeId::Enum) else {
+        let Some(target) = self.get_type(name) else {
             return Vec::new();
         };
         self.tables
             .read()
             .values()
             .filter_map(|entry| match entry {
-                TableOrView::Table(table) if table.columns.iter().any(|c| mentions(&c.ty, &target)) => {
+                TableOrView::Table(table) if table.columns.iter().any(|c| mentions(&c.ty, &target, name)) => {
                     Some(table.name.clone())
                 }
                 _ => None,

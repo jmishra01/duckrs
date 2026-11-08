@@ -660,6 +660,9 @@ pub fn bind_nested_function(name: &str, names: Vec<String>, children: Vec<BoundE
                 )));
             };
             match lower.as_str() {
+                "union_extract" if !matches!(child.return_type.id(), LogicalTypeId::Union | LogicalTypeId::Unknown) => {
+                    Err(binder_error("union_extract can only take a union parameter"))
+                }
                 "struct_extract" | "struct_extract_at" | "union_extract" => bind_struct_extract(child, key),
                 _ => bind_extract(&lower, child, key),
             }

@@ -218,7 +218,7 @@ pub(crate) fn range_parameters(values: &[i128], generate_series: bool) -> Result
     if difference % increment != 0 {
         count += 1;
     }
-    Ok((start, count as u64, increment))
+    Ok((start, u64::try_from(count).unwrap_or(u64::MAX), increment))
 }
 
 /// `BindContext::AliasColumnNames`: column aliases first, and duplicate names made unique.
@@ -310,6 +310,9 @@ impl Binder<'_> {
     /// A reference to the CTE at `index` of the visible ones (`Binder::Bind(BaseTableRef)`).
     fn bind_cte_reference(&mut self, table_ref: &TableRef, index: usize) -> Result<LogicalOperator> {
         let (name, cte, outer_depth) = self.ctes[index].clone();
+        if cte.aliases.iter().any(String::is_empty) {
+            return Err(binder_error("column alias cannot be empty"));
+        }
         let mut binder = self.child_binder();
         // a CTE sees the ones before it, and not itself
         binder.ctes.truncate(index);
@@ -958,6 +961,9 @@ impl Binder<'_> {
             None => None,
         };
         let qualify = match &node.qualify {
+            Some(_) if node.force_aggregates => {
+                return Err(binder_error("Combining QUALIFY with GROUP BY ALL is not supported yet"));
+            }
             Some(qualify) => {
                 let qualify = self.qualified_with_aliases(qualify, &state);
                 let bound = self.bind_expression(&qualify);
@@ -1528,6 +1534,9 @@ impl Binder<'_> {
 
     /// `Binder::Bind(TableRef)` + `CreatePlan`: the FROM clause.
     pub(super) fn bind_table_ref(&mut self, table_ref: &TableRef) -> Result<LogicalOperator> {
+        if table_ref.column_name_alias.iter().any(String::is_empty) {
+            return Err(binder_error("column alias cannot be empty"));
+        }
         let plan = self.bind_unsampled_table_ref(table_ref)?;
         match &table_ref.sample {
             Some(options) => bind_sample(options, plan),
@@ -2112,7 +2121,9 @@ impl Binder<'_> {
         // `VerifyNotExcluded`
         for expr in &list {
             let mut excluded = false;
+            let mut subquery = false;
             visit_expr_mut(&mut expr.clone(), &mut |e| {
+                subquery |= matches!(e.kind, ExprKind::Subquery { .. });
                 if let ExprKind::ColumnRef(names) = &e.kind
                     && names.len() > 1
                     && names[names.len() - 2].eq_ignore_ascii_case("excluded")
@@ -2122,6 +2133,10 @@ impl Binder<'_> {
             });
             if excluded {
                 return Err(excluded_in_returning());
+            }
+            // `ReturningBinder::BindExpression`
+            if subquery {
+                return Err(binder_error("SUBQUERY is not supported in returning statements"));
             }
         }
         let names: Vec<String> = list.iter().map(expression_name).collect();

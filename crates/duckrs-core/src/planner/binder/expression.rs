@@ -893,6 +893,19 @@ impl Binder<'_> {
                 let call = crate::storage::writer::parse_expression(&format!("{function}()"))?;
                 return self.bind_expression(&call);
             }
+            ExprKind::ColumnRef(names)
+                if names.len() == 2
+                    && names[0] == super::macros::CREATE_PARAMETER_MARK
+                    && !self.macro_arguments.is_empty() =>
+            {
+                // `ColumnQualifier::QualifyColumnName`: a parameter can't also be a column here
+                let (name, argument) =
+                    self.macro_arguments[names[1].parse::<usize>().expect("a marked position")].clone();
+                if !self.bind_context.matching_bindings(&name).is_empty() {
+                    return Err(binder_error(format!("Conflicting column names for column {name}!")));
+                }
+                return self.bind_expression(&argument);
+            }
             ExprKind::ColumnRef(names) => {
                 let mode = self
                     .aggregates

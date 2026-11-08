@@ -11,7 +11,7 @@ use super::{BindContext, Binder, Binding, UsingColumnSet, binder_error};
 use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{JoinCondition, LogicalOperator, LogicalOperatorKind};
 use duckrs_common::Result;
-use duckrs_common::types::LogicalType;
+use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::Value;
 use duckrs_parser::ast::{
     ComparisonOp, Expr, ExprKind, JoinRef, JoinRefType, JoinType, Literal, NullOrder, OperatorType, OrderByNode,
@@ -114,6 +114,92 @@ fn table_indexes(plan: &LogicalOperator) -> HashSet<usize> {
         .iter()
         .map(|b: &ColumnBinding| b.table_index)
         .collect()
+}
+
+/// `PlanMarkJoin`: an explicit MARK join only runs the comparison families the mark join
+/// implements, which `ExtractJoinConditions` and `TryGetMarkJoinGroupTypes` decide.
+fn plan_mark_join(predicates: &[BoundExpr], left: &LogicalOperator, right: &LogicalOperator) -> Result<()> {
+    let unsupported = || crate::error_not_implemented("Unsupported explicit MARK join conditions");
+    let left_tables = table_indexes(left);
+    let right_tables = table_indexes(right);
+    // `JoinSide::GetJoinSide`: 0 none, 1 left, 2 right, 3 both
+    let side =
+        |expr: &BoundExpr| u8::from(references(expr, &left_tables)) | (u8::from(references(expr, &right_tables)) << 1);
+    let mut split = Vec::new();
+    for predicate in predicates {
+        split_predicates(predicate.clone(), &mut split);
+    }
+    // the comparisons, as (op, left type, right type)
+    let mut conditions = Vec::with_capacity(split.len());
+    for expr in &split {
+        // `CanEliminate`: a constant TRUE condition drops out
+        if matches!(&expr.kind, BoundExprKind::Constant(value) if *value == Value::boolean(true)) {
+            continue;
+        }
+        let BoundExprKind::Comparison {
+            op,
+            left: first,
+            right: second,
+        } = &expr.kind
+        else {
+            return Err(unsupported());
+        };
+        if contains_subquery(expr) {
+            return Err(unsupported());
+        }
+        let (a, b) = (side(first), side(second));
+        if !matches!((a, b), (0 | 1, 0 | 2) | (0 | 2, 0 | 1)) {
+            return Err(unsupported());
+        }
+        conditions.push((*op, &first.return_type, &second.return_type));
+    }
+    if mark_join_group_types(&conditions) {
+        return Ok(());
+    }
+    let all_equal = !conditions.is_empty() && conditions.iter().all(|(op, ..)| *op == ComparisonOp::Equal);
+    let null_safe = conditions.iter().any(|(op, ..)| *op == ComparisonOp::NotDistinctFrom)
+        && conditions
+            .iter()
+            .all(|(op, ..)| matches!(op, ComparisonOp::NotDistinctFrom | ComparisonOp::DistinctFrom));
+    if all_equal || null_safe || conditions.len() == 1 {
+        return Ok(());
+    }
+    Err(unsupported())
+}
+
+/// `LogicalComparisonJoin::TryGetMarkJoinGroupTypes`: null-safe group keys, then one comparison.
+fn mark_join_group_types(conditions: &[(ComparisonOp, &LogicalType, &LogicalType)]) -> bool {
+    if conditions.len() < 2 {
+        return false;
+    }
+    for (i, (op, lhs, rhs)) in conditions.iter().enumerate() {
+        if lhs != rhs {
+            return false;
+        }
+        if i + 1 < conditions.len() {
+            if *op != ComparisonOp::NotDistinctFrom {
+                return false;
+            }
+            continue;
+        }
+        let id = lhs.id();
+        if id == LogicalTypeId::Union || (id == LogicalTypeId::Tuple && *op != ComparisonOp::Equal) {
+            return false;
+        }
+        match op {
+            ComparisonOp::Equal | ComparisonOp::NotEqual => {}
+            ComparisonOp::LessThan
+            | ComparisonOp::GreaterThan
+            | ComparisonOp::LessThanOrEqual
+            | ComparisonOp::GreaterThanOrEqual => {
+                if lhs.is_nested() {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// `ExtractJoinConditions`: the equalities between the two sides become join keys, and what
@@ -356,6 +442,7 @@ impl Binder<'_> {
             ));
         }
         if join.join_type == JoinType::Mark {
+            plan_mark_join(&predicates, &left, &right)?;
             self.bind_context.remove_context(&right_aliases);
             let table_index = self.generate_table_index();
             self.bind_context.add_binding(Binding {

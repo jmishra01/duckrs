@@ -149,12 +149,49 @@ fn rewrite(replacement: &str) -> String {
     out
 }
 
+/// RE2's `CheckRewriteString`: a backslash takes a digit or another backslash, and the
+/// groups it names exist.
+fn check_rewrite(replacement: &str, groups: usize) -> Result<()> {
+    let invalid = |message: String| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            format!("Invalid replacement string for regexp_replace: {message}"),
+        )
+    };
+    let mut max_token = 0;
+    let mut bytes = replacement.bytes();
+    while let Some(c) = bytes.next() {
+        if c != b'\\' {
+            continue;
+        }
+        match bytes.next() {
+            None => return Err(invalid("Rewrite schema error: '\\' not allowed at end.".to_string())),
+            Some(b'\\') => {}
+            Some(digit) if digit.is_ascii_digit() => max_token = max_token.max(usize::from(digit - b'0')),
+            Some(_) => {
+                return Err(invalid(
+                    "Rewrite schema error: '\\' must be followed by a digit or '\\'.".to_string(),
+                ));
+            }
+        }
+    }
+    if max_token > groups {
+        return Err(invalid(format!(
+            "Rewrite schema requests {max_token} matches, but the regexp only has {groups} parenthesized \
+             subexpressions."
+        )));
+    }
+    Ok(())
+}
+
 fn regexp_replace(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
         let options = options_of(row, 3)?;
         let regex = compile(&text(&row[1]), options, false)?;
         let input = text(&row[0]);
-        let replacement = rewrite(&text(&row[2]));
+        let replacement = text(&row[2]);
+        check_rewrite(&replacement, regex.captures_len() - 1)?;
+        let replacement = rewrite(&replacement);
         Ok(Value::varchar(if options.global {
             regex.replace_all(&input, replacement.as_str()).into_owned()
         } else {

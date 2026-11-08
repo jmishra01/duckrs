@@ -218,6 +218,62 @@ fn on_set(setting: &SettingDefinition, value: Value) -> Result<Value> {
         }
     }
     Ok(match setting.name {
+        // `ForceCompressionSetting::OnSet`: a `CompressionType` that can be forced
+        "force_compression" => {
+            const TYPES: [&str; 17] = [
+                "AUTO",
+                "UNCOMPRESSED",
+                "CONSTANT",
+                "RLE",
+                "DICTIONARY",
+                "PFOR",
+                "BITPACKING",
+                "FSST",
+                "CHIMP",
+                "PATAS",
+                "ALP",
+                "ALPRD",
+                "ZSTD",
+                "ROARING",
+                "EMPTY",
+                "DICT_FSST",
+                "ENUM_SIZE",
+            ];
+            let compression = text()?;
+            if compression == "none" || compression == "auto" {
+                return Ok(Value::varchar("auto"));
+            }
+            let input = value.try_to_string()?;
+            let Some(found) = TYPES.iter().find(|t| t.eq_ignore_ascii_case(&compression)) else {
+                let scores = TYPES
+                    .iter()
+                    .map(|v| (v.to_string(), similarity_rating(v, &input)))
+                    .collect();
+                return Err(Error::new(
+                    ErrorKind::NotImplemented,
+                    format!(
+                        "Enum value: unrecognized value \"{input}\" for enum \"CompressionType\"\n{}",
+                        candidates_message(&top_n_strings(scores), "Candidates")
+                    ),
+                ));
+            };
+            match *found {
+                "CONSTANT" | "EMPTY" => {
+                    return Err(Error::new(
+                        ErrorKind::Parser,
+                        "auto / constant cannot be used for force_compression",
+                    ));
+                }
+                "CHIMP" | "PATAS" => {
+                    let name = if *found == "CHIMP" { "Chimp" } else { "Patas" };
+                    return Err(Error::new(
+                        ErrorKind::Parser,
+                        format!("Attempted to force a deprecated compression type ({name})"),
+                    ));
+                }
+                _ => value,
+            }
+        }
         // `DefaultCollationSetting::OnSet`: the collation has to exist
         "default_collation" => {
             crate::planner::collation::test_collation(&value.try_to_string()?)?;

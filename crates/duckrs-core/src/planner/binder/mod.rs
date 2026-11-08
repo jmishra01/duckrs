@@ -702,6 +702,8 @@ pub struct Binder<'a> {
     row_subquery: bool,
     /// The table macros being bound, innermost last (`bound_macros`).
     bound_macros: Vec<Arc<MacroCatalogEntry>>,
+    /// `Binder::macro_binding`: the parameters of a macro being created, and what they bind as.
+    macro_arguments: Vec<(String, ast::Expr)>,
     /// How many scalar macros the expression being bound is nested in.
     macro_depth: usize,
     /// The parameters of the prepared statement being bound, if it is one.
@@ -771,6 +773,7 @@ impl<'a> Binder<'a> {
             search_schema: None,
             row_subquery: false,
             bound_macros: Vec::new(),
+            macro_arguments: Vec::new(),
             macro_depth: 0,
             parameters: None,
             ctes: Vec::new(),
@@ -819,6 +822,7 @@ impl<'a> Binder<'a> {
         binder.next_table_index = self.next_table_index;
         binder.bound_views = self.bound_views.clone();
         binder.bound_macros = self.bound_macros.clone();
+        binder.macro_arguments = self.macro_arguments.clone();
         binder.search_schema = self.search_schema.clone();
         binder.parameters = self.parameters.clone();
         binder.ctes = self.ctes.clone();

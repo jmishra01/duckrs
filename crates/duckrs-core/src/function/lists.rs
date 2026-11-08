@@ -95,7 +95,7 @@ pub fn is_list_function(name: &str) -> bool {
         )
 }
 
-fn no_match(name: &str, children: &[BoundExpr]) -> Error {
+pub(super) fn no_match(name: &str, children: &[BoundExpr]) -> Error {
     let types: Vec<String> = children.iter().map(|c| c.return_type.to_string()).collect();
     Error::new(
         ErrorKind::Binder,
@@ -541,6 +541,9 @@ pub fn bind_list_function(name: &str, children: Vec<BoundExpr>) -> Result<BoundE
             ))
         }
         "list_reverse" | "array_reverse" => {
+            if children.len() != 1 {
+                return Err(no_match(&lower, &children));
+            }
             let (list, _) = list_arg(&children)?;
             let ty = list.return_type.clone();
             Ok(bound_function("list_reverse", vec![list], ty, list_reverse))
