@@ -77,6 +77,9 @@ pub fn is_list_function(name: &str) -> bool {
                 | "array_has_any"
                 | "list_has_all"
                 | "array_has_all"
+                | "&&"
+                | "@>"
+                | "<@"
                 | "flatten"
                 | "list_resize"
                 | "array_resize"
@@ -89,7 +92,6 @@ pub fn is_list_function(name: &str) -> bool {
                 | "list_grade_up"
                 | "array_grade_up"
                 | "grade_up"
-                | "generate_subscripts"
         )
 }
 
@@ -368,14 +370,6 @@ fn list_grade_up(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
-fn generate_subscripts(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    let ty = result.logical_type().clone();
-    strict_rows(args, result, |row| {
-        let subscripts = (1..=items(&row[0]).len()).map(|at| Value::bigint(at as i64)).collect();
-        Value::new(ty.clone(), ValueData::List(subscripts))
-    })
-}
-
 /// `ListAggregatesFunction`: the aggregate over the items of each list.
 fn list_aggr(args: &DataChunk, result: &mut Vector) -> Result<()> {
     let ty = result.logical_type().clone();
@@ -551,8 +545,10 @@ pub fn bind_list_function(name: &str, children: Vec<BoundExpr>) -> Result<BoundE
             let ty = list.return_type.clone();
             Ok(bound_function("list_reverse", vec![list], ty, list_reverse))
         }
-        "list_has_any" | "array_has_any" | "list_has_all" | "array_has_all" => {
+        "list_has_any" | "array_has_any" | "list_has_all" | "array_has_all" | "&&" | "@>" | "<@" => {
             let (left, right) = match children.as_slice() {
+                // `a <@ b` is whether b has all of a
+                [left, right] if lower == "<@" => (as_list(right.clone()), as_list(left.clone())),
                 [left, right] => (as_list(left.clone()), as_list(right.clone())),
                 _ => return Err(no_match(&lower, &children)),
             };
@@ -561,7 +557,7 @@ pub fn bind_list_function(name: &str, children: Vec<BoundExpr>) -> Result<BoundE
             };
             let common = LogicalType::list(force_max_logical_type(&a, &b));
             let args = vec![left.cast_to(&common, false), right.cast_to(&common, false)];
-            if lower.ends_with("any") {
+            if lower.ends_with("any") || lower == "&&" {
                 Ok(bound_function("list_has_any", args, LogicalType::BOOLEAN, list_has_any))
             } else {
                 Ok(bound_function("list_has_all", args, LogicalType::BOOLEAN, list_has_all))
@@ -647,16 +643,6 @@ pub fn bind_list_function(name: &str, children: Vec<BoundExpr>) -> Result<BoundE
             );
             let ty = LogicalType::list(LogicalType::BIGINT);
             Ok(bound_function("list_grade_up", args, ty, list_grade_up))
-        }
-        "generate_subscripts" => {
-            let (list, _) = list_arg(&children)?;
-            let ty = LogicalType::list(LogicalType::BIGINT);
-            Ok(bound_function(
-                "generate_subscripts",
-                vec![list],
-                ty,
-                generate_subscripts,
-            ))
         }
         other => unreachable!("{other} is not a list function"),
     }

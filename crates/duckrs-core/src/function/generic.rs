@@ -610,6 +610,21 @@ fn uuid_v7(args: &DataChunk, result: &mut Vector) -> Result<()> {
     Ok(())
 }
 
+fn list_length_of_dimension(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| {
+        if row[1].as_i128() != Some(1) {
+            return Err(Error::new(
+                ErrorKind::NotImplemented,
+                "array_length for lists with dimensions other than 1 not implemented",
+            ));
+        }
+        match row[0].data() {
+            ValueData::List(items) => Ok(Value::bigint(items.len() as i64)),
+            _ => Ok(Value::null(LogicalType::BIGINT)),
+        }
+    })
+}
+
 /// `ListRangeFunction`: the numbers a `range` of the same arguments gives as rows.
 fn range_list(args: &DataChunk, result: &mut Vector, generate_series: bool) -> Result<()> {
     let ty = result.logical_type().clone();
@@ -738,6 +753,25 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
     };
     match lower.as_str() {
         "array_slice" | "list_slice" => bind_array_slice(children),
+        // `ListLengthBinaryFunction`: the length of a list, of its only dimension
+        "array_length"
+            if children.len() == 2
+                && matches!(
+                    children[0].return_type.id(),
+                    LogicalTypeId::List | LogicalTypeId::SqlNull
+                ) =>
+        {
+            let args = vec![
+                children[0].clone(),
+                children[1].clone().cast_to(&LogicalType::BIGINT, false),
+            ];
+            Ok(bound_function(
+                &lower,
+                args,
+                LogicalType::BIGINT,
+                list_length_of_dimension,
+            ))
+        }
         "len" | "array_length" | "length" => {
             let child = as_list(single(&children)?);
             let id = child.return_type.id();

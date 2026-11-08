@@ -441,6 +441,7 @@ test/optimizer/issue_21011.test
 test/optimizer/issue_23294.test
 test/optimizer/issue_25819.test
 test/optimizer/issue_topn_window_elimination_cte_mixed_partition_types.test
+test/optimizer/join_reorder_optimizer.test
 test/optimizer/joins/always_true_scan_filter_estimate.test
 test/optimizer/joins/asof_join_adds_rows.test
 test/optimizer/joins/better_ce_estimates_for_bad_join_conditions.test
@@ -594,6 +595,7 @@ test/sql/aggregate/aggregates/test_incorrect_aggregate.test
 test/sql/aggregate/aggregates/test_kahan_avg.test
 test/sql/aggregate/aggregates/test_kahan_combine.test
 test/sql/aggregate/aggregates/test_kahan_sum.test
+test/sql/aggregate/aggregates/test_kurtosis.test
 test/sql/aggregate/aggregates/test_last.test
 test/sql/aggregate/aggregates/test_last_noninlined.test
 test/sql/aggregate/aggregates/test_mad_hugeint_range.test
@@ -949,20 +951,24 @@ test/sql/collate/collate_group_subquery.test
 test/sql/collate/collate_in_subquery.test
 test/sql/collate/collate_json_ordered_aggregate.test
 test/sql/collate/collate_like.test
+test/sql/collate/collate_nested.test
 test/sql/collate/collate_non_varchar.test
 test/sql/collate/collate_order_by_alias.test
 test/sql/collate/collate_ordered_aggregate.test
 test/sql/collate/collate_string_col.test
+test/sql/collate/collate_struct_minmax.test
 test/sql/collate/collate_subquery.test
 test/sql/collate/test_collate_accent_insensitive.test
 test/sql/collate/test_collate_between.test
 test/sql/collate/test_collate_case_insensitive.test
 test/sql/collate/test_collate_expression.test
+test/sql/collate/test_collate_list_contains.test
 test/sql/collate/test_collate_null_constant.test
 test/sql/collate/test_collate_orderby_column_number.test
 test/sql/collate/test_collate_pivot.test
 test/sql/collate/test_collation_propagation.test
 test/sql/collate/test_combined_collation.test
+test/sql/collate/test_default_collation_functions.test
 test/sql/collate/test_default_collations.test
 test/sql/collate/test_strpos_collate.test
 test/sql/collate/test_unsupported_collations.test
@@ -1489,6 +1495,7 @@ test/sql/function/date/test_extract_edge_cases.test
 test/sql/function/date/test_extract_month.test
 test/sql/function/date/test_extract_year.test
 test/sql/function/date/test_strftime.test
+test/sql/function/date/test_strftime_exhaustive.test
 test/sql/function/date/yearweek_bc_statistics.test
 test/sql/function/enum/enum_range_large.test
 test/sql/function/enum/test_enum_first.test
@@ -1544,6 +1551,8 @@ test/sql/function/list/aggregates/sum.test
 test/sql/function/list/aggregates/sum_bool.test
 test/sql/function/list/aggregates/sum_no_overflow.test
 test/sql/function/list/aggregates/uhugeint.test
+test/sql/function/list/array_length.test
+test/sql/function/list/generate_subscripts.test
 test/sql/function/list/lambda_constant_null.test
 test/sql/function/list/lambdas/arrow/filter_deprecated.test
 test/sql/function/list/lambdas/arrow/lambdas_and_functions_deprecated.test
@@ -2399,6 +2408,7 @@ test/sql/show_select/test_describe_quoted.test
 test/sql/show_select/test_show_select.test
 test/sql/show_select/test_summarize_quoted.test
 test/sql/sql_export/basic_plan_shapes.test
+test/sql/sql_export/ci_reconstruction.test
 test/sql/sql_export/collation_results.test
 test/sql/sql_export/composition_q1.test
 test/sql/sql_export/compressed_materialization_sql_export.test
@@ -2870,6 +2880,7 @@ test/sql/subquery/scalar/test_delete_subquery.test
 test/sql/subquery/scalar/test_issue_4216.test
 test/sql/subquery/scalar/test_issue_6136.test
 test/sql/subquery/scalar/test_issue_6184.test
+test/sql/subquery/scalar/test_issue_7079.test
 test/sql/subquery/scalar/test_join_in_subquery.test
 test/sql/subquery/scalar/test_many_correlated_columns.test
 test/sql/subquery/scalar/test_scalar_subquery_cte.test
@@ -3232,6 +3243,7 @@ test/sql/types/nested/struct/struct_is_null.test
 test/sql/types/nested/struct/struct_of_lists_where.test
 test/sql/types/nested/struct/struct_subquery.test
 test/sql/types/nested/struct/test_struct.test
+test/sql/types/nested/test_deeply_nested_types.test
 test/sql/types/nested/unnest_range_plan.test
 test/sql/types/null/test_boolean_null.test
 test/sql/types/null/test_is_null.test
@@ -3295,6 +3307,7 @@ test/sql/types/test_user_type_errors_18452.test
 test/sql/types/time/test_time.test
 test/sql/types/time/test_time_2411.test
 test/sql/types/time/test_time_tz.test
+test/sql/types/time/test_time_tz_collate.test
 test/sql/types/time/time_limits.test
 test/sql/types/time/time_parsing.test
 test/sql/types/time/time_try_cast.test

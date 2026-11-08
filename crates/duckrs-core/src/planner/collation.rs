@@ -220,6 +220,115 @@ fn push_struct_collation(
     Ok((result.with_alias(alias), true))
 }
 
+/// `FunctionCollations`: the collation of the VARCHARs of a (nested) type, by field.
+#[derive(Debug, Default)]
+pub struct FunctionCollations {
+    collation: Option<String>,
+    fields: Vec<(String, FunctionCollations)>,
+}
+
+impl FunctionCollations {
+    fn field(&mut self, name: String) -> &mut FunctionCollations {
+        let at = match self.fields.iter().position(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+            Some(at) => at,
+            None => {
+                self.fields.push((name, FunctionCollations::default()));
+                self.fields.len() - 1
+            }
+        };
+        &mut self.fields[at].1
+    }
+
+    fn get(&self, name: &str) -> Option<&FunctionCollations> {
+        self.fields
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, f)| f)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.collation.is_none() && self.fields.is_empty()
+    }
+
+    /// The collation of the VARCHARs at the top.
+    pub fn collation(&self) -> Option<&str> {
+        self.collation.as_deref()
+    }
+}
+
+/// `CollationFieldName`.
+fn field_name(ty: &LogicalType, index: usize) -> String {
+    if ty.id() == LogicalTypeId::Tuple {
+        index.to_string()
+    } else {
+        ty.struct_children()[index].0.clone()
+    }
+}
+
+/// `ExtractCollationFromType`: adds the collations of `ty`'s VARCHARs, an error where two differ.
+pub fn extract_collations(ty: &LogicalType, collations: &mut FunctionCollations) -> Result<()> {
+    if ty.alias().is_some() {
+        return Ok(());
+    }
+    match ty.id() {
+        LogicalTypeId::Varchar => match (&collations.collation, ty.collation()) {
+            (Some(existing), Some(other)) if existing != other => {
+                return Err(Error::new(
+                    ErrorKind::Binder,
+                    "Cannot combine types with different collation",
+                ));
+            }
+            (None, Some(other)) => collations.collation = Some(other.to_string()),
+            _ => {}
+        },
+        LogicalTypeId::List | LogicalTypeId::Array => {
+            extract_collations(ty.child_type().expect("a child"), collations)?;
+        }
+        LogicalTypeId::Struct | LogicalTypeId::Tuple => {
+            for (index, (_, child)) in ty.struct_children().iter().enumerate() {
+                extract_collations(child, collations.field(field_name(ty, index)))?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// `ApplyCollationToType`: `ty` with the collations on its VARCHARs.
+pub fn apply_collations(ty: &LogicalType, collations: &FunctionCollations) -> LogicalType {
+    if ty.alias().is_some() {
+        return ty.clone();
+    }
+    match ty.id() {
+        LogicalTypeId::Varchar => match &collations.collation {
+            Some(collation) => LogicalType::varchar_collation(collation),
+            None => ty.clone(),
+        },
+        LogicalTypeId::List => LogicalType::list(apply_collations(ty.child_type().expect("a child"), collations)),
+        LogicalTypeId::Array => LogicalType::array(
+            apply_collations(ty.child_type().expect("a child"), collations),
+            ty.array_size().unwrap_or(0),
+        ),
+        LogicalTypeId::Struct | LogicalTypeId::Tuple => {
+            let children: Vec<(String, LogicalType)> = ty
+                .struct_children()
+                .iter()
+                .enumerate()
+                .map(|(index, (name, child))| match collations.get(&field_name(ty, index)) {
+                    Some(field) => (name.clone(), apply_collations(child, field)),
+                    None => (name.clone(), child.clone()),
+                })
+                .collect();
+            if ty.id() == LogicalTypeId::Tuple {
+                LogicalType::tuple(children.into_iter().map(|(_, t)| t).collect())
+            } else {
+                LogicalType::struct_type(children)
+            }
+        }
+        _ => ty.clone(),
+    }
+}
+
 /// `ExpressionBinder::TestCollation`: fails if `collation` is not one there is.
 pub fn test_collation(collation: &str) -> Result<()> {
     collation_functions(

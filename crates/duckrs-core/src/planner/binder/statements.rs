@@ -635,7 +635,7 @@ impl Binder<'_> {
         }
         // ORDER BY and DISTINCT see the values as their collation does
         let default_collation = self.default_collation();
-        let column = |i: usize| -> Result<BoundExpr> {
+        let collated_column = |i: usize| -> Result<BoundExpr> {
             let expr = column(i)?;
             let ty = expr.return_type.clone();
             let kind = crate::planner::collation::CollationType::AllCollations;
@@ -644,10 +644,10 @@ impl Binder<'_> {
         for modifier in prepared {
             let kind = match modifier {
                 PreparedModifier::Distinct => LogicalOperatorKind::Distinct {
-                    targets: (0..column_count).map(column).collect::<Result<_>>()?,
+                    targets: (0..column_count).map(collated_column).collect::<Result<_>>()?,
                 },
                 PreparedModifier::DistinctOn(indexes) => LogicalOperatorKind::Distinct {
-                    targets: indexes.into_iter().map(column).collect::<Result<_>>()?,
+                    targets: indexes.into_iter().map(collated_column).collect::<Result<_>>()?,
                 },
                 PreparedModifier::LimitPercent { percent, offset } => {
                     LogicalOperatorKind::LimitPercent { percent, offset }
@@ -658,7 +658,7 @@ impl Binder<'_> {
                         .map(|(modifiers, index)| {
                             Ok(BoundOrderByNode {
                                 modifiers,
-                                expr: column(index)?,
+                                expr: collated_column(index)?,
                             })
                         })
                         .collect::<Result<_>>()?,
@@ -668,7 +668,7 @@ impl Binder<'_> {
                         .map(|i| {
                             Ok(BoundOrderByNode {
                                 modifiers,
-                                expr: column(i)?,
+                                expr: collated_column(i)?,
                             })
                         })
                         .collect::<Result<_>>()?,

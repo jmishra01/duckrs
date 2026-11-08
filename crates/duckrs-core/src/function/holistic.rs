@@ -423,6 +423,45 @@ fn moments(values: &[f64]) -> (f64, f64, f64, f64, f64) {
     (n, mean, central(2), central(3), central(4))
 }
 
+/// `KurtosisState`: the count, the mean and the central moments M2..M4, updated one value at a
+/// time (Terriberry / Pébay), so that they are exactly zero for constant input.
+fn online_moments(values: &[f64]) -> (f64, f64, f64, f64, f64) {
+    let (mut count, mut mean, mut m2, mut m3, mut m4) = (0u64, 0.0, 0.0, 0.0, 0.0);
+    for &value in values {
+        let n1 = count as f64;
+        count += 1;
+        let n = count as f64;
+        let delta = value - mean;
+        let delta_n = delta / n;
+        let delta_n2 = delta_n * delta_n;
+        let term1 = delta * delta_n * n1;
+        mean += delta_n;
+        m4 += term1 * delta_n2 * (n * n - 3.0 * n + 3.0) + 6.0 * delta_n2 * m2 - 4.0 * delta_n * m3;
+        m3 += term1 * delta_n * (n - 2.0) - 3.0 * delta_n * m2;
+        m2 += term1;
+    }
+    (count as f64, mean, m2, m3, m4)
+}
+
+/// `KurtosisOperation::Finalize`: NULL for too few values or no variance.
+fn kurtosis(values: &[f64], bias_correction: bool) -> Result<Value> {
+    let null = || Value::null(LogicalType::DOUBLE);
+    let (n, _, m2, _, m4) = online_moments(values);
+    if n <= 1.0 || (bias_correction && n <= 3.0) || m2 <= 0.0 {
+        return Ok(null());
+    }
+    let m4_over_m2_sqr = n * (m4 / m2) / m2;
+    let target = if bias_correction {
+        (n - 1.0) * ((n + 1.0) * m4_over_m2_sqr - 3.0 * (n - 1.0)) / ((n - 2.0) * (n - 3.0))
+    } else {
+        m4_over_m2_sqr - 3.0
+    };
+    if !target.is_finite() {
+        return Err(out_of_range("Kurtosis is out of range!"));
+    }
+    Ok(Value::double(target))
+}
+
 fn checked(name: &str, value: f64) -> Result<Value> {
     if value.is_finite() {
         Ok(Value::double(value))
@@ -893,18 +932,7 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
             let g1 = n.sqrt() * (m3 / m2) / m2.sqrt();
             checked("SKEW", (n * (n - 1.0)).sqrt() / (n - 2.0) * g1)?
         }
-        Kurtosis => {
-            let values = numbers(rows);
-            if values.len() <= 3 {
-                return Ok(null());
-            }
-            let (n, _, square, _, fourth) = moments(&values);
-            if square == 0.0 {
-                return Ok(null());
-            }
-            let g2 = (fourth / n) / (square / n).powi(2) - 3.0;
-            checked("KURTOSIS", (n - 1.0) / ((n - 2.0) * (n - 3.0)) * ((n + 1.0) * g2 + 6.0))?
-        }
+        Kurtosis => kurtosis(&numbers(rows), true)?,
         Entropy => {
             let values: Vec<Value> = rows.iter().filter(|v| !v.is_null()).cloned().collect();
             if values.is_empty() {
@@ -951,17 +979,7 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
             }
             combined
         }
-        KurtosisPop => {
-            let values = numbers(rows);
-            if values.is_empty() {
-                return Ok(null());
-            }
-            let (n, _, square, _, fourth) = moments(&values);
-            if square == 0.0 {
-                return Ok(null());
-            }
-            checked("KURTOSIS", (fourth / n) / (square / n).powi(2) - 3.0)?
-        }
+        KurtosisPop => kurtosis(&numbers(rows), false)?,
         CountIf if rows.is_empty() => null(),
         CountIf => {
             let count = rows

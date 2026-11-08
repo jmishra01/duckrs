@@ -905,11 +905,25 @@ impl Binder<'_> {
     /// The VARCHARs `exprs`, compared with each other, with the collation of their types
     /// (`originals`, before the casts) applied; an error if two of them disagree.
     pub(crate) fn collate_compared(&self, originals: &[LogicalType], exprs: Vec<BoundExpr>) -> Result<Vec<BoundExpr>> {
+        // `ComparisonBind`: what is not a VARCHAR compares with the collation of its type (a TIMETZ
+        // by its instant, an INTERVAL normalized, the fields and elements of a nested value)
         if exprs
             .iter()
             .any(|e| e.return_type.id() != duckrs_common::types::LogicalTypeId::Varchar)
         {
-            return Ok(exprs);
+            // the collations of the VARCHARs nested in either go to both (the comparison type)
+            use crate::planner::collation::{FunctionCollations, apply_collations, extract_collations};
+            let mut collations = FunctionCollations::default();
+            for ty in originals.iter().chain(exprs.iter().map(|e| &e.return_type)) {
+                extract_collations(ty, &mut collations)?;
+            }
+            return exprs
+                .into_iter()
+                .map(|e| {
+                    let ty = apply_collations(&e.return_type, &collations);
+                    self.collate(e, &ty)
+                })
+                .collect();
         }
         let mut collation: Option<String> = None;
         for ty in originals {

@@ -1016,6 +1016,19 @@ pub fn value_keys(input: &Vector, count: usize) -> Result<Vec<Vec<u8>>> {
         order: OrderType::Ascending,
         nulls: NullOrder::NullsLast,
     };
+    // `dtime_tz_t::operator<`: a TIMETZ orders by its instant
+    if input.logical_type().id() == LogicalTypeId::TimeTz {
+        let mut instants = Vector::new(LogicalType::UBIGINT, count.max(1));
+        for row in 0..count {
+            let value = input.get_value(row);
+            let instant = match value.data() {
+                ValueData::Int64(bits) => Value::ubigint(duckrs_common::types::TimeTz(*bits as u64).sort_key()),
+                _ => Value::null(LogicalType::UBIGINT),
+            };
+            instants.set_value(row, &instant)?;
+        }
+        return create_sort_keys(&[(&instants, modifiers)], count);
+    }
     create_sort_keys(&[(input, modifiers)], count)
 }
 

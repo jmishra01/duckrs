@@ -765,28 +765,31 @@ impl Binder<'_> {
         };
         let pushes = PUSH_COMBINABLE_COLLATIONS.contains(&function.name.to_lowercase().as_str());
         let varchar = |ty: &LogicalType| ty.id() == LogicalTypeId::Varchar && ty.alias().is_none();
+        // `ExtractCollation`, for a function that gives a VARCHAR (`PropagateReturnCollation`)
         let mut collation: Option<String> = None;
-        for child in children.iter().filter(|c| varchar(&c.return_type)) {
-            match (&collation, child.return_type.collation()) {
-                (Some(c), Some(other)) if c != other => {
-                    return Err(binder_error(if pushes {
-                        "Cannot combine types with different collation"
-                    } else {
-                        "Cannot combine types with different collation!"
-                    }));
+        if !pushes && varchar(&bound.return_type) {
+            for child in children.iter().filter(|c| varchar(&c.return_type)) {
+                match (&collation, child.return_type.collation()) {
+                    (Some(c), Some(other)) if c != other => {
+                        return Err(binder_error("Cannot combine types with different collation!"));
+                    }
+                    (None, Some(other)) => collation = Some(other.to_string()),
+                    _ => {}
                 }
-                (None, Some(other)) => collation = Some(other.to_string()),
-                _ => {}
             }
         }
         if pushes {
-            let ty = LogicalType::VARCHAR.with_collation(collation.as_deref());
+            // `PushCollations`: the collations of all arguments, nested ones too, go to each of them
+            use crate::planner::collation::{FunctionCollations, apply_collations, extract_collations};
+            let mut collations = FunctionCollations::default();
+            for child in children.iter() {
+                extract_collations(&child.return_type, &mut collations)?;
+            }
             let default = self.default_collation();
             for child in children.iter_mut() {
-                if varchar(&child.return_type) {
-                    let taken = std::mem::replace(child, BoundExpr::constant(Value::sql_null()));
-                    *child = push_collation(taken, &ty, &default, CollationType::CombinableCollations)?.0;
-                }
+                let ty = apply_collations(&child.return_type, &collations);
+                let taken = std::mem::replace(child, BoundExpr::constant(Value::sql_null()));
+                *child = push_collation(taken, &ty, &default, CollationType::CombinableCollations)?.0;
             }
         } else if varchar(&bound.return_type)
             && let Some(collation) = collation
@@ -1711,13 +1714,22 @@ impl Binder<'_> {
                 "In a DISTINCT aggregate, ORDER BY expressions must appear in the argument list",
             ));
         }
-        // `BindMinMax`: min and max of a collated VARCHAR are arg_min and arg_max of the value
-        // by its collated value
+        // `BindMinMax`: min and max of a collated type are arg_min and arg_max of the value by its
+        // collated value (`MinMaxUsesCollation`: VARCHAR, BIT, TIMETZ and the nested types)
         let mut set = set;
         let mut children = children;
         if matches!(set.name.as_str(), "min" | "max")
             && let [child] = children.as_slice()
-            && child.return_type.id() == LogicalTypeId::Varchar
+            && matches!(
+                child.return_type.id(),
+                LogicalTypeId::Varchar
+                    | LogicalTypeId::Bit
+                    | LogicalTypeId::TimeTz
+                    | LogicalTypeId::Struct
+                    | LogicalTypeId::Tuple
+                    | LogicalTypeId::List
+                    | LogicalTypeId::Array
+            )
             && !function.export_state
         {
             let ty = child.return_type.clone();

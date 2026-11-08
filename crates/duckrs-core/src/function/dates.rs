@@ -1193,7 +1193,8 @@ pub(crate) fn strftime_text(format: &str, days: i32, time: i64, zoned: bool) -> 
             'V' => out += &pad(i64::from(iso), 2),
             'G' if (0..=9999).contains(&iso_year) => out += &format!("{iso_year:04}"),
             'G' => out += &iso_year.to_string(),
-            'y' => out += &pad(i64::from(year.rem_euclid(100)), 2),
+            // `AbsValue(year) % 100`
+            'y' => out += &pad(i64::from(year.unsigned_abs() % 100), 2),
             'Y' if year < 0 => out += &year.to_string(),
             'Y' => out += &format!("{year:04}"),
             'z' => out += "+00",
