@@ -14,14 +14,14 @@ use crate::function::binder::expression_return_type;
 use crate::function::cast_rules::implicit_cast;
 use crate::planner::expression::BoundExpr;
 use crate::planner::logical::LogicalOperator;
-use duckrs_common::Result;
 use duckrs_common::types::{LogicalType, LogicalTypeId};
+use duckrs_common::{ErrorKind, Result};
 use duckrs_parser::ast::sql_quoted_identifier;
 use duckrs_parser::ast::{
     CastType, Expr, ExprKind, FunctionExpr, Literal, LiteralKind, MacroBody, MacroFunction, QualifiedName, QueryNode,
     SelectStatement, TableRef, sql_identifier,
 };
-use duckrs_parser::transformer::{visit_expr_mut, visit_query_node_exprs_mut};
+use duckrs_parser::transformer::{visit_all_query_node_exprs_mut as visit_query_node_exprs_mut, visit_expr_mut};
 use std::sync::Arc;
 
 /// How deep macros may nest. DuckDB counts expression depth against `max_expression_depth`,
@@ -55,10 +55,20 @@ fn mark_parameters(expr: &mut Expr, parameters: &[String]) {
         return;
     }
     if let ExprKind::ColumnRef(names) = &expr.kind
-        && let [name] = names.as_slice()
-        && let Some(i) = parameters.iter().position(|p| p.eq_ignore_ascii_case(name))
+        && let Some(first) = names.first()
+        && let Some(i) = parameters.iter().position(|p| p.eq_ignore_ascii_case(first))
     {
-        expr.kind = ExprKind::ColumnRef(vec![PARAMETER_MARK.to_string(), i.to_string()]);
+        // `p.a.b` is a field of the parameter (`ColumnQualifier::QualifyColumnNameWithManyDots`)
+        let fields = names[1..].to_vec();
+        let mut marked = Expr::from(ExprKind::ColumnRef(vec![PARAMETER_MARK.to_string(), i.to_string()]));
+        for field in fields {
+            marked = Expr::operator(
+                duckrs_parser::ast::OperatorType::StructExtract,
+                vec![marked, Expr::constant(Literal::string(&field))],
+            );
+        }
+        marked.alias = std::mem::take(&mut expr.alias);
+        *expr = marked;
     }
 }
 
@@ -67,6 +77,19 @@ fn mark_parameters(expr: &mut Expr, parameters: &[String]) {
 const LAMBDA_MARK: char = '\u{3}';
 
 fn protect_lambda_parameters(expr: &mut Expr, parameters: &[String]) {
+    // `ReplaceMacroParametersInLambda`: only the lambda of a lambda function, as `->` is also JSON
+    let ExprKind::Function(function) = &mut expr.kind else {
+        return;
+    };
+    if !super::lambda::is_lambda_function(&function.name.name) {
+        return;
+    }
+    for argument in &mut function.args {
+        protect_lambda(&mut argument.expr, parameters);
+    }
+}
+
+fn protect_lambda(expr: &mut Expr, parameters: &[String]) {
     let ExprKind::Lambda { lhs, expr: body, .. } = &mut expr.kind else {
         return;
     };
@@ -490,7 +513,9 @@ impl Binder<'_> {
                     // a macro's body may aggregate, and whether that fits shows where it is used
                     binder.aggregate_error = MACRO_AGGREGATE;
                     match binder.bind_expression(&body) {
-                        Err(error) if error.message == MACRO_AGGREGATE => {}
+                        // `BindCreateFunctionInfo`: what can't be bound yet is bound when it's called
+                        Err(error)
+                            if error.message == MACRO_AGGREGATE || error.kind == ErrorKind::ParameterNotResolved => {}
                         result => {
                             result?;
                         }
@@ -516,6 +541,20 @@ impl Binder<'_> {
 
     /// A default value has to be a constant the parameter's type accepts.
     fn check_macro_default(&mut self, parameter: &str, default: &Expr, ty: Option<&LogicalType>) -> Result<()> {
+        // `ConstantBinder` for the clause "Default value for parameter p"
+        let clause = format!("Default value for parameter {}", sql_quoted_identifier(parameter));
+        let mut unsupported = None;
+        visit_expr_mut(&mut default.clone(), &mut |e| {
+            let message = match &e.kind {
+                ExprKind::ColumnRef(_) => "cannot contain column names",
+                ExprKind::Subquery { .. } => "cannot contain subqueries",
+                _ => return,
+            };
+            unsupported.get_or_insert_with(|| format!("{clause} {message}"));
+        });
+        if let Some(message) = unsupported {
+            return Err(binder_error(message));
+        }
         let mut binder = Binder::new(self.catalog);
         let bound = binder.bind_expression(default)?;
         if !bound.is_foldable() {

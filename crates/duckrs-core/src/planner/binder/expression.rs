@@ -581,6 +581,13 @@ impl Binder<'_> {
             }
             let mut binder = self.child_binder();
             binder.outer_contexts.push(context);
+            for (alias, aliased) in &self.alias_fallback {
+                let mut aliased = aliased.clone();
+                self.qualify_column_names(&mut aliased);
+                binder
+                    .outer_aliases
+                    .push((alias.clone(), aliased, self.later_select_aliases.is_some()));
+            }
             binder.correlated = Arc::default();
             match binder.bind_select_statement(&rewritten) {
                 Ok(bound) => break (binder, bound),
@@ -821,9 +828,114 @@ impl Binder<'_> {
         Ok(bound)
     }
 
+    /// Whether `expr` is an untyped parameter of the macro being created, which binds as
+    /// UNKNOWN (`DummyBinding`).
+    fn is_unknown_macro_parameter(&self, expr: &Expr) -> bool {
+        matches!(&expr.kind, ExprKind::ColumnRef(names)
+            if names.len() == 2
+                && names[0] == super::macros::CREATE_PARAMETER_MARK
+                && names[1].parse::<usize>().ok().and_then(|i| self.macro_arguments.get(i))
+                    .is_some_and(|(_, argument)| matches!(argument.kind, ExprKind::Constant(_))))
+    }
+
+    /// `ColumnQualifier::CreateStructPack`: a name that is a table of the FROM clause, as
+    /// `[schema.]table`, is a STRUCT of its columns.
+    fn implicit_struct_pack(&self, names: &[String]) -> Option<Expr> {
+        let (schema, table) = match names {
+            [table] => (None, table),
+            [schema, table] => (Some(schema.as_str()), table),
+            _ => return None,
+        };
+        let bindings = self.bind_context.bindings_of(schema, table).ok()?;
+        let [binding] = bindings.as_slice() else {
+            return None;
+        };
+        let args = binding
+            .names
+            .iter()
+            .map(|column| ast::FunctionArgument {
+                name: column.clone(),
+                expr: Expr::column(vec![binding.alias.clone(), column.clone()]),
+            })
+            .collect();
+        let mut function = ast::FunctionExpr::new("struct_pack", Vec::new());
+        function.args = args;
+        Some(Expr::from(ExprKind::Function(function)))
+    }
+
+    /// `SelectBinder::TryResolveAliasReference` / `ColumnAliasBinder::BindAlias`: the select
+    /// list entry that `name` is the alias of, if there is one before it.
+    fn try_bind_alias_reference(&mut self, name: &str) -> Result<Option<BoundExpr>> {
+        let Some(position) = self
+            .alias_fallback
+            .iter()
+            .position(|(a, _)| a.eq_ignore_ascii_case(name))
+        else {
+            if self
+                .later_select_aliases
+                .as_ref()
+                .is_some_and(|later| later.iter().any(|a| a.eq_ignore_ascii_case(name)))
+            {
+                return Err(binder_error(format!(
+                    "Column \"{name}\" referenced that exists in the SELECT clause - but this column cannot be \
+                     referenced before it is defined"
+                )));
+            }
+            // an alias of a query around this one
+            let Some(position) = self
+                .outer_aliases
+                .iter()
+                .rposition(|(a, ..)| a.eq_ignore_ascii_case(name))
+            else {
+                return Ok(None);
+            };
+            let (alias, aliased, select_list) = self.outer_aliases.remove(position);
+            if select_list && super::pivot::has_subquery(&aliased) {
+                return Err(alias_subquery_error(name));
+            }
+            let bound = self.bind_expression(&aliased);
+            self.outer_aliases.insert(position, (alias, aliased, select_list));
+            return bound.map(Some);
+        };
+        if self.later_select_aliases.is_some() && super::pivot::has_subquery(&self.alias_fallback[position].1) {
+            return Err(alias_subquery_error(name));
+        }
+        // an alias may not refer to itself
+        let (alias, aliased) = self.alias_fallback.remove(position);
+        let bound = self.bind_expression(&aliased);
+        self.alias_fallback.insert(position, (alias, aliased));
+        bound.map(Some)
+    }
+
     fn bind_expression_inner(&mut self, expr: &Expr) -> Result<BoundExpr> {
         if let Some(group) = self.try_bind_group(expr) {
             return Ok(group);
+        }
+        // `ParameterNotResolvedException`: what an untyped macro parameter goes into can't be
+        // bound before the macro is called, and binding the macro waits for it
+        if !self.macro_arguments.is_empty() {
+            let children: Vec<&Expr> = match &expr.kind {
+                ExprKind::Function(function) => function.args.iter().map(|a| &a.expr).collect(),
+                ExprKind::Operator { children, .. } | ExprKind::Conjunction { children, .. } => {
+                    children.iter().collect()
+                }
+                ExprKind::Comparison { left, right, .. } => vec![left, right],
+                ExprKind::Between { input, lower, upper } => vec![input, lower, upper],
+                ExprKind::Collate { child, .. } => vec![child],
+                _ => Vec::new(),
+            };
+            if children.iter().any(|child| self.is_unknown_macro_parameter(child)) {
+                // the arguments bind first: a column that isn't there is the error
+                for child in children {
+                    if !matches!(child.kind, ExprKind::Lambda { .. }) {
+                        self.bind_expression(child)?;
+                    }
+                }
+                return Err(Error::new(
+                    ErrorKind::ParameterNotResolved,
+                    "Could not determine the types of the macro parameters",
+                ));
+            }
         }
         if let ExprKind::Function(function) = &expr.kind
             && let Some(entry) = self.find_macro(&function.name, false)?
@@ -906,6 +1018,24 @@ impl Binder<'_> {
                 }
                 return self.bind_expression(&argument);
             }
+            // `IsPotentialAlias`: `alias.x` names the select list alias `x` when no table is
+            // called "alias"
+            ExprKind::ColumnRef(names)
+                if names.len() == 2 && names[0] == "alias" && self.bind_context.bind_column_ref(names).is_err() =>
+            {
+                if let Some(bound) = self.try_bind_alias_reference(&names[1])? {
+                    return Ok(bound);
+                }
+                let error = self.bind_context.bind_column_ref(names).expect_err("checked above");
+                return Err(self.lateral_error(names, error));
+            }
+            ExprKind::ColumnRef(names)
+                if names.len() <= 2
+                    && self.bind_context.bind_column_ref(names).is_err()
+                    && let Some(pack) = self.implicit_struct_pack(names) =>
+            {
+                return self.bind_expression(&pack);
+            }
             ExprKind::ColumnRef(names) => {
                 let mode = self
                     .aggregates
@@ -943,18 +1073,10 @@ impl Binder<'_> {
                         Ok(bound) => bound,
                         Err(error) => {
                             // a column that is not in the FROM clause may name a select list alias
-                            let alias = self
-                                .alias_fallback
-                                .iter()
-                                .position(|(a, _)| a.eq_ignore_ascii_case(column));
-                            let Some(position) = alias else {
-                                return Err(self.lateral_error(names, error));
-                            };
-                            // an alias may not refer to itself
-                            let (_, aliased) = self.alias_fallback.remove(position);
-                            let bound = self.bind_expression(&aliased);
-                            self.alias_fallback.insert(position, (column.clone(), aliased));
-                            return bound;
+                            if let Some(bound) = self.try_bind_alias_reference(column)? {
+                                return Ok(bound);
+                            }
+                            return Err(self.lateral_error(names, error));
                         }
                     },
                     names => self
@@ -2286,6 +2408,14 @@ impl Binder<'_> {
             return_type,
         ))
     }
+}
+
+/// `SelectBinder::TryResolveAliasReference`: an alias of a select list entry with a subquery.
+fn alias_subquery_error(name: &str) -> Error {
+    binder_error(format!(
+        "Alias \"{name}\" referenced in a SELECT clause - but the expression has a subquery. This is not yet \
+         supported."
+    ))
 }
 
 #[cfg(test)]

@@ -91,8 +91,8 @@ fn replace_select_ref(
     used_select_entries: &mut Vec<usize>,
 ) -> Result<()> {
     let select_index = match &group.kind {
-        ExprKind::ColumnRef(names) if names.len() == 1 => {
-            let name = &names[0];
+        ExprKind::ColumnRef(names) if names.len() == 1 || (names.len() == 2 && names[0] == "alias") => {
+            let name = names.last().expect("checked above");
             let Some((alias, index)) = state.alias_map.iter().find(|(a, _)| a.eq_ignore_ascii_case(name)) else {
                 return Ok(());
             };
@@ -891,8 +891,17 @@ impl Binder<'_> {
                 .filter(|(_, j)| *j < i)
                 .map(|(alias, j)| (alias.clone(), state.original_expressions[*j].clone()))
                 .collect();
+            self.later_select_aliases = Some(
+                state
+                    .alias_map
+                    .iter()
+                    .filter(|(_, j)| *j >= i)
+                    .map(|(alias, _)| alias.clone())
+                    .collect(),
+            );
             let bound = self.bind_expression(expr);
             self.alias_fallback.clear();
+            self.later_select_aliases = None;
             expressions.push(bound?);
             let aggregates = self.aggregates.as_mut().expect("set above");
             if node.force_aggregates && i < column_count {
@@ -1411,6 +1420,52 @@ impl Binder<'_> {
                 .filter(|b| b.alias.eq_ignore_ascii_case(&star.relation_name))
                 .collect();
             if found.is_empty() {
+                // `struct.*`: the fields of a STRUCT column
+                if let Some((binding, index)) = self.bind_context.matching_binding(&star.relation_name)? {
+                    let ty = &binding.types[index];
+                    if ty.id() != LogicalTypeId::Struct {
+                        return Err(binder_error(format!(
+                            "Cannot extract field from expression \"{}\" because it is not a struct",
+                            Expr::from(ExprKind::Star(star.clone()))
+                        )));
+                    }
+                    let mut excluded = vec![false; star.exclude_list.len()];
+                    for (field, _) in ty.struct_children() {
+                        if let Some(position) = star
+                            .exclude_list
+                            .iter()
+                            .position(|e| e.qualification.is_empty() && e.column.eq_ignore_ascii_case(field))
+                        {
+                            excluded[position] = true;
+                            continue;
+                        }
+                        let mut column =
+                            Expr::column(vec![binding.alias.clone(), binding.names[index].clone(), field.clone()]);
+                        column.alias = field.clone();
+                        // HandleRename
+                        if let Some((name, replacement)) =
+                            star.replace_list.iter().find(|(n, _)| n.eq_ignore_ascii_case(field))
+                        {
+                            column = replacement.clone();
+                            column.alias = name.clone();
+                        }
+                        if let Some((_, alias)) = star
+                            .rename_list
+                            .iter()
+                            .find(|(n, _)| n.qualification.is_empty() && n.column.eq_ignore_ascii_case(field))
+                        {
+                            column.alias = alias.clone();
+                        }
+                        result.push(column);
+                    }
+                    if let Some(position) = excluded.iter().position(|e| !e) {
+                        return Err(binder_error(format!(
+                            "Column \"{}\" in EXCLUDE list not found in FROM clause",
+                            star.exclude_list[position].column
+                        )));
+                    }
+                    return Ok(result);
+                }
                 return Err(binder_error(format!(
                     "Referenced table \"{}\" not found!",
                     star.relation_name

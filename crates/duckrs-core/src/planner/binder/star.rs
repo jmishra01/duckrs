@@ -334,6 +334,7 @@ impl Binder<'_> {
             return Ok((columns, None));
         };
         let mut binder = Binder::new(self.catalog);
+        binder.macro_arguments = self.macro_arguments.clone();
         binder.parameters = self.parameters.clone();
         let bound = binder.bind_expression(argument)?;
         if !bound.is_foldable() {

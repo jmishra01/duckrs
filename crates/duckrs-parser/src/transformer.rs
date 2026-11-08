@@ -3500,6 +3500,69 @@ pub fn visit_query_node_exprs_mut(node: &mut QueryNode, f: &mut impl FnMut(&mut 
     }
 }
 
+/// [`visit_query_node_exprs_mut`] that also goes into the WITH clause, the children of set
+/// operations and recursive CTEs, and the same in the subqueries of the FROM clause
+/// (`ParsedExpressionIterator::EnumerateQueryNodeChildren`).
+pub fn visit_all_query_node_exprs_mut(node: &mut QueryNode, f: &mut impl FnMut(&mut Expr)) {
+    for (_, cte) in &mut node.cte_map.0 {
+        visit_all_query_node_exprs_mut(&mut cte.query, f);
+    }
+    match &mut node.kind {
+        QueryNodeKind::Select(select) => {
+            select.select_list.iter_mut().for_each(|e| visit_expr_mut(e, f));
+            visit_all_table_ref_exprs_mut(&mut select.from_table, f);
+            for clause in [&mut select.where_clause, &mut select.having, &mut select.qualify]
+                .into_iter()
+                .flatten()
+            {
+                visit_expr_mut(clause, f);
+            }
+            select
+                .groups
+                .group_expressions
+                .iter_mut()
+                .for_each(|e| visit_expr_mut(e, f));
+        }
+        QueryNodeKind::SetOperation(set) => {
+            set.children
+                .iter_mut()
+                .for_each(|child| visit_all_query_node_exprs_mut(child, f));
+        }
+        QueryNodeKind::RecursiveCte(cte) => {
+            visit_all_query_node_exprs_mut(&mut cte.left, f);
+            visit_all_query_node_exprs_mut(&mut cte.right, f);
+        }
+        _ => {}
+    }
+    for modifier in &mut node.modifiers {
+        match modifier {
+            ResultModifier::Order(nodes) => nodes.iter_mut().for_each(|n| visit_expr_mut(&mut n.expr, f)),
+            ResultModifier::Limit { limit, offset, .. } => {
+                for e in [limit, offset].into_iter().flatten() {
+                    visit_expr_mut(e, f);
+                }
+            }
+            ResultModifier::Distinct(targets) => targets.iter_mut().for_each(|e| visit_expr_mut(e, f)),
+        }
+    }
+}
+
+fn visit_all_table_ref_exprs_mut(table_ref: &mut TableRef, f: &mut impl FnMut(&mut Expr)) {
+    match &mut table_ref.kind {
+        TableRefKind::Join(join) => {
+            visit_all_table_ref_exprs_mut(&mut join.left, f);
+            visit_all_table_ref_exprs_mut(&mut join.right, f);
+            if let Some(condition) = &mut join.condition {
+                visit_expr_mut(condition, f);
+            }
+        }
+        TableRefKind::Subquery(select) => visit_all_query_node_exprs_mut(&mut select.node, f),
+        TableRefKind::TableFunction { function, .. } => visit_expr_mut(function, f),
+        TableRefKind::ExpressionList(rows) => rows.iter_mut().flatten().for_each(|e| visit_expr_mut(e, f)),
+        _ => {}
+    }
+}
+
 fn visit_table_ref_exprs_mut(table_ref: &mut TableRef, f: &mut impl FnMut(&mut Expr)) {
     match &mut table_ref.kind {
         TableRefKind::Join(join) => {

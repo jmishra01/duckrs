@@ -690,6 +690,12 @@ pub struct Binder<'a> {
     /// The select list aliases the expression being bound may refer to: all of them in WHERE,
     /// the earlier ones in the select list (`ColumnAliasBinder`, `SelectBinder`).
     alias_fallback: Vec<(String, duckrs_parser::ast::Expr)>,
+    /// While a select list entry binds: the aliases of the entries from it on, which it can't
+    /// refer to yet (`SelectBinder::TryResolveAliasReference`).
+    later_select_aliases: Option<Vec<String>>,
+    /// The select list aliases of the queries around this subquery, innermost last, with their
+    /// columns qualified, and whether they come from a select list (`ExpressionBinder::BindInEnclosingScope`).
+    outer_aliases: Vec<(String, duckrs_parser::ast::Expr, bool)>,
     /// The left sides of the joins whose right side is being bound. Their columns are out of
     /// reach until LATERAL exists, which is a missing feature and not a bad column.
     left_of_join: Vec<BindContext>,
@@ -768,6 +774,8 @@ impl<'a> Binder<'a> {
             window_error: "window functions are not supported here",
             inside_window: false,
             alias_fallback: Vec::new(),
+            later_select_aliases: None,
+            outer_aliases: Vec::new(),
             left_of_join: Vec::new(),
             bound_views: Vec::new(),
             search_schema: None,
@@ -828,6 +836,7 @@ impl<'a> Binder<'a> {
         binder.ctes = self.ctes.clone();
         binder.ctes_being_bound = self.ctes_being_bound.clone();
         binder.outer_contexts = self.outer_contexts.clone();
+        binder.outer_aliases = self.outer_aliases.clone();
         binder.session = self.session.clone();
         binder.correlated = self.correlated.clone();
         binder.working_tables = self.working_tables.clone();
