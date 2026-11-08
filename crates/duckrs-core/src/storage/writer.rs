@@ -380,14 +380,27 @@ fn write_column(s: &mut BinarySerializer, column: &ColumnOut, ty: Option<&Logica
     }
 }
 
+/// `SchemaCatalogEntry::GetQualifiedName`: [catalog, schema path..., name].
 fn entry_path(catalog: &str, schema: &SchemaCatalogEntry, name: &str) -> Vec<String> {
-    vec![catalog.to_string(), schema.name.clone(), name.to_string()]
+    let mut path = vec![catalog.to_string()];
+    path.extend(schema.path.iter().cloned());
+    path.push(name.to_string());
+    path
 }
 
-pub(super) fn schema_info(name: &str) -> g::CreateInfo {
+/// `SchemaCatalogEntry::GetInfo`: a top-level schema is its name, a nested one its full path, each
+/// with an empty name for the entry.
+pub(super) fn schema_info(catalog: &str, path: &[String]) -> g::CreateInfo {
+    let mut full = if path.len() > 1 {
+        vec![catalog.to_string()]
+    } else {
+        Vec::new()
+    };
+    full.extend(path.iter().cloned());
+    full.push(String::new());
     to_stored::create_info(
         catalog_type::SCHEMA_ENTRY,
-        vec![name.to_string(), String::new()],
+        full,
         g::CreateInfoKind::CreateSchemaInfo(g::CreateSchemaInfo { options: Vec::new() }),
     )
 }
@@ -1535,7 +1548,7 @@ impl<'a> Writer<'a> {
             s.into_bytes()
         };
         let name = self.name.clone();
-        entries.push(simple(catalog_type::SCHEMA_ENTRY, schema_info(&schema.name)));
+        entries.push(simple(catalog_type::SCHEMA_ENTRY, schema_info(&name, &schema.path)));
         for (type_name, logical_type) in schema.type_entries() {
             let info = type_info(&name, schema, type_name, logical_type);
             entries.push(simple(catalog_type::TYPE_ENTRY, info));

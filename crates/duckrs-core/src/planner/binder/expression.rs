@@ -5,7 +5,7 @@
 //
 //! Binding parsed expressions into [`BoundExpr`]s.
 
-use super::{Binder, ColumnMode, CorrelatedColumn, binder_error, schema_of};
+use super::{Binder, ColumnMode, CorrelatedColumn, binder_error};
 use crate::catalog::DEFAULT_CATALOG;
 use crate::execution::expression_executor::{evaluate_scalar, try_evaluate_scalar};
 use crate::function::binder::{bind_aggregate_function, bind_scalar_function, expression_return_type};
@@ -311,13 +311,16 @@ impl Binder<'_> {
             CastType::Parsed(expr) => match &expr.kind {
                 ExprKind::Type(TypeExpr { name, children }) => {
                     if !name.qualification.is_empty() {
-                        let schema = schema_of(name)?;
-                        return self.catalog.get_type(schema, None, &name.name)?.ok_or_else(|| {
-                            Error::new(
-                                ErrorKind::Catalog,
-                                format!("Type with name {} does not exist!", name.name),
-                            )
-                        });
+                        let schema = self.schema_of(name)?;
+                        return self
+                            .catalog
+                            .get_type(schema.as_deref(), None, &name.name)?
+                            .ok_or_else(|| {
+                                Error::new(
+                                    ErrorKind::Catalog,
+                                    format!("Type with name {} does not exist!", name.name),
+                                )
+                            });
                     }
                     (name.name.as_str(), children.as_slice())
                 }
@@ -1422,13 +1425,16 @@ impl Binder<'_> {
             return Ok(BoundExpr::constant(Value::null(LogicalType::BIGINT)));
         }
         let parts = parse_qualified_name(&value.try_to_string()?)?;
-        let (schema, name) = match parts.as_slice() {
-            [name] => (None, name),
-            [schema, name] => (Some(schema.as_str()), name),
-            [catalog, schema, name] if catalog.eq_ignore_ascii_case(DEFAULT_CATALOG) => (Some(schema.as_str()), name),
-            _ => return Err(crate::unported("this sequence name")),
+        let Some((name, qualification)) = parts.split_last() else {
+            return Err(crate::unported("this sequence name"));
         };
-        let sequence = self.catalog.get_sequence(schema, self.search_schema.as_deref(), name)?;
+        let schema = self.schema_of(&ast::QualifiedName {
+            qualification: qualification.to_vec(),
+            name: name.clone(),
+        })?;
+        let sequence = self
+            .catalog
+            .get_sequence(schema.as_deref(), self.search_schema.as_deref(), name)?;
         Ok(BoundExpr::new(
             BoundExprKind::Sequence {
                 op,

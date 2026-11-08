@@ -3,7 +3,6 @@
 //
 //! Binds CREATE INDEX.
 
-use super::statements::schema_of;
 use super::{Binder, Binding, binder_error};
 use crate::catalog::{IndexCatalogEntry, TableCatalogEntry, TableOrView, missing_entry};
 use crate::planner::column_binding_resolver::resolve_expression;
@@ -76,7 +75,9 @@ impl Binder<'_> {
         if !index_type.eq_ignore_ascii_case("ART") {
             return Err(binder_error(format!("Unknown index type: {index_type}")));
         }
-        let schema = self.catalog.schema_with_entry(schema_of(&info.name)?, table)?;
+        let schema = self
+            .catalog
+            .schema_with_entry(self.schema_of(&info.name)?.as_deref(), table)?;
         let table = match schema.get_entry(table) {
             Some(TableOrView::Table(table)) => table,
             Some(TableOrView::View(_)) => return Err(binder_error("can only create an index on a base table")),

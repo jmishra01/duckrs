@@ -1019,6 +1019,9 @@ impl TableOrView {
 #[derive(Debug)]
 pub struct SchemaCatalogEntry {
     pub name: String,
+    /// The schemas from the outermost down to this one (`GetSchemaPath`): only the name for a
+    /// top-level schema
+    pub path: Vec<String>,
     tables: RwLock<BTreeMap<String, TableOrView>>,
     sequences: RwLock<BTreeMap<String, Arc<SequenceCatalogEntry>>>,
     /// the scalar macros and the table macros, which can share a name
@@ -1039,10 +1042,30 @@ fn key(name: &str) -> String {
     name.to_lowercase()
 }
 
+/// What separates the schemas of a nested schema's path in its key: no name can have it.
+pub const SCHEMA_PATH_SEPARATOR: char = '\u{1f}';
+
+/// The key of the schema at `path`: a top-level schema's is its name.
+pub fn schema_key<S: AsRef<str>>(path: &[S]) -> String {
+    let parts: Vec<String> = path.iter().map(|p| key(p.as_ref())).collect();
+    parts.join(&SCHEMA_PATH_SEPARATOR.to_string())
+}
+
+/// A schema's key as SQL writes the path: `s1.child`.
+pub fn display_schema(schema: &str) -> String {
+    schema.replace(SCHEMA_PATH_SEPARATOR, ".")
+}
+
 impl SchemaCatalogEntry {
     fn new(name: &str) -> Self {
+        Self::at_path(vec![name.to_string()])
+    }
+
+    /// The schema at `path`, nested in the one before it if there is one.
+    fn at_path(path: Vec<String>) -> Self {
         Self {
-            name: name.to_string(),
+            name: path.last().cloned().unwrap_or_default(),
+            path,
             tables: RwLock::new(BTreeMap::new()),
             sequences: RwLock::new(BTreeMap::new()),
             macros: [RwLock::new(BTreeMap::new()), RwLock::new(BTreeMap::new())],
@@ -1052,6 +1075,27 @@ impl SchemaCatalogEntry {
 
     pub fn get_type(&self, name: &str) -> Option<LogicalType> {
         self.types.read().get(&key(name)).cloned()
+    }
+
+    /// How an entry names the schema it is in: a nested one by its path, which looks it up as
+    /// its key does.
+    pub fn ident(&self) -> String {
+        self.path.join(&SCHEMA_PATH_SEPARATOR.to_string())
+    }
+
+    /// The key of the schema in its catalog.
+    pub fn key(&self) -> String {
+        schema_key(&self.path)
+    }
+
+    /// The key of the schema it is nested in (`GetParentSchema`), if it is.
+    pub fn parent_key(&self) -> Option<String> {
+        (self.path.len() > 1).then(|| schema_key(&self.path[..self.path.len() - 1]))
+    }
+
+    /// An empty schema at the same place.
+    pub(crate) fn empty_like(&self) -> Self {
+        Self::at_path(self.path.clone())
     }
 
     /// `DuckSchemaEntry::CreateType`.
@@ -1238,7 +1282,7 @@ impl SchemaCatalogEntry {
         }
         let types = columns.iter().map(|c| c.ty.clone()).collect();
         let mut table = TableCatalogEntry::new(
-            self.name.clone(),
+            self.ident(),
             name.to_string(),
             columns,
             ColumnDataCollection::new(types),
@@ -1262,7 +1306,7 @@ impl SchemaCatalogEntry {
         let mut tables = self.tables.write();
         if Self::check_conflict(&tables, name, "View", on_conflict)? {
             let view = ViewCatalogEntry {
-                schema: self.name.clone(),
+                schema: self.ident(),
                 name: name.to_string(),
                 query,
                 aliases,
@@ -1682,8 +1726,29 @@ impl Catalog {
 
     /// `DuckCatalog::CreateSchema`.
     pub fn create_schema(&self, name: &str, on_conflict: OnCreateConflict) -> Result<()> {
+        self.create_schema_path(&[name.to_string()], on_conflict)
+    }
+
+    /// `DuckCatalog::CreateSchemaInternal`: a schema at `path`, nested in the schemas before it,
+    /// which have to exist.
+    pub fn create_schema_path(&self, path: &[String], on_conflict: OnCreateConflict) -> Result<()> {
         let mut schemas = self.schemas.write();
-        if schemas.contains_key(&key(name)) {
+        let name = path.last().expect("a schema has a name");
+        if path.len() > 1 && !schemas.contains_key(&schema_key(&path[..path.len() - 1])) {
+            // `LookupSchemaPath`: the root that is no schema, else the first parent that is missing
+            if !schemas.contains_key(&key(&path[0])) {
+                return Err(Error::new(
+                    ErrorKind::Catalog,
+                    format!("\"{}\" is not a catalog or schema", path[0]),
+                ));
+            }
+            let missing = (2..path.len())
+                .find(|end| !schemas.contains_key(&schema_key(&path[..*end])))
+                .expect("a parent is missing");
+            return Err(missing_entry("Schema", &path[missing - 1]));
+        }
+        let schema_key = schema_key(path);
+        if schemas.contains_key(&schema_key) {
             match on_conflict {
                 OnCreateConflict::Error => {
                     return Err(Error::new(
@@ -1692,21 +1757,22 @@ impl Catalog {
                     ));
                 }
                 OnCreateConflict::Ignore => return Ok(()),
-                OnCreateConflict::Replace => dependency_check(&schemas[&key(name)])?,
+                OnCreateConflict::Replace => dependency_check(&schemas, &schemas[&schema_key])?,
             }
         }
-        schemas.insert(key(name), Arc::new(SchemaCatalogEntry::new(name)));
+        schemas.insert(schema_key, Arc::new(SchemaCatalogEntry::at_path(path.to_vec())));
         Ok(())
     }
 
-    /// `DuckCatalog::DropSchema`: a schema with tables only goes with CASCADE.
+    /// `DuckCatalog::DropSchema`: a schema with entries, or with schemas in it, only goes with
+    /// CASCADE, which drops what is nested in it too.
     pub fn drop_schema(&self, name: &str, if_exists: bool, cascade: bool) -> Result<()> {
         let mut schemas = self.schemas.write();
         let Some(schema) = schemas.get(&key(name)) else {
             return if if_exists {
                 Ok(())
             } else {
-                Err(missing_entry("Schema", name))
+                Err(self.missing_schema(&schemas, name))
             };
         };
         if name.eq_ignore_ascii_case(DEFAULT_SCHEMA) {
@@ -1716,10 +1782,31 @@ impl Catalog {
             ));
         }
         if !cascade {
-            dependency_check(schema)?;
+            dependency_check(&schemas, schema)?;
         }
-        schemas.remove(&key(name));
+        let dropped = key(name);
+        let nested = format!("{dropped}{SCHEMA_PATH_SEPARATOR}");
+        schemas.retain(|schema, _| *schema != dropped && !schema.starts_with(&nested));
         Ok(())
+    }
+
+    /// `CatalogException::MissingEntry` of a schema: of a nested one, the first schema of its path
+    /// that is missing.
+    fn missing_schema(&self, schemas: &BTreeMap<String, Arc<SchemaCatalogEntry>>, schema: &str) -> Error {
+        let path: Vec<&str> = schema.split(SCHEMA_PATH_SEPARATOR).collect();
+        let missing = (1..=path.len())
+            .find(|end| !schemas.contains_key(&schema_key(&path[..*end])))
+            .unwrap_or(path.len());
+        missing_entry("Schema", path[missing - 1])
+    }
+
+    /// The schemas nested right in `schema`.
+    pub fn nested_schemas(&self, schema: &SchemaCatalogEntry) -> Vec<Arc<SchemaCatalogEntry>> {
+        let parent = schema.key();
+        self.schemas()
+            .into_iter()
+            .filter(|nested| nested.parent_key().as_deref() == Some(parent.as_str()))
+            .collect()
     }
 
     /// All the schemas, by name.
@@ -1756,7 +1843,8 @@ impl Catalog {
     /// The schema an object qualified with `schema` (or not, with `None`) lives in.
     pub fn schema_for(&self, schema: Option<&str>) -> Result<Arc<SchemaCatalogEntry>> {
         let name = schema.unwrap_or(DEFAULT_SCHEMA);
-        self.get_schema(name).ok_or_else(|| missing_entry("Schema", name))
+        self.get_schema(name)
+            .ok_or_else(|| self.missing_schema(&self.schemas.read(), name))
     }
 
     /// `schema_for`, of what is called `name`: without a schema that can be a temporary one.
@@ -1776,7 +1864,8 @@ impl Catalog {
                     return Err(Error::new(
                         ErrorKind::Catalog,
                         format!(
-                            "Table with name \"{schema}.{name}\" does not exist because schema \"{schema}\" does not exist."
+                            "Table with name \"{0}.{name}\" does not exist because schema \"{0}\" does not exist.",
+                            display_schema(schema)
                         ),
                     ));
                 }
@@ -1918,8 +2007,14 @@ fn entry_in_use(name: &str, kind: &str, tables: &[String]) -> Error {
 }
 
 /// `DependencyManager::VerifyExistence`: a schema with tables cannot just go away.
-fn dependency_check(schema: &SchemaCatalogEntry) -> Result<()> {
-    let entries = schema.entries();
+fn dependency_check(schemas: &BTreeMap<String, Arc<SchemaCatalogEntry>>, schema: &SchemaCatalogEntry) -> Result<()> {
+    let mut entries = schema.entries();
+    let own = schema.key();
+    for nested in schemas.values() {
+        if nested.parent_key().as_deref() == Some(own.as_str()) {
+            entries.push(("Schema".to_string(), nested.name.clone()));
+        }
+    }
     if entries.is_empty() {
         return Ok(());
     }

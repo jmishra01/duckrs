@@ -7,7 +7,6 @@
 //! for a rollback.
 
 use super::expression::checked_cast;
-use super::statements::schema_of;
 use super::table_constraints::{bind_unique, check_key_types};
 use super::{Binder, Binding, binder_error};
 use crate::catalog::{
@@ -187,11 +186,18 @@ fn identity(table: &TableCatalogEntry) -> Result<Vec<BoundExpr>> {
 impl Binder<'_> {
     /// `Binder::Bind(AlterStatement)` and `AlterEntry`.
     pub fn bind_alter(&mut self, info: &AlterInfo) -> Result<BoundAlter> {
-        let schema = match self.catalog.schema_with_entry(schema_of(&info.name)?, &info.name.name) {
+        let schema = match self
+            .catalog
+            .schema_with_entry(self.schema_of(&info.name)?.as_deref(), &info.name.name)
+        {
             Ok(schema) => schema,
             Err(_) if info.if_exists => return Ok(BoundAlter::Nothing),
             Err(error) => return Err(error),
         };
+        // the names of a table of a nested schema are looked up in that schema
+        if schema.path.len() > 1 && self.search_schema.is_none() {
+            self.search_schema = Some(schema.ident());
+        }
         let Some(entry) = schema.get_entry(&info.name.name) else {
             if info.if_exists {
                 return Ok(BoundAlter::Nothing);
@@ -278,6 +284,7 @@ impl Binder<'_> {
     fn bind_default(&self, default: &Expr, ty: &LogicalType) -> Result<BoundExpr> {
         let mut binder = Binder::new(self.catalog);
         binder.aggregate_error = "DEFAULT value cannot contain aggregates!";
+        binder.search_schema = self.search_schema.clone();
         checked_cast(binder.bind_expression(default)?, ty)
     }
 

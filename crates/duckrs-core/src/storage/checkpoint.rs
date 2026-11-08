@@ -108,7 +108,8 @@ pub struct StoredSequence {
 /// it depends on, so they are kept in it.
 #[derive(Debug, Clone)]
 pub enum StoredEntry {
-    Schema(String),
+    /// the schemas from the outermost down to it
+    Schema(Vec<String>),
     Table(Box<StoredTable>),
     View {
         schema: String,
@@ -147,7 +148,9 @@ fn schema_of(info: &g::CreateInfo) -> Result<String> {
     match info.qualified_name.as_ref().map_or(&[][..], |name| &name.path) {
         [] => Ok(info.schema.clone()),
         [_, schema, _] => Ok(schema.clone()),
-        _ => Err(not_ported("an entry in a nested schema")),
+        // [catalog, schema path..., name] of an entry in a nested schema
+        [_, path @ .., _] if !path.is_empty() => Ok(crate::catalog::schema_key(path)),
+        _ => Err(corrupt("an entry has no schema")),
     }
 }
 
@@ -328,10 +331,11 @@ pub(super) fn convert_entry(info: g::CreateInfo) -> Result<Converted> {
             return Err(not_ported("schema options"));
         }
         let path = info.qualified_name.map(|name| name.path).unwrap_or_default();
-        return match <[String; 2]>::try_from(path) {
-            Ok([name, _]) => Ok(Converted::Entry(StoredEntry::Schema(name))),
-            Err(path) if path.is_empty() => Ok(Converted::Entry(StoredEntry::Schema(info.schema))),
-            Err(_) => Err(not_ported("a nested schema")),
+        return match path.as_slice() {
+            [] => Ok(Converted::Entry(StoredEntry::Schema(vec![info.schema]))),
+            [name] | [name, _] => Ok(Converted::Entry(StoredEntry::Schema(vec![name.clone()]))),
+            // `CheckpointReader::ReadSchema`: [catalog, schema path..., ""] of a nested one
+            [_, schemas @ .., _] => Ok(Converted::Entry(StoredEntry::Schema(schemas.to_vec()))),
         };
     }
     let schema = schema_of(&info)?;

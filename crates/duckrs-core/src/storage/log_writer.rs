@@ -19,7 +19,7 @@ use super::serialization::generated::{self as g};
 use super::serialization::to_stored::write_not_ported;
 use super::table_data::fixed_width;
 use super::writer::{
-    index_info, macro_info, parents_first, raw_bytes, schema_info, sequence_info, table_info, type_info, view_info,
+    index_info, macro_info, parents_first, raw_bytes, sequence_info, table_info, type_info, view_info,
 };
 use crate::catalog::{
     Catalog, IndexCatalogEntry, MacroCatalogEntry, RowIds, SchemaCatalogEntry, SequenceCatalogEntry, TEMP_SCHEMA,
@@ -45,10 +45,22 @@ fn key(schema: &str, name: &str) -> Key {
     (schema.to_lowercase(), name.to_lowercase())
 }
 
+use crate::catalog::SCHEMA_PATH_SEPARATOR;
+
+/// The schemas of a schema's name here: a nested one is named by its path.
+fn schema_path(schema: &str) -> Vec<String> {
+    schema.split(SCHEMA_PATH_SEPARATOR).map(str::to_string).collect()
+}
+
+/// The name of a schema here: a nested one by its path, so that the log can say where it is.
+fn schema_ident(schema: &SchemaCatalogEntry) -> String {
+    schema.path.join(&SCHEMA_PATH_SEPARATOR.to_string())
+}
+
 fn path_of((schema, name): &Key) -> Option<QualifiedName> {
-    Some(QualifiedName {
-        path: vec![schema.clone(), name.clone()],
-    })
+    let mut path = schema_path(schema);
+    path.push(name.clone());
+    Some(QualifiedName { path })
 }
 
 /// The entries that are durable, each with its original name.
@@ -72,30 +84,29 @@ impl Durable {
             .iter()
             .filter(|s| !s.name.eq_ignore_ascii_case(TEMP_SCHEMA))
         {
-            let named = |name: &str| (schema.name.clone(), name.to_string());
-            result.schemas.insert(schema.name.to_lowercase(), schema.name.clone());
+            let ident = schema_ident(schema);
+            let named = |name: &str| (ident.clone(), name.to_string());
+            result.schemas.insert(ident.to_lowercase(), ident.clone());
             for entry in schema.tables_and_views() {
                 match entry {
                     TableOrView::Table(table) => {
                         for index in table.indexes.read().iter() {
                             let entry = (named(&index.name), table.clone(), index.clone());
-                            result.indexes.insert(key(&schema.name, &index.name), entry);
+                            result.indexes.insert(key(&ident, &index.name), entry);
                         }
                         result
                             .tables
-                            .insert(key(&schema.name, &table.name), (named(&table.name), table));
+                            .insert(key(&ident, &table.name), (named(&table.name), table));
                     }
                     TableOrView::View(view) => {
-                        result
-                            .views
-                            .insert(key(&schema.name, &view.name), (named(&view.name), view));
+                        result.views.insert(key(&ident, &view.name), (named(&view.name), view));
                     }
                 }
             }
             for table_macro in [false, true] {
                 for entry in schema.macro_entries(table_macro) {
                     let name = named(&entry.name);
-                    result.macros[usize::from(table_macro)].insert(key(&schema.name, &entry.name), (name, entry));
+                    result.macros[usize::from(table_macro)].insert(key(&ident, &entry.name), (name, entry));
                 }
             }
             for sequence in schema.sequence_entries() {
@@ -103,10 +114,10 @@ impl Durable {
                 let name = named(&sequence.name);
                 result
                     .sequences
-                    .insert(key(&schema.name, &sequence.name), (name, sequence, usage));
+                    .insert(key(&ident, &sequence.name), (name, sequence, usage));
             }
             for (name, ty) in schema.type_entries() {
-                result.types.insert(key(&schema.name, &name), (named(&name), ty));
+                result.types.insert(key(&ident, &name), (named(&name), ty));
             }
         }
         result
@@ -678,7 +689,7 @@ impl WriteAheadLog {
                         102,
                         "qualified_name",
                         &QualifiedName {
-                            path: vec![original.clone()],
+                            path: schema_path(original),
                         },
                     );
                 });
@@ -686,14 +697,13 @@ impl WriteAheadLog {
         }
         for (k, original) in &current.schemas {
             if !self.durable.schemas.contains_key(k) {
-                let info = schema_info(original);
-                debug_assert!(matches!(info.kind, g::CreateInfoKind::CreateSchemaInfo(_)));
+                // `WriteCreateSchema`: the schema's path
                 records.entry(wal_type::CREATE_SCHEMA, |s| {
                     s.write_property(
                         102,
                         "qualified_name",
                         &QualifiedName {
-                            path: vec![original.clone()],
+                            path: schema_path(original),
                         },
                     );
                 });

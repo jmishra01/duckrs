@@ -777,7 +777,10 @@ test/sql/attach/attach_null.test
 test/sql/attach/attach_persistent.test
 test/sql/attach/attach_pragma_storage_info.test
 test/sql/attach/attach_read_only_transaction.test
+test/sql/attach/attach_schema.test
 test/sql/attach/attach_serialize_dependency.test
+test/sql/attach/attach_show_all_tables.test
+test/sql/attach/attach_table_constraints.test
 test/sql/attach/attach_table_ddl.test
 test/sql/attach/attach_wal_alter_sequence.test
 test/sql/attach/detach_keyword.test
@@ -884,6 +887,18 @@ test/sql/catalog/function/test_recursive_table_macro.test
 test/sql/catalog/function/test_table_macro.test
 test/sql/catalog/identifier_embedded_nul.test
 test/sql/catalog/issue_9459.test
+test/sql/catalog/nested_schema/create_nested_schema.test
+test/sql/catalog/nested_schema/deeply_nested_entries.test
+test/sql/catalog/nested_schema/drop_nested_schema.test
+test/sql/catalog/nested_schema/drop_nested_schema_persist.test
+test/sql/catalog/nested_schema/nested_constraints.test
+test/sql/catalog/nested_schema/nested_table.test
+test/sql/catalog/nested_schema/nested_table_dml.test
+test/sql/catalog/nested_schema/nested_table_dml_persist.test
+test/sql/catalog/nested_schema/nested_table_persist.test
+test/sql/catalog/nested_schema/nested_view_function_attached.test
+test/sql/catalog/nested_schema/nested_wal_replay_index.test
+test/sql/catalog/nested_schema/persist.test
 test/sql/catalog/sequence/prepared_currval_dropped_sequence.test
 test/sql/catalog/sequence/sequence_currval_before_nextval_supported.test
 test/sql/catalog/sequence/sequence_currval_before_nextval_v1_5_storage.test
@@ -894,6 +909,7 @@ test/sql/catalog/sequence/sequence_offset_increment.test
 test/sql/catalog/sequence/sequence_overflow.test
 test/sql/catalog/sequence/setval.test
 test/sql/catalog/sequence/test_duckdb_sequences.test
+test/sql/catalog/sequence/test_sequence.test
 test/sql/catalog/sequence/test_sequence_dependency.test
 test/sql/catalog/table/create_table_as_abort.test
 test/sql/catalog/table/long_identifier.test
@@ -914,6 +930,7 @@ test/sql/catalog/test_temporary_index.test
 test/sql/catalog/test_temporary_schema.test
 test/sql/catalog/test_unicode_schema.test
 test/sql/catalog/view/deferred_binding.test
+test/sql/catalog/view/nested_view_search_path.test
 test/sql/catalog/view/recursive_view.test
 test/sql/catalog/view/test_stacked_view.test
 test/sql/catalog/view/test_view.test
@@ -2159,6 +2176,7 @@ test/sql/parser/create_macro_tostring.test
 test/sql/parser/cte_printing.test
 test/sql/parser/division_operator_precedence.test
 test/sql/parser/dollar_quotes_internal_issue2224.test
+test/sql/parser/drop_qualified_names.test
 test/sql/parser/empty_quoted_identifier.test
 test/sql/parser/expression_depth_limit.test
 test/sql/parser/fetch_first.test

@@ -719,6 +719,7 @@ impl ClientContext {
         let (db, session) = (self.home.clone(), self.settings.clone());
         let (list_db, list_session) = (self.home.clone(), self.settings.clone());
         Arc::new(SessionValues {
+            database: self.db.name.clone(),
             log_manager: self.home.log_manager.clone(),
             log_target: self.log_target_id,
             connection_id: self.id,
@@ -1127,7 +1128,7 @@ impl ClientContext {
         };
         name.is_some_and(|name| {
             self.catalog()
-                .get_table(schema_of(&name).ok().flatten(), &name.name)
+                .get_table(schema_of(&name).ok().flatten().as_deref(), &name.name)
                 .is_ok_and(|table| table.schema.eq_ignore_ascii_case(TEMP_SCHEMA))
         })
     }
@@ -1239,7 +1240,7 @@ impl ClientContext {
             if let Statement::Insert(insert) = statement
                 && let Ok(table) = self
                     .catalog()
-                    .get_table(schema_of(&insert.table).ok().flatten(), &insert.table.name)
+                    .get_table(schema_of(&insert.table).ok().flatten().as_deref(), &insert.table.name)
             {
                 appending = Some(table);
             }
@@ -1382,6 +1383,32 @@ impl ClientContext {
         }
         self.db = database;
         Ok(true)
+    }
+
+    /// `CatalogSearchPath::Set`: the error of a `catalog.schema` that names neither, as when it is
+    /// a nested schema.
+    fn search_path_error(&self, setting: &str, target: &str) -> Option<Error> {
+        let parts: Vec<&str> = target.split('.').map(|part| part.trim_matches('"')).collect();
+        let [first, second] = parts.as_slice() else {
+            return None;
+        };
+        if self
+            .find_database(first)
+            .is_some_and(|database| database.catalog.get_schema(second).is_some())
+        {
+            return None;
+        }
+        let set = format!("SET {}", setting.to_lowercase());
+        if self.catalog().get_schema(&crate::catalog::schema_key(&parts)).is_some() {
+            return Some(Error::new(
+                ErrorKind::NotImplemented,
+                format!("{set}: \"{target}\" is a nested schema - nested schemas cannot be used in the search path"),
+            ));
+        }
+        Some(Error::new(
+            ErrorKind::Catalog,
+            format!("{set}: No catalog + schema named \"{target}\" found."),
+        ))
     }
 
     /// `PhysicalAttach`.
@@ -1552,7 +1579,7 @@ impl ClientContext {
             unreachable!("checked by the caller");
         };
         let catalog = self.catalog();
-        let schema = catalog.schema_for(schema_of(&info.name)?)?;
+        let schema = catalog.schema_for(schema_of(&info.name)?.as_deref())?;
         let Some((table, index)) = schema.get_index(&info.name.name) else {
             return Err(missing_entry("Index", &info.name.name));
         };
@@ -1720,7 +1747,9 @@ impl ClientContext {
                     && let duckrs_parser::ast::TableRefKind::BaseTable { name, .. } = &table.kind
                 {
                     let schema = crate::planner::binder::schema_of(name)?;
-                    if let crate::catalog::TableOrView::View(_) = self.catalog().get_entry(schema, None, &name.name)? {
+                    if let crate::catalog::TableOrView::View(_) =
+                        self.catalog().get_entry(schema.as_deref(), None, &name.name)?
+                    {
                         return Err(Error::new(ErrorKind::Binder, "Can only vacuum or analyze base tables"));
                     }
                 }
@@ -1749,6 +1778,14 @@ impl ClientContext {
                     && self.use_database(&target)? =>
             {
                 return Ok(Self::success());
+            }
+            Statement::SetVariable { name, value, .. }
+                if (name.eq_ignore_ascii_case("schema") || name.eq_ignore_ascii_case("search_path"))
+                    && let Ok(target) = evaluate_scalar(&bind_constant_expression(&self.catalog(), value)?)
+                        .and_then(|value| value.try_to_string())
+                    && let Some(error) = self.search_path_error(name, &target) =>
+            {
+                return Err(error);
             }
             Statement::Attach(info) => {
                 self.attach(info)?;
@@ -1933,13 +1970,15 @@ impl ClientContext {
                         "WITH clause is not supported for schemas",
                     ));
                 }
-                let catalog = match info.name.qualification.as_slice() {
-                    [] => self.catalog(),
+                // `Binder::ResolveCatalog`: the qualification of the new schema is its catalog, or the
+                // schemas it is nested in, or both
+                let qualification = &info.name.qualification;
+                if let Some(first) = qualification.first() {
                     // `PhysicalCreateSchema` and `CatalogSet::CreateEntry`
-                    [catalog] if catalog.eq_ignore_ascii_case("system") => {
+                    if first.eq_ignore_ascii_case("system") {
                         return Err(Error::new(ErrorKind::Binder, "Cannot create schema in system catalog"));
                     }
-                    [catalog] if catalog.eq_ignore_ascii_case(TEMP_SCHEMA) => {
+                    if first.eq_ignore_ascii_case(TEMP_SCHEMA) {
                         return Err(Error::new(
                             ErrorKind::InvalidInput,
                             format!(
@@ -1948,23 +1987,32 @@ impl ClientContext {
                             ),
                         ));
                     }
-                    [catalog] if catalog_qualifier_only(&info.name.qualification) => self.catalog(),
+                }
+                let catalog = self.catalog();
+                let is_schema = |name: &str| catalog.get_schema(name).is_some();
+                let mut path = qualification.clone();
+                match qualification.as_slice() {
+                    [] => {}
+                    [first] if is_schema(first) => {}
+                    [first, ..] if catalog_qualifier_only(&qualification[..1]) => {
+                        path.remove(0);
+                    }
                     // a schema of an attached database is created there
-                    [catalog]
-                        if self.catalog().get_schema(catalog).is_none()
-                            && let Some(database) = self.find_database(catalog) =>
+                    [first, ..]
+                        if !first.eq_ignore_ascii_case(&self.db.name)
+                            && let Some(database) = self.find_database(first) =>
                     {
                         let mut routed = info.clone();
-                        routed.name.qualification.clear();
+                        routed.name.qualification.remove(0);
                         let previous = std::mem::replace(&mut self.db, database);
                         let result = self.run_statement(&Statement::Create(routed));
                         self.db = previous;
                         return result;
                     }
-                    // a schema in a schema
-                    _ => return Err(crate::unported("this form of CREATE SCHEMA")),
-                };
-                catalog.create_schema(&info.name.name, on_create_conflict(info.on_conflict))?;
+                    _ => {}
+                }
+                path.push(info.name.name.clone());
+                catalog.create_schema_path(&path, on_create_conflict(info.on_conflict))?;
                 return Ok(Self::success());
             }
             Statement::Drop(info) => {
@@ -2000,9 +2048,9 @@ impl ClientContext {
 }
 
 /// The schema a CREATE puts its object in: temporary objects have one of their own.
-fn create_schema_of(info: &CreateInfo) -> Result<Option<&str>> {
+fn create_schema_of(info: &CreateInfo) -> Result<Option<String>> {
     if info.temporary {
-        return Ok(Some(TEMP_SCHEMA));
+        return Ok(Some(TEMP_SCHEMA.to_string()));
     }
     schema_of(&info.name)
 }
@@ -2110,7 +2158,7 @@ impl ClientContext {
             return Err(crate::unported("view dependencies"));
         }
         let catalog = self.catalog();
-        let schema = catalog.schema_for(create_schema_of(info)?)?;
+        let schema = catalog.schema_for(create_schema_of(info)?.as_deref())?;
         let on_conflict = on_create_conflict(info.on_conflict);
         // IF NOT EXISTS for a view that exists does not look at the query
         let exists = matches!(schema.get_entry(&info.name.name), Some(TableOrView::View(_)));
@@ -2118,7 +2166,7 @@ impl ClientContext {
         if !skip_binding {
             let mut binder = Binder::with_options(&catalog, self.bind_options());
             binder.session = Some(self.session_values());
-            binder.bind_create_view(query, aliases, &schema.name)?;
+            binder.bind_create_view(query, aliases, &schema.ident())?;
         }
         schema.create_view(&info.name.name, (**query).clone(), aliases.clone(), on_conflict)
     }
@@ -2132,10 +2180,10 @@ impl ClientContext {
             return Err(crate::unported("macro dependencies"));
         }
         let catalog = self.catalog();
-        let schema = catalog.schema_for(create_schema_of(info)?)?;
+        let schema = catalog.schema_for(create_schema_of(info)?.as_deref())?;
         let mut binder = Binder::with_options(&catalog, self.bind_options());
         binder.session = Some(self.session_values());
-        binder.bind_create_macro(&info.name.name, macros, *table_macro, &schema.name)?;
+        binder.bind_create_macro(&info.name.name, macros, *table_macro, &schema.ident())?;
         if on_create_conflict(info.on_conflict) == OnCreateConflict::Replace {
             macro_is_free(&schema, &info.name.name)?;
         }
@@ -2178,9 +2226,9 @@ impl ClientContext {
                 binder.bind_type(target)?
             }
         };
-        let schema = self.catalog().schema_for(create_schema_of(info)?)?;
+        let schema = self.catalog().schema_for(create_schema_of(info)?.as_deref())?;
         // `DefaultTypeGenerator`: the built-in types are entries of a main schema
-        let main = schema.name.eq_ignore_ascii_case("main") || schema.name.eq_ignore_ascii_case(TEMP_SCHEMA);
+        let main = schema.key() == "main" || schema.key() == TEMP_SCHEMA;
         if main && is_builtin_type(&info.name.name) {
             return Err(Error::new(
                 ErrorKind::Catalog,
@@ -2212,7 +2260,7 @@ impl ClientContext {
             cycle,
             start_value,
         };
-        let schema = self.catalog().schema_for(create_schema_of(info)?)?;
+        let schema = self.catalog().schema_for(create_schema_of(info)?.as_deref())?;
         schema.create_sequence(&info.name.name, data, on_create_conflict(info.on_conflict))
     }
 
@@ -2248,7 +2296,7 @@ impl ClientContext {
             kind @ ("TABLE" | "VIEW") => {
                 let type_name = if kind == "TABLE" { "Table" } else { "View" };
                 let schema = schema_of(&info.name).map_err(|_| crate::unported(format!("this form of DROP {kind}")))?;
-                let dropped = match catalog.schema_for(schema) {
+                let dropped = match catalog.schema_for(schema.as_deref()) {
                     Ok(schema) => schema.drop_entry(&info.name.name, type_name)?,
                     Err(_) if info.if_exists => false,
                     Err(error) => return Err(error),
@@ -2261,7 +2309,7 @@ impl ClientContext {
             kind @ ("MACRO" | "MACRO TABLE") => {
                 let table_macro = kind == "MACRO TABLE";
                 let schema = schema_of(&info.name).map_err(|_| crate::unported("this form of DROP MACRO"))?;
-                let dropped = match catalog.schema_for(schema) {
+                let dropped = match catalog.schema_for(schema.as_deref()) {
                     // DROP MACRO also drops a table macro, if there is no scalar one
                     Ok(schema) => {
                         macro_is_free(&schema, &info.name.name)?;
@@ -2278,7 +2326,7 @@ impl ClientContext {
             }
             "INDEX" => {
                 let schema = schema_of(&info.name).map_err(|_| crate::unported("this form of DROP INDEX"))?;
-                let dropped = match catalog.schema_for(schema) {
+                let dropped = match catalog.schema_for(schema.as_deref()) {
                     Ok(schema) => schema.drop_index(&info.name.name),
                     Err(_) if info.if_exists => false,
                     Err(error) => return Err(error),
@@ -2290,7 +2338,7 @@ impl ClientContext {
             }
             "SEQUENCE" => {
                 let schema = schema_of(&info.name).map_err(|_| crate::unported("this form of DROP SEQUENCE"))?;
-                let dropped = match catalog.schema_for(schema) {
+                let dropped = match catalog.schema_for(schema.as_deref()) {
                     Ok(schema) => schema.drop_sequence_checked(&info.name.name, info.cascade)?,
                     Err(_) if info.if_exists => false,
                     Err(error) => return Err(error),
@@ -2302,7 +2350,7 @@ impl ClientContext {
             }
             "TYPE" => {
                 let schema = schema_of(&info.name).map_err(|_| crate::unported("this form of DROP TYPE"))?;
-                let dropped = match catalog.schema_for(schema) {
+                let dropped = match catalog.schema_for(schema.as_deref()) {
                     Ok(schema) => schema.drop_type_checked(&info.name.name, info.cascade)?,
                     Err(_) if info.if_exists => false,
                     Err(error) => return Err(error),
@@ -2312,8 +2360,20 @@ impl ClientContext {
                 }
                 Ok(())
             }
-            "SCHEMA" if catalog_qualifier_only(&info.name.qualification) => {
-                catalog.drop_schema(&info.name.name, info.if_exists, info.cascade)
+            "SCHEMA" => {
+                // the schemas it is nested in, after the catalog
+                let mut path = info.name.qualification.clone();
+                if let Some(first) = path.first()
+                    && (path.len() > 1 || catalog.get_schema(first).is_none())
+                {
+                    if catalog_qualifier_only(&path[..1]) {
+                        path.remove(0);
+                    } else if !first.eq_ignore_ascii_case(&self.db.name) && self.find_database(first).is_some() {
+                        return Err(crate::unported("DROP SCHEMA of another catalog"));
+                    }
+                }
+                path.push(info.name.name.clone());
+                catalog.drop_schema(&crate::catalog::schema_key(&path), info.if_exists, info.cascade)
             }
             other => Err(crate::unported(format!("DROP {other}"))),
         }

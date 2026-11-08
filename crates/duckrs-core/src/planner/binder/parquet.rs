@@ -4,7 +4,7 @@
 
 use super::copy::{hive_columns, is_true, string_literal, strings};
 use super::table_functions::{named_argument, parse_select};
-use super::{Binder, Binding, BoundStatement, StatementReturnType, binder_error, schema_of};
+use super::{Binder, Binding, BoundStatement, StatementReturnType, binder_error};
 use crate::execution::file_system;
 use crate::execution::parquet::{
     ParquetScanData, ParquetWriteOptions, Partitioning, file_metadata_row, file_schema, key_value_rows, metadata_rows,
@@ -222,7 +222,9 @@ impl Binder<'_> {
 
     /// COPY FROM with FORMAT PARQUET: an INSERT of the columns of the file, in their order.
     pub(super) fn bind_copy_from_parquet(&mut self, info: &CopyInfo, path: &str) -> Result<BoundStatement> {
-        let table = self.catalog.get_table(schema_of(&info.table)?, &info.table.name)?;
+        let table = self
+            .catalog
+            .get_table(self.schema_of(&info.table)?.as_deref(), &info.table.name)?;
         let columns: Vec<String> = if info.select_list.is_empty() {
             table.columns.iter().map(|c| c.name.clone()).collect()
         } else {

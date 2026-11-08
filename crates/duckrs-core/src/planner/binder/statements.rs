@@ -246,24 +246,40 @@ fn alias_column_names(table: &str, names: &[String], aliases: &[String]) -> Resu
 }
 
 /// The schema of a qualified table name, checking that its catalog is ours.
-pub fn schema_of(name: &QualifiedName) -> Result<Option<&str>> {
+/// The schema a name is qualified with (`Binder::BindTableName`): the key of a nested one when
+/// the qualification is a path of schemas. A leading component that is the catalog goes.
+pub fn schema_of(name: &QualifiedName) -> Result<Option<String>> {
     match name.qualification.as_slice() {
         [] => Ok(None),
-        [schema] => Ok(Some(schema)),
-        [catalog, schema] => {
-            if catalog.eq_ignore_ascii_case(TEMP_SCHEMA) {
-                return Ok(Some(TEMP_SCHEMA));
-            }
-            if !catalog.eq_ignore_ascii_case(DEFAULT_CATALOG) {
-                return Err(binder_error(format!("Catalog \"{catalog}\" does not exist!")));
-            }
-            Ok(Some(schema))
+        [schema] => Ok(Some(schema.clone())),
+        [catalog, _] if catalog.eq_ignore_ascii_case(TEMP_SCHEMA) => Ok(Some(TEMP_SCHEMA.to_string())),
+        [catalog, schema] if catalog.eq_ignore_ascii_case(DEFAULT_CATALOG) => Ok(Some(schema.clone())),
+        [catalog, path @ ..] if catalog.eq_ignore_ascii_case(DEFAULT_CATALOG) => {
+            Ok(Some(crate::catalog::schema_key(path)))
         }
-        _ => Err(not_implemented("a nested schema path")),
+        path => Ok(Some(crate::catalog::schema_key(path))),
     }
 }
 
 impl Binder<'_> {
+    /// `schema_of` in this binder's catalog, which a qualification can name by its own name, as
+    /// the body of a view of an attached database does.
+    pub(super) fn schema_of(&self, name: &QualifiedName) -> Result<Option<String>> {
+        let database = self
+            .session
+            .as_ref()
+            .map_or(self.catalog.name.as_str(), |s| s.database.as_str());
+        if name.qualification.len() >= 2
+            && name.qualification[0].eq_ignore_ascii_case(database)
+            && !name.qualification[0].eq_ignore_ascii_case(DEFAULT_CATALOG)
+        {
+            let mut rest = name.clone();
+            rest.qualification[0] = DEFAULT_CATALOG.to_string();
+            return schema_of(&rest);
+        }
+        schema_of(name)
+    }
+
     /// `Binder::Bind(SelectStatement)`.
     pub(super) fn bind_select_statement(&mut self, select: &SelectStatement) -> Result<BoundStatement> {
         self.bind_query_node(&select.node)
@@ -1624,9 +1640,11 @@ impl Binder<'_> {
                 {
                     return self.bind_cte_reference(table_ref, index);
                 }
-                let entry = self
-                    .catalog
-                    .get_entry(schema_of(name)?, self.search_schema.as_deref(), &name.name);
+                let entry = self.catalog.get_entry(
+                    self.schema_of(name)?.as_deref(),
+                    self.search_schema.as_deref(),
+                    &name.name,
+                );
                 if entry.is_err()
                     && name.qualification.is_empty()
                     && self
@@ -2213,6 +2231,10 @@ impl Binder<'_> {
     pub(super) fn bind_update(&mut self, update: &UpdateStatement) -> Result<BoundStatement> {
         self.with_ctes(&update.cte_map, |binder| {
             let (mut plan, table, row_id) = binder.bind_write_target(&update.table, "Can only update base table")?;
+            // the defaults of a table of a nested schema are bound in that schema
+            if table.schema.contains(crate::catalog::SCHEMA_PATH_SEPARATOR) && binder.search_schema.is_none() {
+                binder.search_schema = Some(table.schema.clone());
+            }
             if let Some(from) = &update.from_table {
                 let mut context = std::mem::take(&mut binder.bind_context);
                 let right = binder.bind_table_ref(from)?;
@@ -2301,7 +2323,13 @@ impl Binder<'_> {
     }
 
     fn bind_insert_body(&mut self, insert: &InsertStatement) -> Result<BoundStatement> {
-        let table = self.catalog.get_table(schema_of(&insert.table)?, &insert.table.name)?;
+        let table = self
+            .catalog
+            .get_table(self.schema_of(&insert.table)?.as_deref(), &insert.table.name)?;
+        // the defaults of a table of a nested schema are bound in that schema
+        if table.schema.contains(crate::catalog::SCHEMA_PATH_SEPARATOR) && self.search_schema.is_none() {
+            self.search_schema = Some(table.schema.clone());
+        }
         if insert.by_name {
             // the columns are the names of the query
             let InsertValues::Select(select) = &insert.values else {
@@ -2522,11 +2550,15 @@ impl Binder<'_> {
                 format!("Only TEMPORARY table names can use the \"{TEMP_SCHEMA}\" catalog"),
             ));
         }
-        let schema = self.catalog.schema_for(
-            info.temporary
-                .then_some(TEMP_SCHEMA)
-                .map_or_else(|| schema_of(&info.name), |s| Ok(Some(s)))?,
-        )?;
+        let schema_name = match info.temporary {
+            true => Some(TEMP_SCHEMA.to_string()),
+            false => self.schema_of(&info.name)?,
+        };
+        let schema = self.catalog.schema_for(schema_name.as_deref())?;
+        // the names of a table of a nested schema are looked up in that schema
+        if schema.path.len() > 1 && self.search_schema.is_none() {
+            self.search_schema = Some(schema.ident());
+        }
         let on_conflict = match info.on_conflict {
             AstConflict::Error => OnCreateConflict::Error,
             AstConflict::Ignore => OnCreateConflict::Ignore,
@@ -2559,6 +2591,7 @@ impl Binder<'_> {
             if let Some(default) = &column.default_value {
                 let mut binder = Binder::new(self.catalog);
                 binder.aggregate_error = "DEFAULT value cannot contain aggregates!";
+                binder.search_schema = self.search_schema.clone();
                 definition.default_value = Some(checked_cast(binder.bind_expression(default)?, &definition.ty)?);
                 definition.default_text = Some(default.to_string());
             }

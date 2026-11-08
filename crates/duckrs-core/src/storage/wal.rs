@@ -55,8 +55,9 @@ pub(super) enum DropKind {
 /// A record that changes the database.
 pub(super) enum Record {
     Create(Box<StoredEntry>),
-    CreateSchema(String),
-    DropSchema(String),
+    /// the schemas from the outermost down to it
+    CreateSchema(Vec<String>),
+    DropSchema(Vec<String>),
     Drop(DropKind, EntryName),
     SequenceValue {
         name: EntryName,
@@ -116,12 +117,12 @@ fn version_error(wal_iteration: u64, file_iteration: u64) -> Error {
 /// `QualifiedName` of a record, or the schema and name of logs from before v2.0.0.
 fn entry_name(schema: String, name: String, path: Option<QualifiedName>) -> Result<EntryName> {
     let path = path.map(|name| name.path).unwrap_or_default();
-    if path.is_empty() {
-        return Ok((schema, name));
-    }
-    match <[String; 2]>::try_from(path) {
-        Ok([schema, name]) => Ok((schema, name)),
-        Err(_) => Err(not_ported("an entry in a nested schema")),
+    match path.as_slice() {
+        [] => Ok((schema, name)),
+        [schema, name] => Ok((schema.clone(), name.clone())),
+        // [schema path..., name] of an entry in a nested schema
+        [schemas @ .., name] if !schemas.is_empty() => Ok((crate::catalog::schema_key(schemas), name.clone())),
+        _ => Err(corrupt("a log entry names no schema")),
     }
 }
 
@@ -133,13 +134,10 @@ fn create(info: Option<Box<g::CreateInfo>>) -> Result<Record> {
     })))
 }
 
-fn schema_name(schema: String, path: Option<QualifiedName>) -> Result<String> {
+/// `ReplayCreateSchema`: the path of the schema, of which old logs only have the name.
+fn schema_name(schema: String, path: Option<QualifiedName>) -> Result<Vec<String>> {
     let path = path.map(|name| name.path).unwrap_or_default();
-    match <[String; 1]>::try_from(path) {
-        Ok([name]) => Ok(name),
-        Err(path) if path.is_empty() => Ok(schema),
-        Err(_) => Err(not_ported("a nested schema")),
-    }
+    Ok(if path.is_empty() { vec![schema] } else { path })
 }
 
 /// The value of each row of a vector with an unknown number of them: the mask comes first.
@@ -826,7 +824,7 @@ impl<'a> Replay<'a> {
     /// Puts an entry in the catalog.
     pub(super) fn add_entry(&mut self, entry: StoredEntry) -> Result<()> {
         match entry {
-            StoredEntry::Schema(name) => self.catalog.create_schema(&name, OnCreateConflict::Ignore)?,
+            StoredEntry::Schema(path) => self.catalog.create_schema_path(&path, OnCreateConflict::Ignore)?,
             StoredEntry::Table(table) => self.load_table(*table)?,
             StoredEntry::View {
                 schema,
@@ -946,8 +944,10 @@ impl<'a> Replay<'a> {
                 }
                 self.add_entry(*entry)
             }
-            Record::CreateSchema(name) => self.catalog.create_schema(&name, OnCreateConflict::Ignore),
-            Record::DropSchema(name) => self.catalog.drop_schema(&name, false, true),
+            Record::CreateSchema(path) => self.catalog.create_schema_path(&path, OnCreateConflict::Ignore),
+            Record::DropSchema(path) => self
+                .catalog
+                .drop_schema(&crate::catalog::schema_key(&path), false, true),
             Record::Drop(kind, name) => self.drop_entry(kind, &name),
             Record::SequenceValue {
                 name,

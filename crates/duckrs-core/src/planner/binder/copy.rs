@@ -7,7 +7,7 @@
 
 use super::expression::enum_type_from;
 use super::table_functions::{named_argument, parse_select};
-use super::{Binder, Binding, BoundStatement, StatementReturnType, binder_error, schema_of};
+use super::{Binder, Binding, BoundStatement, StatementReturnType, binder_error};
 use crate::catalog::{ColumnDefinition, OnCreateConflict, TableCatalogEntry, TableOrView};
 use crate::execution::csv::{
     CsvFile, CsvReadOptions, CsvRejects, CsvScanData, CsvWriteOptions, hive_parts, new_line_identifier, read_csv_file,
@@ -1183,7 +1183,9 @@ impl Binder<'_> {
 
     /// `Binder::BindCopyFrom`.
     fn bind_copy_from(&mut self, info: &CopyInfo, path: &str, tsv: bool) -> Result<BoundStatement> {
-        let table = self.catalog.get_table(schema_of(&info.table)?, &info.table.name)?;
+        let table = self
+            .catalog
+            .get_table(self.schema_of(&info.table)?.as_deref(), &info.table.name)?;
         let columns: Vec<String> = if info.select_list.is_empty() {
             table.columns.iter().map(|c| c.name.clone()).collect()
         } else {

@@ -8,7 +8,6 @@
 //! parameters, and that binds like anything the query could have spelled out itself.
 
 use super::expression::checked_cast;
-use super::statements::schema_of;
 use super::{Binder, binder_error};
 use crate::catalog::MacroCatalogEntry;
 use crate::function::binder::expression_return_type;
@@ -143,9 +142,10 @@ impl Binder<'_> {
     /// before the built-in functions on the search path, and a qualification that does not name
     /// a schema of theirs means a built-in.
     pub(super) fn find_macro(&self, name: &QualifiedName, table_macro: bool) -> Result<Option<Arc<MacroCatalogEntry>>> {
-        let Ok(schema) = schema_of(name) else {
+        let Ok(schema) = self.schema_of(name) else {
             return Ok(None);
         };
+        let schema = schema.as_deref();
         if let Some(schema) = schema
             && self.catalog.get_schema(schema).is_none()
         {

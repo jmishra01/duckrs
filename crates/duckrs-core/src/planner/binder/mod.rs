@@ -340,7 +340,7 @@ impl BindContext {
             .iter()
             .filter(|b| b.alias.eq_ignore_ascii_case(table))
             .filter(|b| match schema {
-                Some(schema) => b.schema.as_ref().is_some_and(|s| s.eq_ignore_ascii_case(schema)),
+                Some(schema) => b.schema.as_ref().is_some_and(|s| Self::schema_matches(s, schema)),
                 None => true,
             })
             .collect();
@@ -362,6 +362,20 @@ impl BindContext {
         Ok(matching)
     }
 
+    /// `BindingAlias::Matches`: whether a qualification names the schema a binding is of. It is the
+    /// end of its path: the innermost schema, the path, or the catalog and the path.
+    fn schema_matches(binding: &str, qualification: &str) -> bool {
+        let sep = crate::catalog::SCHEMA_PATH_SEPARATOR;
+        let mut full = vec![crate::catalog::DEFAULT_CATALOG];
+        full.extend(binding.split(sep));
+        let given: Vec<&str> = qualification.split(sep).collect();
+        given.len() <= full.len()
+            && full[full.len() - given.len()..]
+                .iter()
+                .zip(&given)
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    }
+
     /// `Binder::QualifyColumnName`: where the struct fields of a dotted name start, if it has
     /// any. What comes before is the column.
     pub(super) fn struct_field_start(&self, names: &[String]) -> Option<usize> {
@@ -373,11 +387,19 @@ impl BindContext {
         let schema_table_column = |schema: &str, table: &str, column: &str| {
             self.bindings.iter().any(|b| {
                 b.alias.eq_ignore_ascii_case(table)
-                    && b.schema.as_ref().is_some_and(|s| s.eq_ignore_ascii_case(schema))
+                    && b.schema.as_ref().is_some_and(|s| Self::schema_matches(s, schema))
                     && b.column_index(column).is_some()
             })
         };
         let has_column = |column: &str| self.bindings.iter().any(|b| b.column_index(column).is_some());
+        // `[catalog.]schema path.table.column` of a table in a nested schema, the longest first
+        let sep = crate::catalog::SCHEMA_PATH_SEPARATOR.to_string();
+        let nested = (2..names.len().saturating_sub(1))
+            .rev()
+            .find(|&table| schema_table_column(&names[..table].join(&sep), &names[table], &names[table + 1]));
+        if let Some(table) = nested {
+            return (table + 2 < names.len()).then_some(table + 2);
+        }
         let column_parts = match names {
             [schema, table, column, ..] if schema_table_column(schema, table, column) => 3,
             [table, column, ..] if has_table_column(table, column) => 2,
@@ -439,6 +461,11 @@ impl BindContext {
             [catalog, schema, table, column] if catalog.eq_ignore_ascii_case(crate::catalog::DEFAULT_CATALOG) => {
                 self.bind_qualified_column(Some(schema), table, column)
             }
+            // `[catalog.]schema path.table.column` of a table in a nested schema
+            [prefix @ .., table, column] if prefix.len() >= 2 => {
+                let nested = prefix.join(&crate::catalog::SCHEMA_PATH_SEPARATOR.to_string());
+                self.bind_qualified_column(Some(&nested), table, column)
+            }
             _ => Err(crate::unported("column references with this qualification")),
         }
     }
@@ -491,6 +518,8 @@ pub enum DefaultNullOrder {
 /// What the session knows that binding can ask for: `current_setting` and `getvariable` are
 /// constants by the time they run.
 pub struct SessionValues {
+    /// the name of the database statements run in, which its catalog does not know
+    pub database: String,
     pub variables: HashMap<String, Value>,
     pub setting: SettingLookup,
     /// `duckdb_logs()`, and the connection's logger for `write_log`

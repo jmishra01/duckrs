@@ -261,7 +261,18 @@ const OPTIMIZERS: [&str; 49] = [
 type SystemRows = (Vec<(&'static str, LogicalType)>, Vec<Vec<Value>>);
 
 /// A table of the listing, with the ids the listings share.
+struct ListedSchema {
+    database: String,
+    database_oid: i64,
+    /// the schema's name as listed
+    display: String,
+    schema: Arc<SchemaCatalogEntry>,
+    oid: i64,
+}
+
 struct ListedEntry {
+    database: String,
+    database_oid: i64,
     schema: Arc<SchemaCatalogEntry>,
     schema_oid: i64,
     oid: i64,
@@ -351,9 +362,11 @@ impl Binder<'_> {
                 .map(|(n, t)| plain_column_info(n, t))
                 .collect());
         }
-        let entry = self
-            .catalog
-            .get_entry(super::schema_of(name)?, self.search_schema.as_deref(), &name.name)?;
+        let entry = self.catalog.get_entry(
+            super::schema_of(name)?.as_deref(),
+            self.search_schema.as_deref(),
+            &name.name,
+        )?;
         Ok(match entry {
             TableOrView::Table(table) => table
                 .logical_columns()
@@ -422,7 +435,7 @@ impl Binder<'_> {
             };
             let temporary = listed.schema.name.eq_ignore_ascii_case(TEMP_SCHEMA);
             rows.push(vec![
-                text(if temporary { "temp" } else { self.catalog.name.as_str() }),
+                text(&listed.database),
                 text(if temporary { "main" } else { &listed.schema.name }),
                 text(listed.entry.name()),
                 Value::list(LogicalType::VARCHAR, names.into_iter().map(Value::varchar).collect())?,
@@ -822,8 +835,8 @@ impl Binder<'_> {
                     Value::list(LogicalType::VARCHAR, names.into_iter().map(Value::varchar).collect())
                 };
                 rows.push(vec![
-                    Value::varchar(if temporary { "temp" } else { self.catalog.name.as_str() }),
-                    Value::bigint(if temporary { 3 } else { 1 }),
+                    Value::varchar(listed.database.as_str()),
+                    Value::bigint(listed.database_oid),
                     Value::varchar(if temporary { "main" } else { listed.schema.name.as_str() }),
                     Value::bigint(listed.schema_oid),
                     Value::varchar(table.name.as_str()),
@@ -871,16 +884,57 @@ impl Binder<'_> {
     fn listed_entries(&self) -> Vec<ListedEntry> {
         let mut result = Vec::new();
         let mut oid = 1000;
-        for (schema_oid, schema) in self.catalog.schemas().into_iter().enumerate() {
-            for entry in schema.tables_and_views() {
+        for listed in self.listed_schemas() {
+            for entry in listed.schema.tables_and_views() {
                 oid += 1;
                 result.push(ListedEntry {
-                    schema: schema.clone(),
-                    schema_oid: schema_oid as i64 + 1,
+                    database: listed.database.clone(),
+                    database_oid: listed.database_oid,
+                    schema: listed.schema.clone(),
+                    schema_oid: listed.oid,
                     oid,
                     entry,
                 });
             }
+        }
+        result
+    }
+
+    /// `Catalog::GetAllSchemas`: the schemas of all databases, by database and then name, with
+    /// the oids of both. The temporary schema is `main` of the database `temp`.
+    fn listed_schemas(&self) -> Vec<ListedSchema> {
+        let mut result = Vec::new();
+        let databases = self.catalog.databases();
+        let mut add = |database: &str, database_oid: i64, catalog: &crate::catalog::Catalog, current: bool| {
+            for schema in catalog.schemas() {
+                let temporary = schema.key() == TEMP_SCHEMA;
+                if temporary && !current {
+                    continue;
+                }
+                result.push(ListedSchema {
+                    database: if temporary { "temp".into() } else { database.to_string() },
+                    database_oid: if temporary { 3 } else { database_oid },
+                    display: if temporary { "main".into() } else { schema.name.clone() },
+                    schema,
+                    oid: 0,
+                });
+            }
+        };
+        if databases.is_empty() {
+            add(&self.catalog.name, 1, self.catalog, true);
+        }
+        for (index, database) in databases.iter().enumerate() {
+            let oid = if index == 0 { 1 } else { index as i64 + 3 };
+            if database.name.eq_ignore_ascii_case(&self.catalog.name) {
+                add(&database.name, oid, self.catalog, true);
+            } else {
+                self.catalog
+                    .with_database(&database.name, &mut |catalog| add(&database.name, oid, catalog, false));
+            }
+        }
+        result.sort_by(|a, b| (&a.database, &a.display).cmp(&(&b.database, &b.display)));
+        for (index, listed) in result.iter_mut().enumerate() {
+            listed.oid = index as i64 + 1;
         }
         result
     }
@@ -1714,17 +1768,31 @@ impl Binder<'_> {
             }
             "duckdb_schemas" => {
                 let mut rows = Vec::new();
-                for (oid, schema) in self.catalog.schemas().iter().enumerate() {
-                    let temporary = schema.name.eq_ignore_ascii_case(TEMP_SCHEMA);
+                let schemas = self.listed_schemas();
+                let oid_of = |database: &str, key: &str| {
+                    schemas
+                        .iter()
+                        .find(|s| s.database == database && s.schema.key() == key)
+                        .map(|s| s.oid)
+                };
+                for listed in &schemas {
+                    // `DuckDBSchemasFunction`: the schema a nested one is in
+                    let schema = &listed.schema;
+                    let parent_name = schema.path.len().checked_sub(2).map(|i| schema.path[i].as_str());
                     rows.push(vec![
-                        Value::bigint(oid as i64 + 1),
-                        text(if temporary { "temp" } else { self.catalog.name.as_str() }),
-                        Value::bigint(if temporary { 3 } else { 1 }),
-                        text(if temporary { "main" } else { &schema.name }),
+                        Value::bigint(listed.oid),
+                        text(&listed.database),
+                        Value::bigint(listed.database_oid),
+                        text(&listed.display),
                         null_text(),
                         Value::null(tags.clone()),
-                        Value::boolean(temporary),
+                        Value::boolean(listed.database == "temp"),
                         null_text(),
+                        parent_name.map_or_else(null_text, text),
+                        schema
+                            .parent_key()
+                            .and_then(|parent| oid_of(&listed.database, &parent))
+                            .map_or_else(|| Value::null(bigint.clone()), Value::bigint),
                     ]);
                 }
                 (
@@ -1737,6 +1805,8 @@ impl Binder<'_> {
                         ("tags", tags.clone()),
                         ("internal", boolean.clone()),
                         ("sql", varchar.clone()),
+                        ("parent_schema", varchar.clone()),
+                        ("parent_schema_oid", bigint.clone()),
                     ],
                     rows,
                 )
@@ -1763,8 +1833,8 @@ impl Binder<'_> {
                         .filter(|c| matches!(c, TableConstraint::Unique { .. } | TableConstraint::ForeignKey(_)))
                         .count();
                     rows.push(vec![
-                        text(if temporary { "temp" } else { self.catalog.name.as_str() }),
-                        Value::bigint(if temporary { 3 } else { 1 }),
+                        text(&listed.database),
+                        Value::bigint(listed.database_oid),
                         text(if temporary { "main" } else { &listed.schema.name }),
                         Value::bigint(listed.schema_oid),
                         text(&table.name),
@@ -1813,8 +1883,8 @@ impl Binder<'_> {
                     for (position, index) in table.indexes.read().iter().enumerate() {
                         let temporary = listed.schema.name.eq_ignore_ascii_case(TEMP_SCHEMA);
                         rows.push(vec![
-                            text(if temporary { "temp" } else { self.catalog.name.as_str() }),
-                            Value::bigint(if temporary { 3 } else { 1 }),
+                            text(&listed.database),
+                            Value::bigint(listed.database_oid),
                             text(if temporary { "main" } else { &listed.schema.name }),
                             Value::bigint(listed.schema_oid),
                             text(&index.name),
@@ -1861,8 +1931,8 @@ impl Binder<'_> {
                     // a view that doesn't bind is still listed, without columns
                     let (names, types) = self.view_columns(view).unwrap_or_default();
                     rows.push(vec![
-                        text(if temporary { "temp" } else { self.catalog.name.as_str() }),
-                        Value::bigint(if temporary { 3 } else { 1 }),
+                        text(&listed.database),
+                        Value::bigint(listed.database_oid),
                         text(if temporary { "main" } else { &listed.schema.name }),
                         Value::bigint(listed.schema_oid),
                         text(&view.name),
@@ -1963,8 +2033,8 @@ impl Binder<'_> {
                             _ => (None, None, None),
                         };
                         rows.push(vec![
-                            text(if temporary { "temp" } else { self.catalog.name.as_str() }),
-                            Value::bigint(if temporary { 3 } else { 1 }),
+                            text(&listed.database),
+                            Value::bigint(listed.database_oid),
                             text(if temporary { "main" } else { &listed.schema.name }),
                             Value::bigint(listed.schema_oid),
                             text(listed.entry.name()),

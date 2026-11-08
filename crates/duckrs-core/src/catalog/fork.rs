@@ -315,7 +315,7 @@ fn changed_entries(base: &[SchemaEntries], catalog: &Catalog) -> Vec<ChangedEntr
     let mut found = Vec::new();
     let schemas = catalog.schemas.read();
     for saved in base {
-        let name = key(&saved.schema.name);
+        let name = saved.schema.key();
         let Some(schema) = schemas.get(&name) else {
             found.push(ChangedEntry {
                 key: format!("schema {name}"),
@@ -377,7 +377,7 @@ fn changed_entries(base: &[SchemaEntries], catalog: &Catalog) -> Vec<ChangedEntr
         );
     }
     for name in schemas.keys() {
-        if !base.iter().any(|saved| key(&saved.schema.name) == *name) {
+        if !base.iter().any(|saved| saved.schema.key() == *name) {
             found.push(ChangedEntry {
                 key: format!("schema {name}"),
                 schema: name.clone(),
@@ -460,7 +460,7 @@ impl Catalog {
         let mut base = Vec::with_capacity(schemas.len());
         let mut tables = Vec::new();
         for (name, schema) in &schemas {
-            let copy = Arc::new(SchemaCatalogEntry::new(&schema.name));
+            let copy = Arc::new(schema.empty_like());
             let saved = schema.tables.read().clone();
             let mut copies = BTreeMap::new();
             for (table_name, entry) in &saved {
@@ -675,7 +675,7 @@ impl Fork {
         let own = self.catalog.schemas.read();
         let live = self.database.schema_map();
         for saved in &self.base {
-            let name = key(&saved.schema.name);
+            let name = saved.schema.key();
             if own.contains_key(&name) {
                 if !live.contains_key(&name) && changes.iter().any(|entry| entry.schema == name) {
                     return Err(Error::new(
@@ -716,13 +716,13 @@ impl Fork {
         let own = self.catalog.schemas.read();
         let mut schemas = self.database.schemas.write();
         for saved in &self.base {
-            let name = key(&saved.schema.name);
+            let name = saved.schema.key();
             if !own.contains_key(&name) {
                 schemas.remove(&name);
             }
         }
         for (name, schema) in own.iter() {
-            let saved = self.base.iter().find(|saved| key(&saved.schema.name) == *name);
+            let saved = self.base.iter().find(|saved| saved.schema.key() == *name);
             // one that another transaction dropped has nothing of this one: `check_drops`
             if saved.is_some() && !schemas.contains_key(name) {
                 continue;
@@ -731,7 +731,7 @@ impl Fork {
                 Some(temp) => temp,
                 None => schemas
                     .entry(name.clone())
-                    .or_insert_with(|| Arc::new(SchemaCatalogEntry::new(&schema.name)))
+                    .or_insert_with(|| Arc::new(schema.empty_like()))
                     .clone(),
             };
             {
