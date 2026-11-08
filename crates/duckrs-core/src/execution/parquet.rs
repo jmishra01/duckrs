@@ -6,26 +6,17 @@
 
 use super::csv::hive_parts;
 use super::physical::{PhysicalOperator, SourceState};
+use crate::execution::parquet_writer::{Codec, ParquetFileWriter};
 use crate::function::cast::{CastMode, cast_vector};
-use arrow::array::{
-    Array, ArrayRef, AsArray, BinaryArray, BooleanArray, Decimal128Array, FixedSizeBinaryBuilder, GenericListArray,
-    MapArray, PrimitiveArray, RecordBatch, StringArray, StructArray,
-};
-use arrow::buffer::{NullBuffer, OffsetBuffer};
-use arrow::datatypes::{
-    self as adt, ArrowPrimitiveType, DataType, Field, FieldRef, Fields, IntervalMonthDayNano, Schema, TimeUnit,
-};
+use arrow::array::{Array, ArrayRef, AsArray, RecordBatch};
+use arrow::datatypes::{self as adt, DataType, Field, TimeUnit};
 use duckrs_common::types::{Date, Interval, LogicalType, LogicalTypeId, Time, TimeTz, Timestamp};
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, Vector};
 use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
 use parking_lot::Mutex;
-use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
-use parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
-use parquet::file::metadata::KeyValue;
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
-use parquet::file::properties::{WriterProperties, WriterVersion};
 use parquet::file::statistics::Statistics;
 use parquet::schema::types::Type;
 use std::collections::HashMap;
@@ -176,26 +167,58 @@ pub enum Int96As {
     Struct,
 }
 
-/// Which top-level columns of a file are INT96 (Impala timestamps), which the crate reads as nanoseconds.
-fn int96_columns(builder: &ParquetRecordBatchReaderBuilder<File>) -> Vec<bool> {
+/// A TIME, or with `ty` TIMETZ, a TIME in UTC (`ParquetIntToTimeTZ`).
+fn time_value(micros: i64, ty: &LogicalType) -> Value {
+    if ty.id() == LogicalTypeId::TimeTz {
+        Value::time_tz(TimeTz::new(Time(micros), 0))
+    } else {
+        Value::time(Time(micros))
+    }
+}
+
+/// What the crate leaves out of a top-level column's type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Special {
+    None,
+    /// INT96 (Impala timestamps), which the crate reads as nanoseconds
+    Int96,
+    /// a TIME adjusted to UTC, which DuckDB reads as TIMETZ
+    TimeUtc,
+}
+
+fn special_columns(builder: &ParquetRecordBatchReaderBuilder<File>) -> Vec<Special> {
     builder
         .parquet_schema()
         .root_schema()
         .get_fields()
         .iter()
-        .map(|field| field.is_primitive() && field.get_physical_type() == parquet::basic::Type::INT96)
+        .map(|field| {
+            if !field.is_primitive() {
+                return Special::None;
+            }
+            if field.get_physical_type() == parquet::basic::Type::INT96 {
+                return Special::Int96;
+            }
+            match field.get_basic_info().logical_type_ref() {
+                Some(parquet::basic::LogicalType::Time(time)) if time.is_adjusted_to_u_t_c => Special::TimeUtc,
+                _ => Special::None,
+            }
+        })
         .collect()
 }
 
 /// The DuckDB type of top-level column `index` of a file: INT96 by `int96_as`, the rest by [`logical_type`].
 fn column_type(
     field: &Field,
-    int96: &[bool],
+    special: &[Special],
     index: usize,
     binary_as_string: bool,
     int96_as: Int96As,
 ) -> Result<LogicalType> {
-    if int96.get(index).copied().unwrap_or(false) {
+    if special.get(index) == Some(&Special::TimeUtc) {
+        return Ok(LogicalType::new(LogicalTypeId::TimeTz));
+    }
+    if special.get(index) == Some(&Special::Int96) {
         return Ok(match int96_as {
             Int96As::Timestamp => LogicalType::TIMESTAMP,
             Int96As::TimestampNs => LogicalType::new(LogicalTypeId::TimestampNs),
@@ -211,7 +234,7 @@ fn column_type(
 /// The names and types of a file's columns.
 pub fn file_schema(path: &str, binary_as_string: bool, int96_as: Int96As) -> Result<(Vec<String>, Vec<LogicalType>)> {
     let builder = open_builder(path)?;
-    let int96 = int96_columns(&builder);
+    let int96 = special_columns(&builder);
     let schema = builder.schema();
     let names = schema.fields().iter().map(|f| f.name().clone()).collect();
     let types = schema
@@ -312,16 +335,16 @@ fn array_value(array: &dyn Array, row: usize, ty: &LogicalType) -> Result<Value>
         }
         DataType::Time32(TimeUnit::Second) => {
             let seconds = array.as_primitive::<adt::Time32SecondType>().value(row);
-            Value::time(Time(i64::from(seconds) * 1_000_000))
+            time_value(i64::from(seconds) * 1_000_000, ty)
         }
         DataType::Time32(_) => {
             let millis = array.as_primitive::<adt::Time32MillisecondType>().value(row);
-            Value::time(Time(i64::from(millis) * 1_000))
+            time_value(i64::from(millis) * 1_000, ty)
         }
-        DataType::Time64(TimeUnit::Nanosecond) => Value::time(Time(
-            array.as_primitive::<adt::Time64NanosecondType>().value(row) / 1_000,
-        )),
-        DataType::Time64(_) => Value::time(Time(array.as_primitive::<adt::Time64MicrosecondType>().value(row))),
+        DataType::Time64(TimeUnit::Nanosecond) => {
+            time_value(array.as_primitive::<adt::Time64NanosecondType>().value(row) / 1_000, ty)
+        }
+        DataType::Time64(_) => time_value(array.as_primitive::<adt::Time64MicrosecondType>().value(row), ty),
         DataType::Timestamp(unit, _) => {
             let raw = match unit {
                 TimeUnit::Second => array.as_primitive::<adt::TimestampSecondType>().value(row),
@@ -439,7 +462,7 @@ impl std::fmt::Debug for ParquetScanState {
 
 fn open_file(scan: &ParquetScanData, state: &mut ParquetScanState, path: &str) -> Result<()> {
     let builder = open_builder(path)?.with_batch_size(STANDARD_VECTOR_SIZE);
-    let int96 = int96_columns(&builder);
+    let int96 = special_columns(&builder);
     let schema = Arc::clone(builder.schema());
     let names: Vec<&String> = schema.fields().iter().map(|f| f.name()).collect();
     let mut mapping = Vec::with_capacity(scan.names.len());
@@ -607,31 +630,10 @@ pub struct Partitioning {
 }
 
 /// What a COPY TO says of the file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ParquetWriteOptions {
-    pub compression: Compression,
-    pub row_group_size: usize,
-    pub version: WriterVersion,
-    pub key_values: Vec<(String, String)>,
-    pub data_page_size_limit: Option<usize>,
-    pub bloom_filter: bool,
-    pub bloom_filter_fpp: Option<f64>,
+    pub writer: crate::execution::parquet_writer::WriterOptions,
     pub partitioning: Option<Partitioning>,
-}
-
-impl Default for ParquetWriteOptions {
-    fn default() -> Self {
-        Self {
-            compression: Compression::SNAPPY,
-            row_group_size: 122_880,
-            version: WriterVersion::PARQUET_1_0,
-            key_values: Vec::new(),
-            data_page_size_limit: None,
-            bloom_filter: false,
-            bloom_filter_fpp: None,
-            partitioning: None,
-        }
-    }
 }
 
 impl Partitioning {
@@ -695,280 +697,21 @@ fn hive_escape(text: &str) -> String {
     result
 }
 
-/// The codec a `compression` option names.
-pub fn parse_compression(name: &str, level: Option<i32>) -> Result<Compression> {
-    let wrong = |e: parquet::errors::ParquetError| invalid(e);
+/// The codec a `compression` option names, and the level of ZSTD.
+pub fn parse_compression(name: &str, level: Option<i32>) -> Result<Codec> {
     Ok(match name.to_lowercase().as_str() {
-        "uncompressed" | "none" => Compression::UNCOMPRESSED,
-        "snappy" => Compression::SNAPPY,
-        "gzip" => Compression::GZIP(match level {
-            Some(level) => GzipLevel::try_new(level.max(0) as u32).map_err(wrong)?,
-            None => GzipLevel::default(),
-        }),
-        "zstd" => Compression::ZSTD(match level {
-            Some(level) => ZstdLevel::try_new(level).map_err(wrong)?,
-            None => ZstdLevel::default(),
-        }),
-        "brotli" => Compression::BROTLI(match level {
-            Some(level) => BrotliLevel::try_new(level.max(0) as u32).map_err(wrong)?,
-            None => BrotliLevel::default(),
-        }),
-        "lz4" | "lz4_raw" => Compression::LZ4_RAW,
+        "uncompressed" | "none" => Codec::Uncompressed,
+        "snappy" => Codec::Snappy,
+        "gzip" => Codec::Gzip,
+        "zstd" => Codec::Zstd(level.unwrap_or(3)),
+        "brotli" => Codec::Brotli,
+        "lz4" | "lz4_raw" => Codec::Lz4Raw,
         other => {
             return Err(Error::new(
                 ErrorKind::Binder,
                 format!("Expected uncompressed, snappy, gzip, zstd, lz4, lz4_raw or brotli, got {other}"),
             ));
         }
-    })
-}
-
-/// `ParquetWriter::DuckDBTypeToParquetType`, in Arrow.
-fn arrow_field(name: &str, ty: &LogicalType) -> Result<Field> {
-    let field = Field::new(name, arrow_type(ty)?, true);
-    Ok(if ty.id() == LogicalTypeId::Uuid {
-        field.with_metadata([(EXTENSION_KEY.to_string(), UUID_EXTENSION.to_string())])
-    } else {
-        field
-    })
-}
-
-fn arrow_type(ty: &LogicalType) -> Result<DataType> {
-    Ok(match ty.id() {
-        LogicalTypeId::Boolean => DataType::Boolean,
-        LogicalTypeId::TinyInt => DataType::Int8,
-        LogicalTypeId::SmallInt => DataType::Int16,
-        LogicalTypeId::Integer => DataType::Int32,
-        LogicalTypeId::BigInt => DataType::Int64,
-        LogicalTypeId::UTinyInt => DataType::UInt8,
-        LogicalTypeId::USmallInt => DataType::UInt16,
-        LogicalTypeId::UInteger => DataType::UInt32,
-        LogicalTypeId::UBigInt => DataType::UInt64,
-        LogicalTypeId::Float => DataType::Float32,
-        LogicalTypeId::Double | LogicalTypeId::HugeInt | LogicalTypeId::UHugeInt => DataType::Float64,
-        LogicalTypeId::Varchar | LogicalTypeId::Enum | LogicalTypeId::TimeTz | LogicalTypeId::Bignum => DataType::Utf8,
-        LogicalTypeId::Blob | LogicalTypeId::Bit => DataType::Binary,
-        LogicalTypeId::Uuid => DataType::FixedSizeBinary(16),
-        LogicalTypeId::Date => DataType::Date32,
-        LogicalTypeId::Time => DataType::Time64(TimeUnit::Microsecond),
-        LogicalTypeId::Timestamp | LogicalTypeId::TimestampSec | LogicalTypeId::TimestampMs => {
-            DataType::Timestamp(TimeUnit::Microsecond, None)
-        }
-        LogicalTypeId::TimestampNs => DataType::Timestamp(TimeUnit::Nanosecond, None),
-        LogicalTypeId::TimestampTz => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-        LogicalTypeId::Interval => DataType::Interval(adt::IntervalUnit::MonthDayNano),
-        LogicalTypeId::Decimal => {
-            let (width, scale) = ty.decimal_properties().unwrap_or((38, 0));
-            DataType::Decimal128(width, scale as i8)
-        }
-        LogicalTypeId::List | LogicalTypeId::Array => {
-            let child = ty.child_type().cloned().unwrap_or(LogicalType::INTEGER);
-            DataType::List(Arc::new(arrow_field("element", &child)?))
-        }
-        LogicalTypeId::Struct => {
-            let fields: Vec<FieldRef> = ty
-                .struct_children()
-                .iter()
-                .map(|(name, child)| arrow_field(name, child).map(Arc::new))
-                .collect::<Result<_>>()?;
-            DataType::Struct(Fields::from(fields))
-        }
-        LogicalTypeId::Map => {
-            let entry = ty.child_type().cloned().unwrap_or(LogicalType::INTEGER);
-            let children = entry.struct_children();
-            let key = Field::new("key", arrow_type(&children[0].1)?, false);
-            let value = arrow_field("value", &children[1].1)?;
-            let entries = Field::new("key_value", DataType::Struct(Fields::from(vec![key, value])), false);
-            DataType::Map(Arc::new(entries), false)
-        }
-        LogicalTypeId::SqlNull => DataType::Int32,
-        _ => return Err(crate::unported(format!("writing {ty} to a Parquet file"))),
-    })
-}
-
-fn primitive<T: ArrowPrimitiveType>(
-    values: &[&Value],
-    data_type: DataType,
-    get: impl Fn(&Value) -> Option<T::Native>,
-) -> ArrayRef {
-    let items = values.iter().map(|v| if v.is_null() { None } else { get(v) });
-    Arc::new(PrimitiveArray::<T>::from_iter(items).with_data_type(data_type))
-}
-
-/// The values of a nested column, and which of its rows are NULL.
-fn list_parts<'a>(values: &[&'a Value]) -> (Vec<i32>, Vec<&'a Value>, NullBuffer) {
-    let mut offsets = Vec::with_capacity(values.len() + 1);
-    offsets.push(0i32);
-    let mut items = Vec::new();
-    for value in values {
-        if let ValueData::List(children) = value.data() {
-            items.extend(children.iter());
-        }
-        offsets.push(items.len() as i32);
-    }
-    let nulls = NullBuffer::from_iter(values.iter().map(|v| !v.is_null()));
-    (offsets, items, nulls)
-}
-
-/// A column of Arrow from its values.
-fn build_array(values: &[&Value], ty: &LogicalType) -> Result<ArrayRef> {
-    let data_type = arrow_type(ty)?;
-    let int = |v: &Value| v.as_i128();
-    Ok(match ty.id() {
-        LogicalTypeId::Boolean => Arc::new(
-            values
-                .iter()
-                .map(|v| match v.data() {
-                    ValueData::Bool(flag) => Some(*flag),
-                    _ => None,
-                })
-                .collect::<BooleanArray>(),
-        ),
-        LogicalTypeId::TinyInt => primitive::<adt::Int8Type>(values, data_type, |v| int(v).map(|i| i as i8)),
-        LogicalTypeId::SmallInt => primitive::<adt::Int16Type>(values, data_type, |v| int(v).map(|i| i as i16)),
-        LogicalTypeId::Integer | LogicalTypeId::SqlNull => {
-            primitive::<adt::Int32Type>(values, data_type, |v| int(v).map(|i| i as i32))
-        }
-        LogicalTypeId::BigInt => primitive::<adt::Int64Type>(values, data_type, |v| int(v).map(|i| i as i64)),
-        LogicalTypeId::UTinyInt => primitive::<adt::UInt8Type>(values, data_type, |v| int(v).map(|i| i as u8)),
-        LogicalTypeId::USmallInt => primitive::<adt::UInt16Type>(values, data_type, |v| int(v).map(|i| i as u16)),
-        LogicalTypeId::UInteger => primitive::<adt::UInt32Type>(values, data_type, |v| int(v).map(|i| i as u32)),
-        LogicalTypeId::UBigInt => primitive::<adt::UInt64Type>(values, data_type, |v| int(v).map(|i| i as u64)),
-        LogicalTypeId::Float => primitive::<adt::Float32Type>(values, data_type, |v| match v.data() {
-            ValueData::Float(x) => Some(*x),
-            _ => None,
-        }),
-        LogicalTypeId::Double => primitive::<adt::Float64Type>(values, data_type, |v| match v.data() {
-            ValueData::Double(x) => Some(*x),
-            _ => None,
-        }),
-        LogicalTypeId::HugeInt | LogicalTypeId::UHugeInt => {
-            primitive::<adt::Float64Type>(values, data_type, |v| match v.data() {
-                ValueData::Int128(x) => Some(*x as f64),
-                ValueData::UInt128(x) => Some(*x as f64),
-                _ => None,
-            })
-        }
-        LogicalTypeId::Varchar | LogicalTypeId::Enum | LogicalTypeId::TimeTz | LogicalTypeId::Bignum => {
-            let texts: Vec<Option<String>> = values
-                .iter()
-                .map(|v| {
-                    if v.is_null() {
-                        Ok(None)
-                    } else {
-                        v.try_to_string().map(Some)
-                    }
-                })
-                .collect::<Result<_>>()?;
-            Arc::new(texts.into_iter().collect::<StringArray>())
-        }
-        LogicalTypeId::Blob | LogicalTypeId::Bit => {
-            let bytes: Vec<Option<&[u8]>> = values
-                .iter()
-                .map(|v| match v.data() {
-                    ValueData::Bytes(b) => Some(b.as_slice()),
-                    _ => None,
-                })
-                .collect();
-            Arc::new(BinaryArray::from(bytes))
-        }
-        LogicalTypeId::Uuid => {
-            let mut builder = FixedSizeBinaryBuilder::with_capacity(values.len(), 16);
-            for value in values {
-                match value.data() {
-                    ValueData::Int128(stored) => builder
-                        .append_value(((*stored as u128) ^ (1 << 127)).to_be_bytes())
-                        .map_err(invalid)?,
-                    _ => builder.append_null(),
-                }
-            }
-            Arc::new(builder.finish())
-        }
-        LogicalTypeId::Date => primitive::<adt::Date32Type>(values, data_type, |v| int(v).map(|i| i as i32)),
-        LogicalTypeId::Time => primitive::<adt::Time64MicrosecondType>(values, data_type, |v| int(v).map(|i| i as i64)),
-        LogicalTypeId::Timestamp | LogicalTypeId::TimestampTz => {
-            primitive::<adt::TimestampMicrosecondType>(values, data_type, |v| int(v).map(|i| i as i64))
-        }
-        LogicalTypeId::TimestampSec => {
-            primitive::<adt::TimestampMicrosecondType>(values, data_type, |v| int(v).map(|i| i as i64 * 1_000_000))
-        }
-        LogicalTypeId::TimestampMs => {
-            primitive::<adt::TimestampMicrosecondType>(values, data_type, |v| int(v).map(|i| i as i64 * 1_000))
-        }
-        LogicalTypeId::TimestampNs => {
-            primitive::<adt::TimestampNanosecondType>(values, data_type, |v| int(v).map(|i| i as i64))
-        }
-        LogicalTypeId::Interval => primitive::<adt::IntervalMonthDayNanoType>(values, data_type, |v| match v.data() {
-            ValueData::Interval(x) => Some(IntervalMonthDayNano::new(x.months, x.days, x.micros * 1_000)),
-            _ => None,
-        }),
-        LogicalTypeId::Decimal => {
-            let items = values.iter().map(|v| if v.is_null() { None } else { v.as_i128() });
-            Arc::new(Decimal128Array::from_iter(items).with_data_type(data_type))
-        }
-        LogicalTypeId::List | LogicalTypeId::Array => {
-            let child = ty.child_type().cloned().unwrap_or(LogicalType::INTEGER);
-            let (offsets, items, nulls) = list_parts(values);
-            let DataType::List(field) = data_type else {
-                unreachable!("a list is a list");
-            };
-            Arc::new(GenericListArray::<i32>::new(
-                field,
-                OffsetBuffer::new(offsets.into()),
-                build_array(&items, &child)?,
-                Some(nulls),
-            ))
-        }
-        LogicalTypeId::Struct => {
-            let DataType::Struct(fields) = data_type else {
-                unreachable!("a struct is a struct");
-            };
-            let null = Value::sql_null();
-            let mut arrays = Vec::with_capacity(fields.len());
-            for (index, (_, child)) in ty.struct_children().iter().enumerate() {
-                let items: Vec<&Value> = values
-                    .iter()
-                    .map(|v| match v.data() {
-                        ValueData::Struct(parts) => &parts[index],
-                        _ => &null,
-                    })
-                    .collect();
-                arrays.push(build_array(&items, child)?);
-            }
-            let nulls = NullBuffer::from_iter(values.iter().map(|v| !v.is_null()));
-            Arc::new(StructArray::new(fields, arrays, Some(nulls)))
-        }
-        LogicalTypeId::Map => {
-            let entry = ty.child_type().cloned().unwrap_or(LogicalType::INTEGER);
-            let (offsets, items, nulls) = list_parts(values);
-            let DataType::Map(field, sorted) = data_type else {
-                unreachable!("a map is a map");
-            };
-            let DataType::Struct(fields) = field.data_type().clone() else {
-                unreachable!("map entries are a struct");
-            };
-            let null = Value::sql_null();
-            let mut arrays = Vec::with_capacity(2);
-            for (index, (_, child)) in entry.struct_children().iter().enumerate() {
-                let parts: Vec<&Value> = items
-                    .iter()
-                    .map(|v| match v.data() {
-                        ValueData::Struct(parts) => &parts[index],
-                        _ => &null,
-                    })
-                    .collect();
-                arrays.push(build_array(&parts, child)?);
-            }
-            let entries = StructArray::new(fields, arrays, None);
-            Arc::new(MapArray::new(
-                field,
-                OffsetBuffer::new(offsets.into()),
-                entries,
-                Some(nulls),
-                sorted,
-            ))
-        }
-        _ => return Err(crate::unported(format!("writing {ty} to a Parquet file"))),
     })
 }
 
@@ -980,7 +723,7 @@ pub struct PhysicalCopyToParquet {
     path: String,
     names: Vec<String>,
     /// by the directory of a partition, or `""` without partitions
-    writers: Mutex<HashMap<String, ArrowWriter<File>>>,
+    writers: Mutex<HashMap<String, ParquetFileWriter>>,
     rows: AtomicU64,
 }
 
@@ -1019,48 +762,16 @@ impl PhysicalCopyToParquet {
         }
     }
 
-    fn schema(&self) -> Result<Arc<Schema>> {
+    fn create(&self, path: &str) -> Result<ParquetFileWriter> {
         let types = self.children[0].types();
-        let fields: Vec<Field> = self
-            .written_columns()
-            .into_iter()
-            .map(|column| arrow_field(&self.names[column], &types[column]))
-            .collect::<Result<_>>()?;
-        Ok(Arc::new(Schema::new(fields)))
-    }
-
-    fn failed(&self, error: impl std::fmt::Display) -> Error {
-        Error::new(ErrorKind::Io, format!("Could not write \"{}\": {error}", self.path))
-    }
-
-    fn create(&self, path: &str) -> Result<ArrowWriter<File>> {
-        let file =
-            File::create(path).map_err(|e| Error::new(ErrorKind::Io, format!("Cannot open file \"{path}\": {e}")))?;
-        let key_values: Vec<KeyValue> = self
-            .options
-            .key_values
-            .iter()
-            .map(|(key, value)| KeyValue::new(key.clone(), value.clone()))
-            .collect();
-        let mut properties = WriterProperties::builder()
-            .set_compression(self.options.compression)
-            .set_max_row_group_row_count(Some(self.options.row_group_size.max(1)))
-            .set_writer_version(self.options.version)
-            .set_created_by("DuckDB".to_string())
-            .set_bloom_filter_enabled(self.options.bloom_filter)
-            .set_key_value_metadata((!key_values.is_empty()).then_some(key_values));
-        if let Some(limit) = self.options.data_page_size_limit {
-            properties = properties.set_data_page_size_limit(limit);
-        }
-        if let Some(fpp) = self.options.bloom_filter_fpp {
-            properties = properties.set_bloom_filter_fpp(fpp);
-        }
-        ArrowWriter::try_new(file, self.schema()?, Some(properties.build())).map_err(|e| self.failed(e))
+        let columns = self.written_columns();
+        let names: Vec<String> = columns.iter().map(|&c| self.names[c].clone()).collect();
+        let types: Vec<LogicalType> = columns.iter().map(|&c| types[c].clone()).collect();
+        ParquetFileWriter::create(path, &names, &types, self.options.writer.clone())
     }
 
     /// Writes `rows` of `chunk` to the file of `directory`.
     fn write_rows(&self, directory: &str, chunk: &DataChunk, rows: &[usize]) -> Result<()> {
-        let types = self.children[0].types();
         let mut writers = self.writers.lock();
         if !writers.contains_key(directory) {
             let path = match &self.options.partitioning {
@@ -1070,15 +781,12 @@ impl PhysicalCopyToParquet {
             let writer = self.create(&path)?;
             writers.insert(directory.to_string(), writer);
         }
-        let mut arrays = Vec::new();
-        for column in self.written_columns() {
-            let values: Vec<Value> = rows.iter().map(|&row| chunk.get_value(column, row)).collect();
-            let values: Vec<&Value> = values.iter().collect();
-            arrays.push(build_array(&values, &types[column])?);
-        }
-        let batch = RecordBatch::try_new(self.schema()?, arrays).map_err(|e| self.failed(e))?;
-        let writer = writers.get_mut(directory).expect("just opened");
-        writer.write(&batch).map_err(|e| self.failed(e))
+        let columns: Vec<Vec<Value>> = self
+            .written_columns()
+            .into_iter()
+            .map(|column| rows.iter().map(|&row| chunk.get_value(column, row)).collect())
+            .collect();
+        writers.get_mut(directory).expect("just opened").append(columns)
     }
 }
 
@@ -1121,8 +829,11 @@ impl PhysicalOperator for PhysicalCopyToParquet {
             }
             writers.insert(String::new(), self.create(&self.path)?);
         }
-        for (_, writer) in writers.drain() {
-            writer.close().map_err(|e| self.failed(e))?;
+        let mut directories: Vec<String> = writers.keys().cloned().collect();
+        directories.sort();
+        for directory in directories {
+            let writer = writers.remove(&directory).expect("listed");
+            writer.finish()?;
         }
         Ok(())
     }

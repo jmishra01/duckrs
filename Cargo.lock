@@ -749,19 +749,24 @@ name = "duckrs-core"
 version = "0.0.1"
 dependencies = [
  "arrow",
+ "brotli",
  "duckrs-common",
  "duckrs-parser",
  "flate2",
  "libc",
  "libm",
+ "lz4_flex",
  "parking_lot",
  "parquet",
  "proptest",
  "regex",
  "sha1",
  "sha2 0.10.9",
+ "snap",
+ "twox-hash",
  "unicode-normalization",
  "unicode-segmentation",
+ "zstd",
 ]
 
 [[package]]

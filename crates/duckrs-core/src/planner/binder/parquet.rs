@@ -10,13 +10,13 @@ use crate::execution::parquet::{
     ParquetScanData, ParquetWriteOptions, file_metadata_row, file_schema, key_value_rows, metadata_rows,
     parse_compression, schema_table_rows,
 };
+use crate::execution::parquet_writer::{MAX_UNCOMPRESSED_DICT_PAGE_SIZE, MAX_UNCOMPRESSED_PAGE_SIZE};
 use crate::function::combine_types::force_max_logical_type;
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
-use duckrs_common::types::LogicalType;
+use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast::{CopyInfo, FunctionExpr, InsertStatement, InsertValues, TableRef};
-use parquet::file::properties::WriterVersion;
 use std::sync::Arc;
 
 const METADATA_COLUMNS: &str = "file_name, row_group_id, row_group_num_rows, row_group_num_columns, row_group_bytes, \
@@ -267,6 +267,7 @@ impl Binder<'_> {
         let select = self.copy_to_select(info)?;
         let bound = self.bind_select_statement(&select)?;
         let mut options = ParquetWriteOptions::default();
+        let writer = &mut options.writer;
         let mut compression = None;
         let mut level = None;
         let mut partition = PartitionOptions::default();
@@ -280,19 +281,53 @@ impl Binder<'_> {
                     .parse()
                     .map_err(|_| binder_error(format!("{name} must be an integer")))
             };
+            let bytes = || -> Result<usize> {
+                match value.as_i128() {
+                    Some(n) => Ok(n.max(0) as usize),
+                    None => Ok(
+                        crate::execution::temporary::parse_memory_limit(&value.try_to_string()?)?.unwrap_or(u64::MAX)
+                            as usize,
+                    ),
+                }
+            };
             match name.as_str() {
                 "format" | "use_tmp_file" | "preserve_order" | "order_by" => {}
                 "compression" | "codec" => compression = Some(value.try_to_string()?),
                 "compression_level" => level = Some(number()? as i32),
-                "row_group_size" => options.row_group_size = number()?.max(1) as usize,
-                // how the file is laid out, not what it holds
-                "row_group_size_bytes"
-                | "row_groups_per_file"
-                | "dictionary_size_limit"
-                | "string_dictionary_page_size_limit"
-                | "dictionary_compression_ratio_threshold" => {}
-                "data_page_size_limit" => options.data_page_size_limit = Some(number()?.max(1) as usize),
-                "write_bloom_filter" => options.bloom_filter = is_true(&value, &name)?,
+                "row_group_size" | "chunk_size" => writer.row_group_size = number()?.max(1) as usize,
+                "row_group_size_bytes" => writer.row_group_size_bytes = Some(bytes()?),
+                // a file per this many row groups is FILE_SIZE_BYTES' kin, which isn't ported
+                "row_groups_per_file" | "dictionary_compression_ratio_threshold" | "debug_use_openssl" => {}
+                "dictionary_size_limit" => {
+                    let limit = number()?;
+                    if limit < 0 {
+                        return Err(binder_error(
+                            "dictionary_size_limit must be greater than 0 or 0 to disable",
+                        ));
+                    }
+                    writer.dictionary_size_limit = Some(limit as usize);
+                }
+                "string_dictionary_page_size_limit" => {
+                    let limit = number()?;
+                    if limit <= 0 || limit as usize > MAX_UNCOMPRESSED_DICT_PAGE_SIZE {
+                        return Err(binder_error(format!(
+                            "string_dictionary_page_size_limit cannot be 0 and must be less than or equal to \
+                             {MAX_UNCOMPRESSED_DICT_PAGE_SIZE}"
+                        )));
+                    }
+                    writer.string_dictionary_page_size_limit = limit as usize;
+                }
+                "data_page_size_limit" => {
+                    let limit = number()?;
+                    if limit <= 0 || limit as usize > MAX_UNCOMPRESSED_PAGE_SIZE {
+                        return Err(binder_error(format!(
+                            "data_page_size_limit cannot be 0 and must be less than or equal to \
+                             {MAX_UNCOMPRESSED_PAGE_SIZE}"
+                        )));
+                    }
+                    writer.data_page_size_limit = limit as usize;
+                }
+                "write_bloom_filter" => writer.bloom_filters = is_true(&value, &name)?,
                 "bloom_filter_false_positive_ratio" => {
                     let ratio: f64 = value
                         .try_to_string()?
@@ -303,18 +338,14 @@ impl Binder<'_> {
                             "bloom_filter_false_positive_ratio must be greater than 0 and at most 1",
                         ));
                     }
-                    // the crate takes less than 1, and a filter that passes everything is no filter
-                    options.bloom_filter_fpp = (ratio < 1.0).then_some(ratio);
+                    writer.bloom_filter_fpp = ratio;
                 }
+                "write_timestamp_as_int96" => writer.timestamp_as_int96 = is_true(&value, &name)?,
                 "parquet_version" => {
-                    options.version = match value.try_to_string()?.to_uppercase().as_str() {
-                        "V1" => WriterVersion::PARQUET_1_0,
-                        "V2" => WriterVersion::PARQUET_2_0,
-                        other => {
-                            return Err(binder_error(format!(
-                                "Expected parquet_version 'V1' or 'V2', got {other}"
-                            )));
-                        }
+                    writer.version = match value.try_to_string()?.to_uppercase().as_str() {
+                        "V1" => 1,
+                        "V2" => 2,
+                        _ => return Err(binder_error("Expected parquet_version 'V1' or 'V2'")),
                     };
                 }
                 "kv_metadata" => {
@@ -322,14 +353,28 @@ impl Binder<'_> {
                         return Err(binder_error("Expected kv_metadata argument to be a STRUCT"));
                     };
                     for ((key, _), item) in value.logical_type().struct_children().iter().zip(values) {
-                        options.key_values.push((key.clone(), Value::try_to_string(item)?));
+                        if item.is_null() {
+                            // the parameters of a prepared COPY are NULL until it runs
+                            if self.parameters.is_some() {
+                                continue;
+                            }
+                            return Err(binder_error(format!(
+                                "kv_metadata value for key \"{key}\" cannot be NULL"
+                            )));
+                        }
+                        // a BLOB is its bytes, the rest their text
+                        let bytes = match item.data() {
+                            ValueData::Bytes(raw) if item.logical_type().id() == LogicalTypeId::Blob => raw.clone(),
+                            _ => Value::try_to_string(item)?.into_bytes(),
+                        };
+                        writer.key_values.push((key.clone(), bytes));
                     }
                 }
                 _ => return Err(crate::unported(format!("the COPY option {name} for Parquet"))),
             }
         }
         if let Some(name) = compression {
-            options.compression = parse_compression(&name, level)?;
+            writer.codec = parse_compression(&name, level)?;
         }
         options.partitioning = partition.bind(&path, &bound.names, "parquet")?;
         let plan = LogicalOperator::new(
