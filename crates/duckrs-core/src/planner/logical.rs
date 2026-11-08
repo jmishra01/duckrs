@@ -745,6 +745,7 @@ impl LogicalOperator {
                         .iter_mut()
                         .chain(a.filter.iter_mut())
                         .chain(a.order_by.iter_mut().map(|(expr, _)| expr))
+                        .chain(a.distinct_key.iter_mut())
                 }))
                 .collect(),
             LogicalOperatorKind::Window { windows, .. } => {

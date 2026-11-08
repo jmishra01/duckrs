@@ -317,6 +317,7 @@ pub fn bind_aggregate_function(
         filter,
         distinct,
         order_by: Vec::new(),
+        distinct_key: None,
     })
 }
 

@@ -763,6 +763,28 @@ impl Binder<'_> {
         let BoundExprKind::Function { function, children, .. } = &mut bound.kind else {
             return Ok(bound);
         };
+        // `ListSortBindData`: the elements sort by their collated values, a list of them after the
+        // options, and keep their own
+        if matches!(function.name.as_str(), "list_sort" | "array_sort") && children.len() <= 3 {
+            let ty = children[0].return_type.clone();
+            let (keys, collated) = push_collation(
+                children[0].clone(),
+                &ty,
+                &self.default_collation(),
+                CollationType::AllCollations,
+            )?;
+            if collated {
+                let option = |text: &str| BoundExpr::constant(Value::varchar(text));
+                if children.len() < 2 {
+                    children.push(option("ASC"));
+                }
+                if children.len() < 3 {
+                    children.push(option("NULLS FIRST"));
+                }
+                children.push(keys);
+            }
+            return Ok(bound);
+        }
         let pushes = PUSH_COMBINABLE_COLLATIONS.contains(&function.name.to_lowercase().as_str());
         let varchar = |ty: &LogicalType| ty.id() == LogicalTypeId::Varchar && ty.alias().is_none();
         // `ExtractCollation`, for a function that gives a VARCHAR (`PropagateReturnCollation`)
@@ -1719,7 +1741,7 @@ impl Binder<'_> {
         let mut set = set;
         let mut children = children;
         if matches!(set.name.as_str(), "min" | "max")
-            && let [child] = children.as_slice()
+            && let Some(child) = children.first().filter(|_| children.len() <= 2)
             && matches!(
                 child.return_type.id(),
                 LogicalTypeId::Varchar
@@ -1744,7 +1766,8 @@ impl Binder<'_> {
                 set = crate::function::BuiltinFunctions::get()
                     .aggregate(name)
                     .expect("arg_min and arg_max are aggregates");
-                children.push(collated);
+                // `min(x, n)` is `arg_min(x, key, n)` (`MinMaxNBind`)
+                children.insert(1, collated);
             }
         }
         // `FunctionBinder::BindAggregateFunction`: a DISTINCT count counts collated values
@@ -1760,6 +1783,23 @@ impl Binder<'_> {
             children
         };
         let mut aggregate = bind_aggregate_function(set, children, filter, function.distinct)?;
+        // `MultiStageAggregateRewriter`: a DISTINCT aggregate (other than count, whose argument is
+        // collated already) tells its rows apart by their collated values, and aggregates the values
+        if aggregate.distinct
+            && aggregate.function.name != "count"
+            && let Some(child) = aggregate.children.first()
+        {
+            let ty = child.return_type.clone();
+            let (key, pushed) = crate::planner::collation::push_collation(
+                child.clone(),
+                &ty,
+                &self.default_collation(),
+                crate::planner::collation::CollationType::AllCollations,
+            )?;
+            if pushed {
+                aggregate.distinct_key = Some(key);
+            }
+        }
         // `BindAggregate`: the rows are ordered as the collation of their sort keys says
         aggregate.order_by = order_by
             .into_iter()
@@ -1779,8 +1819,13 @@ impl Binder<'_> {
         state.inside_aggregate = false;
         // equal aggregates are computed once
         let key = format!(
-            "{:?}{:?}{:?}{}{:?}",
-            aggregate.function, aggregate.children, aggregate.filter, aggregate.distinct, aggregate.order_by
+            "{:?}{:?}{:?}{}{:?}{:?}",
+            aggregate.function,
+            aggregate.children,
+            aggregate.filter,
+            aggregate.distinct,
+            aggregate.order_by,
+            aggregate.distinct_key
         );
         let index = match state.aggregate_keys.iter().position(|k| *k == key) {
             Some(index) => index,

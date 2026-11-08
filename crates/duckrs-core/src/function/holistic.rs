@@ -197,6 +197,21 @@ fn interval_micros(interval: &Interval) -> Result<i64> {
 
 /// `InterpolateOperator`: the value a fraction `d` of the way from `lo` to `hi`, both of type `ty`.
 fn interpolate(lo: &Value, d: f64, hi: &Value, ty: &LogicalType) -> Result<Value> {
+    // `InterpolateOperator::Operation(dtime_tz_t)`: between the instants, as a time at +00
+    if ty.id() == LogicalTypeId::TimeTz
+        && let (ValueData::Int64(a), ValueData::Int64(b)) = (lo.data(), hi.data())
+    {
+        use duckrs_common::types::{Time, TimeTz};
+        let (lo_key, hi_key) = (TimeTz(*a as u64).sort_key(), TimeTz(*b as u64).sort_key());
+        if lo_key == hi_key {
+            return Ok(lo.clone());
+        }
+        let (lo_micros, hi_micros) = ((lo_key >> 24) as f64, (hi_key >> 24) as f64);
+        let mut micros = (lo_micros * (1.0 - d) + hi_micros * d).round() as i64;
+        micros -= i64::from(TimeTz::MAX_OFFSET) * 1_000_000;
+        micros = micros.rem_euclid(Interval::MICROS_PER_DAY);
+        return Ok(Value::time_tz(TimeTz::new(Time(micros), 0)));
+    }
     match (lo.data(), hi.data()) {
         (ValueData::Interval(lo), ValueData::Interval(hi)) => {
             let (lo, hi) = (i128::from(interval_micros(lo)?), i128::from(interval_micros(hi)?));

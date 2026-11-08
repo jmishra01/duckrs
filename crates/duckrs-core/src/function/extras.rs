@@ -795,6 +795,35 @@ fn time_bucket(args: &DataChunk, result: &mut Vector) -> Result<()> {
         let ValueData::Interval(width) = row[0].data() else {
             return Err(invalid("time_bucket needs an INTERVAL as its width"));
         };
+        // an infinite date or timestamp is its own bucket, and an infinite origin has none
+        let finite = |value: &Value| match value.logical_type().id() {
+            LogicalTypeId::Date => value.as_i128().is_none_or(|days| Date(days as i32).is_finite()),
+            LogicalTypeId::Timestamp | LogicalTypeId::TimestampTz => value
+                .as_i128()
+                .is_none_or(|micros| Timestamp(micros as i64).is_finite()),
+            _ => true,
+        };
+        if !finite(&row[1]) {
+            let positive = row[1].as_i128().is_some_and(|v| v > 0);
+            return Ok(match ty.id() {
+                LogicalTypeId::Date => Value::date(if positive { Date::INFINITY } else { Date::NINFINITY }),
+                id => {
+                    let ts = if positive {
+                        Timestamp::INFINITY
+                    } else {
+                        Timestamp::NINFINITY
+                    };
+                    if id == LogicalTypeId::TimestampTz {
+                        Value::timestamp_tz(ts)
+                    } else {
+                        Value::timestamp(ts)
+                    }
+                }
+            });
+        }
+        if row.get(2).is_some_and(|origin| !finite(origin)) {
+            return Ok(Value::null(ty.clone()));
+        }
         let micros = micros_of(&row[1]).unwrap_or(0);
         let (origin, offset) = match row.get(2).map(Value::data) {
             Some(ValueData::Interval(offset)) => (None, Some(*offset)),

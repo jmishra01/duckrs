@@ -2434,7 +2434,12 @@ impl PhysicalAggregate {
             None => None,
         };
         let input = aggregate.children.first().map(|c| execute(c, chunk)).transpose()?;
-        let distinct_keys = match (aggregate.distinct, &input) {
+        let distinct_input = aggregate
+            .distinct_key
+            .as_ref()
+            .map(|key| execute(key, chunk))
+            .transpose()?;
+        let distinct_keys = match (aggregate.distinct, distinct_input.as_ref().or(input.as_ref())) {
             (true, Some(input)) => {
                 let unified = input.to_unified(chunk.len());
                 let keys = value_keys(input, chunk.len())?.into_iter().enumerate();

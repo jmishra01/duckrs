@@ -189,6 +189,8 @@ pub struct BoundAggregate {
     pub distinct: bool,
     /// `ORDER BY`: the order the aggregate sees its rows in
     pub order_by: Vec<(BoundExpr, OrderModifiers)>,
+    /// what DISTINCT tells rows apart by, if not the argument itself: its collated value
+    pub distinct_key: Option<BoundExpr>,
 }
 
 /// The functions that give something else on each call (`FunctionStability::VOLATILE`).

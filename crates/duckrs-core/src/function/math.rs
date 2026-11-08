@@ -214,8 +214,22 @@ fn round_exact(input: f64, precision: usize) -> f64 {
     rounded.copysign(input)
 }
 
-/// `RoundOperatorPrecision`.
-fn round_double(input: f64, precision: i128, nearest: fn(f64) -> f64) -> f64 {
+/// `ProductError`: the error of the rounded product `a * b`, by Dekker's algorithm.
+fn product_error(a: f64, b: f64, product: f64) -> f64 {
+    const SPLITTER: f64 = 134_217_729.0; // 2^27 + 1
+    let a_scaled = SPLITTER * a;
+    let a_high = a_scaled - (a_scaled - a);
+    let a_low = a - a_high;
+    let b_scaled = SPLITTER * b;
+    let b_high = b_scaled - (b_scaled - b);
+    let b_low = b - b_high;
+    ((a_high * b_high - product) + a_high * b_low + a_low * b_high) + a_low * b_low
+}
+
+/// `RoundOperatorPrecision`. With `exact_midpoints`, a product that rounds onto a midpoint the
+/// input is not on (2.675 * 100 is 267.5, the stored 2.675 is below it) goes the way of the exact
+/// product.
+fn round_double(input: f64, precision: i128, nearest: fn(f64) -> f64, exact_midpoints: bool) -> f64 {
     if precision < 0 {
         let modifier = 10f64.powi((-precision).min(400) as i32);
         if modifier.is_infinite() {
@@ -225,7 +239,17 @@ fn round_double(input: f64, precision: i128, nearest: fn(f64) -> f64) -> f64 {
         if rounded.is_finite() { rounded } else { input }
     } else {
         let modifier = 10f64.powi(precision.min(400) as i32);
-        let rounded = nearest(input * modifier) / modifier;
+        let scaled = input * modifier;
+        let mut error = 0.0;
+        if exact_midpoints && (1..=22).contains(&precision) && (scaled - scaled.trunc()).abs() == 0.5 {
+            error = product_error(input, modifier, scaled);
+        }
+        let rounded_scaled = if error != 0.0 {
+            if error < 0.0 { scaled.floor() } else { scaled.ceil() }
+        } else {
+            nearest(scaled)
+        };
+        let rounded = rounded_scaled / modifier;
         if rounded.is_finite() { rounded } else { input }
     }
 }
@@ -240,21 +264,31 @@ fn round_precision(args: &DataChunk, result: &mut Vector) -> Result<()> {
         if (1..=22).contains(&precision) && input.is_finite() {
             return Ok(Value::double(round_exact(input, precision as usize)));
         }
-        Ok(Value::double(round_double(input, precision, f64::round)))
+        Ok(Value::double(round_double(input, precision, f64::round, true)))
     })
 }
 
 fn round_even_precision(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
         let precision = row[1].as_i128().expect("an INTEGER");
-        Ok(Value::double(round_double(float(&row[0]), precision, round_half_even)))
+        Ok(Value::double(round_double(
+            float(&row[0]),
+            precision,
+            round_half_even,
+            true,
+        )))
     })
 }
 
 fn trunc_precision(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
         let precision = row[1].as_i128().expect("an INTEGER");
-        Ok(Value::double(round_double(float(&row[0]), precision, f64::trunc)))
+        Ok(Value::double(round_double(
+            float(&row[0]),
+            precision,
+            f64::trunc,
+            false,
+        )))
     })
 }
 

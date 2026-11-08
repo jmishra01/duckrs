@@ -257,11 +257,19 @@ fn list_sort(args: &DataChunk, result: &mut Vector) -> Result<()> {
             },
         };
         let items = items_of(&row[0]);
-        let mut column = Vector::new(child.clone(), items.len().max(1));
-        for (i, item) in items.iter().enumerate() {
+        // the collated elements the binder gives, which the elements sort by
+        let (key_items, key_type) = match row.get(3) {
+            Some(keys) => (
+                items_of(keys),
+                keys.logical_type().child_type().cloned().unwrap_or(child.clone()),
+            ),
+            None => (items, child.clone()),
+        };
+        let mut column = Vector::new(key_type, key_items.len().max(1));
+        for (i, item) in key_items.iter().enumerate() {
             column.set_value(i, item)?;
         }
-        let keys = create_sort_keys(&[(&column, modifiers)], items.len())?;
+        let keys = create_sort_keys(&[(&column, modifiers)], key_items.len())?;
         let mut order: Vec<usize> = (0..items.len()).collect();
         order.sort_by(|a, b| keys[*a].cmp(&keys[*b]));
         Value::new(

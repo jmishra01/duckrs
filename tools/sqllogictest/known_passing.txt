@@ -609,6 +609,7 @@ test/sql/aggregate/aggregates/test_product.test
 test/sql/aggregate/aggregates/test_quantile_disc.test
 test/sql/aggregate/aggregates/test_quantile_disc_double.test
 test/sql/aggregate/aggregates/test_quantile_timestamp_exact.test
+test/sql/aggregate/aggregates/test_quantile_timetz.test
 test/sql/aggregate/aggregates/test_reservoir_quantile_decimal.test
 test/sql/aggregate/aggregates/test_scalar_aggr.test
 test/sql/aggregate/aggregates/test_sem.test
@@ -1609,6 +1610,7 @@ test/sql/function/numeric/test_modulo_min_by_minus_one.test
 test/sql/function/numeric/test_nextafter.test
 test/sql/function/numeric/test_random.test
 test/sql/function/numeric/test_round.test
+test/sql/function/numeric/test_round_double_exact_midpoint.test
 test/sql/function/numeric/test_round_even.test
 test/sql/function/numeric/test_sign_bit.test
 test/sql/function/numeric/test_trunc.test
