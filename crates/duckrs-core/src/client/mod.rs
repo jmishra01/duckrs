@@ -2132,7 +2132,9 @@ impl ClientContext {
             }
         };
         let schema = self.catalog().schema_for(create_schema_of(info)?)?;
-        if is_builtin_type(&info.name.name) {
+        // `DefaultTypeGenerator`: the built-in types are entries of a main schema
+        let main = schema.name.eq_ignore_ascii_case("main") || schema.name.eq_ignore_ascii_case(TEMP_SCHEMA);
+        if main && is_builtin_type(&info.name.name) {
             return Err(Error::new(
                 ErrorKind::Catalog,
                 format!("Type with name \"{}\" already exists!", info.name.name),

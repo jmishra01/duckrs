@@ -14,7 +14,7 @@ use crate::execution::expression_executor::evaluate_scalar;
 use crate::execution::zone_map::ROW_GROUP_SIZE;
 use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{COLUMN_IDENTIFIER_ROW_ID, LogicalOperator, LogicalOperatorKind};
-use duckrs_common::types::LogicalType;
+use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::Value;
 use duckrs_common::{ErrorKind, Result};
 use duckrs_parser::ast::{
@@ -156,7 +156,9 @@ fn human_readable_bytes(bytes: u64) -> String {
 
 const DESCRIBE_NAMES: [&str; 6] = ["column_name", "column_type", "null", "key", "default", "extra"];
 
-const SYSTEM_TABLES: [&str; 10] = [
+const SYSTEM_TABLES: [&str; 12] = [
+    "duckdb_functions",
+    "duckdb_types",
     "duckdb_sequences",
     "duckdb_optimizers",
     "pragma_database_size",
@@ -1204,13 +1206,382 @@ impl Binder<'_> {
                 vec![("name", varchar.clone())],
                 OPTIMIZERS.iter().map(|name| vec![text(name)]).collect(),
             ),
+            // `DuckDBFunctionsFunction`: a row per overload, by kind of function
+            "duckdb_functions" => {
+                use crate::catalog::MacroCatalogEntry;
+                use crate::function::BuiltinFunctions;
+                use crate::planner::expression::VOLATILE_FUNCTIONS;
+                use duckrs_parser::ast::MacroBody;
+                let list = LogicalType::list(LogicalType::VARCHAR);
+                let strings = |items: Vec<Value>| Value::list(LogicalType::VARCHAR, items);
+                let no_tags = Value::new(tags.clone(), duckrs_common::value::ValueData::List(vec![]))?;
+                // (CatalogType, database, database oid, schema, name, kind, return type, parameters,
+                // parameter types, macro definition, side effects, internal, stability)
+                type Row = (
+                    u8,
+                    String,
+                    i64,
+                    String,
+                    String,
+                    &'static str,
+                    Value,
+                    Value,
+                    Value,
+                    Value,
+                    Value,
+                    bool,
+                    Value,
+                );
+                let mut functions: Vec<Row> = Vec::new();
+                let builtin = |name: &str,
+                               kind: &'static str,
+                               catalog_type: u8,
+                               arguments: &[LogicalType],
+                               ret: &LogicalType|
+                 -> Result<Row> {
+                    let volatile = VOLATILE_FUNCTIONS.contains(&name);
+                    // `GetParameterNames`: without a description the parameters are col0, col1, ...
+                    let names = (0..arguments.len()).map(|i| text(&format!("col{i}"))).collect();
+                    let types = arguments.iter().map(|t| text(&t.to_string())).collect();
+                    Ok((
+                        catalog_type,
+                        "system".into(),
+                        2,
+                        "main".into(),
+                        name.to_string(),
+                        kind,
+                        text(&ret.to_string()),
+                        strings(names)?,
+                        strings(types)?,
+                        null_text(),
+                        Value::boolean(volatile),
+                        true,
+                        text(if volatile { "VOLATILE" } else { "CONSISTENT" }),
+                    ))
+                };
+                let functions_ref = &mut functions;
+                for set in BuiltinFunctions::get().scalar_sets() {
+                    for function in &set.functions {
+                        functions_ref.push(builtin(
+                            &set.name,
+                            "scalar",
+                            26,
+                            &function.arguments,
+                            &function.return_type,
+                        )?);
+                    }
+                }
+                for set in BuiltinFunctions::get().aggregate_sets() {
+                    for function in &set.functions {
+                        functions_ref.push(builtin(
+                            &set.name,
+                            "aggregate",
+                            27,
+                            &function.arguments,
+                            &function.return_type,
+                        )?);
+                    }
+                }
+                // `MacroExtractor` and `TableMacroExtractor`
+                let mut macro_rows = |database: &str,
+                                      database_oid: i64,
+                                      schema: &str,
+                                      entry: &MacroCatalogEntry,
+                                      internal: bool|
+                 -> Result<()> {
+                    for function in &entry.macros {
+                        let names = function.parameters.iter().map(|p| text(&p.name)).collect();
+                        let types = function
+                            .parameters
+                            .iter()
+                            .map(|p| match &p.parameter_type {
+                                Some(ty) => self.bind_type(ty).map(|t| text(&t.to_string())),
+                                None => Ok(null_text()),
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        let (kind, catalog_type, definition) = match &function.body {
+                            MacroBody::Scalar(body) => ("macro", 30, body.to_string()),
+                            MacroBody::Table(query) => ("table_macro", 31, query.to_string()),
+                        };
+                        let return_type = match (&function.return_type, kind) {
+                            (Some(ty), "macro") => text(&self.bind_type(ty)?.to_string()),
+                            _ => null_text(),
+                        };
+                        functions_ref.push((
+                            catalog_type,
+                            database.to_string(),
+                            database_oid,
+                            schema.to_string(),
+                            entry.name.clone(),
+                            kind,
+                            return_type,
+                            strings(names)?,
+                            strings(types)?,
+                            text(&definition),
+                            Value::null(boolean.clone()),
+                            internal,
+                            null_text(),
+                        ));
+                    }
+                    Ok(())
+                };
+                for (schema, name, table_macro) in crate::catalog::defaults::default_macro_names() {
+                    if let Some(entry) = crate::catalog::defaults::default_macro(Some(schema), name, table_macro) {
+                        macro_rows("system", 2, schema, &entry, true)?;
+                    }
+                }
+                for schema in self.catalog.schemas().iter() {
+                    let temporary = schema.name.eq_ignore_ascii_case(TEMP_SCHEMA);
+                    let database = if temporary { "temp" } else { self.catalog.name.as_str() };
+                    let schema_name = if temporary { "main" } else { schema.name.as_str() };
+                    for table_macro in [false, true] {
+                        for entry in schema.macro_entries(table_macro) {
+                            macro_rows(database, if temporary { 3 } else { 1 }, schema_name, &entry, false)?;
+                        }
+                    }
+                }
+                // `DuckDBFunctionsInit`: by kind, then as `GetAllSchemas` orders the schemas
+                functions.sort_by(|a, b| (a.0, &a.1, &a.3).cmp(&(b.0, &b.1, &b.3)));
+                let mut rows = Vec::with_capacity(functions.len());
+                for (
+                    oid,
+                    (
+                        _,
+                        database,
+                        database_oid,
+                        schema,
+                        name,
+                        kind,
+                        ret,
+                        parameters,
+                        types,
+                        definition,
+                        volatile,
+                        internal,
+                        stability,
+                    ),
+                ) in functions.into_iter().enumerate()
+                {
+                    rows.push(vec![
+                        text(&database),
+                        text(&database_oid.to_string()),
+                        text(&schema),
+                        text(&name),
+                        null_text(),
+                        text(kind),
+                        null_text(),
+                        null_text(),
+                        no_tags.clone(),
+                        ret,
+                        parameters,
+                        types,
+                        null_text(),
+                        definition,
+                        volatile,
+                        Value::boolean(internal),
+                        null_text(),
+                        Value::bigint(oid as i64 + 1),
+                        strings(vec![])?,
+                        stability,
+                        strings(vec![])?,
+                    ]);
+                }
+                (
+                    vec![
+                        ("database_name", varchar.clone()),
+                        // `DuckDBFunctionsBind` declares it VARCHAR, and appends a BIGINT
+                        ("database_oid", varchar.clone()),
+                        ("schema_name", varchar.clone()),
+                        ("function_name", varchar.clone()),
+                        ("alias_of", varchar.clone()),
+                        ("function_type", varchar.clone()),
+                        ("description", varchar.clone()),
+                        ("comment", varchar.clone()),
+                        ("tags", tags.clone()),
+                        ("return_type", varchar.clone()),
+                        ("parameters", list.clone()),
+                        ("parameter_types", list.clone()),
+                        ("varargs", varchar.clone()),
+                        ("macro_definition", varchar.clone()),
+                        ("has_side_effects", boolean.clone()),
+                        ("internal", boolean.clone()),
+                        ("extension_name", varchar.clone()),
+                        ("function_oid", bigint.clone()),
+                        ("examples", list.clone()),
+                        ("stability", varchar.clone()),
+                        ("categories", list.clone()),
+                    ],
+                    rows,
+                )
+            }
+            // `DuckDBTypesFunction`: a row per constructor of each type
+            "duckdb_types" => {
+                use crate::catalog::default_types::{BUILTIN_TYPES, Constructor};
+                use duckrs_common::types::LogicalTypeId as L;
+                // (database, database oid, schema, schema oid, type oid, name, type, internal, constructors)
+                type Entry<'a> = (
+                    String,
+                    i64,
+                    String,
+                    i64,
+                    i64,
+                    String,
+                    LogicalType,
+                    bool,
+                    &'a [Constructor],
+                );
+                const USER: &[Constructor] = &[Constructor {
+                    parameters: &[],
+                    varargs: None,
+                }];
+                let mut builtin: Vec<_> = BUILTIN_TYPES.iter().collect();
+                builtin.sort_by_key(|(name, ..)| *name);
+                // `DefaultTypeGenerator`: the main schema of every database has the built-in types
+                let builtins = |database: &str, database_oid: i64, schema_oid: i64| -> Vec<Entry> {
+                    builtin
+                        .iter()
+                        .map(|(name, id, constructors)| {
+                            let (database, schema) = (database.to_string(), "main".to_string());
+                            let ty = LogicalType::new(*id);
+                            (
+                                database,
+                                database_oid,
+                                schema,
+                                schema_oid,
+                                *id as i64,
+                                name.to_string(),
+                                ty,
+                                true,
+                                *constructors,
+                            )
+                        })
+                        .collect()
+                };
+                let mut entries: Vec<Entry> = builtins("system", 2, 0);
+                let mut oid = 3000;
+                for (schema_oid, schema) in self.catalog.schemas().iter().enumerate() {
+                    let temporary = schema.name.eq_ignore_ascii_case(TEMP_SCHEMA);
+                    let database = if temporary { "temp" } else { self.catalog.name.as_str() };
+                    let database_oid = if temporary { 3 } else { 1 };
+                    let schema_name = if temporary { "main" } else { schema.name.as_str() };
+                    let schema_oid = schema_oid as i64 + 1;
+                    if schema_name.eq_ignore_ascii_case("main") {
+                        entries.extend(builtins(database, database_oid, schema_oid));
+                    }
+                    for (name, ty) in schema.type_entries() {
+                        oid += 1;
+                        let (database, schema) = (database.to_string(), schema_name.to_string());
+                        entries.push((database, database_oid, schema, schema_oid, oid, name, ty, false, USER));
+                    }
+                }
+                // `GetAllSchemas` orders by database, then schema; a schema's entries are by name
+                entries.sort_by(|a, b| (&a.0, &a.2, &a.5).cmp(&(&b.0, &b.2, &b.5)));
+                let mut oids = std::collections::HashSet::new();
+                let mut rows = Vec::new();
+                let list = LogicalType::list(LogicalType::VARCHAR);
+                for (database, database_oid, schema, schema_oid, oid, name, ty, internal, constructors) in &entries {
+                    for constructor in constructors.iter() {
+                        let category = match ty.id() {
+                            L::TinyInt
+                            | L::SmallInt
+                            | L::Integer
+                            | L::BigInt
+                            | L::Decimal
+                            | L::Float
+                            | L::Double
+                            | L::UTinyInt
+                            | L::USmallInt
+                            | L::UInteger
+                            | L::UBigInt
+                            | L::HugeInt
+                            | L::UHugeInt => Some("NUMERIC"),
+                            L::Date
+                            | L::Time
+                            | L::TimeNs
+                            | L::TimestampSec
+                            | L::TimestampMs
+                            | L::Timestamp
+                            | L::TimestampNs
+                            | L::Interval
+                            | L::TimeTz
+                            | L::TimestampTz
+                            | L::TimestampTzNs => Some("DATETIME"),
+                            L::Char | L::Varchar => Some("STRING"),
+                            L::Boolean => Some("BOOLEAN"),
+                            L::Struct | L::List | L::Array | L::Map | L::Union => Some("COMPOSITE"),
+                            L::Variant => Some("VARIANT"),
+                            _ => None,
+                        };
+                        let physical = ty.physical_type();
+                        let labels = if ty.id() == L::Enum && ty.has_params() {
+                            Value::list(LogicalType::VARCHAR, ty.enum_values().iter().map(|v| text(v)).collect())?
+                        } else {
+                            Value::null(list.clone())
+                        };
+                        let strings =
+                            |items: Vec<&str>| Value::list(LogicalType::VARCHAR, items.into_iter().map(text).collect());
+                        let parameters = strings(constructor.parameters.iter().map(|(n, _)| *n).collect())?;
+                        let parameter_types = strings(constructor.parameters.iter().map(|(_, t)| *t).collect())?;
+                        rows.push(vec![
+                            text(database),
+                            Value::bigint(*database_oid),
+                            text(schema),
+                            Value::bigint(*schema_oid),
+                            // a type id is listed once, by the first name that has it
+                            if oids.insert(*oid) {
+                                Value::bigint(*oid)
+                            } else {
+                                Value::null(bigint.clone())
+                            },
+                            text(name),
+                            if physical == duckrs_common::types::PhysicalType::Invalid {
+                                Value::null(bigint.clone())
+                            } else {
+                                Value::bigint(physical.size() as i64)
+                            },
+                            text(ty.id().name()),
+                            category.map_or_else(null_text, text),
+                            null_text(),
+                            Value::new(tags.clone(), duckrs_common::value::ValueData::List(vec![]))?,
+                            Value::boolean(*internal),
+                            null_text(),
+                            labels,
+                            parameters,
+                            parameter_types,
+                            constructor.varargs.map_or_else(null_text, text),
+                        ]);
+                    }
+                }
+                (
+                    vec![
+                        ("database_name", varchar.clone()),
+                        ("database_oid", bigint.clone()),
+                        ("schema_name", varchar.clone()),
+                        ("schema_oid", bigint.clone()),
+                        ("type_oid", bigint.clone()),
+                        ("type_name", varchar.clone()),
+                        ("type_size", bigint.clone()),
+                        ("logical_type", varchar.clone()),
+                        ("type_category", varchar.clone()),
+                        ("comment", varchar.clone()),
+                        ("tags", tags.clone()),
+                        ("internal", boolean.clone()),
+                        ("extension_name", varchar.clone()),
+                        ("labels", list.clone()),
+                        ("parameters", list.clone()),
+                        ("parameter_types", list.clone()),
+                        ("varargs", varchar.clone()),
+                    ],
+                    rows,
+                )
+            }
             // `DuckDBSequencesFunction`
             "duckdb_sequences" => {
                 let mut rows = Vec::new();
                 let mut oid = 2000;
                 for (schema_oid, schema) in self.catalog.schemas().iter().enumerate() {
                     let temporary = schema.name.eq_ignore_ascii_case(TEMP_SCHEMA);
-                    for sequence in schema.sequences() {
+                    for sequence in schema.sequence_entries() {
                         oid += 1;
                         let data = sequence.data();
                         let last_value = match data.last_value {
@@ -1575,6 +1946,22 @@ impl Binder<'_> {
                     for (index, (column, ty, not_null, default, expression, generated)) in
                         table_columns.into_iter().enumerate()
                     {
+                        // (precision, radix, scale)
+                        let binary = |bits: i32| (Some(bits), Some(2), Some(0));
+                        let (numeric_precision, numeric_radix, numeric_scale) = match ty.id() {
+                            LogicalTypeId::Decimal => {
+                                let (width, scale) = ty.decimal_properties().unwrap_or((18, 3));
+                                (Some(width.into()), Some(10), Some(scale.into()))
+                            }
+                            LogicalTypeId::HugeInt => binary(128),
+                            LogicalTypeId::BigInt => binary(64),
+                            LogicalTypeId::Integer => binary(32),
+                            LogicalTypeId::SmallInt => binary(16),
+                            LogicalTypeId::TinyInt => binary(8),
+                            LogicalTypeId::Float => binary(24),
+                            LogicalTypeId::Double => binary(53),
+                            _ => (None, None, None),
+                        };
                         rows.push(vec![
                             text(if temporary { "temp" } else { self.catalog.name.as_str() }),
                             Value::bigint(if temporary { 3 } else { 1 }),
@@ -1589,11 +1976,15 @@ impl Binder<'_> {
                             default,
                             Value::boolean(!not_null),
                             text(&ty.to_string()),
-                            Value::bigint(ty.id() as i64),
+                            if ty.id() == LogicalTypeId::Invalid {
+                                Value::null(bigint.clone())
+                            } else {
+                                Value::bigint(ty.id() as i64)
+                            },
                             Value::null(integer.clone()),
-                            Value::null(integer.clone()),
-                            Value::null(integer.clone()),
-                            Value::null(integer.clone()),
+                            numeric_precision.map_or_else(|| Value::null(integer.clone()), Value::integer),
+                            numeric_radix.map_or_else(|| Value::null(integer.clone()), Value::integer),
+                            numeric_scale.map_or_else(|| Value::null(integer.clone()), Value::integer),
                             Value::null(tags.clone()),
                             Value::boolean(generated),
                             expression,

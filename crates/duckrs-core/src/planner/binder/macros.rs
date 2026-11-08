@@ -55,16 +55,29 @@ fn replace_marked(expr: &mut Expr, arguments: &[Expr]) {
     }
 }
 
+/// `op` on `expr`, and on the expressions of the subqueries in it, as
+/// `ReplaceMacroParameters` goes into them.
+fn into_subqueries(expr: &mut Expr, op: &mut dyn FnMut(&mut Expr)) {
+    op(expr);
+    if let ExprKind::Subquery { subquery, .. } = &mut expr.kind {
+        visit_query_node_exprs_mut(&mut subquery.node, &mut |child| into_subqueries(child, op));
+    }
+}
+
 /// `ExpressionBinder::ReplaceMacroParameters` over a scalar macro's body.
 fn replace_in_expr(body: &mut Expr, parameters: &[String], arguments: &[Expr]) {
-    visit_expr_mut(body, &mut |e| mark_parameters(e, parameters));
-    visit_expr_mut(body, &mut |e| replace_marked(e, arguments));
+    visit_expr_mut(body, &mut |e| {
+        into_subqueries(e, &mut |e| mark_parameters(e, parameters))
+    });
+    visit_expr_mut(body, &mut |e| into_subqueries(e, &mut |e| replace_marked(e, arguments)));
 }
 
 /// `ExpressionBinder::ReplaceMacroParameters` over a table macro's query.
 fn replace_in_query(body: &mut QueryNode, parameters: &[String], arguments: &[Expr]) {
-    visit_query_node_exprs_mut(body, &mut |e| mark_parameters(e, parameters));
-    visit_query_node_exprs_mut(body, &mut |e| replace_marked(e, arguments));
+    visit_query_node_exprs_mut(body, &mut |e| {
+        into_subqueries(e, &mut |e| mark_parameters(e, parameters))
+    });
+    visit_query_node_exprs_mut(body, &mut |e| into_subqueries(e, &mut |e| replace_marked(e, arguments)));
 }
 
 fn cast_to(expr: Expr, target: &CastType) -> Expr {

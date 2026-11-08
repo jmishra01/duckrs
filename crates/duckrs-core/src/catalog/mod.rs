@@ -18,6 +18,7 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Weak};
 
+pub mod default_types;
 pub mod defaults;
 mod defaults_table;
 mod fork;
@@ -1072,7 +1073,6 @@ impl SchemaCatalogEntry {
         Ok(())
     }
 
-    /// Drops a type, returning whether it existed.
     /// The custom types, by name.
     pub fn type_entries(&self) -> Vec<(String, LogicalType)> {
         self.types.read().iter().map(|(n, t)| (n.clone(), t.clone())).collect()
@@ -1086,21 +1086,17 @@ impl SchemaCatalogEntry {
         self.macros[usize::from(table_macro)].read().values().cloned().collect()
     }
 
+    /// Drops a type, returning whether it existed.
     pub fn drop_type(&self, name: &str) -> bool {
         self.types.write().remove(&key(name)).is_some()
     }
 
-    /// The table or view with this name.
     /// All the tables and views, by name.
-    /// The sequences of the schema, by name.
-    pub fn sequences(&self) -> Vec<Arc<SequenceCatalogEntry>> {
-        self.sequences.read().values().cloned().collect()
-    }
-
     pub fn tables_and_views(&self) -> Vec<TableOrView> {
         self.tables.read().values().cloned().collect()
     }
 
+    /// The table or view with this name.
     pub fn get_entry(&self, name: &str) -> Option<TableOrView> {
         self.tables.read().get(&key(name)).cloned()
     }

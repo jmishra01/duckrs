@@ -63,6 +63,12 @@ pub fn default_macro(schema: Option<&str>, name: &str, table_macro: bool) -> Opt
     None
 }
 
+/// The system macros, in order: (schema, name, whether a table macro).
+pub fn default_macro_names() -> impl Iterator<Item = (&'static str, &'static str, bool)> {
+    let scalar = MACROS.iter().map(|(schema, name, _)| (*schema, *name, false));
+    scalar.chain(TABLE_MACROS.iter().map(|(schema, name, ..)| (*schema, *name, true)))
+}
+
 /// `CreateInternalMacroInfo`: the macro from its definition.
 fn build_macro(schema: &str, name: &str, table_macro: bool) -> Option<Arc<MacroCatalogEntry>> {
     let sql = if table_macro {

@@ -366,4 +366,18 @@ impl BuiltinFunctions {
     pub fn aggregate(&self, name: &str) -> Option<&aggregates::AggregateFunctionSet> {
         self.aggregate.get(&name.to_ascii_lowercase())
     }
+
+    /// The scalar function sets, by name.
+    pub fn scalar_sets(&self) -> Vec<&ScalarFunctionSet> {
+        let mut sets: Vec<_> = self.scalar.values().collect();
+        sets.sort_by(|a, b| a.name.cmp(&b.name));
+        sets
+    }
+
+    /// The aggregate function sets, by name.
+    pub fn aggregate_sets(&self) -> Vec<&aggregates::AggregateFunctionSet> {
+        let mut sets: Vec<_> = self.aggregate.values().collect();
+        sets.sort_by(|a, b| a.name.cmp(&b.name));
+        sets
+    }
 }

@@ -39,6 +39,7 @@ test/fuzzer/duckfuzz/invalid_make_time.test
 test/fuzzer/duckfuzz/json_extract_string_null.test
 test/fuzzer/duckfuzz/julian_overflow.test
 test/fuzzer/duckfuzz/late_materialization_filter.test
+test/fuzzer/duckfuzz/limit_offset_macro_subquery.test
 test/fuzzer/duckfuzz/limit_percent_subquery.test
 test/fuzzer/duckfuzz/list_try_cast.test
 test/fuzzer/duckfuzz/list_zip_no_args.test
@@ -232,6 +233,7 @@ test/issues/general/test_1427.test
 test/issues/general/test_14286.test
 test/issues/general/test_14540.test
 test/issues/general/test_15416.test
+test/issues/general/test_15432.test
 test/issues/general/test_15483.test
 test/issues/general/test_1599.test
 test/issues/general/test_1613.test
@@ -870,9 +872,12 @@ test/sql/catalog/function/python_style_macro_parameters.test
 test/sql/catalog/function/test_cross_catalog_macros.test
 test/sql/catalog/function/test_macro_issue_13104.test
 test/sql/catalog/function/test_macro_issue_19119.test
+test/sql/catalog/function/test_macro_overloads.test
 test/sql/catalog/function/test_macro_relpersistence_conflict.test
+test/sql/catalog/function/test_macro_with_unknown_types.test
 test/sql/catalog/function/test_recursive_macro_no_dependency.test
 test/sql/catalog/function/test_recursive_table_macro.test
+test/sql/catalog/function/test_table_macro.test
 test/sql/catalog/identifier_embedded_nul.test
 test/sql/catalog/issue_9459.test
 test/sql/catalog/sequence/prepared_currval_dropped_sequence.test
@@ -1338,6 +1343,7 @@ test/sql/cte/materialized/annotated_and_auto_materialized.test
 test/sql/cte/materialized/cte_runtime_filters.test
 test/sql/cte/materialized/dml_materialized_cte.test
 test/sql/cte/materialized/incorrect_recursive_cte_materialized.test
+test/sql/cte/materialized/internal_3004.test
 test/sql/cte/materialized/recursive_array_slice_materialized.test
 test/sql/cte/materialized/recursive_cte_complex_pipelines.test
 test/sql/cte/materialized/recursive_cte_error_materialized.test
@@ -1518,6 +1524,7 @@ test/sql/function/list/lambdas/arrow/lambdas_and_functions_deprecated.test
 test/sql/function/list/lambdas/arrow/lambdas_and_group_by_deprecated.test
 test/sql/function/list/lambdas/arrow/list_comprehension_deprecated.test
 test/sql/function/list/lambdas/arrow/rhs_parameters_deprecated.test
+test/sql/function/list/lambdas/arrow/test_lambda_arrow_storage_deprecated.test
 test/sql/function/list/lambdas/arrow/transform_deprecated.test
 test/sql/function/list/lambdas/arrow/transform_with_index_deprecated.test
 test/sql/function/list/lambdas/filter.test
@@ -2198,14 +2205,18 @@ test/sql/peg_parser/qualified_operator.test
 test/sql/peg_parser/transformer/between_asymmetric.test
 test/sql/peg_parser/transformer/is_predicate_operators.test
 test/sql/peg_parser/transformer/trim.test
+test/sql/pg_catalog/pg_attribute.test
 test/sql/pg_catalog/pg_database.test
+test/sql/pg_catalog/pg_enum.test
 test/sql/pg_catalog/pg_index.test
 test/sql/pg_catalog/pg_privilege.test
 test/sql/pg_catalog/pg_sequence.test
 test/sql/pg_catalog/pg_sequences.test
 test/sql/pg_catalog/pg_settings.test
 test/sql/pg_catalog/pg_tablespace.test
+test/sql/pg_catalog/pg_type.test
 test/sql/pg_catalog/pg_views.test
+test/sql/pg_catalog/sqlalchemy.test
 test/sql/pivot/optional_pivots.test
 test/sql/pivot/pivot_15141.test
 test/sql/pivot/pivot_6390.test
@@ -2650,6 +2661,7 @@ test/sql/storage/temp_directory/test_default_temp_directory.test
 test/sql/storage/test_empty_shutdown.test
 test/sql/storage/test_empty_table.test
 test/sql/storage/test_ignore_duplicate_deletes_unique_index.test
+test/sql/storage/test_index_checkpoint.test
 test/sql/storage/test_large_commits.test
 test/sql/storage/test_read_only_wal_replay.test
 test/sql/storage/test_restart_extension.test
@@ -2837,6 +2849,7 @@ test/sql/table_function/duckdb_constraints_issue12863.test
 test/sql/table_function/duckdb_optimizers.test
 test/sql/table_function/duckdb_sequences.test
 test/sql/table_function/duckdb_settings_extension.test
+test/sql/table_function/duckdb_types.test
 test/sql/table_function/duckdb_views.test
 test/sql/table_function/glob_prepared.test
 test/sql/table_function/information_schema_fkey_constraint_names.test
@@ -3029,6 +3042,7 @@ test/sql/types/enum/test_enum_case.test
 test/sql/types/enum/test_enum_cast.test
 test/sql/types/enum/test_enum_comparisons.test
 test/sql/types/enum/test_enum_constraints.test
+test/sql/types/enum/test_enum_duckdb_types.test
 test/sql/types/enum/test_enum_range_boundary_rows.test
 test/sql/types/enum/test_enum_schema.test
 test/sql/types/enum/test_enum_storage.test
@@ -3090,6 +3104,7 @@ test/sql/types/list/nested_comparison_validity.test
 test/sql/types/list/nested_list_extract.test
 test/sql/types/list/nested_list_slice.test
 test/sql/types/list/nested_list_updates.test
+test/sql/types/list/unnest_aggregate.test
 test/sql/types/list/unnest_complex_types.test
 test/sql/types/list/unnest_having_qualify.test
 test/sql/types/list/unnest_null_empty.test
