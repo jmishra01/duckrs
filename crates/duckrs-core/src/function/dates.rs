@@ -1157,12 +1157,16 @@ fn interval_plus_interval(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+/// `SubtractOperator::Operation(interval_t, interval_t)`: each part on its own.
 fn interval_minus_interval(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
-        Ok(Value::interval(interval_arithmetic(
-            interval_of(&row[0]),
-            negated(interval_of(&row[1])),
-        )?))
+        let (left, right) = (interval_of(&row[0]), interval_of(&row[1]));
+        let failed = |part: &str| out_of_range(format!("Interval {part} subtraction out of range"));
+        Ok(Value::interval(Interval {
+            months: left.months.checked_sub(right.months).ok_or_else(|| failed("months"))?,
+            days: left.days.checked_sub(right.days).ok_or_else(|| failed("days"))?,
+            micros: left.micros.checked_sub(right.micros).ok_or_else(|| failed("micros"))?,
+        }))
     })
 }
 

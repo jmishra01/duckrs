@@ -153,8 +153,19 @@ fn bind_array_slice(children: Vec<BoundExpr>) -> Result<BoundExpr> {
     };
     let mut arguments = vec![input];
     for bound in children {
-        // an empty list stands for a bound that was left out
+        // an empty list stands for a bound that was left out (`CheckIfParamIsEmpty`), and
+        // another list is a mistake
         if is_list(&bound.return_type) {
+            let empty = match &bound.kind {
+                BoundExprKind::Constant(value) => matches!(value.data(), ValueData::List(items) if items.is_empty()),
+                BoundExprKind::Function { function, children, .. } => {
+                    function.name == "list_value" && children.is_empty()
+                }
+                _ => false,
+            };
+            if !empty {
+                return Err(binder_error("The upper and lower bounds of the slice must be a BIGINT"));
+            }
             arguments.push(bound);
         } else if bound.return_type.is_numeric() || bound.return_type.id() == LogicalTypeId::SqlNull {
             arguments.push(bound.cast_to(&LogicalType::BIGINT, false));

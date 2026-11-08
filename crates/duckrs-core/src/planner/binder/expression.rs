@@ -903,8 +903,15 @@ impl Binder<'_> {
         // an alias may not refer to itself
         let (alias, aliased) = self.alias_fallback.remove(position);
         let bound = self.bind_expression(&aliased);
-        self.alias_fallback.insert(position, (alias, aliased));
-        bound.map(Some)
+        self.alias_fallback.insert(position, (alias.clone(), aliased));
+        let bound = bound?;
+        // `SelectBindState::BindAlias`: a copy of a volatile expression would be another value
+        if bound.is_volatile() {
+            return Err(binder_error(format!(
+                "Alias \"{alias}\" referenced - but the expression has side effects. This is not yet supported."
+            )));
+        }
+        Ok(Some(bound))
     }
 
     fn bind_expression_inner(&mut self, expr: &Expr) -> Result<BoundExpr> {
@@ -1959,6 +1966,13 @@ impl Binder<'_> {
             })
             .collect::<Result<Vec<_>>>()?;
         if function.export_state {
+            // the exported state does not keep the values seen so far
+            if function.distinct {
+                return Err(binder_error(
+                    "EXPORT_STATE is not supported for DISTINCT aggregates: the exported state does not retain the \
+                     set of distinct values, so combining states would produce incorrect results",
+                ));
+            }
             let arguments: Vec<LogicalType> = aggregate.children.iter().map(|c| c.return_type.clone()).collect();
             let (exported, ty) =
                 crate::function::aggregates::export_state(&aggregate.function, &aggregate.return_type, &arguments)?;

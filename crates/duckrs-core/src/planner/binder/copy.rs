@@ -1178,6 +1178,9 @@ impl Binder<'_> {
 
     pub(super) fn bind_copy(&mut self, info: &CopyInfo) -> Result<BoundStatement> {
         if let Some(path) = self.parquet_copy_path(info)? {
+            if !info.is_from {
+                verify_not_extension(&path)?;
+            }
             return if info.is_from {
                 self.bind_copy_from_parquet(info, &path)
             } else {
@@ -1185,6 +1188,9 @@ impl Binder<'_> {
             };
         }
         let (path, tsv) = self.copy_target(info)?;
+        if !info.is_from {
+            verify_not_extension(&path)?;
+        }
         if info.is_from {
             self.bind_copy_from(info, &path, tsv)
         } else {
@@ -1432,4 +1438,20 @@ fn quoted_columns(value: &Value, names: &[String]) -> Result<Vec<bool>> {
         result[position] = true;
     }
     Ok(result)
+}
+
+/// `OpenerFileSystem::VerifyCanAccessExtension`: what ends with `.duckdb_extension`, or has a
+/// `.duckdb_extension.` part, is written only by INSTALL.
+fn verify_not_extension(path: &str) -> Result<()> {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path).to_lowercase();
+    if name.ends_with(".duckdb_extension") || name.contains(".duckdb_extension.") {
+        return Err(duckrs_common::Error::new(
+            duckrs_common::ErrorKind::Permission,
+            format!(
+                "File '{path}' cannot be opened for writing since files ending with '.duckdb_extension' are \
+                 reserved for DuckDB extensions, and these can only be installed through the INSTALL command"
+            ),
+        ));
+    }
+    Ok(())
 }

@@ -16,6 +16,9 @@
 #   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
 # Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
 # stop passing. Regenerate with:
+#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
+# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
+# stop passing. Regenerate with:
 test/common/test_cast_hugeint.test
 test/fuzzer/afl/alter_if_exists.test
 test/fuzzer/afl/analyze_empty_table.test
@@ -215,6 +218,7 @@ test/fuzzer/sqlsmith/bitstring_agg_overflow.test
 test/fuzzer/sqlsmith/dayofweek_overflow.test
 test/fuzzer/sqlsmith/fuzzer_window_varchar.test
 test/fuzzer/sqlsmith/generate_series_overflow.test
+test/fuzzer/sqlsmith/interval_diff_overflow.test
 test/fuzzer/sqlsmith/json_contains_null.test
 test/fuzzer/sqlsmith/like_null_pattern.test
 test/fuzzer/sqlsmith/mad_overflow.test
@@ -843,6 +847,7 @@ test/sql/binder/alias_qualification_order_by.test
 test/sql/binder/alias_qualification_qualify.test
 test/sql/binder/alias_qualification_select_projection.test
 test/sql/binder/alias_qualification_where.test
+test/sql/binder/alias_where_side_effects.test
 test/sql/binder/column_value_alias_group.test
 test/sql/binder/duplicate_alias.test
 test/sql/binder/empty_column_alias.test
@@ -862,6 +867,7 @@ test/sql/binder/test_function_chaining_alias.test
 test/sql/binder/test_having_alias.test
 test/sql/binder/test_implicit_struct_pack.test
 test/sql/binder/test_in_with_collate.test
+test/sql/binder/test_select_clause_alias.test
 test/sql/binder/test_string_alias.test
 test/sql/cast/array_to_varchar_quoting.test
 test/sql/cast/boolean_autocast.test
@@ -2125,6 +2131,7 @@ test/sql/json/issues/large_quoted_string_constant.test
 test/sql/json/issues/map_inference_threshold_internal_exception.test
 test/sql/json/issues/test_json_temp_8062.test
 test/sql/json/json_blob_roundtrip.test
+test/sql/json/scalar/json_transform_case_insensitive_keys.test
 test/sql/json/scalar/test_json_array_length.test
 test/sql/json/scalar/test_json_arrow_expr.test
 test/sql/json/scalar/test_json_contains.test

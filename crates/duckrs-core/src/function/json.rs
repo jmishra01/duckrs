@@ -1103,12 +1103,23 @@ fn structure_type(json: &Json, parse_type: &dyn Fn(&str) -> Result<LogicalType>)
                 "Too many items in JSON structure: arrays must have exactly one item",
             )),
         },
-        Json::Object(items) if !items.is_empty() => Ok(LogicalType::struct_type(
-            items
-                .iter()
-                .map(|(key, value)| Ok((key.clone(), structure_type(value, parse_type)?)))
-                .collect::<Result<_>>()?,
-        )),
+        Json::Object(items) if !items.is_empty() => {
+            // `StructureToTypeObject`: STRUCT field names are case-insensitive
+            let mut fields: Vec<(String, LogicalType)> = Vec::with_capacity(items.len());
+            for (key, value) in items {
+                if key.is_empty() {
+                    return Err(binder_error("Empty key in object in JSON structure"));
+                }
+                if fields.iter().any(|(name, _)| name.eq_ignore_ascii_case(key)) {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("Duplicate keys in object in JSON structure: {}", value.text()),
+                    ));
+                }
+                fields.push((key.clone(), structure_type(value, parse_type)?));
+            }
+            Ok(LogicalType::struct_type(fields))
+        }
         Json::Object(_) => Err(binder_error("Empty object in JSON structure")),
         _ => Err(binder_error(
             "invalid JSON structure: expected an object, an array or the name of a type",

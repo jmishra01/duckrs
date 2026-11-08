@@ -98,6 +98,22 @@ impl Binder<'_> {
         let mut columns = Vec::new();
         for expression in expressions {
             let (key, display) = self.bind_index_expression(&table, expression)?;
+            // lambda functions need a ClientContext to execute, which appends and deletes do not have
+            let mut lambda = None;
+            key.clone().walk_mut(&mut |e| {
+                if let BoundExprKind::ListLambda { kind, .. } = &e.kind {
+                    lambda.get_or_insert(match kind {
+                        crate::planner::expression::LambdaKind::Transform => "list_transform",
+                        crate::planner::expression::LambdaKind::Filter => "list_filter",
+                        crate::planner::expression::LambdaKind::Reduce => "list_reduce",
+                    });
+                }
+            });
+            if let Some(name) = lambda {
+                return Err(binder_error(format!(
+                    "Index keys cannot contain lambda functions such as \"{name}\"."
+                )));
+            }
             key.clone().walk_mut(&mut |e| {
                 if let BoundExprKind::Reference(column) = e.kind
                     && !columns.contains(&column)
