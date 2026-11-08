@@ -2,12 +2,12 @@
 //
 //! `read_parquet` and COPY with FORMAT PARQUET.
 
-use super::copy::{hive_columns, is_true, string_literal, strings};
+use super::copy::{PartitionOptions, hive_columns, is_true, string_literal, strings};
 use super::table_functions::{named_argument, parse_select};
 use super::{Binder, Binding, BoundStatement, StatementReturnType, binder_error};
 use crate::execution::file_system;
 use crate::execution::parquet::{
-    ParquetScanData, ParquetWriteOptions, Partitioning, file_metadata_row, file_schema, key_value_rows, metadata_rows,
+    ParquetScanData, ParquetWriteOptions, file_metadata_row, file_schema, key_value_rows, metadata_rows,
     parse_compression, schema_table_rows,
 };
 use crate::function::combine_types::force_max_logical_type;
@@ -15,9 +15,7 @@ use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::{Error, ErrorKind, Result};
-use duckrs_parser::ast::{
-    CopyInfo, FunctionExpr, InsertStatement, InsertValues, SelectStatement, TableRef, sql_identifier,
-};
+use duckrs_parser::ast::{CopyInfo, FunctionExpr, InsertStatement, InsertValues, TableRef};
 use parquet::file::properties::WriterVersion;
 use std::sync::Arc;
 
@@ -248,28 +246,16 @@ impl Binder<'_> {
 
     /// `ParquetWriteBind`.
     pub(super) fn bind_copy_to_parquet(&mut self, info: &CopyInfo, path: String) -> Result<BoundStatement> {
-        let select = match &info.select {
-            Some(query) => SelectStatement {
-                node: (**query).clone(),
-            },
-            None => {
-                let columns = if info.select_list.is_empty() {
-                    "*".to_string()
-                } else {
-                    let names: Vec<_> = info.select_list.iter().map(|c| sql_identifier(c)).collect();
-                    names.join(", ")
-                };
-                parse_select(&format!("SELECT {columns} FROM {}", info.table), "Expected a table")?
-            }
-        };
+        let select = self.copy_to_select(info)?;
         let bound = self.bind_select_statement(&select)?;
         let mut options = ParquetWriteOptions::default();
         let mut compression = None;
         let mut level = None;
-        let mut partition_columns: Option<Vec<String>> = None;
-        let (mut write_partition_columns, mut overwrite_or_ignore, mut overwrite) = (false, false, false);
-        let (mut filename_pattern, mut extension) = (None, None);
+        let mut partition = PartitionOptions::default();
         for (name, value) in self.copy_options(info)? {
+            if partition.take(&name, &value)? {
+                continue;
+            }
             let number = || -> Result<i64> {
                 value
                     .try_to_string()?
@@ -277,7 +263,7 @@ impl Binder<'_> {
                     .map_err(|_| binder_error(format!("{name} must be an integer")))
             };
             match name.as_str() {
-                "format" | "use_tmp_file" | "preserve_order" => {}
+                "format" | "use_tmp_file" | "preserve_order" | "order_by" => {}
                 "compression" | "codec" => compression = Some(value.try_to_string()?),
                 "compression_level" => level = Some(number()? as i32),
                 "row_group_size" => options.row_group_size = number()?.max(1) as usize,
@@ -302,12 +288,6 @@ impl Binder<'_> {
                     // the crate takes less than 1, and a filter that passes everything is no filter
                     options.bloom_filter_fpp = (ratio < 1.0).then_some(ratio);
                 }
-                "partition_by" => partition_columns = Some(strings(&value)?),
-                "write_partition_columns" => write_partition_columns = is_true(&value, &name)?,
-                "overwrite_or_ignore" => overwrite_or_ignore = is_true(&value, &name)?,
-                "overwrite" => overwrite = is_true(&value, &name)?,
-                "filename_pattern" => filename_pattern = Some(value.try_to_string()?),
-                "file_extension" => extension = Some(value.try_to_string()?),
                 "parquet_version" => {
                     options.version = match value.try_to_string()?.to_uppercase().as_str() {
                         "V1" => WriterVersion::PARQUET_1_0,
@@ -333,42 +313,7 @@ impl Binder<'_> {
         if let Some(name) = compression {
             options.compression = parse_compression(&name, level)?;
         }
-        if let Some(wanted) = partition_columns {
-            if wanted.is_empty() {
-                return Err(binder_error("PARTITION_BY cannot be empty"));
-            }
-            let mut columns = Vec::with_capacity(wanted.len());
-            for column in &wanted {
-                let Some(found) = bound.names.iter().position(|n| n.eq_ignore_ascii_case(column)) else {
-                    return Err(binder_error(format!("Partition by column \"{column}\" not found")));
-                };
-                columns.push(found);
-            }
-            if columns.len() == bound.names.len() && !write_partition_columns {
-                return Err(binder_error(
-                    "No column to write as all columns are specified as partition columns. WRITE_PARTITION_COLUMNS \
-                     option can be used to write partition columns.",
-                ));
-            }
-            let occupied = std::fs::read_dir(&path).is_ok_and(|mut entries| entries.next().is_some());
-            if occupied && !overwrite_or_ignore {
-                if overwrite {
-                    std::fs::remove_dir_all(&path)
-                        .map_err(|e| Error::new(ErrorKind::Io, format!("Could not clear \"{path}\": {e}")))?;
-                } else {
-                    return Err(Error::new(
-                        ErrorKind::Io,
-                        format!("Directory \"{path}\" is not empty! Enable OVERWRITE option to overwrite files"),
-                    ));
-                }
-            }
-            options.partitioning = Some(Partitioning {
-                columns,
-                write_columns: write_partition_columns,
-                filename_pattern: filename_pattern.unwrap_or_else(|| "data_{i}".to_string()),
-                extension: extension.unwrap_or_else(|| "parquet".to_string()),
-            });
-        }
+        options.partitioning = partition.bind(&path, &bound.names, "parquet")?;
         let plan = LogicalOperator::new(
             LogicalOperatorKind::CopyToParquet {
                 path,

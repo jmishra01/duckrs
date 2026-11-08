@@ -1,21 +1,3 @@
-# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
-# stop passing. Regenerate with:
-#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
-#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
-# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
-# stop passing. Regenerate with:
-#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
-# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
-# stop passing. Regenerate with:
-#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
-# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
-# stop passing. Regenerate with:
-#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
-# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
-# stop passing. Regenerate with:
-#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
-# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
-# stop passing. Regenerate with:
 #   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
 # Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
 # stop passing. Regenerate with:
@@ -1099,6 +1081,7 @@ test/sql/constraints/unique/test_unique_string.test
 test/sql/constraints/unique/test_unique_temp.test
 test/sql/copy/async_file_character_device.test
 test/sql/copy/copy_legacy_options.test
+test/sql/copy/copy_order_by_collation.test
 test/sql/copy/csv/14512.test
 test/sql/copy/csv/14874.test
 test/sql/copy/csv/17738.test
@@ -1157,6 +1140,7 @@ test/sql/copy/csv/code_cov/csv_sniffer_header.test
 test/sql/copy/csv/code_cov/csv_type_detection.test
 test/sql/copy/csv/code_cov/csv_type_refinement.test
 test/sql/copy/csv/column_names.test
+test/sql/copy/csv/comment_quoting.test
 test/sql/copy/csv/copy_disable_parallelism.test
 test/sql/copy/csv/copy_expression.test
 test/sql/copy/csv/copy_to_overwrite.test
@@ -1304,6 +1288,7 @@ test/sql/copy/csv/unquoted_escape/basic.test
 test/sql/copy/csv/unquoted_escape/identical.test
 test/sql/copy/csv/unquoted_escape/mixed.test
 test/sql/copy/csv/write_header_default.test
+test/sql/copy/hive_partition_null_overwrite.test
 test/sql/copy/parquet/aws2.test
 test/sql/copy/parquet/aws_kinesis.test
 test/sql/copy/parquet/broken_parquet.test
@@ -1416,14 +1401,20 @@ test/sql/copy/partitioned/hive_partition_case_insensitive_column.test
 test/sql/copy/partitioned/hive_partition_compression.test
 test/sql/copy/partitioned/hive_partition_duplicate_name.test
 test/sql/copy/partitioned/hive_partition_recursive_cte.test
+test/sql/copy/partitioned/hive_partitioned_delayed_flush.test
+test/sql/copy/partitioned/partition_by_syntax.test
 test/sql/copy/partitioned/partition_issue_6304.test
 test/sql/copy/partitioned/partition_null_row_group_size_bytes.test
 test/sql/copy/partitioned/partitioned_asof_join.test
+test/sql/copy/partitioned/partitioned_flush_join_race.test
 test/sql/copy/partitioned/partitioned_full_outer_hash_join.test
 test/sql/copy/partitioned/partitioned_iejoin.test
+test/sql/copy/partitioned/partitioned_order_by_flush_race.test
 test/sql/copy/partitioned/partitioned_outer_asof_join.test
 test/sql/copy/partitioned/partitioned_row_group_size_bytes_boundary.test
 test/sql/copy/partitioned/partitioned_window.test
+test/sql/copy/partitioned/partitioned_write_backpressure.test
+test/sql/copy/partitioned/skip_partition_column_writes.test
 test/sql/copy/tmp_file.test
 test/sql/create/create_as.test
 test/sql/create/create_as_issue_11968.test
@@ -2151,6 +2142,7 @@ test/sql/json/scalar/test_json_value.test
 test/sql/json/table/read_json_root_bignum.test
 test/sql/json/table/test_json_nested_struct_projection_pushdown.test
 test/sql/json/test_json_bool.test
+test/sql/json/test_json_copy_dateformat_error.test
 test/sql/json/test_json_macros.test
 test/sql/json/test_json_persistence.test
 test/sql/json/test_json_sqlite.test

@@ -1117,6 +1117,8 @@ pub struct CsvWriteOptions {
     pub suffix: String,
     /// the columns that are always quoted, by position
     pub force_quote: Vec<bool>,
+    /// `PARTITION_BY`: a directory of files, one per partition
+    pub partitioning: Option<super::parquet::Partitioning>,
 }
 
 impl Default for CsvWriteOptions {
@@ -1136,6 +1138,7 @@ impl Default for CsvWriteOptions {
             prefix: String::new(),
             suffix: String::new(),
             force_quote: Vec::new(),
+            partitioning: None,
         }
     }
 }
@@ -1171,27 +1174,42 @@ impl CsvWriteOptions {
     }
 
     pub fn write_header(&self, out: &mut Vec<u8>, names: &[String]) {
+        let columns: Vec<usize> = (0..names.len()).collect();
+        self.write_header_of(out, names, &columns);
+    }
+
+    /// The header of a file that holds `columns` of the rows.
+    pub fn write_header_of(&self, out: &mut Vec<u8>, names: &[String], columns: &[usize]) {
         if !self.prefix.is_empty() {
             out.extend_from_slice(self.prefix.as_bytes());
         }
         if !self.header {
             return;
         }
-        for (i, name) in names.iter().enumerate() {
+        for (i, &column) in columns.iter().enumerate() {
             if i > 0 {
                 out.extend_from_slice(&self.delimiter);
             }
-            self.write_value(out, name.as_bytes(), self.force_quote.get(i).copied().unwrap_or(false));
+            let force = self.force_quote.get(column).copied().unwrap_or(false);
+            self.write_value(out, names[column].as_bytes(), force);
         }
         out.extend_from_slice(self.new_line.as_bytes());
     }
 
     /// A value as text: with the format of its type, if there is one.
     fn formatted(&self, value: &Value) -> Result<String> {
+        match self.formatted_temporal(value)? {
+            Some(text) => Ok(text),
+            None => value.try_to_string(),
+        }
+    }
+
+    /// A date or timestamp in the format the COPY gave for its type, if it gave one.
+    fn formatted_temporal(&self, value: &Value) -> Result<Option<String>> {
         const MICROS_PER_DAY: i64 = 86_400_000_000;
         match (value.logical_type().id(), value.data()) {
             (LogicalTypeId::Date, ValueData::Int32(days)) if self.date_format.is_some() => {
-                strftime_text(self.date_format.as_deref().unwrap_or_default(), *days, 0, false)
+                strftime_text(self.date_format.as_deref().unwrap_or_default(), *days, 0, false).map(Some)
             }
             (LogicalTypeId::Timestamp | LogicalTypeId::TimestampTz, ValueData::Int64(micros))
                 if self.timestamp_format.is_some() =>
@@ -1202,28 +1220,48 @@ impl CsvWriteOptions {
                     micros.rem_euclid(MICROS_PER_DAY),
                     value.logical_type().id() == LogicalTypeId::TimestampTz,
                 )
+                .map(Some)
             }
-            _ => value.try_to_string(),
+            _ => Ok(None),
         }
     }
 
     pub fn write_chunk(&self, out: &mut Vec<u8>, chunk: &DataChunk) -> Result<()> {
+        let rows: Vec<usize> = (0..chunk.len()).collect();
+        let columns: Vec<usize> = (0..chunk.column_count()).collect();
+        self.write_rows(out, chunk, &rows, &columns, &self.json_rows)
+    }
+
+    /// Writes `columns` of `rows` of `chunk`; `json_rows` counts the JSON objects of the file so far.
+    pub fn write_rows(
+        &self,
+        out: &mut Vec<u8>,
+        chunk: &DataChunk,
+        rows: &[usize],
+        columns: &[usize],
+        json_rows: &std::sync::atomic::AtomicU64,
+    ) -> Result<()> {
         if let Some(names) = &self.json_names {
-            for row in 0..chunk.len() {
-                let mut items = Vec::with_capacity(names.len());
-                for (column, name) in names.iter().enumerate() {
-                    items.push((name.clone(), value_to_json(&chunk.get_value(column, row))?));
+            for &row in rows {
+                let mut items = Vec::with_capacity(columns.len());
+                for &column in columns {
+                    let value = chunk.get_value(column, row);
+                    let value = match self.formatted_temporal(&value)? {
+                        Some(text) => Value::varchar(text),
+                        None => value,
+                    };
+                    items.push((names[column].clone(), value_to_json(&value)?));
                 }
-                if self.json_rows.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0 {
+                if json_rows.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0 {
                     out.extend_from_slice(self.new_line.as_bytes());
                 }
                 out.extend_from_slice(Json::Object(items).text().as_bytes());
             }
             return Ok(());
         }
-        for row in 0..chunk.len() {
-            for column in 0..chunk.columns().len() {
-                if column > 0 {
+        for &row in rows {
+            for (i, &column) in columns.iter().enumerate() {
+                if i > 0 {
                     out.extend_from_slice(&self.delimiter);
                 }
                 let value = chunk.get_value(column, row);

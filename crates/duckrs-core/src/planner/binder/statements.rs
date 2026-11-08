@@ -1892,6 +1892,12 @@ impl Binder<'_> {
                 }
                 if let ExprKind::Function(call) = &function.kind
                     && call.name.qualification.is_empty()
+                    && matches!(call.name.name.to_lowercase().as_str(), "read_text" | "read_blob")
+                {
+                    return self.bind_read_file(call, table_ref);
+                }
+                if let ExprKind::Function(call) = &function.kind
+                    && call.name.qualification.is_empty()
                     && call.name.name.eq_ignore_ascii_case("sniff_csv")
                 {
                     return self.bind_sniff_csv(call, table_ref);

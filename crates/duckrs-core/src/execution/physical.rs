@@ -591,8 +591,9 @@ pub struct PhysicalCopyToFile {
     children: Vec<Box<dyn PhysicalOperator>>,
     path: String,
     names: Vec<String>,
-    /// opened by the first row or at the end, so that planning alone (EXPLAIN) leaves the file be
-    writer: Mutex<Option<CopyWriter>>,
+    /// opened by the first row or at the end, so that planning alone (EXPLAIN) leaves the file be;
+    /// by the directory of a partition, or `""` without partitions, with the JSON objects of the file so far
+    writers: Mutex<HashMap<String, (CopyWriter, std::sync::atomic::AtomicU64)>>,
     gzip: bool,
     rows: std::sync::atomic::AtomicU64,
     /// the logger of the statement, for the file it writes
@@ -614,39 +615,62 @@ impl PhysicalCopyToFile {
             children,
             path,
             names,
-            writer: Mutex::new(None),
+            writers: Mutex::new(HashMap::new()),
             gzip,
             rows: std::sync::atomic::AtomicU64::new(0),
             logger: crate::logging::current_file_logger(),
         }
     }
 
-    fn with_writer(&self, f: impl FnOnce(&mut CopyWriter) -> Result<()>) -> Result<()> {
-        let mut writer = self.writer.lock();
-        if writer.is_none() {
-            let file = std::fs::File::create(&self.path)
-                .map_err(|e| Error::new(ErrorKind::Io, format!("Cannot open file \"{}\": {e}", self.path)))?;
-            crate::logging::log_file_system_to(self.logger.as_ref(), &self.path, "OPEN", None);
-            let file = std::io::BufWriter::new(LoggedFile {
-                file,
-                path: self.path.clone(),
-                position: 0,
-                logger: self.logger.clone(),
-            });
-            let mut opened = if self.gzip {
-                CopyWriter::Gzip(Box::new(flate2::write::GzEncoder::new(
-                    file,
-                    flate2::Compression::default(),
-                )))
-            } else {
-                CopyWriter::Plain(file)
-            };
-            let mut header = Vec::new();
-            self.options.write_header(&mut header, &self.names);
-            write_all(&mut opened, &header)?;
-            *writer = Some(opened);
+    /// The columns that go in a file, by their position in the rows.
+    fn written_columns(&self) -> Vec<usize> {
+        match &self.options.partitioning {
+            Some(partitioning) => partitioning.written_columns(self.names.len()),
+            None => (0..self.names.len()).collect(),
         }
-        f(writer.as_mut().expect("just opened"))
+    }
+
+    fn open(&self, path: &str) -> Result<CopyWriter> {
+        let file = std::fs::File::create(path)
+            .map_err(|e| Error::new(ErrorKind::Io, format!("Cannot open file \"{path}\": {e}")))?;
+        crate::logging::log_file_system_to(self.logger.as_ref(), path, "OPEN", None);
+        let file = std::io::BufWriter::new(LoggedFile {
+            file,
+            path: path.to_string(),
+            position: 0,
+            logger: self.logger.clone(),
+        });
+        let mut opened = if self.gzip {
+            CopyWriter::Gzip(Box::new(flate2::write::GzEncoder::new(
+                file,
+                flate2::Compression::default(),
+            )))
+        } else {
+            CopyWriter::Plain(file)
+        };
+        let mut header = Vec::new();
+        self.options
+            .write_header_of(&mut header, &self.names, &self.written_columns());
+        write_all(&mut opened, &header)?;
+        Ok(opened)
+    }
+
+    /// Writes `rows` of `chunk` to the file of `directory` (`""` without partitions).
+    fn write_rows(&self, directory: &str, chunk: &DataChunk, rows: &[usize]) -> Result<()> {
+        let mut writers = self.writers.lock();
+        if !writers.contains_key(directory) {
+            let path = match &self.options.partitioning {
+                Some(partitioning) => partitioning.create_file_path(directory)?,
+                None => self.path.clone(),
+            };
+            let writer = self.open(&path)?;
+            writers.insert(directory.to_string(), (writer, std::sync::atomic::AtomicU64::new(0)));
+        }
+        let (writer, json_rows) = writers.get_mut(directory).expect("just opened");
+        let mut out = Vec::new();
+        self.options
+            .write_rows(&mut out, chunk, rows, &self.written_columns(), json_rows)?;
+        write_all(writer, &out)
     }
 }
 
@@ -670,20 +694,43 @@ impl PhysicalOperator for PhysicalCopyToFile {
         true
     }
     fn sink(&self, chunk: &DataChunk) -> Result<()> {
-        let mut out = Vec::new();
-        self.options.write_chunk(&mut out, chunk)?;
-        self.with_writer(|writer| write_all(writer, &out))?;
+        match &self.options.partitioning {
+            Some(partitioning) => {
+                for (directory, rows) in partitioning.group_rows(&self.path, &self.names, chunk)? {
+                    self.write_rows(&directory, chunk, &rows)?;
+                }
+            }
+            None => {
+                let rows: Vec<usize> = (0..chunk.len()).collect();
+                self.write_rows("", chunk, &rows)?;
+            }
+        }
         self.rows
             .fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
     fn finalize(&self) -> Result<()> {
-        self.with_writer(|writer| write_all(writer, self.options.suffix.as_bytes()))?;
-        let finished = match self.writer.lock().take().expect("just opened") {
-            CopyWriter::Plain(mut writer) => std::io::Write::flush(&mut writer),
-            CopyWriter::Gzip(writer) => writer.finish().and_then(|mut file| std::io::Write::flush(&mut file)),
-        };
-        finished.map_err(|e| Error::new(ErrorKind::Io, format!("Could not write file: {e}")))
+        let mut writers = self.writers.lock();
+        if writers.is_empty() {
+            if self.options.partitioning.is_some() {
+                return std::fs::create_dir_all(&self.path)
+                    .map_err(|e| Error::new(ErrorKind::Io, format!("Cannot create directory \"{}\": {e}", self.path)));
+            }
+            let writer = self.open(&self.path)?;
+            writers.insert(String::new(), (writer, std::sync::atomic::AtomicU64::new(0)));
+        }
+        let mut directories: Vec<String> = writers.keys().cloned().collect();
+        directories.sort();
+        for directory in directories {
+            let (mut writer, _) = writers.remove(&directory).expect("listed");
+            write_all(&mut writer, self.options.suffix.as_bytes())?;
+            let finished = match writer {
+                CopyWriter::Plain(mut writer) => std::io::Write::flush(&mut writer),
+                CopyWriter::Gzip(writer) => writer.finish().and_then(|mut file| std::io::Write::flush(&mut file)),
+            };
+            finished.map_err(|e| Error::new(ErrorKind::Io, format!("Could not write file: {e}")))?;
+        }
+        Ok(())
     }
     fn is_source(&self) -> bool {
         true

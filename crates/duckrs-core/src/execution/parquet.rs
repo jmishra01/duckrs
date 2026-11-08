@@ -555,6 +555,55 @@ impl Default for ParquetWriteOptions {
     }
 }
 
+impl Partitioning {
+    /// The columns that go in a file, of `count`, by their position in the rows.
+    pub fn written_columns(&self, count: usize) -> Vec<usize> {
+        (0..count)
+            .filter(|column| self.write_columns || !self.columns.contains(column))
+            .collect()
+    }
+
+    /// The directory of a row's partition, under `path`.
+    pub fn directory(&self, path: &str, names: &[String], chunk: &DataChunk, row: usize) -> Result<String> {
+        let mut directory = path.to_string();
+        for &column in &self.columns {
+            let value = chunk.get_value(column, row);
+            let text = if value.is_null() {
+                "__HIVE_DEFAULT_PARTITION__".to_string()
+            } else {
+                hive_escape(&value.try_to_string()?)
+            };
+            directory += &format!("/{}={text}", hive_escape(&names[column]));
+        }
+        Ok(directory)
+    }
+
+    /// The rows of `chunk`, grouped by the directory of their partition, in the order they first appear.
+    pub fn group_rows(&self, path: &str, names: &[String], chunk: &DataChunk) -> Result<Vec<(String, Vec<usize>)>> {
+        let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
+        for row in 0..chunk.len() {
+            let directory = self.directory(path, names, chunk, row)?;
+            match index.get(&directory) {
+                Some(&at) => groups[at].1.push(row),
+                None => {
+                    index.insert(directory.clone(), groups.len());
+                    groups.push((directory, vec![row]));
+                }
+            }
+        }
+        Ok(groups)
+    }
+
+    /// Creates the directory of a partition, and says the path of its file.
+    pub fn create_file_path(&self, directory: &str) -> Result<String> {
+        std::fs::create_dir_all(directory)
+            .map_err(|e| Error::new(ErrorKind::Io, format!("Cannot create directory \"{directory}\": {e}")))?;
+        let name = self.filename_pattern.replace("{i}", "0");
+        Ok(format!("{directory}/{name}.{}", self.extension))
+    }
+}
+
 /// `HivePartitioning::Escape`
 fn hive_escape(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
@@ -885,12 +934,9 @@ impl PhysicalCopyToParquet {
 
     /// The columns that go in a file, by their position in the rows.
     fn written_columns(&self) -> Vec<usize> {
-        let all = 0..self.names.len();
         match &self.options.partitioning {
-            Some(partitioning) if !partitioning.write_columns => {
-                all.filter(|column| !partitioning.columns.contains(column)).collect()
-            }
-            _ => all.collect(),
+            Some(partitioning) => partitioning.written_columns(self.names.len()),
+            None => (0..self.names.len()).collect(),
         }
     }
 
@@ -933,34 +979,13 @@ impl PhysicalCopyToParquet {
         ArrowWriter::try_new(file, self.schema()?, Some(properties.build())).map_err(|e| self.failed(e))
     }
 
-    /// The directory of a row's partition, under the path of the COPY.
-    fn partition_directory(&self, partitioning: &Partitioning, chunk: &DataChunk, row: usize) -> Result<String> {
-        let mut directory = self.path.clone();
-        for &column in &partitioning.columns {
-            let value = chunk.get_value(column, row);
-            let text = if value.is_null() {
-                "__HIVE_DEFAULT_PARTITION__".to_string()
-            } else {
-                hive_escape(&value.try_to_string()?)
-            };
-            directory += &format!("/{}={text}", hive_escape(&self.names[column]));
-        }
-        Ok(directory)
-    }
-
     /// Writes `rows` of `chunk` to the file of `directory`.
     fn write_rows(&self, directory: &str, chunk: &DataChunk, rows: &[usize]) -> Result<()> {
         let types = self.children[0].types();
         let mut writers = self.writers.lock();
         if !writers.contains_key(directory) {
             let path = match &self.options.partitioning {
-                Some(partitioning) => {
-                    std::fs::create_dir_all(directory).map_err(|e| {
-                        Error::new(ErrorKind::Io, format!("Cannot create directory \"{directory}\": {e}"))
-                    })?;
-                    let name = partitioning.filename_pattern.replace("{i}", "0");
-                    format!("{directory}/{name}.{}", partitioning.extension)
-                }
+                Some(partitioning) => partitioning.create_file_path(directory)?,
                 None => self.path.clone(),
             };
             let writer = self.create(&path)?;
@@ -994,15 +1019,7 @@ impl PhysicalOperator for PhysicalCopyToParquet {
     fn sink(&self, chunk: &DataChunk) -> Result<()> {
         match &self.options.partitioning {
             Some(partitioning) => {
-                let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
-                for row in 0..chunk.len() {
-                    let directory = self.partition_directory(partitioning, chunk, row)?;
-                    match groups.iter_mut().find(|(d, _)| *d == directory) {
-                        Some((_, rows)) => rows.push(row),
-                        None => groups.push((directory, vec![row])),
-                    }
-                }
-                for (directory, rows) in groups {
+                for (directory, rows) in partitioning.group_rows(&self.path, &self.names, chunk)? {
                     self.write_rows(&directory, chunk, &rows)?;
                 }
             }

@@ -15,6 +15,7 @@ use crate::execution::csv::{
 use crate::execution::csv_sniffer::{Parsing, Sniffed, can_cast, sniff};
 use crate::execution::csv_state_machine::NewLine;
 use crate::execution::file_system::{self, Compression};
+use crate::execution::parquet::Partitioning;
 use crate::function::combine_types::force_max_logical_type;
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
@@ -1261,8 +1262,9 @@ impl Binder<'_> {
         })
     }
 
-    /// `Binder::BindCopyTo`.
-    fn bind_copy_to(&mut self, info: &CopyInfo, path: String, tsv: bool) -> Result<BoundStatement> {
+    /// The query of a COPY TO, sorted by its `ORDER BY` option (`ParseOrderByColumns`), with the checks of
+    /// `ValidateCopyToOptionCombinations` on the options that shape the files.
+    pub(super) fn copy_to_select(&mut self, info: &CopyInfo) -> Result<SelectStatement> {
         let select = match &info.select {
             Some(query) => SelectStatement {
                 node: (**query).clone(),
@@ -1277,6 +1279,56 @@ impl Binder<'_> {
                 parse_select(&format!("SELECT {columns} FROM {}", info.table), "Expected a table")?
             }
         };
+        let options = self.copy_options(info)?;
+        let given = |name: &str| options.iter().find(|(n, _)| n == name).map(|(_, v)| v);
+        let flag = |name: &str| -> Result<bool> {
+            match given(name) {
+                Some(value) => is_true(value, name),
+                None => Ok(false),
+            }
+        };
+        let partitioned = given("partition_by").is_some() || given("partitioned_by").is_some();
+        let order_by = given("order_by");
+        if given("use_tmp_file").is_some() {
+            if flag("per_thread_output")? {
+                return Err(Error::not_implemented(
+                    "Can't combine USE_TMP_FILE and PER_THREAD_OUTPUT for COPY",
+                ));
+            }
+            if partitioned {
+                return Err(Error::not_implemented(
+                    "Can't combine USE_TMP_FILE and PARTITIONED BY for COPY",
+                ));
+            }
+            if order_by.is_some() {
+                return Err(Error::not_implemented(
+                    "Can't combine USE_TMP_FILE and ORDER BY for COPY",
+                ));
+            }
+        }
+        if flag("per_thread_output")? && partitioned {
+            return Err(Error::not_implemented(
+                "Can't combine PER_THREAD_OUTPUT and PARTITIONED BY for COPY",
+            ));
+        }
+        let Some(order_by) = order_by else {
+            return Ok(select);
+        };
+        if flag("per_thread_output")? {
+            return Err(Error::not_implemented(
+                "Can't combine PER_THREAD_OUTPUT and ORDER BY for COPY",
+            ));
+        }
+        let clause = strings(order_by)?.join(", ");
+        parse_select(
+            &format!("SELECT * FROM ({select}) __copy_input ORDER BY {clause}"),
+            "Expected a single SELECT statement",
+        )
+    }
+
+    /// `Binder::BindCopyTo`.
+    fn bind_copy_to(&mut self, info: &CopyInfo, path: String, tsv: bool) -> Result<BoundStatement> {
+        let select = self.copy_to_select(info)?;
         let mut options = CsvWriteOptions::default();
         if tsv {
             options.delimiter = b"\t".to_vec();
@@ -1294,9 +1346,13 @@ impl Binder<'_> {
             options.new_line = "\n".to_string();
             options.suffix = "\n".to_string();
         }
+        let mut partition = PartitionOptions::default();
         for (name, value) in copy_options {
+            if partition.take(&name, &value)? {
+                continue;
+            }
             match name.as_str() {
-                "format" => {}
+                "format" | "order_by" => {}
                 "array" if self.copy_json => {
                     if is_true(&value, &name)? {
                         options.prefix = "[\n\t".to_string();
@@ -1346,6 +1402,11 @@ impl Binder<'_> {
         if compression == Compression::Zstd {
             return Err(crate::unported("writing zstd files"));
         }
+        let mut extension = if self.copy_json { "json" } else { "csv" }.to_string();
+        if compression == Compression::Gzip {
+            extension += ".gz";
+        }
+        options.partitioning = partition.bind(&path, &bound.names, &extension)?;
         let plan = LogicalOperator::new(
             LogicalOperatorKind::CopyToFile {
                 path,
@@ -1362,6 +1423,78 @@ impl Binder<'_> {
             column_aliases: Vec::new(),
             return_type: StatementReturnType::ChangedRows,
         })
+    }
+}
+
+/// The options of a COPY TO that write a directory of hive partitions (`PARTITION_BY` and friends).
+#[derive(Default)]
+pub(super) struct PartitionOptions {
+    columns: Option<Vec<String>>,
+    write_columns: bool,
+    overwrite_or_ignore: bool,
+    overwrite: bool,
+    filename_pattern: Option<String>,
+    extension: Option<String>,
+}
+
+impl PartitionOptions {
+    /// Takes the option `name`, if it is one of these.
+    pub(super) fn take(&mut self, name: &str, value: &Value) -> Result<bool> {
+        match name {
+            "partition_by" | "partitioned_by" => self.columns = Some(strings(value)?),
+            "write_partition_columns" => self.write_columns = is_true(value, name)?,
+            "overwrite_or_ignore" => self.overwrite_or_ignore = is_true(value, name)?,
+            "overwrite" => self.overwrite = is_true(value, name)?,
+            "filename_pattern" => self.filename_pattern = Some(value.try_to_string()?),
+            "file_extension" => self.extension = Some(value.try_to_string()?),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// The partitioning of a COPY to `path` of columns `names`, after clearing the directory if told to.
+    pub(super) fn bind(self, path: &str, names: &[String], extension: &str) -> Result<Option<Partitioning>> {
+        let Some(wanted) = self.columns else {
+            return Ok(None);
+        };
+        if wanted.is_empty() {
+            return Err(binder_error("PARTITION_BY cannot be empty"));
+        }
+        let mut columns = Vec::with_capacity(wanted.len());
+        let star = wanted.len() == 1 && wanted[0] == "*";
+        if star {
+            columns.extend(0..names.len());
+        }
+        for column in wanted.iter().filter(|_| !star) {
+            let Some(found) = names.iter().position(|n| n.eq_ignore_ascii_case(column)) else {
+                return Err(binder_error(format!("Partition by column \"{column}\" not found")));
+            };
+            columns.push(found);
+        }
+        if columns.len() == names.len() && !self.write_columns {
+            return Err(Error::not_implemented(
+                "No column to write as all columns are specified as partition columns. WRITE_PARTITION_COLUMNS \
+                 option can be used to write partition columns.",
+            ));
+        }
+        let occupied = std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some());
+        if occupied && !self.overwrite_or_ignore {
+            if self.overwrite {
+                std::fs::remove_dir_all(path)
+                    .map_err(|e| Error::new(ErrorKind::Io, format!("Could not clear \"{path}\": {e}")))?;
+            } else {
+                return Err(Error::new(
+                    ErrorKind::Io,
+                    format!("Directory \"{path}\" is not empty! Enable OVERWRITE option to overwrite files"),
+                ));
+            }
+        }
+        Ok(Some(Partitioning {
+            columns,
+            write_columns: self.write_columns,
+            filename_pattern: self.filename_pattern.unwrap_or_else(|| "data_{i}".to_string()),
+            extension: self.extension.unwrap_or_else(|| extension.to_string()),
+        }))
     }
 }
 
@@ -1454,4 +1587,100 @@ fn verify_not_extension(path: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+impl Binder<'_> {
+    /// `read_text` and `read_blob` (`DirectMultiFileInfo`): a row for each file, with its name, content, size and
+    /// modification time. A pattern may match no files.
+    pub(super) fn bind_read_file(&mut self, call: &FunctionExpr, table_ref: &TableRef) -> Result<LogicalOperator> {
+        let name = call.name.name.to_lowercase();
+        let text = name == "read_text";
+        let args: Vec<_> = call.args.iter().map(named_argument).collect();
+        let mut patterns = Vec::new();
+        for argument in &args {
+            let value = self.constant_argument(&argument.expr)?;
+            if !argument.name.is_empty() {
+                let option = &argument.name;
+                return Err(binder_error(format!(
+                    "Invalid named parameter \"{option}\" for function {name}"
+                )));
+            }
+            if value.is_null() {
+                return Err(binder_error(format!("{name} cannot take NULL as parameter")));
+            }
+            patterns.extend(strings(&value)?);
+        }
+        if patterns.is_empty() {
+            return Err(binder_error(format!("{name} requires a file name")));
+        }
+        let mut files = Vec::new();
+        for pattern in &patterns {
+            files.extend(file_system::glob(pattern));
+        }
+        let content_type = if text { LogicalType::VARCHAR } else { LogicalType::BLOB };
+        let mut names = ["filename", "content", "size", "last_modified"]
+            .map(String::from)
+            .to_vec();
+        let hive = hive_columns(&files, None, &names)?;
+        let mut rows = Vec::with_capacity(files.len());
+        for file in files {
+            let mut partitions = Vec::with_capacity(hive.len());
+            let parts = hive_parts(&file);
+            for (key, ty) in &hive {
+                let value = parts
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                    .and_then(|(_, v)| v.clone());
+                let mut strings = duckrs_common::vector::Vector::new(LogicalType::VARCHAR, 1);
+                strings.set_value(0, &value.map_or(Value::null(LogicalType::VARCHAR), Value::varchar))?;
+                let mut typed = duckrs_common::vector::Vector::new(ty.clone(), 1);
+                crate::function::cast::cast_vector(&strings, &mut typed, 1, crate::function::cast::CastMode::Strict)?;
+                partitions.push(typed.get_value(0));
+            }
+            let io = |e: std::io::Error| Error::new(ErrorKind::Io, format!("Cannot open file \"{file}\": {e}"));
+            let bytes = std::fs::read(&file).map_err(io)?;
+            let metadata = std::fs::metadata(&file).map_err(io)?;
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|since| since.as_micros() as i64)
+                .unwrap_or(0);
+            let size = bytes.len() as i64;
+            let content = if text {
+                match String::from_utf8(bytes) {
+                    Ok(content) => Value::varchar(content),
+                    Err(_) => {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "read_text: could not read content of file '{file}' as valid UTF-8 encoded text. \
+                                 You may want to use read_blob instead."
+                            ),
+                        ));
+                    }
+                }
+            } else {
+                Value::blob(bytes)
+            };
+            rows.push(vec![
+                Value::varchar(file),
+                content,
+                Value::bigint(size),
+                Value::timestamp_tz(duckrs_common::types::Timestamp(modified)),
+            ]);
+            rows.last_mut().expect("just pushed").extend(partitions);
+        }
+        let mut types = vec![
+            LogicalType::VARCHAR,
+            content_type,
+            LogicalType::BIGINT,
+            LogicalType::new(LogicalTypeId::TimestampTz),
+        ];
+        for (key, ty) in hive {
+            names.push(key);
+            types.push(ty);
+        }
+        self.bind_rows(table_ref, &name, names, types, rows)
+    }
 }
