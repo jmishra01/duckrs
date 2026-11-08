@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 3686 of 6367 test files pass (**60.9%**). The v1 target is ≥ 90%.
+- Overall: 3696 of 6367 test files pass (**61.1%**). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -23,6 +23,13 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] `PER_THREAD_OUTPUT`, `FILE_SIZE_BYTES`, `APPEND`, `PARTITION_PATH`, `RETURN_STATS`
   - [ ] COPY formats `blob` and `tbl`, writing zstd
 - [ ] 2. JSON: `read_json`/`read_json_auto`, the JSON type, JSON functions (`sql/json`: 95 failing, 34.9%)
+  - [x] `json_normalize`, `json_deep_merge`, `json_merge_patch_diff`
+  - [x] `json_each` / `json_tree`, with columns as arguments (LATERAL) and the hidden `json`, `root`, `rowid`
+  - [x] escaped quotes and backslashes in quoted JSON path keys; no wildcards in `json_set`/`json_remove`/...
+  - [ ] documents nested deeper than 4096 levels: the parser and printer recurse, C++'s yyjson does not
+  - [ ] `json_serialize_sql` / `json_deserialize_sql` / `json_execute_serialized_sql` / `json_serialize_plan` (~20 files): needs an AST serializer
+  - [ ] GeoJSON (`read_json` geojson, `ST_AsGeoJSON`, `json_geometry_format`): needs the GEOMETRY type
+  - [ ] `json_group_object`/`json_group_array` as window functions (they are macros today)
 - [ ] 3. Parquet reader/writer: missing types, filter/statistics pushdown, corrupt-file errors, delta encoding (`parquet*`: ~53 failing)
 - [ ] 4. Parquet VARIANT, including shredding (`parquet/variant`: 47 failing, 0%)
 - [ ] 5. `EXPORT DATABASE` / `IMPORT DATABASE` (`sql/export`: 27 failing, 0%)

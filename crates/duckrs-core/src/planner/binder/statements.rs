@@ -1894,6 +1894,12 @@ impl Binder<'_> {
                 }
                 if let ExprKind::Function(call) = &function.kind
                     && call.name.qualification.is_empty()
+                    && matches!(call.name.name.to_lowercase().as_str(), "json_each" | "json_tree")
+                {
+                    return self.bind_json_table_in_out(call, table_ref);
+                }
+                if let ExprKind::Function(call) = &function.kind
+                    && call.name.qualification.is_empty()
                     && matches!(call.name.name.to_lowercase().as_str(), "read_text" | "read_blob")
                 {
                     return self.bind_read_file(call, table_ref);
