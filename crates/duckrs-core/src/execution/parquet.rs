@@ -15,7 +15,7 @@ use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow::datatypes::{
     self as adt, ArrowPrimitiveType, DataType, Field, FieldRef, Fields, IntervalMonthDayNano, Schema, TimeUnit,
 };
-use duckrs_common::types::{Date, Interval, LogicalType, LogicalTypeId, Time, Timestamp};
+use duckrs_common::types::{Date, Interval, LogicalType, LogicalTypeId, Time, TimeTz, Timestamp};
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, Vector};
 use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
@@ -52,6 +52,8 @@ pub struct ParquetScanData {
     pub names: Vec<String>,
     pub types: Vec<LogicalType>,
     pub binary_as_string: bool,
+    /// `int96_as`
+    pub int96_as: Int96As,
     pub union_by_name: bool,
     pub file_row_number: bool,
     pub filename: bool,
@@ -163,15 +165,60 @@ fn logical_type(field: &Field, binary_as_string: bool) -> Result<LogicalType> {
     })
 }
 
+/// What `read_parquet` makes of INT96 columns (`int96_as`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Int96As {
+    /// microseconds, the nanoseconds cut off
+    #[default]
+    Timestamp,
+    TimestampNs,
+    /// `STRUCT(date DATE, time TIME_NS)`, all of the value
+    Struct,
+}
+
+/// Which top-level columns of a file are INT96 (Impala timestamps), which the crate reads as nanoseconds.
+fn int96_columns(builder: &ParquetRecordBatchReaderBuilder<File>) -> Vec<bool> {
+    builder
+        .parquet_schema()
+        .root_schema()
+        .get_fields()
+        .iter()
+        .map(|field| field.is_primitive() && field.get_physical_type() == parquet::basic::Type::INT96)
+        .collect()
+}
+
+/// The DuckDB type of top-level column `index` of a file: INT96 by `int96_as`, the rest by [`logical_type`].
+fn column_type(
+    field: &Field,
+    int96: &[bool],
+    index: usize,
+    binary_as_string: bool,
+    int96_as: Int96As,
+) -> Result<LogicalType> {
+    if int96.get(index).copied().unwrap_or(false) {
+        return Ok(match int96_as {
+            Int96As::Timestamp => LogicalType::TIMESTAMP,
+            Int96As::TimestampNs => LogicalType::new(LogicalTypeId::TimestampNs),
+            Int96As::Struct => LogicalType::struct_type(vec![
+                ("date".to_string(), LogicalType::DATE),
+                ("time".to_string(), LogicalType::new(LogicalTypeId::TimeNs)),
+            ]),
+        });
+    }
+    logical_type(field, binary_as_string)
+}
+
 /// The names and types of a file's columns.
-pub fn file_schema(path: &str, binary_as_string: bool) -> Result<(Vec<String>, Vec<LogicalType>)> {
+pub fn file_schema(path: &str, binary_as_string: bool, int96_as: Int96As) -> Result<(Vec<String>, Vec<LogicalType>)> {
     let builder = open_builder(path)?;
+    let int96 = int96_columns(&builder);
     let schema = builder.schema();
     let names = schema.fields().iter().map(|f| f.name().clone()).collect();
     let types = schema
         .fields()
         .iter()
-        .map(|f| logical_type(f, binary_as_string))
+        .enumerate()
+        .map(|(i, f)| column_type(f, &int96, i, binary_as_string, int96_as))
         .collect::<Result<_>>()?;
     Ok((names, types))
 }
@@ -194,6 +241,19 @@ fn binary_value(bytes: &[u8], ty: &LogicalType) -> Result<Value> {
 }
 
 fn timestamp_value(value: i64, unit: &TimeUnit, ty: &LogicalType) -> Result<Value> {
+    if ty.id() == LogicalTypeId::Struct && *unit == TimeUnit::Nanosecond {
+        // `int96_as = 'struct'`: the day, and the nanoseconds into it
+        const NANOS_PER_DAY: i64 = 86_400_000_000_000;
+        let date = Value::date(Date(value.div_euclid(NANOS_PER_DAY) as i32));
+        let time = Value::new(
+            LogicalType::new(LogicalTypeId::TimeNs),
+            ValueData::Int64(value.rem_euclid(NANOS_PER_DAY)),
+        )?;
+        return Ok(Value::struct_value(vec![
+            ("date".to_string(), date),
+            ("time".to_string(), time),
+        ]));
+    }
     if ty.id() == LogicalTypeId::TimestampNs {
         return Value::new(ty.clone(), ValueData::Int64(value));
     }
@@ -379,6 +439,7 @@ impl std::fmt::Debug for ParquetScanState {
 
 fn open_file(scan: &ParquetScanData, state: &mut ParquetScanState, path: &str) -> Result<()> {
     let builder = open_builder(path)?.with_batch_size(STANDARD_VECTOR_SIZE);
+    let int96 = int96_columns(&builder);
     let schema = Arc::clone(builder.schema());
     let names: Vec<&String> = schema.fields().iter().map(|f| f.name()).collect();
     let mut mapping = Vec::with_capacity(scan.names.len());
@@ -395,7 +456,13 @@ fn open_file(scan: &ParquetScanData, state: &mut ParquetScanState, path: &str) -
             )));
         }
         file_types.push(match found {
-            Some(column) => logical_type(schema.field(column), scan.binary_as_string)?,
+            Some(column) => column_type(
+                schema.field(column),
+                &int96,
+                column,
+                scan.binary_as_string,
+                scan.int96_as,
+            )?,
             None => LogicalType::SQLNULL,
         });
         mapping.push(found);
@@ -1130,13 +1197,201 @@ fn statistics_text(stats: &Statistics) -> (Option<String>, Option<String>, Optio
     )
 }
 
+/// `ParquetStatisticsUtils::ConvertValueInternal`, as text: a statistic of a column, by the DuckDB type that the
+/// column reads as. `None` where C++ gives NULL: values that don't fit the type, or infinities.
+fn statistic_text(column: &parquet::schema::types::ColumnDescriptor, bytes: &[u8]) -> Option<String> {
+    use parquet::basic::{ConvertedType, LogicalType as Logical, TimeUnit as Unit, Type as Physical};
+    const MICROS_PER_DAY: i64 = 86_400_000_000;
+    let i32_of = |b: &[u8]| b.try_into().ok().map(i32::from_le_bytes);
+    let i64_of = |b: &[u8]| b.try_into().ok().map(i64::from_le_bytes);
+    let decimal = |unscaled: i128| -> Option<String> {
+        let (precision, scale) = (column.type_precision(), column.type_scale());
+        if !(1..=38).contains(&precision) {
+            return None;
+        }
+        let limit = 10i128.checked_pow(precision as u32)?;
+        if unscaled >= limit || unscaled <= -limit {
+            return None;
+        }
+        Value::decimal(unscaled, precision as u8, scale.max(0) as u8)
+            .ok()?
+            .try_to_string()
+            .ok()
+    };
+    // big-endian two's complement, as decimals in byte arrays are
+    let big_endian = |b: &[u8]| -> Option<i128> {
+        if b.is_empty() || b.len() > 16 {
+            return None;
+        }
+        let mut value: i128 = if b[0] & 0x80 != 0 { -1 } else { 0 };
+        for &byte in b {
+            value = (value << 8) | i128::from(byte);
+        }
+        Some(value)
+    };
+    let blob = |b: &[u8]| Value::blob(b.to_vec()).try_to_string().ok();
+    let logical = column.logical_type_ref();
+    let converted = column.converted_type();
+    let is_decimal = matches!(logical, Some(Logical::Decimal(_))) || converted == ConvertedType::DECIMAL;
+    let shown = |value: Value| value.try_to_string().ok();
+    match column.physical_type() {
+        Physical::BOOLEAN => Some((bytes.first()? != &0).to_string()),
+        Physical::INT32 => {
+            let value = i32_of(bytes)?;
+            if is_decimal {
+                return decimal(i128::from(value));
+            }
+            match (logical, converted) {
+                (Some(Logical::Integer(int)), _) if !int.is_signed => Some((value as u32).to_string()),
+                (_, ConvertedType::UINT_8 | ConvertedType::UINT_16 | ConvertedType::UINT_32) => {
+                    Some((value as u32).to_string())
+                }
+                (Some(Logical::Date), _) | (_, ConvertedType::DATE) => shown(Value::date(Date(value))),
+                (Some(Logical::Time(time)), _) => {
+                    let micros = i64::from(value) * 1000;
+                    if !(0..=MICROS_PER_DAY).contains(&micros) && !time.is_adjusted_to_u_t_c {
+                        return None;
+                    }
+                    if time.is_adjusted_to_u_t_c {
+                        shown(Value::time_tz(TimeTz::new(Time(micros), 0)))
+                    } else {
+                        shown(Value::time(Time(micros)))
+                    }
+                }
+                (_, ConvertedType::TIME_MILLIS) => {
+                    let micros = i64::from(value) * 1000;
+                    (0..=MICROS_PER_DAY)
+                        .contains(&micros)
+                        .then(|| shown(Value::time(Time(micros))))?
+                }
+                _ => Some(value.to_string()),
+            }
+        }
+        Physical::INT64 => {
+            let value = i64_of(bytes)?;
+            if is_decimal {
+                return decimal(i128::from(value));
+            }
+            match (logical, converted) {
+                (Some(Logical::Integer(int)), _) if !int.is_signed => Some((value as u64).to_string()),
+                (_, ConvertedType::UINT_64) => Some((value as u64).to_string()),
+                (Some(Logical::Timestamp(ts)), _) => {
+                    let utc = ts.is_adjusted_to_u_t_c;
+                    let value = match ts.unit {
+                        Unit::MILLIS => Value::timestamp(Timestamp(value.checked_mul(1000)?)),
+                        Unit::MICROS => Value::timestamp(Timestamp(value)),
+                        Unit::NANOS => {
+                            return Value::new(LogicalType::new(LogicalTypeId::TimestampNs), ValueData::Int64(value))
+                                .ok()
+                                .and_then(shown);
+                        }
+                    };
+                    let value = if utc {
+                        value.reinterpret(&LogicalType::new(LogicalTypeId::TimestampTz)).ok()?
+                    } else {
+                        value
+                    };
+                    shown(value)
+                }
+                (_, ConvertedType::TIMESTAMP_MILLIS) => shown(Value::timestamp(Timestamp(value.checked_mul(1000)?))),
+                (_, ConvertedType::TIMESTAMP_MICROS) => shown(Value::timestamp(Timestamp(value))),
+                (Some(Logical::Time(time)), _) => {
+                    let micros = match time.unit {
+                        Unit::NANOS => value / 1000,
+                        _ => value,
+                    };
+                    if time.is_adjusted_to_u_t_c {
+                        shown(Value::time_tz(TimeTz::new(Time(micros), 0)))
+                    } else if (0..=MICROS_PER_DAY).contains(&micros) {
+                        shown(Value::time(Time(micros)))
+                    } else {
+                        None
+                    }
+                }
+                (_, ConvertedType::TIME_MICROS) => (0..=MICROS_PER_DAY)
+                    .contains(&value)
+                    .then(|| shown(Value::time(Time(value))))?,
+                _ => Some(value.to_string()),
+            }
+        }
+        Physical::INT96 => {
+            // `ImpalaTimestampToTimestamp`: nanoseconds of the day, then the Julian day
+            if bytes.len() != 12 {
+                return None;
+            }
+            let nanos = i64::from_le_bytes(bytes[..8].try_into().ok()?);
+            let julian = i64::from(u32::from_le_bytes(bytes[8..].try_into().ok()?));
+            const JULIAN_TO_UNIX_EPOCH_DAYS: i64 = 2_440_588;
+            let micros = (julian - JULIAN_TO_UNIX_EPOCH_DAYS)
+                .checked_mul(MICROS_PER_DAY)?
+                .checked_add(nanos / 1000)?;
+            shown(Value::timestamp(Timestamp(micros)))
+        }
+        Physical::FLOAT => {
+            let value = f32::from_le_bytes(bytes.try_into().ok()?);
+            value.is_finite().then(|| shown(Value::float(value)))?
+        }
+        Physical::DOUBLE => {
+            let value = f64::from_le_bytes(bytes.try_into().ok()?);
+            value.is_finite().then(|| shown(Value::double(value)))?
+        }
+        Physical::BYTE_ARRAY => {
+            if is_decimal {
+                return decimal(big_endian(bytes)?);
+            }
+            let text = matches!(logical, Some(Logical::String | Logical::Enum | Logical::Json))
+                || matches!(
+                    converted,
+                    ConvertedType::UTF8 | ConvertedType::ENUM | ConvertedType::JSON
+                );
+            match std::str::from_utf8(bytes) {
+                Ok(text_value) if text => Some(text_value.to_string()),
+                _ => blob(bytes),
+            }
+        }
+        Physical::FIXED_LEN_BYTE_ARRAY => {
+            if is_decimal {
+                return decimal(big_endian(bytes)?);
+            }
+            match logical {
+                Some(Logical::Uuid) if bytes.len() == 16 => {
+                    let stored = i128::from_be_bytes(bytes.try_into().ok()?) ^ (1 << 127);
+                    shown(Value::uuid(stored))
+                }
+                Some(Logical::Float16) if bytes.len() == 2 => {
+                    let value = half_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]));
+                    value.is_finite().then(|| shown(Value::float(value)))?
+                }
+                _ => blob(bytes),
+            }
+        }
+    }
+}
+
+/// `Float16ToFloat32`.
+fn half_to_f32(bits: u16) -> f32 {
+    let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exponent = i32::from((bits >> 10) & 0x1f);
+    let fraction = f32::from(bits & 0x3ff);
+    match exponent {
+        0 => sign * fraction * 2f32.powi(-24),
+        31 if fraction == 0.0 => sign * f32::INFINITY,
+        31 => f32::NAN,
+        _ => sign * (1.0 + fraction / 1024.0) * 2f32.powi(exponent - 15),
+    }
+}
+
 /// `parquet_metadata`: a row of SQL per column of a row group.
 pub fn metadata_rows(path: &str) -> Result<Vec<String>> {
     let (metadata, _) = read_metadata(path)?;
     let mut rows = Vec::new();
     for (group, row_group) in metadata.row_groups().iter().enumerate() {
         for (column, chunk) in row_group.columns().iter().enumerate() {
-            let (min, max, nulls, distinct) = chunk.statistics().map_or((None, None, None, None), statistics_text);
+            let (_, _, nulls, distinct) = chunk.statistics().map_or((None, None, None, None), statistics_text);
+            let descriptor = chunk.column_descr();
+            let stat = |bytes: Option<&[u8]>| bytes.and_then(|b| statistic_text(descriptor, b));
+            let min = stat(chunk.statistics().and_then(Statistics::min_bytes_opt));
+            let max = stat(chunk.statistics().and_then(Statistics::max_bytes_opt));
             let encodings: Vec<String> = chunk.encodings().map(|e| e.to_string()).collect();
             rows.push(format!(
                 "({}, {group}, {}, {}, {}, {column}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, NULL::BIGINT, {}, {}, \

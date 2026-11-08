@@ -121,6 +121,7 @@ struct OpenTransactions {
 
 impl DatabaseInstance {
     fn with_file_access(file_access: Option<FileAccess>) -> Self {
+        duckrs_common::types::set_keyword_check(duckrs_parser::keywords::is_keyword);
         Self {
             catalog: Arc::new(Catalog::new(DEFAULT_CATALOG)),
             settings: Arc::default(),

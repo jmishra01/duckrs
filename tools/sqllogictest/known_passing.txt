@@ -298,6 +298,7 @@ test/issues/general/test_26175.test
 test/issues/general/test_26175_bind_once.test
 test/issues/general/test_26177.test
 test/issues/general/test_26274.test
+test/issues/general/test_26797_parquet.test
 test/issues/general/test_26957.test
 test/issues/general/test_27205.test
 test/issues/general/test_2743.test
@@ -559,6 +560,7 @@ test/optimizer/unused_columns/distinct_on_projection_pushdown.test
 test/optimizer/using_optimizer.test
 test/parquet/concatenated_gzip_members.test
 test/parquet/constant_dictionary_vector_parquet.test
+test/parquet/corrupt/decimal_stats_signed_overflow.test
 test/parquet/corrupt/f1_scratch_buffer_stale_ptr.test
 test/parquet/dbp_small_decimal.test
 test/parquet/dictionary_multipage_filter_pushdown.test
@@ -879,6 +881,7 @@ test/sql/cast/string_to_list_roundtrip.test
 test/sql/cast/string_to_map_escapes.test
 test/sql/cast/string_to_map_invalid_entries.test
 test/sql/cast/string_to_struct_cast.test
+test/sql/cast/string_to_struct_escapes.test
 test/sql/cast/string_to_struct_roundtrip.test
 test/sql/cast/string_to_struct_variant_child.test
 test/sql/cast/string_to_unnamed_struct.test
@@ -1299,6 +1302,7 @@ test/sql/copy/parquet/broken_parquet.test
 test/sql/copy/parquet/byte_stream_split.test
 test/sql/copy/parquet/byte_stream_split_flba.test
 test/sql/copy/parquet/case_insensitive_replacement.test
+test/sql/copy/parquet/copy_ninf_stats.test
 test/sql/copy/parquet/copy_option_prepared.test
 test/sql/copy/parquet/crafted_rowgroup_huge_columns.test
 test/sql/copy/parquet/decimal_filter.test
@@ -1352,6 +1356,7 @@ test/sql/copy/parquet/parquet_go.test
 test/sql/copy/parquet/parquet_hive2.test
 test/sql/copy/parquet/parquet_hive_empty.test
 test/sql/copy/parquet/parquet_list.test
+test/sql/copy/parquet/parquet_metadata_blob.test
 test/sql/copy/parquet/parquet_metadata_cache.test
 test/sql/copy/parquet/parquet_metadata_prepared.test
 test/sql/copy/parquet/parquet_nan.test
@@ -1389,6 +1394,7 @@ test/sql/copy/parquet/union_by_name_pushdown.test
 test/sql/copy/parquet/union_by_name_struct_extract_stats.test
 test/sql/copy/parquet/union_by_name_struct_filter.test
 test/sql/copy/parquet/union_by_name_struct_projection.test
+test/sql/copy/parquet/writer/parquet_timetz_metadata.test
 test/sql/copy/parquet/writer/parquet_write_booleans.test
 test/sql/copy/parquet/writer/parquet_write_date.test
 test/sql/copy/parquet/writer/parquet_write_enums.test
@@ -1398,6 +1404,7 @@ test/sql/copy/parquet/writer/parquet_write_memory_usage.test
 test/sql/copy/parquet/writer/parquet_write_signed.test
 test/sql/copy/parquet/writer/parquet_write_uhugeint.test
 test/sql/copy/parquet/writer/parquet_write_unsigned.test
+test/sql/copy/parquet/writer/parquet_write_uuid.test
 test/sql/copy/parquet/writer/test_parquet_write_complex.test
 test/sql/copy/parquet/writer/write_complex_nested.test
 test/sql/copy/parquet/writer/write_list.test

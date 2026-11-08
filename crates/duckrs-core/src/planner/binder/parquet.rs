@@ -48,6 +48,7 @@ impl Binder<'_> {
         let (mut binary_as_string, mut union_by_name, mut file_row_number) = (false, false, false);
         let mut filename = None;
         let mut hive_partitioning = None;
+        let mut int96_as = crate::execution::parquet::Int96As::Timestamp;
         for argument in &args {
             let value = self.constant_argument(&argument.expr)?;
             if argument.name.is_empty() {
@@ -66,6 +67,19 @@ impl Binder<'_> {
                 "union_by_name" => union_by_name = is_true(&value, &option)?,
                 "file_row_number" => file_row_number = is_true(&value, &option)?,
                 "hive_partitioning" => hive_partitioning = Some(is_true(&value, &option)?),
+                "int96_as" => {
+                    use crate::execution::parquet::Int96As;
+                    int96_as = match value.try_to_string()?.to_lowercase().as_str() {
+                        "timestamp" => Int96As::Timestamp,
+                        "timestamp_ns" => Int96As::TimestampNs,
+                        "struct" => Int96As::Struct,
+                        other => {
+                            return Err(binder_error(format!(
+                                "int96_as must be 'timestamp', 'timestamp_ns' or 'struct', not '{other}'"
+                            )));
+                        }
+                    };
+                }
                 "hive_types_autocast" | "explicit_cardinality" | "can_have_nan" => {}
                 "filename" => {
                     filename = match value.data() {
@@ -92,10 +106,10 @@ impl Binder<'_> {
         if files.is_empty() {
             return Err(binder_error(format!("{name} needs at least one file to read")));
         }
-        let (mut names, mut types) = file_schema(&files[0], binary_as_string)?;
+        let (mut names, mut types) = file_schema(&files[0], binary_as_string, int96_as)?;
         if union_by_name {
             for path in &files[1..] {
-                let (file_names, file_types) = file_schema(path, binary_as_string)?;
+                let (file_names, file_types) = file_schema(path, binary_as_string, int96_as)?;
                 for (column, ty) in file_names.iter().zip(&file_types) {
                     match names.iter().position(|n| n.eq_ignore_ascii_case(column)) {
                         Some(i) => types[i] = force_max_logical_type(&types[i], ty),
@@ -145,6 +159,7 @@ impl Binder<'_> {
             names,
             types,
             binary_as_string,
+            int96_as,
             union_by_name,
             file_row_number,
             filename: filename.is_some(),

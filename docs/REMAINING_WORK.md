@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 3696 of 6367 test files pass (**61.1%**). The v1 target is ≥ 90%.
+- Overall: 3703 of 6367 test files pass (**61.2%**). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -31,6 +31,12 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] GeoJSON (`read_json` geojson, `ST_AsGeoJSON`, `json_geometry_format`): needs the GEOMETRY type
   - [ ] `json_group_object`/`json_group_array` as window functions (they are macros today)
 - [ ] 3. Parquet reader/writer: missing types, filter/statistics pushdown, corrupt-file errors, delta encoding (`parquet*`: ~53 failing)
+  - [x] `parquet_metadata` stats in the column's DuckDB type (decimals, UUID, TIMETZ, INT96, blobs; NULL for infinities and out-of-range values)
+  - [x] `int96_as` (`timestamp` by default, `timestamp_ns`, `struct`)
+  - [ ] the writer is arrow-rs, so encodings (`PLAIN_DICTIONARY` for V1, `BYTE_STREAM_SPLIT`, `DELTA_*`), stats (64-byte truncation, distinct counts), bloom filters, page sizes and footer size differ from DuckDB's writer (~25 files): needs the native writer port
+  - [ ] TIMETZ is written as text; DuckDB writes TIME adjusted to UTC
+  - [ ] prefetch / read-ahead metrics and EXPLAIN shapes of Parquet scans (~20 files)
+  - [ ] `write_timestamp_as_int96`, `parquet_metadata` logical type names (`Float16Type()`), duplicate column names
 - [ ] 4. Parquet VARIANT, including shredding (`parquet/variant`: 47 failing, 0%)
 - [ ] 5. `EXPORT DATABASE` / `IMPORT DATABASE` (`sql/export`: 27 failing, 0%)
 - [ ] 6. `COPY FROM DATABASE` (`sql/copy_database`: 12 failing, 0%)
