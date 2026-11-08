@@ -57,7 +57,7 @@ const STRING_FUNCTIONS: [&str; 21] = [
     "path_join",
 ];
 
-const OTHER_FUNCTIONS: [&str; 45] = [
+const OTHER_FUNCTIONS: [&str; 46] = [
     "finalize",
     "combine",
     "gamma",
@@ -89,6 +89,7 @@ const OTHER_FUNCTIONS: [&str; 45] = [
     "array_cross_product",
     "struct_insert",
     "struct_update",
+    "timetz_byte_comparable",
     "struct_contains",
     "struct_has",
     "struct_position",
@@ -787,6 +788,16 @@ fn time_bucket(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+/// `TimeTZSortKeyFun`: the sort key of a TIME WITH TIME ZONE.
+fn timetz_byte_comparable(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    row_wise(args, result, |row| {
+        Ok(match row[0].data() {
+            ValueData::Int64(bits) => Value::ubigint(duckrs_common::types::TimeTz(*bits as u64).sort_key()),
+            _ => Value::null(LogicalType::UBIGINT),
+        })
+    })
+}
+
 fn normalized_interval(args: &DataChunk, result: &mut Vector) -> Result<()> {
     row_wise(args, result, |row| {
         let ValueData::Interval(value) = row[0].data() else {
@@ -1006,22 +1017,83 @@ fn struct_keys(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+/// `StructContainsResolveTypes`: the value and the members it can be compared with are cast to
+/// the type all of them can be cast to. The others never match.
+fn struct_search_types(name: &str, mut children: Vec<BoundExpr>) -> Result<Vec<BoundExpr>> {
+    let struct_type = children[0].return_type.clone();
+    let members = struct_type.struct_children().to_vec();
+    if struct_type.id() == LogicalTypeId::SqlNull || members.is_empty() {
+        return Ok(children);
+    }
+    if struct_type.id() != LogicalTypeId::Tuple {
+        return Err(binder_error(format!("\"{name}\" can only be used on unnamed structs")));
+    }
+    let mut target = children[1].return_type.clone();
+    for (_, member) in &members {
+        if let Some(max) = super::combine_types::try_max_logical_type(member, &target) {
+            target = max;
+        }
+    }
+    let cast: Vec<LogicalType> = members
+        .iter()
+        .map(
+            |(_, member)| match super::combine_types::try_max_logical_type(member, &target) {
+                Some(max) if max == target => target.clone(),
+                _ => member.clone(),
+            },
+        )
+        .collect();
+    let value = children.pop().expect("two arguments").cast_to(&target, false);
+    let row = children
+        .pop()
+        .expect("two arguments")
+        .cast_to(&LogicalType::tuple(cast), false);
+    Ok(vec![row, value])
+}
+
+/// `TemplatedStructSearch`: the position of the member that is the value, of those of its type,
+/// and with `find_nulls` a NULL member for a NULL value.
+fn struct_search(row: &[Value], find_nulls: bool) -> Option<Option<usize>> {
+    if row[0].is_null() {
+        return None;
+    }
+    let target = &row[1];
+    let mut candidates = struct_fields(&row[0])
+        .iter()
+        .enumerate()
+        .filter(|(_, member)| member.logical_type() == target.logical_type())
+        .peekable();
+    if target.is_null() && !find_nulls {
+        return None;
+    }
+    if candidates.peek().is_none() {
+        return Some(None);
+    }
+    Some(candidates.find_map(|(index, member)| {
+        let found = if target.is_null() {
+            member.is_null()
+        } else {
+            !member.is_null() && member == target
+        };
+        found.then_some(index)
+    }))
+}
+
 fn struct_contains(args: &DataChunk, result: &mut Vector) -> Result<()> {
     row_wise(args, result, |row| {
-        if row[0].is_null() || row[1].is_null() {
-            return Ok(Value::null(LogicalType::BOOLEAN));
-        }
-        Ok(Value::boolean(struct_fields(&row[0]).contains(&row[1])))
+        Ok(match struct_search(row, false) {
+            None => Value::null(LogicalType::BOOLEAN),
+            Some(found) => Value::boolean(found.is_some()),
+        })
     })
 }
 
 fn struct_position(args: &DataChunk, result: &mut Vector) -> Result<()> {
     row_wise(args, result, |row| {
-        if row[0].is_null() || row[1].is_null() {
-            return Ok(Value::null(LogicalType::INTEGER));
-        }
-        let at = struct_fields(&row[0]).iter().position(|v| *v == row[1]);
-        Ok(Value::integer(at.map_or(0, |i| i as i32 + 1)))
+        Ok(match struct_search(row, true).flatten() {
+            Some(index) => Value::integer(index as i32 + 1),
+            None => Value::null(LogicalType::INTEGER),
+        })
     })
 }
 
@@ -1234,6 +1306,7 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
             Ok(bound_function(&lower, children, ty, time_bucket))
         }
         "normalized_interval" => simple(1, 1, LogicalType::INTERVAL, normalized_interval, children),
+        "timetz_byte_comparable" => simple(1, 1, LogicalType::UBIGINT, timetz_byte_comparable, children),
         "uuid_extract_version" => simple(1, 1, LogicalType::UINTEGER, uuid_extract_version, children),
         "uuid_extract_timestamp" => simple(
             1,
@@ -1327,8 +1400,17 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
             ))
         }
         "struct_keys" => simple(1, 1, list_of_text, struct_keys, children),
-        "struct_contains" | "struct_has" => simple(2, 2, LogicalType::BOOLEAN, struct_contains, children),
-        "struct_position" | "struct_indexof" => simple(2, 2, LogicalType::INTEGER, struct_position, children),
+        "struct_contains" | "struct_has" | "struct_position" | "struct_indexof" => {
+            count_args(&lower, &children, 2, 2)?;
+            let position = matches!(lower.as_str(), "struct_position" | "struct_indexof");
+            let (ty, function): (LogicalType, super::ScalarCallback) = if position {
+                (LogicalType::INTEGER, struct_position)
+            } else {
+                (LogicalType::BOOLEAN, struct_contains)
+            };
+            let children = struct_search_types(&lower, children)?;
+            Ok(bound_function(&lower, children, ty, function))
+        }
         "map_extract" | "element_at" | "map_extract_value" | "map_contains" => {
             count_args(&lower, &children, 2, 2)?;
             let map = children[0].return_type.clone();

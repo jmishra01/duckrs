@@ -222,6 +222,12 @@ impl TimeTz {
         Self::MAX_OFFSET - (self.0 & Self::OFFSET_MASK) as i32
     }
 
+    /// `dtime_tz_t::sort_key`: orders by the instant (the time in UTC), then by the offset.
+    pub fn sort_key(self) -> u64 {
+        self.0
+            .wrapping_add(((self.0 & Self::OFFSET_MASK) * 1_000_000) << Self::OFFSET_BITS)
+    }
+
     /// Parses `time[±HH[:MM[:SS]]]` (`Time::TryConvertTimeTZ`).
     pub fn try_convert(buf: &[u8], strict: bool) -> Option<TimeTz> {
         let Some((time, mut pos)) = Time::try_convert_interval(buf, false, None, false) else {

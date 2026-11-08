@@ -659,6 +659,7 @@ test/sql/aggregate/grouping_sets/multiple_empty_grouping_sets.test
 test/sql/aggregate/grouping_sets/rollup.test
 test/sql/aggregate/having/having_alias.test
 test/sql/aggregate/having/having_without_groupby.test
+test/sql/aggregate/having/test_having.test
 test/sql/aggregate/having/test_scalar_having.test
 test/sql/aggregate/qualify/test_qualify_macro.test
 test/sql/aggregate/qualify/test_qualify_view_no_view_dependencies.test
@@ -2194,6 +2195,7 @@ test/sql/parser/numeric_literal_underscore_trailing_dot.test
 test/sql/parser/parser_rewrites_method_chain.test
 test/sql/parser/position_prepare.test
 test/sql/parser/qualified_underscore_digit.test
+test/sql/parser/reject_accidental_expression_syntax.test
 test/sql/parser/reject_accidental_type_syntax.test
 test/sql/parser/reject_unknown_option_values.test
 test/sql/parser/test_columns_where.test
@@ -2835,8 +2837,10 @@ test/sql/subquery/lateral/test_lateral_join.test
 test/sql/subquery/scalar/array_subquery.test
 test/sql/subquery/scalar/coalesce_subquery.test
 test/sql/subquery/scalar/correlated_subquery_in_list_null.test
+test/sql/subquery/scalar/in_multiple_columns.test
 test/sql/subquery/scalar/nested_subquery_window.test
 test/sql/subquery/scalar/order_by_correlated.test
+test/sql/subquery/scalar/subquery_row_in_any.test
 test/sql/subquery/scalar/test_complex_correlated_subquery.test
 test/sql/subquery/scalar/test_complex_nested_correlated_subquery.test
 test/sql/subquery/scalar/test_correlated_count_nested_subquery.test
@@ -3245,17 +3249,22 @@ test/sql/types/struct/struct_cast.test
 test/sql/types/struct/struct_cast_parent_path_order.test
 test/sql/types/struct/struct_cast_superset.test
 test/sql/types/struct/struct_comparison.test
+test/sql/types/struct/struct_contains.test
+test/sql/types/struct/struct_contains_types.test
 test/sql/types/struct/struct_cross_product.test
 test/sql/types/struct/struct_different_names.test
 test/sql/types/struct/struct_distinct.test
 test/sql/types/struct/struct_equality_bug.test
 test/sql/types/struct/struct_index.test
+test/sql/types/struct/struct_key_collation_and_combine.test
 test/sql/types/struct/struct_named_cast.test
 test/sql/types/struct/struct_null_members.test
 test/sql/types/struct/struct_operations.test
 test/sql/types/struct/struct_pack_list.test
+test/sql/types/struct/struct_position.test
 test/sql/types/struct/struct_projection_pushdown_optimizer_bug.test
 test/sql/types/struct/struct_projection_pushdown_unnamed.test
+test/sql/types/struct/struct_search_physical_types.test
 test/sql/types/struct/struct_subquery.test
 test/sql/types/struct/struct_tables.test
 test/sql/types/struct/struct_updates.test
@@ -3306,6 +3315,8 @@ test/sql/types/uhugeint/uhugeint_try_cast.test
 test/sql/types/union/struct_to_union_try_cast.test
 test/sql/types/union/union_aggregate.test
 test/sql/types/union/union_ambiguous.test
+test/sql/types/union/union_cast.test
+test/sql/types/union/union_common_type.test
 test/sql/types/union/union_join.test
 test/sql/types/union/union_limit_offset.test
 test/sql/types/union/union_limits.test
@@ -3315,6 +3326,7 @@ test/sql/types/union/union_sort.test
 test/sql/types/union/union_struct.test
 test/sql/types/union/union_tag.test
 test/sql/types/union/union_test.test
+test/sql/types/union/union_validity.test
 test/sql/types/union/union_value.test
 test/sql/types/unsigned/test_unsigned_arithmetic.test
 test/sql/types/unsigned/test_unsigned_auto_cast.test

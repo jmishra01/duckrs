@@ -291,6 +291,7 @@ fn run_subquery(subquery: &BoundSubquery, values: &[Value]) -> Result<SubqueryRe
         first: None,
         keys: HashSet::new(),
         has_null: false,
+        rows_values: Vec::new(),
     };
     let modifiers = OrderModifiers {
         order: OrderType::Ascending,
@@ -305,6 +306,11 @@ fn run_subquery(subquery: &BoundSubquery, values: &[Value]) -> Result<SubqueryRe
         if !matches!(subquery.kind, SubqueryKind::Any(_)) {
             continue;
         }
+        if subquery.row {
+            result
+                .rows_values
+                .extend((0..chunk.len()).map(|row| column.get_value(row)));
+        }
         let u = column.to_unified(chunk.len());
         let keys = create_sort_keys(&[(column, modifiers)], chunk.len())?;
         for (row, key) in keys.into_iter().enumerate() {
@@ -316,6 +322,41 @@ fn run_subquery(subquery: &BoundSubquery, values: &[Value]) -> Result<SubqueryRe
         }
     }
     Ok(result)
+}
+
+/// `MarkJoinRowComparison::CompareEquality`: whether two rows are equal under SQL's three-valued
+/// logic, `None` for unknown: a pair of columns that differs decides, else a NULL leaves it open.
+fn row_equals(left: &Value, right: &Value) -> Option<bool> {
+    let (ValueData::Struct(left), ValueData::Struct(right)) = (left.data(), right.data()) else {
+        return None;
+    };
+    let mut unknown = false;
+    for (l, r) in left.iter().zip(right) {
+        if l.is_null() || r.is_null() {
+            unknown = true;
+        } else if l != r {
+            return Some(false);
+        }
+    }
+    (!unknown).then_some(true)
+}
+
+/// `row op ANY (...)` of a row subquery, for `=` and `<>`: `None` for NULL.
+fn any_row_matches(result: &SubqueryResult, op: ComparisonOp, child: &Value) -> Option<bool> {
+    let mut unknown = child.is_null();
+    for row in &result.rows_values {
+        let equal = if row.is_null() || child.is_null() {
+            None
+        } else {
+            row_equals(child, row)
+        };
+        match equal.map(|equal| equal == (op == ComparisonOp::Equal)) {
+            Some(true) => return Some(true),
+            Some(false) => {}
+            None => unknown = true,
+        }
+    }
+    (!unknown).then_some(false)
 }
 
 /// `x op ANY (...)` for a value with sort key `key`: `None` for NULL.
@@ -410,7 +451,17 @@ fn execute_subquery(
             (Some(keys), Some(format)) if format.validity.is_valid(format.sel.get(row)) => Some(keys[row].as_slice()),
             _ => None,
         };
-        let value = subquery_value(subquery, result, child_key, return_type)?;
+        let value = match (subquery.kind, &child_values) {
+            (SubqueryKind::Any(op @ (ComparisonOp::Equal | ComparisonOp::NotEqual)), Some(values))
+                if subquery.row && result.rows > 0 =>
+            {
+                match any_row_matches(result, op, &values.get_value(row)) {
+                    Some(answer) => Value::boolean(answer),
+                    None => Value::null(LogicalType::BOOLEAN),
+                }
+            }
+            _ => subquery_value(subquery, result, child_key, return_type)?,
+        };
         output.set_value(row, &value)?;
     }
     Ok(output)

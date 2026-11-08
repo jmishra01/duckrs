@@ -782,6 +782,7 @@ impl Binder<'_> {
             bound_aggregate: false,
             force_aggregates: node.force_aggregates,
             collated_groups: Vec::new(),
+            grouping_set_count: node.groups.grouping_sets.len(),
         };
         let mut group_expressions = node.groups.group_expressions.clone();
         let mut used_select_entries = Vec::new();

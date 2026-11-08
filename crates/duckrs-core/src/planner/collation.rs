@@ -5,7 +5,7 @@
 //! `nocase` lowers it and `noaccent` strips its accents (both combinable), `nfc` normalizes it.
 //! The ICU collations are not here: naming one fails as an unknown collation.
 
-use crate::planner::expression::BoundExpr;
+use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, LambdaKind};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::{Error, ErrorKind, Result};
 
@@ -27,6 +27,14 @@ pub enum CollationType {
 /// `GetVarcharCollationFunctions`: the functions the collation of `ty` (or the default
 /// collation) applies, in order. Binary collations apply none.
 pub fn collation_functions(ty: &LogicalType, default: &str, kind: CollationType) -> Result<Vec<&'static str>> {
+    // `GetTimeTZCollationFunctions`, `GetBitStringCollationFunctions` and
+    // `GetIntervalCollationFunctions`: these compare by what they stand for
+    match ty.id() {
+        LogicalTypeId::TimeTz => return Ok(vec!["timetz_byte_comparable"]),
+        LogicalTypeId::Bit => return Ok(vec!["bitstring_byte_comparable"]),
+        LogicalTypeId::Interval => return Ok(vec!["normalized_interval"]),
+        _ => {}
+    }
     if ty.id() != LogicalTypeId::Varchar || ty.alias().is_some() {
         return Ok(Vec::new());
     }
@@ -87,13 +95,23 @@ fn apply(function: &str, source: BoundExpr) -> Result<BoundExpr> {
 }
 
 /// `CollationBinding::PushCollation`: `source` with the collation of `ty` applied, and whether
-/// there was one to apply.
+/// there was one to apply. The elements of a LIST or ARRAY and the fields of a STRUCT get theirs.
 pub fn push_collation(
     source: BoundExpr,
     ty: &LogicalType,
     default: &str,
     kind: CollationType,
 ) -> Result<(BoundExpr, bool)> {
+    if ty.alias().is_none() {
+        match ty.id() {
+            LogicalTypeId::Struct | LogicalTypeId::Tuple => return push_struct_collation(source, ty, default, kind),
+            LogicalTypeId::List | LogicalTypeId::Array => {
+                let child = ty.child_type().expect("a child").clone();
+                return push_nested_collation(source, &child, default, kind);
+            }
+            _ => {}
+        }
+    }
     let functions = collation_functions(ty, default, kind)?;
     if functions.is_empty() {
         return Ok((source, false));
@@ -103,6 +121,103 @@ pub fn push_collation(
         result = apply(function, result)?;
     }
     Ok((result, true))
+}
+
+/// The element of the list a lambda runs over.
+fn lambda_element(ty: &LogicalType) -> BoundExpr {
+    BoundExpr::new(BoundExprKind::Reference(0), ty.clone())
+}
+
+/// `list_transform(source, x -> body)`.
+fn list_transform(source: BoundExpr, body: BoundExpr) -> BoundExpr {
+    let ty = LogicalType::list(body.return_type.clone());
+    BoundExpr::new(
+        BoundExprKind::ListLambda {
+            kind: LambdaKind::Transform,
+            list: Box::new(source),
+            initial: None,
+            captures: Vec::new(),
+            body: Box::new(body),
+        },
+        ty,
+    )
+}
+
+/// `PushNestedCollation`: each element of a LIST or ARRAY with its collation, by a lambda.
+fn push_nested_collation(
+    source: BoundExpr,
+    child: &LogicalType,
+    default: &str,
+    kind: CollationType,
+) -> Result<(BoundExpr, bool)> {
+    let (body, collated) = push_collation(lambda_element(child), child, default, kind)?;
+    if !collated {
+        return Ok((source, false));
+    }
+    let alias = source.alias.clone();
+    Ok((list_transform(source, body).with_alias(alias), true))
+}
+
+/// `PushStructCollation`: the struct rebuilt from its fields with their collations, NULL staying
+/// NULL. The source is evaluated once, as C++'s `invoke` does, by a lambda over a list of it.
+fn push_struct_collation(
+    source: BoundExpr,
+    ty: &LogicalType,
+    default: &str,
+    kind: CollationType,
+) -> Result<(BoundExpr, bool)> {
+    use crate::function::nested::bind_nested_function;
+    let element = lambda_element(ty);
+    let tuple = ty.id() == LogicalTypeId::Tuple;
+    let mut fields = Vec::new();
+    let mut names = Vec::new();
+    let mut collated = false;
+    for (index, (name, field_type)) in ty.struct_children().iter().enumerate() {
+        // a field of a named struct by its name, of a tuple by its position
+        let key = if tuple {
+            duckrs_common::value::Value::bigint(index as i64 + 1)
+        } else {
+            duckrs_common::value::Value::varchar(name.clone())
+        };
+        let field = bind_nested_function(
+            "struct_extract",
+            vec![String::new(); 2],
+            vec![element.clone(), BoundExpr::constant(key)],
+        )?;
+        let (field, changed) = push_collation(field, field_type, default, kind)?;
+        collated |= changed;
+        fields.push(field.with_alias(name.clone()));
+        names.push(if tuple { String::new() } else { name.clone() });
+    }
+    if !collated {
+        return Ok((source, false));
+    }
+    let rebuilt = bind_nested_function(if tuple { "row" } else { "struct_pack" }, names, fields)?;
+    let null = BoundExpr::constant(duckrs_common::value::Value::null(rebuilt.return_type.clone()));
+    let is_null = BoundExpr::new(
+        BoundExprKind::Operator {
+            op: BoundOperator::IsNull,
+            children: vec![element],
+        },
+        LogicalType::BOOLEAN,
+    );
+    let return_type = rebuilt.return_type.clone();
+    let body = BoundExpr::new(
+        BoundExprKind::Case {
+            checks: vec![(is_null, null)],
+            else_expr: Box::new(rebuilt),
+        },
+        return_type,
+    );
+    let alias = source.alias.clone();
+    let list = bind_nested_function("list_value", vec![String::new()], vec![source])?;
+    let one = BoundExpr::constant(duckrs_common::value::Value::bigint(1));
+    let result = bind_nested_function(
+        "list_extract",
+        vec![String::new(); 2],
+        vec![list_transform(list, body), one],
+    )?;
+    Ok((result.with_alias(alias), true))
 }
 
 /// `ExpressionBinder::TestCollation`: fails if `collation` is not one there is.

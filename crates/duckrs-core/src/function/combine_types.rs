@@ -225,7 +225,7 @@ fn combine_rules(force: bool, left: &LogicalType, right: &LogicalType) -> Option
         Map => resolve(force, left.child_type().unwrap(), right.child_type().unwrap()).map(LogicalType::map_from_entry),
         Struct | Tuple => combine_struct_types(force, left, right),
         Union if left == right => Some(left.clone()),
-        Union => return None,
+        Union => Some(combine_equal_union(force, left, right)),
         _ => return None,
     })
 }
@@ -295,6 +295,33 @@ fn try_max_internal(force: bool, left: &LogicalType, right: &LogicalType) -> Opt
 }
 
 /// `LogicalType::TryGetMaxLogicalType`: the type both sides implicitly cast to, if any.
+/// `CombineEqualUnion`: the union with the most members, its member types merged with those of
+/// the other of the same name, and the other's members it lacks after them.
+fn combine_equal_union(force: bool, left: &LogicalType, right: &LogicalType) -> LogicalType {
+    // the members after the tag
+    let members = |ty: &LogicalType| ty.struct_children()[1..].to_vec();
+    let (base, other) = if members(right).len() > members(left).len() {
+        (right, left)
+    } else {
+        (left, right)
+    };
+    let mut merged = members(base);
+    for (name, member_type) in members(other) {
+        match merged.iter().position(|(n, _)| *n == name) {
+            Some(at) => match resolve(force, &merged[at].1, &member_type) {
+                Some(combined) => merged[at].1 = combined,
+                None => return base.clone(),
+            },
+            None if merged.len() >= MAX_UNION_MEMBERS => return base.clone(),
+            None => merged.push((name, member_type)),
+        }
+    }
+    LogicalType::union_type(merged)
+}
+
+/// `UnionType::MAX_UNION_MEMBERS`.
+const MAX_UNION_MEMBERS: usize = 255;
+
 pub fn try_max_logical_type(left: &LogicalType, right: &LogicalType) -> Option<LogicalType> {
     try_max_internal(false, left, right)
 }

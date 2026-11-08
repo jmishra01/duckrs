@@ -661,6 +661,8 @@ struct AggregateBindState {
     /// the groups that are collated, with the `first(x)` aggregate that gives their value as it
     /// was (`collated_groups`)
     collated_groups: Vec<(usize, usize)>,
+    /// how many grouping sets there are (`grouping_sets.size()`)
+    grouping_set_count: usize,
 }
 
 /// Binds statements (`Binder`).
@@ -696,6 +698,8 @@ pub struct Binder<'a> {
     /// The schema unqualified tables are looked up in before the default one: the schema of the
     /// view being bound (`GetSearchPath`).
     search_schema: Option<String>,
+    /// the subquery being bound is the columns of another, as a row for `(a, b) IN (...)`
+    row_subquery: bool,
     /// The table macros being bound, innermost last (`bound_macros`).
     bound_macros: Vec<Arc<MacroCatalogEntry>>,
     /// How many scalar macros the expression being bound is nested in.
@@ -765,6 +769,7 @@ impl<'a> Binder<'a> {
             left_of_join: Vec::new(),
             bound_views: Vec::new(),
             search_schema: None,
+            row_subquery: false,
             bound_macros: Vec::new(),
             macro_depth: 0,
             parameters: None,

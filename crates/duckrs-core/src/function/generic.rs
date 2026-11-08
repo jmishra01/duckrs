@@ -912,6 +912,13 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             if is_list(&text.return_type) {
                 return bind_generic_function("list_contains", children);
             }
+            // `ContainsFun`: of a MAP its keys, of an unnamed struct its members
+            if text.return_type.id() == LogicalTypeId::Map {
+                return super::extras::bind_function("map_contains", &[String::new(), String::new()], children);
+            }
+            if text.return_type.id() == LogicalTypeId::Tuple {
+                return super::extras::bind_function("struct_contains", &[String::new(), String::new()], children);
+            }
             if children.iter().all(|c| c.return_type.id() == LogicalTypeId::SqlNull) {
                 return Err(binder_error(
                     "Could not choose a best candidate function for the function call \"contains(\"NULL\", \

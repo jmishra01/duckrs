@@ -654,6 +654,7 @@ impl Binder<'_> {
                     };
                     let node: ast::QueryNode = select.into();
                     let wrapped = ast::SelectStatement { node };
+                    self.row_subquery = true;
                     return self.bind_subquery(&wrapped, subquery_type, parsed_child, comparison);
                 }
                 Some(width) if bound.types[0].id() != LogicalTypeId::Tuple || columns != 1 => {
@@ -722,6 +723,7 @@ impl Binder<'_> {
                     correlated: bindings,
                     volatile,
                     error_on_multiple_rows: self.options.scalar_subquery_error,
+                    row: std::mem::take(&mut self.row_subquery),
                     results: Mutex::default(),
                 }),
                 child,
@@ -1450,11 +1452,39 @@ impl Binder<'_> {
         let group = self.find_group(expr)?;
         let state = self.aggregates.as_ref()?;
         if let Some((_, aggregate)) = state.collated_groups.iter().find(|(g, _)| *g == group) {
-            return Some(BoundExpr::column_ref(
+            let return_type = state.aggregates[*aggregate].return_type.clone();
+            let first = BoundExpr::column_ref(
                 ColumnBinding::new(state.aggregate_index, *aggregate),
-                state.aggregates[*aggregate].return_type.clone(),
+                return_type.clone(),
                 expr.alias.clone(),
-            ));
+            );
+            if state.grouping_set_count <= 1 {
+                return Some(first);
+            }
+            // with grouping sets, NULL where the set does not have the group
+            let collated = BoundExpr::column_ref(
+                ColumnBinding::new(state.group_index, group),
+                state.groups[group].return_type.clone(),
+                expr.alias.clone(),
+            );
+            let is_null = BoundExpr::new(
+                BoundExprKind::Operator {
+                    op: BoundOperator::IsNull,
+                    children: vec![collated],
+                },
+                LogicalType::BOOLEAN,
+            );
+            let null = BoundExpr::constant(Value::null(return_type.clone()));
+            return Some(
+                BoundExpr::new(
+                    BoundExprKind::Case {
+                        checks: vec![(is_null, null)],
+                        else_expr: Box::new(first),
+                    },
+                    return_type,
+                )
+                .with_alias(expr.alias.clone()),
+            );
         }
         Some(BoundExpr::column_ref(
             ColumnBinding::new(state.group_index, group),

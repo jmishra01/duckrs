@@ -309,6 +309,15 @@ pub(super) fn cast_value(value: &Value, target: &LogicalType, mode: CastMode) ->
 fn cast_inner(value: &Value, target: &LogicalType, mode: CastMode) -> Result<Value> {
     use LogicalTypeId as L;
     if value.is_null() {
+        // `ToUnionMemberCast` keeps the tag of a NULL of a member's type: the member is NULL
+        let source = value.logical_type();
+        if target.id() == L::Union
+            && !matches!(source.id(), L::SqlNull | L::Union)
+            && let Ok(member) = union_member(source, target)
+        {
+            let member_type = target.struct_children()[member + 1].1.clone();
+            return union_value(target, member, Value::null(member_type));
+        }
         return Ok(Value::null(target.clone()));
     }
     let source = value.logical_type();

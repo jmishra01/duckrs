@@ -83,6 +83,9 @@ pub struct BoundSubquery {
     pub volatile: bool,
     /// `scalar_subquery_error_on_multiple_rows`
     pub error_on_multiple_rows: bool,
+    /// whether a row is compared to the columns of the subquery as a row of them, column by column
+    /// (`ExtractSubqueryChildren`), and not to a struct the subquery returns
+    pub row: bool,
     /// what ran so far, by the sort keys of the correlated values
     pub results: Mutex<HashMap<Vec<u8>, Arc<Result<SubqueryResult>>>>,
 }
@@ -96,6 +99,8 @@ pub struct SubqueryResult {
     /// the sort keys of the non-NULL values, for ANY
     pub keys: HashSet<Vec<u8>>,
     pub has_null: bool,
+    /// the rows of a row subquery, which compare column by column
+    pub rows_values: Vec<Value>,
 }
 
 /// What a call of a sequence function does.
@@ -415,6 +420,7 @@ impl BoundExpr {
                     correlated: subquery.correlated.clone(),
                     volatile: subquery.volatile,
                     error_on_multiple_rows: subquery.error_on_multiple_rows,
+                    row: subquery.row,
                     results: Mutex::default(),
                 });
             }

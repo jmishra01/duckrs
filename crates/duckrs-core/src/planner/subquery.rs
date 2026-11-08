@@ -165,6 +165,7 @@ fn flatten_in(expr: &BoundExpr, left: &mut LogicalOperator, next_table_index: &m
         kind: SubqueryKind::Any(ComparisonOp::Equal),
         raw: Some(raw),
         volatile: false,
+        row,
         ..
     } = subquery.as_ref()
     else {
@@ -179,22 +180,86 @@ fn flatten_in(expr: &BoundExpr, left: &mut LogicalOperator, next_table_index: &m
         return Err(Unsupported);
     }
     let table_index = take_index(next_table_index);
-    let condition = JoinCondition {
-        left: (**child).clone(),
-        right: BoundExpr::column_ref(right_bindings[0], raw.types()[0].clone(), ""),
-        null_safe: false,
+    let right = BoundExpr::column_ref(right_bindings[0], raw.types()[0].clone(), "");
+    // `MarkJoinRowComparison`: a row compares column by column, each pair of rows in turn
+    let (conditions, predicate) = match row_comparison(ComparisonOp::Equal, child, &right).filter(|_| *row) {
+        Some(predicate) => (Vec::new(), Some(predicate)),
+        None => (
+            vec![JoinCondition {
+                left: (**child).clone(),
+                right,
+                null_safe: false,
+            }],
+            None,
+        ),
     };
     let outer = std::mem::replace(left, LogicalOperator::new(K::CrossProduct, Vec::new()));
     *left = LogicalOperator::new(
         K::MarkJoin {
             table_index,
-            conditions: vec![condition],
-            predicate: None,
+            conditions,
+            predicate,
         },
         vec![outer, raw.clone()],
     );
     let marker = BoundExpr::column_ref(ColumnBinding::new(table_index, 0), LogicalType::BOOLEAN, "");
     Ok(marker.with_alias(expr.alias.clone()))
+}
+
+/// `MarkJoinRowComparison::CompareEquality`: a row `=` or `<>` of a MARK join under SQL's
+/// three-valued logic, `a = x AND b = y` and `a <> x OR b <> y`. Other comparisons are of the whole
+/// row, ordered as a struct is.
+fn row_comparison(op: ComparisonOp, child: &BoundExpr, right: &BoundExpr) -> Option<BoundExpr> {
+    let and = match op {
+        ComparisonOp::Equal => true,
+        ComparisonOp::NotEqual => false,
+        _ => return None,
+    };
+    let children = split_row(child, right)?
+        .into_iter()
+        .map(|(left, right)| {
+            BoundExpr::new(
+                BoundExprKind::Comparison {
+                    op,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                LogicalType::BOOLEAN,
+            )
+        })
+        .collect();
+    Some(BoundExpr::new(
+        BoundExprKind::Conjunction { and, children },
+        LogicalType::BOOLEAN,
+    ))
+}
+
+/// The pairs of columns of `(a, b) op ANY (SELECT x, y ...)`, if the left side is a row.
+fn split_row(child: &BoundExpr, right: &BoundExpr) -> Option<Vec<(BoundExpr, BoundExpr)>> {
+    let BoundExprKind::Function { function, children, .. } = &child.kind else {
+        return None;
+    };
+    let width = right.return_type.struct_children().len();
+    if function.name != "row"
+        || right.return_type.id() != duckrs_common::types::LogicalTypeId::Tuple
+        || width < 2
+        || children.len() != width
+    {
+        return None;
+    }
+    children
+        .iter()
+        .enumerate()
+        .map(|(i, column)| {
+            let field = crate::function::nested::bind_nested_function(
+                "struct_extract_at",
+                vec![String::new(); 2],
+                vec![right.clone(), BoundExpr::constant(Value::bigint(i as i64 + 1))],
+            )
+            .ok()?;
+            Some((column.clone(), field))
+        })
+        .collect()
 }
 
 /// `PlanCorrelatedSubquery`: puts the join on top of `left`, and gives what stands in for `expr`.
@@ -213,6 +278,7 @@ fn flatten_subquery(expr: &BoundExpr, left: &mut LogicalOperator, next_table_ind
         correlated: bindings,
         volatile: false,
         error_on_multiple_rows,
+        row,
         ..
     } = subquery.as_ref()
     else {
@@ -269,14 +335,17 @@ fn flatten_subquery(expr: &BoundExpr, left: &mut LogicalOperator, next_table_ind
             let Some(child) = child else {
                 return Err(Unsupported);
             };
-            let comparison = BoundExpr::new(
-                BoundExprKind::Comparison {
-                    op: *op,
-                    left: child.clone(),
-                    right: Box::new(BoundExpr::column_ref(output, output_type, "")),
-                },
-                LogicalType::BOOLEAN,
-            );
+            let right = BoundExpr::column_ref(output, output_type, "");
+            let comparison = row_comparison(*op, child, &right).filter(|_| *row).unwrap_or_else(|| {
+                BoundExpr::new(
+                    BoundExprKind::Comparison {
+                        op: *op,
+                        left: child.clone(),
+                        right: Box::new(right),
+                    },
+                    LogicalType::BOOLEAN,
+                )
+            });
             (JoinType::Mark, Some(take_index(next_table_index)), Some(comparison))
         }
     };
