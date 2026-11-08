@@ -56,6 +56,8 @@ pub struct ParquetScanData {
     pub file_row_number: bool,
     pub filename: bool,
     pub hive: Vec<(String, LogicalType)>,
+    /// the virtual columns, after the rest
+    pub virtual_columns: Vec<crate::execution::multi_file::VirtualColumn>,
 }
 
 impl ParquetScanData {
@@ -68,6 +70,7 @@ impl ParquetScanData {
             types.push(LogicalType::VARCHAR);
         }
         types.extend(self.hive.iter().map(|(_, ty)| ty.clone()));
+        types.extend(crate::execution::multi_file::virtual_types(&self.virtual_columns));
         types
     }
 }
@@ -365,6 +368,7 @@ pub struct ParquetScanState {
     mapping: Vec<Option<usize>>,
     file_types: Vec<LogicalType>,
     row: i64,
+    virtual_rows: crate::execution::multi_file::VirtualRows,
 }
 
 impl std::fmt::Debug for ParquetScanState {
@@ -504,7 +508,15 @@ impl PhysicalOperator for PhysicalParquetScan {
                 Some(batch) => {
                     let batch = batch.map_err(|e| invalid(format!("Could not read \"{path}\": {e}")))?;
                     if batch.num_rows() > 0 {
-                        return batch_chunk(&self.scan, state, &batch, path).map(Some);
+                        let chunk = batch_chunk(&self.scan, state, &batch, path)?;
+                        return crate::execution::multi_file::append_virtual_columns(
+                            chunk,
+                            &self.scan.virtual_columns,
+                            path,
+                            state.file,
+                            &mut state.virtual_rows,
+                        )
+                        .map(Some);
                     }
                 }
                 None => {

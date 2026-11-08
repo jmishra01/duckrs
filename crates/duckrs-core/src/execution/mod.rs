@@ -15,6 +15,7 @@ pub mod external_sort;
 pub mod file_system;
 pub mod join;
 pub mod json_scan;
+pub mod multi_file;
 pub mod parquet;
 pub mod physical;
 pub mod temporary;

@@ -226,6 +226,7 @@ impl Binder<'_> {
         };
         let output_names = Self::alias_columns(table_ref, &alias, output_names)?;
         let table_index = self.generate_table_index();
+        let (virtual_columns, bound_virtual) = crate::execution::multi_file::bind_virtual_columns(&output_names);
         self.bind_context.add_binding(Binding {
             alias,
             schema: None,
@@ -233,6 +234,7 @@ impl Binder<'_> {
             names: output_names,
             types: output_types,
             row_id: None,
+            virtual_columns: bound_virtual,
             generated: Vec::new(),
         });
         let scan = JsonScanData {
@@ -249,6 +251,7 @@ impl Binder<'_> {
             timestamp_format: formats.timestamp,
             filename: filename.is_some(),
             hive,
+            virtual_columns,
         };
         Ok(LogicalOperator::new(
             LogicalOperatorKind::JsonScan {

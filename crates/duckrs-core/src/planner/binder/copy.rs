@@ -741,6 +741,7 @@ impl Binder<'_> {
         };
         let output_names = Self::alias_columns(table_ref, &alias, output_names)?;
         let table_index = self.generate_table_index();
+        let (virtual_columns, bound_virtual) = crate::execution::multi_file::bind_virtual_columns(&output_names);
         self.bind_context.add_binding(Binding {
             alias,
             schema: None,
@@ -748,6 +749,7 @@ impl Binder<'_> {
             names: output_names,
             types: output_types,
             row_id: None,
+            virtual_columns: bound_virtual,
             generated: Vec::new(),
         });
         let wanted = &arguments.options.force_not_null;
@@ -799,6 +801,7 @@ impl Binder<'_> {
             types,
             filename: arguments.filename.is_some(),
             first_data: std::sync::Mutex::new(Some(first_data)),
+            virtual_columns,
         };
         Ok(LogicalOperator::new(
             LogicalOperatorKind::CsvScan {
@@ -829,6 +832,7 @@ impl Binder<'_> {
             names: output_names,
             types: types.clone(),
             row_id: None,
+            virtual_columns: Vec::new(),
             generated: Vec::new(),
         });
         let scan = CsvScanData {
@@ -846,6 +850,7 @@ impl Binder<'_> {
             filename: false,
             rejects: None,
             first_data: std::sync::Mutex::new(None),
+            virtual_columns: Vec::new(),
         };
         Ok(LogicalOperator::new(
             LogicalOperatorKind::CsvScan {

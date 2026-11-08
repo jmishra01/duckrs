@@ -1705,6 +1705,7 @@ impl Binder<'_> {
                         names,
                         types: working.types.clone(),
                         row_id: None,
+                        virtual_columns: Vec::new(),
                         generated: Vec::new(),
                     });
                     return Ok(LogicalOperator::new(
@@ -1811,6 +1812,7 @@ impl Binder<'_> {
                     names,
                     types: types.clone(),
                     row_id: None,
+                    virtual_columns: Vec::new(),
                     generated: Vec::new(),
                 });
                 Ok(LogicalOperator::new(
@@ -1955,6 +1957,7 @@ impl Binder<'_> {
             names,
             types: bound.types,
             row_id: None,
+            virtual_columns: Vec::new(),
             generated: Vec::new(),
         });
         Ok(bound.plan)
@@ -2066,6 +2069,7 @@ impl Binder<'_> {
             names,
             types: vec![LogicalType::BIGINT],
             row_id: None,
+            virtual_columns: Vec::new(),
             generated: Vec::new(),
         });
         Ok(LogicalOperator::new(
@@ -2186,6 +2190,7 @@ impl Binder<'_> {
             names: table.columns.iter().map(|c| c.name.clone()).collect(),
             types: table.types(),
             row_id: None,
+            virtual_columns: Vec::new(),
             generated: Vec::new(),
         });
         let excluded_star =
@@ -2230,6 +2235,7 @@ impl Binder<'_> {
                 names: hidden,
                 types,
                 row_id: None,
+                virtual_columns: Vec::new(),
                 generated: Vec::new(),
             });
         }

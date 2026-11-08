@@ -192,6 +192,8 @@ pub struct CsvScanData {
     pub union_by_name: bool,
     /// whether a last column says which file a row is from (the `filename` option)
     pub filename: bool,
+    /// the virtual columns, after the rest
+    pub virtual_columns: Vec<crate::execution::multi_file::VirtualColumn>,
     /// where rejected rows go (`store_rejects`)
     pub rejects: Option<CsvRejects>,
     /// the bytes of the first file that sniffing read, for the first scan (the CSV reader keeps
@@ -240,6 +242,7 @@ impl CsvScanData {
             types.push(LogicalType::VARCHAR);
         }
         types.extend(self.hive.iter().map(|(_, ty)| ty.clone()));
+        types.extend(crate::execution::multi_file::virtual_types(&self.virtual_columns));
         types
     }
 }
@@ -297,6 +300,7 @@ pub struct CsvScanState {
     line: usize,
     rejects: Vec<Reject>,
     flushed: bool,
+    virtual_rows: crate::execution::multi_file::VirtualRows,
 }
 
 /// `CSVFileScan`: a file after the first, as sniffing it finds it, with its columns found by name.
@@ -357,6 +361,21 @@ fn sniff_next_file(scan: &CsvScanData, file: &CsvFile, data: &[u8]) -> Result<Cs
 
 /// The next rows of the scan, typed. `None` when all files are done.
 pub fn scan_chunk(scan: &CsvScanData, state: &mut CsvScanState) -> Result<Option<DataChunk>> {
+    let Some(chunk) = scan_file_chunk(scan, state)? else {
+        return Ok(None);
+    };
+    let path = &scan.files[state.file].path;
+    crate::execution::multi_file::append_virtual_columns(
+        chunk,
+        &scan.virtual_columns,
+        path,
+        state.file,
+        &mut state.virtual_rows,
+    )
+    .map(Some)
+}
+
+fn scan_file_chunk(scan: &CsvScanData, state: &mut CsvScanState) -> Result<Option<DataChunk>> {
     loop {
         let Some(file) = scan.files.get(state.file) else {
             flush_rejects(scan, state)?;

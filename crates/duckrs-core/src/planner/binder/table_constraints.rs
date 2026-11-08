@@ -163,6 +163,7 @@ impl Binder<'_> {
             names: columns.iter().map(|c| c.name.clone()).collect(),
             types: columns.iter().map(|c| c.ty.clone()).collect(),
             row_id: None,
+            virtual_columns: Vec::new(),
             generated: Vec::new(),
         });
         let mut bound = checked_cast(binder.bind_expression(check)?, &LogicalType::INTEGER)?;

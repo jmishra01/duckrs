@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 3680 of 6367 test files pass (**60.8%**). The v1 target is ≥ 90%.
+- Overall: 3686 of 6367 test files pass (**60.9%**). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -17,7 +17,8 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] `PARTITION_BY` for CSV and JSON (Parquet had it), `PARTITION_BY *`, `PARTITIONED_BY` alias
   - [x] the `ORDER BY` option of COPY TO, and its checks against `USE_TMP_FILE` / `PER_THREAD_OUTPUT`
   - [x] `read_text` / `read_blob`, with hive partition columns
-  - [ ] the `filename`, `file_index`, `file_row_number` virtual columns of the multi-file readers
+  - [x] the `filename`, `file_index`, `file_row_number` virtual columns of `read_csv`, `read_json`, `read_parquet`
+  - [ ] `file_row_group_number` and the other Parquet-only virtual columns; `filename=1` name conflicts
   - [ ] `read_text` reads content even when only `filename`/`size` is selected, so binary files fail
   - [ ] `PER_THREAD_OUTPUT`, `FILE_SIZE_BYTES`, `APPEND`, `PARTITION_PATH`, `RETURN_STATS`
   - [ ] COPY formats `blob` and `tbl`, writing zstd

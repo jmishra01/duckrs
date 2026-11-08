@@ -44,6 +44,8 @@ pub struct JsonScanData {
     pub timestamp_format: Option<String>,
     pub filename: bool,
     pub hive: Vec<(String, LogicalType)>,
+    /// the virtual columns, after the rest
+    pub virtual_columns: Vec<crate::execution::multi_file::VirtualColumn>,
 }
 
 impl JsonScanData {
@@ -53,6 +55,7 @@ impl JsonScanData {
             types.push(LogicalType::VARCHAR);
         }
         types.extend(self.hive.iter().map(|(_, ty)| ty.clone()));
+        types.extend(crate::execution::multi_file::virtual_types(&self.virtual_columns));
         types
     }
 }
@@ -305,6 +308,7 @@ pub struct JsonScanState {
     file: usize,
     data: Vec<u8>,
     records: Option<std::vec::IntoIter<Record>>,
+    virtual_rows: crate::execution::multi_file::VirtualRows,
 }
 
 fn record_row(scan: &JsonScanData, record: &Json, formats: &Formats, strict: bool) -> Result<Option<Vec<Value>>> {
@@ -447,7 +451,14 @@ impl PhysicalOperator for PhysicalJsonScan {
                 columns.push(column);
             }
             extra_columns(scan, path, count, &mut columns)?;
-            return Ok(Some(DataChunk::from_columns(columns, count)));
+            return crate::execution::multi_file::append_virtual_columns(
+                DataChunk::from_columns(columns, count),
+                &scan.virtual_columns,
+                path,
+                state.file,
+                &mut state.virtual_rows,
+            )
+            .map(Some);
         }
     }
 }
