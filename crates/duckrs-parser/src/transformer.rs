@@ -2920,11 +2920,12 @@ impl<'g> Transformer<'g> {
                 repeatable: false,
             })
         } else {
+            // `SampleOptions::MAX_SAMPLE_ROWS`
+            const MAX_SAMPLE_ROWS: i64 = 1_000_000_000;
             let rows = number as i64;
-            if rows < 0 {
+            if !(0..=MAX_SAMPLE_ROWS).contains(&rows) {
                 return Err(parser_error(format!(
-                    "Sample rows {rows} out of range, must be between 0 and {}",
-                    1u64 << 40
+                    "Sample rows {rows} out of range, must be between 0 and {MAX_SAMPLE_ROWS}"
                 )));
             }
             Ok(SampleOptions {

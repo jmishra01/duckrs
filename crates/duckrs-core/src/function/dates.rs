@@ -942,9 +942,9 @@ pub(crate) fn add_interval(micros: i64, interval: Interval) -> Result<i64> {
 
 fn negated(interval: Interval) -> Interval {
     Interval {
-        months: -interval.months,
-        days: -interval.days,
-        micros: -interval.micros,
+        months: interval.months.wrapping_neg(),
+        days: interval.days.wrapping_neg(),
+        micros: interval.micros.wrapping_neg(),
     }
 }
 
@@ -1003,7 +1003,21 @@ fn interval_plus_moment(args: &DataChunk, result: &mut Vector) -> Result<()> {
 
 fn moment_minus_interval(args: &DataChunk, result: &mut Vector) -> Result<()> {
     let ty = result.logical_type().clone();
-    strict_rows(args, result, |row| shifted(&row[0], negated(interval_of(&row[1])), &ty))
+    strict_rows(args, result, |row| {
+        let interval = interval_of(&row[1]);
+        // `Interval::Invert`, of which a time only takes the micros (`SubtractTimeOperator`)
+        let time = matches!(ty.id(), LogicalTypeId::Time | LogicalTypeId::TimeTz);
+        if !time && interval.days == i32::MIN {
+            return Err(out_of_range("Interval days value out of range"));
+        }
+        if interval.micros == i64::MIN {
+            return Err(out_of_range("Interval micros value out of range"));
+        }
+        if !time && interval.months == i32::MIN {
+            return Err(out_of_range("Interval months value out of range"));
+        }
+        shifted(&row[0], negated(interval), &ty)
+    })
 }
 
 fn days_shifted(value: &Value, days: i128) -> Result<Value> {

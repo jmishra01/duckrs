@@ -197,6 +197,330 @@ pub(crate) fn cast_value(value: &Value, target: &LogicalType) -> Result<Value> {
     Ok(result.get_value(0))
 }
 
+/// `EXTENSION_SETTINGS` of `extension_entries.hpp`: the settings of the extensions.
+const EXTENSION_SETTING_NAMES: &[&str] = &[
+    "__iceberg_unsafe_struct_null_default_interp",
+    "allow_asterisks_in_http_paths",
+    "auto_fallback_to_full_download",
+    "aws_default_credentials",
+    "aws_network_calls_via_duckdb",
+    "azure_account_name",
+    "azure_context_caching",
+    "azure_credential_chain",
+    "azure_endpoint",
+    "azure_http_logging",
+    "azure_http_logging_redact_headers",
+    "azure_http_logging_redact_query_params",
+    "azure_http_proxy",
+    "azure_http_stats",
+    "azure_proxy_password",
+    "azure_proxy_user_name",
+    "azure_read_buffer_size",
+    "azure_read_transfer_chunk_size",
+    "azure_read_transfer_concurrency",
+    "azure_storage_connection_string",
+    "azure_transport_option_type",
+    "azure_write_block_size",
+    "azure_write_staged_blocks_per_commit",
+    "binary_as_string",
+    "ca_cert_file",
+    "calendar",
+    "disable_parquet_prefetching",
+    "ducklake_default_data_inlining_row_limit",
+    "ducklake_default_version",
+    "ducklake_max_retry_count",
+    "ducklake_retry_backoff",
+    "ducklake_retry_wait_ms",
+    "ducklake_target_file_size",
+    "ducklake_write_deletion_vectors",
+    "enable_curl_server_cert_verification",
+    "enable_geoparquet_conversion",
+    "enable_global_s3_configuration",
+    "enable_legacy_parser",
+    "enable_server_cert_verification",
+    "extra_http_headers",
+    "force_download",
+    "force_download_threshold",
+    "gcs_user_project",
+    "geometry_always_xy",
+    "glue_create_bucketed_tables",
+    "glue_get_partitions_segments",
+    "glue_metadata_cache_scope",
+    "glue_network_calls_via_duckdb",
+    "gpu_execution",
+    "hf_max_per_page",
+    "hive_partition_listing_threshold",
+    "hnsw_ef_search",
+    "hnsw_enable_experimental_persistence",
+    "hnsw_prefilter",
+    "http_keep_alive",
+    "http_retries",
+    "http_retry_backoff",
+    "http_retry_wait_ms",
+    "http_timeout",
+    "httpfs_client_implementation",
+    "httpfs_connection_caching",
+    "httpfs_enable_credential_refresh",
+    "iceberg_default_format_version",
+    "iceberg_equality_delete_fast_filter",
+    "iceberg_logging_post_body_truncate_limit",
+    "iceberg_metadata_log_clock_skew_ms",
+    "iceberg_test_force_token_expiry",
+    "iceberg_unsafe_skip_puffin_verification",
+    "iceberg_use_metadata_log",
+    "iceberg_use_server_side_scan_planning",
+    "json_geometry_format",
+    "merge_http_secret_into_s3_request",
+    "mysql_bit1_as_boolean",
+    "mysql_debug_show_queries",
+    "mysql_enable_filter_pushdown",
+    "mysql_enable_remote_pushdown",
+    "mysql_enable_transactions",
+    "mysql_incomplete_dates_as_nulls",
+    "mysql_pool_acquire_mode",
+    "mysql_pool_connection_idle_timeout_millis",
+    "mysql_pool_connection_max_lifetime_millis",
+    "mysql_pool_enable_reaper_thread",
+    "mysql_pool_enable_thread_local_cache",
+    "mysql_pool_health_check_query",
+    "mysql_pool_size",
+    "mysql_pool_wait_timeout_millis",
+    "mysql_session_time_zone",
+    "mysql_time_as_time",
+    "mysql_tinyint1_as_boolean",
+    "parquet_can_have_nan",
+    "parquet_metadata_cache",
+    "parquet_prefetch_column_gap",
+    "parquet_use_page_index",
+    "pg_array_as_varchar",
+    "pg_connection_cache",
+    "pg_connection_limit",
+    "pg_debug_show_queries",
+    "pg_enable_filter_pushdown",
+    "pg_idle_in_transaction_timeout_millis",
+    "pg_null_byte_replacement",
+    "pg_numeric_as_varchar",
+    "pg_numeric_nan_as_null",
+    "pg_oauth_token",
+    "pg_pages_per_task",
+    "pg_pool_acquire_mode",
+    "pg_pool_enable_reaper_thread",
+    "pg_pool_enable_thread_local_cache",
+    "pg_pool_health_check_query",
+    "pg_pool_idle_timeout_millis",
+    "pg_pool_max_connections",
+    "pg_pool_max_lifetime_millis",
+    "pg_pool_wait_timeout_millis",
+    "pg_query_mode",
+    "pg_staleness_query",
+    "pg_staleness_query_enabled",
+    "pg_statement_timeout_millis",
+    "pg_use_binary_copy",
+    "pg_use_ctid_scan",
+    "pg_use_information_schema_introspection",
+    "pg_use_text_protocol",
+    "prefetch_all_parquet_files",
+    "quack_authentication_function",
+    "quack_authorization_function",
+    "quack_cache_max_rows",
+    "quack_debug_drop_batch",
+    "quack_debug_duplicate_sends",
+    "quack_debug_emit_delay_ms",
+    "quack_debug_fetch_delay_ms",
+    "quack_debug_send_delay_ms",
+    "quack_default_client_id",
+    "quack_default_heartbeat_timeout",
+    "quack_enable_reconnects",
+    "quack_fetch_read_ahead",
+    "quack_loaded_at_us",
+    "quack_prepare_inline_rows",
+    "quack_rebalance_buffer_bytes",
+    "quack_result_ttl",
+    "quack_server_keep_alive_timeout",
+    "quack_server_max_connections",
+    "quack_server_stream_buffer_bytes",
+    "quack_target_batch_bytes",
+    "rtree_index_scan_min_rows",
+    "rtree_index_scan_ratio",
+    "s3_access_key_id",
+    "s3_allow_recursive_globbing",
+    "s3_enable_deprecated_url_parameters",
+    "s3_endpoint",
+    "s3_kms_key_id",
+    "s3_list_concurrency",
+    "s3_region",
+    "s3_requester_pays",
+    "s3_secret_access_key",
+    "s3_session_token",
+    "s3_uploader_max_filesize",
+    "s3_uploader_max_parts_per_file",
+    "s3_url_compatibility_mode",
+    "s3_url_scheme_aliases",
+    "s3_url_style",
+    "s3_use_global_endpoint",
+    "s3_use_ssl",
+    "s3_version_id_pinning",
+    "sqlite_all_varchar",
+    "sqlite_debug_show_queries",
+    "sqlite_disable_multithreaded_scans",
+    "timezone",
+    "ui_local_port",
+    "ui_polling_interval",
+    "ui_remote_url",
+    "unsafe_disable_etag_checks",
+    "unsafe_enable_version_guessing",
+    "whoami_hostname",
+    "whoami_meta",
+    "whoami_name",
+    "whoami_provider",
+    "whoami_region",
+    "whoami_started_at",
+];
+
+/// `CompressionType`'s names.
+const COMPRESSION_TYPES: [&str; 16] = [
+    "AUTO",
+    "UNCOMPRESSED",
+    "CONSTANT",
+    "RLE",
+    "DICTIONARY",
+    "PFOR",
+    "BITPACKING",
+    "FSST",
+    "CHIMP",
+    "PATAS",
+    "ALP",
+    "ALPRD",
+    "ZSTD",
+    "ROARING",
+    "EMPTY",
+    "DICT_FSST",
+];
+
+/// `EnumUtil::FromString<CompressionType>` of a name that is none.
+fn compression_type_error(input: &str) -> Error {
+    let scores = COMPRESSION_TYPES
+        .iter()
+        .map(|v| (v.to_string(), similarity_rating(v, input)))
+        .collect();
+    Error::new(
+        ErrorKind::NotImplemented,
+        format!(
+            "Enum value: unrecognized value \"{input}\" for enum \"CompressionType\"\n{}",
+            candidates_message(&top_n_strings(scores), "Candidates")
+        ),
+    )
+}
+
+/// The settings whose `OnSet` or `SetGlobal` refuses a NULL.
+const NULL_REJECTING: &[&str] = &[
+    "allocator_background_threads",
+    "allow_community_extensions",
+    "allow_extension_repositories",
+    "allow_parser_override_extension",
+    "allow_persistent_secrets",
+    "allow_unredacted_secrets",
+    "allow_unsigned_extensions",
+    "allowed_configs",
+    "allowed_directories",
+    "allowed_paths",
+    "arrow_output_version",
+    "checkpoint_on_detach",
+    "debug_checkpoint_abort",
+    "debug_force_bitpacking_mode",
+    "debug_physical_table_scan_execution_strategy",
+    "debug_verify_progress",
+    "debug_verify_statement",
+    "debug_verify_vector",
+    "debug_window_mode",
+    "default_block_size",
+    "default_transaction_invalidation_policy",
+    "dialect_compatibility_mode",
+    "enable_block_allocator",
+    "enable_external_access",
+    "enable_external_file_cache",
+    "enable_logging",
+    "enable_progress_bar",
+    "enable_progress_bar_print",
+    "explain_output",
+    "extension_directories",
+    "external_file_cache_local_max_block_size",
+    "external_file_cache_remote_max_block_size",
+    "external_file_cache_remote_min_block_size",
+    "external_file_cache_request_sizing",
+    "fsync_mode",
+    "index_scan_percentage",
+    "initial_column_segment_size",
+    "lambda_syntax",
+    "max_temp_directory_size",
+    "pin_threads",
+    "preserve_identifier_case",
+    "progress_bar_time",
+    "read_ahead_depth",
+    "regex_match_operator_semantics",
+    "show_behavior",
+    "storage_block_prefetch",
+    "table_function_identifier_conversion",
+    "tracked_metrics",
+    "validate_external_file_cache",
+    "warnings_as_errors",
+];
+
+/// `OptimizerTypeFromString`'s names.
+const OPTIMIZER_TYPES: &[&str] = &[
+    "expression_rewriter",
+    "filter_pullup",
+    "filter_pushdown",
+    "empty_result_pullup",
+    "cte_filter_pusher",
+    "regex_range",
+    "in_clause",
+    "join_order",
+    "deliminator",
+    "unnest_rewriter",
+    "unused_columns",
+    "statistics_propagation",
+    "common_subexpressions",
+    "common_aggregate",
+    "column_lifetime",
+    "limit_pushdown",
+    "row_group_pruner",
+    "top_n",
+    "top_n_window_elimination",
+    "build_side_probe_side",
+    "compressed_materialization",
+    "duplicate_groups",
+    "reorder_filter",
+    "sampling_pushdown",
+    "join_filter_pushdown",
+    "extension",
+    "materialized_cte",
+    "aggregate_function_rewriter",
+    "late_materialization",
+    "cte_inlining",
+    "common_subplan",
+    "join_elimination",
+    "window_self_join",
+    "window_join_pushdown",
+    "projection_pullup",
+    "outer_join_simplification",
+    "window_rewriter",
+    "partitioned_execution",
+    "partial_aggregate_pushdown",
+    "remote_pushdown",
+    "grouping_sets",
+    "type_pushdown",
+    "scalar_fn_pushdown",
+    "distinct_aggregate_rewrite",
+    "aggregate_reuse",
+    "projection_placement",
+    "redundant_order_keys",
+    "disjunctive_join_rewriter",
+    "redundant_order",
+    "self_join_aggregate",
+    "scalar_aggregate_merge",
+];
+
 /// The custom `OnSet` callbacks of the settings duckrs honors: they normalize the value.
 fn on_set(setting: &SettingDefinition, value: Value) -> Result<Value> {
     let text = || value.try_to_string().map(|s| s.to_lowercase());
@@ -217,45 +541,114 @@ fn on_set(setting: &SettingDefinition, value: Value) -> Result<Value> {
             ));
         }
     }
+    let invalid = |message: String| Err(Error::new(ErrorKind::InvalidInput, message));
+    let number = || value.try_to_string().ok().and_then(|s| s.parse::<f64>().ok());
+    match setting.name {
+        "threads" if number().is_some_and(|n| n < 1.0) => {
+            return Err(Error::new(ErrorKind::Syntax, "Must have at least 1 thread!"));
+        }
+        "progress_bar_time" if number().is_some_and(|n| n < 0.0) => {
+            return invalid("progress_bar_time setting cannot be negative".into());
+        }
+        "index_scan_percentage" if !number().is_some_and(|n| (0.0..=1.0).contains(&n)) => {
+            return invalid("the index scan percentage must be within [0, 1]".into());
+        }
+        "initial_column_segment_size" => match number() {
+            Some(n) if n < 8.0 => {
+                return invalid(
+                    "The initial column segment size must be at least 8 bytes (default block header storage size)"
+                        .into(),
+                );
+            }
+            Some(n) if !(n as u64).is_power_of_two() => {
+                return invalid("The initial column segment size must be a power of two".into());
+            }
+            _ => {}
+        },
+        "read_ahead_depth" if number().is_some_and(|n| n < -1.0) => {
+            return invalid("read_ahead_depth must be -1 (automatic), 0 (disabled) or a positive number".into());
+        }
+        "http_client_pool_capacity" if number().is_some_and(|n| n <= 0.0) => {
+            return invalid(
+                "http_client_pool_capacity must be a positive integer, RESET it to return to the automatic value"
+                    .into(),
+            );
+        }
+        "profiling_mode" => {
+            let mode = text()?;
+            if !matches!(mode.as_str(), "standard" | "detailed" | "all") {
+                return Err(Error::new(
+                    ErrorKind::Parser,
+                    format!("Unrecognized profiling mode \"{mode}\", supported formats: [standard, detailed, all]"),
+                ));
+            }
+        }
+        // `DisabledCompressionMethodsSetting`: what every column can fall back to stays
+        "disabled_compression_methods" => {
+            for entry in value.try_to_string()?.split(',') {
+                let entry = entry.trim().to_lowercase();
+                if entry == "none" {
+                    break;
+                }
+                if entry.is_empty() {
+                    continue;
+                }
+                if !COMPRESSION_TYPES.iter().any(|t| t.eq_ignore_ascii_case(&entry)) {
+                    return Err(compression_type_error(&entry));
+                }
+                if matches!(entry.as_str(), "auto" | "constant" | "empty" | "uncompressed") {
+                    return invalid(format!("Compression method {entry} cannot be disabled"));
+                }
+            }
+        }
+        // `DBConfig::AddAllowedConfig`
+        "allowed_configs" => {
+            if let duckrs_common::value::ValueData::List(names) = value.data() {
+                for name in names {
+                    let name = name.try_to_string()?;
+                    if name.is_empty() {
+                        return invalid("Cannot provide an empty string for allowed_configs".into());
+                    }
+                    if name.eq_ignore_ascii_case("allowed_configs") || name.eq_ignore_ascii_case("lock_configuration") {
+                        return invalid(format!("Cannot include \"{name}\" in allowed_configs"));
+                    }
+                    if find_setting(&name).is_none()
+                        && !EXTENSION_SETTING_NAMES.iter().any(|s| s.eq_ignore_ascii_case(&name))
+                    {
+                        return invalid(format!("Unknown configuration option \"{name}\" in allowed_configs"));
+                    }
+                }
+            }
+        }
+        // `DisabledOptimizersSetting::SetGlobal`: `OptimizerTypeFromString` of each entry
+        "disabled_optimizers" => {
+            let list = value.try_to_string()?;
+            for entry in list.split(',') {
+                let entry = entry.trim().to_lowercase();
+                if !entry.is_empty() && !OPTIMIZER_TYPES.contains(&entry.as_str()) {
+                    let names: Vec<String> = OPTIMIZER_TYPES.iter().map(|s| s.to_string()).collect();
+                    return Err(Error::new(
+                        ErrorKind::Parser,
+                        format!(
+                            "Optimizer type \"{entry}\" not recognized\n{}",
+                            candidates_error_message(&names, &entry, "Candidate optimizers")
+                        ),
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
     Ok(match setting.name {
         // `ForceCompressionSetting::OnSet`: a `CompressionType` that can be forced
         "force_compression" => {
-            const TYPES: [&str; 17] = [
-                "AUTO",
-                "UNCOMPRESSED",
-                "CONSTANT",
-                "RLE",
-                "DICTIONARY",
-                "PFOR",
-                "BITPACKING",
-                "FSST",
-                "CHIMP",
-                "PATAS",
-                "ALP",
-                "ALPRD",
-                "ZSTD",
-                "ROARING",
-                "EMPTY",
-                "DICT_FSST",
-                "ENUM_SIZE",
-            ];
             let compression = text()?;
             if compression == "none" || compression == "auto" {
                 return Ok(Value::varchar("auto"));
             }
             let input = value.try_to_string()?;
-            let Some(found) = TYPES.iter().find(|t| t.eq_ignore_ascii_case(&compression)) else {
-                let scores = TYPES
-                    .iter()
-                    .map(|v| (v.to_string(), similarity_rating(v, &input)))
-                    .collect();
-                return Err(Error::new(
-                    ErrorKind::NotImplemented,
-                    format!(
-                        "Enum value: unrecognized value \"{input}\" for enum \"CompressionType\"\n{}",
-                        candidates_message(&top_n_strings(scores), "Candidates")
-                    ),
-                ));
+            let Some(found) = COMPRESSION_TYPES.iter().find(|t| t.eq_ignore_ascii_case(&compression)) else {
+                return Err(compression_type_error(&input));
             };
             match *found {
                 "CONSTANT" | "EMPTY" => {
@@ -406,7 +799,29 @@ pub fn set_variable(
     }
     let (index, setting) = find_setting(name).ok_or_else(|| unrecognized(name))?;
     let is_global = resolve_scope(setting, scope)?;
-    let value = on_set(setting, cast_value(value, &input_type(setting)?)?)?;
+    if value.is_null() {
+        let invalid = |message: String| Err(Error::new(ErrorKind::InvalidInput, message));
+        match setting.name {
+            "threads" | "external_threads" | "async_threads" | "ordered_aggregate_threshold" => {
+                return invalid(format!("{} must be a positive integer", setting.name));
+            }
+            "perfect_ht_threshold" => return invalid("perfect_ht_threshold must be an integer".into()),
+            "http_client_pool_capacity" => {
+                return invalid("http_client_pool_capacity must be a positive integer".into());
+            }
+            name if NULL_REJECTING.contains(&name) => return invalid(format!("{name} setting cannot be NULL")),
+            _ => {}
+        }
+    }
+    // `Value::CastAs`: a value that does not cast is not one of the setting's
+    let value = cast_value(value, &input_type(setting)?).map_err(|error| match error.kind {
+        ErrorKind::Conversion => Error::new(
+            ErrorKind::InvalidInput,
+            format!("Failed to cast value: {}", error.message),
+        ),
+        _ => error,
+    })?;
+    let value = on_set(setting, value)?;
     if UNHONORED.contains(&setting.name) && Some(&value) != default_value(setting).as_ref() {
         return Err(crate::unported(format!("the {} setting", setting.name)));
     }

@@ -13,6 +13,9 @@
 #   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
 # Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
 # stop passing. Regenerate with:
+#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
+# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
+# stop passing. Regenerate with:
 test/common/test_cast_hugeint.test
 test/fuzzer/afl/alter_if_exists.test
 test/fuzzer/afl/analyze_empty_table.test
@@ -1364,6 +1367,7 @@ test/sql/copy/parquet/parquet_schema_num_children_fix.test
 test/sql/copy/parquet/parquet_union_by_name.test
 test/sql/copy/parquet/parquet_zstd.test
 test/sql/copy/parquet/read_ahead/readahead_active_jobs_hang.test
+test/sql/copy/parquet/read_ahead/readahead_depth_setting.test
 test/sql/copy/parquet/read_ahead/readahead_file_descriptor_limit_threads.test
 test/sql/copy/parquet/read_ahead/readahead_io_errors.test
 test/sql/copy/parquet/read_ahead/readahead_limit_slot_leak_hang.test
@@ -1510,6 +1514,7 @@ test/sql/error/missing_type.test
 test/sql/error/mix_aggregate_and_non_aggregate.test
 test/sql/error/subquery_single_column.test
 test/sql/error/test_try_common_subexpression.test
+test/sql/error/test_try_constant_regex.test
 test/sql/error/test_try_nested_conditional.test
 test/sql/error/unknown_window_function.test
 test/sql/execution/column_binding_resolver.test
@@ -1717,6 +1722,7 @@ test/sql/function/string/regex_escape.test
 test/sql/function/string/regex_extract_all_struct.test
 test/sql/function/string/regex_extract_empty_group_name.test
 test/sql/function/string/regex_filter_pushdown.test
+test/sql/function/string/regex_search.test
 test/sql/function/string/regexp_split_to_table.test
 test/sql/function/string/sha1.test
 test/sql/function/string/sha256.test
@@ -2405,7 +2411,9 @@ test/sql/pivot/unpivot_view.test
 test/sql/pragma/profiling/test_custom_profiling_errors.test
 test/sql/pragma/profiling/test_duckdb_profiling_settings_function.test
 test/sql/pragma/profiling/test_no_reset_setting.test
+test/sql/pragma/test_disabled_compression.test
 test/sql/pragma/test_force_compression.test
+test/sql/pragma/test_various_pragmas.test
 test/sql/prepared/invalid_prepare.test
 test/sql/prepared/parameter_order_subquery.test
 test/sql/prepared/parameter_variants.test
@@ -2467,6 +2475,7 @@ test/sql/sample/table_samples/basic_sample_tests.test
 test/sql/sample/table_samples/table_sample_converts_to_block_sample.test
 test/sql/sample/table_samples/test_sample_is_destroyed_on_updates.test
 test/sql/sample/table_samples/test_sample_types.test
+test/sql/sample/test_sample_too_big.test
 test/sql/select/test_positional_reference.test
 test/sql/select/test_projection_names.test
 test/sql/select/test_schema_reference.test
@@ -2500,10 +2509,17 @@ test/sql/settings/connection_local_settings.test
 test/sql/settings/debug_deprecated_settings.test
 test/sql/settings/max_memory_percentage.test
 test/sql/settings/reset/reset_threads.test
+test/sql/settings/set_null_settings.test
 test/sql/settings/setting_alias.test
 test/sql/settings/setting_collation.test
+test/sql/settings/setting_disabled_optimizer.test
 test/sql/settings/setting_null_order.test
 test/sql/settings/setting_order.test
+test/sql/settings/setting_profiling_mode.test
+test/sql/settings/setting_threads.test
+test/sql/settings/test_nan_percentage_settings.test
+test/sql/settings/test_progress_bar_null.test
+test/sql/settings/test_progress_bar_time_negative.test
 test/sql/show_select/describe_case_alias.test
 test/sql/show_select/describe_rowid.test
 test/sql/show_select/describe_subquery.test
@@ -3207,6 +3223,7 @@ test/sql/types/enum/create_enum_collection_alias.test
 test/sql/types/enum/enum_cast_optimizer.test
 test/sql/types/enum/enum_enum_cast_missing_value.test
 test/sql/types/enum/standalone_enum.test
+test/sql/types/enum/test_25633.test
 test/sql/types/enum/test_26369.test
 test/sql/types/enum/test_3479.test
 test/sql/types/enum/test_3641.test
@@ -3426,6 +3443,7 @@ test/sql/types/struct/unnamed_struct_mix.test
 test/sql/types/struct/unnest_struct_distinct.test
 test/sql/types/struct/update_empty_row.test
 test/sql/types/test_date_cast.test
+test/sql/types/test_interval_negation_overflow.test
 test/sql/types/test_quotes.test
 test/sql/types/test_typeof.test
 test/sql/types/test_user_type_errors_18452.test

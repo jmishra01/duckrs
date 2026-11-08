@@ -134,11 +134,15 @@ impl Time {
     }
 
     /// Parses a TIME (`Time::TryConvertTime`). Non-strict parsing also accepts a timestamp and
-    /// takes its time of day.
+    /// takes its time of day. A UTC offset after the time is dropped, as the TIMESTAMP cast
+    /// drops one, and anything else after it is an error.
     pub fn try_convert(buf: &[u8], strict: bool, nanos: Option<&mut i32>) -> Option<Time> {
         let mut nanos = nanos;
         match Self::try_convert_interval(buf, strict, nanos.as_deref_mut(), false) {
-            Some((t, _)) => (t.0 <= MICROS_PER_DAY).then_some(t),
+            Some((t, mut pos)) => {
+                offset_suffix(buf, &mut pos)?;
+                (t.0 <= MICROS_PER_DAY).then_some(t)
+            }
             None if !strict => {
                 let ts = Timestamp::try_convert(buf, nanos).ok()?;
                 ts.is_finite().then(|| ts.time())
@@ -151,6 +155,31 @@ impl Time {
     pub fn parse(s: &str, strict: bool) -> crate::Result<Time> {
         Self::try_convert(s.as_bytes(), strict, None).ok_or_else(|| time_error(s))
     }
+}
+
+/// `TryParseOffsetSuffix`: what may follow a time is optional space, an optional UTC offset
+/// (`Z` or `±HH[:MM[:SS]]`, within ±15:59:59), then only space.
+fn offset_suffix(buf: &[u8], pos: &mut usize) -> Option<i32> {
+    let len = buf.len();
+    let only_space = |pos: &mut usize| {
+        while *pos < len && is_space(buf[*pos]) {
+            *pos += 1;
+        }
+        *pos == len
+    };
+    let (mut hh, mut mm, mut ss) = (0, 0, 0);
+    if !only_space(pos) {
+        if buf[*pos] == b'Z' {
+            *pos += 1;
+        } else {
+            (hh, mm, ss) = parse_utc_offset(buf, pos, true)?;
+        }
+    }
+    let offset = (hh * 60 + mm) * 60 + ss;
+    if !(TimeTz::MIN_OFFSET..=TimeTz::MAX_OFFSET).contains(&offset) {
+        return None;
+    }
+    only_space(pos).then_some(offset)
 }
 
 /// `Time::ConversionError`.
@@ -240,26 +269,7 @@ impl TimeTz {
         if time.0 > MICROS_PER_DAY {
             return None;
         }
-        let len = buf.len();
-        while pos < len && is_space(buf[pos]) {
-            pos += 1;
-        }
-        let (mut hh, mut mm, mut ss) = (0, 0, 0);
-        if pos < len {
-            (hh, mm, ss) = parse_utc_offset(buf, &mut pos, true)?;
-        }
-        let offset = (hh * 60 + mm) * 60 + ss;
-        if !(Self::MIN_OFFSET..=Self::MAX_OFFSET).contains(&offset) {
-            return None;
-        }
-        if strict {
-            while pos < len && is_space(buf[pos]) {
-                pos += 1;
-            }
-            if pos < len {
-                return None;
-            }
-        }
+        let offset = offset_suffix(buf, &mut pos)?;
         Some(TimeTz::new(time, offset))
     }
 }

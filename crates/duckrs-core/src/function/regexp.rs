@@ -57,6 +57,8 @@ struct Options {
     dot_matches_newline: bool,
     literal: bool,
     global: bool,
+    /// `k`: the input when nothing matches, for `regexp_extract`
+    keep: bool,
 }
 
 fn parse_options(options: &str) -> Result<Options> {
@@ -69,6 +71,7 @@ fn parse_options(options: &str) -> Result<Options> {
             // newline-sensitive: `.` does not match a newline, as without an option
             'm' | 'n' | 'p' => parsed.dot_matches_newline = false,
             'g' => parsed.global = true,
+            'k' => parsed.keep = true,
             's' => parsed.dot_matches_newline = true,
             ' ' | '\t' | '\n' => {}
             other => {
@@ -109,6 +112,24 @@ fn text(value: &Value) -> String {
     }
 }
 
+/// `ParseRegexOptions`: `g` only for `regexp_replace`, `k` only for `regexp_extract`.
+fn options_for(row: &[Value], at: usize, global_ok: bool, keep_ok: bool) -> Result<Options> {
+    let options = options_of(row, at)?;
+    if options.global && !global_ok {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "Option 'g' (global replace) is only valid for regexp_replace",
+        ));
+    }
+    if options.keep && !keep_ok {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "Option 'k' (keep input on no match) is only valid for regexp_extract",
+        ));
+    }
+    Ok(options)
+}
+
 fn options_of(row: &[Value], at: usize) -> Result<Options> {
     match row.get(at) {
         Some(options) => parse_options(&text(options)),
@@ -118,14 +139,14 @@ fn options_of(row: &[Value], at: usize) -> Result<Options> {
 
 fn regexp_matches(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
-        let regex = compile(&text(&row[1]), options_of(row, 2)?, false)?;
+        let regex = compile(&text(&row[1]), options_for(row, 2, false, false)?, false)?;
         Ok(Value::boolean(regex.is_match(&text(&row[0]))))
     })
 }
 
 fn regexp_full_match(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
-        let regex = compile(&text(&row[1]), options_of(row, 2)?, true)?;
+        let regex = compile(&text(&row[1]), options_for(row, 2, false, false)?, true)?;
         Ok(Value::boolean(regex.is_match(&text(&row[0]))))
     })
 }
@@ -186,7 +207,7 @@ fn check_rewrite(replacement: &str, groups: usize) -> Result<()> {
 
 fn regexp_replace(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
-        let options = options_of(row, 3)?;
+        let options = options_for(row, 3, true, false)?;
         let regex = compile(&text(&row[1]), options, false)?;
         let input = text(&row[0]);
         let replacement = text(&row[2]);
@@ -207,7 +228,8 @@ fn group_of(row: &[Value]) -> Result<usize> {
 
 fn regexp_extract(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
-        let regex = compile(&text(&row[1]), options_of(row, 3)?, false)?;
+        let options = options_for(row, 3, false, true)?;
+        let regex = compile(&text(&row[1]), options, false)?;
         let group = group_of(row)?;
         if group >= regex.captures_len() {
             return Err(Error::new(
@@ -216,10 +238,10 @@ fn regexp_extract(args: &DataChunk, result: &mut Vector) -> Result<()> {
             ));
         }
         let input = text(&row[0]);
-        let found = regex
-            .captures(&input)
-            .and_then(|c| c.get(group).map(|m| m.as_str().to_string()));
-        Ok(Value::varchar(found.unwrap_or_default()))
+        let Some(captures) = regex.captures(&input) else {
+            return Ok(Value::varchar(if options.keep { input.as_str() } else { "" }));
+        };
+        Ok(Value::varchar(captures.get(group).map_or("", |m| m.as_str())))
     })
 }
 
@@ -229,7 +251,7 @@ fn regexp_extract_all(args: &DataChunk, result: &mut Vector) -> Result<()> {
         if row.iter().take(2).any(Value::is_null) {
             return Ok(Value::null(ty.clone()));
         }
-        let regex = compile(&text(&row[1]), options_of(row, 3)?, false)?;
+        let regex = compile(&text(&row[1]), options_for(row, 3, false, false)?, false)?;
         let group = group_of(row)?;
         if group >= regex.captures_len() {
             return Err(Error::new(
@@ -289,7 +311,7 @@ fn regexp_split(args: &DataChunk, result: &mut Vector) -> Result<()> {
             return Ok(Value::null(ty.clone()));
         }
         let pattern = text(&row[1]);
-        let regex = compile(&pattern, options_of(row, 2)?, false)?;
+        let regex = compile(&pattern, options_for(row, 2, false, false)?, false)?;
         let input = text(&row[0]);
         let parts = split_regex(&input, &pattern, &regex);
         Value::new(
@@ -438,6 +460,16 @@ pub(crate) fn bind_regexp_struct(
             ));
         }
         options = parse_options(&given.try_to_string()?)?;
+        if options.global || options.keep {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                if options.global {
+                    "Option 'g' (global replace) is only valid for regexp_replace"
+                } else {
+                    "Option 'k' (keep input on no match) is only valid for regexp_extract"
+                },
+            ));
+        }
     }
     if !children[2].is_foldable() {
         return Err(binder_error(format!(
@@ -493,7 +525,7 @@ fn regexp_extract_struct(args: &DataChunk, result: &mut Vector) -> Result<()> {
         if row[0].is_null() || row[1].is_null() {
             return Ok(Value::null(ty.clone()));
         }
-        let regex = compile(&text(&row[1]), options_of(row, 3)?, false)?;
+        let regex = compile(&text(&row[1]), options_for(row, 3, false, false)?, false)?;
         let input = text(&row[0]);
         let captures = regex.captures(&input);
         let fields = (1..=count)
@@ -513,7 +545,7 @@ fn regexp_extract_all_struct(args: &DataChunk, result: &mut Vector) -> Result<()
         if row[0].is_null() || row[1].is_null() {
             return Ok(Value::null(ty.clone()));
         }
-        let regex = compile(&text(&row[1]), options_of(row, 3)?, false)?;
+        let regex = compile(&text(&row[1]), options_for(row, 3, false, false)?, false)?;
         let input = text(&row[0]);
         let mut items = Vec::new();
         let mut start = 0;
@@ -536,4 +568,18 @@ fn regexp_extract_all_struct(args: &DataChunk, result: &mut Vector) -> Result<()
         }
         Value::new(ty.clone(), ValueData::List(items))
     })
+}
+
+/// `TryParseConstantPattern` in the bind of the regex functions: a constant pattern compiles
+/// then, so a pattern that does not parse fails without rows.
+pub(crate) fn check_constant_pattern(pattern: &str, options: Option<&str>) -> Result<()> {
+    let options = match options {
+        Some(options) => parse_options(options)?,
+        None => Options::default(),
+    };
+    // only an error RE2 shares: the regex crate refuses some patterns RE2 takes
+    match compile(pattern, options, false) {
+        Err(error) if error.message.starts_with("Invalid regular expression:") => Ok(()),
+        result => result.map(|_| ()),
+    }
 }

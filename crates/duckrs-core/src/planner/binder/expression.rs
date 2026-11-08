@@ -1133,7 +1133,8 @@ impl Binder<'_> {
                 op: OperatorType::Try,
                 children,
             } => {
-                let child = self.bind_expression(&children[0])?;
+                // what a TRY catches at runtime does not fail its binding either
+                let child = crate::function::binder::inside_try(|| self.bind_expression(&children[0]))?;
                 let ty = child.return_type.clone();
                 BoundExpr::new(
                     BoundExprKind::Operator {

@@ -1152,6 +1152,12 @@ impl Binder<'_> {
                 Some(expression) => self.constant_argument(expression)?,
                 None => Value::boolean(true),
             };
+            // `BindCopyOption`
+            if value.is_null() {
+                return Err(binder_error(format!(
+                    "NULL is not supported as a valid option for COPY option \"{name}\""
+                )));
+            }
             result.push((name.to_lowercase(), value));
         }
         for (name, literals) in &info.options {
@@ -1160,6 +1166,11 @@ impl Binder<'_> {
                 [literal] => self.constant_argument(&Expr::constant(literal.clone()))?,
                 _ => return Err(crate::unported(format!("the COPY option {name} with several values"))),
             };
+            if value.is_null() {
+                return Err(binder_error(format!(
+                    "NULL is not supported as a valid option for COPY option \"{name}\""
+                )));
+            }
             result.push((name.to_lowercase(), value));
         }
         Ok(result)

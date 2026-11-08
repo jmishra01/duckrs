@@ -253,21 +253,53 @@ pub(super) fn constant_parameter(
     Ok(Some(value))
 }
 
+thread_local! {
+    /// How many TRY expressions are being bound around the current one.
+    static TRY_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Binds `f` inside of a TRY: the errors that C++ raises when the expression's state is
+/// initialized, which a TRY catches, are left to the execution.
+pub fn inside_try<T>(f: impl FnOnce() -> T) -> T {
+    TRY_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    let result = f();
+    TRY_DEPTH.with(|depth| depth.set(depth.get() - 1));
+    result
+}
+
 /// The bind callbacks of the scalar functions with a parameter that has to be constant.
 fn check_scalar_constant_parameters(name: &str, children: &[BoundExpr]) -> Result<()> {
     // `ParseRegexOptions` on the options of the regex functions
     let options = match (name, children.len()) {
-        ("regexp_matches" | "regexp_full_match", 3) => 2,
-        ("regexp_replace" | "regexp_extract" | "regexp_extract_all", 4) => 3,
+        ("regexp_matches" | "regexp_full_match", 3) => Some(2),
+        ("regexp_replace" | "regexp_extract" | "regexp_extract_all", 4) => Some(3),
+        ("regexp_matches" | "regexp_full_match" | "regexp_replace" | "regexp_extract" | "regexp_extract_all", _) => {
+            None
+        }
         _ => return Ok(()),
     };
-    if let Some(value) = constant_parameter(name, &children[options], options, true)?
-        && value.is_null()
+    let mut option_text = None;
+    if let Some(options) = options
+        && let Some(value) = constant_parameter(name, &children[options], options, true)?
     {
-        return Err(duckrs_common::Error::new(
-            duckrs_common::ErrorKind::InvalidInput,
-            "Regex options field must not be NULL",
-        ));
+        if value.is_null() {
+            return Err(duckrs_common::Error::new(
+                duckrs_common::ErrorKind::InvalidInput,
+                "Regex options field must not be NULL",
+            ));
+        }
+        option_text = value.try_to_string().ok();
+    }
+    // a constant pattern compiles at bind time
+    if let Some(pattern) = children.get(1)
+        && TRY_DEPTH.with(|depth| depth.get() == 0)
+        && pattern.is_foldable()
+        && pattern.return_type.id() != LogicalTypeId::Unknown
+        && let Ok(value) = evaluate_scalar(pattern)
+        && !value.is_null()
+        && let Ok(text) = value.try_to_string()
+    {
+        crate::function::regexp::check_constant_pattern(&text, option_text.as_deref())?;
     }
     Ok(())
 }

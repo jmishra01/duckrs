@@ -1474,6 +1474,13 @@ impl ClientContext {
         } else {
             stem
         };
+        // `AttachedDatabase::NameIsReserved`
+        if ["main", "temp", "system"].iter().any(|r| r.eq_ignore_ascii_case(&name)) {
+            return Err(Error::new(
+                ErrorKind::Binder,
+                format!("Attached database name \"{name}\" cannot be used because it is a reserved name"),
+            ));
+        }
         if self.find_database(&name).is_some() {
             if info.on_conflict == Conflict::Ignore {
                 return Ok(());
