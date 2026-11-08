@@ -29,7 +29,12 @@ fn number(value: &Value) -> Option<f64> {
     match value.data() {
         ValueData::Double(x) => Some(*x),
         ValueData::Float(x) => Some(f64::from(*x)),
-        _ => value.as_i128().map(|x| x as f64),
+        // a DECIMAL is its unscaled integer and its scale
+        _ => {
+            let unscaled = value.as_i128()? as f64;
+            let scale = value.logical_type().decimal_properties().map_or(0, |(_, scale)| scale);
+            Some(unscaled / 10f64.powi(i32::from(scale)))
+        }
     }
 }
 
@@ -201,30 +206,32 @@ fn parse_dirpath(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+/// `PathJoinFunction`: each path joined onto the ones before it (`Path::Join`).
 fn path_join(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    use duckrs_common::path::Path;
     row_wise(args, result, |row| {
-        let mut joined = String::new();
+        let mut parts = Vec::new();
         for value in row {
-            let ValueData::List(parts) = value.data() else {
-                if value.is_null() {
-                    return Ok(Value::null(LogicalType::VARCHAR));
+            if value.is_null() {
+                return Ok(Value::null(LogicalType::VARCHAR));
+            }
+            match value.data() {
+                ValueData::List(items) => {
+                    for item in items {
+                        parts.push(text(item)?);
+                    }
                 }
-                let part = text(value)?;
-                if !joined.is_empty() && !joined.ends_with('/') {
-                    joined.push('/');
-                }
-                joined += &part;
-                continue;
-            };
-            for part in parts {
-                let part = text(part)?;
-                if !joined.is_empty() && !joined.ends_with('/') {
-                    joined.push('/');
-                }
-                joined += &part;
+                _ => parts.push(text(value)?),
             }
         }
-        Ok(Value::varchar(joined))
+        let Some((first, rest)) = parts.split_first() else {
+            return Ok(Value::null(LogicalType::VARCHAR));
+        };
+        let mut path = Path::from_string(first)?;
+        for part in rest {
+            path = path.join_str(part)?;
+        }
+        Ok(Value::varchar(path.to_path_string()))
     })
 }
 
@@ -290,7 +297,8 @@ fn sha256_function(args: &DataChunk, result: &mut Vector) -> Result<()> {
 }
 
 /// `damerau_levenshtein`: true transpositions, over bytes as in C++.
-fn damerau(a: &[u8], b: &[u8]) -> i64 {
+/// The Damerau-Levenshtein distance of the characters of two strings.
+fn damerau(a: &[char], b: &[char]) -> i64 {
     let (n, m) = (a.len(), b.len());
     let big = n + m;
     let mut table = vec![vec![0usize; m + 2]; n + 2];
@@ -303,11 +311,12 @@ fn damerau(a: &[u8], b: &[u8]) -> i64 {
         table[0][j + 1] = big;
         table[1][j + 1] = j;
     }
-    let mut last = [0usize; 256];
+    // the last row each character was seen in
+    let mut last: std::collections::HashMap<char, usize> = std::collections::HashMap::new();
     for i in 1..=n {
         let mut last_match = 0;
         for j in 1..=m {
-            let (k, l) = (last[b[j - 1] as usize], last_match);
+            let (k, l) = (last.get(&b[j - 1]).copied().unwrap_or(0), last_match);
             let cost = usize::from(a[i - 1] != b[j - 1]);
             if cost == 0 {
                 last_match = j;
@@ -317,7 +326,7 @@ fn damerau(a: &[u8], b: &[u8]) -> i64 {
                 .min(table[i][j + 1] + 1)
                 .min(table[k][l] + (i - k - 1) + 1 + (j - l - 1));
         }
-        last[a[i - 1] as usize] = i;
+        last.insert(a[i - 1], i);
     }
     table[n + 1][m + 1] as i64
 }
@@ -327,10 +336,8 @@ fn damerau_levenshtein(args: &DataChunk, result: &mut Vector) -> Result<()> {
         if row[0].is_null() || row[1].is_null() {
             return Ok(Value::null(LogicalType::BIGINT));
         }
-        Ok(Value::bigint(damerau(
-            text(&row[0])?.as_bytes(),
-            text(&row[1])?.as_bytes(),
-        )))
+        let chars = |value: &Value| text(value).map(|s| s.chars().collect::<Vec<char>>());
+        Ok(Value::bigint(damerau(&chars(&row[0])?, &chars(&row[1])?)))
     })
 }
 
@@ -343,7 +350,7 @@ fn jaccard(args: &DataChunk, result: &mut Vector) -> Result<()> {
         if a.is_empty() || b.is_empty() {
             return Err(invalid("Jaccard Function: An argument too short!"));
         }
-        let set = |s: &str| s.bytes().collect::<std::collections::BTreeSet<u8>>();
+        let set = |s: &str| s.chars().collect::<std::collections::BTreeSet<char>>();
         let (a, b) = (set(&a), set(&b));
         let common = a.intersection(&b).count() as f64;
         let all = a.union(&b).count() as f64;
@@ -351,7 +358,8 @@ fn jaccard(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
-fn jaro(a: &[u8], b: &[u8]) -> f64 {
+/// The Jaro similarity of the characters of two strings.
+fn jaro(a: &[char], b: &[char]) -> f64 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
     }
@@ -378,7 +386,7 @@ fn jaro(a: &[u8], b: &[u8]) -> f64 {
     (matches / a.len() as f64 + matches / b.len() as f64 + (matches - transpositions) / matches) / 3.0
 }
 
-fn jaro_winkler(a: &[u8], b: &[u8]) -> f64 {
+fn jaro_winkler(a: &[char], b: &[char]) -> f64 {
     let similarity = jaro(a, b);
     if similarity <= 0.7 {
         return similarity;
@@ -387,12 +395,13 @@ fn jaro_winkler(a: &[u8], b: &[u8]) -> f64 {
     similarity + prefix * 0.1 * (1.0 - similarity)
 }
 
-fn similarity(args: &DataChunk, result: &mut Vector, f: fn(&[u8], &[u8]) -> f64) -> Result<()> {
+fn similarity(args: &DataChunk, result: &mut Vector, f: fn(&[char], &[char]) -> f64) -> Result<()> {
     row_wise(args, result, |row| {
         if row[0].is_null() || row[1].is_null() {
             return Ok(Value::null(LogicalType::DOUBLE));
         }
-        let score = f(text(&row[0])?.as_bytes(), text(&row[1])?.as_bytes());
+        let chars = |value: &Value| text(value).map(|s| s.chars().collect::<Vec<char>>());
+        let score = f(&chars(&row[0])?, &chars(&row[1])?);
         let cutoff = row.get(2).and_then(number).unwrap_or(0.0);
         Ok(Value::double(if score >= cutoff { score } else { 0.0 }))
     })
@@ -439,86 +448,99 @@ fn to_base(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+/// `BarScalarFunction`: whole blocks, then the eighth of a block that is left over, padded to the
+/// width with spaces.
 fn bar(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    const PARTS: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+    // `UnicodeBar::PartialBlocks`
+    const PARTIAL_BLOCKS: [&str; 8] = [" ", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+    let out_of_range = |message: &str| Error::new(ErrorKind::OutOfRange, message);
     row_wise(args, result, |row| {
-        let Some(x) = number(&row[0]) else {
+        let values: Option<Vec<f64>> = row.iter().map(number).collect();
+        let Some(values) = values else {
             return Ok(Value::null(LogicalType::VARCHAR));
         };
-        let (Some(low), Some(high)) = (number(&row[1]), number(&row[2])) else {
-            return Ok(Value::null(LogicalType::VARCHAR));
-        };
-        let width = row.get(3).and_then(Value::as_i128).unwrap_or(80);
-        if !(1..=1000).contains(&width) {
-            return Err(Error::new(ErrorKind::OutOfRange, "Max bar width is 1000"));
+        let (x, min, max) = (values[0], values[1], values[2]);
+        let max_width = values.get(3).copied().unwrap_or(80.0);
+        if !max_width.is_finite() {
+            return Err(out_of_range("Max bar width must not be NaN or infinity"));
         }
-        if x.is_nan() || low.is_nan() || high.is_nan() || x.is_infinite() || low.is_infinite() || high.is_infinite() {
-            return Err(Error::new(
-                ErrorKind::OutOfRange,
-                "Bar function arguments must be finite.",
-            ));
+        if max_width < 1.0 {
+            return Err(out_of_range("Max bar width must be >= 1"));
         }
-        if low > high {
-            return Err(Error::new(
-                ErrorKind::OutOfRange,
-                "Bar function arguments max must be greater than min.",
-            ));
+        if max_width > 1000.0 {
+            return Err(out_of_range("Max bar width must be <= 1000"));
         }
-        let ratio = if high == low {
+        let width = if x.is_nan() || min.is_nan() || max.is_nan() || x <= min {
             0.0
+        } else if x >= max {
+            max_width
         } else {
-            ((x - low) / (high - low)).clamp(0.0, 1.0)
+            max_width * (x - min) / (max - min)
         };
-        let eighths = (ratio * width as f64 * 8.0).round() as usize;
-        let (full, part) = (eighths / 8, eighths % 8);
+        if !width.is_finite() {
+            return Err(out_of_range("Bar width must not be NaN or infinity"));
+        }
+        let eighths = (width * PARTIAL_BLOCKS.len() as f64) as u32 as usize;
+        let full = eighths / PARTIAL_BLOCKS.len();
+        let remaining = eighths % PARTIAL_BLOCKS.len();
         let mut out = "█".repeat(full);
-        out += PARTS[part];
-        let used = full + usize::from(part > 0);
-        out += &" ".repeat(width as usize - used.min(width as usize));
+        let mut used = full;
+        if remaining > 0 {
+            used += 1;
+            out += PARTIAL_BLOCKS[remaining];
+        }
+        let integer_width = max_width as usize;
+        if used < integer_width {
+            out += &" ".repeat(integer_width - used);
+        }
         Ok(Value::varchar(out))
     })
 }
 
 /// `StringUtil::BytesToHumanReadableString`
-fn human_bytes(bytes: i128, unit: f64, names: [&str; 6]) -> String {
-    let sign = if bytes < 0 { "-" } else { "" };
-    let mut amount = bytes.unsigned_abs() as f64;
-    if amount < unit {
-        return format!("{sign}{} bytes", bytes.unsigned_abs());
+/// `StringUtil::BytesToHumanReadableString`: the largest unit with a whole amount, and the tenths
+/// truncated.
+fn bytes_to_human(bytes: u64, multiplier: u64) -> String {
+    let units = if multiplier == 1000 {
+        ["bytes", "kB", "MB", "GB", "TB", "PB"]
+    } else {
+        ["bytes", "KiB", "MiB", "GiB", "TiB", "PiB"]
+    };
+    let mut parts = [0u64; 6];
+    parts[0] = bytes;
+    for i in 1..6 {
+        parts[i] = parts[i - 1] / multiplier;
+        parts[i - 1] %= multiplier;
     }
-    let mut index = 0;
-    amount /= unit;
-    while amount >= unit && index + 1 < names.len() {
-        amount /= unit;
-        index += 1;
+    for i in (1..6).rev() {
+        if parts[i] != 0 {
+            let fractional = parts[i - 1] * 10 / multiplier;
+            return format!("{}.{fractional} {}", parts[i], units[i]);
+        }
     }
-    format!("{sign}{amount:.1} {}", names[index])
+    format!("{}{}", parts[0], if bytes == 1 { " byte" } else { " bytes" })
+}
+
+/// `FormatBytesFunction`: a BIGINT, its sign in front.
+fn format_bytes_with(args: &DataChunk, result: &mut Vector, multiplier: u64) -> Result<()> {
+    row_wise(args, result, |row| {
+        let Some(bytes) = row[0].as_i128() else {
+            return Ok(Value::null(LogicalType::VARCHAR));
+        };
+        let sign = if bytes < 0 { "-" } else { "" };
+        Ok(Value::varchar(format!(
+            "{sign}{}",
+            bytes_to_human(bytes.unsigned_abs() as u64, multiplier)
+        )))
+    })
 }
 
 fn format_bytes(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    row_wise(args, result, |row| {
-        let Some(bytes) = row[0].as_i128() else {
-            return Ok(Value::null(LogicalType::VARCHAR));
-        };
-        Ok(Value::varchar(human_bytes(
-            bytes,
-            1024.0,
-            ["KiB", "MiB", "GiB", "TiB", "PiB", "EiB"],
-        )))
-    })
+    format_bytes_with(args, result, 1024)
 }
 
 fn format_decimal_bytes(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    row_wise(args, result, |row| {
-        let Some(bytes) = row[0].as_i128() else {
-            return Ok(Value::null(LogicalType::VARCHAR));
-        };
-        Ok(Value::varchar(human_bytes(
-            bytes,
-            1000.0,
-            ["kB", "MB", "GB", "TB", "PB", "EB"],
-        )))
-    })
+    format_bytes_with(args, result, 1000)
 }
 
 fn url_encode(args: &DataChunk, result: &mut Vector) -> Result<()> {
@@ -853,9 +875,11 @@ fn list_intersect(args: &DataChunk, result: &mut Vector) -> Result<()> {
     let ty = result.logical_type().clone();
     let child = ty.child_type().cloned().unwrap_or(LogicalType::SQLNULL);
     row_wise(args, result, |row| {
-        let (Some(left), Some(right)) = (list_values(&row[0]), list_values(&row[1])) else {
+        // NULL on the left is NULL, and on the right has nothing in common with it
+        let Some(left) = list_values(&row[0]) else {
             return Ok(Value::null(ty.clone()));
         };
+        let right = list_values(&row[1]).unwrap_or(&[]);
         let mut kept: Vec<Value> = Vec::new();
         for item in left {
             if !item.is_null() && right.contains(item) && !kept.contains(item) {
@@ -1135,9 +1159,16 @@ fn map_extract_value(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+/// `MapContainsFun`: `list_contains` of the keys, so an empty map has no NULL key either.
 fn map_contains(args: &DataChunk, result: &mut Vector) -> Result<()> {
     row_wise(args, result, |row| {
         if row[0].is_null() {
+            return Ok(Value::null(LogicalType::BOOLEAN));
+        }
+        if map_entries(&row[0]).is_empty() {
+            return Ok(Value::boolean(false));
+        }
+        if row[1].is_null() {
             return Ok(Value::null(LogicalType::BOOLEAN));
         }
         Ok(Value::boolean(map_find(&row[0], &row[1]).is_some()))
@@ -1307,14 +1338,26 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
         }
         "normalized_interval" => simple(1, 1, LogicalType::INTERVAL, normalized_interval, children),
         "timetz_byte_comparable" => simple(1, 1, LogicalType::UBIGINT, timetz_byte_comparable, children),
-        "uuid_extract_version" => simple(1, 1, LogicalType::UINTEGER, uuid_extract_version, children),
-        "uuid_extract_timestamp" => simple(
-            1,
-            1,
-            LogicalType::new(LogicalTypeId::TimestampTz),
-            uuid_extract_timestamp,
-            children,
-        ),
+        // their argument is a UUID
+        "uuid_extract_version" | "uuid_extract_timestamp" => {
+            count_args(&lower, &children, 1, 1)?;
+            let children = vec![
+                children[0]
+                    .clone()
+                    .cast_to(&LogicalType::new(LogicalTypeId::Uuid), false),
+            ];
+            if lower == "uuid_extract_version" {
+                Ok(bound_function(
+                    &lower,
+                    children,
+                    LogicalType::UINTEGER,
+                    uuid_extract_version,
+                ))
+            } else {
+                let ty = LogicalType::new(LogicalTypeId::TimestampTz);
+                Ok(bound_function(&lower, children, ty, uuid_extract_timestamp))
+            }
+        }
         "list_intersect" | "array_intersect" => {
             count_args(&lower, &children, 2, 2)?;
             let ty = children[0].return_type.clone();

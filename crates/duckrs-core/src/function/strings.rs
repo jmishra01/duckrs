@@ -417,15 +417,20 @@ fn hamming(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
-/// `LikeOperatorFunction` with an escape character.
-fn like_match(text: &[char], pattern: &[char], escape: Option<char>) -> bool {
+/// `TemplatedLikeOperator`: an escape at the end of the pattern is an error when the match gets
+/// there.
+fn like_match(text: &[char], pattern: &[char], escape: Option<char>) -> Result<bool> {
+    let ends_with_escape = || Error::new(ErrorKind::Syntax, "Like pattern must not end with escape character!");
     let (mut t, mut p) = (0, 0);
     let mut star: Option<(usize, usize)> = None;
     while t < text.len() {
         let mut matched = false;
         if p < pattern.len() {
             let c = pattern[p];
-            if Some(c) == escape && p + 1 < pattern.len() {
+            if Some(c) == escape {
+                if p + 1 == pattern.len() {
+                    return Err(ends_with_escape());
+                }
                 if pattern[p + 1] == text[t] {
                     t += 1;
                     p += 2;
@@ -445,16 +450,27 @@ fn like_match(text: &[char], pattern: &[char], escape: Option<char>) -> bool {
             continue;
         }
         let Some((star_pattern, star_text)) = star else {
-            return false;
+            return Ok(false);
         };
         star = Some((star_pattern, star_text + 1));
         p = star_pattern;
         t = star_text + 1;
     }
-    while p < pattern.len() && pattern[p] == '%' {
+    // a trailing '%' only matches an empty suffix when it is not escaped
+    while p < pattern.len() {
+        if Some(pattern[p]) == escape {
+            if p + 1 == pattern.len() {
+                return Err(ends_with_escape());
+            }
+            // the escape sequence needs a character to match, and there is none left
+            break;
+        }
+        if pattern[p] != '%' {
+            break;
+        }
         p += 1;
     }
-    p == pattern.len()
+    Ok(p == pattern.len())
 }
 
 fn escape_of(value: &Value) -> Result<Option<char>> {
@@ -470,31 +486,12 @@ fn escape_of(value: &Value) -> Result<Option<char>> {
     Ok(first)
 }
 
-/// `LikeFun`: an escape needs something to escape.
-fn check_pattern(pattern: &[char], escape: Option<char>) -> Result<()> {
-    let mut at = 0;
-    while at < pattern.len() {
-        if Some(pattern[at]) == escape {
-            if at + 1 == pattern.len() {
-                return Err(Error::new(
-                    ErrorKind::Syntax,
-                    "Like pattern must not end with escape character!",
-                ));
-            }
-            at += 1;
-        }
-        at += 1;
-    }
-    Ok(())
-}
-
 fn like_escape(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
         let input: Vec<char> = text(&row[0]).chars().collect();
         let pattern: Vec<char> = text(&row[1]).chars().collect();
         let escape = escape_of(&row[2])?;
-        check_pattern(&pattern, escape)?;
-        Ok(Value::boolean(like_match(&input, &pattern, escape)))
+        Ok(Value::boolean(like_match(&input, &pattern, escape)?))
     })
 }
 
@@ -503,8 +500,7 @@ fn ilike_escape(args: &DataChunk, result: &mut Vector) -> Result<()> {
         let input: Vec<char> = text(&row[0]).to_lowercase().chars().collect();
         let pattern: Vec<char> = text(&row[1]).to_lowercase().chars().collect();
         let escape = escape_of(&row[2])?;
-        check_pattern(&pattern, escape)?;
-        Ok(Value::boolean(like_match(&input, &pattern, escape)))
+        Ok(Value::boolean(like_match(&input, &pattern, escape)?))
     })
 }
 

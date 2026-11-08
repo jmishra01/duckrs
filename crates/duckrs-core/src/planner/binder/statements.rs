@@ -1211,16 +1211,17 @@ impl Binder<'_> {
         let mut binder = self.child_binder();
         let bound = binder.bind_expression(expr)?;
         let value = evaluate_scalar(&bound.cast_to(&LogicalType::DOUBLE, false))?;
-        if value.is_null() {
-            return Ok(PreparedModifier::Limit { limit: None, offset });
-        }
-        let percent: f64 = value.try_to_string()?.parse().unwrap_or(0.0);
-        if !(0.0..=100.0).contains(&percent) {
-            return Err(binder_error(if percent < 0.0 {
-                "Percentage value(s) cannot be negative"
-            } else {
-                "Percentage value(s) must be between 0 and 100"
-            }));
+        // NULL is all of the rows
+        let percent: f64 = if value.is_null() {
+            100.0
+        } else {
+            value.try_to_string()?.parse().unwrap_or(f64::NAN)
+        };
+        if percent.is_nan() || !(0.0..=100.0).contains(&percent) {
+            return Err(Error::new(
+                ErrorKind::OutOfRange,
+                "Limit percent out of range, should be between 0% and 100%",
+            ));
         }
         Ok(PreparedModifier::LimitPercent { percent, offset })
     }

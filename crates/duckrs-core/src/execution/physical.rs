@@ -1697,7 +1697,9 @@ impl PhysicalOperator for PhysicalLimitPercent {
         let mut data = self.data.lock();
         let total = data.len() as u64;
         let available = total.saturating_sub(self.offset);
-        let limit = ((available as f64) * self.percent / 100.0) as u64;
+        // `GetDataInternal`: the percentage is of the rows with those of the offset, if any remain
+        let count = if available > 0 { available + self.offset } else { 0 };
+        let limit = (((count as f64) * self.percent / 100.0) as u64).min(count);
         let mut kept = ColumnDataCollection::new(self.types.clone());
         let mut position = 0u64;
         for chunk in data.chunks() {

@@ -588,6 +588,28 @@ fn uuid(args: &DataChunk, result: &mut Vector) -> Result<()> {
     Ok(())
 }
 
+/// `UUIDv7::GenerateRandomUUID`: a 48 bit big-endian Unix timestamp in milliseconds, then random
+/// bits, with the version and the variant set.
+fn uuid_v7(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    for row in 0..args.len() {
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as u64);
+        let mut bytes = [0u8; 16];
+        bytes[..6].copy_from_slice(&millis.to_be_bytes()[2..]);
+        let random = [next_random() >> 32, next_random() >> 32, next_random() >> 32].map(|r| r as u32);
+        bytes[6..10].copy_from_slice(&random[0].to_be_bytes());
+        bytes[10..14].copy_from_slice(&random[1].to_be_bytes());
+        bytes[14..16].copy_from_slice(&random[2].to_be_bytes()[..2]);
+        bytes[6] = (bytes[6] & 0x0f) | (7 << 4);
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        // the top bit is flipped, so that the values sort as their bytes
+        let stored = (u128::from_be_bytes(bytes) ^ (1 << 127)) as i128;
+        result.set_value(row, &Value::uuid(stored))?;
+    }
+    Ok(())
+}
+
 /// `ListRangeFunction`: the numbers a `range` of the same arguments gives as rows.
 fn range_list(args: &DataChunk, result: &mut Vector, generate_series: bool) -> Result<()> {
     let ty = result.logical_type().clone();
@@ -689,6 +711,8 @@ pub fn is_generic_function(name: &str) -> bool {
                 | "setseed"
                 | "uuid"
                 | "gen_random_uuid"
+                | "uuidv4"
+                | "uuidv7"
                 | "printf"
                 | "format"
         )
@@ -988,11 +1012,12 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             let child = single(&children)?.cast_to(&LogicalType::DOUBLE, false);
             Ok(bound_function("setseed", vec![child], LogicalType::SQLNULL, setseed))
         }
-        "uuid" | "gen_random_uuid" => {
+        "uuid" | "gen_random_uuid" | "uuidv4" | "uuidv7" => {
             if !children.is_empty() {
                 return Err(no_match(&lower, &children));
             }
-            Ok(bound_function(&lower, children, LogicalType::UUID, uuid))
+            let function = if lower == "uuidv7" { uuid_v7 } else { uuid };
+            Ok(bound_function(&lower, children, LogicalType::UUID, function))
         }
         "printf" | "format" => {
             if children.is_empty() {

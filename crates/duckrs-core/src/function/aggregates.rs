@@ -232,7 +232,6 @@ fn holistic_functions() -> Vec<AggregateFunctionSet> {
         of(&["skewness"], unary_double(Skewness)),
         of(&["kurtosis"], unary_double(Kurtosis)),
         of(&["kurtosis_pop"], unary_double(KurtosisPop)),
-        of(&["weighted_avg", "wavg"], binary_double(WeightedAvg)),
         of(&["sem"], unary_double(Sem)),
         of(&["entropy"], vec![(vec![any()], d.clone(), kind(Entropy))]),
         of(

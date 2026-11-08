@@ -55,7 +55,6 @@ thread_local! {
 struct Options {
     case_insensitive: bool,
     dot_matches_newline: bool,
-    multi_line: bool,
     literal: bool,
     global: bool,
 }
@@ -67,9 +66,11 @@ fn parse_options(options: &str) -> Result<Options> {
             'c' => parsed.case_insensitive = false,
             'i' => parsed.case_insensitive = true,
             'l' => parsed.literal = true,
-            'm' | 'n' | 'p' => parsed.multi_line = true,
+            // newline-sensitive: `.` does not match a newline, as without an option
+            'm' | 'n' | 'p' => parsed.dot_matches_newline = false,
             'g' => parsed.global = true,
             's' => parsed.dot_matches_newline = true,
+            ' ' | '\t' | '\n' => {}
             other => {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
@@ -95,7 +96,6 @@ fn compile(pattern: &str, options: Options, anchored: bool) -> Result<Regex> {
     let regex = RegexBuilder::new(&source)
         .case_insensitive(options.case_insensitive)
         .dot_matches_new_line(options.dot_matches_newline)
-        .multi_line(options.multi_line)
         .build()
         .map_err(|error| Error::new(ErrorKind::InvalidInput, regex_error(&error.to_string(), pattern)))?;
     CACHE.with(|cache| cache.borrow_mut().insert(key, regex.clone()));
@@ -201,12 +201,48 @@ fn regexp_extract_all(args: &DataChunk, result: &mut Vector) -> Result<()> {
             ));
         }
         let input = text(&row[0]);
-        let items = regex
-            .captures_iter(&input)
-            .map(|c| Value::varchar(c.get(group).map_or("", |m| m.as_str())))
-            .collect();
+        // `ExtractAllMatches`: an empty match moves one character on, and one at the end is the last
+        let mut items = Vec::new();
+        let mut start = 0;
+        while start <= input.len() {
+            let Some(captures) = regex.captures_at(&input, start) else {
+                break;
+            };
+            let matched = captures.get(0).expect("the whole match");
+            items.push(Value::varchar(captures.get(group).map_or("", |m| m.as_str())));
+            start = matched.end();
+            if matched.is_empty() {
+                start += input[start..].chars().next().map_or(1, char::len_utf8);
+            }
+        }
         Value::new(ty.clone(), ValueData::List(items))
     })
+}
+
+/// `StringSplitter::Split` with `RegexpStringSplit`: a match that is empty where the part starts
+/// splits off one character, and an empty pattern splits an empty string into nothing.
+fn split_regex<'a>(input: &'a str, pattern: &str, regex: &regex::Regex) -> Vec<&'a str> {
+    if input.is_empty() && pattern.is_empty() {
+        return Vec::new();
+    }
+    let mut parts = Vec::new();
+    let mut start = 0;
+    while start < input.len() {
+        let Some(found) = regex.find_at(input, start) else {
+            break;
+        };
+        let (mut position, size) = (found.start(), found.len());
+        if size == 0 && position == start {
+            position += input[start..].chars().next().map_or(1, char::len_utf8);
+            if position == input.len() {
+                break;
+            }
+        }
+        parts.push(&input[start..position]);
+        start = position + size;
+    }
+    parts.push(&input[start..]);
+    parts
 }
 
 fn regexp_split(args: &DataChunk, result: &mut Vector) -> Result<()> {
@@ -215,11 +251,13 @@ fn regexp_split(args: &DataChunk, result: &mut Vector) -> Result<()> {
         if row.iter().take(2).any(Value::is_null) {
             return Ok(Value::null(ty.clone()));
         }
-        let regex = compile(&text(&row[1]), options_of(row, 2)?, false)?;
+        let pattern = text(&row[1]);
+        let regex = compile(&pattern, options_of(row, 2)?, false)?;
         let input = text(&row[0]);
+        let parts = split_regex(&input, &pattern, &regex);
         Value::new(
             ty.clone(),
-            ValueData::List(regex.split(&input).map(Value::varchar).collect()),
+            ValueData::List(parts.into_iter().map(Value::varchar).collect()),
         )
     })
 }

@@ -1062,17 +1062,44 @@ fn bigint_times_interval(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
-fn scale_interval_double(interval: Interval, factor: f64) -> Interval {
+/// `TryMultiplyOperator::Operation(interval_t, double)` (PostgreSQL's `interval_mul`): the whole
+/// months and days, with the fractions cascading down into days and then microseconds.
+fn scale_interval_double(interval: Interval, factor: f64) -> Result<Interval> {
+    let overflow = || out_of_range("Overflow in multiplication of INTERVAL.");
+    // `PGTimestampRound`
+    let round = |j: f64| (j * 1_000_000.0).round_ties_even() / 1_000_000.0;
+    let fits = |d: f64| !d.is_nan() && d >= f64::from(i32::MIN) && d <= f64::from(i32::MAX);
     let months = f64::from(interval.months) * factor;
-    let whole_months = months.trunc();
-    let days = f64::from(interval.days) * factor + (months - whole_months) * 30.0;
-    let whole_days = days.trunc();
-    let micros = interval.micros as f64 * factor + (days - whole_days) * MICROS_PER_DAY as f64;
-    Interval {
-        months: whole_months as i32,
-        days: whole_days as i32,
-        micros: micros.round() as i64,
+    if !fits(months) {
+        return Err(overflow());
     }
+    let result_months = months as i32;
+    let days = f64::from(interval.days) * factor;
+    if !fits(days) {
+        return Err(overflow());
+    }
+    let mut result_days = days as i32;
+    let month_remainder = round((months - f64::from(result_months)) * 30.0);
+    let day_remainder = month_remainder as i32;
+    const SECS_PER_DAY: f64 = 86_400.0;
+    let mut sec_remainder =
+        round((days - f64::from(result_days) + month_remainder - f64::from(day_remainder)) * SECS_PER_DAY);
+    // there can be 24 hours or more, from rounding or what cascades down
+    if sec_remainder.abs() >= SECS_PER_DAY {
+        let extra_days = (sec_remainder / SECS_PER_DAY) as i32;
+        result_days = result_days.checked_add(extra_days).ok_or_else(overflow)?;
+        sec_remainder -= f64::from(extra_days) * SECS_PER_DAY;
+    }
+    result_days = result_days.checked_add(day_remainder).ok_or_else(overflow)?;
+    let micros = (interval.micros as f64 * factor + sec_remainder * 1_000_000.0).round_ties_even();
+    if micros.is_nan() || micros < i64::MIN as f64 || micros >= i64::MAX as f64 {
+        return Err(overflow());
+    }
+    Ok(Interval {
+        months: result_months,
+        days: result_days,
+        micros: micros as i64,
+    })
 }
 
 fn interval_times_double(args: &DataChunk, result: &mut Vector) -> Result<()> {
@@ -1080,7 +1107,7 @@ fn interval_times_double(args: &DataChunk, result: &mut Vector) -> Result<()> {
         Ok(Value::interval(scale_interval_double(
             interval_of(&row[0]),
             seconds_of(&row[1]),
-        )))
+        )?))
     })
 }
 
@@ -1089,16 +1116,17 @@ fn double_times_interval(args: &DataChunk, result: &mut Vector) -> Result<()> {
         Ok(Value::interval(scale_interval_double(
             interval_of(&row[1]),
             seconds_of(&row[0]),
-        )))
+        )?))
     })
 }
 
+/// `DivideOperator::Operation(interval_t, double)`: a multiplication by the inverse.
 fn interval_divided(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
-        Ok(Value::interval(scale_interval_double(
-            interval_of(&row[0]),
-            1.0 / seconds_of(&row[1]),
-        )))
+        let interval = interval_of(&row[0]);
+        scale_interval_double(interval, 1.0 / seconds_of(&row[1]))
+            .map(Value::interval)
+            .map_err(|_| out_of_range("Overflow in INTERVAL division"))
     })
 }
 

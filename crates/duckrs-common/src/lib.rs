@@ -8,6 +8,7 @@ mod error;
 pub mod executor;
 mod fmt_float;
 pub mod hash;
+pub mod path;
 pub mod row;
 pub mod serializer;
 pub mod sort_key;

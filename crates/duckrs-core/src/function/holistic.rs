@@ -54,7 +54,6 @@ pub enum Holistic {
     ArgMaxN,
     ApproxTopK,
     BitstringAgg,
-    WeightedAvg,
     /// `combine_aggr`: a state of the states of its rows
     CombineAggr,
     CountIf,
@@ -951,21 +950,6 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
                 combined = super::aggregates::combine_state_values(&combined, &scaled, ty)?;
             }
             combined
-        }
-        WeightedAvg => {
-            let (mut sum, mut weights) = (0.0, 0.0);
-            for row in rows {
-                let parts = fields(row);
-                if let (Some(x), Some(w)) = (number(&parts[0]), number(&parts[1])) {
-                    sum += x * w;
-                    weights += w;
-                }
-            }
-            if weights == 0.0 {
-                null()
-            } else {
-                Value::double(sum / weights)
-            }
         }
         KurtosisPop => {
             let values = numbers(rows);

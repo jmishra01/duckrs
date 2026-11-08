@@ -200,6 +200,8 @@ pub(crate) const VOLATILE_FUNCTIONS: &[&str] = &[
     "setseed",
     "uuid",
     "gen_random_uuid",
+    "uuidv4",
+    "uuidv7",
     "now",
     "get_current_timestamp",
     "transaction_timestamp",

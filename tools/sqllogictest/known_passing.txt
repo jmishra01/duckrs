@@ -10,6 +10,7 @@ test/fuzzer/afl/grouping_empty_table.test
 test/fuzzer/afl/invalid_foreign_key.test
 test/fuzzer/afl/issue_7551.test
 test/fuzzer/afl/issue_8185.test
+test/fuzzer/afl/limit_out_of_range.test
 test/fuzzer/afl/non_foldable_parameter.test
 test/fuzzer/afl/random_join.test
 test/fuzzer/afl/self_referential_alias.test
@@ -615,6 +616,7 @@ test/sql/aggregate/aggregates/test_string_agg_big.test
 test/sql/aggregate/aggregates/test_sum.test
 test/sql/aggregate/aggregates/test_sum_decimal_overflow.test
 test/sql/aggregate/aggregates/test_sum_fastpath.test
+test/sql/aggregate/aggregates/test_weighted_avg.test
 test/sql/aggregate/count_execution_paths.test
 test/sql/aggregate/distinct/distinct_on_nulls.test
 test/sql/aggregate/distinct/distinct_on_order_by.test
@@ -1513,6 +1515,7 @@ test/sql/function/generic/test_in.test
 test/sql/function/generic/test_least_greatest.test
 test/sql/function/generic/test_null_if.test
 test/sql/function/interval/test_extract.test
+test/sql/function/interval/test_interval_muldiv.test
 test/sql/function/list/aggregates/any_value.test
 test/sql/function/list/aggregates/bigints_sum_avg.test
 test/sql/function/list/aggregates/bit_and.test
@@ -1565,6 +1568,7 @@ test/sql/function/list/lambdas/test_lambda_storage.test
 test/sql/function/list/lambdas/transform.test
 test/sql/function/list/lambdas/transform_with_index.test
 test/sql/function/list/lambdas/vector_types.test
+test/sql/function/list/list_contains.test
 test/sql/function/list/list_distinct.test
 test/sql/function/list/list_position.test
 test/sql/function/list/list_position_nan.test
@@ -1610,9 +1614,11 @@ test/sql/function/operator/test_comparison.test
 test/sql/function/operator/test_conjunction_nulls.test
 test/sql/function/operator/test_division_overflow.test
 test/sql/function/operator/test_in_empty_table.test
+test/sql/function/string/format_bytes.test
 test/sql/function/string/format_large_precision.test
 test/sql/function/string/like_unicode.test
 test/sql/function/string/null_byte.test
+test/sql/function/string/path_join.test
 test/sql/function/string/regex_escape.test
 test/sql/function/string/regex_filter_pushdown.test
 test/sql/function/string/regexp_split_to_table.test
@@ -1621,6 +1627,7 @@ test/sql/function/string/sha256.test
 test/sql/function/string/strip_accents.test
 test/sql/function/string/test_array_extract.test
 test/sql/function/string/test_ascii.test
+test/sql/function/string/test_bar.test
 test/sql/function/string/test_caseconvert.test
 test/sql/function/string/test_complex_unicode.test
 test/sql/function/string/test_concat.test
@@ -1643,9 +1650,11 @@ test/sql/function/string/test_instr.test
 test/sql/function/string/test_instr_utf8.test
 test/sql/function/string/test_issue_1812.test
 test/sql/function/string/test_jaccard.test
+test/sql/function/string/test_jaro_winkler.test
 test/sql/function/string/test_left.test
 test/sql/function/string/test_levenshtein.test
 test/sql/function/string/test_like.test
+test/sql/function/string/test_like_escape.test
 test/sql/function/string/test_like_many_wildcards.test
 test/sql/function/string/test_mismatches.test
 test/sql/function/string/test_pad.test
@@ -1657,6 +1666,8 @@ test/sql/function/string/test_reverse.test
 test/sql/function/string/test_right.test
 test/sql/function/string/test_similar_to.test
 test/sql/function/string/test_similar_to_escape.test
+test/sql/function/string/test_similarity_utf8.test
+test/sql/function/string/test_split_empty_string.test
 test/sql/function/string/test_split_part.test
 test/sql/function/string/test_starts_with_function.test
 test/sql/function/string/test_starts_with_function_utf8.test
@@ -1664,6 +1675,7 @@ test/sql/function/string/test_starts_with_operator.test
 test/sql/function/string/test_starts_with_operator_utf8.test
 test/sql/function/string/test_string_array_slice.test
 test/sql/function/string/test_string_slice.test
+test/sql/function/string/test_string_split.test
 test/sql/function/string/test_subscript.test
 test/sql/function/string/test_substring.test
 test/sql/function/string/test_substring_utf8.test
@@ -1685,6 +1697,7 @@ test/sql/function/timestamp/test_now_prepared.test
 test/sql/function/timestamp/test_strftime_timestamp.test
 test/sql/function/timestamp/test_strptime_nonascii.test
 test/sql/function/timetz/test_extract.test
+test/sql/function/uuid/test_uuid.test
 test/sql/generated_columns/stored/basic.test
 test/sql/generated_columns/virtual/alter_table.test
 test/sql/generated_columns/virtual/ambiguity.test
@@ -2122,6 +2135,7 @@ test/sql/order/issue_11936.test
 test/sql/order/limit_full_outer_join.test
 test/sql/order/limit_parameter.test
 test/sql/order/limit_percent_cardinality_overflow.test
+test/sql/order/limit_percent_view.test
 test/sql/order/limit_union.test
 test/sql/order/order_by_all.test
 test/sql/order/order_by_internal_5293.test
@@ -3103,6 +3117,7 @@ test/sql/types/hugeint/test_hugeint_ops.test
 test/sql/types/interval/frac_interval.test
 test/sql/types/interval/interval_colon_time_overflow.test
 test/sql/types/interval/interval_constants.test
+test/sql/types/interval/interval_multiply_overflow.test
 test/sql/types/interval/interval_ten_digit_hours.test
 test/sql/types/interval/interval_try_cast.test
 test/sql/types/interval/test_interval_between.test
