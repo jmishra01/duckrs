@@ -1162,7 +1162,19 @@ impl Binder<'_> {
                 value.logical_type().id(),
                 LogicalTypeId::Varchar | LogicalTypeId::SqlNull
             ) {
-                return Err(binder_error(format!("\"{name}\" requires an argument of type VARCHAR")));
+                // an option without a value is `true`
+                if value.logical_type().id() == LogicalTypeId::Boolean {
+                    return Err(binder_error(format!("\"{name}\" requires an argument of type VARCHAR")));
+                }
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "Copy option \"{name}\" expected an argument of type VARCHAR - the argument \"{}\" of type {} \
+                         could not be cast as this type",
+                        value.try_to_string().unwrap_or_default(),
+                        value.logical_type()
+                    ),
+                ));
             }
         }
         Ok(())

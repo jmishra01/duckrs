@@ -1752,6 +1752,150 @@ fn statistics_text(stats: &Statistics) -> (Option<String>, Option<String>, Optio
     )
 }
 
+/// The most files whose footers statistics are read from (`parquet_metadata_cache` aside, each is a read).
+const MAX_FILES_FOR_STATISTICS: usize = 64;
+
+/// `ParquetReader::ReadStatistics` over the files of a scan: what the footers say of each column from the
+/// files, `None` where they don't say it.
+pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::ColumnStatistics>> {
+    let unknown = vec![None; scan.names.len()];
+    if scan.files.len() > MAX_FILES_FOR_STATISTICS || scan.schema.is_some() {
+        return unknown;
+    }
+    let mut result: Vec<Option<crate::catalog::ColumnStatistics>> = Vec::new();
+    for (file_index, path) in scan.files.iter().enumerate() {
+        let Ok((metadata, _)) = read_metadata(path) else {
+            return unknown;
+        };
+        let descriptor = metadata.file_metadata().schema_descr();
+        let mut file_stats = Vec::with_capacity(scan.names.len());
+        for (name, ty) in scan.names.iter().zip(&scan.types) {
+            if scan
+                .hive_overrides
+                .iter()
+                .any(|(_, key)| key.eq_ignore_ascii_case(name))
+            {
+                file_stats.push(None);
+                continue;
+            }
+            // a top-level column that is a leaf
+            let leaf = (0..descriptor.num_columns()).find(|&i| {
+                let path = descriptor.column(i).path().parts().to_vec();
+                path.len() == 1 && path[0].eq_ignore_ascii_case(name)
+            });
+            let Some(leaf) = leaf else {
+                file_stats.push(None);
+                continue;
+            };
+            let column = descriptor.column(leaf);
+            use parquet::basic::Type as Physical;
+            // NaNs are left out of float bounds, but are the largest values to DuckDB; INT96 bounds compare bytes
+            let bounded = !matches!(
+                column.physical_type(),
+                Physical::FLOAT | Physical::DOUBLE | Physical::INT96
+            ) && !matches!(ty.id(), LogicalTypeId::Float | LogicalTypeId::Double);
+            let mut stats = crate::catalog::ColumnStatistics {
+                min: None,
+                max: None,
+                can_be_null: false,
+                can_be_valid: false,
+            };
+            let mut bounds_known = bounded;
+            let mut usable = true;
+            for group in metadata.row_groups() {
+                let chunk = group.column(leaf);
+                let Some(statistics) = chunk.statistics() else {
+                    usable = false;
+                    break;
+                };
+                let rows = group.num_rows() as u64;
+                let Some(nulls) = statistics.null_count_opt() else {
+                    usable = false;
+                    break;
+                };
+                stats.can_be_null |= nulls > 0;
+                stats.can_be_valid |= nulls < rows;
+                if nulls >= rows {
+                    continue;
+                }
+                // byte arrays with only the deprecated bounds may be ordered as signed bytes
+                let deprecated = statistics.is_min_max_deprecated()
+                    && matches!(
+                        column.physical_type(),
+                        Physical::BYTE_ARRAY | Physical::FIXED_LEN_BYTE_ARRAY
+                    );
+                let bound = |bytes: Option<&[u8]>, exact: bool| -> Option<Value> {
+                    let text = statistic_text(&column, bytes?)?;
+                    if !exact || deprecated {
+                        return None;
+                    }
+                    try_cast_value(&Value::varchar(text), ty)
+                };
+                let min = bound(statistics.min_bytes_opt(), statistics.min_is_exact());
+                let max = bound(statistics.max_bytes_opt(), statistics.max_is_exact());
+                match (min, max) {
+                    (Some(min), Some(max)) if bounds_known => {
+                        let less = |a: &Value, b: &Value| {
+                            crate::optimizer::statistics::compare_values(
+                                duckrs_parser::ast::ComparisonOp::LessThan,
+                                a,
+                                b,
+                            ) == Some(true)
+                        };
+                        if stats.min.as_ref().is_none_or(|current| less(&min, current)) {
+                            stats.min = Some(min);
+                        }
+                        if stats.max.as_ref().is_none_or(|current| less(current, &max)) {
+                            stats.max = Some(max);
+                        }
+                    }
+                    _ => bounds_known = false,
+                }
+            }
+            if !bounds_known {
+                stats.min = None;
+                stats.max = None;
+            }
+            file_stats.push(usable.then_some(stats));
+        }
+        if file_index == 0 {
+            result = file_stats;
+            continue;
+        }
+        // `MergeStatistics`
+        for (merged, file) in result.iter_mut().zip(file_stats) {
+            *merged = match (merged.take(), file) {
+                (Some(mut a), Some(b)) => {
+                    a.can_be_null |= b.can_be_null;
+                    a.can_be_valid |= b.can_be_valid;
+                    let less = |x: &Value, y: &Value| {
+                        crate::optimizer::statistics::compare_values(duckrs_parser::ast::ComparisonOp::LessThan, x, y)
+                            == Some(true)
+                    };
+                    a.min = match (a.min, b.min) {
+                        (Some(x), Some(y)) => Some(if less(&y, &x) { y } else { x }),
+                        (x, None) if !b.can_be_valid => x,
+                        (None, y) if !a.can_be_valid => y,
+                        _ => None,
+                    };
+                    a.max = match (a.max, b.max) {
+                        (Some(x), Some(y)) => Some(if less(&x, &y) { y } else { x }),
+                        (x, None) if !b.can_be_valid => x,
+                        (None, y) if !a.can_be_valid => y,
+                        _ => None,
+                    };
+                    Some(a)
+                }
+                _ => None,
+            };
+        }
+    }
+    if result.len() != scan.names.len() {
+        return unknown;
+    }
+    result
+}
+
 /// `ParquetStatisticsUtils::ConvertValueInternal`, as text: a statistic of a column, by the DuckDB type that the
 /// column reads as. `None` where C++ gives NULL: values that don't fit the type, or infinities.
 fn statistic_text(column: &parquet::schema::types::ColumnDescriptor, bytes: &[u8]) -> Option<String> {

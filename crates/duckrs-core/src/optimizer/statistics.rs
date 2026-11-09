@@ -1142,6 +1142,13 @@ impl StatisticsPropagator {
                     }
                 }
             }
+            K::ParquetScan { table_index, scan } => {
+                for (column, stats) in crate::execution::parquet::scan_statistics(scan).into_iter().enumerate() {
+                    if let Some(stats) = stats {
+                        self.stats.insert(ColumnBinding::new(*table_index, column), stats);
+                    }
+                }
+            }
             K::Filter { .. } => self.filter(op),
             K::Join { .. } => self.join(op),
             K::Projection {

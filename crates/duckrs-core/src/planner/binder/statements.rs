@@ -1868,6 +1868,15 @@ impl Binder<'_> {
                 }
                 if let ExprKind::Function(call) = &function.kind
                     && call.name.qualification.is_empty()
+                    && matches!(
+                        call.name.name.to_lowercase().as_str(),
+                        "read_single_csv_file" | "read_single_parquet_file"
+                    )
+                {
+                    return self.bind_read_single_file(call, table_ref);
+                }
+                if let ExprKind::Function(call) = &function.kind
+                    && call.name.qualification.is_empty()
                     && matches!(call.name.name.to_lowercase().as_str(), "read_csv" | "read_csv_auto")
                 {
                     return self.bind_read_csv(call, table_ref);

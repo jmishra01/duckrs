@@ -52,6 +52,52 @@ const FILE_METADATA_EMPTY: &str = "(NULL::VARCHAR, NULL::VARCHAR, NULL::BIGINT, 
 
 impl Binder<'_> {
     /// `ParquetScanFunction::ParquetScanBind`.
+    /// `read_single_csv_file` and `read_single_parquet_file`: the reader of one file that the multi-file
+    /// readers wrap (`TableFunctionMultiFile`), here the multi-file reader of that one file.
+    pub(super) fn bind_read_single_file(
+        &mut self,
+        call: &FunctionExpr,
+        table_ref: &TableRef,
+    ) -> Result<LogicalOperator> {
+        let name = call.name.name.to_lowercase();
+        let args: Vec<_> = call.args.iter().map(named_argument).collect();
+        if let Some(path) = args.iter().find(|argument| argument.name.is_empty()) {
+            let value = self.constant_argument(&path.expr)?;
+            if !matches!(
+                value.logical_type().id(),
+                LogicalTypeId::Varchar | LogicalTypeId::Struct
+            ) {
+                return Err(binder_error(format!(
+                    "{name} reads a single file - given as a VARCHAR path or as a file struct, not as {}",
+                    value.logical_type()
+                )));
+            }
+            if value.logical_type().id() == LogicalTypeId::Varchar {
+                let path = value.try_to_string()?;
+                if path.is_empty() {
+                    return Err(binder_error(format!("{name} requires a non-empty file name")));
+                }
+                if !std::path::Path::new(&path).is_file() {
+                    return Err(Error::new(
+                        ErrorKind::Io,
+                        format!("Cannot open file \"{path}\": No such file or directory"),
+                    ));
+                }
+            }
+        }
+        let mut call = call.clone();
+        call.name.name = if name == "read_single_csv_file" {
+            "read_csv".to_string()
+        } else {
+            "read_parquet".to_string()
+        };
+        if name == "read_single_csv_file" {
+            self.bind_read_csv(&call, table_ref)
+        } else {
+            self.bind_read_parquet(&call, table_ref)
+        }
+    }
+
     pub(super) fn bind_read_parquet(&mut self, call: &FunctionExpr, table_ref: &TableRef) -> Result<LogicalOperator> {
         let name = call.name.name.to_lowercase();
         let args: Vec<_> = call.args.iter().map(named_argument).collect();
