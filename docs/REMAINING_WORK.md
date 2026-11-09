@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 3741 of 6367 test files pass (**61.8%**). The v1 target is ≥ 90%.
+- Overall: 3797 of 6367 test files pass (**62.7%**). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -13,15 +13,23 @@ Each item gives the number of failing files in `test/` that it should fix, where
 
 ## Phase 11: File formats and I/O
 
-- [ ] 1. COPY TO/FROM failures (`sql/copy`: 299 failing, 52.2% pass; target ≥ 85%)
+- [ ] 1. COPY TO/FROM failures (`sql/copy`: 208 failing, 66.8% pass; target ≥ 85%)
   - [x] `PARTITION_BY` for CSV and JSON (Parquet had it), `PARTITION_BY *`, `PARTITIONED_BY` alias
   - [x] the `ORDER BY` option of COPY TO, and its checks against `USE_TMP_FILE` / `PER_THREAD_OUTPUT`
   - [x] `read_text` / `read_blob`, with hive partition columns
   - [x] the `filename`, `file_index`, `file_row_number` virtual columns of `read_csv`, `read_json`, `read_parquet`
   - [ ] `file_row_group_number` and the other Parquet-only virtual columns; `filename=1` name conflicts
   - [ ] `read_text` reads content even when only `filename`/`size` is selected, so binary files fail
-  - [ ] `PER_THREAD_OUTPUT`, `FILE_SIZE_BYTES`, `APPEND`, `PARTITION_PATH`, `RETURN_STATS`
-  - [ ] COPY formats `blob` and `tbl`, writing zstd
+  - [x] `APPEND`, `HIVE_FILE_PATTERN`, `PARTITION_PATH` (with `hive_partition_component`), `RETURN_STATS`
+  - [x] `partitioned_write_max_open_files` and `partitioned_write_flush_threshold`: rows buffered by partition
+  - [x] COPY `FORMAT BLOB`; a file extension no COPY function has (`.tbl`) is CSV; reading and writing zstd
+  - [x] `read_single_csv_file` / `read_single_parquet_file`
+  - [x] hive partitions as C++ finds them: keys as a set and sorted, values unescaped, `hive_types`,
+    `hive_types_autocast`, a partition that is also a column of a Parquet file overrides it
+  - [ ] `RETURN_STATS` of VARIANT columns, and with `SHREDDING`
+  - [ ] gzip output: miniz writes a stored block for tiny inputs, so a 3-byte file is 26 bytes in C++ and 23 here
+  - [ ] streamed reads of compressed CSV (`compressed_read_size`); `read_csv`'s `schema` option
+  - [ ] many CSV sniffer, rejects-table and error-message differences (~50 files under `sql/copy/csv`)
 - [ ] 2. JSON: `read_json`/`read_json_auto`, the JSON type, JSON functions (`sql/json`: 95 failing, 34.9%)
   - [x] `json_normalize`, `json_deep_merge`, `json_merge_patch_diff`
   - [x] `json_each` / `json_tree`, with columns as arguments (LATERAL) and the hidden `json`, `root`, `rowid`
@@ -30,7 +38,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] `json_serialize_sql` / `json_deserialize_sql` / `json_execute_serialized_sql` / `json_serialize_plan` (~20 files): needs an AST serializer
   - [ ] GeoJSON (`read_json` geojson, `ST_AsGeoJSON`, `json_geometry_format`): needs the GEOMETRY type
   - [ ] `json_group_object`/`json_group_array` as window functions (they are macros today)
-- [ ] 3. Parquet reader/writer: missing types, filter/statistics pushdown, corrupt-file errors, delta encoding (`parquet*`: ~53 failing)
+- [ ] 3. Parquet reader/writer: missing types, filter pushdown, delta encoding (`test/parquet`: 28 failing, `corrupt`: 5)
   - [x] `parquet_metadata` stats in the column's DuckDB type (decimals, UUID, TIMETZ, INT96, blobs; NULL for infinities and out-of-range values)
   - [x] `int96_as` (`timestamp` by default, `timestamp_ns`, `struct`)
   - [x] the native Parquet writer (`execution/parquet_writer`): DuckDB's encodings, dictionaries, pages, statistics, bloom filters and footer, written with our own Thrift; TIMETZ as TIME in UTC
@@ -38,10 +46,17 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] fallback bloom filters (sortedness, distinct estimate, 64 MiB budget, folding), interval bloom hashes, `parquet_bloom_probe`
   - [x] the page index (`write_page_index`), and `parquet_page_index` / the index columns of `parquet_metadata`
   - [x] `FILE_SIZE_BYTES`, `ROW_GROUPS_PER_FILE`, `PER_THREAD_OUTPUT`, `RETURN_FILES`, `WRITE_EMPTY_FILE`, `FIELD_IDS`, TUPLE columns
-  - [ ] `RETURN_STATS` (needs the stats unifiers and a VARIANT `extra_info`)
+  - [x] `RETURN_STATS`: the stats unifiers of the writer, nested and NaN counts, a VARIANT `extra_info`
+  - [x] `read_parquet(..., schema)`: by field id or name, defaults, nested STRUCT/LIST/MAP children
+  - [x] only the columns a query reads are decoded (projection pushdown into the scan)
+  - [x] statistics of Parquet scans from the footers (bounds where exact; not floats, INT96, deprecated bounds)
+  - [x] C++'s errors for corrupt files (footer length, short decompression, RLE widths, DBP miniblocks, ...)
+  - [x] `TIME(NANOS)` reads as `TIME_NS`; Thrift texts of logical types in `parquet_schema`
   - [ ] encryption, UNION, VARIANT and GEOMETRY columns
   - [ ] rotation inside partitions groups rows into files differently from C++ (`partitioned_file_rotation`)
-  - [ ] reader side: row-group pruning by bloom filters and page indexes, `read_parquet(..., schema)`, reading a directory path
+  - [ ] reader side: row-group pruning by bloom filters and page indexes, `bound_schema` (needs struct field
+    projection and `EXPLAIN (SQL)`), reading a directory path, `maximum_files_for_stats`
+  - [ ] corrupt files C++ rejects that the crate reads (INT96 out of range, WKB types, page index row counts)
   - [ ] prefetch / read-ahead metrics and EXPLAIN shapes of Parquet scans (~20 files)
   - [ ] `write_timestamp_as_int96`, `parquet_metadata` logical type names (`Float16Type()`), duplicate column names
 - [ ] 4. Parquet VARIANT, including shredding (`parquet/variant`: 47 failing, 0%)

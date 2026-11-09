@@ -298,7 +298,7 @@ impl Transformer<'_> {
                         None => {
                             if option.children.is_empty() {
                                 return Err(binder_error(format!(
-                                    "{} expects a column list or * as parameter",
+                                    "\"{}\" expects a column list or * as parameter",
                                     option.name
                                 )));
                             }

@@ -17,6 +17,7 @@ pub mod join;
 pub mod json_scan;
 pub mod multi_file;
 pub mod parquet;
+pub mod parquet_schema;
 pub mod parquet_writer;
 pub mod physical;
 pub mod temporary;
@@ -167,8 +168,15 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             path,
             names,
             options,
-            gzip,
-        } => Box::new(PhysicalCopyToFile::new(types, path, names, options, children, gzip)),
+            compression,
+        } => Box::new(PhysicalCopyToFile::new(
+            types,
+            path,
+            names,
+            options,
+            children,
+            compression,
+        )),
         LogicalOperatorKind::Range {
             start,
             increment,

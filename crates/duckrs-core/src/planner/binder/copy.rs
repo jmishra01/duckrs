@@ -151,7 +151,7 @@ struct CsvArguments {
     types_by_position: Vec<LogicalType>,
     union_by_name: bool,
     allow_empty: bool,
-    hive_partitioning: Option<bool>,
+    hive: HiveOptions,
     filename: Option<String>,
     store_rejects: Option<bool>,
     storing: bool,
@@ -423,9 +423,11 @@ impl Binder<'_> {
                     shown = false;
                     result.allow_empty = is_true(&value, &option)?;
                 }
-                "hive_partitioning" => {
+                "hive_partitioning" | "hive_types" | "hive_type" | "hive_types_autocast" | "hive_type_autocast" => {
                     shown = false;
-                    result.hive_partitioning = Some(is_true(&value, &option)?);
+                    let mut hive = std::mem::take(&mut result.hive);
+                    self.take_hive_option(&mut hive, &option, &value)?;
+                    result.hive = hive;
                 }
                 "compression" => options.compression = Compression::parse(&text(&value)?)?,
                 "columns" => {
@@ -729,7 +731,7 @@ impl Binder<'_> {
             output_names.push(column.clone());
             output_types.push(LogicalType::VARCHAR);
         }
-        let hive = hive_columns(&arguments.files, arguments.hive_partitioning, &names)?;
+        let hive = hive_columns_with(&arguments.files, &arguments.hive, &names)?;
         for (key, ty) in &hive {
             output_names.push(key.clone());
             output_types.push(ty.clone());
@@ -1096,6 +1098,23 @@ impl Binder<'_> {
         } else {
             info.format.to_lowercase()
         };
+        let known = matches!(
+            format.as_str(),
+            "csv" | "tsv" | "auto" | "json" | "ndjson" | "jsonl" | "blob"
+        );
+        // a format taken from the file's extension that no COPY function has is CSV
+        let format = if !known && !info.format_given {
+            "csv".to_string()
+        } else {
+            format
+        };
+        if format == "blob" {
+            if info.is_from {
+                return Err(binder_error("COPY FROM is not supported for FORMAT BLOB"));
+            }
+            self.copy_json = false;
+            return Ok((path, false));
+        }
         if !matches!(format.as_str(), "csv" | "tsv" | "auto" | "json" | "ndjson" | "jsonl") {
             return Err(crate::unported(format!("COPY with the format {format}")));
         }
@@ -1143,7 +1162,19 @@ impl Binder<'_> {
                 value.logical_type().id(),
                 LogicalTypeId::Varchar | LogicalTypeId::SqlNull
             ) {
-                return Err(binder_error(format!("\"{name}\" requires an argument of type VARCHAR")));
+                // an option without a value is `true`
+                if value.logical_type().id() == LogicalTypeId::Boolean {
+                    return Err(binder_error(format!("\"{name}\" requires an argument of type VARCHAR")));
+                }
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "Copy option \"{name}\" expected an argument of type VARCHAR - the argument \"{}\" of type {} \
+                         could not be cast as this type",
+                        value.try_to_string().unwrap_or_default(),
+                        value.logical_type()
+                    ),
+                ));
             }
         }
         Ok(())
@@ -1153,6 +1184,9 @@ impl Binder<'_> {
     pub(super) fn copy_options(&mut self, info: &CopyInfo) -> Result<Vec<(String, Value)>> {
         let mut result = Vec::new();
         for (name, expression) in &info.parsed_options {
+            if name.eq_ignore_ascii_case("partition_path") {
+                continue;
+            }
             let value = match expression {
                 Some(expression) if expression.is_empty_star() => Value::varchar("*"),
                 Some(expression) => self.constant_argument(expression)?,
@@ -1183,6 +1217,17 @@ impl Binder<'_> {
     }
 
     pub(super) fn bind_copy(&mut self, info: &CopyInfo) -> Result<BoundStatement> {
+        if info.is_from
+            && info
+                .parsed_options
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case("partition_path"))
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Option partition_path is not supported for reading - only for writing",
+            ));
+        }
         if let Some(path) = self.parquet_copy_path(info)? {
             if !info.is_from {
                 verify_not_extension(&path)?;
@@ -1196,6 +1241,9 @@ impl Binder<'_> {
         let (path, tsv) = self.copy_target(info)?;
         if !info.is_from {
             verify_not_extension(&path)?;
+        }
+        if !info.is_from && info.format.eq_ignore_ascii_case("blob") {
+            return self.bind_copy_to_blob(info, path);
         }
         if info.is_from {
             self.bind_copy_from(info, &path, tsv)
@@ -1340,6 +1388,88 @@ impl Binder<'_> {
     }
 
     /// `Binder::BindCopyTo`.
+    /// `WriteBlobBind`: the bytes of a single BLOB column, one value after the other.
+    fn bind_copy_to_blob(&mut self, info: &CopyInfo, path: String) -> Result<BoundStatement> {
+        let select = self.copy_to_select(info)?;
+        let bound = self.bind_select_statement(&select)?;
+        if bound.types.len() != 1 || bound.types[0].id() != LogicalTypeId::Blob {
+            return Err(binder_error(
+                "\"COPY (FORMAT BLOB)\" only supports a single BLOB column",
+            ));
+        }
+        let mut compression = Compression::Auto;
+        let valueless = info
+            .options
+            .iter()
+            .filter(|(_, values)| values.is_empty())
+            .map(|(name, _)| name.to_lowercase())
+            .chain(
+                info.parsed_options
+                    .iter()
+                    .filter(|(_, e)| e.is_none())
+                    .map(|(n, _)| n.to_lowercase()),
+            )
+            .collect::<Vec<_>>();
+        for (name, value) in self.copy_options(info)? {
+            if name == "compression" && valueless.contains(&name) {
+                return Err(binder_error(format!(
+                    "COPY (FORMAT BLOB) option {} requires a value",
+                    sql_identifier(&name)
+                )));
+            }
+            match name.as_str() {
+                "format" => {}
+                "compression" => {
+                    // `ParseStringOption`
+                    let mut value = value;
+                    if let ValueData::List(items) = value.data() {
+                        if items.len() != 1 {
+                            return Err(binder_error(format!(
+                                "{name} expects a single argument as a string value"
+                            )));
+                        }
+                        value = items[0].clone();
+                    }
+                    if value.logical_type().id() != LogicalTypeId::Varchar {
+                        return Err(binder_error(format!("{name} expects a string argument!")));
+                    }
+                    compression = Compression::parse(&text(&value)?)?;
+                }
+                _ => {
+                    return Err(binder_error(format!(
+                        "Unrecognized option for COPY (FORMAT BLOB): {}",
+                        sql_identifier(&name)
+                    )));
+                }
+            }
+        }
+        let compression = compression.for_path(&path);
+        let options = CsvWriteOptions {
+            raw_blob: true,
+            header: false,
+            new_line: String::new(),
+            ..Default::default()
+        };
+        let (result_names, return_type) = copy_result(&options.output);
+        let result_types = options.output.types();
+        let plan = LogicalOperator::new(
+            LogicalOperatorKind::CopyToFile {
+                path,
+                names: bound.names.clone(),
+                options,
+                compression,
+            },
+            vec![bound.plan],
+        );
+        Ok(BoundStatement {
+            plan,
+            names: result_names,
+            types: result_types,
+            column_aliases: Vec::new(),
+            return_type,
+        })
+    }
+
     fn bind_copy_to(&mut self, info: &CopyInfo, path: String, tsv: bool) -> Result<BoundStatement> {
         let select = self.copy_to_select(info)?;
         let mut options = CsvWriteOptions::default();
@@ -1435,16 +1565,24 @@ impl Binder<'_> {
         }
         options.force_quote = force_quote;
         let compression = compression.for_path(&path);
-        if compression == Compression::Zstd {
-            return Err(crate::unported("writing zstd files"));
-        }
         let mut extension = if self.copy_json { "json" } else { "csv" }.to_string();
-        if compression == Compression::Gzip {
-            extension += ".gz";
+        match compression {
+            Compression::Gzip => extension += ".gz",
+            Compression::Zstd => extension += ".zst",
+            _ => {}
         }
         options.partitioning = partition.bind(&path, &bound.names, &extension)?;
+        self.bind_partition_path(
+            info,
+            &bound.names,
+            &bound.types,
+            &partition,
+            options.partitioning.as_mut(),
+        )?;
+        self.set_max_open_files(options.partitioning.as_mut());
         options.rotation = partition.rotation(&path, &extension, file_size_bytes, None, per_thread)?;
-        options.output = output.build(options.partitioning.is_some(), per_thread, ordered)?;
+        let format = if self.copy_json { "json" } else { "csv" };
+        options.output = output.build(options.partitioning.is_some(), per_thread, ordered, Some(format))?;
         let (result_names, return_type) = copy_result(&options.output);
         let result_types = options.output.types();
         let plan = LogicalOperator::new(
@@ -1452,7 +1590,7 @@ impl Binder<'_> {
                 path,
                 names: bound.names.clone(),
                 options,
-                gzip: compression == Compression::Gzip,
+                compression,
             },
             vec![bound.plan],
         );
@@ -1467,14 +1605,35 @@ impl Binder<'_> {
 }
 
 /// The options of a COPY TO that write a directory of hive partitions (`PARTITION_BY` and friends).
-#[derive(Default)]
 pub(super) struct PartitionOptions {
     columns: Option<Vec<String>>,
     write_columns: bool,
     overwrite_or_ignore: bool,
     overwrite: bool,
+    append: bool,
+    /// whether OVERWRITE_OR_IGNORE, OVERWRITE or APPEND came
+    overwrite_mode_given: bool,
+    hive_file_pattern: bool,
+    hive_file_pattern_given: bool,
     filename_pattern: Option<String>,
     extension: Option<String>,
+}
+
+impl Default for PartitionOptions {
+    fn default() -> Self {
+        Self {
+            columns: None,
+            write_columns: false,
+            overwrite_or_ignore: false,
+            overwrite: false,
+            append: false,
+            overwrite_mode_given: false,
+            hive_file_pattern: true,
+            hive_file_pattern_given: false,
+            filename_pattern: None,
+            extension: None,
+        }
+    }
 }
 
 impl PartitionOptions {
@@ -1483,8 +1642,29 @@ impl PartitionOptions {
         match name {
             "partition_by" | "partitioned_by" => self.columns = Some(strings(value)?),
             "write_partition_columns" => self.write_columns = is_true(value, name)?,
-            "overwrite_or_ignore" => self.overwrite_or_ignore = is_true(value, name)?,
-            "overwrite" => self.overwrite = is_true(value, name)?,
+            "overwrite_or_ignore" | "overwrite" | "append" => {
+                if self.overwrite_mode_given {
+                    return Err(binder_error(
+                        "Can only set one of OVERWRITE_OR_IGNORE, OVERWRITE or APPEND",
+                    ));
+                }
+                self.overwrite_mode_given = true;
+                let on = is_true(value, name)?;
+                match name {
+                    "overwrite_or_ignore" => self.overwrite_or_ignore = on,
+                    "overwrite" => self.overwrite = on,
+                    _ => {
+                        self.append = on;
+                        if on && self.filename_pattern.is_none() {
+                            self.filename_pattern = Some("{uuid}".to_string());
+                        }
+                    }
+                }
+            }
+            "hive_file_pattern" => {
+                self.hive_file_pattern = is_true(value, name)?;
+                self.hive_file_pattern_given = true;
+            }
             "filename_pattern" => self.filename_pattern = Some(value.try_to_string()?),
             "file_extension" => self.extension = Some(value.try_to_string()?),
             _ => return Ok(false),
@@ -1510,7 +1690,7 @@ impl PartitionOptions {
             }
         }
         let occupied = std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some());
-        if occupied && !self.overwrite_or_ignore {
+        if occupied && !self.overwrite_or_ignore && !self.append {
             if self.overwrite {
                 std::fs::remove_dir_all(path)
                     .map_err(|e| Error::new(ErrorKind::Io, format!("Could not clear \"{path}\": {e}")))?;
@@ -1552,6 +1732,14 @@ impl PartitionOptions {
 
     /// The partitioning of a COPY to `path` of columns `names`, after clearing the directory if told to.
     pub(super) fn bind(&self, path: &str, names: &[String], extension: &str) -> Result<Option<Partitioning>> {
+        if self.append
+            && !self
+                .filename_pattern
+                .as_deref()
+                .is_some_and(|pattern| pattern.contains("{uuid"))
+        {
+            return Err(binder_error("APPEND mode requires a {uuid} label in filename_pattern"));
+        }
         let Some(wanted) = &self.columns else {
             return Ok(None);
         };
@@ -1580,49 +1768,292 @@ impl PartitionOptions {
         Ok(Some(Partitioning {
             columns,
             write_columns: self.write_columns,
+            hive_file_pattern: self.hive_file_pattern,
+            path_expression: None,
+            claims: Default::default(),
+            max_open_files: 100,
+            flush_threshold: 524_288,
             filename_pattern: self.filename_pattern.clone().unwrap_or_else(|| "data_{i}".to_string()),
             extension: self.extension.clone().unwrap_or_else(|| extension.to_string()),
         }))
     }
 }
 
-/// `AutoDetectHivePartitioning`: every file says the same keys. What the file has itself stays.
+impl Binder<'_> {
+    /// `partitioned_write_max_open_files`.
+    pub(super) fn set_max_open_files(&self, partitioning: Option<&mut Partitioning>) {
+        let (Some(partitioning), Some(session)) = (partitioning, &self.session) else {
+            return;
+        };
+        if let Ok(value) = (session.setting)("partitioned_write_max_open_files")
+            && let Some(limit) = value.as_i128()
+        {
+            partitioning.max_open_files = limit.max(1) as usize;
+        }
+        if let Ok(value) = (session.setting)("partitioned_write_flush_threshold")
+            && let Some(threshold) = value.as_i128()
+        {
+            partitioning.flush_threshold = threshold.max(1) as usize;
+        }
+    }
+
+    /// `PartitionPathBinder`: PARTITION_PATH, over the values of the PARTITION_BY columns.
+    pub(super) fn bind_partition_path(
+        &mut self,
+        info: &CopyInfo,
+        names: &[String],
+        types: &[LogicalType],
+        partition: &PartitionOptions,
+        partitioning: Option<&mut Partitioning>,
+    ) -> Result<()> {
+        use crate::planner::column_binding_resolver::resolve_expression;
+        use crate::planner::expression::ColumnBinding;
+        use duckrs_parser::ast::ExprKind;
+        let Some((_, Some(expression))) = info
+            .parsed_options
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("partition_path"))
+        else {
+            return Ok(());
+        };
+        let Some(partitioning) = partitioning else {
+            return Err(binder_error("PARTITION_PATH requires PARTITION_BY"));
+        };
+        if partition.hive_file_pattern_given {
+            return Err(binder_error(
+                "Can't combine HIVE_FILE_PATTERN and PARTITION_PATH for COPY",
+            ));
+        }
+        let columns = partitioning.columns.clone();
+        let mut error = None;
+        let mut parsed = expression.clone();
+        duckrs_parser::transformer::visit_expr_mut(&mut parsed, &mut |expr: &mut Expr| match &expr.kind {
+            ExprKind::Subquery { .. } => {
+                error.get_or_insert_with(|| "cannot use subquery in PARTITION_PATH".to_string());
+            }
+            ExprKind::Window(_) => {
+                error.get_or_insert_with(|| "window functions are not allowed in PARTITION_PATH".to_string());
+            }
+            ExprKind::Lambda { .. } => {
+                error.get_or_insert_with(|| "lambda functions are not allowed in PARTITION_PATH".to_string());
+            }
+            ExprKind::ColumnRef(parts) => {
+                let known = parts.len() == 1 && columns.iter().any(|&c| names[c] == parts[0]);
+                if !known {
+                    error.get_or_insert_with(|| {
+                        format!(
+                            "Column \"{}\" referenced in PARTITION_PATH is not a PARTITION_BY column",
+                            parts.join(".")
+                        )
+                    });
+                }
+            }
+            _ => {}
+        });
+        if let Some(error) = error {
+            return Err(binder_error(error));
+        }
+        let mut binder = Binder::new(self.catalog);
+        binder.options = self.options;
+        binder.session = self.session.clone();
+        binder.parameters = self.parameters.clone();
+        binder.aggregate_error = "aggregate functions are not allowed in PARTITION_PATH";
+        let table_index = binder.generate_table_index();
+        binder.bind_context.add_binding(Binding {
+            alias: String::new(),
+            schema: None,
+            table_index,
+            names: columns.iter().map(|&c| names[c].clone()).collect(),
+            types: columns.iter().map(|&c| types[c].clone()).collect(),
+            row_id: None,
+            virtual_columns: Vec::new(),
+            generated: Vec::new(),
+        });
+        let mut bound = binder
+            .bind_expression(expression)?
+            .cast_to(&LogicalType::VARCHAR, false);
+        let bindings: Vec<ColumnBinding> = (0..columns.len())
+            .map(|column_index| ColumnBinding {
+                table_index,
+                column_index,
+            })
+            .collect();
+        resolve_expression(&mut bound, &bindings)?;
+        partitioning.path_expression = Some(bound);
+        Ok(())
+    }
+}
+
+/// `hive_partitioning`, `hive_types` and `hive_types_autocast` of a multi-file scan.
+#[derive(Debug, Clone)]
+pub(super) struct HiveOptions {
+    pub wanted: Option<bool>,
+    pub types: Vec<(String, LogicalType)>,
+    pub autocast: bool,
+}
+
+impl Default for HiveOptions {
+    fn default() -> Self {
+        Self {
+            wanted: None,
+            types: Vec::new(),
+            autocast: true,
+        }
+    }
+}
+
+impl Binder<'_> {
+    /// `MultiFileOptions::ParseOption`, of the hive options; whether `option` is one.
+    pub(super) fn take_hive_option(&mut self, hive: &mut HiveOptions, option: &str, value: &Value) -> Result<bool> {
+        let invalid = |message: String| Error::new(ErrorKind::InvalidInput, message);
+        match option {
+            "hive_partitioning" => hive.wanted = Some(is_true(value, option)?),
+            "hive_types_autocast" | "hive_type_autocast" => {
+                if value.is_null() {
+                    return Err(invalid(format!("Cannot use NULL as argument for {option}")));
+                }
+                hive.autocast = is_true(value, option)?;
+            }
+            "hive_types" | "hive_type" => {
+                if value.is_null() {
+                    return Err(invalid(format!("Cannot use NULL as argument for {option}")));
+                }
+                if value.logical_type().id() != LogicalTypeId::Struct {
+                    return Err(invalid(format!(
+                        "'hive_types' only accepts a STRUCT('name':VARCHAR, ...), but '{}' was provided",
+                        value.logical_type()
+                    )));
+                }
+                let fields = value.logical_type().struct_children().to_vec();
+                let ValueData::Struct(children) = value.data() else {
+                    return Err(invalid(format!("Cannot use NULL as argument for {option}")));
+                };
+                if children.is_empty() {
+                    return Err(invalid(
+                        "'hive_types' must specify the type of at least one column".to_string(),
+                    ));
+                }
+                for ((name, ty), child) in fields.iter().zip(children) {
+                    if ty.id() != LogicalTypeId::Varchar {
+                        return Err(invalid(format!(
+                            "hive_types: {name} must be a VARCHAR, instead: '{ty}' was provided"
+                        )));
+                    }
+                    let parsed = self.csv_type(&child.try_to_string()?)?;
+                    hive.types.retain(|(n, _)| n != name);
+                    hive.types.push((name.clone(), parsed));
+                }
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+}
+
+/// `HivePartitioning::Parse`: the keys of a path, sorted, with their values.
+fn sorted_parts(path: &str) -> std::collections::BTreeMap<String, Option<String>> {
+    hive_parts(path).into_iter().collect()
+}
+
+/// The hive partition columns of `files` (`AutoDetectHivePartitioning` and `MultiFileReader::BindOptions`), by
+/// key: also those the files have as a column, which they override.
+pub(super) fn hive_partition_columns(files: &[String], options: &HiveOptions) -> Result<Vec<(String, LogicalType)>> {
+    let invalid = |message: String| Error::new(ErrorKind::InvalidInput, message);
+    let Some(first_file) = files.first() else {
+        return Ok(Vec::new());
+    };
+    let parts: Vec<_> = files.iter().map(|path| sorted_parts(path)).collect();
+    let first = &parts[0];
+    let types_given = !options.types.is_empty();
+    if options.wanted == Some(false) && types_given {
+        return Err(invalid(
+            "cannot disable hive_partitioning when hive_types is enabled".to_string(),
+        ));
+    }
+    let enabled = match options.wanted {
+        Some(wanted) => wanted,
+        // hive_types implies hive_partitioning
+        None if types_given => true,
+        // `AutoDetectHivePartitioningInternal`
+        None => {
+            !first.is_empty()
+                && parts
+                    .iter()
+                    .all(|file| file.len() == first.len() && file.keys().all(|key| first.contains_key(key)))
+        }
+    };
+    if !enabled {
+        return Ok(Vec::new());
+    }
+    for (path, file) in files.iter().zip(&parts) {
+        if let Some(key) = first.keys().find(|key| !file.contains_key(*key)) {
+            return Err(binder_error(format!(
+                "Hive partition mismatch between file \"{first_file}\" and \"{path}\": key \"{key}\" not found"
+            )));
+        }
+        if file.len() != first.len() {
+            return Err(binder_error(format!(
+                "Hive partition mismatch between file \"{first_file}\" and \"{path}\""
+            )));
+        }
+    }
+    if let Some((name, _)) = options.types.iter().find(|(name, _)| !first.contains_key(name)) {
+        return Err(invalid(format!(
+            "Unknown hive_type: \"{name}\" does not appear to be a partition"
+        )));
+    }
+    let parsing = Parsing {
+        decimal_separator: b'.',
+        ..Parsing::default()
+    };
+    let mut hive = Vec::with_capacity(first.len());
+    for key in first.keys() {
+        if let Some((_, ty)) = options.types.iter().find(|(name, _)| name == key) {
+            hive.push((key.clone(), ty.clone()));
+            continue;
+        }
+        if !options.autocast {
+            hive.push((key.clone(), LogicalType::VARCHAR));
+            continue;
+        }
+        // `AutoDetectHiveTypesInternal`: the first candidate each value casts to, VARCHAR where they differ
+        let mut detected: Option<LogicalType> = None;
+        for value in parts.iter().filter_map(|file| file.get(key).cloned().flatten()) {
+            let ty = [LogicalType::DATE, LogicalType::TIMESTAMP, LogicalType::BIGINT]
+                .into_iter()
+                .find(|ty| can_cast(&value, ty, &parsing))
+                .unwrap_or(LogicalType::VARCHAR);
+            detected = match detected {
+                Some(previous) if previous != ty => Some(LogicalType::VARCHAR),
+                _ => Some(ty),
+            };
+        }
+        hive.push((key.clone(), detected.unwrap_or(LogicalType::VARCHAR)));
+    }
+    Ok(hive)
+}
+
+/// The hive partition columns of `files` that are not columns of the files themselves.
 pub(super) fn hive_columns(
     files: &[String],
     wanted: Option<bool>,
     names: &[String],
 ) -> Result<Vec<(String, LogicalType)>> {
-    let parts: Vec<_> = files.iter().map(|path| hive_parts(path)).collect();
-    let Some(first) = parts.first() else {
-        return Ok(Vec::new());
+    let options = HiveOptions {
+        wanted,
+        ..HiveOptions::default()
     };
-    let keys: Vec<String> = first.iter().map(|(key, _)| key.clone()).collect();
-    let consistent = parts
-        .iter()
-        .all(|file| file.len() == keys.len() && file.iter().zip(&keys).all(|((key, _), k)| key == k));
-    if wanted == Some(true) && !consistent {
-        return Err(binder_error(
-            "Hive partition mismatch between files: the files must have the same partition keys",
-        ));
-    }
-    let mut hive = Vec::new();
-    if wanted.unwrap_or(consistent) && consistent {
-        let parsing = Parsing {
-            decimal_separator: b'.',
-            ..Parsing::default()
-        };
-        for (column, key) in keys.iter().enumerate() {
-            if names.iter().any(|n| n.eq_ignore_ascii_case(key)) {
-                continue;
-            }
-            let values: Vec<&str> = parts.iter().filter_map(|file| file[column].1.as_deref()).collect();
-            let ty = [LogicalType::DATE, LogicalType::TIMESTAMP, LogicalType::BIGINT]
-                .into_iter()
-                .find(|ty| values.iter().all(|value| can_cast(value, ty, &parsing)))
-                .unwrap_or(LogicalType::VARCHAR);
-            hive.push((key.clone(), ty));
-        }
-    }
+    hive_columns_with(files, &options, names)
+}
+
+/// [`hive_partition_columns`], without those the files have as a column.
+pub(super) fn hive_columns_with(
+    files: &[String],
+    options: &HiveOptions,
+    names: &[String],
+) -> Result<Vec<(String, LogicalType)>> {
+    let mut hive = hive_partition_columns(files, options)?;
+    hive.retain(|(key, _)| !names.iter().any(|n| n.eq_ignore_ascii_case(key)));
     Ok(hive)
 }
 
@@ -1828,12 +2259,19 @@ impl OutputOptionsBuilder {
         partitioned: bool,
         per_thread: bool,
         ordered: bool,
+        no_stats_format: Option<&str>,
     ) -> Result<crate::execution::parquet::CopyOutputOptions> {
         if self.return_files && self.return_stats {
-            return Err(binder_error("Can't combine RETURN_FILES and RETURN_STATS for COPY"));
+            return Err(binder_error(
+                "Can only set one of RETURN_FILES or RETURN_STATS for COPY",
+            ));
         }
-        if self.return_stats {
-            return Err(crate::unported("the COPY option return_stats"));
+        if self.return_stats
+            && let Some(format) = no_stats_format
+        {
+            return Err(Error::not_implemented(format!(
+                "RETURN_STATS is not supported for the \"{format}\" copy format"
+            )));
         }
         let write_empty_file = self.write_empty_file.unwrap_or(true);
         if !write_empty_file {
@@ -1855,6 +2293,7 @@ impl OutputOptionsBuilder {
         }
         Ok(crate::execution::parquet::CopyOutputOptions {
             return_files: self.return_files,
+            return_stats: self.return_stats,
             write_empty_file,
         })
     }
@@ -1862,6 +2301,12 @@ impl OutputOptionsBuilder {
 
 /// What a COPY TO returns: its `Count`, and with RETURN_FILES its `Files`.
 pub(super) fn copy_result(output: &crate::execution::parquet::CopyOutputOptions) -> (Vec<String>, StatementReturnType) {
+    if output.return_stats {
+        return (
+            crate::execution::parquet::CopyOutputOptions::stats_names(),
+            StatementReturnType::QueryResult,
+        );
+    }
     if output.return_files {
         (
             vec!["Count".to_string(), "Files".to_string()],

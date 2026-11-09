@@ -562,10 +562,20 @@ impl Drop for LoggedFile {
 }
 
 /// The file of a COPY TO, compressed or not.
-#[derive(Debug)]
 enum CopyWriter {
     Plain(std::io::BufWriter<LoggedFile>),
     Gzip(Box<flate2::write::GzEncoder<std::io::BufWriter<LoggedFile>>>),
+    Zstd(Box<zstd::stream::Encoder<'static, std::io::BufWriter<LoggedFile>>>),
+}
+
+impl std::fmt::Debug for CopyWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Plain(_) => "Plain",
+            Self::Gzip(_) => "Gzip",
+            Self::Zstd(_) => "Zstd",
+        })
+    }
 }
 
 impl std::io::Write for CopyWriter {
@@ -573,12 +583,14 @@ impl std::io::Write for CopyWriter {
         match self {
             Self::Plain(writer) => writer.write(bytes),
             Self::Gzip(writer) => writer.write(bytes),
+            Self::Zstd(writer) => writer.write(bytes),
         }
     }
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             Self::Plain(writer) => writer.flush(),
             Self::Gzip(writer) => writer.flush(),
+            Self::Zstd(writer) => writer.flush(),
         }
     }
 }
@@ -603,10 +615,11 @@ pub struct PhysicalCopyToFile {
     /// opened by the first row or at the end, so that planning alone (EXPLAIN) leaves the file be;
     /// by the directory of a partition, or `""` without partitions, with the JSON objects of the file so far
     writers: Mutex<super::parquet::OutputFiles<CsvOutput>>,
-    gzip: bool,
+    compression: super::file_system::Compression,
     rows: std::sync::atomic::AtomicU64,
     /// the logger of the statement, for the file it writes
     logger: Option<Arc<crate::logging::LogTarget>>,
+    buffers: Mutex<super::parquet::PartitionBuffers>,
 }
 
 impl PhysicalCopyToFile {
@@ -616,7 +629,7 @@ impl PhysicalCopyToFile {
         names: Vec<String>,
         options: super::csv::CsvWriteOptions,
         children: Vec<Box<dyn PhysicalOperator>>,
-        gzip: bool,
+        compression: super::file_system::Compression,
     ) -> Self {
         Self {
             types,
@@ -625,7 +638,8 @@ impl PhysicalCopyToFile {
             path,
             names,
             writers: Mutex::new(super::parquet::OutputFiles::default()),
-            gzip,
+            buffers: Mutex::new(super::parquet::PartitionBuffers::default()),
+            compression,
             rows: std::sync::atomic::AtomicU64::new(0),
             logger: crate::logging::current_file_logger(),
         }
@@ -649,13 +663,17 @@ impl PhysicalCopyToFile {
             position: 0,
             logger: self.logger.clone(),
         });
-        let mut opened = if self.gzip {
-            CopyWriter::Gzip(Box::new(flate2::write::GzEncoder::new(
+        let mut opened = match self.compression {
+            super::file_system::Compression::Gzip => CopyWriter::Gzip(Box::new(flate2::write::GzEncoder::new(
                 file,
                 flate2::Compression::default(),
-            )))
-        } else {
-            CopyWriter::Plain(file)
+            ))),
+            super::file_system::Compression::Zstd => {
+                CopyWriter::Zstd(Box::new(zstd::stream::Encoder::new(file, 0).map_err(|e| {
+                    Error::new(ErrorKind::Io, format!("Cannot open file \"{path}\": {e}"))
+                })?))
+            }
+            _ => CopyWriter::Plain(file),
         };
         let mut header = Vec::new();
         self.options
@@ -682,15 +700,16 @@ impl PhysicalCopyToFile {
         if !files.open.contains_key(&key) {
             let path = files.next_path(&self.path, directory, self.options.partitioning.as_ref(), rotation)?;
             let writer = self.open(&path)?;
-            files.open.insert(
-                key.clone(),
-                CsvOutput {
-                    writer,
-                    json_rows: std::sync::atomic::AtomicU64::new(0),
-                    bytes: 0,
-                    rows: 0,
-                },
-            );
+            let limit = self.options.partitioning.as_ref().map(|p| p.max_open_files);
+            let output = CsvOutput {
+                writer,
+                json_rows: std::sync::atomic::AtomicU64::new(0),
+                bytes: 0,
+                rows: 0,
+            };
+            for evicted in files.insert_limited(key.clone(), output, limit) {
+                self.close(evicted)?;
+            }
         }
         let out_file = files.open.get_mut(&key).expect("just opened");
         let mut out = Vec::new();
@@ -702,6 +721,7 @@ impl PhysicalCopyToFile {
         out_file.bytes = match &out_file.writer {
             CopyWriter::Plain(writer) => writer.get_ref().position as usize + writer.buffer().len(),
             CopyWriter::Gzip(writer) => writer.get_ref().get_ref().position as usize + writer.get_ref().buffer().len(),
+            CopyWriter::Zstd(writer) => writer.get_ref().get_ref().position as usize + writer.get_ref().buffer().len(),
         };
         Ok(())
     }
@@ -713,6 +733,7 @@ impl PhysicalCopyToFile {
         let finished = match writer {
             CopyWriter::Plain(mut writer) => std::io::Write::flush(&mut writer),
             CopyWriter::Gzip(writer) => writer.finish().and_then(|mut file| std::io::Write::flush(&mut file)),
+            CopyWriter::Zstd(writer) => writer.finish().and_then(|mut file| std::io::Write::flush(&mut file)),
         };
         finished.map_err(|e| Error::new(ErrorKind::Io, format!("Could not write file: {e}")))
     }
@@ -741,7 +762,14 @@ impl PhysicalOperator for PhysicalCopyToFile {
         match &self.options.partitioning {
             Some(partitioning) => {
                 for (directory, rows) in partitioning.group_rows(&self.path, &self.names, chunk)? {
-                    self.write_rows(&directory, chunk, &rows)?;
+                    let ready = self
+                        .buffers
+                        .lock()
+                        .add(&directory, chunk, &rows, partitioning.flush_threshold)?;
+                    for piece in ready.unwrap_or_default() {
+                        let rows: Vec<usize> = (0..piece.len()).collect();
+                        self.write_rows(&directory, &piece, &rows)?;
+                    }
                 }
             }
             None => {
@@ -754,6 +782,13 @@ impl PhysicalOperator for PhysicalCopyToFile {
         Ok(())
     }
     fn finalize(&self) -> Result<()> {
+        let buffered = self.buffers.lock().drain();
+        for (directory, pieces) in buffered {
+            for piece in pieces {
+                let rows: Vec<usize> = (0..piece.len()).collect();
+                self.write_rows(&directory, &piece, &rows)?;
+            }
+        }
         let mut files = self.writers.lock();
         let rotation = self.options.rotation.as_ref();
         if files.created == 0 && !self.options.output.write_empty_file {

@@ -145,6 +145,7 @@ pub fn hive_parts(path: &str) -> Vec<(String, Option<String>)> {
     for part in parts {
         if let Some((key, value)) = part.split_once('=')
             && !key.is_empty()
+            && !value.contains('=')
             && !result.iter().any(|(k, _): &(String, _)| k == key)
         {
             let value = (value != "__HIVE_DEFAULT_PARTITION__").then_some(value.to_string());
@@ -152,6 +153,55 @@ pub fn hive_parts(path: &str) -> Vec<(String, Option<String>)> {
         }
     }
     result
+}
+
+/// `HivePartitioning::Unescape`: `%XX` escapes decoded.
+fn hive_unescape(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut result = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(byte) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("zz"), 16)
+        {
+            result.push(byte);
+            i += 3;
+            continue;
+        }
+        result.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&result).into_owned()
+}
+
+/// `HivePartitioning::GetValue`: the value of the hive partition `key` of the file at `path`, as `ty`.
+pub fn hive_value(path: &str, key: &str, ty: &LogicalType) -> Result<Value> {
+    let parts = hive_parts(path);
+    let Some(raw) = parts
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        .and_then(|(_, v)| v.clone())
+    else {
+        return Ok(Value::null(ty.clone()));
+    };
+    if ty.id() == LogicalTypeId::Varchar {
+        return Ok(Value::varchar(hive_unescape(&raw)));
+    }
+    if raw.eq_ignore_ascii_case("NULL") || raw.is_empty() {
+        return Ok(Value::null(ty.clone()));
+    }
+    let text = Value::varchar(hive_unescape(&raw));
+    crate::execution::parquet::try_cast_value(&text, ty).ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "Unable to cast '{}' (from hive partition column '{}') to: '{ty}'",
+                hive_unescape(&raw),
+                key.to_uppercase()
+            ),
+        )
+    })
 }
 
 /// A file of a scan, with where its columns go.
@@ -1000,19 +1050,12 @@ fn typed_chunk(
         result.push(names);
     }
     if !scan.hive.is_empty() {
-        let parts = hive_parts(&file.path);
         for (key, ty) in &scan.hive {
-            let value = parts
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(key))
-                .and_then(|(_, v)| v.clone());
-            let mut strings = Vector::new(LogicalType::VARCHAR, count);
-            let value = value.map_or(Value::null(LogicalType::VARCHAR), Value::varchar);
-            for i in 0..count {
-                strings.set_value(i, &value)?;
-            }
+            let value = hive_value(&file.path, key, ty)?;
             let mut typed = Vector::new(ty.clone(), count);
-            cast_vector(&strings, &mut typed, count, CastMode::Strict)?;
+            for i in 0..count {
+                typed.set_value(i, &value)?;
+            }
             result.push(typed);
         }
     }
@@ -1141,6 +1184,8 @@ pub struct CsvWriteOptions {
     /// `FILE_SIZE_BYTES` and `PER_THREAD_OUTPUT`: a directory of files
     pub rotation: Option<super::parquet::Rotation>,
     pub output: super::parquet::CopyOutputOptions,
+    /// `FORMAT BLOB`: the bytes of the values, nothing else
+    pub raw_blob: bool,
 }
 
 impl Default for CsvWriteOptions {
@@ -1160,6 +1205,7 @@ impl Default for CsvWriteOptions {
             prefix: String::new(),
             suffix: String::new(),
             force_quote: Vec::new(),
+            raw_blob: false,
             partitioning: None,
             rotation: None,
             output: super::parquet::CopyOutputOptions::default(),
@@ -1265,6 +1311,14 @@ impl CsvWriteOptions {
         columns: &[usize],
         json_rows: &std::sync::atomic::AtomicU64,
     ) -> Result<()> {
+        if self.raw_blob {
+            for &row in rows {
+                if let ValueData::Bytes(bytes) = chunk.get_value(columns[0], row).data() {
+                    out.extend_from_slice(bytes);
+                }
+            }
+            return Ok(());
+        }
         if let Some(names) = &self.json_names {
             for &row in rows {
                 let mut items = Vec::with_capacity(columns.len());

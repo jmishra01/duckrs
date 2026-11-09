@@ -3,8 +3,7 @@
 //! `read_parquet` and COPY with FORMAT PARQUET.
 
 use super::copy::{
-    OutputOptionsBuilder, PartitionOptions, copy_result, hive_columns, is_true, parse_bytes_argument, string_literal,
-    strings,
+    OutputOptionsBuilder, PartitionOptions, copy_result, is_true, parse_bytes_argument, string_literal, strings,
 };
 use super::table_functions::{named_argument, parse_select};
 use super::{Binder, Binding, BoundStatement, binder_error};
@@ -53,14 +52,61 @@ const FILE_METADATA_EMPTY: &str = "(NULL::VARCHAR, NULL::VARCHAR, NULL::BIGINT, 
 
 impl Binder<'_> {
     /// `ParquetScanFunction::ParquetScanBind`.
+    /// `read_single_csv_file` and `read_single_parquet_file`: the reader of one file that the multi-file
+    /// readers wrap (`TableFunctionMultiFile`), here the multi-file reader of that one file.
+    pub(super) fn bind_read_single_file(
+        &mut self,
+        call: &FunctionExpr,
+        table_ref: &TableRef,
+    ) -> Result<LogicalOperator> {
+        let name = call.name.name.to_lowercase();
+        let args: Vec<_> = call.args.iter().map(named_argument).collect();
+        if let Some(path) = args.iter().find(|argument| argument.name.is_empty()) {
+            let value = self.constant_argument(&path.expr)?;
+            if !matches!(
+                value.logical_type().id(),
+                LogicalTypeId::Varchar | LogicalTypeId::Struct
+            ) {
+                return Err(binder_error(format!(
+                    "{name} reads a single file - given as a VARCHAR path or as a file struct, not as {}",
+                    value.logical_type()
+                )));
+            }
+            if value.logical_type().id() == LogicalTypeId::Varchar {
+                let path = value.try_to_string()?;
+                if path.is_empty() {
+                    return Err(binder_error(format!("{name} requires a non-empty file name")));
+                }
+                if !std::path::Path::new(&path).is_file() {
+                    return Err(Error::new(
+                        ErrorKind::Io,
+                        format!("Cannot open file \"{path}\": No such file or directory"),
+                    ));
+                }
+            }
+        }
+        let mut call = call.clone();
+        call.name.name = if name == "read_single_csv_file" {
+            "read_csv".to_string()
+        } else {
+            "read_parquet".to_string()
+        };
+        if name == "read_single_csv_file" {
+            self.bind_read_csv(&call, table_ref)
+        } else {
+            self.bind_read_parquet(&call, table_ref)
+        }
+    }
+
     pub(super) fn bind_read_parquet(&mut self, call: &FunctionExpr, table_ref: &TableRef) -> Result<LogicalOperator> {
         let name = call.name.name.to_lowercase();
         let args: Vec<_> = call.args.iter().map(named_argument).collect();
         let mut paths = None;
         let (mut binary_as_string, mut union_by_name, mut file_row_number) = (false, false, false);
         let mut filename = None;
-        let mut hive_partitioning = None;
+        let mut hive_options = super::copy::HiveOptions::default();
         let mut int96_as = crate::execution::parquet::Int96As::Timestamp;
+        let mut schema_value = None;
         for argument in &args {
             let value = self.constant_argument(&argument.expr)?;
             if argument.name.is_empty() {
@@ -74,11 +120,13 @@ impl Binder<'_> {
                 continue;
             }
             let option = argument.name.to_lowercase();
+            if self.take_hive_option(&mut hive_options, &option, &value)? {
+                continue;
+            }
             match option.as_str() {
                 "binary_as_string" => binary_as_string = is_true(&value, &option)?,
                 "union_by_name" => union_by_name = is_true(&value, &option)?,
                 "file_row_number" => file_row_number = is_true(&value, &option)?,
-                "hive_partitioning" => hive_partitioning = Some(is_true(&value, &option)?),
                 "int96_as" => {
                     use crate::execution::parquet::Int96As;
                     int96_as = match value.try_to_string()?.to_lowercase().as_str() {
@@ -92,7 +140,8 @@ impl Binder<'_> {
                         }
                     };
                 }
-                "hive_types_autocast" | "explicit_cardinality" | "can_have_nan" => {}
+                "explicit_cardinality" | "can_have_nan" => {}
+                "schema" => schema_value = Some(value),
                 // options of COPY TO, which reading doesn't have
                 "write_page_index"
                 | "write_bloom_filter"
@@ -133,7 +182,30 @@ impl Binder<'_> {
         if files.is_empty() {
             return Err(binder_error(format!("{name} needs at least one file to read")));
         }
-        let (mut names, mut types) = file_schema(&files[0], binary_as_string, int96_as)?;
+        let schema = match &schema_value {
+            Some(value) => {
+                if union_by_name {
+                    return Err(binder_error("'schema' cannot be combined with union_by_name=true"));
+                }
+                let try_cast = |value: &Value, ty: &LogicalType| crate::execution::parquet::try_cast_value(value, ty);
+                let mut parse_type = |name: &str| self.csv_type(name);
+                let columns = crate::execution::parquet_schema::SchemaParser {
+                    parse_type: &mut parse_type,
+                    try_cast: &try_cast,
+                }
+                .parse(value)?;
+                crate::execution::parquet::check_schema(&files[0], binary_as_string, int96_as, &columns)?;
+                Some(Arc::new(columns))
+            }
+            None => None,
+        };
+        let (mut names, mut types) = match &schema {
+            Some(columns) => (
+                columns.iter().map(|c| c.name.clone()).collect(),
+                columns.iter().map(|c| c.ty.clone()).collect(),
+            ),
+            None => file_schema(&files[0], binary_as_string, int96_as)?,
+        };
         if union_by_name {
             for path in &files[1..] {
                 let (file_names, file_types) = file_schema(path, binary_as_string, int96_as)?;
@@ -158,16 +230,46 @@ impl Binder<'_> {
             output_names.push(column.clone());
             output_types.push(LogicalType::VARCHAR);
         }
-        let hive = hive_columns(&files, hive_partitioning, &names)?;
-        for (key, ty) in &hive {
-            output_names.push(key.clone());
-            output_types.push(ty.clone());
+        let mut hive = Vec::new();
+        let mut hive_overrides = Vec::new();
+        for (key, ty) in super::copy::hive_partition_columns(&files, &hive_options)? {
+            match names.iter().position(|n| n.eq_ignore_ascii_case(&key)) {
+                // a column of the file as well: the path gives its values, and its type
+                Some(column) => {
+                    if let Some(columns) = &schema
+                        && columns[column].ty != ty
+                    {
+                        return Err(binder_error(format!(
+                            "'schema' declares column \"{}\" as {}, but its hive partition type is {ty} - set the \
+                             partition type with hive_types",
+                            columns[column].name, columns[column].ty
+                        )));
+                    }
+                    types[column] = ty.clone();
+                    output_types[column] = ty;
+                    hive_overrides.push((column, key));
+                }
+                None => {
+                    output_names.push(key.clone());
+                    output_types.push(ty.clone());
+                    hive.push((key, ty));
+                }
+            }
         }
         let alias = if table_ref.alias.is_empty() {
             name
         } else {
             table_ref.alias.clone()
         };
+        if schema.is_some() {
+            for (i, name) in output_names.iter().enumerate() {
+                if output_names[..i].iter().any(|other| other.eq_ignore_ascii_case(name)) {
+                    return Err(binder_error(format!(
+                        "table \"{alias}\" has duplicate column name \"{name}\""
+                    )));
+                }
+            }
+        }
         let output_names = Self::alias_columns(table_ref, &alias, output_names)?;
         let table_index = self.generate_table_index();
         let (virtual_columns, bound_virtual) = crate::execution::multi_file::bind_virtual_columns(&output_names);
@@ -192,6 +294,9 @@ impl Binder<'_> {
             filename: filename.is_some(),
             hive,
             virtual_columns,
+            schema,
+            read: None,
+            hive_overrides,
         };
         Ok(LogicalOperator::new(
             LogicalOperatorKind::ParquetScan {
@@ -367,9 +472,36 @@ impl Binder<'_> {
             };
             match name.as_str() {
                 "format" | "use_tmp_file" | "preserve_order" | "order_by" => {}
-                "compression" | "codec" => compression = Some(value.try_to_string()?),
+                "compression" | "codec" => {
+                    if value.logical_type().id() == LogicalTypeId::Boolean {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            format!("Copy option \"{name}\" requires an argument"),
+                        ));
+                    }
+                    if value.logical_type().id() != LogicalTypeId::Varchar {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "Copy option \"{name}\" expected an argument of type VARCHAR - the argument \"{}\" of \
+                                 type {} could not be cast as this type",
+                                value.try_to_string()?,
+                                value.logical_type()
+                            ),
+                        ));
+                    }
+                    compression = Some((name.clone(), value.try_to_string()?));
+                }
                 "compression_level" => level = Some(number()? as i32),
-                "row_group_size" | "chunk_size" => writer.row_group_size = number()?.max(1) as usize,
+                "row_group_size" | "chunk_size" => {
+                    if value.as_i128().is_some_and(|n| n >= i128::from(u64::MAX)) {
+                        return Err(binder_error(format!(
+                            "BATCH_SIZE/ROW_GROUP_SIZE value {} is too large",
+                            value.try_to_string()?
+                        )));
+                    }
+                    writer.row_group_size = number()?.max(1) as usize;
+                }
                 "row_group_size_bytes" => writer.row_group_size_bytes = Some(bytes()?),
                 "bloom_filter_fallback_max_bytes" => {
                     writer.bloom_filter_fallback_max_bytes = parse_bytes_argument(&name, &value)?;
@@ -432,6 +564,16 @@ impl Binder<'_> {
                 }
                 "write_timestamp_as_int96" => writer.timestamp_as_int96 = is_true(&value, &name)?,
                 "parquet_version" => {
+                    // an option without a value is `true`, which is no VARCHAR
+                    if value.logical_type().id() == LogicalTypeId::Boolean {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "Copy option \"{name}\" expected an argument of type VARCHAR - the argument \"true\" of \
+                                 type BOOLEAN could not be cast as this type"
+                            ),
+                        ));
+                    }
                     writer.version = match value.try_to_string()?.to_uppercase().as_str() {
                         "V1" => 1,
                         "V2" => 2,
@@ -463,8 +605,13 @@ impl Binder<'_> {
                 _ => return Err(crate::unported(format!("the COPY option {name} for Parquet"))),
             }
         }
-        if let Some(name) = compression {
-            writer.codec = parse_compression(&name, level)?;
+        if let Some((option, name)) = compression {
+            writer.codec = parse_compression(&name, level).map_err(|_| {
+                binder_error(format!(
+                    "Expected \"{option}\" argument to be any of [uncompressed, brotli, gzip, snappy, lz4, lz4_raw or \
+                     zstd]"
+                ))
+            })?;
         }
         // `DEFAULT_DATA_PAGE_SIZE_LIMIT`: with the page index, pages of 1 MiB; without, one per column chunk
         writer.data_page_size_limit = page_size_limit.unwrap_or(if writer.write_page_index {
@@ -472,9 +619,25 @@ impl Binder<'_> {
         } else {
             MAX_UNCOMPRESSED_PAGE_SIZE
         });
+        options.partitioning = partition.bind(&path, &bound.names, "parquet")?;
+        self.bind_partition_path(
+            info,
+            &bound.names,
+            &bound.types,
+            &partition,
+            options.partitioning.as_mut(),
+        )?;
+        self.set_max_open_files(options.partitioning.as_mut());
         if let Some(value) = field_ids {
-            let columns: Vec<(String, LogicalType)> =
-                bound.names.iter().cloned().zip(bound.types.iter().cloned()).collect();
+            // the partition columns are not written, unless WRITE_PARTITION_COLUMNS says so
+            let written = match &options.partitioning {
+                Some(partitioning) => partitioning.written_columns(bound.names.len()),
+                None => (0..bound.names.len()).collect(),
+            };
+            let columns: Vec<(String, LogicalType)> = written
+                .iter()
+                .map(|&c| (bound.names[c].clone(), bound.types[c].clone()))
+                .collect();
             options.writer.field_ids = if value.logical_type().id() == LogicalTypeId::Varchar
                 && value.try_to_string()?.eq_ignore_ascii_case("auto")
             {
@@ -484,9 +647,9 @@ impl Binder<'_> {
                 parse_field_ids(&value, &columns, &mut std::collections::HashSet::new())?
             };
         }
-        options.partitioning = partition.bind(&path, &bound.names, "parquet")?;
         options.rotation = partition.rotation(&path, "parquet", file_size_bytes, row_groups_per_file, per_thread)?;
-        options.output = output.build(options.partitioning.is_some(), per_thread, ordered)?;
+        options.output = output.build(options.partitioning.is_some(), per_thread, ordered, None)?;
+        options.writer.return_stats = options.output.return_stats;
         let (result_names, return_type) = copy_result(&options.output);
         let result_types = options.output.types();
         let plan = LogicalOperator::new(

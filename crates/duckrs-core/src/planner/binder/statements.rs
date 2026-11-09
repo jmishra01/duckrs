@@ -1630,7 +1630,7 @@ impl Binder<'_> {
                 // `ReplacementScan`: a file named like a table, once the catalog has no such table
                 let lower = name.name.to_lowercase();
                 if name.qualification.is_empty()
-                    && [".csv", ".tsv", ".csv.gz", ".tsv.gz"]
+                    && [".csv", ".tsv", ".csv.gz", ".tsv.gz", ".csv.zst", ".tsv.zst"]
                         .iter()
                         .any(|end| lower.ends_with(end))
                     && !crate::execution::file_system::glob(&name.name).is_empty()
@@ -1647,9 +1647,19 @@ impl Binder<'_> {
                     return self.bind_read_csv(&call, &file_ref);
                 }
                 if name.qualification.is_empty()
-                    && [".json", ".jsonl", ".ndjson", ".json.gz", ".jsonl.gz", ".ndjson.gz"]
-                        .iter()
-                        .any(|end| lower.ends_with(end))
+                    && [
+                        ".json",
+                        ".jsonl",
+                        ".ndjson",
+                        ".json.gz",
+                        ".jsonl.gz",
+                        ".ndjson.gz",
+                        ".json.zst",
+                        ".jsonl.zst",
+                        ".ndjson.zst",
+                    ]
+                    .iter()
+                    .any(|end| lower.ends_with(end))
                     && !crate::execution::file_system::glob(&name.name).is_empty()
                 {
                     let call = ast::FunctionExpr::new(
@@ -1855,6 +1865,15 @@ impl Binder<'_> {
                     && let Some(entry) = self.find_macro(&call.name, true)?
                 {
                     return self.bind_table_macro(table_ref, call, entry);
+                }
+                if let ExprKind::Function(call) = &function.kind
+                    && call.name.qualification.is_empty()
+                    && matches!(
+                        call.name.name.to_lowercase().as_str(),
+                        "read_single_csv_file" | "read_single_parquet_file"
+                    )
+                {
+                    return self.bind_read_single_file(call, table_ref);
                 }
                 if let ExprKind::Function(call) = &function.kind
                     && call.name.qualification.is_empty()

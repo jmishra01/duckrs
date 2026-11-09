@@ -2,7 +2,7 @@
 //
 //! `read_json`, `read_ndjson`, `read_json_objects` and their `_auto` forms.
 
-use super::copy::{hive_columns, is_true, strings};
+use super::copy::{is_true, strings};
 use super::table_functions::{named_argument, parse_select};
 use super::{Binder, Binding, binder_error};
 use crate::execution::file_system::{self, Compression, read_file};
@@ -50,7 +50,7 @@ impl Binder<'_> {
         };
         let mut compression = Compression::Auto;
         let mut filename = None;
-        let mut hive_partitioning = None;
+        let mut hive_options = super::copy::HiveOptions::default();
         let mut union_by_name = false;
         for argument in &args {
             let value = self.constant_argument(&argument.expr)?;
@@ -135,7 +135,9 @@ impl Binder<'_> {
                 | "maximum_sample_files"
                 | "convert_strings_to_integers" => {}
                 "union_by_name" => union_by_name = is_true(&value, &option)?,
-                "hive_partitioning" => hive_partitioning = Some(is_true(&value, &option)?),
+                "hive_partitioning" | "hive_types" | "hive_type" | "hive_types_autocast" | "hive_type_autocast" => {
+                    self.take_hive_option(&mut hive_options, &option, &value)?;
+                }
                 "filename" => {
                     filename = match value.data() {
                         ValueData::Bool(true) => Some("filename".to_string()),
@@ -214,7 +216,7 @@ impl Binder<'_> {
             output_names.push(column.clone());
             output_types.push(LogicalType::VARCHAR);
         }
-        let hive = hive_columns(&files, hive_partitioning, &names)?;
+        let hive = super::copy::hive_columns_with(&files, &hive_options, &names)?;
         for (key, ty) in &hive {
             output_names.push(key.clone());
             output_types.push(ty.clone());
