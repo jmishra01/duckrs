@@ -6,6 +6,7 @@
 //! starts with the checksum of the rest of it. Nothing here interprets what is in a block.
 
 use super::checksum::checksum;
+use duckrs_common::serializer::StorageVersion;
 use duckrs_common::{Error, ErrorKind, Result};
 use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap};
@@ -34,10 +35,15 @@ const STANDARD_VECTOR_SIZE: u64 = 2048;
 /// `INVALID_BLOCK`.
 pub const INVALID_BLOCK: u64 = u64::MAX;
 
-/// What a file made here says it is: v2.0.0, as checkpoints write it, where the main header gives
-/// up the version for the one in the database headers.
-const NEW_FILE_VERSION_NUMBER: u64 = DEPRECATED_VERSION_NUMBER;
-const NEW_FILE_SERIALIZATION_VERSION: u64 = 69;
+/// What the main header of a file in `version` says (`MainHeader::Write`): from v2.0.0 on it gives up the
+/// version for the one in the database headers.
+fn main_header_version_number(version: StorageVersion) -> u64 {
+    if version >= StorageVersion::V2_0_0 {
+        DEPRECATED_VERSION_NUMBER
+    } else {
+        version.main_header_number()
+    }
+}
 /// `MainHeader::DB_IDENTIFIER_LEN`.
 pub const DB_IDENTIFIER_LEN: usize = 16;
 /// `MainHeader::ENCRYPTION_METADATA_LEN`.
@@ -194,6 +200,8 @@ pub struct SingleFileBlockManager {
     path: PathBuf,
     file: Mutex<File>,
     main_header: MainHeader,
+    /// what the main header says of the version now, after `rewrite_main_header`
+    main_version: std::sync::atomic::AtomicU64,
     state: Mutex<State>,
 }
 
@@ -242,6 +250,7 @@ impl SingleFileBlockManager {
         Ok(Self {
             path: path.to_path_buf(),
             file: Mutex::new(file),
+            main_version: std::sync::atomic::AtomicU64::new(main_header.version_number),
             main_header,
             state: Mutex::new(State {
                 active_header,
@@ -252,8 +261,8 @@ impl SingleFileBlockManager {
         })
     }
 
-    /// `CreateNewDatabase`: a file with no blocks, which DuckDB can open too.
-    pub fn create(path: &Path, block_alloc_size: u64) -> Result<Self> {
+    /// `CreateNewDatabase`: a file with no blocks in `version`, which DuckDB can open too.
+    pub fn create(path: &Path, block_alloc_size: u64, version: StorageVersion) -> Result<Self> {
         verify_block_alloc_size(block_alloc_size)?;
         let mut file = OpenOptions::new()
             .read(true)
@@ -265,12 +274,15 @@ impl SingleFileBlockManager {
         let mut buffer = vec![0; FILE_HEADER_SIZE];
         let data = &mut buffer[BLOCK_HEADER_SIZE..];
         data[..4].copy_from_slice(MAGIC_BYTES);
-        data[4..12].copy_from_slice(&NEW_FILE_VERSION_NUMBER.to_le_bytes());
+        data[4..12].copy_from_slice(&main_header_version_number(version).to_le_bytes());
         let desc_at = 12 + FLAG_COUNT * 8;
-        let version = concat!("duckrs ", env!("CARGO_PKG_VERSION")).as_bytes();
-        data[desc_at..desc_at + version.len()].copy_from_slice(version);
+        let description = concat!("duckrs ", env!("CARGO_PKG_VERSION")).as_bytes();
+        data[desc_at..desc_at + description.len()].copy_from_slice(description);
         let identifier_at = desc_at + 2 * MAX_VERSION_SIZE + ENCRYPTION_METADATA_LEN;
-        data[identifier_at..identifier_at + DB_IDENTIFIER_LEN].copy_from_slice(&new_db_identifier(path));
+        // the identifier is there from v1.4.0 on
+        if version >= StorageVersion::V1_4_0 {
+            data[identifier_at..identifier_at + DB_IDENTIFIER_LEN].copy_from_slice(&new_db_identifier(path));
+        }
         write_checked(&mut file, path, 0, &mut buffer)?;
 
         let header = DatabaseHeader {
@@ -280,7 +292,7 @@ impl SingleFileBlockManager {
             block_count: 0,
             block_alloc_size,
             vector_size: STANDARD_VECTOR_SIZE,
-            storage_compatibility: NEW_FILE_SERIALIZATION_VERSION,
+            storage_compatibility: version.database_header_number(),
         };
         for slot in 1..=2 {
             buffer.fill(0);
@@ -388,6 +400,43 @@ impl SingleFileBlockManager {
 
     /// `WriteHeader`: makes `header` the current one. The blocks it needs must be on disk, and they
     /// are synced before it goes out, so that a crash leaves either this header or the last.
+    /// `DatabaseHeader::SetStorageVersionInDatabaseHeader`: the version the file is in.
+    pub fn storage_version(&self) -> Result<StorageVersion> {
+        let read = self.header().storage_compatibility;
+        let main = self.main_version.load(std::sync::atomic::Ordering::SeqCst);
+        if main == DEPRECATED_VERSION_NUMBER || read >= StorageVersion::V2_0_0.0 {
+            return match read {
+                69 | 70 => Ok(StorageVersion(read)),
+                _ => Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("Unsupported Storage Version '{read}' in the database header!"),
+                )),
+            };
+        }
+        StorageVersion::from_serialization_number(read).ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!("Deprecated Serialization Version '{read}' is not found!"),
+            )
+        })
+    }
+
+    /// `RewriteMainHeader`: the main header of a file whose version changes, to say the new one.
+    pub fn rewrite_main_header(&self, version: StorageVersion) -> Result<()> {
+        let number = main_header_version_number(version);
+        if self.main_version.load(std::sync::atomic::Ordering::SeqCst) == number {
+            return Ok(());
+        }
+        let mut file = self.file.lock();
+        let mut buffer = vec![0; FILE_HEADER_SIZE];
+        read_checked(&mut file, &self.path, 0, &mut buffer)?;
+        buffer[BLOCK_HEADER_SIZE + 4..BLOCK_HEADER_SIZE + 12].copy_from_slice(&number.to_le_bytes());
+        write_checked(&mut file, &self.path, 0, &mut buffer)?;
+        drop(file);
+        self.main_version.store(number, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
     pub fn write_header(&self, mut header: DatabaseHeader) -> Result<()> {
         let mut file = self.file.lock();
         file.sync_all().map_err(|e| io_error(&self.path, e))?;
@@ -461,7 +510,7 @@ mod tests {
     fn a_new_file_has_no_blocks() {
         let directory = directory("new");
         let path = directory.join("new.db");
-        drop(SingleFileBlockManager::create(&path, 16384).unwrap());
+        drop(SingleFileBlockManager::create(&path, 16384, StorageVersion::DEFAULT).unwrap());
         let blocks = SingleFileBlockManager::open(&path, true).unwrap();
         let header = blocks.header();
         assert_eq!(header.iteration, 0);
@@ -470,7 +519,10 @@ mod tests {
         assert_eq!(blocks.block_size(), 16384 - BLOCK_HEADER_SIZE);
         assert!(blocks.main_header().library_git_desc.starts_with("duckrs"));
         assert!(blocks.read_block(0).is_err());
-        assert!(SingleFileBlockManager::create(&path, 16384).is_err(), "it is there");
+        assert!(
+            SingleFileBlockManager::create(&path, 16384, StorageVersion::DEFAULT).is_err(),
+            "it is there"
+        );
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -478,7 +530,7 @@ mod tests {
     fn blocks_and_headers_survive_reopening_and_headers_take_turns() {
         let directory = directory("blocks");
         let path = directory.join("blocks.db");
-        let blocks = SingleFileBlockManager::create(&path, 16384).unwrap();
+        let blocks = SingleFileBlockManager::create(&path, 16384, StorageVersion::DEFAULT).unwrap();
         let data = vec![7; blocks.block_size()];
         blocks.write_block(0, &data).unwrap();
         blocks.write_block(1, &vec![9; blocks.block_size()]).unwrap();
@@ -514,7 +566,7 @@ mod tests {
     fn invalid_block_sizes_are_refused() {
         let directory = directory("size");
         for size in [0, 1000, 16385, 524288] {
-            assert!(SingleFileBlockManager::create(&directory.join("x.db"), size).is_err());
+            assert!(SingleFileBlockManager::create(&directory.join("x.db"), size, StorageVersion::DEFAULT).is_err());
         }
         std::fs::remove_dir_all(&directory).unwrap();
     }

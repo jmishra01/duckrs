@@ -440,7 +440,7 @@ fn alp_candidates<T: AlpFloat>(values: &[T]) -> Vec<(u8, u8)> {
         .collect()
 }
 
-fn alp_vector<T: AlpFloat>(values: &[T], raw: &[u8], candidates: &[(u8, u8)]) -> Vec<u8> {
+fn alp_vector<T: AlpFloat>(values: &[T], raw: &[u8], candidates: &[(u8, u8)], fallback: bool) -> Vec<u8> {
     const UNCOMPRESSED: u8 = 255;
     let step = (values.len() / ALP_SAMPLES).max(1);
     let sample: Vec<T> = values.iter().copied().step_by(step).collect();
@@ -469,7 +469,7 @@ fn alp_vector<T: AlpFloat>(values: &[T], raw: &[u8], candidates: &[(u8, u8)]) ->
     for &row in &exceptions {
         vector.extend_from_slice(&(row as u16).to_le_bytes());
     }
-    if vector.len() > raw.len() {
+    if fallback && vector.len() > raw.len() {
         let mut plain = vec![UNCOMPRESSED];
         plain.extend_from_slice(raw);
         return plain;
@@ -512,23 +512,24 @@ fn alp_segments(header: &[u8], vectors: Vec<(Vec<u8>, usize)>, block_size: usize
     segments
 }
 
-fn encode_alp_typed<T: AlpFloat>(data: &[u8], block_size: usize) -> Vec<Encoded> {
+fn encode_alp_typed<T: AlpFloat>(data: &[u8], block_size: usize, fallback: bool) -> Vec<Encoded> {
     let values: Vec<T> = data.chunks_exact(T::WIDTH).map(T::read).collect();
     let candidates = alp_candidates(&values);
     let vectors = values
         .chunks(ALP_VECTOR_ROWS)
         .zip(data.chunks(ALP_VECTOR_ROWS * T::WIDTH))
-        .map(|(values, raw)| (alp_vector(values, raw, &candidates), values.len()))
+        .map(|(values, raw)| (alp_vector(values, raw, &candidates, fallback), values.len()))
         .collect();
     alp_segments(&[0; 4], vectors, block_size)
 }
 
-/// `AlpCompressionState`: floats that are decimals, as integers with an exponent and a factor.
-pub fn encode_alp(data: &[u8], width: usize, block_size: usize) -> Vec<Encoded> {
+/// `AlpCompressionState`: floats that are decimals, as integers with an exponent and a factor. `fallback`:
+/// a vector that doesn't get smaller is stored as it is, which files have since v1.5.0.
+pub fn encode_alp(data: &[u8], width: usize, block_size: usize, fallback: bool) -> Vec<Encoded> {
     if width == 8 {
-        encode_alp_typed::<f64>(data, block_size)
+        encode_alp_typed::<f64>(data, block_size, fallback)
     } else {
-        encode_alp_typed::<f32>(data, block_size)
+        encode_alp_typed::<f32>(data, block_size, fallback)
     }
 }
 
@@ -547,7 +548,7 @@ fn alprd_dictionary(values: &[u64], right: usize) -> Vec<u16> {
 
 /// `AlpRDCompressionState`: the low bits as they are, and the high bits through a dictionary, which
 /// suits floats that aren't decimals. A value whose high bits aren't in it is an exception.
-pub fn encode_alprd(data: &[u8], width: usize, block_size: usize) -> Vec<Encoded> {
+pub fn encode_alprd(data: &[u8], width: usize, block_size: usize, fallback: bool) -> Vec<Encoded> {
     /// `AlpRDConstants::CUTTING_LIMIT`.
     const CUTTING_LIMIT: usize = 16;
     const UNCOMPRESSED: u16 = u16::MAX;
@@ -612,7 +613,7 @@ pub fn encode_alprd(data: &[u8], width: usize, block_size: usize) -> Vec<Encoded
             for (row, _) in &exceptions {
                 vector.extend_from_slice(&(*row as u16).to_le_bytes());
             }
-            if vector.len() > raw.len() + 1 {
+            if fallback && vector.len() > raw.len() + 1 {
                 vector = UNCOMPRESSED.to_le_bytes().to_vec();
                 vector.extend_from_slice(raw);
             }

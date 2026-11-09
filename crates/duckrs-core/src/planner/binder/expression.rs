@@ -122,7 +122,7 @@ fn number_to_value(text: &str) -> Result<Value> {
 }
 
 /// `Literal::ToValue`.
-fn literal_to_value(literal: &Literal) -> Result<Value> {
+pub(crate) fn literal_to_value(literal: &Literal) -> Result<Value> {
     match literal.kind {
         LiteralKind::Null => Ok(Value::sql_null()),
         LiteralKind::Boolean => Ok(Value::boolean(literal.text == "true")),
@@ -989,6 +989,12 @@ impl Binder<'_> {
                 let column = ast::Expr::from(ExprKind::ColumnRef(names[..start].to_vec()));
                 let mut bound = self.bind_expression(&column)?;
                 for field in &names[start..] {
+                    // `STRUCT_EXTRACT` of a MAP is `map_extract_value`
+                    if bound.return_type.id() == LogicalTypeId::Map {
+                        let key = BoundExpr::constant(Value::varchar(field.clone()));
+                        bound = crate::function::extras::bind_function("map_extract_value", &[], vec![bound, key])?;
+                        continue;
+                    }
                     if !matches!(
                         bound.return_type.id(),
                         LogicalTypeId::Struct | LogicalTypeId::Tuple | LogicalTypeId::Union | LogicalTypeId::Variant

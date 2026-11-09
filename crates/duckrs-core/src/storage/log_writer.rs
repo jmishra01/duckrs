@@ -26,7 +26,7 @@ use crate::catalog::{
     TableCatalogEntry, TableConstraint, TableLog, TableOrView, ViewCatalogEntry,
 };
 use duckrs_common::column_data::ColumnDataCollection;
-use duckrs_common::serializer::{BinarySerializer, SerializationOptions, Serialize};
+use duckrs_common::serializer::{BinarySerializer, SerializationOptions, Serialize, StorageVersion};
 use duckrs_common::types::{ListEntry, LogicalType, LogicalTypeId, PhysicalType, StringT};
 use duckrs_common::vector::{DataChunk, SelectionVector, Vector};
 use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
@@ -124,12 +124,15 @@ impl Durable {
     }
 }
 
-/// The records of one commit.
-struct Records(Vec<u8>);
+/// The records of one commit, as the version of the file has them.
+struct Records(Vec<u8>, StorageVersion);
 
 impl Records {
     fn entry(&mut self, wal: u64, body: impl FnOnce(&mut BinarySerializer)) {
-        let mut s = BinarySerializer::new(SerializationOptions::default());
+        let mut s = BinarySerializer::new(SerializationOptions {
+            target: self.1,
+            ..Default::default()
+        });
         s.write_object_value(|s| {
             s.write_property(100, "wal_type", &wal);
             body(s);
@@ -141,18 +144,37 @@ impl Records {
     }
 
     /// DROP of a kind that all have the same fields.
+    /// `WALDropTable` and the like: before v2.0.0 by schema and name, from then on by the path.
     fn drop_entry(&mut self, wal: u64, name: &Key) {
         self.entry(wal, |s| {
-            s.write_property(103, "qualified_name", &path_of(name).expect("a path"))
+            g::WALDropTable {
+                schema: name.0.clone(),
+                name: name.1.clone(),
+                qualified_name: path_of(name),
+            }
+            .write_members(s);
         });
     }
 
     fn use_table(&mut self, name: &Key) {
         self.entry(wal_type::USE_TABLE, |s| {
             g::WALUseTable {
-                schema: String::new(),
-                table: String::new(),
+                schema: name.0.clone(),
+                table: name.1.clone(),
                 qualified_name: path_of(name),
+            }
+            .write_members(s);
+        });
+    }
+
+    /// `WALCreateSchema` and `WALDropSchema`.
+    fn schema_entry(&mut self, wal: u64, schema: &str) {
+        self.entry(wal, |s| {
+            g::WALDropSchema {
+                schema: schema.to_string(),
+                qualified_name: Some(QualifiedName {
+                    path: schema_path(schema),
+                }),
             }
             .write_members(s);
         });
@@ -469,6 +491,8 @@ pub struct WriteAheadLog {
     file: Option<File>,
     /// What is in the file.
     size: u64,
+    /// The version of the database file, which its log is written in.
+    version: StorageVersion,
 }
 
 impl std::fmt::Debug for WriteAheadLog {
@@ -501,6 +525,12 @@ impl WriteAheadLog {
         }
     }
 
+    /// The log of a file in `version`.
+    pub fn with_version(mut self, version: StorageVersion) -> Self {
+        self.version = version;
+        self
+    }
+
     pub fn size(&self) -> u64 {
         self.size
     }
@@ -517,14 +547,20 @@ impl WriteAheadLog {
             .write(true)
             .open(&wal)
             .map_err(|error| io_error(&wal, error))?;
-        let mut s = BinarySerializer::new(SerializationOptions::default());
+        let mut s = BinarySerializer::new(SerializationOptions {
+            target: self.version,
+            ..Default::default()
+        });
         s.write_object_value(|s| {
             s.write_property(100, "wal_type", &wal_type::WAL_VERSION);
             s.write_property(101, "version", &WAL_VERSION);
-            s.write_list(102, "db_identifier", DB_IDENTIFIER_LEN, |s, i| {
-                identifier[i].write_value(s)
-            });
-            s.write_property(103, "checkpoint_iteration", &iteration);
+            // which file the log is of, from v1.3.0 on
+            if s.should_serialize(StorageVersion::V1_3_0) {
+                s.write_list(102, "db_identifier", DB_IDENTIFIER_LEN, |s, i| {
+                    identifier[i].write_value(s)
+                });
+                s.write_property(103, "checkpoint_iteration", &iteration);
+            }
         });
         let header = s.into_bytes();
         file.write_all(&header).map_err(|error| io_error(&wal, error))?;
@@ -623,7 +659,7 @@ impl WriteAheadLog {
 
     /// What differs from what is durable, in records. Drops go first, as a name can come back.
     fn differences(&self, catalog: &Catalog, name: &str, current: &Durable, block_size: usize) -> Result<Records> {
-        let mut records = Records(Vec::new());
+        let mut records = Records(Vec::new(), self.version);
         let schema_of = |key: &Key| -> Result<Arc<SchemaCatalogEntry>> { catalog.schema_for(Some(&key.0)) };
         let gone = |old_same: bool, new_exists: bool| !new_exists || !old_same;
         for (k, (original, view)) in &self.durable.views {
@@ -684,29 +720,13 @@ impl WriteAheadLog {
         }
         for (k, original) in &self.durable.schemas {
             if !current.schemas.contains_key(k) {
-                records.entry(wal_type::DROP_SCHEMA, |s| {
-                    s.write_property(
-                        102,
-                        "qualified_name",
-                        &QualifiedName {
-                            path: schema_path(original),
-                        },
-                    );
-                });
+                records.schema_entry(wal_type::DROP_SCHEMA, original);
             }
         }
         for (k, original) in &current.schemas {
             if !self.durable.schemas.contains_key(k) {
                 // `WriteCreateSchema`: the schema's path
-                records.entry(wal_type::CREATE_SCHEMA, |s| {
-                    s.write_property(
-                        102,
-                        "qualified_name",
-                        &QualifiedName {
-                            path: schema_path(original),
-                        },
-                    );
-                });
+                records.schema_entry(wal_type::CREATE_SCHEMA, original);
             }
         }
         for (k, (original, ty)) in &current.types {
@@ -724,8 +744,8 @@ impl WriteAheadLog {
                     if usage != old_usage {
                         let data = sequence.data();
                         let entry = g::WALSequenceValue {
-                            schema: String::new(),
-                            name: String::new(),
+                            schema: original.0.clone(),
+                            name: original.1.clone(),
                             usage_count: Some(data.usage_count),
                             counter: Some(data.counter),
                             last_value: data.last_value,
@@ -830,7 +850,7 @@ impl WriteAheadLog {
     pub fn mark_checkpoint(&mut self, path: &Path, root: MetaBlockPointer) -> Result<u64> {
         let size = self.size;
         if self.file.is_some() {
-            let mut records = Records(Vec::new());
+            let mut records = Records(Vec::new(), self.version);
             records.entry(wal_type::CHECKPOINT, |s| s.write_property(101, "meta_block", &root));
             records.entry(wal_type::WAL_FLUSH, |_| {});
             self.append(path, &records.0)?;

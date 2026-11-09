@@ -17,17 +17,7 @@ use crate::{Error, ErrorKind, Result};
 /// Marks the end of an object.
 pub const MESSAGE_TERMINATOR_FIELD_ID: u16 = 0xFFFF;
 
-/// The storage format version being written; older versions get backwards-compatible output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum StorageVersion {
-    V1_0_0,
-    V1_1_0,
-    V1_2_0,
-    V1_3_0,
-    V1_4_0,
-    V1_5_0,
-    V2_0_0,
-}
+pub use crate::storage_version::StorageVersion;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SerializationOptions {
@@ -144,6 +134,13 @@ impl BinarySerializer {
     pub fn write_property<T: Serialize + ?Sized>(&mut self, field_id: u16, _tag: &str, value: &T) {
         self.write_field(field_id);
         value.write_value(self);
+    }
+
+    /// A property that is there when it is `Some`.
+    pub fn write_optional_property<T: Serialize + ?Sized>(&mut self, field_id: u16, tag: &str, value: Option<&T>) {
+        if let Some(value) = value {
+            self.write_property(field_id, tag, value);
+        }
     }
 
     /// `WritePropertyWithDefault`: omitted when the value is its type's default.

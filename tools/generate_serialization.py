@@ -234,9 +234,23 @@ class Generator:
         ty = member["type"].replace("duckdb::", "")
         return self.has_explicit_default(member) and not (self.is_pointer(ty) or "<" in ty or ty == "identifier_set_t")
 
+    @staticmethod
+    def version_const(version):
+        """`version_string_to_storage_version_enum`: the constant of a version of the specs."""
+        version = version if version.startswith("v") else "v" + version
+        return "StorageVersion::V" + version[1:].replace(".", "_")
+
+    @staticmethod
+    def kept_for_old_versions(member):
+        """A member that was deleted or became read-only in a version: older versions still get it written."""
+        return member.get("status") in ("deleted", "read_only") and member.get("version") not in (None, "v0.10.2")
+
     def field_decl(self, member):
-        if member.get("status") == "deleted":
+        if member.get("status") == "deleted" and not self.kept_for_old_versions(member):
             return None
+        if member.get("status") == "deleted":
+            # what an older version needs written, filled in by whoever writes for it
+            return f"    pub {self.field_name(member)}: Option<{self.member_type(member)}>,\n"
         ty = self.member_type(member)
         if self.is_option(member):
             ty = f"Option<{ty}>"
@@ -245,6 +259,9 @@ class Generator:
     def field_read(self, member):
         ty = self.member_type(member)
         field, tag = member["id"], member["name"]
+        if member.get("status") == "deleted" and self.kept_for_old_versions(member):
+            name = self.field_name(member)
+            return f'        let {name} = d.read_optional_property::<{ty}>({field}, "{tag}")?;\n'
         if member.get("status") == "deleted":
             return f'        d.read_deleted_property::<{ty}>({field}, "{tag}")?;\n'
         name = self.field_name(member)
@@ -260,17 +277,39 @@ class Generator:
         class_type = entry["class_type"]
         return next(m for m in entry["members"] if class_type in (m["name"], m.get("property")))
 
-    def field_write(self, member):
-        """The write of a member as v2.0.0 has it. Fields of older versions stay out."""
-        if member.get("status") in ("deleted", "read_only") or member.get("serialize_until") == "v2.0.0":
-            return ""
+    def plain_write(self, member):
         name = self.field_name(member)
         field, tag = member["id"], member["name"]
-        if self.is_option(member):
-            return f'        if let Some(value) = &self.{name} {{ s.write_property({field}, "{tag}", value); }}\n'
+        if self.is_option(member) or (member.get("status") == "deleted"):
+            return f's.write_optional_property({field}, "{tag}", self.{name}.as_ref());'
         if self.has_natural_default(member):
-            return f'        s.write_property_with_default({field}, "{tag}", &self.{name});\n'
-        return f'        s.write_property({field}, "{tag}", &self.{name});\n'
+            return f's.write_property_with_default({field}, "{tag}", &self.{name});'
+        return f's.write_property({field}, "{tag}", &self.{name});'
+
+    def field_write(self, member):
+        """The write of a member, by the version written (`get_serialize_element` of the C++ generator)."""
+        status = member.get("status")
+        version = member.get("version")
+        conditional = version not in (None, "v0.10.2")
+        if status in ("deleted", "read_only") and not conditional:
+            return ""
+        code = self.plain_write(member)
+        if "serialize_until" in member:
+            return f'        if !s.should_serialize({self.version_const(member["serialize_until"])}) {{ {code} }}\n'
+        if "required_until" in member:
+            name = self.field_name(member)
+            field, tag = member["id"], member["name"]
+            if self.is_option(member):
+                required = f's.write_property({field}, "{tag}", &self.{name}.clone().unwrap_or_default());'
+            else:
+                required = f's.write_property({field}, "{tag}", &self.{name});'
+            until = self.version_const(member["required_until"])
+            return f'        if s.should_serialize({until}) {{ {code} }} else {{ {required} }}\n'
+        if conditional and status in ("deleted", "read_only"):
+            return f'        if !s.should_serialize({self.version_const(version)}) {{ {code} }}\n'
+        if conditional:
+            return f'        if s.should_serialize({self.version_const(version)}) {{ {code} }}\n'
+        return f"        {code}\n"
 
     def generate_plain(self, entry, members):
         """The struct of a class, and `read_members`, for its properties without the object around them."""
@@ -280,7 +319,9 @@ class Generator:
         out += "}\n\n"
         out += f"impl {name} {{\n    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {{\n"
         out += "".join(map(self.field_read, members))
-        fields = ", ".join(self.field_name(m) for m in members if m.get("status") != "deleted")
+        fields = ", ".join(
+            self.field_name(m) for m in members if m.get("status") != "deleted" or self.kept_for_old_versions(m)
+        )
         out += f"        Ok(Self {{ {fields} }})\n    }}\n\n"
         out += "    pub fn write_members(&self, s: &mut BinarySerializer) {\n"
         out += "".join(map(self.field_write, members))
@@ -327,7 +368,9 @@ class Generator:
         out += "".join(map(self.field_read, members))
         out += f"        let kind = match u64::from({self.field_name(discriminant)}) {{\n{arms}"
         out += f'            other => return Err(unknown("{name}", other)),\n        }};\n'
-        fields = ", ".join(self.field_name(m) for m in members if m.get("status") != "deleted")
+        fields = ", ".join(
+            self.field_name(m) for m in members if m.get("status") != "deleted" or self.kept_for_old_versions(m)
+        )
         out += f"        Ok(Self {{ {fields}, kind }})\n    }}\n\n"
         out += "    pub fn write_members(&self, s: &mut BinarySerializer) {\n"
         out += "".join(map(self.field_write, members))
@@ -398,7 +441,7 @@ HEADER = """\
 use super::custom::{CastExpression, FunctionExpression, LambdaExpression, QualifiedName, WindowExpression};
 use super::{not_ported, unknown};
 use duckrs_common::Result;
-use duckrs_common::serializer::{BinaryDeserializer, BinarySerializer, Deserialize, Serialize};
+use duckrs_common::serializer::{BinaryDeserializer, BinarySerializer, Deserialize, Serialize, StorageVersion};
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
 

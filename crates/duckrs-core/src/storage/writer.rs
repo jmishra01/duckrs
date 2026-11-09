@@ -9,9 +9,9 @@
 //! codec, and it changes nothing about the format. Segments of a size that fits share blocks, or
 //! small tables would take a block per column.
 
-use super::block_manager::{DatabaseHeader, INVALID_BLOCK};
+use super::block_manager::{DEFAULT_BLOCK_ALLOC_SIZE, DatabaseHeader, INVALID_BLOCK};
 use super::buffer_manager::BufferManager;
-use super::checkpoint::{self, STORAGE_VERSION_V2_0_0, StoredEntry};
+use super::checkpoint::{self, StoredEntry};
 use super::compression::{
     COMPRESSION_ALP, COMPRESSION_ALPRD, COMPRESSION_BITPACKING, COMPRESSION_CONSTANT, COMPRESSION_DICT_FSST,
     COMPRESSION_RLE, COMPRESSION_ROARING, COMPRESSION_UNCOMPRESSED,
@@ -35,6 +35,7 @@ use crate::catalog::{
 };
 use crate::planner::binder::Binder;
 use duckrs_common::column_data::ColumnDataCollection;
+use duckrs_common::serializer::StorageVersion;
 use duckrs_common::serializer::{BinarySerializer, SerializationOptions, Serialize};
 use duckrs_common::types::{Interval, ListEntry, LogicalType, LogicalTypeId, PhysicalType, StringT};
 use duckrs_common::value::Value;
@@ -49,6 +50,8 @@ use std::sync::Arc;
 /// What a database or a session asks of its checkpoints.
 #[derive(Debug, Clone, Copy)]
 pub struct CheckpointOptions<'a> {
+    /// what the file is written in
+    pub storage_version: StorageVersion,
     pub force_compression: &'a str,
     /// In rows: `ATTACH ... (ROW_GROUP_SIZE)` checks that it is whole vectors.
     pub row_group_size: u64,
@@ -294,8 +297,21 @@ fn write_stats(s: &mut BinarySerializer, ty: Option<&LogicalType>, stats: &Stats
             s.write_object_value(|s| write_stats(s, ty, &Stats::unknown()));
         };
         match ty.physical_type() {
+            // `LegacyConstructMinMax` of no stats: the lowest min and the highest max
+            PhysicalType::Varchar if !s.should_serialize(StorageVersion::V2_0_0) => {
+                for (field, byte) in [(200, 0u8), (201, 0xFF)] {
+                    s.write_field(field);
+                    s.write_varint_unsigned(8);
+                    s.write_raw(&[byte; 8]);
+                }
+                s.write_property(202, "has_unicode", &true);
+                s.write_property(203, "has_max_string_length", &false);
+                s.write_property(204, "max_string_length", &0u32);
+            }
             // what `StringStatsField` says of no bounds, no lengths and that there can be unicode
             PhysicalType::Varchar => s.write_property(206, "packed_field", &0u32),
+            // INTERVAL stats are only serialized in v2.0.0 and later
+            PhysicalType::Interval if !s.should_serialize(StorageVersion::V2_0_0) => {}
             PhysicalType::Struct => {
                 let children = ty.struct_children();
                 s.write_list(200, "child_stats", children.len(), |s, i| {
@@ -336,8 +352,12 @@ struct ColumnOut {
     stats: Stats,
 }
 
-fn write_segment(s: &mut BinarySerializer, segment: &SegmentOut, ty: Option<&LogicalType>) {
+fn write_segment(s: &mut BinarySerializer, segment: &SegmentOut, ty: Option<&LogicalType>, row_start: u64) {
     s.write_object_value(|s| {
+        // `DataPointer::row_start`, which v1.5.0 deleted
+        if !s.should_serialize(StorageVersion::V1_5_0) {
+            s.write_property(100, "row_start", &row_start);
+        }
         s.write_property_with_default(101, "tuple_count", &(segment.tuple_count as u64));
         s.write_object(102, "block_pointer", |s| {
             s.write_property(100, "block_id", &segment.block_id);
@@ -354,26 +374,32 @@ fn write_segment(s: &mut BinarySerializer, segment: &SegmentOut, ty: Option<&Log
 }
 
 /// `PersistentColumnData::Serialize`, without the object around it.
-fn write_column(s: &mut BinarySerializer, column: &ColumnOut, ty: Option<&LogicalType>) {
+fn write_column(s: &mut BinarySerializer, column: &ColumnOut, ty: Option<&LogicalType>, row_start: u64) {
     if !column.segments.is_empty() {
+        let mut starts = Vec::with_capacity(column.segments.len());
+        let mut start = row_start;
+        for segment in &column.segments {
+            starts.push(start);
+            start += segment.tuple_count as u64;
+        }
         s.write_list(100, "data_pointers", column.segments.len(), |s, i| {
-            write_segment(s, &column.segments[i], ty);
+            write_segment(s, &column.segments[i], ty, starts[i]);
         });
     }
     let Some(ty) = ty else { return };
     if let Some(validity) = &column.validity {
-        s.write_object(101, "validity", |s| write_column(s, validity, None));
+        s.write_object(101, "validity", |s| write_column(s, validity, None, row_start));
     }
     match ty.physical_type() {
         PhysicalType::List | PhysicalType::Array => {
             s.write_object(102, "child_column", |s| {
-                write_column(s, &column.children[0], ty.child_type())
+                write_column(s, &column.children[0], ty.child_type(), 0)
             });
         }
         PhysicalType::Struct => {
             let fields = ty.struct_children();
             s.write_list(102, "sub_columns", column.children.len(), |s, i| {
-                s.write_object_value(|s| write_column(s, &column.children[i], Some(&fields[i].1)));
+                s.write_object_value(|s| write_column(s, &column.children[i], Some(&fields[i].1), row_start));
             });
         }
         _ => {}
@@ -693,6 +719,8 @@ struct Writer<'a> {
     chunks_per_row_group: usize,
     vacuum_tasks: usize,
     abort: String,
+    /// what the file is written in
+    version: StorageVersion,
 }
 
 /// A row group that a table is written as. Its rows have the ids from `row_start` on, and those
@@ -773,12 +801,15 @@ fn vacuum_groups(groups: Vec<PlannedGroup>, size: usize, tasks: usize) -> Vec<Pl
 
 /// The row groups of rows with these ids: those that a file has, without the ones whose rows all
 /// went, and new ones of `size` for what came after them.
-fn plan_groups(ids: &RowIds, size: usize, vacuum_tasks: usize) -> Vec<PlannedGroup> {
+/// `dense`: the file can't say that row ids have gaps (`CanPersistRowIdGaps`, before v2.0.0), so row groups
+/// without rows stay, and none come together.
+fn plan_groups(ids: &RowIds, size: usize, vacuum_tasks: usize, dense: bool) -> Vec<PlannedGroup> {
+    let vacuum_tasks = if dense { 0 } else { vacuum_tasks };
     let mut groups: Vec<PlannedGroup> = Vec::new();
     let mut add = |row_start: u64, rows: usize| {
         let first_position = ids.first_from(row_start);
         let live = ids.first_from(row_start + rows as u64) - first_position;
-        if live > 0 {
+        if live > 0 || dense {
             groups.push(PlannedGroup {
                 row_start,
                 rows,
@@ -877,6 +908,7 @@ impl<'a> Writer<'a> {
             chunks_per_row_group: options.row_group_size as usize / STANDARD_VECTOR_SIZE,
             vacuum_tasks: options.vacuum_tasks,
             abort: options.abort.to_string(),
+            version: options.storage_version,
         }
     }
 
@@ -997,7 +1029,8 @@ impl<'a> Writer<'a> {
         if force == "uncompressed" {
             return plain();
         }
-        if force == "roaring" && physical == PhysicalType::Bool {
+        // `RoaringInitAnalyze`: from v1.2.0 on, and for booleans from v1.5.0
+        if force == "roaring" && physical == PhysicalType::Bool && self.version >= StorageVersion::V1_5_0 {
             let bits: Vec<bool> = data.iter().map(|byte| *byte != 0).collect();
             return (encode_roaring(&bits, self.block_size), COMPRESSION_ROARING);
         }
@@ -1007,9 +1040,12 @@ impl<'a> Writer<'a> {
         if force == "bitpacking" && supports_bitpacking(physical) {
             return packed();
         }
-        let float = matches!(physical, PhysicalType::Float | PhysicalType::Double);
-        let alp = || (encode_alp(data, width, self.block_size), COMPRESSION_ALP);
-        let alprd = || (encode_alprd(data, width, self.block_size), COMPRESSION_ALPRD);
+        // `AlpInitAnalyze`: before v1.5.0 vectors can't be stored uncompressed, which small blocks need
+        let fallback = self.version >= StorageVersion::V1_5_0;
+        let small_blocks = self.buffer.block_manager().block_alloc_size() < DEFAULT_BLOCK_ALLOC_SIZE as usize;
+        let float = matches!(physical, PhysicalType::Float | PhysicalType::Double) && (fallback || !small_blocks);
+        let alp = || (encode_alp(data, width, self.block_size, fallback), COMPRESSION_ALP);
+        let alprd = || (encode_alprd(data, width, self.block_size, fallback), COMPRESSION_ALPRD);
         if force == "alp" && float {
             return alp();
         }
@@ -1136,8 +1172,13 @@ impl<'a> Writer<'a> {
             }
         }
         let force = self.force_compression.as_str();
-        // the Dictionary of C++ isn't written any more: forcing it gives plain strings there too
-        if force != "uncompressed" && force != "dictionary" && valid.iter().any(|v| *v) {
+        // the Dictionary of C++ isn't written any more: forcing it gives plain strings there too; DICT_FSST
+        // came with v1.3.0
+        if force != "uncompressed"
+            && force != "dictionary"
+            && self.version >= StorageVersion::V1_3_0
+            && valid.iter().any(|v| *v)
+        {
             let plain_size: usize = strings.iter().map(|string| string.len() + 4).sum();
             let total = |segments: &Vec<Encoded>| segments.iter().map(|(bytes, _)| bytes.len()).sum::<usize>();
             let plain = encode_dictionary(&strings, valid, self.block_size, limit, None);
@@ -1239,7 +1280,8 @@ impl<'a> Writer<'a> {
             let roaring_size: usize = roaring.iter().map(|(bytes, _)| bytes.len()).sum();
             let plain_size = valid.len().div_ceil(64) * 8;
             let force = self.force_compression.as_str();
-            let use_roaring = force == "roaring" || (force != "uncompressed" && roaring_size < plain_size);
+            let use_roaring = self.version >= StorageVersion::V1_2_0
+                && (force == "roaring" || (force != "uncompressed" && roaring_size < plain_size));
             let encoded: Vec<(Vec<u8>, usize, u8)> = if use_roaring {
                 roaring
                     .into_iter()
@@ -1383,8 +1425,8 @@ impl<'a> Writer<'a> {
                 Some(stats) => stats.merge(&out.stats, ty.physical_type()),
                 empty => *empty = Some(out.stats.clone()),
             }
-            let mut s = BinarySerializer::new(SerializationOptions::default());
-            s.write_object_value(|s| write_column(s, &out, Some(ty)));
+            let mut s = serializer(self.version);
+            s.write_object_value(|s| write_column(s, &out, Some(ty), row_start));
             pointers.push(self.pointer(&mut tables));
             self.write_metadata(&mut tables, &s.into_bytes());
         }
@@ -1399,13 +1441,15 @@ impl<'a> Writer<'a> {
             left = rest;
         }
         self.tables = tables;
-        let mut s = BinarySerializer::new(SerializationOptions::default());
+        let mut s = serializer(self.version);
         s.write_object_value(|s| {
             s.write_property(100, "row_start", &row_start);
             s.write_property(101, "tuple_count", &(rows as u64));
             s.write_property(102, "data_pointers", &pointers);
             s.write_property(103, "delete_pointers", &delete_pointers);
-            s.write_property(104, "has_metadata_blocks", &false);
+            if s.should_serialize(StorageVersion::V1_4_0) {
+                s.write_property(104, "has_metadata_blocks", &false);
+            }
         });
         Ok(s.into_bytes())
     }
@@ -1509,13 +1553,14 @@ impl<'a> Writer<'a> {
         let mut row_groups = Vec::new();
         let size = self.chunks_per_row_group * STANDARD_VECTOR_SIZE;
         let (mut stored_rows, mut next_row_id) = (0u64, 0u64);
-        for group in plan_groups(&ids, size, self.vacuum_tasks) {
+        let dense = self.version < StorageVersion::V2_0_0;
+        for group in plan_groups(&ids, size, self.vacuum_tasks, dense) {
             let (written, end) = self.write_group(table, &group, &ids, &mut rows, indexes, &mut statistics)?;
             row_groups.push(written);
             stored_rows += group.rows as u64;
             next_row_id = next_row_id.max(end as u64);
         }
-        let mut s = BinarySerializer::new(SerializationOptions::default());
+        let mut s = serializer(self.version);
         s.write_object_value(|s| {
             s.write_list(100, "column_stats", types.len(), |s, column| {
                 true.write_value(s);
@@ -1539,8 +1584,9 @@ impl<'a> Writer<'a> {
     /// The entries of a schema, in an order in which each can be read: tables can use macros and
     /// sequences in their defaults, and C++ doesn't bind macros or views when it reads them.
     fn write_schema(&mut self, schema: &Arc<SchemaCatalogEntry>, entries: &mut Vec<Vec<u8>>) -> Result<()> {
+        let version = self.version;
         let simple = |entry_type: u64, info: g::CreateInfo| {
-            let mut s = BinarySerializer::new(SerializationOptions::default());
+            let mut s = serializer(version);
             s.write_object_value(|s| {
                 s.write_property(99, "type", &entry_type);
                 s.write_property(100, "info", &Some(Box::new(info)));
@@ -1577,6 +1623,13 @@ impl<'a> Writer<'a> {
             let table = &tables[position];
             let info = table_info(&name, schema, table)?;
             let mut indexes = TableIndex::all_of(table, self.block_size);
+            // `ART::GetSerializationFormat`: older versions have layouts of their own, which aren't written here
+            if !indexes.is_empty() && self.version < StorageVersion::V2_0_0 {
+                return Err(write_not_ported(&format!(
+                    "an index into a database file of storage version {}",
+                    self.version.display_name(false)
+                )));
+            }
             let (pointer, rows, next_row_id) = self.write_table_data(table, &mut indexes)?;
             let mut storage = Vec::with_capacity(indexes.len());
             for index in &indexes {
@@ -1585,7 +1638,7 @@ impl<'a> Writer<'a> {
                     Ok(g::BlockPointer { block_id, offset })
                 })?);
             }
-            let mut s = BinarySerializer::new(SerializationOptions::default());
+            let mut s = serializer(self.version);
             s.write_object_value(|s| {
                 s.write_property(99, "type", &catalog_type::TABLE_ENTRY);
                 s.write_property(100, "info", &Some(Box::new(info)));
@@ -1593,7 +1646,9 @@ impl<'a> Writer<'a> {
                 s.write_property(102, "total_rows", &rows);
                 s.write_property(103, "index_pointers", &Vec::<g::BlockPointer>::new());
                 s.write_property(104, "index_storage_infos", &storage);
-                s.write_property(105, "next_row_id", &next_row_id);
+                if s.should_serialize(StorageVersion::V2_0_0) {
+                    s.write_property(105, "next_row_id", &next_row_id);
+                }
             });
             entries.push(s.into_bytes());
         }
@@ -1697,7 +1752,7 @@ impl<'a> Writer<'a> {
             meta_block: root.block_pointer,
             free_list,
             block_count: self.next_block,
-            storage_compatibility: STORAGE_VERSION_V2_0_0,
+            storage_compatibility: self.version.database_header_number(),
             ..blocks.header()
         })?;
         blocks.set_free_list(free.into_iter().collect(), multi_use.into_iter().collect());
@@ -1726,6 +1781,14 @@ pub(crate) fn parse_expression(text: &str) -> Result<Expr> {
 /// `SingleFileCheckpointWriter::CreateCheckpoint`: makes the file at `path` hold what is in
 /// `catalog`, and leaves the tables of the catalog in it. `mark` gets the root of the checkpoint
 /// before any of it is written, for the log to say what a crash can be told by.
+/// A serializer of what goes into a file in `version`.
+fn serializer(version: StorageVersion) -> BinarySerializer {
+    BinarySerializer::new(SerializationOptions {
+        target: version,
+        ..Default::default()
+    })
+}
+
 pub fn write_checkpoint(
     path: &Path,
     buffer: &Arc<BufferManager>,
@@ -1735,6 +1798,10 @@ pub fn write_checkpoint(
     mark: &mut dyn FnMut(MetaBlockPointer) -> Result<()>,
 ) -> Result<()> {
     let mut writer = Writer::new(buffer, catalog, name.to_string(), options);
+    // `RewriteMainHeader`: a file of v0.10.2 that goes to v1.2.0 or newer says so in its main header
+    if writer.version >= StorageVersion::V1_2_0 && buffer.block_manager().main_header().version_number == 64 {
+        buffer.block_manager().rewrite_main_header(StorageVersion::V1_2_0)?;
+    }
     let mut root = MetaStream::default();
     let pointer = writer.pointer(&mut root);
     mark(pointer)?;
@@ -1744,7 +1811,7 @@ pub fn write_checkpoint(
             writer.write_schema(&schema, &mut entries)?;
         }
     }
-    let mut s = BinarySerializer::new(SerializationOptions::default());
+    let mut s = serializer(writer.version);
     s.write_object_value(|s| {
         s.write_list(100, "catalog_entries", entries.len(), |s, i| s.write_raw(&entries[i]));
     });

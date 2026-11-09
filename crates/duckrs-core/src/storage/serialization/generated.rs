@@ -6,7 +6,7 @@
 use super::custom::{CastExpression, FunctionExpression, LambdaExpression, QualifiedName, WindowExpression};
 use super::{not_ported, unknown};
 use duckrs_common::Result;
-use duckrs_common::serializer::{BinaryDeserializer, BinarySerializer, Deserialize, Serialize};
+use duckrs_common::serializer::{BinaryDeserializer, BinarySerializer, Deserialize, Serialize, StorageVersion};
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
 
@@ -463,20 +463,24 @@ impl CreateInfo {
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
         s.write_property(100, "type", &self.type_);
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(101, "catalog", &self.catalog);
+        }
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(102, "schema", &self.schema);
+        }
         s.write_property_with_default(103, "temporary", &self.temporary);
         s.write_property_with_default(104, "internal", &self.internal);
         s.write_property(105, "on_conflict", &self.on_conflict);
         s.write_property_with_default(106, "sql", &self.sql);
-        if let Some(value) = &self.comment {
-            s.write_property(107, "comment", value);
-        }
+        s.write_optional_property(107, "comment", self.comment.as_ref());
         s.write_property_with_default(108, "tags", &self.tags);
-        if let Some(value) = &self.dependencies {
-            s.write_property(109, "dependencies", value);
+        if s.should_serialize(StorageVersion::V0_10_3) {
+            s.write_optional_property(109, "dependencies", self.dependencies.as_ref());
         }
         s.write_property_with_default(110, "extension_name", &self.extension_name);
-        if let Some(value) = &self.qualified_name {
-            s.write_property(111, "qualified_name", value);
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(111, "qualified_name", self.qualified_name.as_ref());
         }
         match &self.kind {
             CreateInfoKind::CreateIndexInfo(value) => value.write_members(s),
@@ -618,7 +622,11 @@ impl WALCreateTable {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property_with_default(101, "table", &self.table);
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(101, "table", &self.table);
+        } else {
+            s.write_property(101, "table", &self.table);
+        }
     }
 }
 
@@ -654,8 +662,14 @@ impl WALDropTable {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        if let Some(value) = &self.qualified_name {
-            s.write_property(103, "qualified_name", value);
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(101, "schema", &self.schema);
+        }
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(102, "name", &self.name);
+        }
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(103, "qualified_name", self.qualified_name.as_ref());
         }
     }
 }
@@ -686,8 +700,11 @@ impl WALCreateSchema {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        if let Some(value) = &self.qualified_name {
-            s.write_property(102, "qualified_name", value);
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(101, "schema", &self.schema);
+        }
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(102, "qualified_name", self.qualified_name.as_ref());
         }
     }
 }
@@ -718,8 +735,11 @@ impl WALDropSchema {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        if let Some(value) = &self.qualified_name {
-            s.write_property(102, "qualified_name", value);
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(101, "schema", &self.schema);
+        }
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(102, "qualified_name", self.qualified_name.as_ref());
         }
     }
 }
@@ -748,7 +768,11 @@ impl WALCreateView {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property_with_default(101, "view", &self.view);
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(101, "view", &self.view);
+        } else {
+            s.write_property(101, "view", &self.view);
+        }
     }
 }
 
@@ -784,8 +808,14 @@ impl WALDropView {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        if let Some(value) = &self.qualified_name {
-            s.write_property(103, "qualified_name", value);
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(101, "schema", &self.schema);
+        }
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(102, "name", &self.name);
+        }
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(103, "qualified_name", self.qualified_name.as_ref());
         }
     }
 }
@@ -814,7 +844,11 @@ impl WALCreateSequence {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property_with_default(101, "sequence", &self.sequence);
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(101, "sequence", &self.sequence);
+        } else {
+            s.write_property(101, "sequence", &self.sequence);
+        }
     }
 }
 
@@ -850,8 +884,14 @@ impl WALDropSequence {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        if let Some(value) = &self.qualified_name {
-            s.write_property(103, "qualified_name", value);
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(101, "schema", &self.schema);
+        }
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(102, "name", &self.name);
+        }
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(103, "qualified_name", self.qualified_name.as_ref());
         }
     }
 }
@@ -897,15 +937,27 @@ impl WALSequenceValue {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        if let Some(value) = &self.usage_count {
-            s.write_property(103, "usage_count", value);
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(101, "schema", &self.schema);
         }
-        if let Some(value) = &self.counter {
-            s.write_property(104, "counter", value);
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(102, "name", &self.name);
         }
-        s.write_property_with_default(105, "last_value", &self.last_value);
-        if let Some(value) = &self.qualified_name {
-            s.write_property(106, "qualified_name", value);
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(103, "usage_count", self.usage_count.as_ref());
+        } else {
+            s.write_property(103, "usage_count", &self.usage_count.clone().unwrap_or_default());
+        }
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(104, "counter", self.counter.as_ref());
+        } else {
+            s.write_property(104, "counter", &self.counter.clone().unwrap_or_default());
+        }
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(105, "last_value", &self.last_value);
+        }
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(106, "qualified_name", self.qualified_name.as_ref());
         }
     }
 }
@@ -934,7 +986,11 @@ impl WALCreateMacro {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property_with_default(101, "macro", &self.macro_);
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(101, "macro", &self.macro_);
+        } else {
+            s.write_property(101, "macro", &self.macro_);
+        }
     }
 }
 
@@ -970,8 +1026,14 @@ impl WALDropMacro {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        if let Some(value) = &self.qualified_name {
-            s.write_property(103, "qualified_name", value);
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(101, "schema", &self.schema);
+        }
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(102, "name", &self.name);
+        }
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(103, "qualified_name", self.qualified_name.as_ref());
         }
     }
 }
@@ -1000,7 +1062,11 @@ impl WALCreateTableMacro {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property_with_default(101, "table_macro", &self.table_macro);
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(101, "table_macro", &self.table_macro);
+        } else {
+            s.write_property(101, "table_macro", &self.table_macro);
+        }
     }
 }
 
@@ -1036,8 +1102,14 @@ impl WALDropTableMacro {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        if let Some(value) = &self.qualified_name {
-            s.write_property(103, "qualified_name", value);
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(101, "schema", &self.schema);
+        }
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(102, "name", &self.name);
+        }
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(103, "qualified_name", self.qualified_name.as_ref());
         }
     }
 }
@@ -1066,7 +1138,11 @@ impl WALCreateType {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property_with_default(101, "type", &self.type_);
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(101, "type", &self.type_);
+        } else {
+            s.write_property(101, "type", &self.type_);
+        }
     }
 }
 
@@ -1102,8 +1178,14 @@ impl WALDropType {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        if let Some(value) = &self.qualified_name {
-            s.write_property(103, "qualified_name", value);
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(101, "schema", &self.schema);
+        }
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(102, "name", &self.name);
+        }
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(103, "qualified_name", self.qualified_name.as_ref());
         }
     }
 }
@@ -1132,7 +1214,11 @@ impl WALCreateTrigger {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property_with_default(101, "trigger", &self.trigger);
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(101, "trigger", &self.trigger);
+        } else {
+            s.write_property(101, "trigger", &self.trigger);
+        }
     }
 }
 
@@ -1171,9 +1257,15 @@ impl WALDropTrigger {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(101, "schema", &self.schema);
+        }
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(102, "name", &self.name);
+        }
         s.write_property_with_default(103, "table", &self.table);
-        if let Some(value) = &self.qualified_name {
-            s.write_property(104, "qualified_name", value);
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(104, "qualified_name", self.qualified_name.as_ref());
         }
     }
 }
@@ -1210,8 +1302,14 @@ impl WALDropIndex {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        if let Some(value) = &self.qualified_name {
-            s.write_property(103, "qualified_name", value);
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(101, "schema", &self.schema);
+        }
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(102, "name", &self.name);
+        }
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(103, "qualified_name", self.qualified_name.as_ref());
         }
     }
 }
@@ -1248,8 +1346,14 @@ impl WALUseTable {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        if let Some(value) = &self.qualified_name {
-            s.write_property(103, "qualified_name", value);
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(101, "schema", &self.schema);
+        }
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(102, "table", &self.table);
+        }
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(103, "qualified_name", self.qualified_name.as_ref());
         }
     }
 }
@@ -1417,9 +1521,14 @@ impl CreateViewInfo {
         s.write_property_with_default(202, "types", &self.types);
         s.write_property_with_default(203, "query", &self.query);
         s.write_property_with_default(204, "names", &self.names);
-        s.write_property_with_default(206, "column_comments_map", &self.column_comments_map);
-        if let Some(value) = &self.security_type {
-            s.write_property(207, "security_type", value);
+        if !s.should_serialize(StorageVersion::V1_5_0) {
+            s.write_property_with_default(205, "column_comments", &self.column_comments);
+        }
+        if s.should_serialize(StorageVersion::V1_5_0) {
+            s.write_property_with_default(206, "column_comments_map", &self.column_comments_map);
+        }
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(207, "security_type", self.security_type.as_ref());
         }
     }
 }
@@ -1512,7 +1621,9 @@ impl CreateSequenceInfo {
         s.write_property_with_default(204, "max_value", &self.max_value);
         s.write_property_with_default(205, "start_value", &self.start_value);
         s.write_property_with_default(206, "cycle", &self.cycle);
-        s.write_property_with_default(207, "last_value", &self.last_value);
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(207, "last_value", &self.last_value);
+        }
     }
 }
 
@@ -1651,11 +1762,9 @@ impl ParsedExpression {
         s.write_property(100, "class", &self.class);
         s.write_property(101, "type", &self.type_);
         s.write_property_with_default(102, "alias", &self.alias);
-        if let Some(value) = &self.query_location {
-            s.write_property(103, "query_location", value);
-        }
-        if let Some(value) = &self.query_location_length {
-            s.write_property(104, "query_location_length", value);
+        s.write_optional_property(103, "query_location", self.query_location.as_ref());
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(104, "query_location_length", self.query_location_length.as_ref());
         }
         match &self.kind {
             ParsedExpressionKind::BetweenExpression(value) => value.write_members(s),
@@ -1901,9 +2010,11 @@ impl MacroFunction {
         s.write_property(100, "type", &self.type_);
         s.write_property_with_default(101, "parameters", &self.parameters);
         s.write_property_with_default(102, "default_parameters", &self.default_parameters);
-        s.write_property_with_default(103, "types", &self.types);
-        if let Some(value) = &self.return_type {
-            s.write_property(104, "return_type", value);
+        if s.should_serialize(StorageVersion::V1_4_0) {
+            s.write_property_with_default(103, "types", &self.types);
+        }
+        if s.should_serialize(StorageVersion::V2_1_0) {
+            s.write_optional_property(104, "return_type", self.return_type.as_ref());
         }
         match &self.kind {
             MacroFunctionKind::ScalarMacroFunction(value) => value.write_members(s),
@@ -1942,8 +2053,8 @@ impl LogicalDependency {
     pub fn write_members(&self, s: &mut BinarySerializer) {
         s.write_property(100, "entry", &self.entry);
         s.write_property_with_default(101, "catalog", &self.catalog);
-        if let Some(value) = &self.flags {
-            s.write_property(102, "flags", value);
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(102, "flags", self.flags.as_ref());
         }
     }
 }
@@ -2107,8 +2218,11 @@ impl ConstantExpression {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        if let Some(value) = &self.literal {
-            s.write_property(201, "literal", value);
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(200, "value", self.value.as_ref());
+        }
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(201, "literal", self.literal.as_ref());
         }
     }
 }
@@ -2210,13 +2324,15 @@ impl StarExpression {
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
         s.write_property_with_default(200, "relation_name", &self.relation_name);
-        s.write_property_with_default(201, "exclude_list", &self.exclude_list);
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(201, "exclude_list", &self.exclude_list);
+        } else {
+            s.write_property(201, "exclude_list", &self.exclude_list);
+        }
         s.write_property_with_default(202, "replace_list", &self.replace_list);
         s.write_property_with_default(203, "columns", &self.columns);
         s.write_property_with_default(204, "expr", &self.expr);
-        if let Some(value) = &self.qualified_exclude_list {
-            s.write_property(206, "qualified_exclude_list", value);
-        }
+        s.write_optional_property(206, "qualified_exclude_list", self.qualified_exclude_list.as_ref());
         s.write_property_with_default(207, "rename_list", &self.rename_list);
     }
 }
@@ -2281,8 +2397,8 @@ impl TypeExpression {
         s.write_property_with_default(201, "schema", &self.schema);
         s.write_property_with_default(202, "type_name", &self.type_name);
         s.write_property_with_default(203, "children", &self.children);
-        if let Some(value) = &self.qualified_name {
-            s.write_property(204, "qualified_name", value);
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(204, "qualified_name", self.qualified_name.as_ref());
         }
     }
 }
@@ -2324,9 +2440,7 @@ impl ColumnDefinition {
         s.write_property_with_default(102, "expression", &self.expression);
         s.write_property(103, "category", &self.category);
         s.write_property(104, "compression_type", &self.compression_type);
-        if let Some(value) = &self.comment {
-            s.write_property(105, "comment", value);
-        }
+        s.write_optional_property(105, "comment", self.comment.as_ref());
         s.write_property_with_default(106, "tags", &self.tags);
     }
 }
@@ -2443,8 +2557,8 @@ impl UniqueConstraint {
         s.write_property_with_default(200, "is_primary_key", &self.is_primary_key);
         s.write_property(201, "index", &self.index);
         s.write_property_with_default(202, "columns", &self.columns);
-        if let Some(value) = &self.check_mode {
-            s.write_property(203, "check_mode", value);
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(203, "check_mode", self.check_mode.as_ref());
         }
     }
 }
@@ -2578,10 +2692,15 @@ impl CatalogEntryInfo {
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
         s.write_property(100, "type", &self.type_);
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(101, "schema", &self.schema);
+        }
         s.write_property_with_default(102, "name", &self.name);
-        s.write_property_with_default(103, "schema_path", &self.schema_path);
-        if let Some(value) = &self.table {
-            s.write_property(104, "table", value);
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(103, "schema_path", &self.schema_path);
+        }
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(104, "table", self.table.as_ref());
         }
     }
 }
@@ -2810,10 +2929,10 @@ impl SetOperationNode {
         s.write_property(200, "setop_type", &self.setop_type);
         s.write_property_with_default(201, "left", &self.left);
         s.write_property_with_default(202, "right", &self.right);
-        if let Some(value) = &self.setop_all {
-            s.write_property(203, "setop_all", value);
+        s.write_optional_property(203, "setop_all", self.setop_all.as_ref());
+        if s.should_serialize(StorageVersion::V1_5_0) {
+            s.write_property_with_default(204, "children", &self.children);
         }
-        s.write_property_with_default(204, "children", &self.children);
     }
 }
 
@@ -2847,9 +2966,7 @@ impl RecursiveCTENode {
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
         s.write_property_with_default(200, "cte_name", &self.cte_name);
-        if let Some(value) = &self.union_all {
-            s.write_property(201, "union_all", value);
-        }
+        s.write_optional_property(201, "union_all", self.union_all.as_ref());
         s.write_property_with_default(202, "left", &self.left);
         s.write_property_with_default(203, "right", &self.right);
         s.write_property_with_default(204, "aliases", &self.aliases);
@@ -2887,9 +3004,7 @@ impl CTENode {
         s.write_property_with_default(201, "query", &self.query);
         s.write_property_with_default(202, "child", &self.child);
         s.write_property_with_default(203, "aliases", &self.aliases);
-        if let Some(value) = &self.materialized {
-            s.write_property(204, "materialized", value);
-        }
+        s.write_optional_property(204, "materialized", self.materialized.as_ref());
     }
 }
 
@@ -3038,11 +3153,9 @@ impl TableRef {
         s.write_property(100, "type", &self.type_);
         s.write_property_with_default(101, "alias", &self.alias);
         s.write_property_with_default(102, "sample", &self.sample);
-        if let Some(value) = &self.query_location {
-            s.write_property(103, "query_location", value);
-        }
-        if let Some(value) = &self.query_location_length {
-            s.write_property(104, "query_location_length", value);
+        s.write_optional_property(103, "query_location", self.query_location.as_ref());
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(104, "query_location_length", self.query_location_length.as_ref());
         }
         match &self.kind {
             TableRefKind::BaseTableRef(value) => value.write_members(s),
@@ -3102,9 +3215,7 @@ impl SampleOptions {
         s.write_property(102, "method", &self.method);
         s.write_property_with_default(103, "seed", &self.seed);
         s.write_property_with_default(104, "repeatable", &self.repeatable);
-        if let Some(value) = &self.sample_rate {
-            s.write_property(105, "sample_rate", value);
-        }
+        s.write_optional_property(105, "sample_rate", self.sample_rate.as_ref());
     }
 }
 
@@ -3142,9 +3253,7 @@ impl LimitModifier {
     pub fn write_members(&self, s: &mut BinarySerializer) {
         s.write_property_with_default(200, "limit", &self.limit);
         s.write_property_with_default(201, "offset", &self.offset);
-        if let Some(value) = &self.limit_type {
-            s.write_property(202, "limit_type", value);
-        }
+        s.write_optional_property(202, "limit_type", self.limit_type.as_ref());
     }
 }
 
@@ -3231,10 +3340,15 @@ impl CommonTableExpressionInfo {
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
         s.write_property_with_default(100, "aliases", &self.aliases);
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(101, "query", &self.query);
+        }
         s.write_property(102, "materialized", &self.materialized);
         s.write_property_with_default(103, "key_targets", &self.key_targets);
         s.write_property_with_default(104, "payload_aggregates", &self.payload_aggregates);
-        s.write_property_with_default(105, "query_node", &self.query_node);
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(105, "query_node", &self.query_node);
+        }
     }
 }
 
@@ -3284,8 +3398,8 @@ impl BaseTableRef {
         s.write_property_with_default(202, "column_name_alias", &self.column_name_alias);
         s.write_property_with_default(203, "catalog_name", &self.catalog_name);
         s.write_property_with_default(204, "at_clause", &self.at_clause);
-        if let Some(value) = &self.qualified_name {
-            s.write_property(205, "qualified_name", value);
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(205, "qualified_name", self.qualified_name.as_ref());
         }
     }
 }
@@ -3350,18 +3464,20 @@ impl JoinRef {
         s.write_property_with_default(205, "using_columns", &self.using_columns);
         s.write_property_with_default(206, "delim_flipped", &self.delim_flipped);
         s.write_property_with_default(207, "duplicate_eliminated_columns", &self.duplicate_eliminated_columns);
-        if let Some(value) = &self.is_implicit {
-            s.write_property(208, "is_implicit", value);
+        if s.should_serialize(StorageVersion::V1_4_0) {
+            s.write_optional_property(208, "is_implicit", self.is_implicit.as_ref());
         }
-        s.write_property_with_default(209, "ranking_expression", &self.ranking_expression);
-        if let Some(value) = &self.nearest_count {
-            s.write_property(210, "nearest_count", value);
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(209, "ranking_expression", &self.ranking_expression);
         }
-        if let Some(value) = &self.nearest_order_type {
-            s.write_property(211, "nearest_order_type", value);
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(210, "nearest_count", self.nearest_count.as_ref());
         }
-        if let Some(value) = &self.nearest_approx {
-            s.write_property(212, "nearest_approx", value);
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(211, "nearest_order_type", self.nearest_order_type.as_ref());
+        }
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(212, "nearest_approx", self.nearest_approx.as_ref());
         }
     }
 }
@@ -3410,9 +3526,7 @@ impl TableFunctionRef {
     pub fn write_members(&self, s: &mut BinarySerializer) {
         s.write_property_with_default(200, "function", &self.function);
         s.write_property_with_default(201, "column_name_alias", &self.column_name_alias);
-        if let Some(value) = &self.with_ordinality {
-            s.write_property(202, "with_ordinality", value);
-        }
+        s.write_optional_property(202, "with_ordinality", self.with_ordinality.as_ref());
     }
 }
 
