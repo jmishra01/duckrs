@@ -3,8 +3,7 @@
 //! `read_parquet` and COPY with FORMAT PARQUET.
 
 use super::copy::{
-    OutputOptionsBuilder, PartitionOptions, copy_result, hive_columns, is_true, parse_bytes_argument, string_literal,
-    strings,
+    OutputOptionsBuilder, PartitionOptions, copy_result, is_true, parse_bytes_argument, string_literal, strings,
 };
 use super::table_functions::{named_argument, parse_select};
 use super::{Binder, Binding, BoundStatement, binder_error};
@@ -59,7 +58,7 @@ impl Binder<'_> {
         let mut paths = None;
         let (mut binary_as_string, mut union_by_name, mut file_row_number) = (false, false, false);
         let mut filename = None;
-        let mut hive_partitioning = None;
+        let mut hive_options = super::copy::HiveOptions::default();
         let mut int96_as = crate::execution::parquet::Int96As::Timestamp;
         let mut schema_value = None;
         for argument in &args {
@@ -75,11 +74,13 @@ impl Binder<'_> {
                 continue;
             }
             let option = argument.name.to_lowercase();
+            if self.take_hive_option(&mut hive_options, &option, &value)? {
+                continue;
+            }
             match option.as_str() {
                 "binary_as_string" => binary_as_string = is_true(&value, &option)?,
                 "union_by_name" => union_by_name = is_true(&value, &option)?,
                 "file_row_number" => file_row_number = is_true(&value, &option)?,
-                "hive_partitioning" => hive_partitioning = Some(is_true(&value, &option)?),
                 "int96_as" => {
                     use crate::execution::parquet::Int96As;
                     int96_as = match value.try_to_string()?.to_lowercase().as_str() {
@@ -93,7 +94,7 @@ impl Binder<'_> {
                         }
                     };
                 }
-                "hive_types_autocast" | "explicit_cardinality" | "can_have_nan" => {}
+                "explicit_cardinality" | "can_have_nan" => {}
                 "schema" => schema_value = Some(value),
                 // options of COPY TO, which reading doesn't have
                 "write_page_index"
@@ -183,10 +184,31 @@ impl Binder<'_> {
             output_names.push(column.clone());
             output_types.push(LogicalType::VARCHAR);
         }
-        let hive = hive_columns(&files, hive_partitioning, &names)?;
-        for (key, ty) in &hive {
-            output_names.push(key.clone());
-            output_types.push(ty.clone());
+        let mut hive = Vec::new();
+        let mut hive_overrides = Vec::new();
+        for (key, ty) in super::copy::hive_partition_columns(&files, &hive_options)? {
+            match names.iter().position(|n| n.eq_ignore_ascii_case(&key)) {
+                // a column of the file as well: the path gives its values, and its type
+                Some(column) => {
+                    if let Some(columns) = &schema
+                        && columns[column].ty != ty
+                    {
+                        return Err(binder_error(format!(
+                            "'schema' declares column \"{}\" as {}, but its hive partition type is {ty} - set the \
+                             partition type with hive_types",
+                            columns[column].name, columns[column].ty
+                        )));
+                    }
+                    types[column] = ty.clone();
+                    output_types[column] = ty;
+                    hive_overrides.push((column, key));
+                }
+                None => {
+                    output_names.push(key.clone());
+                    output_types.push(ty.clone());
+                    hive.push((key, ty));
+                }
+            }
         }
         let alias = if table_ref.alias.is_empty() {
             name
@@ -228,6 +250,7 @@ impl Binder<'_> {
             virtual_columns,
             schema,
             read: None,
+            hive_overrides,
         };
         Ok(LogicalOperator::new(
             LogicalOperatorKind::ParquetScan {

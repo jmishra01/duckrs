@@ -151,7 +151,7 @@ struct CsvArguments {
     types_by_position: Vec<LogicalType>,
     union_by_name: bool,
     allow_empty: bool,
-    hive_partitioning: Option<bool>,
+    hive: HiveOptions,
     filename: Option<String>,
     store_rejects: Option<bool>,
     storing: bool,
@@ -423,9 +423,11 @@ impl Binder<'_> {
                     shown = false;
                     result.allow_empty = is_true(&value, &option)?;
                 }
-                "hive_partitioning" => {
+                "hive_partitioning" | "hive_types" | "hive_type" | "hive_types_autocast" | "hive_type_autocast" => {
                     shown = false;
-                    result.hive_partitioning = Some(is_true(&value, &option)?);
+                    let mut hive = std::mem::take(&mut result.hive);
+                    self.take_hive_option(&mut hive, &option, &value)?;
+                    result.hive = hive;
                 }
                 "compression" => options.compression = Compression::parse(&text(&value)?)?,
                 "columns" => {
@@ -729,7 +731,7 @@ impl Binder<'_> {
             output_names.push(column.clone());
             output_types.push(LogicalType::VARCHAR);
         }
-        let hive = hive_columns(&arguments.files, arguments.hive_partitioning, &names)?;
+        let hive = hive_columns_with(&arguments.files, &arguments.hive, &names)?;
         for (key, ty) in &hive {
             output_names.push(key.clone());
             output_types.push(ty.clone());
@@ -1870,43 +1872,176 @@ impl Binder<'_> {
     }
 }
 
-/// `AutoDetectHivePartitioning`: every file says the same keys. What the file has itself stays.
+/// `hive_partitioning`, `hive_types` and `hive_types_autocast` of a multi-file scan.
+#[derive(Debug, Clone)]
+pub(super) struct HiveOptions {
+    pub wanted: Option<bool>,
+    pub types: Vec<(String, LogicalType)>,
+    pub autocast: bool,
+}
+
+impl Default for HiveOptions {
+    fn default() -> Self {
+        Self {
+            wanted: None,
+            types: Vec::new(),
+            autocast: true,
+        }
+    }
+}
+
+impl Binder<'_> {
+    /// `MultiFileOptions::ParseOption`, of the hive options; whether `option` is one.
+    pub(super) fn take_hive_option(&mut self, hive: &mut HiveOptions, option: &str, value: &Value) -> Result<bool> {
+        let invalid = |message: String| Error::new(ErrorKind::InvalidInput, message);
+        match option {
+            "hive_partitioning" => hive.wanted = Some(is_true(value, option)?),
+            "hive_types_autocast" | "hive_type_autocast" => {
+                if value.is_null() {
+                    return Err(invalid(format!("Cannot use NULL as argument for {option}")));
+                }
+                hive.autocast = is_true(value, option)?;
+            }
+            "hive_types" | "hive_type" => {
+                if value.is_null() {
+                    return Err(invalid(format!("Cannot use NULL as argument for {option}")));
+                }
+                if value.logical_type().id() != LogicalTypeId::Struct {
+                    return Err(invalid(format!(
+                        "'hive_types' only accepts a STRUCT('name':VARCHAR, ...), but '{}' was provided",
+                        value.logical_type()
+                    )));
+                }
+                let fields = value.logical_type().struct_children().to_vec();
+                let ValueData::Struct(children) = value.data() else {
+                    return Err(invalid(format!("Cannot use NULL as argument for {option}")));
+                };
+                if children.is_empty() {
+                    return Err(invalid(
+                        "'hive_types' must specify the type of at least one column".to_string(),
+                    ));
+                }
+                for ((name, ty), child) in fields.iter().zip(children) {
+                    if ty.id() != LogicalTypeId::Varchar {
+                        return Err(invalid(format!(
+                            "hive_types: {name} must be a VARCHAR, instead: '{ty}' was provided"
+                        )));
+                    }
+                    let parsed = self.csv_type(&child.try_to_string()?)?;
+                    hive.types.retain(|(n, _)| n != name);
+                    hive.types.push((name.clone(), parsed));
+                }
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+}
+
+/// `HivePartitioning::Parse`: the keys of a path, sorted, with their values.
+fn sorted_parts(path: &str) -> std::collections::BTreeMap<String, Option<String>> {
+    hive_parts(path).into_iter().collect()
+}
+
+/// The hive partition columns of `files` (`AutoDetectHivePartitioning` and `MultiFileReader::BindOptions`), by
+/// key: also those the files have as a column, which they override.
+pub(super) fn hive_partition_columns(files: &[String], options: &HiveOptions) -> Result<Vec<(String, LogicalType)>> {
+    let invalid = |message: String| Error::new(ErrorKind::InvalidInput, message);
+    let Some(first_file) = files.first() else {
+        return Ok(Vec::new());
+    };
+    let parts: Vec<_> = files.iter().map(|path| sorted_parts(path)).collect();
+    let first = &parts[0];
+    let types_given = !options.types.is_empty();
+    if options.wanted == Some(false) && types_given {
+        return Err(invalid(
+            "cannot disable hive_partitioning when hive_types is enabled".to_string(),
+        ));
+    }
+    let enabled = match options.wanted {
+        Some(wanted) => wanted,
+        // hive_types implies hive_partitioning
+        None if types_given => true,
+        // `AutoDetectHivePartitioningInternal`
+        None => {
+            !first.is_empty()
+                && parts
+                    .iter()
+                    .all(|file| file.len() == first.len() && file.keys().all(|key| first.contains_key(key)))
+        }
+    };
+    if !enabled {
+        return Ok(Vec::new());
+    }
+    for (path, file) in files.iter().zip(&parts) {
+        if let Some(key) = first.keys().find(|key| !file.contains_key(*key)) {
+            return Err(binder_error(format!(
+                "Hive partition mismatch between file \"{first_file}\" and \"{path}\": key \"{key}\" not found"
+            )));
+        }
+        if file.len() != first.len() {
+            return Err(binder_error(format!(
+                "Hive partition mismatch between file \"{first_file}\" and \"{path}\""
+            )));
+        }
+    }
+    if let Some((name, _)) = options.types.iter().find(|(name, _)| !first.contains_key(name)) {
+        return Err(invalid(format!(
+            "Unknown hive_type: \"{name}\" does not appear to be a partition"
+        )));
+    }
+    let parsing = Parsing {
+        decimal_separator: b'.',
+        ..Parsing::default()
+    };
+    let mut hive = Vec::with_capacity(first.len());
+    for key in first.keys() {
+        if let Some((_, ty)) = options.types.iter().find(|(name, _)| name == key) {
+            hive.push((key.clone(), ty.clone()));
+            continue;
+        }
+        if !options.autocast {
+            hive.push((key.clone(), LogicalType::VARCHAR));
+            continue;
+        }
+        // `AutoDetectHiveTypesInternal`: the first candidate each value casts to, VARCHAR where they differ
+        let mut detected: Option<LogicalType> = None;
+        for value in parts.iter().filter_map(|file| file.get(key).cloned().flatten()) {
+            let ty = [LogicalType::DATE, LogicalType::TIMESTAMP, LogicalType::BIGINT]
+                .into_iter()
+                .find(|ty| can_cast(&value, ty, &parsing))
+                .unwrap_or(LogicalType::VARCHAR);
+            detected = match detected {
+                Some(previous) if previous != ty => Some(LogicalType::VARCHAR),
+                _ => Some(ty),
+            };
+        }
+        hive.push((key.clone(), detected.unwrap_or(LogicalType::VARCHAR)));
+    }
+    Ok(hive)
+}
+
+/// The hive partition columns of `files` that are not columns of the files themselves.
 pub(super) fn hive_columns(
     files: &[String],
     wanted: Option<bool>,
     names: &[String],
 ) -> Result<Vec<(String, LogicalType)>> {
-    let parts: Vec<_> = files.iter().map(|path| hive_parts(path)).collect();
-    let Some(first) = parts.first() else {
-        return Ok(Vec::new());
+    let options = HiveOptions {
+        wanted,
+        ..HiveOptions::default()
     };
-    let keys: Vec<String> = first.iter().map(|(key, _)| key.clone()).collect();
-    let consistent = parts
-        .iter()
-        .all(|file| file.len() == keys.len() && file.iter().zip(&keys).all(|((key, _), k)| key == k));
-    if wanted == Some(true) && !consistent {
-        return Err(binder_error(
-            "Hive partition mismatch between files: the files must have the same partition keys",
-        ));
-    }
-    let mut hive = Vec::new();
-    if wanted.unwrap_or(consistent) && consistent {
-        let parsing = Parsing {
-            decimal_separator: b'.',
-            ..Parsing::default()
-        };
-        for (column, key) in keys.iter().enumerate() {
-            if names.iter().any(|n| n.eq_ignore_ascii_case(key)) {
-                continue;
-            }
-            let values: Vec<&str> = parts.iter().filter_map(|file| file[column].1.as_deref()).collect();
-            let ty = [LogicalType::DATE, LogicalType::TIMESTAMP, LogicalType::BIGINT]
-                .into_iter()
-                .find(|ty| values.iter().all(|value| can_cast(value, ty, &parsing)))
-                .unwrap_or(LogicalType::VARCHAR);
-            hive.push((key.clone(), ty));
-        }
-    }
+    hive_columns_with(files, &options, names)
+}
+
+/// [`hive_partition_columns`], without those the files have as a column.
+pub(super) fn hive_columns_with(
+    files: &[String],
+    options: &HiveOptions,
+    names: &[String],
+) -> Result<Vec<(String, LogicalType)>> {
+    let mut hive = hive_partition_columns(files, options)?;
+    hive.retain(|(key, _)| !names.iter().any(|n| n.eq_ignore_ascii_case(key)));
     Ok(hive)
 }
 

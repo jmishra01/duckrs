@@ -4,11 +4,9 @@
 //! `read_json` and its kin. A file is read whole, one thread scans it, and the columns come from
 //! the structure of a sample of its records.
 
-use super::csv::hive_parts;
 use super::csv_sniffer::{Parsing, can_cast};
 use super::file_system::{Compression, read_file};
 use super::physical::{PhysicalOperator, SourceState};
-use crate::function::cast::{CastMode, cast_vector};
 use crate::function::dates::strptime_micros;
 use crate::function::json::{Json, ParseError, Structure, json_type, parse_prefix, transform_with};
 use duckrs_common::types::{LogicalType, Timestamp};
@@ -366,17 +364,9 @@ fn extra_columns(scan: &JsonScanData, path: &str, count: usize, columns: &mut Ve
         columns.push(constant(&LogicalType::VARCHAR, &Value::varchar(path))?);
     }
     if !scan.hive.is_empty() {
-        let parts = hive_parts(path);
         for (key, ty) in &scan.hive {
-            let value = parts
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(key))
-                .and_then(|(_, v)| v.clone());
-            let value = value.map_or(Value::null(LogicalType::VARCHAR), Value::varchar);
-            let strings = constant(&LogicalType::VARCHAR, &value)?;
-            let mut typed = Vector::new(ty.clone(), count);
-            cast_vector(&strings, &mut typed, count, CastMode::Strict)?;
-            columns.push(typed);
+            let value = super::csv::hive_value(path, key, ty)?;
+            columns.push(constant(ty, &value)?);
         }
     }
     Ok(())

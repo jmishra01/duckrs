@@ -4,7 +4,6 @@
 //! Rows pass as `Value`s between Arrow and vectors, so this is complete rather than fast, and
 //! neither filters nor projections are pushed into the file.
 
-use super::csv::hive_parts;
 use super::physical::{PhysicalOperator, SourceState};
 use crate::execution::parquet_writer::{Codec, ParquetFileWriter};
 use crate::function::cast::{CastMode, cast_vector};
@@ -55,6 +54,8 @@ pub struct ParquetScanData {
     pub schema: Option<Arc<Vec<crate::execution::parquet_schema::SchemaColumn>>>,
     /// by the columns from the files, those the query reads (`column_ids`); the others are NULL
     pub read: Option<Vec<bool>>,
+    /// the hive partitions that are also columns of the files, by the position of the column
+    pub hive_overrides: Vec<(usize, String)>,
 }
 
 impl ParquetScanData {
@@ -800,19 +801,14 @@ fn batch_chunk(
     if scan.filename {
         columns.push(constant_column(&LogicalType::VARCHAR, &Value::varchar(path), count)?);
     }
-    if !scan.hive.is_empty() {
-        let parts = hive_parts(path);
-        for (key, ty) in &scan.hive {
-            let value = parts
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(key))
-                .and_then(|(_, v)| v.clone());
-            let value = value.map_or(Value::null(LogicalType::VARCHAR), Value::varchar);
-            let strings = constant_column(&LogicalType::VARCHAR, &value, count)?;
-            let mut typed = Vector::new(ty.clone(), count);
-            cast_vector(&strings, &mut typed, count, CastMode::Strict)?;
-            columns.push(typed);
-        }
+    for (key, ty) in &scan.hive {
+        let value = super::csv::hive_value(path, key, ty)?;
+        columns.push(constant_column(ty, &value, count)?);
+    }
+    // the hive partitions that are columns of the files as well take their place
+    for (column, key) in &scan.hive_overrides {
+        let value = super::csv::hive_value(path, key, &scan.types[*column])?;
+        columns[*column] = constant_column(&scan.types[*column], &value, count)?;
     }
     Ok(DataChunk::from_columns(columns, count))
 }
