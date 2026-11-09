@@ -155,7 +155,10 @@ fn schema_of(info: &g::CreateInfo) -> Result<String> {
 }
 
 /// `CreateTableInfo::Deserialize`: what it says of a table.
-fn table_definition(schema: &str, stored: g::CreateTableInfo) -> Result<(ast::CreateTableInfo, Vec<StoredColumn>)> {
+pub(super) fn table_definition(
+    schema: &str,
+    stored: g::CreateTableInfo,
+) -> Result<(ast::CreateTableInfo, Vec<StoredColumn>)> {
     if stored.query.is_some() {
         return Err(not_ported("CREATE TABLE AS queries"));
     }

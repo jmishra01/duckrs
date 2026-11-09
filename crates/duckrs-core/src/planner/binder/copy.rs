@@ -1289,6 +1289,10 @@ impl Binder<'_> {
         if tsv && !delimiter_given {
             arguments.push("delimiter := '\t'".to_string());
         }
+        // `MultiFileBindCopy`: a COPY FROM only reads hive partitions when told to
+        if !options.iter().any(|(name, _)| name.starts_with("hive_")) {
+            arguments.push("hive_partitioning := false".to_string());
+        }
         for (name, value) in options {
             if name == "format" {
                 continue;

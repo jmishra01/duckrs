@@ -5,6 +5,7 @@
 //! parser, binder, planner and executor.
 
 mod explain;
+mod export;
 mod logging;
 pub mod settings;
 mod settings_table;
@@ -1847,6 +1848,7 @@ impl ClientContext {
     /// `ClientContext::PendingStatementOrPreparedStatement` + `ExecutePendingQueryInternal`.
     fn execute_statement(&mut self, statement: &Statement) -> Result<MaterializedQueryResult> {
         match statement {
+            Statement::Export { database, info } => return self.export_database(database, info),
             // statistics here are made when they are needed, and in-memory tables have nothing to
             // compact, so this only says whether there is such a table
             Statement::Vacuum { table, columns, .. } => {
@@ -1974,6 +1976,19 @@ impl ClientContext {
                     return Ok(Self::success());
                 }
                 let lower = name.to_lowercase();
+                if lower == "import_database" {
+                    let [path] = parameters.as_slice() else {
+                        return Err(Error::new(
+                            ErrorKind::Binder,
+                            "No function matches the given name and argument types 'import_database'",
+                        ));
+                    };
+                    let path = match &path.kind {
+                        duckrs_parser::ast::ExprKind::Constant(literal) => literal.text.clone(),
+                        _ => path.to_string(),
+                    };
+                    return self.import_database(&path);
+                }
                 if parameters.is_empty() && lower.ends_with("_checkpoint_on_shutdown") {
                     let enable = lower == "enable_checkpoint_on_shutdown";
                     self.db.checkpoint_on_shutdown.store(enable, AtomicOrdering::SeqCst);
