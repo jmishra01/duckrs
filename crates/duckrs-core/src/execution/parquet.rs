@@ -70,6 +70,149 @@ impl ParquetScanData {
     }
 }
 
+/// The numbers in `text`, in order.
+fn numbers_in(text: &str) -> Vec<u64> {
+    text.split(|c: char| !c.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse().ok())
+        .collect()
+}
+
+/// The codecs of the column chunks of the file at `path`.
+fn file_codecs(path: &str) -> Vec<parquet::basic::Compression> {
+    let Ok(file) = File::open(path) else {
+        return Vec::new();
+    };
+    let Ok(metadata) = ParquetMetaDataReader::new().parse_and_finish(&file) else {
+        return Vec::new();
+    };
+    metadata
+        .row_groups()
+        .iter()
+        .flat_map(|group| group.columns().iter().map(|column| column.compression()))
+        .collect()
+}
+
+/// The error C++ gives for the corruption the crate reports as `message`, in the file at `path` (the checks of
+/// `ParquetReader`, `ColumnReader` and their decoders); `None` where there is no such error to give.
+fn corrupt_file_error(path: &str, message: &str) -> Option<Error> {
+    use parquet::basic::Compression as Codec;
+    let numbers = numbers_in(message);
+    let error = |kind: ErrorKind, text: String| Some(Error::new(kind, text));
+    if message.contains("Parquet file too small. Size is") {
+        return error(
+            ErrorKind::DataCorruption,
+            format!("Footer length error in file '{path}'"),
+        );
+    }
+    if message.contains("Actual decompressed size doesn't match the expected one") && numbers.len() >= 2 {
+        let codecs = file_codecs(path);
+        let name = if codecs.iter().any(|c| matches!(c, Codec::GZIP(_))) {
+            "GZIP"
+        } else if codecs.iter().any(|c| matches!(c, Codec::BROTLI(_))) {
+            "Brotli"
+        } else {
+            return None;
+        };
+        return error(
+            ErrorKind::DataCorruption,
+            format!(
+                "Failed to read file \"{path}\": {name} uncompressed data size mismatch (expected {}, actual: {})",
+                numbers[1], numbers[0]
+            ),
+        );
+    }
+    if message.contains("unexpected end of file") && file_codecs(path).iter().any(|c| matches!(c, Codec::GZIP(_))) {
+        return error(
+            ErrorKind::Invalid,
+            "Failed to decompress GZIP block: incomplete GZIP member footer".to_string(),
+        );
+    }
+    // `ByteBuffer`'s bounds checks
+    if message.contains("not enough data to read levels") || message.contains("insufficient values read from column") {
+        return error(ErrorKind::Invalid, "Out of buffer".to_string());
+    }
+    if message.contains("out of sync in read_records") && numbers.len() >= 2 {
+        return error(
+            ErrorKind::InvalidInput,
+            format!(
+                "Mismatch in parquet read, expected {} rows, got {}",
+                numbers[numbers.len() - 2],
+                numbers[numbers.len() - 1]
+            ),
+        );
+    }
+    if message.contains("Invalid DECIMAL: scale") && numbers.len() >= 2 {
+        return error(
+            ErrorKind::Io,
+            format!("Invalid DECIMAL precision {} and scale {}", numbers[1], numbers[0]),
+        );
+    }
+    if message.contains("Invalid or corrupted RLE bit width") && numbers.len() >= 2 {
+        return error(
+            ErrorKind::Io,
+            format!(
+                "The width ({}) of the bitpacked data exceeds the maximum width ({}) for the target type, the file \
+                 might be corrupted.",
+                numbers[0], numbers[1]
+            ),
+        );
+    }
+    if message.contains("cannot have zero miniblocks per block") {
+        return error(
+            ErrorKind::InvalidInput,
+            "Parquet file has invalid number of miniblocks per block for DELTA_BINARY_PACKED".to_string(),
+        );
+    }
+    if message.contains("encountered non UTF-8 data") {
+        return error(
+            ErrorKind::InvalidInput,
+            format!("Invalid string encoding found in Parquet file \"{path}\": value is not valid UTF8!"),
+        );
+    }
+    if let Some(at) = message.find(" cannot annotate field ") {
+        // e.g. `INT_64 cannot annotate field 'val' because it is not a INT64 field`
+        let converted = message[..at].rsplit(' ').next().unwrap_or_default().replace('_', "");
+        let physical = message
+            .rsplit("not a ")
+            .next()
+            .and_then(|rest| rest.split(' ').next())
+            .unwrap_or_default();
+        return error(
+            ErrorKind::Io,
+            format!("{converted} converted type can only be set for value of Type::{physical}"),
+        );
+    }
+    if message.contains("Required field encodings is missing") {
+        return error(
+            ErrorKind::InvalidInput,
+            format!("Failed to read file \"{path}\": column chunk is missing its metadata"),
+        );
+    }
+    if let Some(rest) = message.split("Invalid FIXED_LEN_BYTE_ARRAY length: ").nth(1) {
+        // e.g. `-1 for field 'u'`
+        let length = rest.split(' ').next().unwrap_or_default();
+        let field = rest.split('\'').nth(1).unwrap_or_default();
+        return error(
+            ErrorKind::Io,
+            format!("Invalid negative type_length {length} for column \"{field}\""),
+        );
+    }
+    if message.contains("column start and length should not be negative") {
+        return error(
+            ErrorKind::DataCorruption,
+            format!("Failed to read file \"{path}\": metadata is corrupt. Column chunk has a negative offset or size"),
+        );
+    }
+    None
+}
+
+/// An error of the crate reading the file at `path`: what C++ says of the same corruption, if it is one.
+fn read_error(path: &str, prefix: &str, error: impl std::fmt::Display) -> Error {
+    let message = error.to_string();
+    corrupt_file_error(path, &message).unwrap_or_else(|| invalid(format!("{prefix} \"{path}\": {message}")))
+}
+
 /// Runs the crate on a file that may be corrupt: it panics on some, which must stay one query's error.
 fn guarded<T>(path: &str, read: impl FnOnce() -> Result<T>) -> Result<T> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)).unwrap_or_else(|panic| {
@@ -78,17 +221,18 @@ fn guarded<T>(path: &str, read: impl FnOnce() -> Result<T>) -> Result<T> {
             .map(String::as_str)
             .or_else(|| panic.downcast_ref::<&str>().copied())
             .unwrap_or("the file is corrupt");
-        Err(invalid(format!(
-            "Invalid Parquet file \"{path}\": {reason}. Parquet file is likely corrupted"
-        )))
+        Err(corrupt_file_error(path, reason).unwrap_or_else(|| {
+            invalid(format!(
+                "Invalid Parquet file \"{path}\": {reason}. Parquet file is likely corrupted"
+            ))
+        }))
     })
 }
 
 fn open_builder(path: &str) -> Result<ParquetRecordBatchReaderBuilder<File>> {
     let file = File::open(path).map_err(|e| Error::new(ErrorKind::Io, format!("Cannot open file \"{path}\": {e}")))?;
     guarded(path, || {
-        ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|e| invalid(format!("Invalid Parquet file \"{path}\": {e}")))
+        ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| read_error(path, "Invalid Parquet file", e))
     })
 }
 
@@ -542,9 +686,7 @@ fn open_file(scan: &ParquetScanData, state: &mut ParquetScanState, path: &str) -
         transforms.push(None);
     }
     state.reader = Some(guarded(path, || {
-        builder
-            .build()
-            .map_err(|e| invalid(format!("Could not read \"{path}\": {e}")))
+        builder.build().map_err(|e| read_error(path, "Could not read", e))
     })?);
     state.mapping = mapping;
     state.file_types = file_types;
@@ -679,7 +821,7 @@ impl PhysicalOperator for PhysicalParquetScan {
             let reader = state.reader.as_mut().expect("just opened");
             match guarded(path, || Ok(reader.next()))? {
                 Some(batch) => {
-                    let batch = batch.map_err(|e| invalid(format!("Could not read \"{path}\": {e}")))?;
+                    let batch = batch.map_err(|e| read_error(path, "Could not read", e))?;
                     if batch.num_rows() > 0 {
                         let chunk = batch_chunk(&self.scan, state, &batch, path)?;
                         return crate::execution::multi_file::append_virtual_columns(
@@ -1551,7 +1693,7 @@ fn read_metadata(path: &str) -> Result<(ParquetMetaData, u64)> {
                 parquet::file::metadata::ParquetMetaDataOptions::new().with_encoding_stats_as_mask(false),
             ))
             .parse_and_finish(&file)
-            .map_err(|e| invalid(format!("Invalid Parquet file \"{path}\": {e}")))
+            .map_err(|e| read_error(path, "Invalid Parquet file", e))
     })?;
     Ok((metadata, size))
 }
