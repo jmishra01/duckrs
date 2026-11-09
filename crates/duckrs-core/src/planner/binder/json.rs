@@ -3,11 +3,11 @@
 //! `read_json`, `read_ndjson`, `read_json_objects` and their `_auto` forms.
 
 use super::copy::{hive_columns, is_true, strings};
-use super::table_functions::named_argument;
+use super::table_functions::{named_argument, parse_select};
 use super::{Binder, Binding, binder_error};
 use crate::execution::file_system::{self, Compression, read_file};
 use crate::execution::json_scan::{Formats, JsonFormat, JsonScanData, infer, read_records, record_error, refine_type};
-use crate::function::json::{Json, json_type};
+use crate::function::json::{Json, TABLE_IN_OUT_COLUMNS, json_type};
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::ValueData;
@@ -226,6 +226,7 @@ impl Binder<'_> {
         };
         let output_names = Self::alias_columns(table_ref, &alias, output_names)?;
         let table_index = self.generate_table_index();
+        let (virtual_columns, bound_virtual) = crate::execution::multi_file::bind_virtual_columns(&output_names);
         self.bind_context.add_binding(Binding {
             alias,
             schema: None,
@@ -233,6 +234,7 @@ impl Binder<'_> {
             names: output_names,
             types: output_types,
             row_id: None,
+            virtual_columns: bound_virtual,
             generated: Vec::new(),
         });
         let scan = JsonScanData {
@@ -249,6 +251,7 @@ impl Binder<'_> {
             timestamp_format: formats.timestamp,
             filename: filename.is_some(),
             hive,
+            virtual_columns,
         };
         Ok(LogicalOperator::new(
             LogicalOperatorKind::JsonScan {
@@ -257,5 +260,47 @@ impl Binder<'_> {
             },
             vec![],
         ))
+    }
+}
+
+impl Binder<'_> {
+    /// `json_each` and `json_tree` (`JSONTableInOutBind`): the unnested rows of `__json_each` or `__json_tree`, so
+    /// that their arguments can be columns of a LATERAL join, with the hidden columns `json`, `root` and `rowid`.
+    pub(super) fn bind_json_table_in_out(
+        &mut self,
+        call: &FunctionExpr,
+        table_ref: &TableRef,
+    ) -> Result<LogicalOperator> {
+        let name = call.name.name.to_lowercase();
+        let args: Vec<_> = call.args.iter().map(named_argument).collect();
+        if args.iter().any(|argument| !argument.name.is_empty()) || !(1..=2).contains(&args.len()) {
+            return Err(binder_error(format!(
+                "No function matches the given name and argument types for {name}"
+            )));
+        }
+        let arguments: Vec<String> = args.iter().map(|argument| argument.expr.to_string()).collect();
+        let columns: Vec<String> = TABLE_IN_OUT_COLUMNS
+            .iter()
+            .map(|column| format!("__row['{column}'] AS \"{column}\""))
+            .collect();
+        let select = parse_select(
+            &format!(
+                "SELECT {} FROM (SELECT unnest(__{name}({})) AS __row)",
+                columns.join(", "),
+                arguments.join(", ")
+            ),
+            "Expected a single SELECT statement",
+        )?;
+        let plan = self.bind_rewritten(&select, table_ref, &name)?;
+        let binding = self.bind_context.bindings.last_mut().expect("just bound");
+        let visible = TABLE_IN_OUT_COLUMNS.len() - 3;
+        binding.virtual_columns = vec![
+            ("json".to_string(), json_type(), visible),
+            ("root".to_string(), LogicalType::VARCHAR, visible + 1),
+        ];
+        binding.row_id = Some(visible + 2);
+        binding.names.truncate(visible);
+        binding.types.truncate(visible);
+        Ok(plan)
     }
 }

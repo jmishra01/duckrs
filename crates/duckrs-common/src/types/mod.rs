@@ -15,7 +15,7 @@ mod uuid;
 
 pub use date::{Date, DateCastError, ParsedDate, date_error};
 pub use date_part::DatePart;
-pub use identifier::sql_identifier;
+pub use identifier::{set_keyword_check, sql_identifier};
 pub use interval::{Interval, IntervalParseError};
 pub use native::{ListEntry, NativeType};
 pub use string_t::{StringHeap, StringT};

@@ -1705,6 +1705,7 @@ impl Binder<'_> {
                         names,
                         types: working.types.clone(),
                         row_id: None,
+                        virtual_columns: Vec::new(),
                         generated: Vec::new(),
                     });
                     return Ok(LogicalOperator::new(
@@ -1811,6 +1812,7 @@ impl Binder<'_> {
                     names,
                     types: types.clone(),
                     row_id: None,
+                    virtual_columns: Vec::new(),
                     generated: Vec::new(),
                 });
                 Ok(LogicalOperator::new(
@@ -1885,10 +1887,27 @@ impl Binder<'_> {
                     && call.name.qualification.is_empty()
                     && matches!(
                         call.name.name.to_lowercase().as_str(),
-                        "parquet_metadata" | "parquet_schema" | "parquet_kv_metadata" | "parquet_file_metadata"
+                        "parquet_metadata"
+                            | "parquet_schema"
+                            | "parquet_kv_metadata"
+                            | "parquet_file_metadata"
+                            | "parquet_bloom_probe"
+                            | "parquet_page_index"
                     )
                 {
                     return self.bind_parquet_metadata(call, table_ref);
+                }
+                if let ExprKind::Function(call) = &function.kind
+                    && call.name.qualification.is_empty()
+                    && matches!(call.name.name.to_lowercase().as_str(), "json_each" | "json_tree")
+                {
+                    return self.bind_json_table_in_out(call, table_ref);
+                }
+                if let ExprKind::Function(call) = &function.kind
+                    && call.name.qualification.is_empty()
+                    && matches!(call.name.name.to_lowercase().as_str(), "read_text" | "read_blob")
+                {
+                    return self.bind_read_file(call, table_ref);
                 }
                 if let ExprKind::Function(call) = &function.kind
                     && call.name.qualification.is_empty()
@@ -1949,6 +1968,7 @@ impl Binder<'_> {
             names,
             types: bound.types,
             row_id: None,
+            virtual_columns: Vec::new(),
             generated: Vec::new(),
         });
         Ok(bound.plan)
@@ -2060,6 +2080,7 @@ impl Binder<'_> {
             names,
             types: vec![LogicalType::BIGINT],
             row_id: None,
+            virtual_columns: Vec::new(),
             generated: Vec::new(),
         });
         Ok(LogicalOperator::new(
@@ -2180,6 +2201,7 @@ impl Binder<'_> {
             names: table.columns.iter().map(|c| c.name.clone()).collect(),
             types: table.types(),
             row_id: None,
+            virtual_columns: Vec::new(),
             generated: Vec::new(),
         });
         let excluded_star =
@@ -2224,6 +2246,7 @@ impl Binder<'_> {
                 names: hidden,
                 types,
                 row_id: None,
+                virtual_columns: Vec::new(),
                 generated: Vec::new(),
             });
         }

@@ -90,6 +90,7 @@ pub(super) fn table_binding(
         table_index,
         names,
         row_id: Some(table.columns.len()),
+        virtual_columns: Vec::new(),
         generated,
     }
 }
@@ -174,6 +175,7 @@ impl Binder<'_> {
                 names: names.clone(),
                 types: (0..names.len()).map(usable).collect(),
                 row_id: None,
+                virtual_columns: Vec::new(),
                 generated: parsed
                     .iter()
                     .map(|c| c.generated.as_deref().map(|e| qualify(e, table)))

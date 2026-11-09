@@ -559,10 +559,19 @@ fn dollar_path(text: &str) -> Result<Path> {
                         match bytes.get(at) {
                             None => return Err(path_error(text, at)),
                             Some(b'"') => break,
-                            Some(b'\\') if bytes.get(at + 1) == Some(&b'"') => {
-                                unescaped.push('"');
-                                at += 2;
-                            }
+                            // `ReadString`: a backslash escapes a quote or a backslash, and is kept before
+                            // anything else
+                            Some(b'\\') => match bytes.get(at + 1) {
+                                None => return Err(path_error(text, at)),
+                                Some(&escaped @ (b'"' | b'\\')) => {
+                                    unescaped.push(char::from(escaped));
+                                    at += 2;
+                                }
+                                Some(_) => {
+                                    unescaped.push('\\');
+                                    at += 1;
+                                }
+                            },
                             Some(_) => {
                                 let ch = text[at..].chars().next().unwrap_or(' ');
                                 unescaped.push(ch);
@@ -1167,6 +1176,11 @@ pub fn is_json_function(name: &str) -> bool {
             | "array_to_json"
             | "row_to_json"
             | "json_merge_patch"
+            | "json_merge_patch_diff"
+            | "json_deep_merge"
+            | "json_normalize"
+            | "__json_each"
+            | "__json_tree"
             | "json_pretty"
             | "json_transform"
             | "from_json"
@@ -1506,6 +1520,113 @@ fn json_merge_patch(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+/// `DeepMerge`: a merge where a NULL in the patch keeps what was there, and objects merge all the way down.
+fn deep_merge(original: Json, patch: Json) -> Json {
+    let (Json::Object(original), Json::Object(patch)) = (original.clone(), &patch) else {
+        return if matches!(patch, Json::Null) { original } else { patch };
+    };
+    let find = |items: &[(String, Json)], key: &str| items.iter().position(|(k, _)| k == key);
+    let mut merged = Vec::with_capacity(original.len() + patch.len());
+    for (key, value) in &original {
+        match find(patch, key) {
+            Some(at) if !matches!(patch[at].1, Json::Null) => {}
+            _ => merged.push((key.clone(), value.clone())),
+        }
+    }
+    for (key, value) in patch {
+        if matches!(value, Json::Null) {
+            continue;
+        }
+        let old = find(&original, key).map(|at| original[at].1.clone());
+        let value = match old {
+            Some(old @ Json::Object(_)) if matches!(value, Json::Object(_)) => deep_merge(old, value.clone()),
+            _ => value.clone(),
+        };
+        merged.push((key.clone(), value));
+    }
+    Json::Object(merged)
+}
+
+fn json_deep_merge(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    row_wise(args, result, |row| {
+        let mut merged: Option<Json> = None;
+        for (i, value) in row.iter().enumerate() {
+            let patch = document(value)?;
+            merged = match (i, merged, patch) {
+                (0, _, patch) => patch,
+                (_, _, None) => None,
+                (_, None, patch) => patch,
+                (_, Some(original), Some(patch)) => Some(deep_merge(original, patch)),
+            };
+        }
+        match merged {
+            None => Ok(nothing(&json_type())),
+            Some(merged) => Value::varchar(merged.text()).reinterpret(&json_type()),
+        }
+    })
+}
+
+/// `ComputeDiff`: the merge patch that makes `old` into `new`, both objects; `None` if they are the same.
+fn object_diff(old: &[(String, Json)], new: &[(String, Json)]) -> Option<Json> {
+    let mut diff = Vec::new();
+    for (key, _) in old {
+        if !new.iter().any(|(k, _)| k == key) {
+            diff.push((key.clone(), Json::Null));
+        }
+    }
+    for (key, value) in new {
+        let before = old.iter().find(|(k, _)| k == key).map(|(_, v)| v);
+        match (before, value) {
+            (Some(Json::Object(before)), Json::Object(after)) => {
+                if let Some(child) = object_diff(before, after) {
+                    diff.push((key.clone(), child));
+                }
+            }
+            (Some(before), after) if before == after => {}
+            _ => diff.push((key.clone(), value.clone())),
+        }
+    }
+    (!diff.is_empty()).then_some(Json::Object(diff))
+}
+
+fn json_merge_patch_diff(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    row_wise(args, result, |row| {
+        let Some(new) = document(&row[1])? else {
+            return Ok(nothing(&json_type()));
+        };
+        let diff = match (document(&row[0])?, &new) {
+            (Some(Json::Object(old)), Json::Object(after)) => {
+                object_diff(&old, after).unwrap_or(Json::Object(Vec::new()))
+            }
+            _ => new,
+        };
+        Value::varchar(diff.text()).reinterpret(&json_type())
+    })
+}
+
+/// `SortKeys`: the keys of every object in byte order.
+fn sort_keys(json: Json) -> Json {
+    match json {
+        Json::Object(items) => {
+            let mut items: Vec<(String, Json)> =
+                items.into_iter().map(|(key, value)| (key, sort_keys(value))).collect();
+            items.sort_by(|(a, _), (b, _)| a.as_bytes().cmp(b.as_bytes()));
+            Json::Object(items)
+        }
+        Json::Array(items) => Json::Array(items.into_iter().map(sort_keys).collect()),
+        other => other,
+    }
+}
+
+fn json_normalize(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    row_wise(args, result, |row| {
+        let Some(json) = document(&row[0])? else {
+            return Ok(nothing(&LogicalType::VARCHAR));
+        };
+        Ok(Value::varchar(sort_keys(json).text()))
+    })
+}
+
 fn strip_nulls(json: Json) -> Json {
     match json {
         Json::Object(items) => Json::Object(
@@ -1621,7 +1742,7 @@ fn modify_rows(args: &DataChunk, result: &mut Vector, modify: Modify) -> Result<
             if pair[1].is_null() {
                 return Ok(nothing(&json_type()));
             }
-            let path = parse_path(&path_text(&pair[0])?)?;
+            let path = modify_path(&path_text(&pair[0])?)?;
             let value = inserted(&pair[1])?;
             set_path(&mut json, &path.steps, &value, modify);
         }
@@ -1662,6 +1783,24 @@ fn json_replace(args: &DataChunk, result: &mut Vector) -> Result<()> {
     )
 }
 
+/// `ParseModifyPath`: a path for the functions that change a document, which can't have wildcards.
+fn modify_path(text: &str) -> Result<Path> {
+    let path = parse_path(text)?;
+    let wildcard = path.steps.iter().any(|step| {
+        matches!(
+            step,
+            Step::AllKeys | Step::AllItems | Step::RecursiveWildcard | Step::RecursiveKey(_)
+        )
+    });
+    if wildcard {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "JSON path wildcards are not supported in JSON modification functions",
+        ));
+    }
+    Ok(path)
+}
+
 fn json_remove(args: &DataChunk, result: &mut Vector) -> Result<()> {
     row_wise(args, result, |row| {
         let Some(mut json) = document(&row[0])? else {
@@ -1671,7 +1810,7 @@ fn json_remove(args: &DataChunk, result: &mut Vector) -> Result<()> {
             if path.is_null() {
                 return Ok(nothing(&json_type()));
             }
-            let path = parse_path(&path_text(path)?)?;
+            let path = modify_path(&path_text(path)?)?;
             if path.steps.is_empty() {
                 return Ok(nothing(&json_type()));
             }
@@ -1843,6 +1982,29 @@ pub fn bind_function(
             }
             Ok(bound_function(&lower, children, json_type(), json_merge_patch))
         }
+        "json_deep_merge" => {
+            if children.len() < 2 {
+                return Err(binder_error("json_deep_merge requires at least two parameters"));
+            }
+            Ok(bound_function(&lower, children, json_type(), json_deep_merge))
+        }
+        "json_merge_patch_diff" => {
+            expect_args(&lower, &children, 2, 2)?;
+            Ok(bound_function(&lower, children, json_type(), json_merge_patch_diff))
+        }
+        "__json_each" | "__json_tree" => {
+            expect_args(&lower, &children, 1, 2)?;
+            let callback: super::ScalarCallback = if lower == "__json_tree" {
+                json_tree_rows
+            } else {
+                json_each_rows
+            };
+            Ok(bound_function(&lower, children, table_in_out_type(), callback))
+        }
+        "json_normalize" => {
+            expect_args(&lower, &children, 1, 1)?;
+            Ok(bound_function(&lower, children, LogicalType::VARCHAR, json_normalize))
+        }
         "json_strip_nulls" => {
             expect_args(&lower, &children, 1, 1)?;
             Ok(bound_function(&lower, children, json_type(), json_strip_nulls))
@@ -1885,4 +2047,225 @@ pub fn bind_function(
         }
         _ => Err(binder_error(format!("Unknown JSON function {lower}"))),
     }
+}
+
+/// How many values a document has from `json` on, keys counted (`yyjson_doc_get_val_count`): what the ids of
+/// `json_each` and `json_tree` count.
+fn value_count(json: &Json) -> u64 {
+    match json {
+        Json::Array(items) => 1 + items.iter().map(value_count).sum::<u64>(),
+        Json::Object(items) => 1 + items.iter().map(|(_, value)| 1 + value_count(value)).sum::<u64>(),
+        _ => 1,
+    }
+}
+
+/// `AppendObjectPathElement`: `.key`, the key quoted unless it is a letter followed by letters, digits and `_`.
+fn append_path_key(path: &mut String, key: &str) {
+    path.push('.');
+    let bytes = key.as_bytes();
+    let plain = bytes.first().is_some_and(u8::is_ascii_alphabetic)
+        && bytes[1..].iter().all(|&c| c.is_ascii_alphanumeric() || c == b'_');
+    if plain {
+        path.push_str(key);
+        return;
+    }
+    path.push('"');
+    for c in key.chars() {
+        if c == '"' || c == '\\' {
+            path.push('\\');
+        }
+        path.push(c);
+    }
+    path.push('"');
+}
+
+/// The value at `steps` under `json` whose id is `id`, with its id.
+fn find_with_id<'a>(json: &'a Json, id: u64, steps: &[Step]) -> Option<(&'a Json, u64)> {
+    let Some((step, rest)) = steps.split_first() else {
+        return Some((json, id));
+    };
+    match (step, json) {
+        (Step::Key(key), Json::Object(items)) => {
+            let mut at = id + 1;
+            for (k, value) in items {
+                if k == key {
+                    return find_with_id(value, at + 1, rest);
+                }
+                at += 1 + value_count(value);
+            }
+            None
+        }
+        (Step::Index(_) | Step::ReverseIndex(_), Json::Array(items)) => {
+            let index = match step {
+                Step::Index(index) => *index,
+                Step::ReverseIndex(back) => items.len().checked_sub(*back)?,
+                _ => unreachable!("an index"),
+            };
+            let mut at = id + 1;
+            for (i, item) in items.iter().enumerate() {
+                if i == index {
+                    return find_with_id(item, at, rest);
+                }
+                at += value_count(item);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// The rows `json_each` (or with `tree`, `json_tree`) makes of a document (`JSONTableInOutFunction`): `key`, `value`,
+/// `type`, `atom`, `id`, `parent`, `fullkey` and `path`, then the hidden `json`, `root` and `rowid`.
+pub fn table_in_out_rows(document_value: &Value, path_value: Option<&Value>, tree: bool) -> Result<Vec<Vec<Value>>> {
+    let binder = |message: &str| Error::new(ErrorKind::Binder, message.to_string());
+    let root_path = match path_value {
+        Some(value) if value.is_null() => return Ok(Vec::new()),
+        Some(value) => path_text(value)?,
+        None => "$".to_string(),
+    };
+    let path = parse_path(&root_path)?;
+    if path.is_wildcard() {
+        return Err(binder("Wildcard JSON path not supported in json_each/json_tree"));
+    }
+    if !root_path.starts_with('$') {
+        return Err(binder("JSON path must start with '$' for json_each/json_tree"));
+    }
+    let Some(json) = document(document_value)? else {
+        return Ok(Vec::new());
+    };
+    let text = if document_value.logical_type().id() == LogicalTypeId::Varchar {
+        document_value.try_to_string()?
+    } else {
+        json.text()
+    };
+    let Some((root, root_id)) = find_with_id(&json, 0, &path.steps) else {
+        return Ok(Vec::new());
+    };
+    let mut rows = Vec::new();
+    let container = matches!(root, Json::Array(_) | Json::Object(_));
+    if !container || tree {
+        rows.push(vec![
+            Value::null(LogicalType::VARCHAR),
+            extract_json(Some(root))?,
+            Value::varchar(root.type_name()),
+            extract_value(Some(root))?,
+            Value::ubigint(root_id),
+            Value::null(LogicalType::UBIGINT),
+            Value::varchar(root_path.as_str()),
+            Value::varchar(root_path.as_str()),
+        ]);
+    }
+    if container {
+        rows.extend(table_in_out_subtree(root, root_id, &root_path, tree)?);
+    }
+    let json_value = Value::varchar(text.as_str()).reinterpret(&json_type())?;
+    for (rowid, row) in rows.iter_mut().enumerate() {
+        row.push(json_value.clone());
+        row.push(Value::varchar(root_path.as_str()));
+        row.push(Value::bigint(rowid as i64));
+    }
+    Ok(rows)
+}
+
+/// The rows of the values in `parent`, a container with id `parent_id` at `parent_path`: with `tree`, of all the
+/// values under it, depth first; the hidden columns are left for the caller.
+fn table_in_out_subtree(parent: &Json, parent_id: u64, parent_path: &str, tree: bool) -> Result<Vec<Vec<Value>>> {
+    let mut rows = Vec::new();
+    let mut at = parent_id + 1;
+    let children: Vec<(Option<String>, String, &Json, u64)> = match parent {
+        Json::Array(items) => items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let id = at;
+                at += value_count(item);
+                (Some(i.to_string()), format!("{parent_path}[{i}]"), item, id)
+            })
+            .collect(),
+        Json::Object(items) => items
+            .iter()
+            .map(|(key, value)| {
+                let mut fullkey = parent_path.to_string();
+                append_path_key(&mut fullkey, key);
+                let id = at + 1;
+                at += 1 + value_count(value);
+                (Some(key.clone()), fullkey, value, id)
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    for (key, fullkey, value, id) in children {
+        rows.push(vec![
+            key.map_or(Value::null(LogicalType::VARCHAR), Value::varchar),
+            extract_json(Some(value))?,
+            Value::varchar(value.type_name()),
+            extract_value(Some(value))?,
+            Value::ubigint(id),
+            if tree {
+                Value::ubigint(parent_id)
+            } else {
+                Value::null(LogicalType::UBIGINT)
+            },
+            Value::varchar(fullkey.as_str()),
+            Value::varchar(parent_path),
+        ]);
+        if tree && matches!(value, Json::Array(_) | Json::Object(_)) {
+            rows.extend(table_in_out_subtree(value, id, &fullkey, true)?);
+        }
+    }
+    Ok(rows)
+}
+
+/// The columns of `json_each` and `json_tree`, then their hidden ones, by name.
+pub const TABLE_IN_OUT_COLUMNS: [&str; 11] = [
+    "key", "value", "type", "atom", "id", "parent", "fullkey", "path", "json", "root", "rowid",
+];
+
+/// What `__json_each` and `__json_tree` give: the rows of `json_each` and `json_tree`, as a list of structs.
+pub fn table_in_out_type() -> LogicalType {
+    let types = [
+        LogicalType::VARCHAR,
+        json_type(),
+        LogicalType::VARCHAR,
+        json_type(),
+        LogicalType::UBIGINT,
+        LogicalType::UBIGINT,
+        LogicalType::VARCHAR,
+        LogicalType::VARCHAR,
+        json_type(),
+        LogicalType::VARCHAR,
+        LogicalType::BIGINT,
+    ];
+    let fields = TABLE_IN_OUT_COLUMNS
+        .iter()
+        .zip(types)
+        .map(|(name, ty)| (name.to_string(), ty))
+        .collect();
+    LogicalType::list(LogicalType::struct_type(fields))
+}
+
+fn table_in_out_list(args: &DataChunk, result: &mut Vector, tree: bool) -> Result<()> {
+    let ty = table_in_out_type();
+    let child = ty.child_type().cloned().expect("a list");
+    row_wise(args, result, |row| {
+        let rows = table_in_out_rows(&row[0], row.get(1), tree)?;
+        let mut items = Vec::with_capacity(rows.len());
+        for values in rows {
+            let fields = TABLE_IN_OUT_COLUMNS
+                .iter()
+                .zip(values)
+                .map(|(name, value)| (name.to_string(), value))
+                .collect();
+            items.push(Value::struct_value(fields));
+        }
+        Value::list(child.clone(), items)
+    })
+}
+
+fn json_each_rows(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    table_in_out_list(args, result, false)
+}
+
+fn json_tree_rows(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    table_in_out_list(args, result, true)
 }

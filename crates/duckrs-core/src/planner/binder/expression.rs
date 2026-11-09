@@ -576,6 +576,7 @@ impl Binder<'_> {
                     names: outer_aggregates.iter().map(|(n, ..)| n.clone()).collect(),
                     types: outer_aggregates.iter().map(|(.., t)| t.clone()).collect(),
                     row_id: None,
+                    virtual_columns: Vec::new(),
                     generated: Vec::new(),
                 });
             }

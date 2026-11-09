@@ -303,6 +303,7 @@ impl Binder<'_> {
             names,
             types: types.clone(),
             row_id: None,
+            virtual_columns: Vec::new(),
             generated: Vec::new(),
         });
         let expressions = rows

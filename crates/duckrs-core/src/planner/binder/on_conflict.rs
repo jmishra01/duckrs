@@ -112,6 +112,7 @@ impl Binder<'_> {
                 names: table.columns.iter().map(|c| c.name.clone()).collect(),
                 types: table.types(),
                 row_id: None,
+                virtual_columns: Vec::new(),
                 generated: Vec::new(),
             });
         }

@@ -15,6 +15,7 @@ use crate::execution::csv::{
 use crate::execution::csv_sniffer::{Parsing, Sniffed, can_cast, sniff};
 use crate::execution::csv_state_machine::NewLine;
 use crate::execution::file_system::{self, Compression};
+use crate::execution::parquet::Partitioning;
 use crate::function::combine_types::force_max_logical_type;
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
@@ -740,6 +741,7 @@ impl Binder<'_> {
         };
         let output_names = Self::alias_columns(table_ref, &alias, output_names)?;
         let table_index = self.generate_table_index();
+        let (virtual_columns, bound_virtual) = crate::execution::multi_file::bind_virtual_columns(&output_names);
         self.bind_context.add_binding(Binding {
             alias,
             schema: None,
@@ -747,6 +749,7 @@ impl Binder<'_> {
             names: output_names,
             types: output_types,
             row_id: None,
+            virtual_columns: bound_virtual,
             generated: Vec::new(),
         });
         let wanted = &arguments.options.force_not_null;
@@ -798,6 +801,7 @@ impl Binder<'_> {
             types,
             filename: arguments.filename.is_some(),
             first_data: std::sync::Mutex::new(Some(first_data)),
+            virtual_columns,
         };
         Ok(LogicalOperator::new(
             LogicalOperatorKind::CsvScan {
@@ -828,6 +832,7 @@ impl Binder<'_> {
             names: output_names,
             types: types.clone(),
             row_id: None,
+            virtual_columns: Vec::new(),
             generated: Vec::new(),
         });
         let scan = CsvScanData {
@@ -845,6 +850,7 @@ impl Binder<'_> {
             filename: false,
             rejects: None,
             first_data: std::sync::Mutex::new(None),
+            virtual_columns: Vec::new(),
         };
         Ok(LogicalOperator::new(
             LogicalOperatorKind::CsvScan {
@@ -1261,8 +1267,9 @@ impl Binder<'_> {
         })
     }
 
-    /// `Binder::BindCopyTo`.
-    fn bind_copy_to(&mut self, info: &CopyInfo, path: String, tsv: bool) -> Result<BoundStatement> {
+    /// The query of a COPY TO, sorted by its `ORDER BY` option (`ParseOrderByColumns`), with the checks of
+    /// `ValidateCopyToOptionCombinations` on the options that shape the files.
+    pub(super) fn copy_to_select(&mut self, info: &CopyInfo) -> Result<SelectStatement> {
         let select = match &info.select {
             Some(query) => SelectStatement {
                 node: (**query).clone(),
@@ -1277,6 +1284,64 @@ impl Binder<'_> {
                 parse_select(&format!("SELECT {columns} FROM {}", info.table), "Expected a table")?
             }
         };
+        let options = self.copy_options(info)?;
+        let given = |name: &str| options.iter().find(|(n, _)| n == name).map(|(_, v)| v);
+        let flag = |name: &str| -> Result<bool> {
+            match given(name) {
+                Some(value) => is_true(value, name),
+                None => Ok(false),
+            }
+        };
+        let partitioned = given("partition_by").is_some() || given("partitioned_by").is_some();
+        let order_by = given("order_by");
+        if given("use_tmp_file").is_some() {
+            if flag("per_thread_output")? {
+                return Err(Error::not_implemented(
+                    "Can't combine USE_TMP_FILE and PER_THREAD_OUTPUT for COPY",
+                ));
+            }
+            if partitioned {
+                return Err(Error::not_implemented(
+                    "Can't combine USE_TMP_FILE and PARTITIONED BY for COPY",
+                ));
+            }
+            if order_by.is_some() {
+                return Err(Error::not_implemented(
+                    "Can't combine USE_TMP_FILE and ORDER BY for COPY",
+                ));
+            }
+            let rotates = ["file_size_bytes", "row_groups_per_file", "batches_per_file"]
+                .iter()
+                .any(|name| given(name).is_some());
+            if rotates {
+                return Err(Error::not_implemented(
+                    "Can't combine USE_TMP_FILE and FILE_SIZE_BYTES/BATCHES_PER_FILE for COPY",
+                ));
+            }
+        }
+        if flag("per_thread_output")? && partitioned {
+            return Err(Error::not_implemented(
+                "Can't combine PER_THREAD_OUTPUT and PARTITIONED BY for COPY",
+            ));
+        }
+        let Some(order_by) = order_by else {
+            return Ok(select);
+        };
+        if flag("per_thread_output")? {
+            return Err(Error::not_implemented(
+                "Can't combine PER_THREAD_OUTPUT and ORDER BY for COPY",
+            ));
+        }
+        let clause = strings(order_by)?.join(", ");
+        parse_select(
+            &format!("SELECT * FROM ({select}) __copy_input ORDER BY {clause}"),
+            "Expected a single SELECT statement",
+        )
+    }
+
+    /// `Binder::BindCopyTo`.
+    fn bind_copy_to(&mut self, info: &CopyInfo, path: String, tsv: bool) -> Result<BoundStatement> {
+        let select = self.copy_to_select(info)?;
         let mut options = CsvWriteOptions::default();
         if tsv {
             options.delimiter = b"\t".to_vec();
@@ -1294,9 +1359,36 @@ impl Binder<'_> {
             options.new_line = "\n".to_string();
             options.suffix = "\n".to_string();
         }
+        let mut partition = PartitionOptions::default();
+        let (mut file_size_bytes, mut per_thread) = (None, false);
+        let mut output = OutputOptionsBuilder::default();
+        let ordered = info
+            .parsed_options
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case("order_by"));
         for (name, value) in copy_options {
+            if partition.take(&name, &value)? || output.take(&name, &value)? {
+                continue;
+            }
             match name.as_str() {
-                "format" => {}
+                "file_size_bytes" => {
+                    file_size_bytes = Some(parse_bytes_argument(&name, &value)?);
+                    continue;
+                }
+                "per_thread_output" => {
+                    per_thread = is_true(&value, &name)?;
+                    continue;
+                }
+                "row_groups_per_file" | "batches_per_file" => {
+                    return Err(Error::not_implemented(format!(
+                        "Can't use file rotation (e.g., ROW_GROUPS_PER_FILE) with FORMAT {}",
+                        if self.copy_json { "json" } else { "csv" }
+                    )));
+                }
+                _ => {}
+            }
+            match name.as_str() {
+                "format" | "order_by" => {}
                 "array" if self.copy_json => {
                     if is_true(&value, &name)? {
                         options.prefix = "[\n\t".to_string();
@@ -1346,6 +1438,15 @@ impl Binder<'_> {
         if compression == Compression::Zstd {
             return Err(crate::unported("writing zstd files"));
         }
+        let mut extension = if self.copy_json { "json" } else { "csv" }.to_string();
+        if compression == Compression::Gzip {
+            extension += ".gz";
+        }
+        options.partitioning = partition.bind(&path, &bound.names, &extension)?;
+        options.rotation = partition.rotation(&path, &extension, file_size_bytes, None, per_thread)?;
+        options.output = output.build(options.partitioning.is_some(), per_thread, ordered)?;
+        let (result_names, return_type) = copy_result(&options.output);
+        let result_types = options.output.types();
         let plan = LogicalOperator::new(
             LogicalOperatorKind::CopyToFile {
                 path,
@@ -1357,11 +1458,131 @@ impl Binder<'_> {
         );
         Ok(BoundStatement {
             plan,
-            names: vec!["Count".to_string()],
-            types: vec![LogicalType::BIGINT],
+            names: result_names,
+            types: result_types,
             column_aliases: Vec::new(),
-            return_type: StatementReturnType::ChangedRows,
+            return_type,
         })
+    }
+}
+
+/// The options of a COPY TO that write a directory of hive partitions (`PARTITION_BY` and friends).
+#[derive(Default)]
+pub(super) struct PartitionOptions {
+    columns: Option<Vec<String>>,
+    write_columns: bool,
+    overwrite_or_ignore: bool,
+    overwrite: bool,
+    filename_pattern: Option<String>,
+    extension: Option<String>,
+}
+
+impl PartitionOptions {
+    /// Takes the option `name`, if it is one of these.
+    pub(super) fn take(&mut self, name: &str, value: &Value) -> Result<bool> {
+        match name {
+            "partition_by" | "partitioned_by" => self.columns = Some(strings(value)?),
+            "write_partition_columns" => self.write_columns = is_true(value, name)?,
+            "overwrite_or_ignore" => self.overwrite_or_ignore = is_true(value, name)?,
+            "overwrite" => self.overwrite = is_true(value, name)?,
+            "filename_pattern" => self.filename_pattern = Some(value.try_to_string()?),
+            "file_extension" => self.extension = Some(value.try_to_string()?),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// `PrepareOutputDirectory`: a directory to write files into, cleared with OVERWRITE.
+    fn prepare_directory(&self, path: &str) -> Result<()> {
+        let target = std::path::Path::new(path);
+        if target.is_file() {
+            if self.overwrite {
+                std::fs::remove_file(target)
+                    .map_err(|e| Error::new(ErrorKind::Io, format!("Could not remove \"{path}\": {e}")))?;
+            } else {
+                return Err(Error::new(
+                    ErrorKind::Io,
+                    format!(
+                        "Cannot write to \"{path}\" - it exists and is a file, not a directory! Enable OVERWRITE \
+                         option to overwrite the file"
+                    ),
+                ));
+            }
+        }
+        let occupied = std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some());
+        if occupied && !self.overwrite_or_ignore {
+            if self.overwrite {
+                std::fs::remove_dir_all(path)
+                    .map_err(|e| Error::new(ErrorKind::Io, format!("Could not clear \"{path}\": {e}")))?;
+            } else {
+                return Err(Error::new(
+                    ErrorKind::Io,
+                    format!("Directory \"{path}\" is not empty! Enable OVERWRITE option to overwrite files"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `FILE_SIZE_BYTES`, `ROW_GROUPS_PER_FILE` and `PER_THREAD_OUTPUT`: files in the directory of `path`.
+    pub(super) fn rotation(
+        &self,
+        path: &str,
+        extension: &str,
+        file_size_bytes: Option<usize>,
+        row_groups_per_file: Option<usize>,
+        per_thread: bool,
+    ) -> Result<Option<crate::execution::parquet::Rotation>> {
+        if file_size_bytes.is_none() && row_groups_per_file.is_none() && !per_thread {
+            return Ok(None);
+        }
+        if self.columns.is_none() {
+            self.prepare_directory(path)?;
+            std::fs::create_dir_all(path)
+                .map_err(|e| Error::new(ErrorKind::Io, format!("Cannot create directory \"{path}\": {e}")))?;
+        }
+        Ok(Some(crate::execution::parquet::Rotation {
+            file_size_bytes,
+            row_groups_per_file,
+            per_thread,
+            filename_pattern: self.filename_pattern.clone().unwrap_or_else(|| "data_{i}".to_string()),
+            extension: self.extension.clone().unwrap_or_else(|| extension.to_string()),
+        }))
+    }
+
+    /// The partitioning of a COPY to `path` of columns `names`, after clearing the directory if told to.
+    pub(super) fn bind(&self, path: &str, names: &[String], extension: &str) -> Result<Option<Partitioning>> {
+        let Some(wanted) = &self.columns else {
+            return Ok(None);
+        };
+        if wanted.is_empty() {
+            return Err(binder_error("PARTITION_BY cannot be empty"));
+        }
+        let mut columns = Vec::with_capacity(wanted.len());
+        let wanted = wanted.clone();
+        let star = wanted.len() == 1 && wanted[0] == "*";
+        if star {
+            columns.extend(0..names.len());
+        }
+        for column in wanted.iter().filter(|_| !star) {
+            let Some(found) = names.iter().position(|n| n.eq_ignore_ascii_case(column)) else {
+                return Err(binder_error(format!("Partition by column \"{column}\" not found")));
+            };
+            columns.push(found);
+        }
+        if columns.len() == names.len() && !self.write_columns {
+            return Err(Error::not_implemented(
+                "No column to write as all columns are specified as partition columns. WRITE_PARTITION_COLUMNS \
+                 option can be used to write partition columns.",
+            ));
+        }
+        self.prepare_directory(path)?;
+        Ok(Some(Partitioning {
+            columns,
+            write_columns: self.write_columns,
+            filename_pattern: self.filename_pattern.clone().unwrap_or_else(|| "data_{i}".to_string()),
+            extension: self.extension.clone().unwrap_or_else(|| extension.to_string()),
+        }))
     }
 }
 
@@ -1454,4 +1675,199 @@ fn verify_not_extension(path: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+impl Binder<'_> {
+    /// `read_text` and `read_blob` (`DirectMultiFileInfo`): a row for each file, with its name, content, size and
+    /// modification time. A pattern may match no files.
+    pub(super) fn bind_read_file(&mut self, call: &FunctionExpr, table_ref: &TableRef) -> Result<LogicalOperator> {
+        let name = call.name.name.to_lowercase();
+        let text = name == "read_text";
+        let args: Vec<_> = call.args.iter().map(named_argument).collect();
+        let mut patterns = Vec::new();
+        for argument in &args {
+            let value = self.constant_argument(&argument.expr)?;
+            if !argument.name.is_empty() {
+                let option = &argument.name;
+                return Err(binder_error(format!(
+                    "Invalid named parameter \"{option}\" for function {name}"
+                )));
+            }
+            if value.is_null() {
+                return Err(binder_error(format!("{name} cannot take NULL as parameter")));
+            }
+            patterns.extend(strings(&value)?);
+        }
+        if patterns.is_empty() {
+            return Err(binder_error(format!("{name} requires a file name")));
+        }
+        let mut files = Vec::new();
+        for pattern in &patterns {
+            files.extend(file_system::glob(pattern));
+        }
+        let content_type = if text { LogicalType::VARCHAR } else { LogicalType::BLOB };
+        let mut names = ["filename", "content", "size", "last_modified"]
+            .map(String::from)
+            .to_vec();
+        let hive = hive_columns(&files, None, &names)?;
+        let mut rows = Vec::with_capacity(files.len());
+        for file in files {
+            let mut partitions = Vec::with_capacity(hive.len());
+            let parts = hive_parts(&file);
+            for (key, ty) in &hive {
+                let value = parts
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                    .and_then(|(_, v)| v.clone());
+                let mut strings = duckrs_common::vector::Vector::new(LogicalType::VARCHAR, 1);
+                strings.set_value(0, &value.map_or(Value::null(LogicalType::VARCHAR), Value::varchar))?;
+                let mut typed = duckrs_common::vector::Vector::new(ty.clone(), 1);
+                crate::function::cast::cast_vector(&strings, &mut typed, 1, crate::function::cast::CastMode::Strict)?;
+                partitions.push(typed.get_value(0));
+            }
+            let io = |e: std::io::Error| Error::new(ErrorKind::Io, format!("Cannot open file \"{file}\": {e}"));
+            let bytes = std::fs::read(&file).map_err(io)?;
+            let metadata = std::fs::metadata(&file).map_err(io)?;
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|since| since.as_micros() as i64)
+                .unwrap_or(0);
+            let size = bytes.len() as i64;
+            let content = if text {
+                match String::from_utf8(bytes) {
+                    Ok(content) => Value::varchar(content),
+                    Err(_) => {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "read_text: could not read content of file '{file}' as valid UTF-8 encoded text. \
+                                 You may want to use read_blob instead."
+                            ),
+                        ));
+                    }
+                }
+            } else {
+                Value::blob(bytes)
+            };
+            rows.push(vec![
+                Value::varchar(file),
+                content,
+                Value::bigint(size),
+                Value::timestamp_tz(duckrs_common::types::Timestamp(modified)),
+            ]);
+            rows.last_mut().expect("just pushed").extend(partitions);
+        }
+        let mut types = vec![
+            LogicalType::VARCHAR,
+            content_type,
+            LogicalType::BIGINT,
+            LogicalType::new(LogicalTypeId::TimestampTz),
+        ];
+        for (key, ty) in hive {
+            names.push(key);
+            types.push(ty);
+        }
+        self.bind_rows(table_ref, &name, names, types, rows)
+    }
+}
+
+/// `ParseBytesArg`: a size in bytes, as a number or as text like `'10MB'`.
+pub(super) fn parse_bytes_argument(name: &str, value: &Value) -> Result<usize> {
+    let upper = name.to_uppercase();
+    if value.is_null() {
+        return Err(binder_error(format!(
+            "NULL is not supported as a valid option for COPY option \"{upper}\""
+        )));
+    }
+    let shown = value.try_to_string()?;
+    let result = if value.logical_type().id() == LogicalTypeId::Varchar {
+        crate::execution::temporary::parse_memory_limit(&shown)?
+    } else {
+        match value.as_i128() {
+            Some(bytes) if (0..i128::from(u64::MAX)).contains(&bytes) => Some(bytes as u64),
+            Some(bytes) if bytes == i128::from(u64::MAX) => None,
+            _ => {
+                return Err(binder_error(format!(
+                    "Unable to parse bytes from \"{shown}\" for copy option \"{upper}\" "
+                )));
+            }
+        }
+    };
+    match result {
+        Some(bytes) => Ok(bytes as usize),
+        None => Err(binder_error(format!(
+            "Copy option \"{upper}\" must be a valid size, not \"{shown}\""
+        ))),
+    }
+}
+
+/// `RETURN_FILES`, `RETURN_STATS` and `WRITE_EMPTY_FILE`, and the result they make a COPY TO return.
+#[derive(Default)]
+pub(super) struct OutputOptionsBuilder {
+    return_files: bool,
+    return_stats: bool,
+    write_empty_file: Option<bool>,
+}
+
+impl OutputOptionsBuilder {
+    pub(super) fn take(&mut self, name: &str, value: &Value) -> Result<bool> {
+        match name {
+            "return_files" => self.return_files = is_true(value, name)?,
+            "return_stats" => self.return_stats = is_true(value, name)?,
+            "write_empty_file" => self.write_empty_file = Some(is_true(value, name)?),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// `ValidateCopyToOptionCombinations`, of these options.
+    pub(super) fn build(
+        &self,
+        partitioned: bool,
+        per_thread: bool,
+        ordered: bool,
+    ) -> Result<crate::execution::parquet::CopyOutputOptions> {
+        if self.return_files && self.return_stats {
+            return Err(binder_error("Can't combine RETURN_FILES and RETURN_STATS for COPY"));
+        }
+        if self.return_stats {
+            return Err(crate::unported("the COPY option return_stats"));
+        }
+        let write_empty_file = self.write_empty_file.unwrap_or(true);
+        if !write_empty_file {
+            if per_thread {
+                return Err(Error::not_implemented(
+                    "Can't combine WRITE_EMPTY_FILE false with PER_THREAD_OUTPUT",
+                ));
+            }
+            if partitioned {
+                return Err(Error::not_implemented(
+                    "Can't combine WRITE_EMPTY_FILE false with PARTITIONED BY",
+                ));
+            }
+            if ordered {
+                return Err(Error::not_implemented(
+                    "Can't combine WRITE_EMPTY_FILE false with ORDER BY",
+                ));
+            }
+        }
+        Ok(crate::execution::parquet::CopyOutputOptions {
+            return_files: self.return_files,
+            write_empty_file,
+        })
+    }
+}
+
+/// What a COPY TO returns: its `Count`, and with RETURN_FILES its `Files`.
+pub(super) fn copy_result(output: &crate::execution::parquet::CopyOutputOptions) -> (Vec<String>, StatementReturnType) {
+    if output.return_files {
+        (
+            vec!["Count".to_string(), "Files".to_string()],
+            StatementReturnType::QueryResult,
+        )
+    } else {
+        (vec!["Count".to_string()], StatementReturnType::ChangedRows)
+    }
 }

@@ -81,6 +81,8 @@ pub struct Binding {
     pub row_id: Option<usize>,
     /// with `names`, the expressions of the generated columns; empty without any
     pub generated: Vec<Option<ast::Expr>>,
+    /// columns a scan offers that `*` leaves out (`GetVirtualColumns`), as name, type and position
+    pub virtual_columns: Vec<(String, LogicalType, usize)>,
 }
 
 impl Binding {
@@ -106,8 +108,22 @@ impl Binding {
             }
             None => self
                 .row_id_column(name)
-                .map(|index| (index, LogicalType::BIGINT, "rowid".to_string())),
+                .map(|index| (index, LogicalType::BIGINT, "rowid".to_string()))
+                .or_else(|| self.virtual_column(name)),
         }
+    }
+
+    /// A virtual column of a scan, such as `filename`, by name.
+    fn virtual_column(&self, name: &str) -> Option<(usize, LogicalType, String)> {
+        self.virtual_columns
+            .iter()
+            .find(|(n, _, _)| n.eq_ignore_ascii_case(name))
+            .map(|(n, ty, index)| (*index, ty.clone(), n.clone()))
+    }
+
+    /// Whether `name` is a hidden column here: `rowid` or a virtual column of a scan.
+    fn hidden_column(&self, name: &str) -> bool {
+        self.row_id_column(name).is_some() || self.virtual_column(name).is_some()
     }
 }
 
@@ -305,7 +321,7 @@ impl BindContext {
         let found = match self.matching_binding(name)? {
             Some((binding, _)) => Some(binding),
             None => {
-                let mut with_row_id = self.bindings.iter().filter(|b| b.row_id_column(name).is_some());
+                let mut with_row_id = self.bindings.iter().filter(|b| b.hidden_column(name));
                 let first = with_row_id.next();
                 if let (Some(first), Some(second)) = (first, with_row_id.next()) {
                     return Err(binder_error(format!(

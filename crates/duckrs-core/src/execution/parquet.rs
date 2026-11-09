@@ -6,26 +6,17 @@
 
 use super::csv::hive_parts;
 use super::physical::{PhysicalOperator, SourceState};
+use crate::execution::parquet_writer::{Codec, ParquetFileWriter};
 use crate::function::cast::{CastMode, cast_vector};
-use arrow::array::{
-    Array, ArrayRef, AsArray, BinaryArray, BooleanArray, Decimal128Array, FixedSizeBinaryBuilder, GenericListArray,
-    MapArray, PrimitiveArray, RecordBatch, StringArray, StructArray,
-};
-use arrow::buffer::{NullBuffer, OffsetBuffer};
-use arrow::datatypes::{
-    self as adt, ArrowPrimitiveType, DataType, Field, FieldRef, Fields, IntervalMonthDayNano, Schema, TimeUnit,
-};
-use duckrs_common::types::{Date, Interval, LogicalType, LogicalTypeId, Time, Timestamp};
+use arrow::array::{Array, ArrayRef, AsArray, RecordBatch};
+use arrow::datatypes::{self as adt, DataType, Field, TimeUnit};
+use duckrs_common::types::{Date, Interval, LogicalType, LogicalTypeId, Time, TimeTz, Timestamp};
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, Vector};
 use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
 use parking_lot::Mutex;
-use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
-use parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
-use parquet::file::metadata::KeyValue;
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
-use parquet::file::properties::{WriterProperties, WriterVersion};
 use parquet::file::statistics::Statistics;
 use parquet::schema::types::Type;
 use std::collections::HashMap;
@@ -52,10 +43,14 @@ pub struct ParquetScanData {
     pub names: Vec<String>,
     pub types: Vec<LogicalType>,
     pub binary_as_string: bool,
+    /// `int96_as`
+    pub int96_as: Int96As,
     pub union_by_name: bool,
     pub file_row_number: bool,
     pub filename: bool,
     pub hive: Vec<(String, LogicalType)>,
+    /// the virtual columns, after the rest
+    pub virtual_columns: Vec<crate::execution::multi_file::VirtualColumn>,
 }
 
 impl ParquetScanData {
@@ -68,6 +63,7 @@ impl ParquetScanData {
             types.push(LogicalType::VARCHAR);
         }
         types.extend(self.hive.iter().map(|(_, ty)| ty.clone()));
+        types.extend(crate::execution::multi_file::virtual_types(&self.virtual_columns));
         types
     }
 }
@@ -160,15 +156,92 @@ fn logical_type(field: &Field, binary_as_string: bool) -> Result<LogicalType> {
     })
 }
 
+/// What `read_parquet` makes of INT96 columns (`int96_as`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Int96As {
+    /// microseconds, the nanoseconds cut off
+    #[default]
+    Timestamp,
+    TimestampNs,
+    /// `STRUCT(date DATE, time TIME_NS)`, all of the value
+    Struct,
+}
+
+/// A TIME, or with `ty` TIMETZ, a TIME in UTC (`ParquetIntToTimeTZ`).
+fn time_value(micros: i64, ty: &LogicalType) -> Value {
+    if ty.id() == LogicalTypeId::TimeTz {
+        Value::time_tz(TimeTz::new(Time(micros), 0))
+    } else {
+        Value::time(Time(micros))
+    }
+}
+
+/// What the crate leaves out of a top-level column's type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Special {
+    None,
+    /// INT96 (Impala timestamps), which the crate reads as nanoseconds
+    Int96,
+    /// a TIME adjusted to UTC, which DuckDB reads as TIMETZ
+    TimeUtc,
+}
+
+fn special_columns(builder: &ParquetRecordBatchReaderBuilder<File>) -> Vec<Special> {
+    builder
+        .parquet_schema()
+        .root_schema()
+        .get_fields()
+        .iter()
+        .map(|field| {
+            if !field.is_primitive() {
+                return Special::None;
+            }
+            if field.get_physical_type() == parquet::basic::Type::INT96 {
+                return Special::Int96;
+            }
+            match field.get_basic_info().logical_type_ref() {
+                Some(parquet::basic::LogicalType::Time(time)) if time.is_adjusted_to_u_t_c => Special::TimeUtc,
+                _ => Special::None,
+            }
+        })
+        .collect()
+}
+
+/// The DuckDB type of top-level column `index` of a file: INT96 by `int96_as`, the rest by [`logical_type`].
+fn column_type(
+    field: &Field,
+    special: &[Special],
+    index: usize,
+    binary_as_string: bool,
+    int96_as: Int96As,
+) -> Result<LogicalType> {
+    if special.get(index) == Some(&Special::TimeUtc) {
+        return Ok(LogicalType::new(LogicalTypeId::TimeTz));
+    }
+    if special.get(index) == Some(&Special::Int96) {
+        return Ok(match int96_as {
+            Int96As::Timestamp => LogicalType::TIMESTAMP,
+            Int96As::TimestampNs => LogicalType::new(LogicalTypeId::TimestampNs),
+            Int96As::Struct => LogicalType::struct_type(vec![
+                ("date".to_string(), LogicalType::DATE),
+                ("time".to_string(), LogicalType::new(LogicalTypeId::TimeNs)),
+            ]),
+        });
+    }
+    logical_type(field, binary_as_string)
+}
+
 /// The names and types of a file's columns.
-pub fn file_schema(path: &str, binary_as_string: bool) -> Result<(Vec<String>, Vec<LogicalType>)> {
+pub fn file_schema(path: &str, binary_as_string: bool, int96_as: Int96As) -> Result<(Vec<String>, Vec<LogicalType>)> {
     let builder = open_builder(path)?;
+    let int96 = special_columns(&builder);
     let schema = builder.schema();
     let names = schema.fields().iter().map(|f| f.name().clone()).collect();
     let types = schema
         .fields()
         .iter()
-        .map(|f| logical_type(f, binary_as_string))
+        .enumerate()
+        .map(|(i, f)| column_type(f, &int96, i, binary_as_string, int96_as))
         .collect::<Result<_>>()?;
     Ok((names, types))
 }
@@ -191,6 +264,19 @@ fn binary_value(bytes: &[u8], ty: &LogicalType) -> Result<Value> {
 }
 
 fn timestamp_value(value: i64, unit: &TimeUnit, ty: &LogicalType) -> Result<Value> {
+    if ty.id() == LogicalTypeId::Struct && *unit == TimeUnit::Nanosecond {
+        // `int96_as = 'struct'`: the day, and the nanoseconds into it
+        const NANOS_PER_DAY: i64 = 86_400_000_000_000;
+        let date = Value::date(Date(value.div_euclid(NANOS_PER_DAY) as i32));
+        let time = Value::new(
+            LogicalType::new(LogicalTypeId::TimeNs),
+            ValueData::Int64(value.rem_euclid(NANOS_PER_DAY)),
+        )?;
+        return Ok(Value::struct_value(vec![
+            ("date".to_string(), date),
+            ("time".to_string(), time),
+        ]));
+    }
     if ty.id() == LogicalTypeId::TimestampNs {
         return Value::new(ty.clone(), ValueData::Int64(value));
     }
@@ -249,16 +335,16 @@ fn array_value(array: &dyn Array, row: usize, ty: &LogicalType) -> Result<Value>
         }
         DataType::Time32(TimeUnit::Second) => {
             let seconds = array.as_primitive::<adt::Time32SecondType>().value(row);
-            Value::time(Time(i64::from(seconds) * 1_000_000))
+            time_value(i64::from(seconds) * 1_000_000, ty)
         }
         DataType::Time32(_) => {
             let millis = array.as_primitive::<adt::Time32MillisecondType>().value(row);
-            Value::time(Time(i64::from(millis) * 1_000))
+            time_value(i64::from(millis) * 1_000, ty)
         }
-        DataType::Time64(TimeUnit::Nanosecond) => Value::time(Time(
-            array.as_primitive::<adt::Time64NanosecondType>().value(row) / 1_000,
-        )),
-        DataType::Time64(_) => Value::time(Time(array.as_primitive::<adt::Time64MicrosecondType>().value(row))),
+        DataType::Time64(TimeUnit::Nanosecond) => {
+            time_value(array.as_primitive::<adt::Time64NanosecondType>().value(row) / 1_000, ty)
+        }
+        DataType::Time64(_) => time_value(array.as_primitive::<adt::Time64MicrosecondType>().value(row), ty),
         DataType::Timestamp(unit, _) => {
             let raw = match unit {
                 TimeUnit::Second => array.as_primitive::<adt::TimestampSecondType>().value(row),
@@ -365,6 +451,7 @@ pub struct ParquetScanState {
     mapping: Vec<Option<usize>>,
     file_types: Vec<LogicalType>,
     row: i64,
+    virtual_rows: crate::execution::multi_file::VirtualRows,
 }
 
 impl std::fmt::Debug for ParquetScanState {
@@ -375,6 +462,7 @@ impl std::fmt::Debug for ParquetScanState {
 
 fn open_file(scan: &ParquetScanData, state: &mut ParquetScanState, path: &str) -> Result<()> {
     let builder = open_builder(path)?.with_batch_size(STANDARD_VECTOR_SIZE);
+    let int96 = special_columns(&builder);
     let schema = Arc::clone(builder.schema());
     let names: Vec<&String> = schema.fields().iter().map(|f| f.name()).collect();
     let mut mapping = Vec::with_capacity(scan.names.len());
@@ -391,7 +479,13 @@ fn open_file(scan: &ParquetScanData, state: &mut ParquetScanState, path: &str) -
             )));
         }
         file_types.push(match found {
-            Some(column) => logical_type(schema.field(column), scan.binary_as_string)?,
+            Some(column) => column_type(
+                schema.field(column),
+                &int96,
+                column,
+                scan.binary_as_string,
+                scan.int96_as,
+            )?,
             None => LogicalType::SQLNULL,
         });
         mapping.push(found);
@@ -504,7 +598,15 @@ impl PhysicalOperator for PhysicalParquetScan {
                 Some(batch) => {
                     let batch = batch.map_err(|e| invalid(format!("Could not read \"{path}\": {e}")))?;
                     if batch.num_rows() > 0 {
-                        return batch_chunk(&self.scan, state, &batch, path).map(Some);
+                        let chunk = batch_chunk(&self.scan, state, &batch, path)?;
+                        return crate::execution::multi_file::append_virtual_columns(
+                            chunk,
+                            &self.scan.virtual_columns,
+                            path,
+                            state.file,
+                            &mut state.virtual_rows,
+                        )
+                        .map(Some);
                     }
                 }
                 None => {
@@ -528,31 +630,153 @@ pub struct Partitioning {
 }
 
 /// What a COPY TO says of the file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ParquetWriteOptions {
-    pub compression: Compression,
-    pub row_group_size: usize,
-    pub version: WriterVersion,
-    pub key_values: Vec<(String, String)>,
-    pub data_page_size_limit: Option<usize>,
-    pub bloom_filter: bool,
-    pub bloom_filter_fpp: Option<f64>,
+    pub writer: crate::execution::parquet_writer::WriterOptions,
     pub partitioning: Option<Partitioning>,
+    pub rotation: Option<Rotation>,
+    pub output: CopyOutputOptions,
+    /// by column, those the statistics say have no NULLs
+    pub not_null_columns: Vec<bool>,
 }
 
-impl Default for ParquetWriteOptions {
+impl Partitioning {
+    /// The columns that go in a file, of `count`, by their position in the rows.
+    pub fn written_columns(&self, count: usize) -> Vec<usize> {
+        (0..count)
+            .filter(|column| self.write_columns || !self.columns.contains(column))
+            .collect()
+    }
+
+    /// The directory of a row's partition, under `path`.
+    pub fn directory(&self, path: &str, names: &[String], chunk: &DataChunk, row: usize) -> Result<String> {
+        let mut directory = path.to_string();
+        for &column in &self.columns {
+            let value = chunk.get_value(column, row);
+            let text = if value.is_null() {
+                "__HIVE_DEFAULT_PARTITION__".to_string()
+            } else {
+                hive_escape(&value.try_to_string()?)
+            };
+            directory += &format!("/{}={text}", hive_escape(&names[column]));
+        }
+        Ok(directory)
+    }
+
+    /// The rows of `chunk`, grouped by the directory of their partition, in the order they first appear.
+    pub fn group_rows(&self, path: &str, names: &[String], chunk: &DataChunk) -> Result<Vec<(String, Vec<usize>)>> {
+        let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
+        for row in 0..chunk.len() {
+            let directory = self.directory(path, names, chunk, row)?;
+            match index.get(&directory) {
+                Some(&at) => groups[at].1.push(row),
+                None => {
+                    index.insert(directory.clone(), groups.len());
+                    groups.push((directory, vec![row]));
+                }
+            }
+        }
+        Ok(groups)
+    }
+
+    /// Creates the directory of a partition, and says the path of its file.
+    pub fn create_file_path(&self, directory: &str) -> Result<String> {
+        self.create_file_path_at(directory, 0)
+    }
+
+    /// The path of file number `offset` of a partition's directory, which it creates.
+    pub fn create_file_path_at(&self, directory: &str, offset: usize) -> Result<String> {
+        std::fs::create_dir_all(directory)
+            .map_err(|e| Error::new(ErrorKind::Io, format!("Cannot create directory \"{directory}\": {e}")))?;
+        Ok(file_name(directory, &self.filename_pattern, &self.extension, offset))
+    }
+}
+
+/// `RETURN_FILES` and `WRITE_EMPTY_FILE`.
+#[derive(Debug, Clone)]
+pub struct CopyOutputOptions {
+    pub return_files: bool,
+    pub write_empty_file: bool,
+}
+
+impl Default for CopyOutputOptions {
     fn default() -> Self {
         Self {
-            compression: Compression::SNAPPY,
-            row_group_size: 122_880,
-            version: WriterVersion::PARQUET_1_0,
-            key_values: Vec::new(),
-            data_page_size_limit: None,
-            bloom_filter: false,
-            bloom_filter_fpp: None,
-            partitioning: None,
+            return_files: false,
+            write_empty_file: true,
         }
     }
+}
+
+impl CopyOutputOptions {
+    /// The types of what the COPY returns.
+    pub fn types(&self) -> Vec<LogicalType> {
+        if self.return_files {
+            vec![LogicalType::BIGINT, LogicalType::list(LogicalType::VARCHAR)]
+        } else {
+            vec![LogicalType::BIGINT]
+        }
+    }
+
+    /// The row a COPY returns: the rows, and with RETURN_FILES the files.
+    pub fn result(&self, rows: u64, files: &[String]) -> Result<DataChunk> {
+        let mut columns = vec![Vector::new(LogicalType::BIGINT, 1)];
+        columns[0].set_value(0, &Value::bigint(rows as i64))?;
+        if self.return_files {
+            let mut list = Vector::new(LogicalType::list(LogicalType::VARCHAR), 1);
+            let mut sorted = files.to_vec();
+            sorted.sort();
+            let items = sorted.iter().map(|f| Value::varchar(f.as_str())).collect();
+            list.set_value(0, &Value::list(LogicalType::VARCHAR, items)?)?;
+            columns.push(list);
+        }
+        Ok(DataChunk::from_columns(columns, 1))
+    }
+}
+
+/// When a COPY TO starts a new file (`FILE_SIZE_BYTES`, `ROW_GROUPS_PER_FILE`), or writes one per thread
+/// (`PER_THREAD_OUTPUT`): into the directory of the path.
+#[derive(Debug, Clone)]
+pub struct Rotation {
+    pub file_size_bytes: Option<usize>,
+    pub row_groups_per_file: Option<usize>,
+    pub per_thread: bool,
+    pub filename_pattern: String,
+    pub extension: String,
+}
+
+impl Rotation {
+    /// `PhysicalCopyRotateNow`: a file with data that reached a limit.
+    pub fn rotate_now(&self, bytes: usize, row_groups: usize, has_data: bool) -> bool {
+        has_data
+            && (self.file_size_bytes.is_some_and(|limit| bytes >= limit)
+                || self.row_groups_per_file.is_some_and(|limit| row_groups >= limit))
+    }
+}
+
+/// `FilenamePattern::CreateFilename`: `{i}` is the number of the file, `{uuid}` a new UUID; a pattern of neither
+/// gets the number at its end.
+pub fn file_name(directory: &str, pattern: &str, extension: &str, offset: usize) -> String {
+    let has_placeholder = ["{i}", "{uuid}", "{uuidv4}", "{uuidv7}"]
+        .iter()
+        .any(|p| pattern.contains(p));
+    let mut name = pattern.to_string();
+    // only a pattern that is all literal gets the number at its end; an empty one is the bare extension
+    if !has_placeholder && !pattern.is_empty() {
+        name += "{i}";
+    }
+    let name = name.replace("{i}", &offset.to_string());
+    let mut result = String::new();
+    let mut rest = name.as_str();
+    while let Some(at) = rest.find("{uuid") {
+        result += &rest[..at];
+        let end = rest[at..].find('}').map_or(rest.len(), |e| at + e + 1);
+        result += &crate::function::generic::random_uuid_text();
+        rest = &rest[end..];
+    }
+    result += rest;
+    format!("{directory}/{result}.{extension}")
 }
 
 /// `HivePartitioning::Escape`
@@ -567,280 +791,21 @@ fn hive_escape(text: &str) -> String {
     result
 }
 
-/// The codec a `compression` option names.
-pub fn parse_compression(name: &str, level: Option<i32>) -> Result<Compression> {
-    let wrong = |e: parquet::errors::ParquetError| invalid(e);
+/// The codec a `compression` option names, and the level of ZSTD.
+pub fn parse_compression(name: &str, level: Option<i32>) -> Result<Codec> {
     Ok(match name.to_lowercase().as_str() {
-        "uncompressed" | "none" => Compression::UNCOMPRESSED,
-        "snappy" => Compression::SNAPPY,
-        "gzip" => Compression::GZIP(match level {
-            Some(level) => GzipLevel::try_new(level.max(0) as u32).map_err(wrong)?,
-            None => GzipLevel::default(),
-        }),
-        "zstd" => Compression::ZSTD(match level {
-            Some(level) => ZstdLevel::try_new(level).map_err(wrong)?,
-            None => ZstdLevel::default(),
-        }),
-        "brotli" => Compression::BROTLI(match level {
-            Some(level) => BrotliLevel::try_new(level.max(0) as u32).map_err(wrong)?,
-            None => BrotliLevel::default(),
-        }),
-        "lz4" | "lz4_raw" => Compression::LZ4_RAW,
+        "uncompressed" | "none" => Codec::Uncompressed,
+        "snappy" => Codec::Snappy,
+        "gzip" => Codec::Gzip,
+        "zstd" => Codec::Zstd(level.unwrap_or(3)),
+        "brotli" => Codec::Brotli,
+        "lz4" | "lz4_raw" => Codec::Lz4Raw,
         other => {
             return Err(Error::new(
                 ErrorKind::Binder,
                 format!("Expected uncompressed, snappy, gzip, zstd, lz4, lz4_raw or brotli, got {other}"),
             ));
         }
-    })
-}
-
-/// `ParquetWriter::DuckDBTypeToParquetType`, in Arrow.
-fn arrow_field(name: &str, ty: &LogicalType) -> Result<Field> {
-    let field = Field::new(name, arrow_type(ty)?, true);
-    Ok(if ty.id() == LogicalTypeId::Uuid {
-        field.with_metadata([(EXTENSION_KEY.to_string(), UUID_EXTENSION.to_string())])
-    } else {
-        field
-    })
-}
-
-fn arrow_type(ty: &LogicalType) -> Result<DataType> {
-    Ok(match ty.id() {
-        LogicalTypeId::Boolean => DataType::Boolean,
-        LogicalTypeId::TinyInt => DataType::Int8,
-        LogicalTypeId::SmallInt => DataType::Int16,
-        LogicalTypeId::Integer => DataType::Int32,
-        LogicalTypeId::BigInt => DataType::Int64,
-        LogicalTypeId::UTinyInt => DataType::UInt8,
-        LogicalTypeId::USmallInt => DataType::UInt16,
-        LogicalTypeId::UInteger => DataType::UInt32,
-        LogicalTypeId::UBigInt => DataType::UInt64,
-        LogicalTypeId::Float => DataType::Float32,
-        LogicalTypeId::Double | LogicalTypeId::HugeInt | LogicalTypeId::UHugeInt => DataType::Float64,
-        LogicalTypeId::Varchar | LogicalTypeId::Enum | LogicalTypeId::TimeTz | LogicalTypeId::Bignum => DataType::Utf8,
-        LogicalTypeId::Blob | LogicalTypeId::Bit => DataType::Binary,
-        LogicalTypeId::Uuid => DataType::FixedSizeBinary(16),
-        LogicalTypeId::Date => DataType::Date32,
-        LogicalTypeId::Time => DataType::Time64(TimeUnit::Microsecond),
-        LogicalTypeId::Timestamp | LogicalTypeId::TimestampSec | LogicalTypeId::TimestampMs => {
-            DataType::Timestamp(TimeUnit::Microsecond, None)
-        }
-        LogicalTypeId::TimestampNs => DataType::Timestamp(TimeUnit::Nanosecond, None),
-        LogicalTypeId::TimestampTz => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-        LogicalTypeId::Interval => DataType::Interval(adt::IntervalUnit::MonthDayNano),
-        LogicalTypeId::Decimal => {
-            let (width, scale) = ty.decimal_properties().unwrap_or((38, 0));
-            DataType::Decimal128(width, scale as i8)
-        }
-        LogicalTypeId::List | LogicalTypeId::Array => {
-            let child = ty.child_type().cloned().unwrap_or(LogicalType::INTEGER);
-            DataType::List(Arc::new(arrow_field("element", &child)?))
-        }
-        LogicalTypeId::Struct => {
-            let fields: Vec<FieldRef> = ty
-                .struct_children()
-                .iter()
-                .map(|(name, child)| arrow_field(name, child).map(Arc::new))
-                .collect::<Result<_>>()?;
-            DataType::Struct(Fields::from(fields))
-        }
-        LogicalTypeId::Map => {
-            let entry = ty.child_type().cloned().unwrap_or(LogicalType::INTEGER);
-            let children = entry.struct_children();
-            let key = Field::new("key", arrow_type(&children[0].1)?, false);
-            let value = arrow_field("value", &children[1].1)?;
-            let entries = Field::new("key_value", DataType::Struct(Fields::from(vec![key, value])), false);
-            DataType::Map(Arc::new(entries), false)
-        }
-        LogicalTypeId::SqlNull => DataType::Int32,
-        _ => return Err(crate::unported(format!("writing {ty} to a Parquet file"))),
-    })
-}
-
-fn primitive<T: ArrowPrimitiveType>(
-    values: &[&Value],
-    data_type: DataType,
-    get: impl Fn(&Value) -> Option<T::Native>,
-) -> ArrayRef {
-    let items = values.iter().map(|v| if v.is_null() { None } else { get(v) });
-    Arc::new(PrimitiveArray::<T>::from_iter(items).with_data_type(data_type))
-}
-
-/// The values of a nested column, and which of its rows are NULL.
-fn list_parts<'a>(values: &[&'a Value]) -> (Vec<i32>, Vec<&'a Value>, NullBuffer) {
-    let mut offsets = Vec::with_capacity(values.len() + 1);
-    offsets.push(0i32);
-    let mut items = Vec::new();
-    for value in values {
-        if let ValueData::List(children) = value.data() {
-            items.extend(children.iter());
-        }
-        offsets.push(items.len() as i32);
-    }
-    let nulls = NullBuffer::from_iter(values.iter().map(|v| !v.is_null()));
-    (offsets, items, nulls)
-}
-
-/// A column of Arrow from its values.
-fn build_array(values: &[&Value], ty: &LogicalType) -> Result<ArrayRef> {
-    let data_type = arrow_type(ty)?;
-    let int = |v: &Value| v.as_i128();
-    Ok(match ty.id() {
-        LogicalTypeId::Boolean => Arc::new(
-            values
-                .iter()
-                .map(|v| match v.data() {
-                    ValueData::Bool(flag) => Some(*flag),
-                    _ => None,
-                })
-                .collect::<BooleanArray>(),
-        ),
-        LogicalTypeId::TinyInt => primitive::<adt::Int8Type>(values, data_type, |v| int(v).map(|i| i as i8)),
-        LogicalTypeId::SmallInt => primitive::<adt::Int16Type>(values, data_type, |v| int(v).map(|i| i as i16)),
-        LogicalTypeId::Integer | LogicalTypeId::SqlNull => {
-            primitive::<adt::Int32Type>(values, data_type, |v| int(v).map(|i| i as i32))
-        }
-        LogicalTypeId::BigInt => primitive::<adt::Int64Type>(values, data_type, |v| int(v).map(|i| i as i64)),
-        LogicalTypeId::UTinyInt => primitive::<adt::UInt8Type>(values, data_type, |v| int(v).map(|i| i as u8)),
-        LogicalTypeId::USmallInt => primitive::<adt::UInt16Type>(values, data_type, |v| int(v).map(|i| i as u16)),
-        LogicalTypeId::UInteger => primitive::<adt::UInt32Type>(values, data_type, |v| int(v).map(|i| i as u32)),
-        LogicalTypeId::UBigInt => primitive::<adt::UInt64Type>(values, data_type, |v| int(v).map(|i| i as u64)),
-        LogicalTypeId::Float => primitive::<adt::Float32Type>(values, data_type, |v| match v.data() {
-            ValueData::Float(x) => Some(*x),
-            _ => None,
-        }),
-        LogicalTypeId::Double => primitive::<adt::Float64Type>(values, data_type, |v| match v.data() {
-            ValueData::Double(x) => Some(*x),
-            _ => None,
-        }),
-        LogicalTypeId::HugeInt | LogicalTypeId::UHugeInt => {
-            primitive::<adt::Float64Type>(values, data_type, |v| match v.data() {
-                ValueData::Int128(x) => Some(*x as f64),
-                ValueData::UInt128(x) => Some(*x as f64),
-                _ => None,
-            })
-        }
-        LogicalTypeId::Varchar | LogicalTypeId::Enum | LogicalTypeId::TimeTz | LogicalTypeId::Bignum => {
-            let texts: Vec<Option<String>> = values
-                .iter()
-                .map(|v| {
-                    if v.is_null() {
-                        Ok(None)
-                    } else {
-                        v.try_to_string().map(Some)
-                    }
-                })
-                .collect::<Result<_>>()?;
-            Arc::new(texts.into_iter().collect::<StringArray>())
-        }
-        LogicalTypeId::Blob | LogicalTypeId::Bit => {
-            let bytes: Vec<Option<&[u8]>> = values
-                .iter()
-                .map(|v| match v.data() {
-                    ValueData::Bytes(b) => Some(b.as_slice()),
-                    _ => None,
-                })
-                .collect();
-            Arc::new(BinaryArray::from(bytes))
-        }
-        LogicalTypeId::Uuid => {
-            let mut builder = FixedSizeBinaryBuilder::with_capacity(values.len(), 16);
-            for value in values {
-                match value.data() {
-                    ValueData::Int128(stored) => builder
-                        .append_value(((*stored as u128) ^ (1 << 127)).to_be_bytes())
-                        .map_err(invalid)?,
-                    _ => builder.append_null(),
-                }
-            }
-            Arc::new(builder.finish())
-        }
-        LogicalTypeId::Date => primitive::<adt::Date32Type>(values, data_type, |v| int(v).map(|i| i as i32)),
-        LogicalTypeId::Time => primitive::<adt::Time64MicrosecondType>(values, data_type, |v| int(v).map(|i| i as i64)),
-        LogicalTypeId::Timestamp | LogicalTypeId::TimestampTz => {
-            primitive::<adt::TimestampMicrosecondType>(values, data_type, |v| int(v).map(|i| i as i64))
-        }
-        LogicalTypeId::TimestampSec => {
-            primitive::<adt::TimestampMicrosecondType>(values, data_type, |v| int(v).map(|i| i as i64 * 1_000_000))
-        }
-        LogicalTypeId::TimestampMs => {
-            primitive::<adt::TimestampMicrosecondType>(values, data_type, |v| int(v).map(|i| i as i64 * 1_000))
-        }
-        LogicalTypeId::TimestampNs => {
-            primitive::<adt::TimestampNanosecondType>(values, data_type, |v| int(v).map(|i| i as i64))
-        }
-        LogicalTypeId::Interval => primitive::<adt::IntervalMonthDayNanoType>(values, data_type, |v| match v.data() {
-            ValueData::Interval(x) => Some(IntervalMonthDayNano::new(x.months, x.days, x.micros * 1_000)),
-            _ => None,
-        }),
-        LogicalTypeId::Decimal => {
-            let items = values.iter().map(|v| if v.is_null() { None } else { v.as_i128() });
-            Arc::new(Decimal128Array::from_iter(items).with_data_type(data_type))
-        }
-        LogicalTypeId::List | LogicalTypeId::Array => {
-            let child = ty.child_type().cloned().unwrap_or(LogicalType::INTEGER);
-            let (offsets, items, nulls) = list_parts(values);
-            let DataType::List(field) = data_type else {
-                unreachable!("a list is a list");
-            };
-            Arc::new(GenericListArray::<i32>::new(
-                field,
-                OffsetBuffer::new(offsets.into()),
-                build_array(&items, &child)?,
-                Some(nulls),
-            ))
-        }
-        LogicalTypeId::Struct => {
-            let DataType::Struct(fields) = data_type else {
-                unreachable!("a struct is a struct");
-            };
-            let null = Value::sql_null();
-            let mut arrays = Vec::with_capacity(fields.len());
-            for (index, (_, child)) in ty.struct_children().iter().enumerate() {
-                let items: Vec<&Value> = values
-                    .iter()
-                    .map(|v| match v.data() {
-                        ValueData::Struct(parts) => &parts[index],
-                        _ => &null,
-                    })
-                    .collect();
-                arrays.push(build_array(&items, child)?);
-            }
-            let nulls = NullBuffer::from_iter(values.iter().map(|v| !v.is_null()));
-            Arc::new(StructArray::new(fields, arrays, Some(nulls)))
-        }
-        LogicalTypeId::Map => {
-            let entry = ty.child_type().cloned().unwrap_or(LogicalType::INTEGER);
-            let (offsets, items, nulls) = list_parts(values);
-            let DataType::Map(field, sorted) = data_type else {
-                unreachable!("a map is a map");
-            };
-            let DataType::Struct(fields) = field.data_type().clone() else {
-                unreachable!("map entries are a struct");
-            };
-            let null = Value::sql_null();
-            let mut arrays = Vec::with_capacity(2);
-            for (index, (_, child)) in entry.struct_children().iter().enumerate() {
-                let parts: Vec<&Value> = items
-                    .iter()
-                    .map(|v| match v.data() {
-                        ValueData::Struct(parts) => &parts[index],
-                        _ => &null,
-                    })
-                    .collect();
-                arrays.push(build_array(&parts, child)?);
-            }
-            let entries = StructArray::new(fields, arrays, None);
-            Arc::new(MapArray::new(
-                field,
-                OffsetBuffer::new(offsets.into()),
-                entries,
-                Some(nulls),
-                sorted,
-            ))
-        }
-        _ => return Err(crate::unported(format!("writing {ty} to a Parquet file"))),
     })
 }
 
@@ -851,9 +816,78 @@ pub struct PhysicalCopyToParquet {
     children: Vec<Box<dyn PhysicalOperator>>,
     path: String,
     names: Vec<String>,
-    /// by the directory of a partition, or `""` without partitions
-    writers: Mutex<HashMap<String, ArrowWriter<File>>>,
+    /// by the directory of a partition, or `""` without partitions, and the thread with PER_THREAD_OUTPUT
+    writers: Mutex<OutputFiles<ParquetFileWriter>>,
     rows: AtomicU64,
+}
+
+/// The files a COPY TO has open, and how many each directory got (`last_file_offset`).
+#[derive(Debug)]
+pub struct OutputFiles<W> {
+    pub open: HashMap<String, W>,
+    pub offsets: HashMap<String, usize>,
+    pub created: usize,
+    /// the paths of the files, in the order they were created
+    pub paths: Vec<String>,
+}
+
+impl<W> Default for OutputFiles<W> {
+    fn default() -> Self {
+        Self {
+            open: HashMap::new(),
+            offsets: HashMap::new(),
+            created: 0,
+            paths: Vec::new(),
+        }
+    }
+}
+
+impl<W> OutputFiles<W> {
+    /// The key of the file of a partition's `directory` for this thread.
+    pub fn key(directory: &str, rotation: Option<&Rotation>) -> String {
+        match rotation {
+            Some(rotation) if rotation.per_thread => format!("{directory}#{:?}", std::thread::current().id()),
+            _ => directory.to_string(),
+        }
+    }
+
+    /// The path of the next file of `directory` (`""` for the target itself).
+    pub fn next_path(
+        &mut self,
+        target: &str,
+        directory: &str,
+        partitioning: Option<&Partitioning>,
+        rotation: Option<&Rotation>,
+    ) -> Result<String> {
+        self.created += 1;
+        let path = self.path_of(target, directory, partitioning, rotation)?;
+        self.paths.push(path.clone());
+        Ok(path)
+    }
+
+    fn path_of(
+        &mut self,
+        target: &str,
+        directory: &str,
+        partitioning: Option<&Partitioning>,
+        rotation: Option<&Rotation>,
+    ) -> Result<String> {
+        match (partitioning, rotation) {
+            (Some(partitioning), _) => {
+                let offset = self.offsets.entry(directory.to_string()).or_insert(0);
+                let path = partitioning.create_file_path_at(directory, *offset)?;
+                *offset += 1;
+                Ok(path)
+            }
+            (None, Some(rotation)) => {
+                let offset = self.offsets.entry(String::new()).or_insert(0);
+                let path = file_name(target, &rotation.filename_pattern, &rotation.extension, *offset);
+                *offset += 1;
+                Ok(path)
+            }
+            (None, None) => Ok(target.to_string()),
+        }
+    }
 }
 
 impl std::fmt::Debug for PhysicalCopyToParquet {
@@ -878,103 +912,68 @@ impl PhysicalCopyToParquet {
             children,
             path,
             names,
-            writers: Mutex::new(HashMap::new()),
+            writers: Mutex::new(OutputFiles::default()),
             rows: AtomicU64::new(0),
         }
     }
 
     /// The columns that go in a file, by their position in the rows.
     fn written_columns(&self) -> Vec<usize> {
-        let all = 0..self.names.len();
         match &self.options.partitioning {
-            Some(partitioning) if !partitioning.write_columns => {
-                all.filter(|column| !partitioning.columns.contains(column)).collect()
-            }
-            _ => all.collect(),
+            Some(partitioning) => partitioning.written_columns(self.names.len()),
+            None => (0..self.names.len()).collect(),
         }
     }
 
-    fn schema(&self) -> Result<Arc<Schema>> {
+    fn create(&self, path: &str) -> Result<ParquetFileWriter> {
         let types = self.children[0].types();
-        let fields: Vec<Field> = self
-            .written_columns()
-            .into_iter()
-            .map(|column| arrow_field(&self.names[column], &types[column]))
-            .collect::<Result<_>>()?;
-        Ok(Arc::new(Schema::new(fields)))
-    }
-
-    fn failed(&self, error: impl std::fmt::Display) -> Error {
-        Error::new(ErrorKind::Io, format!("Could not write \"{}\": {error}", self.path))
-    }
-
-    fn create(&self, path: &str) -> Result<ArrowWriter<File>> {
-        let file =
-            File::create(path).map_err(|e| Error::new(ErrorKind::Io, format!("Cannot open file \"{path}\": {e}")))?;
-        let key_values: Vec<KeyValue> = self
-            .options
-            .key_values
+        let columns = self.written_columns();
+        let names: Vec<String> = columns.iter().map(|&c| self.names[c].clone()).collect();
+        let types: Vec<LogicalType> = columns.iter().map(|&c| types[c].clone()).collect();
+        let mut options = self.options.writer.clone();
+        options.not_null_columns = columns
             .iter()
-            .map(|(key, value)| KeyValue::new(key.clone(), value.clone()))
+            .map(|&c| self.options.not_null_columns.get(c).copied().unwrap_or(false))
             .collect();
-        let mut properties = WriterProperties::builder()
-            .set_compression(self.options.compression)
-            .set_max_row_group_row_count(Some(self.options.row_group_size.max(1)))
-            .set_writer_version(self.options.version)
-            .set_created_by("DuckDB".to_string())
-            .set_bloom_filter_enabled(self.options.bloom_filter)
-            .set_key_value_metadata((!key_values.is_empty()).then_some(key_values));
-        if let Some(limit) = self.options.data_page_size_limit {
-            properties = properties.set_data_page_size_limit(limit);
-        }
-        if let Some(fpp) = self.options.bloom_filter_fpp {
-            properties = properties.set_bloom_filter_fpp(fpp);
-        }
-        ArrowWriter::try_new(file, self.schema()?, Some(properties.build())).map_err(|e| self.failed(e))
+        ParquetFileWriter::create(path, &names, &types, options)
     }
 
-    /// The directory of a row's partition, under the path of the COPY.
-    fn partition_directory(&self, partitioning: &Partitioning, chunk: &DataChunk, row: usize) -> Result<String> {
-        let mut directory = self.path.clone();
-        for &column in &partitioning.columns {
-            let value = chunk.get_value(column, row);
-            let text = if value.is_null() {
-                "__HIVE_DEFAULT_PARTITION__".to_string()
-            } else {
-                hive_escape(&value.try_to_string()?)
-            };
-            directory += &format!("/{}={text}", hive_escape(&self.names[column]));
-        }
-        Ok(directory)
-    }
-
-    /// Writes `rows` of `chunk` to the file of `directory`.
+    /// Writes `rows` of `chunk` to the file of `directory`, starting new files where the rotation says.
     fn write_rows(&self, directory: &str, chunk: &DataChunk, rows: &[usize]) -> Result<()> {
-        let types = self.children[0].types();
-        let mut writers = self.writers.lock();
-        if !writers.contains_key(directory) {
-            let path = match &self.options.partitioning {
-                Some(partitioning) => {
-                    std::fs::create_dir_all(directory).map_err(|e| {
-                        Error::new(ErrorKind::Io, format!("Cannot create directory \"{directory}\": {e}"))
-                    })?;
-                    let name = partitioning.filename_pattern.replace("{i}", "0");
-                    format!("{directory}/{name}.{}", partitioning.extension)
+        let rotation = self.options.rotation.as_ref();
+        let key = OutputFiles::<ParquetFileWriter>::key(directory, rotation);
+        let mut files = self.writers.lock();
+        let mut done = 0;
+        while done < rows.len() {
+            if !files.open.contains_key(&key) {
+                let path = files.next_path(&self.path, directory, self.options.partitioning.as_ref(), rotation)?;
+                let writer = self.create(&path)?;
+                files.open.insert(key.clone(), writer);
+            }
+            let writer = files.open.get_mut(&key).expect("just opened");
+            // with a rotation, a file may end at any row group
+            let take = match rotation {
+                Some(r) if r.file_size_bytes.is_some() || r.row_groups_per_file.is_some() => {
+                    writer.rows_until_row_group().min(rows.len() - done)
                 }
-                None => self.path.clone(),
+                _ => rows.len() - done,
             };
-            let writer = self.create(&path)?;
-            writers.insert(directory.to_string(), writer);
+            let piece = &rows[done..done + take];
+            let columns: Vec<Vec<Value>> = self
+                .written_columns()
+                .into_iter()
+                .map(|column| piece.iter().map(|&row| chunk.get_value(column, row)).collect())
+                .collect();
+            writer.append(columns)?;
+            done += take;
+            if let Some(rotation) = rotation
+                && rotation.rotate_now(writer.bytes_written(), writer.row_group_count(), writer.has_data())
+            {
+                let writer = files.open.remove(&key).expect("open");
+                writer.finish()?;
+            }
         }
-        let mut arrays = Vec::new();
-        for column in self.written_columns() {
-            let values: Vec<Value> = rows.iter().map(|&row| chunk.get_value(column, row)).collect();
-            let values: Vec<&Value> = values.iter().collect();
-            arrays.push(build_array(&values, &types[column])?);
-        }
-        let batch = RecordBatch::try_new(self.schema()?, arrays).map_err(|e| self.failed(e))?;
-        let writer = writers.get_mut(directory).expect("just opened");
-        writer.write(&batch).map_err(|e| self.failed(e))
+        Ok(())
     }
 }
 
@@ -994,15 +993,7 @@ impl PhysicalOperator for PhysicalCopyToParquet {
     fn sink(&self, chunk: &DataChunk) -> Result<()> {
         match &self.options.partitioning {
             Some(partitioning) => {
-                let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
-                for row in 0..chunk.len() {
-                    let directory = self.partition_directory(partitioning, chunk, row)?;
-                    match groups.iter_mut().find(|(d, _)| *d == directory) {
-                        Some((_, rows)) => rows.push(row),
-                        None => groups.push((directory, vec![row])),
-                    }
-                }
-                for (directory, rows) in groups {
+                for (directory, rows) in partitioning.group_rows(&self.path, &self.names, chunk)? {
                     self.write_rows(&directory, chunk, &rows)?;
                 }
             }
@@ -1015,18 +1006,27 @@ impl PhysicalOperator for PhysicalCopyToParquet {
         Ok(())
     }
     fn finalize(&self) -> Result<()> {
-        let mut writers = self.writers.lock();
-        if writers.is_empty() {
+        let mut files = self.writers.lock();
+        let rotation = self.options.rotation.as_ref();
+        if files.created == 0 && !self.options.output.write_empty_file {
+            return Ok(());
+        }
+        if files.created == 0 {
             if self.options.partitioning.is_some() {
                 std::fs::create_dir_all(&self.path).map_err(|e| {
                     Error::new(ErrorKind::Io, format!("Cannot create directory \"{}\": {e}", self.path))
                 })?;
                 return Ok(());
             }
-            writers.insert(String::new(), self.create(&self.path)?);
+            let path = files.next_path(&self.path, "", None, rotation)?;
+            let writer = self.create(&path)?;
+            files.open.insert(String::new(), writer);
         }
-        for (_, writer) in writers.drain() {
-            writer.close().map_err(|e| self.failed(e))?;
+        let mut keys: Vec<String> = files.open.keys().cloned().collect();
+        keys.sort();
+        for key in keys {
+            let writer = files.open.remove(&key).expect("listed");
+            writer.finish()?;
         }
         Ok(())
     }
@@ -1042,9 +1042,11 @@ impl PhysicalOperator for PhysicalCopyToParquet {
             return Ok(None);
         }
         *done = true;
-        let mut count = Vector::new(LogicalType::BIGINT, 1);
-        count.set_value(0, &Value::bigint(self.rows.load(Ordering::Relaxed) as i64))?;
-        Ok(Some(DataChunk::from_columns(vec![count], 1)))
+        let files = self.writers.lock();
+        self.options
+            .output
+            .result(self.rows.load(Ordering::Relaxed), &files.paths)
+            .map(Some)
     }
 }
 
@@ -1065,6 +1067,9 @@ fn read_metadata(path: &str) -> Result<(ParquetMetaData, u64)> {
     let size = file.metadata().map(|m| m.len()).unwrap_or(0);
     let metadata = guarded(path, || {
         ParquetMetaDataReader::new()
+            .with_metadata_options(Some(
+                parquet::file::metadata::ParquetMetaDataOptions::new().with_encoding_stats_as_mask(false),
+            ))
             .parse_and_finish(&file)
             .map_err(|e| invalid(format!("Invalid Parquet file \"{path}\": {e}")))
     })?;
@@ -1101,17 +1106,224 @@ fn statistics_text(stats: &Statistics) -> (Option<String>, Option<String>, Optio
     )
 }
 
+/// `ParquetStatisticsUtils::ConvertValueInternal`, as text: a statistic of a column, by the DuckDB type that the
+/// column reads as. `None` where C++ gives NULL: values that don't fit the type, or infinities.
+fn statistic_text(column: &parquet::schema::types::ColumnDescriptor, bytes: &[u8]) -> Option<String> {
+    use parquet::basic::{ConvertedType, LogicalType as Logical, TimeUnit as Unit, Type as Physical};
+    const MICROS_PER_DAY: i64 = 86_400_000_000;
+    let i32_of = |b: &[u8]| b.try_into().ok().map(i32::from_le_bytes);
+    let i64_of = |b: &[u8]| b.try_into().ok().map(i64::from_le_bytes);
+    let decimal = |unscaled: i128| -> Option<String> {
+        let (precision, scale) = (column.type_precision(), column.type_scale());
+        if !(1..=38).contains(&precision) {
+            return None;
+        }
+        let limit = 10i128.checked_pow(precision as u32)?;
+        if unscaled >= limit || unscaled <= -limit {
+            return None;
+        }
+        Value::decimal(unscaled, precision as u8, scale.max(0) as u8)
+            .ok()?
+            .try_to_string()
+            .ok()
+    };
+    // big-endian two's complement, as decimals in byte arrays are
+    let big_endian = |b: &[u8]| -> Option<i128> {
+        if b.is_empty() || b.len() > 16 {
+            return None;
+        }
+        let mut value: i128 = if b[0] & 0x80 != 0 { -1 } else { 0 };
+        for &byte in b {
+            value = (value << 8) | i128::from(byte);
+        }
+        Some(value)
+    };
+    let blob = |b: &[u8]| Value::blob(b.to_vec()).try_to_string().ok();
+    let logical = column.logical_type_ref();
+    let converted = column.converted_type();
+    let is_decimal = matches!(logical, Some(Logical::Decimal(_))) || converted == ConvertedType::DECIMAL;
+    let shown = |value: Value| value.try_to_string().ok();
+    match column.physical_type() {
+        Physical::BOOLEAN => Some((bytes.first()? != &0).to_string()),
+        Physical::INT32 => {
+            let value = i32_of(bytes)?;
+            if is_decimal {
+                return decimal(i128::from(value));
+            }
+            match (logical, converted) {
+                (Some(Logical::Integer(int)), _) if !int.is_signed => Some((value as u32).to_string()),
+                (_, ConvertedType::UINT_8 | ConvertedType::UINT_16 | ConvertedType::UINT_32) => {
+                    Some((value as u32).to_string())
+                }
+                (Some(Logical::Date), _) | (_, ConvertedType::DATE) => shown(Value::date(Date(value))),
+                (Some(Logical::Time(time)), _) => {
+                    let micros = i64::from(value) * 1000;
+                    if !(0..=MICROS_PER_DAY).contains(&micros) && !time.is_adjusted_to_u_t_c {
+                        return None;
+                    }
+                    if time.is_adjusted_to_u_t_c {
+                        shown(Value::time_tz(TimeTz::new(Time(micros), 0)))
+                    } else {
+                        shown(Value::time(Time(micros)))
+                    }
+                }
+                (_, ConvertedType::TIME_MILLIS) => {
+                    let micros = i64::from(value) * 1000;
+                    (0..=MICROS_PER_DAY)
+                        .contains(&micros)
+                        .then(|| shown(Value::time(Time(micros))))?
+                }
+                _ => Some(value.to_string()),
+            }
+        }
+        Physical::INT64 => {
+            let value = i64_of(bytes)?;
+            if is_decimal {
+                return decimal(i128::from(value));
+            }
+            match (logical, converted) {
+                (Some(Logical::Integer(int)), _) if !int.is_signed => Some((value as u64).to_string()),
+                (_, ConvertedType::UINT_64) => Some((value as u64).to_string()),
+                (Some(Logical::Timestamp(ts)), _) => {
+                    let utc = ts.is_adjusted_to_u_t_c;
+                    let value = match ts.unit {
+                        Unit::MILLIS => Value::timestamp(Timestamp(value.checked_mul(1000)?)),
+                        Unit::MICROS => Value::timestamp(Timestamp(value)),
+                        Unit::NANOS => {
+                            return Value::new(LogicalType::new(LogicalTypeId::TimestampNs), ValueData::Int64(value))
+                                .ok()
+                                .and_then(shown);
+                        }
+                    };
+                    let value = if utc {
+                        value.reinterpret(&LogicalType::new(LogicalTypeId::TimestampTz)).ok()?
+                    } else {
+                        value
+                    };
+                    shown(value)
+                }
+                (_, ConvertedType::TIMESTAMP_MILLIS) => shown(Value::timestamp(Timestamp(value.checked_mul(1000)?))),
+                (_, ConvertedType::TIMESTAMP_MICROS) => shown(Value::timestamp(Timestamp(value))),
+                (Some(Logical::Time(time)), _) => {
+                    let micros = match time.unit {
+                        Unit::NANOS => value / 1000,
+                        _ => value,
+                    };
+                    if time.is_adjusted_to_u_t_c {
+                        shown(Value::time_tz(TimeTz::new(Time(micros), 0)))
+                    } else if (0..=MICROS_PER_DAY).contains(&micros) {
+                        shown(Value::time(Time(micros)))
+                    } else {
+                        None
+                    }
+                }
+                (_, ConvertedType::TIME_MICROS) => (0..=MICROS_PER_DAY)
+                    .contains(&value)
+                    .then(|| shown(Value::time(Time(value))))?,
+                _ => Some(value.to_string()),
+            }
+        }
+        Physical::INT96 => {
+            // `ImpalaTimestampToTimestamp`: nanoseconds of the day, then the Julian day
+            if bytes.len() != 12 {
+                return None;
+            }
+            let nanos = i64::from_le_bytes(bytes[..8].try_into().ok()?);
+            let julian = i64::from(u32::from_le_bytes(bytes[8..].try_into().ok()?));
+            const JULIAN_TO_UNIX_EPOCH_DAYS: i64 = 2_440_588;
+            let micros = (julian - JULIAN_TO_UNIX_EPOCH_DAYS)
+                .checked_mul(MICROS_PER_DAY)?
+                .checked_add(nanos / 1000)?;
+            shown(Value::timestamp(Timestamp(micros)))
+        }
+        Physical::FLOAT => {
+            let value = f32::from_le_bytes(bytes.try_into().ok()?);
+            value.is_finite().then(|| shown(Value::float(value)))?
+        }
+        Physical::DOUBLE => {
+            let value = f64::from_le_bytes(bytes.try_into().ok()?);
+            value.is_finite().then(|| shown(Value::double(value)))?
+        }
+        Physical::BYTE_ARRAY => {
+            if is_decimal {
+                return decimal(big_endian(bytes)?);
+            }
+            let text = matches!(logical, Some(Logical::String | Logical::Enum | Logical::Json))
+                || matches!(
+                    converted,
+                    ConvertedType::UTF8 | ConvertedType::ENUM | ConvertedType::JSON
+                );
+            match std::str::from_utf8(bytes) {
+                Ok(text_value) if text => Some(text_value.to_string()),
+                _ => blob(bytes),
+            }
+        }
+        Physical::FIXED_LEN_BYTE_ARRAY => {
+            if is_decimal {
+                return decimal(big_endian(bytes)?);
+            }
+            match logical {
+                Some(Logical::Uuid) if bytes.len() == 16 => {
+                    let stored = i128::from_be_bytes(bytes.try_into().ok()?) ^ (1 << 127);
+                    shown(Value::uuid(stored))
+                }
+                Some(Logical::Float16) if bytes.len() == 2 => {
+                    let value = half_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]));
+                    value.is_finite().then(|| shown(Value::float(value)))?
+                }
+                _ => blob(bytes),
+            }
+        }
+    }
+}
+
+/// `Float16ToFloat32`.
+fn half_to_f32(bits: u16) -> f32 {
+    let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exponent = i32::from((bits >> 10) & 0x1f);
+    let fraction = f32::from(bits & 0x3ff);
+    match exponent {
+        0 => sign * fraction * 2f32.powi(-24),
+        31 if fraction == 0.0 => sign * f32::INFINITY,
+        31 => f32::NAN,
+        _ => sign * (1.0 + fraction / 1024.0) * 2f32.powi(exponent - 15),
+    }
+}
+
 /// `parquet_metadata`: a row of SQL per column of a row group.
 pub fn metadata_rows(path: &str) -> Result<Vec<String>> {
     let (metadata, _) = read_metadata(path)?;
     let mut rows = Vec::new();
     for (group, row_group) in metadata.row_groups().iter().enumerate() {
         for (column, chunk) in row_group.columns().iter().enumerate() {
-            let (min, max, nulls, distinct) = chunk.statistics().map_or((None, None, None, None), statistics_text);
+            let (_, _, nulls, distinct) = chunk.statistics().map_or((None, None, None, None), statistics_text);
+            let descriptor = chunk.column_descr();
+            let stat = |bytes: Option<&[u8]>| bytes.and_then(|b| statistic_text(descriptor, b));
+            let min = stat(chunk.statistics().and_then(Statistics::min_bytes_opt));
+            let max = stat(chunk.statistics().and_then(Statistics::max_bytes_opt));
             let encodings: Vec<String> = chunk.encodings().map(|e| e.to_string()).collect();
+            let encoding_stats = match chunk.page_encoding_stats() {
+                Some(all) => {
+                    let items: Vec<String> = all
+                        .iter()
+                        .map(|stat| {
+                            format!(
+                                "{{'page_type': {}, 'encoding': {}, 'count': {}}}",
+                                sql_text(&format!("{:?}", stat.page_type)),
+                                sql_text(&stat.encoding.to_string()),
+                                stat.count
+                            )
+                        })
+                        .collect();
+                    format!("[{}]::{ENCODING_STATS_TYPE}", items.join(", "))
+                }
+                None => format!("NULL::{ENCODING_STATS_TYPE}"),
+            };
+            let nan_count = chunk.statistics().and_then(Statistics::nan_count_opt).map(|n| n as i64);
             rows.push(format!(
                 "({}, {group}, {}, {}, {}, {column}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, NULL::BIGINT, {}, {}, \
-                 {}, {}, NULL::MAP(BLOB, BLOB), {}, {}, {}, {}, {})",
+                 {}, {}, NULL::MAP(BLOB, BLOB), {}, {}, {}, {}, {}, NULL::{GEO_BBOX_TYPE}, NULL::VARCHAR[], {}, {}, {}, \
+                 {}, {}, {})",
                 sql_text(path),
                 row_group.num_rows(),
                 row_group.num_columns(),
@@ -1137,6 +1349,12 @@ pub fn metadata_rows(path: &str) -> Result<Vec<String>> {
                 chunk.statistics().is_some_and(Statistics::min_is_exact),
                 chunk.statistics().is_some_and(Statistics::max_is_exact),
                 row_group.compressed_size(),
+                encoding_stats,
+                sql_number(nan_count),
+                sql_number(chunk.column_index_offset()),
+                sql_number(chunk.column_index_length().map(i64::from)),
+                sql_number(chunk.offset_index_offset()),
+                sql_number(chunk.offset_index_length().map(i64::from)),
             ));
         }
     }
@@ -1226,6 +1444,385 @@ pub fn key_value_rows(path: &str) -> Result<Vec<String>> {
                 .collect()
         })
         .unwrap_or_default())
+}
+
+/// The type of `encoding_stats` in `parquet_metadata`.
+pub const ENCODING_STATS_TYPE: &str = "STRUCT(page_type VARCHAR, encoding VARCHAR, count INTEGER)[]";
+/// The type of `geo_bbox` in `parquet_metadata`.
+pub const GEO_BBOX_TYPE: &str = "STRUCT(xmin DOUBLE, xmax DOUBLE, ymin DOUBLE, ymax DOUBLE, zmin DOUBLE, zmax DOUBLE, \
+                                 mmin DOUBLE, mmax DOUBLE)";
+
+/// A value of Thrift's compact protocol, as far as the page index needs.
+#[derive(Debug)]
+enum ThriftValue {
+    Int(i64),
+    Bool(bool),
+    Binary(Vec<u8>),
+    List(Vec<ThriftValue>),
+    Struct(Vec<(i16, ThriftValue)>),
+}
+
+impl ThriftValue {
+    fn field(&self, id: i16) -> Option<&ThriftValue> {
+        match self {
+            ThriftValue::Struct(fields) => fields.iter().find(|(i, _)| *i == id).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+
+    fn int(&self) -> Option<i64> {
+        match self {
+            ThriftValue::Int(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    fn items(&self) -> &[ThriftValue] {
+        match self {
+            ThriftValue::List(items) => items,
+            _ => &[],
+        }
+    }
+}
+
+struct ThriftReader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl ThriftReader<'_> {
+    fn byte(&mut self) -> Option<u8> {
+        let byte = *self.bytes.get(self.at)?;
+        self.at += 1;
+        Some(byte)
+    }
+
+    fn varint(&mut self) -> Option<u64> {
+        let mut result = 0u64;
+        let mut shift = 0;
+        loop {
+            let byte = self.byte()?;
+            result |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Some(result);
+            }
+            shift += 7;
+            if shift > 63 {
+                return None;
+            }
+        }
+    }
+
+    fn zigzag(&mut self) -> Option<i64> {
+        let z = self.varint()?;
+        Some(((z >> 1) as i64) ^ -((z & 1) as i64))
+    }
+
+    fn value(&mut self, kind: u8) -> Option<ThriftValue> {
+        Some(match kind {
+            1 => ThriftValue::Bool(true),
+            2 => ThriftValue::Bool(false),
+            3 => ThriftValue::Int(i64::from(self.byte()? as i8)),
+            4..=6 => ThriftValue::Int(self.zigzag()?),
+            7 => {
+                let bytes = self.bytes.get(self.at..self.at + 8)?;
+                self.at += 8;
+                ThriftValue::Int(i64::from_le_bytes(bytes.try_into().ok()?))
+            }
+            8 => {
+                let length = self.varint()? as usize;
+                let bytes = self.bytes.get(self.at..self.at + length)?.to_vec();
+                self.at += length;
+                ThriftValue::Binary(bytes)
+            }
+            9 | 10 => {
+                let header = self.byte()?;
+                let size = if header >> 4 == 15 {
+                    self.varint()? as usize
+                } else {
+                    (header >> 4) as usize
+                };
+                let element = header & 0x0f;
+                let mut items = Vec::with_capacity(size.min(1 << 16));
+                for _ in 0..size {
+                    items.push(if element == 1 || element == 2 {
+                        ThriftValue::Bool(self.byte()? == 1)
+                    } else {
+                        self.value(element)?
+                    });
+                }
+                ThriftValue::List(items)
+            }
+            12 => self.structure()?,
+            _ => return None,
+        })
+    }
+
+    fn structure(&mut self) -> Option<ThriftValue> {
+        let mut fields = Vec::new();
+        let mut last = 0i16;
+        loop {
+            let header = self.byte()?;
+            if header == 0 {
+                return Some(ThriftValue::Struct(fields));
+            }
+            let id = if header >> 4 == 0 {
+                self.zigzag()? as i16
+            } else {
+                last + i16::from(header >> 4)
+            };
+            last = id;
+            fields.push((id, self.value(header & 0x0f)?));
+        }
+    }
+}
+
+/// A Thrift struct of a file, at `offset` and `length` bytes long.
+fn read_thrift_struct(file: &mut File, offset: i64, length: i32) -> Option<ThriftValue> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(u64::try_from(offset).ok()?)).ok()?;
+    let mut bytes = vec![0u8; usize::try_from(length).ok()?];
+    file.read_exact(&mut bytes).ok()?;
+    ThriftReader { bytes: &bytes, at: 0 }.structure()
+}
+
+/// `parquet_page_index`: a row of SQL for each page of the column chunks with a page index
+/// (`ParquetPageIndexProcessor`).
+pub fn page_index_rows(path: &str) -> Result<Vec<String>> {
+    let (metadata, _) = read_metadata(path)?;
+    let mut file =
+        File::open(path).map_err(|e| Error::new(ErrorKind::Io, format!("Cannot open file \"{path}\": {e}")))?;
+    let mut rows = Vec::new();
+    for (group, row_group) in metadata.row_groups().iter().enumerate() {
+        for (column, chunk) in row_group.columns().iter().enumerate() {
+            let offset_index = match (chunk.offset_index_offset(), chunk.offset_index_length()) {
+                (Some(offset), Some(length)) => read_thrift_struct(&mut file, offset, length),
+                _ => None,
+            };
+            let column_index = match (chunk.column_index_offset(), chunk.column_index_length()) {
+                (Some(offset), Some(length)) => read_thrift_struct(&mut file, offset, length),
+                _ => None,
+            };
+            let locations = offset_index
+                .as_ref()
+                .and_then(|o| o.field(1))
+                .map(ThriftValue::items)
+                .unwrap_or(&[]);
+            let null_pages = column_index
+                .as_ref()
+                .and_then(|c| c.field(1))
+                .map(ThriftValue::items)
+                .unwrap_or(&[]);
+            let min_values = column_index
+                .as_ref()
+                .and_then(|c| c.field(2))
+                .map(ThriftValue::items)
+                .unwrap_or(&[]);
+            let max_values = column_index
+                .as_ref()
+                .and_then(|c| c.field(3))
+                .map(ThriftValue::items)
+                .unwrap_or(&[]);
+            let null_counts = column_index.as_ref().and_then(|c| c.field(5)).map(ThriftValue::items);
+            let boundary = column_index
+                .as_ref()
+                .and_then(|c| c.field(4))
+                .and_then(ThriftValue::int);
+            let pages = locations.len().max(null_pages.len());
+            for page in 0..pages {
+                let (mut offset, mut size, mut first, mut count) = (None, None, None, None);
+                if let Some(location) = locations.get(page) {
+                    offset = location.field(1).and_then(ThriftValue::int);
+                    size = location.field(2).and_then(ThriftValue::int);
+                    first = location.field(3).and_then(ThriftValue::int);
+                    let next = locations
+                        .get(page + 1)
+                        .and_then(|l| l.field(3))
+                        .and_then(ThriftValue::int)
+                        .unwrap_or(row_group.num_rows());
+                    count = first.map(|f| next - f);
+                }
+                let has_bounds = column_index.is_some()
+                    && page < null_pages.len()
+                    && page < min_values.len()
+                    && page < max_values.len();
+                let (mut null_page, mut min, mut max, mut nulls, mut order) = (None, None, None, None, None);
+                if has_bounds {
+                    let is_null = matches!(null_pages[page], ThriftValue::Bool(true));
+                    null_page = Some(is_null);
+                    let bound = |value: &ThriftValue| match value {
+                        ThriftValue::Binary(bytes) if !is_null => statistic_text(chunk.column_descr(), bytes),
+                        _ => None,
+                    };
+                    min = bound(&min_values[page]);
+                    max = bound(&max_values[page]);
+                    nulls = null_counts.and_then(|n| n.get(page)).and_then(ThriftValue::int);
+                    order = boundary.map(|b| match b {
+                        1 => "ASCENDING",
+                        2 => "DESCENDING",
+                        _ => "UNORDERED",
+                    });
+                }
+                rows.push(format!(
+                    "({}, {group}, {column}, {}, {page}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                    sql_text(path),
+                    sql_text(&chunk.column_path().parts().join(", ")),
+                    sql_number(offset),
+                    sql_number(size),
+                    sql_number(first),
+                    sql_number(count),
+                    null_page.map_or("NULL".to_string(), |b| b.to_string()),
+                    sql_or_null(min),
+                    sql_or_null(max),
+                    sql_number(nulls),
+                    sql_or_null(order.map(str::to_string)),
+                ));
+            }
+        }
+    }
+    Ok(rows)
+}
+
+/// `parquet_bloom_probe`: for each row group of a file, whether the bloom filter of `column` rules `value` out
+/// (`ParquetBloomProbeProcessor`), as rows of SQL.
+pub fn bloom_probe_rows(path: &str, column: &str, value: &Value) -> Result<Vec<String>> {
+    let (metadata, _) = read_metadata(path)?;
+    let (names, types) = file_schema(path, false, Int96As::Timestamp)?;
+    let Some(index) = names.iter().position(|n| n == column) else {
+        return Err(invalid(format!("Column {column} not found in {path}")));
+    };
+    let ty = &types[index];
+    let mut source = Vector::new(value.logical_type().clone(), 1);
+    source.set_value(0, value)?;
+    let mut cast = Vector::new(ty.clone(), 1);
+    crate::function::cast::cast_vector(&source, &mut cast, 1, crate::function::cast::CastMode::Strict)?;
+    let mut probe = cast.get_value(0);
+    let mut probe_type = ty.clone();
+    let normalized = metadata.file_metadata().key_value_metadata().is_some_and(|kvs| {
+        kvs.iter()
+            .any(|kv| kv.key == "duckdb.interval_bloom_filter" && kv.value.as_deref() == Some("normalized-v1"))
+    });
+    let mut file =
+        File::open(path).map_err(|e| Error::new(ErrorKind::Io, format!("Cannot open file \"{path}\": {e}")))?;
+    let mut rows = Vec::new();
+    for (group, row_group) in metadata.row_groups().iter().enumerate() {
+        let Some(chunk) = row_group
+            .columns()
+            .iter()
+            .find(|c| c.column_path().parts().len() == 1 && c.column_path().parts()[0] == column)
+        else {
+            continue;
+        };
+        // the unit the file stores timestamps in
+        if group == 0
+            && ty.id() == LogicalTypeId::Timestamp
+            && let Some(parquet::basic::LogicalType::Timestamp(ts)) = chunk.column_descr().logical_type_ref()
+        {
+            let micros = probe.as_i128().unwrap_or(0) as i64;
+            match ts.unit {
+                parquet::basic::TimeUnit::MILLIS => {
+                    probe_type = LogicalType::new(LogicalTypeId::TimestampMs);
+                    probe = Value::new(probe_type.clone(), ValueData::Int64(micros.div_euclid(1000)))?;
+                }
+                parquet::basic::TimeUnit::NANOS => {
+                    probe_type = LogicalType::new(LogicalTypeId::TimestampNs);
+                    probe = Value::new(probe_type.clone(), ValueData::Int64(micros.saturating_mul(1000)))?;
+                }
+                _ => {}
+            }
+        }
+        let hash = crate::execution::parquet_writer::bloom_probe_hash(&probe_type, &probe, normalized)?;
+        let excludes = match (hash, chunk.bloom_filter_offset()) {
+            (Some(hash), Some(offset)) => match read_bloom_filter(&mut file, offset as u64) {
+                Some(filter) => !filter.contains(hash),
+                None => false,
+            },
+            _ => false,
+        };
+        rows.push(format!("({}, {group}::BIGINT, {excludes})", sql_text(path)));
+    }
+    Ok(rows)
+}
+
+/// A bloom filter of a file: its `BloomFilterHeader`, then `numBytes` of bits.
+fn read_bloom_filter(file: &mut File, offset: u64) -> Option<crate::execution::parquet_writer::BloomFilter> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut header = vec![0u8; 64];
+    let read = file.read(&mut header).ok()?;
+    header.truncate(read);
+    let mut at = 0usize;
+    let mut num_bytes = None;
+    // Thrift's compact protocol: field headers, then the values; only `numBytes` (1) matters
+    fn varint(bytes: &[u8], at: &mut usize) -> Option<u64> {
+        let mut result = 0u64;
+        let mut shift = 0;
+        loop {
+            let byte = *bytes.get(*at)?;
+            *at += 1;
+            result |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Some(result);
+            }
+            shift += 7;
+        }
+    }
+    fn skip_struct(bytes: &[u8], at: &mut usize) -> Option<()> {
+        loop {
+            let byte = *bytes.get(*at)?;
+            *at += 1;
+            if byte == 0 {
+                return Some(());
+            }
+            if byte >> 4 == 0 {
+                varint(bytes, at)?;
+            }
+            match byte & 0x0f {
+                1 | 2 => {}
+                3 => *at += 1,
+                4..=6 => {
+                    varint(bytes, at)?;
+                }
+                8 => {
+                    let length = varint(bytes, at)? as usize;
+                    *at += length;
+                }
+                12 => skip_struct(bytes, at)?,
+                _ => return None,
+            }
+        }
+    }
+    let mut last = 0i64;
+    loop {
+        let byte = *header.get(at)?;
+        at += 1;
+        if byte == 0 {
+            break;
+        }
+        let id = if byte >> 4 == 0 {
+            let z = varint(&header, &mut at)?;
+            ((z >> 1) as i64) ^ -((z & 1) as i64)
+        } else {
+            last + i64::from(byte >> 4)
+        };
+        last = id;
+        match byte & 0x0f {
+            5 if id == 1 => {
+                let z = varint(&header, &mut at)?;
+                num_bytes = Some((((z >> 1) as i64) ^ -((z & 1) as i64)) as usize);
+            }
+            5 | 6 => {
+                varint(&header, &mut at)?;
+            }
+            12 => skip_struct(&header, &mut at)?,
+            _ => return None,
+        }
+    }
+    let size = num_bytes?;
+    let mut data = vec![0u8; size];
+    file.seek(SeekFrom::Start(offset + at as u64)).ok()?;
+    file.read_exact(&mut data).ok()?;
+    Some(crate::execution::parquet_writer::BloomFilter { data })
 }
 
 /// `parquet_file_metadata`: the row of SQL of a file.

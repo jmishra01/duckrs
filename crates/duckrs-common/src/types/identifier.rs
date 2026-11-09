@@ -1,9 +1,21 @@
 // Ported from duckdb/src/parser/keyword_helper.cpp (SQLIdentifier::ToString) @ rust-port-baseline
 
-/// Renders an identifier, double-quoting it when it is not a plain lowercase/uppercase word.
-///
-/// The C++ version also quotes reserved keywords. The keyword list comes from the grammar, so
-/// that check is added with the parser (Phase 2).
+use std::sync::OnceLock;
+
+/// Whether a word is a keyword of the grammar, which the parser crate knows (`KeywordHelper::IsKeyword`).
+static KEYWORD_CHECK: OnceLock<fn(&str) -> bool> = OnceLock::new();
+
+/// Gives [`sql_identifier`] the keywords of the grammar: the engine does this when it starts.
+pub fn set_keyword_check(check: fn(&str) -> bool) {
+    let _ = KEYWORD_CHECK.set(check);
+}
+
+fn is_keyword(text: &str) -> bool {
+    KEYWORD_CHECK.get().is_some_and(|check| check(text))
+}
+
+/// Renders an identifier, double-quoting it when it is not a plain lowercase/uppercase word, or is a keyword
+/// once [`set_keyword_check`] says what keywords are.
 pub fn sql_identifier(text: &str) -> String {
     let bytes = text.as_bytes();
     let ambiguous_after_dot = bytes.len() > 1 && bytes[0] == b'_' && bytes[1].is_ascii_digit();
@@ -11,7 +23,7 @@ pub fn sql_identifier(text: &str) -> String {
         .iter()
         .enumerate()
         .all(|(i, &c)| (i > 0 && c.is_ascii_digit()) || c.is_ascii_lowercase() || c.is_ascii_uppercase() || c == b'_');
-    if !text.is_empty() && !ambiguous_after_dot && plain {
+    if !text.is_empty() && !ambiguous_after_dot && plain && !is_keyword(text) {
         return text.to_string();
     }
     format!("\"{}\"", text.replace('"', "\"\""))

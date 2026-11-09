@@ -452,6 +452,7 @@ impl Binder<'_> {
                 names: vec!["__mark_join_marker".to_string()],
                 types: vec![LogicalType::BOOLEAN],
                 row_id: None,
+                virtual_columns: Vec::new(),
                 generated: Vec::new(),
             });
             return Ok(LogicalOperator::new(

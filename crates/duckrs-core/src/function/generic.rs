@@ -548,6 +548,22 @@ fn signbit(args: &DataChunk, result: &mut Vector) -> Result<()> {
 /// relies on the numbers of a seed needs its pcg32, which isn't ported.
 static RANDOM_STATE: Mutex<u64> = Mutex::new(0x9E37_79B9_7F4A_7C15);
 
+/// The text of a random UUID (version 4), for `{uuid}` in the names of the files a COPY writes.
+pub(crate) fn random_uuid_text() -> String {
+    let bits = (u128::from(next_random()) << 64) | u128::from(next_random());
+    let bits = bits & !(0xF000_u128 << 64) | (0x4000_u128 << 64);
+    let bits = bits & !(0xC000_u128 << 48) | (0x8000_u128 << 48);
+    let hex = format!("{bits:032x}");
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
+}
+
 fn next_random() -> u64 {
     // xorshift64*
     let mut state = RANDOM_STATE.lock();
