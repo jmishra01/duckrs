@@ -51,6 +51,8 @@ pub struct ParquetScanData {
     pub hive: Vec<(String, LogicalType)>,
     /// the virtual columns, after the rest
     pub virtual_columns: Vec<crate::execution::multi_file::VirtualColumn>,
+    /// `schema`: the columns by field id or name, in place of those of the first file
+    pub schema: Option<Arc<Vec<crate::execution::parquet_schema::SchemaColumn>>>,
 }
 
 impl ParquetScanData {
@@ -122,6 +124,7 @@ fn logical_type(field: &Field, binary_as_string: bool) -> Result<LogicalType> {
         }
         DataType::FixedSizeBinary(_) => text_or_blob,
         DataType::Date32 | DataType::Date64 => LogicalType::DATE,
+        DataType::Time64(TimeUnit::Nanosecond) => LogicalType::new(LogicalTypeId::TimeNs),
         DataType::Time32(_) | DataType::Time64(_) => LogicalType::TIME,
         DataType::Timestamp(TimeUnit::Nanosecond, None) => LogicalType::new(LogicalTypeId::TimestampNs),
         DataType::Timestamp(_, None) => LogicalType::TIMESTAMP,
@@ -246,6 +249,26 @@ pub fn file_schema(path: &str, binary_as_string: bool, int96_as: Int96As) -> Res
     Ok((names, types))
 }
 
+/// That the columns of `schema` map onto those of the file at `path` (`MultiFileColumnMapper`).
+pub fn check_schema(
+    path: &str,
+    binary_as_string: bool,
+    int96_as: Int96As,
+    columns: &[crate::execution::parquet_schema::SchemaColumn],
+) -> Result<()> {
+    let builder = open_builder(path)?;
+    let int96 = special_columns(&builder);
+    let schema = builder.schema();
+    let fields: Vec<&Field> = schema.fields().iter().map(|f| f.as_ref()).collect();
+    for column in columns {
+        if let Some(index) = crate::execution::parquet_schema::find_field(&fields, &column.key) {
+            let file_type = column_type(schema.field(index), &int96, index, binary_as_string, int96_as)?;
+            crate::execution::parquet_schema::build_transform(column, schema.field(index), &file_type)?;
+        }
+    }
+    Ok(())
+}
+
 fn utf8(bytes: &[u8]) -> Result<Value> {
     std::str::from_utf8(bytes)
         .map(Value::varchar)
@@ -342,7 +365,11 @@ fn array_value(array: &dyn Array, row: usize, ty: &LogicalType) -> Result<Value>
             time_value(i64::from(millis) * 1_000, ty)
         }
         DataType::Time64(TimeUnit::Nanosecond) => {
-            time_value(array.as_primitive::<adt::Time64NanosecondType>().value(row) / 1_000, ty)
+            let nanos = array.as_primitive::<adt::Time64NanosecondType>().value(row);
+            if ty.id() == LogicalTypeId::TimeNs {
+                return Value::new(ty.clone(), ValueData::Int64(nanos));
+            }
+            time_value(nanos.div_euclid(1_000), ty)
         }
         DataType::Time64(_) => time_value(array.as_primitive::<adt::Time64MicrosecondType>().value(row), ty),
         DataType::Timestamp(unit, _) => {
@@ -450,6 +477,8 @@ pub struct ParquetScanState {
     /// for each column of the scan, the column of this file
     mapping: Vec<Option<usize>>,
     file_types: Vec<LogicalType>,
+    /// with `schema`: how the values of each mapped column become those of the result
+    transforms: Vec<Option<crate::execution::parquet_schema::Transform>>,
     row: i64,
     virtual_rows: crate::execution::multi_file::VirtualRows,
 }
@@ -467,7 +496,28 @@ fn open_file(scan: &ParquetScanData, state: &mut ParquetScanState, path: &str) -
     let names: Vec<&String> = schema.fields().iter().map(|f| f.name()).collect();
     let mut mapping = Vec::with_capacity(scan.names.len());
     let mut file_types = Vec::with_capacity(scan.names.len());
-    for name in &scan.names {
+    let mut transforms = Vec::with_capacity(scan.names.len());
+    if let Some(columns) = &scan.schema {
+        let fields: Vec<&Field> = schema.fields().iter().map(|f| f.as_ref()).collect();
+        for column in columns.iter() {
+            let found = crate::execution::parquet_schema::find_field(&fields, &column.key);
+            let Some(index) = found else {
+                mapping.push(None);
+                file_types.push(LogicalType::SQLNULL);
+                transforms.push(None);
+                continue;
+            };
+            let file_type = column_type(schema.field(index), &int96, index, scan.binary_as_string, scan.int96_as)?;
+            transforms.push(Some(crate::execution::parquet_schema::build_transform(
+                column,
+                schema.field(index),
+                &file_type,
+            )?));
+            file_types.push(file_type);
+            mapping.push(Some(index));
+        }
+    }
+    for name in scan.names.iter().filter(|_| scan.schema.is_none()) {
         let found = names.iter().position(|n| n.eq_ignore_ascii_case(name));
         if found.is_none() && !scan.union_by_name {
             return Err(invalid(format!(
@@ -489,6 +539,7 @@ fn open_file(scan: &ParquetScanData, state: &mut ParquetScanState, path: &str) -
             None => LogicalType::SQLNULL,
         });
         mapping.push(found);
+        transforms.push(None);
     }
     state.reader = Some(guarded(path, || {
         builder
@@ -497,8 +548,24 @@ fn open_file(scan: &ParquetScanData, state: &mut ParquetScanState, path: &str) -
     })?);
     state.mapping = mapping;
     state.file_types = file_types;
+    state.transforms = transforms;
     state.row = 0;
     Ok(())
+}
+
+/// A value cast to `ty`, as a cast of its column would.
+pub fn cast_value(value: &Value, ty: &LogicalType) -> Result<Value> {
+    let mut source = Vector::new(value.logical_type().clone(), 1);
+    source.set_value(0, value)?;
+    let mut result = Vector::new(ty.clone(), 1);
+    cast_vector(&source, &mut result, 1, CastMode::Strict)?;
+    Ok(result.get_value(0))
+}
+
+/// A value cast to `ty`, or `None` if it doesn't cast.
+pub fn try_cast_value(value: &Value, ty: &LogicalType) -> Option<Value> {
+    let result = cast_value(value, ty).ok()?;
+    (value.is_null() || !result.is_null()).then_some(result)
 }
 
 fn constant_column(ty: &LogicalType, value: &Value, count: usize) -> Result<Vector> {
@@ -519,11 +586,27 @@ fn batch_chunk(
     let mut columns = Vec::with_capacity(scan.types.len() + 2);
     for (index, ty) in scan.types.iter().enumerate() {
         let Some(column) = state.mapping[index] else {
-            columns.push(constant_column(ty, &Value::null(ty.clone()), count)?);
+            let default = match &scan.schema {
+                Some(schema) => schema[index].default.clone(),
+                None => Value::null(ty.clone()),
+            };
+            columns.push(constant_column(ty, &default, count)?);
             continue;
         };
         let file_type = &state.file_types[index];
         let array = batch.column(column);
+        if let Some(transform) = &state.transforms[index]
+            && !matches!(transform, crate::execution::parquet_schema::Transform::Direct)
+        {
+            let mut vector = Vector::new(ty.clone(), count);
+            for row in 0..count {
+                let value = array_value(array, row, file_type)?;
+                let value = crate::execution::parquet_schema::apply(transform, value, ty, &cast_value)?;
+                vector.set_value(row, &value)?;
+            }
+            columns.push(vector);
+            continue;
+        }
         let mut vector = Vector::new(file_type.clone(), count);
         for row in 0..count {
             vector.set_value(row, &array_value(array, row, file_type)?)?;

@@ -61,6 +61,7 @@ impl Binder<'_> {
         let mut filename = None;
         let mut hive_partitioning = None;
         let mut int96_as = crate::execution::parquet::Int96As::Timestamp;
+        let mut schema_value = None;
         for argument in &args {
             let value = self.constant_argument(&argument.expr)?;
             if argument.name.is_empty() {
@@ -93,6 +94,7 @@ impl Binder<'_> {
                     };
                 }
                 "hive_types_autocast" | "explicit_cardinality" | "can_have_nan" => {}
+                "schema" => schema_value = Some(value),
                 // options of COPY TO, which reading doesn't have
                 "write_page_index"
                 | "write_bloom_filter"
@@ -133,7 +135,30 @@ impl Binder<'_> {
         if files.is_empty() {
             return Err(binder_error(format!("{name} needs at least one file to read")));
         }
-        let (mut names, mut types) = file_schema(&files[0], binary_as_string, int96_as)?;
+        let schema = match &schema_value {
+            Some(value) => {
+                if union_by_name {
+                    return Err(binder_error("'schema' cannot be combined with union_by_name=true"));
+                }
+                let try_cast = |value: &Value, ty: &LogicalType| crate::execution::parquet::try_cast_value(value, ty);
+                let mut parse_type = |name: &str| self.csv_type(name);
+                let columns = crate::execution::parquet_schema::SchemaParser {
+                    parse_type: &mut parse_type,
+                    try_cast: &try_cast,
+                }
+                .parse(value)?;
+                crate::execution::parquet::check_schema(&files[0], binary_as_string, int96_as, &columns)?;
+                Some(Arc::new(columns))
+            }
+            None => None,
+        };
+        let (mut names, mut types) = match &schema {
+            Some(columns) => (
+                columns.iter().map(|c| c.name.clone()).collect(),
+                columns.iter().map(|c| c.ty.clone()).collect(),
+            ),
+            None => file_schema(&files[0], binary_as_string, int96_as)?,
+        };
         if union_by_name {
             for path in &files[1..] {
                 let (file_names, file_types) = file_schema(path, binary_as_string, int96_as)?;
@@ -168,6 +193,15 @@ impl Binder<'_> {
         } else {
             table_ref.alias.clone()
         };
+        if schema.is_some() {
+            for (i, name) in output_names.iter().enumerate() {
+                if output_names[..i].iter().any(|other| other.eq_ignore_ascii_case(name)) {
+                    return Err(binder_error(format!(
+                        "table \"{alias}\" has duplicate column name \"{name}\""
+                    )));
+                }
+            }
+        }
         let output_names = Self::alias_columns(table_ref, &alias, output_names)?;
         let table_index = self.generate_table_index();
         let (virtual_columns, bound_virtual) = crate::execution::multi_file::bind_virtual_columns(&output_names);
@@ -192,6 +226,7 @@ impl Binder<'_> {
             filename: filename.is_some(),
             hive,
             virtual_columns,
+            schema,
         };
         Ok(LogicalOperator::new(
             LogicalOperatorKind::ParquetScan {
@@ -472,18 +507,6 @@ impl Binder<'_> {
         } else {
             MAX_UNCOMPRESSED_PAGE_SIZE
         });
-        if let Some(value) = field_ids {
-            let columns: Vec<(String, LogicalType)> =
-                bound.names.iter().cloned().zip(bound.types.iter().cloned()).collect();
-            options.writer.field_ids = if value.logical_type().id() == LogicalTypeId::Varchar
-                && value.try_to_string()?.eq_ignore_ascii_case("auto")
-            {
-                let mut next = 0;
-                generate_field_ids(&columns, &mut next)
-            } else {
-                parse_field_ids(&value, &columns, &mut std::collections::HashSet::new())?
-            };
-        }
         options.partitioning = partition.bind(&path, &bound.names, "parquet")?;
         self.bind_partition_path(
             info,
@@ -493,6 +516,25 @@ impl Binder<'_> {
             options.partitioning.as_mut(),
         )?;
         self.set_max_open_files(options.partitioning.as_mut());
+        if let Some(value) = field_ids {
+            // the partition columns are not written, unless WRITE_PARTITION_COLUMNS says so
+            let written = match &options.partitioning {
+                Some(partitioning) => partitioning.written_columns(bound.names.len()),
+                None => (0..bound.names.len()).collect(),
+            };
+            let columns: Vec<(String, LogicalType)> = written
+                .iter()
+                .map(|&c| (bound.names[c].clone(), bound.types[c].clone()))
+                .collect();
+            options.writer.field_ids = if value.logical_type().id() == LogicalTypeId::Varchar
+                && value.try_to_string()?.eq_ignore_ascii_case("auto")
+            {
+                let mut next = 0;
+                generate_field_ids(&columns, &mut next)
+            } else {
+                parse_field_ids(&value, &columns, &mut std::collections::HashSet::new())?
+            };
+        }
         options.rotation = partition.rotation(&path, "parquet", file_size_bytes, row_groups_per_file, per_thread)?;
         options.output = output.build(options.partitioning.is_some(), per_thread, ordered, None)?;
         options.writer.return_stats = options.output.return_stats;
