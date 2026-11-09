@@ -14,11 +14,11 @@ use super::buffer_manager::BufferManager;
 use super::checkpoint::{self, StoredEntry};
 use super::compression::{
     COMPRESSION_ALP, COMPRESSION_ALPRD, COMPRESSION_BITPACKING, COMPRESSION_CONSTANT, COMPRESSION_DICT_FSST,
-    COMPRESSION_RLE, COMPRESSION_ROARING, COMPRESSION_UNCOMPRESSED,
+    COMPRESSION_DICTIONARY, COMPRESSION_FSST, COMPRESSION_RLE, COMPRESSION_ROARING, COMPRESSION_UNCOMPRESSED,
 };
 use super::encode::{
-    Encoded, encode_alp, encode_alprd, encode_bitpacking, encode_dictionary, encode_rle, encode_roaring, fill_nulls,
-    is_signed, supports_bitpacking, supports_rle,
+    Encoded, encode_alp, encode_alprd, encode_bitpacking, encode_dictionary, encode_old_dictionary, encode_old_fsst,
+    encode_rle, encode_roaring, fill_nulls, is_signed, supports_bitpacking, supports_rle,
 };
 use super::fsst::SymbolTable;
 use super::index_data::TableIndex;
@@ -1172,6 +1172,43 @@ impl<'a> Writer<'a> {
             }
         }
         let force = self.force_compression.as_str();
+        // before v1.3.0: DICTIONARY and FSST, which DICT_FSST replaced
+        if self.version < StorageVersion::V1_3_0 && force != "uncompressed" && valid.iter().any(|v| *v) {
+            let plain_size: usize = strings.iter().map(|string| string.len() + 4).sum();
+            let total = |segments: &Vec<Encoded>| segments.iter().map(|(bytes, _)| bytes.len()).sum::<usize>();
+            let dictionary = (force != "fsst")
+                .then(|| encode_old_dictionary(&strings, valid, self.block_size, limit))
+                .flatten()
+                .map(|segments| (segments, COMPRESSION_DICTIONARY));
+            let fsst = (force != "dictionary")
+                .then(|| SymbolTable::train(&strings))
+                .flatten()
+                .and_then(|table| encode_old_fsst(&strings, valid, self.block_size, limit, &table))
+                .map(|segments| (segments, COMPRESSION_FSST));
+            let forced = matches!(force, "dictionary" | "fsst");
+            let best = [dictionary, fsst]
+                .into_iter()
+                .flatten()
+                .filter(|(segments, _)| forced || total(segments) < plain_size)
+                .min_by_key(|(segments, _)| total(segments));
+            if let Some((encoded, compression)) = best {
+                let mut segments = Vec::with_capacity(encoded.len());
+                let mut row = 0;
+                for (bytes, rows) in encoded {
+                    let (block_id, offset) = self.place(&bytes)?;
+                    segments.push(SegmentOut {
+                        tuple_count: rows,
+                        block_id,
+                        offset,
+                        compression,
+                        stats: Stats::of_validity(&valid[row..row + rows]),
+                        overflow_blocks: Vec::new(),
+                    });
+                    row += rows;
+                }
+                return Ok(segments);
+            }
+        }
         // the Dictionary of C++ isn't written any more: forcing it gives plain strings there too; DICT_FSST
         // came with v1.3.0
         if force != "uncompressed"
@@ -1625,8 +1662,8 @@ impl<'a> Writer<'a> {
             let mut indexes = TableIndex::all_of(table, self.block_size);
             // `ART::GetSerializationFormat`: older versions have layouts of their own, which aren't written here
             if !indexes.is_empty() && self.version < StorageVersion::V2_0_0 {
-                return Err(write_not_ported(&format!(
-                    "an index into a database file of storage version {}",
+                return Err(Error::not_implemented(format!(
+                    "writing an index to a database file of storage version {} is not yet ported to duckrs",
                     self.version.display_name(false)
                 )));
             }
