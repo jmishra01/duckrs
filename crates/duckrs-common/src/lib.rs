@@ -12,6 +12,7 @@ pub mod path;
 pub mod row;
 pub mod serializer;
 pub mod sort_key;
+pub mod storage_version;
 pub mod string_cast;
 pub mod string_util;
 pub mod types;

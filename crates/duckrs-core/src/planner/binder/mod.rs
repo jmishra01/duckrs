@@ -682,6 +682,11 @@ struct AggregateBindState {
 }
 
 /// Binds statements (`Binder`).
+/// The value of a constant, as the binder makes it.
+pub(crate) fn literal_value(literal: &duckrs_parser::ast::Literal) -> Result<Value> {
+    expression::literal_to_value(literal)
+}
+
 pub struct Binder<'a> {
     catalog: &'a Catalog,
     pub options: BindOptions,

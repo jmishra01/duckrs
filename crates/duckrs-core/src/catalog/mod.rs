@@ -132,6 +132,25 @@ pub struct DatabaseListing {
     pub total_blocks: u64,
     pub free_blocks: u64,
     pub wal_size: u64,
+    /// `tags['storage_version']`, of a database in a file
+    pub storage_version: Option<String>,
+}
+
+/// `TypeVisitor`: `visit` for a type and all types in it.
+fn each_type(ty: &LogicalType, visit: &mut dyn FnMut(&LogicalType)) {
+    visit(ty);
+    match ty.id() {
+        LogicalTypeId::Struct | LogicalTypeId::Tuple | LogicalTypeId::Union => {
+            for (_, child) in ty.struct_children() {
+                each_type(child, visit);
+            }
+        }
+        _ => {
+            if let Some(child) = ty.child_type() {
+                each_type(child, visit);
+            }
+        }
+    }
 }
 
 /// What knows of all databases of a connection, as a catalog only knows of itself.
@@ -1570,6 +1589,8 @@ pub struct Catalog {
     versions: Mutex<CatalogVersions>,
     /// Whether this is the copy of a transaction, which has temporary objects of its own already.
     forked: bool,
+    /// The storage version of the file the catalog is in, if it is in one
+    storage_version: RwLock<Option<duckrs_common::serializer::StorageVersion>>,
 }
 
 thread_local! {
@@ -1627,6 +1648,57 @@ struct SchemaEntries {
 }
 
 impl Catalog {
+    /// `StorageManager::GetStorageVersion`, of a catalog in a file.
+    pub fn storage_version(&self) -> Option<duckrs_common::serializer::StorageVersion> {
+        *self.storage_version.read()
+    }
+
+    pub fn set_storage_version(&self, version: duckrs_common::serializer::StorageVersion) {
+        *self.storage_version.write() = Some(version);
+    }
+
+    /// `CheckTypeIsSupported`: what files before a storage version can't hold.
+    pub fn check_column_type(&self, ty: &LogicalType) -> Result<()> {
+        use duckrs_common::serializer::StorageVersion;
+        let Some(version) = self.storage_version() else {
+            return Ok(());
+        };
+        let unsupported = |what: &str, required: StorageVersion| {
+            Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "{what} columns are not supported in storage versions prior to {} (database {} is using storage \
+                     version {})",
+                    required.display_name(false),
+                    self.name,
+                    version.display_name(false)
+                ),
+            ))
+        };
+        let mut found = Ok(());
+        each_type(ty, &mut |ty: &LogicalType| {
+            if found.is_err() {
+                return;
+            }
+            found = match ty.id() {
+                LogicalTypeId::LegacyAggregateState if version < StorageVersion::V2_0_0 => {
+                    unsupported("Aggregate state", StorageVersion::V2_0_0)
+                }
+                LogicalTypeId::Struct if version < StorageVersion::V2_0_0 && ty.struct_children().is_empty() => {
+                    unsupported("Empty STRUCT", StorageVersion::V2_0_0)
+                }
+                LogicalTypeId::Tuple if version < StorageVersion::V2_0_0 => {
+                    unsupported("TUPLE", StorageVersion::V2_0_0)
+                }
+                LogicalTypeId::Variant if version < StorageVersion::V1_5_0 => {
+                    unsupported("VARIANT", StorageVersion::V1_5_0)
+                }
+                _ => Ok(()),
+            };
+        });
+        found
+    }
+
     /// Says who lists the databases that this one is among.
     pub fn set_database_list(&self, list: std::sync::Weak<dyn DatabaseList>) {
         *self.database_list.write() = Some(list);
@@ -1725,6 +1797,7 @@ impl Catalog {
             database_list: RwLock::new(None),
             versions: Mutex::default(),
             forked: false,
+            storage_version: RwLock::new(None),
         };
         catalog
             .schemas

@@ -110,7 +110,14 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("duckrs-buffer-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();
-        let blocks = Arc::new(SingleFileBlockManager::create(&directory.join("b.db"), 16384).unwrap());
+        let blocks = Arc::new(
+            SingleFileBlockManager::create(
+                &directory.join("b.db"),
+                16384,
+                duckrs_common::serializer::StorageVersion::DEFAULT,
+            )
+            .unwrap(),
+        );
         let size = blocks.block_size();
         for id in 0..4 {
             blocks.write_block(id, &vec![id as u8; size]).unwrap();

@@ -7,7 +7,7 @@
 use super::generated::enums::lambda_syntax_type;
 use super::generated::{FunctionArgument, OrderByNode, ParsedExpression, ResultModifier};
 use duckrs_common::Result;
-use duckrs_common::serializer::{BinaryDeserializer, BinarySerializer, Deserialize, Serialize};
+use duckrs_common::serializer::{BinaryDeserializer, BinarySerializer, Deserialize, Serialize, StorageVersion};
 use duckrs_common::types::LogicalType;
 
 type Child = Option<Box<ParsedExpression>>;
@@ -128,13 +128,18 @@ impl FunctionExpression {
     pub fn write_members(&self, s: &mut BinarySerializer) {
         s.write_property_with_default(200, "function_name", &self.function_name);
         s.write_property_with_default(201, "schema", &self.schema);
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(202, "children", &legacy_children(&self.arguments));
+        }
         s.write_property_with_default(203, "filter", &self.filter);
         s.write_property_with_default(204, "order_bys", &self.order_bys);
         s.write_property_with_default(205, "distinct", &self.distinct);
         s.write_property_with_default(206, "is_operator", &self.is_operator);
         s.write_property_with_default(207, "export_state", &self.export_state);
         s.write_property_with_default(208, "catalog", &self.catalog);
-        s.write_property_with_default(209, "arguments", &self.arguments);
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(209, "arguments", &self.arguments);
+        }
     }
 }
 
@@ -196,12 +201,27 @@ impl WindowExpression {
         s.write_property_with_default(200, "function_name", &self.function_name);
         s.write_property_with_default(201, "schema", &self.schema);
         s.write_property_with_default(202, "catalog", &self.catalog);
+        let legacy = !s.should_serialize(StorageVersion::V2_0_0);
+        if legacy {
+            s.write_property_with_default(203, "children", &legacy_children(&self.arguments));
+        }
         s.write_property_with_default(204, "partitions", &self.partitions);
         s.write_property_with_default(205, "orders", &self.orders);
         s.write_property(206, "start", &self.start);
         s.write_property(207, "end", &self.end);
         s.write_property_with_default(208, "start_expr", &self.start_expr);
         s.write_property_with_default(209, "end_expr", &self.end_expr);
+        // `SerializedOffset` and `SerializedDefault`: lead and lag have them apart before v2.0.0
+        let lead_or_lag = matches!(self.function_name.as_str(), "lead" | "lag");
+        let argument = |at: usize| -> Child {
+            if legacy && lead_or_lag {
+                self.arguments.get(at).and_then(|argument| argument.expression.clone())
+            } else {
+                None
+            }
+        };
+        s.write_property_with_default(210, "offset_expr", &argument(1));
+        s.write_property_with_default(211, "default_expr", &argument(2));
         s.write_property_with_default(212, "ignore_nulls", &self.ignore_nulls);
         s.write_property_with_default(213, "filter_expr", &self.filter_expr);
         if let Some(exclude) = &self.exclude_clause {
@@ -209,7 +229,24 @@ impl WindowExpression {
         }
         s.write_property_with_default(215, "distinct", &self.distinct);
         s.write_property_with_default(216, "arg_orders", &self.arg_orders);
-        s.write_property_with_default(217, "has_ignore_nulls", &self.has_ignore_nulls);
-        s.write_property_with_default(218, "arguments", &self.arguments);
+        if !legacy {
+            s.write_property_with_default(217, "has_ignore_nulls", &self.has_ignore_nulls);
+            s.write_property_with_default(218, "arguments", &self.arguments);
+        }
     }
+}
+
+/// The arguments of a function as files before v2.0.0 have them: expressions, named by their aliases.
+fn legacy_children(arguments: &[FunctionArgument]) -> Vec<Child> {
+    arguments
+        .iter()
+        .map(|argument| {
+            argument.expression.clone().map(|mut expression| {
+                if !argument.name.is_empty() {
+                    expression.alias.clone_from(&argument.name);
+                }
+                expression
+            })
+        })
+        .collect()
 }

@@ -2738,6 +2738,11 @@ impl Binder<'_> {
             ..info.clone()
         };
         let constraints = self.bind_table_constraints(&physical, &mut columns, &schema)?;
+        if !info.temporary {
+            for column in &columns {
+                self.catalog.check_column_type(&column.ty)?;
+            }
+        }
         let plan = LogicalOperator::new(
             LogicalOperatorKind::CreateTable {
                 schema,
@@ -2828,6 +2833,11 @@ impl Binder<'_> {
                 ty.clone()
             };
             columns.push(ColumnDefinition::new(name.clone(), ty));
+        }
+        if !info.temporary {
+            for column in &columns {
+                self.catalog.check_column_type(&column.ty)?;
+            }
         }
         let plan = LogicalOperator::new(
             LogicalOperatorKind::CreateTableAs {

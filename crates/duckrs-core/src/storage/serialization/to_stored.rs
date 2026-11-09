@@ -309,7 +309,8 @@ pub fn expression(stored: &Expr) -> Result<g::ParsedExpression> {
             class::CONSTANT,
             ty::VALUE_CONSTANT,
             K::ConstantExpression(g::ConstantExpression {
-                value: None,
+                // what files before v2.0.0 have of a constant: its value
+                value: crate::planner::binder::literal_value(value).ok(),
                 literal: Some(literal(value)),
             }),
         ),
@@ -521,9 +522,14 @@ fn cte_map(stored: &ast::CteMap) -> Result<g::CommonTableExpressionMap> {
     use enums::cte_materialize::*;
     let mut map = Vec::with_capacity(stored.0.len());
     for (name, info) in &stored.0 {
+        let node = query_node(&info.query)?;
         let info = g::CommonTableExpressionInfo {
             aliases: info.aliases.clone(),
-            query: None,
+            // what files before v2.0.0 have of the query
+            query: Some(Box::new(g::SelectStatement {
+                node: Some(Box::new(node.clone())),
+                named_param_map: Vec::new(),
+            })),
             materialized: match info.materialized {
                 ast::CteMaterialize::Default => CTE_MATERIALIZE_DEFAULT,
                 ast::CteMaterialize::Always => CTE_MATERIALIZE_ALWAYS,
@@ -531,7 +537,7 @@ fn cte_map(stored: &ast::CteMap) -> Result<g::CommonTableExpressionMap> {
             },
             key_targets: expressions(&info.key_targets)?,
             payload_aggregates: Vec::new(),
-            query_node: Some(Box::new(query_node(&info.query)?)),
+            query_node: Some(Box::new(node)),
         };
         map.push((name.clone(), Some(Box::new(info))));
     }
@@ -828,10 +834,21 @@ pub fn macro_function(
 /// The `CreateInfo` around what an entry says of itself. A file names entries by a path that starts
 /// with the catalog, and a schema by its name and an empty name for the entry.
 pub fn create_info(type_: u64, path: Vec<String>, kind: g::CreateInfoKind) -> g::CreateInfo {
+    // `QualifiedName::Catalog` and `Schema`, which files before v2.0.0 have in place of the path
+    let catalog = if path.len() >= 3 {
+        path[0].clone()
+    } else {
+        String::new()
+    };
+    let schema = if path.len() >= 2 {
+        path[path.len() - 2].clone()
+    } else {
+        String::new()
+    };
     g::CreateInfo {
         type_,
-        catalog: String::new(),
-        schema: String::new(),
+        catalog,
+        schema,
         temporary: false,
         internal: false,
         on_conflict: enums::on_create_conflict::ERROR_ON_CONFLICT,

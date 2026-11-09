@@ -21,7 +21,6 @@ use crate::catalog::Catalog;
 use block_manager::SingleFileBlockManager;
 use buffer_manager::BufferManager;
 use duckrs_common::{Error, ErrorKind, Result};
-use metadata::MetaBlockPointer;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -57,19 +56,22 @@ pub fn has_log(path: &Path) -> bool {
     std::fs::metadata(log).is_ok()
 }
 
-/// A new database file, for `load_database`.
-pub fn create_database(path: &Path, block_size: Option<u64>) -> Result<()> {
+/// A new database file in `version`, for `load_database`.
+pub fn create_database(
+    path: &Path,
+    block_size: Option<u64>,
+    version: duckrs_common::serializer::StorageVersion,
+) -> Result<()> {
     if std::fs::metadata(path).is_ok() {
         std::fs::remove_file(path).map_err(|e| Error::new(ErrorKind::Io, format!("{}: {e}", path.display())))?;
     }
     let block_size = block_size.unwrap_or(block_manager::DEFAULT_BLOCK_ALLOC_SIZE);
-    SingleFileBlockManager::create(path, block_size).map(drop)
+    SingleFileBlockManager::create(path, block_size, version).map(drop)
 }
 
-/// Whether checkpoints can go into this file: they write v2.0.0, which an older file isn't.
+/// Whether checkpoints can go into this file: in the version of the file, from v0.10.2 on.
 pub fn takes_checkpoints(buffer: &BufferManager) -> bool {
-    let header = buffer.block_manager().header();
-    !checkpoint::is_before_v2(&header) || !MetaBlockPointer::new(header.meta_block, 0).is_valid()
+    buffer.block_manager().storage_version().is_ok()
 }
 
 #[cfg(test)]

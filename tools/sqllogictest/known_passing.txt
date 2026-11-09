@@ -835,10 +835,12 @@ test/sql/attach/attach_null.test
 test/sql/attach/attach_persistent.test
 test/sql/attach/attach_pragma_storage_info.test
 test/sql/attach/attach_read_only_transaction.test
+test/sql/attach/attach_row_group_size.test
 test/sql/attach/attach_same_db.test
 test/sql/attach/attach_schema.test
 test/sql/attach/attach_serialize_dependency.test
 test/sql/attach/attach_show_all_tables.test
+test/sql/attach/attach_storage_version.test
 test/sql/attach/attach_table_constraints.test
 test/sql/attach/attach_table_ddl.test
 test/sql/attach/attach_wal_alter_sequence.test
@@ -2684,6 +2686,9 @@ test/sql/storage/append_strings_to_persistent.test
 test/sql/storage/attach/attach_invalidation_default_db.test
 test/sql/storage/bc/null_rows_v1_5_or_filter.test
 test/sql/storage/bc/test_broken_view_v092.test
+test/sql/storage/bc/test_null_stats_v1_5.test
+test/sql/storage/bc/test_slice_bounds_storage_version.test
+test/sql/storage/bc/test_slice_bounds_v1_5.test
 test/sql/storage/bc/test_view_v092.test
 test/sql/storage/catalog/generated_columns/virtual/basic.test
 test/sql/storage/catalog/generated_columns/virtual/constraints.test
@@ -2741,6 +2746,7 @@ test/sql/storage/compression/alp/alp_nulls_simple.test
 test/sql/storage/compression/alp/alp_out_of_range.test
 test/sql/storage/compression/alp/alp_simple.test
 test/sql/storage/compression/alp/alp_simple_float.test
+test/sql/storage/compression/alp/alp_storage_version.test
 test/sql/storage/compression/alp/alp_zeros.test
 test/sql/storage/compression/alprd/alprd_corrupt_count.test
 test/sql/storage/compression/alprd/alprd_corrupt_dictionary_count.test
@@ -2760,6 +2766,7 @@ test/sql/storage/compression/alprd/alprd_nulls.test
 test/sql/storage/compression/alprd/alprd_nulls_simple.test
 test/sql/storage/compression/alprd/alprd_simple.test
 test/sql/storage/compression/alprd/alprd_simple_float.test
+test/sql/storage/compression/alprd/alprd_storage_version.test
 test/sql/storage/compression/alprd/alprd_zeros.test
 test/sql/storage/compression/bitpacking/bitpacking_bool_modes.test
 test/sql/storage/compression/bitpacking/bitpacking_corrupt_count.test
@@ -2803,8 +2810,11 @@ test/sql/storage/compression/dictionary/dict_corrupted_offset.test
 test/sql/storage/compression/dictionary/dictionary_corrupt_count.test
 test/sql/storage/compression/dictionary/dictionary_corrupt_count_consistent.test
 test/sql/storage/compression/dictionary/dictionary_corrupt_null_index.test
+test/sql/storage/compression/dictionary/dictionary_empty_segment.test
 test/sql/storage/compression/fsst/fsst_corrupt_decoded_length.test
 test/sql/storage/compression/fsst/fsst_corrupt_escape_symbol_index.test
+test/sql/storage/compression/fsst/fsst_greedy_long_strings.test
+test/sql/storage/compression/fsst/fsst_small_symbol_table.test
 test/sql/storage/compression/fsst/invalid_fsst_bitpacking_width.test
 test/sql/storage/compression/fsst/issue_5675.test
 test/sql/storage/compression/fsst/issue_5675_followup.test
@@ -2853,6 +2863,10 @@ test/sql/storage/compression/roaring/roaring_run_boundaries.test
 test/sql/storage/compression/roaring/roaring_run_simple.test
 test/sql/storage/compression/roaring/roaring_smaller_than_vector.test
 test/sql/storage/compression/simple_compression.test
+test/sql/storage/compression/string/big_strings.test
+test/sql/storage/compression/string/empty.test
+test/sql/storage/compression/string/filter_pushdown.test
+test/sql/storage/compression/string/simple.test
 test/sql/storage/compression/string/string_corrupt_dict_end.test
 test/sql/storage/compression/string/string_corrupt_dict_offset.test
 test/sql/storage/compression/string/string_corrupt_int32_min.test
@@ -2871,6 +2885,14 @@ test/sql/storage/compression/zstd/fetch_row.test
 test/sql/storage/compression/zstd/nulls.test
 test/sql/storage/compression/zstd/test_skipping.test
 test/sql/storage/compression/zstd/zstd.test
+test/sql/storage/compression/zstd/zstd_corrupt_compressed_size.test
+test/sql/storage/compression/zstd/zstd_corrupt_next_page_id.test
+test/sql/storage/compression/zstd/zstd_corrupt_page_id.test
+test/sql/storage/compression/zstd/zstd_corrupt_page_offset.test
+test/sql/storage/compression/zstd/zstd_corrupt_page_offset_boundary.test
+test/sql/storage/compression/zstd/zstd_corrupt_page_offset_directory.test
+test/sql/storage/compression/zstd/zstd_corrupt_string_length.test
+test/sql/storage/compression/zstd/zstd_force_compression.test
 test/sql/storage/concurrent_attach_if_not_exists_create.test
 test/sql/storage/constraints/foreignkey/foreign_key_persistent.test
 test/sql/storage/constraints/foreignkey/foreign_key_persistent_memory_limit.test
@@ -2906,6 +2928,7 @@ test/sql/storage/mix/test_update_delete_string.test
 test/sql/storage/mix/updates_deletes_big_table.test
 test/sql/storage/mix/updates_deletes_persistent_segments.test
 test/sql/storage/multiple_clients_checkpoint_pending_updates.test
+test/sql/storage/nan_min_statistics.test
 test/sql/storage/nested/struct_of_lists_unaligned.test
 test/sql/storage/null_byte_storage.test
 test/sql/storage/optimistic_write/optimistic_write_alter_then_append.test
@@ -2948,6 +2971,8 @@ test/sql/storage/storage_exceeds_single_block.test
 test/sql/storage/storage_exceeds_single_block_strings.test
 test/sql/storage/storage_exceeds_single_block_types.test
 test/sql/storage/storage_types.test
+test/sql/storage/storage_version_65.test
+test/sql/storage/storage_versions.test
 test/sql/storage/store_group_order_all.test
 test/sql/storage/temp_directory/max_swap_space_explicit.test
 test/sql/storage/temp_directory/max_swap_space_unlimited.test
@@ -3060,6 +3085,8 @@ test/sql/storage/wal/wal_uhugeint_storage.test
 test/sql/storage/wal/wal_uuid_storage.test
 test/sql/storage/wal/wal_view_explicit_aliases_no_view_dependencies.test
 test/sql/storage/wal/wal_view_storage_no_view_dependencies.test
+test/sql/storage_version/storage_hyperloglog.test
+test/sql/storage_version/storage_version_bump.test
 test/sql/subquery/any_all/issue_2999.test
 test/sql/subquery/any_all/test_any_all.test
 test/sql/subquery/any_all/test_any_left_join_in_on_clause.test

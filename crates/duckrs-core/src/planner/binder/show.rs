@@ -1728,6 +1728,16 @@ impl Binder<'_> {
                 )
             }
             "duckdb_databases" => {
+                let tags_of = |version: Option<&str>| -> Result<Value> {
+                    let Some(version) = version else {
+                        return Ok(Value::null(tags.clone()));
+                    };
+                    let entry = Value::struct_value(vec![
+                        ("key".to_string(), text("storage_version")),
+                        ("value".to_string(), text(version)),
+                    ]);
+                    Value::new(tags.clone(), duckrs_common::value::ValueData::List(vec![entry]))
+                };
                 let database = |name: &str, oid: i64, path: Option<&str>, internal: bool, read_only: bool| {
                     vec![
                         text(name),
@@ -1750,7 +1760,8 @@ impl Binder<'_> {
                 }
                 for (index, listed) in listed.iter().enumerate() {
                     let oid = if index == 0 { 1 } else { index as i64 + 3 };
-                    let row = database(&listed.name, oid, listed.path.as_deref(), false, listed.read_only);
+                    let mut row = database(&listed.name, oid, listed.path.as_deref(), false, listed.read_only);
+                    row[4] = tags_of(listed.storage_version.as_deref())?;
                     rows.insert(index.min(rows.len()), row);
                 }
                 (

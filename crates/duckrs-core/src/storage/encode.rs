@@ -345,6 +345,176 @@ pub fn encode_dictionary(
     Some(segments)
 }
 
+/// `GetCompactionFlushLimit`: a segment that fills less of a block than this is moved to its start.
+fn compaction_limit(block_size: usize) -> usize {
+    block_size / 5 * 4
+}
+
+/// `BitpackingPrimitives::GetRequiredSize`.
+fn packed_bytes(count: usize, width: usize) -> usize {
+    count.next_multiple_of(PACKING_ROWS) * width / 8
+}
+
+/// The strings of a segment, from its end down, and where the dictionary ends (`StringDictionaryContainer`).
+/// A segment that fills a block keeps them at the end; another one ends right after them.
+fn place_dictionary(mut head: Vec<u8>, dictionary: &[u8], block_size: usize) -> (Vec<u8>, usize) {
+    let total = head.len() + dictionary.len();
+    if total >= compaction_limit(block_size) {
+        head.resize(block_size - dictionary.len(), 0);
+        head.extend_from_slice(dictionary);
+        (head, block_size)
+    } else {
+        head.extend_from_slice(dictionary);
+        (head, total)
+    }
+}
+
+/// `DictionaryCompressionCompressState`, the DICTIONARY of files before v1.3.0: per row the index of its
+/// string, where 0 is NULL, a table of where each string ends, and the strings from the end of the segment
+/// down. `None` where a string is too long for it.
+pub fn encode_old_dictionary(
+    strings: &[&[u8]],
+    valid: &[bool],
+    block_size: usize,
+    limit: usize,
+) -> Option<Vec<Encoded>> {
+    const HEADER: usize = 20;
+    let required = |count: usize, index_count: usize, dict_size: usize, width: usize| {
+        HEADER + dict_size + index_count * 4 + packed_bytes(count, width)
+    };
+    let mut segments = Vec::new();
+    let mut row = 0;
+    while row < strings.len() || segments.is_empty() {
+        let mut positions: HashMap<&[u8], u32> = HashMap::new();
+        let mut index_buffer: Vec<u32> = vec![0];
+        let mut selection: Vec<u128> = Vec::new();
+        // in the order the strings came; the segment has them the other way round
+        let mut added: Vec<&[u8]> = Vec::new();
+        let (mut dict_size, mut width) = (0usize, 0usize);
+        while row < strings.len() {
+            let string = strings[row];
+            if valid[row] && string.len() >= limit {
+                return None;
+            }
+            let known = !valid[row] || positions.contains_key(string);
+            let (new_count, new_size, new_width) = if known {
+                (index_buffer.len(), dict_size, width)
+            } else {
+                (
+                    index_buffer.len() + 1,
+                    dict_size + string.len(),
+                    bit_width(index_buffer.len() as u64),
+                )
+            };
+            if required(selection.len() + 1, new_count, new_size, new_width) > block_size {
+                if selection.is_empty() {
+                    return None;
+                }
+                break;
+            }
+            let index = if !valid[row] {
+                0
+            } else if let Some(&index) = positions.get(string) {
+                index
+            } else {
+                dict_size += string.len();
+                index_buffer.push(dict_size as u32);
+                added.push(string);
+                let index = (index_buffer.len() - 1) as u32;
+                positions.insert(string, index);
+                width = new_width;
+                index
+            };
+            selection.push(u128::from(index));
+            row += 1;
+        }
+        let count = selection.len();
+        let index_offset = HEADER + packed_bytes(count, width);
+        let mut head = vec![0u8; HEADER];
+        head.extend_from_slice(&pack(&selection, width)[..packed_bytes(count, width)]);
+        for offset in &index_buffer {
+            head.extend_from_slice(&offset.to_le_bytes());
+        }
+        let dictionary: Vec<u8> = added.iter().rev().flat_map(|string| string.iter().copied()).collect();
+        let (mut segment, dict_end) = place_dictionary(head, &dictionary, block_size);
+        for (at, value) in [dict_size, dict_end, index_offset, index_buffer.len(), width]
+            .iter()
+            .enumerate()
+        {
+            segment[at * 4..at * 4 + 4].copy_from_slice(&(*value as u32).to_le_bytes());
+        }
+        segments.push((segment, count));
+        if row >= strings.len() {
+            break;
+        }
+    }
+    Some(segments)
+}
+
+/// `FSSTCompressionState`, the FSST of files before v1.3.0: per row how long its compressed string is, the
+/// symbol table, and the strings from the end of the segment down. NULLs and empty strings have no bytes.
+pub fn encode_old_fsst(
+    strings: &[&[u8]],
+    valid: &[bool],
+    block_size: usize,
+    limit: usize,
+    table: &SymbolTable,
+) -> Option<Vec<Encoded>> {
+    const HEADER: usize = 16;
+    let symbols = table.export();
+    let mut segments = Vec::new();
+    let mut row = 0;
+    let mut entry = Vec::new();
+    while row < strings.len() || segments.is_empty() {
+        let mut lengths: Vec<u128> = Vec::new();
+        let mut added: Vec<Vec<u8>> = Vec::new();
+        let (mut dict_size, mut longest) = (0usize, 0usize);
+        while row < strings.len() {
+            let string = strings[row];
+            if valid[row] && string.len() >= limit {
+                return None;
+            }
+            if valid[row] && !string.is_empty() {
+                table.compress(string, &mut entry);
+            } else {
+                entry.clear();
+            }
+            let width = bit_width(longest.max(entry.len()) as u64);
+            let required = HEADER + dict_size + packed_bytes(lengths.len() + 1, width) + entry.len() + symbols.len();
+            if required > block_size {
+                if lengths.is_empty() {
+                    return None;
+                }
+                break;
+            }
+            longest = longest.max(entry.len());
+            dict_size += entry.len();
+            lengths.push(entry.len() as u128);
+            added.push(entry.clone());
+            row += 1;
+        }
+        let count = lengths.len();
+        let width = bit_width(longest as u64);
+        let table_offset = HEADER + packed_bytes(count, width);
+        let mut head = vec![0u8; HEADER];
+        head.extend_from_slice(&pack(&lengths, width)[..packed_bytes(count, width)]);
+        head.extend_from_slice(&symbols);
+        let dictionary: Vec<u8> = added.iter().rev().flatten().copied().collect();
+        let full = head.len() + dictionary.len() >= compaction_limit(block_size);
+        let (mut segment, dict_end) = place_dictionary(head, &dictionary, block_size);
+        // a full block keeps the dictionary of a new segment in its header (`SetDictionary` isn't called)
+        let (size_field, end_field) = if full { (0, block_size) } else { (dict_size, dict_end) };
+        for (at, value) in [size_field, end_field, width, table_offset].iter().enumerate() {
+            segment[at * 4..at * 4 + 4].copy_from_slice(&(*value as u32).to_le_bytes());
+        }
+        segments.push((segment, count));
+        if row >= strings.len() {
+            break;
+        }
+    }
+    Some(segments)
+}
+
 /// `AlpConstants::ALP_VECTOR_SIZE`.
 const ALP_VECTOR_ROWS: usize = 1024;
 /// How many values of a vector decide which of the candidates it takes.
@@ -440,7 +610,7 @@ fn alp_candidates<T: AlpFloat>(values: &[T]) -> Vec<(u8, u8)> {
         .collect()
 }
 
-fn alp_vector<T: AlpFloat>(values: &[T], raw: &[u8], candidates: &[(u8, u8)]) -> Vec<u8> {
+fn alp_vector<T: AlpFloat>(values: &[T], raw: &[u8], candidates: &[(u8, u8)], fallback: bool) -> Vec<u8> {
     const UNCOMPRESSED: u8 = 255;
     let step = (values.len() / ALP_SAMPLES).max(1);
     let sample: Vec<T> = values.iter().copied().step_by(step).collect();
@@ -469,7 +639,7 @@ fn alp_vector<T: AlpFloat>(values: &[T], raw: &[u8], candidates: &[(u8, u8)]) ->
     for &row in &exceptions {
         vector.extend_from_slice(&(row as u16).to_le_bytes());
     }
-    if vector.len() > raw.len() {
+    if fallback && vector.len() > raw.len() {
         let mut plain = vec![UNCOMPRESSED];
         plain.extend_from_slice(raw);
         return plain;
@@ -512,23 +682,24 @@ fn alp_segments(header: &[u8], vectors: Vec<(Vec<u8>, usize)>, block_size: usize
     segments
 }
 
-fn encode_alp_typed<T: AlpFloat>(data: &[u8], block_size: usize) -> Vec<Encoded> {
+fn encode_alp_typed<T: AlpFloat>(data: &[u8], block_size: usize, fallback: bool) -> Vec<Encoded> {
     let values: Vec<T> = data.chunks_exact(T::WIDTH).map(T::read).collect();
     let candidates = alp_candidates(&values);
     let vectors = values
         .chunks(ALP_VECTOR_ROWS)
         .zip(data.chunks(ALP_VECTOR_ROWS * T::WIDTH))
-        .map(|(values, raw)| (alp_vector(values, raw, &candidates), values.len()))
+        .map(|(values, raw)| (alp_vector(values, raw, &candidates, fallback), values.len()))
         .collect();
     alp_segments(&[0; 4], vectors, block_size)
 }
 
-/// `AlpCompressionState`: floats that are decimals, as integers with an exponent and a factor.
-pub fn encode_alp(data: &[u8], width: usize, block_size: usize) -> Vec<Encoded> {
+/// `AlpCompressionState`: floats that are decimals, as integers with an exponent and a factor. `fallback`:
+/// a vector that doesn't get smaller is stored as it is, which files have since v1.5.0.
+pub fn encode_alp(data: &[u8], width: usize, block_size: usize, fallback: bool) -> Vec<Encoded> {
     if width == 8 {
-        encode_alp_typed::<f64>(data, block_size)
+        encode_alp_typed::<f64>(data, block_size, fallback)
     } else {
-        encode_alp_typed::<f32>(data, block_size)
+        encode_alp_typed::<f32>(data, block_size, fallback)
     }
 }
 
@@ -547,7 +718,7 @@ fn alprd_dictionary(values: &[u64], right: usize) -> Vec<u16> {
 
 /// `AlpRDCompressionState`: the low bits as they are, and the high bits through a dictionary, which
 /// suits floats that aren't decimals. A value whose high bits aren't in it is an exception.
-pub fn encode_alprd(data: &[u8], width: usize, block_size: usize) -> Vec<Encoded> {
+pub fn encode_alprd(data: &[u8], width: usize, block_size: usize, fallback: bool) -> Vec<Encoded> {
     /// `AlpRDConstants::CUTTING_LIMIT`.
     const CUTTING_LIMIT: usize = 16;
     const UNCOMPRESSED: u16 = u16::MAX;
@@ -612,7 +783,7 @@ pub fn encode_alprd(data: &[u8], width: usize, block_size: usize) -> Vec<Encoded
             for (row, _) in &exceptions {
                 vector.extend_from_slice(&(*row as u16).to_le_bytes());
             }
-            if vector.len() > raw.len() + 1 {
+            if fallback && vector.len() > raw.len() + 1 {
                 vector = UNCOMPRESSED.to_le_bytes().to_vec();
                 vector.extend_from_slice(raw);
             }

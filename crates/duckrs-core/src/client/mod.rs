@@ -29,6 +29,7 @@ use crate::storage;
 use crate::storage::buffer_manager::BufferManager;
 use crate::storage::log_writer::WriteAheadLog;
 use duckrs_common::column_data::ColumnDataCollection;
+use duckrs_common::serializer::StorageVersion;
 use duckrs_common::sort_key::OrderType;
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
@@ -89,6 +90,8 @@ pub struct AttachOptions {
     pub read_only: bool,
     pub block_size: Option<u64>,
     pub row_group_size: Option<u64>,
+    /// `STORAGE_VERSION`, as given and as known
+    pub storage_version: Option<(String, duckrs_common::serializer::StorageVersion)>,
     /// Those of the database that it is attached to, as a log is replayed with them.
     settings: Option<Arc<RwLock<SettingValues>>>,
 }
@@ -102,6 +105,8 @@ struct DatabaseFile {
     log: Mutex<WriteAheadLog>,
     /// What this attachment asked for: a file doesn't say.
     row_group_size: u64,
+    /// `StorageManager::GetStorageVersion`: what checkpoints write
+    storage_version: duckrs_common::serializer::StorageVersion,
 }
 
 /// Why a database that came from a file takes no writes.
@@ -152,6 +157,7 @@ impl DatabaseInstance {
             read_only,
             block_size: None,
             row_group_size: None,
+            storage_version: None,
             settings: None,
         };
         Self::open_with(path, &options)
@@ -163,8 +169,11 @@ impl DatabaseInstance {
         if read_only && !storage::is_database_file(path) {
             return Ok(Self::new());
         }
+        let requested = options.storage_version.as_ref().map(|(_, version)| *version);
         if !storage::is_database_file(path) {
-            storage::create_database(path, options.block_size)?;
+            let version = requested.unwrap_or_else(|| default_storage_version(options.settings.as_ref()));
+            // checkpoints write v2.0.0 at the newest
+            storage::create_database(path, options.block_size, version.min(StorageVersion::V2_0_0))?;
         }
         let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
         let mut db = Self::with_file_access(None);
@@ -173,6 +182,42 @@ impl DatabaseInstance {
             db.settings = settings.clone();
         }
         let buffer = storage::load_database(path, &db.catalog, read_only)?;
+        // `SingleFileBlockManager::Initialize`: an explicit version can go up, not down
+        let file_version = buffer.block_manager().storage_version()?;
+        let storage_version = match requested {
+            Some(requested) if requested < file_version => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "Error opening \"{}\": cannot initialize database with storage version {} - which is lower \
+                         than what the database itself uses ({}). The storage version of an existing database cannot \
+                         be lowered.",
+                        path.display(),
+                        requested.0,
+                        file_version.0
+                    ),
+                ));
+            }
+            Some(requested) => requested,
+            None => file_version,
+        };
+        // a file in a version newer than v2.0.0 is written as v2.0.0, the newest that checkpoints write
+        let storage_version = storage_version
+            .min(StorageVersion::V2_0_0)
+            .max(file_version.min(StorageVersion::V2_0_0));
+        if let Some(size) = options.row_group_size
+            && size > 122_880
+            && storage_version < StorageVersion::V1_2_0
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "Unsupported row group size {size} - row group sizes >= 122_880 are only supported with \
+                     STORAGE_VERSION '1.2.0' or above.\nExplicitly specify a newer storage version when creating the \
+                     database to enable larger row groups"
+                ),
+            ));
+        }
         db.file_access = if read_only {
             Some(FileAccess::ReadOnly(name.clone()))
         } else if !storage::takes_checkpoints(&buffer) || db.has_foreign_indexes() {
@@ -180,7 +225,8 @@ impl DatabaseInstance {
         } else {
             None
         };
-        let log = Mutex::new(WriteAheadLog::new(&db.catalog));
+        let log = Mutex::new(WriteAheadLog::new(&db.catalog).with_version(storage_version));
+        db.catalog.set_storage_version(storage_version);
         db.file = Some(DatabaseFile {
             path: path.to_path_buf(),
             name,
@@ -189,6 +235,7 @@ impl DatabaseInstance {
             row_group_size: options
                 .row_group_size
                 .unwrap_or(crate::execution::zone_map::ROW_GROUP_SIZE as u64),
+            storage_version,
         });
         // a log that was replayed can end in anything a crash leaves, so it isn't added to: its
         // records go to the file, and the next commit starts a new one
@@ -244,8 +291,10 @@ impl DatabaseInstance {
             total_blocks: 0,
             free_blocks: 0,
             wal_size: 0,
+            storage_version: None,
         };
         if let Some(file) = &self.file {
+            listing.storage_version = Some(file.storage_version.display_name(true));
             let blocks = file.buffer.block_manager();
             listing.path = Some(file.path.display().to_string());
             listing.block_size = blocks.block_alloc_size() as u64;
@@ -302,6 +351,7 @@ impl DatabaseInstance {
             .and_then(|value| value.as_i128())
             .map_or(100, |tasks| tasks as usize);
         let options = storage::writer::CheckpointOptions {
+            storage_version: file.storage_version,
             keep_free_blocks: self.catalog.has_forks(),
             force_compression: &force,
             row_group_size: file.row_group_size,
@@ -378,14 +428,19 @@ const NO_OP_PRAGMAS: &[&str] = &[
     "disable_object_cache",
 ];
 
-fn storage_version_at_least_v2(version: &str) -> bool {
-    version == "latest"
-        || version
-            .trim_start_matches('v')
-            .split('.')
-            .next()
-            .and_then(|m| m.parse::<u32>().ok())
-            >= Some(2)
+/// The version new database files are written in: `storage_compatibility_version`, or the default.
+fn default_storage_version(settings: Option<&Arc<RwLock<SettingValues>>>) -> StorageVersion {
+    settings
+        .and_then(|settings| {
+            settings::current_value(
+                "storage_compatibility_version",
+                &settings.read(),
+                &SettingValues::default(),
+            )
+        })
+        .and_then(|value| value.try_to_string().ok())
+        .and_then(|name| StorageVersion::from_name(&name))
+        .unwrap_or(StorageVersion::DEFAULT)
 }
 
 /// Fails if an index depends on the macro `name`.
@@ -1426,8 +1481,23 @@ impl ClientContext {
                 "readonly" | "read_only" => options.read_only = text != "false",
                 "readwrite" | "read_write" => options.read_only = text == "false",
                 "type" if text == "duckdb" => {}
-                // files are written as v2.0.0, and nothing else is: an older one has to be refused
-                "storage_version" if storage_version_at_least_v2(&text) => {}
+                // `StorageCompatibility::FromString`
+                "storage_version" => {
+                    let given = value.text.clone();
+                    if given.is_empty() {
+                        return Err(Error::new(ErrorKind::InvalidInput, "Version string can not be empty"));
+                    }
+                    let Some(version) = StorageVersion::from_name(&given) else {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "The version string '{given}' is not a known DuckDB version, valid options are: {}",
+                                StorageVersion::candidates().join(", ")
+                            ),
+                        ));
+                    };
+                    options.storage_version = Some((given, version));
+                }
                 "block_size" => {
                     let size = text
                         .parse()
