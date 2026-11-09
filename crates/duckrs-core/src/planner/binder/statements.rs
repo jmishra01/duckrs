@@ -1630,7 +1630,7 @@ impl Binder<'_> {
                 // `ReplacementScan`: a file named like a table, once the catalog has no such table
                 let lower = name.name.to_lowercase();
                 if name.qualification.is_empty()
-                    && [".csv", ".tsv", ".csv.gz", ".tsv.gz"]
+                    && [".csv", ".tsv", ".csv.gz", ".tsv.gz", ".csv.zst", ".tsv.zst"]
                         .iter()
                         .any(|end| lower.ends_with(end))
                     && !crate::execution::file_system::glob(&name.name).is_empty()
@@ -1647,9 +1647,19 @@ impl Binder<'_> {
                     return self.bind_read_csv(&call, &file_ref);
                 }
                 if name.qualification.is_empty()
-                    && [".json", ".jsonl", ".ndjson", ".json.gz", ".jsonl.gz", ".ndjson.gz"]
-                        .iter()
-                        .any(|end| lower.ends_with(end))
+                    && [
+                        ".json",
+                        ".jsonl",
+                        ".ndjson",
+                        ".json.gz",
+                        ".jsonl.gz",
+                        ".ndjson.gz",
+                        ".json.zst",
+                        ".jsonl.zst",
+                        ".ndjson.zst",
+                    ]
+                    .iter()
+                    .any(|end| lower.ends_with(end))
                     && !crate::execution::file_system::glob(&name.name).is_empty()
                 {
                     let call = ast::FunctionExpr::new(

@@ -1141,6 +1141,8 @@ pub struct CsvWriteOptions {
     /// `FILE_SIZE_BYTES` and `PER_THREAD_OUTPUT`: a directory of files
     pub rotation: Option<super::parquet::Rotation>,
     pub output: super::parquet::CopyOutputOptions,
+    /// `FORMAT BLOB`: the bytes of the values, nothing else
+    pub raw_blob: bool,
 }
 
 impl Default for CsvWriteOptions {
@@ -1160,6 +1162,7 @@ impl Default for CsvWriteOptions {
             prefix: String::new(),
             suffix: String::new(),
             force_quote: Vec::new(),
+            raw_blob: false,
             partitioning: None,
             rotation: None,
             output: super::parquet::CopyOutputOptions::default(),
@@ -1265,6 +1268,14 @@ impl CsvWriteOptions {
         columns: &[usize],
         json_rows: &std::sync::atomic::AtomicU64,
     ) -> Result<()> {
+        if self.raw_blob {
+            for &row in rows {
+                if let ValueData::Bytes(bytes) = chunk.get_value(columns[0], row).data() {
+                    out.extend_from_slice(bytes);
+                }
+            }
+            return Ok(());
+        }
         if let Some(names) = &self.json_names {
             for &row in rows {
                 let mut items = Vec::with_capacity(columns.len());

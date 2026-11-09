@@ -69,7 +69,7 @@ pub enum LogicalOperatorKind {
         path: String,
         names: Vec<String>,
         options: crate::execution::csv::CsvWriteOptions,
-        gzip: bool,
+        compression: crate::execution::file_system::Compression,
     },
     /// `LogicalEmptyResult`: no rows, with the columns of the plan it replaced.
     EmptyResult {

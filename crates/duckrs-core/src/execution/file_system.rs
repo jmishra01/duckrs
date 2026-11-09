@@ -190,7 +190,8 @@ pub fn read_file(path: &str, compression: Compression) -> Result<Vec<u8>> {
                 .map_err(|e| io_error(format!("Failed to decompress GZIP file \"{path}\": {e}")))?;
             Ok(result)
         }
-        Compression::Zstd => Err(crate::unported("reading zstd files")),
+        Compression::Zstd => zstd::stream::decode_all(data.as_slice())
+            .map_err(|e| io_error(format!("Failed to decompress ZSTD file \"{path}\": {e}"))),
         _ => Ok(data),
     }
 }

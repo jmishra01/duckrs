@@ -1096,6 +1096,23 @@ impl Binder<'_> {
         } else {
             info.format.to_lowercase()
         };
+        let known = matches!(
+            format.as_str(),
+            "csv" | "tsv" | "auto" | "json" | "ndjson" | "jsonl" | "blob"
+        );
+        // a format taken from the file's extension that no COPY function has is CSV
+        let format = if !known && !info.format_given {
+            "csv".to_string()
+        } else {
+            format
+        };
+        if format == "blob" {
+            if info.is_from {
+                return Err(binder_error("COPY FROM is not supported for FORMAT BLOB"));
+            }
+            self.copy_json = false;
+            return Ok((path, false));
+        }
         if !matches!(format.as_str(), "csv" | "tsv" | "auto" | "json" | "ndjson" | "jsonl") {
             return Err(crate::unported(format!("COPY with the format {format}")));
         }
@@ -1210,6 +1227,9 @@ impl Binder<'_> {
         let (path, tsv) = self.copy_target(info)?;
         if !info.is_from {
             verify_not_extension(&path)?;
+        }
+        if !info.is_from && info.format.eq_ignore_ascii_case("blob") {
+            return self.bind_copy_to_blob(info, path);
         }
         if info.is_from {
             self.bind_copy_from(info, &path, tsv)
@@ -1354,6 +1374,88 @@ impl Binder<'_> {
     }
 
     /// `Binder::BindCopyTo`.
+    /// `WriteBlobBind`: the bytes of a single BLOB column, one value after the other.
+    fn bind_copy_to_blob(&mut self, info: &CopyInfo, path: String) -> Result<BoundStatement> {
+        let select = self.copy_to_select(info)?;
+        let bound = self.bind_select_statement(&select)?;
+        if bound.types.len() != 1 || bound.types[0].id() != LogicalTypeId::Blob {
+            return Err(binder_error(
+                "\"COPY (FORMAT BLOB)\" only supports a single BLOB column",
+            ));
+        }
+        let mut compression = Compression::Auto;
+        let valueless = info
+            .options
+            .iter()
+            .filter(|(_, values)| values.is_empty())
+            .map(|(name, _)| name.to_lowercase())
+            .chain(
+                info.parsed_options
+                    .iter()
+                    .filter(|(_, e)| e.is_none())
+                    .map(|(n, _)| n.to_lowercase()),
+            )
+            .collect::<Vec<_>>();
+        for (name, value) in self.copy_options(info)? {
+            if name == "compression" && valueless.contains(&name) {
+                return Err(binder_error(format!(
+                    "COPY (FORMAT BLOB) option {} requires a value",
+                    sql_identifier(&name)
+                )));
+            }
+            match name.as_str() {
+                "format" => {}
+                "compression" => {
+                    // `ParseStringOption`
+                    let mut value = value;
+                    if let ValueData::List(items) = value.data() {
+                        if items.len() != 1 {
+                            return Err(binder_error(format!(
+                                "{name} expects a single argument as a string value"
+                            )));
+                        }
+                        value = items[0].clone();
+                    }
+                    if value.logical_type().id() != LogicalTypeId::Varchar {
+                        return Err(binder_error(format!("{name} expects a string argument!")));
+                    }
+                    compression = Compression::parse(&text(&value)?)?;
+                }
+                _ => {
+                    return Err(binder_error(format!(
+                        "Unrecognized option for COPY (FORMAT BLOB): {}",
+                        sql_identifier(&name)
+                    )));
+                }
+            }
+        }
+        let compression = compression.for_path(&path);
+        let options = CsvWriteOptions {
+            raw_blob: true,
+            header: false,
+            new_line: String::new(),
+            ..Default::default()
+        };
+        let (result_names, return_type) = copy_result(&options.output);
+        let result_types = options.output.types();
+        let plan = LogicalOperator::new(
+            LogicalOperatorKind::CopyToFile {
+                path,
+                names: bound.names.clone(),
+                options,
+                compression,
+            },
+            vec![bound.plan],
+        );
+        Ok(BoundStatement {
+            plan,
+            names: result_names,
+            types: result_types,
+            column_aliases: Vec::new(),
+            return_type,
+        })
+    }
+
     fn bind_copy_to(&mut self, info: &CopyInfo, path: String, tsv: bool) -> Result<BoundStatement> {
         let select = self.copy_to_select(info)?;
         let mut options = CsvWriteOptions::default();
@@ -1449,12 +1551,11 @@ impl Binder<'_> {
         }
         options.force_quote = force_quote;
         let compression = compression.for_path(&path);
-        if compression == Compression::Zstd {
-            return Err(crate::unported("writing zstd files"));
-        }
         let mut extension = if self.copy_json { "json" } else { "csv" }.to_string();
-        if compression == Compression::Gzip {
-            extension += ".gz";
+        match compression {
+            Compression::Gzip => extension += ".gz",
+            Compression::Zstd => extension += ".zst",
+            _ => {}
         }
         options.partitioning = partition.bind(&path, &bound.names, &extension)?;
         self.bind_partition_path(
@@ -1475,7 +1576,7 @@ impl Binder<'_> {
                 path,
                 names: bound.names.clone(),
                 options,
-                gzip: compression == Compression::Gzip,
+                compression,
             },
             vec![bound.plan],
         );

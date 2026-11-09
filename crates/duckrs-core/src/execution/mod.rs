@@ -167,8 +167,15 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             path,
             names,
             options,
-            gzip,
-        } => Box::new(PhysicalCopyToFile::new(types, path, names, options, children, gzip)),
+            compression,
+        } => Box::new(PhysicalCopyToFile::new(
+            types,
+            path,
+            names,
+            options,
+            children,
+            compression,
+        )),
         LogicalOperatorKind::Range {
             start,
             increment,
