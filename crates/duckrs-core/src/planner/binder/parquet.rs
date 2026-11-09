@@ -472,9 +472,36 @@ impl Binder<'_> {
             };
             match name.as_str() {
                 "format" | "use_tmp_file" | "preserve_order" | "order_by" => {}
-                "compression" | "codec" => compression = Some(value.try_to_string()?),
+                "compression" | "codec" => {
+                    if value.logical_type().id() == LogicalTypeId::Boolean {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            format!("Copy option \"{name}\" requires an argument"),
+                        ));
+                    }
+                    if value.logical_type().id() != LogicalTypeId::Varchar {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "Copy option \"{name}\" expected an argument of type VARCHAR - the argument \"{}\" of \
+                                 type {} could not be cast as this type",
+                                value.try_to_string()?,
+                                value.logical_type()
+                            ),
+                        ));
+                    }
+                    compression = Some((name.clone(), value.try_to_string()?));
+                }
                 "compression_level" => level = Some(number()? as i32),
-                "row_group_size" | "chunk_size" => writer.row_group_size = number()?.max(1) as usize,
+                "row_group_size" | "chunk_size" => {
+                    if value.as_i128().is_some_and(|n| n >= i128::from(u64::MAX)) {
+                        return Err(binder_error(format!(
+                            "BATCH_SIZE/ROW_GROUP_SIZE value {} is too large",
+                            value.try_to_string()?
+                        )));
+                    }
+                    writer.row_group_size = number()?.max(1) as usize;
+                }
                 "row_group_size_bytes" => writer.row_group_size_bytes = Some(bytes()?),
                 "bloom_filter_fallback_max_bytes" => {
                     writer.bloom_filter_fallback_max_bytes = parse_bytes_argument(&name, &value)?;
@@ -537,6 +564,16 @@ impl Binder<'_> {
                 }
                 "write_timestamp_as_int96" => writer.timestamp_as_int96 = is_true(&value, &name)?,
                 "parquet_version" => {
+                    // an option without a value is `true`, which is no VARCHAR
+                    if value.logical_type().id() == LogicalTypeId::Boolean {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "Copy option \"{name}\" expected an argument of type VARCHAR - the argument \"true\" of \
+                                 type BOOLEAN could not be cast as this type"
+                            ),
+                        ));
+                    }
                     writer.version = match value.try_to_string()?.to_uppercase().as_str() {
                         "V1" => 1,
                         "V2" => 2,
@@ -568,8 +605,13 @@ impl Binder<'_> {
                 _ => return Err(crate::unported(format!("the COPY option {name} for Parquet"))),
             }
         }
-        if let Some(name) = compression {
-            writer.codec = parse_compression(&name, level)?;
+        if let Some((option, name)) = compression {
+            writer.codec = parse_compression(&name, level).map_err(|_| {
+                binder_error(format!(
+                    "Expected \"{option}\" argument to be any of [uncompressed, brotli, gzip, snappy, lz4, lz4_raw or \
+                     zstd]"
+                ))
+            })?;
         }
         // `DEFAULT_DATA_PAGE_SIZE_LIMIT`: with the page index, pages of 1 MiB; without, one per column chunk
         writer.data_page_size_limit = page_size_limit.unwrap_or(if writer.write_page_index {

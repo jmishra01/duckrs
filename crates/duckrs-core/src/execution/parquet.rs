@@ -2151,12 +2151,55 @@ pub fn metadata_rows(path: &str) -> Result<Vec<String>> {
     Ok(rows)
 }
 
+/// `ParquetLogicalTypeToString`: the Thrift `printTo` of the member of the union that is set.
+fn logical_type_text(logical: &parquet::basic::LogicalType) -> Option<String> {
+    use parquet::basic::{LogicalType as L, TimeUnit as U};
+    let unit = |unit: &U| {
+        let (millis, micros, nanos) = match unit {
+            U::MILLIS => ("MilliSeconds()", "<null>", "<null>"),
+            U::MICROS => ("<null>", "MicroSeconds()", "<null>"),
+            U::NANOS => ("<null>", "<null>", "NanoSeconds()"),
+        };
+        format!("TimeUnit(MILLIS={millis}, MICROS={micros}, NANOS={nanos})")
+    };
+    Some(match logical {
+        L::String => "StringType()".to_string(),
+        L::Map => "MapType()".to_string(),
+        L::List => "ListType()".to_string(),
+        L::Enum => "EnumType()".to_string(),
+        L::Decimal(decimal) => format!("DecimalType(scale={}, precision={})", decimal.scale, decimal.precision),
+        L::Date => "DateType()".to_string(),
+        L::Time(time) => format!(
+            "TimeType(isAdjustedToUTC={}, unit={})",
+            u8::from(time.is_adjusted_to_u_t_c),
+            unit(&time.unit)
+        ),
+        L::Timestamp(ts) => format!(
+            "TimestampType(isAdjustedToUTC={}, unit={})",
+            u8::from(ts.is_adjusted_to_u_t_c),
+            unit(&ts.unit)
+        ),
+        L::Integer(int) => format!(
+            "IntType(bitWidth={}, isSigned={})",
+            int.bit_width,
+            u8::from(int.is_signed)
+        ),
+        L::Unknown => "NullType()".to_string(),
+        L::Json => "JsonType()".to_string(),
+        L::Bson => "BsonType()".to_string(),
+        L::Uuid => "UUIDType()".to_string(),
+        L::Float16 => "Float16Type()".to_string(),
+        // C++ has no text for the others
+        _ => return None,
+    })
+}
+
 fn schema_rows(ty: &Type, path: &str, column: &mut i64, rows: &mut Vec<String>) {
     let info = ty.get_basic_info();
     let repetition = info.has_repetition().then(|| info.repetition().to_string());
     let converted = info.converted_type();
     let converted = (converted != parquet::basic::ConvertedType::NONE).then(|| converted.to_string());
-    let logical = info.logical_type_ref().map(|t| format!("{t:?}"));
+    let logical = info.logical_type_ref().and_then(logical_type_text);
     let id = info.has_id().then(|| i64::from(info.id()));
     let (physical, length, scale, precision, children, id_of_column) = match ty {
         Type::PrimitiveType {
