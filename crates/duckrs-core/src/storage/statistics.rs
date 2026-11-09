@@ -109,7 +109,18 @@ fn read_type_stats(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>) -> 
     let Some(ty) = ty.filter(|ty| ty.id() != LogicalTypeId::SqlNull) else {
         return Ok(None);
     };
-    if matches!(ty.id(), LogicalTypeId::Geometry | LogicalTypeId::Variant) {
+    if ty.id() == LogicalTypeId::Variant {
+        let state: u8 = d.read_property(200, "shredding_state")?;
+        if state != 1 {
+            return Err(Error::not_implemented(
+                "reading a shredded VARIANT column from a database file is not yet ported to duckrs",
+            ));
+        }
+        let unshredded = duckrs_common::variant::unshredded_type();
+        d.read_object_field(225, "unshredded_stats", |d| read_statistics(d, Some(&unshredded)))?;
+        return Ok(None);
+    }
+    if ty.id() == LogicalTypeId::Geometry {
         return Err(Error::not_implemented(format!(
             "reading a {} column from a database file is not yet ported to duckrs",
             ty.id().name()

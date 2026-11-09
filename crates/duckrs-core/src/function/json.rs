@@ -851,6 +851,36 @@ pub fn value_to_json(value: &Value) -> Result<Json> {
     })
 }
 
+/// `ConvertJSON` of `json_to_variant.hpp`: of a repeated key, the last value counts.
+fn json_to_variant(json: &Json) -> Result<duckrs_common::variant::VariantNode> {
+    use duckrs_common::variant::VariantNode;
+    Ok(match json {
+        Json::Null => VariantNode::Null,
+        Json::Bool(flag) => VariantNode::Scalar(Value::boolean(*flag)),
+        Json::UInt(x) => VariantNode::Scalar(Value::ubigint(*x)),
+        Json::Int(x) => VariantNode::Scalar(Value::bigint(*x)),
+        Json::Real(x) => VariantNode::Scalar(Value::double(*x)),
+        Json::Raw(text) => match text.parse::<f64>() {
+            Ok(x) => VariantNode::Scalar(Value::double(x)),
+            Err(_) => return Err(invalid(format!("Unable to cast '{text}' to VARIANT"))),
+        },
+        Json::Str(text) => VariantNode::Scalar(Value::varchar(text.as_str())),
+        Json::Array(items) => VariantNode::Array(items.iter().map(json_to_variant).collect::<Result<_>>()?),
+        Json::Object(items) => {
+            let mut children: Vec<(String, VariantNode)> = Vec::with_capacity(items.len());
+            for (key, item) in items {
+                let node = json_to_variant(item)?;
+                match children.iter_mut().find(|(k, _)| k == key) {
+                    Some(entry) => entry.1 = node,
+                    None => children.push((key.clone(), node)),
+                }
+            }
+            children.sort_by(|a, b| a.0.cmp(&b.0));
+            VariantNode::Object(children)
+        }
+    })
+}
+
 /// A value cast through the engine's casts, or `None` if it doesn't fit.
 fn cast_value(value: &Value, ty: &LogicalType) -> Option<Value> {
     let mut source = Vector::new(value.logical_type().clone(), 1);
@@ -886,6 +916,10 @@ pub fn transform_with(json: &Json, ty: &LogicalType, strict: bool, formats: &For
     }
     if is_json_type(ty) {
         return Value::varchar(json.text()).reinterpret(ty);
+    }
+    if ty.id() == LogicalTypeId::Variant {
+        let node = json_to_variant(json)?;
+        return Value::new(ty.clone(), ValueData::Bytes(node.encode()));
     }
     match (ty.id(), json) {
         (LogicalTypeId::SqlNull, _) => Ok(Value::null(ty.clone())),

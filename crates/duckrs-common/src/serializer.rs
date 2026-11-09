@@ -803,6 +803,8 @@ impl Serialize for LogicalType {
             let info_type = match self.id() {
                 // `StringTypeInfo`: a VARCHAR's collation
                 LogicalTypeId::Varchar if self.collation().is_some() => Some(type_info::STRING),
+                // `CreateVariantTypeInfo`: the STRUCT it is stored as
+                LogicalTypeId::Variant => Some(type_info::STRUCT),
                 _ if !self.has_params() && self.alias().is_none() => None,
                 LogicalTypeId::Decimal => Some(type_info::DECIMAL),
                 LogicalTypeId::List | LogicalTypeId::Map => Some(type_info::LIST),
@@ -831,6 +833,10 @@ impl Serialize for LogicalType {
                     type_info::ARRAY => {
                         s.write_property(200, "child_type", self.child_type().expect("ARRAY has a child"));
                         s.write_property_with_default(201, "size", &self.array_size().expect("ARRAY has a size"));
+                    }
+                    type_info::STRUCT if self.id() == LogicalTypeId::Variant => {
+                        let children = crate::variant::unshredded_type().struct_children().to_vec();
+                        s.write_property_with_default(200, "child_types", &children);
                     }
                     type_info::STRUCT => {
                         let children: Vec<(String, LogicalType)> = self.struct_children().to_vec();
@@ -901,6 +907,7 @@ impl Deserialize for LogicalType {
                         let children: Vec<(String, LogicalType)> = d.read_property_with_default(200, "child_types")?;
                         match id {
                             LogicalTypeId::Union => LogicalType::union_type(children.into_iter().skip(1).collect()),
+                            LogicalTypeId::Variant => LogicalType::new(LogicalTypeId::Variant),
                             _ => {
                                 // Unnamed structs written for older versions read back as TUPLE.
                                 if id == LogicalTypeId::Struct

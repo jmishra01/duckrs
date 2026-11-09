@@ -339,6 +339,464 @@ impl Reader<'_> {
     }
 }
 
+/// `VariantLogicalType`: how DuckDB's physical layout tags a value.
+mod physical_type {
+    pub const NULL: u8 = 0;
+    pub const BOOL_TRUE: u8 = 1;
+    pub const BOOL_FALSE: u8 = 2;
+    pub const DECIMAL: u8 = 15;
+    pub const OBJECT: u8 = 29;
+    pub const ARRAY: u8 = 30;
+}
+
+/// The scalar types of `VariantLogicalType`, by their tag; `None` where the tag is no plain scalar.
+fn scalar_type_of_tag(tag: u8) -> Option<LogicalTypeId> {
+    use LogicalTypeId::*;
+    Some(match tag {
+        3 => TinyInt,
+        4 => SmallInt,
+        5 => Integer,
+        6 => BigInt,
+        7 => HugeInt,
+        8 => UTinyInt,
+        9 => USmallInt,
+        10 => UInteger,
+        11 => UBigInt,
+        12 => UHugeInt,
+        13 => Float,
+        14 => Double,
+        16 => Varchar,
+        17 => Blob,
+        18 => Uuid,
+        19 => Date,
+        20 => Time,
+        21 => TimeNs,
+        22 => TimestampSec,
+        23 => TimestampMs,
+        24 => Timestamp,
+        25 => TimestampNs,
+        26 => TimeTz,
+        27 => TimestampTz,
+        28 => Interval,
+        31 => Bignum,
+        32 => Bit,
+        34 => TimestampTzNs,
+        _ => return None,
+    })
+}
+
+fn tag_of_scalar_type(id: LogicalTypeId) -> Option<u8> {
+    (0..=34u8).find(|tag| scalar_type_of_tag(*tag) == Some(id))
+}
+
+/// `VarintEncode`: 7 bits at a time, the low ones first.
+fn varint(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn read_varint(bytes: &[u8], at: &mut usize) -> Result<u64> {
+    let mut result = 0u64;
+    let mut shift = 0;
+    loop {
+        let byte = *bytes.get(*at).ok_or_else(corrupt_variant)?;
+        *at += 1;
+        result |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(result);
+        }
+        shift += 7;
+        if shift >= 64 {
+            return Err(corrupt_variant());
+        }
+    }
+}
+
+fn corrupt_variant() -> Error {
+    Error::new(
+        ErrorKind::Serialization,
+        "Corrupted VARIANT value: the data is out of range",
+    )
+}
+
+/// The type DuckDB stores a VARIANT as (`VariantShredding::GetUnshreddedType`): per row its keys, the children
+/// of its objects and arrays, its values, and their data.
+pub fn unshredded_type() -> LogicalType {
+    LogicalType::struct_type(vec![
+        ("keys".to_string(), LogicalType::list(LogicalType::VARCHAR)),
+        (
+            "children".to_string(),
+            LogicalType::list(LogicalType::struct_type(vec![
+                ("keys_index".to_string(), LogicalType::UINTEGER),
+                ("values_index".to_string(), LogicalType::UINTEGER),
+            ])),
+        ),
+        (
+            "values".to_string(),
+            LogicalType::list(LogicalType::struct_type(vec![
+                ("type_id".to_string(), LogicalType::UTINYINT),
+                ("byte_offset".to_string(), LogicalType::UINTEGER),
+            ])),
+        ),
+        ("data".to_string(), LogicalType::BLOB),
+    ])
+}
+
+/// What one row of a VARIANT holds in DuckDB's layout.
+#[derive(Debug, Default)]
+struct Physical {
+    keys: Vec<String>,
+    children: Vec<(Option<u32>, u32)>,
+    values: Vec<(u8, u32)>,
+    data: Vec<u8>,
+}
+
+impl Physical {
+    fn emit(&mut self, node: &VariantNode) -> Result<u32> {
+        let index = self.values.len() as u32;
+        self.values.push((physical_type::NULL, self.data.len() as u32));
+        let offset = self.data.len() as u32;
+        let tag = match node {
+            VariantNode::Null => physical_type::NULL,
+            VariantNode::Array(items) => {
+                self.container(items.iter().map(|item| (None, item)).collect())?;
+                physical_type::ARRAY
+            }
+            VariantNode::Object(entries) => {
+                let mut children = Vec::with_capacity(entries.len());
+                for (key, child) in entries {
+                    let key_index = self.keys.binary_search(key).map_err(|_| corrupt_variant())? as u32;
+                    children.push((Some(key_index), child));
+                }
+                self.container(children)?;
+                physical_type::OBJECT
+            }
+            VariantNode::Scalar(value) => self.scalar(value)?,
+        };
+        self.values[index as usize] = (tag, offset);
+        Ok(index)
+    }
+
+    /// `WriteContainerData`: how many children, and where they start.
+    fn container(&mut self, children: Vec<(Option<u32>, &VariantNode)>) -> Result<()> {
+        let start = self.children.len();
+        varint(&mut self.data, children.len() as u64);
+        if !children.is_empty() {
+            varint(&mut self.data, start as u64);
+        }
+        self.children.extend(children.iter().map(|(key, _)| (*key, 0)));
+        for (i, (_, child)) in children.into_iter().enumerate() {
+            let value = self.emit(child)?;
+            self.children[start + i].1 = value;
+        }
+        Ok(())
+    }
+
+    fn scalar(&mut self, value: &Value) -> Result<u8> {
+        let ty = value.logical_type();
+        let out = &mut self.data;
+        if ty.id() == LogicalTypeId::Boolean {
+            return Ok(if *value == Value::boolean(true) {
+                physical_type::BOOL_TRUE
+            } else {
+                physical_type::BOOL_FALSE
+            });
+        }
+        if ty.id() == LogicalTypeId::Decimal {
+            let (width, scale) = ty.decimal_properties().expect("DECIMAL has properties");
+            varint(out, u64::from(width));
+            varint(out, u64::from(scale));
+            let unscaled = value.as_i128().unwrap_or(0);
+            match width {
+                0..=4 => out.extend_from_slice(&(unscaled as i16).to_le_bytes()),
+                5..=9 => out.extend_from_slice(&(unscaled as i32).to_le_bytes()),
+                10..=18 => out.extend_from_slice(&(unscaled as i64).to_le_bytes()),
+                _ => out.extend_from_slice(&unscaled.to_le_bytes()),
+            }
+            return Ok(physical_type::DECIMAL);
+        }
+        let tag = tag_of_scalar_type(ty.id()).ok_or_else(|| {
+            Error::new(
+                ErrorKind::NotImplemented,
+                format!("storing {ty} in a VARIANT is not yet ported to duckrs"),
+            )
+        })?;
+        match value.data() {
+            ValueData::Int8(v) => out.extend_from_slice(&v.to_le_bytes()),
+            ValueData::Int16(v) => out.extend_from_slice(&v.to_le_bytes()),
+            ValueData::Int32(v) => out.extend_from_slice(&v.to_le_bytes()),
+            ValueData::Int64(v) => out.extend_from_slice(&v.to_le_bytes()),
+            ValueData::Int128(v) => out.extend_from_slice(&v.to_le_bytes()),
+            ValueData::UInt8(v) => out.extend_from_slice(&v.to_le_bytes()),
+            ValueData::UInt16(v) => out.extend_from_slice(&v.to_le_bytes()),
+            ValueData::UInt32(v) => out.extend_from_slice(&v.to_le_bytes()),
+            ValueData::UInt64(v) => out.extend_from_slice(&v.to_le_bytes()),
+            ValueData::UInt128(v) => out.extend_from_slice(&v.to_le_bytes()),
+            ValueData::Float(v) => out.extend_from_slice(&v.to_le_bytes()),
+            ValueData::Double(v) => out.extend_from_slice(&v.to_le_bytes()),
+            ValueData::Interval(v) => {
+                out.extend_from_slice(&v.months.to_le_bytes());
+                out.extend_from_slice(&v.days.to_le_bytes());
+                out.extend_from_slice(&v.micros.to_le_bytes());
+            }
+            ValueData::Bytes(bytes) => {
+                varint(out, bytes.len() as u64);
+                out.extend_from_slice(bytes);
+            }
+            _ => return Err(corrupt_variant()),
+        }
+        Ok(tag)
+    }
+
+    fn node(&self, value: u32, depth: usize) -> Result<VariantNode> {
+        if depth > 1000 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "VARIANT value is nested too deeply",
+            ));
+        }
+        let &(tag, offset) = self.values.get(value as usize).ok_or_else(corrupt_variant)?;
+        let mut at = offset as usize;
+        let data = &self.data;
+        let take = |at: &mut usize, size: usize| -> Result<&[u8]> {
+            let slice = data.get(*at..*at + size).ok_or_else(corrupt_variant)?;
+            *at += size;
+            Ok(slice)
+        };
+        Ok(match tag {
+            physical_type::NULL => VariantNode::Null,
+            physical_type::BOOL_TRUE => VariantNode::Scalar(Value::boolean(true)),
+            physical_type::BOOL_FALSE => VariantNode::Scalar(Value::boolean(false)),
+            physical_type::ARRAY | physical_type::OBJECT => {
+                let count = read_varint(data, &mut at)? as usize;
+                let start = if count > 0 {
+                    read_varint(data, &mut at)? as usize
+                } else {
+                    0
+                };
+                let mut array = Vec::new();
+                let mut object = Vec::new();
+                for i in 0..count {
+                    let &(key, child) = self.children.get(start + i).ok_or_else(corrupt_variant)?;
+                    let child = self.node(child, depth + 1)?;
+                    if tag == physical_type::ARRAY {
+                        array.push(child);
+                    } else {
+                        let key = key
+                            .and_then(|key| self.keys.get(key as usize))
+                            .ok_or_else(corrupt_variant)?;
+                        object.push((key.clone(), child));
+                    }
+                }
+                if tag == physical_type::ARRAY {
+                    VariantNode::Array(array)
+                } else {
+                    object.sort_by(|a, b| a.0.cmp(&b.0));
+                    VariantNode::Object(object)
+                }
+            }
+            physical_type::DECIMAL => {
+                let width = read_varint(data, &mut at)? as u8;
+                let scale = read_varint(data, &mut at)? as u8;
+                let unscaled = match width {
+                    0..=4 => i128::from(i16::from_le_bytes(take(&mut at, 2)?.try_into().expect("2 bytes"))),
+                    5..=9 => i128::from(i32::from_le_bytes(take(&mut at, 4)?.try_into().expect("4 bytes"))),
+                    10..=18 => i128::from(i64::from_le_bytes(take(&mut at, 8)?.try_into().expect("8 bytes"))),
+                    _ => i128::from_le_bytes(take(&mut at, 16)?.try_into().expect("16 bytes")),
+                };
+                VariantNode::Scalar(Value::decimal(unscaled, width, scale)?)
+            }
+            tag => {
+                let id = scalar_type_of_tag(tag).ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::NotImplemented,
+                        format!("VARIANT values of type {tag} are not yet ported to duckrs"),
+                    )
+                })?;
+                let ty = LogicalType::new(id);
+                use crate::types::PhysicalType as P;
+                let data = match ty.physical_type() {
+                    P::Int8 => ValueData::Int8(i8::from_le_bytes(take(&mut at, 1)?.try_into().expect("1"))),
+                    P::Int16 => ValueData::Int16(i16::from_le_bytes(take(&mut at, 2)?.try_into().expect("2"))),
+                    P::Int32 => ValueData::Int32(i32::from_le_bytes(take(&mut at, 4)?.try_into().expect("4"))),
+                    P::Int64 => ValueData::Int64(i64::from_le_bytes(take(&mut at, 8)?.try_into().expect("8"))),
+                    P::Int128 => ValueData::Int128(i128::from_le_bytes(take(&mut at, 16)?.try_into().expect("16"))),
+                    P::UInt8 => ValueData::UInt8(take(&mut at, 1)?[0]),
+                    P::UInt16 => ValueData::UInt16(u16::from_le_bytes(take(&mut at, 2)?.try_into().expect("2"))),
+                    P::UInt32 => ValueData::UInt32(u32::from_le_bytes(take(&mut at, 4)?.try_into().expect("4"))),
+                    P::UInt64 => ValueData::UInt64(u64::from_le_bytes(take(&mut at, 8)?.try_into().expect("8"))),
+                    P::UInt128 => ValueData::UInt128(u128::from_le_bytes(take(&mut at, 16)?.try_into().expect("16"))),
+                    P::Float => ValueData::Float(f32::from_le_bytes(take(&mut at, 4)?.try_into().expect("4"))),
+                    P::Double => ValueData::Double(f64::from_le_bytes(take(&mut at, 8)?.try_into().expect("8"))),
+                    P::Interval => {
+                        let raw = take(&mut at, 16)?;
+                        let months = i32::from_le_bytes(raw[0..4].try_into().expect("4"));
+                        let days = i32::from_le_bytes(raw[4..8].try_into().expect("4"));
+                        let micros = i64::from_le_bytes(raw[8..16].try_into().expect("8"));
+                        ValueData::Interval(crate::types::Interval::new(months, days, micros))
+                    }
+                    _ => {
+                        let length = read_varint(data, &mut at)? as usize;
+                        ValueData::Bytes(take(&mut at, length)?.to_vec())
+                    }
+                };
+                VariantNode::Scalar(Value::new(ty, data)?)
+            }
+        })
+    }
+}
+
+impl VariantNode {
+    fn collect_keys(&self, keys: &mut std::collections::BTreeSet<String>) {
+        match self {
+            Self::Object(entries) => {
+                for (key, child) in entries {
+                    keys.insert(key.clone());
+                    child.collect_keys(keys);
+                }
+            }
+            Self::Array(items) => items.iter().for_each(|item| item.collect_keys(keys)),
+            _ => {}
+        }
+    }
+
+    /// The row of [`unshredded_type`] that DuckDB stores this value as. A NULL at the top is a NULL row.
+    pub fn to_unshredded(&self) -> Result<Value> {
+        let ty = unshredded_type();
+        if *self == Self::Null {
+            return Ok(Value::null(ty));
+        }
+        let mut keys = std::collections::BTreeSet::new();
+        self.collect_keys(&mut keys);
+        let mut physical = Physical {
+            keys: keys.into_iter().collect(),
+            ..Physical::default()
+        };
+        physical.emit(self)?;
+        let fields = ty.struct_children();
+        let child_of = |at: usize| fields[at].1.child_type().cloned().expect("a list");
+        let keys = Value::list(
+            LogicalType::VARCHAR,
+            physical.keys.iter().map(|k| Value::varchar(k.as_str())).collect(),
+        )?;
+        let children_type = child_of(1);
+        let children = physical
+            .children
+            .iter()
+            .map(|(key, value)| {
+                Value::new(
+                    children_type.clone(),
+                    ValueData::Struct(vec![
+                        key.map_or_else(|| Value::null(LogicalType::UINTEGER), Value::uinteger),
+                        Value::uinteger(*value),
+                    ]),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let values_type = child_of(2);
+        let values = physical
+            .values
+            .iter()
+            .map(|(tag, offset)| {
+                Value::new(
+                    values_type.clone(),
+                    ValueData::Struct(vec![Value::utinyint(*tag), Value::uinteger(*offset)]),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Value::new(
+            ty,
+            ValueData::Struct(vec![
+                keys,
+                Value::list(children_type, children)?,
+                Value::list(values_type, values)?,
+                Value::blob(physical.data.as_slice()),
+            ]),
+        )
+    }
+
+    /// A row of [`unshredded_type`] back as a value; a NULL row is a NULL.
+    pub fn from_unshredded(row: &Value) -> Result<Self> {
+        let ValueData::Struct(fields) = row.data() else {
+            return Ok(Self::Null);
+        };
+        let list = |at: usize| -> Result<&[Value]> {
+            match fields.get(at).map(Value::data) {
+                Some(ValueData::List(items)) => Ok(items),
+                _ => Err(corrupt_variant()),
+            }
+        };
+        let u32_of = |value: &Value| -> Option<u32> { value.as_i128().map(|v| v as u32) };
+        let pair = |value: &Value| -> Result<(Option<u32>, u32)> {
+            let ValueData::Struct(parts) = value.data() else {
+                return Err(corrupt_variant());
+            };
+            Ok((u32_of(&parts[0]), u32_of(&parts[1]).ok_or_else(corrupt_variant)?))
+        };
+        let physical = Physical {
+            keys: list(0)?.iter().map(Value::try_to_string).collect::<Result<_>>()?,
+            children: list(1)?.iter().map(pair).collect::<Result<_>>()?,
+            values: list(2)?
+                .iter()
+                .map(|value| pair(value).map(|(tag, offset)| (tag.unwrap_or(0) as u8, offset)))
+                .collect::<Result<_>>()?,
+            data: match fields.get(3).map(Value::data) {
+                Some(ValueData::Bytes(bytes)) => bytes.clone(),
+                _ => Vec::new(),
+            },
+        };
+        if physical.values.is_empty() {
+            return Ok(Self::Null);
+        }
+        physical.node(0, 0)
+    }
+}
+
+/// The rows of a VARIANT vector as the unshredded struct C++ stores, a NULL VARIANT as a NULL row.
+pub fn to_unshredded_vector(vector: &crate::vector::Vector, count: usize) -> Result<crate::vector::Vector> {
+    let mut result = crate::vector::Vector::new(unshredded_type(), count.max(1));
+    for row in 0..count {
+        let value = vector.get_value(row);
+        let node = match value.data() {
+            crate::value::ValueData::Bytes(bytes) if !value.is_null() => VariantNode::decode(bytes)?,
+            _ => {
+                result.set_null(row, true);
+                continue;
+            }
+        };
+        result.set_value(row, &node.to_unshredded()?)?;
+    }
+    Ok(result)
+}
+
+/// The VARIANT vector of `ty` that the unshredded struct rows of [`to_unshredded_vector`] stand for.
+pub fn from_unshredded_vector(
+    stored: &crate::vector::Vector,
+    ty: &LogicalType,
+    count: usize,
+) -> Result<crate::vector::Vector> {
+    let mut result = crate::vector::Vector::new(ty.clone(), count.max(1));
+    for row in 0..count {
+        if !stored.is_valid(row) {
+            result.set_null(row, true);
+            continue;
+        }
+        let node = VariantNode::from_unshredded(&stored.get_value(row))?;
+        result.set_value(
+            row,
+            &Value::new(ty.clone(), crate::value::ValueData::Bytes(node.encode()))?,
+        )?;
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,5 +819,13 @@ mod tests {
         assert_eq!(VariantNode::decode(&node.encode()).unwrap(), node);
         assert_eq!(node.render().unwrap(), "{'a': 'x, y', 'b': [1, NULL], 'c': 12.34}");
         assert_eq!(node.describe(), "OBJECT(a, b, c)");
+        // as DuckDB stores it, and back
+        let stored = node.to_unshredded().unwrap();
+        assert_eq!(VariantNode::from_unshredded(&stored).unwrap(), node);
+        let nested = VariantNode::Array(vec![node.clone(), VariantNode::Null, VariantNode::Object(Vec::new())]);
+        assert_eq!(
+            VariantNode::from_unshredded(&nested.to_unshredded().unwrap()).unwrap(),
+            nested
+        );
     }
 }

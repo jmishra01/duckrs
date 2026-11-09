@@ -196,8 +196,12 @@ fn write_validity(s: &mut BinarySerializer, vector: &Vector, count: usize) -> bo
 
 /// `Vector::Serialize`, of a flat vector, as v2.0.0 has it.
 fn write_vector(s: &mut BinarySerializer, vector: &Vector, ty: &LogicalType, count: usize) -> Result<()> {
-    if matches!(ty.id(), LogicalTypeId::Geometry | LogicalTypeId::Variant) {
+    if ty.id() == LogicalTypeId::Geometry {
         return Err(write_not_ported(&format!("a {} column", ty.id().name())));
+    }
+    if ty.id() == LogicalTypeId::Variant {
+        let stored = duckrs_common::variant::to_unshredded_vector(vector, count)?;
+        return write_vector(s, &stored, &duckrs_common::variant::unshredded_type(), count);
     }
     write_validity(s, vector, count);
     match ty.physical_type() {
@@ -300,7 +304,7 @@ pub(crate) fn serialize_chunk(chunk: &DataChunk) -> Result<Vec<u8>> {
 /// Whether a chunk of these types can be serialized.
 pub(crate) fn can_serialize(types: &[LogicalType]) -> bool {
     fn can(ty: &LogicalType) -> bool {
-        !matches!(ty.id(), LogicalTypeId::Geometry | LogicalTypeId::Variant)
+        ty.id() != LogicalTypeId::Geometry
             && ty.child_type().is_none_or(can)
             && ty.struct_children().iter().all(|(_, child)| can(child))
     }
@@ -582,7 +586,7 @@ impl WriteAheadLog {
     /// table: with one that fails after that, the rows of the others would never reach the log.
     fn check_storable(&self, catalog: &Catalog, name: &str, current: &Durable) -> Result<()> {
         fn check_type(ty: &LogicalType) -> Result<()> {
-            if matches!(ty.id(), LogicalTypeId::Geometry | LogicalTypeId::Variant) {
+            if ty.id() == LogicalTypeId::Geometry {
                 return Err(write_not_ported(&format!("a {} column", ty.id().name())));
             }
             match ty.physical_type() {

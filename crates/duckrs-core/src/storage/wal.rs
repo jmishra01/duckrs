@@ -273,6 +273,10 @@ fn read_list_vector(
 }
 
 fn read_flat_vector(d: &mut BinaryDeserializer<'_>, ty: &LogicalType, count: usize) -> Result<Vector> {
+    if ty.id() == duckrs_common::types::LogicalTypeId::Variant {
+        let stored = read_flat_vector(d, &duckrs_common::variant::unshredded_type(), count)?;
+        return duckrs_common::variant::from_unshredded_vector(&stored, ty, count);
+    }
     if d.has_property(99)? {
         return Err(not_ported("GEOMETRY in a write-ahead log"));
     }

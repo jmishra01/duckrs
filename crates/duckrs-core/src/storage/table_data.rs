@@ -13,8 +13,8 @@ use crate::catalog::{ColumnStatistics, ColumnZone, RowIds, SegmentInfo, TableSou
 use crate::optimizer::statistics::{compare_values, has_ordered_statistics};
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::serializer::{BinaryDeserializer, Deserialize};
-use duckrs_common::types::{Interval, ListEntry, LogicalType, NativeType, PhysicalType};
-use duckrs_common::value::Value;
+use duckrs_common::types::{Interval, ListEntry, LogicalType, LogicalTypeId, NativeType, PhysicalType};
+use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, SelectionVector, Vector};
 use duckrs_common::{Error, Result};
 use duckrs_parser::ast::ComparisonOp;
@@ -89,9 +89,12 @@ fn not_ported_column(ty: &LogicalType) -> Error {
 fn read_persistent_column(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>) -> Result<PersistentColumn> {
     d.read_object_value(|d| {
         if d.has_property(99)? {
-            return Err(Error::not_implemented(
-                "reading extra column data from a database file is not yet ported to duckrs",
-            ));
+            return Err(Error::not_implemented(match ty.map(LogicalType::id) {
+                Some(LogicalTypeId::Variant) => {
+                    "reading a shredded VARIANT column from a database file is not yet ported to duckrs"
+                }
+                _ => "reading extra column data from a database file is not yet ported to duckrs",
+            }));
         }
         let pointers = if d.has_property(100)? {
             d.read_list(100, "data_pointers", |d| read_data_pointer(d, ty))?
@@ -106,6 +109,15 @@ fn read_persistent_column(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalTyp
             });
         };
         let validity = d.read_object_field(101, "validity", |d| read_persistent_column(d, None))?;
+        if ty.id() == LogicalTypeId::Variant {
+            let unshredded = duckrs_common::variant::unshredded_type();
+            let child = d.read_object_field(102, "unshredded", |d| read_persistent_column(d, Some(&unshredded)))?;
+            return Ok(PersistentColumn {
+                pointers,
+                validity: Some(Box::new(validity)),
+                children: vec![child],
+            });
+        }
         let children = match ty.physical_type() {
             PhysicalType::List | PhysicalType::Array => {
                 let child = ty.child_type().ok_or_else(|| corrupt("a list has no child type"))?;
@@ -363,6 +375,24 @@ fn scan_column(buffer: &BufferManager, column: &PersistentColumn, ty: &LogicalTy
         .as_ref()
         .ok_or_else(|| corrupt("a column has no validity"))?;
     let valid = scan_validity_column(buffer, validity, rows)?;
+    if ty.id() == LogicalTypeId::Variant {
+        let unshredded = duckrs_common::variant::unshredded_type();
+        let child = column
+            .children
+            .first()
+            .ok_or_else(|| corrupt("a VARIANT column has no data"))?;
+        let stored = scan_column(buffer, child, &unshredded, rows)?;
+        let mut vector = Vector::new(ty.clone(), rows);
+        for (row, &valid) in valid.iter().enumerate() {
+            if !valid {
+                vector.set_null(row, true);
+                continue;
+            }
+            let node = duckrs_common::variant::VariantNode::from_unshredded(&stored.get_value(row))?;
+            vector.set_value(row, &Value::new(ty.clone(), ValueData::Bytes(node.encode()))?)?;
+        }
+        return Ok(vector);
+    }
     let physical = ty.physical_type();
     if !matches!(physical, PhysicalType::Struct | PhysicalType::Array) {
         check_rows(column, rows)?;
