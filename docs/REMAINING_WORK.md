@@ -66,10 +66,11 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] the key dictionary in insertion order (`VariantNode` keeps keys sorted, so bytes differ from C++)
   - [ ] `vector_type`, VARIANT ordering (`variant_comparator`), `stats()` of VARIANT, case-sensitive shredded
     extraction, `debug_delta_only_variant_encoding_enabled`
-- [ ] 5. `EXPORT DATABASE` / `IMPORT DATABASE` (`sql/export`: 6 failing)
+- [ ] 5. `EXPORT DATABASE` / `IMPORT DATABASE` (`sql/export`: 4 failing, 1 skipped for ICU)
   - [x] a COPY of each table, `schema.sql` and `load.sql` as C++ writes them, IMPORT of the two, an attached source database
   - [ ] macro dependencies (`export_macros`, `export_generated_columns`), `enable_external_access`
-  - [ ] HUGEINT through Parquet (written as DOUBLE, its maximum doesn't come back), UNION columns in Parquet
+  - [x] HUGEINT and UHUGEINT written as VARCHAR to Parquet, as `ParquetWriteSelect` does for an EXPORT
+  - [ ] UNION columns in Parquet
 - [ ] 6. `COPY FROM DATABASE` (`sql/copy_database`: 12 failing, 0%)
 - [ ] 7. MultiFileReader: hive partitioning, `union_by_name`, filename column (`sql/multi_file`: 4 failing)
 - [ ] 8. GeoParquet (`geoparquet`: 7 failing)
