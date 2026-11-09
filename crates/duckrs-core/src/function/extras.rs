@@ -38,7 +38,8 @@ fn number(value: &Value) -> Option<f64> {
     }
 }
 
-const STRING_FUNCTIONS: [&str; 21] = [
+const STRING_FUNCTIONS: [&str; 22] = [
+    "hive_partition_component",
     "parse_filename",
     "parse_path",
     "parse_dirname",
@@ -207,6 +208,26 @@ fn parse_dirpath(args: &DataChunk, result: &mut Vector) -> Result<()> {
 }
 
 /// `PathJoinFunction`: each path joined onto the ones before it (`Path::Join`).
+/// `HivePartitionComponentFunction`: `name=value`, escaped as the hive layout of COPY is.
+fn hive_partition_component(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    row_wise(args, result, |row| {
+        let name = if row[0].is_null() {
+            "NULL".to_string()
+        } else {
+            row[0].try_to_string()?
+        };
+        let value = if row[1].is_null() {
+            "__HIVE_DEFAULT_PARTITION__".to_string()
+        } else {
+            crate::execution::parquet::hive_escape_value(&row[1].try_to_string()?)
+        };
+        Ok(Value::varchar(format!(
+            "{}={value}",
+            crate::execution::parquet::hive_escape(&name)
+        )))
+    })
+}
+
 fn path_join(args: &DataChunk, result: &mut Vector) -> Result<()> {
     use duckrs_common::path::Path;
     row_wise(args, result, |row| {
@@ -1304,6 +1325,12 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
         "parse_dirname" => simple(1, 2, v, parse_dirname, children),
         "parse_dirpath" => simple(1, 2, v, parse_dirpath, children),
         "path_join" => simple(1, usize::MAX, v, path_join, children),
+        "hive_partition_component" => {
+            count_args(&lower, &children, 2, 2)?;
+            let mut children = children;
+            children[0] = children[0].clone().cast_to(&v, false);
+            Ok(bound_function(&lower, children, v, hive_partition_component))
+        }
         "strip_accents" => simple(1, 1, v, strip_accents, children),
         "nfc_normalize" => simple(1, 1, v, nfc_normalize, children),
         "length_grapheme" => simple(1, 1, LogicalType::BIGINT, length_grapheme, children),

@@ -485,8 +485,17 @@ impl Binder<'_> {
             };
         }
         options.partitioning = partition.bind(&path, &bound.names, "parquet")?;
+        self.bind_partition_path(
+            info,
+            &bound.names,
+            &bound.types,
+            &partition,
+            options.partitioning.as_mut(),
+        )?;
+        self.set_max_open_files(options.partitioning.as_mut());
         options.rotation = partition.rotation(&path, "parquet", file_size_bytes, row_groups_per_file, per_thread)?;
-        options.output = output.build(options.partitioning.is_some(), per_thread, ordered)?;
+        options.output = output.build(options.partitioning.is_some(), per_thread, ordered, None)?;
+        options.writer.return_stats = options.output.return_stats;
         let (result_names, return_type) = copy_result(&options.output);
         let result_types = options.output.types();
         let plan = LogicalOperator::new(

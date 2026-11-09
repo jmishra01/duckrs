@@ -1153,6 +1153,9 @@ impl Binder<'_> {
     pub(super) fn copy_options(&mut self, info: &CopyInfo) -> Result<Vec<(String, Value)>> {
         let mut result = Vec::new();
         for (name, expression) in &info.parsed_options {
+            if name.eq_ignore_ascii_case("partition_path") {
+                continue;
+            }
             let value = match expression {
                 Some(expression) if expression.is_empty_star() => Value::varchar("*"),
                 Some(expression) => self.constant_argument(expression)?,
@@ -1183,6 +1186,17 @@ impl Binder<'_> {
     }
 
     pub(super) fn bind_copy(&mut self, info: &CopyInfo) -> Result<BoundStatement> {
+        if info.is_from
+            && info
+                .parsed_options
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case("partition_path"))
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Option partition_path is not supported for reading - only for writing",
+            ));
+        }
         if let Some(path) = self.parquet_copy_path(info)? {
             if !info.is_from {
                 verify_not_extension(&path)?;
@@ -1443,8 +1457,17 @@ impl Binder<'_> {
             extension += ".gz";
         }
         options.partitioning = partition.bind(&path, &bound.names, &extension)?;
+        self.bind_partition_path(
+            info,
+            &bound.names,
+            &bound.types,
+            &partition,
+            options.partitioning.as_mut(),
+        )?;
+        self.set_max_open_files(options.partitioning.as_mut());
         options.rotation = partition.rotation(&path, &extension, file_size_bytes, None, per_thread)?;
-        options.output = output.build(options.partitioning.is_some(), per_thread, ordered)?;
+        let format = if self.copy_json { "json" } else { "csv" };
+        options.output = output.build(options.partitioning.is_some(), per_thread, ordered, Some(format))?;
         let (result_names, return_type) = copy_result(&options.output);
         let result_types = options.output.types();
         let plan = LogicalOperator::new(
@@ -1467,14 +1490,35 @@ impl Binder<'_> {
 }
 
 /// The options of a COPY TO that write a directory of hive partitions (`PARTITION_BY` and friends).
-#[derive(Default)]
 pub(super) struct PartitionOptions {
     columns: Option<Vec<String>>,
     write_columns: bool,
     overwrite_or_ignore: bool,
     overwrite: bool,
+    append: bool,
+    /// whether OVERWRITE_OR_IGNORE, OVERWRITE or APPEND came
+    overwrite_mode_given: bool,
+    hive_file_pattern: bool,
+    hive_file_pattern_given: bool,
     filename_pattern: Option<String>,
     extension: Option<String>,
+}
+
+impl Default for PartitionOptions {
+    fn default() -> Self {
+        Self {
+            columns: None,
+            write_columns: false,
+            overwrite_or_ignore: false,
+            overwrite: false,
+            append: false,
+            overwrite_mode_given: false,
+            hive_file_pattern: true,
+            hive_file_pattern_given: false,
+            filename_pattern: None,
+            extension: None,
+        }
+    }
 }
 
 impl PartitionOptions {
@@ -1483,8 +1527,29 @@ impl PartitionOptions {
         match name {
             "partition_by" | "partitioned_by" => self.columns = Some(strings(value)?),
             "write_partition_columns" => self.write_columns = is_true(value, name)?,
-            "overwrite_or_ignore" => self.overwrite_or_ignore = is_true(value, name)?,
-            "overwrite" => self.overwrite = is_true(value, name)?,
+            "overwrite_or_ignore" | "overwrite" | "append" => {
+                if self.overwrite_mode_given {
+                    return Err(binder_error(
+                        "Can only set one of OVERWRITE_OR_IGNORE, OVERWRITE or APPEND",
+                    ));
+                }
+                self.overwrite_mode_given = true;
+                let on = is_true(value, name)?;
+                match name {
+                    "overwrite_or_ignore" => self.overwrite_or_ignore = on,
+                    "overwrite" => self.overwrite = on,
+                    _ => {
+                        self.append = on;
+                        if on && self.filename_pattern.is_none() {
+                            self.filename_pattern = Some("{uuid}".to_string());
+                        }
+                    }
+                }
+            }
+            "hive_file_pattern" => {
+                self.hive_file_pattern = is_true(value, name)?;
+                self.hive_file_pattern_given = true;
+            }
             "filename_pattern" => self.filename_pattern = Some(value.try_to_string()?),
             "file_extension" => self.extension = Some(value.try_to_string()?),
             _ => return Ok(false),
@@ -1510,7 +1575,7 @@ impl PartitionOptions {
             }
         }
         let occupied = std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some());
-        if occupied && !self.overwrite_or_ignore {
+        if occupied && !self.overwrite_or_ignore && !self.append {
             if self.overwrite {
                 std::fs::remove_dir_all(path)
                     .map_err(|e| Error::new(ErrorKind::Io, format!("Could not clear \"{path}\": {e}")))?;
@@ -1552,6 +1617,14 @@ impl PartitionOptions {
 
     /// The partitioning of a COPY to `path` of columns `names`, after clearing the directory if told to.
     pub(super) fn bind(&self, path: &str, names: &[String], extension: &str) -> Result<Option<Partitioning>> {
+        if self.append
+            && !self
+                .filename_pattern
+                .as_deref()
+                .is_some_and(|pattern| pattern.contains("{uuid"))
+        {
+            return Err(binder_error("APPEND mode requires a {uuid} label in filename_pattern"));
+        }
         let Some(wanted) = &self.columns else {
             return Ok(None);
         };
@@ -1580,9 +1653,119 @@ impl PartitionOptions {
         Ok(Some(Partitioning {
             columns,
             write_columns: self.write_columns,
+            hive_file_pattern: self.hive_file_pattern,
+            path_expression: None,
+            claims: Default::default(),
+            max_open_files: 100,
+            flush_threshold: 524_288,
             filename_pattern: self.filename_pattern.clone().unwrap_or_else(|| "data_{i}".to_string()),
             extension: self.extension.clone().unwrap_or_else(|| extension.to_string()),
         }))
+    }
+}
+
+impl Binder<'_> {
+    /// `partitioned_write_max_open_files`.
+    pub(super) fn set_max_open_files(&self, partitioning: Option<&mut Partitioning>) {
+        let (Some(partitioning), Some(session)) = (partitioning, &self.session) else {
+            return;
+        };
+        if let Ok(value) = (session.setting)("partitioned_write_max_open_files")
+            && let Some(limit) = value.as_i128()
+        {
+            partitioning.max_open_files = limit.max(1) as usize;
+        }
+        if let Ok(value) = (session.setting)("partitioned_write_flush_threshold")
+            && let Some(threshold) = value.as_i128()
+        {
+            partitioning.flush_threshold = threshold.max(1) as usize;
+        }
+    }
+
+    /// `PartitionPathBinder`: PARTITION_PATH, over the values of the PARTITION_BY columns.
+    pub(super) fn bind_partition_path(
+        &mut self,
+        info: &CopyInfo,
+        names: &[String],
+        types: &[LogicalType],
+        partition: &PartitionOptions,
+        partitioning: Option<&mut Partitioning>,
+    ) -> Result<()> {
+        use crate::planner::column_binding_resolver::resolve_expression;
+        use crate::planner::expression::ColumnBinding;
+        use duckrs_parser::ast::ExprKind;
+        let Some((_, Some(expression))) = info
+            .parsed_options
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("partition_path"))
+        else {
+            return Ok(());
+        };
+        let Some(partitioning) = partitioning else {
+            return Err(binder_error("PARTITION_PATH requires PARTITION_BY"));
+        };
+        if partition.hive_file_pattern_given {
+            return Err(binder_error(
+                "Can't combine HIVE_FILE_PATTERN and PARTITION_PATH for COPY",
+            ));
+        }
+        let columns = partitioning.columns.clone();
+        let mut error = None;
+        let mut parsed = expression.clone();
+        duckrs_parser::transformer::visit_expr_mut(&mut parsed, &mut |expr: &mut Expr| match &expr.kind {
+            ExprKind::Subquery { .. } => {
+                error.get_or_insert_with(|| "cannot use subquery in PARTITION_PATH".to_string());
+            }
+            ExprKind::Window(_) => {
+                error.get_or_insert_with(|| "window functions are not allowed in PARTITION_PATH".to_string());
+            }
+            ExprKind::Lambda { .. } => {
+                error.get_or_insert_with(|| "lambda functions are not allowed in PARTITION_PATH".to_string());
+            }
+            ExprKind::ColumnRef(parts) => {
+                let known = parts.len() == 1 && columns.iter().any(|&c| names[c] == parts[0]);
+                if !known {
+                    error.get_or_insert_with(|| {
+                        format!(
+                            "Column \"{}\" referenced in PARTITION_PATH is not a PARTITION_BY column",
+                            parts.join(".")
+                        )
+                    });
+                }
+            }
+            _ => {}
+        });
+        if let Some(error) = error {
+            return Err(binder_error(error));
+        }
+        let mut binder = Binder::new(self.catalog);
+        binder.options = self.options;
+        binder.session = self.session.clone();
+        binder.parameters = self.parameters.clone();
+        binder.aggregate_error = "aggregate functions are not allowed in PARTITION_PATH";
+        let table_index = binder.generate_table_index();
+        binder.bind_context.add_binding(Binding {
+            alias: String::new(),
+            schema: None,
+            table_index,
+            names: columns.iter().map(|&c| names[c].clone()).collect(),
+            types: columns.iter().map(|&c| types[c].clone()).collect(),
+            row_id: None,
+            virtual_columns: Vec::new(),
+            generated: Vec::new(),
+        });
+        let mut bound = binder
+            .bind_expression(expression)?
+            .cast_to(&LogicalType::VARCHAR, false);
+        let bindings: Vec<ColumnBinding> = (0..columns.len())
+            .map(|column_index| ColumnBinding {
+                table_index,
+                column_index,
+            })
+            .collect();
+        resolve_expression(&mut bound, &bindings)?;
+        partitioning.path_expression = Some(bound);
+        Ok(())
     }
 }
 
@@ -1828,12 +2011,19 @@ impl OutputOptionsBuilder {
         partitioned: bool,
         per_thread: bool,
         ordered: bool,
+        no_stats_format: Option<&str>,
     ) -> Result<crate::execution::parquet::CopyOutputOptions> {
         if self.return_files && self.return_stats {
-            return Err(binder_error("Can't combine RETURN_FILES and RETURN_STATS for COPY"));
+            return Err(binder_error(
+                "Can only set one of RETURN_FILES or RETURN_STATS for COPY",
+            ));
         }
-        if self.return_stats {
-            return Err(crate::unported("the COPY option return_stats"));
+        if self.return_stats
+            && let Some(format) = no_stats_format
+        {
+            return Err(Error::not_implemented(format!(
+                "RETURN_STATS is not supported for the \"{format}\" copy format"
+            )));
         }
         let write_empty_file = self.write_empty_file.unwrap_or(true);
         if !write_empty_file {
@@ -1855,6 +2045,7 @@ impl OutputOptionsBuilder {
         }
         Ok(crate::execution::parquet::CopyOutputOptions {
             return_files: self.return_files,
+            return_stats: self.return_stats,
             write_empty_file,
         })
     }
@@ -1862,6 +2053,12 @@ impl OutputOptionsBuilder {
 
 /// What a COPY TO returns: its `Count`, and with RETURN_FILES its `Files`.
 pub(super) fn copy_result(output: &crate::execution::parquet::CopyOutputOptions) -> (Vec<String>, StatementReturnType) {
+    if output.return_stats {
+        return (
+            crate::execution::parquet::CopyOutputOptions::stats_names(),
+            StatementReturnType::QueryResult,
+        );
+    }
     if output.return_files {
         (
             vec!["Count".to_string(), "Files".to_string()],

@@ -89,12 +89,64 @@ pub fn is_regex_comparison(expected: &str) -> bool {
 /// `<REGEX>:pattern` must fully match; `<!REGEX>:pattern` must not. `.` also matches newlines.
 pub fn matches_regex(actual: &str, expected: &str) -> Result<bool, String> {
     let want_match = expected.starts_with("<REGEX>:");
-    let pattern = expected.replace("<REGEX>:", "").replace("<!REGEX>:", "");
+    let pattern = literal_braces(&expected.replace("<REGEX>:", "").replace("<!REGEX>:", ""));
     let regex = RegexBuilder::new(&format!("^(?:{pattern})$"))
         .dot_matches_new_line(true)
         .build()
         .map_err(|e| format!("Failed to parse regex: {e}"))?;
     Ok(regex.is_match(actual) == want_match)
+}
+
+/// Braces that are no repetition, as `std::regex` reads them: literal, where the regex crate rejects them.
+fn literal_braces(pattern: &str) -> String {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut result = String::with_capacity(pattern.len());
+    let mut in_class = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\\' if i + 1 < chars.len() => {
+                result.push(c);
+                result.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            '{' if !in_class => {
+                // `{n}`, `{n,}` or `{n,m}` after something to repeat
+                let end = chars[i..].iter().position(|&c| c == '}').map(|e| i + e);
+                let quantifier = i > 0
+                    && end.is_some_and(|end| {
+                        let inner: String = chars[i + 1..end].iter().collect();
+                        let mut parts = inner.splitn(2, ',');
+                        let first = parts.next().unwrap_or("");
+                        !first.is_empty()
+                            && first.bytes().all(|b| b.is_ascii_digit())
+                            && parts.next().is_none_or(|rest| rest.bytes().all(|b| b.is_ascii_digit()))
+                    });
+                if quantifier {
+                    let end = end.unwrap_or(i);
+                    result.extend(&chars[i..=end]);
+                    i = end + 1;
+                    continue;
+                }
+                result.push_str("\\{");
+                i += 1;
+                continue;
+            }
+            '}' if !in_class => {
+                result.push_str("\\}");
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        result.push(c);
+        i += 1;
+    }
+    result
 }
 
 /// `ApproxEqual` from duckdb/src/common/types.cpp. `expected` sets the tolerance.

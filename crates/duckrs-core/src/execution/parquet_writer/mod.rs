@@ -9,8 +9,11 @@
 //! `ColumnDataCollection` hands them out, because where pages end depends on that.
 
 mod encoding;
+mod written_stats;
 
 pub use encoding::BloomFilter;
+use written_stats::StatsAccumulator;
+pub use written_stats::WrittenFileStats;
 
 use duckrs_common::types::{LogicalType, LogicalTypeId, TimeTz};
 use duckrs_common::value::{Value, ValueData};
@@ -163,6 +166,8 @@ pub struct WriterOptions {
     pub write_page_index: bool,
     /// `FIELD_IDS`
     pub field_ids: FieldIds,
+    /// `RETURN_STATS`: gather what each column holds
+    pub return_stats: bool,
 }
 
 /// `ChildFieldIDs`: the field ids of columns by name, each with those of the columns in it.
@@ -193,6 +198,7 @@ impl Default for WriterOptions {
             not_null_columns: Vec::new(),
             write_page_index: false,
             field_ids: FieldIds::default(),
+            return_stats: false,
         }
     }
 }
@@ -1832,6 +1838,8 @@ enum State {
     List {
         levels: Levels,
         parent_index: usize,
+        own_null_count: usize,
+        num_values: usize,
         child: Box<State>,
     },
 }
@@ -1878,6 +1886,15 @@ pub struct ParquetFileWriter {
     bloom_budget_used: usize,
     page_indexes: Vec<PageIndexEntry>,
     num_rows: i64,
+    stats: Option<StatsAccumulator>,
+}
+
+/// What [`ParquetFileWriter::finish`] wrote.
+#[derive(Debug, Clone)]
+pub struct FinishedFile {
+    pub rows: u64,
+    /// with `return_stats`
+    pub stats: Option<WrittenFileStats>,
 }
 
 impl ParquetFileWriter {
@@ -1914,7 +1931,11 @@ impl ParquetFileWriter {
             bloom_budget_used: 0,
             page_indexes: Vec::new(),
             num_rows: 0,
+            stats: None,
         };
+        if writer.options.return_stats {
+            writer.stats = Some(StatsAccumulator::new(&writer.nodes));
+        }
         if writer.options.bloom_filters {
             for node in &mut writer.nodes {
                 if let Node::Leaf(leaf) = node
@@ -1961,6 +1982,11 @@ impl ParquetFileWriter {
             self.flush_rows(self.buffered_rows())?;
         }
         Ok(())
+    }
+
+    /// The path of the file.
+    pub fn path(&self) -> &str {
+        &self.path
     }
 
     /// What the file holds so far (`ParquetWriteFileSize`).
@@ -2036,8 +2062,9 @@ impl ParquetFileWriter {
         let mut metas = Vec::new();
         let mut total_byte_size = 0;
         let row_group = self.row_groups.len();
+        let mut nested = 0;
         for (node, state) in nodes.iter().zip(states) {
-            self.finalize_write(node, state, &mut metas, &mut total_byte_size, row_group)?;
+            self.finalize_write(node, state, &mut metas, &mut total_byte_size, row_group, &mut nested)?;
         }
         let total_compressed_size = self.written as i64 - file_offset;
         self.row_groups.push(RowGroupMeta {
@@ -2122,6 +2149,8 @@ impl ParquetFileWriter {
             Node::List { child, .. } | Node::Array { child, .. } => State::List {
                 levels: Levels::default(),
                 parent_index: 0,
+                own_null_count: 0,
+                num_values: 0,
                 child: Box::new(self.initialize_state(child, rows, leaf_index)),
             },
         }
@@ -2135,6 +2164,7 @@ impl ParquetFileWriter {
         metas: &mut Vec<ChunkMeta>,
         total_byte_size: &mut i64,
         row_group: usize,
+        nested: &mut usize,
     ) -> Result<()> {
         match (node, state) {
             (Node::Leaf(leaf), State::Leaf(state)) => {
@@ -2142,14 +2172,41 @@ impl ParquetFileWriter {
                 metas.push(meta);
                 Ok(())
             }
-            (Node::Struct { children, .. }, State::Struct { children: states, .. }) => {
+            (
+                Node::Struct { children, .. },
+                State::Struct {
+                    children: states,
+                    levels,
+                    own_null_count,
+                },
+            ) => {
+                if let Some(stats) = &mut self.stats {
+                    stats.flush_nested(
+                        *nested,
+                        own_null_count,
+                        levels.definition.len() - levels.parent_null_count,
+                    );
+                }
+                *nested += 1;
                 for (child, state) in children.iter().zip(states) {
-                    self.finalize_write(child, state, metas, total_byte_size, row_group)?;
+                    self.finalize_write(child, state, metas, total_byte_size, row_group, nested)?;
                 }
                 Ok(())
             }
-            (Node::List { child, .. } | Node::Array { child, .. }, State::List { child: state, .. }) => {
-                self.finalize_write(child, *state, metas, total_byte_size, row_group)
+            (
+                Node::List { child, .. } | Node::Array { child, .. },
+                State::List {
+                    child: state,
+                    own_null_count,
+                    num_values,
+                    ..
+                },
+            ) => {
+                if let Some(stats) = &mut self.stats {
+                    stats.flush_nested(*nested, own_null_count, num_values);
+                }
+                *nested += 1;
+                self.finalize_write(child, *state, metas, total_byte_size, row_group, nested)
             }
             _ => Err(io_error("a Parquet column writer without its state")),
         }
@@ -2279,6 +2336,15 @@ impl ParquetFileWriter {
         }
         meta.total_compressed_size = (self.written - start) as i64;
         meta.total_uncompressed_size = total_uncompressed as i64;
+        if let Some(accumulator) = &mut self.stats {
+            accumulator.flush_column(
+                state.column,
+                meta.statistics.as_ref(),
+                state.stats.as_ref(),
+                meta.num_values,
+                meta.total_compressed_size,
+            );
+        }
         *total_byte_size += meta.total_uncompressed_size;
         if let Some(bloom) = state.bloom.take() {
             let keep = has_dictionary
@@ -2338,7 +2404,7 @@ impl ParquetFileWriter {
     }
 
     /// `ParquetWriter::Finalize`: the rest of the rows, the bloom filters and the footer.
-    pub fn finish(mut self) -> Result<u64> {
+    pub fn finish(mut self) -> Result<FinishedFile> {
         let rows = self.buffered_rows();
         self.flush_rows(rows)?;
         self.flush_blooms()?;
@@ -2367,7 +2433,17 @@ impl ParquetFileWriter {
         self.out
             .flush()
             .map_err(|e| io_error(format!("Could not write \"{}\": {e}", self.path)))?;
-        Ok(self.num_rows as u64)
+        let stats = self.stats.as_ref().map(|accumulator| WrittenFileStats {
+            row_count: self.num_rows as u64,
+            file_size_bytes: self.written,
+            footer_size_bytes: footer.len() as u64,
+            column_statistics: accumulator.gather(),
+            row_group_count: self.row_groups.len() as u64,
+        });
+        Ok(FinishedFile {
+            rows: self.num_rows as u64,
+            stats,
+        })
     }
 
     fn footer(&self) -> Vec<u8> {
@@ -2944,6 +3020,8 @@ fn prepare(
             State::List {
                 levels,
                 parent_index,
+                own_null_count,
+                num_values,
                 child: state,
             },
             Input::List {
@@ -2982,6 +3060,7 @@ fn prepare(
                     levels.repetition.push(first_repeat);
                     levels.is_empty.push(true);
                 } else if valid.get(vector_index).copied().unwrap_or(false) {
+                    *num_values += 1;
                     let length = lengths[vector_index];
                     if length == 0 {
                         levels.definition.push(max_define);
@@ -3002,6 +3081,8 @@ fn prepare(
                             "Parquet writer: map key column is not allowed to contain NULL values",
                         ));
                     }
+                    *own_null_count += 1;
+                    *num_values += 1;
                     levels.definition.push(max_define.saturating_sub(1));
                     levels.repetition.push(first_repeat);
                     levels.is_empty.push(true);
@@ -3016,6 +3097,8 @@ fn prepare(
             State::List {
                 levels,
                 parent_index,
+                own_null_count,
+                num_values,
                 child: state,
             },
             Input::List {
@@ -3062,8 +3145,11 @@ fn prepare(
                 {
                     push(levels, first_repeat, parent.definition[at], false);
                 } else if valid.get(vector_index).copied().unwrap_or(false) {
+                    *num_values += 1;
                     push(levels, first_repeat, DEFINE_VALID, false);
                 } else {
+                    *own_null_count += 1;
+                    *num_values += 1;
                     push(levels, first_repeat, schema.max_define.saturating_sub(1), false);
                 }
                 vector_index += 1;

@@ -607,6 +607,7 @@ pub struct PhysicalCopyToFile {
     rows: std::sync::atomic::AtomicU64,
     /// the logger of the statement, for the file it writes
     logger: Option<Arc<crate::logging::LogTarget>>,
+    buffers: Mutex<super::parquet::PartitionBuffers>,
 }
 
 impl PhysicalCopyToFile {
@@ -625,6 +626,7 @@ impl PhysicalCopyToFile {
             path,
             names,
             writers: Mutex::new(super::parquet::OutputFiles::default()),
+            buffers: Mutex::new(super::parquet::PartitionBuffers::default()),
             gzip,
             rows: std::sync::atomic::AtomicU64::new(0),
             logger: crate::logging::current_file_logger(),
@@ -682,15 +684,16 @@ impl PhysicalCopyToFile {
         if !files.open.contains_key(&key) {
             let path = files.next_path(&self.path, directory, self.options.partitioning.as_ref(), rotation)?;
             let writer = self.open(&path)?;
-            files.open.insert(
-                key.clone(),
-                CsvOutput {
-                    writer,
-                    json_rows: std::sync::atomic::AtomicU64::new(0),
-                    bytes: 0,
-                    rows: 0,
-                },
-            );
+            let limit = self.options.partitioning.as_ref().map(|p| p.max_open_files);
+            let output = CsvOutput {
+                writer,
+                json_rows: std::sync::atomic::AtomicU64::new(0),
+                bytes: 0,
+                rows: 0,
+            };
+            for evicted in files.insert_limited(key.clone(), output, limit) {
+                self.close(evicted)?;
+            }
         }
         let out_file = files.open.get_mut(&key).expect("just opened");
         let mut out = Vec::new();
@@ -741,7 +744,14 @@ impl PhysicalOperator for PhysicalCopyToFile {
         match &self.options.partitioning {
             Some(partitioning) => {
                 for (directory, rows) in partitioning.group_rows(&self.path, &self.names, chunk)? {
-                    self.write_rows(&directory, chunk, &rows)?;
+                    let ready = self
+                        .buffers
+                        .lock()
+                        .add(&directory, chunk, &rows, partitioning.flush_threshold)?;
+                    for piece in ready.unwrap_or_default() {
+                        let rows: Vec<usize> = (0..piece.len()).collect();
+                        self.write_rows(&directory, &piece, &rows)?;
+                    }
                 }
             }
             None => {
@@ -754,6 +764,13 @@ impl PhysicalOperator for PhysicalCopyToFile {
         Ok(())
     }
     fn finalize(&self) -> Result<()> {
+        let buffered = self.buffers.lock().drain();
+        for (directory, pieces) in buffered {
+            for piece in pieces {
+                let rows: Vec<usize> = (0..piece.len()).collect();
+                self.write_rows(&directory, &piece, &rows)?;
+            }
+        }
         let mut files = self.writers.lock();
         let rotation = self.options.rotation.as_ref();
         if files.created == 0 && !self.options.output.write_empty_file {

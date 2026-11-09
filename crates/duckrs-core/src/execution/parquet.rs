@@ -624,6 +624,16 @@ pub struct Partitioning {
     /// the columns of the rows that name a file
     pub columns: Vec<usize>,
     pub write_columns: bool,
+    /// `HIVE_FILE_PATTERN`: files in `key=value` directories; without it, every file in the target directory
+    pub hive_file_pattern: bool,
+    /// `PARTITION_PATH`: the directory of a partition, over the values of its columns in order
+    pub path_expression: Option<crate::planner::expression::BoundExpr>,
+    /// with `PARTITION_PATH`: the partition of each directory, and the directory of each partition
+    pub claims: Arc<Mutex<HashMap<String, String>>>,
+    /// `partitioned_write_max_open_files`: more open files close the ones opened first
+    pub max_open_files: usize,
+    /// `partitioned_write_flush_threshold`: the rows a partition buffers before they go to its file
+    pub flush_threshold: usize,
     /// `{i}` and `{uuid}` become a number and a UUID
     pub filename_pattern: String,
     pub extension: String,
@@ -656,7 +666,7 @@ impl Partitioning {
             let text = if value.is_null() {
                 "__HIVE_DEFAULT_PARTITION__".to_string()
             } else {
-                hive_escape(&value.try_to_string()?)
+                hive_escape_value(&value.try_to_string()?)
             };
             directory += &format!("/{}={text}", hive_escape(&names[column]));
         }
@@ -677,7 +687,106 @@ impl Partitioning {
                 }
             }
         }
-        Ok(groups)
+        let Some(expression) = &self.path_expression else {
+            return Ok(groups);
+        };
+        groups
+            .into_iter()
+            .map(|(hive, rows)| {
+                Ok((
+                    self.evaluate_path(expression, path, names, chunk, rows[0], &hive)?,
+                    rows,
+                ))
+            })
+            .collect()
+    }
+
+    /// `PartitionValuesToString`: e.g. `year=2024, month=NULL`.
+    fn values_text(&self, names: &[String], chunk: &DataChunk, row: usize) -> String {
+        self.columns
+            .iter()
+            .map(|&column| {
+                let value = chunk.get_value(column, row);
+                let text = if value.is_null() {
+                    "NULL".to_string()
+                } else {
+                    value.try_to_string().unwrap_or_default()
+                };
+                format!("{}={text}", names[column])
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// `BuildDirectory` with `EvaluatePartitionPath`: the directory PARTITION_PATH gives the partition of `row`.
+    fn evaluate_path(
+        &self,
+        expression: &crate::planner::expression::BoundExpr,
+        path: &str,
+        names: &[String],
+        chunk: &DataChunk,
+        row: usize,
+        hive: &str,
+    ) -> Result<String> {
+        let invalid = |message: String| Error::new(ErrorKind::InvalidInput, message);
+        let columns = self
+            .columns
+            .iter()
+            .map(|&column| {
+                let value = chunk.get_value(column, row);
+                let mut vector = Vector::new(chunk.column(column).logical_type().clone(), 1);
+                vector.set_value(0, &value)?;
+                Ok(vector)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let values = DataChunk::from_columns(columns, 1);
+        let result = crate::execution::expression_executor::execute(expression, &values)?.get_value(0);
+        if result.is_null() {
+            return Err(invalid(format!(
+                "PARTITION_PATH evaluated to NULL for partition {}",
+                self.values_text(names, chunk, row)
+            )));
+        }
+        let relative = result.try_to_string()?;
+        if relative.starts_with('/') || relative.starts_with('\\') || relative.contains("://") {
+            return Err(invalid(format!(
+                "PARTITION_PATH must be relative to the COPY target, but got \"{relative}\""
+            )));
+        }
+        let mut components = Vec::new();
+        for component in relative.split('/') {
+            if component.is_empty() || component == "." {
+                continue;
+            }
+            if component == ".." {
+                return Err(invalid(format!(
+                    "PARTITION_PATH cannot contain \"..\", but got \"{relative}\""
+                )));
+            }
+            components.push(component);
+        }
+        if components.is_empty() {
+            return Err(invalid(format!(
+                "PARTITION_PATH evaluated to an empty path for partition {}",
+                self.values_text(names, chunk, row)
+            )));
+        }
+        let relative = components.join("/");
+        let mut claims = self.claims.lock();
+        // `ClaimDirectory`: by the hive directory of the partition, and by the directory it gets
+        let partition_key = format!("partition:{hive}");
+        let directory_key = format!("directory:{relative}");
+        if claims.get(&partition_key) != Some(&relative) {
+            if let Some(owner) = claims.get(&directory_key) {
+                return Err(invalid(format!(
+                    "PARTITION_PATH puts partitions ({owner}) and ({}) in the same directory \"{relative}\"",
+                    self.values_text(names, chunk, row)
+                )));
+            }
+            claims.insert(directory_key, self.values_text(names, chunk, row));
+            claims.insert(partition_key, relative.clone());
+        }
+        Ok(format!("{path}/{relative}"))
     }
 
     /// Creates the directory of a partition, and says the path of its file.
@@ -693,10 +802,11 @@ impl Partitioning {
     }
 }
 
-/// `RETURN_FILES` and `WRITE_EMPTY_FILE`.
+/// `RETURN_FILES`, `RETURN_STATS` and `WRITE_EMPTY_FILE`.
 #[derive(Debug, Clone)]
 pub struct CopyOutputOptions {
     pub return_files: bool,
+    pub return_stats: bool,
     pub write_empty_file: bool,
 }
 
@@ -704,14 +814,137 @@ impl Default for CopyOutputOptions {
     fn default() -> Self {
         Self {
             return_files: false,
+            return_stats: false,
             write_empty_file: true,
         }
     }
 }
 
+/// The files written, and the partition values of the files being written, by path.
+type WrittenFiles = (Vec<WrittenFile>, HashMap<String, Vec<(String, String)>>);
+
+/// A file a COPY TO wrote with `RETURN_STATS`, and the values of its partition.
+#[derive(Debug, Clone)]
+pub struct WrittenFile {
+    pub path: String,
+    pub stats: crate::execution::parquet_writer::WrittenFileStats,
+    pub partition_keys: Option<Vec<(String, String)>>,
+}
+
+/// `MAP(VARCHAR, value)` of `entries`.
+fn map_value(value_type: LogicalType, entries: Vec<(String, Value)>) -> Result<Value> {
+    let items = entries
+        .into_iter()
+        .map(|(key, value)| {
+            Value::struct_value(vec![
+                ("key".to_string(), Value::varchar(key)),
+                ("value".to_string(), value),
+            ])
+        })
+        .collect();
+    Value::new(
+        LogicalType::map(LogicalType::VARCHAR, value_type),
+        ValueData::List(items),
+    )
+}
+
+fn to_variant(value: &Value) -> Result<Value> {
+    let mut source = Vector::new(value.logical_type().clone(), 1);
+    source.set_value(0, value)?;
+    let mut result = Vector::new(LogicalType::new(LogicalTypeId::Variant), 1);
+    crate::function::cast::cast_vector(&source, &mut result, 1, crate::function::cast::CastMode::Strict)?;
+    Ok(result.get_value(0))
+}
+
 impl CopyOutputOptions {
+    /// `WRITTEN_FILE_STATISTICS`: the names of what a COPY with RETURN_STATS returns.
+    pub fn stats_names() -> Vec<String> {
+        [
+            "filename",
+            "count",
+            "file_size_bytes",
+            "footer_size_bytes",
+            "column_statistics",
+            "partition_keys",
+            "extra_info",
+        ]
+        .map(String::from)
+        .to_vec()
+    }
+
+    fn stats_types() -> Vec<LogicalType> {
+        let stats_map = LogicalType::map(LogicalType::VARCHAR, LogicalType::VARCHAR);
+        vec![
+            LogicalType::VARCHAR,
+            LogicalType::BIGINT,
+            LogicalType::BIGINT,
+            LogicalType::BIGINT,
+            LogicalType::map(LogicalType::VARCHAR, stats_map.clone()),
+            stats_map,
+            LogicalType::map(LogicalType::VARCHAR, LogicalType::new(LogicalTypeId::Variant)),
+        ]
+    }
+
+    /// `ReturnStatistics`: a row for each file.
+    pub fn stats_result(&self, files: &[WrittenFile]) -> Result<DataChunk> {
+        let types = Self::stats_types();
+        let mut columns: Vec<Vector> = types
+            .iter()
+            .map(|ty| Vector::new(ty.clone(), files.len().max(1)))
+            .collect();
+        for (row, file) in files.iter().enumerate() {
+            let stats = &file.stats;
+            let column_statistics = stats
+                .column_statistics
+                .iter()
+                .map(|(name, column)| {
+                    let entries = column
+                        .iter()
+                        .map(|(key, value)| Ok((key.clone(), Value::varchar(value.try_to_string()?))))
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok((name.clone(), map_value(LogicalType::VARCHAR, entries)?))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let partition_keys = match &file.partition_keys {
+                Some(keys) => map_value(
+                    LogicalType::VARCHAR,
+                    keys.iter()
+                        .map(|(k, v)| (k.clone(), Value::varchar(v.as_str())))
+                        .collect(),
+                )?,
+                None => Value::null(types[5].clone()),
+            };
+            let extra_info = map_value(
+                LogicalType::new(LogicalTypeId::Variant),
+                vec![(
+                    "row_group_count".to_string(),
+                    to_variant(&Value::ubigint(stats.row_group_count))?,
+                )],
+            )?;
+            let values = [
+                Value::varchar(file.path.as_str()),
+                Value::bigint(stats.row_count as i64),
+                Value::bigint(stats.file_size_bytes as i64),
+                Value::bigint(stats.footer_size_bytes as i64),
+                map_value(
+                    LogicalType::map(LogicalType::VARCHAR, LogicalType::VARCHAR),
+                    column_statistics,
+                )?,
+                partition_keys,
+                extra_info,
+            ];
+            for (column, value) in columns.iter_mut().zip(values.iter()) {
+                column.set_value(row, value)?;
+            }
+        }
+        Ok(DataChunk::from_columns(columns, files.len()))
+    }
+
     /// The types of what the COPY returns.
     pub fn types(&self) -> Vec<LogicalType> {
+        if self.return_stats {
+            return Self::stats_types();
+        }
         if self.return_files {
             vec![LogicalType::BIGINT, LogicalType::list(LogicalType::VARCHAR)]
         } else {
@@ -779,8 +1012,17 @@ pub fn file_name(directory: &str, pattern: &str, extension: &str, offset: usize)
     format!("{directory}/{result}.{extension}")
 }
 
+/// `HivePartitioning::EscapeValue`: a value spelled like the NULL directory gets a directory of its own.
+pub fn hive_escape_value(text: &str) -> String {
+    let result = hive_escape(text);
+    if !result.eq_ignore_ascii_case("__HIVE_DEFAULT_PARTITION__") {
+        return result;
+    }
+    format!("%{:02X}{}", result.as_bytes()[0], &result[1..])
+}
+
 /// `HivePartitioning::Escape`
-fn hive_escape(text: &str) -> String {
+pub fn hive_escape(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     for byte in text.bytes() {
         match byte {
@@ -819,6 +1061,61 @@ pub struct PhysicalCopyToParquet {
     /// by the directory of a partition, or `""` without partitions, and the thread with PER_THREAD_OUTPUT
     writers: Mutex<OutputFiles<ParquetFileWriter>>,
     rows: AtomicU64,
+    /// with RETURN_STATS: the files written, and the partition values of the files being written by path
+    written: Mutex<WrittenFiles>,
+    buffers: Mutex<PartitionBuffers>,
+}
+
+/// `DelayedPartitionBuffers`: the rows of each partition, until there are enough to write.
+#[derive(Debug, Default)]
+pub struct PartitionBuffers {
+    buffers: HashMap<String, (Vec<DataChunk>, usize)>,
+    /// the directories, in the order their first rows came
+    order: Vec<String>,
+}
+
+impl PartitionBuffers {
+    /// Buffers `rows` of `chunk` for `directory`; the rows of the partition, once they reach `threshold`.
+    pub fn add(
+        &mut self,
+        directory: &str,
+        chunk: &DataChunk,
+        rows: &[usize],
+        threshold: usize,
+    ) -> Result<Option<Vec<DataChunk>>> {
+        if !self.buffers.contains_key(directory) {
+            self.order.push(directory.to_string());
+        }
+        let (pieces, count) = self.buffers.entry(directory.to_string()).or_default();
+        let types = chunk.types();
+        let mut row_values = Vec::with_capacity(types.len());
+        for &row in rows {
+            if pieces.last().is_none_or(|piece| piece.len() == piece.capacity()) {
+                pieces.push(DataChunk::new(&types));
+            }
+            row_values.clear();
+            row_values.extend((0..types.len()).map(|column| chunk.get_value(column, row)));
+            pieces.last_mut().expect("just pushed").append_row(&row_values)?;
+            *count += 1;
+        }
+        if *count < threshold.max(1) {
+            return Ok(None);
+        }
+        *count = 0;
+        Ok(Some(std::mem::take(pieces)))
+    }
+
+    /// The rows still buffered, by directory in the order they came.
+    pub fn drain(&mut self) -> Vec<(String, Vec<DataChunk>)> {
+        let order = std::mem::take(&mut self.order);
+        order
+            .into_iter()
+            .filter_map(|directory| {
+                let (pieces, _) = self.buffers.remove(&directory)?;
+                (!pieces.is_empty()).then_some((directory, pieces))
+            })
+            .collect()
+    }
 }
 
 /// The files a COPY TO has open, and how many each directory got (`last_file_offset`).
@@ -829,6 +1126,8 @@ pub struct OutputFiles<W> {
     pub created: usize,
     /// the paths of the files, in the order they were created
     pub paths: Vec<String>,
+    /// the keys of the open files, in the order they were opened
+    pub opened: Vec<String>,
 }
 
 impl<W> Default for OutputFiles<W> {
@@ -838,11 +1137,30 @@ impl<W> Default for OutputFiles<W> {
             offsets: HashMap::new(),
             created: 0,
             paths: Vec::new(),
+            opened: Vec::new(),
         }
     }
 }
 
 impl<W> OutputFiles<W> {
+    /// Opens `writer` for `key`; with more than `limit` open, takes out those opened first, to be closed.
+    pub fn insert_limited(&mut self, key: String, writer: W, limit: Option<usize>) -> Vec<W> {
+        self.opened.retain(|k| *k != key && self.open.contains_key(k));
+        self.opened.push(key.clone());
+        self.open.insert(key, writer);
+        let mut evicted = Vec::new();
+        let Some(limit) = limit else {
+            return evicted;
+        };
+        while self.open.len() > limit.max(1) && self.opened.len() > 1 {
+            let oldest = self.opened.remove(0);
+            if let Some(writer) = self.open.remove(&oldest) {
+                evicted.push(writer);
+            }
+        }
+        evicted
+    }
+
     /// The key of the file of a partition's `directory` for this thread.
     pub fn key(directory: &str, rotation: Option<&Rotation>) -> String {
         match rotation {
@@ -874,7 +1192,12 @@ impl<W> OutputFiles<W> {
     ) -> Result<String> {
         match (partitioning, rotation) {
             (Some(partitioning), _) => {
-                let offset = self.offsets.entry(directory.to_string()).or_insert(0);
+                let (directory, offset_key) = if partitioning.hive_file_pattern {
+                    (directory, directory)
+                } else {
+                    (target, "")
+                };
+                let offset = self.offsets.entry(offset_key.to_string()).or_insert(0);
                 let path = partitioning.create_file_path_at(directory, *offset)?;
                 *offset += 1;
                 Ok(path)
@@ -914,7 +1237,49 @@ impl PhysicalCopyToParquet {
             names,
             writers: Mutex::new(OutputFiles::default()),
             rows: AtomicU64::new(0),
+            written: Mutex::new((Vec::new(), HashMap::new())),
+            buffers: Mutex::new(PartitionBuffers::default()),
         }
+    }
+
+    /// Writes the buffered rows of a partition.
+    fn write_pieces(&self, directory: &str, pieces: &[DataChunk]) -> Result<()> {
+        for piece in pieces {
+            let rows: Vec<usize> = (0..piece.len()).collect();
+            self.write_rows(directory, piece, &rows)?;
+        }
+        Ok(())
+    }
+
+    /// `ParquetWriter::Finalize`, keeping what RETURN_STATS returns of the file.
+    fn finish(&self, writer: ParquetFileWriter) -> Result<()> {
+        let path = writer.path().to_string();
+        let finished = writer.finish()?;
+        if let Some(stats) = finished.stats {
+            let mut written = self.written.lock();
+            let partition_keys = written.1.remove(&path);
+            written.0.push(WrittenFile {
+                path,
+                stats,
+                partition_keys,
+            });
+        }
+        Ok(())
+    }
+
+    /// The partition values of the rows of `directory`, as text, by the names of their columns.
+    fn partition_keys(&self, chunk: &DataChunk, row: usize) -> Result<Vec<(String, String)>> {
+        let Some(partitioning) = &self.options.partitioning else {
+            return Ok(Vec::new());
+        };
+        partitioning
+            .columns
+            .iter()
+            .map(|&column| {
+                let value = chunk.get_value(column, row);
+                Ok((self.names[column].clone(), value.try_to_string()?))
+            })
+            .collect()
     }
 
     /// The columns that go in a file, by their position in the rows.
@@ -947,8 +1312,15 @@ impl PhysicalCopyToParquet {
         while done < rows.len() {
             if !files.open.contains_key(&key) {
                 let path = files.next_path(&self.path, directory, self.options.partitioning.as_ref(), rotation)?;
+                if self.options.output.return_stats && self.options.partitioning.is_some() {
+                    let keys = self.partition_keys(chunk, rows[done])?;
+                    self.written.lock().1.insert(path.clone(), keys);
+                }
                 let writer = self.create(&path)?;
-                files.open.insert(key.clone(), writer);
+                let limit = self.options.partitioning.as_ref().map(|p| p.max_open_files);
+                for evicted in files.insert_limited(key.clone(), writer, limit) {
+                    self.finish(evicted)?;
+                }
             }
             let writer = files.open.get_mut(&key).expect("just opened");
             // with a rotation, a file may end at any row group
@@ -970,7 +1342,7 @@ impl PhysicalCopyToParquet {
                 && rotation.rotate_now(writer.bytes_written(), writer.row_group_count(), writer.has_data())
             {
                 let writer = files.open.remove(&key).expect("open");
-                writer.finish()?;
+                self.finish(writer)?;
             }
         }
         Ok(())
@@ -994,7 +1366,13 @@ impl PhysicalOperator for PhysicalCopyToParquet {
         match &self.options.partitioning {
             Some(partitioning) => {
                 for (directory, rows) in partitioning.group_rows(&self.path, &self.names, chunk)? {
-                    self.write_rows(&directory, chunk, &rows)?;
+                    let ready = self
+                        .buffers
+                        .lock()
+                        .add(&directory, chunk, &rows, partitioning.flush_threshold)?;
+                    if let Some(pieces) = ready {
+                        self.write_pieces(&directory, &pieces)?;
+                    }
                 }
             }
             None => {
@@ -1006,6 +1384,10 @@ impl PhysicalOperator for PhysicalCopyToParquet {
         Ok(())
     }
     fn finalize(&self) -> Result<()> {
+        let buffered = self.buffers.lock().drain();
+        for (directory, pieces) in buffered {
+            self.write_pieces(&directory, &pieces)?;
+        }
         let mut files = self.writers.lock();
         let rotation = self.options.rotation.as_ref();
         if files.created == 0 && !self.options.output.write_empty_file {
@@ -1026,7 +1408,7 @@ impl PhysicalOperator for PhysicalCopyToParquet {
         keys.sort();
         for key in keys {
             let writer = files.open.remove(&key).expect("listed");
-            writer.finish()?;
+            self.finish(writer)?;
         }
         Ok(())
     }
@@ -1042,11 +1424,26 @@ impl PhysicalOperator for PhysicalCopyToParquet {
             return Ok(None);
         }
         *done = true;
+        if self.options.output.return_stats {
+            let mut written = self.written.lock();
+            written.0.sort_by(|a, b| a.path.cmp(&b.path));
+            let chunk = self.options.output.stats_result(&written.0)?;
+            return Ok((!chunk.is_empty()).then_some(chunk));
+        }
         let files = self.writers.lock();
         self.options
             .output
             .result(self.rows.load(Ordering::Relaxed), &files.paths)
             .map(Some)
+    }
+}
+
+/// `is_min_value_exact` / `is_max_value_exact`, which a file sets only with the bound itself.
+fn exact_or_null(stats: Option<&Statistics>, min: bool) -> String {
+    match stats {
+        Some(stats) if min && stats.min_bytes_opt().is_some() => stats.min_is_exact().to_string(),
+        Some(stats) if !min && stats.max_bytes_opt().is_some() => stats.max_is_exact().to_string(),
+        _ => "NULL::BOOLEAN".to_string(),
     }
 }
 
@@ -1346,8 +1743,8 @@ pub fn metadata_rows(path: &str) -> Result<Vec<String>> {
                 chunk.uncompressed_size(),
                 sql_number(chunk.bloom_filter_offset()),
                 sql_number(chunk.bloom_filter_length().map(i64::from)),
-                chunk.statistics().is_some_and(Statistics::min_is_exact),
-                chunk.statistics().is_some_and(Statistics::max_is_exact),
+                exact_or_null(chunk.statistics(), true),
+                exact_or_null(chunk.statistics(), false),
                 row_group.compressed_size(),
                 encoding_stats,
                 sql_number(nan_count),
