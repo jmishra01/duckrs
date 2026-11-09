@@ -139,6 +139,37 @@ fn reorder_tables(
     ordered
 }
 
+/// `IsTypeLossy` and `TypeVisitor::VisitReplace`: `ty` with HUGEINT and UHUGEINT as VARCHAR, if it has them.
+fn lossless_type(ty: &duckrs_common::types::LogicalType) -> Option<duckrs_common::types::LogicalType> {
+    use duckrs_common::types::{LogicalType, LogicalTypeId as T};
+    fn replace(ty: &LogicalType) -> LogicalType {
+        let children = |ty: &LogicalType| -> Vec<(String, LogicalType)> {
+            ty.struct_children()
+                .iter()
+                .map(|(n, c)| (n.clone(), replace(c)))
+                .collect()
+        };
+        match ty.id() {
+            T::HugeInt | T::UHugeInt => LogicalType::VARCHAR,
+            T::List => LogicalType::list(replace(ty.child_type().expect("a LIST has a child"))),
+            T::Array => LogicalType::array(
+                replace(ty.child_type().expect("an ARRAY has a child")),
+                ty.array_size().unwrap_or(0),
+            ),
+            T::Map => {
+                let entry = ty.child_type().expect("a MAP has entries");
+                let fields = entry.struct_children();
+                LogicalType::map(replace(&fields[0].1), replace(&fields[1].1))
+            }
+            T::Struct => LogicalType::struct_type(children(ty)),
+            T::Union => LogicalType::union_type(children(ty)),
+            _ => ty.clone(),
+        }
+    }
+    let replaced = replace(ty);
+    (replaced != *ty).then_some(replaced)
+}
+
 /// The name of a table to read or write it with, without the default schema.
 fn table_name(schema: &SchemaCatalogEntry, table: &str) -> String {
     let mut parts = Vec::new();
@@ -372,7 +403,18 @@ impl ClientContext {
             })?;
         }
         for (schema, table, path) in &exported {
-            let columns: Vec<String> = table.columns.iter().map(|c| sql_identifier(&c.name)).collect();
+            // `ParquetWriteSelect`: EXPORT writes the "lossy" types as VARCHAR, so they come back exactly
+            let columns: Vec<String> = table
+                .columns
+                .iter()
+                .map(|c| {
+                    let name = sql_identifier(&c.name);
+                    match lossless_type(&c.ty).filter(|_| format == "parquet") {
+                        Some(ty) => format!("CAST({name} AS {ty}) AS {name}"),
+                        None => name,
+                    }
+                })
+                .collect();
             let sql = format!(
                 "COPY (SELECT {} FROM {}) TO {}",
                 columns.join(", "),
