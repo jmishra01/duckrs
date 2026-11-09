@@ -19,6 +19,7 @@ pub const COMPRESSION_FSST: u8 = 7;
 pub const COMPRESSION_ALP: u8 = 10;
 pub const COMPRESSION_ALPRD: u8 = 11;
 pub const COMPRESSION_ROARING: u8 = 13;
+pub const COMPRESSION_ZSTD: u8 = 12;
 pub const COMPRESSION_EMPTY: u8 = 14;
 pub const COMPRESSION_DICT_FSST: u8 = 15;
 
@@ -296,6 +297,106 @@ fn read_overflow_string(pin: &PinBlock<'_>, block: i64, offset: i32) -> Result<V
         }
     }
     Ok(result)
+}
+
+/// `ZSTD_VECTOR_SIZE`.
+const ZSTD_VECTOR_ROWS: usize = 2048;
+
+fn zstd_corrupt(message: &str) -> Error {
+    corrupted(&format!("ZSTD Decompression failed: {message}"))
+}
+
+/// `ZSTDStorage::StringScan`: per vector of 2048 strings their lengths and one zstd frame of them, on the page
+/// of the segment or a page of its own, and on from there through pages whose last 8 bytes say which is next.
+/// `segment` is the segment to the end of its block, and `packed` says whether others share that block.
+pub fn scan_zstd(segment: &[u8], count: usize, packed: bool, pin: &PinBlock<'_>, out: &mut Vec<Vec<u8>>) -> Result<()> {
+    const INVALID_BLOCK: i64 = -1;
+    let vectors = count.div_ceil(ZSTD_VECTOR_ROWS);
+    let what = "the metadata of a ZSTD segment";
+    // `GetVectorMetadataSize`: the arrays, each aligned to its own width
+    let ids_at = 0;
+    let offsets_at = (ids_at + 8 * vectors).next_multiple_of(4);
+    let uncompressed_at = (offsets_at + 4 * vectors).next_multiple_of(8);
+    let compressed_at = uncompressed_at + 8 * vectors;
+    for vector in 0..vectors {
+        let rows = (count - vector * ZSTD_VECTOR_ROWS).min(ZSTD_VECTOR_ROWS);
+        let block_id = u64_at(segment, ids_at + 8 * vector, what)? as i64;
+        let offset = u32_at(segment, offsets_at + 4 * vector, what)? as usize;
+        let uncompressed = u64_at(segment, uncompressed_at + 8 * vector, what)? as usize;
+        let compressed = u64_at(segment, compressed_at + 8 * vector, what)? as usize;
+        let mut visited = std::collections::HashSet::new();
+        let first_page;
+        let page: &[u8] = if block_id == INVALID_BLOCK {
+            segment
+        } else {
+            first_page = pin(block_id as u64)?;
+            visited.insert(block_id as u64);
+            &first_page
+        };
+        let mut position = offset.next_multiple_of(4);
+        let lengths: Vec<usize> = (0..rows)
+            .map(|row| u32_at(page, position + 4 * row, "the string lengths of a ZSTD vector").map(|l| l as usize))
+            .collect::<Result<_>>()?;
+        position += 4 * rows;
+        // what the first page holds of the frame: all but the id of the next page, unless others share it
+        let chained = block_id != INVALID_BLOCK || !packed;
+        let room = if chained {
+            page.len().saturating_sub(position).saturating_sub(8)
+        } else {
+            page.len().saturating_sub(position)
+        };
+        if chained && room == 0 && compressed > 0 {
+            return Err(zstd_corrupt("the page is too small for the vector"));
+        }
+        let mut frame = bytes(page, position, compressed.min(room), "a ZSTD frame")?.to_vec();
+        let mut next_at = position + compressed.min(room);
+        let mut current: Option<std::sync::Arc<Vec<u8>>> = None;
+        while frame.len() < compressed {
+            if !chained {
+                return Err(zstd_corrupt("the compressed data was exhausted"));
+            }
+            let holder = current.as_deref().map_or(page, |p| p.as_slice());
+            let next = u64_at(holder, next_at, "the next page of a ZSTD vector")?;
+            if !visited.insert(next) {
+                return Err(zstd_corrupt("the pages of a vector form a cycle"));
+            }
+            let next_page = pin(next)?;
+            let room = next_page.len().saturating_sub(8);
+            let take = (compressed - frame.len()).min(room);
+            frame.extend_from_slice(bytes(&next_page, 0, take, "a ZSTD frame")?);
+            next_at = take;
+            current = Some(next_page);
+        }
+        // `DecompressString`: as many bytes as the strings take, streamed from the frame
+        let wanted: usize = lengths.iter().sum();
+        let _ = uncompressed;
+        let mut data = vec![0u8; wanted];
+        let mut decoder =
+            zstd::stream::read::Decoder::with_buffer(frame.as_slice()).map_err(|e| zstd_corrupt(&e.to_string()))?;
+        let mut filled = 0;
+        while filled < wanted {
+            match std::io::Read::read(&mut decoder, &mut data[filled..]) {
+                Ok(0) => {
+                    return Err(corrupted(
+                        "Corrupted ZSTD vector: frame ended before producing the requested bytes",
+                    ));
+                }
+                Ok(read) => filled += read,
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    return Err(corrupted(
+                        "Corrupted ZSTD vector: compressed data ended before decompression finished",
+                    ));
+                }
+                Err(error) => return Err(zstd_corrupt(&error.to_string())),
+            }
+        }
+        let mut at = 0;
+        for length in lengths {
+            out.push(data[at..at + length].to_vec());
+            at += length;
+        }
+    }
+    Ok(())
 }
 
 /// `StringScan`: offsets, counted back from the end of the dictionary. A negative one is a marker

@@ -32,6 +32,8 @@ struct DataPointer {
     offset: usize,
     compression: u8,
     statistics: BaseStatistics,
+    /// `UncompressedStringSegmentState`: the blocks of its own that a segment reads from
+    overflow_blocks: Vec<i64>,
 }
 
 fn read_data_pointer(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>) -> Result<DataPointer> {
@@ -45,12 +47,13 @@ fn read_data_pointer(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>) -
         })?;
         let compression: u8 = d.read_property(103, "compression_type")?;
         let statistics = d.read_object_field(104, "statistics", |d| read_statistics(d, ty))?;
+        let mut overflow_blocks = Vec::new();
         if d.has_property(105)? {
             // `UncompressedStringStorage::DeserializeState`: which blocks hold overflow strings,
             // and the markers in the segment say so too
             d.read_object_field(105, "segment_state", |d| {
                 if bool::read_value(d)? {
-                    d.read_object_value(|d| d.read_property::<Vec<i64>>(1, "overflow_blocks"))?;
+                    overflow_blocks = d.read_object_value(|d| d.read_property::<Vec<i64>>(1, "overflow_blocks"))?;
                 }
                 Ok(())
             })?;
@@ -62,6 +65,7 @@ fn read_data_pointer(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>) -
             offset: offset as usize,
             compression,
             statistics,
+            overflow_blocks,
         })
     })
 }
@@ -216,6 +220,19 @@ fn scan_strings(
         COMPRESSION_DICTIONARY => scan_dictionary(data, count, out),
         COMPRESSION_FSST => scan_fsst(data, count, out),
         COMPRESSION_DICT_FSST => scan_dict_fsst(data, count, out, nulls),
+        COMPRESSION_ZSTD => {
+            // `UncompressedStringSegmentState::GetHandle`: only the pages of the segment
+            let pin = |block: u64| {
+                if !pointer.overflow_blocks.contains(&(block as i64)) {
+                    return Err(Error::new(
+                        duckrs_common::ErrorKind::DataCorruption,
+                        "Corrupted uncompressed string segment: overflow string block is not owned by the segment",
+                    ));
+                }
+                buffer.pin(block)
+            };
+            scan_zstd(data, count, pointer.offset != 0, &pin, out)
+        }
         other => Err(not_ported(other)),
     }
 }
