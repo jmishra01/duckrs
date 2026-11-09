@@ -1192,8 +1192,8 @@ impl Binder<'_> {
                 Some(expression) => self.constant_argument(expression)?,
                 None => Value::boolean(true),
             };
-            // `BindCopyOption`
-            if value.is_null() {
+            // `BindCopyOption`; SHREDDING says itself what it takes
+            if value.is_null() && !name.eq_ignore_ascii_case("shredding") {
                 return Err(binder_error(format!(
                     "NULL is not supported as a valid option for COPY option \"{name}\""
                 )));
@@ -1206,7 +1206,7 @@ impl Binder<'_> {
                 [literal] => self.constant_argument(&Expr::constant(literal.clone()))?,
                 _ => return Err(crate::unported(format!("the COPY option {name} with several values"))),
             };
-            if value.is_null() {
+            if value.is_null() && !name.eq_ignore_ascii_case("shredding") {
                 return Err(binder_error(format!(
                     "NULL is not supported as a valid option for COPY option \"{name}\""
                 )));

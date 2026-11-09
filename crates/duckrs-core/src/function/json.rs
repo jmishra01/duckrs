@@ -782,6 +782,22 @@ fn single<'a>(value: &'a Json, path: &Path) -> Option<&'a Json> {
 }
 
 /// The JSON of a `Value`, for `to_json` and casts to JSON (`JSONCreateFunctionData`).
+/// `VariantCasts::CastVariantToJSON`: a VARIANT NULL is a JSON null.
+fn variant_node_to_json(node: &duckrs_common::variant::VariantNode) -> Result<Json> {
+    use duckrs_common::variant::VariantNode;
+    Ok(match node {
+        VariantNode::Null => Json::Null,
+        VariantNode::Scalar(value) => value_to_json(value)?,
+        VariantNode::Array(items) => Json::Array(items.iter().map(variant_node_to_json).collect::<Result<_>>()?),
+        VariantNode::Object(children) => Json::Object(
+            children
+                .iter()
+                .map(|(key, child)| Ok((key.clone(), variant_node_to_json(child)?)))
+                .collect::<Result<_>>()?,
+        ),
+    })
+}
+
 pub fn value_to_json(value: &Value) -> Result<Json> {
     if value.is_null() {
         return Ok(Json::Null);
@@ -791,6 +807,9 @@ pub fn value_to_json(value: &Value) -> Result<Json> {
         return Ok(
             parse(&value.try_to_string()?).unwrap_or_else(|_| Json::Raw(value.try_to_string().unwrap_or_default()))
         );
+    }
+    if let (LogicalTypeId::Variant, ValueData::Bytes(bytes)) = (ty.id(), value.data()) {
+        return variant_node_to_json(&duckrs_common::variant::VariantNode::decode(bytes)?);
     }
     Ok(match (ty.id(), value.data()) {
         (LogicalTypeId::Boolean, ValueData::Bool(flag)) => Json::Bool(*flag),

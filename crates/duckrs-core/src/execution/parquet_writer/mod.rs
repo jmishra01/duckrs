@@ -168,6 +168,8 @@ pub struct WriterOptions {
     pub field_ids: FieldIds,
     /// `RETURN_STATS`: gather what each column holds
     pub return_stats: bool,
+    /// `SHREDDING`: the types to shred VARIANT columns on, by lowercase name (VARIANT: not at all)
+    pub shredding: HashMap<String, LogicalType>,
 }
 
 /// `ChildFieldIDs`: the field ids of columns by name, each with those of the columns in it.
@@ -199,6 +201,7 @@ impl Default for WriterOptions {
             write_page_index: false,
             field_ids: FieldIds::default(),
             return_stats: false,
+            shredding: HashMap::new(),
         }
     }
 }
@@ -918,6 +921,8 @@ struct ColumnSchema {
     max_define: u16,
     max_repeat: u16,
     field_id: Option<i32>,
+    /// a group annotated as VARIANT
+    variant: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1058,6 +1063,103 @@ fn has_parquet_type(ty: &LogicalType) -> bool {
     )
 }
 
+/// A shredded `typed_value` of `shredding`, whose field and element groups are REQUIRED.
+fn typed_value_node(
+    mut path: Vec<String>,
+    shredding: &LogicalType,
+    max_repeat: u16,
+    max_define: u16,
+    options: &WriterOptions,
+) -> Result<Node> {
+    let ty = super::parquet_variant::typed_value_type(shredding)?;
+    let schema = ColumnSchema {
+        name: "typed_value".to_string(),
+        ty: ty.clone(),
+        repetition: OPTIONAL,
+        max_define,
+        max_repeat,
+        field_id: None,
+        variant: false,
+    };
+    match shredding.id() {
+        LogicalTypeId::Struct => {
+            path.push("typed_value".to_string());
+            let children = shredding
+                .struct_children()
+                .iter()
+                .map(|(name, field)| variant_group(path.clone(), name, field, max_repeat, max_define + 1, options))
+                .collect::<Result<_>>()?;
+            Ok(Node::Struct {
+                schema,
+                children,
+                can_have_nulls: true,
+            })
+        }
+        LogicalTypeId::List => {
+            path.push("typed_value".to_string());
+            path.push("list".to_string());
+            let element = shredding.child_type().expect("a LIST has a child");
+            let child = variant_group(path, "element", element, max_repeat + 1, max_define + 2, options)?;
+            Ok(Node::List {
+                schema,
+                child: Box::new(child),
+                map: false,
+                can_have_nulls: true,
+            })
+        }
+        _ => create_node(path, &ty, "typed_value", max_repeat, max_define, true, options, None),
+    }
+}
+
+/// A REQUIRED group of a shredded field or element: its `value`, and its `typed_value` if it has a type.
+fn variant_group(
+    mut path: Vec<String>,
+    name: &str,
+    shredding: &LogicalType,
+    max_repeat: u16,
+    max_define: u16,
+    options: &WriterOptions,
+) -> Result<Node> {
+    path.push(name.to_string());
+    let max_define = max_define - 1;
+    let mut fields = vec![("value".to_string(), LogicalType::BLOB)];
+    let mut children = vec![create_node(
+        path.clone(),
+        &LogicalType::BLOB,
+        "value",
+        max_repeat,
+        max_define + 1,
+        true,
+        options,
+        None,
+    )?];
+    if !matches!(shredding.id(), LogicalTypeId::Variant | LogicalTypeId::SqlNull) {
+        let typed = typed_value_node(path, shredding, max_repeat, max_define + 1, options)?;
+        fields.push(("typed_value".to_string(), node_type(&typed).clone()));
+        children.push(typed);
+    }
+    Ok(Node::Struct {
+        schema: ColumnSchema {
+            name: name.to_string(),
+            ty: LogicalType::struct_type(fields),
+            repetition: REQUIRED,
+            max_define,
+            max_repeat,
+            field_id: None,
+            variant: false,
+        },
+        children,
+        can_have_nulls: false,
+    })
+}
+
+fn node_type(node: &Node) -> &LogicalType {
+    match node {
+        Node::Leaf(leaf) => &leaf.schema.ty,
+        Node::Struct { schema, .. } | Node::List { schema, .. } | Node::Array { schema, .. } => &schema.ty,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn create_node(
     mut path: Vec<String>,
@@ -1085,6 +1187,7 @@ fn create_node(
         max_define,
         max_repeat,
         field_id,
+        variant: false,
     };
     match ty.id() {
         T::Struct | T::Tuple => {
@@ -1191,6 +1294,7 @@ fn create_node(
                     max_define: max_define + 1,
                     max_repeat: max_repeat + 1,
                     field_id: None,
+                    variant: false,
                 },
                 children: vec![key, value],
                 can_have_nulls: false,
@@ -1202,7 +1306,55 @@ fn create_node(
                 can_have_nulls,
             });
         }
-        T::Union | T::Variant | T::Geometry => {
+        T::Variant => {
+            if path.len() > 1 {
+                return Err(Error::not_implemented(
+                    "ColumnWriter of type 'VARIANT' requires a transform, but is not a root column, this isn't \
+                     supported currently",
+                ));
+            }
+            let shredding = options.shredding.get(&name.to_lowercase());
+            let shredded = shredding.is_some_and(|ty| ty.id() != T::Variant);
+            let mut children = vec![
+                create_node(
+                    path.clone(),
+                    &LogicalType::BLOB,
+                    "metadata",
+                    max_repeat,
+                    max_define + 1,
+                    false,
+                    options,
+                    None,
+                )?,
+                create_node(
+                    path.clone(),
+                    &LogicalType::BLOB,
+                    "value",
+                    max_repeat,
+                    max_define + 1,
+                    shredded,
+                    options,
+                    None,
+                )?,
+            ];
+            if let Some(shredding) = shredding.filter(|_| shredded) {
+                children.push(typed_value_node(
+                    path.clone(),
+                    shredding,
+                    max_repeat,
+                    max_define + 1,
+                    options,
+                )?);
+            }
+            let mut schema = schema(&super::parquet_variant::parquet_variant_type(shredding)?);
+            schema.variant = true;
+            return Ok(Node::Struct {
+                schema,
+                children,
+                can_have_nulls,
+            });
+        }
+        T::Union | T::Geometry => {
             return Err(crate::unported(format!("writing {ty} to a Parquet file")));
         }
         _ => {}
@@ -1343,6 +1495,8 @@ enum LogicalAnnotation {
         precision: i32,
     },
     Unknown,
+    /// `VARIANT` of specification version 1
+    Variant,
 }
 
 impl SchemaElement {
@@ -1389,6 +1543,7 @@ impl SchemaElement {
                     t.i32(2, precision);
                 }),
                 LogicalAnnotation::Unknown => t.empty(11),
+                LogicalAnnotation::Variant => t.structure(16, |t| t.i8(1, 1)),
             });
         }
     }
@@ -1477,6 +1632,7 @@ fn finalize_schema(node: &Node, schemas: &mut Vec<SchemaElement>, options: &Writ
                 name: schema.name.clone(),
                 num_children: Some(children.len() as i32),
                 field_id: schema.field_id,
+                logical: schema.variant.then_some(LogicalAnnotation::Variant),
                 ..Default::default()
             });
             children
@@ -1887,6 +2043,17 @@ pub struct ParquetFileWriter {
     page_indexes: Vec<PageIndexEntry>,
     num_rows: i64,
     stats: Option<StatsAccumulator>,
+    /// of each column, if it is a VARIANT
+    variants: Vec<Option<VariantColumn>>,
+}
+
+/// A VARIANT column (`VariantColumnWriter`): what it is shredded on, once that is known.
+struct VariantColumn {
+    name: String,
+    ty: LogicalType,
+    can_have_nulls: bool,
+    /// `None` until the first row group is analyzed; VARIANT for not shredded
+    shredding: Option<LogicalType>,
 }
 
 /// What [`ParquetFileWriter::finish`] wrote.
@@ -1917,8 +2084,22 @@ impl ParquetFileWriter {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
+        let variants = names
+            .iter()
+            .zip(types)
+            .enumerate()
+            .map(|(i, (name, ty))| {
+                (ty.id() == LogicalTypeId::Variant).then(|| VariantColumn {
+                    name: name.clone(),
+                    ty: ty.clone(),
+                    can_have_nulls: !options.not_null_columns.get(i).copied().unwrap_or(false),
+                    shredding: options.shredding.get(&name.to_lowercase()).cloned(),
+                })
+            })
+            .collect();
         let file = std::fs::File::create(path).map_err(|e| io_error(format!("Cannot open file \"{path}\": {e}")))?;
         let mut writer = Self {
+            variants,
             out: std::io::BufWriter::new(file),
             path: path.to_string(),
             written: 0,
@@ -2024,10 +2205,11 @@ impl ParquetFileWriter {
     }
 
     /// `PrepareRowGroup` and `FlushRowGroup`.
-    fn write_row_group(&mut self, columns: Vec<Vec<Value>>, rows: usize) -> Result<()> {
+    fn write_row_group(&mut self, mut columns: Vec<Vec<Value>>, rows: usize) -> Result<()> {
         if rows == 0 {
             return Ok(());
         }
+        self.prepare_variants(&mut columns)?;
         let nodes = self.nodes.clone();
         let mut leaf_index = 0;
         let mut states = Vec::with_capacity(nodes.len());
@@ -2075,6 +2257,48 @@ impl ParquetFileWriter {
             total_compressed_size,
         });
         self.num_rows += rows as i64;
+        Ok(())
+    }
+
+    /// `AnalyzeSchema` of the VARIANT columns, on the first row group, and their `TransformExpression`.
+    fn prepare_variants(&mut self, columns: &mut [Vec<Value>]) -> Result<()> {
+        let mut changed = false;
+        for (index, values) in columns.iter_mut().enumerate() {
+            let Some(variant) = self.variants.get_mut(index).and_then(Option::as_mut) else {
+                continue;
+            };
+            if variant.shredding.is_none() {
+                let shredding = super::parquet_variant::analyze_shredding(values)?
+                    .unwrap_or_else(|| LogicalType::new(LogicalTypeId::Variant));
+                self.options
+                    .shredding
+                    .insert(variant.name.to_lowercase(), shredding.clone());
+                self.nodes[index] = create_node(
+                    Vec::new(),
+                    &variant.ty,
+                    &variant.name,
+                    0,
+                    1,
+                    variant.can_have_nulls,
+                    &self.options,
+                    Some(&self.options.field_ids),
+                )?;
+                variant.shredding = Some(shredding);
+                changed = true;
+            }
+            let shredding = variant.shredding.as_ref();
+            let ty = node_type(&self.nodes[index]).clone();
+            for value in values.iter_mut() {
+                *value = if value.is_null() {
+                    Value::null(ty.clone())
+                } else {
+                    super::parquet_variant::to_parquet_variant(value, shredding, &ty)?
+                };
+            }
+        }
+        if changed && self.stats.is_some() {
+            self.stats = Some(StatsAccumulator::new(&self.nodes));
+        }
         Ok(())
     }
 

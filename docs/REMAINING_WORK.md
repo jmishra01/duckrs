@@ -52,14 +52,20 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] statistics of Parquet scans from the footers (bounds where exact; not floats, INT96, deprecated bounds)
   - [x] C++'s errors for corrupt files (footer length, short decompression, RLE widths, DBP miniblocks, ...)
   - [x] `TIME(NANOS)` reads as `TIME_NS`; Thrift texts of logical types in `parquet_schema`
-  - [ ] encryption, UNION, VARIANT and GEOMETRY columns
+  - [x] VARIANT columns: reading the binary encoding and shredded `typed_value`s, writing with auto-shredding and
+    `SHREDDING`, `variant_to_parquet_variant` / `variant_bytes_to_variant`
+  - [ ] encryption, UNION and GEOMETRY columns
   - [ ] rotation inside partitions groups rows into files differently from C++ (`partitioned_file_rotation`)
   - [ ] reader side: row-group pruning by bloom filters and page indexes, `bound_schema` (needs struct field
     projection and `EXPLAIN (SQL)`), reading a directory path, `maximum_files_for_stats`
   - [ ] corrupt files C++ rejects that the crate reads (INT96 out of range, WKB types, page index row counts)
   - [ ] prefetch / read-ahead metrics and EXPLAIN shapes of Parquet scans (~20 files)
   - [ ] `write_timestamp_as_int96`, `parquet_metadata` logical type names (`Float16Type()`), duplicate column names
-- [ ] 4. Parquet VARIANT, including shredding (`parquet/variant`: 47 failing, 0%)
+- [ ] 4. Parquet VARIANT, including shredding (`parquet/variant`: 15 failing, 68%)
+  - [x] reading, writing, auto-shredding, the `SHREDDING` option, VARIANT to JSON
+  - [ ] the key dictionary in insertion order (`VariantNode` keeps keys sorted, so bytes differ from C++)
+  - [ ] `vector_type`, VARIANT ordering (`variant_comparator`), `stats()` of VARIANT, case-sensitive shredded
+    extraction, `debug_delta_only_variant_encoding_enabled`
 - [ ] 5. `EXPORT DATABASE` / `IMPORT DATABASE` (`sql/export`: 27 failing, 0%)
 - [ ] 6. `COPY FROM DATABASE` (`sql/copy_database`: 12 failing, 0%)
 - [ ] 7. MultiFileReader: hive partitioning, `union_by_name`, filename column (`sql/multi_file`: 4 failing)
@@ -73,7 +79,8 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] DICTIONARY and FSST segments for files before v1.3.0; reading and writing ZSTD segments
   - [ ] the ART layouts of files before v2.0.0 (an index in such a file is refused for now)
   - [ ] dense row id rewriting of files before v2.0.0 (`rowid_gaps/old_storage_*`): row groups stay as they are
-  - [ ] VARIANT and GEOMETRY columns (~30 files), Patas and Chimp segments (8), `read_duckdb` (8)
+  - [x] unshredded VARIANT columns, in the file and the WAL
+  - [ ] shredded VARIANT columns (~20 files), GEOMETRY columns, Patas and Chimp segments (8), `read_duckdb` (8)
   - [ ] string and list-length statistics for `stats()` (~10 files), per-column `USING COMPRESSION`
 - [ ] 10. `ATTACH`/`DETACH` and multi-database features (`sql/attach`: 69 failing, 30.3%)
   - [ ] `ENCRYPTION_KEY`, `COMPRESS`, `RECOVERY_MODE`, `IO_MODE` and the other ATTACH options

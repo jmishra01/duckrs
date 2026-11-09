@@ -451,6 +451,7 @@ impl Binder<'_> {
             .iter()
             .any(|(n, _)| n.eq_ignore_ascii_case("order_by"));
         let mut field_ids = None;
+        let mut shredding = None;
         for (name, value) in self.copy_options(info)? {
             if partition.take(&name, &value)? || output.take(&name, &value)? {
                 continue;
@@ -550,6 +551,7 @@ impl Binder<'_> {
                 "write_bloom_filter" => writer.bloom_filters = is_true(&value, &name)?,
                 "write_page_index" => writer.write_page_index = is_true(&value, &name)?,
                 "field_ids" => field_ids = Some(value.clone()),
+                "shredding" => shredding = Some(value.clone()),
                 "bloom_filter_false_positive_ratio" => {
                     let ratio: f64 = value
                         .try_to_string()?
@@ -647,6 +649,18 @@ impl Binder<'_> {
                 parse_field_ids(&value, &columns, &mut std::collections::HashSet::new())?
             };
         }
+        if let Some(value) = shredding {
+            let written = match &options.partitioning {
+                Some(partitioning) => partitioning.written_columns(bound.names.len()),
+                None => (0..bound.names.len()).collect(),
+            };
+            let variants: Vec<&String> = written
+                .iter()
+                .filter(|&&c| bound.types[c].id() == LogicalTypeId::Variant)
+                .map(|&c| &bound.names[c])
+                .collect();
+            options.writer.shredding = self.bind_shredding(&value, &variants)?;
+        }
         options.rotation = partition.rotation(&path, "parquet", file_size_bytes, row_groups_per_file, per_thread)?;
         options.output = output.build(options.partitioning.is_some(), per_thread, ordered, None)?;
         options.writer.return_stats = options.output.return_stats;
@@ -667,6 +681,108 @@ impl Binder<'_> {
             column_aliases: Vec::new(),
             return_type,
         })
+    }
+}
+
+impl Binder<'_> {
+    /// The `SHREDDING` option: the type each VARIANT column is shredded on.
+    fn bind_shredding(
+        &mut self,
+        value: &Value,
+        variants: &[&String],
+    ) -> Result<std::collections::HashMap<String, LogicalType>> {
+        if value.logical_type().id() == LogicalTypeId::Varchar && value.try_to_string()?.eq_ignore_ascii_case("auto") {
+            return Err(Error::not_implemented(
+                "The 'auto' option is not yet implemented for 'shredding'",
+            ));
+        }
+        let ValueData::Struct(fields) = value.data() else {
+            return Err(binder_error(
+                "SHREDDING value should be a STRUCT of column names to types, i.e: {col1: 'INTEGER[]', col2: 'BOOLEAN'}",
+            ));
+        };
+        if value.logical_type().id() != LogicalTypeId::Struct || value.is_null() {
+            return Err(binder_error(
+                "SHREDDING value should be a STRUCT of column names to types, i.e: {col1: 'INTEGER[]', col2: 'BOOLEAN'}",
+            ));
+        }
+        let mut result = std::collections::HashMap::new();
+        for ((name, _), field) in value.logical_type().struct_children().iter().zip(fields) {
+            let Some(column) = variants.iter().find(|c| c.eq_ignore_ascii_case(name)) else {
+                if variants.is_empty() {
+                    return Err(binder_error(format!(
+                        "VARIANT by name \"{name}\" specified in SHREDDING not found. There are no VARIANT columns present."
+                    )));
+                }
+                let names = variants.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
+                return Err(binder_error(format!(
+                    "VARIANT by name \"{name}\" specified in SHREDDING not found. Consider using WRITE_PARTITION_COLUMNS \
+                     if this column is a partition column. Available names of VARIANT columns: [{names}]"
+                )));
+            };
+            if field.logical_type().id() != LogicalTypeId::Varchar {
+                return Err(binder_error(
+                    "SHREDDING value should be of type VARCHAR, a stringified type to use for the column",
+                ));
+            }
+            // a NULL, or the type NULL, writes the column without shredding
+            let disabled = LogicalType::new(LogicalTypeId::Variant);
+            if field.is_null() {
+                result.insert(column.to_lowercase(), disabled);
+                continue;
+            }
+            let text = field.try_to_string()?;
+            let cannot = || {
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("Value \"{text}\" can not be converted to a DuckDB Type."),
+                )
+            };
+            let ty = if text.trim().eq_ignore_ascii_case("null") {
+                disabled
+            } else {
+                let ty = self.csv_type(&text).map_err(|error| match error.kind {
+                    ErrorKind::Catalog => error,
+                    _ => cannot(),
+                })?;
+                if contains_any(&ty) {
+                    return Err(cannot());
+                }
+                ty
+            };
+            check_shredding_type(&ty)?;
+            result.insert(column.to_lowercase(), ty);
+        }
+        Ok(result)
+    }
+}
+
+fn contains_any(ty: &LogicalType) -> bool {
+    ty.id() == LogicalTypeId::Any
+        || ty.child_type().is_some_and(contains_any)
+        || ty.struct_children().iter().any(|(_, child)| contains_any(child))
+}
+
+/// `ConvertShreddingTypeRecursive`: the types a VARIANT can be shredded on in Parquet.
+fn check_shredding_type(ty: &LogicalType) -> Result<()> {
+    use LogicalTypeId as T;
+    match ty.id() {
+        T::Variant => Ok(()),
+        T::Struct => ty
+            .struct_children()
+            .iter()
+            .try_for_each(|(_, child)| check_shredding_type(child)),
+        T::List => check_shredding_type(ty.child_type().expect("a LIST has a child")),
+        _ if ty.is_nested() => Err(binder_error(format!(
+            "VARIANT can only be shredded on LIST/STRUCT/ANY/non-nested type, not {ty}"
+        ))),
+        T::Bit | T::Bignum => Err(binder_error(format!(
+            "VARIANT cannot be shredded on type {ty} in Parquet"
+        ))),
+        _ if ty.alias().is_some() => Err(binder_error(format!(
+            "VARIANT cannot be shredded on type {ty} in Parquet"
+        ))),
+        _ => Ok(()),
     }
 }
 

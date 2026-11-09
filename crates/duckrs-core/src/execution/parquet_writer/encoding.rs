@@ -459,6 +459,12 @@ impl Thrift {
         varint(&mut self.out, zigzag(value));
     }
 
+    /// A byte field (`i8`).
+    pub fn i8(&mut self, id: i16, value: i8) {
+        self.field(id, 3);
+        self.out.push(value as u8);
+    }
+
     pub fn bool(&mut self, id: i16, value: bool) {
         self.field(id, if value { ttype::BOOL_TRUE } else { ttype::BOOL_FALSE });
     }
