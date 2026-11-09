@@ -15,6 +15,7 @@ use super::checkpoint::{self, StoredEntry};
 use super::compression::{
     COMPRESSION_ALP, COMPRESSION_ALPRD, COMPRESSION_BITPACKING, COMPRESSION_CONSTANT, COMPRESSION_DICT_FSST,
     COMPRESSION_DICTIONARY, COMPRESSION_FSST, COMPRESSION_RLE, COMPRESSION_ROARING, COMPRESSION_UNCOMPRESSED,
+    COMPRESSION_ZSTD,
 };
 use super::encode::{
     Encoded, encode_alp, encode_alprd, encode_bitpacking, encode_dictionary, encode_old_dictionary, encode_old_fsst,
@@ -1157,6 +1158,118 @@ impl<'a> Writer<'a> {
         }
     }
 
+    /// `ZSTDCompressionState`: per segment the metadata of its vectors, and per vector of 2048 strings their
+    /// lengths and a zstd frame of them, after one another and on through pages of the segment's own, each of
+    /// which ends in the id of the next where a vector goes on.
+    fn write_zstd(&mut self, strings: &[&[u8]], valid: &[bool]) -> Result<Vec<SegmentOut>> {
+        const VECTOR_ROWS: usize = 2048;
+        let block_size = self.block_size;
+        let writable = block_size - 8;
+        let metadata_size =
+            |vectors: usize| ((8 * vectors).next_multiple_of(4) + 4 * vectors).next_multiple_of(8) + 16 * vectors;
+        let mut per_segment = 1;
+        while metadata_size(per_segment + 1) <= writable {
+            per_segment += 1;
+        }
+        let mut segments = Vec::new();
+        let mut start = 0;
+        while start < strings.len() {
+            let rows = (strings.len() - start).min(per_segment * VECTOR_ROWS);
+            let vectors = rows.div_ceil(VECTOR_ROWS);
+            // the pages: the segment's first, then those of its own
+            let mut pages: Vec<(Option<u64>, Vec<u8>)> = vec![(None, vec![0; block_size])];
+            let mut position = metadata_size(vectors);
+            let mut metadata: Vec<(i64, u32, u64, u64)> = Vec::with_capacity(vectors);
+            for vector in 0..vectors {
+                let first = start + vector * VECTOR_ROWS;
+                let last = (first + VECTOR_ROWS).min(start + rows);
+                let lengths: Vec<u32> = (first..last)
+                    .map(|row| if valid[row] { strings[row].len() as u32 } else { 0 })
+                    .collect();
+                let data: Vec<u8> = (first..last)
+                    .filter(|&row| valid[row])
+                    .flat_map(|row| strings[row].iter().copied())
+                    .collect();
+                let frame = zstd::bulk::compress(&data, 3)
+                    .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("ZSTD Compression failed: {e}")))?;
+                position = position.next_multiple_of(4);
+                let next_page = |pages: &mut Vec<(Option<u64>, Vec<u8>)>, position: usize, this: &mut Self| {
+                    let id = this.allocate_block();
+                    let page = &mut pages.last_mut().expect("a page").1;
+                    page[position..position + 8].copy_from_slice(&id.to_le_bytes());
+                    pages.push((Some(id), vec![0; block_size]));
+                };
+                if position + lengths.len() * 4 >= writable {
+                    next_page(&mut pages, position, self);
+                    position = 0;
+                }
+                let page_id = pages.last().expect("a page").0.map_or(-1, |id| id as i64);
+                metadata.push((page_id, position as u32, data.len() as u64, frame.len() as u64));
+                {
+                    let page = &mut pages.last_mut().expect("a page").1;
+                    for length in &lengths {
+                        page[position..position + 4].copy_from_slice(&length.to_le_bytes());
+                        position += 4;
+                    }
+                }
+                let mut rest = frame.as_slice();
+                while !rest.is_empty() {
+                    let take = rest.len().min(writable - position);
+                    let page = &mut pages.last_mut().expect("a page").1;
+                    page[position..position + take].copy_from_slice(&rest[..take]);
+                    position += take;
+                    rest = &rest[take..];
+                    if !rest.is_empty() {
+                        next_page(&mut pages, position, self);
+                        position = 0;
+                    }
+                }
+            }
+            // the metadata, at the start of the segment
+            let ids_at = 0;
+            let offsets_at = (8 * vectors).next_multiple_of(4);
+            let uncompressed_at = (offsets_at + 4 * vectors).next_multiple_of(8);
+            let compressed_at = uncompressed_at + 8 * vectors;
+            let segment = &mut pages[0].1;
+            for (vector, (page, offset, uncompressed, compressed)) in metadata.iter().enumerate() {
+                segment[ids_at + 8 * vector..ids_at + 8 * vector + 8].copy_from_slice(&page.to_le_bytes());
+                segment[offsets_at + 4 * vector..offsets_at + 4 * vector + 4].copy_from_slice(&offset.to_le_bytes());
+                let at = uncompressed_at + 8 * vector;
+                segment[at..at + 8].copy_from_slice(&uncompressed.to_le_bytes());
+                let at = compressed_at + 8 * vector;
+                segment[at..at + 8].copy_from_slice(&compressed.to_le_bytes());
+            }
+            let overflow_blocks: Vec<i64> = pages.iter().filter_map(|(id, _)| id.map(|id| id as i64)).collect();
+            let (block_id, offset) = if overflow_blocks.is_empty() {
+                // a segment on its page alone can share its block
+                let size = position;
+                let page = std::mem::take(&mut pages[0].1);
+                self.place(&page[..size])?
+            } else {
+                // what goes on to other pages starts the block of its segment
+                let block = self.allocate_block();
+                *self.segments_in_block.entry(block).or_default() += 1;
+                self.buffer.block_manager().write_block(block, &pages[0].1)?;
+                (block as i64, 0)
+            };
+            for (id, page) in pages.iter().skip(1) {
+                self.buffer
+                    .block_manager()
+                    .write_block(id.expect("an extra page"), page)?;
+            }
+            segments.push(SegmentOut {
+                tuple_count: rows,
+                block_id,
+                offset,
+                compression: COMPRESSION_ZSTD,
+                stats: Stats::of_validity(&valid[start..start + rows]),
+                overflow_blocks,
+            });
+            start += rows;
+        }
+        Ok(segments)
+    }
+
     fn write_strings(&mut self, parts: &[Part], valid: &[bool]) -> Result<Vec<SegmentOut>> {
         let limit = STRING_BLOCK_LIMIT.min((self.block_size / 4) & !7);
         let mut strings: Vec<&[u8]> = Vec::with_capacity(valid.len());
@@ -1172,6 +1285,10 @@ impl<'a> Writer<'a> {
             }
         }
         let force = self.force_compression.as_str();
+        // `ZSTDStorage::StringInitAnalyze`: from v1.2.0 on
+        if force == "zstd" && self.version >= StorageVersion::V1_2_0 && !strings.is_empty() {
+            return self.write_zstd(&strings, valid);
+        }
         // before v1.3.0: DICTIONARY and FSST, which DICT_FSST replaced
         if self.version < StorageVersion::V1_3_0 && force != "uncompressed" && valid.iter().any(|v| *v) {
             let plain_size: usize = strings.iter().map(|string| string.len() + 4).sum();
