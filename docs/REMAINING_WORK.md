@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 3797 of 6367 test files pass (**62.7%**). The v1 target is ≥ 90%.
+- Overall: 3824 of 6367 test files pass (**63.2%**). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -67,9 +67,17 @@ Each item gives the number of failing files in `test/` that it should fix, where
 
 ## Phase 9: Storage engine
 
-- [ ] 9. Remaining storage failures (`sql/storage`: 216 failing, 64.0%; target ≥ 85%)
-- [ ] 10. `ATTACH`/`DETACH` and multi-database features (`sql/attach`: 71 failing, 28.3%)
-- [ ] 11. Files that C++ DuckDB v69 can read and write (`sql/storage_version`: 2 failing)
+- [ ] 9. Remaining storage failures (`sql/storage`: 193 failing, 67.8%; target ≥ 85%)
+  - [x] files in older storage versions: `ATTACH (STORAGE_VERSION ...)`, `storage_compatibility_version`, the
+    header numbers, C++'s version gates in the generated and hand-written serializers, compressions by version
+  - [x] DICTIONARY and FSST segments for files before v1.3.0; reading and writing ZSTD segments
+  - [ ] the ART layouts of files before v2.0.0 (an index in such a file is refused for now)
+  - [ ] dense row id rewriting of files before v2.0.0 (`rowid_gaps/old_storage_*`): row groups stay as they are
+  - [ ] VARIANT and GEOMETRY columns (~30 files), Patas and Chimp segments (8), `read_duckdb` (8)
+  - [ ] string and list-length statistics for `stats()` (~10 files), per-column `USING COMPRESSION`
+- [ ] 10. `ATTACH`/`DETACH` and multi-database features (`sql/attach`: 69 failing, 30.3%)
+  - [ ] `ENCRYPTION_KEY`, `COMPRESS`, `RECOVERY_MODE`, `IO_MODE` and the other ATTACH options
+- [x] 11. Files that C++ DuckDB v69 can read and write (`sql/storage_version`: all pass)
 - [ ] 12. `VACUUM` (`sql/vacuum`: 1 failing)
 - [ ] 13. Crash-recovery fuzzing: kill the process during writes, then reopen and verify
 
