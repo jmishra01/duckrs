@@ -39,7 +39,7 @@ use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::serializer::StorageVersion;
 use duckrs_common::serializer::{BinarySerializer, SerializationOptions, Serialize};
 use duckrs_common::types::{Interval, ListEntry, LogicalType, LogicalTypeId, PhysicalType, StringT};
-use duckrs_common::value::Value;
+use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, SelectionVector, Vector};
 use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
 use duckrs_parser::ast::{self, Expr};
@@ -294,6 +294,16 @@ fn write_stats(s: &mut BinarySerializer, ty: Option<&LogicalType>, stats: &Stats
         let Some(ty) = ty.filter(|ty| ty.id() != LogicalTypeId::SqlNull) else {
             return;
         };
+        // `VariantStats::Serialize`: not shredded, and the statistics of what it is stored as
+        if ty.id() == LogicalTypeId::Variant {
+            const NOT_SHREDDED: u8 = 1;
+            s.write_property(200, "shredding_state", &NOT_SHREDDED);
+            let unshredded = duckrs_common::variant::unshredded_type();
+            s.write_object(225, "unshredded_stats", |s| {
+                write_stats(s, Some(&unshredded), &Stats::unknown())
+            });
+            return;
+        }
         let child = |s: &mut BinarySerializer, ty: Option<&LogicalType>| {
             s.write_object_value(|s| write_stats(s, ty, &Stats::unknown()));
         };
@@ -390,6 +400,14 @@ fn write_column(s: &mut BinarySerializer, column: &ColumnOut, ty: Option<&Logica
     let Some(ty) = ty else { return };
     if let Some(validity) = &column.validity {
         s.write_object(101, "validity", |s| write_column(s, validity, None, row_start));
+    }
+    // `PersistentColumnData::Serialize` of a VARIANT: what it is stored as, unshredded
+    if ty.id() == LogicalTypeId::Variant {
+        let unshredded = duckrs_common::variant::unshredded_type();
+        s.write_object(102, "unshredded", |s| {
+            write_column(s, &column.children[0], Some(&unshredded), row_start)
+        });
+        return;
     }
     match ty.physical_type() {
         PhysicalType::List | PhysicalType::Array => {
@@ -1477,7 +1495,10 @@ impl<'a> Writer<'a> {
 
     /// `ColumnData::Checkpoint`.
     fn write_column_data(&mut self, ty: &LogicalType, parts: &[Part]) -> Result<ColumnOut> {
-        if matches!(ty.id(), LogicalTypeId::Geometry | LogicalTypeId::Variant) {
+        if ty.id() == LogicalTypeId::Variant {
+            return self.write_variant(parts);
+        }
+        if matches!(ty.id(), LogicalTypeId::Geometry) {
             return Err(write_not_ported(&format!("a {} column", ty.id().name())));
         }
         let rows = parts.iter().map(|part| part.count).sum();
@@ -1557,6 +1578,39 @@ impl<'a> Writer<'a> {
             validity: Some(validity),
             children,
             stats,
+        })
+    }
+
+    /// `VariantColumnData::Checkpoint`, unshredded: its validity, and the STRUCT DuckDB stores its values as.
+    fn write_variant(&mut self, parts: &[Part]) -> Result<ColumnOut> {
+        let unshredded = duckrs_common::variant::unshredded_type();
+        let mut valid = Vec::new();
+        let mut stored = Vec::with_capacity(parts.len());
+        for part in parts {
+            let mut vector = Vector::new(unshredded.clone(), part.count.max(1));
+            for row in 0..part.count {
+                let value = part.vector.get_value(row);
+                valid.push(!value.is_null());
+                let node = match value.data() {
+                    ValueData::Bytes(bytes) => duckrs_common::variant::VariantNode::decode(bytes)?,
+                    _ => duckrs_common::variant::VariantNode::Null,
+                };
+                vector.set_value(row, &node.to_unshredded()?)?;
+            }
+            stored.push(vector);
+        }
+        let stored_parts: Vec<Part> = stored
+            .iter()
+            .zip(parts)
+            .map(|(vector, part)| Part::new(vector, part.count))
+            .collect();
+        let child = self.write_column_data(&unshredded, &stored_parts)?;
+        let validity = Box::new(self.write_validity(&valid)?);
+        Ok(ColumnOut {
+            segments: Vec::new(),
+            validity: Some(validity),
+            children: vec![child],
+            stats: Stats::of_validity(&valid),
         })
     }
 

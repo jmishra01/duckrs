@@ -234,9 +234,38 @@ fn guarded<T>(path: &str, read: impl FnOnce() -> Result<T>) -> Result<T> {
 
 fn open_builder(path: &str) -> Result<ParquetRecordBatchReaderBuilder<File>> {
     let file = File::open(path).map_err(|e| Error::new(ErrorKind::Io, format!("Cannot open file \"{path}\": {e}")))?;
-    guarded(path, || {
+    let builder = guarded(path, || {
         ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| read_error(path, "Invalid Parquet file", e))
-    })
+    })?;
+    check_variant_groups(builder.parquet_schema().root_schema(), path)?;
+    Ok(builder)
+}
+
+/// `VariantColumnReader`: a VARIANT group starts with its `metadata` and `value`.
+fn check_variant_groups(ty: &parquet::schema::types::Type, path: &str) -> Result<()> {
+    if ty.is_primitive() {
+        return Ok(());
+    }
+    let fields = ty.get_fields();
+    if matches!(
+        ty.get_basic_info().logical_type_ref(),
+        Some(parquet::basic::LogicalType::Variant(_))
+    ) {
+        let name = |i: usize| fields.get(i).map(|f| f.name());
+        let ok = matches!(
+            (name(0), name(1)),
+            (Some("metadata"), Some("value")) | (Some("value"), Some("metadata"))
+        );
+        if !ok {
+            return Err(Error::new(
+                ErrorKind::DataCorruption,
+                format!(
+                    "Failed to read file \"{path}\": the Variant column must have 'metadata' and 'value' as the first two columns"
+                ),
+            ));
+        }
+    }
+    fields.iter().try_for_each(|field| check_variant_groups(field, path))
 }
 
 /// `ParquetReader::DeriveLogicalType`, from what the crate makes of the file.
@@ -334,6 +363,8 @@ enum Special {
     Int96,
     /// a TIME adjusted to UTC, which DuckDB reads as TIMETZ
     TimeUtc,
+    /// a group annotated as VARIANT
+    Variant,
 }
 
 fn special_columns(builder: &ParquetRecordBatchReaderBuilder<File>) -> Vec<Special> {
@@ -344,7 +375,10 @@ fn special_columns(builder: &ParquetRecordBatchReaderBuilder<File>) -> Vec<Speci
         .iter()
         .map(|field| {
             if !field.is_primitive() {
-                return Special::None;
+                return match field.get_basic_info().logical_type_ref() {
+                    Some(parquet::basic::LogicalType::Variant(_)) => Special::Variant,
+                    _ => Special::None,
+                };
             }
             if field.get_physical_type() == parquet::basic::Type::INT96 {
                 return Special::Int96;
@@ -367,6 +401,9 @@ fn column_type(
 ) -> Result<LogicalType> {
     if special.get(index) == Some(&Special::TimeUtc) {
         return Ok(LogicalType::new(LogicalTypeId::TimeTz));
+    }
+    if special.get(index) == Some(&Special::Variant) {
+        return Ok(LogicalType::new(LogicalTypeId::Variant));
     }
     if special.get(index) == Some(&Special::Int96) {
         return Ok(match int96_as {
@@ -447,7 +484,9 @@ fn timestamp_value(value: i64, unit: &TimeUnit, ty: &LogicalType) -> Result<Valu
             ("time".to_string(), time),
         ]));
     }
-    if ty.id() == LogicalTypeId::TimestampNs {
+    if ty.id() == LogicalTypeId::TimestampNs
+        || (ty.id() == LogicalTypeId::TimestampTzNs && *unit == TimeUnit::Nanosecond)
+    {
         return Value::new(ty.clone(), ValueData::Int64(value));
     }
     let micros = match unit {
@@ -470,9 +509,24 @@ fn decimal_value(unscaled: i128, ty: &LogicalType) -> Result<Value> {
 }
 
 /// The value of `row` of `array`, as a `ty`.
+/// The DuckDB type of a field of a file, read as is.
+pub(super) fn field_type(field: &Field) -> Result<LogicalType> {
+    logical_type(field, false)
+}
+
+/// The value of `row` of `array`, as a `ty`.
+pub(super) fn field_value(array: &dyn Array, row: usize, ty: &LogicalType) -> Result<Value> {
+    array_value(array, row, ty)
+}
+
 fn array_value(array: &dyn Array, row: usize, ty: &LogicalType) -> Result<Value> {
     if array.is_null(row) {
         return Ok(Value::null(ty.clone()));
+    }
+    if ty.id() == LogicalTypeId::Variant
+        && let Some(group) = array.as_struct_opt()
+    {
+        return super::parquet_variant::read_row(group, row);
     }
     let list_items = |values: ArrayRef, child: &LogicalType| -> Result<Vec<Value>> {
         (0..values.len()).map(|i| array_value(&values, i, child)).collect()
@@ -2194,9 +2248,34 @@ fn logical_type_text(logical: &parquet::basic::LogicalType) -> Option<String> {
     })
 }
 
+/// The repetition of the root of the schema, which the crate leaves out.
+fn root_repetition(path: &str) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = File::open(path).ok()?;
+    let size = file.seek(SeekFrom::End(0)).ok()?;
+    file.seek(SeekFrom::Start(size.checked_sub(8)?)).ok()?;
+    let mut tail = [0u8; 8];
+    file.read_exact(&mut tail).ok()?;
+    let length = i32::from_le_bytes(tail[..4].try_into().ok()?);
+    let footer = read_thrift_struct(&mut file, size as i64 - 8 - i64::from(length), length)?;
+    let root = footer.field(2)?.items().first()?;
+    Some(
+        match root.field(3)?.int()? {
+            0 => "REQUIRED",
+            1 => "OPTIONAL",
+            _ => "REPEATED",
+        }
+        .to_string(),
+    )
+}
+
 fn schema_rows(ty: &Type, path: &str, column: &mut i64, rows: &mut Vec<String>) {
     let info = ty.get_basic_info();
-    let repetition = info.has_repetition().then(|| info.repetition().to_string());
+    let repetition = if *column == 0 {
+        root_repetition(path)
+    } else {
+        info.has_repetition().then(|| info.repetition().to_string())
+    };
     let converted = info.converted_type();
     let converted = (converted != parquet::basic::ConvertedType::NONE).then(|| converted.to_string());
     let logical = info.logical_type_ref().and_then(logical_type_text);
@@ -2208,20 +2287,18 @@ fn schema_rows(ty: &Type, path: &str, column: &mut i64, rows: &mut Vec<String>) 
             scale,
             precision,
             ..
-        } => {
-            let id = *column;
-            *column += 1;
-            (
-                Some(physical_type.to_string()),
-                (*type_length > 0).then(|| type_length.to_string()),
-                Some(i64::from(*scale)),
-                Some(i64::from(*precision)),
-                None,
-                Some(id),
-            )
-        }
-        Type::GroupType { fields, .. } => (None, None, None, None, Some(fields.len() as i64), None),
+        } => (
+            Some(physical_type.to_string()),
+            (*type_length > 0).then(|| type_length.to_string()),
+            Some(i64::from(*scale)),
+            Some(i64::from(*precision)),
+            None,
+            Some(*column),
+        ),
+        Type::GroupType { fields, .. } => (None, None, None, None, Some(fields.len() as i64), Some(*column)),
     };
+    // `column_id`: the index of the element in the schema
+    *column += 1;
     rows.push(format!(
         "({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, NULL, {})",
         sql_text(path),

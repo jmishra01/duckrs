@@ -296,7 +296,12 @@ fn variant_array_length(args: &DataChunk, result: &mut Vector) -> Result<()> {
 pub fn is_variant_function(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "variant_typeof" | "variant_extract" | "variant_keys" | "variant_array_length"
+        "variant_typeof"
+            | "variant_extract"
+            | "variant_keys"
+            | "variant_array_length"
+            | "variant_to_parquet_variant"
+            | "variant_bytes_to_variant"
     )
 }
 
@@ -327,6 +332,9 @@ fn as_variant(child: BoundExpr) -> BoundExpr {
 /// Binds a function of [`is_variant_function`].
 pub fn bind_variant_function(name: &str, children: Vec<BoundExpr>) -> Result<BoundExpr> {
     let lower = name.to_ascii_lowercase();
+    if lower == "variant_to_parquet_variant" || lower == "variant_bytes_to_variant" {
+        return bind_parquet_variant_function(&lower, children);
+    }
     let mut children = children.into_iter();
     let (Some(child), key, None) = (children.next(), children.next(), children.next()) else {
         return Err(binder_error(format!(
@@ -364,4 +372,51 @@ pub fn bind_variant_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             "{lower} expects either one VARIANT column argument, or a VARIANT column and a path"
         ))),
     }
+}
+
+/// `variant_to_parquet_variant` and `variant_bytes_to_variant` of the Parquet extension.
+fn bind_parquet_variant_function(name: &str, children: Vec<BoundExpr>) -> Result<BoundExpr> {
+    let mut children = children.into_iter();
+    let (Some(child), None) = (children.next(), children.next()) else {
+        return Err(binder_error(format!(
+            "No function matches the given name and argument types for '{name}'"
+        )));
+    };
+    if name == "variant_to_parquet_variant" {
+        let ty = crate::execution::parquet_variant::parquet_variant_type(None)?.with_alias("PARQUET_VARIANT");
+        return Ok(bound_function(
+            name,
+            vec![as_variant(child)],
+            ty,
+            variant_to_parquet_variant,
+        ));
+    }
+    Ok(bound_function(
+        name,
+        vec![child.cast_to(&LogicalType::BLOB, false)],
+        variant_type(),
+        variant_bytes_to_variant,
+    ))
+}
+
+fn variant_to_parquet_variant(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let ty = result.logical_type().clone();
+    row_wise(args, result, |row| {
+        crate::execution::parquet_variant::to_parquet_variant(&row[0], None, &ty)
+    })
+}
+
+fn variant_bytes_to_variant(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    row_wise(args, result, |row| {
+        let ValueData::Bytes(bytes) = row[0].data() else {
+            return Ok(Value::null(variant_type()));
+        };
+        if row[0].is_null() {
+            return Ok(Value::null(variant_type()));
+        }
+        match crate::execution::parquet_variant::from_bytes(bytes)? {
+            VariantNode::Null => Ok(Value::null(variant_type())),
+            node => Ok(variant_value(&node)),
+        }
+    })
 }
