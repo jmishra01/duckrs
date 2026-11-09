@@ -419,7 +419,10 @@ impl Binder<'_> {
             info.select_list.clone()
         };
         let select = parse_select(
-            &format!("SELECT * FROM read_parquet({})", string_literal(path)),
+            &format!(
+                "SELECT * FROM read_parquet({}, hive_partitioning := false)",
+                string_literal(path)
+            ),
             "Expected a single SELECT statement",
         )?;
         self.bind_insert(&InsertStatement {

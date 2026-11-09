@@ -74,6 +74,24 @@ pub fn takes_checkpoints(buffer: &BufferManager) -> bool {
     buffer.block_manager().storage_version().is_ok()
 }
 
+/// `TableCatalogEntry::GetInfo()->ToString()`: the CREATE TABLE of `table`, as EXPORT DATABASE writes it.
+pub fn table_create_sql(
+    schema: &crate::catalog::SchemaCatalogEntry,
+    table: &crate::catalog::TableCatalogEntry,
+) -> Result<String> {
+    let info = writer::table_info("", schema, table)?;
+    let serialization::generated::CreateInfoKind::CreateTableInfo(stored) = info.kind else {
+        unreachable!("a table's info is a CreateTableInfo");
+    };
+    let (mut definition, _) = checkpoint::table_definition(&schema.key(), stored)?;
+    definition.name.qualification = if schema.name.eq_ignore_ascii_case(crate::catalog::DEFAULT_SCHEMA) {
+        Vec::new()
+    } else {
+        schema.path.clone()
+    };
+    Ok(definition.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

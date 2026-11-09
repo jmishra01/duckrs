@@ -67,8 +67,6 @@ macro_rules! integer_cast_number {
                     }
                     Number::Double(v) => round_into_range(v, min, max).map(|r| r as $t),
                 }
-                // `Hugeint::TryConvert`: -2^127 itself is out of range for floating point input
-                .filter(|r| !(<$t>::BITS == 128 && *r == <$t>::MIN && matches!(n, Number::Float(_) | Number::Double(_))))
             }
             fn render(self) -> String {
                 self.to_string()
