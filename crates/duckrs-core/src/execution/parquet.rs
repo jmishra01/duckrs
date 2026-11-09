@@ -36,7 +36,7 @@ fn unsupported(what: impl std::fmt::Display) -> Error {
 }
 
 /// What `read_parquet` found and was told.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ParquetScanData {
     pub files: Vec<String>,
     /// the columns that come from the files
@@ -53,6 +53,8 @@ pub struct ParquetScanData {
     pub virtual_columns: Vec<crate::execution::multi_file::VirtualColumn>,
     /// `schema`: the columns by field id or name, in place of those of the first file
     pub schema: Option<Arc<Vec<crate::execution::parquet_schema::SchemaColumn>>>,
+    /// by the columns from the files, those the query reads (`column_ids`); the others are NULL
+    pub read: Option<Vec<bool>>,
 }
 
 impl ParquetScanData {
@@ -685,6 +687,32 @@ fn open_file(scan: &ParquetScanData, state: &mut ParquetScanState, path: &str) -
         mapping.push(found);
         transforms.push(None);
     }
+    // only the columns the query reads are decoded; a batch holds them in the order of the file
+    let builder = match &scan.read {
+        Some(read) => {
+            let mut roots: Vec<usize> = mapping
+                .iter()
+                .zip(read)
+                .filter(|(_, read)| **read)
+                .filter_map(|(column, _)| *column)
+                .collect();
+            if roots.is_empty() {
+                roots.push(0);
+            }
+            roots.sort_unstable();
+            roots.dedup();
+            for (column, read) in mapping.iter_mut().zip(read) {
+                *column = match column {
+                    Some(index) if *read => roots.iter().position(|root| root == index),
+                    // nothing reads it: NULL, whatever its type
+                    _ => None,
+                };
+            }
+            let mask = parquet::arrow::ProjectionMask::roots(builder.parquet_schema(), roots);
+            builder.with_projection(mask)
+        }
+        None => builder,
+    };
     state.reader = Some(guarded(path, || {
         builder.build().map_err(|e| read_error(path, "Could not read", e))
     })?);

@@ -227,6 +227,7 @@ impl Binder<'_> {
             hive,
             virtual_columns,
             schema,
+            read: None,
         };
         Ok(LogicalOperator::new(
             LogicalOperatorKind::ParquetScan {
