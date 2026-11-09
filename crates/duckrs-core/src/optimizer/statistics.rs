@@ -1117,6 +1117,17 @@ impl StatisticsPropagator {
             self.visit(child);
         }
         self.count_valid_as_count_star(op);
+        // `ParquetCopyToPropagateStatistics`: columns that can't be NULL are written REQUIRED
+        if matches!(op.kind, K::CopyToParquet { .. }) {
+            let not_null: Vec<bool> = op.children[0]
+                .column_bindings()
+                .into_iter()
+                .map(|binding| !self.lookup(binding).can_be_null)
+                .collect();
+            if let K::CopyToParquet { options, .. } = &mut op.kind {
+                options.not_null_columns = not_null;
+            }
+        }
         match &mut op.kind {
             K::Get {
                 table,

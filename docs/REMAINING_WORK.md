@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 3721 of 6367 test files pass (**61.5%**). The v1 target is ≥ 90%.
+- Overall: 3741 of 6367 test files pass (**61.8%**). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -34,9 +34,14 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] `parquet_metadata` stats in the column's DuckDB type (decimals, UUID, TIMETZ, INT96, blobs; NULL for infinities and out-of-range values)
   - [x] `int96_as` (`timestamp` by default, `timestamp_ns`, `struct`)
   - [x] the native Parquet writer (`execution/parquet_writer`): DuckDB's encodings, dictionaries, pages, statistics, bloom filters and footer, written with our own Thrift; TIMETZ as TIME in UTC
-  - [ ] columns the optimizer's statistics prove NOT NULL are not written REQUIRED (`ParquetCopyToPropagateStatistics`)
-  - [ ] fallback bloom filters for columns whose dictionary is full (`StartBloomFilterFallback`)
-  - [ ] the page index (`write_page_index`), `FILE_SIZE_BYTES` / `ROW_GROUPS_PER_FILE` rotation, `RETURN_STATS`, field ids, encryption, UNION, VARIANT and GEOMETRY columns
+  - [x] NOT NULL columns (by the optimizer's statistics) written REQUIRED; uncompressed sizes now match C++ byte for byte
+  - [x] fallback bloom filters (sortedness, distinct estimate, 64 MiB budget, folding), interval bloom hashes, `parquet_bloom_probe`
+  - [x] the page index (`write_page_index`), and `parquet_page_index` / the index columns of `parquet_metadata`
+  - [x] `FILE_SIZE_BYTES`, `ROW_GROUPS_PER_FILE`, `PER_THREAD_OUTPUT`, `RETURN_FILES`, `WRITE_EMPTY_FILE`, `FIELD_IDS`, TUPLE columns
+  - [ ] `RETURN_STATS` (needs the stats unifiers and a VARIANT `extra_info`)
+  - [ ] encryption, UNION, VARIANT and GEOMETRY columns
+  - [ ] rotation inside partitions groups rows into files differently from C++ (`partitioned_file_rotation`)
+  - [ ] reader side: row-group pruning by bloom filters and page indexes, `read_parquet(..., schema)`, reading a directory path
   - [ ] prefetch / read-ahead metrics and EXPLAIN shapes of Parquet scans (~20 files)
   - [ ] `write_timestamp_as_int96`, `parquet_metadata` logical type names (`Float16Type()`), duplicate column names
 - [ ] 4. Parquet VARIANT, including shredding (`parquet/variant`: 47 failing, 0%)

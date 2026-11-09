@@ -1138,6 +1138,9 @@ pub struct CsvWriteOptions {
     pub force_quote: Vec<bool>,
     /// `PARTITION_BY`: a directory of files, one per partition
     pub partitioning: Option<super::parquet::Partitioning>,
+    /// `FILE_SIZE_BYTES` and `PER_THREAD_OUTPUT`: a directory of files
+    pub rotation: Option<super::parquet::Rotation>,
+    pub output: super::parquet::CopyOutputOptions,
 }
 
 impl Default for CsvWriteOptions {
@@ -1158,6 +1161,8 @@ impl Default for CsvWriteOptions {
             suffix: String::new(),
             force_quote: Vec::new(),
             partitioning: None,
+            rotation: None,
+            output: super::parquet::CopyOutputOptions::default(),
         }
     }
 }

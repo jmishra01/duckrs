@@ -326,6 +326,56 @@ impl BloomFilter {
         Self::size(entries, target).map(|size| Self { data: vec![0; size] })
     }
 
+    /// `OneRatio`: how many of the bits are set.
+    fn one_ratio(&self) -> f64 {
+        let ones: u32 = self.data.iter().map(|b| b.count_ones()).sum();
+        f64::from(ones) / (self.data.len() as f64 * 8.0)
+    }
+
+    /// `FoldToTarget`: halves the filter, ORing its blocks together, while it stays below the false positive
+    /// rate `target`.
+    pub fn fold_to_target(&mut self, target: f64) {
+        let blocks = self.data.len() / Self::BLOCK;
+        let mut zero_ratio = 1.0 - self.one_ratio();
+        let mut new_blocks = blocks;
+        while new_blocks > 1 {
+            zero_ratio *= zero_ratio;
+            if (1.0 - zero_ratio).powi(8) > target {
+                break;
+            }
+            new_blocks /= 2;
+        }
+        if new_blocks == blocks {
+            return;
+        }
+        let factor = blocks / new_blocks;
+        let mut folded = vec![0u8; new_blocks * Self::BLOCK];
+        for (i, target_block) in folded.chunks_mut(Self::BLOCK).enumerate() {
+            for source in self.data[i * factor * Self::BLOCK..(i + 1) * factor * Self::BLOCK].chunks(Self::BLOCK) {
+                for (a, b) in target_block.iter_mut().zip(source) {
+                    *a |= b;
+                }
+            }
+        }
+        self.data = folded;
+    }
+
+    /// `FilterCheck`: whether a value of this hash may be in the filter.
+    pub fn contains(&self, hash: u64) -> bool {
+        let blocks = (self.data.len() / Self::BLOCK) as u64;
+        if blocks == 0 {
+            return true;
+        }
+        let block = (((hash >> 32) * blocks) >> 32) as usize;
+        let key = hash as u32;
+        Self::SALT.iter().enumerate().all(|(word, salt)| {
+            let bit = key.wrapping_mul(*salt) >> 27;
+            let at = block * Self::BLOCK + word * 4;
+            let value = u32::from_le_bytes(self.data[at..at + 4].try_into().expect("four bytes"));
+            value & (1 << bit) != 0
+        })
+    }
+
     /// `FilterInsert` of a value's XXH64.
     pub fn insert(&mut self, hash: u64) {
         let blocks = (self.data.len() / Self::BLOCK) as u64;

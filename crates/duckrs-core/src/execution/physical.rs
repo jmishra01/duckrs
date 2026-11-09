@@ -583,6 +583,15 @@ impl std::io::Write for CopyWriter {
     }
 }
 
+/// A file a CSV or JSON COPY writes: the JSON objects in it so far, and its bytes.
+#[derive(Debug)]
+pub struct CsvOutput {
+    writer: CopyWriter,
+    json_rows: std::sync::atomic::AtomicU64,
+    bytes: usize,
+    rows: usize,
+}
+
 /// `PhysicalCopyToFile`: writes the rows of its child, and reports how many there were.
 #[derive(Debug)]
 pub struct PhysicalCopyToFile {
@@ -593,7 +602,7 @@ pub struct PhysicalCopyToFile {
     names: Vec<String>,
     /// opened by the first row or at the end, so that planning alone (EXPLAIN) leaves the file be;
     /// by the directory of a partition, or `""` without partitions, with the JSON objects of the file so far
-    writers: Mutex<HashMap<String, (CopyWriter, std::sync::atomic::AtomicU64)>>,
+    writers: Mutex<super::parquet::OutputFiles<CsvOutput>>,
     gzip: bool,
     rows: std::sync::atomic::AtomicU64,
     /// the logger of the statement, for the file it writes
@@ -615,7 +624,7 @@ impl PhysicalCopyToFile {
             children,
             path,
             names,
-            writers: Mutex::new(HashMap::new()),
+            writers: Mutex::new(super::parquet::OutputFiles::default()),
             gzip,
             rows: std::sync::atomic::AtomicU64::new(0),
             logger: crate::logging::current_file_logger(),
@@ -657,20 +666,55 @@ impl PhysicalCopyToFile {
 
     /// Writes `rows` of `chunk` to the file of `directory` (`""` without partitions).
     fn write_rows(&self, directory: &str, chunk: &DataChunk, rows: &[usize]) -> Result<()> {
-        let mut writers = self.writers.lock();
-        if !writers.contains_key(directory) {
-            let path = match &self.options.partitioning {
-                Some(partitioning) => partitioning.create_file_path(directory)?,
-                None => self.path.clone(),
-            };
-            let writer = self.open(&path)?;
-            writers.insert(directory.to_string(), (writer, std::sync::atomic::AtomicU64::new(0)));
+        let rotation = self.options.rotation.as_ref();
+        let key = super::parquet::OutputFiles::<CsvOutput>::key(directory, rotation);
+        let mut files = self.writers.lock();
+        // `PhysicalCopyRotateNow`, before the rows go to a file
+        if let Some(rotation) = rotation
+            && files
+                .open
+                .get(&key)
+                .is_some_and(|out| rotation.rotate_now(out.bytes, 0, out.rows > 0))
+        {
+            let out = files.open.remove(&key).expect("open");
+            self.close(out)?;
         }
-        let (writer, json_rows) = writers.get_mut(directory).expect("just opened");
+        if !files.open.contains_key(&key) {
+            let path = files.next_path(&self.path, directory, self.options.partitioning.as_ref(), rotation)?;
+            let writer = self.open(&path)?;
+            files.open.insert(
+                key.clone(),
+                CsvOutput {
+                    writer,
+                    json_rows: std::sync::atomic::AtomicU64::new(0),
+                    bytes: 0,
+                    rows: 0,
+                },
+            );
+        }
+        let out_file = files.open.get_mut(&key).expect("just opened");
         let mut out = Vec::new();
         self.options
-            .write_rows(&mut out, chunk, rows, &self.written_columns(), json_rows)?;
-        write_all(writer, &out)
+            .write_rows(&mut out, chunk, rows, &self.written_columns(), &out_file.json_rows)?;
+        out_file.rows += rows.len();
+        write_all(&mut out_file.writer, &out)?;
+        // what the file holds: for gzip, the compressed bytes so far
+        out_file.bytes = match &out_file.writer {
+            CopyWriter::Plain(writer) => writer.get_ref().position as usize + writer.buffer().len(),
+            CopyWriter::Gzip(writer) => writer.get_ref().get_ref().position as usize + writer.get_ref().buffer().len(),
+        };
+        Ok(())
+    }
+
+    /// The suffix of a file, and its end.
+    fn close(&self, out: CsvOutput) -> Result<()> {
+        let mut writer = out.writer;
+        write_all(&mut writer, self.options.suffix.as_bytes())?;
+        let finished = match writer {
+            CopyWriter::Plain(mut writer) => std::io::Write::flush(&mut writer),
+            CopyWriter::Gzip(writer) => writer.finish().and_then(|mut file| std::io::Write::flush(&mut file)),
+        };
+        finished.map_err(|e| Error::new(ErrorKind::Io, format!("Could not write file: {e}")))
     }
 }
 
@@ -710,25 +754,33 @@ impl PhysicalOperator for PhysicalCopyToFile {
         Ok(())
     }
     fn finalize(&self) -> Result<()> {
-        let mut writers = self.writers.lock();
-        if writers.is_empty() {
+        let mut files = self.writers.lock();
+        let rotation = self.options.rotation.as_ref();
+        if files.created == 0 && !self.options.output.write_empty_file {
+            return Ok(());
+        }
+        if files.created == 0 {
             if self.options.partitioning.is_some() {
                 return std::fs::create_dir_all(&self.path)
                     .map_err(|e| Error::new(ErrorKind::Io, format!("Cannot create directory \"{}\": {e}", self.path)));
             }
-            let writer = self.open(&self.path)?;
-            writers.insert(String::new(), (writer, std::sync::atomic::AtomicU64::new(0)));
+            let path = files.next_path(&self.path, "", None, rotation)?;
+            let writer = self.open(&path)?;
+            files.open.insert(
+                String::new(),
+                CsvOutput {
+                    writer,
+                    json_rows: std::sync::atomic::AtomicU64::new(0),
+                    bytes: 0,
+                    rows: 0,
+                },
+            );
         }
-        let mut directories: Vec<String> = writers.keys().cloned().collect();
-        directories.sort();
-        for directory in directories {
-            let (mut writer, _) = writers.remove(&directory).expect("listed");
-            write_all(&mut writer, self.options.suffix.as_bytes())?;
-            let finished = match writer {
-                CopyWriter::Plain(mut writer) => std::io::Write::flush(&mut writer),
-                CopyWriter::Gzip(writer) => writer.finish().and_then(|mut file| std::io::Write::flush(&mut file)),
-            };
-            finished.map_err(|e| Error::new(ErrorKind::Io, format!("Could not write file: {e}")))?;
+        let mut keys: Vec<String> = files.open.keys().cloned().collect();
+        keys.sort();
+        for key in keys {
+            let out = files.open.remove(&key).expect("listed");
+            self.close(out)?;
         }
         Ok(())
     }
@@ -744,10 +796,11 @@ impl PhysicalOperator for PhysicalCopyToFile {
             return Ok(None);
         }
         *done = true;
-        let rows = self.rows.load(std::sync::atomic::Ordering::Relaxed);
-        let mut column = Vector::new(LogicalType::BIGINT, 1);
-        column.data_mut::<i64>()[0] = rows as i64;
-        Ok(Some(DataChunk::from_columns(vec![column], 1)))
+        let files = self.writers.lock();
+        self.options
+            .output
+            .result(self.rows.load(std::sync::atomic::Ordering::Relaxed), &files.paths)
+            .map(Some)
     }
 }
 

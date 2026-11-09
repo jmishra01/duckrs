@@ -466,9 +466,9 @@ impl LogicalOperator {
                     })
                     .collect()
             }
-            LogicalOperatorKind::CopyToParquet { .. }
-            | LogicalOperatorKind::Range { .. }
-            | LogicalOperatorKind::CopyToFile { .. } => vec![LogicalType::BIGINT],
+            LogicalOperatorKind::CopyToParquet { options, .. } => options.output.types(),
+            LogicalOperatorKind::CopyToFile { options, .. } => options.output.types(),
+            LogicalOperatorKind::Range { .. } => vec![LogicalType::BIGINT],
             LogicalOperatorKind::JsonScan { scan, .. } => scan.output_types(),
             LogicalOperatorKind::ParquetScan { scan, .. } => scan.output_types(),
             LogicalOperatorKind::CsvScan { scan, .. } => scan.output_types(),
@@ -701,10 +701,9 @@ impl LogicalOperator {
             | LogicalOperatorKind::Join { .. }
             | LogicalOperatorKind::AsOfJoin { .. }
             | LogicalOperatorKind::PositionalJoin => self.join_output(|child| child.column_bindings()),
-            LogicalOperatorKind::CreateTable { .. }
-            | LogicalOperatorKind::CreateTableAs { .. }
-            | LogicalOperatorKind::CopyToParquet { .. }
-            | LogicalOperatorKind::CopyToFile { .. } => numbered(0, 1),
+            LogicalOperatorKind::CreateTable { .. } | LogicalOperatorKind::CreateTableAs { .. } => numbered(0, 1),
+            LogicalOperatorKind::CopyToParquet { options, .. } => numbered(0, options.output.types().len()),
+            LogicalOperatorKind::CopyToFile { options, .. } => numbered(0, options.output.types().len()),
         }
     }
 

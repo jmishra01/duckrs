@@ -1887,7 +1887,12 @@ impl Binder<'_> {
                     && call.name.qualification.is_empty()
                     && matches!(
                         call.name.name.to_lowercase().as_str(),
-                        "parquet_metadata" | "parquet_schema" | "parquet_kv_metadata" | "parquet_file_metadata"
+                        "parquet_metadata"
+                            | "parquet_schema"
+                            | "parquet_kv_metadata"
+                            | "parquet_file_metadata"
+                            | "parquet_bloom_probe"
+                            | "parquet_page_index"
                     )
                 {
                     return self.bind_parquet_metadata(call, table_ref);

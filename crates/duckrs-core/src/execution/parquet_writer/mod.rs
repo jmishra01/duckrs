@@ -10,12 +10,13 @@
 
 mod encoding;
 
+pub use encoding::BloomFilter;
+
 use duckrs_common::types::{LogicalType, LogicalTypeId, TimeTz};
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
 use encoding::{
-    BloomFilter, BssEncoder, DbpEncoder, DlbaEncoder, RleBpEncoder, Thrift, bit_width_of_count, bit_width_of_max,
-    ttype, xxhash64,
+    BssEncoder, DbpEncoder, DlbaEncoder, RleBpEncoder, Thrift, bit_width_of_count, bit_width_of_max, ttype, xxhash64,
 };
 use std::collections::HashMap;
 use std::io::Write;
@@ -154,6 +155,24 @@ pub struct WriterOptions {
     pub bloom_filter_fpp: f64,
     pub key_values: Vec<(String, Vec<u8>)>,
     pub timestamp_as_int96: bool,
+    /// `bloom_filter_fallback_max_bytes`: what the bloom filters of columns without a dictionary may take
+    pub bloom_filter_fallback_max_bytes: usize,
+    /// `not_null_columns`: the columns written REQUIRED, by position
+    pub not_null_columns: Vec<bool>,
+    /// `write_page_index`: a ColumnIndex and an OffsetIndex for each column chunk of more than one page
+    pub write_page_index: bool,
+    /// `FIELD_IDS`
+    pub field_ids: FieldIds,
+}
+
+/// `ChildFieldIDs`: the field ids of columns by name, each with those of the columns in it.
+#[derive(Debug, Clone, Default)]
+pub struct FieldIds(pub HashMap<String, (Option<i32>, FieldIds)>);
+
+impl FieldIds {
+    fn get(&self, name: &str) -> Option<&(Option<i32>, FieldIds)> {
+        self.0.get(&name.to_lowercase())
+    }
 }
 
 impl Default for WriterOptions {
@@ -170,6 +189,10 @@ impl Default for WriterOptions {
             bloom_filter_fpp: 0.01,
             key_values: Vec::new(),
             timestamp_as_int96: false,
+            bloom_filter_fallback_max_bytes: 64 * 1024 * 1024,
+            not_null_columns: Vec::new(),
+            write_page_index: false,
+            field_ids: FieldIds::default(),
         }
     }
 }
@@ -663,6 +686,165 @@ impl Stats {
         }
     }
 
+    /// `Merge`: the statistics of a page into those of its column chunk.
+    fn merge(&mut self, other: &Stats) {
+        match (self, other) {
+            (
+                Stats::Float {
+                    min, max, nan_count, ..
+                },
+                Stats::Float {
+                    min: omin,
+                    max: omax,
+                    nan_count: other_nans,
+                },
+            ) => {
+                *nan_count += other_nans;
+                if let Some(o) = omin
+                    && min.as_ref().is_none_or(|m| o.less(m))
+                {
+                    *min = Some(o.clone());
+                }
+                if let Some(o) = omax
+                    && max.as_ref().is_none_or(|m| m.less(o))
+                {
+                    *max = Some(o.clone());
+                }
+            }
+            (
+                Stats::Numeric { min, max, .. },
+                Stats::Numeric {
+                    min: omin, max: omax, ..
+                },
+            ) => {
+                if let Some(o) = omin
+                    && min.as_ref().is_none_or(|m| o.less(m))
+                {
+                    *min = Some(o.clone());
+                }
+                if let Some(o) = omax
+                    && max.as_ref().is_none_or(|m| m.less(o))
+                {
+                    *max = Some(o.clone());
+                }
+            }
+            (Stats::String(a), Stats::String(b)) => {
+                if b.failed_truncate {
+                    a.failed_truncate = true;
+                    a.has_stats = false;
+                    a.min.clear();
+                    a.max.clear();
+                    return;
+                }
+                if a.failed_truncate || !b.has_stats {
+                    return;
+                }
+                if !a.has_stats || b.min < a.min {
+                    a.min.clone_from(&b.min);
+                    a.min_truncated = b.min_truncated;
+                }
+                if !a.has_stats || b.max > a.max {
+                    a.max.clone_from(&b.max);
+                    a.max_truncated = b.max_truncated;
+                }
+                a.has_stats = true;
+            }
+            (Stats::Uuid { min, max }, Stats::Uuid { min: omin, max: omax }) => {
+                if let Some(o) = omin
+                    && min.as_ref().is_none_or(|m| o < m)
+                {
+                    *min = Some(o.clone());
+                }
+                if let Some(o) = omax
+                    && max.as_ref().is_none_or(|m| o > m)
+                {
+                    *max = Some(o.clone());
+                }
+            }
+            (Stats::Bool { min, max }, Stats::Bool { min: omin, max: omax }) => {
+                if *omin && !*omax {
+                    return;
+                }
+                *min = *min && *omin;
+                *max = *max || *omax;
+            }
+            (Stats::Decimal { min, max }, Stats::Decimal { min: omin, max: omax }) => {
+                for value in [omin, omax].into_iter().flatten() {
+                    if min.is_none_or(|m| *value < m) {
+                        *min = Some(*value);
+                    }
+                    if max.is_none_or(|m| *value > m) {
+                        *max = Some(*value);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `CompareMin` and `CompareMax`: the order of the bounds of two pages.
+    fn compare(&self, other: &Stats, max: bool) -> std::cmp::Ordering {
+        use std::cmp::Ordering::*;
+        let order = |a: &Target, b: &Target| {
+            if a.less(b) {
+                Less
+            } else if b.less(a) {
+                Greater
+            } else {
+                Equal
+            }
+        };
+        match (self, other) {
+            (
+                Stats::Numeric { min, max: mx, .. },
+                Stats::Numeric {
+                    min: omin, max: omx, ..
+                },
+            )
+            | (
+                Stats::Float { min, max: mx, .. },
+                Stats::Float {
+                    min: omin, max: omx, ..
+                },
+            ) => {
+                let (a, b) = if max { (mx, omx) } else { (min, omin) };
+                match (a, b) {
+                    (Some(a), Some(b)) => order(a, b),
+                    _ => Equal,
+                }
+            }
+            (Stats::String(a), Stats::String(b)) => {
+                if max {
+                    a.max.cmp(&b.max)
+                } else {
+                    a.min.cmp(&b.min)
+                }
+            }
+            (Stats::Uuid { min, max: mx }, Stats::Uuid { min: omin, max: omx }) => {
+                if max {
+                    mx.cmp(omx)
+                } else {
+                    min.cmp(omin)
+                }
+            }
+            (Stats::Bool { min, max: mx }, Stats::Bool { min: omin, max: omx }) => {
+                if max {
+                    mx.cmp(omx)
+                } else {
+                    min.cmp(omin)
+                }
+            }
+            (Stats::Decimal { min, max: mx }, Stats::Decimal { min: omin, max: omx }) => {
+                if max {
+                    mx.cmp(omx)
+                } else {
+                    min.cmp(omin)
+                }
+            }
+            _ => Equal,
+        }
+    }
+
     fn nan_count(&self) -> u64 {
         match self {
             Stats::Float { nan_count, .. } => *nan_count,
@@ -729,6 +911,7 @@ struct ColumnSchema {
     repetition: i32,
     max_define: u16,
     max_repeat: u16,
+    field_id: Option<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -751,6 +934,8 @@ struct Leaf {
     path: Vec<String>,
     kind: LeafKind,
     can_have_nulls: bool,
+    /// `bloom_filter_fallback`: a top-level column that gets a bloom filter even without a dictionary
+    bloom_fallback: bool,
 }
 
 impl Leaf {
@@ -761,6 +946,39 @@ impl Leaf {
             LeafKind::Enum(_) => physical::BYTE_ARRAY,
             LeafKind::FixedDecimal => physical::FIXED_LEN_BYTE_ARRAY,
         }
+    }
+
+    /// `BloomFilterEntriesPerValue`: intervals hash twice, as written and normalized.
+    fn bloom_entries_per_value(&self) -> u64 {
+        match self.kind {
+            LeafKind::Standard {
+                convert: Convert::Interval,
+                ..
+            } => 2,
+            _ => 1,
+        }
+    }
+
+    /// `SortednessKey::TRACKED`: whether the values have an order that tells a sorted column.
+    fn tracks_sortedness(&self) -> bool {
+        matches!(
+            self.kind,
+            LeafKind::Standard {
+                convert: Convert::I32
+                    | Convert::U32
+                    | Convert::I64
+                    | Convert::U64
+                    | Convert::TimestampSec
+                    | Convert::Int96 { .. }
+                    | Convert::Double
+                    | Convert::F32
+                    | Convert::F64
+                    | Convert::Bytes
+                    | Convert::Text
+                    | Convert::Uuid,
+                ..
+            }
+        )
     }
 
     /// `TypeIsConstantSize` of the vector's physical type.
@@ -834,6 +1052,7 @@ fn has_parquet_type(ty: &LogicalType) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_node(
     mut path: Vec<String>,
     ty: &LogicalType,
@@ -842,9 +1061,13 @@ fn create_node(
     mut max_define: u16,
     can_have_nulls: bool,
     options: &WriterOptions,
+    field_ids: Option<&FieldIds>,
 ) -> Result<Node> {
     use LogicalTypeId as T;
     path.push(name.to_string());
+    let found = field_ids.and_then(|ids| ids.get(name));
+    let field_id = found.and_then(|(id, _)| *id);
+    let child_ids = found.map(|(_, children)| children);
     if !can_have_nulls {
         max_define -= 1;
     }
@@ -855,10 +1078,24 @@ fn create_node(
         repetition,
         max_define,
         max_repeat,
+        field_id,
     };
     match ty.id() {
-        T::Struct => {
-            let fields = ty.struct_children();
+        T::Struct | T::Tuple => {
+            // `TupleType::NamedChildren`: TUPLE children are `element1`, `element2`, ...
+            let fields: Vec<(String, LogicalType)> = ty
+                .struct_children()
+                .iter()
+                .enumerate()
+                .map(|(i, (name, child))| {
+                    let name = if name.is_empty() {
+                        format!("element{}", i + 1)
+                    } else {
+                        name.clone()
+                    };
+                    (name, child.clone())
+                })
+                .collect();
             if fields.is_empty() {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
@@ -876,6 +1113,7 @@ fn create_node(
                         max_define + 1,
                         true,
                         options,
+                        child_ids,
                     )
                 })
                 .collect::<Result<_>>()?;
@@ -897,6 +1135,7 @@ fn create_node(
                 max_define + 2,
                 true,
                 options,
+                child_ids,
             )?;
             return Ok(if ty.id() == T::List {
                 Node::List {
@@ -926,6 +1165,7 @@ fn create_node(
                 max_define + 2,
                 false,
                 options,
+                child_ids,
             )?;
             let value = create_node(
                 child_path,
@@ -935,6 +1175,7 @@ fn create_node(
                 max_define + 2,
                 true,
                 options,
+                child_ids,
             )?;
             let key_value = Node::Struct {
                 schema: ColumnSchema {
@@ -943,6 +1184,7 @@ fn create_node(
                     repetition: REPEATED,
                     max_define: max_define + 1,
                     max_repeat: max_repeat + 1,
+                    field_id: None,
                 },
                 children: vec![key, value],
                 can_have_nulls: false,
@@ -1063,6 +1305,7 @@ fn create_node(
         path,
         kind,
         can_have_nulls,
+        bloom_fallback: false,
     }))
 }
 
@@ -1077,6 +1320,7 @@ struct SchemaElement {
     converted: Option<i32>,
     scale: Option<i32>,
     precision: Option<i32>,
+    field_id: Option<i32>,
     logical: Option<LogicalAnnotation>,
 }
 
@@ -1119,6 +1363,9 @@ impl SchemaElement {
         if let Some(v) = self.precision {
             t.i32(8, v);
         }
+        if let Some(v) = self.field_id {
+            t.i32(9, v);
+        }
         if let Some(logical) = self.logical {
             t.structure(10, |t| match logical {
                 LogicalAnnotation::Json => t.empty(12),
@@ -1149,6 +1396,7 @@ fn leaf_schema_element(leaf: &Leaf, options: &WriterOptions) -> SchemaElement {
         ty: Some(leaf.physical()),
         repetition: Some(leaf.schema.repetition),
         name: leaf.schema.name.clone(),
+        field_id: leaf.schema.field_id,
         ..Default::default()
     };
     if ty.alias() == Some("JSON") && ty.id() == T::Varchar {
@@ -1222,6 +1470,7 @@ fn finalize_schema(node: &Node, schemas: &mut Vec<SchemaElement>, options: &Writ
                 repetition: Some(schema.repetition),
                 name: schema.name.clone(),
                 num_children: Some(children.len() as i32),
+                field_id: schema.field_id,
                 ..Default::default()
             });
             children
@@ -1235,6 +1484,7 @@ fn finalize_schema(node: &Node, schemas: &mut Vec<SchemaElement>, options: &Writ
                 name: schema.name.clone(),
                 num_children: Some(1),
                 converted: Some(if *map { converted::MAP } else { converted::LIST }),
+                field_id: schema.field_id,
                 ..Default::default()
             });
             if !*map {
@@ -1253,6 +1503,7 @@ fn finalize_schema(node: &Node, schemas: &mut Vec<SchemaElement>, options: &Writ
                 name: schema.name.clone(),
                 num_children: Some(1),
                 converted: Some(converted::LIST),
+                field_id: schema.field_id,
                 ..Default::default()
             });
             schemas.push(SchemaElement {
@@ -1413,6 +1664,11 @@ struct PageWrite {
     write_count: usize,
     max_write_count: usize,
     encoder: PageEncoder,
+    /// with the page index, the statistics of this page alone
+    page_stats: Option<Stats>,
+    /// the rows of the page, and the values below the maximum definition level
+    num_rows: usize,
+    null_count: usize,
 }
 
 /// The dictionary of a column chunk (`PrimitiveDictionary`): its values in the order they came.
@@ -1457,8 +1713,113 @@ struct LeafState {
     key_bit_width: u32,
     stats: Option<Stats>,
     bloom: Option<BloomFilter>,
+    /// what the bloom filter holds of the budget of fallback filters
+    bloom_reserved: usize,
+    /// `dictionary_values`: the values analyzed while the dictionary was not full
+    dictionary_values: usize,
+    sortedness: Sortedness,
     num_values: usize,
     enum_seen: Vec<bool>,
+    /// whether every page begins at a row, as the OffsetIndex requires
+    pages_start_at_rows: bool,
+}
+
+/// `SortednessTracker`: whether the values come in order, ascending or descending.
+#[derive(Debug)]
+struct Sortedness {
+    previous: Option<Target>,
+    ascending: bool,
+    descending: bool,
+}
+
+impl Default for Sortedness {
+    fn default() -> Self {
+        Self {
+            previous: None,
+            ascending: true,
+            descending: true,
+        }
+    }
+}
+
+impl Sortedness {
+    fn is_sorted(&self) -> bool {
+        self.ascending || self.descending
+    }
+
+    fn update(&mut self, value: Target) {
+        if let Some(previous) = &self.previous {
+            self.ascending = self.ascending && !greater(previous, &value);
+            self.descending = self.descending && !greater(&value, previous);
+        }
+        self.previous = Some(value);
+    }
+}
+
+/// `GreaterThan`, where NaN is above every number.
+fn greater(a: &Target, b: &Target) -> bool {
+    match (a, b) {
+        (Target::F32(x), Target::F32(y)) => !y.is_nan() && (x.is_nan() || x > y),
+        (Target::F64(x), Target::F64(y)) => !y.is_nan() && (x.is_nan() || x > y),
+        _ => b.less(a),
+    }
+}
+
+/// `EstimateDistinctValues`: the distinct values of `total` rows, from `seen_distinct` of `seen` values drawn
+/// from a fixed set.
+fn estimate_distinct_values(seen_distinct: usize, seen: usize, total: usize) -> usize {
+    if seen_distinct >= seen {
+        return total;
+    }
+    let distinct = seen_distinct as f64;
+    let values = seen as f64;
+    let expected = |population: f64, draws: f64| -population * (-draws / population).exp_m1();
+    let mut low = distinct;
+    let mut high = distinct;
+    while expected(high, values) < distinct {
+        high *= 2.0;
+    }
+    for _ in 0..64 {
+        let mid = (low + high) / 2.0;
+        if expected(mid, values) < distinct {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    let estimate = expected(high, total as f64);
+    total.min(estimate.ceil() as usize)
+}
+
+/// `ParquetIntervalUtils::TryHashNormalized`, from the bytes of an interval as Parquet stores it.
+fn interval_normalized_hash(bytes: &[u8]) -> Option<u64> {
+    let part = |i: usize| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().expect("four bytes"));
+    let interval = duckrs_common::types::Interval {
+        months: part(0) as i32,
+        days: part(1) as i32,
+        micros: i64::from(part(2)) * 1000,
+    };
+    let (months, days, micros) = interval.normalize();
+    // `Borrow`: what does not fit a field saturates it
+    let months = months.clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+    let days = days + micros / MICROS_PER_DAY;
+    let micros = micros % MICROS_PER_DAY;
+    if months < 0 || days < 0 || micros < 0 {
+        return None;
+    }
+    let mut out = (months as u32).to_le_bytes().to_vec();
+    out.extend_from_slice(&(days as u32).to_le_bytes());
+    out.extend_from_slice(&((micros / 1000) as u32).to_le_bytes());
+    Some(xxhash64(&out))
+}
+
+/// `InsertBloomFilterValue`.
+fn insert_bloom_value(bloom: &mut BloomFilter, value: &Target, interval: bool) {
+    let raw = value.raw();
+    bloom.insert(xxhash64(&raw));
+    if interval && let Some(hash) = interval_normalized_hash(&raw) {
+        bloom.insert(hash);
+    }
 }
 
 enum State {
@@ -1488,6 +1849,8 @@ struct ChunkMeta {
     statistics: Option<FooterStats>,
     encoding_stats: Vec<(i32, i32, i32)>,
     bloom_filter: Option<(i64, i32)>,
+    column_index: Option<(i64, i32)>,
+    offset_index: Option<(i64, i32)>,
 }
 
 struct RowGroupMeta {
@@ -1509,8 +1872,11 @@ pub struct ParquetFileWriter {
     buffer: Vec<Vec<Value>>,
     buffered_bytes: usize,
     row_groups: Vec<RowGroupMeta>,
-    /// by leaf column and row group
-    blooms: Vec<(usize, usize, BloomFilter)>,
+    /// by leaf column and row group, with what they hold of the budget
+    blooms: Vec<(usize, usize, BloomFilter, usize)>,
+    /// `ParquetBloomFilterMemory`: what fallback filters take, written or not
+    bloom_budget_used: usize,
+    page_indexes: Vec<PageIndexEntry>,
     num_rows: i64,
 }
 
@@ -1519,7 +1885,20 @@ impl ParquetFileWriter {
         let nodes = names
             .iter()
             .zip(types)
-            .map(|(name, ty)| create_node(Vec::new(), ty, name, 0, 1, true, &options))
+            .enumerate()
+            .map(|(i, (name, ty))| {
+                let can_have_nulls = !options.not_null_columns.get(i).copied().unwrap_or(false);
+                create_node(
+                    Vec::new(),
+                    ty,
+                    name,
+                    0,
+                    1,
+                    can_have_nulls,
+                    &options,
+                    Some(&options.field_ids),
+                )
+            })
             .collect::<Result<Vec<_>>>()?;
         let file = std::fs::File::create(path).map_err(|e| io_error(format!("Cannot open file \"{path}\": {e}")))?;
         let mut writer = Self {
@@ -1532,8 +1911,25 @@ impl ParquetFileWriter {
             buffered_bytes: 0,
             row_groups: Vec::new(),
             blooms: Vec::new(),
+            bloom_budget_used: 0,
+            page_indexes: Vec::new(),
             num_rows: 0,
         };
+        if writer.options.bloom_filters {
+            for node in &mut writer.nodes {
+                if let Node::Leaf(leaf) = node
+                    && matches!(leaf.kind, LeafKind::Standard { convert, .. } if !matches!(convert, Convert::Int96 { .. }))
+                {
+                    leaf.bloom_fallback = true;
+                }
+            }
+            if types.iter().any(contains_interval) {
+                writer
+                    .options
+                    .key_values
+                    .push(("duckdb.interval_bloom_filter".to_string(), b"normalized-v1".to_vec()));
+            }
+        }
         writer.write_bytes(b"PAR1")?;
         Ok(writer)
     }
@@ -1565,6 +1961,26 @@ impl ParquetFileWriter {
             self.flush_rows(self.buffered_rows())?;
         }
         Ok(())
+    }
+
+    /// What the file holds so far (`ParquetWriteFileSize`).
+    pub fn bytes_written(&self) -> usize {
+        self.written as usize
+    }
+
+    /// The row groups written so far.
+    pub fn row_group_count(&self) -> usize {
+        self.row_groups.len()
+    }
+
+    /// Whether any row came in.
+    pub fn has_data(&self) -> bool {
+        self.num_rows > 0 || self.buffered_rows() > 0
+    }
+
+    /// The rows that fill the row group being buffered.
+    pub fn rows_until_row_group(&self) -> usize {
+        self.options.row_group_size.max(1) - self.buffered_rows().min(self.options.row_group_size.max(1) - 1)
     }
 
     fn buffered_rows(&self) -> usize {
@@ -1603,9 +2019,9 @@ impl ParquetFileWriter {
             }
             let mut state = self.initialize_state(node, rows, &mut leaf_index);
             for (input, count) in &inputs {
-                analyze(node, &mut state, input, *count);
+                analyze(node, &mut state, input, *count, rows, self)?;
             }
-            finalize_analyze(node, &mut state, &self.options);
+            finalize_analyze(node, &mut state, &self.options, &mut self.bloom_budget_used);
             for (input, count) in &inputs {
                 prepare(node, &mut state, None, input, *count, true, &self.options)?;
             }
@@ -1687,6 +2103,10 @@ impl ParquetFileWriter {
                     key_bit_width: 0,
                     stats,
                     bloom: None,
+                    bloom_reserved: 0,
+                    dictionary_values: 0,
+                    sortedness: Sortedness::default(),
+                    pages_start_at_rows: true,
                     num_values: 0,
                     enum_seen: vec![false; enum_count],
                 }))
@@ -1756,6 +2176,8 @@ impl ParquetFileWriter {
             statistics: None,
             encoding_stats: Vec::new(),
             bloom_filter: None,
+            column_index: None,
+            offset_index: None,
         };
         // `SetParquetStatistics`
         for page in &state.pages {
@@ -1806,14 +2228,54 @@ impl ParquetFileWriter {
             meta.statistics = Some(footer);
         }
         let mut total_uncompressed = 0usize;
-        for page in std::mem::take(&mut state.pages) {
-            let header = page_header(&page);
+        let mut index = PageIndexEntry {
+            column: state.column,
+            row_group,
+            has_column_index: false,
+            null_pages: Vec::new(),
+            min_values: Vec::new(),
+            max_values: Vec::new(),
+            boundary_order: 0,
+            null_counts: Vec::new(),
+            locations: Vec::new(),
+        };
+        let mut first_row = 0i64;
+        let pages = std::mem::take(&mut state.pages);
+        for page in &pages {
+            let header = page_header(page);
+            let offset = self.written as i64;
             if meta.data_page_offset == 0 && page.page_type == DATA_PAGE {
-                meta.data_page_offset = self.written as i64;
+                meta.data_page_offset = offset;
+            }
+            if self.options.write_page_index && page.page_type == DATA_PAGE {
+                // `AddPageToPageIndex`
+                index
+                    .locations
+                    .push((offset, (header.len() + page.compressed.len()) as i32, first_row));
+                first_row += page.num_rows as i64;
+                let null_page = page.page_stats.as_ref().is_none_or(|stats| !stats.has_stats());
+                index.null_pages.push(null_page);
+                let stats = page.page_stats.as_ref();
+                index.min_values.push(if null_page {
+                    Vec::new()
+                } else {
+                    stats.map(Stats::min_value).unwrap_or_default()
+                });
+                index.max_values.push(if null_page {
+                    Vec::new()
+                } else {
+                    stats.map(Stats::max_value).unwrap_or_default()
+                });
+                index.null_counts.push(page.null_count as i64);
             }
             total_uncompressed += header.len() + page.uncompressed_size;
             self.write_bytes(&header)?;
             self.write_bytes(&page.compressed)?;
+        }
+        // a chunk of a single page has no page index: its statistics describe that page
+        if self.options.write_page_index && state.pages_start_at_rows && index.locations.len() > 1 {
+            finalize_page_index(&pages, &mut index);
+            self.page_indexes.push(index);
         }
         meta.total_compressed_size = (self.written - start) as i64;
         meta.total_uncompressed_size = total_uncompressed as i64;
@@ -1822,20 +2284,37 @@ impl ParquetFileWriter {
             let keep = has_dictionary
                 || bloom.data.len() * MIN_COMPRESSED_TO_FILTER_RATIO <= meta.total_compressed_size as usize;
             if keep {
-                self.blooms.push((state.column, row_group, bloom));
+                self.blooms.push((state.column, row_group, bloom, state.bloom_reserved));
+            } else {
+                self.bloom_budget_used -= state.bloom_reserved;
             }
         }
         Ok(meta)
     }
 
-    /// `ParquetWriter::Finalize`: the rest of the rows, the bloom filters and the footer.
-    pub fn finish(mut self) -> Result<u64> {
-        let rows = self.buffered_rows();
-        self.flush_rows(rows)?;
-        // `FlushBloomFilters`, by column and then by row group
+    /// `ParquetBloomFilterMemory::TryReserve`: makes room by writing the bloom filters that are done.
+    fn try_reserve(&mut self, bytes: usize) -> bool {
+        let limit = self.options.bloom_filter_fallback_max_bytes;
+        if self.bloom_budget_used + bytes <= limit {
+            self.bloom_budget_used += bytes;
+            return true;
+        }
+        if bytes > limit || self.flush_blooms().is_err() {
+            return false;
+        }
+        if self.bloom_budget_used + bytes <= limit {
+            self.bloom_budget_used += bytes;
+            return true;
+        }
+        false
+    }
+
+    /// `FlushBloomFilters`, by column and then by row group.
+    fn flush_blooms(&mut self) -> Result<()> {
         let mut blooms = std::mem::take(&mut self.blooms);
-        blooms.sort_by_key(|(column, row_group, _)| (*column, *row_group));
-        for (column, row_group, bloom) in blooms {
+        blooms.sort_by_key(|(column, row_group, _, _)| (*column, *row_group));
+        for (column, row_group, bloom, reserved) in blooms {
+            self.bloom_budget_used -= reserved;
             let offset = self.written as i64;
             let mut t = Thrift::new();
             t.begin();
@@ -1847,8 +2326,38 @@ impl ParquetFileWriter {
             self.write_bytes(&t.out)?;
             self.write_bytes(&bloom.data)?;
             let length = (t.out.len() + bloom.data.len()) as i32;
-            if let Some(meta) = self.row_groups[row_group].columns.get_mut(column) {
+            if let Some(meta) = self
+                .row_groups
+                .get_mut(row_group)
+                .and_then(|g| g.columns.get_mut(column))
+            {
                 meta.bloom_filter = Some((offset, length));
+            }
+        }
+        Ok(())
+    }
+
+    /// `ParquetWriter::Finalize`: the rest of the rows, the bloom filters and the footer.
+    pub fn finish(mut self) -> Result<u64> {
+        let rows = self.buffered_rows();
+        self.flush_rows(rows)?;
+        self.flush_blooms()?;
+        // the ColumnIndex of every column chunk, then the OffsetIndex of every one
+        let indexes = std::mem::take(&mut self.page_indexes);
+        for entry in indexes.iter().filter(|entry| entry.has_column_index) {
+            let bytes = entry.column_index();
+            let at = (self.written as i64, bytes.len() as i32);
+            self.write_bytes(&bytes)?;
+            if let Some(meta) = self.row_groups[entry.row_group].columns.get_mut(entry.column) {
+                meta.column_index = Some(at);
+            }
+        }
+        for entry in &indexes {
+            let bytes = entry.offset_index();
+            let at = (self.written as i64, bytes.len() as i32);
+            self.write_bytes(&bytes)?;
+            if let Some(meta) = self.row_groups[entry.row_group].columns.get_mut(entry.column) {
+                meta.offset_index = Some(at);
             }
         }
         let footer = self.footer();
@@ -1890,6 +2399,14 @@ impl ParquetFileWriter {
                     t.element_struct(|t| {
                         t.i64(2, 0);
                         t.structure(3, |t| write_column_meta(t, column, codec));
+                        if let Some((offset, length)) = column.offset_index {
+                            t.i64(4, offset);
+                            t.i32(5, length);
+                        }
+                        if let Some((offset, length)) = column.column_index {
+                            t.i64(6, offset);
+                            t.i32(7, length);
+                        }
                     });
                 }
                 t.i64(2, row_group.total_byte_size);
@@ -2009,24 +2526,57 @@ fn converted_value(leaf: &Leaf, value: &Value) -> Result<Target> {
     }
 }
 
-/// `Analyze`: the dictionaries of the leaves.
-fn analyze(node: &Node, state: &mut State, input: &Input, count: usize) {
+/// `Analyze`: the dictionaries of the leaves, and the bloom filters of those that outgrow them.
+fn analyze(
+    node: &Node,
+    state: &mut State,
+    input: &Input,
+    count: usize,
+    rows: usize,
+    writer: &mut ParquetFileWriter,
+) -> Result<()> {
     match (node, state, input) {
         (Node::Leaf(leaf), State::Leaf(state), Input::Leaf(values)) => {
             let LeafKind::Standard { .. } = leaf.kind else {
-                return;
+                return Ok(());
             };
-            let Some(dictionary) = state.dictionary.as_mut() else {
-                return;
-            };
-            for value in values.iter().take(count) {
-                if value.is_null() || dictionary.full {
-                    continue;
+            if state.dictionary.is_none() {
+                return Ok(());
+            }
+            let values = &values[..count.min(values.len())];
+            // `TracksSortedness`
+            let full = state.dictionary.as_ref().is_some_and(|d| d.full);
+            let track = leaf.bloom_fallback
+                && leaf.tracks_sortedness()
+                && state.sortedness.is_sorted()
+                && (!full || state.bloom.is_some());
+            if !track {
+                state.sortedness.ascending &= !leaf.bloom_fallback || leaf.tracks_sortedness();
+                state.sortedness.descending &= !leaf.bloom_fallback || leaf.tracks_sortedness();
+            }
+            let all_valid = values.iter().all(|v| !v.is_null());
+            if all_valid {
+                if track {
+                    for value in values {
+                        if !state.sortedness.is_sorted() {
+                            break;
+                        }
+                        state.sortedness.update(converted_value(leaf, value)?);
+                    }
                 }
-                if let Ok(target) = converted_value(leaf, value) {
-                    dictionary.insert(target);
+                for value in values {
+                    analyze_value(leaf, state, converted_value(leaf, value)?, rows, writer);
+                }
+            } else {
+                for value in values.iter().filter(|v| !v.is_null()) {
+                    let target = converted_value(leaf, value)?;
+                    if track {
+                        state.sortedness.update(target.clone());
+                    }
+                    analyze_value(leaf, state, target, rows, writer);
                 }
             }
+            Ok(())
         }
         (
             Node::Struct { children, .. },
@@ -2034,8 +2584,9 @@ fn analyze(node: &Node, state: &mut State, input: &Input, count: usize) {
             Input::Struct { children: inputs, .. },
         ) => {
             for ((child, state), input) in children.iter().zip(states).zip(inputs) {
-                analyze(child, state, input, count);
+                analyze(child, state, input, count, rows, writer)?;
             }
+            Ok(())
         }
         (
             Node::List { child, .. } | Node::Array { child, .. },
@@ -2045,13 +2596,98 @@ fn analyze(node: &Node, state: &mut State, input: &Input, count: usize) {
                 child_count,
                 ..
             },
-        ) => analyze(child, state, input, *child_count),
-        _ => {}
+        ) => analyze(child, state, input, *child_count, rows, writer),
+        _ => Ok(()),
+    }
+}
+
+/// `AnalyzeValue`: `CountAnalyzedValue` and `InsertAnalyzedValue`.
+fn analyze_value(leaf: &Leaf, state: &mut LeafState, value: Target, rows: usize, writer: &mut ParquetFileWriter) {
+    let interval = leaf.bloom_entries_per_value() == 2;
+    let dictionary = state.dictionary.as_mut().expect("a dictionary");
+    if !dictionary.full {
+        state.dictionary_values += 1;
+        let before = dictionary.full;
+        dictionary.insert(value.clone());
+        if !dictionary.full {
+            return;
+        }
+        if !before {
+            start_bloom_fallback(leaf, state, rows, writer);
+        }
+    }
+    if let Some(bloom) = state.bloom.as_mut() {
+        insert_bloom_value(bloom, &value, interval);
+    }
+}
+
+/// `StartBloomFilterFallback`: a dictionary that is full hands its values to a bloom filter for all the rows.
+fn start_bloom_fallback(leaf: &Leaf, state: &mut LeafState, rows: usize, writer: &mut ParquetFileWriter) {
+    const MIN_PREFIX_VALUES: usize = 1024;
+    const MIN_COLUMN_TO_FILTER_RATIO: usize = 4;
+    if !leaf.bloom_fallback {
+        return;
+    }
+    let fpp = writer.options.bloom_filter_fpp;
+    let entries = leaf.bloom_entries_per_value();
+    let dictionary = state.dictionary.as_ref().expect("a dictionary");
+    // `SkipBloomFilterFallback`
+    if state.dictionary_values >= MIN_PREFIX_VALUES {
+        if state.sortedness.is_sorted() {
+            return;
+        }
+        let distinct = estimate_distinct_values(dictionary.values.len() + 1, state.dictionary_values, rows);
+        let Some(filter_size) = BloomFilter::size(distinct as u64 * entries, fpp) else {
+            return;
+        };
+        let value_size = dictionary.target_size / dictionary.values.len().max(1);
+        if filter_size * MIN_COLUMN_TO_FILTER_RATIO > value_size * rows {
+            return;
+        }
+    }
+    // `ParquetBloomFilter::TryCreate`
+    if rows == 0 {
+        return;
+    }
+    let Some(size) = BloomFilter::size(rows as u64 * entries, fpp) else {
+        return;
+    };
+    let reservation = size + size / 2;
+    if !writer.try_reserve(reservation) {
+        return;
+    }
+    let mut bloom = BloomFilter { data: vec![0; size] };
+    let interval = entries == 2;
+    let mut seedable = true;
+    let dictionary = state.dictionary.as_mut().expect("a dictionary");
+    for value in &dictionary.values {
+        // `CanSeedBloomFilter`: a NaN can't be looked up, so the filter would pass over it
+        seedable &= !matches!(value, Target::F32(v) if v.is_nan()) && !matches!(value, Target::F64(v) if v.is_nan());
+        insert_bloom_value(&mut bloom, value, interval);
+    }
+    dictionary.values.clear();
+    dictionary.index.clear();
+    if seedable {
+        state.bloom = Some(bloom);
+        state.bloom_reserved = reservation;
+    } else {
+        writer.bloom_budget_used -= reservation;
+    }
+}
+
+fn contains_interval(ty: &LogicalType) -> bool {
+    match ty.id() {
+        LogicalTypeId::Interval => true,
+        LogicalTypeId::Struct => ty.struct_children().iter().any(|(_, child)| contains_interval(child)),
+        LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Map => {
+            ty.child_type().is_some_and(contains_interval)
+        }
+        _ => false,
     }
 }
 
 /// `FinalizeAnalyze`: dictionary encoding, or else what is better than PLAIN.
-fn finalize_analyze(node: &Node, state: &mut State, options: &WriterOptions) {
+fn finalize_analyze(node: &Node, state: &mut State, options: &WriterOptions, budget: &mut usize) {
     match (node, state) {
         (Node::Leaf(leaf), State::Leaf(state)) => {
             let LeafKind::Standard { convert, .. } = leaf.kind else {
@@ -2073,14 +2709,23 @@ fn finalize_analyze(node: &Node, state: &mut State, options: &WriterOptions) {
             } else {
                 state.key_bit_width = bit_width_of_count(dictionary.values.len() as u64);
             }
+            if state.bloom.is_some() && state.sortedness.is_sorted() {
+                state.bloom = None;
+                *budget -= std::mem::take(&mut state.bloom_reserved);
+            }
+            if let Some(bloom) = state.bloom.as_mut() {
+                bloom.fold_to_target(options.bloom_filter_fpp);
+                *budget -= state.bloom_reserved - bloom.data.len();
+                state.bloom_reserved = bloom.data.len();
+            }
         }
         (Node::Struct { children, .. }, State::Struct { children: states, .. }) => {
             for (child, state) in children.iter().zip(states) {
-                finalize_analyze(child, state, options);
+                finalize_analyze(child, state, options, budget);
             }
         }
         (Node::List { child, .. } | Node::Array { child, .. }, State::List { child: state, .. }) => {
-            finalize_analyze(child, state, options)
+            finalize_analyze(child, state, options, budget)
         }
         _ => {}
     }
@@ -2214,6 +2859,18 @@ fn prepare(
             }
             let mut vector_index = 0;
             for i in 0..vcount {
+                if i == 0 && !can_span && options.write_page_index {
+                    // the values of a list start on a new page when this one is full, so that every page
+                    // begins at a row as the OffsetIndex requires
+                    let page = state.page_info.last().expect("a page");
+                    if page.row_count > 0 && page.estimated_page_size >= limit {
+                        let offset = page.offset + page.row_count;
+                        state.page_info.push(PageInfo {
+                            offset,
+                            ..Default::default()
+                        });
+                    }
+                }
                 let page = state.page_info.last_mut().expect("a page");
                 page.row_count += 1;
                 if check_parent_empty && parent.is_some_and(|p| p.is_empty[parent_index + i]) {
@@ -2225,7 +2882,7 @@ fn prepare(
                     let size = row_size(leaf, state, value.expect("checked"));
                     let page = state.page_info.last_mut().expect("a page");
                     page.estimated_page_size += size;
-                    if page.estimated_page_size >= limit && (can_span || i == 0) {
+                    if page.estimated_page_size >= limit && (can_span || (i == 0 && !options.write_page_index)) {
                         let offset = page.offset + page.row_count;
                         state.page_info.push(PageInfo {
                             offset,
@@ -2464,6 +3121,26 @@ fn begin_write(node: &Node, state: &mut State, options: &WriterOptions) {
             }
             let mut pages = Vec::with_capacity(state.page_info.len());
             for info in &state.page_info {
+                let (mut num_rows, mut null_count, mut page_stats) = (info.row_count, 0, None);
+                if options.write_page_index {
+                    page_stats = fresh_stats(leaf);
+                    let range = info.offset..info.offset + info.row_count;
+                    if leaf.schema.max_repeat > 0 {
+                        num_rows = state.levels.repetition[range.clone()]
+                            .iter()
+                            .filter(|r| **r == 0)
+                            .count();
+                        if state.levels.repetition.get(info.offset).is_some_and(|r| *r != 0) {
+                            state.pages_start_at_rows = false;
+                        }
+                    }
+                    if leaf.schema.max_define > 0 {
+                        null_count = state.levels.definition[range]
+                            .iter()
+                            .filter(|d| **d != leaf.schema.max_define)
+                            .count();
+                    }
+                }
                 pages.push(PageWrite {
                     page_type: DATA_PAGE,
                     num_values: info.row_count,
@@ -2474,6 +3151,9 @@ fn begin_write(node: &Node, state: &mut State, options: &WriterOptions) {
                     write_count: info.empty_count,
                     max_write_count: info.row_count,
                     encoder: page_encoder(leaf, state, info),
+                    page_stats,
+                    num_rows,
+                    null_count,
                 });
             }
             state.pages = pages;
@@ -2549,6 +3229,10 @@ fn flush_page(state: &mut LeafState, options: &WriterOptions) {
     }
     let page = &mut state.pages[state.current_page - 1];
     flush_encoder(&mut page.encoder, &mut page.buffer);
+    // the statistics of the column chunk are the merged statistics of its pages
+    if let (Some(page_stats), Some(stats)) = (page.page_stats.as_ref(), state.stats.as_mut()) {
+        stats.merge(page_stats);
+    }
     page.uncompressed_size = page.buffer.len();
     let data = std::mem::take(&mut page.buffer);
     page.compressed = options.codec.compress(data).unwrap_or_default();
@@ -2604,7 +3288,7 @@ fn write(node: &Node, state: &mut State, input: &Input, count: usize, options: &
                     return Err(io_error("Writes are not correctly aligned!?"));
                 };
                 let write_count = remaining.min(page.max_write_count - page.write_count);
-                write_values(leaf, state, page_index, &values[offset..offset + write_count])?;
+                write_values(leaf, state, page_index, &values[offset..offset + write_count], options)?;
                 let page = &mut state.pages[page_index];
                 page.write_count += write_count;
                 if page.write_count == page.max_write_count {
@@ -2639,15 +3323,33 @@ fn write(node: &Node, state: &mut State, input: &Input, count: usize, options: &
 }
 
 /// `WriteVector`: values of a page.
-fn write_values(leaf: &Leaf, state: &mut LeafState, page_index: usize, values: &[Value]) -> Result<()> {
-    let page = &mut state.pages[page_index];
+fn write_values(
+    leaf: &Leaf,
+    state: &mut LeafState,
+    page_index: usize,
+    values: &[Value],
+    options: &WriterOptions,
+) -> Result<()> {
+    let LeafState {
+        pages,
+        stats: chunk_stats,
+        dictionary,
+        enum_seen,
+        ..
+    } = state;
+    let page = &mut pages[page_index];
     let out = &mut page.buffer;
+    // with the page index every page tracks its own statistics
+    let stats = match page.page_stats.as_mut() {
+        Some(stats) => Some(stats),
+        None => chunk_stats.as_mut(),
+    };
     match &leaf.kind {
         LeafKind::Boolean => {
             let PageEncoder::Boolean { byte, position } = &mut page.encoder else {
                 return Ok(());
             };
-            let Some(Stats::Bool { min, max }) = state.stats.as_mut() else {
+            let Some(Stats::Bool { min, max }) = stats else {
                 return Ok(());
             };
             // like C++, once a page has seen both values the statistics stop changing
@@ -2688,13 +3390,13 @@ fn write_values(leaf: &Leaf, state: &mut LeafState, page_index: usize, values: &
                     *written = true;
                 }
                 encoder.write_value(out, index as u32);
-                if let Some(seen) = state.enum_seen.get_mut(index as usize) {
+                if let Some(seen) = enum_seen.get_mut(index as usize) {
                     *seen = true;
                 }
             }
         }
         LeafKind::FixedDecimal => {
-            let Some(Stats::Decimal { min, max }) = state.stats.as_mut() else {
+            let Some(Stats::Decimal { min, max }) = stats else {
                 return Ok(());
             };
             for value in values {
@@ -2713,13 +3415,15 @@ fn write_values(leaf: &Leaf, state: &mut LeafState, page_index: usize, values: &
         }
         LeafKind::Standard { convert, .. } => {
             let stats_per_value = !matches!(page.encoder, PageEncoder::Dictionary { .. })
-                || matches!(convert, Convert::F32 | Convert::F64);
+                || matches!(convert, Convert::F32 | Convert::F64)
+                || options.write_page_index;
+            let mut stats = stats;
             for value in values {
                 if value.is_null() {
                     continue;
                 }
                 let target = convert.apply(value)?;
-                if stats_per_value && let Some(stats) = state.stats.as_mut() {
+                if stats_per_value && let Some(stats) = stats.as_deref_mut() {
                     stats.update(&target);
                 }
                 match &mut page.encoder {
@@ -2733,8 +3437,7 @@ fn write_values(leaf: &Leaf, state: &mut LeafState, page_index: usize, values: &
                             encoder.begin_write();
                             *written = true;
                         }
-                        let index = state
-                            .dictionary
+                        let index = dictionary
                             .as_ref()
                             .and_then(|d| d.index.get(&target.key()).copied())
                             .unwrap_or(0);
@@ -2812,15 +3515,17 @@ fn flush_dictionary(leaf: &Leaf, state: &mut LeafState, options: &WriterOptions)
             let dictionary = state.dictionary.as_ref().expect("a dictionary");
             count = dictionary.values.len();
             if options.bloom_filters {
-                state.bloom = BloomFilter::create(count as u64, options.bloom_filter_fpp);
+                state.bloom =
+                    BloomFilter::create(count as u64 * leaf.bloom_entries_per_value(), options.bloom_filter_fpp);
             }
-            let stats_from_dictionary = !matches!(convert, Convert::F32 | Convert::F64);
+            let interval = leaf.bloom_entries_per_value() == 2;
+            let stats_from_dictionary = !matches!(convert, Convert::F32 | Convert::F64) && !options.write_page_index;
             for value in &dictionary.values {
                 if stats_from_dictionary && let Some(stats) = state.stats.as_mut() {
                     stats.update(value);
                 }
                 if let Some(bloom) = state.bloom.as_mut() {
-                    bloom.insert(xxhash64(&value.raw()));
+                    insert_bloom_value(bloom, value, interval);
                 }
                 value.plain(&mut data);
             }
@@ -2841,7 +3546,129 @@ fn flush_dictionary(leaf: &Leaf, state: &mut LeafState, options: &WriterOptions)
             write_count: 0,
             max_write_count: 0,
             encoder: PageEncoder::Plain,
+            page_stats: None,
+            num_rows: 0,
+            null_count: 0,
         },
     );
     Ok(())
+}
+
+/// The hash a bloom filter of a column of type `ty` holds for `value` (`ParquetBloomFilterHashStrategy`): of the
+/// value as the writer stores it, or for intervals written with `normalized-v1`, of its normalized form. `None`
+/// for values no filter holds.
+pub fn bloom_probe_hash(ty: &LogicalType, value: &Value, normalized_intervals: bool) -> Result<Option<u64>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Node::Leaf(leaf) = create_node(Vec::new(), ty, "probe", 0, 1, true, &WriterOptions::default(), None)? else {
+        return Ok(None);
+    };
+    let LeafKind::Standard { convert, .. } = leaf.kind else {
+        return Ok(None);
+    };
+    let raw = convert.apply(value)?.raw();
+    if convert == Convert::Interval && normalized_intervals {
+        return Ok(interval_normalized_hash(&raw));
+    }
+    Ok(Some(xxhash64(&raw)))
+}
+
+/// `InitializeStatsState`: empty statistics of a leaf.
+fn fresh_stats(leaf: &Leaf) -> Option<Stats> {
+    match &leaf.kind {
+        LeafKind::Standard { stats, .. } => Stats::new(*stats),
+        LeafKind::Boolean => Some(Stats::Bool { min: true, max: false }),
+        LeafKind::Enum(_) => Some(Stats::String(StringStats::new(false, true))),
+        LeafKind::FixedDecimal => Some(Stats::Decimal { min: None, max: None }),
+    }
+}
+
+/// The page index of a column chunk (`ParquetPageIndexEntry`).
+struct PageIndexEntry {
+    column: usize,
+    row_group: usize,
+    has_column_index: bool,
+    null_pages: Vec<bool>,
+    min_values: Vec<Vec<u8>>,
+    max_values: Vec<Vec<u8>>,
+    boundary_order: i32,
+    null_counts: Vec<i64>,
+    /// offset, compressed size with the header, first row
+    locations: Vec<(i64, i32, i64)>,
+}
+
+impl PageIndexEntry {
+    fn column_index(&self) -> Vec<u8> {
+        let mut t = Thrift::new();
+        t.begin();
+        t.list(1, ttype::BOOL_TRUE, self.null_pages.len());
+        for null in &self.null_pages {
+            t.out.push(if *null { 1 } else { 2 });
+        }
+        t.list(2, ttype::BINARY, self.min_values.len());
+        for value in &self.min_values {
+            t.raw_binary(value);
+        }
+        t.list(3, ttype::BINARY, self.max_values.len());
+        for value in &self.max_values {
+            t.raw_binary(value);
+        }
+        t.i32(4, self.boundary_order);
+        t.list(5, ttype::I64, self.null_counts.len());
+        for count in &self.null_counts {
+            encoding::varint(&mut t.out, encoding::zigzag(*count));
+        }
+        t.end();
+        t.out
+    }
+
+    fn offset_index(&self) -> Vec<u8> {
+        let mut t = Thrift::new();
+        t.begin();
+        t.list(1, ttype::STRUCT, self.locations.len());
+        for (offset, size, first_row) in &self.locations {
+            t.element_struct(|t| {
+                t.i64(1, *offset);
+                t.i32(2, *size);
+                t.i64(3, *first_row);
+            });
+        }
+        t.end();
+        t.out
+    }
+}
+
+/// `FinalizePageIndex`: the ColumnIndex needs bounds for every page with values, and its order.
+fn finalize_page_index(pages: &[PageWrite], index: &mut PageIndexEntry) {
+    index.has_column_index = true;
+    let mut previous: Option<&Stats> = None;
+    let (mut ascending, mut descending) = (true, true);
+    for (page_number, page) in pages.iter().filter(|page| page.page_type == DATA_PAGE).enumerate() {
+        let stats = page.page_stats.as_ref();
+        let null_page = index.null_pages[page_number];
+        let page_has_values = page.null_count < page.max_write_count;
+        if (null_page && page_has_values) || stats.is_some_and(|s| s.nan_count() > 0) {
+            index.has_column_index = false;
+            return;
+        }
+        if null_page {
+            continue;
+        }
+        let stats = stats.expect("a page with bounds has statistics");
+        if let Some(previous) = previous {
+            use std::cmp::Ordering::*;
+            let (min, max) = (previous.compare(stats, false), previous.compare(stats, true));
+            ascending = ascending && min != Greater && max != Greater;
+            descending = descending && min != Less && max != Less;
+        }
+        previous = Some(stats);
+    }
+    index.boundary_order = if ascending {
+        1
+    } else if descending {
+        2
+    } else {
+        0
+    };
 }
