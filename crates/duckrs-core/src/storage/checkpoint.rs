@@ -31,11 +31,8 @@ pub(super) fn catalog_deserializer(data: &[u8], before_v2: bool) -> BinaryDeseri
         .from_before_v2(before_v2)
 }
 
-fn not_ported_entry(entry_type: u64) -> Error {
-    not_ported(match entry_type {
-        catalog_type::TRIGGER_ENTRY => "triggers",
-        _ => "this kind of catalog entry",
-    })
+fn not_ported_entry(_entry_type: u64) -> Error {
+    not_ported("this kind of catalog entry")
 }
 
 /// A stored column of a table in a file.
@@ -135,6 +132,10 @@ pub enum StoredEntry {
     },
     /// With what `COMMENT ON INDEX` said.
     Index(Box<ast::CreateInfo>, Option<String>),
+    Trigger {
+        schema: String,
+        trigger: Box<crate::catalog::TriggerCatalogEntry>,
+    },
 }
 
 /// The catalog of a file.
@@ -275,6 +276,7 @@ fn read_entry(d: &mut BinaryDeserializer<'_>) -> Result<Pending> {
         catalog_type::INDEX_ENTRY,
         catalog_type::MACRO_ENTRY,
         catalog_type::TABLE_MACRO_ENTRY,
+        catalog_type::TRIGGER_ENTRY,
     ]
     .contains(&entry_type)
     {
@@ -396,6 +398,51 @@ pub(super) fn convert_entry(info: g::CreateInfo) -> Result<Converted> {
                 cycle: stored.cycle,
             },
         },
+        g::CreateInfoKind::CreateTriggerInfo(stored) => {
+            use crate::catalog::{TriggerEvent, TriggerForEach, TriggerTiming};
+            let base = convert::table_ref(*stored.base_table.ok_or_else(|| corrupt("a trigger has no table"))?)?;
+            let ast::TableRefKind::BaseTable { name: table, .. } = base.kind else {
+                return Err(corrupt("the table of a trigger is not a table"));
+            };
+            let action = convert::query_node(*stored.trigger_action.ok_or_else(|| corrupt("a trigger has no body"))?)?;
+            let mut written = table.qualification.clone();
+            written.push(table.name.clone());
+            let comment = comment.filter(|value| !value.is_null());
+            let dependencies = crate::client::trigger_body_dependencies(
+                &action,
+                &[&stored.referencing_new_table, &stored.referencing_old_table],
+            );
+            StoredEntry::Trigger {
+                schema,
+                trigger: Box::new(crate::catalog::TriggerCatalogEntry {
+                    name: stored.trigger_name,
+                    table: table.name,
+                    table_written: written,
+                    timing: match stored.timing {
+                        0 => TriggerTiming::Before,
+                        1 => TriggerTiming::After,
+                        _ => TriggerTiming::InsteadOf,
+                    },
+                    event: match stored.event_type {
+                        0 => TriggerEvent::Insert,
+                        1 => TriggerEvent::Delete,
+                        _ => TriggerEvent::Update,
+                    },
+                    columns: stored.columns,
+                    for_each: if stored.for_each == 1 {
+                        TriggerForEach::Row
+                    } else {
+                        TriggerForEach::Statement
+                    },
+                    referencing_new: stored.referencing_new_table,
+                    referencing_old: stored.referencing_old_table,
+                    action,
+                    temporary: info.temporary,
+                    dependencies,
+                    comment: comment.map(|value| value.try_to_string()).transpose()?,
+                }),
+            }
+        }
         g::CreateInfoKind::CreateTypeInfo(stored) => StoredEntry::Type {
             schema,
             name: stored.name,

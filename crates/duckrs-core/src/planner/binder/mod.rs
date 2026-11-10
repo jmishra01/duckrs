@@ -763,6 +763,8 @@ struct WorkingTable {
     recurring: Arc<Mutex<ColumnDataCollection>>,
     /// whether the recursive part reads it
     used: Arc<AtomicBool>,
+    /// a transition table of a trigger body, which a CTE of the body can shadow
+    transition: bool,
 }
 
 /// A column of a query around a subquery (`CorrelatedColumnInfo`).
@@ -779,7 +781,7 @@ impl<'a> Binder<'a> {
     }
 
     pub fn with_options(catalog: &'a Catalog, options: BindOptions) -> Self {
-        Self {
+        let mut binder = Self {
             catalog,
             options,
             bind_context: BindContext::default(),
@@ -792,7 +794,7 @@ impl<'a> Binder<'a> {
             session: None,
             lambda_scopes: Vec::new(),
             windows: None,
-            window_error: "window functions are not supported here",
+            window_error: "Window functions are not supported here",
             inside_window: false,
             alias_fallback: Vec::new(),
             later_select_aliases: None,
@@ -812,7 +814,22 @@ impl<'a> Binder<'a> {
             working_tables: Vec::new(),
             merge_action_column: false,
             pending_outer_aggregate: None,
+        };
+        // the transition tables of the trigger whose body this binds
+        if let Some(scope) = crate::planner::trigger_scope::current() {
+            for table in &scope.tables {
+                binder.working_tables.push(WorkingTable {
+                    name: table.name.clone(),
+                    names: table.names.clone(),
+                    types: table.types.clone(),
+                    rows: table.rows.clone(),
+                    recurring: table.rows.clone(),
+                    used: Arc::new(AtomicBool::new(false)),
+                    transition: true,
+                });
+            }
         }
+        binder
     }
 
     /// `Binder::BindView` + `BindCreateViewInfo`: checks the query of a view being created.

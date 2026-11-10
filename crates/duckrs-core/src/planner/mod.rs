@@ -8,3 +8,4 @@ pub mod expression;
 pub mod logical;
 pub mod sql_export;
 pub mod subquery;
+pub mod trigger_scope;

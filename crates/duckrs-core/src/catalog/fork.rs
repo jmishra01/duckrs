@@ -375,6 +375,15 @@ fn changed_entries(base: &[SchemaEntries], catalog: &Catalog) -> Vec<ChangedEntr
             |a, b| a == b,
             &mut found,
         );
+        let triggers = schema.triggers.read();
+        map_changes(
+            &format!("trigger {name}."),
+            &name,
+            &saved.triggers,
+            &triggers,
+            Arc::ptr_eq,
+            &mut found,
+        );
     }
     for name in schemas.keys() {
         if !base.iter().any(|saved| saved.schema.key() == *name) {
@@ -480,6 +489,8 @@ impl Catalog {
             let sequences = schema.sequences.read().clone();
             let macros = [schema.macros[0].read().clone(), schema.macros[1].read().clone()];
             let types = schema.types.read().clone();
+            let triggers = schema.triggers.read().clone();
+            copy.triggers.write().clone_from(&triggers);
             copy.sequences.write().clone_from(&sequences);
             copy.macros[0].write().clone_from(&macros[0]);
             copy.macros[1].write().clone_from(&macros[1]);
@@ -491,6 +502,7 @@ impl Catalog {
                 sequences,
                 macros,
                 types,
+                triggers,
             });
             forked.insert(name.clone(), copy);
         }
@@ -770,6 +782,12 @@ impl Fork {
             copy_changes(&schema.types, &live.types, saved.map(|saved| &saved.types), |a, b| {
                 a == b
             });
+            copy_changes(
+                &schema.triggers,
+                &live.triggers,
+                saved.map(|saved| &saved.triggers),
+                Arc::ptr_eq,
+            );
             live.link_foreign_keys();
         }
         let mut versions = self.database.versions.lock();

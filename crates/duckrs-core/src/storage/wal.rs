@@ -41,7 +41,7 @@ const STANDARD_VECTOR_SIZE: usize = 2048;
 /// Schema and name of an entry, as a record gives them.
 type EntryName = (String, String);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum DropKind {
     Table,
     View,
@@ -50,6 +50,8 @@ pub(super) enum DropKind {
     TableMacro,
     Type,
     Index,
+    /// a trigger, on the table of this name
+    Trigger(String),
 }
 
 /// A record that changes the database.
@@ -451,6 +453,14 @@ impl Reader<'_> {
             CREATE_MACRO => create(g::WALCreateMacro::read_members(d)?.macro_)?,
             CREATE_TABLE_MACRO => create(g::WALCreateTableMacro::read_members(d)?.table_macro)?,
             CREATE_TYPE => create(g::WALCreateType::read_members(d)?.type_)?,
+            CREATE_TRIGGER => create(g::WALCreateTrigger::read_members(d)?.trigger)?,
+            DROP_TRIGGER => {
+                let e = g::WALDropTrigger::read_members(d)?;
+                Record::Drop(
+                    DropKind::Trigger(e.table),
+                    entry_name(e.schema, e.name, e.qualified_name)?,
+                )
+            }
             CREATE_SCHEMA => {
                 let entry = g::WALCreateSchema::read_members(d)?;
                 Record::CreateSchema(schema_name(entry.schema, entry.qualified_name)?)
@@ -528,7 +538,6 @@ impl Reader<'_> {
                 }
             }
             ALTER_INFO => return Err(not_ported("ALTER in a write-ahead log")),
-            CREATE_TRIGGER | DROP_TRIGGER => return Err(not_ported("triggers")),
             other => return Err(corrupt(format!("unknown write-ahead log entry {other}"))),
         };
         Ok(Entry::Record(record))
@@ -860,6 +869,10 @@ impl<'a> Replay<'a> {
                 let schema = self.catalog.schema_for(Some(&schema))?;
                 schema.create_type(&name, ty, OnCreateConflict::Ignore)?;
             }
+            StoredEntry::Trigger { schema, trigger } => {
+                let schema = self.catalog.schema_for(Some(&schema))?;
+                schema.create_trigger(*trigger, OnCreateConflict::Error)?;
+            }
             StoredEntry::Index(mut info, comment) => {
                 let index_type = match &mut info.kind {
                     duckrs_parser::ast::CreateKind::Index { index_type, .. } => {
@@ -885,6 +898,8 @@ impl<'a> Replay<'a> {
                 let table_key = key(&(schema.clone(), name.clone()));
                 self.tables.remove(&table_key);
                 self.disk.remove(&table_key);
+                // its triggers go with it
+                entry.drop_triggers_on(name);
                 entry.drop_entry(name, "Table")?
             }
             DropKind::View => entry.drop_entry(name, "View")?,
@@ -893,6 +908,7 @@ impl<'a> Replay<'a> {
             DropKind::TableMacro => entry.drop_macro(name, true),
             DropKind::Type => entry.drop_type(name),
             DropKind::Index => entry.drop_index(name),
+            DropKind::Trigger(table) => entry.drop_trigger(&table, name),
         };
         if !dropped {
             return Err(corrupt(format!("a log drops {name}, which does not exist")));

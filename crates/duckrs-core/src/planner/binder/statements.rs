@@ -369,6 +369,7 @@ impl Binder<'_> {
             rows: working.clone(),
             recurring: recurring.clone(),
             used: used.clone(),
+            transition: false,
         });
         let recursive = binder.bind_query_node(&node.right)?;
         self.next_table_index = binder.next_table_index;
@@ -1696,6 +1697,7 @@ impl Binder<'_> {
                         .working_tables
                         .iter()
                         .rev()
+                        .filter(|w| !(w.transition && self.ctes.iter().any(|(n, ..)| n.eq_ignore_ascii_case(&w.name))))
                         .find(|w| w.name.eq_ignore_ascii_case(&name.name))
                 {
                     let mut working = working.clone();
@@ -2228,16 +2230,28 @@ impl Binder<'_> {
         alias: String,
     ) -> Result<BoundStatement> {
         self.bind_context = BindContext::default();
-        self.bind_context.add_binding(Binding {
-            alias,
-            schema: None,
-            table_index,
-            names: table.columns.iter().map(|c| c.name.clone()).collect(),
-            types: table.types(),
-            row_id: None,
-            virtual_columns: Vec::new(),
-            generated: Vec::new(),
-        });
+        // the generated columns too, computed from the stored ones the statement returns (not with
+        // MERGE, whose `merge_action` comes after the stored columns)
+        let logical = !table.generated.is_empty() && !self.merge_action_column;
+        if logical {
+            let names = table.logical_columns().iter().map(|c| c.name.to_string()).collect();
+            let mut binding = super::generated::table_binding(table, alias, table_index, names);
+            binding.schema = Some(table.schema.clone());
+            binding.row_id = None;
+            self.bind_context.add_binding(binding);
+        } else {
+            self.bind_context.add_binding(Binding {
+                alias,
+                // `schema.table.column` reads it too
+                schema: Some(table.schema.clone()),
+                table_index,
+                names: table.columns.iter().map(|c| c.name.clone()).collect(),
+                types: table.types(),
+                row_id: None,
+                virtual_columns: Vec::new(),
+                generated: Vec::new(),
+            });
+        }
         let excluded_star =
             |e: &Expr| matches!(&e.kind, ExprKind::Star(s) if s.relation_name.eq_ignore_ascii_case("excluded"));
         if returning.iter().any(excluded_star) {
@@ -2284,10 +2298,33 @@ impl Binder<'_> {
                 generated: Vec::new(),
             });
         }
-        let expressions = list
+        let mut expressions = list
             .iter()
             .map(|e| self.bind_expression(e))
             .collect::<Result<Vec<_>>>()?;
+        if logical {
+            // a stored column by its position among the stored ones, which is what the statement returns
+            let columns = table.logical_columns();
+            let stored: Vec<Option<usize>> = columns
+                .iter()
+                .scan(0, |next, c| {
+                    Some(c.generated.is_none().then(|| {
+                        *next += 1;
+                        *next - 1
+                    }))
+                })
+                .collect();
+            for e in &mut expressions {
+                e.walk_mut(&mut |e| {
+                    if let BoundExprKind::ColumnRef { binding, depth: 0 } = &mut e.kind
+                        && binding.table_index == table_index
+                        && let Some(Some(position)) = stored.get(binding.column_index)
+                    {
+                        binding.column_index = *position;
+                    }
+                });
+            }
+        }
         let types: Vec<LogicalType> = expressions.iter().map(|e| e.return_type.clone()).collect();
         let plan = LogicalOperator::new(
             LogicalOperatorKind::Projection {

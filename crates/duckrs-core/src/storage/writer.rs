@@ -552,6 +552,38 @@ pub(super) fn macro_info(
     ))
 }
 
+/// `TriggerCatalogEntry::GetInfo`: the table as the CREATE TRIGGER named it.
+pub(super) fn trigger_info(
+    catalog: &str,
+    schema: &SchemaCatalogEntry,
+    trigger: &crate::catalog::TriggerCatalogEntry,
+) -> Result<g::CreateInfo> {
+    let base_table: ast::TableRef = ast::TableRefKind::BaseTable {
+        name: ast::QualifiedName::from_parts(trigger.table_written.clone()),
+        at_clause: None,
+    }
+    .into();
+    let kind = g::CreateInfoKind::CreateTriggerInfo(g::CreateTriggerInfo {
+        trigger_name: trigger.name.clone(),
+        base_table: Some(Box::new(to_stored::table_ref(&base_table)?)),
+        timing: trigger.timing as u64,
+        event_type: trigger.event as u64,
+        columns: trigger.columns.clone(),
+        for_each: trigger.for_each as u64,
+        trigger_action: Some(Box::new(to_stored::query_node(&trigger.action)?)),
+        referencing_new_table: trigger.referencing_new.clone(),
+        referencing_old_table: trigger.referencing_old.clone(),
+    });
+    let mut info = to_stored::create_info(
+        catalog_type::TRIGGER_ENTRY,
+        entry_path(catalog, schema, &trigger.name),
+        kind,
+    );
+    info.temporary = trigger.temporary;
+    info.comment = trigger.comment.clone().map(Value::varchar);
+    Ok(info)
+}
+
 pub(super) fn view_info(catalog: &str, schema: &SchemaCatalogEntry, view: &ViewCatalogEntry) -> Result<g::CreateInfo> {
     let kind = g::CreateInfoKind::CreateViewInfo(g::CreateViewInfo {
         view_name: view.name.clone(),
@@ -1931,6 +1963,13 @@ impl<'a> Writer<'a> {
                 let info = index_info(&name, schema, table, index)?;
                 entries.push(simple(catalog_type::INDEX_ENTRY, info));
             }
+        }
+        // after the tables they are on and read
+        for trigger in schema.trigger_entries() {
+            entries.push(simple(
+                catalog_type::TRIGGER_ENTRY,
+                trigger_info(&name, schema, &trigger)?,
+            ));
         }
         Ok(())
     }
