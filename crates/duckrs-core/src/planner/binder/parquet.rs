@@ -267,7 +267,13 @@ impl Binder<'_> {
                 }
             }
         }
-        let output_names = Self::alias_columns(table_ref, &alias, output_names)?;
+        let mut output_names = Self::alias_columns(table_ref, &alias, output_names)?;
+        // `Binder::BindTableFunctionInternal`: a column without a name is `C` and its index
+        for (i, name) in output_names.iter_mut().enumerate() {
+            if name.is_empty() {
+                *name = format!("C{i}");
+            }
+        }
         let table_index = self.generate_table_index();
         let (virtual_columns, bound_virtual) = crate::execution::multi_file::bind_virtual_columns(&output_names);
         self.bind_context.add_binding(Binding {
@@ -623,7 +629,11 @@ impl Binder<'_> {
         } else {
             MAX_UNCOMPRESSED_PAGE_SIZE
         });
-        options.partitioning = partition.bind(&path, &bound.names, "parquet")?;
+        let order = self.bind_copy_order(info, &bound.names, &bound.types)?;
+        options.partitioning = partition.bind_ordered(&path, &bound.names, "parquet", !order.is_empty())?;
+        if let Some(partitioning) = options.partitioning.as_mut() {
+            partitioning.order = order;
+        }
         self.bind_partition_path(
             info,
             &bound.names,
@@ -671,7 +681,7 @@ impl Binder<'_> {
         let plan = LogicalOperator::new(
             LogicalOperatorKind::CopyToParquet {
                 path,
-                names: bound.names.clone(),
+                names: super::copy::unique_names(&bound.names),
                 options,
             },
             vec![bound.plan],

@@ -199,7 +199,7 @@ fn format_macro(function: &MacroFunction, name: &str) -> String {
 }
 
 /// Whether a parsed expression has a prepared statement parameter in it.
-fn has_parameter(expr: &Expr) -> bool {
+pub(super) fn has_parameter(expr: &Expr) -> bool {
     let mut found = false;
     visit_expr_mut(&mut expr.clone(), &mut |e| {
         found |= matches!(e.kind, ExprKind::Parameter(_));

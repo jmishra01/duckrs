@@ -1151,8 +1151,12 @@ test/sql/constraints/unique/test_unique_string.test
 test/sql/constraints/unique/test_unique_temp.test
 test/sql/copy/async_file_character_device.test
 test/sql/copy/copy_blob_options.test
+test/sql/copy/copy_cte.test
 test/sql/copy/copy_legacy_options.test
 test/sql/copy/copy_order_by_collation.test
+test/sql/copy/copy_order_by_subquery.test
+test/sql/copy/copy_to_attached_database_path.test
+test/sql/copy/copy_to_parameter_filename.test
 test/sql/copy/csv/14512.test
 test/sql/copy/csv/14874.test
 test/sql/copy/csv/17738.test
@@ -1220,10 +1224,13 @@ test/sql/copy/csv/copy_to_overwrite.test
 test/sql/copy/csv/csv_comment_quoted_sniff.test
 test/sql/copy/csv/csv_copy_sniffer.test
 test/sql/copy/csv/csv_decimal_separator.test
+test/sql/copy/csv/csv_dtypes.test
 test/sql/copy/csv/csv_dtypes_union_by_name.test
+test/sql/copy/csv/csv_duck_fuzz.test
 test/sql/copy/csv/csv_enum.test
 test/sql/copy/csv/csv_enum_storage.test
 test/sql/copy/csv/csv_external_access.test
+test/sql/copy/csv/csv_glob_fallback.test
 test/sql/copy/csv/csv_hive.test
 test/sql/copy/csv/csv_hive_filename_union.test
 test/sql/copy/csv/csv_limit_copy.test
@@ -1270,6 +1277,7 @@ test/sql/copy/csv/read_ahead/csv_readahead_gzip.test
 test/sql/copy/csv/read_ahead/csv_readahead_multi_file.test
 test/sql/copy/csv/read_ahead/csv_readahead_rejects.test
 test/sql/copy/csv/read_ahead/csv_readahead_single_file.test
+test/sql/copy/csv/read_csv_subquery.test
 test/sql/copy/csv/read_csv_variable.test
 test/sql/copy/csv/recursive_csv_union_by_name.test
 test/sql/copy/csv/recursive_read_csv.test
@@ -1277,9 +1285,11 @@ test/sql/copy/csv/rejects/csv_incorrect_columns_amount_rejects.test
 test/sql/copy/csv/rejects/csv_rejects_auto.test
 test/sql/copy/csv/rejects/csv_rejects_cache_key_collision.test
 test/sql/copy/csv/rejects/csv_rejects_flush_cast.test
+test/sql/copy/csv/rejects/csv_rejects_flush_message.test
 test/sql/copy/csv/rejects/csv_rejects_maximum_line.test
 test/sql/copy/csv/rejects/csv_unquoted_rejects.test
 test/sql/copy/csv/rejects/test_invalid_parameters.test
+test/sql/copy/csv/rejects/test_invalid_utf_rejects.test
 test/sql/copy/csv/relaxed_quotes.test
 test/sql/copy/csv/sniff_csv_skip_overflow.test
 test/sql/copy/csv/struct.test
@@ -1323,6 +1333,7 @@ test/sql/copy/csv/test_empty_quote.test
 test/sql/copy/csv/test_enum_csv.test
 test/sql/copy/csv/test_escape_long_value.test
 test/sql/copy/csv/test_export_force_quotes.test
+test/sql/copy/csv/test_export_not_null.test
 test/sql/copy/csv/test_extra_delimiters_rfc.test
 test/sql/copy/csv/test_filename_filter.test
 test/sql/copy/csv/test_force_quote.test
@@ -1372,6 +1383,7 @@ test/sql/copy/csv/test_thousands_separator.test
 test/sql/copy/csv/test_time.test
 test/sql/copy/csv/test_timestamp_offset.test
 test/sql/copy/csv/test_union_by_name.test
+test/sql/copy/csv/test_unregistered_compression.test
 test/sql/copy/csv/test_utf16_odd_length.test
 test/sql/copy/csv/test_utf16_surrogate_pairs.test
 test/sql/copy/csv/test_web_page.test
@@ -1430,6 +1442,7 @@ test/sql/copy/parquet/parquet2strings.test
 test/sql/copy/parquet/parquet_10148.test
 test/sql/copy/parquet/parquet_10279.test
 test/sql/copy/parquet/parquet_12621.test
+test/sql/copy/parquet/parquet_13053_duplicate_column_names.test
 test/sql/copy/parquet/parquet_1554.test
 test/sql/copy/parquet/parquet_1588.test
 test/sql/copy/parquet/parquet_1589.test
@@ -1487,10 +1500,12 @@ test/sql/copy/parquet/parquet_schema_num_children_fix.test
 test/sql/copy/parquet/parquet_serialize_pruned_file_list.test
 test/sql/copy/parquet/parquet_short_decompress.test
 test/sql/copy/parquet/parquet_shredding_unsupported_types.test
+test/sql/copy/parquet/parquet_silly.test
 test/sql/copy/parquet/parquet_union_by_name.test
 test/sql/copy/parquet/parquet_virtual_columns.test
 test/sql/copy/parquet/parquet_virtual_file_row_number.test
 test/sql/copy/parquet/parquet_write_codecs.test
+test/sql/copy/parquet/parquet_write_repeated_lists.test
 test/sql/copy/parquet/parquet_zstd.test
 test/sql/copy/parquet/partition_by_bind_issues.test
 test/sql/copy/parquet/read_ahead/readahead_active_jobs_hang.test
@@ -1503,6 +1518,7 @@ test/sql/copy/parquet/read_ahead/readahead_open_error.test
 test/sql/copy/parquet/read_ahead/readahead_order_preservation.test
 test/sql/copy/parquet/read_ahead/readahead_parked_job_progress.test
 test/sql/copy/parquet/read_ahead/readahead_starved_consumers.test
+test/sql/copy/parquet/read_parquet_parameter.test
 test/sql/copy/parquet/read_single_parquet_file_late_materialization.test
 test/sql/copy/parquet/recursive_parquet_union_by_name.test
 test/sql/copy/parquet/replacement_scan_custom_extension.test
@@ -1512,6 +1528,7 @@ test/sql/copy/parquet/struct_column_reader_skip.test
 test/sql/copy/parquet/struct_skip_pushdown_null.test
 test/sql/copy/parquet/test_parallel_many_row_groups.test
 test/sql/copy/parquet/test_parquet_decimal_gt38.test
+test/sql/copy/parquet/test_parquet_duplicate_columns.test
 test/sql/copy/parquet/test_parquet_filter_pushdown.test
 test/sql/copy/parquet/test_parquet_gzip.test
 test/sql/copy/parquet/test_parquet_nested.test
@@ -1570,6 +1587,7 @@ test/sql/copy/partitioned/hive_partitioned_delayed_flush.test
 test/sql/copy/partitioned/hive_partitioned_write.test
 test/sql/copy/partitioned/hive_partitioning_overwrite.test
 test/sql/copy/partitioned/integer_partitioned_write.test
+test/sql/copy/partitioned/order_by_without_partition.test
 test/sql/copy/partitioned/partition_by_syntax.test
 test/sql/copy/partitioned/partition_issue_6304.test
 test/sql/copy/partitioned/partition_null_row_group_size_bytes.test
@@ -1580,6 +1598,7 @@ test/sql/copy/partitioned/partitioned_early_finalize.test
 test/sql/copy/partitioned/partitioned_flush_join_race.test
 test/sql/copy/partitioned/partitioned_full_outer_hash_join.test
 test/sql/copy/partitioned/partitioned_iejoin.test
+test/sql/copy/partitioned/partitioned_order_by.test
 test/sql/copy/partitioned/partitioned_order_by_flush_race.test
 test/sql/copy/partitioned/partitioned_outer_asof_join.test
 test/sql/copy/partitioned/partitioned_row_group_size_bytes_boundary.test
@@ -1589,7 +1608,9 @@ test/sql/copy/partitioned/skip_partition_column_writes.test
 test/sql/copy/return_files.test
 test/sql/copy/return_stats_all_null_row_group.test
 test/sql/copy/return_stats_extra_info.test
+test/sql/copy/return_stats_nested.test
 test/sql/copy/return_stats_truncate.test
+test/sql/copy/return_stats_variant.test
 test/sql/copy/row_groups_per_file.test
 test/sql/copy/tmp_file.test
 test/sql/create/create_as.test
@@ -1609,7 +1630,9 @@ test/sql/cte/cte_null_values.test
 test/sql/cte/cte_on_conflict_issue.test
 test/sql/cte/cte_schema.test
 test/sql/cte/cte_with_replacement_scan.test
+test/sql/cte/dml_cte.test
 test/sql/cte/incorrect_recursive_cte.test
+test/sql/cte/insert_cte_bug_3417.test
 test/sql/cte/lazy_cte_bind.test
 test/sql/cte/lazy_cte_bind_correlated.test
 test/sql/cte/materialized/annotated_and_auto_materialized.test
@@ -1676,6 +1699,7 @@ test/sql/delete/test_delete.test
 test/sql/delete/test_delete_indexed.test
 test/sql/delete/test_large_delete.test
 test/sql/delete/test_large_delete_parallel.test
+test/sql/delete/test_parallel_delete_transaction_local.test
 test/sql/delete/test_segment_deletes.test
 test/sql/delete/test_truncate.test
 test/sql/delete/test_using_delete.test
@@ -1987,6 +2011,7 @@ test/sql/function/string/test_to_base.test
 test/sql/function/string/test_translate.test
 test/sql/function/string/test_trim.test
 test/sql/function/string/test_unicode.test
+test/sql/function/table/query_function_null.test
 test/sql/function/test_scalar_executor.test
 test/sql/function/time/epoch.test
 test/sql/function/time/make_time_nan.test
@@ -2414,6 +2439,7 @@ test/sql/optimizer/distinctness_statistics.test
 test/sql/optimizer/distinctness_statistics_nested.test
 test/sql/optimizer/expression/date_trunc_non_interval_parts.test
 test/sql/optimizer/expression/enum_compare_null.test
+test/sql/optimizer/expression/enum_full_domain_fold_guard.test
 test/sql/optimizer/expression/list_comprehension_casts.test
 test/sql/optimizer/expression/test_casting_negative_integer_to_bit.test
 test/sql/optimizer/expression/test_comparison_simplification.test
@@ -2654,6 +2680,7 @@ test/sql/pragma/test_various_pragmas.test
 test/sql/prepared/invalid_prepare.test
 test/sql/prepared/parameter_order_subquery.test
 test/sql/prepared/parameter_variants.test
+test/sql/prepared/prepare_copy.test
 test/sql/prepared/prepare_default_varchar.test
 test/sql/prepared/prepare_from_first.test
 test/sql/prepared/prepare_in.test

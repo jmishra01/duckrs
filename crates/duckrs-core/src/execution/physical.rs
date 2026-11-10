@@ -683,6 +683,27 @@ impl PhysicalCopyToFile {
     }
 
     /// Writes `rows` of `chunk` to the file of `directory` (`""` without partitions).
+    /// Buffered rows of a partition; with ORDER_BY, sorted and in a file of their own.
+    fn write_pieces(&self, directory: &str, pieces: Vec<DataChunk>) -> Result<()> {
+        let ordered = self.options.partitioning.as_ref().filter(|p| !p.order.is_empty());
+        let pieces = match ordered {
+            Some(partitioning) => partitioning.sorted(pieces)?,
+            None => pieces,
+        };
+        for piece in &pieces {
+            let rows: Vec<usize> = (0..piece.len()).collect();
+            self.write_rows(directory, piece, &rows)?;
+        }
+        if ordered.is_some() {
+            let key = super::parquet::OutputFiles::<CsvOutput>::key(directory, self.options.rotation.as_ref());
+            let out = self.writers.lock().open.remove(&key);
+            if let Some(out) = out {
+                self.close(out)?;
+            }
+        }
+        Ok(())
+    }
+
     fn write_rows(&self, directory: &str, chunk: &DataChunk, rows: &[usize]) -> Result<()> {
         let rotation = self.options.rotation.as_ref();
         let key = super::parquet::OutputFiles::<CsvOutput>::key(directory, rotation);
@@ -766,9 +787,8 @@ impl PhysicalOperator for PhysicalCopyToFile {
                         .buffers
                         .lock()
                         .add(&directory, chunk, &rows, partitioning.flush_threshold)?;
-                    for piece in ready.unwrap_or_default() {
-                        let rows: Vec<usize> = (0..piece.len()).collect();
-                        self.write_rows(&directory, &piece, &rows)?;
+                    if let Some(pieces) = ready {
+                        self.write_pieces(&directory, pieces)?;
                     }
                 }
             }
@@ -784,10 +804,7 @@ impl PhysicalOperator for PhysicalCopyToFile {
     fn finalize(&self) -> Result<()> {
         let buffered = self.buffers.lock().drain();
         for (directory, pieces) in buffered {
-            for piece in pieces {
-                let rows: Vec<usize> = (0..piece.len()).collect();
-                self.write_rows(&directory, &piece, &rows)?;
-            }
+            self.write_pieces(&directory, pieces)?;
         }
         let mut files = self.writers.lock();
         let rotation = self.options.rotation.as_ref();

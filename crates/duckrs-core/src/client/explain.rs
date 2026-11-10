@@ -22,6 +22,22 @@ pub(super) struct ExplainNode {
     children: Vec<ExplainNode>,
 }
 
+impl ExplainNode {
+    /// `PhysicalCTE::ParamsToString` of a CTE whose body runs to completion before the query.
+    pub(super) fn dependent_cte(name: &str, body: ExplainNode, query: ExplainNode) -> ExplainNode {
+        ExplainNode {
+            name: "CTE".to_string(),
+            info: vec![
+                ("CTE Name".to_string(), name.to_string()),
+                ("Execution Mode".to_string(), "PIPELINE_DEPENDENT".to_string()),
+                ("Run To Completion".to_string(), "true".to_string()),
+            ],
+            estimate: None,
+            children: vec![body, query],
+        }
+    }
+}
+
 /// `LogicalOperatorToString`.
 fn logical_name(op: &LogicalOperator) -> &'static str {
     match &op.kind {

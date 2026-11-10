@@ -84,11 +84,28 @@ fn union_tables_query(tables: &Value, by_name: bool) -> Result<String> {
 impl Binder<'_> {
     /// A table function's argument, which C++ evaluates when binding.
     pub(super) fn constant_argument(&mut self, expr: &Expr) -> Result<Value> {
+        // `TableFunctionBinder::BindExpression`
+        let mut subquery = false;
+        duckrs_parser::transformer::visit_expr_mut(&mut expr.clone(), &mut |e: &mut Expr| {
+            subquery |= matches!(e.kind, duckrs_parser::ast::ExprKind::Subquery { .. });
+        });
+        if subquery {
+            return Err(binder_error("Table function cannot contain subqueries"));
+        }
         let mut binder = self.child_binder();
         binder.table_function_argument = true;
+        binder.aggregate_error = "Table function cannot contain aggregates!";
+        binder.window_error = "Table function cannot contain window functions!";
         let bound = binder.bind_expression(expr);
         self.next_table_index = binder.next_table_index;
         let bound = bound?;
+        // `ParameterNotResolvedException`: the statement binds again with the values when it is executed
+        if self.parameters.as_ref().is_some_and(|p| p.values.is_none()) && super::macros::has_parameter(expr) {
+            return Err(Error::new(
+                ErrorKind::ParameterNotResolved,
+                "Parameter types could not be resolved",
+            ));
+        }
         if !bound.is_foldable() {
             return Err(binder_error("Table function requires a constant parameter"));
         }
@@ -210,12 +227,21 @@ impl Binder<'_> {
                 let [pattern] = args.as_slice() else {
                     return Err(binder_error("glob requires a pattern"));
                 };
-                let pattern = self.constant_argument(&pattern.expr)?.try_to_string()?;
-                self.check_file_access(&pattern)?;
-                let files: Vec<String> = crate::execution::file_system::glob(&pattern)
-                    .iter()
-                    .map(|file| format!("'{}'", file.replace('\'', "''")))
-                    .collect();
+                let value = self.constant_argument(&pattern.expr)?;
+                // a list of patterns: the files of each, in turn
+                let patterns = match value.data() {
+                    ValueData::List(items) => items.iter().map(Value::try_to_string).collect::<Result<Vec<_>>>()?,
+                    _ => vec![value.try_to_string()?],
+                };
+                let mut files = Vec::new();
+                for pattern in &patterns {
+                    self.check_file_access(pattern)?;
+                    files.extend(
+                        crate::execution::file_system::glob(pattern)
+                            .iter()
+                            .map(|file| format!("'{}'", file.replace('\'', "''"))),
+                    );
+                }
                 format!("SELECT unnest([{}]::VARCHAR[]) AS file", files.join(", "))
             }
             "test_all_types" => return self.bind_test_all_types(&args, table_ref).map(Some),

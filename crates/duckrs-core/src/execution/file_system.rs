@@ -12,7 +12,7 @@ fn io_error(message: impl Into<String>) -> Error {
 }
 
 /// `FileSystem::HasGlob`.
-fn has_glob(text: &str) -> bool {
+pub fn has_glob(text: &str) -> bool {
     text.contains(['*', '?', '['])
 }
 
@@ -126,11 +126,16 @@ pub fn glob(pattern: &str) -> Vec<String> {
         Some(relative) => ("/", relative),
         None => ("", pattern),
     };
-    let segments: Vec<&str> = relative.split('/').collect();
+    // `Path`: a backslash separates as a slash does, and empty segments are dropped
+    let segments: Vec<&str> = relative.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
     let mut result = Vec::new();
     walk(root, &segments, &mut result);
     result.sort();
     result.dedup();
+    // a file whose name has glob characters in it (#4699)
+    if result.is_empty() && Path::new(pattern).is_file() {
+        result.push(pattern.to_string());
+    }
     result
 }
 
@@ -184,8 +189,38 @@ impl Compression {
     }
 }
 
+/// `VirtualFileSystem::FindCompressionFileSystem`: a name that says the file is compressed in a
+/// way no file system here reads (`CompressionFromExtension`) is an error, not plain text.
+pub fn check_compression(path: &str, compression: Compression) -> Result<()> {
+    if compression != Compression::Auto {
+        return Ok(());
+    }
+    let lower = path.to_lowercase();
+    let lower = lower.strip_suffix(".tmp").unwrap_or(&lower);
+    let suffixes = [
+        (".bz2", "bzip2"),
+        (".xz", "xz"),
+        (".lz4", "lz4"),
+        (".br", "brotli"),
+        (".lzma", "lzma"),
+        (".zip", "zip"),
+    ];
+    match suffixes.iter().find(|(suffix, _)| lower.ends_with(suffix)) {
+        Some((_, name)) => Err(Error::new(
+            ErrorKind::NotImplemented,
+            format!(
+                "Attempting to open a compressed file, but the compression type is not supported (compression \
+                 type \"{name}\")\nThe compression was detected from the name of \"{path}\"; set compression = \
+                 'none' to treat it as uncompressed"
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
 /// All of a file, decompressed.
 pub fn read_file(path: &str, compression: Compression) -> Result<Vec<u8>> {
+    check_compression(path, compression)?;
     let data = std::fs::read(path).map_err(|e| io_error(format!("Cannot open file \"{path}\": {e}")))?;
     // the file is read at once: one READ of all of it
     crate::logging::log_file_system(path, "OPEN", None);

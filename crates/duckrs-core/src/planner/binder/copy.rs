@@ -266,6 +266,9 @@ impl Binder<'_> {
                 if paths.is_some() {
                     return Err(binder_error(format!("{name} takes one positional parameter")));
                 }
+                if value.is_null() {
+                    return Err(binder_error(format!("\"{name}\" cannot take NULL list as parameter")));
+                }
                 paths = Some(strings(&value)?);
                 continue;
             }
@@ -583,6 +586,37 @@ impl Binder<'_> {
             }
             if shown {
                 result.user_arguments.push((option, value_literal(&value)?));
+            }
+        }
+        // `VerifyTypeListsMatch`: with `columns`, the types of `types` must be those of the columns
+        if let Some(columns) = &result.columns {
+            let given: Vec<LogicalType> = if result.types_by_position.is_empty() {
+                result.types_by_name.iter().map(|(_, ty)| ty.clone()).collect()
+            } else {
+                result.types_by_position.clone()
+            };
+            if !given.is_empty() {
+                if given.len() != columns.len() {
+                    return Err(binder_error(format!(
+                        "read_csv: the 'columns' option specifies {} column(s), but 'types'/'dtypes'/'column_types' \
+                         specifies {} type(s). When both are provided they must agree. Consider removing the 'type' \
+                         option.",
+                        columns.len(),
+                        given.len()
+                    )));
+                }
+                for (at, ((_, column), ty)) in columns.iter().zip(&given).enumerate() {
+                    if column != ty {
+                        return Err(binder_error(format!(
+                            "read_csv: column type mismatch at position {}: 'columns' specifies '{column}' but \
+                             'types'/'dtypes'/'column_types' specifies '{ty}'. When both are provided they must \
+                             agree. Consider removing the 'type' option.",
+                            at + 1
+                        )));
+                    }
+                }
+                result.types_by_position.clear();
+                result.types_by_name.clear();
             }
         }
         csv_finalize(&result.options)?;
@@ -1150,12 +1184,61 @@ impl Binder<'_> {
         self.bind_rewritten(&select, table_ref, "sniff_csv")
     }
 
+    /// `DatabaseManager::IsAttachedDatabaseFile`: `path` or one of its WAL files is a database file.
+    fn is_attached_database_file(&self, path: &str) -> bool {
+        if path.contains("://") {
+            return false;
+        }
+        let Some(session) = &self.session else {
+            return false;
+        };
+        let files = (session.database_files)();
+        let given = std::path::Path::new(path);
+        let canonical = std::fs::canonicalize(given).unwrap_or_else(|_| {
+            // a file that does not exist yet: its directory canonicalized
+            let parent = given
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(std::path::Path::new("."));
+            match (std::fs::canonicalize(parent), given.file_name()) {
+                (Ok(directory), Some(name)) => directory.join(name),
+                _ => given.to_path_buf(),
+            }
+        });
+        let canonical = canonical.to_string_lossy();
+        [".wal", ".wal.checkpoint", ".wal.recovery", ""]
+            .into_iter()
+            .any(|suffix| {
+                canonical
+                    .strip_suffix(suffix)
+                    .is_some_and(|database| files.iter().any(|file| file.to_string_lossy() == database))
+            })
+    }
+
     /// The file a COPY names, with its format.
     fn copy_target(&mut self, info: &CopyInfo) -> Result<(String, bool)> {
         let path = match &info.file_path_expression {
-            Some(expression) => text(&self.constant_argument(expression)?)?,
+            Some(expression) => {
+                let value = self.constant_argument(expression)?;
+                if value.logical_type().id() != LogicalTypeId::Varchar {
+                    return Err(binder_error(
+                        "Unsupported parameter type for filename: expected e.g. TARGET 'file.parquet'",
+                    ));
+                }
+                if value.is_null() {
+                    return Err(binder_error(
+                        "NULL is not supported as a valid option for COPY option filename",
+                    ));
+                }
+                text(&value)?
+            }
             None => info.file_path.clone(),
         };
+        if !info.is_from && !path.is_empty() && self.is_attached_database_file(&path) {
+            return Err(binder_error(format!(
+                "Cannot COPY to \"{path}\": the file belongs to an attached database"
+            )));
+        }
         let format = if info.format.is_empty() {
             let lower = path.to_lowercase();
             ["parquet", "json", "ndjson", "jsonl"]
@@ -1218,14 +1301,18 @@ impl Binder<'_> {
         const WRITE_ONLY: [&str; 3] = ["force_quote", "prefix", "suffix"];
         for (name, value) in options {
             if !reading && READ_ONLY.contains(&name.as_str()) {
-                return Err(binder_error(format!("Option \"{name}\" is not supported for writing")));
+                return Err(binder_error(format!(
+                    "Option \"{name}\" is not supported for writing - only for reading"
+                )));
             }
             if reading && WRITE_ONLY.contains(&name.as_str()) {
-                return Err(binder_error(format!("Option \"{name}\" is not supported for reading")));
+                return Err(binder_error(format!(
+                    "Option \"{name}\" is not supported for reading - only for writing"
+                )));
             }
             if matches!(
                 name.as_str(),
-                "delim" | "delimiter" | "sep" | "separator" | "quote" | "escape" | "comment" | "new_line"
+                "delim" | "delimiter" | "sep" | "separator" | "quote" | "escape" | "comment" | "new_line" | "encoding"
             ) && !matches!(
                 value.logical_type().id(),
                 LogicalTypeId::Varchar | LogicalTypeId::SqlNull
@@ -1285,6 +1372,34 @@ impl Binder<'_> {
     }
 
     pub(super) fn bind_copy(&mut self, info: &CopyInfo) -> Result<BoundStatement> {
+        // `ParameterNotResolvedException`: a COPY with parameters in its target or options binds
+        // when it is executed; every parameter is seen first
+        let preparing = self.parameters.as_ref().is_some_and(|p| p.values.is_none());
+        let has_parameter = |e: &Expr| super::macros::has_parameter(e);
+        if preparing
+            && (info.file_path_expression.as_deref().is_some_and(has_parameter)
+                || info
+                    .parsed_options
+                    .iter()
+                    .any(|(_, e)| e.as_ref().is_some_and(has_parameter)))
+        {
+            if let Some(select) = &info.select {
+                let mut binder = self.child_binder();
+                binder.bind_query_node(select)?;
+                self.next_table_index = binder.next_table_index;
+            }
+            // binding them sees their parameters; their values come later
+            if let Some(expression) = &info.file_path_expression {
+                let _ = self.constant_argument(expression);
+            }
+            for expression in info.parsed_options.iter().filter_map(|(_, e)| e.as_ref()) {
+                let _ = self.constant_argument(expression);
+            }
+            return Err(Error::new(
+                ErrorKind::ParameterNotResolved,
+                "Parameter types could not be resolved",
+            ));
+        }
         if info.is_from
             && info
                 .parsed_options
@@ -1441,24 +1556,127 @@ impl Binder<'_> {
                 ));
             }
         }
+        // `CreatePlan(LogicalCopyToFile)`: these write files in whatever order rows come
+        let splits = flag("per_thread_output")?
+            || partitioned
+            || order_by.is_some()
+            || ["file_size_bytes", "row_groups_per_file", "batches_per_file"]
+                .iter()
+                .any(|name| given(name).is_some());
+        if splits && flag("preserve_order")? {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "PRESERVE_ORDER is not supported with these parameters",
+            ));
+        }
         if flag("per_thread_output")? && partitioned {
             return Err(Error::not_implemented(
                 "Can't combine PER_THREAD_OUTPUT and PARTITIONED BY for COPY",
             ));
         }
-        let Some(order_by) = order_by else {
+        if order_by.is_none() {
             return Ok(select);
-        };
+        }
         if flag("per_thread_output")? {
             return Err(Error::not_implemented(
                 "Can't combine PER_THREAD_OUTPUT and ORDER BY for COPY",
             ));
         }
-        let clause = strings(order_by)?.join(", ");
-        parse_select(
-            &format!("SELECT * FROM ({select}) __copy_input ORDER BY {clause}"),
+        if given("write_empty_file").is_some_and(|value| !is_true(value, "write_empty_file").unwrap_or(true)) {
+            return Err(Error::not_implemented(
+                "Can't combine WRITE_EMPTY_FILE false with ORDER BY",
+            ));
+        }
+        // the rows are sorted by run as they are written (`bind_copy_order`)
+        Ok(select)
+    }
+
+    /// `ParseOrderByColumns`: the ORDER_BY of a COPY TO, bound against the columns of its query.
+    pub(super) fn bind_copy_order(
+        &mut self,
+        info: &CopyInfo,
+        names: &[String],
+        types: &[LogicalType],
+    ) -> Result<
+        Vec<(
+            crate::planner::expression::BoundExpr,
+            duckrs_common::sort_key::OrderModifiers,
+        )>,
+    > {
+        use crate::planner::column_binding_resolver::resolve_expression;
+        use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
+        use duckrs_parser::ast::{ExprKind, ResultModifier};
+        let options = self.copy_options(info)?;
+        let Some((_, value)) = options.iter().find(|(name, _)| name == "order_by") else {
+            return Ok(Vec::new());
+        };
+        let clause = strings(value)?.join(", ");
+        let select = parse_select(
+            &format!("SELECT 1 ORDER BY {clause}"),
             "Expected a single SELECT statement",
-        )
+        )?;
+        let orders = select
+            .node
+            .modifiers
+            .iter()
+            .find_map(|modifier| match modifier {
+                ResultModifier::Order(orders) => Some(orders.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        const SUBQUERY: &str = "subqueries are not allowed in ORDER_BY";
+        for order in &orders {
+            let mut subquery = false;
+            duckrs_parser::transformer::visit_expr_mut(&mut order.expr.clone(), &mut |expr: &mut Expr| {
+                subquery |= matches!(expr.kind, ExprKind::Subquery { .. });
+            });
+            if subquery {
+                return Err(binder_error(SUBQUERY));
+            }
+        }
+        let mut binder = Binder::new(self.catalog);
+        binder.options = self.options.clone();
+        binder.session = self.session.clone();
+        binder.parameters = self.parameters.clone();
+        binder.aggregate_error = "aggregate functions are not allowed in ORDER_BY";
+        let table_index = binder.generate_table_index();
+        binder.bind_context.add_binding(Binding {
+            alias: "__copy_input".to_string(),
+            schema: None,
+            table_index,
+            names: names.to_vec(),
+            types: types.to_vec(),
+            row_id: None,
+            virtual_columns: Vec::new(),
+            generated: Vec::new(),
+        });
+        let bindings: Vec<ColumnBinding> = (0..names.len())
+            .map(|column_index| ColumnBinding {
+                table_index,
+                column_index,
+            })
+            .collect();
+        fn has_subquery(expr: &BoundExpr) -> bool {
+            matches!(expr.kind, BoundExprKind::Subquery { .. }) || expr.children().into_iter().any(has_subquery)
+        }
+        let mut result = Vec::with_capacity(orders.len());
+        for order in orders {
+            let bound = binder.bind_expression(&order.expr)?;
+            if has_subquery(&bound) {
+                return Err(binder_error(SUBQUERY));
+            }
+            // the rows sort as the collation of the term says
+            let ty = bound.return_type.clone();
+            let (mut bound, _) = crate::planner::collation::push_collation(
+                bound,
+                &ty,
+                &self.default_collation(),
+                crate::planner::collation::CollationType::AllCollations,
+            )?;
+            resolve_expression(&mut bound, &bindings)?;
+            result.push((bound, self.options.resolve_order(order.order, order.nulls)));
+        }
+        Ok(result)
     }
 
     /// `Binder::BindCopyTo`.
@@ -1645,7 +1863,11 @@ impl Binder<'_> {
             Compression::Zstd => extension += ".zst",
             _ => {}
         }
-        options.partitioning = partition.bind(&path, &bound.names, &extension)?;
+        let order = self.bind_copy_order(info, &bound.names, &bound.types)?;
+        options.partitioning = partition.bind_ordered(&path, &bound.names, &extension, !order.is_empty())?;
+        if let Some(partitioning) = options.partitioning.as_mut() {
+            partitioning.order = order;
+        }
         self.bind_partition_path(
             info,
             &bound.names,
@@ -1805,7 +2027,15 @@ impl PartitionOptions {
     }
 
     /// The partitioning of a COPY to `path` of columns `names`, after clearing the directory if told to.
-    pub(super) fn bind(&self, path: &str, names: &[String], extension: &str) -> Result<Option<Partitioning>> {
+    /// The partitioning of a COPY to `path`; with ORDER_BY and no PARTITION_BY, all rows are one
+    /// partition written to the directory itself.
+    pub(super) fn bind_ordered(
+        &self,
+        path: &str,
+        names: &[String],
+        extension: &str,
+        ordered: bool,
+    ) -> Result<Option<Partitioning>> {
         if self.append
             && !self
                 .filename_pattern
@@ -1814,10 +2044,13 @@ impl PartitionOptions {
         {
             return Err(binder_error("APPEND mode requires a {uuid} label in filename_pattern"));
         }
-        let Some(wanted) = &self.columns else {
-            return Ok(None);
+        let implicit = Vec::new();
+        let wanted = match &self.columns {
+            Some(wanted) => wanted,
+            None if ordered => &implicit,
+            None => return Ok(None),
         };
-        if wanted.is_empty() {
+        if wanted.is_empty() && !ordered {
             return Err(binder_error("PARTITION_BY cannot be empty"));
         }
         let mut columns = Vec::with_capacity(wanted.len());
@@ -1828,11 +2061,13 @@ impl PartitionOptions {
         }
         for column in wanted.iter().filter(|_| !star) {
             let Some(found) = names.iter().position(|n| n.eq_ignore_ascii_case(column)) else {
-                return Err(binder_error(format!("Partition by column \"{column}\" not found")));
+                return Err(binder_error(format!(
+                    "\"partition_by\" expected to find {column}, but it was not found in the table"
+                )));
             };
             columns.push(found);
         }
-        if columns.len() == names.len() && !self.write_columns {
+        if !columns.is_empty() && columns.len() == names.len() && !self.write_columns {
             return Err(Error::not_implemented(
                 "No column to write as all columns are specified as partition columns. WRITE_PARTITION_COLUMNS \
                  option can be used to write partition columns.",
@@ -1849,6 +2084,7 @@ impl PartitionOptions {
             flush_threshold: 524_288,
             filename_pattern: self.filename_pattern.clone().unwrap_or_else(|| "data_{i}".to_string()),
             extension: self.extension.clone().unwrap_or_else(|| extension.to_string()),
+            order: Vec::new(),
         }))
     }
 }
@@ -2393,7 +2629,7 @@ pub(super) fn copy_result(output: &crate::execution::parquet::CopyOutputOptions)
 }
 
 /// The names COPY TO writes: `QueryResult::DeduplicateColumns` of the select list.
-fn unique_names(names: &[String]) -> Vec<String> {
+pub(super) fn unique_names(names: &[String]) -> Vec<String> {
     let mut names = names.to_vec();
     super::star::deduplicate_columns(&mut names);
     names

@@ -4,6 +4,7 @@
 //! Databases and client contexts (DuckDB's `src/main`): running SQL text statement by statement through the
 //! parser, binder, planner and executor.
 
+mod dml_cte;
 mod explain;
 mod triggers;
 pub(crate) use triggers::body_dependencies as trigger_body_dependencies;
@@ -564,6 +565,45 @@ fn for_each_table_name(statement: &mut Statement, f: &mut impl FnMut(&mut Qualif
     }
 }
 
+/// The names of the `$name` parameters in the text of a statement, outside of string literals and
+/// quoted identifiers, lowercase.
+fn parameter_names(sql: &str) -> Vec<String> {
+    let bytes = sql.as_bytes();
+    let mut names = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            quote @ (b'\'' | b'"') => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == quote {
+                        if bytes.get(i + 1) == Some(&quote) {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            b'$' => {
+                let start = i + 1;
+                let mut end = start;
+                while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                    end += 1;
+                }
+                if end > start {
+                    names.push(sql[start..end].to_lowercase());
+                }
+                i = end.max(i + 1) - 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    names
+}
+
 /// A column named with its database, which a statement that runs there doesn't have any more.
 fn strip_database(statement: &mut Statement, database: &str) {
     let mut strip = |e: &mut Expr| match &mut e.kind {
@@ -835,6 +875,7 @@ impl ClientContext {
     fn session_values(&self) -> Arc<SessionValues> {
         let (db, session) = (self.home.clone(), self.settings.clone());
         let (list_db, list_session) = (self.home.clone(), self.settings.clone());
+        let files_db = self.home.clone();
         Arc::new(SessionValues {
             database: self.db.name.clone(),
             log_manager: self.home.log_manager.clone(),
@@ -845,6 +886,15 @@ impl ClientContext {
             variables: self.variables.clone(),
             setting: Box::new(move |name| settings::get_setting(name, &db.settings.read(), &session)),
             settings: Box::new(move || settings::list_settings(&list_db.settings.read(), &list_session)),
+            database_files: Box::new(move || {
+                let mut databases = vec![files_db.clone()];
+                databases.extend(files_db.attached.read().values().cloned());
+                databases
+                    .iter()
+                    .filter_map(|database| database.file.as_ref())
+                    .map(|file| std::fs::canonicalize(&file.path).unwrap_or_else(|_| file.path.clone()))
+                    .collect()
+            }),
         })
     }
 
@@ -983,7 +1033,25 @@ impl ClientContext {
             let catalog = self.catalog();
             let mut binder = Binder::with_options(&catalog, self.bind_options());
             binder.parameters = Some(parameters.clone());
-            binder.bind(&statement)?;
+            let bound = match dml_cte::split(&statement) {
+                Some((ctes, rest)) => self.bind_dml_ctes(&ctes, &rest, &parameters),
+                None => binder.bind(&statement).map(drop),
+            };
+            match bound {
+                // `ParameterNotResolvedException`: bound again with the values on execution; the
+                // parameters after the one that stopped binding are found in the text
+                Err(error) if error.kind == ErrorKind::ParameterNotResolved => {
+                    let mut seen = parameters.seen.lock();
+                    for name in parameter_names(&statement.to_string()) {
+                        if !seen.contains(&name) {
+                            seen.push(name);
+                        }
+                    }
+                }
+                other => {
+                    other?;
+                }
+            }
         }
         let seen = parameters.seen.lock().clone();
         Ok(Arc::new(PreparedStatementData {
@@ -1333,6 +1401,15 @@ impl ClientContext {
             // EXECUTE comes back here with the statement it runs
             Statement::Prepare { .. } | Statement::Execute { .. } | Statement::Deallocate(_) => {
                 return self.execute_statement(statement);
+            }
+            Statement::Select(_)
+            | Statement::Copy(_)
+            | Statement::Insert(_)
+            | Statement::Update(_)
+            | Statement::Delete(_) => {
+                if let Some((ctes, rest)) = dml_cte::split(statement) {
+                    return self.run_with_dml_ctes(&ctes, &rest);
+                }
             }
             _ => {}
         }
@@ -1963,6 +2040,33 @@ impl ClientContext {
         Ok(Some(statements.remove(0)))
     }
 
+    /// The logical, optimized logical and physical plans of `statement`, with the names and types
+    /// of its result.
+    fn explain_trees(
+        &mut self,
+        statement: &Statement,
+        analyze: bool,
+    ) -> Result<([explain::ExplainNode; 3], Vec<String>, Vec<LogicalType>)> {
+        if let Some((ctes, rest)) = dml_cte::split(statement) {
+            return self.explain_dml_ctes(&ctes, &rest, analyze);
+        }
+        let catalog = self.catalog();
+        let mut binder = Binder::with_options(&catalog, self.bind_options());
+        binder.parameters = self.parameters.clone();
+        binder.session = Some(self.session_values());
+        let bound = binder.bind(statement)?;
+        let (names, types) = (bound.names.clone(), bound.types.clone());
+        let logical = explain::logical_tree(&bound.plan, None);
+        let mut plan = optimize(bound.plan, self.optimizer_options());
+        let optimized = plan.clone();
+        let estimate = estimate_plan(&plan);
+        let logical_optimized = explain::logical_tree(&plan, Some(&estimate));
+        resolve_column_bindings(&mut plan)?;
+        let physical_plan = create_plan(plan);
+        let physical = explain::physical_tree(physical_plan.as_ref(), Some(&optimized), Some(&estimate), analyze);
+        Ok(([logical, logical_optimized, physical], names, types))
+    }
+
     fn explain(
         &mut self,
         statement: &Statement,
@@ -1972,25 +2076,15 @@ impl ClientContext {
         if explain_type == ExplainType::Sql {
             return self.explain_sql(statement);
         }
-        let catalog = self.catalog();
-        let mut binder = Binder::with_options(&catalog, self.bind_options());
-        binder.parameters = self.parameters.clone();
-        binder.session = Some(self.session_values());
-        let bound = binder.bind(statement)?;
         let upper = self
             .setting_text("profiling_renderer_settings")
             .to_lowercase()
             .replace(['\'', ' '], "")
             .contains("operator_casing=upper");
-        let logical = explain::render(&explain::logical_tree(&bound.plan, None), format, upper);
-        let mut plan = optimize(bound.plan, self.optimizer_options());
-        let optimized = plan.clone();
-        let estimate = estimate_plan(&plan);
-        let logical_optimized = explain::render(&explain::logical_tree(&plan, Some(&estimate)), format, upper);
-        resolve_column_bindings(&mut plan)?;
-        let physical_plan = create_plan(plan);
         let analyze = explain_type == ExplainType::Analyze;
-        let physical = explain::physical_tree(physical_plan.as_ref(), Some(&optimized), Some(&estimate), analyze);
+        let ([logical, logical_optimized, physical], _, _) = self.explain_trees(statement, analyze)?;
+        let logical = explain::render(&logical, format, upper);
+        let logical_optimized = explain::render(&logical_optimized, format, upper);
         let physical = explain::render(&physical, format, upper);
         if explain_type == ExplainType::Analyze {
             self.execute_statement(statement)?;

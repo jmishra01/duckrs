@@ -548,6 +548,8 @@ pub struct SessionValues {
     pub default_collation: String,
     /// `duckdb_settings()`
     pub settings: SettingList,
+    /// `DatabaseManager::IsAttachedDatabaseFile`: the files of the attached databases
+    pub database_files: Box<dyn Fn() -> Vec<std::path::PathBuf> + Send + Sync>,
 }
 
 /// `current_setting`.
@@ -846,6 +848,22 @@ impl<'a> Binder<'a> {
 
     /// `Binder::BindView` + `BindCreateViewInfo`: checks the query of a view being created.
     pub fn bind_create_view(&mut self, query: &ast::SelectStatement, aliases: &[String], schema: &str) -> Result<()> {
+        // a DML or COPY body would run each time the view is read
+        for (_, cte) in &query.node.cte_map.0 {
+            match cte.query.kind {
+                ast::QueryNodeKind::Insert(_) | ast::QueryNodeKind::Update(_) | ast::QueryNodeKind::Delete(_) => {
+                    return Err(binder_error(
+                        "DML statements (INSERT/UPDATE/DELETE) are not allowed as CTE bodies inside a VIEW",
+                    ));
+                }
+                ast::QueryNodeKind::Copy(_) => {
+                    return Err(binder_error(
+                        "COPY statements are not allowed as CTE bodies inside a VIEW",
+                    ));
+                }
+                _ => {}
+            }
+        }
         self.search_schema = Some(schema.to_string());
         let bound = self.bind_select_statement(query)?;
         if aliases.len() > bound.names.len() {

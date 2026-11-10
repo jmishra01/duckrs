@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 4011 of 6367 test files pass (**66.3%** of the 6051 that run). The v1 target is ≥ 90%.
+- Overall: 4080 of 6367 test files pass (**67.4%** of the 6050 that run). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -13,9 +13,14 @@ Each item gives the number of failing files in `test/` that it should fix, where
 
 ## Phase 11: File formats and I/O
 
-- [ ] 1. COPY TO/FROM failures (`sql/copy`: 208 failing, 66.8% pass; target ≥ 85%)
+- [ ] 1. COPY TO/FROM failures (`sql/copy`: 162 failing, 74.1% pass; target ≥ 85%)
   - [x] `PARTITION_BY` for CSV and JSON (Parquet had it), `PARTITION_BY *`, `PARTITIONED_BY` alias
   - [x] the `ORDER BY` option of COPY TO, and its checks against `USE_TMP_FILE` / `PER_THREAD_OUTPUT`
+  - [x] `ORDER_BY` as C++ writes it: each run of buffered rows sorted (with its terms' collations) into a file of its
+    own, with or without `PARTITION_BY`; `PRESERVE_ORDER` and `WRITE_EMPTY_FILE false` refused with it
+  - [x] COPY as the body of a CTE, and a COPY of a query with one (see item 23)
+  - [x] COPY over the file (or a WAL file) of an attached database refused; a prepared parameter as the file name,
+    and parameters in COPY options, bound when the statement is executed
   - [x] `read_text` / `read_blob`, with hive partition columns
   - [x] the `filename`, `file_index`, `file_row_number` virtual columns of `read_csv`, `read_json`, `read_parquet`
   - [ ] `file_row_group_number` and the other Parquet-only virtual columns; `filename=1` name conflicts
@@ -37,8 +42,12 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] `enable_external_access`, `allowed_paths` and `allowed_directories`: checked where the binder takes a path
     (readers, `glob`, COPY, ATTACH), EXPORT / IMPORT, the profiler's output, LOAD and INSTALL, `temp_directory`
   - [ ] the checks C++'s opener file system makes elsewhere: secrets, `home_directory`, files opened during execution
-  - [ ] the other CSV sniffer, rejects-table and error-message differences (48 of 278 files under `sql/copy/csv` fail)
-- [ ] 2. JSON: `read_json`/`read_json_auto`, the JSON type, JSON functions (`sql/json`: 95 failing, 34.9%)
+  - [x] a name that says the file is compressed in a way nothing here reads (`.bz2`, `.xz`, `.zip`, ...) is an error;
+    `glob` of a list of patterns, `\` as a separator, a file whose name has glob characters in it
+  - [x] the agreement of `columns` with `types`, unnamed after named arguments, subqueries, aggregates and windows
+    in table function arguments; rejects-table lines made valid UTF-8 as `Utf8Proc::MakeValid` does
+  - [ ] the other CSV sniffer, rejects-table and error-message differences (about 40 files under `sql/copy/csv` fail)
+- [ ] 2. JSON: `read_json`/`read_json_auto`, the JSON type, JSON functions (`sql/json`: 82 failing, 43.8%)
   - [x] `json_normalize`, `json_deep_merge`, `json_merge_patch_diff`
   - [x] `json_each` / `json_tree`, with columns as arguments (LATERAL) and the hidden `json`, `root`, `rowid`
   - [x] escaped quotes and backslashes in quoted JSON path keys; no wildcards in `json_set`/`json_remove`/...
@@ -69,7 +78,8 @@ Each item gives the number of failing files in `test/` that it should fix, where
     projection and `EXPLAIN (SQL)`), `maximum_files_for_stats`
   - [ ] corrupt files C++ rejects that the crate reads (INT96 out of range, WKB types, page index row counts)
   - [ ] prefetch / read-ahead metrics and EXPLAIN shapes of Parquet scans (~20 files)
-  - [ ] `write_timestamp_as_int96`, `parquet_metadata` logical type names (`Float16Type()`), duplicate column names
+  - [x] duplicate column names (`_1`, `_2`, ... when read, deduplicated when written) and nameless columns (`C0`, ...)
+  - [ ] `write_timestamp_as_int96`, `parquet_metadata` logical type names (`Float16Type()`)
 - [ ] 4. Parquet VARIANT, including shredding (`parquet/variant`: 15 failing, 68%)
   - [x] reading, writing, auto-shredding, the `SHREDDING` option, VARIANT to JSON
   - [ ] the key dictionary in insertion order (`VariantNode` keeps keys sorted, so bytes differ from C++)
@@ -127,7 +137,11 @@ Each item gives the number of failing files in `test/` that it should fix, where
     AFTER statement triggers, AFTER row triggers with NEW / OLD, REFERENCING transition tables,
     UPDATE OF, COPY FROM, RETURNING, dependencies (DROP, ALTER, CASCADE), the WAL and checkpoints
   - [ ] the write-write conflict of a concurrent rename; a trigger body in a data-modifying CTE
-- [ ] 23. CTEs: recursive, materialized, `USING KEY` (`sql/cte`: 31 failing, 9 erroring)
+- [ ] 23. CTEs: recursive, materialized, `USING KEY` (`sql/cte`: 29 failing, 9 erroring)
+  - [x] data-modifying CTEs (INSERT, UPDATE, DELETE, MERGE, COPY): each runs to completion before the query, in its
+    transaction, whether the query reads it or not; RETURNING rows as a table; WITH before INSERT/UPDATE/DELETE;
+    prepared; EXPLAIN as C++'s `PIPELINE_DEPENDENT` CTE; refused below the top level and in views
+  - [ ] the EXPLAIN shapes of materialized CTEs, and their runtime filters
 - [ ] 24. Subquery flattening edge cases (`sql/subquery`: 25 failing, 3 erroring)
 - [ ] 25. Joins: ASOF, positional, lateral (`sql/join`: 46 failing)
 - [ ] 26. Set operations, `SAMPLE`, `RETURNING`, `WITH ORDINALITY`, `UNNEST` (`setops` 8, `sample` 7, `returning` 2, `ordinality` 2, `unnest` 2)
