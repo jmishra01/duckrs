@@ -861,7 +861,9 @@ test/sql/attach/attach_database_size.test
 test/sql/attach/attach_defaults.test
 test/sql/attach/attach_dependencies.test
 test/sql/attach/attach_different_alias.test
+test/sql/attach/attach_enable_external_access.test
 test/sql/attach/attach_export_import.test
+test/sql/attach/attach_external_access.test
 test/sql/attach/attach_foreign_key.test
 test/sql/attach/attach_foreign_key_external_catalog.test
 test/sql/attach/attach_huggingface_index.test
@@ -1221,6 +1223,7 @@ test/sql/copy/csv/csv_decimal_separator.test
 test/sql/copy/csv/csv_dtypes_union_by_name.test
 test/sql/copy/csv/csv_enum.test
 test/sql/copy/csv/csv_enum_storage.test
+test/sql/copy/csv/csv_external_access.test
 test/sql/copy/csv/csv_hive.test
 test/sql/copy/csv/csv_hive_filename_union.test
 test/sql/copy/csv/csv_limit_copy.test
@@ -1456,6 +1459,7 @@ test/sql/copy/parquet/parquet_empty_enum.test
 test/sql/copy/parquet/parquet_encoding_skip.test
 test/sql/copy/parquet/parquet_enum_test.test
 test/sql/copy/parquet/parquet_expression_filter.test
+test/sql/copy/parquet/parquet_external_access.test
 test/sql/copy/parquet/parquet_field_ids_invalid.test
 test/sql/copy/parquet/parquet_filename_filter.test
 test/sql/copy/parquet/parquet_filter_bug1391.test
@@ -1699,6 +1703,7 @@ test/sql/export/export_compression_level.test
 test/sql/export/export_csv_empty_strings.test
 test/sql/export/export_database.test
 test/sql/export/export_exhausted_sequence.test
+test/sql/export/export_external_access.test
 test/sql/export/export_hive_path.test
 test/sql/export/export_indexes.test
 test/sql/export/export_legacy_options.test
@@ -2623,6 +2628,7 @@ test/sql/pivot/unpivot_non_aligned_columns.test
 test/sql/pivot/unpivot_types.test
 test/sql/pivot/unpivot_unnamed_subquery.test
 test/sql/pivot/unpivot_view.test
+test/sql/pragma/profiling/profiling_output_not_allowed.test
 test/sql/pragma/profiling/test_all_profiling_settings.test
 test/sql/pragma/profiling/test_attach_and_checkpoint_latency.test
 test/sql/pragma/profiling/test_autocheckpoint_latency.test
@@ -2738,6 +2744,8 @@ test/sql/setops/union_pipeline.test
 test/sql/setops/union_shared_scan.test
 test/sql/setops/union_single_dedup.test
 test/sql/setops/value_union.test
+test/sql/settings/allowed_directories.test
+test/sql/settings/allowed_paths.test
 test/sql/settings/connection_local_settings.test
 test/sql/settings/debug_deprecated_settings.test
 test/sql/settings/max_memory_percentage.test

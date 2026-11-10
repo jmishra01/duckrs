@@ -166,6 +166,7 @@ impl Binder<'_> {
         let patterns = paths.ok_or_else(|| binder_error(format!("{name} requires a file name")))?;
         let mut files = Vec::new();
         for pattern in &patterns {
+            self.check_file_access(pattern)?;
             let found = file_system::glob_or_directory(pattern, "parquet");
             if found.is_empty() {
                 return Err(Error::new(
@@ -329,6 +330,7 @@ impl Binder<'_> {
             let column = column.try_to_string()?;
             let mut rows = vec!["(NULL::VARCHAR, NULL::BIGINT, NULL::BOOLEAN)".to_string()];
             for pattern in strings(&file)? {
+                self.check_file_access(&pattern)?;
                 let found = file_system::glob(&pattern);
                 if found.is_empty() {
                     return Err(Error::new(
@@ -355,6 +357,7 @@ impl Binder<'_> {
         let value = self.constant_argument(&argument.expr)?;
         let mut files = Vec::new();
         for pattern in strings(&value)? {
+            self.check_file_access(&pattern)?;
             let found = file_system::glob(&pattern);
             if found.is_empty() {
                 return Err(Error::new(

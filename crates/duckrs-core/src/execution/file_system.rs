@@ -221,3 +221,86 @@ mod tests {
         assert!(!glob_match(b"a.tsv", b"*.csv"));
     }
 }
+
+/// `FileSystem::ExpandPath`: a leading `~` is the home directory.
+pub fn expand_path(path: &str) -> String {
+    if path == "~" || path.starts_with("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{home}{}", &path[1..]);
+        }
+    }
+    path.to_string()
+}
+
+/// `FileSystem::IsRemoteFile`, by its scheme.
+fn is_remote(path: &str) -> bool {
+    path.contains("://")
+}
+
+/// `FileSystem::CanonicalizePath`: `.` and empty segments dropped, `..` resolved, without the file
+/// system (symbolic links are not followed).
+pub fn canonicalize_path(path: &str) -> String {
+    if is_remote(path) {
+        return path.to_string();
+    }
+    let mut stack: Vec<&str> = Vec::new();
+    for element in path.split('/') {
+        match element {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            _ => stack.push(element),
+        }
+    }
+    let mut result = String::new();
+    if path.starts_with('/') {
+        result.push('/');
+    }
+    result += &stack.join("/");
+    result
+}
+
+/// `DBConfig::SanitizeAllowedPath`.
+pub fn sanitize_allowed_path(path: &str) -> String {
+    canonicalize_path(&expand_path(path))
+}
+
+/// What a database with `enable_external_access` off may still read and write
+/// (`allowed_paths` and `allowed_directories`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FileAccess {
+    pub paths: std::collections::BTreeSet<String>,
+    /// each ending in `/`
+    pub directories: std::collections::BTreeSet<String>,
+}
+
+impl FileAccess {
+    /// `DBConfig::CanAccessFile`.
+    pub fn can_access(&self, input: &str, directory: bool) -> bool {
+        let mut path = sanitize_allowed_path(input);
+        if self.paths.contains(&path) {
+            return true;
+        }
+        if directory && !path.ends_with('/') {
+            path.push('/');
+        }
+        self.directories
+            .iter()
+            .any(|allowed| path.starts_with(allowed.as_str()))
+    }
+
+    /// `OpenerFileSystem::VerifyCanAccessFile` and `VerifyCanAccessDirectory`.
+    pub fn check(&self, path: &str, directory: bool) -> Result<()> {
+        if self.can_access(path, directory) {
+            return Ok(());
+        }
+        Err(Error::new(
+            ErrorKind::Permission,
+            format!(
+                "Cannot access {} \"{path}\" - file system operations are disabled by configuration",
+                if directory { "directory" } else { "file" }
+            ),
+        ))
+    }
+}

@@ -616,6 +616,7 @@ impl Binder<'_> {
         }
         let patterns = paths.ok_or_else(|| binder_error(format!("{name} requires a file name")))?;
         for pattern in &patterns {
+            self.check_file_access(pattern)?;
             let found = file_system::glob_or_directory(pattern, "csv");
             if found.is_empty() && !result.allow_empty {
                 return Err(Error::new(
@@ -1296,6 +1297,7 @@ impl Binder<'_> {
             ));
         }
         if let Some(path) = self.parquet_copy_path(info)? {
+            self.check_file_access(&path)?;
             if !info.is_from {
                 verify_not_extension(&path)?;
             }
@@ -1306,6 +1308,7 @@ impl Binder<'_> {
             };
         }
         let (path, tsv) = self.copy_target(info)?;
+        self.check_file_access(&path)?;
         if !info.is_from {
             verify_not_extension(&path)?;
         }
@@ -1925,7 +1928,7 @@ impl Binder<'_> {
             return Err(binder_error(error));
         }
         let mut binder = Binder::new(self.catalog);
-        binder.options = self.options;
+        binder.options = self.options.clone();
         binder.session = self.session.clone();
         binder.parameters = self.parameters.clone();
         binder.aggregate_error = "aggregate functions are not allowed in PARTITION_PATH";
@@ -2205,6 +2208,7 @@ impl Binder<'_> {
         }
         let mut files = Vec::new();
         for pattern in &patterns {
+            self.check_file_access(pattern)?;
             files.extend(file_system::glob(pattern));
         }
         let content_type = if text { LogicalType::VARCHAR } else { LogicalType::BLOB };

@@ -14,6 +14,7 @@
 //! its default fails as not yet ported, so a test never sees a silently different result.
 
 use super::settings_table::SETTINGS;
+use crate::execution::file_system::{FileAccess, sanitize_allowed_path};
 use crate::function::cast::{CastMode, cast_vector};
 use duckrs_common::string_util::{candidates_error_message, candidates_message, similarity_rating, top_n_strings};
 use duckrs_common::types::LogicalType;
@@ -56,9 +57,6 @@ const UNHONORED: &[&str] = &[
     "access_mode",
     "active_grammar_extensions",
     "allow_parser_override_extension",
-    // they restrict file access, which duckrs does not check yet
-    "allowed_directories",
-    "allowed_paths",
     "current_dialect",
     "dialect_compatibility_mode",
     "disable_timestamptz_casts",
@@ -822,6 +820,7 @@ pub fn set_variable(
         _ => error,
     })?;
     let value = on_set(setting, value)?;
+    let value = file_access_on_set(setting.name, value, global, session)?;
     if UNHONORED.contains(&setting.name) && Some(&value) != default_value(setting).as_ref() {
         return Err(crate::unported(format!("the {} setting", setting.name)));
     }
@@ -841,12 +840,134 @@ pub fn reset_variable(
         return Err(crate::unported("RESET VARIABLE"));
     }
     let (index, setting) = find_setting(name).ok_or_else(|| unrecognized(name))?;
+    if matches!(setting.name, "allowed_directories" | "allowed_paths") {
+        check_external_access_enabled(setting.name, global, session)?;
+    }
+    if setting.name == "temp_directory" {
+        check_temp_directory_change(global, session)?;
+    }
     if resolve_scope(setting, scope)? {
         global.0.remove(&index);
     } else {
         session.0.remove(&index);
     }
     Ok(())
+}
+
+/// Whether `enable_external_access` is on.
+pub fn external_access_enabled(global: &SettingValues, session: &SettingValues) -> bool {
+    current_value("enable_external_access", global, session)
+        .is_none_or(|value| !matches!(value.data(), duckrs_common::value::ValueData::Bool(false)))
+}
+
+/// What may still be read and written while `enable_external_access` is off; `None` while it is on.
+pub fn file_access(global: &SettingValues, session: &SettingValues) -> Option<FileAccess> {
+    if external_access_enabled(global, session) {
+        return None;
+    }
+    let list = |name: &str| -> std::collections::BTreeSet<String> {
+        current_value(name, global, session)
+            .map(|value| list_items(&value))
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|value| value.try_to_string().ok())
+            .collect()
+    };
+    Some(FileAccess {
+        paths: list("allowed_paths"),
+        directories: list("allowed_directories"),
+    })
+}
+
+/// Adds `path` to `allowed_paths` (`DBConfig::AddAllowedPath`).
+pub fn add_allowed_path(path: &str, global: &mut SettingValues) {
+    let Some((index, _)) = find_setting("allowed_paths") else {
+        return;
+    };
+    let mut paths: std::collections::BTreeSet<String> = global
+        .0
+        .get(&index)
+        .map(list_items)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|value| value.try_to_string().ok())
+        .collect();
+    paths.insert(sanitize_allowed_path(path));
+    global.0.insert(index, varchar_list(paths));
+}
+
+/// The items of a LIST value; none for anything else.
+fn list_items(value: &Value) -> Vec<Value> {
+    match value.data() {
+        duckrs_common::value::ValueData::List(items) => items.clone(),
+        _ => Vec::new(),
+    }
+}
+
+fn varchar_list(items: impl IntoIterator<Item = String>) -> Value {
+    Value::list(LogicalType::VARCHAR, items.into_iter().map(Value::varchar).collect()).expect("a list of VARCHAR")
+}
+
+fn check_external_access_enabled(name: &str, global: &SettingValues, session: &SettingValues) -> Result<()> {
+    if external_access_enabled(global, session) {
+        return Ok(());
+    }
+    Err(Error::new(
+        ErrorKind::InvalidInput,
+        format!("Cannot change {name} when enable_external_access is disabled"),
+    ))
+}
+
+/// `TempDirectorySetting::SetGlobal` and `ResetGlobal`.
+fn check_temp_directory_change(global: &SettingValues, session: &SettingValues) -> Result<()> {
+    if external_access_enabled(global, session) {
+        return Ok(());
+    }
+    Err(Error::new(
+        ErrorKind::Permission,
+        "Modifying the temp_directory has been disabled by configuration",
+    ))
+}
+
+/// `EnableExternalAccessSetting::OnSet`, `AllowedDirectoriesSetting::SetGlobal` and
+/// `AllowedPathsSetting::SetGlobal`: the paths are kept as `SanitizeAllowedPath` makes them.
+fn file_access_on_set(name: &str, value: Value, global: &SettingValues, session: &SettingValues) -> Result<Value> {
+    match name {
+        "enable_external_access" => {
+            if matches!(value.data(), duckrs_common::value::ValueData::Bool(true)) {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "Cannot enable external access while database is running",
+                ));
+            }
+            Ok(value)
+        }
+        "temp_directory" => {
+            check_temp_directory_change(global, session)?;
+            Ok(value)
+        }
+        "allowed_directories" | "allowed_paths" => {
+            check_external_access_enabled(name, global, session)?;
+            let mut items = std::collections::BTreeSet::new();
+            for item in list_items(&value) {
+                let mut path = sanitize_allowed_path(&item.try_to_string()?);
+                if name == "allowed_directories" {
+                    if path.is_empty() {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            "Cannot provide an empty string for allowed_directory",
+                        ));
+                    }
+                    if !path.ends_with('/') {
+                        path.push('/');
+                    }
+                }
+                items.insert(path);
+            }
+            Ok(varchar_list(items))
+        }
+        _ => Ok(value),
+    }
 }
 
 /// Stores `value` as the global value of `name`, as it is: for the settings whose value lives
@@ -963,7 +1084,7 @@ mod tests {
             (row.scope, row.value.clone()),
             ("LOCAL", Some(Value::varchar("NULLS_FIRST")))
         );
-        // VARCHAR[] settings can be stored, and those that restrict file access fail as unported
+        // VARCHAR[] settings can be stored; allowed directories are kept sanitized, ending in `/`
         set_variable(
             "extension_directories",
             SetScope::Automatic,
@@ -972,15 +1093,40 @@ mod tests {
             &mut session,
         )
         .unwrap();
-        let err = set_variable(
+        set_variable(
             "allowed_directories",
             SetScope::Automatic,
-            &Value::list(LogicalType::VARCHAR, vec![Value::varchar("/tmp")]).unwrap(),
+            &Value::list(LogicalType::VARCHAR, vec![Value::varchar("/tmp/a/../b")]).unwrap(),
+            &mut global,
+            &mut session,
+        )
+        .unwrap();
+        let access = |g: &SettingValues, s: &SettingValues| file_access(g, s);
+        assert_eq!(access(&global, &session), None);
+        set_variable(
+            "enable_external_access",
+            SetScope::Automatic,
+            &Value::boolean(false),
+            &mut global,
+            &mut session,
+        )
+        .unwrap();
+        let policy = access(&global, &session).unwrap();
+        assert!(policy.can_access("/tmp/b/x.csv", false));
+        assert!(policy.can_access("/tmp/b", true));
+        assert!(!policy.can_access("/tmp/b/../c.csv", false));
+        assert!(!policy.can_access("/tmp/bc.csv", false));
+        let err = set_variable(
+            "enable_external_access",
+            SetScope::Automatic,
+            &Value::boolean(true),
             &mut global,
             &mut session,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("is not yet ported"), "{err}");
+        assert!(err.to_string().contains("Cannot enable external access"), "{err}");
+        let err = reset_variable("allowed_directories", SetScope::Automatic, &mut global, &mut session).unwrap_err();
+        assert!(err.to_string().contains("enable_external_access is disabled"), "{err}");
     }
 
     #[test]

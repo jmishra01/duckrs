@@ -565,7 +565,7 @@ impl std::fmt::Debug for SessionValues {
 }
 
 /// The settings that change how statements bind.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct BindOptions {
     /// `txid_current`
     pub transaction_id: u64,
@@ -583,6 +583,8 @@ pub struct BindOptions {
     pub show_behavior: ShowBehavior,
     /// The optimizer passes for the plans of subqueries.
     pub optimizer: OptimizerOptions,
+    /// what files can be read and written, with `enable_external_access` off
+    pub file_access: Option<crate::execution::file_system::FileAccess>,
 }
 
 /// What `SHOW name` looks for (`ShowBehaviorType`).
@@ -604,6 +606,7 @@ impl Default for BindOptions {
             scalar_subquery_error: true,
             show_behavior: ShowBehavior::Auto,
             optimizer: OptimizerOptions::default(),
+            file_access: None,
         }
     }
 }
@@ -776,6 +779,15 @@ pub struct CorrelatedColumn {
 }
 
 impl<'a> Binder<'a> {
+    /// `OpenerFileSystem::VerifyCanAccessFile`: with `enable_external_access` off, only the
+    /// allowed paths and directories can be read or written.
+    pub(crate) fn check_file_access(&self, path: &str) -> Result<()> {
+        match &self.options.file_access {
+            Some(access) => access.check(path, false),
+            None => Ok(()),
+        }
+    }
+
     pub fn new(catalog: &'a Catalog) -> Self {
         Self::with_options(catalog, BindOptions::default())
     }
@@ -864,7 +876,7 @@ impl<'a> Binder<'a> {
     /// `Binder::CreateBinder` for a query inside of this one: it numbers tables on from here and
     /// knows what is being bound around it, but none of the columns.
     fn child_binder(&self) -> Binder<'a> {
-        let mut binder = Binder::with_options(self.catalog, self.options);
+        let mut binder = Binder::with_options(self.catalog, self.options.clone());
         binder.next_table_index = self.next_table_index;
         binder.bound_views = self.bound_views.clone();
         binder.bound_macros = self.bound_macros.clone();
