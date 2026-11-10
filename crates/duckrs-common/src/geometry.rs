@@ -951,22 +951,54 @@ mod tests {
     }
 }
 
-/// `GeometryExtent`: the bounds of the vertices.
-#[derive(Debug, Clone, Copy)]
+/// `GeometryExtent`: the bounds of the vertices, in X, Y, Z and M.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Extent {
     pub x_min: f64,
     pub y_min: f64,
+    pub z_min: f64,
+    pub m_min: f64,
     pub x_max: f64,
     pub y_max: f64,
+    pub z_max: f64,
+    pub m_max: f64,
+}
+
+/// `MinValue` and `MaxValue`: a NaN carries over, as in C++.
+fn min_value(a: f64, b: f64) -> f64 {
+    if a < b { a } else { b }
+}
+
+fn max_value(a: f64, b: f64) -> f64 {
+    if a > b { a } else { b }
 }
 
 impl Extent {
-    fn empty() -> Self {
+    /// `GeometryExtent::Empty`: nothing intersects it, and merging it changes nothing.
+    pub fn empty() -> Self {
         Self {
             x_min: f64::INFINITY,
             y_min: f64::INFINITY,
+            z_min: f64::INFINITY,
+            m_min: f64::INFINITY,
             x_max: f64::NEG_INFINITY,
             y_max: f64::NEG_INFINITY,
+            z_max: f64::NEG_INFINITY,
+            m_max: f64::NEG_INFINITY,
+        }
+    }
+
+    /// `GeometryExtent::Unknown`: any value.
+    pub fn unknown() -> Self {
+        Self {
+            x_min: f64::NEG_INFINITY,
+            y_min: f64::NEG_INFINITY,
+            z_min: f64::NEG_INFINITY,
+            m_min: f64::NEG_INFINITY,
+            x_max: f64::INFINITY,
+            y_max: f64::INFINITY,
+            z_max: f64::INFINITY,
+            m_max: f64::INFINITY,
         }
     }
 
@@ -974,14 +1006,43 @@ impl Extent {
     pub fn intersects_xy(&self, other: &Extent) -> bool {
         !(self.x_min > other.x_max || self.x_max < other.x_min || self.y_min > other.y_max || self.y_max < other.y_min)
     }
+
+    /// `GeometryExtent::Merge`.
+    pub fn merge(&mut self, other: &Extent) {
+        self.x_min = min_value(self.x_min, other.x_min);
+        self.y_min = min_value(self.y_min, other.y_min);
+        self.z_min = min_value(self.z_min, other.z_min);
+        self.m_min = min_value(self.m_min, other.m_min);
+        self.x_max = max_value(self.x_max, other.x_max);
+        self.y_max = max_value(self.y_max, other.y_max);
+        self.z_max = max_value(self.z_max, other.z_max);
+        self.m_max = max_value(self.m_max, other.m_max);
+    }
+
+    /// `GeometryExtent::Extend` by a vertex, its Z and M if it has them.
+    fn extend(&mut self, vertex: &[f64], has_z: bool, has_m: bool) {
+        self.x_min = min_value(self.x_min, vertex[0]);
+        self.y_min = min_value(self.y_min, vertex[1]);
+        self.x_max = max_value(self.x_max, vertex[0]);
+        self.y_max = max_value(self.y_max, vertex[1]);
+        if has_z {
+            self.z_min = min_value(self.z_min, vertex[2]);
+            self.z_max = max_value(self.z_max, vertex[2]);
+        }
+        if has_m {
+            let m = vertex[2 + usize::from(has_z)];
+            self.m_min = min_value(self.m_min, m);
+            self.m_max = max_value(self.m_max, m);
+        }
+    }
 }
 
-/// `Geometry::GetExtent`: the bounds of a GEOMETRY's X and Y, and how many vertices count towards
-/// them (an empty POINT doesn't).
-pub fn extent(wkb: &[u8]) -> Result<(Extent, u32)> {
+/// `Geometry::GetExtent`: grows `extent` by the vertices of a GEOMETRY, and gives how many
+/// count towards it (an empty POINT doesn't) and whether any part of it is empty.
+pub fn extend_extent(wkb: &[u8], extent: &mut Extent) -> Result<(u32, bool)> {
     let mut reader = BlobReader::new(wkb);
-    let mut extent = Extent::empty();
     let mut count = 0;
+    let mut any_empty = false;
     while !reader.at_end() {
         let order = reader.u8()?;
         if order != 1 {
@@ -996,8 +1057,10 @@ pub fn extent(wkb: &[u8]) -> Result<(Extent, u32)> {
         if flag > 3 {
             return Err(invalid(format!("Unsupported geometry flag {flag} in WKB")));
         }
-        let dims = 2 + usize::from(flag & 1 != 0) + usize::from(flag & 2 != 0);
-        let mut vertices = |reader: &mut BlobReader<'_>, n: u32, check_nan: bool| -> Result<()> {
+        let (has_z, has_m) = (flag & 1 != 0, flag & 2 != 0);
+        let dims = 2 + usize::from(has_z) + usize::from(has_m);
+        let mut vertices = |reader: &mut BlobReader<'_>, n: u32, check_nan: bool| -> Result<u32> {
+            let mut counted = 0;
             for _ in 0..n {
                 let mut values = [0f64; 4];
                 for value in values.iter_mut().take(dims) {
@@ -1006,36 +1069,108 @@ pub fn extent(wkb: &[u8]) -> Result<(Extent, u32)> {
                 if check_nan && values[..dims].iter().all(|v| v.is_nan()) {
                     continue;
                 }
-                // `MinValue`/`MaxValue`: a NaN coordinate carries over, as in C++
-                let min = |a: f64, b: f64| if a < b { a } else { b };
-                let max = |a: f64, b: f64| if a > b { a } else { b };
-                extent.x_min = min(extent.x_min, values[0]);
-                extent.y_min = min(extent.y_min, values[1]);
-                extent.x_max = max(extent.x_max, values[0]);
-                extent.y_max = max(extent.y_max, values[1]);
-                count += 1;
+                extent.extend(&values, has_z, has_m);
+                counted += 1;
             }
-            Ok(())
+            Ok(counted)
         };
         match type_id {
-            1 => vertices(&mut reader, 1, true)?,
+            1 => {
+                let counted = vertices(&mut reader, 1, true)?;
+                if counted == 0 {
+                    any_empty = true;
+                }
+                count += counted;
+            }
             2 => {
                 let n = reader.u32(true)?;
-                vertices(&mut reader, n, false)?;
+                if n == 0 {
+                    any_empty = true;
+                }
+                count += vertices(&mut reader, n, false)?;
             }
             3 => {
                 let rings = reader.u32(true)?;
+                if rings == 0 {
+                    any_empty = true;
+                }
                 for _ in 0..rings {
                     let n = reader.u32(true)?;
-                    vertices(&mut reader, n, false)?;
+                    if n == 0 {
+                        any_empty = true;
+                    }
+                    count += vertices(&mut reader, n, false)?;
                 }
             }
             _ => {
-                reader.u32(true)?;
+                if reader.u32(true)? == 0 {
+                    any_empty = true;
+                }
             }
         }
     }
+    Ok((count, any_empty))
+}
+
+/// The X and Y bounds of a GEOMETRY and how many vertices count towards them.
+pub fn extent(wkb: &[u8]) -> Result<(Extent, u32)> {
+    let mut extent = Extent::empty();
+    let (count, _) = extend_extent(wkb, &mut extent)?;
     Ok((extent, count))
+}
+
+/// `GeometryStatsData`: the types, the extent and the kinds of emptiness of some GEOMETRYs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GeometryStats {
+    /// per vertex type (XY, XYZ, XYM, XYZM), a bit for each geometry type
+    pub types: [u8; 4],
+    pub extent: Extent,
+    /// `GeometryStatsFlags`: empty geometry, non-empty geometry, empty part, non-empty part
+    pub flags: u8,
+}
+
+pub const HAS_EMPTY_GEOM: u8 = 0x1;
+pub const HAS_NON_EMPTY_GEOM: u8 = 0x2;
+pub const HAS_EMPTY_PART: u8 = 0x4;
+pub const HAS_NON_EMPTY_PART: u8 = 0x8;
+
+impl GeometryStats {
+    /// `SetEmpty`: of no GEOMETRY.
+    pub fn empty() -> Self {
+        Self {
+            types: [0; 4],
+            extent: Extent::empty(),
+            flags: 0,
+        }
+    }
+
+    /// `SetUnknown`: of any.
+    pub fn unknown() -> Self {
+        Self {
+            types: [0xFF; 4],
+            extent: Extent::unknown(),
+            flags: 0x0F,
+        }
+    }
+
+    /// `GeometryStatsData::Update`.
+    pub fn update(&mut self, wkb: &[u8]) -> Result<()> {
+        let (kind, has_z, has_m) = geometry_type(wkb)?;
+        self.types[usize::from(has_z) + 2 * usize::from(has_m)] |= 1 << (kind as u8);
+        let (count, any_empty) = extend_extent(wkb, &mut self.extent)?;
+        self.flags |= if any_empty { HAS_EMPTY_PART } else { HAS_NON_EMPTY_PART };
+        self.flags |= if count == 0 { HAS_EMPTY_GEOM } else { HAS_NON_EMPTY_GEOM };
+        Ok(())
+    }
+
+    /// `GeometryStatsData::Merge`.
+    pub fn merge(&mut self, other: &GeometryStats) {
+        for (mine, theirs) in self.types.iter_mut().zip(other.types) {
+            *mine |= theirs;
+        }
+        self.extent.merge(&other.extent);
+        self.flags |= other.flags;
+    }
 }
 
 /// `VertexExtractFunction`: coordinate `index` (X, Y, Z, M) of a POINT, if it has one that isn't NaN.

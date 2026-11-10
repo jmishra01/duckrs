@@ -689,6 +689,7 @@ impl TableSource for DiskTable {
                     max: None,
                     can_be_null: true,
                     can_be_valid: true,
+                    geometry: None,
                 };
                 let Some(stored) = stored else {
                     return Some(unknown);
@@ -698,6 +699,7 @@ impl TableSource for DiskTable {
                     max: self.bound(column, stored.max.as_ref()).ok()?,
                     can_be_null: stored.has_null,
                     can_be_valid: stored.has_no_null,
+                    geometry: stored.geometry,
                 })
             })
             .collect()

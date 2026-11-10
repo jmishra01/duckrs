@@ -36,6 +36,7 @@ fn unknown() -> Stats {
         max: None,
         can_be_null: true,
         can_be_valid: true,
+        geometry: None,
     }
 }
 
@@ -53,10 +54,140 @@ pub(crate) fn has_ordered_statistics(ty: &LogicalType) -> bool {
 fn compute_statistics(table: &Arc<TableCatalogEntry>, positions: Option<Vec<usize>>) -> Option<Vec<Stats>> {
     // a file knows these already, and reading its rows for them would read the whole table
     if positions.is_none()
-        && let Some(statistics) = table.source().and_then(|source| source.column_statistics())
+        && let Some(mut statistics) = table.source().and_then(|source| source.column_statistics())
     {
+        add_geometry_statistics(table, None, &mut statistics)?;
         return Some(statistics);
     }
+    let mut statistics = compute_ordered_statistics(table, positions.clone())?;
+    add_geometry_statistics(table, positions, &mut statistics)?;
+    Some(statistics)
+}
+
+/// `VertexExtractStats`: the bounds of a coordinate of the points, and whether it is always NULL.
+fn vertex_extract_stats(
+    child: &Stats,
+    geometry: &duckrs_common::geometry::GeometryStats,
+    coordinate: Option<&str>,
+) -> (Stats, bool) {
+    use duckrs_common::geometry::{HAS_EMPTY_GEOM, HAS_NON_EMPTY_GEOM};
+    let always_null = Stats {
+        can_be_null: true,
+        can_be_valid: false,
+        ..unknown()
+    };
+    const POINT: u8 = 1 << 1;
+    // vertex types: XY, XYZ, XYM, XYZM
+    let has_vertex = |index: usize| geometry.types[index] != 0;
+    let has_point = geometry.types.iter().any(|set| set & POINT != 0);
+    if !has_point || geometry.flags & HAS_NON_EMPTY_GEOM == 0 {
+        return (always_null, true);
+    }
+    let mut result = Stats {
+        can_be_null: child.can_be_null,
+        can_be_valid: child.can_be_valid,
+        ..unknown()
+    };
+    if geometry.types.iter().any(|set| set & !POINT != 0) || geometry.flags & HAS_EMPTY_GEOM != 0 {
+        result.can_be_null = true;
+    }
+    let index = match coordinate.map(str::to_lowercase).as_deref() {
+        Some("x") => 0,
+        Some("y") => 1,
+        Some("z") => 2,
+        Some("m") => 3,
+        _ => return (result, false),
+    };
+    if index == 2 {
+        if has_vertex(0) || has_vertex(2) {
+            result.can_be_null = true;
+        }
+        if !has_vertex(1) && !has_vertex(3) {
+            return (always_null, true);
+        }
+    }
+    if index == 3 {
+        if has_vertex(0) || has_vertex(1) {
+            result.can_be_null = true;
+        }
+        if !has_vertex(2) && !has_vertex(3) {
+            return (always_null, true);
+        }
+    }
+    let extent = geometry.extent;
+    let finite = |a: f64, b: f64| a.is_finite() && b.is_finite();
+    let has_xy = finite(extent.x_min, extent.x_max) && finite(extent.y_min, extent.y_max);
+    let bounds = match index {
+        0 if has_xy => Some((extent.x_min, extent.x_max)),
+        1 if has_xy => Some((extent.y_min, extent.y_max)),
+        2 if finite(extent.z_min, extent.z_max) => Some((extent.z_min, extent.z_max)),
+        3 if finite(extent.m_min, extent.m_max) => Some((extent.m_min, extent.m_max)),
+        _ => None,
+    };
+    if let Some((min, max)) = bounds {
+        result.min = Some(Value::double(min));
+        result.max = Some(Value::double(max));
+    }
+    (result, false)
+}
+
+/// The `GeometryStats` of a GEOMETRY value.
+fn geometry_stats_of(value: &Value) -> Option<duckrs_common::geometry::GeometryStats> {
+    if value.logical_type().id() != LogicalTypeId::Geometry {
+        return None;
+    }
+    let duckrs_common::value::ValueData::Bytes(wkb) = value.data() else {
+        return None;
+    };
+    let mut stats = duckrs_common::geometry::GeometryStats::empty();
+    stats.update(wkb).ok()?;
+    Some(stats)
+}
+
+/// The `GeometryStats` of the GEOMETRY columns that don't have them yet, from a scan of those
+/// columns (of the rows at `positions`).
+fn add_geometry_statistics(
+    table: &Arc<TableCatalogEntry>,
+    positions: Option<Vec<usize>>,
+    statistics: &mut [Stats],
+) -> Option<()> {
+    let columns: Vec<usize> = (0..table.columns.len())
+        .filter(|&c| table.columns[c].ty.id() == LogicalTypeId::Geometry && statistics[c].geometry.is_none())
+        .collect();
+    if columns.is_empty() {
+        return Some(());
+    }
+    let scan = LogicalOperator::new(
+        K::Get {
+            table: table.clone(),
+            table_index: 0,
+            column_ids: columns.clone(),
+            filters: Vec::new(),
+            projection: None,
+            index_rows: positions.map(Arc::new),
+        },
+        Vec::new(),
+    );
+    let mut plan = scan;
+    resolve_column_bindings(&mut plan).ok()?;
+    let result = run_plan(plan).ok()?;
+    for (index, &column) in columns.iter().enumerate() {
+        let mut stats = duckrs_common::geometry::GeometryStats::empty();
+        for row in 0..result.len() {
+            let value = result.get_value(index, row);
+            if let duckrs_common::value::ValueData::Bytes(wkb) = value.data()
+                && !value.is_null()
+            {
+                stats.update(wkb).ok()?;
+            }
+        }
+        statistics[column].geometry = Some(stats);
+    }
+    Some(())
+}
+
+/// The min, max and NULLs of the columns, from an aggregate over the rows (at `positions`).
+fn compute_ordered_statistics(table: &Arc<TableCatalogEntry>, positions: Option<Vec<usize>>) -> Option<Vec<Stats>> {
     let functions = BuiltinFunctions::get();
     let aggregate = |name: &str, column: BoundExpr| {
         bind_aggregate_function(functions.aggregate(name)?, vec![column], None, false).ok()
@@ -118,6 +249,7 @@ fn compute_statistics(table: &Arc<TableCatalogEntry>, positions: Option<Vec<usiz
             max: count_at.checked_sub(1).and_then(bound),
             can_be_null: valid < total,
             can_be_valid: valid > 0,
+            geometry: None,
         });
     }
     Some(statistics)
@@ -440,6 +572,13 @@ fn union(a: Stats, b: Stats) -> Stats {
         max,
         can_be_null: a.can_be_null || b.can_be_null,
         can_be_valid: a_valid || b_valid,
+        geometry: match (a.geometry, b.geometry) {
+            (Some(mut a), Some(b)) => {
+                a.merge(&b);
+                Some(a)
+            }
+            _ => None,
+        },
     }
 }
 
@@ -532,14 +671,18 @@ impl StatisticsPropagator {
                 max: None,
                 can_be_null: true,
                 can_be_valid: false,
+                geometry: Some(duckrs_common::geometry::GeometryStats::empty())
+                    .filter(|_| expr.return_type.id() == LogicalTypeId::Geometry),
             },
             BoundExprKind::Constant(value) => {
+                let geometry = geometry_stats_of(value);
                 let value = has_ordered_statistics(&expr.return_type).then(|| value.clone());
                 Stats {
                     min: value.clone(),
                     max: value,
                     can_be_null: false,
                     can_be_valid: true,
+                    geometry,
                 }
             }
             BoundExprKind::ColumnRef { binding, depth: 0 } => {
@@ -806,6 +949,21 @@ impl StatisticsPropagator {
                 children.push(BoundExpr::constant(value));
             }
             return unknown();
+        }
+        if function.name == "vertex_extract" && children.len() == 2 {
+            let coordinate = match &children[1].kind {
+                BoundExprKind::Constant(value) => value.try_to_string().ok(),
+                _ => None,
+            };
+            let Some(geometry) = stats[0].geometry else {
+                return unknown();
+            };
+            let (result, always_null) = vertex_extract_stats(&stats[0], &geometry, coordinate.as_deref());
+            if always_null {
+                let alias = expr.alias.clone();
+                *expr = BoundExpr::constant(Value::null(LogicalType::DOUBLE)).with_alias(alias);
+            }
+            return result;
         }
         if function.name == "constant_or_null" && stats[1..].iter().all(|s| !s.can_be_null) {
             let alias = expr.alias.clone();
@@ -1214,6 +1372,37 @@ fn stats_struct(stats: &Stats, ty: &LogicalType) -> Option<Value> {
     {
         fields.push(("min".to_string(), min.clone()));
         fields.push(("max".to_string(), max.clone()));
+    }
+    // `GeometryStats::ToStruct`
+    if ty.id() == LogicalTypeId::Geometry {
+        let geometry = stats.geometry?;
+        let extent = geometry.extent;
+        let mut bounds = vec![
+            ("x_min", extent.x_min),
+            ("x_max", extent.x_max),
+            ("y_min", extent.y_min),
+            ("y_max", extent.y_max),
+        ];
+        if extent.z_min.is_finite() || extent.z_max.is_finite() {
+            bounds.extend([("z_min", extent.z_min), ("z_max", extent.z_max)]);
+        }
+        if extent.m_min.is_finite() || extent.m_max.is_finite() {
+            bounds.extend([("m_min", extent.m_min), ("m_max", extent.m_max)]);
+        }
+        let bounds = bounds
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), Value::double(value)))
+            .collect();
+        fields.push(("extent".to_string(), Value::struct_value(bounds)));
+        use duckrs_common::geometry::{HAS_EMPTY_GEOM, HAS_EMPTY_PART, HAS_NON_EMPTY_GEOM, HAS_NON_EMPTY_PART};
+        for (name, flag) in [
+            ("has_empty_geom", HAS_EMPTY_GEOM),
+            ("has_non_empty_geom", HAS_NON_EMPTY_GEOM),
+            ("has_empty_part", HAS_EMPTY_PART),
+            ("has_non_empty_part", HAS_NON_EMPTY_PART),
+        ] {
+            fields.push((name.to_string(), Value::boolean(geometry.flags & flag != 0)));
+        }
     }
     fields.push(("has_null".to_string(), Value::boolean(stats.can_be_null)));
     fields.push(("has_no_null".to_string(), Value::boolean(stats.can_be_valid)));

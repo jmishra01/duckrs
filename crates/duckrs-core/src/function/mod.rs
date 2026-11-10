@@ -230,7 +230,7 @@ pub fn typeof_constant(argument: &LogicalType) -> Value {
 /// numeric ones (`NumericStats`), which is what duckrs keeps. The others (strings, nested
 /// types, VARIANT) have statistics of more kinds than duckrs works out.
 pub fn stats_supported(ty: &LogicalType) -> bool {
-    ty.id() == LogicalTypeId::SqlNull
+    matches!(ty.id(), LogicalTypeId::SqlNull | LogicalTypeId::Geometry)
         || (crate::optimizer::statistics::has_ordered_statistics(ty) && ty.id() != LogicalTypeId::Varchar)
 }
 

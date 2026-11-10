@@ -26,6 +26,8 @@ pub struct BaseStatistics {
     /// The bounds of a numeric column as they are in a vector, in little-endian bytes.
     pub min: Option<[u8; 16]>,
     pub max: Option<[u8; 16]>,
+    /// of a GEOMETRY that the file has the `GeometryStats` of
+    pub geometry: Option<duckrs_common::geometry::GeometryStats>,
 }
 
 fn numeric_value(d: &mut BinaryDeserializer<'_>, physical: PhysicalType) -> Result<Option<[u8; 16]>> {
@@ -92,12 +94,14 @@ pub fn read_statistics(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>)
         let has_null = d.read_property(100, "has_null")?;
         let has_no_null = d.read_property(101, "has_no_null")?;
         d.read_property::<u64>(102, "distinct_count")?;
-        let bounds = d.read_object(103, "type_stats", |d| read_type_stats(d, ty))?;
+        let mut geometry = None;
+        let bounds = d.read_object(103, "type_stats", |d| read_type_stats(d, ty, &mut geometry))?;
         Ok(BaseStatistics {
             has_null,
             has_no_null,
             min: bounds.map(|(min, _)| min),
             max: bounds.and_then(|(_, max)| max),
+            geometry,
         })
     })
 }
@@ -105,7 +109,11 @@ pub fn read_statistics(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>)
 /// The bounds of the values, of the types that have numeric statistics.
 type Bounds = Option<([u8; 16], Option<[u8; 16]>)>;
 
-fn read_type_stats(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>) -> Result<Bounds> {
+fn read_type_stats(
+    d: &mut BinaryDeserializer<'_>,
+    ty: Option<&LogicalType>,
+    geometry: &mut Option<duckrs_common::geometry::GeometryStats>,
+) -> Result<Bounds> {
     let Some(ty) = ty.filter(|ty| ty.id() != LogicalTypeId::SqlNull) else {
         return Ok(None);
     };
@@ -126,23 +134,30 @@ fn read_type_stats(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>) -> 
         if d.has_property(200)? {
             return string_stats(d).map(|()| None);
         }
-        d.read_object_field(300, "extent", |d| {
+        let mut stats = duckrs_common::geometry::GeometryStats::empty();
+        let bounds = d.read_object_field(300, "extent", |d| {
             d.read_object_value(|d| {
-                for field in 101..=108 {
-                    d.read_property::<f64>(field, "extent")?;
+                let mut bounds = [0f64; 8];
+                for (field, bound) in (101..=108).zip(bounds.iter_mut()) {
+                    *bound = d.read_property::<f64>(field, "extent")?;
                 }
-                Ok(())
+                Ok(bounds)
             })
         })?;
-        d.read_object_field(301, "types", |d| {
+        let extent = &mut stats.extent;
+        [extent.x_min, extent.x_max, extent.y_min, extent.y_max] = [bounds[0], bounds[1], bounds[2], bounds[3]];
+        [extent.z_min, extent.z_max, extent.m_min, extent.m_max] = [bounds[4], bounds[5], bounds[6], bounds[7]];
+        stats.types = d.read_object_field(301, "types", |d| {
             d.read_object_value(|d| {
-                for field in 101..=104 {
-                    d.read_property::<u8>(field, "types")?;
+                let mut types = [0u8; 4];
+                for (field, set) in (101..=104).zip(types.iter_mut()) {
+                    *set = d.read_property::<u8>(field, "types")?;
                 }
-                Ok(())
+                Ok(types)
             })
         })?;
-        d.read_optional_property::<u8>(302, "flags")?;
+        stats.flags = d.read_optional_property::<u8>(302, "flags")?.unwrap_or(0);
+        *geometry = Some(stats);
         return Ok(None);
     }
     let physical = ty.physical_type();

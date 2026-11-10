@@ -1853,6 +1853,7 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
                 max: None,
                 can_be_null: false,
                 can_be_valid: false,
+                geometry: None,
             };
             let mut bounds_known = bounded;
             let mut usable = true;
