@@ -470,6 +470,7 @@ fn new_db_identifier(path: &Path) -> [u8; DB_IDENTIFIER_LEN] {
 /// `ReadAndChecksum`.
 fn read_checked(file: &mut File, path: &Path, location: u64, buffer: &mut [u8]) -> Result<()> {
     file.seek(SeekFrom::Start(location)).map_err(|e| io_error(path, e))?;
+    crate::execution::profiler::track_read(buffer.len());
     file.read_exact(buffer).map_err(|e| {
         if e.kind() == std::io::ErrorKind::UnexpectedEof {
             corrupt(format!("the file ends before the block at location {location}"))
@@ -492,6 +493,7 @@ fn write_checked(file: &mut File, path: &Path, location: u64, buffer: &mut [u8])
     let sum = checksum(&buffer[BLOCK_HEADER_SIZE..]);
     buffer[..BLOCK_HEADER_SIZE].copy_from_slice(&sum.to_le_bytes());
     file.seek(SeekFrom::Start(location)).map_err(|e| io_error(path, e))?;
+    crate::execution::profiler::track_write(buffer.len());
     file.write_all(buffer).map_err(|e| io_error(path, e))
 }
 

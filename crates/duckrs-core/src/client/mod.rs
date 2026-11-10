@@ -254,7 +254,7 @@ impl DatabaseInstance {
 
     /// Makes a commit durable, in the log of the file, and checkpoints if the log has grown past
     /// `threshold` bytes and nobody is in the middle of a transaction.
-    fn log_commit(&self, threshold: u64, abort: &str) -> Result<()> {
+    fn log_commit(&self, threshold: u64, entry_limit: u64, abort: &str) -> Result<()> {
         let Some(file) = self.file.as_ref().filter(|_| self.file_access.is_none()) else {
             return Ok(());
         };
@@ -263,6 +263,8 @@ impl DatabaseInstance {
         let blocks = file.buffer.block_manager();
         let mut log = file.log.lock();
         let identifier = blocks.main_header().db_identifier;
+        // `AutomaticCheckpoint`: what the log held before this commit
+        let entries = log.entries();
         if !log.commit(
             &file.path,
             &self.catalog,
@@ -274,7 +276,7 @@ impl DatabaseInstance {
             return Ok(());
         }
         self.changed.store(true, AtomicOrdering::SeqCst);
-        let full = log.size() >= threshold;
+        let full = log.size() >= threshold || (entry_limit > 0 && entries >= entry_limit);
         drop(log);
         drop(reading);
         if full && self.transactions.lock().open.is_empty() {
@@ -333,6 +335,10 @@ impl DatabaseInstance {
 
     /// `abort` is `debug_checkpoint_abort`, which belongs to the session that asked.
     fn write_checkpoint_with(&self, abort: &str) -> Result<()> {
+        crate::execution::profiler::time_metric("storage.checkpoint_latency", || self.write_checkpoint_timed(abort))
+    }
+
+    fn write_checkpoint_timed(&self, abort: &str) -> Result<()> {
         let Some(file) = self.file.as_ref().filter(|_| self.file_access.is_none()) else {
             return Ok(());
         };
@@ -419,10 +425,6 @@ const NO_OP_PRAGMAS: &[&str] = &[
     "disable_verify_serializer",
     "verify_parallelism",
     "disable_verify_parallelism",
-    "enable_profiling",
-    "enable_profile",
-    "disable_profiling",
-    "disable_profile",
     "enable_progress_bar",
     "disable_progress_bar",
     "enable_print_progress_bar",
@@ -610,6 +612,13 @@ pub struct ClientContext {
     query_id: u64,
     /// the transaction number of the statement running now
     statement_transaction: u64,
+    /// `ClientConfig::enable_profiler`: whether queries are profiled, in the `enable_profiling` format
+    profiling: bool,
+    /// what the plan of the statement being profiled did: its phases and its operators
+    pending_profile: Option<(
+        Vec<(String, std::time::Duration)>,
+        Option<crate::execution::profiler::ProfileNode>,
+    )>,
 }
 
 /// A transaction started with BEGIN.
@@ -722,6 +731,8 @@ impl ClientContext {
             log_target_id,
             query_id: 0,
             statement_transaction: 0,
+            profiling: false,
+            pending_profile: None,
         };
         context.sync_logging_settings();
         context
@@ -868,8 +879,19 @@ impl ClientContext {
         for (statement, text) in &statements {
             self.begin_statement_logging(text)?;
             let target = self.log_target.clone();
-            let outcome = crate::logging::with_file_logging(&target, || self.run_statement(statement));
+            // `QueryProfiler::StartQuery`: a statement that starts with profiling on is profiled
+            let profiled = self.profiling.then(std::time::Instant::now);
+            self.pending_profile = None;
+            let profiler = profiled.map(|_| Arc::new(crate::execution::profiler::OperatorProfiler::default()));
+            let outcome = crate::execution::profiler::with_profiler(profiler.clone(), || {
+                crate::logging::with_file_logging(&target, || self.run_statement(statement))
+            });
             self.end_statement_logging();
+            if let (Some(start), Some(profiler)) = (profiled, &profiler)
+                && self.profiling
+            {
+                self.write_profile(text.trim(), start.elapsed(), profiler)?;
+            }
             result = outcome?;
         }
         Ok(result)
@@ -1051,7 +1073,12 @@ impl ClientContext {
     /// A commit, as far as this connection can fail one.
     fn log_commit(&self) -> Result<()> {
         let abort = self.setting_text("debug_checkpoint_abort").to_lowercase();
-        self.db.log_commit(self.checkpoint_threshold(), &abort)
+        let entry_limit = self
+            .setting_text("wal_autocheckpoint_entries")
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        self.db.log_commit(self.checkpoint_threshold(), entry_limit, &abort)
     }
 
     /// What `debug_force_commit_failure` and `debug_force_wal_fsync_failure` turn a commit into,
@@ -1536,6 +1563,10 @@ impl ClientContext {
             return Err(crate::unported(format!("ATTACH with {}", names.join(", "))));
         }
         let in_memory = path.is_empty() || path == ":memory:";
+        // `MetricStorageWaitingToAttachLatency`: one instance attaches at a time, so there is no wait.
+        if !in_memory {
+            crate::execution::profiler::add_timing("storage.waiting_to_attach_latency", std::time::Duration::ZERO);
+        }
         let stem = Path::new(&path)
             .file_stem()
             .unwrap_or_default()
@@ -1608,6 +1639,11 @@ impl ClientContext {
             opened
         };
         database.catalog.set_database_list(self.database_list());
+        // `checkpoint_on_shutdown` is an option of the instance, which the attached databases share.
+        let on_shutdown = self.home.checkpoint_on_shutdown.load(AtomicOrdering::SeqCst);
+        database
+            .checkpoint_on_shutdown
+            .store(on_shutdown, AtomicOrdering::SeqCst);
         self.home.attached.write().insert(name.to_lowercase(), database);
         Ok(())
     }
@@ -1951,7 +1987,37 @@ impl ClientContext {
                     self.set_logging_setting(setting, &value)?;
                     return Ok(Self::success());
                 }
+                // `EnableProfilingSetting::SetLocal`: a format the profiler knows, and profiling on
+                if name.eq_ignore_ascii_case("enable_profiling") {
+                    let format = value.try_to_string()?.to_lowercase();
+                    if !matches!(
+                        format.as_str(),
+                        "json" | "query_tree" | "query_tree_optimizer" | "no_output" | "html" | "graphviz"
+                    ) {
+                        return Err(Error::new(
+                            ErrorKind::Parser,
+                            format!(
+                                "Unrecognized print format {format}, supported formats: [json, query_tree, \
+                                 query_tree_optimizer, no_output, html, graphviz]"
+                            ),
+                        ));
+                    }
+                    settings::set_variable(name, *scope, &Value::varchar(format), &mut global, &mut self.settings)?;
+                    self.profiling = true;
+                    return Ok(Self::success());
+                }
                 settings::set_variable(name, *scope, &value, &mut global, &mut self.settings)?;
+                return Ok(Self::success());
+            }
+            Statement::ResetVariable { name, .. } if name.eq_ignore_ascii_case("enable_profiling") => {
+                self.profiling = false;
+                let mut global = self.home.settings.write();
+                settings::reset_variable(
+                    name,
+                    duckrs_parser::ast::SetScope::Local,
+                    &mut global,
+                    &mut self.settings,
+                )?;
                 return Ok(Self::success());
             }
             Statement::ResetVariable { name, scope } => {
@@ -1978,6 +2044,19 @@ impl ClientContext {
                     return Ok(Self::success());
                 }
                 let lower = name.to_lowercase();
+                // `PragmaEnableProfilingStatement` and `PragmaDisableProfiling`
+                if parameters.is_empty() && matches!(lower.as_str(), "enable_profiling" | "enable_profile") {
+                    let format = match self.setting_text("enable_profiling") {
+                        format if format.is_empty() => "query_tree".to_string(),
+                        format => format,
+                    };
+                    let query = duckrs_parser::parse_ast(&format!("SET enable_profiling = '{format}'"))?.remove(0);
+                    return self.execute_statement(&query);
+                }
+                if parameters.is_empty() && matches!(lower.as_str(), "disable_profiling" | "disable_profile") {
+                    self.profiling = false;
+                    return Ok(Self::success());
+                }
                 if lower == "import_database" {
                     let [path] = parameters.as_slice() else {
                         return Err(Error::new(
@@ -1994,6 +2073,9 @@ impl ClientContext {
                 if parameters.is_empty() && lower.ends_with("_checkpoint_on_shutdown") {
                     let enable = lower == "enable_checkpoint_on_shutdown";
                     self.db.checkpoint_on_shutdown.store(enable, AtomicOrdering::SeqCst);
+                    for database in self.home.attached.read().values() {
+                        database.checkpoint_on_shutdown.store(enable, AtomicOrdering::SeqCst);
+                    }
                     return Ok(Self::success());
                 }
                 let sql = match (lower.as_str(), parameters.as_slice()) {
@@ -2172,17 +2254,49 @@ impl ClientContext {
             }
             _ => {}
         }
+        let profiling = self.profiling.then(std::time::Instant::now);
         let catalog = self.catalog();
         let mut binder = Binder::with_options(&catalog, self.bind_options());
         binder.parameters = self.parameters.clone();
         binder.session = Some(self.session_values());
         let bound = binder.bind(statement)?;
-        let mut plan = optimize(bound.plan, self.optimizer_options());
+        let planned = profiling.map(|_| std::time::Instant::now());
+        let mut optimizers = Vec::new();
+        let mut plan = crate::optimizer::optimize_timed(bound.plan, self.optimizer_options(), &mut optimizers);
+        let optimized = profiling.map(|_| std::time::Instant::now());
         resolve_column_bindings(&mut plan)?;
         let plan = create_plan(plan);
+        let physical = profiling.map(|_| std::time::Instant::now());
         let collector = PhysicalResultCollector::new(plan);
         let threads = self.thread_count();
-        crate::execution::temporary::with_memory(self.query_memory()?, || execute_plan_with(&collector, threads))?;
+        let operator_profiler = profiling.and_then(|_| crate::execution::profiler::current());
+        if let Some(profiler) = &operator_profiler {
+            profiler.clear_operators();
+        }
+        let memory = self.query_memory()?;
+        crate::execution::profiler::with_profiler(operator_profiler.clone(), || {
+            crate::execution::temporary::with_memory(memory, || execute_plan_with(&collector, threads))
+        })?;
+        if let (Some(start), Some(planned), Some(optimized), Some(physical), Some(operators)) =
+            (profiling, planned, optimized, physical, &operator_profiler)
+        {
+            let mut phases = vec![
+                ("planner.total_time".to_string(), planned - start),
+                ("optimizer.total_time".to_string(), optimized - planned),
+                ("physical_planner.total_time".to_string(), physical - optimized),
+            ];
+            phases.extend(
+                optimizers
+                    .iter()
+                    .map(|(name, time)| (format!("optimizer.{name}"), *time)),
+            );
+            let select_coverage = !self.setting_text("profiling_coverage").eq_ignore_ascii_case("all");
+            let root =
+                crate::execution::profiler::ProfileNode::of(collector.children[0].as_ref(), operators, select_coverage)
+                    .into_iter()
+                    .next();
+            self.pending_profile = Some((phases, root));
+        }
         let collection = collector.result.into_inner();
         // the result has the statement's types, which a collector of e.g. CREATE TABLE lacks
         let collection = if collection.types() == bound.types.as_slice() {
@@ -2196,6 +2310,98 @@ impl ClientContext {
             collection,
         })
     }
+}
+
+impl ClientContext {
+    /// `QueryProfiler::EndQuery`: the profile of a statement, to `profiling_output` in the format of
+    /// `enable_profiling` (only JSON is written there for now), with the metrics of
+    /// `FinalizeMetricValues` that duckrs doesn't measure as their defaults.
+    fn write_profile(
+        &mut self,
+        sql: &str,
+        total: std::time::Duration,
+        profiler: &crate::execution::profiler::OperatorProfiler,
+    ) -> Result<()> {
+        use crate::execution::profiler::{Metric, QueryProfile, TrackedMetrics};
+        let format = self.setting_text("enable_profiling");
+        let output = self.setting_text("profiling_output");
+        let (phases, root) = self.pending_profile.take().unwrap_or_default();
+        if format != "json" || output.is_empty() {
+            return Ok(());
+        }
+        // `QueryMetrics::FinalizeMetrics`: the live counters and the system peaks are always there,
+        // the timings and counters only when something recorded them
+        let mut metrics = std::collections::BTreeMap::new();
+        for name in [
+            "system.blocked_thread_time",
+            "io.total_read_time",
+            "io.total_write_time",
+        ] {
+            metrics.insert(name.to_string(), Metric::Double(0.0));
+        }
+        for name in [
+            "system.peak_buffer_memory",
+            "system.peak_streaming_buffer_size",
+            "system.peak_temp_dir_size",
+            "system.total_bytes_spilled",
+            "system.total_memory_allocated",
+            "io.total_bytes_read",
+            "io.total_bytes_written",
+            "io.total_read_operations",
+            "io.total_write_operations",
+        ] {
+            metrics.insert(name.to_string(), Metric::UBigInt(0));
+        }
+        let (counters, timings) = profiler.gathered();
+        for (name, value) in counters {
+            metrics.insert(name.to_string(), Metric::UBigInt(value));
+        }
+        for (name, time) in timings {
+            metrics.insert(name.to_string(), Metric::Double(time.as_secs_f64()));
+        }
+        metrics.insert("query.sql".to_string(), Metric::Text(sql.to_string()));
+        metrics.insert("query.total_time".to_string(), Metric::Double(total.as_secs_f64()));
+        for (name, time) in &phases {
+            metrics.insert(name.clone(), Metric::Double(time.as_secs_f64()));
+        }
+        if let Some(root) = &root {
+            let totals = root.totals();
+            metrics.insert("query.cpu_time".to_string(), Metric::Double(totals.time.as_secs_f64()));
+            metrics.insert(
+                "query.total_intermediate_rows".to_string(),
+                Metric::UBigInt(totals.rows),
+            );
+            metrics.insert(
+                "query.total_rows_scanned".to_string(),
+                Metric::UBigInt(totals.rows_scanned),
+            );
+            metrics.insert(
+                "query.total_intermediate_size_bytes".to_string(),
+                Metric::UBigInt(totals.size_bytes),
+            );
+            let (scanned, to_scan) = row_group_totals(root);
+            metrics.insert("query.total_row_groups_scanned".to_string(), Metric::UBigInt(scanned));
+            metrics.insert("query.total_row_groups_to_scan".to_string(), Metric::UBigInt(to_scan));
+        }
+        let tracked = match self.setting("tracked_metrics").map(|value| value.data().clone()) {
+            Some(duckrs_common::value::ValueData::List(items)) => {
+                TrackedMetrics::new(items.iter().filter_map(|item| item.try_to_string().ok()).collect())
+            }
+            _ => TrackedMetrics::new(vec!["*".to_string()]),
+        };
+        let legacy = self.setting_text("legacy_metrics_format") == "true";
+        let profile = QueryProfile { metrics, root };
+        std::fs::write(&output, profile.to_json(&tracked, legacy))
+            .map_err(|error| Error::new(ErrorKind::Io, format!("Cannot open file \"{output}\": {error}")))
+    }
+}
+
+/// The row groups the scans of a profile scanned, of those they could have.
+fn row_group_totals(node: &crate::execution::profiler::ProfileNode) -> (u64, u64) {
+    node.children
+        .iter()
+        .map(row_group_totals)
+        .fold(node.row_groups, |(a, b), (c, d)| (a + c, b + d))
 }
 
 /// The schema a CREATE puts its object in: temporary objects have one of their own.

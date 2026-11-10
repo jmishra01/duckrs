@@ -17,7 +17,8 @@ fn has_glob(text: &str) -> bool {
 }
 
 /// `Glob` of `file_system.cpp`: `*`, `?` and `[...]`, within one path segment.
-fn glob_match(name: &[u8], pattern: &[u8]) -> bool {
+/// `Glob`: whether `name` matches `pattern` of `*`, `?` and `[...]`.
+pub fn glob_match(name: &[u8], pattern: &[u8]) -> bool {
     let Some((&first, rest)) = pattern.split_first() else {
         return name.is_empty();
     };
@@ -189,6 +190,7 @@ pub fn read_file(path: &str, compression: Compression) -> Result<Vec<u8>> {
     // the file is read at once: one READ of all of it
     crate::logging::log_file_system(path, "OPEN", None);
     crate::logging::log_file_system(path, "READ", Some((data.len() as i64, 0)));
+    crate::execution::profiler::track_read(data.len());
     crate::logging::log_file_system(path, "CLOSE", None);
     match compression.for_path(path) {
         Compression::Gzip => {

@@ -21,6 +21,7 @@ pub mod parquet_schema;
 pub mod parquet_variant;
 pub mod parquet_writer;
 pub mod physical;
+pub mod profiler;
 pub mod temporary;
 pub mod zone_map;
 
@@ -480,11 +481,21 @@ impl Pipeline<'_> {
         if chunk.is_empty() {
             return Ok(());
         }
+        let profiler = profiler::current();
         let Some(op) = self.operators.get(index) else {
-            return sink(&chunk);
+            let (result, time) = profiler::timed(profiler.as_deref(), || sink(&chunk));
+            if let Some(profiler) = &profiler {
+                profiler.add_time(self.sink, time);
+            }
+            return result;
         };
         loop {
-            let (output, result) = op.execute_stateful(&chunk, &mut states[index])?;
+            let (result, time) =
+                profiler::timed(profiler.as_deref(), || op.execute_stateful(&chunk, &mut states[index]));
+            let (output, result) = result?;
+            if let Some(profiler) = &profiler {
+                profiler.record(*op, time, &output, false);
+            }
             self.push_into(output, index + 1, states, sink)?;
             // A finished operator wants no more input, which only stops what feeds it: the
             // operators above it still emit the output of the rows it already passed on.
@@ -517,6 +528,7 @@ impl Pipeline<'_> {
         let failed = AtomicBool::new(false);
         let error = Mutex::new(None);
         let memory = temporary::current();
+        let query_profiler = profiler::current();
         let worker = || -> Result<()> {
             let mut local = self.sink.local_sink_state();
             let mut states: Vec<OperatorState> = self.operators.iter().map(|op| op.operator_state()).collect();
@@ -525,7 +537,12 @@ impl Pipeline<'_> {
                 if index >= morsels {
                     break;
                 }
-                if let Some(chunk) = self.source.parallel_chunk(&shared, index)? {
+                let profiler = profiler::current();
+                let (chunk, time) = profiler::timed(profiler.as_deref(), || self.source.parallel_chunk(&shared, index));
+                if let Some(chunk) = chunk? {
+                    if let Some(profiler) = &profiler {
+                        profiler.record(self.source, time, &chunk, profiler::is_scan(self.source));
+                    }
                     self.push_into(chunk, 0, &mut states, &mut |chunk| {
                         self.sink.sink_local(&mut local, index, chunk)
                     })?;
@@ -536,7 +553,8 @@ impl Pipeline<'_> {
         std::thread::scope(|scope| {
             for _ in 0..threads.min(morsels) {
                 scope.spawn(|| {
-                    if let Err(failure) = temporary::with_memory(Arc::clone(&memory), worker) {
+                    let run = || temporary::with_memory(Arc::clone(&memory), worker);
+                    if let Err(failure) = profiler::with_profiler(query_profiler.clone(), run) {
                         failed.store(true, Ordering::Relaxed);
                         error.lock().get_or_insert(failure);
                     }
@@ -553,7 +571,13 @@ impl Pipeline<'_> {
         } else {
             let mut state = self.source.source_state();
             let mut operator_states: Vec<OperatorState> = self.operators.iter().map(|op| op.operator_state()).collect();
-            while let Some(chunk) = self.source.get_data(&mut state)? {
+            let profiler = profiler::current();
+            loop {
+                let (chunk, time) = profiler::timed(profiler.as_deref(), || self.source.get_data(&mut state));
+                let Some(chunk) = chunk? else { break };
+                if let Some(profiler) = &profiler {
+                    profiler.record(self.source, time, &chunk, profiler::is_scan(self.source));
+                }
                 self.push(chunk, 0, &mut operator_states)?;
                 if self.is_finished() {
                     break;
@@ -621,7 +645,8 @@ fn build_pipelines<'a>(sink: &'a dyn PhysicalOperator, pipelines: &mut Vec<Pipel
 /// Runs a plan with resolved column bindings, and returns its rows.
 pub fn run_plan(plan: LogicalOperator) -> Result<ColumnDataCollection> {
     let collector = PhysicalResultCollector::new(create_plan(plan));
-    execute_plan(&collector)?;
+    // what the statement runs on its own (e.g. statistics) is not part of its profile
+    profiler::with_profiler(None, || execute_plan(&collector))?;
     Ok(collector.result.into_inner())
 }
 
