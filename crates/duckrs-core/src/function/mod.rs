@@ -14,6 +14,7 @@ pub(crate) mod dates;
 pub use dates::date_part_call_of;
 pub mod extras;
 pub mod generic;
+pub(crate) mod geometry;
 pub(crate) mod holistic;
 pub mod json;
 mod lists;
@@ -295,7 +296,10 @@ impl BuiltinFunctions {
             for set in sequence_functions() {
                 functions.scalar.insert(set.name.clone(), set);
             }
-            for set in bit_functions::bit_functions() {
+            for set in bit_functions::bit_functions()
+                .into_iter()
+                .chain(geometry::geometry_functions())
+            {
                 functions.scalar.insert(set.name.clone(), set);
             }
             for set in generic::generic_functions()

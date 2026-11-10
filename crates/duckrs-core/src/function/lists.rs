@@ -552,6 +552,25 @@ pub fn bind_list_function(name: &str, children: Vec<BoundExpr>) -> Result<BoundE
             Ok(bound_function("list_reverse", vec![list], ty, list_reverse))
         }
         "list_has_any" | "array_has_any" | "list_has_all" | "array_has_all" | "&&" | "@>" | "<@" => {
+            // `&&` is also `ST_Intersects_Extent`
+            if lower == "&&"
+                && let [left, right] = children.as_slice()
+                && [left, right]
+                    .iter()
+                    .any(|c| c.return_type.id() == LogicalTypeId::Geometry)
+                && [left, right].iter().all(|c| {
+                    matches!(
+                        super::binder::expression_return_type(c).id(),
+                        LogicalTypeId::Geometry | LogicalTypeId::StringLiteral
+                    )
+                })
+            {
+                let geometry = LogicalType::new(LogicalTypeId::Geometry);
+                return Ok(super::geometry::bind_intersects_extent(
+                    left.clone().cast_to(&geometry, false),
+                    right.clone().cast_to(&geometry, false),
+                ));
+            }
             let (left, right) = match children.as_slice() {
                 // `a <@ b` is whether b has all of a
                 [left, right] if lower == "<@" => (as_list(right.clone()), as_list(left.clone())),

@@ -31,9 +31,12 @@ const DATE_MAX: i32 = 2_147_483_646;
 const TIMESTAMP_MIN: i64 = -9_223_372_022_400_000_000;
 const TIMESTAMP_MAX: i64 = i64::MAX - 1;
 const BIGNUM_MAX: &str = "179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368";
-/// What casting the WKT of the C++ file to GEOMETRY and back gives. There is no GEOMETRY code
-/// yet, so that the column holds this text instead of WKB until the spatial types are ported.
+/// The WKT of the largest GEOMETRY of the C++ file.
 const GEOMETRY_MAX: &str = "GEOMETRYCOLLECTION (POINT (1 2), POINT EMPTY, LINESTRING (0 0, 1 1), LINESTRING EMPTY, POLYGON ((0 0, 0 1, 1 1, 1 0, 0 0)), POLYGON EMPTY, MULTIPOINT (5 6, EMPTY), MULTILINESTRING ((0 0, 1 1), EMPTY, (2 2, 3 3), EMPTY), MULTILINESTRING EMPTY, MULTIPOLYGON (((0 0, 0 1, 1 1, 1 0, 0 0)), EMPTY, ((0 0, 0 2, 2 2, 2 0, 0 0)), EMPTY), MULTIPOLYGON EMPTY, GEOMETRYCOLLECTION (POINT (5 6)), GEOMETRYCOLLECTION EMPTY)";
+
+fn wkb(wkt: &str) -> Vec<u8> {
+    duckrs_common::geometry::from_wkt(wkt).expect("valid WKT")
+}
 
 fn raw(id: LogicalTypeId, data: ValueData) -> Result<Value> {
     Value::new(LogicalType::new(id), data)
@@ -435,8 +438,8 @@ pub fn test_all_types(large_enum: bool, large_bignum: bool) -> Result<Vec<TestCo
     );
     push(
         "geometry",
-        raw(Id::Geometry, ValueData::Bytes(b"POINT EMPTY".to_vec()))?,
-        raw(Id::Geometry, ValueData::Bytes(GEOMETRY_MAX.as_bytes().to_vec()))?,
+        raw(Id::Geometry, ValueData::Bytes(wkb("POINT EMPTY")))?,
+        raw(Id::Geometry, ValueData::Bytes(wkb(GEOMETRY_MAX)))?,
     );
     let tuple = LogicalType::tuple(vec![LogicalType::INTEGER, LogicalType::VARCHAR]);
     push(

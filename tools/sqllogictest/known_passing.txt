@@ -2152,6 +2152,7 @@ test/sql/join/asof/test_asof_join_doubles.test
 test/sql/join/asof/test_asof_join_filter_pushdown.test
 test/sql/join/asof/test_asof_join_inequalities.test
 test/sql/join/asof/test_asof_join_integers.test
+test/sql/join/asof/test_asof_join_key_types.test
 test/sql/join/asof/test_asof_join_list_partition_key.test
 test/sql/join/asof/test_asof_join_nulls.test
 test/sql/join/asof/test_asof_join_prefix.test
@@ -3477,6 +3478,16 @@ test/sql/types/float/nan_ordering.test
 test/sql/types/float/nan_test.test
 test/sql/types/float/nan_window.test
 test/sql/types/float/nested_nan.test
+test/sql/types/geo/geometry.test
+test/sql/types/geo/geometry_blob_cast_invalid_parts.test
+test/sql/types/geo/geometry_intersects.test
+test/sql/types/geo/geometry_shred_fetch.test
+test/sql/types/geo/geometry_shred_list.test
+test/sql/types/geo/geometry_stats_prune_nan.test
+test/sql/types/geo/geometry_try_cast_malformed.test
+test/sql/types/geo/geometry_wkb.test
+test/sql/types/geo/geometry_wkb_depth.test
+test/sql/types/geo/geometry_wkb_invalid_flag.test
 test/sql/types/hugeint/hugeint_multiply.test
 test/sql/types/hugeint/hugeint_sum_overflow.test
 test/sql/types/hugeint/hugeint_try_cast.test
@@ -3782,6 +3793,7 @@ test/sql/update/test_update_mix.test
 test/sql/update/test_update_same_string_value.test
 test/sql/update/test_update_same_value.test
 test/sql/update/test_update_snapshot_versions.test
+test/sql/update/test_update_with_non_regular_type.test
 test/sql/update/update_after_commit.test
 test/sql/update/update_default.test
 test/sql/update/update_delete_wal.test

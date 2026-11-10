@@ -421,9 +421,7 @@ impl Binder<'_> {
             // the length of a BIT is accepted and ignored
             LogicalTypeId::Bit if children.len() <= 1 => Ok(LogicalType::new(id)),
             _ if !children.is_empty() => Err(crate::unported(format!("type parameters for {}", name.to_uppercase()))),
-            LogicalTypeId::Geometry | LogicalTypeId::Type => {
-                Err(crate::unported(format!("the {} type", name.to_uppercase())))
-            }
+            LogicalTypeId::Type => Err(crate::unported(format!("the {} type", name.to_uppercase()))),
             id => Ok(LogicalType::new(id)),
         }
     }
@@ -997,7 +995,11 @@ impl Binder<'_> {
                     }
                     if !matches!(
                         bound.return_type.id(),
-                        LogicalTypeId::Struct | LogicalTypeId::Tuple | LogicalTypeId::Union | LogicalTypeId::Variant
+                        LogicalTypeId::Struct
+                            | LogicalTypeId::Tuple
+                            | LogicalTypeId::Union
+                            | LogicalTypeId::Variant
+                            | LogicalTypeId::Geometry
                     ) {
                         return Err(binder_error(format!(
                             "Cannot extract field '{field}' from expression \"{}\" because it is not a struct",
@@ -1318,6 +1320,14 @@ impl Binder<'_> {
                         return bind_unnest(children);
                     }
                     return bind_generic_function(&function.name.name, children);
+                }
+                if function.name.name.eq_ignore_ascii_case("vertex_extract") {
+                    let children = function
+                        .args
+                        .iter()
+                        .map(|a| self.bind_expression(&a.expr))
+                        .collect::<Result<Vec<_>>>()?;
+                    return crate::function::geometry::bind_vertex_extract_call(children);
                 }
                 if is_variant_function(&function.name.name) {
                     let children = function

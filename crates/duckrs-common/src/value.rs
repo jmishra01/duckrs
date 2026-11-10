@@ -376,10 +376,8 @@ impl Value {
             }
             (ValueData::Float(v), _) => format_float(*v),
             (ValueData::Double(v), _) => format_double(*v),
-            // until the spatial types come, the only GEOMETRY values are `test_all_types`' WKT
-            (ValueData::Bytes(b), LogicalTypeId::Varchar | LogicalTypeId::Char | LogicalTypeId::Geometry) => {
-                String::from_utf8_lossy(b).into()
-            }
+            (ValueData::Bytes(b), LogicalTypeId::Varchar | LogicalTypeId::Char) => String::from_utf8_lossy(b).into(),
+            (ValueData::Bytes(b), LogicalTypeId::Geometry) => crate::geometry::to_wkt(b)?,
             (ValueData::Bytes(b), LogicalTypeId::Blob | LogicalTypeId::LegacyAggregateState) => format_blob(b),
             (ValueData::Bytes(b), LogicalTypeId::Bit) => crate::types::bit::bit_to_string(b),
             (ValueData::Bytes(b), LogicalTypeId::Variant) => crate::variant::VariantNode::decode(b)?.render()?,

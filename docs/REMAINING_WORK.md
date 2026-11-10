@@ -123,6 +123,12 @@ Each item gives the number of failing files in `test/` that it should fix, where
 
 ## Phase 4: Types and casts
 
+- [ ] 34a. GEOMETRY (`sql/types/geo`: 10 of 42 pass)
+  - [x] WKB as stored, WKT in and out (with EWKT's SRID), BLOB and VARCHAR casts, `ST_GeomFromWKB`, `ST_AsWKB`,
+    `ST_AsText`, `ST_Intersects_Extent` / `&&`, `vertex_extract` and the `.x`/`.y`/`.z`/`.m` syntax
+  - [ ] CRS type parameters (`GEOMETRY('EPSG:4326')`, PROJJSON, WKT2) and `ST_SetCRS` (8 files)
+  - [ ] GEOMETRY columns in database files and the WAL, with shredding (14 files)
+  - [ ] statistics of GEOMETRY (`stats()`, bounding boxes), GeoParquet, the spatial extension's blob format
 - [ ] 34. Remaining type and cast failures (`sql/types`: 146 failing, 72.4%; `sql/cast`: 6 failing)
 - [ ] 35. The VARIANT type (`sql/variant`: 2 failing)
 
