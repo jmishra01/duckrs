@@ -1200,6 +1200,7 @@ test/sql/copy/csv/auto/test_sniffer_empty_start_value.test
 test/sql/copy/csv/auto/test_timings_csv.test
 test/sql/copy/csv/auto/test_type_candidates.test
 test/sql/copy/csv/auto/test_type_detection.test
+test/sql/copy/csv/auto_glob_directory.test
 test/sql/copy/csv/code_cov/buffer_manager_finalize.test
 test/sql/copy/csv/code_cov/csv_dialect_detection.test
 test/sql/copy/csv/code_cov/csv_sniffer_header.test
@@ -1372,6 +1373,7 @@ test/sql/copy/file_size_bytes_tiny_limit.test
 test/sql/copy/filename_pattern_serialization.test
 test/sql/copy/hive_partition_null_overwrite.test
 test/sql/copy/parquet/alltypes-dictionaries.test
+test/sql/copy/parquet/auto_glob_directory.test
 test/sql/copy/parquet/aws2.test
 test/sql/copy/parquet/aws_kinesis.test
 test/sql/copy/parquet/bloom_filter_decimal.test
@@ -1470,6 +1472,7 @@ test/sql/copy/parquet/parquet_virtual_columns.test
 test/sql/copy/parquet/parquet_virtual_file_row_number.test
 test/sql/copy/parquet/parquet_write_codecs.test
 test/sql/copy/parquet/parquet_zstd.test
+test/sql/copy/parquet/partition_by_bind_issues.test
 test/sql/copy/parquet/read_ahead/readahead_active_jobs_hang.test
 test/sql/copy/parquet/read_ahead/readahead_depth_setting.test
 test/sql/copy/parquet/read_ahead/readahead_file_descriptor_limit_threads.test
@@ -1482,6 +1485,7 @@ test/sql/copy/parquet/read_ahead/readahead_parked_job_progress.test
 test/sql/copy/parquet/read_ahead/readahead_starved_consumers.test
 test/sql/copy/parquet/read_single_parquet_file_late_materialization.test
 test/sql/copy/parquet/recursive_parquet_union_by_name.test
+test/sql/copy/parquet/replacement_scan_custom_extension.test
 test/sql/copy/parquet/rle_bool.test
 test/sql/copy/parquet/spark_v2.test
 test/sql/copy/parquet/struct_column_reader_skip.test
@@ -2328,6 +2332,7 @@ test/sql/json/scalar/test_json_structure_depth.test
 test/sql/json/scalar/test_json_type.test
 test/sql/json/scalar/test_json_valid.test
 test/sql/json/scalar/test_json_value.test
+test/sql/json/table/auto_glob_directory.test
 test/sql/json/table/json_table_in_out_fullkey_quoting.test
 test/sql/json/table/json_table_in_out_threads.test
 test/sql/json/table/read_json_root_bignum.test

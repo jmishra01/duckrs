@@ -1633,7 +1633,7 @@ impl Binder<'_> {
                     && [".csv", ".tsv", ".csv.gz", ".tsv.gz", ".csv.zst", ".tsv.zst"]
                         .iter()
                         .any(|end| lower.ends_with(end))
-                    && !crate::execution::file_system::glob(&name.name).is_empty()
+                    && !crate::execution::file_system::glob_or_directory(&name.name, "csv").is_empty()
                 {
                     let call = ast::FunctionExpr::new(
                         "read_csv_auto",
@@ -1660,7 +1660,7 @@ impl Binder<'_> {
                     ]
                     .iter()
                     .any(|end| lower.ends_with(end))
-                    && !crate::execution::file_system::glob(&name.name).is_empty()
+                    && !crate::execution::file_system::glob_or_directory(&name.name, "json").is_empty()
                 {
                     let call = ast::FunctionExpr::new(
                         "read_json_auto",
@@ -1675,7 +1675,7 @@ impl Binder<'_> {
                 }
                 if name.qualification.is_empty()
                     && lower.ends_with(".parquet")
-                    && !crate::execution::file_system::glob(&name.name).is_empty()
+                    && !crate::execution::file_system::glob_or_directory(&name.name, "parquet").is_empty()
                 {
                     let call = ast::FunctionExpr::new(
                         "read_parquet",
@@ -1751,6 +1751,19 @@ impl Binder<'_> {
                 }
                 if entry.is_err() && name.qualification.is_empty() && Self::is_system_table(&name.name) {
                     return self.bind_system_table(table_ref, &name.name);
+                }
+                // `BindBaseTableRef`: a file that is there, but that no reader is for
+                if entry.is_err()
+                    && name.qualification.is_empty()
+                    && name.name.contains(['.', '/', '\\'])
+                    && std::path::Path::new(&name.name).is_file()
+                {
+                    return Err(binder_error(format!(
+                        "No extension found that is capable of reading the file \"{}\"\n* If this file is a \
+                         supported file format you can explicitly use the reader functions, such as read_csv, \
+                         read_json or read_parquet",
+                        name.name
+                    )));
                 }
                 // the `duckdb_logs` view of `default_views.cpp`
                 if entry.is_err() && name.qualification.is_empty() && name.name.eq_ignore_ascii_case("duckdb_logs") {
