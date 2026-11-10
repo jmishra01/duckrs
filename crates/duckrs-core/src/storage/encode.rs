@@ -8,13 +8,9 @@ use super::fsst::SymbolTable;
 use duckrs_common::types::PhysicalType;
 use std::collections::HashMap;
 
-/// `BITPACKING_METADATA_GROUP_SIZE`.
-const GROUP_ROWS: usize = 2048;
 /// The packer of C++ fills groups of this many values, also for fewer.
 const PACKING_ROWS: usize = 32;
 const HEADER_SIZE: usize = 8;
-const MODE_CONSTANT: u32 = 2;
-const MODE_FOR: u32 = 5;
 
 /// A segment and the rows it holds.
 pub type Encoded = (Vec<u8>, usize);
@@ -79,19 +75,6 @@ pub fn encode_rle(data: &[u8], width: usize, block_size: usize) -> Vec<Encoded> 
     segments
 }
 
-/// A value of `width` bytes as a number, sign extended for `signed` types.
-fn number(bytes: &[u8], signed: bool) -> i128 {
-    let mut value = [0u8; 16];
-    value[..bytes.len()].copy_from_slice(bytes);
-    let unsigned = u128::from_le_bytes(value);
-    let bits = bytes.len() * 8;
-    if signed && bits < 128 && unsigned >> (bits - 1) & 1 != 0 {
-        (unsigned | (u128::MAX << bits)) as i128
-    } else {
-        unsigned as i128
-    }
-}
-
 fn pack(values: &[u128], bits: usize) -> Vec<u8> {
     let rows = values.len().next_multiple_of(PACKING_ROWS);
     let mut packed = vec![0u8; (rows * bits).div_ceil(8)];
@@ -105,68 +88,6 @@ fn pack(values: &[u128], bits: usize) -> Vec<u8> {
         }
     }
     packed
-}
-
-/// The widths that the packer of C++ has for a type: all of them, but 0 is a constant.
-fn encode_group(group: &[u8], width: usize, signed: bool) -> (Vec<u8>, u32) {
-    let mut smallest = None;
-    let mut largest = None;
-    for value in group.chunks_exact(width) {
-        let value = number(value, signed);
-        smallest = Some(smallest.map_or(value, |s: i128| s.min(value)));
-        largest = Some(largest.map_or(value, |l: i128| l.max(value)));
-    }
-    let (smallest, largest) = (smallest.expect("a group has rows"), largest.expect("a group has rows"));
-    let frame = &(smallest as u128).to_le_bytes()[..width];
-    if smallest == largest {
-        return (frame.to_vec(), MODE_CONSTANT);
-    }
-    let range = largest.wrapping_sub(smallest) as u128;
-    let bits = (128 - range.leading_zeros()) as usize;
-    let differences: Vec<u128> = group
-        .chunks_exact(width)
-        .map(|value| number(value, signed).wrapping_sub(smallest) as u128)
-        .collect();
-    let mut data = frame.to_vec();
-    data.extend_from_slice(&(bits as u128).to_le_bytes()[..width]);
-    data.extend_from_slice(&pack(&differences, bits));
-    (data, MODE_FOR)
-}
-
-/// `BitpackingCompressionState`: groups of 2048 rows, each a constant or a frame of reference and
-/// packed differences, and at the end of the segment, from the back, where each group is.
-pub fn encode_bitpacking(data: &[u8], width: usize, signed: bool, block_size: usize) -> Vec<Encoded> {
-    let mut segments = Vec::new();
-    let mut body = vec![0u8; HEADER_SIZE];
-    let mut entries: Vec<u32> = Vec::new();
-    let mut rows = 0;
-    let mut finish = |body: &mut Vec<u8>, entries: &mut Vec<u32>, rows: &mut usize| {
-        if *rows == 0 {
-            return;
-        }
-        let table_at = body.len().next_multiple_of(8);
-        body.resize(table_at, 0);
-        for entry in entries.iter().rev() {
-            body.extend_from_slice(&entry.to_le_bytes());
-        }
-        let end = body.len() as u64;
-        body[..HEADER_SIZE].copy_from_slice(&end.to_le_bytes());
-        segments.push((std::mem::replace(body, vec![0u8; HEADER_SIZE]), *rows));
-        entries.clear();
-        *rows = 0;
-    };
-    for group in data.chunks(GROUP_ROWS * width) {
-        let (encoded, mode) = encode_group(group, width, signed);
-        let needed = body.len() + encoded.len() + 8 + (entries.len() + 1) * 4;
-        if needed > block_size {
-            finish(&mut body, &mut entries, &mut rows);
-        }
-        entries.push(body.len() as u32 | mode << 24);
-        body.extend_from_slice(&encoded);
-        rows += group.len() / width;
-    }
-    finish(&mut body, &mut entries, &mut rows);
-    segments
 }
 
 /// One Roaring container: arrays of the rows that are the exception, or a bitset. C++ also has
@@ -802,17 +723,24 @@ pub fn supports_rle(physical: PhysicalType) -> bool {
     )
 }
 
+/// `BitpackingFun::TypeIsSupported` (LIST offsets are written uncompressed here).
 pub fn supports_bitpacking(physical: PhysicalType) -> bool {
     use PhysicalType::*;
     matches!(
         physical,
-        Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64
+        Bool | Int8 | Int16 | Int32 | Int64 | Int128 | UInt8 | UInt16 | UInt32 | UInt64 | UInt128
     )
 }
 
+/// Whether the type packed for `physical` is signed: BOOL is packed as `int8_t`.
 pub fn is_signed(physical: PhysicalType) -> bool {
     matches!(
         physical,
-        PhysicalType::Int8 | PhysicalType::Int16 | PhysicalType::Int32 | PhysicalType::Int64
+        PhysicalType::Bool
+            | PhysicalType::Int8
+            | PhysicalType::Int16
+            | PhysicalType::Int32
+            | PhysicalType::Int64
+            | PhysicalType::Int128
     )
 }

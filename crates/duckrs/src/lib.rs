@@ -41,6 +41,16 @@ impl Database {
         })
     }
 
+    /// [`Database::open`], making a new file in the storage version named `version` (e.g. `v1.0.0`),
+    /// as the `storage_compatibility_version` of C++'s config does.
+    pub fn open_with_storage_version(path: impl AsRef<Path>, read_only: bool, version: &str) -> Result<Self> {
+        Ok(Self {
+            instance: DatabaseInstance::open_file_with_version(path.as_ref(), read_only, version)?,
+            path: Some(path.as_ref().to_path_buf()),
+            read_only,
+        })
+    }
+
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }

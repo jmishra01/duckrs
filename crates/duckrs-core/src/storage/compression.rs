@@ -95,13 +95,12 @@ pub fn scan_uncompressed(segment: &[u8], count: usize, width: usize, out: &mut V
     Ok(())
 }
 
-/// `ConstantScanFunction`: the value of the segment is in its statistics.
+/// `ConstantScanFunction`: the value of the segment is in its statistics. A segment of NULLs only
+/// has none there, and its rows are NULL by the validity column whatever they hold.
 pub fn scan_constant(stats: &BaseStatistics, count: usize, width: usize, out: &mut Vec<u8>) -> Result<()> {
-    let min = stats
-        .min
-        .ok_or_else(|| corrupt("a constant segment has no value in its statistics"))?;
+    let value = stats.min.map_or([0u8; 16], |min| min);
     for _ in 0..count {
-        out.extend_from_slice(&min[..width]);
+        out.extend_from_slice(&value[..width]);
     }
     Ok(())
 }
