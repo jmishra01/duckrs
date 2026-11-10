@@ -133,6 +133,16 @@ pub fn glob(pattern: &str) -> Vec<String> {
     result
 }
 
+/// `FileSystem::GlobFileList` with `FALLBACK_GLOB`: a path that is no file and has no glob is read as
+/// a directory of files with the reader's extension, as a partitioned COPY writes them.
+pub fn glob_or_directory(pattern: &str, extension: &str) -> Vec<String> {
+    let found = glob(pattern);
+    if !found.is_empty() || has_glob(pattern) {
+        return found;
+    }
+    glob(&join(&join(pattern, "**"), &format!("*.{extension}")))
+}
+
 /// `FileCompressionType`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {

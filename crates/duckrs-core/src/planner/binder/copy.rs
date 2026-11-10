@@ -590,7 +590,7 @@ impl Binder<'_> {
         }
         let patterns = paths.ok_or_else(|| binder_error(format!("{name} requires a file name")))?;
         for pattern in &patterns {
-            let found = file_system::glob(pattern);
+            let found = file_system::glob_or_directory(pattern, "csv");
             if found.is_empty() && !result.allow_empty {
                 return Err(Error::new(
                     ErrorKind::Io,

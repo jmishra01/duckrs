@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 3824 of 6367 test files pass (**63.2%**). The v1 target is ≥ 90%.
+- Overall: 3956 of 6367 test files pass (**65.4%** of the 6051 that run). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -56,8 +56,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
     `SHREDDING`, `variant_to_parquet_variant` / `variant_bytes_to_variant`
   - [ ] encryption, UNION and GEOMETRY columns
   - [ ] rotation inside partitions groups rows into files differently from C++ (`partitioned_file_rotation`)
+  - [x] reading a directory path, as `FALLBACK_GLOB` globs `dir/**/*.ext` (also for CSV and JSON)
   - [ ] reader side: row-group pruning by bloom filters and page indexes, `bound_schema` (needs struct field
-    projection and `EXPLAIN (SQL)`), reading a directory path, `maximum_files_for_stats`
+    projection and `EXPLAIN (SQL)`), `maximum_files_for_stats`
   - [ ] corrupt files C++ rejects that the crate reads (INT96 out of range, WKB types, page index row counts)
   - [ ] prefetch / read-ahead metrics and EXPLAIN shapes of Parquet scans (~20 files)
   - [ ] `write_timestamp_as_int96`, `parquet_metadata` logical type names (`Float16Type()`), duplicate column names
@@ -142,6 +143,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
 - [ ] 38. Secrets manager: `CREATE SECRET` and related statements (`sql/secrets`: 16 failing, 0%)
 - [ ] 39. SQL export and DDL rendering (`sql/sql_export`: 69 failing)
 - [ ] 40. Logging and error messages (`sql/logging` 8, `sql/error` 13, `test/logging` 2)
+- [ ] 40a. The query profiler: `enable_profiling = 'json'`, `profiling_output`, `tracked_metrics` and the
+  metrics C++ writes (rows scanned, intermediate rows, bytes read, timing, memory). About 27 files under
+  `sql/pragma/profiling` and `sql/optimizer` read the JSON it writes.
 - [ ] 41. **C API** (`duckrs-capi`): implement `duckdb.h`, then pass `test/api/capi/*`. There is no code for this yet.
 - [ ] 42. **CLI shell**: rustyline, `.mode` box renderer, `.timer`, `.read`, `.import`, autocomplete. There is no code for this yet.
 - [ ] 43. **Rust API**: `Appender`, streaming results, Arrow `RecordBatch` export, `Relation` API. There is no code for this yet.
