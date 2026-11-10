@@ -120,11 +120,30 @@ fn read_type_stats(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>) -> 
         d.read_object_field(225, "unshredded_stats", |d| read_statistics(d, Some(&unshredded)))?;
         return Ok(None);
     }
+    // `GeometryStats::Deserialize`: the string stats of files of the spatial extension, or the extent,
+    // types and flags, none of which is used yet
     if ty.id() == LogicalTypeId::Geometry {
-        return Err(Error::not_implemented(format!(
-            "reading a {} column from a database file is not yet ported to duckrs",
-            ty.id().name()
-        )));
+        if d.has_property(200)? {
+            return string_stats(d).map(|()| None);
+        }
+        d.read_object_field(300, "extent", |d| {
+            d.read_object_value(|d| {
+                for field in 101..=108 {
+                    d.read_property::<f64>(field, "extent")?;
+                }
+                Ok(())
+            })
+        })?;
+        d.read_object_field(301, "types", |d| {
+            d.read_object_value(|d| {
+                for field in 101..=104 {
+                    d.read_property::<u8>(field, "types")?;
+                }
+                Ok(())
+            })
+        })?;
+        d.read_optional_property::<u8>(302, "flags")?;
+        return Ok(None);
     }
     let physical = ty.physical_type();
     match physical {

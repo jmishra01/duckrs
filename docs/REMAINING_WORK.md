@@ -84,7 +84,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] the ART layouts of files before v2.0.0 (an index in such a file is refused for now)
   - [ ] dense row id rewriting of files before v2.0.0 (`rowid_gaps/old_storage_*`): row groups stay as they are
   - [x] unshredded VARIANT columns, in the file and the WAL
-  - [ ] shredded VARIANT columns (~20 files), GEOMETRY columns, Patas and Chimp segments (8), `read_duckdb` (8)
+  - [ ] shredded VARIANT columns (~20 files), shredded GEOMETRY columns, Patas and Chimp segments (8), `read_duckdb` (8)
   - [ ] string and list-length statistics for `stats()` (~10 files), per-column `USING COMPRESSION`
 - [ ] 10. `ATTACH`/`DETACH` and multi-database features (`sql/attach`: 69 failing, 30.3%)
   - [ ] `ENCRYPTION_KEY`, `COMPRESS`, `RECOVERY_MODE`, `IO_MODE` and the other ATTACH options
@@ -123,11 +123,12 @@ Each item gives the number of failing files in `test/` that it should fix, where
 
 ## Phase 4: Types and casts
 
-- [ ] 34a. GEOMETRY (`sql/types/geo`: 10 of 42 pass)
+- [ ] 34a. GEOMETRY (`sql/types/geo`: 21 of 42 pass)
   - [x] WKB as stored, WKT in and out (with EWKT's SRID), BLOB and VARCHAR casts, `ST_GeomFromWKB`, `ST_AsWKB`,
     `ST_AsText`, `ST_Intersects_Extent` / `&&`, `vertex_extract` and the `.x`/`.y`/`.z`/`.m` syntax
   - [ ] CRS type parameters (`GEOMETRY('EPSG:4326')`, PROJJSON, WKT2) and `ST_SetCRS` (8 files)
-  - [ ] GEOMETRY columns in database files and the WAL, with shredding (14 files)
+  - [x] GEOMETRY columns in database files (v1.5.0 and later, as WKB) and the WAL
+  - [ ] shredded GEOMETRY columns, and the spatial extension's format of files before v1.5.0
   - [ ] statistics of GEOMETRY (`stats()`, bounding boxes), GeoParquet, the spatial extension's blob format
 - [ ] 34. Remaining type and cast failures (`sql/types`: 146 failing, 72.4%; `sql/cast`: 6 failing)
 - [ ] 35. The VARIANT type (`sql/variant`: 2 failing)

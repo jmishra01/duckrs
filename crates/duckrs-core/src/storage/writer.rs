@@ -304,6 +304,21 @@ fn write_stats(s: &mut BinarySerializer, ty: Option<&LogicalType>, stats: &Stats
             });
             return;
         }
+        // `GeometryStats::Serialize` of `CreateUnknown`: any extent, type and flag, which prunes nothing
+        if ty.id() == LogicalTypeId::Geometry {
+            s.write_object(300, "extent", |s| {
+                for (field, value) in (101..=108).zip([f64::NEG_INFINITY, f64::INFINITY].repeat(4)) {
+                    s.write_property(field, "extent", &value);
+                }
+            });
+            s.write_object(301, "types", |s| {
+                for field in 101..=104 {
+                    s.write_property(field, "types", &0xFFu8);
+                }
+            });
+            s.write_property(302, "flags", &0x0Fu8);
+            return;
+        }
         let child = |s: &mut BinarySerializer, ty: Option<&LogicalType>| {
             s.write_object_value(|s| write_stats(s, ty, &Stats::unknown()));
         };
@@ -386,6 +401,13 @@ fn write_segment(s: &mut BinarySerializer, segment: &SegmentOut, ty: Option<&Log
 
 /// `PersistentColumnData::Serialize`, without the object around it.
 fn write_column(s: &mut BinarySerializer, column: &ColumnOut, ty: Option<&LogicalType>, row_start: u64) {
+    // `GeometryPersistentColumnData`: stored as WKB, the default storage type
+    if ty.is_some_and(|ty| ty.id() == LogicalTypeId::Geometry) {
+        const GEOMETRY_EXTRA_DATA: u8 = 2;
+        s.write_object(99, "extra_data", |s| {
+            s.write_property(100, "type", &GEOMETRY_EXTRA_DATA)
+        });
+    }
     if !column.segments.is_empty() {
         let mut starts = Vec::with_capacity(column.segments.len());
         let mut start = row_start;
@@ -1498,8 +1520,12 @@ impl<'a> Writer<'a> {
         if ty.id() == LogicalTypeId::Variant {
             return self.write_variant(parts);
         }
-        if matches!(ty.id(), LogicalTypeId::Geometry) {
-            return Err(write_not_ported(&format!("a {} column", ty.id().name())));
+        // before v1.5.0, a GEOMETRY is stored as the spatial extension's blob (`GetSpatialGeometryType`)
+        if ty.id() == LogicalTypeId::Geometry && self.version < StorageVersion::V1_5_0 {
+            return Err(Error::not_implemented(format!(
+                "writing a GEOMETRY column to a database file of storage version {} is not yet ported to duckrs",
+                self.version.display_name(false)
+            )));
         }
         let rows = parts.iter().map(|part| part.count).sum();
         let mut valid = Vec::with_capacity(rows);
