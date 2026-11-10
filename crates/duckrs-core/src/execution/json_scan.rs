@@ -58,8 +58,9 @@ impl JsonScanData {
     }
 }
 
-/// A record of a file, or why it isn't one, by the byte where that shows.
-pub type Record = std::result::Result<Json, ParseError>;
+/// A record of a file and the bytes it is (the unit `read_json_objects` gives), or why it isn't
+/// one, by the byte where that shows.
+pub type Record = std::result::Result<(Json, std::ops::Range<usize>), ParseError>;
 
 fn is_space(c: u8) -> bool {
     matches!(c, b' ' | b'\t' | b'\n' | b'\r')
@@ -83,7 +84,7 @@ fn lines_of(data: &[u8]) -> Vec<Record> {
         let first = skip_space(&data[..end], start);
         if first < end {
             records.push(match parse_prefix(&data[..end], first) {
-                Ok((value, stop)) if skip_space(&data[..end], stop) == end => Ok(value),
+                Ok((value, stop)) if skip_space(&data[..end], stop) == end => Ok((value, first..stop)),
                 Ok((_, stop)) => Err(ParseError {
                     position: stop,
                     message: "unexpected content after document",
@@ -102,7 +103,7 @@ fn concatenated(data: &[u8]) -> Vec<Record> {
     while at < data.len() {
         match parse_prefix(data, at) {
             Ok((value, end)) => {
-                records.push(Ok(value));
+                records.push(Ok((value, at..end)));
                 at = skip_space(data, end);
                 // a comma between values is fine in C++'s unstructured format
                 if data.get(at) == Some(&b',') {
@@ -123,19 +124,80 @@ fn array_items(data: &[u8]) -> Vec<Record> {
     if start == data.len() {
         return Vec::new();
     }
-    match parse_prefix(data, start) {
-        Ok((Json::Array(items), end)) if skip_space(data, end) == data.len() => items.into_iter().map(Ok).collect(),
-        Ok(_) => vec![Err(ParseError {
+    let not_an_array = || {
+        vec![Err(ParseError {
             position: start,
             message: "expected top-level JSON array",
-        })],
-        Err(error) => vec![Err(error)],
+        })]
+    };
+    if data[start] != b'[' {
+        // what is there may not be JSON at all, which is the error then
+        return match parse_prefix(data, start) {
+            Err(error) => vec![Err(error)],
+            Ok(_) => not_an_array(),
+        };
     }
+    // each item on its own, for the bytes it is
+    let mut records = Vec::new();
+    let mut at = skip_space(data, start + 1);
+    loop {
+        match data.get(at) {
+            Some(b']') => break,
+            None => {
+                return vec![Err(ParseError {
+                    position: at,
+                    message: "unexpected end of data",
+                })];
+            }
+            _ => {}
+        }
+        let end = match parse_prefix(data, at) {
+            Ok((value, end)) => {
+                records.push(Ok((value, at..end)));
+                end
+            }
+            Err(error) => return vec![Err(error)],
+        };
+        at = skip_space(data, end);
+        match data.get(at) {
+            Some(b',') => at = skip_space(data, at + 1),
+            Some(b']') => break,
+            None => {
+                return vec![Err(ParseError {
+                    position: at,
+                    message: "unexpected end of data",
+                })];
+            }
+            _ => {
+                return vec![Err(ParseError {
+                    position: at,
+                    message: "unexpected character, expected a comma or a closing bracket",
+                })];
+            }
+        }
+    }
+    if skip_space(data, at + 1) != data.len() {
+        return not_an_array();
+    }
+    records
 }
 
 /// The records of a file, and the format they turned out to have.
 pub fn read_records(data: &[u8], format: JsonFormat) -> (Vec<Record>, JsonFormat) {
-    let data = data.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(data);
+    let bom = data.starts_with(&[0xef, 0xbb, 0xbf]);
+    let (mut records, format) = records_of(if bom { &data[3..] } else { data }, format);
+    if bom {
+        for record in &mut records {
+            match record {
+                Ok((_, span)) => *span = span.start + 3..span.end + 3,
+                Err(error) => error.position += 3,
+            }
+        }
+    }
+    (records, format)
+}
+
+fn records_of(data: &[u8], format: JsonFormat) -> (Vec<Record>, JsonFormat) {
     match format {
         JsonFormat::Array => (array_items(data), JsonFormat::Array),
         JsonFormat::NewlineDelimited => (lines_of(data), JsonFormat::NewlineDelimited),
@@ -277,6 +339,13 @@ fn string_fits(text: &str, ty: &LogicalType, formats: &Formats) -> bool {
     if let Some(format) = format {
         return strptime_micros(text, format).is_ok();
     }
+    // `DefaultTryCast(.., strict)`: a strict UUID is 32 digits and 4 hyphens (`BaseUUID::FromString`)
+    if ty.id() == duckrs_common::types::LogicalTypeId::Uuid {
+        let bytes = text.as_bytes();
+        if bytes.len() != 36 || [8, 13, 18, 23].iter().any(|&at| bytes[at] != b'-') {
+            return false;
+        }
+    }
     let parsing = Parsing {
         decimal_separator: b'.',
         ..Parsing::default()
@@ -309,9 +378,16 @@ pub struct JsonScanState {
     virtual_rows: crate::execution::multi_file::VirtualRows,
 }
 
-fn record_row(scan: &JsonScanData, record: &Json, formats: &Formats, strict: bool) -> Result<Option<Vec<Value>>> {
+fn record_row(
+    scan: &JsonScanData,
+    record: &Json,
+    text: &[u8],
+    formats: &Formats,
+    strict: bool,
+) -> Result<Option<Vec<Value>>> {
+    // `ReadJSONObjectsFunction`: the bytes of the record as they are
     if scan.objects {
-        return Value::varchar(record.text())
+        return Value::varchar(String::from_utf8_lossy(text).into_owned())
             .reinterpret(&json_type())
             .map(|v| Some(vec![v]));
     }
@@ -417,8 +493,9 @@ impl PhysicalOperator for PhysicalJsonScan {
             while rows.len() < STANDARD_VECTOR_SIZE {
                 match records.next() {
                     None => break,
-                    Some(Ok(record)) => {
-                        if let Some(row) = record_row(scan, &record, &formats, strict)? {
+                    Some(Ok((record, span))) => {
+                        let text = &state.data[span];
+                        if let Some(row) = record_row(scan, &record, text, &formats, strict)? {
                             rows.push(row);
                         }
                     }

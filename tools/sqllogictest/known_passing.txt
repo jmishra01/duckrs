@@ -2330,6 +2330,7 @@ test/sql/join/test_join_on_aggregates.test
 test/sql/join/test_nested_inequality.test
 test/sql/join/test_predicate_binding.test
 test/sql/join/test_string_payload.test
+test/sql/json/issues/internal_issue1035.test
 test/sql/json/issues/internal_issue2732.test
 test/sql/json/issues/internal_issue391.test
 test/sql/json/issues/internal_issue4014.test
@@ -2339,6 +2340,7 @@ test/sql/json/issues/internal_issue5288.test
 test/sql/json/issues/issue11804.test
 test/sql/json/issues/issue12861.test
 test/sql/json/issues/issue13212.test
+test/sql/json/issues/issue13725.test
 test/sql/json/issues/issue13948.test
 test/sql/json/issues/issue14167.test
 test/sql/json/issues/issue14245.test
@@ -2347,6 +2349,7 @@ test/sql/json/issues/issue15038.test
 test/sql/json/issues/issue15601.test
 test/sql/json/issues/issue16568.test
 test/sql/json/issues/issue16570.test
+test/sql/json/issues/issue16684.test
 test/sql/json/issues/issue16968.test
 test/sql/json/issues/issue17135.test
 test/sql/json/issues/issue19357.test
@@ -2369,7 +2372,9 @@ test/sql/json/scalar/test_json_deep_merge.test
 test/sql/json/scalar/test_json_exists.test
 test/sql/json/scalar/test_json_extract_input_types.test
 test/sql/json/scalar/test_json_geometry_crs.test
+test/sql/json/scalar/test_json_insert.test
 test/sql/json/scalar/test_json_keys.test
+test/sql/json/scalar/test_json_merge_deep_nesting.test
 test/sql/json/scalar/test_json_merge_patch.test
 test/sql/json/scalar/test_json_merge_patch_diff.test
 test/sql/json/scalar/test_json_normalize.test
@@ -2378,10 +2383,12 @@ test/sql/json/scalar/test_json_path_quoted_keys.test
 test/sql/json/scalar/test_json_pretty.test
 test/sql/json/scalar/test_json_remove.test
 test/sql/json/scalar/test_json_replace.test
+test/sql/json/scalar/test_json_set.test
 test/sql/json/scalar/test_json_strip_nulls.test
 test/sql/json/scalar/test_json_structure.test
 test/sql/json/scalar/test_json_structure_deep.test
 test/sql/json/scalar/test_json_structure_depth.test
+test/sql/json/scalar/test_json_structure_iterative.test
 test/sql/json/scalar/test_json_type.test
 test/sql/json/scalar/test_json_valid.test
 test/sql/json/scalar/test_json_value.test
@@ -2398,6 +2405,7 @@ test/sql/json/test_execute_serialized_reexecute.test
 test/sql/json/test_execute_serialized_rescan.test
 test/sql/json/test_json_bool.test
 test/sql/json/test_json_copy_dateformat_error.test
+test/sql/json/test_json_deserialize_depth.test
 test/sql/json/test_json_deserialize_grouping_sets.test
 test/sql/json/test_json_deserialize_invalid_statements.test
 test/sql/json/test_json_deserialize_invalid_types.test

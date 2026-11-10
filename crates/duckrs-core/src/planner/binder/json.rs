@@ -175,7 +175,7 @@ impl Binder<'_> {
                 let (found, _) = read_records(&data, format);
                 for record in found {
                     match record {
-                        Ok(record) => sampled.push(record),
+                        Ok((record, _)) => sampled.push(record),
                         Err(_) if ignore_errors => {}
                         Err(error) => return Err(record_error(path, &data, &error)),
                     }

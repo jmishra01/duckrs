@@ -363,13 +363,13 @@ fn expression_tree(expression: &g::ParsedExpression) -> Result<()> {
         K::ComparisonExpression(e) => {
             children.extend([&e.left, &e.right]);
             if !is_comparison(expression.type_) {
-                check_children(&children, &invalid)?;
+                present(&children, &invalid)?;
                 return Err(invalid(format!("invalid comparison type {}", type_name())));
             }
         }
         K::ConjunctionExpression(e) => {
             children.extend(&e.children);
-            check_children(&children, &invalid)?;
+            present(&children, &invalid)?;
             use enums::expression_type::{CONJUNCTION_AND, CONJUNCTION_OR};
             if expression.type_ != CONJUNCTION_AND && expression.type_ != CONJUNCTION_OR {
                 return Err(invalid(format!("invalid conjunction type {}", type_name())));
@@ -380,7 +380,7 @@ fn expression_tree(expression: &g::ParsedExpression) -> Result<()> {
         }
         K::OperatorExpression(e) => {
             children.extend(&e.children);
-            check_children(&children, &invalid)?;
+            present(&children, &invalid)?;
             if !is_valid_operator(expression.type_, e.children.len()) {
                 return Err(invalid(format!(
                     "invalid operator type {} for {} children",
@@ -400,7 +400,7 @@ fn expression_tree(expression: &g::ParsedExpression) -> Result<()> {
         }) => {
             children.extend(arguments.iter().map(|argument| &argument.expression));
             children.extend(legacy);
-            check_children(&children, &invalid)?;
+            present(&children, &invalid)?;
             optional(filter)?;
             match order_bys.as_deref() {
                 None => return Err(invalid("missing ORDER BY modifier".into())),
@@ -463,7 +463,7 @@ fn expression_tree(expression: &g::ParsedExpression) -> Result<()> {
             children.extend(arguments.iter().map(|argument| &argument.expression));
             children.extend(legacy);
             children.extend(partitions);
-            check_children(&children, &invalid)?;
+            present(&children, &invalid)?;
             for order in orders {
                 let Some(expression) = &order.expression else {
                     return Err(invalid("missing child expression".into()));
@@ -497,7 +497,6 @@ fn expression_tree(expression: &g::ParsedExpression) -> Result<()> {
             if needs_expression(*end) && end_expr.is_none() {
                 return Err(invalid("missing frame end expression".into()));
             }
-            return Ok(());
         }
         K::TypeExpression(e) => children.extend(&e.children),
         K::ConstantExpression(constant) => {
@@ -512,6 +511,14 @@ fn expression_tree(expression: &g::ParsedExpression) -> Result<()> {
         K::DefaultExpression(_) | K::ParameterExpression(_) | K::PositionalReferenceExpression(_) => {}
     }
     check_children(&children, &invalid)
+}
+
+/// That every child is there.
+fn present(children: &[&Child], invalid: &dyn Fn(String) -> Error) -> Result<()> {
+    if children.iter().any(|child| child.is_none()) {
+        return Err(invalid("missing child expression".into()));
+    }
+    Ok(())
 }
 
 /// That every child is there, and is valid itself.

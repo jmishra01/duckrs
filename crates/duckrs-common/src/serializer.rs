@@ -229,7 +229,7 @@ impl BinarySerializer {
         value.write_value(&mut s);
         let mut writer = s.json.take().expect("set above");
         match writer.stack.pop().map(|frame| frame.value) {
-            Some(Json::Array(mut items)) if !items.is_empty() => items.swap_remove(0),
+            Some(Json::Array(ref mut items)) if !items.is_empty() => items.swap_remove(0),
             _ => Json::Object(Vec::new()),
         }
     }
