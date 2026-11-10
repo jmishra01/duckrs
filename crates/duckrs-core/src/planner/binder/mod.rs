@@ -1018,3 +1018,16 @@ impl Binder<'_> {
         exprs.into_iter().map(|e| self.collate(e, &ty)).collect()
     }
 }
+
+impl Binder<'_> {
+    /// `storage_compatibility_version`: what serialized objects are written for.
+    pub(super) fn storage_compatibility(&self) -> duckrs_common::serializer::StorageVersion {
+        use duckrs_common::serializer::StorageVersion;
+        self.session
+            .as_ref()
+            .and_then(|session| (session.setting)("storage_compatibility_version").ok())
+            .and_then(|value| value.try_to_string().ok())
+            .and_then(|name| StorageVersion::from_name(&name))
+            .unwrap_or(StorageVersion::DEFAULT)
+    }
+}

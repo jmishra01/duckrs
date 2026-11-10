@@ -108,6 +108,8 @@ impl ErrorKind {
 pub struct Error {
     pub kind: ErrorKind,
     pub message: String,
+    /// The byte offset in the query that the error is at (the `position` extra info of C++).
+    pub position: Option<usize>,
 }
 
 impl Error {
@@ -115,7 +117,13 @@ impl Error {
         Self {
             kind,
             message: message.into(),
+            position: None,
         }
+    }
+
+    pub fn with_position(mut self, position: usize) -> Self {
+        self.position = Some(position);
+        self
     }
 
     pub fn not_implemented(message: impl Into<String>) -> Self {

@@ -1435,6 +1435,21 @@ impl Binder<'_> {
                         .collect::<Result<Vec<_>>>()?;
                     return crate::function::extras::bind_function(&function.name.name, &names, children);
                 }
+                if crate::function::json_serialize::is_serialize_function(&function.name.name) {
+                    let names: Vec<String> = function.args.iter().map(|a| a.name.clone()).collect();
+                    let children = function
+                        .args
+                        .iter()
+                        .map(|a| self.bind_expression(&a.expr))
+                        .collect::<Result<Vec<_>>>()?;
+                    let target = self.storage_compatibility();
+                    return crate::function::json_serialize::bind_function(
+                        &function.name.name,
+                        &names,
+                        children,
+                        target,
+                    );
+                }
                 if crate::function::json::is_json_function(&function.name.name) {
                     let children = function
                         .args

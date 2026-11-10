@@ -215,7 +215,11 @@ fn syntax_error(tokens: &[Token], position: usize) -> Error {
         Some(t) if t.token_type != TokenType::EndOfInput => format!("syntax error at or near \"{}\"", t.text),
         _ => "syntax error at end of input".to_string(),
     };
-    Error::new(ErrorKind::Parser, message)
+    let error = Error::new(ErrorKind::Parser, message);
+    match tokens.get(position) {
+        Some(token) => error.with_position(token.offset),
+        None => error,
+    }
 }
 
 #[cfg(test)]

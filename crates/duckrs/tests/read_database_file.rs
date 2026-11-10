@@ -188,8 +188,8 @@ fn stored_queries_render_as_in_duckdb() {
             "FROM base AS a NATURAL INNER JOIN other",
             "FROM (base AS a NATURAL INNER JOIN other)",
         ),
-        // a DOUBLE constant has no literal that reads back as one
-        (" 1000.0 AS e", " CAST('1000.0' AS DOUBLE) AS e"),
+        // the literal of a DOUBLE constant reads back as a DECIMAL (`LiteralOrCast` of the baseline)
+        (" 1000.0 AS e", " CAST(1000.0 AS DOUBLE) AS e"),
     ];
     let bytes = std::fs::read_to_string(fixture("views_sql.expected")).unwrap();
     let expected: Vec<String> = bytes

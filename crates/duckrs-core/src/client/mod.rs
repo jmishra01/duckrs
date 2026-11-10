@@ -2396,6 +2396,24 @@ impl ClientContext {
                     };
                     return self.import_database(&path);
                 }
+                // `ExecuteJsonSerializedSqlPragmaFunction`: the statement of the document, run
+                if lower == "json_execute_serialized_sql"
+                    && let [serialized] = parameters.as_slice()
+                {
+                    let value = match &serialized.kind {
+                        duckrs_parser::ast::ExprKind::Constant(literal)
+                            if literal.kind == duckrs_parser::ast::LiteralKind::Null =>
+                        {
+                            duckrs_common::value::Value::null(LogicalType::VARCHAR)
+                        }
+                        duckrs_parser::ast::ExprKind::Constant(literal) => {
+                            duckrs_common::value::Value::varchar(literal.text.clone())
+                        }
+                        _ => duckrs_common::value::Value::varchar(serialized.to_string()),
+                    };
+                    let select = crate::function::json_serialize::execute_serialized_statement(&value, true)?;
+                    return self.execute_statement(&Statement::Select(select));
+                }
                 if parameters.is_empty() && lower.ends_with("_checkpoint_on_shutdown") {
                     let enable = lower == "enable_checkpoint_on_shutdown";
                     self.db.checkpoint_on_shutdown.store(enable, AtomicOrdering::SeqCst);

@@ -4,10 +4,14 @@
 //! The classes that are marked `custom_implementation` in the specs, as they read fields of older
 //! versions that the specs don't list.
 
-use super::generated::enums::lambda_syntax_type;
+use super::generated::enums::{lambda_syntax_type, window_boundary, window_exclude_mode};
 use super::generated::{FunctionArgument, OrderByNode, ParsedExpression, ResultModifier};
 use duckrs_common::Result;
-use duckrs_common::serializer::{BinaryDeserializer, BinarySerializer, Deserialize, Serialize, StorageVersion};
+use duckrs_common::serializer::{BinaryDeserializer, BinarySerializer, Deserialize, Enum, Serialize, StorageVersion};
+
+type Syntax = Enum<lambda_syntax_type::Names>;
+type Boundary = Enum<window_boundary::Names>;
+type Exclude = Enum<window_exclude_mode::Names>;
 use duckrs_common::types::LogicalType;
 
 type Child = Option<Box<ParsedExpression>>;
@@ -73,8 +77,8 @@ impl LambdaExpression {
         let lhs = d.read_property_with_default(200, "lhs")?;
         let expr = d.read_property_with_default(201, "expr")?;
         let mut syntax_type = d
-            .read_optional_property(202, "syntax_type")?
-            .unwrap_or(lambda_syntax_type::SINGLE_ARROW_STORAGE);
+            .read_optional_property::<Syntax>(202, "syntax_type")?
+            .map_or(lambda_syntax_type::SINGLE_ARROW_STORAGE, |e| e.0);
         if syntax_type == lambda_syntax_type::SINGLE_ARROW && d.is_from_before_v2() {
             syntax_type = lambda_syntax_type::SINGLE_ARROW_STORAGE;
         }
@@ -85,7 +89,7 @@ impl LambdaExpression {
         s.write_property_with_default(200, "lhs", &self.lhs);
         s.write_property_with_default(201, "expr", &self.expr);
         if self.syntax_type != lambda_syntax_type::SINGLE_ARROW_STORAGE {
-            s.write_property(202, "syntax_type", &self.syntax_type);
+            s.write_property(202, "syntax_type", &Syntax::new(self.syntax_type));
         }
     }
 }
@@ -178,15 +182,15 @@ impl WindowExpression {
             children: d.read_property_with_default(203, "children")?,
             partitions: d.read_property_with_default(204, "partitions")?,
             orders: d.read_property_with_default(205, "orders")?,
-            start: d.read_property(206, "start")?,
-            end: d.read_property(207, "end")?,
+            start: d.read_property::<Boundary>(206, "start")?.0,
+            end: d.read_property::<Boundary>(207, "end")?.0,
             start_expr: d.read_property_with_default(208, "start_expr")?,
             end_expr: d.read_property_with_default(209, "end_expr")?,
             offset_expr: d.read_property_with_default(210, "offset_expr")?,
             default_expr: d.read_property_with_default(211, "default_expr")?,
             ignore_nulls: d.read_property_with_default(212, "ignore_nulls")?,
             filter_expr: d.read_property_with_default(213, "filter_expr")?,
-            exclude_clause: d.read_optional_property(214, "exclude_clause")?,
+            exclude_clause: d.read_optional_property::<Exclude>(214, "exclude_clause")?.map(|e| e.0),
             distinct: d.read_property_with_default(215, "distinct")?,
             arg_orders: d.read_property_with_default(216, "arg_orders")?,
             has_ignore_nulls: d.read_property_with_default(217, "has_ignore_nulls")?,
@@ -207,8 +211,8 @@ impl WindowExpression {
         }
         s.write_property_with_default(204, "partitions", &self.partitions);
         s.write_property_with_default(205, "orders", &self.orders);
-        s.write_property(206, "start", &self.start);
-        s.write_property(207, "end", &self.end);
+        s.write_property(206, "start", &Boundary::new(self.start));
+        s.write_property(207, "end", &Boundary::new(self.end));
         s.write_property_with_default(208, "start_expr", &self.start_expr);
         s.write_property_with_default(209, "end_expr", &self.end_expr);
         // `SerializedOffset` and `SerializedDefault`: lead and lag have them apart before v2.0.0
@@ -225,7 +229,7 @@ impl WindowExpression {
         s.write_property_with_default(212, "ignore_nulls", &self.ignore_nulls);
         s.write_property_with_default(213, "filter_expr", &self.filter_expr);
         if let Some(exclude) = &self.exclude_clause {
-            s.write_property(214, "exclude_clause", exclude);
+            s.write_property(214, "exclude_clause", &Exclude::new(*exclude));
         }
         s.write_property_with_default(215, "distinct", &self.distinct);
         s.write_property_with_default(216, "arg_orders", &self.arg_orders);

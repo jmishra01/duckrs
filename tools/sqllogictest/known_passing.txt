@@ -451,6 +451,7 @@ test/optimizer/cte_statistics_propagation.test
 test/optimizer/disjunctive_join_rewriter_nested.test
 test/optimizer/distributivity_rule.test
 test/optimizer/estimated_cardinalities_are_in_logical_plan.test
+test/optimizer/expression_rewriter/functions_that_error_are_not_reordered.test
 test/optimizer/expression_rewriter/ordered_aggregate_incorrectly_remove_order.test
 test/optimizer/filter_pushdown/like_prefix_boundary.test
 test/optimizer/grouping_expression_simplification.test
@@ -511,6 +512,7 @@ test/optimizer/pullup_join_expression_errors.test
 test/optimizer/pushdown/distinct_from_pushdown.test
 test/optimizer/pushdown/filter_cannot_pushdown.test
 test/optimizer/pushdown/filters_on_limit_optimizer.test
+test/optimizer/pushdown/issue_16104.test
 test/optimizer/pushdown/issue_16863.test
 test/optimizer/pushdown/issue_18202.test
 test/optimizer/pushdown/join_filter_pushdown_sample.test
@@ -573,6 +575,7 @@ test/parquet/corrupt/list_short_output.test
 test/parquet/corrupt/rle_truncated_literal_run.test
 test/parquet/corrupted_bitwidth.test
 test/parquet/dbp_small_decimal.test
+test/parquet/dictionary_boolean_selection.test
 test/parquet/dictionary_multipage_filter_pushdown.test
 test/parquet/dlba_utf8_boundaries.test
 test/parquet/gzip_footer_oob.test
@@ -1752,6 +1755,7 @@ test/sql/filter/dense_integral_selection.test
 test/sql/filter/disjunctive_compressed_filter.test
 test/sql/filter/filter_cache.test
 test/sql/filter/filter_cache_dictionary.test
+test/sql/filter/null_selection.test
 test/sql/filter/test_alias_filter.test
 test/sql/filter/test_constant_comparisons.test
 test/sql/filter/test_dynamic_filter_nullable.test
@@ -1799,6 +1803,7 @@ test/sql/function/generic/assert_true.test
 test/sql/function/generic/can_cast_implicitly.test
 test/sql/function/generic/case_condition.test
 test/sql/function/generic/case_null_fill.test
+test/sql/function/generic/case_short_circuit.test
 test/sql/function/generic/case_varchar.test
 test/sql/function/generic/case_when_comparison.test
 test/sql/function/generic/case_when_list.test
@@ -2344,7 +2349,9 @@ test/sql/json/issues/issue16568.test
 test/sql/json/issues/issue16570.test
 test/sql/json/issues/issue16968.test
 test/sql/json/issues/issue17135.test
+test/sql/json/issues/issue19357.test
 test/sql/json/issues/issue19366.test
+test/sql/json/issues/issue22764.test
 test/sql/json/issues/issue23114.test
 test/sql/json/issues/issue25415.test
 test/sql/json/issues/issue27414.test
@@ -2383,12 +2390,27 @@ test/sql/json/table/json_table_in_out_fullkey_quoting.test
 test/sql/json/table/json_table_in_out_threads.test
 test/sql/json/table/read_json_root_bignum.test
 test/sql/json/table/test_json_nested_struct_projection_pushdown.test
+test/sql/json/test_deserialize_at_clause.test
+test/sql/json/test_deserialize_function_validation.test
+test/sql/json/test_deserialize_window_frame.test
+test/sql/json/test_execute_serialized_prepared.test
+test/sql/json/test_execute_serialized_reexecute.test
+test/sql/json/test_execute_serialized_rescan.test
 test/sql/json/test_json_bool.test
 test/sql/json/test_json_copy_dateformat_error.test
+test/sql/json/test_json_deserialize_grouping_sets.test
+test/sql/json/test_json_deserialize_invalid_statements.test
+test/sql/json/test_json_deserialize_invalid_types.test
+test/sql/json/test_json_deserialize_missing_refs.test
+test/sql/json/test_json_deserialize_pointer.test
 test/sql/json/test_json_export.test
 test/sql/json/test_json_macros.test
 test/sql/json/test_json_persistence.test
+test/sql/json/test_json_serialize_sql.test
 test/sql/json/test_json_sqlite.test
+test/sql/json/test_serialized_decimal_no_type_info.test
+test/sql/json/test_serialized_sample_options.test
+test/sql/json/test_serialized_value_out_of_range.test
 test/sql/keywords/escaped_quotes_expressions.test
 test/sql/keywords/keywords_in_expressions.test
 test/sql/limit/limit_exceeds_child_cardinality.test
@@ -2805,6 +2827,7 @@ test/sql/sql_export/compressed_materialization_sql_export.test
 test/sql/sql_export/copy_empty_filename_pattern.test
 test/sql/sql_export/correlated_sql_export.test
 test/sql/sql_export/cte_names.test
+test/sql/sql_export/execution_once.test
 test/sql/sql_export/explain_sql_scopes.test
 test/sql/sql_export/grouped_mark_roundtrip.test
 test/sql/sql_export/grouped_tuple_mark_roundtrip.test

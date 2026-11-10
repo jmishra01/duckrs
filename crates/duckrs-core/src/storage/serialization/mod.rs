@@ -8,6 +8,7 @@ pub mod convert;
 pub mod custom;
 pub mod generated;
 pub mod to_stored;
+pub mod verify;
 
 use super::block_manager::corrupt;
 use duckrs_common::serializer::{BinaryDeserializer, Deserialize};
@@ -28,4 +29,24 @@ pub(crate) fn read_type_expression(d: &mut BinaryDeserializer<'_>) -> Result<Str
 /// A value that selects a subclass and that the format doesn't have.
 fn unknown(class: &str, value: u64) -> Error {
     corrupt(format!("unknown {class} type {value}"))
+}
+
+/// `ColumnDataRef::Deserialize`: what is wrong with one, which has its collection or not.
+pub(crate) fn column_data_ref(d: &mut BinaryDeserializer<'_>) -> Result<Error> {
+    let missing = || {
+        Error::new(
+            duckrs_common::ErrorKind::Serialization,
+            "ColumnDataRef is missing its collection",
+        )
+    };
+    if !d.has_named_property(202, "collection")? {
+        return Ok(missing());
+    }
+    if d.is_json() {
+        d.set_tag("collection");
+        if !d.begin_nullable()? {
+            return Ok(missing());
+        }
+    }
+    Ok(not_ported("column data references"))
 }
