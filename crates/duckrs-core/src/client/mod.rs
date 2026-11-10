@@ -167,6 +167,28 @@ impl DatabaseInstance {
         Self::open_with(path, &options)
     }
 
+    /// `open_file`, writing a new file in the storage version `version` (`storage_compatibility`
+    /// of the config the database starts with, as `StorageCompatibility::FromString` reads it).
+    pub fn open_file_with_version(path: &Path, read_only: bool, version: &str) -> Result<Arc<Self>> {
+        let Some(known) = StorageVersion::from_name(version) else {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "The version string '{version}' is not a known DuckDB version, valid options are: {}",
+                    StorageVersion::candidates().join(", ")
+                ),
+            ));
+        };
+        let options = AttachOptions {
+            read_only,
+            block_size: None,
+            row_group_size: None,
+            storage_version: Some((version.to_string(), known)),
+            settings: None,
+        };
+        Self::open_with(path, &options)
+    }
+
     /// `open_file` with what `ATTACH` can ask for.
     pub fn open_with(path: &Path, options: &AttachOptions) -> Result<Arc<Self>> {
         crate::function::json::register_projjson_parser();
@@ -361,10 +383,19 @@ impl DatabaseInstance {
         let vacuum_tasks = vacuum_tasks
             .and_then(|value| value.as_i128())
             .map_or(100, |tasks| tasks as usize);
+        let bitpacking_mode = settings::current_value(
+            "debug_force_bitpacking_mode",
+            &self.settings.read(),
+            &SettingValues::default(),
+        );
+        let bitpacking_mode = bitpacking_mode
+            .and_then(|value| value.try_to_string().ok())
+            .unwrap_or_default();
         let options = storage::writer::CheckpointOptions {
             storage_version: file.storage_version,
             keep_free_blocks: self.catalog.has_forks(),
             force_compression: &force,
+            bitpacking_mode: &bitpacking_mode,
             row_group_size: file.row_group_size,
             vacuum_tasks: if self.catalog.has_forks() { 0 } else { vacuum_tasks },
             abort,

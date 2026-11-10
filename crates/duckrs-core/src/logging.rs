@@ -1262,6 +1262,16 @@ fn file_system_message(path: &str, op: &str, bytes: Option<(i64, u64)>) -> Strin
     }
 }
 
+/// `DUCKDB_LOG_TRACE` with the database's logger (`Logger::Get(db)`), of the default log type: for
+/// what the storage layer logs while the statement of this thread runs.
+pub fn log_database_trace(message: &str) {
+    let Some(target) = current_file_logger() else {
+        return;
+    };
+    let mut manager = target.manager.lock().expect("not poisoned");
+    let _ = manager.write_global("", LogLevel::Trace, message, false);
+}
+
 /// `DUCKDB_LOG_FILE_SYSTEM`: logs `op` on the file `path` with the logger of the statement, or
 /// the database's (`FileHandle::TryAddLogger`). Errors of logging do not fail the file access.
 pub fn log_file_system(path: &str, op: &str, bytes: Option<(i64, u64)>) {

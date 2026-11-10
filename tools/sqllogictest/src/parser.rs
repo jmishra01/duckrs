@@ -145,6 +145,8 @@ pub enum Record {
         location: Location,
         path: Option<String>,
         read_only: bool,
+        /// the storage version a new database file is written in
+        version: Option<String>,
     },
     Restart,
     Reconnect,
@@ -689,6 +691,7 @@ impl FileParser {
                     location,
                     path: params.first().cloned(),
                     read_only,
+                    version: params.get(2).cloned(),
                 });
             }
             Token::Restart => self.push(Record::Restart),

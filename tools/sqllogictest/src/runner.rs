@@ -590,6 +590,8 @@ struct FileRunner<'a> {
     db: Option<Box<dyn Database>>,
     db_path: Option<PathBuf>,
     read_only: bool,
+    /// the storage version of `load ... <version>`
+    storage_version: Option<String>,
     con: Option<Box<dyn Connection>>,
     named: HashMap<String, Box<dyn Connection>>,
 }
@@ -599,7 +601,9 @@ impl<'a> FileRunner<'a> {
         self.named.clear();
         self.con = None;
         self.db = None;
-        let db = self.engine.open(self.db_path.as_deref(), self.read_only)?;
+        let db =
+            self.engine
+                .open_with_version(self.db_path.as_deref(), self.read_only, self.storage_version.as_deref())?;
         self.con = Some(db.connect()?);
         self.db = Some(db);
         Ok(())
@@ -796,6 +800,7 @@ impl<'a> FileRunner<'a> {
                 location,
                 path,
                 read_only,
+                version,
             } => {
                 let path = path
                     .as_ref()
@@ -805,6 +810,8 @@ impl<'a> FileRunner<'a> {
                 }
                 self.db_path = path;
                 self.read_only = *read_only;
+                // `LoadCommand`: a load without a version goes back to the default
+                self.storage_version = version.clone();
                 match self.open() {
                     Ok(()) => Flow::Next,
                     Err(e) => self
@@ -1172,6 +1179,7 @@ pub fn run_file(config: &RunConfig, engine: &dyn Engine, name: &str, file_index:
         db: None,
         db_path: None,
         read_only: false,
+        storage_version: None,
         con: None,
         named: HashMap::new(),
     };

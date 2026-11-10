@@ -47,6 +47,18 @@ pub trait Engine: Send + Sync {
 
     /// Opens a database; `None` means in-memory.
     fn open(&self, path: Option<&Path>, read_only: bool) -> Result<Box<dyn Database>, String>;
+
+    /// [`Engine::open`], with the storage version a new file is written in (`load <path> readwrite
+    /// <version>`). Engines that can't choose it open the database as usual.
+    fn open_with_version(
+        &self,
+        path: Option<&Path>,
+        read_only: bool,
+        version: Option<&str>,
+    ) -> Result<Box<dyn Database>, String> {
+        let _ = version;
+        self.open(path, read_only)
+    }
 }
 
 pub trait Database: Send + Sync {
@@ -78,6 +90,21 @@ impl Engine for DuckrsEngine {
             None => duckrs::Database::open_in_memory(),
         };
         Ok(Box::new(DuckrsDatabase(db.map_err(|e| e.to_string())?)))
+    }
+
+    fn open_with_version(
+        &self,
+        path: Option<&Path>,
+        read_only: bool,
+        version: Option<&str>,
+    ) -> Result<Box<dyn Database>, String> {
+        match (path, version) {
+            (Some(path), Some(version)) => {
+                let db = duckrs::Database::open_with_storage_version(path, read_only, version);
+                Ok(Box::new(DuckrsDatabase(db.map_err(|e| e.to_string())?)))
+            }
+            _ => self.open(path, read_only),
+        }
     }
 }
 

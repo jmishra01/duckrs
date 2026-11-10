@@ -1,6 +1,7 @@
 //! The storage engine: DuckDB's `src/storage`, in step with its file format (see Phase 9 in
 //! `docs/ARCHITECTURE.md`). For now it reads database files, into memory.
 
+pub mod bitpacking;
 pub mod block_manager;
 pub mod buffer_manager;
 pub mod checkpoint;
