@@ -17,6 +17,7 @@ pub mod generic;
 pub(crate) mod geometry;
 pub(crate) mod holistic;
 pub mod json;
+pub mod json_serialize;
 mod lists;
 pub(crate) mod math;
 pub mod nested;

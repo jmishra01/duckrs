@@ -10,6 +10,7 @@ mod fmt_float;
 pub mod geometry;
 pub mod geometry_crs;
 pub mod hash;
+pub mod json;
 pub mod path;
 pub mod row;
 pub mod serializer;

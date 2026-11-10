@@ -763,6 +763,26 @@ fn execute_sequence(
 
 /// `ExpressionExecutor::Select`: the rows of `input` for which a BOOLEAN expression is true.
 pub fn select(expr: &BoundExpr, input: &DataChunk) -> Result<(SelectionVector, usize)> {
+    // `SelectAnd`: each conjunct sees only the rows the ones before it kept, so that one that
+    // fails on the others (`json_exists(j, ..) AND json_deserialize_sql(j) ..`) does not
+    if let BoundExprKind::Conjunction { and: true, children } = &expr.kind
+        && children.len() > 1
+    {
+        let mut remaining: Vec<u32> = (0..input.len() as u32).collect();
+        for child in children {
+            if remaining.is_empty() {
+                break;
+            }
+            let rows = slice_rows(input, &remaining);
+            let (selected, count) = select(child, &rows)?;
+            if count == remaining.len() {
+                continue;
+            }
+            remaining = (0..count).map(|i| remaining[selected.get(i)]).collect();
+        }
+        let count = remaining.len();
+        return Ok((SelectionVector::from_vec(remaining), count));
+    }
     let result = execute(expr, input)?;
     Ok(executor::select::<bool>(&result, input.len(), |b| b))
 }

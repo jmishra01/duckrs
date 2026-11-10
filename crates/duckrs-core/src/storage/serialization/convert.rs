@@ -114,9 +114,7 @@ fn value_literal(value: &Value) -> Result<Option<Literal>> {
     let text = value.try_to_string()?;
     Ok(match id {
         LogicalTypeId::Boolean => Some(Literal::boolean(text == "true")),
-        LogicalTypeId::Integer | LogicalTypeId::BigInt | LogicalTypeId::HugeInt | LogicalTypeId::Decimal => {
-            Some(Literal::number(text))
-        }
+        LogicalTypeId::Integer | LogicalTypeId::Decimal => Some(Literal::number(text)),
         LogicalTypeId::Varchar => Some(Literal::string(text)),
         _ => None,
     })
@@ -129,12 +127,54 @@ fn constant(value: Value) -> Result<Expr> {
         return Ok(Expr::constant(literal));
     }
     let ty = value.logical_type().clone();
-    let text = if value.is_null() {
-        Literal::null()
-    } else {
-        Literal::string(value.try_to_string()?)
+    if value.is_null() {
+        return Ok(Expr::cast(Expr::constant(Literal::null()), CastType::Resolved(ty)));
+    }
+    // `ConstantExpression::FromValue`: a number is a literal, cast when it would not read back as
+    // the value (`LiteralOrCast`); an infinite one is a number too big for any
+    let number = match value.data() {
+        duckrs_common::value::ValueData::Double(x) if x.is_infinite() => {
+            Some(if *x < 0.0 { "-1e1000" } else { "1e1000" }.to_string())
+        }
+        duckrs_common::value::ValueData::Float(x) if x.is_infinite() => {
+            Some(if *x < 0.0 { "-1e1000" } else { "1e1000" }.to_string())
+        }
+        duckrs_common::value::ValueData::Double(x) if x.is_nan() || (*x == 0.0 && x.is_sign_negative()) => None,
+        duckrs_common::value::ValueData::Float(x) if x.is_nan() || (*x == 0.0 && x.is_sign_negative()) => None,
+        _ if matches!(
+            ty.id(),
+            LogicalTypeId::TinyInt
+                | LogicalTypeId::SmallInt
+                | LogicalTypeId::BigInt
+                | LogicalTypeId::HugeInt
+                | LogicalTypeId::UTinyInt
+                | LogicalTypeId::USmallInt
+                | LogicalTypeId::UInteger
+                | LogicalTypeId::UBigInt
+                | LogicalTypeId::UHugeInt
+                | LogicalTypeId::Float
+                | LogicalTypeId::Double
+        ) =>
+        {
+            Some(value.try_to_string()?)
+        }
+        _ => None,
     };
-    Ok(Expr::cast(Expr::constant(text), CastType::Resolved(ty)))
+    if let Some(text) = number {
+        let literal = Literal::number(text);
+        // `RoundTrips`: the literal binds to this very value
+        let round_trips = crate::planner::binder::literal_value(&literal)
+            .is_ok_and(|bound| bound.logical_type() == &ty && bound == value);
+        if round_trips {
+            return Ok(Expr::constant(literal));
+        }
+        return Ok(Expr::cast(Expr::constant(literal), CastType::Resolved(ty)));
+    }
+    // `StringCast`: the text of the value, cast
+    Ok(Expr::cast(
+        Expr::constant(Literal::string(value.try_to_string()?)),
+        CastType::Resolved(ty),
+    ))
 }
 
 /// `Identifier`s of a STAR's EXCLUDE and RENAME lists.
@@ -521,7 +561,10 @@ fn select_node(stored: g::SelectNode) -> Result<ast::SelectNode> {
     };
     let count = groups.group_expressions.len();
     if groups.grouping_sets.iter().flatten().any(|&index| index >= count) {
-        return Err(corrupt("a grouping set refers to a group that does not exist"));
+        return Err(duckrs_common::Error::new(
+            duckrs_common::ErrorKind::Serialization,
+            "Grouping set refers to a group that does not exist",
+        ));
     }
     Ok(ast::SelectNode {
         select_list: expressions(stored.select_list)?,

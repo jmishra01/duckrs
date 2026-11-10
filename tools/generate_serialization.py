@@ -80,6 +80,26 @@ ENUMS = [
     "WindowExcludeMode",
 ]
 
+# `EnumUtil`'s names of members that differ from them (`overrides` of generate_enum_util.py): the
+# first is the one written, all of them are read.
+ENUM_STRINGS = {
+    "JoinType": {"OUTER": ["FULL"]},
+    "OrderType": {
+        "ORDER_DEFAULT": ["ORDER_DEFAULT", "DEFAULT"],
+        "DESCENDING": ["DESCENDING", "DESC"],
+        "ASCENDING": ["ASCENDING", "ASC"],
+    },
+    "OrderByNullType": {
+        "ORDER_DEFAULT": ["ORDER_DEFAULT", "DEFAULT"],
+        "NULLS_FIRST": ["NULLS FIRST", "NULLS_FIRST"],
+        "NULLS_LAST": ["NULLS LAST", "NULLS_LAST"],
+    },
+    "SampleMethod": {"SYSTEM_SAMPLE": ["System"], "BERNOULLI_SAMPLE": ["Bernoulli"], "RESERVOIR_SAMPLE": ["Reservoir"]},
+    "TableReferenceType": {"EMPTY_FROM": ["EMPTY"]},
+    "TriggerTiming": {"INSTEAD_OF": ["INSTEAD OF"]},
+    "TriggerEventType": {"INSERT_EVENT": ["INSERT"], "DELETE_EVENT": ["DELETE"], "UPDATE_EVENT": ["UPDATE"]},
+}
+
 KEYWORDS = {
     "as",
     "box",
@@ -201,6 +221,21 @@ class Generator:
         # everything else is an enum, which is a number in a binary file
         return "u64"
 
+    def enum_of(self, member):
+        """The C++ enum of a member that is one, which JSON writes by name."""
+        if member.get("base"):
+            return None
+        ty = member["type"].replace("duckdb::", "").strip()
+        name, args = template(ty)
+        if args is not None or ty.endswith("*") or self.rust_type(ty) != "u64" or name in NUMBERS:
+            return None
+        self.enums_used.add(name)
+        return name
+
+    def enum_wrapper(self, member, expression=False):
+        separator = "::" if expression else ""
+        return f"Enum{separator}<enums::{snake(self.enum_of(member))}::Names>"
+
     def visit(self, name):
         """Queues a class to generate."""
         if name not in self.seen and name not in CUSTOM:
@@ -255,6 +290,25 @@ class Generator:
     def field_read(self, member):
         ty = self.member_type(member)
         field, tag = member["id"], member["name"]
+        if ty.startswith("Vec<(") and member.get("status") != "deleted":
+            name = self.field_name(member)
+            wrapper = "Map" + ty[len("Vec<("):-len(")>")].join(["<", ">"])
+            if self.has_natural_default(member):
+                return f'        let {name} = d.read_property_with_default::<{wrapper}>({field}, "{tag}")?.0;\n'
+            return f'        let {name} = d.read_property::<{wrapper}>({field}, "{tag}")?.0;\n'
+        if self.enum_of(member):
+            wrapper = self.enum_wrapper(member)
+            name = self.field_name(member)
+            if member.get("status") == "deleted" and self.kept_for_old_versions(member):
+                return f'        let {name} = d.read_optional_property::<{wrapper}>({field}, "{tag}")?.map(|e| e.0);\n'
+            if member.get("status") == "deleted":
+                return f'        d.read_deleted_property::<{wrapper}>({field}, "{tag}")?;\n'
+            if self.is_option(member):
+                return f'        let {name} = d.read_optional_property::<{wrapper}>({field}, "{tag}")?.map(|e| e.0);\n'
+            if self.has_natural_default(member):
+                return f'        let {name} = d.read_property_with_default::<{wrapper}>({field}, "{tag}")?.0;\n'
+            return f'        let {name} = d.read_property::<{wrapper}>({field}, "{tag}")?.0;\n'
+
         if member.get("status") == "deleted" and self.kept_for_old_versions(member):
             name = self.field_name(member)
             return f'        let {name} = d.read_optional_property::<{ty}>({field}, "{tag}")?;\n'
@@ -276,6 +330,18 @@ class Generator:
     def plain_write(self, member):
         name = self.field_name(member)
         field, tag = member["id"], member["name"]
+        if self.member_type(member).startswith("Vec<(") and not self.is_option(member) and member.get("status") != "deleted":
+            if self.has_natural_default(member):
+                return f's.write_property_with_default({field}, "{tag}", &MapRef(&self.{name}));'
+            return f's.write_property({field}, "{tag}", &MapRef(&self.{name}));'
+        if self.enum_of(member):
+            wrapper = self.enum_wrapper(member, True)
+            if self.is_option(member) or (member.get("status") == "deleted"):
+                return f's.write_optional_property({field}, "{tag}", self.{name}.map({wrapper}::new).as_ref());'
+            if self.has_natural_default(member):
+                return f's.write_property_with_default({field}, "{tag}", &{wrapper}::new(self.{name}));'
+            return f's.write_property({field}, "{tag}", &{wrapper}::new(self.{name}));'
+
         if self.is_option(member) or (member.get("status") == "deleted"):
             return f's.write_optional_property({field}, "{tag}", self.{name}.as_ref());'
         if self.has_natural_default(member):
@@ -295,10 +361,11 @@ class Generator:
         if "required_until" in member:
             name = self.field_name(member)
             field, tag = member["id"], member["name"]
-            if self.is_option(member):
-                required = f's.write_property({field}, "{tag}", &self.{name}.clone().unwrap_or_default());'
+            value = f"self.{name}.clone().unwrap_or_default()" if self.is_option(member) else f"self.{name}"
+            if self.enum_of(member):
+                required = f's.write_property({field}, "{tag}", &{self.enum_wrapper(member, True)}::new({value}));'
             else:
-                required = f's.write_property({field}, "{tag}", &self.{name});'
+                required = f's.write_property({field}, "{tag}", &{value});'
             until = self.version_const(member["required_until"])
             return f'        if s.should_serialize({until}) {{ {code} }} else {{ {required} }}\n'
         if conditional and status in ("deleted", "read_only"):
@@ -349,6 +416,10 @@ class Generator:
             sub_name = sub["class"]
             values = sub["enum"] if isinstance(sub["enum"], list) else [sub["enum"]]
             patterns = " | ".join(f"enums::{module}::{value}" for value in values)
+            if sub_name == "ColumnDataRef":
+                # `ColumnDataRef::Deserialize`: a statement can have one only with its collection
+                arms += f"            {patterns} => return Err(super::column_data_ref(d)?),\n"
+                continue
             if sub_name in NOT_PORTED:
                 arms += f'            {patterns} => return Err(not_ported("{NOT_PORTED[sub_name]}")),\n'
                 continue
@@ -423,6 +494,16 @@ class Generator:
             enums += f"    pub mod {snake(name)} {{\n"
             for member, value in values[name]:
                 enums += f"        pub const {member}: u64 = {value};\n"
+            names = ", ".join(
+                f'("{text}", {value})'
+                for member, value in values[name]
+                for text in ENUM_STRINGS.get(name, {}).get(member, [member])
+            )
+            enums += "        pub struct Names;\n"
+            enums += "        impl duckrs_common::serializer::EnumNames for Names {\n"
+            enums += f'            const NAME: &\'static str = "{name}";\n'
+            enums += f"            const NAMES: &'static [(&'static str, u64)] = &[{names}];\n"
+            enums += "        }\n"
             enums += "    }\n"
         enums += "}\n\n"
         return HEADER + enums + body
@@ -437,7 +518,7 @@ HEADER = """\
 use super::custom::{CastExpression, FunctionExpression, LambdaExpression, QualifiedName, WindowExpression};
 use super::{not_ported, unknown};
 use duckrs_common::Result;
-use duckrs_common::serializer::{BinaryDeserializer, BinarySerializer, Deserialize, Serialize, StorageVersion};
+use duckrs_common::serializer::{BinaryDeserializer, BinarySerializer, Deserialize, Enum, Map, MapRef, Serialize, StorageVersion};
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
 

@@ -244,6 +244,18 @@ impl Binder<'_> {
                 }
                 format!("SELECT unnest([{}]::VARCHAR[]) AS file", files.join(", "))
             }
+            // `ExecuteSqlTableFunction::Bind`: the statement of the document, run as a subquery
+            "json_execute_serialized_sql" => {
+                let [serialized] = args.as_slice() else {
+                    return Err(binder_error(format!(
+                        "No function matches the given name and argument types 'json_execute_serialized_sql({})'",
+                        args.iter().map(|_| "?").collect::<Vec<_>>().join(", ")
+                    )));
+                };
+                let value = self.constant_argument(&serialized.expr)?;
+                let select = crate::function::json_serialize::execute_serialized_statement(&value, false)?;
+                return self.bind_rewritten(&select, table_ref, &name).map(Some);
+            }
             "test_all_types" => return self.bind_test_all_types(&args, table_ref).map(Some),
             "test_vector_types" => return self.bind_test_vector_types(&args, table_ref).map(Some),
             _ => return Ok(None),

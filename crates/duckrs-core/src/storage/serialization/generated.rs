@@ -6,7 +6,9 @@
 use super::custom::{CastExpression, FunctionExpression, LambdaExpression, QualifiedName, WindowExpression};
 use super::{not_ported, unknown};
 use duckrs_common::Result;
-use duckrs_common::serializer::{BinaryDeserializer, BinarySerializer, Deserialize, Serialize, StorageVersion};
+use duckrs_common::serializer::{
+    BinaryDeserializer, BinarySerializer, Deserialize, Enum, Map, MapRef, Serialize, StorageVersion,
+};
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
 
@@ -15,11 +17,29 @@ pub mod enums {
         pub const STANDARD_HANDLING: u64 = 0;
         pub const NO_AGGREGATES_ALLOWED: u64 = 1;
         pub const FORCE_AGGREGATES: u64 = 2;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "AggregateHandling";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("STANDARD_HANDLING", 0),
+                ("NO_AGGREGATES_ALLOWED", 1),
+                ("FORCE_AGGREGATES", 2),
+            ];
+        }
     }
     pub mod cte_materialize {
         pub const CTE_MATERIALIZE_DEFAULT: u64 = 1;
         pub const CTE_MATERIALIZE_ALWAYS: u64 = 2;
         pub const CTE_MATERIALIZE_NEVER: u64 = 3;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "CTEMaterialize";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("CTE_MATERIALIZE_DEFAULT", 1),
+                ("CTE_MATERIALIZE_ALWAYS", 2),
+                ("CTE_MATERIALIZE_NEVER", 3),
+            ];
+        }
     }
     pub mod catalog_type {
         pub const INVALID: u64 = 0;
@@ -48,11 +68,90 @@ pub mod enums {
         pub const SECRET_TYPE_ENTRY: u64 = 72;
         pub const SECRET_FUNCTION_ENTRY: u64 = 73;
         pub const DEPENDENCY_ENTRY: u64 = 100;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "CatalogType";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("INVALID", 0),
+                ("TABLE_ENTRY", 1),
+                ("SCHEMA_ENTRY", 2),
+                ("VIEW_ENTRY", 3),
+                ("INDEX_ENTRY", 4),
+                ("PREPARED_STATEMENT", 5),
+                ("SEQUENCE_ENTRY", 6),
+                ("COLLATION_ENTRY", 7),
+                ("TYPE_ENTRY", 8),
+                ("DATABASE_ENTRY", 9),
+                ("COORDINATE_SYSTEM_ENTRY", 10),
+                ("TRIGGER_ENTRY", 11),
+                ("TABLE_FUNCTION_ENTRY", 25),
+                ("SCALAR_FUNCTION_ENTRY", 26),
+                ("AGGREGATE_FUNCTION_ENTRY", 27),
+                ("PRAGMA_FUNCTION_ENTRY", 28),
+                ("COPY_FUNCTION_ENTRY", 29),
+                ("MACRO_ENTRY", 30),
+                ("TABLE_MACRO_ENTRY", 31),
+                ("WINDOW_FUNCTION_ENTRY", 32),
+                ("DELETED_ENTRY", 51),
+                ("RENAMED_ENTRY", 52),
+                ("SECRET_ENTRY", 71),
+                ("SECRET_TYPE_ENTRY", 72),
+                ("SECRET_FUNCTION_ENTRY", 73),
+                ("DEPENDENCY_ENTRY", 100),
+            ];
+        }
+    }
+    pub mod compression_type {
+        pub const COMPRESSION_AUTO: u64 = 0;
+        pub const COMPRESSION_UNCOMPRESSED: u64 = 1;
+        pub const COMPRESSION_CONSTANT: u64 = 2;
+        pub const COMPRESSION_RLE: u64 = 3;
+        pub const COMPRESSION_DICTIONARY: u64 = 4;
+        pub const COMPRESSION_PFOR_DELTA: u64 = 5;
+        pub const COMPRESSION_BITPACKING: u64 = 6;
+        pub const COMPRESSION_FSST: u64 = 7;
+        pub const COMPRESSION_CHIMP: u64 = 8;
+        pub const COMPRESSION_PATAS: u64 = 9;
+        pub const COMPRESSION_ALP: u64 = 10;
+        pub const COMPRESSION_ALPRD: u64 = 11;
+        pub const COMPRESSION_ZSTD: u64 = 12;
+        pub const COMPRESSION_ROARING: u64 = 13;
+        pub const COMPRESSION_EMPTY: u64 = 14;
+        pub const COMPRESSION_DICT_FSST: u64 = 15;
+        pub const ENUM_SIZE: u64 = 16;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "CompressionType";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("COMPRESSION_AUTO", 0),
+                ("COMPRESSION_UNCOMPRESSED", 1),
+                ("COMPRESSION_CONSTANT", 2),
+                ("COMPRESSION_RLE", 3),
+                ("COMPRESSION_DICTIONARY", 4),
+                ("COMPRESSION_PFOR_DELTA", 5),
+                ("COMPRESSION_BITPACKING", 6),
+                ("COMPRESSION_FSST", 7),
+                ("COMPRESSION_CHIMP", 8),
+                ("COMPRESSION_PATAS", 9),
+                ("COMPRESSION_ALP", 10),
+                ("COMPRESSION_ALPRD", 11),
+                ("COMPRESSION_ZSTD", 12),
+                ("COMPRESSION_ROARING", 13),
+                ("COMPRESSION_EMPTY", 14),
+                ("COMPRESSION_DICT_FSST", 15),
+                ("ENUM_SIZE", 16),
+            ];
+        }
     }
     pub mod constraint_check_mode {
         pub const DEFAULT: u64 = 0;
         pub const IMMEDIATE: u64 = 1;
         pub const DEFERRED: u64 = 2;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "ConstraintCheckMode";
+            const NAMES: &'static [(&'static str, u64)] = &[("DEFAULT", 0), ("IMMEDIATE", 1), ("DEFERRED", 2)];
+        }
     }
     pub mod constraint_type {
         pub const INVALID: u64 = 0;
@@ -60,6 +159,27 @@ pub mod enums {
         pub const CHECK: u64 = 2;
         pub const UNIQUE: u64 = 3;
         pub const FOREIGN_KEY: u64 = 4;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "ConstraintType";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("INVALID", 0),
+                ("NOT_NULL", 1),
+                ("CHECK", 2),
+                ("UNIQUE", 3),
+                ("FOREIGN_KEY", 4),
+            ];
+        }
+    }
+    pub mod deprecated_index_type {
+        pub const INVALID: u64 = 0;
+        pub const ART: u64 = 1;
+        pub const EXTENSION: u64 = 100;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "DeprecatedIndexType";
+            const NAMES: &'static [(&'static str, u64)] = &[("INVALID", 0), ("ART", 1), ("EXTENSION", 100)];
+        }
     }
     pub mod expression_class {
         pub const INVALID: u64 = 0;
@@ -103,6 +223,53 @@ pub mod enums {
         pub const BOUND_LAMBDA: u64 = 41;
         pub const BOUND_LAMBDA_REF: u64 = 42;
         pub const BOUND_EXPANDED: u64 = 51;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "ExpressionClass";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("INVALID", 0),
+                ("AGGREGATE", 1),
+                ("CASE", 2),
+                ("CAST", 3),
+                ("COLUMN_REF", 4),
+                ("COMPARISON", 5),
+                ("CONJUNCTION", 6),
+                ("CONSTANT", 7),
+                ("DEFAULT", 8),
+                ("FUNCTION", 9),
+                ("OPERATOR", 10),
+                ("STAR", 11),
+                ("SUBQUERY", 13),
+                ("WINDOW", 14),
+                ("PARAMETER", 15),
+                ("COLLATE", 16),
+                ("LAMBDA", 17),
+                ("POSITIONAL_REFERENCE", 18),
+                ("BETWEEN", 19),
+                ("LAMBDA_REF", 20),
+                ("TYPE", 21),
+                ("PATTERN", 22),
+                ("BOUND_AGGREGATE", 25),
+                ("BOUND_CASE", 26),
+                ("LEGACY_BOUND_CAST", 27),
+                ("BOUND_COLUMN_REF", 28),
+                ("LEGACY_BOUND_COMPARISON", 29),
+                ("BOUND_CONJUNCTION", 30),
+                ("BOUND_CONSTANT", 31),
+                ("BOUND_DEFAULT", 32),
+                ("BOUND_FUNCTION", 33),
+                ("BOUND_OPERATOR", 34),
+                ("BOUND_PARAMETER", 35),
+                ("BOUND_REF", 36),
+                ("BOUND_SUBQUERY", 37),
+                ("BOUND_WINDOW", 38),
+                ("LEGACY_BOUND_BETWEEN", 39),
+                ("BOUND_UNNEST", 40),
+                ("BOUND_LAMBDA", 41),
+                ("BOUND_LAMBDA_REF", 42),
+                ("BOUND_EXPANDED", 51),
+            ];
+        }
     }
     pub mod expression_type {
         pub const INVALID: u64 = 0;
@@ -186,17 +353,127 @@ pub mod enums {
         pub const POSITIONAL_REFERENCE: u64 = 232;
         pub const BOUND_LAMBDA_REF: u64 = 233;
         pub const BOUND_EXPANDED: u64 = 234;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "ExpressionType";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("INVALID", 0),
+                ("OPERATOR_CAST", 12),
+                ("OPERATOR_NOT", 13),
+                ("OPERATOR_IS_NULL", 14),
+                ("OPERATOR_IS_NOT_NULL", 15),
+                ("OPERATOR_UNPACK", 16),
+                ("COMPARE_EQUAL", 25),
+                ("COMPARE_BOUNDARY_START", 25),
+                ("COMPARE_NOTEQUAL", 26),
+                ("COMPARE_LESSTHAN", 27),
+                ("COMPARE_GREATERTHAN", 28),
+                ("COMPARE_LESSTHANOREQUALTO", 29),
+                ("COMPARE_GREATERTHANOREQUALTO", 30),
+                ("COMPARE_IN", 35),
+                ("COMPARE_NOT_IN", 36),
+                ("COMPARE_DISTINCT_FROM", 37),
+                ("COMPARE_BETWEEN", 38),
+                ("COMPARE_NOT_BETWEEN", 39),
+                ("COMPARE_NOT_DISTINCT_FROM", 40),
+                ("COMPARE_BOUNDARY_END", 40),
+                ("CONJUNCTION_AND", 50),
+                ("CONJUNCTION_OR", 51),
+                ("VALUE_CONSTANT", 75),
+                ("VALUE_PARAMETER", 76),
+                ("VALUE_TUPLE", 77),
+                ("VALUE_TUPLE_ADDRESS", 78),
+                ("VALUE_NULL", 79),
+                ("VALUE_VECTOR", 80),
+                ("VALUE_SCALAR", 81),
+                ("VALUE_DEFAULT", 82),
+                ("AGGREGATE", 100),
+                ("BOUND_AGGREGATE", 101),
+                ("GROUPING_FUNCTION", 102),
+                ("WINDOW_AGGREGATE", 110),
+                ("WINDOW_FUNCTION", 111),
+                ("WINDOW_RANK", 120),
+                ("WINDOW_RANK_DENSE", 121),
+                ("WINDOW_NTILE", 122),
+                ("WINDOW_PERCENT_RANK", 123),
+                ("WINDOW_CUME_DIST", 124),
+                ("WINDOW_ROW_NUMBER", 125),
+                ("WINDOW_FIRST_VALUE", 130),
+                ("WINDOW_LAST_VALUE", 131),
+                ("WINDOW_LEAD", 132),
+                ("WINDOW_LAG", 133),
+                ("WINDOW_NTH_VALUE", 134),
+                ("WINDOW_FILL", 135),
+                ("FUNCTION", 140),
+                ("BOUND_FUNCTION", 141),
+                ("CASE_EXPR", 150),
+                ("OPERATOR_NULLIF", 151),
+                ("OPERATOR_COALESCE", 152),
+                ("ARRAY_EXTRACT", 153),
+                ("ARRAY_SLICE", 154),
+                ("STRUCT_EXTRACT", 155),
+                ("ARRAY_CONSTRUCTOR", 156),
+                ("ARROW", 157),
+                ("OPERATOR_TRY", 158),
+                ("OPERATOR_HAS_ERROR", 159),
+                ("SUBQUERY", 175),
+                ("STAR", 200),
+                ("QUANTIFIER", 210),
+                ("CONCATENATION", 211),
+                ("ALTERNATION", 212),
+                ("ANCHOR", 213),
+                ("TABLE_STAR", 201),
+                ("PLACEHOLDER", 202),
+                ("COLUMN_REF", 203),
+                ("FUNCTION_REF", 204),
+                ("TABLE_REF", 205),
+                ("LAMBDA_REF", 206),
+                ("TYPE", 207),
+                ("CAST", 225),
+                ("BOUND_REF", 227),
+                ("BOUND_COLUMN_REF", 228),
+                ("BOUND_UNNEST", 229),
+                ("COLLATE", 230),
+                ("LAMBDA", 231),
+                ("POSITIONAL_REFERENCE", 232),
+                ("BOUND_LAMBDA_REF", 233),
+                ("BOUND_EXPANDED", 234),
+            ];
+        }
     }
     pub mod foreign_key_type {
         pub const FK_TYPE_PRIMARY_KEY_TABLE: u64 = 0;
         pub const FK_TYPE_FOREIGN_KEY_TABLE: u64 = 1;
         pub const FK_TYPE_SELF_REFERENCE_TABLE: u64 = 2;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "ForeignKeyType";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("FK_TYPE_PRIMARY_KEY_TABLE", 0),
+                ("FK_TYPE_FOREIGN_KEY_TABLE", 1),
+                ("FK_TYPE_SELF_REFERENCE_TABLE", 2),
+            ];
+        }
     }
     pub mod index_constraint_type {
         pub const NONE: u64 = 0;
         pub const UNIQUE: u64 = 1;
         pub const PRIMARY: u64 = 2;
         pub const FOREIGN: u64 = 3;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "IndexConstraintType";
+            const NAMES: &'static [(&'static str, u64)] = &[("NONE", 0), ("UNIQUE", 1), ("PRIMARY", 2), ("FOREIGN", 3)];
+        }
+    }
+    pub mod insert_column_order {
+        pub const INSERT_BY_POSITION: u64 = 0;
+        pub const INSERT_BY_NAME: u64 = 1;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "InsertColumnOrder";
+            const NAMES: &'static [(&'static str, u64)] = &[("INSERT_BY_POSITION", 0), ("INSERT_BY_NAME", 1)];
+        }
     }
     pub mod join_ref_type {
         pub const REGULAR: u64 = 0;
@@ -206,6 +483,19 @@ pub mod enums {
         pub const ASOF: u64 = 4;
         pub const DEPENDENT: u64 = 5;
         pub const NEAREST: u64 = 6;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "JoinRefType";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("REGULAR", 0),
+                ("NATURAL", 1),
+                ("CROSS", 2),
+                ("POSITIONAL", 3),
+                ("ASOF", 4),
+                ("DEPENDENT", 5),
+                ("NEAREST", 6),
+            ];
+        }
     }
     pub mod join_type {
         pub const INVALID: u64 = 0;
@@ -219,15 +509,43 @@ pub mod enums {
         pub const SINGLE: u64 = 8;
         pub const RIGHT_SEMI: u64 = 9;
         pub const RIGHT_ANTI: u64 = 10;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "JoinType";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("INVALID", 0),
+                ("LEFT", 1),
+                ("RIGHT", 2),
+                ("INNER", 3),
+                ("FULL", 4),
+                ("SEMI", 5),
+                ("ANTI", 6),
+                ("MARK", 7),
+                ("SINGLE", 8),
+                ("RIGHT_SEMI", 9),
+                ("RIGHT_ANTI", 10),
+            ];
+        }
     }
     pub mod lambda_syntax_type {
         pub const SINGLE_ARROW_STORAGE: u64 = 0;
         pub const SINGLE_ARROW: u64 = 1;
         pub const LAMBDA_KEYWORD: u64 = 2;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "LambdaSyntaxType";
+            const NAMES: &'static [(&'static str, u64)] =
+                &[("SINGLE_ARROW_STORAGE", 0), ("SINGLE_ARROW", 1), ("LAMBDA_KEYWORD", 2)];
+        }
     }
     pub mod limit_value_type {
         pub const ROW_COUNT: u64 = 0;
         pub const PERCENTAGE: u64 = 1;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "LimitValueType";
+            const NAMES: &'static [(&'static str, u64)] = &[("ROW_COUNT", 0), ("PERCENTAGE", 1)];
+        }
     }
     pub mod literal_kind {
         pub const INVALID: u64 = 0;
@@ -239,33 +557,106 @@ pub mod enums {
         pub const HEX: u64 = 6;
         pub const BIT: u64 = 7;
         pub const POINTER: u64 = 8;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "LiteralKind";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("INVALID", 0),
+                ("NULL_LITERAL", 1),
+                ("BOOLEAN", 2),
+                ("INTEGER", 3),
+                ("NUMERIC", 4),
+                ("STRING", 5),
+                ("HEX", 6),
+                ("BIT", 7),
+                ("POINTER", 8),
+            ];
+        }
     }
     pub mod macro_type {
         pub const VOID_MACRO: u64 = 0;
         pub const TABLE_MACRO: u64 = 1;
         pub const SCALAR_MACRO: u64 = 2;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "MacroType";
+            const NAMES: &'static [(&'static str, u64)] = &[("VOID_MACRO", 0), ("TABLE_MACRO", 1), ("SCALAR_MACRO", 2)];
+        }
+    }
+    pub mod on_conflict_action {
+        pub const THROW: u64 = 0;
+        pub const NOTHING: u64 = 1;
+        pub const UPDATE: u64 = 2;
+        pub const REPLACE: u64 = 3;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "OnConflictAction";
+            const NAMES: &'static [(&'static str, u64)] =
+                &[("THROW", 0), ("NOTHING", 1), ("UPDATE", 2), ("REPLACE", 3)];
+        }
     }
     pub mod on_create_conflict {
         pub const ERROR_ON_CONFLICT: u64 = 0;
         pub const IGNORE_ON_CONFLICT: u64 = 1;
         pub const REPLACE_ON_CONFLICT: u64 = 2;
         pub const ALTER_ON_CONFLICT: u64 = 3;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "OnCreateConflict";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("ERROR_ON_CONFLICT", 0),
+                ("IGNORE_ON_CONFLICT", 1),
+                ("REPLACE_ON_CONFLICT", 2),
+                ("ALTER_ON_CONFLICT", 3),
+            ];
+        }
     }
     pub mod order_by_null_type {
         pub const INVALID: u64 = 0;
         pub const ORDER_DEFAULT: u64 = 1;
         pub const NULLS_FIRST: u64 = 2;
         pub const NULLS_LAST: u64 = 3;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "OrderByNullType";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("INVALID", 0),
+                ("ORDER_DEFAULT", 1),
+                ("DEFAULT", 1),
+                ("NULLS FIRST", 2),
+                ("NULLS_FIRST", 2),
+                ("NULLS LAST", 3),
+                ("NULLS_LAST", 3),
+            ];
+        }
     }
     pub mod order_type {
         pub const INVALID: u64 = 0;
         pub const ORDER_DEFAULT: u64 = 1;
         pub const ASCENDING: u64 = 2;
         pub const DESCENDING: u64 = 3;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "OrderType";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("INVALID", 0),
+                ("ORDER_DEFAULT", 1),
+                ("DEFAULT", 1),
+                ("ASCENDING", 2),
+                ("ASC", 2),
+                ("DESCENDING", 3),
+                ("DESC", 3),
+            ];
+        }
     }
     pub mod ordinality_type {
         pub const WITHOUT_ORDINALITY: u64 = 0;
         pub const WITH_ORDINALITY: u64 = 1;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "OrdinalityType";
+            const NAMES: &'static [(&'static str, u64)] = &[("WITHOUT_ORDINALITY", 0), ("WITH_ORDINALITY", 1)];
+        }
     }
     pub mod query_node_type {
         pub const SELECT_NODE: u64 = 1;
@@ -279,18 +670,51 @@ pub mod enums {
         pub const INSERT_QUERY_NODE: u64 = 9;
         pub const MERGE_QUERY_NODE: u64 = 10;
         pub const COPY_QUERY_NODE: u64 = 11;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "QueryNodeType";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("SELECT_NODE", 1),
+                ("SET_OPERATION_NODE", 2),
+                ("BOUND_SUBQUERY_NODE", 3),
+                ("RECURSIVE_CTE_NODE", 4),
+                ("CTE_NODE", 5),
+                ("STATEMENT_NODE", 6),
+                ("UPDATE_QUERY_NODE", 7),
+                ("DELETE_QUERY_NODE", 8),
+                ("INSERT_QUERY_NODE", 9),
+                ("MERGE_QUERY_NODE", 10),
+                ("COPY_QUERY_NODE", 11),
+            ];
+        }
     }
     pub mod result_modifier_type {
         pub const LIMIT_MODIFIER: u64 = 1;
         pub const ORDER_MODIFIER: u64 = 2;
         pub const DISTINCT_MODIFIER: u64 = 3;
         pub const LEGACY_LIMIT_PERCENT_MODIFIER: u64 = 4;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "ResultModifierType";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("LIMIT_MODIFIER", 1),
+                ("ORDER_MODIFIER", 2),
+                ("DISTINCT_MODIFIER", 3),
+                ("LEGACY_LIMIT_PERCENT_MODIFIER", 4),
+            ];
+        }
     }
     pub mod sample_method {
         pub const SYSTEM_SAMPLE: u64 = 0;
         pub const BERNOULLI_SAMPLE: u64 = 1;
         pub const RESERVOIR_SAMPLE: u64 = 2;
         pub const INVALID: u64 = 255;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "SampleMethod";
+            const NAMES: &'static [(&'static str, u64)] =
+                &[("System", 0), ("Bernoulli", 1), ("Reservoir", 2), ("INVALID", 255)];
+        }
     }
     pub mod set_operation_type {
         pub const NONE: u64 = 0;
@@ -298,6 +722,17 @@ pub mod enums {
         pub const EXCEPT: u64 = 2;
         pub const INTERSECT: u64 = 3;
         pub const UNION_BY_NAME: u64 = 4;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "SetOperationType";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("NONE", 0),
+                ("UNION", 1),
+                ("EXCEPT", 2),
+                ("INTERSECT", 3),
+                ("UNION_BY_NAME", 4),
+            ];
+        }
     }
     pub mod subquery_type {
         pub const INVALID: u64 = 0;
@@ -305,10 +740,26 @@ pub mod enums {
         pub const EXISTS: u64 = 2;
         pub const NOT_EXISTS: u64 = 3;
         pub const ANY: u64 = 4;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "SubqueryType";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("INVALID", 0),
+                ("SCALAR", 1),
+                ("EXISTS", 2),
+                ("NOT_EXISTS", 3),
+                ("ANY", 4),
+            ];
+        }
     }
     pub mod table_column_type {
         pub const STANDARD: u64 = 0;
         pub const GENERATED: u64 = 1;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "TableColumnType";
+            const NAMES: &'static [(&'static str, u64)] = &[("STANDARD", 0), ("GENERATED", 1)];
+        }
     }
     pub mod table_reference_type {
         pub const INVALID: u64 = 0;
@@ -325,6 +776,55 @@ pub mod enums {
         pub const DELIM_GET: u64 = 12;
         pub const BOUND_TABLE_REF: u64 = 13;
         pub const MATCH_RECOGNIZE: u64 = 14;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "TableReferenceType";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("INVALID", 0),
+                ("BASE_TABLE", 1),
+                ("SUBQUERY", 2),
+                ("JOIN", 3),
+                ("TABLE_FUNCTION", 5),
+                ("EXPRESSION_LIST", 6),
+                ("CTE", 7),
+                ("EMPTY", 8),
+                ("PIVOT", 9),
+                ("SHOW_REF", 10),
+                ("COLUMN_DATA", 11),
+                ("DELIM_GET", 12),
+                ("BOUND_TABLE_REF", 13),
+                ("MATCH_RECOGNIZE", 14),
+            ];
+        }
+    }
+    pub mod trigger_event_type {
+        pub const INSERT_EVENT: u64 = 0;
+        pub const DELETE_EVENT: u64 = 1;
+        pub const UPDATE_EVENT: u64 = 2;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "TriggerEventType";
+            const NAMES: &'static [(&'static str, u64)] = &[("INSERT", 0), ("DELETE", 1), ("UPDATE", 2)];
+        }
+    }
+    pub mod trigger_for_each {
+        pub const STATEMENT: u64 = 0;
+        pub const ROW: u64 = 1;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "TriggerForEach";
+            const NAMES: &'static [(&'static str, u64)] = &[("STATEMENT", 0), ("ROW", 1)];
+        }
+    }
+    pub mod trigger_timing {
+        pub const BEFORE: u64 = 0;
+        pub const AFTER: u64 = 1;
+        pub const INSTEAD_OF: u64 = 2;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "TriggerTiming";
+            const NAMES: &'static [(&'static str, u64)] = &[("BEFORE", 0), ("AFTER", 1), ("INSTEAD OF", 2)];
+        }
     }
     pub mod vector_type {
         pub const FLAT_VECTOR: u64 = 0;
@@ -333,6 +833,27 @@ pub mod enums {
         pub const DICTIONARY_VECTOR: u64 = 3;
         pub const SEQUENCE_VECTOR: u64 = 4;
         pub const SHREDDED_VECTOR: u64 = 5;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "VectorType";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("FLAT_VECTOR", 0),
+                ("FSST_VECTOR", 1),
+                ("CONSTANT_VECTOR", 2),
+                ("DICTIONARY_VECTOR", 3),
+                ("SEQUENCE_VECTOR", 4),
+                ("SHREDDED_VECTOR", 5),
+            ];
+        }
+    }
+    pub mod view_security_type {
+        pub const REGULAR_VIEW: u64 = 0;
+        pub const SECURE_VIEW: u64 = 1;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "ViewSecurityType";
+            const NAMES: &'static [(&'static str, u64)] = &[("REGULAR_VIEW", 0), ("SECURE_VIEW", 1)];
+        }
     }
     pub mod wal_type {
         pub const INVALID: u64 = 0;
@@ -364,6 +885,41 @@ pub mod enums {
         pub const WAL_VERSION: u64 = 98;
         pub const CHECKPOINT: u64 = 99;
         pub const WAL_FLUSH: u64 = 100;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "WALType";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("INVALID", 0),
+                ("CREATE_TABLE", 1),
+                ("DROP_TABLE", 2),
+                ("CREATE_SCHEMA", 3),
+                ("DROP_SCHEMA", 4),
+                ("CREATE_VIEW", 5),
+                ("DROP_VIEW", 6),
+                ("CREATE_SEQUENCE", 8),
+                ("DROP_SEQUENCE", 9),
+                ("SEQUENCE_VALUE", 10),
+                ("CREATE_MACRO", 11),
+                ("DROP_MACRO", 12),
+                ("CREATE_TYPE", 13),
+                ("DROP_TYPE", 14),
+                ("ALTER_INFO", 20),
+                ("CREATE_TABLE_MACRO", 21),
+                ("DROP_TABLE_MACRO", 22),
+                ("CREATE_INDEX", 23),
+                ("DROP_INDEX", 24),
+                ("USE_TABLE", 25),
+                ("INSERT_TUPLE", 26),
+                ("DELETE_TUPLE", 27),
+                ("UPDATE_TUPLE", 28),
+                ("ROW_GROUP_DATA", 29),
+                ("CREATE_TRIGGER", 30),
+                ("DROP_TRIGGER", 31),
+                ("WAL_VERSION", 98),
+                ("CHECKPOINT", 99),
+                ("WAL_FLUSH", 100),
+            ];
+        }
     }
     pub mod window_boundary {
         pub const INVALID: u64 = 0;
@@ -378,12 +934,36 @@ pub mod enums {
         pub const CURRENT_ROW_GROUPS: u64 = 9;
         pub const EXPR_PRECEDING_GROUPS: u64 = 10;
         pub const EXPR_FOLLOWING_GROUPS: u64 = 11;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "WindowBoundary";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("INVALID", 0),
+                ("UNBOUNDED_PRECEDING", 1),
+                ("UNBOUNDED_FOLLOWING", 2),
+                ("CURRENT_ROW_RANGE", 3),
+                ("CURRENT_ROW_ROWS", 4),
+                ("EXPR_PRECEDING_ROWS", 5),
+                ("EXPR_FOLLOWING_ROWS", 6),
+                ("EXPR_PRECEDING_RANGE", 7),
+                ("EXPR_FOLLOWING_RANGE", 8),
+                ("CURRENT_ROW_GROUPS", 9),
+                ("EXPR_PRECEDING_GROUPS", 10),
+                ("EXPR_FOLLOWING_GROUPS", 11),
+            ];
+        }
     }
     pub mod window_exclude_mode {
         pub const NO_OTHER: u64 = 0;
         pub const CURRENT_ROW: u64 = 1;
         pub const GROUP: u64 = 2;
         pub const TIES: u64 = 3;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "WindowExcludeMode";
+            const NAMES: &'static [(&'static str, u64)] =
+                &[("NO_OTHER", 0), ("CURRENT_ROW", 1), ("GROUP", 2), ("TIES", 3)];
+        }
     }
 }
 
@@ -418,15 +998,17 @@ pub enum CreateInfoKind {
 
 impl CreateInfo {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let type_ = d.read_property::<u64>(100, "type")?;
+        let type_ = d.read_property::<Enum<enums::catalog_type::Names>>(100, "type")?.0;
         let catalog = d.read_property_with_default::<String>(101, "catalog")?;
         let schema = d.read_property_with_default::<String>(102, "schema")?;
         let temporary = d.read_property_with_default::<bool>(103, "temporary")?;
         let internal = d.read_property_with_default::<bool>(104, "internal")?;
-        let on_conflict = d.read_property::<u64>(105, "on_conflict")?;
+        let on_conflict = d
+            .read_property::<Enum<enums::on_create_conflict::Names>>(105, "on_conflict")?
+            .0;
         let sql = d.read_property_with_default::<String>(106, "sql")?;
         let comment = d.read_optional_property::<Value>(107, "comment")?;
-        let tags = d.read_property_with_default::<Vec<(String, String)>>(108, "tags")?;
+        let tags = d.read_property_with_default::<Map<String, String>>(108, "tags")?.0;
         let dependencies = d.read_optional_property::<LogicalDependencyList>(109, "dependencies")?;
         let extension_name = d.read_property_with_default::<String>(110, "extension_name")?;
         let qualified_name = d.read_optional_property::<QualifiedName>(111, "qualified_name")?;
@@ -465,7 +1047,7 @@ impl CreateInfo {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property(100, "type", &self.type_);
+        s.write_property(100, "type", &Enum::<enums::catalog_type::Names>::new(self.type_));
         if !s.should_serialize(StorageVersion::V2_0_0) {
             s.write_property_with_default(101, "catalog", &self.catalog);
         }
@@ -474,10 +1056,14 @@ impl CreateInfo {
         }
         s.write_property_with_default(103, "temporary", &self.temporary);
         s.write_property_with_default(104, "internal", &self.internal);
-        s.write_property(105, "on_conflict", &self.on_conflict);
+        s.write_property(
+            105,
+            "on_conflict",
+            &Enum::<enums::on_create_conflict::Names>::new(self.on_conflict),
+        );
         s.write_property_with_default(106, "sql", &self.sql);
         s.write_optional_property(107, "comment", self.comment.as_ref());
-        s.write_property_with_default(108, "tags", &self.tags);
+        s.write_property_with_default(108, "tags", &MapRef(&self.tags));
         if s.should_serialize(StorageVersion::V0_10_3) {
             s.write_optional_property(109, "dependencies", self.dependencies.as_ref());
         }
@@ -554,7 +1140,7 @@ impl IndexStorageInfo {
         let name = d.read_property_with_default::<String>(100, "name")?;
         let root = d.read_property_with_default::<u64>(101, "root")?;
         let allocator_infos = d.read_property_with_default::<Vec<FixedSizeAllocatorInfo>>(102, "allocator_infos")?;
-        let options = d.read_property_with_default::<Vec<(String, Value)>>(103, "options")?;
+        let options = d.read_property_with_default::<Map<String, Value>>(103, "options")?.0;
         Ok(Self {
             name,
             root,
@@ -567,7 +1153,7 @@ impl IndexStorageInfo {
         s.write_property_with_default(100, "name", &self.name);
         s.write_property_with_default(101, "root", &self.root);
         s.write_property_with_default(102, "allocator_infos", &self.allocator_infos);
-        s.write_property_with_default(103, "options", &self.options);
+        s.write_property_with_default(103, "options", &MapRef(&self.options));
     }
 }
 
@@ -1391,14 +1977,16 @@ impl CreateIndexInfo {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         let name = d.read_property_with_default::<String>(200, "name")?;
         let table = d.read_property_with_default::<String>(201, "table")?;
-        d.read_deleted_property::<u64>(202, "index_type")?;
-        let constraint_type = d.read_property::<u64>(203, "constraint_type")?;
+        d.read_deleted_property::<Enum<enums::deprecated_index_type::Names>>(202, "index_type")?;
+        let constraint_type = d
+            .read_property::<Enum<enums::index_constraint_type::Names>>(203, "constraint_type")?
+            .0;
         let parsed_expressions =
             d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(204, "parsed_expressions")?;
         let scan_types = d.read_property_with_default::<Vec<LogicalType>>(205, "scan_types")?;
         let names = d.read_property_with_default::<Vec<String>>(206, "names")?;
         let column_ids = d.read_property_with_default::<Vec<u64>>(207, "column_ids")?;
-        let options = d.read_property_with_default::<Vec<(String, Value)>>(208, "options")?;
+        let options = d.read_property_with_default::<Map<String, Value>>(208, "options")?.0;
         let index_type_name = d.read_property_with_default::<String>(209, "index_type_name")?;
         Ok(Self {
             name,
@@ -1416,12 +2004,16 @@ impl CreateIndexInfo {
     pub fn write_members(&self, s: &mut BinarySerializer) {
         s.write_property_with_default(200, "name", &self.name);
         s.write_property_with_default(201, "table", &self.table);
-        s.write_property(203, "constraint_type", &self.constraint_type);
+        s.write_property(
+            203,
+            "constraint_type",
+            &Enum::<enums::index_constraint_type::Names>::new(self.constraint_type),
+        );
         s.write_property_with_default(204, "parsed_expressions", &self.parsed_expressions);
         s.write_property_with_default(205, "scan_types", &self.scan_types);
         s.write_property_with_default(206, "names", &self.names);
         s.write_property_with_default(207, "column_ids", &self.column_ids);
-        s.write_property_with_default(208, "options", &self.options);
+        s.write_property_with_default(208, "options", &MapRef(&self.options));
         s.write_property_with_default(209, "index_type_name", &self.index_type_name);
     }
 }
@@ -1446,7 +2038,9 @@ impl CreateTableInfo {
         let partition_keys =
             d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(204, "partition_keys")?;
         let sort_keys = d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(205, "sort_keys")?;
-        let options = d.read_property_with_default::<Vec<(String, Option<Box<ParsedExpression>>)>>(206, "options")?;
+        let options = d
+            .read_property_with_default::<Map<String, Option<Box<ParsedExpression>>>>(206, "options")?
+            .0;
         Ok(Self {
             table,
             columns,
@@ -1465,7 +2059,7 @@ impl CreateTableInfo {
         s.write_property_with_default(203, "query", &self.query);
         s.write_property_with_default(204, "partition_keys", &self.partition_keys);
         s.write_property_with_default(205, "sort_keys", &self.sort_keys);
-        s.write_property_with_default(206, "options", &self.options);
+        s.write_property_with_default(206, "options", &MapRef(&self.options));
     }
 }
 
@@ -1476,12 +2070,14 @@ pub struct CreateSchemaInfo {
 
 impl CreateSchemaInfo {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let options = d.read_property_with_default::<Vec<(String, Option<Box<ParsedExpression>>)>>(200, "options")?;
+        let options = d
+            .read_property_with_default::<Map<String, Option<Box<ParsedExpression>>>>(200, "options")?
+            .0;
         Ok(Self { options })
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property_with_default(200, "options", &self.options);
+        s.write_property_with_default(200, "options", &MapRef(&self.options));
     }
 }
 
@@ -1505,8 +2101,12 @@ impl CreateViewInfo {
         let query = d.read_property_with_default::<Option<Box<SelectStatement>>>(203, "query")?;
         let names = d.read_property_with_default::<Vec<String>>(204, "names")?;
         let column_comments = d.read_property_with_default::<Vec<Value>>(205, "column_comments")?;
-        let column_comments_map = d.read_property_with_default::<Vec<(String, Value)>>(206, "column_comments_map")?;
-        let security_type = d.read_optional_property::<u64>(207, "security_type")?;
+        let column_comments_map = d
+            .read_property_with_default::<Map<String, Value>>(206, "column_comments_map")?
+            .0;
+        let security_type = d
+            .read_optional_property::<Enum<enums::view_security_type::Names>>(207, "security_type")?
+            .map(|e| e.0);
         Ok(Self {
             view_name,
             aliases,
@@ -1529,10 +2129,16 @@ impl CreateViewInfo {
             s.write_property_with_default(205, "column_comments", &self.column_comments);
         }
         if s.should_serialize(StorageVersion::V1_5_0) {
-            s.write_property_with_default(206, "column_comments_map", &self.column_comments_map);
+            s.write_property_with_default(206, "column_comments_map", &MapRef(&self.column_comments_map));
         }
         if s.should_serialize(StorageVersion::V2_0_0) {
-            s.write_optional_property(207, "security_type", self.security_type.as_ref());
+            s.write_optional_property(
+                207,
+                "security_type",
+                self.security_type
+                    .map(Enum::<enums::view_security_type::Names>::new)
+                    .as_ref(),
+            );
         }
     }
 }
@@ -1648,10 +2254,14 @@ impl CreateTriggerInfo {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         let trigger_name = d.read_property_with_default::<String>(200, "trigger_name")?;
         let base_table = d.read_property_with_default::<Option<Box<TableRef>>>(201, "base_table")?;
-        let timing = d.read_property::<u64>(204, "timing")?;
-        let event_type = d.read_property::<u64>(205, "event_type")?;
+        let timing = d.read_property::<Enum<enums::trigger_timing::Names>>(204, "timing")?.0;
+        let event_type = d
+            .read_property::<Enum<enums::trigger_event_type::Names>>(205, "event_type")?
+            .0;
         let columns = d.read_property_with_default::<Vec<String>>(206, "columns")?;
-        let for_each = d.read_property::<u64>(207, "for_each")?;
+        let for_each = d
+            .read_property::<Enum<enums::trigger_for_each::Names>>(207, "for_each")?
+            .0;
         let trigger_action = d.read_property_with_default::<Option<Box<QueryNode>>>(208, "trigger_action")?;
         let referencing_new_table = d.read_property_with_default::<String>(209, "referencing_new_table")?;
         let referencing_old_table = d.read_property_with_default::<String>(210, "referencing_old_table")?;
@@ -1671,10 +2281,18 @@ impl CreateTriggerInfo {
     pub fn write_members(&self, s: &mut BinarySerializer) {
         s.write_property_with_default(200, "trigger_name", &self.trigger_name);
         s.write_property_with_default(201, "base_table", &self.base_table);
-        s.write_property(204, "timing", &self.timing);
-        s.write_property(205, "event_type", &self.event_type);
+        s.write_property(204, "timing", &Enum::<enums::trigger_timing::Names>::new(self.timing));
+        s.write_property(
+            205,
+            "event_type",
+            &Enum::<enums::trigger_event_type::Names>::new(self.event_type),
+        );
         s.write_property_with_default(206, "columns", &self.columns);
-        s.write_property(207, "for_each", &self.for_each);
+        s.write_property(
+            207,
+            "for_each",
+            &Enum::<enums::trigger_for_each::Names>::new(self.for_each),
+        );
         s.write_property_with_default(208, "trigger_action", &self.trigger_action);
         s.write_property_with_default(209, "referencing_new_table", &self.referencing_new_table);
         s.write_property_with_default(210, "referencing_old_table", &self.referencing_old_table);
@@ -1744,8 +2362,8 @@ pub enum ParsedExpressionKind {
 
 impl ParsedExpression {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let class = d.read_property::<u64>(100, "class")?;
-        let type_ = d.read_property::<u64>(101, "type")?;
+        let class = d.read_property::<Enum<enums::expression_class::Names>>(100, "class")?.0;
+        let type_ = d.read_property::<Enum<enums::expression_type::Names>>(101, "type")?.0;
         let alias = d.read_property_with_default::<String>(102, "alias")?;
         let query_location = d.read_optional_property::<u64>(103, "query_location")?;
         let query_location_length = d.read_optional_property::<u32>(104, "query_location_length")?;
@@ -1813,8 +2431,8 @@ impl ParsedExpression {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property(100, "class", &self.class);
-        s.write_property(101, "type", &self.type_);
+        s.write_property(100, "class", &Enum::<enums::expression_class::Names>::new(self.class));
+        s.write_property(101, "type", &Enum::<enums::expression_type::Names>::new(self.type_));
         s.write_property_with_default(102, "alias", &self.alias);
         s.write_optional_property(103, "query_location", self.query_location.as_ref());
         if s.should_serialize(StorageVersion::V2_0_0) {
@@ -1950,7 +2568,7 @@ pub enum ConstraintKind {
 
 impl Constraint {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let type_ = d.read_property::<u64>(100, "type")?;
+        let type_ = d.read_property::<Enum<enums::constraint_type::Names>>(100, "type")?.0;
         let kind = match u64::from(type_) {
             enums::constraint_type::NOT_NULL => ConstraintKind::NotNullConstraint(NotNullConstraint::read_members(d)?),
             enums::constraint_type::CHECK => ConstraintKind::CheckConstraint(CheckConstraint::read_members(d)?),
@@ -1964,7 +2582,7 @@ impl Constraint {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property(100, "type", &self.type_);
+        s.write_property(100, "type", &Enum::<enums::constraint_type::Names>::new(self.type_));
         match &self.kind {
             ConstraintKind::NotNullConstraint(value) => value.write_members(s),
             ConstraintKind::CheckConstraint(value) => value.write_members(s),
@@ -1995,13 +2613,15 @@ pub struct SelectStatement {
 impl SelectStatement {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         let node = d.read_property_with_default::<Option<Box<QueryNode>>>(100, "node")?;
-        let named_param_map = d.read_property_with_default::<Vec<(String, u64)>>(101, "named_param_map")?;
+        let named_param_map = d
+            .read_property_with_default::<Map<String, u64>>(101, "named_param_map")?
+            .0;
         Ok(Self { node, named_param_map })
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
         s.write_property_with_default(100, "node", &self.node);
-        s.write_property_with_default(101, "named_param_map", &self.named_param_map);
+        s.write_property_with_default(101, "named_param_map", &MapRef(&self.named_param_map));
     }
 }
 
@@ -2035,10 +2655,11 @@ pub enum MacroFunctionKind {
 
 impl MacroFunction {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let type_ = d.read_property::<u64>(100, "type")?;
+        let type_ = d.read_property::<Enum<enums::macro_type::Names>>(100, "type")?.0;
         let parameters = d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(101, "parameters")?;
-        let default_parameters =
-            d.read_property_with_default::<Vec<(String, Option<Box<ParsedExpression>>)>>(102, "default_parameters")?;
+        let default_parameters = d
+            .read_property_with_default::<Map<String, Option<Box<ParsedExpression>>>>(102, "default_parameters")?
+            .0;
         let types = d.read_property_with_default::<Vec<LogicalType>>(103, "types")?;
         let return_type = d.read_optional_property::<LogicalType>(104, "return_type")?;
         let kind = match u64::from(type_) {
@@ -2061,9 +2682,9 @@ impl MacroFunction {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property(100, "type", &self.type_);
+        s.write_property(100, "type", &Enum::<enums::macro_type::Names>::new(self.type_));
         s.write_property_with_default(101, "parameters", &self.parameters);
-        s.write_property_with_default(102, "default_parameters", &self.default_parameters);
+        s.write_property_with_default(102, "default_parameters", &MapRef(&self.default_parameters));
         if s.should_serialize(StorageVersion::V1_4_0) {
             s.write_property_with_default(103, "types", &self.types);
         }
@@ -2112,7 +2733,9 @@ pub enum TableRefKind {
 
 impl TableRef {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let type_ = d.read_property::<u64>(100, "type")?;
+        let type_ = d
+            .read_property::<Enum<enums::table_reference_type::Names>>(100, "type")?
+            .0;
         let alias = d.read_property_with_default::<String>(101, "alias")?;
         let sample = d.read_property_with_default::<Option<Box<SampleOptions>>>(102, "sample")?;
         let query_location = d.read_optional_property::<u64>(103, "query_location")?;
@@ -2129,7 +2752,7 @@ impl TableRef {
             enums::table_reference_type::EXPRESSION_LIST => {
                 TableRefKind::ExpressionListRef(ExpressionListRef::read_members(d)?)
             }
-            enums::table_reference_type::COLUMN_DATA => return Err(not_ported("column data references")),
+            enums::table_reference_type::COLUMN_DATA => return Err(super::column_data_ref(d)?),
             enums::table_reference_type::PIVOT => TableRefKind::PivotRef(PivotRef::read_members(d)?),
             enums::table_reference_type::SHOW_REF => return Err(not_ported("SHOW and DESCRIBE in a stored query")),
             other => return Err(unknown("TableRef", other)),
@@ -2145,7 +2768,11 @@ impl TableRef {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property(100, "type", &self.type_);
+        s.write_property(
+            100,
+            "type",
+            &Enum::<enums::table_reference_type::Names>::new(self.type_),
+        );
         s.write_property_with_default(101, "alias", &self.alias);
         s.write_property_with_default(102, "sample", &self.sample);
         s.write_optional_property(103, "query_location", self.query_location.as_ref());
@@ -2197,7 +2824,7 @@ pub enum QueryNodeKind {
 
 impl QueryNode {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let type_ = d.read_property::<u64>(100, "type")?;
+        let type_ = d.read_property::<Enum<enums::query_node_type::Names>>(100, "type")?.0;
         let modifiers = d.read_property_with_default::<Vec<Option<Box<ResultModifier>>>>(101, "modifiers")?;
         let cte_map = d.read_property::<CommonTableExpressionMap>(102, "cte_map")?;
         let kind = match u64::from(type_) {
@@ -2231,7 +2858,7 @@ impl QueryNode {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property(100, "type", &self.type_);
+        s.write_property(100, "type", &Enum::<enums::query_node_type::Names>::new(self.type_));
         s.write_property_with_default(101, "modifiers", &self.modifiers);
         s.write_property(102, "cte_map", &self.cte_map);
         match &self.kind {
@@ -2525,14 +3152,17 @@ impl StarExpression {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         let relation_name = d.read_property_with_default::<String>(200, "relation_name")?;
         let exclude_list = d.read_property_with_default::<Vec<String>>(201, "exclude_list")?;
-        let replace_list =
-            d.read_property_with_default::<Vec<(String, Option<Box<ParsedExpression>>)>>(202, "replace_list")?;
+        let replace_list = d
+            .read_property_with_default::<Map<String, Option<Box<ParsedExpression>>>>(202, "replace_list")?
+            .0;
         let columns = d.read_property_with_default::<bool>(203, "columns")?;
         let expr = d.read_property_with_default::<Option<Box<ParsedExpression>>>(204, "expr")?;
         let unpacked = d.read_optional_property::<bool>(205, "unpacked")?;
         let qualified_exclude_list =
             d.read_optional_property::<Vec<QualifiedColumnName>>(206, "qualified_exclude_list")?;
-        let rename_list = d.read_property_with_default::<Vec<(QualifiedColumnName, String)>>(207, "rename_list")?;
+        let rename_list = d
+            .read_property_with_default::<Map<QualifiedColumnName, String>>(207, "rename_list")?
+            .0;
         Ok(Self {
             relation_name,
             exclude_list,
@@ -2552,11 +3182,11 @@ impl StarExpression {
         } else {
             s.write_property(201, "exclude_list", &self.exclude_list);
         }
-        s.write_property_with_default(202, "replace_list", &self.replace_list);
+        s.write_property_with_default(202, "replace_list", &MapRef(&self.replace_list));
         s.write_property_with_default(203, "columns", &self.columns);
         s.write_property_with_default(204, "expr", &self.expr);
         s.write_optional_property(206, "qualified_exclude_list", self.qualified_exclude_list.as_ref());
-        s.write_property_with_default(207, "rename_list", &self.rename_list);
+        s.write_property_with_default(207, "rename_list", &MapRef(&self.rename_list));
     }
 }
 
@@ -2570,10 +3200,14 @@ pub struct SubqueryExpression {
 
 impl SubqueryExpression {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let subquery_type = d.read_property::<u64>(200, "subquery_type")?;
+        let subquery_type = d
+            .read_property::<Enum<enums::subquery_type::Names>>(200, "subquery_type")?
+            .0;
         let subquery = d.read_property_with_default::<Option<Box<SelectStatement>>>(201, "subquery")?;
         let child = d.read_property_with_default::<Option<Box<ParsedExpression>>>(202, "child")?;
-        let comparison_type = d.read_property::<u64>(203, "comparison_type")?;
+        let comparison_type = d
+            .read_property::<Enum<enums::expression_type::Names>>(203, "comparison_type")?
+            .0;
         Ok(Self {
             subquery_type,
             subquery,
@@ -2583,10 +3217,18 @@ impl SubqueryExpression {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property(200, "subquery_type", &self.subquery_type);
+        s.write_property(
+            200,
+            "subquery_type",
+            &Enum::<enums::subquery_type::Names>::new(self.subquery_type),
+        );
         s.write_property_with_default(201, "subquery", &self.subquery);
         s.write_property_with_default(202, "child", &self.child);
-        s.write_property(203, "comparison_type", &self.comparison_type);
+        s.write_property(
+            203,
+            "comparison_type",
+            &Enum::<enums::expression_type::Names>::new(self.comparison_type),
+        );
     }
 }
 
@@ -2642,10 +3284,14 @@ impl ColumnDefinition {
         let name = d.read_property_with_default::<String>(100, "name")?;
         let type_ = d.read_property::<LogicalType>(101, "type")?;
         let expression = d.read_property_with_default::<Option<Box<ParsedExpression>>>(102, "expression")?;
-        let category = d.read_property::<u64>(103, "category")?;
-        let compression_type = d.read_property::<u64>(104, "compression_type")?;
+        let category = d
+            .read_property::<Enum<enums::table_column_type::Names>>(103, "category")?
+            .0;
+        let compression_type = d
+            .read_property::<Enum<enums::compression_type::Names>>(104, "compression_type")?
+            .0;
         let comment = d.read_optional_property::<Value>(105, "comment")?;
-        let tags = d.read_property_with_default::<Vec<(String, String)>>(106, "tags")?;
+        let tags = d.read_property_with_default::<Map<String, String>>(106, "tags")?.0;
         Ok(Self {
             name,
             type_,
@@ -2661,10 +3307,18 @@ impl ColumnDefinition {
         s.write_property_with_default(100, "name", &self.name);
         s.write_property(101, "type", &self.type_);
         s.write_property_with_default(102, "expression", &self.expression);
-        s.write_property(103, "category", &self.category);
-        s.write_property(104, "compression_type", &self.compression_type);
+        s.write_property(
+            103,
+            "category",
+            &Enum::<enums::table_column_type::Names>::new(self.category),
+        );
+        s.write_property(
+            104,
+            "compression_type",
+            &Enum::<enums::compression_type::Names>::new(self.compression_type),
+        );
         s.write_optional_property(105, "comment", self.comment.as_ref());
-        s.write_property_with_default(106, "tags", &self.tags);
+        s.write_property_with_default(106, "tags", &MapRef(&self.tags));
     }
 }
 
@@ -2727,7 +3381,9 @@ impl ForeignKeyConstraint {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         let pk_columns = d.read_property_with_default::<Vec<String>>(200, "pk_columns")?;
         let fk_columns = d.read_property_with_default::<Vec<String>>(201, "fk_columns")?;
-        let fk_type = d.read_property::<u64>(202, "fk_type")?;
+        let fk_type = d
+            .read_property::<Enum<enums::foreign_key_type::Names>>(202, "fk_type")?
+            .0;
         let schema = d.read_property_with_default::<String>(203, "schema")?;
         let table = d.read_property_with_default::<String>(204, "table")?;
         let pk_keys = d.read_property_with_default::<Vec<u64>>(205, "pk_keys")?;
@@ -2746,7 +3402,11 @@ impl ForeignKeyConstraint {
     pub fn write_members(&self, s: &mut BinarySerializer) {
         s.write_property_with_default(200, "pk_columns", &self.pk_columns);
         s.write_property_with_default(201, "fk_columns", &self.fk_columns);
-        s.write_property(202, "fk_type", &self.fk_type);
+        s.write_property(
+            202,
+            "fk_type",
+            &Enum::<enums::foreign_key_type::Names>::new(self.fk_type),
+        );
         s.write_property_with_default(203, "schema", &self.schema);
         s.write_property_with_default(204, "table", &self.table);
         s.write_property_with_default(205, "pk_keys", &self.pk_keys);
@@ -2767,7 +3427,9 @@ impl UniqueConstraint {
         let is_primary_key = d.read_property_with_default::<bool>(200, "is_primary_key")?;
         let index = d.read_property::<u64>(201, "index")?;
         let columns = d.read_property_with_default::<Vec<String>>(202, "columns")?;
-        let check_mode = d.read_optional_property::<u64>(203, "check_mode")?;
+        let check_mode = d
+            .read_optional_property::<Enum<enums::constraint_check_mode::Names>>(203, "check_mode")?
+            .map(|e| e.0);
         Ok(Self {
             is_primary_key,
             index,
@@ -2781,7 +3443,13 @@ impl UniqueConstraint {
         s.write_property(201, "index", &self.index);
         s.write_property_with_default(202, "columns", &self.columns);
         if s.should_serialize(StorageVersion::V2_0_0) {
-            s.write_optional_property(203, "check_mode", self.check_mode.as_ref());
+            s.write_optional_property(
+                203,
+                "check_mode",
+                self.check_mode
+                    .map(Enum::<enums::constraint_check_mode::Names>::new)
+                    .as_ref(),
+            );
         }
     }
 }
@@ -2880,8 +3548,8 @@ impl JoinRef {
         let left = d.read_property_with_default::<Option<Box<TableRef>>>(200, "left")?;
         let right = d.read_property_with_default::<Option<Box<TableRef>>>(201, "right")?;
         let condition = d.read_property_with_default::<Option<Box<ParsedExpression>>>(202, "condition")?;
-        let join_type = d.read_property::<u64>(203, "join_type")?;
-        let ref_type = d.read_property::<u64>(204, "ref_type")?;
+        let join_type = d.read_property::<Enum<enums::join_type::Names>>(203, "join_type")?.0;
+        let ref_type = d.read_property::<Enum<enums::join_ref_type::Names>>(204, "ref_type")?.0;
         let using_columns = d.read_property_with_default::<Vec<String>>(205, "using_columns")?;
         let delim_flipped = d.read_property_with_default::<bool>(206, "delim_flipped")?;
         let duplicate_eliminated_columns =
@@ -2890,7 +3558,9 @@ impl JoinRef {
         let ranking_expression =
             d.read_property_with_default::<Option<Box<ParsedExpression>>>(209, "ranking_expression")?;
         let nearest_count = d.read_optional_property::<u64>(210, "nearest_count")?;
-        let nearest_order_type = d.read_optional_property::<u64>(211, "nearest_order_type")?;
+        let nearest_order_type = d
+            .read_optional_property::<Enum<enums::order_type::Names>>(211, "nearest_order_type")?
+            .map(|e| e.0);
         let nearest_approx = d.read_optional_property::<bool>(212, "nearest_approx")?;
         Ok(Self {
             left,
@@ -2913,8 +3583,12 @@ impl JoinRef {
         s.write_property_with_default(200, "left", &self.left);
         s.write_property_with_default(201, "right", &self.right);
         s.write_property_with_default(202, "condition", &self.condition);
-        s.write_property(203, "join_type", &self.join_type);
-        s.write_property(204, "ref_type", &self.ref_type);
+        s.write_property(203, "join_type", &Enum::<enums::join_type::Names>::new(self.join_type));
+        s.write_property(
+            204,
+            "ref_type",
+            &Enum::<enums::join_ref_type::Names>::new(self.ref_type),
+        );
         s.write_property_with_default(205, "using_columns", &self.using_columns);
         s.write_property_with_default(206, "delim_flipped", &self.delim_flipped);
         s.write_property_with_default(207, "duplicate_eliminated_columns", &self.duplicate_eliminated_columns);
@@ -2928,7 +3602,13 @@ impl JoinRef {
             s.write_optional_property(210, "nearest_count", self.nearest_count.as_ref());
         }
         if s.should_serialize(StorageVersion::V2_0_0) {
-            s.write_optional_property(211, "nearest_order_type", self.nearest_order_type.as_ref());
+            s.write_optional_property(
+                211,
+                "nearest_order_type",
+                self.nearest_order_type
+                    .map(Enum::<enums::order_type::Names>::new)
+                    .as_ref(),
+            );
         }
         if s.should_serialize(StorageVersion::V2_0_0) {
             s.write_optional_property(212, "nearest_approx", self.nearest_approx.as_ref());
@@ -2969,7 +3649,9 @@ impl TableFunctionRef {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         let function = d.read_property_with_default::<Option<Box<ParsedExpression>>>(200, "function")?;
         let column_name_alias = d.read_property_with_default::<Vec<String>>(201, "column_name_alias")?;
-        let with_ordinality = d.read_optional_property::<u64>(202, "with_ordinality")?;
+        let with_ordinality = d
+            .read_optional_property::<Enum<enums::ordinality_type::Names>>(202, "with_ordinality")?
+            .map(|e| e.0);
         Ok(Self {
             function,
             column_name_alias,
@@ -2980,7 +3662,13 @@ impl TableFunctionRef {
     pub fn write_members(&self, s: &mut BinarySerializer) {
         s.write_property_with_default(200, "function", &self.function);
         s.write_property_with_default(201, "column_name_alias", &self.column_name_alias);
-        s.write_optional_property(202, "with_ordinality", self.with_ordinality.as_ref());
+        s.write_optional_property(
+            202,
+            "with_ordinality",
+            self.with_ordinality
+                .map(Enum::<enums::ordinality_type::Names>::new)
+                .as_ref(),
+        );
     }
 }
 
@@ -3077,7 +3765,7 @@ impl SampleOptions {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         let sample_size = d.read_property::<Value>(100, "sample_size")?;
         let is_percentage = d.read_property_with_default::<bool>(101, "is_percentage")?;
-        let method = d.read_property::<u64>(102, "method")?;
+        let method = d.read_property::<Enum<enums::sample_method::Names>>(102, "method")?.0;
         let seed = d.read_property_with_default::<i64>(103, "seed")?;
         let repeatable = d.read_property_with_default::<bool>(104, "repeatable")?;
         let sample_rate = d.read_optional_property::<f64>(105, "sample_rate")?;
@@ -3094,7 +3782,7 @@ impl SampleOptions {
     pub fn write_members(&self, s: &mut BinarySerializer) {
         s.write_property(100, "sample_size", &self.sample_size);
         s.write_property_with_default(101, "is_percentage", &self.is_percentage);
-        s.write_property(102, "method", &self.method);
+        s.write_property(102, "method", &Enum::<enums::sample_method::Names>::new(self.method));
         s.write_property_with_default(103, "seed", &self.seed);
         s.write_property_with_default(104, "repeatable", &self.repeatable);
         s.write_optional_property(105, "sample_rate", self.sample_rate.as_ref());
@@ -3134,7 +3822,9 @@ impl SelectNode {
         let group_expressions =
             d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(203, "group_expressions")?;
         let group_sets = d.read_property_with_default::<Vec<Vec<u64>>>(204, "group_sets")?;
-        let aggregate_handling = d.read_property::<u64>(205, "aggregate_handling")?;
+        let aggregate_handling = d
+            .read_property::<Enum<enums::aggregate_handling::Names>>(205, "aggregate_handling")?
+            .0;
         let having = d.read_property_with_default::<Option<Box<ParsedExpression>>>(206, "having")?;
         let sample = d.read_property_with_default::<Option<Box<SampleOptions>>>(207, "sample")?;
         let qualify = d.read_property_with_default::<Option<Box<ParsedExpression>>>(208, "qualify")?;
@@ -3157,7 +3847,11 @@ impl SelectNode {
         s.write_property_with_default(202, "where_clause", &self.where_clause);
         s.write_property_with_default(203, "group_expressions", &self.group_expressions);
         s.write_property_with_default(204, "group_sets", &self.group_sets);
-        s.write_property(205, "aggregate_handling", &self.aggregate_handling);
+        s.write_property(
+            205,
+            "aggregate_handling",
+            &Enum::<enums::aggregate_handling::Names>::new(self.aggregate_handling),
+        );
         s.write_property_with_default(206, "having", &self.having);
         s.write_property_with_default(207, "sample", &self.sample);
         s.write_property_with_default(208, "qualify", &self.qualify);
@@ -3175,7 +3869,9 @@ pub struct SetOperationNode {
 
 impl SetOperationNode {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let setop_type = d.read_property::<u64>(200, "setop_type")?;
+        let setop_type = d
+            .read_property::<Enum<enums::set_operation_type::Names>>(200, "setop_type")?
+            .0;
         let left = d.read_property_with_default::<Option<Box<QueryNode>>>(201, "left")?;
         let right = d.read_property_with_default::<Option<Box<QueryNode>>>(202, "right")?;
         let setop_all = d.read_optional_property::<bool>(203, "setop_all")?;
@@ -3190,7 +3886,11 @@ impl SetOperationNode {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property(200, "setop_type", &self.setop_type);
+        s.write_property(
+            200,
+            "setop_type",
+            &Enum::<enums::set_operation_type::Names>::new(self.setop_type),
+        );
         s.write_property_with_default(201, "left", &self.left);
         s.write_property_with_default(202, "right", &self.right);
         s.write_optional_property(203, "setop_all", self.setop_all.as_ref());
@@ -3253,7 +3953,9 @@ impl CTENode {
         let query = d.read_property_with_default::<Option<Box<QueryNode>>>(201, "query")?;
         let child = d.read_property_with_default::<Option<Box<QueryNode>>>(202, "child")?;
         let aliases = d.read_property_with_default::<Vec<String>>(203, "aliases")?;
-        let materialized = d.read_optional_property::<u64>(204, "materialized")?;
+        let materialized = d
+            .read_optional_property::<Enum<enums::cte_materialize::Names>>(204, "materialized")?
+            .map(|e| e.0);
         Ok(Self {
             cte_name,
             query,
@@ -3268,7 +3970,13 @@ impl CTENode {
         s.write_property_with_default(201, "query", &self.query);
         s.write_property_with_default(202, "child", &self.child);
         s.write_property_with_default(203, "aliases", &self.aliases);
-        s.write_optional_property(204, "materialized", self.materialized.as_ref());
+        s.write_optional_property(
+            204,
+            "materialized",
+            self.materialized
+                .map(Enum::<enums::cte_materialize::Names>::new)
+                .as_ref(),
+        );
     }
 }
 
@@ -3369,7 +4077,9 @@ impl InsertQueryNode {
         let on_conflict_info = d.read_property_with_default::<Option<Box<OnConflictInfo>>>(206, "on_conflict_info")?;
         let table_ref = d.read_property_with_default::<Option<Box<TableRef>>>(207, "table_ref")?;
         let default_values = d.read_optional_property::<bool>(208, "default_values")?;
-        let column_order = d.read_optional_property::<u64>(209, "column_order")?;
+        let column_order = d
+            .read_optional_property::<Enum<enums::insert_column_order::Names>>(209, "column_order")?
+            .map(|e| e.0);
         let qualified_name = d.read_optional_property::<QualifiedName>(210, "qualified_name")?;
         Ok(Self {
             select_statement,
@@ -3396,7 +4106,13 @@ impl InsertQueryNode {
         s.write_property_with_default(206, "on_conflict_info", &self.on_conflict_info);
         s.write_property_with_default(207, "table_ref", &self.table_ref);
         s.write_optional_property(208, "default_values", self.default_values.as_ref());
-        s.write_optional_property(209, "column_order", self.column_order.as_ref());
+        s.write_optional_property(
+            209,
+            "column_order",
+            self.column_order
+                .map(Enum::<enums::insert_column_order::Names>::new)
+                .as_ref(),
+        );
         if s.should_serialize(StorageVersion::V2_0_0) {
             s.write_optional_property(210, "qualified_name", self.qualified_name.as_ref());
         }
@@ -3419,7 +4135,9 @@ pub enum ResultModifierKind {
 
 impl ResultModifier {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let type_ = d.read_property::<u64>(100, "type")?;
+        let type_ = d
+            .read_property::<Enum<enums::result_modifier_type::Names>>(100, "type")?
+            .0;
         let kind = match u64::from(type_) {
             enums::result_modifier_type::LIMIT_MODIFIER => {
                 ResultModifierKind::LimitModifier(LimitModifier::read_members(d)?)
@@ -3439,7 +4157,11 @@ impl ResultModifier {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property(100, "type", &self.type_);
+        s.write_property(
+            100,
+            "type",
+            &Enum::<enums::result_modifier_type::Names>::new(self.type_),
+        );
         match &self.kind {
             ResultModifierKind::LimitModifier(value) => value.write_members(s),
             ResultModifierKind::DistinctModifier(value) => value.write_members(s),
@@ -3468,12 +4190,14 @@ pub struct CommonTableExpressionMap {
 
 impl CommonTableExpressionMap {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let map = d.read_property_with_default::<Vec<(String, Option<Box<CommonTableExpressionInfo>>)>>(100, "map")?;
+        let map = d
+            .read_property_with_default::<Map<String, Option<Box<CommonTableExpressionInfo>>>>(100, "map")?
+            .0;
         Ok(Self { map })
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property_with_default(100, "map", &self.map);
+        s.write_property_with_default(100, "map", &MapRef(&self.map));
     }
 }
 
@@ -3500,7 +4224,7 @@ pub struct CatalogEntryInfo {
 
 impl CatalogEntryInfo {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let type_ = d.read_property::<u64>(100, "type")?;
+        let type_ = d.read_property::<Enum<enums::catalog_type::Names>>(100, "type")?.0;
         let schema = d.read_property_with_default::<String>(101, "schema")?;
         let name = d.read_property_with_default::<String>(102, "name")?;
         let schema_path = d.read_property_with_default::<Vec<String>>(103, "schema_path")?;
@@ -3515,7 +4239,7 @@ impl CatalogEntryInfo {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property(100, "type", &self.type_);
+        s.write_property(100, "type", &Enum::<enums::catalog_type::Names>::new(self.type_));
         if !s.should_serialize(StorageVersion::V2_0_0) {
             s.write_property_with_default(101, "schema", &self.schema);
         }
@@ -3608,13 +4332,13 @@ pub struct Literal {
 
 impl Literal {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let kind = d.read_property::<u64>(100, "kind")?;
+        let kind = d.read_property::<Enum<enums::literal_kind::Names>>(100, "kind")?.0;
         let text = d.read_property_with_default::<String>(101, "text")?;
         Ok(Self { kind, text })
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property(100, "kind", &self.kind);
+        s.write_property(100, "kind", &Enum::<enums::literal_kind::Names>::new(self.kind));
         s.write_property_with_default(101, "text", &self.text);
     }
 }
@@ -3795,7 +4519,9 @@ pub struct OnConflictInfo {
 
 impl OnConflictInfo {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let action_type = d.read_property::<u64>(100, "action_type")?;
+        let action_type = d
+            .read_property::<Enum<enums::on_conflict_action::Names>>(100, "action_type")?
+            .0;
         let indexed_columns = d.read_property_with_default::<Vec<String>>(101, "indexed_columns")?;
         let set_info = d.read_property_with_default::<Option<Box<UpdateSetInfo>>>(102, "set_info")?;
         let condition = d.read_property_with_default::<Option<Box<ParsedExpression>>>(103, "condition")?;
@@ -3808,7 +4534,11 @@ impl OnConflictInfo {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property(100, "action_type", &self.action_type);
+        s.write_property(
+            100,
+            "action_type",
+            &Enum::<enums::on_conflict_action::Names>::new(self.action_type),
+        );
         s.write_property_with_default(101, "indexed_columns", &self.indexed_columns);
         s.write_property_with_default(102, "set_info", &self.set_info);
         s.write_property_with_default(103, "condition", &self.condition);
@@ -3838,7 +4568,9 @@ impl LimitModifier {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         let limit = d.read_property_with_default::<Option<Box<ParsedExpression>>>(200, "limit")?;
         let offset = d.read_property_with_default::<Option<Box<ParsedExpression>>>(201, "offset")?;
-        let limit_type = d.read_optional_property::<u64>(202, "limit_type")?;
+        let limit_type = d
+            .read_optional_property::<Enum<enums::limit_value_type::Names>>(202, "limit_type")?
+            .map(|e| e.0);
         Ok(Self {
             limit,
             offset,
@@ -3849,7 +4581,13 @@ impl LimitModifier {
     pub fn write_members(&self, s: &mut BinarySerializer) {
         s.write_property_with_default(200, "limit", &self.limit);
         s.write_property_with_default(201, "offset", &self.offset);
-        s.write_optional_property(202, "limit_type", self.limit_type.as_ref());
+        s.write_optional_property(
+            202,
+            "limit_type",
+            self.limit_type
+                .map(Enum::<enums::limit_value_type::Names>::new)
+                .as_ref(),
+        );
     }
 }
 
@@ -3919,7 +4657,9 @@ impl CommonTableExpressionInfo {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         let aliases = d.read_property_with_default::<Vec<String>>(100, "aliases")?;
         let query = d.read_property_with_default::<Option<Box<SelectStatement>>>(101, "query")?;
-        let materialized = d.read_property::<u64>(102, "materialized")?;
+        let materialized = d
+            .read_property::<Enum<enums::cte_materialize::Names>>(102, "materialized")?
+            .0;
         let key_targets = d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(103, "key_targets")?;
         let payload_aggregates =
             d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(104, "payload_aggregates")?;
@@ -3939,7 +4679,11 @@ impl CommonTableExpressionInfo {
         if !s.should_serialize(StorageVersion::V2_0_0) {
             s.write_property_with_default(101, "query", &self.query);
         }
-        s.write_property(102, "materialized", &self.materialized);
+        s.write_property(
+            102,
+            "materialized",
+            &Enum::<enums::cte_materialize::Names>::new(self.materialized),
+        );
         s.write_property_with_default(103, "key_targets", &self.key_targets);
         s.write_property_with_default(104, "payload_aggregates", &self.payload_aggregates);
         if s.should_serialize(StorageVersion::V2_0_0) {
@@ -4007,8 +4751,10 @@ pub struct OrderByNode {
 
 impl OrderByNode {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let type_ = d.read_property::<u64>(100, "type")?;
-        let null_order = d.read_property::<u64>(101, "null_order")?;
+        let type_ = d.read_property::<Enum<enums::order_type::Names>>(100, "type")?.0;
+        let null_order = d
+            .read_property::<Enum<enums::order_by_null_type::Names>>(101, "null_order")?
+            .0;
         let expression = d.read_property_with_default::<Option<Box<ParsedExpression>>>(102, "expression")?;
         Ok(Self {
             type_,
@@ -4018,8 +4764,12 @@ impl OrderByNode {
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property(100, "type", &self.type_);
-        s.write_property(101, "null_order", &self.null_order);
+        s.write_property(100, "type", &Enum::<enums::order_type::Names>::new(self.type_));
+        s.write_property(
+            101,
+            "null_order",
+            &Enum::<enums::order_by_null_type::Names>::new(self.null_order),
+        );
         s.write_property_with_default(102, "expression", &self.expression);
     }
 }
