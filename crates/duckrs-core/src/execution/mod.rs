@@ -494,7 +494,7 @@ impl Pipeline<'_> {
                 profiler::timed(profiler.as_deref(), || op.execute_stateful(&chunk, &mut states[index]));
             let (output, result) = result?;
             if let Some(profiler) = &profiler {
-                profiler.record(*op, time, output.len(), false);
+                profiler.record(*op, time, &output, false);
             }
             self.push_into(output, index + 1, states, sink)?;
             // A finished operator wants no more input, which only stops what feeds it: the
@@ -541,7 +541,7 @@ impl Pipeline<'_> {
                 let (chunk, time) = profiler::timed(profiler.as_deref(), || self.source.parallel_chunk(&shared, index));
                 if let Some(chunk) = chunk? {
                     if let Some(profiler) = &profiler {
-                        profiler.record(self.source, time, chunk.len(), profiler::is_scan(self.source));
+                        profiler.record(self.source, time, &chunk, profiler::is_scan(self.source));
                     }
                     self.push_into(chunk, 0, &mut states, &mut |chunk| {
                         self.sink.sink_local(&mut local, index, chunk)
@@ -576,7 +576,7 @@ impl Pipeline<'_> {
                 let (chunk, time) = profiler::timed(profiler.as_deref(), || self.source.get_data(&mut state));
                 let Some(chunk) = chunk? else { break };
                 if let Some(profiler) = &profiler {
-                    profiler.record(self.source, time, chunk.len(), profiler::is_scan(self.source));
+                    profiler.record(self.source, time, &chunk, profiler::is_scan(self.source));
                 }
                 self.push(chunk, 0, &mut operator_states)?;
                 if self.is_finished() {
@@ -645,7 +645,8 @@ fn build_pipelines<'a>(sink: &'a dyn PhysicalOperator, pipelines: &mut Vec<Pipel
 /// Runs a plan with resolved column bindings, and returns its rows.
 pub fn run_plan(plan: LogicalOperator) -> Result<ColumnDataCollection> {
     let collector = PhysicalResultCollector::new(create_plan(plan));
-    execute_plan(&collector)?;
+    // what the statement runs on its own (e.g. statistics) is not part of its profile
+    profiler::with_profiler(None, || execute_plan(&collector))?;
     Ok(collector.result.into_inner())
 }
 

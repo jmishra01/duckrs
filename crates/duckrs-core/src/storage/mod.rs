@@ -38,14 +38,20 @@ pub fn is_database_file(path: &Path) -> bool {
 pub fn load_database(path: &Path, catalog: &Catalog, read_only: bool) -> Result<Arc<BufferManager>> {
     let blocks = Arc::new(SingleFileBlockManager::open(path, read_only)?);
     let buffer = Arc::new(BufferManager::new(blocks, BUFFER_MEMORY));
+    use crate::execution::profiler::{add_counter, time_metric};
     metadata::load_free_list(&buffer)?;
-    let records = wal::read_records(path, &buffer)?;
-    let stored = checkpoint::read_catalog(&buffer)?;
+    let records = time_metric("storage.attach_replay_wal_latency", || wal::read_records(path, &buffer))?;
+    let stored = time_metric("storage.attach_load_storage_latency", || {
+        checkpoint::read_catalog(&buffer)
+    })?;
     let mut replay = wal::Replay::new(buffer.clone(), catalog);
     for entry in stored.entries {
         replay.add_entry(entry)?;
     }
-    replay.replay(records)?;
+    if !records.is_empty() {
+        add_counter("storage.wal_replay_entry_count", records.len() as u64);
+    }
+    time_metric("storage.attach_replay_wal_latency", || replay.replay(records))?;
     Ok(buffer)
 }
 

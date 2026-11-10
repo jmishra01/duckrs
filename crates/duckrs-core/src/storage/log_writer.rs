@@ -125,7 +125,8 @@ impl Durable {
 }
 
 /// The records of one commit, as the version of the file has them.
-struct Records(Vec<u8>, StorageVersion);
+/// The bytes of some log records, the version they are in, and how many there are.
+struct Records(Vec<u8>, StorageVersion, u64);
 
 impl Records {
     fn entry(&mut self, wal: u64, body: impl FnOnce(&mut BinarySerializer)) {
@@ -141,6 +142,7 @@ impl Records {
         self.0.extend_from_slice(&(payload.len() as u64).to_le_bytes());
         self.0.extend_from_slice(&checksum(&payload).to_le_bytes());
         self.0.extend_from_slice(&payload);
+        self.2 += 1;
     }
 
     /// DROP of a kind that all have the same fields.
@@ -508,6 +510,8 @@ pub struct WriteAheadLog {
     size: u64,
     /// The version of the database file, which its log is written in.
     version: StorageVersion,
+    /// `wal_entries_count`: the records since the last checkpoint.
+    entries: u64,
 }
 
 impl std::fmt::Debug for WriteAheadLog {
@@ -550,6 +554,11 @@ impl WriteAheadLog {
         self.size
     }
 
+    /// `GetWALEntriesCount`.
+    pub fn entries(&self) -> u64 {
+        self.entries
+    }
+
     /// `WriteVersion`: starts a log, the only part of it without a checksum.
     fn open(&mut self, path: &Path, identifier: &[u8; DB_IDENTIFIER_LEN], iteration: u64) -> Result<()> {
         if self.file.is_some() {
@@ -587,8 +596,10 @@ impl WriteAheadLog {
     fn append(&mut self, path: &Path, data: &[u8]) -> Result<()> {
         let wal = log_path(path);
         let file = self.file.as_mut().expect("opened first");
-        file.write_all(data).map_err(|error| io_error(&wal, error))?;
-        file.sync_data().map_err(|error| io_error(&wal, error))?;
+        crate::execution::profiler::time_metric("storage.write_to_wal_latency", || {
+            file.write_all(data).map_err(|error| io_error(&wal, error))?;
+            file.sync_data().map_err(|error| io_error(&wal, error))
+        })?;
         self.size += data.len() as u64;
         Ok(())
     }
@@ -671,7 +682,7 @@ impl WriteAheadLog {
 
     /// What differs from what is durable, in records. Drops go first, as a name can come back.
     fn differences(&self, catalog: &Catalog, name: &str, current: &Durable, block_size: usize) -> Result<Records> {
-        let mut records = Records(Vec::new(), self.version);
+        let mut records = Records(Vec::new(), self.version, 0);
         let schema_of = |key: &Key| -> Result<Arc<SchemaCatalogEntry>> { catalog.schema_for(Some(&key.0)) };
         let gone = |old_same: bool, new_exists: bool| !new_exists || !old_same;
         for (k, (original, view)) in &self.durable.views {
@@ -846,7 +857,9 @@ impl WriteAheadLog {
     ) -> Result<bool> {
         let current = Durable::of(catalog);
         self.check_storable(catalog, name, &current)?;
-        let mut records = self.differences(catalog, name, &current, block_size)?;
+        let mut records = crate::execution::profiler::time_metric("storage.commit_local_storage_latency", || {
+            self.differences(catalog, name, &current, block_size)
+        })?;
         self.durable = current;
         if records.0.is_empty() {
             return Ok(false);
@@ -854,6 +867,7 @@ impl WriteAheadLog {
         records.entry(wal_type::WAL_FLUSH, |_| {});
         self.open(path, identifier, iteration)?;
         self.append(path, &records.0)?;
+        self.entries += records.2;
         Ok(true)
     }
 
@@ -862,7 +876,7 @@ impl WriteAheadLog {
     pub fn mark_checkpoint(&mut self, path: &Path, root: MetaBlockPointer) -> Result<u64> {
         let size = self.size;
         if self.file.is_some() {
-            let mut records = Records(Vec::new(), self.version);
+            let mut records = Records(Vec::new(), self.version, 0);
             records.entry(wal_type::CHECKPOINT, |s| s.write_property(101, "meta_block", &root));
             records.entry(wal_type::WAL_FLUSH, |_| {});
             self.append(path, &records.0)?;

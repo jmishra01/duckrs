@@ -2279,7 +2279,8 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         aliases: &[],
         input_type: "VARCHAR[]",
         scope: SettingScope::LocalOnly,
-        default_value: None,
+        // `ClientConfig::tracked_metrics`: all of them
+        default_value: Some("[*]"),
         enum_name: None,
         enum_values: &[],
         description: "A list of metric glob patterns to enable for collection, e.g. ['query.*', 'optimizer.*'].",

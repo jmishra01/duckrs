@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 3970 of 6367 test files pass (**65.6%** of the 6051 that run). The v1 target is ≥ 90%.
+- Overall: 3978 of 6367 test files pass (**65.7%** of the 6051 that run). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -143,14 +143,16 @@ Each item gives the number of failing files in `test/` that it should fix, where
 - [ ] 38. Secrets manager: `CREATE SECRET` and related statements (`sql/secrets`: 16 failing, 0%)
 - [ ] 39. SQL export and DDL rendering (`sql/sql_export`: 69 failing)
 - [ ] 40. Logging and error messages (`sql/logging` 8, `sql/error` 13, `test/logging` 2)
-- [ ] 40a. The query profiler (`sql/pragma/profiling`: 15 of 38 pass)
+- [ ] 40a. The query profiler (`sql/pragma/profiling`: 21 of 36 pass)
   - [x] `enable_profiling = 'json'`, `profiling_output`, `tracked_metrics` (globs), `profiling_coverage`,
     `legacy_metrics_format`; the grouped JSON of `ToResultTree` with the operator tree
-  - [x] measured: query time, CPU time, intermediate rows, rows a scan gave on, planner, optimizer (per pass)
-    and physical planner times; the rest as `FinalizeMetricValues`'s zeros
-  - [ ] rows a scan *read* (C++ counts before pushed-down filters), bytes scanned, intermediate size bytes,
-    row groups, I/O bytes and operations, checkpoint and WAL latencies, memory metrics
-  - [ ] the `query_tree` text output, `duckdb_available_metrics()`, profiling as table functions
+  - [x] measured: query time, CPU time, intermediate rows and size bytes, rows scanned, planner, optimizer
+    (per pass) and physical planner times, I/O bytes and operations (WAL writes left out, as in C++),
+    checkpoint, attach, WAL write, commit and replay latencies, WAL replay entry count
+  - [x] `wal_autocheckpoint_entries`; `disable_checkpoint_on_shutdown` also covers attached databases
+  - [ ] exact `query.total_bytes_scanned`, row groups of local storage, memory metrics, secure views
+  - [ ] the `query_tree` text output, `duckdb_available_metrics()`, `enable_profiling()` / `disable_profiling()`
+    as table functions, the profiler log entries
 - [ ] 41. **C API** (`duckrs-capi`): implement `duckdb.h`, then pass `test/api/capi/*`. There is no code for this yet.
 - [ ] 42. **CLI shell**: rustyline, `.mode` box renderer, `.timer`, `.read`, `.import`, autocomplete. There is no code for this yet.
 - [ ] 43. **Rust API**: `Appender`, streaming results, Arrow `RecordBatch` export, `Relation` API. There is no code for this yet.

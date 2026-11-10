@@ -18,12 +18,78 @@ pub struct OperatorMetrics {
     pub rows: u64,
     /// the rows a scan read
     pub rows_scanned: u64,
+    /// `DataChunk::GetDataSize` of what it gave on
+    pub size_bytes: u64,
 }
 
-/// What the operators of the query running on this thread did, by the address of the operator.
+/// `Vector::GetDataSize`, near enough: the width of each row's slot (16 for strings, the
+/// `string_t`), and of the children of nested types.
+fn type_size(ty: &duckrs_common::types::LogicalType) -> u64 {
+    use duckrs_common::types::PhysicalType as P;
+    match ty.physical_type() {
+        P::Bool | P::Int8 | P::UInt8 => 1,
+        P::Int16 | P::UInt16 => 2,
+        P::Int32 | P::UInt32 | P::Float => 4,
+        P::Int64 | P::UInt64 | P::Double => 8,
+        P::Int128 | P::UInt128 | P::Interval | P::Varchar | P::List => 16,
+        P::Struct => ty.struct_children().iter().map(|(_, child)| type_size(child)).sum(),
+        P::Array => {
+            let child = ty.child_type().map_or(0, type_size);
+            child * u64::from(ty.array_size().unwrap_or(0))
+        }
+        _ => 8,
+    }
+}
+
+fn chunk_size(chunk: &duckrs_common::vector::DataChunk) -> u64 {
+    let rows = chunk.len() as u64;
+    chunk.types().iter().map(|ty| rows * type_size(ty)).sum()
+}
+
+/// What the operators of the query running on this thread did, by the address of the operator,
+/// and the counters and timings of what it did outside of them (I/O, storage), by metric name.
 #[derive(Debug, Default)]
 pub struct OperatorProfiler {
     operators: parking_lot::Mutex<HashMap<usize, OperatorMetrics>>,
+    counters: parking_lot::Mutex<BTreeMap<&'static str, u64>>,
+    timings: parking_lot::Mutex<BTreeMap<&'static str, Duration>>,
+}
+
+/// `QueryProfiler::AddToMetricCounter` on the profiler of this thread, if there is one.
+pub fn add_counter(name: &'static str, amount: u64) {
+    if let Some(profiler) = current() {
+        *profiler.counters.lock().entry(name).or_default() += amount;
+    }
+}
+
+/// `QueryProfiler::AddToMetricTiming` on the profiler of this thread, if there is one.
+pub fn add_timing(name: &'static str, time: Duration) {
+    if let Some(profiler) = current() {
+        *profiler.timings.lock().entry(name).or_default() += time;
+    }
+}
+
+/// `TrackBytesRead`: one read of `bytes` bytes.
+pub fn track_read(bytes: usize) {
+    add_counter("io.total_bytes_read", bytes as u64);
+    add_counter("io.total_read_operations", 1);
+}
+
+/// `TrackBytesWritten`: one write of `bytes` bytes.
+pub fn track_write(bytes: usize) {
+    add_counter("io.total_bytes_written", bytes as u64);
+    add_counter("io.total_write_operations", 1);
+}
+
+/// Times `body` as the metric `name`.
+pub fn time_metric<T>(name: &'static str, body: impl FnOnce() -> T) -> T {
+    if current().is_none() {
+        return body();
+    }
+    let start = Instant::now();
+    let result = body();
+    add_timing(name, start.elapsed());
+    result
 }
 
 fn key(op: &dyn PhysicalOperator) -> usize {
@@ -32,19 +98,39 @@ fn key(op: &dyn PhysicalOperator) -> usize {
 
 impl OperatorProfiler {
     /// `OperatorProfiler::EndOperator`: `op` took `time` and gave on `rows`.
-    pub fn record(&self, op: &dyn PhysicalOperator, time: Duration, rows: usize, scanned: bool) {
+    pub fn record(
+        &self,
+        op: &dyn PhysicalOperator,
+        time: Duration,
+        chunk: &duckrs_common::vector::DataChunk,
+        scanned: bool,
+    ) {
+        let rows = chunk.len() as u64;
+        let size = chunk_size(chunk);
         let mut operators = self.operators.lock();
         let metrics = operators.entry(key(op)).or_default();
         metrics.time += time;
-        metrics.rows += rows as u64;
+        metrics.rows += rows;
+        metrics.size_bytes += size;
         if scanned {
-            metrics.rows_scanned += rows as u64;
+            metrics.rows_scanned += rows;
         }
     }
 
     /// `op` took `time`, without giving on rows (a sink taking its input).
     pub fn add_time(&self, op: &dyn PhysicalOperator, time: Duration) {
         self.operators.lock().entry(key(op)).or_default().time += time;
+    }
+
+    /// Forgets what operators did so far: those of a plan that is gone can share addresses with
+    /// the next one.
+    pub fn clear_operators(&self) {
+        self.operators.lock().clear();
+    }
+
+    /// The counters and timings it gathered.
+    pub fn gathered(&self) -> (BTreeMap<&'static str, u64>, BTreeMap<&'static str, Duration>) {
+        (self.counters.lock().clone(), self.timings.lock().clone())
     }
 
     pub fn metrics(&self, op: &dyn PhysicalOperator) -> OperatorMetrics {
@@ -162,6 +248,8 @@ pub struct ProfileNode {
     pub name: String,
     pub extra_info: Vec<(String, String)>,
     pub metrics: OperatorMetrics,
+    /// of a table scan: the row groups it scanned, of those it could have
+    pub row_groups: (u64, u64),
     pub children: Vec<ProfileNode>,
 }
 
@@ -192,6 +280,9 @@ impl ProfileNode {
             name: operator_name(op).to_string(),
             extra_info,
             metrics: profiler.metrics(op),
+            row_groups: op
+                .row_groups_scanned()
+                .map_or((0, 0), |(scanned, total)| (scanned as u64, total as u64)),
             children,
         }]
     }
@@ -204,6 +295,7 @@ impl ProfileNode {
             total.time += sub.time;
             total.rows += sub.rows;
             total.rows_scanned += sub.rows_scanned;
+            total.size_bytes += sub.size_bytes;
         }
         total
     }
@@ -233,9 +325,12 @@ impl TrackedMetrics {
             "type",
             "name",
             "timing",
-            "cpu_time",
             "intermediate_rows",
+            "intermediate_size_bytes",
             "rows_scanned",
+            "row_groups_scanned",
+            "total_row_groups_to_scan",
+            "bytes_scanned",
             "extra_info",
         ]
         .iter()
@@ -346,23 +441,33 @@ fn seconds(duration: Duration) -> Metric {
 /// `OperatorToResultTree`: an operator's tracked metrics, and its children.
 fn operator_json(node: &ProfileNode, tracked: &TrackedMetrics, legacy: bool) -> JsonObject {
     let mut object = JsonObject::default();
-    let metrics = [
+    let scan = node.op_type == "TABLE_SCAN";
+    let mut metrics = vec![
         ("type", Metric::Text(node.op_type.clone()), "operator_type"),
         ("name", Metric::Text(node.name.clone()), "operator_name"),
         ("timing", seconds(node.metrics.time), "operator_timing"),
-        ("cpu_time", seconds(node.metrics.time), ""),
         (
             "intermediate_rows",
             Metric::UBigInt(node.metrics.rows),
             "operator_cardinality",
         ),
         (
+            "intermediate_size_bytes",
+            Metric::UBigInt(node.metrics.size_bytes),
+            "result_set_size",
+        ),
+    ];
+    // `OperatorMetrics::GetMetrics`: what only a table scan has
+    if scan {
+        metrics.push((
             "rows_scanned",
             Metric::UBigInt(node.metrics.rows_scanned),
             "operator_rows_scanned",
-        ),
-        ("extra_info", Metric::Map(node.extra_info.clone()), "extra_info"),
-    ];
+        ));
+        metrics.push(("row_groups_scanned", Metric::UBigInt(node.row_groups.0), ""));
+        metrics.push(("total_row_groups_to_scan", Metric::UBigInt(node.row_groups.1), ""));
+    }
+    metrics.push(("extra_info", Metric::Map(node.extra_info.clone()), "extra_info"));
     for (name, value, legacy_name) in metrics {
         if !tracked.is_tracked(&format!("operator.{name}")) {
             continue;

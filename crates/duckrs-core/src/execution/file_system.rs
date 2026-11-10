@@ -190,6 +190,7 @@ pub fn read_file(path: &str, compression: Compression) -> Result<Vec<u8>> {
     // the file is read at once: one READ of all of it
     crate::logging::log_file_system(path, "OPEN", None);
     crate::logging::log_file_system(path, "READ", Some((data.len() as i64, 0)));
+    crate::execution::profiler::track_read(data.len());
     crate::logging::log_file_system(path, "CLOSE", None);
     match compression.for_path(path) {
         Compression::Gzip => {

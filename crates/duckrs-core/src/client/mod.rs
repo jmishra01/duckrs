@@ -254,7 +254,7 @@ impl DatabaseInstance {
 
     /// Makes a commit durable, in the log of the file, and checkpoints if the log has grown past
     /// `threshold` bytes and nobody is in the middle of a transaction.
-    fn log_commit(&self, threshold: u64, abort: &str) -> Result<()> {
+    fn log_commit(&self, threshold: u64, entry_limit: u64, abort: &str) -> Result<()> {
         let Some(file) = self.file.as_ref().filter(|_| self.file_access.is_none()) else {
             return Ok(());
         };
@@ -263,6 +263,8 @@ impl DatabaseInstance {
         let blocks = file.buffer.block_manager();
         let mut log = file.log.lock();
         let identifier = blocks.main_header().db_identifier;
+        // `AutomaticCheckpoint`: what the log held before this commit
+        let entries = log.entries();
         if !log.commit(
             &file.path,
             &self.catalog,
@@ -274,7 +276,7 @@ impl DatabaseInstance {
             return Ok(());
         }
         self.changed.store(true, AtomicOrdering::SeqCst);
-        let full = log.size() >= threshold;
+        let full = log.size() >= threshold || (entry_limit > 0 && entries >= entry_limit);
         drop(log);
         drop(reading);
         if full && self.transactions.lock().open.is_empty() {
@@ -333,6 +335,10 @@ impl DatabaseInstance {
 
     /// `abort` is `debug_checkpoint_abort`, which belongs to the session that asked.
     fn write_checkpoint_with(&self, abort: &str) -> Result<()> {
+        crate::execution::profiler::time_metric("storage.checkpoint_latency", || self.write_checkpoint_timed(abort))
+    }
+
+    fn write_checkpoint_timed(&self, abort: &str) -> Result<()> {
         let Some(file) = self.file.as_ref().filter(|_| self.file_access.is_none()) else {
             return Ok(());
         };
@@ -876,12 +882,15 @@ impl ClientContext {
             // `QueryProfiler::StartQuery`: a statement that starts with profiling on is profiled
             let profiled = self.profiling.then(std::time::Instant::now);
             self.pending_profile = None;
-            let outcome = crate::logging::with_file_logging(&target, || self.run_statement(statement));
+            let profiler = profiled.map(|_| Arc::new(crate::execution::profiler::OperatorProfiler::default()));
+            let outcome = crate::execution::profiler::with_profiler(profiler.clone(), || {
+                crate::logging::with_file_logging(&target, || self.run_statement(statement))
+            });
             self.end_statement_logging();
-            if let Some(start) = profiled
+            if let (Some(start), Some(profiler)) = (profiled, &profiler)
                 && self.profiling
             {
-                self.write_profile(text.trim(), start.elapsed())?;
+                self.write_profile(text.trim(), start.elapsed(), profiler)?;
             }
             result = outcome?;
         }
@@ -1064,7 +1073,12 @@ impl ClientContext {
     /// A commit, as far as this connection can fail one.
     fn log_commit(&self) -> Result<()> {
         let abort = self.setting_text("debug_checkpoint_abort").to_lowercase();
-        self.db.log_commit(self.checkpoint_threshold(), &abort)
+        let entry_limit = self
+            .setting_text("wal_autocheckpoint_entries")
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        self.db.log_commit(self.checkpoint_threshold(), entry_limit, &abort)
     }
 
     /// What `debug_force_commit_failure` and `debug_force_wal_fsync_failure` turn a commit into,
@@ -1549,6 +1563,10 @@ impl ClientContext {
             return Err(crate::unported(format!("ATTACH with {}", names.join(", "))));
         }
         let in_memory = path.is_empty() || path == ":memory:";
+        // `MetricStorageWaitingToAttachLatency`: one instance attaches at a time, so there is no wait.
+        if !in_memory {
+            crate::execution::profiler::add_timing("storage.waiting_to_attach_latency", std::time::Duration::ZERO);
+        }
         let stem = Path::new(&path)
             .file_stem()
             .unwrap_or_default()
@@ -1621,6 +1639,11 @@ impl ClientContext {
             opened
         };
         database.catalog.set_database_list(self.database_list());
+        // `checkpoint_on_shutdown` is an option of the instance, which the attached databases share.
+        let on_shutdown = self.home.checkpoint_on_shutdown.load(AtomicOrdering::SeqCst);
+        database
+            .checkpoint_on_shutdown
+            .store(on_shutdown, AtomicOrdering::SeqCst);
         self.home.attached.write().insert(name.to_lowercase(), database);
         Ok(())
     }
@@ -2050,6 +2073,9 @@ impl ClientContext {
                 if parameters.is_empty() && lower.ends_with("_checkpoint_on_shutdown") {
                     let enable = lower == "enable_checkpoint_on_shutdown";
                     self.db.checkpoint_on_shutdown.store(enable, AtomicOrdering::SeqCst);
+                    for database in self.home.attached.read().values() {
+                        database.checkpoint_on_shutdown.store(enable, AtomicOrdering::SeqCst);
+                    }
                     return Ok(Self::success());
                 }
                 let sql = match (lower.as_str(), parameters.as_slice()) {
@@ -2243,7 +2269,10 @@ impl ClientContext {
         let physical = profiling.map(|_| std::time::Instant::now());
         let collector = PhysicalResultCollector::new(plan);
         let threads = self.thread_count();
-        let operator_profiler = profiling.map(|_| Arc::new(crate::execution::profiler::OperatorProfiler::default()));
+        let operator_profiler = profiling.and_then(|_| crate::execution::profiler::current());
+        if let Some(profiler) = &operator_profiler {
+            profiler.clear_operators();
+        }
         let memory = self.query_memory()?;
         crate::execution::profiler::with_profiler(operator_profiler.clone(), || {
             crate::execution::temporary::with_memory(memory, || execute_plan_with(&collector, threads))
@@ -2287,7 +2316,12 @@ impl ClientContext {
     /// `QueryProfiler::EndQuery`: the profile of a statement, to `profiling_output` in the format of
     /// `enable_profiling` (only JSON is written there for now), with the metrics of
     /// `FinalizeMetricValues` that duckrs doesn't measure as their defaults.
-    fn write_profile(&mut self, sql: &str, total: std::time::Duration) -> Result<()> {
+    fn write_profile(
+        &mut self,
+        sql: &str,
+        total: std::time::Duration,
+        profiler: &crate::execution::profiler::OperatorProfiler,
+    ) -> Result<()> {
         use crate::execution::profiler::{Metric, QueryProfile, TrackedMetrics};
         let format = self.setting_text("enable_profiling");
         let output = self.setting_text("profiling_output");
@@ -2295,36 +2329,17 @@ impl ClientContext {
         if format != "json" || output.is_empty() {
             return Ok(());
         }
+        // `QueryMetrics::FinalizeMetrics`: the live counters and the system peaks are always there,
+        // the timings and counters only when something recorded them
         let mut metrics = std::collections::BTreeMap::new();
         for name in [
-            "query.cpu_time",
             "system.blocked_thread_time",
             "io.total_read_time",
             "io.total_write_time",
-            "storage.attach_load_storage_latency",
-            "storage.attach_replay_wal_latency",
-            "storage.checkpoint_latency",
-            "storage.commit_local_storage_latency",
-            "storage.total_vacuum_time",
-            "storage.waiting_to_attach_latency",
-            "storage.write_to_wal_latency",
-            "parser.total_time",
-            "planner.total_time",
-            "planner.binding_time",
-            "optimizer.total_time",
-            "physical_planner.total_time",
-            "physical_planner.column_binding",
-            "physical_planner.create_plan",
-            "physical_planner.resolve_types",
         ] {
             metrics.insert(name.to_string(), Metric::Double(0.0));
         }
         for name in [
-            "query.total_intermediate_rows",
-            "query.total_intermediate_size_bytes",
-            "query.total_rows_scanned",
-            "query.total_row_groups_scanned",
-            "query.total_row_groups_to_scan",
             "system.peak_buffer_memory",
             "system.peak_streaming_buffer_size",
             "system.peak_temp_dir_size",
@@ -2334,9 +2349,15 @@ impl ClientContext {
             "io.total_bytes_written",
             "io.total_read_operations",
             "io.total_write_operations",
-            "storage.wal_replay_entry_count",
         ] {
             metrics.insert(name.to_string(), Metric::UBigInt(0));
+        }
+        let (counters, timings) = profiler.gathered();
+        for (name, value) in counters {
+            metrics.insert(name.to_string(), Metric::UBigInt(value));
+        }
+        for (name, time) in timings {
+            metrics.insert(name.to_string(), Metric::Double(time.as_secs_f64()));
         }
         metrics.insert("query.sql".to_string(), Metric::Text(sql.to_string()));
         metrics.insert("query.total_time".to_string(), Metric::Double(total.as_secs_f64()));
@@ -2354,6 +2375,13 @@ impl ClientContext {
                 "query.total_rows_scanned".to_string(),
                 Metric::UBigInt(totals.rows_scanned),
             );
+            metrics.insert(
+                "query.total_intermediate_size_bytes".to_string(),
+                Metric::UBigInt(totals.size_bytes),
+            );
+            let (scanned, to_scan) = row_group_totals(root);
+            metrics.insert("query.total_row_groups_scanned".to_string(), Metric::UBigInt(scanned));
+            metrics.insert("query.total_row_groups_to_scan".to_string(), Metric::UBigInt(to_scan));
         }
         let tracked = match self.setting("tracked_metrics").map(|value| value.data().clone()) {
             Some(duckrs_common::value::ValueData::List(items)) => {
@@ -2366,6 +2394,14 @@ impl ClientContext {
         std::fs::write(&output, profile.to_json(&tracked, legacy))
             .map_err(|error| Error::new(ErrorKind::Io, format!("Cannot open file \"{output}\": {error}")))
     }
+}
+
+/// The row groups the scans of a profile scanned, of those they could have.
+fn row_group_totals(node: &crate::execution::profiler::ProfileNode) -> (u64, u64) {
+    node.children
+        .iter()
+        .map(row_group_totals)
+        .fold(node.row_groups, |(a, b), (c, d)| (a + c, b + d))
 }
 
 /// The schema a CREATE puts its object in: temporary objects have one of their own.
