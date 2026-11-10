@@ -1115,8 +1115,7 @@ impl<'a> Writer<'a> {
     /// the order of `internal_compression_methods`, each scored by its `final_analyze`; the lowest score
     /// wins, the first of equal ones. With `force_compression` only that method and UNCOMPRESSED (to
     /// fall back on) are left, and the forced one is chosen whenever it can store the column.
-    /// ALP, ALPRD and the Roaring of booleans are scored by what they encode to, as their analyze isn't
-    /// ported yet.
+    /// ALP and ALPRD are scored by what they encode to, as their analyze isn't ported yet.
     fn encode_fixed(&self, ty: &LogicalType, data: &[u8], valid: &[bool], width: usize) -> (Vec<Encoded>, u8) {
         use super::bitpacking;
         let physical = ty.physical_type();
@@ -1172,8 +1171,14 @@ impl<'a> Writer<'a> {
                 }
                 COMPRESSION_ALP => Some(encoded_size(&encode_alp(data, width, self.block_size, fallback))),
                 COMPRESSION_ALPRD => Some(encoded_size(&encode_alprd(data, width, self.block_size, fallback))),
-                // `RoaringFinalAnalyze` doubles the size; here the size is what the encoder makes of it
-                _ => Some(encoded_size(&roaring()) * 2),
+                _ => {
+                    let bits: Vec<bool> = data
+                        .iter()
+                        .zip(valid)
+                        .map(|(byte, valid)| *valid && *byte != 0)
+                        .collect();
+                    Some(super::roaring::final_analyze(&bits, self.block_size))
+                }
             };
             let Some(score) = score else { continue };
             let is_forced = Some(method) == forced;
@@ -1555,14 +1560,20 @@ impl<'a> Writer<'a> {
                 overflow_blocks: Vec::new(),
             });
         } else {
-            let roaring = encode_roaring(valid, self.block_size);
-            let roaring_size: usize = roaring.iter().map(|(bytes, _)| bytes.len()).sum();
-            let plain_size = valid.len().div_ceil(64) * 8;
+            // `DetectBestCompressionMethod` of a validity column: UNCOMPRESSED, and ROARING from v1.2.0
             let force = self.force_compression.as_str();
-            let use_roaring = self.version >= StorageVersion::V1_2_0
-                && (force == "roaring" || (force != "uncompressed" && roaring_size < plain_size));
+            let plain_score = valid.len().div_ceil(8);
+            let roaring_score = (self.version >= StorageVersion::V1_2_0 && force != "uncompressed")
+                .then(|| super::roaring::final_analyze(valid, self.block_size));
+            let use_roaring = roaring_score.is_some_and(|score| force == "roaring" || score < plain_score);
+            let (chosen, score) = if use_roaring {
+                (COMPRESSION_ROARING, roaring_score.expect("scored"))
+            } else {
+                (COMPRESSION_UNCOMPRESSED, plain_score)
+            };
+            self.log_choice(chosen, "VALIDITY", score);
             let encoded: Vec<(Vec<u8>, usize, u8)> = if use_roaring {
-                roaring
+                encode_roaring(valid, self.block_size)
                     .into_iter()
                     .map(|(bytes, rows)| (bytes, rows, COMPRESSION_ROARING))
                     .collect()

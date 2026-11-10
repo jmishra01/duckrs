@@ -12,6 +12,7 @@ mod fsst;
 mod index_data;
 pub mod log_writer;
 pub mod metadata;
+pub mod roaring;
 pub mod serialization;
 pub mod statistics;
 pub mod table_data;
