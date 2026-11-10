@@ -347,6 +347,8 @@ enum Params {
     /// UNBOUND: a type that is known by name, as the SQL that names it (`UnboundTypeInfo`).
     Unbound(Arc<str>),
     /// INTEGER_LITERAL: the constant's own integral type and its value (`IntegerLiteralTypeInfo`).
+    /// GEOMETRY with a coordinate reference system (`GeoTypeInfo`).
+    Geometry(crate::geometry_crs::Crs),
     /// A UHUGEINT above `i128::MAX` keeps `value == i128::MAX` with `beyond_i128` set.
     IntegerLiteral {
         ty: LogicalTypeId,
@@ -753,6 +755,22 @@ impl LogicalType {
         }
     }
 
+    /// `LogicalType::GEOMETRY(crs)`: without a CRS for an empty or invalid one.
+    pub fn geometry(crs: Option<crate::geometry_crs::Crs>) -> Self {
+        match crs.filter(crate::geometry_crs::Crs::is_valid) {
+            Some(crs) => Self::with_params(LogicalTypeId::Geometry, Params::Geometry(crs)),
+            None => Self::new(LogicalTypeId::Geometry),
+        }
+    }
+
+    /// `GeoType::GetCRS` of a GEOMETRY that has one (`GeoType::HasCRS`).
+    pub fn crs(&self) -> Option<&crate::geometry_crs::Crs> {
+        match self.params() {
+            Params::Geometry(crs) => Some(crs),
+            _ => None,
+        }
+    }
+
     pub fn enum_values(&self) -> &[String] {
         match self.params() {
             Params::Enum(values) => values,
@@ -878,6 +896,7 @@ impl fmt::Display for LogicalType {
                 f.write_str(")")
             }
             (LogicalTypeId::Unbound, Params::Unbound(sql)) => f.write_str(sql),
+            (LogicalTypeId::Geometry, Params::Geometry(crs)) => write!(f, "GEOMETRY({})", sql_string(&crs.definition)),
             (LogicalTypeId::SqlNull, _) => f.write_str("\"NULL\""),
             (LogicalTypeId::Template, _) => f.write_str("T"),
             (id, _) => f.write_str(id.name()),

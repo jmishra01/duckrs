@@ -9,11 +9,11 @@ use super::cast::{CastMode, conversion_error};
 use super::nested::row_wise;
 use super::{ScalarCallback, ScalarFunction, ScalarFunctionSet};
 use crate::planner::expression::BoundExpr;
-use duckrs_common::geometry;
 use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, Vector, VectorType};
 use duckrs_common::{Error, ErrorKind, Result};
+use duckrs_common::{geometry, geometry_crs};
 
 /// A GEOMETRY of `wkb`.
 pub(super) fn geometry_value(ty: &LogicalType, wkb: Vec<u8>) -> Result<Value> {
@@ -72,7 +72,22 @@ pub(super) fn geometry_cast(source: &Vector, result: &mut Vector, count: usize, 
             )));
         };
         let cast = match (from.id(), target.id()) {
-            (LogicalTypeId::Geometry, LogicalTypeId::Geometry) => Some(geometry_value(&target, bytes.clone())?),
+            (LogicalTypeId::Geometry, LogicalTypeId::Geometry) => {
+                // `GeoCastSwitch`: two CRSs must be the same one
+                if let (Some(source), Some(target)) = (from.crs(), target.crs())
+                    && source != target
+                {
+                    return Err(Error::new(
+                        ErrorKind::Binder,
+                        format!(
+                            "Cannot cast GEOMETRY with CRS '{}' to GEOMETRY with different CRS '{}'",
+                            source.identifier(),
+                            target.identifier()
+                        ),
+                    ));
+                }
+                Some(geometry_value(&target, bytes.clone())?)
+            }
             (LogicalTypeId::Geometry, LogicalTypeId::Blob) => Some(Value::blob(bytes.clone())),
             (LogicalTypeId::Blob, LogicalTypeId::Geometry) => from_blob(bytes, &target, mode)?,
             (LogicalTypeId::Varchar, LogicalTypeId::Geometry) => {
@@ -252,4 +267,89 @@ pub(crate) fn bind_vertex_extract_call(children: Vec<BoundExpr>) -> Result<Bound
     }
     let geometry = geometry.cast_to(&LogicalType::new(LogicalTypeId::Geometry), false);
     Ok(bind_vertex_extract(geometry, BoundExpr::constant(Value::varchar(name))))
+}
+
+fn no_match(name: &str, children: &[BoundExpr]) -> Error {
+    let types: Vec<String> = children
+        .iter()
+        .map(|c| super::binder::expression_return_type(c).to_string())
+        .collect();
+    Error::new(
+        ErrorKind::Binder,
+        format!(
+            "No function matches the given name and argument types '{name}({})'. You might need to add explicit type \
+             casts.",
+            types.join(", ")
+        ),
+    )
+}
+
+/// Whether `child` can be a GEOMETRY argument: one, a string literal or a NULL.
+fn geometry_argument(child: &BoundExpr) -> bool {
+    matches!(
+        super::binder::expression_return_type(child).id(),
+        LogicalTypeId::Geometry | LogicalTypeId::StringLiteral | LogicalTypeId::SqlNull
+    )
+}
+
+/// `BindCRSFunctionExpression`: the CRS of the argument's type, as a constant.
+pub(crate) fn bind_st_crs(children: Vec<BoundExpr>) -> Result<BoundExpr> {
+    match children.as_slice() {
+        [child] if geometry_argument(child) => Ok(BoundExpr::constant(match child.return_type.crs() {
+            Some(crs) => Value::varchar(crs.definition.clone()),
+            None => Value::null(LogicalType::VARCHAR),
+        })),
+        _ => Err(no_match("st_crs", &children)),
+    }
+}
+
+/// `SetCRSBind`: a GEOMETRY of the CRS the constant names, as the catalog identifies it.
+pub(crate) fn bind_st_setcrs(children: Vec<BoundExpr>) -> Result<BoundExpr> {
+    let [geometry, crs] = children.as_slice() else {
+        return Err(no_match("st_setcrs", &children));
+    };
+    if !geometry_argument(geometry)
+        || !matches!(
+            super::binder::expression_return_type(crs).id(),
+            LogicalTypeId::Varchar | LogicalTypeId::StringLiteral | LogicalTypeId::SqlNull
+        )
+    {
+        return Err(no_match("st_setcrs", &children));
+    }
+    if !crs.is_foldable() {
+        return Err(Error::new(
+            ErrorKind::Binder,
+            "The crs argument in function st_setcrs must be a constant expression",
+        ));
+    }
+    let value = crate::execution::expression_executor::evaluate_scalar(crs)?;
+    let target = if value.is_null() {
+        LogicalType::new(LogicalTypeId::Geometry)
+    } else {
+        let text = value.try_to_string()?;
+        let identified =
+            geometry_crs::try_identify(&text).map_err(|message| Error::new(ErrorKind::InvalidInput, message))?;
+        let crs = identified.unwrap_or_else(|| geometry_crs::Crs::parse(&text));
+        LogicalType::geometry(Some(crs))
+    };
+    // the geometry stays as it is, only its type changes (`SetCRSFunction`)
+    let input = geometry
+        .clone()
+        .cast_to(&LogicalType::new(LogicalTypeId::Geometry), false);
+    Ok(super::nested::bound_function(
+        "st_setcrs",
+        vec![input, crs.clone()],
+        target,
+        st_setcrs,
+    ))
+}
+
+fn st_setcrs(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let ty = result.logical_type().clone();
+    row_wise(args, result, |row| {
+        if row[0].is_null() {
+            return Ok(Value::null(ty.clone()));
+        }
+        geometry_value(&ty, bytes_of(&row[0]).to_vec())
+    })
 }

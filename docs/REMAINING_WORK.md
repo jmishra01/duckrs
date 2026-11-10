@@ -123,10 +123,11 @@ Each item gives the number of failing files in `test/` that it should fix, where
 
 ## Phase 4: Types and casts
 
-- [ ] 34a. GEOMETRY (`sql/types/geo`: 21 of 42 pass)
+- [ ] 34a. GEOMETRY (`sql/types/geo`: 27 of 42 pass)
   - [x] WKB as stored, WKT in and out (with EWKT's SRID), BLOB and VARCHAR casts, `ST_GeomFromWKB`, `ST_AsWKB`,
     `ST_AsText`, `ST_Intersects_Extent` / `&&`, `vertex_extract` and the `.x`/`.y`/`.z`/`.m` syntax
-  - [ ] CRS type parameters (`GEOMETRY('EPSG:4326')`, PROJJSON, WKT2) and `ST_SetCRS` (8 files)
+  - [x] CRS type parameters (AUTH:CODE, PROJJSON, WKT2:2019, the OGC:CRS84/CRS83 defaults), `ST_CRS`, `ST_SetCRS`
+  - [ ] `CREATE COORDINATE SYSTEM`, `duckdb_coordinate_systems()`, `ignore_unknown_crs`
   - [x] GEOMETRY columns in database files (v1.5.0 and later, as WKB) and the WAL
   - [ ] shredded GEOMETRY columns, and the spatial extension's format of files before v1.5.0
   - [ ] statistics of GEOMETRY (`stats()`, bounding boxes), GeoParquet, the spatial extension's blob format

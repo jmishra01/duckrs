@@ -420,6 +420,38 @@ impl Binder<'_> {
             }
             // the length of a BIT is accepted and ignored
             LogicalTypeId::Bit if children.len() <= 1 => Ok(LogicalType::new(id)),
+            // `BindGeometryType`: the CRS, as the catalog of coordinate systems identifies it
+            LogicalTypeId::Geometry if !children.is_empty() => {
+                let [child] = children else {
+                    let types: Vec<&str> = children.iter().map(type_parameter_type).collect();
+                    return Err(binder_error(format!(
+                        "Type \"GEOMETRY\" does not accept type parameters ({})",
+                        types.join(", ")
+                    )));
+                };
+                let text = match &child.kind {
+                    ExprKind::Constant(literal) if literal.kind == LiteralKind::String => literal.text.clone(),
+                    _ => {
+                        return Err(binder_error(format!(
+                            "Type \"GEOMETRY\" does not accept type parameters ({})",
+                            type_parameter_type(child)
+                        )));
+                    }
+                };
+                let identified = duckrs_common::geometry_crs::try_identify(&text)
+                    .map_err(|message| Error::new(ErrorKind::InvalidInput, message))?;
+                match identified {
+                    Some(crs) => Ok(LogicalType::geometry(Some(crs))),
+                    None => Err(binder_error(format!(
+                        "Encountered unrecognized coordinate system '{text}' when trying to create GEOMETRY type\n\
+                         The coordinate system definition may be incomplete or invalid. Your options are as \
+                         follows:\n* Load an extension that can identify this coordinate system\n* Provide a full \
+                         coordinate system definition in e.g. \"PROJJSON\" or \"WKT2\" format\n* Set the \
+                         'ignore_unknown_crs' configuration option to drop the coordinate system from the resulting \
+                         geometry type and make this error go away"
+                    ))),
+                }
+            }
             _ if !children.is_empty() => Err(crate::unported(format!("type parameters for {}", name.to_uppercase()))),
             LogicalTypeId::Type => Err(crate::unported(format!("the {} type", name.to_uppercase()))),
             id => Ok(LogicalType::new(id)),
@@ -1320,6 +1352,21 @@ impl Binder<'_> {
                         return bind_unnest(children);
                     }
                     return bind_generic_function(&function.name.name, children);
+                }
+                if ["st_crs", "st_setcrs"]
+                    .iter()
+                    .any(|name| function.name.name.eq_ignore_ascii_case(name))
+                {
+                    let children = function
+                        .args
+                        .iter()
+                        .map(|a| self.bind_expression(&a.expr))
+                        .collect::<Result<Vec<_>>>()?;
+                    return if function.name.name.eq_ignore_ascii_case("st_crs") {
+                        crate::function::geometry::bind_st_crs(children)
+                    } else {
+                        crate::function::geometry::bind_st_setcrs(children)
+                    };
                 }
                 if function.name.name.eq_ignore_ascii_case("vertex_extract") {
                     let children = function

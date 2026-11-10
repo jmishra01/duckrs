@@ -148,6 +148,7 @@ impl DatabaseInstance {
     }
 
     pub fn new() -> Arc<Self> {
+        crate::function::json::register_projjson_parser();
         Arc::new(Self::with_file_access(None))
     }
 
@@ -166,6 +167,7 @@ impl DatabaseInstance {
 
     /// `open_file` with what `ATTACH` can ask for.
     pub fn open_with(path: &Path, options: &AttachOptions) -> Result<Arc<Self>> {
+        crate::function::json::register_projjson_parser();
         let read_only = options.read_only;
         if read_only && !storage::is_database_file(path) {
             return Ok(Self::new());

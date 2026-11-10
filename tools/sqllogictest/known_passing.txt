@@ -2185,6 +2185,7 @@ test/sql/join/hash_join/hash_join_dict_surviving.test
 test/sql/join/hash_join/hash_join_dict_surviving_computed_build.test
 test/sql/join/hash_join/hash_join_dict_surviving_cte.test
 test/sql/join/hash_join/hash_join_dict_surviving_outer_build.test
+test/sql/join/hash_join/hash_join_dict_surviving_reinterpret.test
 test/sql/join/hash_join/hash_join_local_build.test
 test/sql/join/hash_join/hash_join_nested_key_after_constant_key.test
 test/sql/join/iejoin/iejoin_outer_struct_payload.test
@@ -2310,6 +2311,7 @@ test/sql/json/scalar/test_json_contains.test
 test/sql/json/scalar/test_json_deep_merge.test
 test/sql/json/scalar/test_json_exists.test
 test/sql/json/scalar/test_json_extract_input_types.test
+test/sql/json/scalar/test_json_geometry_crs.test
 test/sql/json/scalar/test_json_keys.test
 test/sql/json/scalar/test_json_merge_patch.test
 test/sql/json/scalar/test_json_merge_patch_diff.test
@@ -3482,8 +3484,16 @@ test/sql/types/float/nan_test.test
 test/sql/types/float/nan_window.test
 test/sql/types/float/nested_nan.test
 test/sql/types/geo/geometry.test
+test/sql/types/geo/geometry_blob_cast.test
 test/sql/types/geo/geometry_blob_cast_invalid_parts.test
+test/sql/types/geo/geometry_crs.test
+test/sql/types/geo/geometry_crs_formats.test
+test/sql/types/geo/geometry_crs_id_overflow.test
+test/sql/types/geo/geometry_crs_persist.test
+test/sql/types/geo/geometry_crs_projjson.test
+test/sql/types/geo/geometry_crs_wkt2.test
 test/sql/types/geo/geometry_intersects.test
+test/sql/types/geo/geometry_nonascii_cast.test
 test/sql/types/geo/geometry_persist.test
 test/sql/types/geo/geometry_persist_wal.test
 test/sql/types/geo/geometry_shred_deletes.test

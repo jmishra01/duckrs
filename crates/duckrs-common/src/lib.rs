@@ -8,6 +8,7 @@ mod error;
 pub mod executor;
 mod fmt_float;
 pub mod geometry;
+pub mod geometry_crs;
 pub mod hash;
 pub mod path;
 pub mod row;

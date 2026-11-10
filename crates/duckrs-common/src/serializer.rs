@@ -711,6 +711,7 @@ mod type_info {
     pub const ENUM: u8 = 6;
     pub const UNBOUND: u8 = 7;
     pub const ARRAY: u8 = 9;
+    pub const GEO: u8 = 13;
 }
 
 fn logical_type_id_from(raw: u8) -> Result<LogicalTypeId> {
@@ -811,6 +812,7 @@ impl Serialize for LogicalType {
                 LogicalTypeId::Struct | LogicalTypeId::Tuple | LogicalTypeId::Union => Some(type_info::STRUCT),
                 LogicalTypeId::Array => Some(type_info::ARRAY),
                 LogicalTypeId::Enum => Some(type_info::ENUM),
+                LogicalTypeId::Geometry if self.crs().is_some() => Some(type_info::GEO),
                 _ if self.has_params() => Some(type_info::STRING),
                 _ => Some(type_info::GENERIC),
             };
@@ -844,6 +846,13 @@ impl Serialize for LogicalType {
                     }
                     type_info::STRING if self.collation().is_some() => {
                         s.write_property_with_default(200, "collation", self.collation().unwrap_or(""));
+                    }
+                    // `GeoTypeInfo::Serialize`: the definition of the CRS
+                    type_info::GEO => {
+                        let definition = self.crs().map_or("", |crs| crs.definition.as_str());
+                        s.write_object(200, "crs", |s| {
+                            s.write_property_with_default(100, "definition", definition)
+                        });
                     }
                     type_info::ENUM => {
                         let values = self.enum_values();
@@ -919,6 +928,13 @@ impl Deserialize for LogicalType {
                                 LogicalType::struct_type(children).with_id(id)
                             }
                         }
+                    }
+                    // `CoordinateReferenceSystem::Deserialize`: parsed again from its definition
+                    type_info::GEO => {
+                        let definition: String = d.read_object_field(200, "crs", |d| {
+                            d.read_object_value(|d| d.read_property_with_default(100, "definition"))
+                        })?;
+                        LogicalType::geometry(Some(crate::geometry_crs::Crs::parse(&definition)))
                     }
                     type_info::ENUM => {
                         let _count: u64 = d.read_property(200, "values_count")?;

@@ -286,6 +286,7 @@ impl BuiltinFunctions {
     pub fn get() -> &'static BuiltinFunctions {
         static FUNCTIONS: OnceLock<BuiltinFunctions> = OnceLock::new();
         FUNCTIONS.get_or_init(|| {
+            json::register_projjson_parser();
             let mut functions = BuiltinFunctions {
                 scalar: HashMap::new(),
                 aggregate: HashMap::new(),
