@@ -27,6 +27,8 @@ pub struct ParseError {
 struct Parser<'a> {
     text: &'a [u8],
     at: usize,
+    /// `YYJSON_READ_NUMBER_AS_RAW`: every number kept as its text
+    numbers_as_raw: bool,
 }
 
 impl Parser<'_> {
@@ -301,6 +303,11 @@ impl Parser<'_> {
             }
         }
         let text = std::str::from_utf8(&self.text[start..self.at]).unwrap_or_default();
+        if self.numbers_as_raw {
+            return Ok(Json::Raw(text.to_string()));
+        }
+        // `YYJSON_READ_BIGNUM_AS_RAW`: an integer too big for 64 bits, or a real too big for a
+        // finite double, is kept as its text
         if !real {
             if negative {
                 if let Ok(value) = text.parse::<i64>() {
@@ -309,17 +316,27 @@ impl Parser<'_> {
             } else if let Ok(value) = text.parse::<u64>() {
                 return Ok(Json::UInt(value));
             }
+            return Ok(Json::Raw(text.to_string()));
         }
-        Ok(Json::Real(text.parse().unwrap_or(f64::NAN)))
+        match text.parse::<f64>() {
+            Ok(value) if value.is_finite() => Ok(Json::Real(value)),
+            _ => Ok(Json::Raw(text.to_string())),
+        }
     }
 }
 
 /// `yyjson_read` of one value, with nothing after it but space.
 pub fn parse(text: &str) -> std::result::Result<Json, ParseError> {
-    let (value, end) = parse_prefix(text.as_bytes(), 0)?;
+    parse_with(text, false)
+}
+
+/// `parse`, with `numbers_as_raw` every number kept as its text.
+pub fn parse_with(text: &str, numbers_as_raw: bool) -> std::result::Result<Json, ParseError> {
+    let (value, end) = parse_prefix_with(text.as_bytes(), 0, numbers_as_raw)?;
     let mut parser = Parser {
         text: text.as_bytes(),
         at: end,
+        numbers_as_raw: false,
     };
     parser.skip_space();
     if parser.at != text.len() {
@@ -330,7 +347,21 @@ pub fn parse(text: &str) -> std::result::Result<Json, ParseError> {
 
 /// One value from `start`, and where it ends.
 pub fn parse_prefix(text: &[u8], start: usize) -> std::result::Result<(Json, usize), ParseError> {
-    let mut parser = Parser { text, at: start };
+    parse_prefix_with(text, start, false)
+}
+
+/// `parse_prefix`, with `numbers_as_raw` every number kept as its text (`YYJSON_READ_NUMBER_AS_RAW`,
+/// what a DECIMAL needs).
+pub fn parse_prefix_with(
+    text: &[u8],
+    start: usize,
+    numbers_as_raw: bool,
+) -> std::result::Result<(Json, usize), ParseError> {
+    let mut parser = Parser {
+        text,
+        at: start,
+        numbers_as_raw,
+    };
     let value = parser.value()?;
     Ok((value, parser.at))
 }

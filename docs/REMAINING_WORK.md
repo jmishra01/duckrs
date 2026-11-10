@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 4111 of 6367 test files pass (**68.0%** of the 6050 that run). The v1 target is ≥ 90%.
+- Overall: 4121 of 6367 test files pass (**68.1%** of the 6049 that run). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -47,7 +47,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] the agreement of `columns` with `types`, unnamed after named arguments, subqueries, aggregates and windows
     in table function arguments; rejects-table lines made valid UTF-8 as `Utf8Proc::MakeValid` does
   - [ ] the other CSV sniffer, rejects-table and error-message differences (about 40 files under `sql/copy/csv` fail)
-- [ ] 2. JSON: `read_json`/`read_json_auto`, the JSON type, JSON functions (`sql/json`: 57 failing, 61.0%)
+- [ ] 2. JSON: `read_json`/`read_json_auto`, the JSON type, JSON functions (`sql/json`: 46 failing, 68.3%)
   - [x] `json_normalize`, `json_deep_merge`, `json_merge_patch_diff`
   - [x] `json_each` / `json_tree`, with columns as arguments (LATERAL) and the hidden `json`, `root`, `rowid`
   - [x] escaped quotes and backslashes in quoted JSON path keys; no wildcards in `json_set`/`json_remove`/...
@@ -56,6 +56,13 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] `json_set`/`json_insert`/`json_replace` as `ModifyDocumentElements`: positions up to the end of an array, the
     missing containers on the way made only if the value goes in; malformed values are errors
   - [x] `read_json_objects` gives each record's bytes as they are; strings are UUIDs only in the strict form
+  - [x] numbers as yyjson reads them: integers beyond 64 bits and overflowing reals kept as text (`BIGNUM_AS_RAW`),
+    every number as text where a DECIMAL reads them (`NUMBER_AS_RAW`), read again for the other columns
+  - [x] JSON to UNION and BLOB; `JSON[]` written as its documents; empty objects are `MAP(VARCHAR, JSON)` (or JSON
+    with `map_inference_threshold = -1`)
+  - [x] `read_json` errors as C++'s reader: transform errors with file, record and hint; the array format's errors of
+    the file; with `ignore_errors` a broken line is a row of NULLs, elsewhere it is still an error
+  - [x] COPY (FORMAT JSON) options checked as `GetSingleJSONCopyValue` does; column types that don't parse suggest some
   - [x] `json_serialize_sql` / `json_deserialize_sql` / `json_execute_serialized_sql` (and its PRAGMA): the serializer of the
     file format has a JSON mode (`JsonSerializer`/`JsonDeserializer`: properties by name, enums by their `EnumUtil`
     names, nulls/empties/defaults left out as asked); C++'s `VerifyDeserialized` checks, the type and value checks of

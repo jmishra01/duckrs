@@ -200,9 +200,12 @@ fn dollar_path(text: &str) -> Result<Path> {
                 while matches!(bytes.get(at), Some(b'0'..=b'9')) {
                     at += 1;
                 }
-                let index = text[start..at].parse::<usize>().ok();
+                // `ReadInteger`: at most 19 digits, then the closing bracket
+                let index = (at - start <= 19)
+                    .then(|| text[start..at].parse::<usize>().ok())
+                    .flatten();
                 let (Some(index), Some(b']')) = (index, bytes.get(at)) else {
-                    return Err(path_error(text, at));
+                    return Err(path_error(text, start));
                 };
                 at += 1;
                 steps.push(if reverse {
@@ -497,6 +500,18 @@ pub fn transform_with(json: &Json, ty: &LogicalType, strict: bool, formats: &For
     }
     let transform = |json: &Json, ty: &LogicalType, strict: bool| transform_with(json, ty, strict, formats);
     let fail = |json: &Json| -> Result<Value> {
+        // `TransformDecimal`: of the value, what `ValToString` writes of it
+        if strict && ty.id() == LogicalTypeId::Decimal {
+            let mut text = json.text();
+            if text.len() > 50 {
+                let mut end = 50;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text = format!("{}...", &text[..end]);
+            }
+            return Err(invalid(format!("Failed to cast value to decimal: {text}")));
+        }
         if strict {
             Err(invalid(format!("Unable to cast '{}' to {ty}", json.text())))
         } else {
@@ -505,6 +520,11 @@ pub fn transform_with(json: &Json, ty: &LogicalType, strict: bool, formats: &For
     };
     if matches!(json, Json::Null) {
         return Ok(Value::null(ty.clone()));
+    }
+    // `ReadRawNumber`: numbers kept as text for a DECIMAL read as the default flags would read them
+    // into anything that has no DECIMAL in it
+    if !contains_decimal(ty) && has_raw_number(json) {
+        return transform_with(&reread_raw_numbers(json.clone()), ty, strict, formats);
     }
     if is_json_type(ty) {
         return Value::varchar(json.text()).reinterpret(ty);
@@ -516,6 +536,9 @@ pub fn transform_with(json: &Json, ty: &LogicalType, strict: bool, formats: &For
     match (ty.id(), json) {
         (LogicalTypeId::SqlNull, _) => Ok(Value::null(ty.clone())),
         (LogicalTypeId::Varchar, Json::Str(text)) => Ok(Value::varchar(text.as_str())),
+        // `TransformToBlob`: a string is cast, anything else is the bytes of its text
+        (LogicalTypeId::Blob, Json::Str(_)) => fail_or_cast(json, ty, strict),
+        (LogicalTypeId::Blob, other) => Value::new(ty.clone(), ValueData::Bytes(other.text().into_bytes())),
         (LogicalTypeId::Varchar, other) => Ok(Value::varchar(other.text())),
         (LogicalTypeId::Struct, Json::Object(items)) => {
             let mut fields = Vec::with_capacity(ty.struct_children().len());
@@ -567,6 +590,42 @@ pub fn transform_with(json: &Json, ty: &LogicalType, strict: bool, formats: &For
             }
             Value::new(ty.clone(), ValueData::List(values))
         }
+        // `TransformValueIntoUnion`: an object of one key, the member it names
+        (LogicalTypeId::Union, _) => {
+            let error = |message: String| -> Result<Value> {
+                if strict {
+                    Err(invalid(message))
+                } else {
+                    Ok(Value::null(ty.clone()))
+                }
+            };
+            let Json::Object(items) = json else {
+                return error(format!(
+                    "Expected an object representing a union, got {}",
+                    yyjson_type_desc(json)
+                ));
+            };
+            let (key, item) = match items.as_slice() {
+                [] => return error("Found empty object, instead of union".to_string()),
+                [entry] => (&entry.0, &entry.1),
+                _ => return error("Found object containing more than one key, instead of union".to_string()),
+            };
+            // the first child of a UNION is its tag
+            let members = &ty.struct_children()[1..];
+            let Some(tag) = members.iter().position(|(name, _)| name == key) else {
+                return error(format!("Found object containing unknown key, instead of union: {key}"));
+            };
+            let member = transform(item, &members[tag].1, strict)?;
+            let mut fields = vec![Value::utinyint(tag as u8)];
+            for (at, (_, member_type)) in members.iter().enumerate() {
+                fields.push(if at == tag {
+                    member.clone()
+                } else {
+                    Value::null(member_type.clone())
+                });
+            }
+            Value::new(ty.clone(), ValueData::Struct(fields))
+        }
         (LogicalTypeId::Struct | LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Map, _) => fail(json),
         (_, Json::Array(_) | Json::Object(_)) => fail(json),
         (_, Json::Bool(flag)) => match cast_value(&Value::boolean(*flag), ty) {
@@ -593,6 +652,92 @@ pub fn transform_with(json: &Json, ty: &LogicalType, strict: bool, formats: &For
             Some(value) => Ok(value),
             None => fail(json),
         },
+    }
+}
+
+/// A string cast to `ty`, or NULL or an error if it isn't one.
+fn fail_or_cast(json: &Json, ty: &LogicalType, strict: bool) -> Result<Value> {
+    let Json::Str(text) = json else {
+        return Ok(Value::null(ty.clone()));
+    };
+    match cast_value(&Value::varchar(text.as_str()), ty) {
+        Some(value) => Ok(value),
+        None if strict => Err(invalid(format!("Unable to cast '{}' to {ty}", json.text()))),
+        None => Ok(Value::null(ty.clone())),
+    }
+}
+
+/// `JSONCommon::NumbersAsRaw`: whether a type has a DECIMAL in it.
+pub fn contains_decimal(ty: &LogicalType) -> bool {
+    match ty.id() {
+        LogicalTypeId::Decimal => true,
+        LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Map => {
+            ty.child_type().is_some_and(contains_decimal)
+        }
+        LogicalTypeId::Struct | LogicalTypeId::Union => {
+            ty.struct_children().iter().any(|(_, child)| contains_decimal(child))
+        }
+        _ => false,
+    }
+}
+
+/// A number kept as text that the default flags read as a number (not a big one, kept as text too).
+fn rereads(json: &Json) -> Option<Json> {
+    match json {
+        Json::Raw(text) => match parse(text) {
+            Ok(number @ (Json::UInt(_) | Json::Int(_) | Json::Real(_))) => Some(number),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether a value has a number in it that `rereads`.
+fn has_raw_number(json: &Json) -> bool {
+    let mut stack = vec![json];
+    while let Some(value) = stack.pop() {
+        match value {
+            Json::Array(items) => stack.extend(items),
+            Json::Object(items) => stack.extend(items.iter().map(|(_, v)| v)),
+            other if rereads(other).is_some() => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The value with each number that `rereads` read again.
+fn reread_raw_numbers(json: Json) -> Json {
+    if let Some(number) = rereads(&json) {
+        return number;
+    }
+    json.map_containers(|container| match container.into_array() {
+        Ok(items) => Json::Array(items.into_iter().map(|item| rereads(&item).unwrap_or(item)).collect()),
+        Err(container) => match container.into_object() {
+            Ok(items) => Json::Object(
+                items
+                    .into_iter()
+                    .map(|(key, item)| (key, rereads(&item).unwrap_or(item)))
+                    .collect(),
+            ),
+            Err(other) => other,
+        },
+    })
+}
+
+/// `yyjson_get_type_desc`.
+fn yyjson_type_desc(json: &Json) -> &'static str {
+    match json {
+        Json::Null => "null",
+        Json::Bool(true) => "true",
+        Json::Bool(false) => "false",
+        Json::UInt(_) => "uint",
+        Json::Int(_) => "sint",
+        Json::Real(_) => "real",
+        Json::Raw(_) => "raw",
+        Json::Str(_) => "string",
+        Json::Array(_) => "array",
+        Json::Object(_) => "object",
     }
 }
 
@@ -699,6 +844,8 @@ impl Structure {
             Structure::Null => Json::Str("NULL".to_string()),
             Structure::Scalar(name) => Json::Str((*name).to_string()),
             Structure::List(element) => Json::Array(vec![element.to_json()]),
+            // an empty object has no structure of its own
+            Structure::Object(fields) if fields.is_empty() => Json::Str("JSON".to_string()),
             Structure::Object(fields) => Json::Object(fields.iter().map(|(k, v)| (k.clone(), v.to_json())).collect()),
             Structure::Mixed => Json::Str("JSON".to_string()),
         }
@@ -706,6 +853,11 @@ impl Structure {
 
     /// `JSONStructure::StructureToType`
     pub fn logical_type(&self, depth: i64) -> LogicalType {
+        self.logical_type_with(depth, true)
+    }
+
+    /// `StructureToType`, with `maps` whether `map_inference_threshold` lets objects be MAPs.
+    pub fn logical_type_with(&self, depth: i64, maps: bool) -> LogicalType {
         if depth == 0 {
             return json_type();
         }
@@ -716,12 +868,16 @@ impl Structure {
             Structure::Scalar("UBIGINT" | "BIGINT") => LogicalType::BIGINT,
             Structure::Scalar("DOUBLE") => LogicalType::DOUBLE,
             Structure::Scalar(_) => LogicalType::VARCHAR,
-            Structure::List(element) => LogicalType::list(element.logical_type(depth - 1)),
+            Structure::List(element) => LogicalType::list(element.logical_type_with(depth - 1, maps)),
+            // `StructureToTypeObject`: an empty object is a MAP of what it could hold
+            Structure::Object(fields) if fields.is_empty() && maps => {
+                LogicalType::map(LogicalType::VARCHAR, json_type())
+            }
             Structure::Object(fields) if fields.is_empty() => json_type(),
             Structure::Object(fields) => LogicalType::struct_type(
                 fields
                     .iter()
-                    .map(|(k, v)| (k.clone(), v.logical_type(depth - 1)))
+                    .map(|(k, v)| (k.clone(), v.logical_type_with(depth - 1, maps)))
                     .collect(),
             ),
         }
@@ -1630,8 +1786,16 @@ fn json_pretty(args: &DataChunk, result: &mut Vector) -> Result<()> {
 
 fn transform_rows(args: &DataChunk, result: &mut Vector, strict: bool) -> Result<()> {
     let ty = result.logical_type().clone();
+    // `JSONCommon::NumbersAsRaw`: a DECIMAL reads numbers from their text
+    let raw = contains_decimal(&ty);
     row_wise(args, result, |row| {
-        let Some(json) = document(&row[0])? else {
+        let json = if raw && !row[0].is_null() && row[0].logical_type().id() == LogicalTypeId::Varchar {
+            let text = row[0].try_to_string()?;
+            Some(parse_with(&text, true).map_err(|e| invalid(parse_error_text(&text, &e)))?)
+        } else {
+            document(&row[0])?
+        };
+        let Some(json) = json else {
             return Ok(nothing(&ty));
         };
         transform(&json, &ty, strict)

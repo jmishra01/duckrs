@@ -43,6 +43,7 @@ impl Binder<'_> {
         let mut columns: Option<Vec<(String, LogicalType)>> = None;
         let (mut auto_detect, mut ignore_errors) = (None, false);
         let (mut sample_size, mut maximum_depth) = (20480usize, -1i64);
+        let mut map_inference = true;
         let mut formats = Formats {
             missing_keys_are_null: true,
             map_threshold: Some(200),
@@ -73,12 +74,28 @@ impl Binder<'_> {
             };
             match option.as_str() {
                 "format" | "json_format" => format = format_of(&value.try_to_string()?)?,
+                // records is tri-state, and a boolean is one of its two others
                 "records" => {
-                    records = match value.try_to_string()?.to_lowercase().as_str() {
+                    let text = match value.logical_type().id() {
+                        LogicalTypeId::Boolean => value.try_to_string()?,
+                        LogicalTypeId::Varchar => value.try_to_string()?,
+                        _ => {
+                            return Err(binder_error(format!(
+                                "read_json \"records\" parameter must be a string ('auto', 'true' or 'false') or a \
+                                 boolean, not {}",
+                                value.logical_type()
+                            )));
+                        }
+                    };
+                    records = match text.as_str() {
                         "auto" => None,
                         "true" => Some(true),
                         "false" => Some(false),
-                        _ => return Err(binder_error("\"records\" must be one of ['auto', 'true', 'false']")),
+                        _ => {
+                            return Err(binder_error(
+                                "read_json requires \"records\" to be one of ['auto', 'true', 'false'].",
+                            ));
+                        }
                     };
                 }
                 "lines" => {
@@ -129,8 +146,9 @@ impl Binder<'_> {
                 "dateformat" | "date_format" => formats.date = Some(value.try_to_string()?),
                 "timestampformat" | "timestamp_format" => formats.timestamp = Some(value.try_to_string()?),
                 "compression" => compression = Compression::parse(&value.try_to_string()?)?,
+                // -1 (`DConstants::INVALID_INDEX`): no objects become MAPs
+                "map_inference_threshold" => map_inference = number()? != -1,
                 "maximum_object_size"
-                | "map_inference_threshold"
                 | "field_appearance_threshold"
                 | "maximum_sample_files"
                 | "convert_strings_to_integers" => {}
@@ -189,14 +207,15 @@ impl Binder<'_> {
             }
             let references: Vec<&Json> = sampled.iter().collect();
             let structure = infer(&references);
-            let ty = structure.logical_type(maximum_depth);
+            let ty = structure.logical_type_with(maximum_depth, map_inference);
             let ty = refine_type(ty, &references, &formats);
             let is_object = ty.id() == LogicalTypeId::Struct;
             let use_records = records.unwrap_or(is_object);
             if use_records && !is_object {
                 if records == Some(true) {
                     return Err(binder_error(
-                        "read_json requires records of objects to be read with records=true",
+                        "json_read expected records, but got non-record JSON instead.\n Try setting records='auto' or \
+                         records='false'.",
                     ));
                 }
                 (vec!["json".to_string()], vec![ty], false)
@@ -245,6 +264,7 @@ impl Binder<'_> {
             names,
             types,
             ignore_errors,
+            auto_detect,
             case_insensitive: formats.case_insensitive,
             date_format: formats.date,
             timestamp_format: formats.timestamp,
