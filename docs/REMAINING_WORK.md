@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 3978 of 6367 test files pass (**65.7%** of the 6051 that run). The v1 target is ≥ 90%.
+- Overall: 3983 of 6367 test files pass (**65.8%** of the 6051 that run). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -141,7 +141,16 @@ Each item gives the number of failing files in `test/` that it should fix, where
 - [ ] 36. Catalog failures (`sql/catalog`: 73 failing)
 - [ ] 37. Settings, generated in full from `settings.json` (`sql/settings`: 35 failing, 2 erroring)
 - [ ] 38. Secrets manager: `CREATE SECRET` and related statements (`sql/secrets`: 16 failing, 0%)
-- [ ] 39. SQL export and DDL rendering (`sql/sql_export`: 69 failing)
+- [ ] 39. SQL export and DDL rendering (`sql/sql_export`: 36 of 101 pass)
+  - [x] `EXPLAIN (SQL)` of SELECT, INSERT, UPDATE and DELETE from the optimized plan; the
+    `explain_sql` and `explain_sql_strict` statement verification
+  - [x] scans, filters, projections, aggregates and grouping sets, windows (RANGE offsets too),
+    ORDER BY / LIMIT / TopN, DISTINCT (ON), USING SAMPLE, UNNEST, set operations, recursive CTEs,
+    joins (inner, outer, SEMI/ANTI, ASOF, positional, lateral), MARK joins with exact NULL results,
+    decorrelated joins as correlated subqueries, subqueries, lambdas, `read_parquet` scans
+  - [ ] RETURNING, ON CONFLICT, MERGE INTO, CREATE TABLE AS, COPY TO; CSV and JSON scans; USING KEY CTEs
+  - [ ] the text of C++ where tests match it (`AS r(column0, ...)` table aliases, its formatter,
+    result-type casts); the `*_plan` tests compare C++ plans
 - [ ] 40. Logging and error messages (`sql/logging` 8, `sql/error` 13, `test/logging` 2)
 - [ ] 40a. The query profiler (`sql/pragma/profiling`: 21 of 36 pass)
   - [x] `enable_profiling = 'json'`, `profiling_output`, `tracked_metrics` (globs), `profiling_coverage`,

@@ -1723,6 +1723,8 @@ impl Transformer<'_> {
                 }
             }
         }
+        // the statement is transformed first, as its PIVOTs are what the check is about
+        let statement = self.statement_kind(self.alt(self.req(node, "ExplainableStatements")?)?)?;
         if sql {
             if format.is_some() || explain_type == ExplainType::Analyze {
                 return Err(invalid_input("EXPLAIN (SQL) cannot be combined with ANALYZE or FORMAT"));
@@ -1730,7 +1732,6 @@ impl Transformer<'_> {
             self.pivot_entry_check("EXPLAIN (SQL) statement")?;
             explain_type = ExplainType::Sql;
         }
-        let statement = self.statement_kind(self.alt(self.req(node, "ExplainableStatements")?)?)?;
         Ok(Statement::Explain {
             statement: Box::new(statement),
             explain_type,

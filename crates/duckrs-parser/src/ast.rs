@@ -1358,7 +1358,8 @@ impl Display for TableRef {
             }
             TableRefKind::ExpressionList(values) => {
                 let rows = join(values, ", ", |row| format!("({})", join(row, ", ", |e| e.to_string())));
-                self.base_to_string(format!("(VALUES {rows})"), &[])
+                // `expected_names`: the names an export gives the columns
+                self.base_to_string(format!("(VALUES {rows})"), &self.column_name_alias)
             }
         };
         f.write_str(&text)

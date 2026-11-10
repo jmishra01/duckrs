@@ -884,7 +884,11 @@ impl ClientContext {
             self.pending_profile = None;
             let profiler = profiled.map(|_| Arc::new(crate::execution::profiler::OperatorProfiler::default()));
             let outcome = crate::execution::profiler::with_profiler(profiler.clone(), || {
-                crate::logging::with_file_logging(&target, || self.run_statement(statement))
+                crate::logging::with_file_logging(&target, || match self.verification_statement(statement) {
+                    Ok(Some(replacement)) => self.run_statement(&replacement),
+                    Ok(None) => self.run_statement(statement),
+                    Err(error) => Err(error),
+                })
             });
             self.end_statement_logging();
             if let (Some(start), Some(profiler)) = (profiled, &profiler)
@@ -1745,6 +1749,114 @@ impl ClientContext {
         Ok(Self::success())
     }
 
+    /// `EXPLAIN (SQL)` (`LogicalExplain::CreateSQLResult`).
+    fn explain_sql(&mut self, statement: &Statement) -> Result<MaterializedQueryResult> {
+        let supported = match statement {
+            Statement::Select(_)
+            | Statement::Insert(_)
+            | Statement::Update(_)
+            | Statement::Delete(_)
+            | Statement::Merge(_) => true,
+            Statement::Copy(copy) => !copy.is_from,
+            Statement::CreateTable(info) => info.query.is_some(),
+            _ => false,
+        };
+        if !supported {
+            return Err(Error::new(
+                ErrorKind::NotImplemented,
+                "EXPLAIN (SQL) supports SELECT, VALUES, WITH, INSERT, UPDATE, DELETE, MERGE INTO, CREATE TABLE ... \
+                 AS and COPY ... TO statements only",
+            ));
+        }
+        let sql = self
+            .export_sql(statement, false)?
+            .expect("an unsupported plan is an error");
+        let types = vec![LogicalType::VARCHAR, LogicalType::VARCHAR];
+        let mut collection = ColumnDataCollection::new(types.clone());
+        let mut chunk = duckrs_common::vector::DataChunk::new(&types);
+        chunk.append_row(&[Value::varchar("sql"), Value::varchar(sql)])?;
+        collection.append(&chunk);
+        Ok(MaterializedQueryResult {
+            names: vec!["explain_key".to_string(), "explain_value".to_string()],
+            types,
+            collection,
+        })
+    }
+
+    /// The SQL of the optimized plan of `statement` (`LogicalPlanSQLExporter::Export`), or `None` for a
+    /// plan without one when `allow_unsupported`.
+    fn export_sql(&mut self, statement: &Statement, allow_unsupported: bool) -> Result<Option<String>> {
+        if let Some((database, routed)) = self.route_to_database(statement) {
+            let previous = std::mem::replace(&mut self.db, database);
+            let result = self.export_sql(&routed, allow_unsupported);
+            self.db = previous;
+            return result;
+        }
+        let catalog = self.catalog();
+        let mut binder = Binder::with_options(&catalog, self.bind_options());
+        binder.parameters = self.parameters.clone();
+        binder.session = Some(self.session_values());
+        let bound = binder.bind(statement)?;
+        let modifies = !matches!(statement, Statement::Select(_));
+        let plan = optimize(bound.plan, self.optimizer_options());
+        let databases: Vec<(String, Arc<crate::catalog::Catalog>)> = std::iter::once(self.db.clone())
+            .chain(std::iter::once(self.home.clone()))
+            .chain(self.home.attached.read().values().cloned())
+            .map(|db| {
+                (
+                    db.name.clone(),
+                    if Arc::ptr_eq(&db, &self.db) {
+                        catalog.clone()
+                    } else {
+                        db.catalog.clone()
+                    },
+                )
+            })
+            .collect();
+        let database_of = |table: &crate::catalog::TableCatalogEntry| -> Option<String> {
+            let found = |exact: bool| {
+                databases.iter().find_map(|(name, catalog)| {
+                    let entry = catalog.get_table(Some(&table.schema), &table.name).ok()?;
+                    (!exact || std::ptr::eq(entry.as_ref(), table)).then(|| name.clone())
+                })
+            };
+            found(true).or_else(|| found(false))
+        };
+        let names = (!modifies).then_some(bound.names.as_slice());
+        match crate::planner::sql_export::export_plan(&plan, names, &database_of) {
+            Ok(sql) => Ok(Some(sql)),
+            Err(_) if allow_unsupported => Ok(None),
+            Err(reason) => Err(Error::new(
+                ErrorKind::NotImplemented,
+                format!("EXPLAIN (SQL) cannot render this query: {reason}"),
+            )),
+        }
+    }
+
+    /// `StatementVerification` with `debug_verify_statement` set to `explain_sql` or
+    /// `explain_sql_strict`: the SELECT that the plan of `statement` exports to, which runs instead.
+    fn verification_statement(&mut self, statement: &Statement) -> Result<Option<Statement>> {
+        if !matches!(statement, Statement::Select(_)) || self.transaction.as_ref().is_some_and(|t| t.invalidated) {
+            return Ok(None);
+        }
+        let strict = match self.setting_text("debug_verify_statement").to_lowercase().as_str() {
+            "explain_sql" => false,
+            "explain_sql_strict" => true,
+            _ => return Ok(None),
+        };
+        let Some(sql) = self.export_sql(statement, !strict)? else {
+            return Ok(None);
+        };
+        let mut statements = duckrs_parser::parse_ast_with(&sql, &self.parser_options())?;
+        if statements.len() != 1 || !matches!(statements[0], Statement::Select(_)) {
+            return Err(Error::new(
+                ErrorKind::Internal,
+                "SQL export verification did not produce one parameter-free SELECT",
+            ));
+        }
+        Ok(Some(statements.remove(0)))
+    }
+
     fn explain(
         &mut self,
         statement: &Statement,
@@ -1752,7 +1864,7 @@ impl ClientContext {
         format: &str,
     ) -> Result<MaterializedQueryResult> {
         if explain_type == ExplainType::Sql {
-            return Err(crate::unported("EXPLAIN (SQL)"));
+            return self.explain_sql(statement);
         }
         let catalog = self.catalog();
         let mut binder = Binder::with_options(&catalog, self.bind_options());
@@ -2115,6 +2227,10 @@ impl ClientContext {
                 let Statement::Execute { name, values } = &**statement else {
                     return self.explain(statement, *explain_type, format);
                 };
+                if *explain_type == ExplainType::Sql {
+                    // `Binder::Bind(ExplainStatement &)`: EXECUTE is not one of the statements
+                    return self.explain_sql(statement);
+                }
                 let (prepared, values) = self.bound_execute(name, values)?;
                 let parameters = ParameterValues {
                     values: Some(values),
