@@ -23,8 +23,10 @@ pub mod defaults;
 mod defaults_table;
 mod fork;
 mod row_ids;
+pub mod trigger;
 pub use fork::{CatalogVersions, Fork, RowVersions, TableOrigin, tick};
 pub use row_ids::{IdSet, MAX_ROW_ID, RowIds};
+pub use trigger::{TriggerCatalogEntry, TriggerEvent, TriggerForEach, TriggerTiming};
 
 /// The name of the in-memory database's catalog.
 pub const DEFAULT_CATALOG: &str = "memory";
@@ -1049,6 +1051,8 @@ pub struct SchemaCatalogEntry {
     macros: [RwLock<BTreeMap<String, Arc<MacroCatalogEntry>>>; 2],
     /// the types of CREATE TYPE, by name
     types: RwLock<BTreeMap<String, LogicalType>>,
+    /// the triggers of the tables of the schema, by name
+    triggers: RwLock<BTreeMap<String, Arc<TriggerCatalogEntry>>>,
 }
 
 /// What to do when an entry being created already exists (`OnCreateConflict`).
@@ -1061,6 +1065,11 @@ pub enum OnCreateConflict {
 
 fn key(name: &str) -> String {
     name.to_lowercase()
+}
+
+/// A trigger's key in its schema: its table, then its name, in the order of names per table.
+fn trigger_key(table: &str, name: &str) -> String {
+    format!("{}{SCHEMA_PATH_SEPARATOR}{}", key(table), key(name))
 }
 
 /// What separates the schemas of a nested schema's path in its key: no name can have it.
@@ -1089,6 +1098,7 @@ impl SchemaCatalogEntry {
             path,
             tables: RwLock::new(BTreeMap::new()),
             sequences: RwLock::new(BTreeMap::new()),
+            triggers: RwLock::new(BTreeMap::new()),
             macros: [RwLock::new(BTreeMap::new()), RwLock::new(BTreeMap::new())],
             types: RwLock::new(BTreeMap::new()),
         }
@@ -1356,6 +1366,67 @@ impl SchemaCatalogEntry {
         Self::check_not_referenced(&tables, existing)?;
         tables.remove(&key(name));
         Ok(true)
+    }
+
+    /// The trigger `name` on `table`: trigger names are unique per table.
+    pub fn get_trigger(&self, table: &str, name: &str) -> Option<Arc<TriggerCatalogEntry>> {
+        self.triggers.read().get(&trigger_key(table, name)).cloned()
+    }
+
+    /// The triggers of the schema, by name.
+    pub fn trigger_entries(&self) -> Vec<Arc<TriggerCatalogEntry>> {
+        self.triggers.read().values().cloned().collect()
+    }
+
+    /// The triggers on `table`, in the order of their names (`TableCatalogEntry::GetTriggersForEvent`).
+    pub fn triggers_on(&self, table: &str) -> Vec<Arc<TriggerCatalogEntry>> {
+        self.triggers
+            .read()
+            .values()
+            .filter(|t| t.table.eq_ignore_ascii_case(table))
+            .cloned()
+            .collect()
+    }
+
+    /// `DuckSchemaEntry::CreateEntry` of a trigger: whether it was created.
+    pub fn create_trigger(&self, trigger: TriggerCatalogEntry, on_conflict: OnCreateConflict) -> Result<bool> {
+        let mut triggers = self.triggers.write();
+        if let Some(existing) = triggers.get(&trigger_key(&trigger.table, &trigger.name)) {
+            match on_conflict {
+                OnCreateConflict::Error => {
+                    return Err(Error::new(
+                        ErrorKind::Catalog,
+                        format!(
+                            "Trigger with name \"{}\" already exists on table \"{}\"",
+                            trigger.name, existing.table
+                        ),
+                    ));
+                }
+                OnCreateConflict::Ignore => return Ok(false),
+                OnCreateConflict::Replace => {}
+            }
+        }
+        triggers.insert(trigger_key(&trigger.table, &trigger.name), Arc::new(trigger));
+        Ok(true)
+    }
+
+    /// Drops a trigger, returning whether it existed.
+    pub fn drop_trigger(&self, table: &str, name: &str) -> bool {
+        self.triggers.write().remove(&trigger_key(table, name)).is_some()
+    }
+
+    /// Drops the triggers on `table`, which go with it.
+    pub fn drop_triggers_on(&self, table: &str) {
+        self.triggers
+            .write()
+            .retain(|_, t| !t.table.eq_ignore_ascii_case(table));
+    }
+
+    /// Puts a changed trigger in place of the one of its name.
+    pub fn replace_trigger(&self, old_table: &str, trigger: TriggerCatalogEntry) {
+        let mut triggers = self.triggers.write();
+        triggers.remove(&trigger_key(old_table, &trigger.name));
+        triggers.insert(trigger_key(&trigger.table, &trigger.name), Arc::new(trigger));
     }
 
     pub fn get_sequence(&self, name: &str) -> Option<Arc<SequenceCatalogEntry>> {
@@ -1647,6 +1718,7 @@ struct SchemaEntries {
     sequences: BTreeMap<String, Arc<SequenceCatalogEntry>>,
     macros: [BTreeMap<String, Arc<MacroCatalogEntry>>; 2],
     types: BTreeMap<String, LogicalType>,
+    triggers: BTreeMap<String, Arc<TriggerCatalogEntry>>,
 }
 
 impl Catalog {
@@ -1748,6 +1820,7 @@ impl Catalog {
                 sequences: schema.sequences.read().clone(),
                 macros: [schema.macros[0].read().clone(), schema.macros[1].read().clone()],
                 types: schema.types.read().clone(),
+                triggers: schema.triggers.read().clone(),
             });
         }
         CatalogSnapshot {
@@ -1773,6 +1846,7 @@ impl Catalog {
             *saved.schema.macros[0].write() = scalar;
             *saved.schema.macros[1].write() = table;
             *saved.schema.types.write() = saved.types;
+            *saved.schema.triggers.write() = saved.triggers;
         }
         for TableRows {
             table,

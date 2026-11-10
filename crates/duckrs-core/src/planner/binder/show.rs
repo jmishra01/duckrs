@@ -156,8 +156,9 @@ fn human_readable_bytes(bytes: u64) -> String {
 
 const DESCRIBE_NAMES: [&str; 6] = ["column_name", "column_type", "null", "key", "default", "extra"];
 
-const SYSTEM_TABLES: [&str; 12] = [
+const SYSTEM_TABLES: [&str; 13] = [
     "duckdb_functions",
+    "duckdb_triggers",
     "duckdb_types",
     "duckdb_sequences",
     "duckdb_optimizers",
@@ -924,9 +925,15 @@ impl Binder<'_> {
         if databases.is_empty() {
             add(&self.catalog.name, 1, self.catalog, true);
         }
+        // the catalog this binds against is that of the database statements run in, whose name only
+        // the session knows
+        let current = self
+            .session
+            .as_ref()
+            .map_or_else(|| self.catalog.name.clone(), |session| session.database.clone());
         for (index, database) in databases.iter().enumerate() {
             let oid = if index == 0 { 1 } else { index as i64 + 3 };
-            if database.name.eq_ignore_ascii_case(&self.catalog.name) {
+            if database.name.eq_ignore_ascii_case(&current) {
                 add(&database.name, oid, self.catalog, true);
             } else {
                 self.catalog
@@ -1626,6 +1633,58 @@ impl Binder<'_> {
                         ("parameters", list.clone()),
                         ("parameter_types", list.clone()),
                         ("varargs", varchar.clone()),
+                    ],
+                    rows,
+                )
+            }
+            // `DuckDBTriggersFunction`
+            "duckdb_triggers" => {
+                let mut rows = Vec::new();
+                let mut oid = 3000;
+                for listed in self.listed_schemas() {
+                    let temporary = listed.schema.key() == TEMP_SCHEMA;
+                    for trigger in listed.schema.trigger_entries() {
+                        oid += 1;
+                        let columns = trigger.columns.iter().map(|c| text(c)).collect();
+                        rows.push(vec![
+                            text(&listed.database),
+                            Value::bigint(listed.database_oid),
+                            text(&listed.display),
+                            Value::bigint(listed.oid),
+                            text(&trigger.name),
+                            Value::bigint(oid),
+                            text(&trigger.table),
+                            text(trigger.timing.name()),
+                            text(trigger.event.name()),
+                            Value::list(varchar.clone(), columns)?,
+                            text(trigger.for_each.name()),
+                            match &trigger.comment {
+                                Some(comment) => text(comment),
+                                None => null_text(),
+                            },
+                            Value::null(tags.clone()),
+                            Value::boolean(temporary),
+                            text(&trigger.to_sql()),
+                        ]);
+                    }
+                }
+                (
+                    vec![
+                        ("database_name", varchar.clone()),
+                        ("database_oid", bigint.clone()),
+                        ("schema_name", varchar.clone()),
+                        ("schema_oid", bigint.clone()),
+                        ("trigger_name", varchar.clone()),
+                        ("trigger_oid", bigint.clone()),
+                        ("table_name", varchar.clone()),
+                        ("action_timing", varchar.clone()),
+                        ("event_manipulation", varchar.clone()),
+                        ("columns", LogicalType::list(varchar.clone())),
+                        ("for_each", varchar.clone()),
+                        ("comment", varchar.clone()),
+                        ("tags", tags.clone()),
+                        ("temporary", boolean.clone()),
+                        ("sql", varchar.clone()),
                     ],
                     rows,
                 )

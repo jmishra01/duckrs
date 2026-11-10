@@ -571,6 +571,25 @@ pub fn query_node(stored: g::QueryNode) -> Result<ast::QueryNode> {
         K::CTENode(node) => return query_node(required(node.child, "the query of a CTE")?),
         K::SelectNode(node) => ast::QueryNodeKind::Select(Box::new(select_node(node)?)),
         K::SetOperationNode(node) => ast::QueryNodeKind::SetOperation(set_operation(node)?),
+        K::InsertQueryNode(node) => ast::QueryNodeKind::Insert(Box::new(insert_node(node)?)),
+        K::UpdateQueryNode(node) => ast::QueryNodeKind::Update(Box::new(ast::UpdateStatement {
+            cte_map: ast::CteMap::default(),
+            table: table_ref(required(node.table, "the table of an UPDATE")?)?,
+            set_info: update_set_info(required(node.set_info, "the SET of an UPDATE")?)?,
+            from_table: node.from_table.map(|t| table_ref(*t)).transpose()?,
+            returning: expressions(node.returning_list)?,
+        })),
+        K::DeleteQueryNode(node) => ast::QueryNodeKind::Delete(Box::new(ast::DeleteStatement {
+            cte_map: ast::CteMap::default(),
+            table: table_ref(required(node.table, "the table of a DELETE")?)?,
+            using: node
+                .using_clauses
+                .into_iter()
+                .map(|t| table_ref(required(t, "a USING clause")?))
+                .collect::<Result<_>>()?,
+            condition: optional(node.condition)?,
+            returning: expressions(node.returning_list)?,
+        })),
         K::RecursiveCTENode(node) => ast::QueryNodeKind::RecursiveCte(ast::RecursiveCteNode {
             ctename: node.cte_name,
             union_all: node.union_all.unwrap_or(false),
@@ -588,6 +607,50 @@ pub fn query_node(stored: g::QueryNode) -> Result<ast::QueryNode> {
             .map(|m| result_modifier(required(m, "a result modifier")?))
             .collect::<Result<_>>()?,
         cte_map: cte_map(stored.cte_map)?,
+    })
+}
+
+/// `UpdateSetInfo::Deserialize`.
+fn update_set_info(stored: g::UpdateSetInfo) -> Result<ast::UpdateSetInfo> {
+    Ok(ast::UpdateSetInfo {
+        columns: stored.columns,
+        expressions: expressions(stored.expressions)?,
+        condition: optional(stored.condition)?,
+    })
+}
+
+/// `InsertQueryNode::Deserialize`.
+fn insert_node(stored: g::InsertQueryNode) -> Result<ast::InsertStatement> {
+    let on_conflict = match stored.on_conflict_info {
+        Some(conflict) => Some(ast::OnConflictInfo {
+            action: match conflict.action_type {
+                1 => ast::OnConflictAction::Nothing,
+                2 => ast::OnConflictAction::Update,
+                3 => ast::OnConflictAction::Replace,
+                other => return Err(corrupt(format!("ON CONFLICT action {other}"))),
+            },
+            indexed_columns: conflict.indexed_columns,
+            condition: optional(conflict.condition)?,
+            set_info: conflict.set_info.map(|info| update_set_info(*info)).transpose()?,
+        }),
+        None => None,
+    };
+    let table_alias = stored
+        .table_ref
+        .map(|t| t.alias.clone())
+        .filter(|alias| !alias.is_empty());
+    Ok(ast::InsertStatement {
+        cte_map: ast::CteMap::default(),
+        table: qualified_name(stored.catalog, stored.schema, stored.table, stored.qualified_name),
+        table_alias,
+        by_name: stored.column_order == Some(1),
+        columns: stored.columns,
+        values: match stored.select_statement {
+            Some(select) => ast::InsertValues::Select(Box::new(select_statement(Some(select))?)),
+            None => ast::InsertValues::DefaultValues,
+        },
+        on_conflict,
+        returning: expressions(stored.returning_list)?,
     })
 }
 

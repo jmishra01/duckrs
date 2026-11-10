@@ -608,13 +608,44 @@ pub fn query_node(stored: &ast::QueryNode) -> Result<g::QueryNode> {
                 key_targets: expressions(&node.key_targets)?,
             }),
         ),
-        ast::QueryNodeKind::Insert(_)
-        | ast::QueryNodeKind::Update(_)
-        | ast::QueryNodeKind::Delete(_)
-        | ast::QueryNodeKind::Merge(_)
-        | ast::QueryNodeKind::Copy(_) => {
+        ast::QueryNodeKind::Insert(insert) => (INSERT_QUERY_NODE, K::InsertQueryNode(insert_node(insert)?)),
+        ast::QueryNodeKind::Update(update) => (
+            UPDATE_QUERY_NODE,
+            K::UpdateQueryNode(g::UpdateQueryNode {
+                table: Some(Box::new(table_ref(&update.table)?)),
+                from_table: update.from_table.as_ref().map(table_ref).transpose()?.map(Box::new),
+                returning_list: expressions(&update.returning)?,
+                set_info: Some(Box::new(update_set_info(&update.set_info)?)),
+                prioritize_table_when_binding: Some(false),
+            }),
+        ),
+        ast::QueryNodeKind::Delete(delete) => (
+            DELETE_QUERY_NODE,
+            K::DeleteQueryNode(g::DeleteQueryNode {
+                condition: optional(&delete.condition)?,
+                table: Some(Box::new(table_ref(&delete.table)?)),
+                using_clauses: delete
+                    .using
+                    .iter()
+                    .map(|t| table_ref(t).map(|t| Some(Box::new(t))))
+                    .collect::<Result<_>>()?,
+                returning_list: expressions(&delete.returning)?,
+            }),
+        ),
+        ast::QueryNodeKind::Merge(_) | ast::QueryNodeKind::Copy(_) => {
             return Err(write_not_ported("a statement that writes in a stored query"));
         }
+    };
+    // a statement keeps its WITH in itself as well
+    let statement_ctes = match &stored.kind {
+        ast::QueryNodeKind::Insert(insert) => Some(&insert.cte_map),
+        ast::QueryNodeKind::Update(update) => Some(&update.cte_map),
+        ast::QueryNodeKind::Delete(delete) => Some(&delete.cte_map),
+        _ => None,
+    };
+    let ctes = match statement_ctes {
+        Some(ctes) if stored.cte_map.0.is_empty() => ctes,
+        _ => &stored.cte_map,
     };
     Ok(g::QueryNode {
         type_,
@@ -623,8 +654,69 @@ pub fn query_node(stored: &ast::QueryNode) -> Result<g::QueryNode> {
             .iter()
             .map(|m| result_modifier(m).map(|m| Some(Box::new(m))))
             .collect::<Result<_>>()?,
-        cte_map: cte_map(&stored.cte_map)?,
+        cte_map: cte_map(ctes)?,
         kind,
+    })
+}
+
+/// `UpdateSetInfo::Serialize`.
+fn update_set_info(info: &ast::UpdateSetInfo) -> Result<g::UpdateSetInfo> {
+    Ok(g::UpdateSetInfo {
+        condition: optional(&info.condition)?,
+        columns: info.columns.clone(),
+        expressions: expressions(&info.expressions)?,
+    })
+}
+
+/// `InsertQueryNode::Serialize`.
+fn insert_node(insert: &ast::InsertStatement) -> Result<g::InsertQueryNode> {
+    let (catalog, schema, table) = name_parts(&insert.table);
+    let mut path = insert.table.qualification.clone();
+    path.push(insert.table.name.clone());
+    let on_conflict_info = match &insert.on_conflict {
+        Some(conflict) => Some(Box::new(g::OnConflictInfo {
+            action_type: match conflict.action {
+                ast::OnConflictAction::Nothing => 1,
+                ast::OnConflictAction::Update => 2,
+                ast::OnConflictAction::Replace => 3,
+            },
+            indexed_columns: conflict.indexed_columns.clone(),
+            set_info: conflict
+                .set_info
+                .as_ref()
+                .map(update_set_info)
+                .transpose()?
+                .map(Box::new),
+            condition: optional(&conflict.condition)?,
+        })),
+        None => None,
+    };
+    let table_ref = match &insert.table_alias {
+        Some(alias) if !alias.is_empty() => {
+            let mut target = ast::TableRef::from(ast::TableRefKind::BaseTable {
+                name: insert.table.clone(),
+                at_clause: None,
+            });
+            target.alias = alias.clone();
+            Some(Box::new(table_ref(&target)?))
+        }
+        _ => None,
+    };
+    Ok(g::InsertQueryNode {
+        select_statement: match &insert.values {
+            ast::InsertValues::Select(select) => Some(Box::new(select_statement(select)?)),
+            ast::InsertValues::DefaultValues => None,
+        },
+        columns: insert.columns.clone(),
+        table,
+        schema,
+        catalog,
+        returning_list: expressions(&insert.returning)?,
+        on_conflict_info,
+        table_ref,
+        default_values: Some(matches!(insert.values, ast::InsertValues::DefaultValues)),
+        column_order: Some(u64::from(insert.by_name)),
+        qualified_name: Some(QualifiedName { path }),
     })
 }
 

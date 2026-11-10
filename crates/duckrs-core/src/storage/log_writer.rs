@@ -19,7 +19,7 @@ use super::serialization::generated::{self as g};
 use super::serialization::to_stored::write_not_ported;
 use super::table_data::fixed_width;
 use super::writer::{
-    index_info, macro_info, parents_first, raw_bytes, sequence_info, table_info, type_info, view_info,
+    index_info, macro_info, parents_first, raw_bytes, sequence_info, table_info, trigger_info, type_info, view_info,
 };
 use crate::catalog::{
     Catalog, IndexCatalogEntry, MacroCatalogEntry, RowIds, SchemaCatalogEntry, SequenceCatalogEntry, TEMP_SCHEMA,
@@ -74,6 +74,8 @@ struct Durable {
     macros: [BTreeMap<Key, (Key, Arc<MacroCatalogEntry>)>; 2],
     sequences: BTreeMap<Key, (Key, Arc<SequenceCatalogEntry>, u64)>,
     types: BTreeMap<Key, (Key, LogicalType)>,
+    /// By the table they are on and their name, which is unique per table.
+    triggers: BTreeMap<Key, (Key, Arc<crate::catalog::TriggerCatalogEntry>)>,
 }
 
 impl Durable {
@@ -118,6 +120,12 @@ impl Durable {
             }
             for (name, ty) in schema.type_entries() {
                 result.types.insert(key(&ident, &name), (named(&name), ty));
+            }
+            for trigger in schema.trigger_entries() {
+                let on = format!("{}{SCHEMA_PATH_SEPARATOR}{}", trigger.table, trigger.name);
+                result
+                    .triggers
+                    .insert(key(&ident, &on), (named(&trigger.name), trigger));
             }
         }
         result
@@ -685,6 +693,24 @@ impl WriteAheadLog {
         let mut records = Records(Vec::new(), self.version, 0);
         let schema_of = |key: &Key| -> Result<Arc<SchemaCatalogEntry>> { catalog.schema_for(Some(&key.0)) };
         let gone = |old_same: bool, new_exists: bool| !new_exists || !old_same;
+        // before the tables they are on go
+        for (k, (original, trigger)) in &self.durable.triggers {
+            let same = current
+                .triggers
+                .get(k)
+                .is_some_and(|(_, new)| Arc::ptr_eq(new, trigger));
+            if !same {
+                records.entry(wal_type::DROP_TRIGGER, |s| {
+                    g::WALDropTrigger {
+                        schema: original.0.clone(),
+                        name: original.1.clone(),
+                        table: trigger.table.clone(),
+                        qualified_name: path_of(original),
+                    }
+                    .write_members(s);
+                });
+            }
+        }
         for (k, (original, view)) in &self.durable.views {
             let same = current.views.get(k).is_some_and(|(_, new)| Arc::ptr_eq(new, view));
             if gone(same, current.views.contains_key(k)) {
@@ -840,6 +866,22 @@ impl WriteAheadLog {
                     view: Some(Box::new(info)),
                 };
                 records.entry(wal_type::CREATE_VIEW, |s| entry.write_members(s));
+            }
+        }
+        // after the tables they are on, and again with a table that goes and comes back
+        for (k, (original, trigger)) in &current.triggers {
+            let same = self
+                .durable
+                .triggers
+                .get(k)
+                .is_some_and(|(_, old)| Arc::ptr_eq(old, trigger))
+                && !again.contains(&key(&original.0, &trigger.table));
+            if !same {
+                let info = trigger_info(name, &*schema_of(original)?, trigger)?;
+                let entry = g::WALCreateTrigger {
+                    trigger: Some(Box::new(info)),
+                };
+                records.entry(wal_type::CREATE_TRIGGER, |s| entry.write_members(s));
             }
         }
         Ok(records)

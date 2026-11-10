@@ -1054,6 +1054,15 @@ impl Binder<'_> {
                 let call = crate::storage::writer::parse_expression(&format!("{function}()"))?;
                 return self.bind_expression(&call);
             }
+            // `SetupRowScope`: NEW.column or OLD.column of the row of a FOR EACH ROW trigger
+            ExprKind::ColumnRef(names)
+                if names.len() <= 2
+                    && self.bind_context.bind_column_ref(names).is_err()
+                    && !self.outer_contexts.iter().any(|c| c.bind_column_ref(names).is_ok())
+                    && let Some(value) = crate::planner::trigger_scope::row_value(names) =>
+            {
+                return Ok(BoundExpr::constant(value).with_alias(names.last().expect("a name").clone()));
+            }
             ExprKind::ColumnRef(names)
                 if names.len() == 2
                     && names[0] == super::macros::CREATE_PARAMETER_MARK

@@ -413,6 +413,7 @@ pub enum CreateInfoKind {
     CreateTypeInfo(CreateTypeInfo),
     CreateMacroInfo(CreateMacroInfo),
     CreateSequenceInfo(CreateSequenceInfo),
+    CreateTriggerInfo(CreateTriggerInfo),
 }
 
 impl CreateInfo {
@@ -441,7 +442,9 @@ impl CreateInfo {
             enums::catalog_type::SEQUENCE_ENTRY => {
                 CreateInfoKind::CreateSequenceInfo(CreateSequenceInfo::read_members(d)?)
             }
-            enums::catalog_type::TRIGGER_ENTRY => return Err(not_ported("triggers")),
+            enums::catalog_type::TRIGGER_ENTRY => {
+                CreateInfoKind::CreateTriggerInfo(CreateTriggerInfo::read_members(d)?)
+            }
             other => return Err(unknown("CreateInfo", other)),
         };
         Ok(Self {
@@ -490,6 +493,7 @@ impl CreateInfo {
             CreateInfoKind::CreateTypeInfo(value) => value.write_members(s),
             CreateInfoKind::CreateMacroInfo(value) => value.write_members(s),
             CreateInfoKind::CreateSequenceInfo(value) => value.write_members(s),
+            CreateInfoKind::CreateTriggerInfo(value) => value.write_members(s),
         }
     }
 }
@@ -1628,6 +1632,56 @@ impl CreateSequenceInfo {
 }
 
 #[derive(Debug, Clone)]
+pub struct CreateTriggerInfo {
+    pub trigger_name: String,
+    pub base_table: Option<Box<TableRef>>,
+    pub timing: u64,
+    pub event_type: u64,
+    pub columns: Vec<String>,
+    pub for_each: u64,
+    pub trigger_action: Option<Box<QueryNode>>,
+    pub referencing_new_table: String,
+    pub referencing_old_table: String,
+}
+
+impl CreateTriggerInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let trigger_name = d.read_property_with_default::<String>(200, "trigger_name")?;
+        let base_table = d.read_property_with_default::<Option<Box<TableRef>>>(201, "base_table")?;
+        let timing = d.read_property::<u64>(204, "timing")?;
+        let event_type = d.read_property::<u64>(205, "event_type")?;
+        let columns = d.read_property_with_default::<Vec<String>>(206, "columns")?;
+        let for_each = d.read_property::<u64>(207, "for_each")?;
+        let trigger_action = d.read_property_with_default::<Option<Box<QueryNode>>>(208, "trigger_action")?;
+        let referencing_new_table = d.read_property_with_default::<String>(209, "referencing_new_table")?;
+        let referencing_old_table = d.read_property_with_default::<String>(210, "referencing_old_table")?;
+        Ok(Self {
+            trigger_name,
+            base_table,
+            timing,
+            event_type,
+            columns,
+            for_each,
+            trigger_action,
+            referencing_new_table,
+            referencing_old_table,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "trigger_name", &self.trigger_name);
+        s.write_property_with_default(201, "base_table", &self.base_table);
+        s.write_property(204, "timing", &self.timing);
+        s.write_property(205, "event_type", &self.event_type);
+        s.write_property_with_default(206, "columns", &self.columns);
+        s.write_property(207, "for_each", &self.for_each);
+        s.write_property_with_default(208, "trigger_action", &self.trigger_action);
+        s.write_property_with_default(209, "referencing_new_table", &self.referencing_new_table);
+        s.write_property_with_default(210, "referencing_old_table", &self.referencing_old_table);
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct LogicalDependencyList {
     pub set: Vec<LogicalDependency>,
 }
@@ -2030,6 +2084,175 @@ impl Deserialize for MacroFunction {
 }
 
 impl Serialize for MacroFunction {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TableRef {
+    pub type_: u64,
+    pub alias: String,
+    pub sample: Option<Box<SampleOptions>>,
+    pub query_location: Option<u64>,
+    pub query_location_length: Option<u32>,
+    pub kind: TableRefKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum TableRefKind {
+    BaseTableRef(BaseTableRef),
+    JoinRef(JoinRef),
+    SubqueryRef(SubqueryRef),
+    TableFunctionRef(TableFunctionRef),
+    EmptyTableRef(EmptyTableRef),
+    ExpressionListRef(ExpressionListRef),
+    PivotRef(PivotRef),
+}
+
+impl TableRef {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let type_ = d.read_property::<u64>(100, "type")?;
+        let alias = d.read_property_with_default::<String>(101, "alias")?;
+        let sample = d.read_property_with_default::<Option<Box<SampleOptions>>>(102, "sample")?;
+        let query_location = d.read_optional_property::<u64>(103, "query_location")?;
+        let query_location_length = d.read_optional_property::<u32>(104, "query_location_length")?;
+        let kind = match u64::from(type_) {
+            enums::table_reference_type::BASE_TABLE => TableRefKind::BaseTableRef(BaseTableRef::read_members(d)?),
+            enums::table_reference_type::JOIN => TableRefKind::JoinRef(JoinRef::read_members(d)?),
+            enums::table_reference_type::SUBQUERY => TableRefKind::SubqueryRef(SubqueryRef::read_members(d)?),
+            enums::table_reference_type::MATCH_RECOGNIZE => return Err(not_ported("MATCH_RECOGNIZE")),
+            enums::table_reference_type::TABLE_FUNCTION => {
+                TableRefKind::TableFunctionRef(TableFunctionRef::read_members(d)?)
+            }
+            enums::table_reference_type::EMPTY_FROM => TableRefKind::EmptyTableRef(EmptyTableRef::read_members(d)?),
+            enums::table_reference_type::EXPRESSION_LIST => {
+                TableRefKind::ExpressionListRef(ExpressionListRef::read_members(d)?)
+            }
+            enums::table_reference_type::COLUMN_DATA => return Err(not_ported("column data references")),
+            enums::table_reference_type::PIVOT => TableRefKind::PivotRef(PivotRef::read_members(d)?),
+            enums::table_reference_type::SHOW_REF => return Err(not_ported("SHOW and DESCRIBE in a stored query")),
+            other => return Err(unknown("TableRef", other)),
+        };
+        Ok(Self {
+            type_,
+            alias,
+            sample,
+            query_location,
+            query_location_length,
+            kind,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(100, "type", &self.type_);
+        s.write_property_with_default(101, "alias", &self.alias);
+        s.write_property_with_default(102, "sample", &self.sample);
+        s.write_optional_property(103, "query_location", self.query_location.as_ref());
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(104, "query_location_length", self.query_location_length.as_ref());
+        }
+        match &self.kind {
+            TableRefKind::BaseTableRef(value) => value.write_members(s),
+            TableRefKind::JoinRef(value) => value.write_members(s),
+            TableRefKind::SubqueryRef(value) => value.write_members(s),
+            TableRefKind::TableFunctionRef(value) => value.write_members(s),
+            TableRefKind::EmptyTableRef(value) => value.write_members(s),
+            TableRefKind::ExpressionListRef(value) => value.write_members(s),
+            TableRefKind::PivotRef(value) => value.write_members(s),
+        }
+    }
+}
+
+impl Deserialize for TableRef {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for TableRef {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct QueryNode {
+    pub type_: u64,
+    pub modifiers: Vec<Option<Box<ResultModifier>>>,
+    pub cte_map: CommonTableExpressionMap,
+    pub kind: QueryNodeKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum QueryNodeKind {
+    SelectNode(SelectNode),
+    SetOperationNode(SetOperationNode),
+    RecursiveCTENode(RecursiveCTENode),
+    CTENode(CTENode),
+    UpdateQueryNode(UpdateQueryNode),
+    DeleteQueryNode(DeleteQueryNode),
+    InsertQueryNode(InsertQueryNode),
+}
+
+impl QueryNode {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let type_ = d.read_property::<u64>(100, "type")?;
+        let modifiers = d.read_property_with_default::<Vec<Option<Box<ResultModifier>>>>(101, "modifiers")?;
+        let cte_map = d.read_property::<CommonTableExpressionMap>(102, "cte_map")?;
+        let kind = match u64::from(type_) {
+            enums::query_node_type::SELECT_NODE => QueryNodeKind::SelectNode(SelectNode::read_members(d)?),
+            enums::query_node_type::SET_OPERATION_NODE => {
+                QueryNodeKind::SetOperationNode(SetOperationNode::read_members(d)?)
+            }
+            enums::query_node_type::RECURSIVE_CTE_NODE => {
+                QueryNodeKind::RecursiveCTENode(RecursiveCTENode::read_members(d)?)
+            }
+            enums::query_node_type::CTE_NODE => QueryNodeKind::CTENode(CTENode::read_members(d)?),
+            enums::query_node_type::UPDATE_QUERY_NODE => {
+                QueryNodeKind::UpdateQueryNode(UpdateQueryNode::read_members(d)?)
+            }
+            enums::query_node_type::DELETE_QUERY_NODE => {
+                QueryNodeKind::DeleteQueryNode(DeleteQueryNode::read_members(d)?)
+            }
+            enums::query_node_type::INSERT_QUERY_NODE => {
+                QueryNodeKind::InsertQueryNode(InsertQueryNode::read_members(d)?)
+            }
+            enums::query_node_type::MERGE_QUERY_NODE => return Err(not_ported("MERGE in a stored query")),
+            enums::query_node_type::COPY_QUERY_NODE => return Err(not_ported("COPY in a stored query")),
+            other => return Err(unknown("QueryNode", other)),
+        };
+        Ok(Self {
+            type_,
+            modifiers,
+            cte_map,
+            kind,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(100, "type", &self.type_);
+        s.write_property_with_default(101, "modifiers", &self.modifiers);
+        s.write_property(102, "cte_map", &self.cte_map);
+        match &self.kind {
+            QueryNodeKind::SelectNode(value) => value.write_members(s),
+            QueryNodeKind::SetOperationNode(value) => value.write_members(s),
+            QueryNodeKind::RecursiveCTENode(value) => value.write_members(s),
+            QueryNodeKind::CTENode(value) => value.write_members(s),
+            QueryNodeKind::UpdateQueryNode(value) => value.write_members(s),
+            QueryNodeKind::DeleteQueryNode(value) => value.write_members(s),
+            QueryNodeKind::InsertQueryNode(value) => value.write_members(s),
+        }
+    }
+}
+
+impl Deserialize for QueryNode {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for QueryNode {
     fn write_value(&self, s: &mut BinarySerializer) {
         s.write_object_value(|s| self.write_members(s));
     }
@@ -2564,76 +2787,6 @@ impl UniqueConstraint {
 }
 
 #[derive(Debug, Clone)]
-pub struct QueryNode {
-    pub type_: u64,
-    pub modifiers: Vec<Option<Box<ResultModifier>>>,
-    pub cte_map: CommonTableExpressionMap,
-    pub kind: QueryNodeKind,
-}
-
-#[derive(Debug, Clone)]
-pub enum QueryNodeKind {
-    SelectNode(SelectNode),
-    SetOperationNode(SetOperationNode),
-    RecursiveCTENode(RecursiveCTENode),
-    CTENode(CTENode),
-}
-
-impl QueryNode {
-    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let type_ = d.read_property::<u64>(100, "type")?;
-        let modifiers = d.read_property_with_default::<Vec<Option<Box<ResultModifier>>>>(101, "modifiers")?;
-        let cte_map = d.read_property::<CommonTableExpressionMap>(102, "cte_map")?;
-        let kind = match u64::from(type_) {
-            enums::query_node_type::SELECT_NODE => QueryNodeKind::SelectNode(SelectNode::read_members(d)?),
-            enums::query_node_type::SET_OPERATION_NODE => {
-                QueryNodeKind::SetOperationNode(SetOperationNode::read_members(d)?)
-            }
-            enums::query_node_type::RECURSIVE_CTE_NODE => {
-                QueryNodeKind::RecursiveCTENode(RecursiveCTENode::read_members(d)?)
-            }
-            enums::query_node_type::CTE_NODE => QueryNodeKind::CTENode(CTENode::read_members(d)?),
-            enums::query_node_type::UPDATE_QUERY_NODE => return Err(not_ported("UPDATE in a stored query")),
-            enums::query_node_type::DELETE_QUERY_NODE => return Err(not_ported("DELETE in a stored query")),
-            enums::query_node_type::INSERT_QUERY_NODE => return Err(not_ported("INSERT in a stored query")),
-            enums::query_node_type::MERGE_QUERY_NODE => return Err(not_ported("MERGE in a stored query")),
-            enums::query_node_type::COPY_QUERY_NODE => return Err(not_ported("COPY in a stored query")),
-            other => return Err(unknown("QueryNode", other)),
-        };
-        Ok(Self {
-            type_,
-            modifiers,
-            cte_map,
-            kind,
-        })
-    }
-
-    pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property(100, "type", &self.type_);
-        s.write_property_with_default(101, "modifiers", &self.modifiers);
-        s.write_property(102, "cte_map", &self.cte_map);
-        match &self.kind {
-            QueryNodeKind::SelectNode(value) => value.write_members(s),
-            QueryNodeKind::SetOperationNode(value) => value.write_members(s),
-            QueryNodeKind::RecursiveCTENode(value) => value.write_members(s),
-            QueryNodeKind::CTENode(value) => value.write_members(s),
-        }
-    }
-}
-
-impl Deserialize for QueryNode {
-    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        d.read_object_value(Self::read_members)
-    }
-}
-
-impl Serialize for QueryNode {
-    fn write_value(&self, s: &mut BinarySerializer) {
-        s.write_object_value(|s| self.write_members(s));
-    }
-}
-
-#[derive(Debug, Clone)]
 pub struct ScalarMacroFunction {
     pub expression: Option<Box<ParsedExpression>>,
 }
@@ -2662,705 +2815,6 @@ impl TableMacroFunction {
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
         s.write_property_with_default(200, "query_node", &self.query_node);
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct CatalogEntryInfo {
-    pub type_: u64,
-    pub schema: String,
-    pub name: String,
-    pub schema_path: Vec<String>,
-    pub table: Option<String>,
-}
-
-impl CatalogEntryInfo {
-    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let type_ = d.read_property::<u64>(100, "type")?;
-        let schema = d.read_property_with_default::<String>(101, "schema")?;
-        let name = d.read_property_with_default::<String>(102, "name")?;
-        let schema_path = d.read_property_with_default::<Vec<String>>(103, "schema_path")?;
-        let table = d.read_optional_property::<String>(104, "table")?;
-        Ok(Self {
-            type_,
-            schema,
-            name,
-            schema_path,
-            table,
-        })
-    }
-
-    pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property(100, "type", &self.type_);
-        if !s.should_serialize(StorageVersion::V2_0_0) {
-            s.write_property_with_default(101, "schema", &self.schema);
-        }
-        s.write_property_with_default(102, "name", &self.name);
-        if s.should_serialize(StorageVersion::V2_0_0) {
-            s.write_property_with_default(103, "schema_path", &self.schema_path);
-        }
-        if s.should_serialize(StorageVersion::V2_0_0) {
-            s.write_optional_property(104, "table", self.table.as_ref());
-        }
-    }
-}
-
-impl Deserialize for CatalogEntryInfo {
-    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        d.read_object_value(Self::read_members)
-    }
-}
-
-impl Serialize for CatalogEntryInfo {
-    fn write_value(&self, s: &mut BinarySerializer) {
-        s.write_object_value(|s| self.write_members(s));
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct DependencyDependentFlags {
-    pub value: u8,
-}
-
-impl DependencyDependentFlags {
-    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let value = d.read_property_with_default::<u8>(100, "value")?;
-        Ok(Self { value })
-    }
-
-    pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property_with_default(100, "value", &self.value);
-    }
-}
-
-impl Deserialize for DependencyDependentFlags {
-    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        d.read_object_value(Self::read_members)
-    }
-}
-
-impl Serialize for DependencyDependentFlags {
-    fn write_value(&self, s: &mut BinarySerializer) {
-        s.write_object_value(|s| self.write_members(s));
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct CaseCheck {
-    pub when_expr: Option<Box<ParsedExpression>>,
-    pub then_expr: Option<Box<ParsedExpression>>,
-}
-
-impl CaseCheck {
-    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let when_expr = d.read_property_with_default::<Option<Box<ParsedExpression>>>(100, "when_expr")?;
-        let then_expr = d.read_property_with_default::<Option<Box<ParsedExpression>>>(101, "then_expr")?;
-        Ok(Self { when_expr, then_expr })
-    }
-
-    pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property_with_default(100, "when_expr", &self.when_expr);
-        s.write_property_with_default(101, "then_expr", &self.then_expr);
-    }
-}
-
-impl Deserialize for CaseCheck {
-    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        d.read_object_value(Self::read_members)
-    }
-}
-
-impl Serialize for CaseCheck {
-    fn write_value(&self, s: &mut BinarySerializer) {
-        s.write_object_value(|s| self.write_members(s));
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Literal {
-    pub kind: u64,
-    pub text: String,
-}
-
-impl Literal {
-    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let kind = d.read_property::<u64>(100, "kind")?;
-        let text = d.read_property_with_default::<String>(101, "text")?;
-        Ok(Self { kind, text })
-    }
-
-    pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property(100, "kind", &self.kind);
-        s.write_property_with_default(101, "text", &self.text);
-    }
-}
-
-impl Deserialize for Literal {
-    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        d.read_object_value(Self::read_members)
-    }
-}
-
-impl Serialize for Literal {
-    fn write_value(&self, s: &mut BinarySerializer) {
-        s.write_object_value(|s| self.write_members(s));
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct QualifiedColumnName {
-    pub catalog: String,
-    pub schema: String,
-    pub table: String,
-    pub column: String,
-}
-
-impl QualifiedColumnName {
-    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let catalog = d.read_property_with_default::<String>(100, "catalog")?;
-        let schema = d.read_property_with_default::<String>(101, "schema")?;
-        let table = d.read_property_with_default::<String>(102, "table")?;
-        let column = d.read_property_with_default::<String>(103, "column")?;
-        Ok(Self {
-            catalog,
-            schema,
-            table,
-            column,
-        })
-    }
-
-    pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property_with_default(100, "catalog", &self.catalog);
-        s.write_property_with_default(101, "schema", &self.schema);
-        s.write_property_with_default(102, "table", &self.table);
-        s.write_property_with_default(103, "column", &self.column);
-    }
-}
-
-impl Deserialize for QualifiedColumnName {
-    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        d.read_object_value(Self::read_members)
-    }
-}
-
-impl Serialize for QualifiedColumnName {
-    fn write_value(&self, s: &mut BinarySerializer) {
-        s.write_object_value(|s| self.write_members(s));
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct SelectNode {
-    pub select_list: Vec<Option<Box<ParsedExpression>>>,
-    pub from_table: Option<Box<TableRef>>,
-    pub where_clause: Option<Box<ParsedExpression>>,
-    pub group_expressions: Vec<Option<Box<ParsedExpression>>>,
-    pub group_sets: Vec<Vec<u64>>,
-    pub aggregate_handling: u64,
-    pub having: Option<Box<ParsedExpression>>,
-    pub sample: Option<Box<SampleOptions>>,
-    pub qualify: Option<Box<ParsedExpression>>,
-}
-
-impl SelectNode {
-    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let select_list = d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(200, "select_list")?;
-        let from_table = d.read_property_with_default::<Option<Box<TableRef>>>(201, "from_table")?;
-        let where_clause = d.read_property_with_default::<Option<Box<ParsedExpression>>>(202, "where_clause")?;
-        let group_expressions =
-            d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(203, "group_expressions")?;
-        let group_sets = d.read_property_with_default::<Vec<Vec<u64>>>(204, "group_sets")?;
-        let aggregate_handling = d.read_property::<u64>(205, "aggregate_handling")?;
-        let having = d.read_property_with_default::<Option<Box<ParsedExpression>>>(206, "having")?;
-        let sample = d.read_property_with_default::<Option<Box<SampleOptions>>>(207, "sample")?;
-        let qualify = d.read_property_with_default::<Option<Box<ParsedExpression>>>(208, "qualify")?;
-        Ok(Self {
-            select_list,
-            from_table,
-            where_clause,
-            group_expressions,
-            group_sets,
-            aggregate_handling,
-            having,
-            sample,
-            qualify,
-        })
-    }
-
-    pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property_with_default(200, "select_list", &self.select_list);
-        s.write_property_with_default(201, "from_table", &self.from_table);
-        s.write_property_with_default(202, "where_clause", &self.where_clause);
-        s.write_property_with_default(203, "group_expressions", &self.group_expressions);
-        s.write_property_with_default(204, "group_sets", &self.group_sets);
-        s.write_property(205, "aggregate_handling", &self.aggregate_handling);
-        s.write_property_with_default(206, "having", &self.having);
-        s.write_property_with_default(207, "sample", &self.sample);
-        s.write_property_with_default(208, "qualify", &self.qualify);
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct SetOperationNode {
-    pub setop_type: u64,
-    pub left: Option<Box<QueryNode>>,
-    pub right: Option<Box<QueryNode>>,
-    pub setop_all: Option<bool>,
-    pub children: Vec<Option<Box<QueryNode>>>,
-}
-
-impl SetOperationNode {
-    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let setop_type = d.read_property::<u64>(200, "setop_type")?;
-        let left = d.read_property_with_default::<Option<Box<QueryNode>>>(201, "left")?;
-        let right = d.read_property_with_default::<Option<Box<QueryNode>>>(202, "right")?;
-        let setop_all = d.read_optional_property::<bool>(203, "setop_all")?;
-        let children = d.read_property_with_default::<Vec<Option<Box<QueryNode>>>>(204, "children")?;
-        Ok(Self {
-            setop_type,
-            left,
-            right,
-            setop_all,
-            children,
-        })
-    }
-
-    pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property(200, "setop_type", &self.setop_type);
-        s.write_property_with_default(201, "left", &self.left);
-        s.write_property_with_default(202, "right", &self.right);
-        s.write_optional_property(203, "setop_all", self.setop_all.as_ref());
-        if s.should_serialize(StorageVersion::V1_5_0) {
-            s.write_property_with_default(204, "children", &self.children);
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct RecursiveCTENode {
-    pub cte_name: String,
-    pub union_all: Option<bool>,
-    pub left: Option<Box<QueryNode>>,
-    pub right: Option<Box<QueryNode>>,
-    pub aliases: Vec<String>,
-    pub key_targets: Vec<Option<Box<ParsedExpression>>>,
-}
-
-impl RecursiveCTENode {
-    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let cte_name = d.read_property_with_default::<String>(200, "cte_name")?;
-        let union_all = d.read_optional_property::<bool>(201, "union_all")?;
-        let left = d.read_property_with_default::<Option<Box<QueryNode>>>(202, "left")?;
-        let right = d.read_property_with_default::<Option<Box<QueryNode>>>(203, "right")?;
-        let aliases = d.read_property_with_default::<Vec<String>>(204, "aliases")?;
-        let key_targets = d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(205, "key_targets")?;
-        Ok(Self {
-            cte_name,
-            union_all,
-            left,
-            right,
-            aliases,
-            key_targets,
-        })
-    }
-
-    pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property_with_default(200, "cte_name", &self.cte_name);
-        s.write_optional_property(201, "union_all", self.union_all.as_ref());
-        s.write_property_with_default(202, "left", &self.left);
-        s.write_property_with_default(203, "right", &self.right);
-        s.write_property_with_default(204, "aliases", &self.aliases);
-        s.write_property_with_default(205, "key_targets", &self.key_targets);
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct CTENode {
-    pub cte_name: String,
-    pub query: Option<Box<QueryNode>>,
-    pub child: Option<Box<QueryNode>>,
-    pub aliases: Vec<String>,
-    pub materialized: Option<u64>,
-}
-
-impl CTENode {
-    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let cte_name = d.read_property_with_default::<String>(200, "cte_name")?;
-        let query = d.read_property_with_default::<Option<Box<QueryNode>>>(201, "query")?;
-        let child = d.read_property_with_default::<Option<Box<QueryNode>>>(202, "child")?;
-        let aliases = d.read_property_with_default::<Vec<String>>(203, "aliases")?;
-        let materialized = d.read_optional_property::<u64>(204, "materialized")?;
-        Ok(Self {
-            cte_name,
-            query,
-            child,
-            aliases,
-            materialized,
-        })
-    }
-
-    pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property_with_default(200, "cte_name", &self.cte_name);
-        s.write_property_with_default(201, "query", &self.query);
-        s.write_property_with_default(202, "child", &self.child);
-        s.write_property_with_default(203, "aliases", &self.aliases);
-        s.write_optional_property(204, "materialized", self.materialized.as_ref());
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ResultModifier {
-    pub type_: u64,
-    pub kind: ResultModifierKind,
-}
-
-#[derive(Debug, Clone)]
-pub enum ResultModifierKind {
-    LimitModifier(LimitModifier),
-    DistinctModifier(DistinctModifier),
-    OrderModifier(OrderModifier),
-    LegacyLimitPercentModifier(LegacyLimitPercentModifier),
-}
-
-impl ResultModifier {
-    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let type_ = d.read_property::<u64>(100, "type")?;
-        let kind = match u64::from(type_) {
-            enums::result_modifier_type::LIMIT_MODIFIER => {
-                ResultModifierKind::LimitModifier(LimitModifier::read_members(d)?)
-            }
-            enums::result_modifier_type::DISTINCT_MODIFIER => {
-                ResultModifierKind::DistinctModifier(DistinctModifier::read_members(d)?)
-            }
-            enums::result_modifier_type::ORDER_MODIFIER => {
-                ResultModifierKind::OrderModifier(OrderModifier::read_members(d)?)
-            }
-            enums::result_modifier_type::LEGACY_LIMIT_PERCENT_MODIFIER => {
-                ResultModifierKind::LegacyLimitPercentModifier(LegacyLimitPercentModifier::read_members(d)?)
-            }
-            other => return Err(unknown("ResultModifier", other)),
-        };
-        Ok(Self { type_, kind })
-    }
-
-    pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property(100, "type", &self.type_);
-        match &self.kind {
-            ResultModifierKind::LimitModifier(value) => value.write_members(s),
-            ResultModifierKind::DistinctModifier(value) => value.write_members(s),
-            ResultModifierKind::OrderModifier(value) => value.write_members(s),
-            ResultModifierKind::LegacyLimitPercentModifier(value) => value.write_members(s),
-        }
-    }
-}
-
-impl Deserialize for ResultModifier {
-    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        d.read_object_value(Self::read_members)
-    }
-}
-
-impl Serialize for ResultModifier {
-    fn write_value(&self, s: &mut BinarySerializer) {
-        s.write_object_value(|s| self.write_members(s));
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct CommonTableExpressionMap {
-    pub map: Vec<(String, Option<Box<CommonTableExpressionInfo>>)>,
-}
-
-impl CommonTableExpressionMap {
-    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let map = d.read_property_with_default::<Vec<(String, Option<Box<CommonTableExpressionInfo>>)>>(100, "map")?;
-        Ok(Self { map })
-    }
-
-    pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property_with_default(100, "map", &self.map);
-    }
-}
-
-impl Deserialize for CommonTableExpressionMap {
-    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        d.read_object_value(Self::read_members)
-    }
-}
-
-impl Serialize for CommonTableExpressionMap {
-    fn write_value(&self, s: &mut BinarySerializer) {
-        s.write_object_value(|s| self.write_members(s));
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct TableRef {
-    pub type_: u64,
-    pub alias: String,
-    pub sample: Option<Box<SampleOptions>>,
-    pub query_location: Option<u64>,
-    pub query_location_length: Option<u32>,
-    pub kind: TableRefKind,
-}
-
-#[derive(Debug, Clone)]
-pub enum TableRefKind {
-    BaseTableRef(BaseTableRef),
-    JoinRef(JoinRef),
-    SubqueryRef(SubqueryRef),
-    TableFunctionRef(TableFunctionRef),
-    EmptyTableRef(EmptyTableRef),
-    ExpressionListRef(ExpressionListRef),
-    PivotRef(PivotRef),
-}
-
-impl TableRef {
-    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let type_ = d.read_property::<u64>(100, "type")?;
-        let alias = d.read_property_with_default::<String>(101, "alias")?;
-        let sample = d.read_property_with_default::<Option<Box<SampleOptions>>>(102, "sample")?;
-        let query_location = d.read_optional_property::<u64>(103, "query_location")?;
-        let query_location_length = d.read_optional_property::<u32>(104, "query_location_length")?;
-        let kind = match u64::from(type_) {
-            enums::table_reference_type::BASE_TABLE => TableRefKind::BaseTableRef(BaseTableRef::read_members(d)?),
-            enums::table_reference_type::JOIN => TableRefKind::JoinRef(JoinRef::read_members(d)?),
-            enums::table_reference_type::SUBQUERY => TableRefKind::SubqueryRef(SubqueryRef::read_members(d)?),
-            enums::table_reference_type::MATCH_RECOGNIZE => return Err(not_ported("MATCH_RECOGNIZE")),
-            enums::table_reference_type::TABLE_FUNCTION => {
-                TableRefKind::TableFunctionRef(TableFunctionRef::read_members(d)?)
-            }
-            enums::table_reference_type::EMPTY_FROM => TableRefKind::EmptyTableRef(EmptyTableRef::read_members(d)?),
-            enums::table_reference_type::EXPRESSION_LIST => {
-                TableRefKind::ExpressionListRef(ExpressionListRef::read_members(d)?)
-            }
-            enums::table_reference_type::COLUMN_DATA => return Err(not_ported("column data references")),
-            enums::table_reference_type::PIVOT => TableRefKind::PivotRef(PivotRef::read_members(d)?),
-            enums::table_reference_type::SHOW_REF => return Err(not_ported("SHOW and DESCRIBE in a stored query")),
-            other => return Err(unknown("TableRef", other)),
-        };
-        Ok(Self {
-            type_,
-            alias,
-            sample,
-            query_location,
-            query_location_length,
-            kind,
-        })
-    }
-
-    pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property(100, "type", &self.type_);
-        s.write_property_with_default(101, "alias", &self.alias);
-        s.write_property_with_default(102, "sample", &self.sample);
-        s.write_optional_property(103, "query_location", self.query_location.as_ref());
-        if s.should_serialize(StorageVersion::V2_0_0) {
-            s.write_optional_property(104, "query_location_length", self.query_location_length.as_ref());
-        }
-        match &self.kind {
-            TableRefKind::BaseTableRef(value) => value.write_members(s),
-            TableRefKind::JoinRef(value) => value.write_members(s),
-            TableRefKind::SubqueryRef(value) => value.write_members(s),
-            TableRefKind::TableFunctionRef(value) => value.write_members(s),
-            TableRefKind::EmptyTableRef(value) => value.write_members(s),
-            TableRefKind::ExpressionListRef(value) => value.write_members(s),
-            TableRefKind::PivotRef(value) => value.write_members(s),
-        }
-    }
-}
-
-impl Deserialize for TableRef {
-    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        d.read_object_value(Self::read_members)
-    }
-}
-
-impl Serialize for TableRef {
-    fn write_value(&self, s: &mut BinarySerializer) {
-        s.write_object_value(|s| self.write_members(s));
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct SampleOptions {
-    pub sample_size: Value,
-    pub is_percentage: bool,
-    pub method: u64,
-    pub seed: i64,
-    pub repeatable: bool,
-    pub sample_rate: Option<f64>,
-}
-
-impl SampleOptions {
-    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let sample_size = d.read_property::<Value>(100, "sample_size")?;
-        let is_percentage = d.read_property_with_default::<bool>(101, "is_percentage")?;
-        let method = d.read_property::<u64>(102, "method")?;
-        let seed = d.read_property_with_default::<i64>(103, "seed")?;
-        let repeatable = d.read_property_with_default::<bool>(104, "repeatable")?;
-        let sample_rate = d.read_optional_property::<f64>(105, "sample_rate")?;
-        Ok(Self {
-            sample_size,
-            is_percentage,
-            method,
-            seed,
-            repeatable,
-            sample_rate,
-        })
-    }
-
-    pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property(100, "sample_size", &self.sample_size);
-        s.write_property_with_default(101, "is_percentage", &self.is_percentage);
-        s.write_property(102, "method", &self.method);
-        s.write_property_with_default(103, "seed", &self.seed);
-        s.write_property_with_default(104, "repeatable", &self.repeatable);
-        s.write_optional_property(105, "sample_rate", self.sample_rate.as_ref());
-    }
-}
-
-impl Deserialize for SampleOptions {
-    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        d.read_object_value(Self::read_members)
-    }
-}
-
-impl Serialize for SampleOptions {
-    fn write_value(&self, s: &mut BinarySerializer) {
-        s.write_object_value(|s| self.write_members(s));
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct LimitModifier {
-    pub limit: Option<Box<ParsedExpression>>,
-    pub offset: Option<Box<ParsedExpression>>,
-    pub limit_type: Option<u64>,
-}
-
-impl LimitModifier {
-    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let limit = d.read_property_with_default::<Option<Box<ParsedExpression>>>(200, "limit")?;
-        let offset = d.read_property_with_default::<Option<Box<ParsedExpression>>>(201, "offset")?;
-        let limit_type = d.read_optional_property::<u64>(202, "limit_type")?;
-        Ok(Self {
-            limit,
-            offset,
-            limit_type,
-        })
-    }
-
-    pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property_with_default(200, "limit", &self.limit);
-        s.write_property_with_default(201, "offset", &self.offset);
-        s.write_optional_property(202, "limit_type", self.limit_type.as_ref());
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct DistinctModifier {
-    pub distinct_on_targets: Vec<Option<Box<ParsedExpression>>>,
-}
-
-impl DistinctModifier {
-    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let distinct_on_targets =
-            d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(200, "distinct_on_targets")?;
-        Ok(Self { distinct_on_targets })
-    }
-
-    pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property_with_default(200, "distinct_on_targets", &self.distinct_on_targets);
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct OrderModifier {
-    pub orders: Vec<OrderByNode>,
-}
-
-impl OrderModifier {
-    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let orders = d.read_property_with_default::<Vec<OrderByNode>>(200, "orders")?;
-        Ok(Self { orders })
-    }
-
-    pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property_with_default(200, "orders", &self.orders);
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct LegacyLimitPercentModifier {
-    pub limit: Option<Box<ParsedExpression>>,
-    pub offset: Option<Box<ParsedExpression>>,
-}
-
-impl LegacyLimitPercentModifier {
-    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let limit = d.read_property_with_default::<Option<Box<ParsedExpression>>>(200, "limit")?;
-        let offset = d.read_property_with_default::<Option<Box<ParsedExpression>>>(201, "offset")?;
-        Ok(Self { limit, offset })
-    }
-
-    pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property_with_default(200, "limit", &self.limit);
-        s.write_property_with_default(201, "offset", &self.offset);
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct CommonTableExpressionInfo {
-    pub aliases: Vec<String>,
-    pub query: Option<Box<SelectStatement>>,
-    pub materialized: u64,
-    pub key_targets: Vec<Option<Box<ParsedExpression>>>,
-    pub payload_aggregates: Vec<Option<Box<ParsedExpression>>>,
-    pub query_node: Option<Box<QueryNode>>,
-}
-
-impl CommonTableExpressionInfo {
-    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let aliases = d.read_property_with_default::<Vec<String>>(100, "aliases")?;
-        let query = d.read_property_with_default::<Option<Box<SelectStatement>>>(101, "query")?;
-        let materialized = d.read_property::<u64>(102, "materialized")?;
-        let key_targets = d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(103, "key_targets")?;
-        let payload_aggregates =
-            d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(104, "payload_aggregates")?;
-        let query_node = d.read_property_with_default::<Option<Box<QueryNode>>>(105, "query_node")?;
-        Ok(Self {
-            aliases,
-            query,
-            materialized,
-            key_targets,
-            payload_aggregates,
-            query_node,
-        })
-    }
-
-    pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property_with_default(100, "aliases", &self.aliases);
-        if !s.should_serialize(StorageVersion::V2_0_0) {
-            s.write_property_with_default(101, "query", &self.query);
-        }
-        s.write_property(102, "materialized", &self.materialized);
-        s.write_property_with_default(103, "key_targets", &self.key_targets);
-        s.write_property_with_default(104, "payload_aggregates", &self.payload_aggregates);
-        if s.should_serialize(StorageVersion::V2_0_0) {
-            s.write_property_with_default(105, "query_node", &self.query_node);
-        }
-    }
-}
-
-impl Deserialize for CommonTableExpressionInfo {
-    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        d.read_object_value(Self::read_members)
-    }
-}
-
-impl Serialize for CommonTableExpressionInfo {
-    fn write_value(&self, s: &mut BinarySerializer) {
-        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -3610,38 +3064,610 @@ impl PivotRef {
 }
 
 #[derive(Debug, Clone)]
-pub struct OrderByNode {
-    pub type_: u64,
-    pub null_order: u64,
-    pub expression: Option<Box<ParsedExpression>>,
+pub struct SampleOptions {
+    pub sample_size: Value,
+    pub is_percentage: bool,
+    pub method: u64,
+    pub seed: i64,
+    pub repeatable: bool,
+    pub sample_rate: Option<f64>,
 }
 
-impl OrderByNode {
+impl SampleOptions {
     pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let type_ = d.read_property::<u64>(100, "type")?;
-        let null_order = d.read_property::<u64>(101, "null_order")?;
-        let expression = d.read_property_with_default::<Option<Box<ParsedExpression>>>(102, "expression")?;
+        let sample_size = d.read_property::<Value>(100, "sample_size")?;
+        let is_percentage = d.read_property_with_default::<bool>(101, "is_percentage")?;
+        let method = d.read_property::<u64>(102, "method")?;
+        let seed = d.read_property_with_default::<i64>(103, "seed")?;
+        let repeatable = d.read_property_with_default::<bool>(104, "repeatable")?;
+        let sample_rate = d.read_optional_property::<f64>(105, "sample_rate")?;
         Ok(Self {
-            type_,
-            null_order,
-            expression,
+            sample_size,
+            is_percentage,
+            method,
+            seed,
+            repeatable,
+            sample_rate,
         })
     }
 
     pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property(100, "type", &self.type_);
-        s.write_property(101, "null_order", &self.null_order);
-        s.write_property_with_default(102, "expression", &self.expression);
+        s.write_property(100, "sample_size", &self.sample_size);
+        s.write_property_with_default(101, "is_percentage", &self.is_percentage);
+        s.write_property(102, "method", &self.method);
+        s.write_property_with_default(103, "seed", &self.seed);
+        s.write_property_with_default(104, "repeatable", &self.repeatable);
+        s.write_optional_property(105, "sample_rate", self.sample_rate.as_ref());
     }
 }
 
-impl Deserialize for OrderByNode {
+impl Deserialize for SampleOptions {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(Self::read_members)
     }
 }
 
-impl Serialize for OrderByNode {
+impl Serialize for SampleOptions {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SelectNode {
+    pub select_list: Vec<Option<Box<ParsedExpression>>>,
+    pub from_table: Option<Box<TableRef>>,
+    pub where_clause: Option<Box<ParsedExpression>>,
+    pub group_expressions: Vec<Option<Box<ParsedExpression>>>,
+    pub group_sets: Vec<Vec<u64>>,
+    pub aggregate_handling: u64,
+    pub having: Option<Box<ParsedExpression>>,
+    pub sample: Option<Box<SampleOptions>>,
+    pub qualify: Option<Box<ParsedExpression>>,
+}
+
+impl SelectNode {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let select_list = d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(200, "select_list")?;
+        let from_table = d.read_property_with_default::<Option<Box<TableRef>>>(201, "from_table")?;
+        let where_clause = d.read_property_with_default::<Option<Box<ParsedExpression>>>(202, "where_clause")?;
+        let group_expressions =
+            d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(203, "group_expressions")?;
+        let group_sets = d.read_property_with_default::<Vec<Vec<u64>>>(204, "group_sets")?;
+        let aggregate_handling = d.read_property::<u64>(205, "aggregate_handling")?;
+        let having = d.read_property_with_default::<Option<Box<ParsedExpression>>>(206, "having")?;
+        let sample = d.read_property_with_default::<Option<Box<SampleOptions>>>(207, "sample")?;
+        let qualify = d.read_property_with_default::<Option<Box<ParsedExpression>>>(208, "qualify")?;
+        Ok(Self {
+            select_list,
+            from_table,
+            where_clause,
+            group_expressions,
+            group_sets,
+            aggregate_handling,
+            having,
+            sample,
+            qualify,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "select_list", &self.select_list);
+        s.write_property_with_default(201, "from_table", &self.from_table);
+        s.write_property_with_default(202, "where_clause", &self.where_clause);
+        s.write_property_with_default(203, "group_expressions", &self.group_expressions);
+        s.write_property_with_default(204, "group_sets", &self.group_sets);
+        s.write_property(205, "aggregate_handling", &self.aggregate_handling);
+        s.write_property_with_default(206, "having", &self.having);
+        s.write_property_with_default(207, "sample", &self.sample);
+        s.write_property_with_default(208, "qualify", &self.qualify);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SetOperationNode {
+    pub setop_type: u64,
+    pub left: Option<Box<QueryNode>>,
+    pub right: Option<Box<QueryNode>>,
+    pub setop_all: Option<bool>,
+    pub children: Vec<Option<Box<QueryNode>>>,
+}
+
+impl SetOperationNode {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let setop_type = d.read_property::<u64>(200, "setop_type")?;
+        let left = d.read_property_with_default::<Option<Box<QueryNode>>>(201, "left")?;
+        let right = d.read_property_with_default::<Option<Box<QueryNode>>>(202, "right")?;
+        let setop_all = d.read_optional_property::<bool>(203, "setop_all")?;
+        let children = d.read_property_with_default::<Vec<Option<Box<QueryNode>>>>(204, "children")?;
+        Ok(Self {
+            setop_type,
+            left,
+            right,
+            setop_all,
+            children,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(200, "setop_type", &self.setop_type);
+        s.write_property_with_default(201, "left", &self.left);
+        s.write_property_with_default(202, "right", &self.right);
+        s.write_optional_property(203, "setop_all", self.setop_all.as_ref());
+        if s.should_serialize(StorageVersion::V1_5_0) {
+            s.write_property_with_default(204, "children", &self.children);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RecursiveCTENode {
+    pub cte_name: String,
+    pub union_all: Option<bool>,
+    pub left: Option<Box<QueryNode>>,
+    pub right: Option<Box<QueryNode>>,
+    pub aliases: Vec<String>,
+    pub key_targets: Vec<Option<Box<ParsedExpression>>>,
+}
+
+impl RecursiveCTENode {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let cte_name = d.read_property_with_default::<String>(200, "cte_name")?;
+        let union_all = d.read_optional_property::<bool>(201, "union_all")?;
+        let left = d.read_property_with_default::<Option<Box<QueryNode>>>(202, "left")?;
+        let right = d.read_property_with_default::<Option<Box<QueryNode>>>(203, "right")?;
+        let aliases = d.read_property_with_default::<Vec<String>>(204, "aliases")?;
+        let key_targets = d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(205, "key_targets")?;
+        Ok(Self {
+            cte_name,
+            union_all,
+            left,
+            right,
+            aliases,
+            key_targets,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "cte_name", &self.cte_name);
+        s.write_optional_property(201, "union_all", self.union_all.as_ref());
+        s.write_property_with_default(202, "left", &self.left);
+        s.write_property_with_default(203, "right", &self.right);
+        s.write_property_with_default(204, "aliases", &self.aliases);
+        s.write_property_with_default(205, "key_targets", &self.key_targets);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CTENode {
+    pub cte_name: String,
+    pub query: Option<Box<QueryNode>>,
+    pub child: Option<Box<QueryNode>>,
+    pub aliases: Vec<String>,
+    pub materialized: Option<u64>,
+}
+
+impl CTENode {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let cte_name = d.read_property_with_default::<String>(200, "cte_name")?;
+        let query = d.read_property_with_default::<Option<Box<QueryNode>>>(201, "query")?;
+        let child = d.read_property_with_default::<Option<Box<QueryNode>>>(202, "child")?;
+        let aliases = d.read_property_with_default::<Vec<String>>(203, "aliases")?;
+        let materialized = d.read_optional_property::<u64>(204, "materialized")?;
+        Ok(Self {
+            cte_name,
+            query,
+            child,
+            aliases,
+            materialized,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "cte_name", &self.cte_name);
+        s.write_property_with_default(201, "query", &self.query);
+        s.write_property_with_default(202, "child", &self.child);
+        s.write_property_with_default(203, "aliases", &self.aliases);
+        s.write_optional_property(204, "materialized", self.materialized.as_ref());
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateQueryNode {
+    pub table: Option<Box<TableRef>>,
+    pub from_table: Option<Box<TableRef>>,
+    pub returning_list: Vec<Option<Box<ParsedExpression>>>,
+    pub set_info: Option<Box<UpdateSetInfo>>,
+    pub prioritize_table_when_binding: Option<bool>,
+}
+
+impl UpdateQueryNode {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let table = d.read_property_with_default::<Option<Box<TableRef>>>(200, "table")?;
+        let from_table = d.read_property_with_default::<Option<Box<TableRef>>>(201, "from_table")?;
+        let returning_list =
+            d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(202, "returning_list")?;
+        let set_info = d.read_property_with_default::<Option<Box<UpdateSetInfo>>>(203, "set_info")?;
+        let prioritize_table_when_binding = d.read_optional_property::<bool>(204, "prioritize_table_when_binding")?;
+        Ok(Self {
+            table,
+            from_table,
+            returning_list,
+            set_info,
+            prioritize_table_when_binding,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "table", &self.table);
+        s.write_property_with_default(201, "from_table", &self.from_table);
+        s.write_property_with_default(202, "returning_list", &self.returning_list);
+        s.write_property_with_default(203, "set_info", &self.set_info);
+        s.write_optional_property(
+            204,
+            "prioritize_table_when_binding",
+            self.prioritize_table_when_binding.as_ref(),
+        );
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DeleteQueryNode {
+    pub condition: Option<Box<ParsedExpression>>,
+    pub table: Option<Box<TableRef>>,
+    pub using_clauses: Vec<Option<Box<TableRef>>>,
+    pub returning_list: Vec<Option<Box<ParsedExpression>>>,
+}
+
+impl DeleteQueryNode {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let condition = d.read_property_with_default::<Option<Box<ParsedExpression>>>(200, "condition")?;
+        let table = d.read_property_with_default::<Option<Box<TableRef>>>(201, "table")?;
+        let using_clauses = d.read_property_with_default::<Vec<Option<Box<TableRef>>>>(202, "using_clauses")?;
+        let returning_list =
+            d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(203, "returning_list")?;
+        Ok(Self {
+            condition,
+            table,
+            using_clauses,
+            returning_list,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "condition", &self.condition);
+        s.write_property_with_default(201, "table", &self.table);
+        s.write_property_with_default(202, "using_clauses", &self.using_clauses);
+        s.write_property_with_default(203, "returning_list", &self.returning_list);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertQueryNode {
+    pub select_statement: Option<Box<SelectStatement>>,
+    pub columns: Vec<String>,
+    pub table: String,
+    pub schema: String,
+    pub catalog: String,
+    pub returning_list: Vec<Option<Box<ParsedExpression>>>,
+    pub on_conflict_info: Option<Box<OnConflictInfo>>,
+    pub table_ref: Option<Box<TableRef>>,
+    pub default_values: Option<bool>,
+    pub column_order: Option<u64>,
+    pub qualified_name: Option<QualifiedName>,
+}
+
+impl InsertQueryNode {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let select_statement = d.read_property_with_default::<Option<Box<SelectStatement>>>(200, "select_statement")?;
+        let columns = d.read_property_with_default::<Vec<String>>(201, "columns")?;
+        let table = d.read_property_with_default::<String>(202, "table")?;
+        let schema = d.read_property_with_default::<String>(203, "schema")?;
+        let catalog = d.read_property_with_default::<String>(204, "catalog")?;
+        let returning_list =
+            d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(205, "returning_list")?;
+        let on_conflict_info = d.read_property_with_default::<Option<Box<OnConflictInfo>>>(206, "on_conflict_info")?;
+        let table_ref = d.read_property_with_default::<Option<Box<TableRef>>>(207, "table_ref")?;
+        let default_values = d.read_optional_property::<bool>(208, "default_values")?;
+        let column_order = d.read_optional_property::<u64>(209, "column_order")?;
+        let qualified_name = d.read_optional_property::<QualifiedName>(210, "qualified_name")?;
+        Ok(Self {
+            select_statement,
+            columns,
+            table,
+            schema,
+            catalog,
+            returning_list,
+            on_conflict_info,
+            table_ref,
+            default_values,
+            column_order,
+            qualified_name,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "select_statement", &self.select_statement);
+        s.write_property_with_default(201, "columns", &self.columns);
+        s.write_property_with_default(202, "table", &self.table);
+        s.write_property_with_default(203, "schema", &self.schema);
+        s.write_property_with_default(204, "catalog", &self.catalog);
+        s.write_property_with_default(205, "returning_list", &self.returning_list);
+        s.write_property_with_default(206, "on_conflict_info", &self.on_conflict_info);
+        s.write_property_with_default(207, "table_ref", &self.table_ref);
+        s.write_optional_property(208, "default_values", self.default_values.as_ref());
+        s.write_optional_property(209, "column_order", self.column_order.as_ref());
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(210, "qualified_name", self.qualified_name.as_ref());
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ResultModifier {
+    pub type_: u64,
+    pub kind: ResultModifierKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum ResultModifierKind {
+    LimitModifier(LimitModifier),
+    DistinctModifier(DistinctModifier),
+    OrderModifier(OrderModifier),
+    LegacyLimitPercentModifier(LegacyLimitPercentModifier),
+}
+
+impl ResultModifier {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let type_ = d.read_property::<u64>(100, "type")?;
+        let kind = match u64::from(type_) {
+            enums::result_modifier_type::LIMIT_MODIFIER => {
+                ResultModifierKind::LimitModifier(LimitModifier::read_members(d)?)
+            }
+            enums::result_modifier_type::DISTINCT_MODIFIER => {
+                ResultModifierKind::DistinctModifier(DistinctModifier::read_members(d)?)
+            }
+            enums::result_modifier_type::ORDER_MODIFIER => {
+                ResultModifierKind::OrderModifier(OrderModifier::read_members(d)?)
+            }
+            enums::result_modifier_type::LEGACY_LIMIT_PERCENT_MODIFIER => {
+                ResultModifierKind::LegacyLimitPercentModifier(LegacyLimitPercentModifier::read_members(d)?)
+            }
+            other => return Err(unknown("ResultModifier", other)),
+        };
+        Ok(Self { type_, kind })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(100, "type", &self.type_);
+        match &self.kind {
+            ResultModifierKind::LimitModifier(value) => value.write_members(s),
+            ResultModifierKind::DistinctModifier(value) => value.write_members(s),
+            ResultModifierKind::OrderModifier(value) => value.write_members(s),
+            ResultModifierKind::LegacyLimitPercentModifier(value) => value.write_members(s),
+        }
+    }
+}
+
+impl Deserialize for ResultModifier {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for ResultModifier {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CommonTableExpressionMap {
+    pub map: Vec<(String, Option<Box<CommonTableExpressionInfo>>)>,
+}
+
+impl CommonTableExpressionMap {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let map = d.read_property_with_default::<Vec<(String, Option<Box<CommonTableExpressionInfo>>)>>(100, "map")?;
+        Ok(Self { map })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(100, "map", &self.map);
+    }
+}
+
+impl Deserialize for CommonTableExpressionMap {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for CommonTableExpressionMap {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CatalogEntryInfo {
+    pub type_: u64,
+    pub schema: String,
+    pub name: String,
+    pub schema_path: Vec<String>,
+    pub table: Option<String>,
+}
+
+impl CatalogEntryInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let type_ = d.read_property::<u64>(100, "type")?;
+        let schema = d.read_property_with_default::<String>(101, "schema")?;
+        let name = d.read_property_with_default::<String>(102, "name")?;
+        let schema_path = d.read_property_with_default::<Vec<String>>(103, "schema_path")?;
+        let table = d.read_optional_property::<String>(104, "table")?;
+        Ok(Self {
+            type_,
+            schema,
+            name,
+            schema_path,
+            table,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(100, "type", &self.type_);
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(101, "schema", &self.schema);
+        }
+        s.write_property_with_default(102, "name", &self.name);
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(103, "schema_path", &self.schema_path);
+        }
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(104, "table", self.table.as_ref());
+        }
+    }
+}
+
+impl Deserialize for CatalogEntryInfo {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for CatalogEntryInfo {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DependencyDependentFlags {
+    pub value: u8,
+}
+
+impl DependencyDependentFlags {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let value = d.read_property_with_default::<u8>(100, "value")?;
+        Ok(Self { value })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(100, "value", &self.value);
+    }
+}
+
+impl Deserialize for DependencyDependentFlags {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for DependencyDependentFlags {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CaseCheck {
+    pub when_expr: Option<Box<ParsedExpression>>,
+    pub then_expr: Option<Box<ParsedExpression>>,
+}
+
+impl CaseCheck {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let when_expr = d.read_property_with_default::<Option<Box<ParsedExpression>>>(100, "when_expr")?;
+        let then_expr = d.read_property_with_default::<Option<Box<ParsedExpression>>>(101, "then_expr")?;
+        Ok(Self { when_expr, then_expr })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(100, "when_expr", &self.when_expr);
+        s.write_property_with_default(101, "then_expr", &self.then_expr);
+    }
+}
+
+impl Deserialize for CaseCheck {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for CaseCheck {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Literal {
+    pub kind: u64,
+    pub text: String,
+}
+
+impl Literal {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let kind = d.read_property::<u64>(100, "kind")?;
+        let text = d.read_property_with_default::<String>(101, "text")?;
+        Ok(Self { kind, text })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(100, "kind", &self.kind);
+        s.write_property_with_default(101, "text", &self.text);
+    }
+}
+
+impl Deserialize for Literal {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for Literal {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct QualifiedColumnName {
+    pub catalog: String,
+    pub schema: String,
+    pub table: String,
+    pub column: String,
+}
+
+impl QualifiedColumnName {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let catalog = d.read_property_with_default::<String>(100, "catalog")?;
+        let schema = d.read_property_with_default::<String>(101, "schema")?;
+        let table = d.read_property_with_default::<String>(102, "table")?;
+        let column = d.read_property_with_default::<String>(103, "column")?;
+        Ok(Self {
+            catalog,
+            schema,
+            table,
+            column,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(100, "catalog", &self.catalog);
+        s.write_property_with_default(101, "schema", &self.schema);
+        s.write_property_with_default(102, "table", &self.table);
+        s.write_property_with_default(103, "column", &self.column);
+    }
+}
+
+impl Deserialize for QualifiedColumnName {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for QualifiedColumnName {
     fn write_value(&self, s: &mut BinarySerializer) {
         s.write_object_value(|s| self.write_members(s));
     }
@@ -3722,6 +3748,219 @@ impl Serialize for PivotColumn {
 }
 
 #[derive(Debug, Clone)]
+pub struct UpdateSetInfo {
+    pub condition: Option<Box<ParsedExpression>>,
+    pub columns: Vec<String>,
+    pub expressions: Vec<Option<Box<ParsedExpression>>>,
+}
+
+impl UpdateSetInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let condition = d.read_property_with_default::<Option<Box<ParsedExpression>>>(100, "condition")?;
+        let columns = d.read_property_with_default::<Vec<String>>(101, "columns")?;
+        let expressions = d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(102, "expressions")?;
+        Ok(Self {
+            condition,
+            columns,
+            expressions,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(100, "condition", &self.condition);
+        s.write_property_with_default(101, "columns", &self.columns);
+        s.write_property_with_default(102, "expressions", &self.expressions);
+    }
+}
+
+impl Deserialize for UpdateSetInfo {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for UpdateSetInfo {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OnConflictInfo {
+    pub action_type: u64,
+    pub indexed_columns: Vec<String>,
+    pub set_info: Option<Box<UpdateSetInfo>>,
+    pub condition: Option<Box<ParsedExpression>>,
+}
+
+impl OnConflictInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let action_type = d.read_property::<u64>(100, "action_type")?;
+        let indexed_columns = d.read_property_with_default::<Vec<String>>(101, "indexed_columns")?;
+        let set_info = d.read_property_with_default::<Option<Box<UpdateSetInfo>>>(102, "set_info")?;
+        let condition = d.read_property_with_default::<Option<Box<ParsedExpression>>>(103, "condition")?;
+        Ok(Self {
+            action_type,
+            indexed_columns,
+            set_info,
+            condition,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(100, "action_type", &self.action_type);
+        s.write_property_with_default(101, "indexed_columns", &self.indexed_columns);
+        s.write_property_with_default(102, "set_info", &self.set_info);
+        s.write_property_with_default(103, "condition", &self.condition);
+    }
+}
+
+impl Deserialize for OnConflictInfo {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for OnConflictInfo {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LimitModifier {
+    pub limit: Option<Box<ParsedExpression>>,
+    pub offset: Option<Box<ParsedExpression>>,
+    pub limit_type: Option<u64>,
+}
+
+impl LimitModifier {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let limit = d.read_property_with_default::<Option<Box<ParsedExpression>>>(200, "limit")?;
+        let offset = d.read_property_with_default::<Option<Box<ParsedExpression>>>(201, "offset")?;
+        let limit_type = d.read_optional_property::<u64>(202, "limit_type")?;
+        Ok(Self {
+            limit,
+            offset,
+            limit_type,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "limit", &self.limit);
+        s.write_property_with_default(201, "offset", &self.offset);
+        s.write_optional_property(202, "limit_type", self.limit_type.as_ref());
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DistinctModifier {
+    pub distinct_on_targets: Vec<Option<Box<ParsedExpression>>>,
+}
+
+impl DistinctModifier {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let distinct_on_targets =
+            d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(200, "distinct_on_targets")?;
+        Ok(Self { distinct_on_targets })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "distinct_on_targets", &self.distinct_on_targets);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OrderModifier {
+    pub orders: Vec<OrderByNode>,
+}
+
+impl OrderModifier {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let orders = d.read_property_with_default::<Vec<OrderByNode>>(200, "orders")?;
+        Ok(Self { orders })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "orders", &self.orders);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LegacyLimitPercentModifier {
+    pub limit: Option<Box<ParsedExpression>>,
+    pub offset: Option<Box<ParsedExpression>>,
+}
+
+impl LegacyLimitPercentModifier {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let limit = d.read_property_with_default::<Option<Box<ParsedExpression>>>(200, "limit")?;
+        let offset = d.read_property_with_default::<Option<Box<ParsedExpression>>>(201, "offset")?;
+        Ok(Self { limit, offset })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "limit", &self.limit);
+        s.write_property_with_default(201, "offset", &self.offset);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CommonTableExpressionInfo {
+    pub aliases: Vec<String>,
+    pub query: Option<Box<SelectStatement>>,
+    pub materialized: u64,
+    pub key_targets: Vec<Option<Box<ParsedExpression>>>,
+    pub payload_aggregates: Vec<Option<Box<ParsedExpression>>>,
+    pub query_node: Option<Box<QueryNode>>,
+}
+
+impl CommonTableExpressionInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let aliases = d.read_property_with_default::<Vec<String>>(100, "aliases")?;
+        let query = d.read_property_with_default::<Option<Box<SelectStatement>>>(101, "query")?;
+        let materialized = d.read_property::<u64>(102, "materialized")?;
+        let key_targets = d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(103, "key_targets")?;
+        let payload_aggregates =
+            d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(104, "payload_aggregates")?;
+        let query_node = d.read_property_with_default::<Option<Box<QueryNode>>>(105, "query_node")?;
+        Ok(Self {
+            aliases,
+            query,
+            materialized,
+            key_targets,
+            payload_aggregates,
+            query_node,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(100, "aliases", &self.aliases);
+        if !s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(101, "query", &self.query);
+        }
+        s.write_property(102, "materialized", &self.materialized);
+        s.write_property_with_default(103, "key_targets", &self.key_targets);
+        s.write_property_with_default(104, "payload_aggregates", &self.payload_aggregates);
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(105, "query_node", &self.query_node);
+        }
+    }
+}
+
+impl Deserialize for CommonTableExpressionInfo {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for CommonTableExpressionInfo {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct PivotColumnEntry {
     pub values: Vec<Value>,
     pub star_expr: Option<Box<ParsedExpression>>,
@@ -3754,6 +3993,44 @@ impl Deserialize for PivotColumnEntry {
 }
 
 impl Serialize for PivotColumnEntry {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OrderByNode {
+    pub type_: u64,
+    pub null_order: u64,
+    pub expression: Option<Box<ParsedExpression>>,
+}
+
+impl OrderByNode {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let type_ = d.read_property::<u64>(100, "type")?;
+        let null_order = d.read_property::<u64>(101, "null_order")?;
+        let expression = d.read_property_with_default::<Option<Box<ParsedExpression>>>(102, "expression")?;
+        Ok(Self {
+            type_,
+            null_order,
+            expression,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(100, "type", &self.type_);
+        s.write_property(101, "null_order", &self.null_order);
+        s.write_property_with_default(102, "expression", &self.expression);
+    }
+}
+
+impl Deserialize for OrderByNode {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for OrderByNode {
     fn write_value(&self, s: &mut BinarySerializer) {
         s.write_object_value(|s| self.write_members(s));
     }

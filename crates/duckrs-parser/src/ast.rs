@@ -1863,7 +1863,7 @@ impl Display for InsertStatement {
         if let Some(conflict) = self.on_conflict.as_ref().filter(|_| !or_replace) {
             r += " ON CONFLICT ";
             if !conflict.indexed_columns.is_empty() {
-                r += &format!("({} )", join(&conflict.indexed_columns, ", ", |c| c.to_lowercase()));
+                r += &format!("({})", join(&conflict.indexed_columns, ", ", |c| sql_identifier(c)));
             }
             if let Some(condition) = &conflict.condition {
                 r += &format!(" WHERE {condition}");
@@ -1873,13 +1873,7 @@ impl Display for InsertStatement {
                 _ => " DO UPDATE",
             };
             if let Some(set) = &conflict.set_info {
-                let sets: Vec<String> = set
-                    .columns
-                    .iter()
-                    .zip(&set.expressions)
-                    .map(|(c, e)| format!("{} = {e}", c.to_lowercase()))
-                    .collect();
-                r += &format!(" SET {}", sets.join(", "));
+                r += &format!(" {set}");
                 if let Some(condition) = &set.condition {
                     r += &format!(" WHERE {condition}");
                 }

@@ -5,6 +5,8 @@
 //! parser, binder, planner and executor.
 
 mod explain;
+mod triggers;
+pub(crate) use triggers::body_dependencies as trigger_body_dependencies;
 mod export;
 mod logging;
 pub mod settings;
@@ -511,7 +513,10 @@ fn for_each_table_name(statement: &mut Statement, f: &mut impl FnMut(&mut Qualif
                 in_query(&mut query.node, f);
             }
         }
+        // a trigger finds the database of its table itself, as it keeps the name as written
+        Statement::Create(info) if matches!(info.kind, CreateKind::Trigger { .. }) => {}
         Statement::Create(info) => f(&mut info.name),
+        Statement::Drop(info) if info.trigger_table.is_some() => {}
         Statement::Drop(info) => f(&mut info.name),
         Statement::Alter(info) => f(&mut info.name),
         Statement::Explain { statement, .. } => for_each_table_name(statement, f),
@@ -615,6 +620,8 @@ pub struct ClientContext {
     /// `ClientConfig::enable_profiler`: whether queries are profiled, in the `enable_profiling` format
     profiling: bool,
     /// what the plan of the statement being profiled did: its phases and its operators
+    /// the tables whose triggers are running, which run no triggers again (`trigger_expanded_tables`)
+    trigger_tables: Vec<String>,
     pending_profile: Option<(
         Vec<(String, std::time::Duration)>,
         Option<crate::execution::profiler::ProfileNode>,
@@ -733,6 +740,7 @@ impl ClientContext {
             statement_transaction: 0,
             profiling: false,
             pending_profile: None,
+            trigger_tables: Vec::new(),
         };
         context.sync_logging_settings();
         context
@@ -1294,6 +1302,10 @@ impl ClientContext {
             return Err(Error::new(ErrorKind::Transaction, INVALIDATED_TRANSACTION));
         }
         self.check_valid(&self.db)?;
+        // the triggers of the table it writes run around it
+        if let Some(result) = self.run_with_triggers(statement)? {
+            return Ok(result);
+        }
         let write = is_write(statement);
         if write {
             self.db.check_writable(statement)?;
@@ -2291,10 +2303,12 @@ impl ClientContext {
                 return self.comment_on_index(info);
             }
             Statement::Alter(info) => {
+                self.check_trigger_alter(info)?;
                 let catalog = self.catalog();
                 let mut binder = Binder::new(&catalog);
                 let alter = binder.bind_alter(info)?;
                 execute_alter(alter)?;
+                self.alter_triggers(info);
                 return Ok(Self::success());
             }
             Statement::Call(function) if checkpoint_call(function).is_some() => {
@@ -2345,6 +2359,10 @@ impl ClientContext {
             }
             Statement::Create(info) if matches!(info.kind, CreateKind::Type(_)) => {
                 self.create_type(info)?;
+                return Ok(Self::success());
+            }
+            Statement::Create(info) if matches!(info.kind, CreateKind::Trigger { .. }) => {
+                self.create_trigger(info)?;
                 return Ok(Self::success());
             }
             Statement::Create(info) if matches!(info.kind, CreateKind::View { .. }) => {
@@ -2407,6 +2425,10 @@ impl ClientContext {
                 }
                 path.push(info.name.name.clone());
                 catalog.create_schema_path(&path, on_create_conflict(info.on_conflict))?;
+                return Ok(Self::success());
+            }
+            Statement::Drop(info) if info.entry_type == "TRIGGER" => {
+                self.drop_trigger(info)?;
                 return Ok(Self::success());
             }
             Statement::Drop(info) => {
@@ -2815,7 +2837,17 @@ impl ClientContext {
                 let type_name = if kind == "TABLE" { "Table" } else { "View" };
                 let schema = schema_of(&info.name).map_err(|_| crate::unported(format!("this form of DROP {kind}")))?;
                 let dropped = match catalog.schema_for(schema.as_deref()) {
-                    Ok(schema) => schema.drop_entry(&info.name.name, type_name)?,
+                    Ok(schema) => {
+                        if schema.get_entry(&info.name.name).is_some() {
+                            self.drop_trigger_dependents(&catalog, &info.name.name, kind, info.cascade)?;
+                        }
+                        let dropped = schema.drop_entry(&info.name.name, type_name)?;
+                        if dropped && kind == "TABLE" {
+                            // the triggers of a table go with it
+                            schema.drop_triggers_on(&info.name.name);
+                        }
+                        dropped
+                    }
                     Err(_) if info.if_exists => false,
                     Err(error) => return Err(error),
                 };

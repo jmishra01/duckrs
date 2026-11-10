@@ -48,12 +48,8 @@ NOT_PORTED = {
     "MatchRecognizeRef": "MATCH_RECOGNIZE",
     "ColumnDataRef": "column data references",
     "ShowRef": "SHOW and DESCRIBE in a stored query",
-    "UpdateQueryNode": "UPDATE in a stored query",
-    "DeleteQueryNode": "DELETE in a stored query",
-    "InsertQueryNode": "INSERT in a stored query",
     "MergeQueryNode": "MERGE in a stored query",
     "CopyQueryNode": "COPY in a stored query",
-    "CreateTriggerInfo": "triggers",
 }
 
 # Enums that convert.rs needs on top of those that select a subclass.
