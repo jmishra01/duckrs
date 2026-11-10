@@ -391,7 +391,15 @@ impl DatabaseInstance {
         let bitpacking_mode = bitpacking_mode
             .and_then(|value| value.try_to_string().ok())
             .unwrap_or_default();
+        let zstd_min_string_length = settings::current_value(
+            "zstd_min_string_length",
+            &self.settings.read(),
+            &SettingValues::default(),
+        )
+        .and_then(|value| value.as_i128())
+        .map_or(4096, |length| length as usize);
         let options = storage::writer::CheckpointOptions {
+            zstd_min_string_length,
             storage_version: file.storage_version,
             keep_free_blocks: self.catalog.has_forks(),
             force_compression: &force,

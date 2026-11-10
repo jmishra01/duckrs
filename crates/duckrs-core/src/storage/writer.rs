@@ -56,6 +56,8 @@ pub struct CheckpointOptions<'a> {
     pub force_compression: &'a str,
     /// `debug_force_bitpacking_mode`
     pub bitpacking_mode: &'a str,
+    /// `zstd_min_string_length`
+    pub zstd_min_string_length: usize,
     /// In rows: `ATTACH ... (ROW_GROUP_SIZE)` checks that it is whole vectors.
     pub row_group_size: u64,
     /// How many times row groups can come together, which gives their rows new ids. There is no
@@ -808,6 +810,7 @@ struct Writer<'a> {
     /// The setting, in lower case.
     force_compression: String,
     bitpacking_mode: super::bitpacking::Mode,
+    zstd_min_string_length: usize,
     /// the table and column being written, for the log of `DetectBestCompressionMethod`
     log_column: (String, usize),
     chunks_per_row_group: usize,
@@ -1000,6 +1003,7 @@ impl<'a> Writer<'a> {
             tables: MetaStream::default(),
             force_compression: options.force_compression.to_lowercase(),
             bitpacking_mode: super::bitpacking::Mode::parse(options.bitpacking_mode),
+            zstd_min_string_length: options.zstd_min_string_length,
             log_column: (String::new(), 0),
             chunks_per_row_group: options.row_group_size as usize / STANDARD_VECTOR_SIZE,
             vacuum_tasks: options.vacuum_tasks,
@@ -1418,12 +1422,25 @@ impl<'a> Writer<'a> {
             }
         }
         let force = self.force_compression.as_str();
+        if self.version >= StorageVersion::V1_3_0 {
+            match self.choose_string_compression(&strings, valid, limit) {
+                COMPRESSION_ZSTD if !strings.is_empty() => return self.write_zstd(&strings, valid),
+                COMPRESSION_DICT_FSST => {
+                    if let Some(segments) = self.write_dict_fsst(&strings, valid, limit)? {
+                        return Ok(segments);
+                    }
+                }
+                _ => {}
+            }
+            return self.write_plain_strings(&strings, valid, limit);
+        }
         // `ZSTDStorage::StringInitAnalyze`: from v1.2.0 on
         if force == "zstd" && self.version >= StorageVersion::V1_2_0 && !strings.is_empty() {
             return self.write_zstd(&strings, valid);
         }
-        // before v1.3.0: DICTIONARY and FSST, which DICT_FSST replaced
-        if self.version < StorageVersion::V1_3_0 && force != "uncompressed" && valid.iter().any(|v| *v) {
+        // before v1.3.0: DICTIONARY and FSST, which DICT_FSST replaced. Their analyze samples at random, so
+        // the smallest of what they encode to is taken instead of their scores.
+        if force != "uncompressed" && valid.iter().any(|v| *v) {
             let plain_size: usize = strings.iter().map(|string| string.len() + 4).sum();
             let total = |segments: &Vec<Encoded>| segments.iter().map(|(bytes, _)| bytes.len()).sum::<usize>();
             let dictionary = (force != "fsst")
@@ -1459,38 +1476,102 @@ impl<'a> Writer<'a> {
                 return Ok(segments);
             }
         }
-        // the Dictionary of C++ isn't written any more: forcing it gives plain strings there too; DICT_FSST
-        // came with v1.3.0
-        if force != "uncompressed"
-            && force != "dictionary"
-            && self.version >= StorageVersion::V1_3_0
-            && valid.iter().any(|v| *v)
-        {
-            let plain_size: usize = strings.iter().map(|string| string.len() + 4).sum();
-            let total = |segments: &Vec<Encoded>| segments.iter().map(|(bytes, _)| bytes.len()).sum::<usize>();
-            let plain = encode_dictionary(&strings, valid, self.block_size, limit, None);
-            let table = SymbolTable::train(&strings);
-            let compressed = table.and_then(|t| encode_dictionary(&strings, valid, self.block_size, limit, Some(&t)));
-            let encoded = [plain, compressed].into_iter().flatten().min_by_key(total);
-            let size = encoded.as_ref().map(total);
-            if let Some(encoded) = encoded.filter(|_| force == "dict_fsst" || size < Some(plain_size)) {
-                let mut segments = Vec::with_capacity(encoded.len());
-                let mut row = 0;
-                for (bytes, rows) in encoded {
-                    let (block_id, offset) = self.place(&bytes)?;
-                    segments.push(SegmentOut {
-                        tuple_count: rows,
-                        block_id,
-                        offset,
-                        compression: COMPRESSION_DICT_FSST,
-                        stats: Stats::of_validity(&valid[row..row + rows]),
-                        overflow_blocks: Vec::new(),
-                    });
-                    row += rows;
-                }
-                return Ok(segments);
+        self.write_plain_strings(&strings, valid, limit)
+    }
+
+    /// `ColumnDataCheckpointer::DetectBestCompressionMethod` of a VARCHAR column from v1.3.0 on:
+    /// UNCOMPRESSED, ZSTD and DICT_FSST by their `final_analyze` scores (DICTIONARY and FSST don't analyze
+    /// any more, so forcing either leaves UNCOMPRESSED).
+    fn choose_string_compression(&self, strings: &[&[u8]], valid: &[bool], limit: usize) -> u8 {
+        let force = self.force_compression.as_str();
+        let rows = strings.len();
+        let valid_lengths = || {
+            strings
+                .iter()
+                .zip(valid)
+                .filter(|(_, valid)| **valid)
+                .map(|(s, _)| s.len())
+        };
+        let total_size: usize = valid_lengths().sum();
+        // `UncompressedStringStorage::StringFinalAnalyze`
+        let overflow = valid_lengths().filter(|length| *length >= limit).count();
+        let uncompressed = rows * 4 + total_size + overflow * BIG_STRING_MARKER_SIZE;
+        // `ZSTDStorage::StringFinalAnalyze`
+        let zstd = || {
+            if rows == 0 {
+                return usize::MAX;
+            }
+            let penalty = if total_size / rows >= self.zstd_min_string_length {
+                1.0
+            } else {
+                1000.0
+            };
+            let vectors = rows.div_ceil(2048);
+            let metadata = ((8 * vectors).next_multiple_of(4) + 4 * vectors).next_multiple_of(8) + 16 * vectors;
+            let estimate = (total_size as f64 / 2.0) as usize + rows * 4 + metadata;
+            (estimate as f64 * penalty) as usize
+        };
+        let mut methods = vec![COMPRESSION_UNCOMPRESSED, COMPRESSION_ZSTD, COMPRESSION_DICT_FSST];
+        let forced = match force {
+            "zstd" => Some(COMPRESSION_ZSTD),
+            "dict_fsst" => Some(COMPRESSION_DICT_FSST),
+            "uncompressed" | "dictionary" | "fsst" => Some(COMPRESSION_UNCOMPRESSED),
+            _ => None,
+        };
+        if let Some(forced) = forced {
+            methods.retain(|method| *method == forced || *method == COMPRESSION_UNCOMPRESSED);
+        }
+        let mut best: Option<(u8, usize)> = None;
+        for method in methods {
+            let score = match method {
+                COMPRESSION_UNCOMPRESSED => Some(uncompressed),
+                COMPRESSION_ZSTD => Some(zstd()),
+                _ => super::dict_fsst_analyze::final_analyze(strings, valid, self.block_size),
+            };
+            let Some(score) = score else { continue };
+            let is_forced = Some(method) == forced;
+            if best.is_none_or(|(_, best)| score < best) || is_forced {
+                best = Some((method, score));
+            }
+            if is_forced {
+                break;
             }
         }
+        let (method, score) = best.expect("UNCOMPRESSED can store any string");
+        self.log_choice(method, "VARCHAR", score);
+        method
+    }
+
+    /// DICT_FSST segments, the dictionaries FSST encoded where that is smaller; `None` where the strings
+    /// don't fit its segments.
+    fn write_dict_fsst(&mut self, strings: &[&[u8]], valid: &[bool], limit: usize) -> Result<Option<Vec<SegmentOut>>> {
+        let total = |segments: &Vec<Encoded>| segments.iter().map(|(bytes, _)| bytes.len()).sum::<usize>();
+        let plain = encode_dictionary(strings, valid, self.block_size, limit, None);
+        let table = valid.iter().any(|v| *v).then(|| SymbolTable::train(strings)).flatten();
+        let compressed = table.and_then(|t| encode_dictionary(strings, valid, self.block_size, limit, Some(&t)));
+        let Some(encoded) = [plain, compressed].into_iter().flatten().min_by_key(total) else {
+            return Ok(None);
+        };
+        let mut segments = Vec::with_capacity(encoded.len());
+        let mut row = 0;
+        for (bytes, rows) in encoded {
+            let (block_id, offset) = self.place(&bytes)?;
+            segments.push(SegmentOut {
+                tuple_count: rows,
+                block_id,
+                offset,
+                compression: COMPRESSION_DICT_FSST,
+                stats: Stats::of_validity(&valid[row..row + rows]),
+                overflow_blocks: Vec::new(),
+            });
+            row += rows;
+        }
+        Ok(Some(segments))
+    }
+
+    /// `UncompressedStringStorage`: the strings after one another, those too large for a segment in
+    /// overflow blocks.
+    fn write_plain_strings(&mut self, strings: &[&[u8]], valid: &[bool], limit: usize) -> Result<Vec<SegmentOut>> {
         let mut segments = Vec::new();
         let mut start = 0;
         while start < strings.len() {
@@ -1549,6 +1630,54 @@ impl<'a> Writer<'a> {
         Ok(segments)
     }
 
+    /// `DetectBestCompressionMethod` of a validity column: UNCOMPRESSED, and ROARING from v1.2.0.
+    fn validity_choice(&self, valid: &[bool]) -> u8 {
+        let force = self.force_compression.as_str();
+        let plain_score = valid.len().div_ceil(8);
+        let roaring_score = (self.version >= StorageVersion::V1_2_0 && force != "uncompressed")
+            .then(|| super::roaring::final_analyze(valid, self.block_size));
+        let use_roaring = roaring_score.is_some_and(|score| force == "roaring" || score < plain_score);
+        let (chosen, score) = if use_roaring {
+            (COMPRESSION_ROARING, roaring_score.expect("scored"))
+        } else {
+            (COMPRESSION_UNCOMPRESSED, plain_score)
+        };
+        self.log_choice(chosen, "VALIDITY", score);
+        chosen
+    }
+
+    /// `ValidityCoveredByBasedata`: DICT_FSST keeps the NULLs of its column, so the validity column is
+    /// EMPTY, one segment of no data, or a constant where it is the same throughout.
+    fn write_empty_validity(&mut self, valid: &[bool]) -> ColumnOut {
+        let stats = Stats::of_validity(valid);
+        let uniform = !stats.has_null || !stats.has_no_null;
+        if !uniform {
+            self.validity_choice(valid);
+        }
+        let segments = if valid.is_empty() {
+            Vec::new()
+        } else {
+            vec![SegmentOut {
+                tuple_count: valid.len(),
+                block_id: -1,
+                offset: 0,
+                compression: if uniform {
+                    COMPRESSION_CONSTANT
+                } else {
+                    COMPRESSION_EMPTY
+                },
+                stats: stats.clone(),
+                overflow_blocks: Vec::new(),
+            }]
+        };
+        ColumnOut {
+            segments,
+            validity: None,
+            children: Vec::new(),
+            stats,
+        }
+    }
+
     /// A validity column: nothing at all if the segment is the same throughout.
     fn write_validity(&mut self, valid: &[bool]) -> Result<ColumnOut> {
         let stats = Stats::of_validity(valid);
@@ -1563,18 +1692,7 @@ impl<'a> Writer<'a> {
                 overflow_blocks: Vec::new(),
             });
         } else {
-            // `DetectBestCompressionMethod` of a validity column: UNCOMPRESSED, and ROARING from v1.2.0
-            let force = self.force_compression.as_str();
-            let plain_score = valid.len().div_ceil(8);
-            let roaring_score = (self.version >= StorageVersion::V1_2_0 && force != "uncompressed")
-                .then(|| super::roaring::final_analyze(valid, self.block_size));
-            let use_roaring = roaring_score.is_some_and(|score| force == "roaring" || score < plain_score);
-            let (chosen, score) = if use_roaring {
-                (COMPRESSION_ROARING, roaring_score.expect("scored"))
-            } else {
-                (COMPRESSION_UNCOMPRESSED, plain_score)
-            };
-            self.log_choice(chosen, "VALIDITY", score);
+            let use_roaring = self.validity_choice(valid) == COMPRESSION_ROARING;
             let encoded: Vec<(Vec<u8>, usize, u8)> = if use_roaring {
                 encode_roaring(valid, self.block_size)
                     .into_iter()
@@ -1631,11 +1749,24 @@ impl<'a> Writer<'a> {
         for part in parts {
             valid.extend((0..part.count).map(|row| part.vector.is_valid(row)));
         }
-        let validity = Box::new(self.write_validity(&valid)?);
-        let mut stats = Stats::of_validity(&valid);
         let physical = ty.physical_type();
+        // the data of a column is analyzed before its validity, which DICT_FSST covers
+        let mut string_segments = match physical {
+            PhysicalType::Varchar => Some(self.write_strings(parts, &valid)?),
+            _ => None,
+        };
+        let covered = string_segments
+            .as_ref()
+            .and_then(|segments| segments.first())
+            .is_some_and(|segment| segment.compression == COMPRESSION_DICT_FSST);
+        let validity = Box::new(if covered {
+            self.write_empty_validity(&valid)
+        } else {
+            self.write_validity(&valid)?
+        });
+        let mut stats = Stats::of_validity(&valid);
         let (segments, children) = match physical {
-            PhysicalType::Varchar => (self.write_strings(parts, &valid)?, Vec::new()),
+            PhysicalType::Varchar => (string_segments.take().expect("written above"), Vec::new()),
             PhysicalType::List => {
                 let mut offsets = Vec::with_capacity(rows * 8);
                 let mut child_parts = Vec::with_capacity(parts.len());

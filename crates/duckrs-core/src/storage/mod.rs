@@ -7,6 +7,7 @@ pub mod buffer_manager;
 pub mod checkpoint;
 pub mod checksum;
 pub mod compression;
+mod dict_fsst_analyze;
 pub mod encode;
 mod fsst;
 mod index_data;

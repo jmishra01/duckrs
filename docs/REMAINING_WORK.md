@@ -93,8 +93,11 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] compression chosen as `DetectBestCompressionMethod` does, by the `final_analyze` score of each method in
     C++'s order (UNCOMPRESSED, RLE, BITPACKING, ROARING for validity and booleans), logged as C++ logs it;
     bitpacking with all of C++'s modes (CONSTANT_DELTA, DELTA_FOR) and types (BOOL, HUGEINT, UHUGEINT)
-  - [ ] the scores of the string methods (DICT_FSST, FSST, DICTIONARY, ZSTD, uncompressed strings), EMPTY validity
-    where DICT_FSST covers the NULLs, the analyze of ALP and ALPRD (scored by their encoded size for now)
+  - [x] strings from v1.3.0 on: UNCOMPRESSED, ZSTD and DICT_FSST by their scores (a port of DictFSSTAnalyzeState,
+    with the FSST of `fsst.rs`), and EMPTY validity where DICT_FSST covers the NULLs
+  - [ ] before v1.3.0, DICTIONARY and FSST by score (their analyze samples at random; the smaller encoding is
+    taken), the analyze of ALP and ALPRD (scored by their encoded size), DICT_FSST and FSST segment layouts
+    as C++ writes them (`dict_fsst_count_bound`, `dict_fsst_boolean_selection`, `string/blob`)
   - [ ] the ART layouts of files before v2.0.0 (an index in such a file is refused for now)
   - [ ] dense row id rewriting of files before v2.0.0 (`rowid_gaps/old_storage_*`): row groups stay as they are
   - [x] unshredded VARIANT columns, in the file and the WAL
