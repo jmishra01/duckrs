@@ -196,8 +196,21 @@ fn write_validity(s: &mut BinarySerializer, vector: &Vector, count: usize) -> bo
 
 /// `Vector::Serialize`, of a flat vector, as v2.0.0 has it.
 fn write_vector(s: &mut BinarySerializer, vector: &Vector, ty: &LogicalType, count: usize) -> Result<()> {
+    // `Vector::Serialize` of a GEOMETRY: its format, then the WKB as a list of blobs
     if ty.id() == LogicalTypeId::Geometry {
-        return Err(write_not_ported(&format!("a {} column", ty.id().name())));
+        const WKB: u8 = 1;
+        s.write_property(99, "geometry_format", &WKB);
+        write_validity(s, vector, count);
+        s.write_list(102, "data", count, |s, row| {
+            let value = vector.get_value(row);
+            let wkb: &[u8] = match value.data() {
+                duckrs_common::value::ValueData::Bytes(bytes) if vector.is_valid(row) => bytes,
+                _ => &[],
+            };
+            s.write_varint_unsigned(wkb.len() as u64);
+            s.write_raw(wkb);
+        });
+        return Ok(());
     }
     if ty.id() == LogicalTypeId::Variant {
         let stored = duckrs_common::variant::to_unshredded_vector(vector, count)?;
@@ -304,9 +317,7 @@ pub(crate) fn serialize_chunk(chunk: &DataChunk) -> Result<Vec<u8>> {
 /// Whether a chunk of these types can be serialized.
 pub(crate) fn can_serialize(types: &[LogicalType]) -> bool {
     fn can(ty: &LogicalType) -> bool {
-        ty.id() != LogicalTypeId::Geometry
-            && ty.child_type().is_none_or(can)
-            && ty.struct_children().iter().all(|(_, child)| can(child))
+        ty.child_type().is_none_or(can) && ty.struct_children().iter().all(|(_, child)| can(child))
     }
     types.iter().all(can)
 }
@@ -586,9 +597,6 @@ impl WriteAheadLog {
     /// table: with one that fails after that, the rows of the others would never reach the log.
     fn check_storable(&self, catalog: &Catalog, name: &str, current: &Durable) -> Result<()> {
         fn check_type(ty: &LogicalType) -> Result<()> {
-            if ty.id() == LogicalTypeId::Geometry {
-                return Err(write_not_ported(&format!("a {} column", ty.id().name())));
-            }
             match ty.physical_type() {
                 PhysicalType::Struct => ty.struct_children().iter().try_for_each(|(_, child)| check_type(child)),
                 PhysicalType::List | PhysicalType::Array => ty.child_type().map_or(Ok(()), check_type),

@@ -88,6 +88,25 @@ fn not_ported_column(ty: &LogicalType) -> Error {
 /// `PersistentColumnData::Deserialize`, of a column or (with no `ty`) of its validity.
 fn read_persistent_column(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>) -> Result<PersistentColumn> {
     d.read_object_value(|d| {
+        // `GeometryPersistentColumnData`: a GEOMETRY stored as WKB reads as the strings it is
+        if ty.map(LogicalType::id) == Some(LogicalTypeId::Geometry) && d.has_property(99)? {
+            let storage_type = d.read_object_field(99, "extra_data", |d| {
+                d.read_object_value(|d| {
+                    d.read_optional_property::<u8>(100, "type")?;
+                    d.read_optional_property::<u8>(101, "storage_type")
+                })
+            })?;
+            const WKB: u8 = 1;
+            if storage_type.unwrap_or(WKB) != WKB {
+                return Err(Error::not_implemented(
+                    "reading a shredded GEOMETRY column from a database file is not yet ported to duckrs",
+                ));
+            }
+        } else if ty.map(LogicalType::id) == Some(LogicalTypeId::Geometry) {
+            return Err(Error::not_implemented(
+                "reading a GEOMETRY column of the spatial extension from a database file is not yet ported to duckrs",
+            ));
+        }
         if d.has_property(99)? {
             return Err(Error::not_implemented(match ty.map(LogicalType::id) {
                 Some(LogicalTypeId::Variant) => {
@@ -670,6 +689,7 @@ impl TableSource for DiskTable {
                     max: None,
                     can_be_null: true,
                     can_be_valid: true,
+                    geometry: None,
                 };
                 let Some(stored) = stored else {
                     return Some(unknown);
@@ -679,6 +699,7 @@ impl TableSource for DiskTable {
                     max: self.bound(column, stored.max.as_ref()).ok()?,
                     can_be_null: stored.has_null,
                     can_be_valid: stored.has_no_null,
+                    geometry: stored.geometry,
                 })
             })
             .collect()

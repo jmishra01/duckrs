@@ -555,6 +555,10 @@ fn bind_struct_extract(child: BoundExpr, key: BoundExpr) -> Result<BoundExpr> {
     if ty.id() == LogicalTypeId::Variant {
         return super::variant::bind_extract(child, key);
     }
+    // `BindOperatorExpression`: `g.x` of a GEOMETRY is `vertex_extract(g, 'x')`
+    if ty.id() == LogicalTypeId::Geometry {
+        return Ok(super::geometry::bind_vertex_extract(child, key));
+    }
     if super::json::is_json_type(&ty) {
         return super::json::bind_function("json_extract", vec![child, key], &|_| Ok(LogicalType::VARCHAR));
     }

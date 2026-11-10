@@ -2322,3 +2322,57 @@ fn json_each_rows(args: &DataChunk, result: &mut Vector) -> Result<()> {
 fn json_tree_rows(args: &DataChunk, result: &mut Vector) -> Result<()> {
     table_in_out_list(args, result, true)
 }
+
+/// `CoordinateReferenceSystem::TryParsePROJJSON`: of a PROJJSON CRS, its identifier (the
+/// `authority:code` of its `id`, else its `name`) and the JSON written out again.
+fn projjson_crs(text: &str) -> Option<(String, String)> {
+    let json = parse(text).ok()?;
+    let Json::Object(root) = &json else { return None };
+    let member = |object: &[(String, Json)], key: &str| object.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+    let Some(Json::Str(kind)) = member(root, "type") else {
+        return None;
+    };
+    const TYPES: [&str; 9] = [
+        "GeographicCRS",
+        "GeodeticCRS",
+        "ProjectedCRS",
+        "CompoundCRS",
+        "BoundCRS",
+        "VerticalCRS",
+        "EngineeringCRS",
+        "TemporalCRS",
+        "ParametricCRS",
+    ];
+    if !TYPES.iter().any(|t| t.eq_ignore_ascii_case(&kind)) {
+        return None;
+    }
+    let target = if kind.eq_ignore_ascii_case("BoundCRS") {
+        match member(root, "transformation") {
+            Some(Json::Object(transformation)) => transformation,
+            _ => return None,
+        }
+    } else {
+        root.clone()
+    };
+    let mut identifier = match member(&target, "name") {
+        Some(Json::Str(name)) => name,
+        _ => String::new(),
+    };
+    if let Some(Json::Object(id)) = member(&target, "id")
+        && let Some(Json::Str(authority)) = member(&id, "authority")
+    {
+        identifier = authority;
+        match member(&id, "code") {
+            Some(Json::Int(code)) => identifier += &format!(":{code}"),
+            Some(Json::UInt(code)) => identifier += &format!(":{code}"),
+            Some(Json::Str(code)) => identifier += &format!(":{code}"),
+            _ => {}
+        }
+    }
+    Some((identifier, json.text()))
+}
+
+/// Lets a GEOMETRY's CRS be PROJJSON, which the types can't read themselves.
+pub fn register_projjson_parser() {
+    duckrs_common::geometry_crs::set_projjson_parser(projjson_crs);
+}

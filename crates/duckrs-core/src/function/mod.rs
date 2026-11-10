@@ -14,6 +14,7 @@ pub(crate) mod dates;
 pub use dates::date_part_call_of;
 pub mod extras;
 pub mod generic;
+pub(crate) mod geometry;
 pub(crate) mod holistic;
 pub mod json;
 mod lists;
@@ -229,7 +230,7 @@ pub fn typeof_constant(argument: &LogicalType) -> Value {
 /// numeric ones (`NumericStats`), which is what duckrs keeps. The others (strings, nested
 /// types, VARIANT) have statistics of more kinds than duckrs works out.
 pub fn stats_supported(ty: &LogicalType) -> bool {
-    ty.id() == LogicalTypeId::SqlNull
+    matches!(ty.id(), LogicalTypeId::SqlNull | LogicalTypeId::Geometry)
         || (crate::optimizer::statistics::has_ordered_statistics(ty) && ty.id() != LogicalTypeId::Varchar)
 }
 
@@ -285,6 +286,7 @@ impl BuiltinFunctions {
     pub fn get() -> &'static BuiltinFunctions {
         static FUNCTIONS: OnceLock<BuiltinFunctions> = OnceLock::new();
         FUNCTIONS.get_or_init(|| {
+            json::register_projjson_parser();
             let mut functions = BuiltinFunctions {
                 scalar: HashMap::new(),
                 aggregate: HashMap::new(),
@@ -295,7 +297,10 @@ impl BuiltinFunctions {
             for set in sequence_functions() {
                 functions.scalar.insert(set.name.clone(), set);
             }
-            for set in bit_functions::bit_functions() {
+            for set in bit_functions::bit_functions()
+                .into_iter()
+                .chain(geometry::geometry_functions())
+            {
                 functions.scalar.insert(set.name.clone(), set);
             }
             for set in generic::generic_functions()

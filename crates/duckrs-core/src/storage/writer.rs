@@ -104,6 +104,8 @@ struct Stats {
     has_null: bool,
     has_no_null: bool,
     bounds: Option<([u8; 16], [u8; 16])>,
+    /// of a GEOMETRY column or segment
+    geometry: Option<duckrs_common::geometry::GeometryStats>,
 }
 
 impl Stats {
@@ -112,6 +114,7 @@ impl Stats {
             has_null: true,
             has_no_null: true,
             bounds: None,
+            geometry: None,
         }
     }
 
@@ -120,12 +123,20 @@ impl Stats {
             has_null: valid.iter().any(|v| !v),
             has_no_null: valid.iter().any(|v| *v),
             bounds: None,
+            geometry: None,
         }
     }
 
     fn merge(&mut self, other: &Self, physical: PhysicalType) {
         self.has_null |= other.has_null;
         self.has_no_null |= other.has_no_null;
+        self.geometry = match (self.geometry, other.geometry) {
+            (Some(mut a), Some(b)) => {
+                a.merge(&b);
+                Some(a)
+            }
+            (a, b) => a.or(b),
+        };
         self.bounds = match (self.bounds, other.bounds) {
             (Some(a), Some(b)) => {
                 let min = if compare(physical, &b.0, &a.0) == Ordering::Less {
@@ -304,6 +315,26 @@ fn write_stats(s: &mut BinarySerializer, ty: Option<&LogicalType>, stats: &Stats
             });
             return;
         }
+        // `GeometryStats::Serialize` of `CreateUnknown`: any extent, type and flag, which prunes nothing
+        if ty.id() == LogicalTypeId::Geometry {
+            let geometry = stats
+                .geometry
+                .unwrap_or_else(duckrs_common::geometry::GeometryStats::unknown);
+            let e = geometry.extent;
+            s.write_object(300, "extent", |s| {
+                let bounds = [e.x_min, e.x_max, e.y_min, e.y_max, e.z_min, e.z_max, e.m_min, e.m_max];
+                for (field, value) in (101..=108).zip(bounds) {
+                    s.write_property(field, "extent", &value);
+                }
+            });
+            s.write_object(301, "types", |s| {
+                for (field, set) in (101..=104).zip(geometry.types) {
+                    s.write_property(field, "types", &set);
+                }
+            });
+            s.write_property_with_default(302, "flags", &geometry.flags);
+            return;
+        }
         let child = |s: &mut BinarySerializer, ty: Option<&LogicalType>| {
             s.write_object_value(|s| write_stats(s, ty, &Stats::unknown()));
         };
@@ -386,6 +417,13 @@ fn write_segment(s: &mut BinarySerializer, segment: &SegmentOut, ty: Option<&Log
 
 /// `PersistentColumnData::Serialize`, without the object around it.
 fn write_column(s: &mut BinarySerializer, column: &ColumnOut, ty: Option<&LogicalType>, row_start: u64) {
+    // `GeometryPersistentColumnData`: stored as WKB, the default storage type
+    if ty.is_some_and(|ty| ty.id() == LogicalTypeId::Geometry) {
+        const GEOMETRY_EXTRA_DATA: u8 = 2;
+        s.write_object(99, "extra_data", |s| {
+            s.write_property(100, "type", &GEOMETRY_EXTRA_DATA)
+        });
+    }
     if !column.segments.is_empty() {
         let mut starts = Vec::with_capacity(column.segments.len());
         let mut start = row_start;
@@ -1498,8 +1536,12 @@ impl<'a> Writer<'a> {
         if ty.id() == LogicalTypeId::Variant {
             return self.write_variant(parts);
         }
-        if matches!(ty.id(), LogicalTypeId::Geometry) {
-            return Err(write_not_ported(&format!("a {} column", ty.id().name())));
+        // before v1.5.0, a GEOMETRY is stored as the spatial extension's blob (`GetSpatialGeometryType`)
+        if ty.id() == LogicalTypeId::Geometry && self.version < StorageVersion::V1_5_0 {
+            return Err(Error::not_implemented(format!(
+                "writing a GEOMETRY column to a database file of storage version {} is not yet ported to duckrs",
+                self.version.display_name(false)
+            )));
         }
         let rows = parts.iter().map(|part| part.count).sum();
         let mut valid = Vec::with_capacity(rows);
@@ -1570,6 +1612,27 @@ impl<'a> Writer<'a> {
             }
             _ => (self.write_fixed(ty, parts, &valid)?, Vec::new()),
         };
+        let mut segments = segments;
+        // `GeometryStats::Update` of each value, by the segment it is in
+        if ty.id() == LogicalTypeId::Geometry {
+            let mut values = parts
+                .iter()
+                .flat_map(|part| (0..part.count).map(|row| part.vector.get_value(row)));
+            for segment in &mut segments {
+                let mut geometry = duckrs_common::geometry::GeometryStats::empty();
+                for value in values.by_ref().take(segment.tuple_count) {
+                    if let duckrs_common::value::ValueData::Bytes(wkb) = value.data()
+                        && !value.is_null()
+                    {
+                        geometry.update(wkb)?;
+                    }
+                }
+                segment.stats.geometry = Some(geometry);
+            }
+            if segments.is_empty() {
+                stats.geometry = Some(duckrs_common::geometry::GeometryStats::empty());
+            }
+        }
         for segment in &segments {
             stats.merge(&segment.stats, physical);
         }

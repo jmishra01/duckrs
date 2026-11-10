@@ -372,6 +372,8 @@ pub struct ColumnStatistics {
     pub can_be_null: bool,
     /// whether there can be values that are not NULL
     pub can_be_valid: bool,
+    /// of a GEOMETRY, its `GeometryStats`, if known
+    pub geometry: Option<duckrs_common::geometry::GeometryStats>,
 }
 
 /// `DuckIndexEntry`. Scans read a table through one with `constraints::index_tree`, and the UNIQUE
