@@ -2633,8 +2633,11 @@ impl Binder<'_> {
                     if bound.types.len() != expected_types.len() {
                         return Err(mismatch(expected_types.len(), bound.types.len()));
                     }
+                    // `ResolveInputProjection`: a projection of the query is only inlined when it
+                    // forwards columns; otherwise the casts go in a projection of their own
+                    let plan = self.resolve_input_projection(bound.plan, &bound.types, &expected_types);
                     // cast the query's columns to the column types
-                    self.cast_logical_operator_to_types(&bound.types, &expected_types, bound.plan)?
+                    self.cast_logical_operator_to_types(&bound.types, &expected_types, plan)?
                 }
             },
         };
@@ -2660,6 +2663,39 @@ impl Binder<'_> {
             column_aliases: Vec::new(),
             return_type: StatementReturnType::ChangedRows,
         })
+    }
+
+    /// `Binder::ResolveInputProjection`, of where the casts of an INSERT go: a projection at the root
+    /// that computes more than column references gets a projection of its columns on top.
+    fn resolve_input_projection(
+        &mut self,
+        op: LogicalOperator,
+        source_types: &[LogicalType],
+        target_types: &[LogicalType],
+    ) -> LogicalOperator {
+        let LogicalOperatorKind::Projection { expressions, .. } = &op.kind else {
+            return op;
+        };
+        let inlinable = expressions
+            .iter()
+            .all(|e| matches!(e.kind, BoundExprKind::ColumnRef { .. }));
+        if inlinable || source_types == target_types {
+            return op;
+        }
+        let expressions = op
+            .column_bindings()
+            .into_iter()
+            .zip(source_types)
+            .map(|(binding, ty)| BoundExpr::column_ref(binding, ty.clone(), String::new()))
+            .collect();
+        let table_index = self.generate_table_index();
+        LogicalOperator::new(
+            LogicalOperatorKind::Projection {
+                table_index,
+                expressions,
+            },
+            vec![op],
+        )
     }
 
     /// `Binder::CastLogicalOperatorToTypes`: casts inside a projection at the root of the plan,

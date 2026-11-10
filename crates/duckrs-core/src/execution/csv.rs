@@ -205,7 +205,7 @@ pub fn hive_value(path: &str, key: &str, ty: &LogicalType) -> Result<Value> {
 }
 
 /// A file of a scan, with where its columns go.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CsvFile {
     pub path: String,
     pub dialect: Dialect,
@@ -252,7 +252,7 @@ pub struct CsvScanData {
 }
 
 /// The tables that `store_rejects` fills (`CSVRejectsTable`).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CsvRejects {
     pub errors: Arc<TableCatalogEntry>,
     pub scans: Arc<TableCatalogEntry>,

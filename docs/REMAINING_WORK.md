@@ -32,9 +32,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] schema discovery over up to `files_to_sniff` files (`MergeSchemas`), empty files and one-row files in a glob,
     the column mapper's error with hive partitions or `filename`, `dtypes` with `union_by_name`, `filename=1`,
     deduplicated header names in COPY TO, C++'s maximum line size (2,000,000, or the buffer size) and its errors
-  - [ ] `TypePushdown` of casts into the CSV scan (`test_insert_into_types`, `test_csv_error_message_type`)
+  - [x] `TypePushdown` of casts into the CSV scan, with the projection `ResolveInputProjection` puts over an INSERT's query
+  - [ ] `TypePushdown` into Parquet scans; trivial projections C++ removes (`optimizer/pushdown/csv_type_pushdown`)
   - [ ] `enable_external_access` (Permission Error in the file readers and writers; ~20 files)
-  - [ ] the other CSV sniffer, rejects-table and error-message differences (50 of 278 files under `sql/copy/csv` fail)
+  - [ ] the other CSV sniffer, rejects-table and error-message differences (48 of 278 files under `sql/copy/csv` fail)
 - [ ] 2. JSON: `read_json`/`read_json_auto`, the JSON type, JSON functions (`sql/json`: 95 failing, 34.9%)
   - [x] `json_normalize`, `json_deep_merge`, `json_merge_patch_diff`
   - [x] `json_each` / `json_tree`, with columns as arguments (LATERAL) and the hidden `json`, `root`, `rowid`
