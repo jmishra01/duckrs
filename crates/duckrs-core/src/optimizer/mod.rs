@@ -16,6 +16,7 @@ pub mod rewriter;
 pub mod scan_filters;
 pub mod statistics;
 pub mod top_n;
+pub mod type_pushdown;
 pub mod unused_columns;
 
 use crate::planner::expression::{BoundExpr, BoundExprKind};
@@ -32,6 +33,7 @@ pub struct OptimizerOptions {
     pub statistics_propagation: bool,
     pub empty_result_pullup: bool,
     pub unused_columns: bool,
+    pub type_pushdown: bool,
     /// `index_scan_percentage`
     pub index_scan_percentage: f64,
     /// `index_scan_max_count`
@@ -50,6 +52,7 @@ impl Default for OptimizerOptions {
             statistics_propagation: true,
             empty_result_pullup: true,
             unused_columns: true,
+            type_pushdown: true,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -68,6 +71,7 @@ impl OptimizerOptions {
             statistics_propagation: false,
             empty_result_pullup: false,
             unused_columns: false,
+            type_pushdown: false,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -85,6 +89,7 @@ impl OptimizerOptions {
             statistics_propagation: !off("statistics_propagation"),
             empty_result_pullup: !off("empty_result_pullup"),
             unused_columns: !off("unused_columns"),
+            type_pushdown: !off("type_pushdown"),
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -157,6 +162,13 @@ pub fn optimize_timed(
         });
     }
     index_scan::plan_index_scans(&mut plan, &options);
+    // casts in SELECT pushed into file readers, e.g. `SELECT num::UHUGEINT FROM read_csv(...)`
+    if options.type_pushdown {
+        plan = run("type_pushdown", plan, &mut |mut plan| {
+            type_pushdown::push_down_types(&mut plan);
+            plan
+        });
+    }
     plan
 }
 

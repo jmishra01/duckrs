@@ -489,7 +489,7 @@ impl Binder<'_> {
                     }
                 })
                 .collect();
-            let mut binder = Binder::with_options(self.catalog, self.options);
+            let mut binder = Binder::with_options(self.catalog, self.options.clone());
             binder.search_schema = Some(schema.to_string());
             let parameters = parameter_names(function);
             match &function.body {

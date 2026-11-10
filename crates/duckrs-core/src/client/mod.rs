@@ -855,7 +855,13 @@ impl ClientContext {
                 "TABLE" => ShowBehavior::Table,
                 _ => ShowBehavior::Auto,
             },
+            file_access: self.file_access(),
         }
+    }
+
+    /// What files can be read and written, with `enable_external_access` off.
+    pub(crate) fn file_access(&self) -> Option<crate::execution::file_system::FileAccess> {
+        settings::file_access(&self.home.settings.read(), &self.settings)
     }
 
     /// `ClientContext::GetParserOptions`.
@@ -1579,6 +1585,10 @@ impl ClientContext {
             return Err(crate::unported(format!("ATTACH with {}", names.join(", "))));
         }
         let in_memory = path.is_empty() || path == ":memory:";
+        // the storage extension opens the file through the opener file system
+        if !in_memory && let Some(access) = self.file_access() {
+            access.check(&path, false)?;
+        }
         // `MetricStorageWaitingToAttachLatency`: one instance attaches at a time, so there is no wait.
         if !in_memory {
             crate::execution::profiler::add_timing("storage.waiting_to_attach_latency", std::time::Duration::ZERO);
@@ -2175,7 +2185,21 @@ impl ClientContext {
                     self.profiling = true;
                     return Ok(Self::success());
                 }
+                let turning_off_access = name.eq_ignore_ascii_case("enable_external_access")
+                    && settings::external_access_enabled(&global, &self.settings);
                 settings::set_variable(name, *scope, &value, &mut global, &mut self.settings)?;
+                // `EnableExternalAccessSetting::OnSet`: the databases attached so far stay reachable
+                if turning_off_access && !settings::external_access_enabled(&global, &self.settings) {
+                    let mut databases = vec![self.home.clone()];
+                    databases.extend(self.home.attached.read().values().cloned());
+                    for database in databases {
+                        let Some(file) = &database.file else { continue };
+                        let path = file.path.display().to_string();
+                        for suffix in ["", ".wal", ".wal.checkpoint", ".wal.recovery"] {
+                            settings::add_allowed_path(&format!("{path}{suffix}"), &mut global);
+                        }
+                    }
+                }
                 return Ok(Self::success());
             }
             Statement::ResetVariable { name, .. } if name.eq_ignore_ascii_case("enable_profiling") => {
@@ -2336,6 +2360,30 @@ impl ClientContext {
                     .any(|name| info.filename.eq_ignore_ascii_case(name)) =>
             {
                 return Ok(Self::success());
+            }
+            // with external access off, nothing can be loaded, and installing writes outside of what
+            // is allowed (`ExtensionHelper::TryInitialLoad`, `ExtensionHelper::InstallExtension`)
+            Statement::Load(info)
+                if let Some(access) = self.file_access()
+                    && matches!(
+                        info.load_type,
+                        duckrs_parser::ast::LoadType::Load
+                            | duckrs_parser::ast::LoadType::Install
+                            | duckrs_parser::ast::LoadType::ForceInstall
+                    ) =>
+            {
+                if info.load_type == duckrs_parser::ast::LoadType::Load {
+                    return Err(Error::new(
+                        ErrorKind::Permission,
+                        "Loading external extensions is disabled through configuration",
+                    ));
+                }
+                let directory = match self.setting_text("extension_directory") {
+                    directory if directory.is_empty() => "~/.duckdb/extensions".to_string(),
+                    directory => directory,
+                };
+                access.check(&crate::execution::file_system::expand_path(&directory), true)?;
+                return Err(crate::unported("INSTALL statements"));
             }
             Statement::Deallocate(name) => {
                 self.prepared_statements.remove(&name.to_lowercase());
@@ -2511,6 +2559,10 @@ impl ClientContext {
         let (phases, root) = self.pending_profile.take().unwrap_or_default();
         if format != "json" || output.is_empty() {
             return Ok(());
+        }
+        // the profile is written through the opener file system
+        if let Some(access) = self.file_access() {
+            access.check(&output, false)?;
         }
         // `QueryMetrics::FinalizeMetrics`: the live counters and the system peaks are always there,
         // the timings and counters only when something recorded them

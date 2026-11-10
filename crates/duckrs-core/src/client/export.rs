@@ -394,6 +394,9 @@ impl ClientContext {
             };
             exported.push((schema.clone(), table.clone(), path));
         }
+        if let Some(access) = self.file_access() {
+            access.check(directory, true)?;
+        }
         if !std::path::Path::new(directory).is_dir() {
             std::fs::create_dir(directory).map_err(|error| {
                 Error::new(
@@ -446,8 +449,12 @@ impl ClientContext {
     /// `PragmaImportDatabase`: runs `schema.sql`, then the COPY statements of `load.sql` on the
     /// files next to it.
     pub(super) fn import_database(&mut self, directory: &str) -> Result<MaterializedQueryResult> {
+        let access = self.file_access();
         let read = |name: &str| -> Result<String> {
             let path = join_path(directory, name);
+            if let Some(access) = &access {
+                access.check(&path, false)?;
+            }
             std::fs::read_to_string(&path)
                 .map_err(|error| Error::new(ErrorKind::Io, format!("Cannot open file \"{path}\": {error}")))
         };

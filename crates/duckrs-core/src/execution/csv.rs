@@ -85,10 +85,10 @@ impl Default for CsvReadOptions {
 }
 
 impl CsvReadOptions {
-    /// `maximum_line_size`: 2 MiB, or as little as what a buffer holds.
+    /// `maximum_line_size`: 2,000,000 bytes, or what a buffer the user sized holds.
     pub fn maximum_line_size(&self) -> usize {
         self.max_line_size
-            .unwrap_or_else(|| self.buffer_size.map_or(2_097_152, |size| size.min(2_097_152)))
+            .unwrap_or_else(|| self.buffer_size.unwrap_or(2_000_000))
     }
 
     /// `sample_size_chunks`, of 2048 rows each.
@@ -205,7 +205,7 @@ pub fn hive_value(path: &str, key: &str, ty: &LogicalType) -> Result<Value> {
 }
 
 /// A file of a scan, with where its columns go.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CsvFile {
     pub path: String,
     pub dialect: Dialect,
@@ -252,7 +252,7 @@ pub struct CsvScanData {
 }
 
 /// The tables that `store_rejects` fills (`CSVRejectsTable`).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CsvRejects {
     pub errors: Arc<TableCatalogEntry>,
     pub scans: Arc<TableCatalogEntry>,
@@ -356,22 +356,25 @@ pub struct CsvScanState {
 /// `CSVFileScan`: a file after the first, as sniffing it finds it, with its columns found by name.
 fn sniff_next_file(scan: &CsvScanData, file: &CsvFile, data: &[u8]) -> Result<CsvFile> {
     let first = &scan.files[0];
+    let as_first = || CsvFile {
+        path: file.path.clone(),
+        dialect: first.dialect.clone(),
+        header: first.header,
+        skip: first.skip,
+        rows_until_header: first.rows_until_header,
+        columns: first.columns,
+        mapping: first.mapping.clone(),
+    };
+    // an empty file is not sniffed: it has the schema of the scan, and no rows
+    if data.is_empty() {
+        return Ok(as_first());
+    }
     let columns = scan
         .columns_set
         .then_some((scan.names.as_slice(), scan.types.as_slice()));
     let sniffed = match sniff(data, &file.path, &scan.options, columns) {
         Ok(sniffed) => sniffed,
-        Err(_) if scan.options.ignore_errors => {
-            return Ok(CsvFile {
-                path: file.path.clone(),
-                dialect: first.dialect.clone(),
-                header: first.header,
-                skip: first.skip,
-                rows_until_header: first.rows_until_header,
-                columns: first.columns,
-                mapping: first.mapping.clone(),
-            });
-        }
+        Err(_) if scan.options.ignore_errors => return Ok(as_first()),
         Err(error) => return Err(error),
     };
     let same_shape = sniffed.names.len() == scan.names.len();
@@ -380,10 +383,40 @@ fn sniff_next_file(scan: &CsvScanData, file: &CsvFile, data: &[u8]) -> Result<Cs
         .iter()
         .map(|name| sniffed.names.iter().position(|n| n.eq_ignore_ascii_case(name)))
         .collect();
+    // `SchemasMatch` of the minimal sniffer: a file of one row whose types match takes the names of the scan,
+    // and keeps the header option of the first file
+    let single_row_match =
+        !by_name.iter().all(Option::is_some) && sniffed.lines_sniffed <= 1 && same_shape && sniffed.types == scan.types;
+    if single_row_match {
+        return Ok(CsvFile {
+            path: file.path.clone(),
+            columns: sniffed.names.len(),
+            header: first.header,
+            skip: sniffed.skip,
+            rows_until_header: sniffed.rows_until_header,
+            dialect: sniffed.dialect,
+            mapping: (0..scan.names.len()).map(Some).collect(),
+        });
+    }
     let mapping = if by_name.iter().all(Option::is_some) {
         by_name
     } else if same_shape && (!sniffed.header || !first.header) {
         (0..scan.names.len()).map(Some).collect()
+    } else if scan.filename || !scan.hive.is_empty() {
+        // `MultiFileOptions::AnySet`: the sniffer leaves the mismatch to `MultiFileColumnMapper`
+        let missing = scan.names.iter().zip(&by_name).find(|(_, found)| found.is_none());
+        let missing = missing.map_or("", |(name, _)| name.as_str());
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "Failed to read file \"{path}\": schema mismatch in glob: column \"{missing}\" was read from the \
+                 original file \"{original}\", but could not be found in file \"{path}\".\nCandidate names: \
+                 {candidates}\nIf you are trying to read files with different schemas, try setting union_by_name=True",
+                path = file.path,
+                original = first.path,
+                candidates = sniffed.names.join(", "),
+            ),
+        ));
     } else {
         let mut error = format!(
             "Schema mismatch between globbed files.\nMain file schema: {}\nCurrent file: {}\n",
@@ -706,13 +739,15 @@ fn read_rows(data: &[u8], scan: &CsvScanData, file: &CsvFile, state: &mut CsvSca
             state.line += count_lines(&data[before..position]);
             let line_size = position.saturating_sub(span.start);
             if line_size > scan.options.maximum_line_size() {
-                if !ignore {
-                    return Err(line_size_error(&scan.options, line_size));
-                }
+                // `CSVError::LineSizeError` of the scanner: the size of the line without its new line
                 let text = span.text(data);
+                if !ignore {
+                    return Err(line_size_error(&scan.options, text.len()));
+                }
                 let message = format!(
-                    "Maximum line size of {} bytes exceeded. Actual Size:{line_size} bytes.",
-                    scan.options.maximum_line_size()
+                    "Maximum line size of {} bytes exceeded. Actual Size:{} bytes.",
+                    scan.options.maximum_line_size(),
+                    text.len()
                 );
                 drop(row_fields);
                 reject(
@@ -723,8 +758,8 @@ fn read_rows(data: &[u8], scan: &CsvScanData, file: &CsvFile, state: &mut CsvSca
                         line: span.line,
                         row_position: span.start + 1,
                         position: Some(span.start + 1),
-                        column: Some(1),
-                        column_name: scan.names.first().cloned(),
+                        column: None,
+                        column_name: None,
                         kind: "LINE SIZE OVER MAXIMUM",
                         text,
                         message,

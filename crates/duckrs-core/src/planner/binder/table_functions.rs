@@ -211,6 +211,7 @@ impl Binder<'_> {
                     return Err(binder_error("glob requires a pattern"));
                 };
                 let pattern = self.constant_argument(&pattern.expr)?.try_to_string()?;
+                self.check_file_access(&pattern)?;
                 let files: Vec<String> = crate::execution::file_system::glob(&pattern)
                     .iter()
                     .map(|file| format!("'{}'", file.replace('\'', "''")))
