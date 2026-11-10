@@ -1822,8 +1822,17 @@ impl ClientContext {
             };
             found(true).or_else(|| found(false))
         };
-        let names = (!modifies).then_some(bound.names.as_slice());
-        match crate::planner::sql_export::export_plan(&plan, names, &database_of) {
+        let names = bound.names.as_slice();
+        let exported = match statement {
+            // the statement as written, with the query its plan exports to
+            Statement::Copy(_) | Statement::CreateTable(_) => self.export_write(statement, &plan, &database_of),
+            _ => crate::planner::sql_export::export_plan(
+                &plan,
+                (!modifies || !names.is_empty()).then_some(names),
+                &database_of,
+            ),
+        };
+        match exported {
             Ok(sql) => Ok(Some(sql)),
             Err(_) if allow_unsupported => Ok(None),
             Err(reason) => Err(Error::new(
@@ -1831,6 +1840,42 @@ impl ClientContext {
                 format!("EXPLAIN (SQL) cannot render this query: {reason}"),
             )),
         }
+    }
+
+    /// COPY ... TO and CREATE TABLE ... AS (`ExportCopyToNode`, `ExportCreateTableAsNode`): the source
+    /// query of the plan in place of the statement's, its options as they were given.
+    fn export_write(
+        &self,
+        statement: &Statement,
+        plan: &crate::planner::logical::LogicalOperator,
+        database_of: crate::planner::sql_export::DatabaseOf,
+    ) -> std::result::Result<String, String> {
+        use crate::planner::logical::LogicalOperatorKind as K;
+        let (names, source) = match (&plan.kind, plan.children.first()) {
+            (K::CopyToFile { names, .. } | K::CopyToParquet { names, .. }, Some(child)) => (names.clone(), child),
+            (K::CreateTableAs { columns, .. }, Some(child)) => {
+                (columns.iter().map(|c| c.name.clone()).collect(), child)
+            }
+            _ => return Err("The write has no SQL export".into()),
+        };
+        let query = crate::planner::sql_export::export_query(source, &names, database_of)?;
+        let sql = match statement {
+            Statement::Copy(copy) => {
+                let mut copy = copy.clone();
+                copy.select = Some(Box::new(query));
+                copy.table = Default::default();
+                copy.select_list.clear();
+                copy.to_string().trim_end_matches(';').to_string()
+            }
+            Statement::CreateTable(info) => {
+                let mut info = info.clone();
+                info.query = Some(Box::new(duckrs_parser::ast::SelectStatement { node: query }));
+                info.columns.clear();
+                info.to_string()
+            }
+            _ => unreachable!("checked by the caller"),
+        };
+        crate::planner::sql_export::finish_sql(&sql)
     }
 
     /// `StatementVerification` with `debug_verify_statement` set to `explain_sql` or

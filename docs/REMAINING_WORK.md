@@ -142,13 +142,15 @@ Each item gives the number of failing files in `test/` that it should fix, where
 - [ ] 37. Settings, generated in full from `settings.json` (`sql/settings`: 35 failing, 2 erroring)
 - [ ] 38. Secrets manager: `CREATE SECRET` and related statements (`sql/secrets`: 16 failing, 0%)
 - [ ] 39. SQL export and DDL rendering (`sql/sql_export`: 36 of 101 pass)
-  - [x] `EXPLAIN (SQL)` of SELECT, INSERT, UPDATE and DELETE from the optimized plan; the
-    `explain_sql` and `explain_sql_strict` statement verification
+  - [x] `EXPLAIN (SQL)` of SELECT, INSERT (with ON CONFLICT), UPDATE, DELETE, MERGE INTO, RETURNING,
+    CREATE TABLE AS and COPY TO from the optimized plan; the `explain_sql` and `explain_sql_strict`
+    statement verification
   - [x] scans, filters, projections, aggregates and grouping sets, windows (RANGE offsets too),
     ORDER BY / LIMIT / TopN, DISTINCT (ON), USING SAMPLE, UNNEST, set operations, recursive CTEs,
     joins (inner, outer, SEMI/ANTI, ASOF, positional, lateral), MARK joins with exact NULL results,
-    decorrelated joins as correlated subqueries, subqueries, lambdas, `read_parquet` scans
-  - [ ] RETURNING, ON CONFLICT, MERGE INTO, CREATE TABLE AS, COPY TO; CSV and JSON scans; USING KEY CTEs
+    decorrelated joins as correlated subqueries, subqueries, lambdas, `read_parquet` scans, USING KEY
+    and `recurring` in recursive CTEs
+  - [ ] WHEN NOT MATCHED BY SOURCE and CSV/JSON scans stay unsupported, as in C++; data-modifying CTEs
   - [ ] the text of C++ where tests match it (`AS r(column0, ...)` table aliases, its formatter,
     result-type casts); the `*_plan` tests compare C++ plans
 - [ ] 40. Logging and error messages (`sql/logging` 8, `sql/error` 13, `test/logging` 2)

@@ -51,7 +51,7 @@ pub fn export_plan(plan: &LogicalOperator, output_names: Option<&[String]>, data
         delims: Vec::new(),
         database_of,
     };
-    if let Some(statement) = exporter.statement(plan)? {
+    if let Some(statement) = exporter.statement(plan, output_names)? {
         return finish_sql(&statement);
     }
     let relation = exporter.export(plan)?;
@@ -67,7 +67,29 @@ pub fn export_plan(plan: &LogicalOperator, output_names: Option<&[String]>, data
     finish_sql(&node.to_string())
 }
 
-fn finish_sql(sql: &str) -> Res<String> {
+/// The query of a plan, its columns named `names`, as a COPY or CREATE TABLE AS takes it.
+pub fn export_query(plan: &LogicalOperator, names: &[String], database_of: DatabaseOf) -> Res<QueryNode> {
+    let mut exporter = Exporter {
+        next_alias: 0,
+        ctes: Vec::new(),
+        working: Vec::new(),
+        outer: Vec::new(),
+        lambdas: Vec::new(),
+        delims: Vec::new(),
+        database_of,
+    };
+    let relation = exporter.export(plan)?;
+    let mut node = exporter.named_query(relation, names)?;
+    if !exporter.ctes.is_empty() {
+        let mut ctes = std::mem::take(&mut exporter.ctes);
+        ctes.append(&mut node.cte_map.0);
+        node.cte_map.0 = ctes;
+    }
+    Ok(node)
+}
+
+/// The SQL of a statement, checked and formatted.
+pub fn finish_sql(sql: &str) -> Res<String> {
     if sql.len() > MAX_SQL_LENGTH {
         return Err("The SQL of the plan is too long".into());
     }
@@ -342,18 +364,82 @@ impl Exporter<'_> {
     }
 
     /// The SQL of a data-modifying plan (`sql_export_dml.cpp`): INSERT of a query into the physical
-    /// columns, UPDATE and DELETE of the rows the query finds by their row id.
-    fn statement(&mut self, plan: &LogicalOperator) -> Res<Option<String>> {
+    /// columns, UPDATE, DELETE and MERGE INTO of the rows the query finds by their row id. A
+    /// projection over one with RETURNING is its RETURNING list (`MatchReturningRoot`).
+    fn statement(&mut self, plan: &LogicalOperator, names: Option<&[String]>) -> Res<Option<String>> {
+        if let Op::Projection { expressions, .. } = &plan.kind
+            && let Some(child) = plan.children.first()
+            && matches!(
+                child.kind,
+                Op::Insert { returning: true, .. }
+                    | Op::Delete { returning: true, .. }
+                    | Op::Update { returning: true, .. }
+                    | Op::MergeInto { returning: true, .. }
+            )
+        {
+            return self.dml(child, Some((expressions, names)));
+        }
+        self.dml(plan, None)
+    }
+
+    /// The RETURNING list: the columns of the table by name, and `merge_action`.
+    fn returning(
+        &mut self,
+        table: &TableCatalogEntry,
+        table_index: usize,
+        returning: Option<(&[BoundExpr], Option<&[String]>)>,
+    ) -> Res<Vec<Expr>> {
+        let Some((expressions, names)) = returning else {
+            return Ok(Vec::new());
+        };
+        let mut scope = Scope::default();
+        for (i, column) in table.columns.iter().enumerate() {
+            scope.columns.insert(
+                ColumnBinding::new(table_index, i),
+                (
+                    Column::plain(Expr::column(vec![column.name.clone()])),
+                    column.ty.clone(),
+                ),
+            );
+        }
+        scope.columns.insert(
+            ColumnBinding::new(table_index, table.columns.len()),
+            (
+                Column::plain(Expr::column(vec!["merge_action".into()])),
+                LogicalType::VARCHAR,
+            ),
+        );
+        let mut list = Vec::new();
+        for (i, e) in expressions.iter().enumerate() {
+            let mut expr = self.expr(&scope, e)?;
+            expr.alias = names.and_then(|n| n.get(i).cloned()).unwrap_or_else(|| e.alias.clone());
+            list.push(expr);
+        }
+        Ok(list)
+    }
+
+    fn target(&self, table: &TableCatalogEntry) -> TableRef {
+        TableRefKind::BaseTable {
+            name: self.table_name(table),
+            at_clause: None,
+        }
+        .into()
+    }
+
+    fn dml(
+        &mut self,
+        plan: &LogicalOperator,
+        returning: Option<(&[BoundExpr], Option<&[String]>)>,
+    ) -> Res<Option<String>> {
         match &plan.kind {
             Op::Insert {
                 table,
                 column_index_map,
-                returning: false,
-                on_conflict: None,
+                on_conflict,
+                table_index,
                 ..
             } => {
                 let child = self.export_child(plan, 0)?;
-                let fields = child.fields.clone();
                 let types = child.fields.iter().map(|f| f.ty.clone()).collect::<Vec<_>>();
                 let source = self.wrap(child);
                 let mut columns = Vec::new();
@@ -382,11 +468,15 @@ impl Exporter<'_> {
                     };
                     columns.push(column);
                 }
-                let _ = fields;
                 let mut select = source;
                 select.columns = columns;
                 let names: Vec<String> = (0..select.columns.len()).map(field_name).collect();
                 let node = finish(select, &names);
+                let on_conflict = match on_conflict {
+                    Some(conflict) => Some(self.on_conflict(table, conflict)?),
+                    None => None,
+                };
+                let returning = self.returning(table, *table_index, returning)?;
                 let statement = ast::InsertStatement {
                     cte_map: self.take_ctes(),
                     table: self.table_name(table),
@@ -394,16 +484,12 @@ impl Exporter<'_> {
                     by_name: false,
                     columns: table.columns.iter().map(|c| c.name.clone()).collect(),
                     values: ast::InsertValues::Select(Box::new(SelectStatement { node })),
-                    on_conflict: None,
-                    returning: Vec::new(),
+                    on_conflict,
+                    returning,
                 };
                 Ok(Some(statement.to_string()))
             }
-            Op::Delete {
-                table,
-                returning: false,
-                ..
-            } => {
+            Op::Delete { table, table_index, .. } => {
                 let child = self.export_child(plan, 0)?;
                 let node = self.query(child);
                 let condition = ExprKind::Subquery {
@@ -412,23 +498,20 @@ impl Exporter<'_> {
                     child: Some(Box::new(Expr::column(vec!["rowid".into()]))),
                     comparison: ComparisonOp::Equal,
                 };
+                let returning = self.returning(table, *table_index, returning)?;
                 let statement = ast::DeleteStatement {
                     cte_map: self.take_ctes(),
-                    table: TableRefKind::BaseTable {
-                        name: self.table_name(table),
-                        at_clause: None,
-                    }
-                    .into(),
+                    table: self.target(table),
                     using: Vec::new(),
                     condition: Some(Box::new(condition.into())),
-                    returning: Vec::new(),
+                    returning,
                 };
                 Ok(Some(statement.to_string()))
             }
             Op::Update {
                 table,
                 columns,
-                returning: false,
+                table_index,
                 ..
             } => {
                 let child = self.export_child(plan, 0)?;
@@ -449,24 +532,155 @@ impl Exporter<'_> {
                         Expr::column(vec![alias.clone(), field_name(count - 1)]),
                     ))),
                 };
+                let returning = self.returning(table, *table_index, returning)?;
                 let statement = ast::UpdateStatement {
                     cte_map: self.take_ctes(),
-                    table: TableRefKind::BaseTable {
-                        name: self.table_name(table),
-                        at_clause: None,
-                    }
-                    .into(),
+                    table: self.target(table),
                     set_info,
                     from_table: Some(from),
-                    returning: Vec::new(),
+                    returning,
                 };
                 Ok(Some(statement.to_string()))
             }
-            Op::Insert { .. } | Op::Delete { .. } | Op::Update { .. } => {
-                Err("RETURNING and ON CONFLICT have no SQL export".into())
+            Op::MergeInto {
+                table,
+                table_index,
+                actions,
+                row_id,
+                marker,
+                ..
+            } => {
+                if marker.is_some() {
+                    return Err("WHEN NOT MATCHED BY SOURCE actions cannot be keyed by the exported row id".into());
+                }
+                let child = self.export_child(plan, 0)?;
+                let fields = child.fields.clone();
+                let count = fields.len();
+                let alias = self.alias();
+                let node = self.query(child);
+                let mut from = TableRef::subquery(SelectStatement { node });
+                from.alias = alias.clone();
+                from.column_name_alias = (0..count).map(field_name).collect();
+                let source_select = Select::new(
+                    TableRef::empty(),
+                    (0..count)
+                        .map(|i| Column::plain(Expr::column(vec![alias.clone(), field_name(i)])))
+                        .collect(),
+                );
+                let scope = Scope::of(&source_select, &fields);
+                let on = Expr::comparison(
+                    ComparisonOp::Equal,
+                    Expr::column(vec![table.name.clone(), "rowid".into()]),
+                    self.expr(&scope, row_id)?,
+                );
+                let mut sql_actions = Vec::new();
+                for (condition, list) in actions {
+                    for action in list {
+                        let when = action.condition.as_ref().map(|c| self.expr(&scope, c)).transpose()?;
+                        let expressions = action
+                            .expressions
+                            .iter()
+                            .map(|e| self.expr(&scope, e))
+                            .collect::<Res<Vec<_>>>()?;
+                        let mut sql = ast::MergeAction {
+                            action_type: action.action_type,
+                            condition: when.map(Box::new),
+                            update_info: None,
+                            by_name: false,
+                            insert_columns: Vec::new(),
+                            expressions: Vec::new(),
+                            default_values: false,
+                        };
+                        match action.action_type {
+                            ast::MergeActionType::Update => {
+                                sql.update_info = Some(ast::UpdateSetInfo {
+                                    columns: action.columns.iter().map(|&c| table.columns[c].name.clone()).collect(),
+                                    expressions,
+                                    condition: None,
+                                });
+                            }
+                            ast::MergeActionType::Insert => {
+                                sql.insert_columns = table.columns.iter().map(|c| c.name.clone()).collect();
+                                sql.expressions = expressions;
+                            }
+                            ast::MergeActionType::Error => sql.expressions = expressions,
+                            ast::MergeActionType::Delete | ast::MergeActionType::DoNothing => {}
+                        }
+                        sql_actions.push((*condition, sql));
+                    }
+                }
+                let returning = self.returning(table, *table_index, returning)?;
+                let statement = ast::MergeStatement {
+                    cte_map: self.take_ctes(),
+                    target: Box::new(self.target(table)),
+                    source: Box::new(from),
+                    join_condition: Some(Box::new(on)),
+                    using_columns: Vec::new(),
+                    actions: sql_actions,
+                    returning,
+                };
+                Ok(Some(statement.to_string()))
             }
             _ => Ok(None),
         }
+    }
+
+    /// ON CONFLICT: its SET expressions read the columns of the row, then those of `excluded`.
+    fn on_conflict(
+        &mut self,
+        table: &TableCatalogEntry,
+        conflict: &super::logical::OnConflict,
+    ) -> Res<ast::OnConflictInfo> {
+        let mut slots: Vec<Expr> = table
+            .columns
+            .iter()
+            .map(|c| Expr::column(vec![table.name.clone(), c.name.clone()]))
+            .collect();
+        slots.extend(
+            table
+                .columns
+                .iter()
+                .map(|c| Expr::column(vec!["excluded".into(), c.name.clone()])),
+        );
+        self.lambdas.push(slots);
+        let result = (|| -> Res<ast::OnConflictInfo> {
+            let scope = Scope::default();
+            let set_info = if conflict.do_update {
+                let expressions = conflict
+                    .set_expressions
+                    .iter()
+                    .map(|e| self.expr(&scope, e))
+                    .collect::<Res<Vec<_>>>()?;
+                let condition = conflict.condition.as_ref().map(|c| self.expr(&scope, c)).transpose()?;
+                Some(ast::UpdateSetInfo {
+                    columns: conflict
+                        .set_columns
+                        .iter()
+                        .map(|&c| table.columns[c].name.clone())
+                        .collect(),
+                    expressions,
+                    condition: condition.map(Box::new),
+                })
+            } else {
+                None
+            };
+            let indexed_columns = match conflict.targets.as_slice() {
+                [target] => target.iter().map(|&c| table.columns[c].name.clone()).collect(),
+                _ => Vec::new(),
+            };
+            Ok(ast::OnConflictInfo {
+                action: if conflict.do_update {
+                    ast::OnConflictAction::Update
+                } else {
+                    ast::OnConflictAction::Nothing
+                },
+                indexed_columns,
+                condition: None,
+                set_info,
+            })
+        })();
+        self.lambdas.pop();
+        result
     }
 
     /// `NextRelationAlias`.
@@ -837,23 +1051,38 @@ impl Exporter<'_> {
                 types,
                 union_all,
                 working,
+                recurring,
                 key,
                 unresolved: recursive,
                 ..
             } => {
-                if !key.is_empty() && key.iter().any(|k| *k != CteKeyColumn::Key) {
-                    return Err("A recursive CTE with USING KEY has no SQL export".into());
-                }
-                if !key.is_empty() {
-                    return Err("A recursive CTE with USING KEY has no SQL export".into());
+                // USING KEY: the key columns, and how the others combine
+                let mut key_targets = Vec::new();
+                for (i, mode) in key.iter().enumerate() {
+                    let column = Expr::column(vec![field_name(i)]);
+                    key_targets.push(match mode {
+                        CteKeyColumn::Key => column,
+                        CteKeyColumn::Last => continue,
+                        CteKeyColumn::First => FunctionExpr::new("first", vec![column]).into(),
+                        CteKeyColumn::Min => FunctionExpr::new("min", vec![column]).into(),
+                        CteKeyColumn::Max => FunctionExpr::new("max", vec![column]).into(),
+                    });
                 }
                 let name = self.alias();
+                // `recurring.name` reads the rows so far
+                self.working.push((
+                    std::sync::Arc::as_ptr(recurring) as usize,
+                    format!("recurring.{name}"),
+                    0,
+                ));
                 let anchor = self.export_child(op, 0)?;
                 let anchor = self.set_child(anchor, types)?;
                 self.working
                     .push((std::sync::Arc::as_ptr(working) as usize, name.clone(), 0));
                 let step = self.export(recursive);
                 let (.., reads) = self.working.pop().expect("pushed above");
+                let (.., recurring_reads) = self.working.pop().expect("pushed above");
+                let reads = reads + recurring_reads;
                 let mut step = step?;
                 if reads == 0 {
                     // the optimizer took out the reads of the working table, which make it recursive:
@@ -898,7 +1127,7 @@ impl Exporter<'_> {
                         left: Box::new(anchor),
                         right: Box::new(step),
                         aliases: aliases.clone(),
-                        key_targets: Vec::new(),
+                        key_targets: key_targets.clone(),
                     }),
                     modifiers: Vec::new(),
                     cte_map: Default::default(),
@@ -908,7 +1137,7 @@ impl Exporter<'_> {
                     CteInfo {
                         aliases,
                         query: Box::new(cte),
-                        key_targets: Vec::new(),
+                        key_targets,
                         materialized: CteMaterialize::Default,
                     },
                 ));
@@ -1053,11 +1282,14 @@ impl Exporter<'_> {
     /// `SELECT c0, ... FROM name`, a WITH entry.
     fn named_source(&mut self, name: &str, count: usize) -> Select {
         let alias = self.alias();
-        let mut from: TableRef = TableRefKind::BaseTable {
-            name: QualifiedName::new(name),
-            at_clause: None,
-        }
-        .into();
+        let name = match name.split_once('.') {
+            Some((schema, table)) => QualifiedName {
+                qualification: vec![schema.to_string()],
+                name: table.to_string(),
+            },
+            None => QualifiedName::new(name),
+        };
+        let mut from: TableRef = TableRefKind::BaseTable { name, at_clause: None }.into();
         from.alias = alias.clone();
         let columns = (0..count)
             .map(|i| Column::plain(Expr::column(vec![alias.clone(), field_name(i)])))
