@@ -294,7 +294,17 @@ impl Binder<'_> {
             match &cte.query.kind {
                 QueryNodeKind::Select(_) | QueryNodeKind::SetOperation(_) => {}
                 QueryNodeKind::RecursiveCte(_) => {}
-                _ => return Err(not_implemented("data-modifying statements in WITH")),
+                // the client runs those of the top-level query before it (`dml_cte`)
+                QueryNodeKind::Copy(_) => {
+                    return Err(binder_error(
+                        "WITH clause containing a COPY statement must be at the top level",
+                    ));
+                }
+                _ => {
+                    return Err(binder_error(
+                        "WITH clause containing a data-modifying statement must be at the top level",
+                    ));
+                }
             }
             self.ctes
                 .push((name.clone(), Arc::new(cte.clone()), self.outer_contexts.len()));
@@ -1636,7 +1646,8 @@ impl Binder<'_> {
                     && [".csv", ".tsv", ".csv.gz", ".tsv.gz", ".csv.zst", ".tsv.zst"]
                         .iter()
                         .any(|end| lower.ends_with(end))
-                    && !crate::execution::file_system::glob_or_directory(&name.name, "csv").is_empty()
+                    && (crate::execution::file_system::has_glob(&name.name)
+                        || !crate::execution::file_system::glob_or_directory(&name.name, "csv").is_empty())
                 {
                     let call = ast::FunctionExpr::new(
                         "read_csv_auto",
@@ -1877,6 +1888,17 @@ impl Binder<'_> {
             } => {
                 if *with_ordinality {
                     return Err(not_implemented("WITH ORDINALITY"));
+                }
+                // `Binder::BindTableFunctionParameters`
+                if let ExprKind::Function(call) = &function.kind {
+                    let named: Vec<bool> = call
+                        .args
+                        .iter()
+                        .map(|a| !super::table_functions::named_argument(a).name.is_empty())
+                        .collect();
+                    if named.windows(2).any(|pair| pair[0] && !pair[1]) {
+                        return Err(binder_error("Unnamed parameters cannot come after named parameters"));
+                    }
                 }
                 if let ExprKind::Function(call) = &function.kind
                     && let Some(entry) = self.find_macro(&call.name, true)?

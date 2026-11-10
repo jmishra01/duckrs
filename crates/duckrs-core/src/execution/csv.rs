@@ -586,8 +586,9 @@ struct RowSpan {
 }
 
 impl RowSpan {
+    /// `FullLinePosition::ReconstructCurrentLine`, made valid UTF-8 with `?`.
     fn text(&self, data: &[u8]) -> String {
-        String::from_utf8_lossy(&data[self.start..self.end]).into_owned()
+        make_valid(&data[self.start..self.end], '?')
     }
 }
 
@@ -1067,7 +1068,13 @@ fn typed_chunk(
                     column_name: Some(scan.names[index].clone()),
                     kind: "CAST",
                     text: spans[row].text(data),
-                    message,
+                    // the rows the scan goes on after name the type by its id (`LogicalTypeIdToString`)
+                    message: format!(
+                        "Error when converting column \"{}\". Could not convert string \"{}\" to '{}'",
+                        scan.names[index],
+                        strings.get_value(row).try_to_string()?,
+                        ty.to_string().split('(').next().unwrap_or_default()
+                    ),
                 },
             );
         }
@@ -1123,12 +1130,37 @@ fn append_text(table: &TableCatalogEntry, rows: &[Vec<Option<String>>]) -> Resul
 }
 
 /// The start of `text`, at most `limit` bytes that stay valid UTF-8.
-fn cut(text: &str, limit: usize) -> &str {
+/// `rejects_line_size_limit`: the first `limit` bytes, the bytes of a character it cuts made `.`
+/// (`Utf8Proc::MakeValid` with `'.'`).
+fn cut(text: &str, limit: usize) -> String {
     if limit == 0 || text.len() <= limit {
-        return text;
+        return text.to_string();
     }
     let end = (0..=limit).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
-    &text[..end]
+    let mut result = text[..end].to_string();
+    result.extend(std::iter::repeat_n('.', limit - end));
+    result
+}
+
+/// `Utf8Proc::MakeValid`: the bytes of each invalid sequence replaced with `flag`.
+pub(crate) fn make_valid(bytes: &[u8], flag: char) -> String {
+    let mut result = String::with_capacity(bytes.len());
+    let mut rest = bytes;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(valid) => {
+                result.push_str(valid);
+                return result;
+            }
+            Err(error) => {
+                let (valid, after) = rest.split_at(error.valid_up_to());
+                result.push_str(std::str::from_utf8(valid).expect("checked"));
+                let invalid = error.error_len().unwrap_or(after.len());
+                result.extend(std::iter::repeat_n(flag, invalid));
+                rest = &after[invalid..];
+            }
+        }
+    }
 }
 
 /// `CSVGlobalState::FillRejectsTable`.
@@ -1157,7 +1189,7 @@ fn flush_rejects(scan: &CsvScanData, state: &mut CsvScanState) -> Result<()> {
                 r.column.map(|c| c.to_string()),
                 r.column_name.clone(),
                 Some(r.kind.to_string()),
-                Some(cut(&r.text, rejects.line_size_limit).to_string()),
+                Some(cut(&r.text, rejects.line_size_limit)),
                 Some(r.message.clone()),
             ]
         })

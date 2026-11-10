@@ -314,9 +314,10 @@ fn logical_type(field: &Field, binary_as_string: bool) -> Result<LogicalType> {
             LogicalType::list(logical_type(child, binary_as_string)?)
         }
         DataType::Struct(fields) => LogicalType::struct_type(
-            fields
-                .iter()
-                .map(|f| Ok((f.name().clone(), logical_type(f, binary_as_string)?)))
+            deduplicate_names(fields.iter().map(|f| f.name()))
+                .into_iter()
+                .zip(fields.iter())
+                .map(|(name, f)| Ok((name, logical_type(f, binary_as_string)?)))
                 .collect::<Result<_>>()?,
         ),
         DataType::Map(entries, _) => {
@@ -418,12 +419,29 @@ fn column_type(
     logical_type(field, binary_as_string)
 }
 
+/// `ParseSchemaRecursive`: names that are the same but for case get `_1`, `_2`, ... appended.
+pub fn deduplicate_names<'a>(names: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    names
+        .into_iter()
+        .map(|name| {
+            let mut name = name.clone();
+            while let Some(count) = counts.get_mut(&name.to_lowercase()) {
+                *count += 1;
+                name = format!("{name}_{count}");
+            }
+            counts.insert(name.to_lowercase(), 0);
+            name
+        })
+        .collect()
+}
+
 /// The names and types of a file's columns.
 pub fn file_schema(path: &str, binary_as_string: bool, int96_as: Int96As) -> Result<(Vec<String>, Vec<LogicalType>)> {
     let builder = open_builder(path)?;
     let int96 = special_columns(&builder);
     let schema = builder.schema();
-    let names = schema.fields().iter().map(|f| f.name().clone()).collect();
+    let names = deduplicate_names(schema.fields().iter().map(|f| f.name()));
     let types = schema
         .fields()
         .iter()
@@ -694,7 +712,7 @@ fn open_file(scan: &ParquetScanData, state: &mut ParquetScanState, path: &str) -
     let builder = open_builder(path)?.with_batch_size(STANDARD_VECTOR_SIZE);
     let int96 = special_columns(&builder);
     let schema = Arc::clone(builder.schema());
-    let names: Vec<&String> = schema.fields().iter().map(|f| f.name()).collect();
+    let names = deduplicate_names(schema.fields().iter().map(|f| f.name()));
     let mut mapping = Vec::with_capacity(scan.names.len());
     let mut file_types = Vec::with_capacity(scan.names.len());
     let mut transforms = Vec::with_capacity(scan.names.len());
@@ -940,6 +958,11 @@ pub struct Partitioning {
     /// `{i}` and `{uuid}` become a number and a UUID
     pub filename_pattern: String,
     pub extension: String,
+    /// `ORDER_BY`: each run of buffered rows is sorted by these, over the rows' columns, and written to a file
+    pub order: Vec<(
+        crate::planner::expression::BoundExpr,
+        duckrs_common::sort_key::OrderModifiers,
+    )>,
 }
 
 /// What a COPY TO says of the file.
@@ -954,6 +977,40 @@ pub struct ParquetWriteOptions {
 }
 
 impl Partitioning {
+    /// `CopyToSortedRuns`: the rows of `pieces` in the order of `ORDER_BY`.
+    pub fn sorted(&self, pieces: Vec<DataChunk>) -> Result<Vec<DataChunk>> {
+        let Some(first) = pieces.first() else {
+            return Ok(pieces);
+        };
+        if self.order.is_empty() {
+            return Ok(pieces);
+        }
+        let types = first.types();
+        let mut keyed: Vec<(Vec<u8>, usize, usize)> = Vec::new();
+        for (index, piece) in pieces.iter().enumerate() {
+            let vectors = self
+                .order
+                .iter()
+                .map(|(expression, _)| crate::execution::expression_executor::execute(expression, piece))
+                .collect::<Result<Vec<_>>>()?;
+            let columns: Vec<_> = vectors.iter().zip(&self.order).map(|(v, (_, m))| (v, *m)).collect();
+            let keys = duckrs_common::sort_key::create_sort_keys(&columns, piece.len())?;
+            keyed.extend(keys.into_iter().enumerate().map(|(row, key)| (key, index, row)));
+        }
+        keyed.sort();
+        let mut sorted: Vec<DataChunk> = Vec::new();
+        let mut row_values = Vec::with_capacity(types.len());
+        for (_, index, row) in keyed {
+            if sorted.last().is_none_or(|chunk| chunk.len() == chunk.capacity()) {
+                sorted.push(DataChunk::new(&types));
+            }
+            row_values.clear();
+            row_values.extend((0..types.len()).map(|column| pieces[index].get_value(column, row)));
+            sorted.last_mut().expect("just pushed").append_row(&row_values)?;
+        }
+        Ok(sorted)
+    }
+
     /// The columns that go in a file, of `count`, by their position in the rows.
     pub fn written_columns(&self, count: usize) -> Vec<usize> {
         (0..count)
@@ -1546,10 +1603,23 @@ impl PhysicalCopyToParquet {
     }
 
     /// Writes the buffered rows of a partition.
-    fn write_pieces(&self, directory: &str, pieces: &[DataChunk]) -> Result<()> {
-        for piece in pieces {
+    fn write_pieces(&self, directory: &str, pieces: Vec<DataChunk>) -> Result<()> {
+        let ordered = self.options.partitioning.as_ref().filter(|p| !p.order.is_empty());
+        let pieces = match ordered {
+            Some(partitioning) => partitioning.sorted(pieces)?,
+            None => pieces,
+        };
+        for piece in &pieces {
             let rows: Vec<usize> = (0..piece.len()).collect();
             self.write_rows(directory, piece, &rows)?;
+        }
+        // a sorted run is a file of its own
+        if ordered.is_some() {
+            let key = OutputFiles::<ParquetFileWriter>::key(directory, self.options.rotation.as_ref());
+            let writer = self.writers.lock().open.remove(&key);
+            if let Some(writer) = writer {
+                self.finish(writer)?;
+            }
         }
         Ok(())
     }
@@ -1615,7 +1685,14 @@ impl PhysicalCopyToParquet {
         while done < rows.len() {
             if !files.open.contains_key(&key) {
                 let path = files.next_path(&self.path, directory, self.options.partitioning.as_ref(), rotation)?;
-                if self.options.output.return_stats && self.options.partitioning.is_some() {
+                // an ORDER_BY without PARTITION_BY has no keys
+                if self.options.output.return_stats
+                    && self
+                        .options
+                        .partitioning
+                        .as_ref()
+                        .is_some_and(|p| !p.columns.is_empty())
+                {
                     let keys = self.partition_keys(chunk, rows[done])?;
                     self.written.lock().1.insert(path.clone(), keys);
                 }
@@ -1674,7 +1751,7 @@ impl PhysicalOperator for PhysicalCopyToParquet {
                         .lock()
                         .add(&directory, chunk, &rows, partitioning.flush_threshold)?;
                     if let Some(pieces) = ready {
-                        self.write_pieces(&directory, &pieces)?;
+                        self.write_pieces(&directory, pieces)?;
                     }
                 }
             }
@@ -1689,7 +1766,7 @@ impl PhysicalOperator for PhysicalCopyToParquet {
     fn finalize(&self) -> Result<()> {
         let buffered = self.buffers.lock().drain();
         for (directory, pieces) in buffered {
-            self.write_pieces(&directory, &pieces)?;
+            self.write_pieces(&directory, pieces)?;
         }
         let mut files = self.writers.lock();
         let rotation = self.options.rotation.as_ref();
