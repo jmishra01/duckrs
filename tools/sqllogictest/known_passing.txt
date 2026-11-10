@@ -585,6 +585,7 @@ test/parquet/parquet_version.test
 test/parquet/prefetching.test
 test/parquet/schema_nested_evolution.test
 test/parquet/schema_nested_extract.test
+test/parquet/test_filename_column.test
 test/parquet/test_internal_5021.test
 test/parquet/test_parquet_reader_compression.test
 test/parquet/test_parquet_schema_incompatible_nested_types.test
@@ -1195,6 +1196,7 @@ test/sql/copy/csv/auto/test_double_quoted_header.test
 test/sql/copy/csv/auto/test_early_out.test
 test/sql/copy/csv/auto/test_header_completion.test
 test/sql/copy/csv/auto/test_header_detection.test
+test/sql/copy/csv/auto/test_large_integer_detection.test
 test/sql/copy/csv/auto/test_normalize_names.test
 test/sql/copy/csv/auto/test_sample_size.test
 test/sql/copy/csv/auto/test_sniffer_blob.test
@@ -1216,9 +1218,11 @@ test/sql/copy/csv/copy_to_overwrite.test
 test/sql/copy/csv/csv_comment_quoted_sniff.test
 test/sql/copy/csv/csv_copy_sniffer.test
 test/sql/copy/csv/csv_decimal_separator.test
+test/sql/copy/csv/csv_dtypes_union_by_name.test
 test/sql/copy/csv/csv_enum.test
 test/sql/copy/csv/csv_enum_storage.test
 test/sql/copy/csv/csv_hive.test
+test/sql/copy/csv/csv_hive_filename_union.test
 test/sql/copy/csv/csv_limit_copy.test
 test/sql/copy/csv/csv_multibyte_delimiter_escapes.test
 test/sql/copy/csv/csv_null_byte.test
@@ -1232,6 +1236,7 @@ test/sql/copy/csv/empty_first_line.test
 test/sql/copy/csv/empty_string_quote.test
 test/sql/copy/csv/except.test
 test/sql/copy/csv/glob/copy_csv_glob.test
+test/sql/copy/csv/glob/test_unmatch_globs.test
 test/sql/copy/csv/inconsistent_cells_error.test
 test/sql/copy/csv/integer_exponent.test
 test/sql/copy/csv/issue_22153.test
@@ -1269,6 +1274,7 @@ test/sql/copy/csv/rejects/csv_incorrect_columns_amount_rejects.test
 test/sql/copy/csv/rejects/csv_rejects_auto.test
 test/sql/copy/csv/rejects/csv_rejects_cache_key_collision.test
 test/sql/copy/csv/rejects/csv_rejects_flush_cast.test
+test/sql/copy/csv/rejects/csv_rejects_maximum_line.test
 test/sql/copy/csv/rejects/csv_unquoted_rejects.test
 test/sql/copy/csv/rejects/test_invalid_parameters.test
 test/sql/copy/csv/relaxed_quotes.test
@@ -1296,6 +1302,7 @@ test/sql/copy/csv/test_copy_csv_multibyte_delimiter.test
 test/sql/copy/csv/test_copy_default.test
 test/sql/copy/csv/test_copy_gzip.test
 test/sql/copy/csv/test_copy_many_empty_lines.test
+test/sql/copy/csv/test_csv_duplicate_columns.test
 test/sql/copy/csv/test_csv_error_projection.test
 test/sql/copy/csv/test_csv_json.test
 test/sql/copy/csv/test_csv_mixed_casts.test
@@ -1317,6 +1324,7 @@ test/sql/copy/csv/test_filename_filter.test
 test/sql/copy/csv/test_force_quote.test
 test/sql/copy/csv/test_glob_reorder_null.test
 test/sql/copy/csv/test_greek_utf8.test
+test/sql/copy/csv/test_header_only.test
 test/sql/copy/csv/test_headers_12089.test
 test/sql/copy/csv/test_hits_problematic.test
 test/sql/copy/csv/test_ignore_errors.test
@@ -1327,6 +1335,7 @@ test/sql/copy/csv/test_infinite_loop_escape.test
 test/sql/copy/csv/test_issue3562_assertion.test
 test/sql/copy/csv/test_issue5077.test
 test/sql/copy/csv/test_lineitem.test
+test/sql/copy/csv/test_linesize.test
 test/sql/copy/csv/test_long_line.test
 test/sql/copy/csv/test_many_columns.test
 test/sql/copy/csv/test_mismatch_schemas.test
@@ -1336,6 +1345,7 @@ test/sql/copy/csv/test_mixed_new_line.test
 test/sql/copy/csv/test_ncvoter.test
 test/sql/copy/csv/test_nfc.test
 test/sql/copy/csv/test_nfc_suite.test
+test/sql/copy/csv/test_null_padding_projection.test
 test/sql/copy/csv/test_null_padding_union.test
 test/sql/copy/csv/test_ontime.test
 test/sql/copy/csv/test_partition_compression.test
@@ -1356,6 +1366,7 @@ test/sql/copy/csv/test_thijs_unquoted_file.test
 test/sql/copy/csv/test_thousands_separator.test
 test/sql/copy/csv/test_time.test
 test/sql/copy/csv/test_timestamp_offset.test
+test/sql/copy/csv/test_union_by_name.test
 test/sql/copy/csv/test_utf16_odd_length.test
 test/sql/copy/csv/test_utf16_surrogate_pairs.test
 test/sql/copy/csv/test_web_page.test
@@ -1624,6 +1635,7 @@ test/sql/cte/recursive_cte_complex_pipelines.test
 test/sql/cte/recursive_cte_error.test
 test/sql/cte/recursive_cte_event_schedule_reset.test
 test/sql/cte/recursive_cte_invariant_build.test
+test/sql/cte/recursive_cte_iteration_state_reuse.test
 test/sql/cte/recursive_cte_key_final_drain.test
 test/sql/cte/recursive_cte_key_snapshot.test
 test/sql/cte/recursive_cte_large_payload.test

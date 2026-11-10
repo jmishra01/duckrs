@@ -593,7 +593,9 @@ impl Sink for CountSink {
     fn add_row(&mut self, machine: &Machine, data: &[u8], position: usize) -> bool {
         let line_end = (position + 1).min(data.len() + 1);
         if line_end.saturating_sub(self.line_start) > self.maximum_line_size && position < data.len() {
-            self.long_line = Some((self.line_start, line_end - self.line_start));
+            // the first line that is too long is the one reported
+            self.long_line
+                .get_or_insert((self.line_start, line_end - self.line_start));
             self.error = true;
         }
         self.line_start = line_end;

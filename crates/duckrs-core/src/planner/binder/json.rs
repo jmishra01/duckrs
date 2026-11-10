@@ -139,11 +139,7 @@ impl Binder<'_> {
                     self.take_hive_option(&mut hive_options, &option, &value)?;
                 }
                 "filename" => {
-                    filename = match value.data() {
-                        ValueData::Bool(true) => Some("filename".to_string()),
-                        ValueData::Bool(false) => None,
-                        _ => Some(value.try_to_string()?),
-                    };
+                    filename = super::copy::filename_option(&value, &option)?;
                 }
                 _ => return Err(crate::unported(format!("the {name} option {option}"))),
             }

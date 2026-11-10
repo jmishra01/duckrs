@@ -39,6 +39,15 @@ pub(super) fn is_true(value: &Value, name: &str) -> Result<bool> {
     }
 }
 
+/// The `filename` option of the multi-file readers (`MultiFileReader::ParseOption`): a VARCHAR names
+/// the column, anything else is cast to BOOLEAN.
+pub(super) fn filename_option(value: &Value, option: &str) -> Result<Option<String>> {
+    if value.logical_type().id() == LogicalTypeId::Varchar {
+        return Ok(Some(value.try_to_string()?));
+    }
+    Ok(is_true(value, option)?.then(|| "filename".to_string()))
+}
+
 fn text(value: &Value) -> Result<String> {
     value.try_to_string()
 }
@@ -150,6 +159,8 @@ struct CsvArguments {
     types_by_name: Vec<(String, LogicalType)>,
     types_by_position: Vec<LogicalType>,
     union_by_name: bool,
+    /// `files_to_sniff`: how many files the schema is taken from
+    files_to_sniff: usize,
     allow_empty: bool,
     hive: HiveOptions,
     filename: Option<String>,
@@ -243,7 +254,10 @@ impl Binder<'_> {
     /// `CSVReaderOptions::FromNamedParameters`.
     fn csv_arguments(&mut self, name: &str, call: &FunctionExpr) -> Result<CsvArguments> {
         let args: Vec<_> = call.args.iter().map(named_argument).collect();
-        let mut result = CsvArguments::default();
+        let mut result = CsvArguments {
+            files_to_sniff: 10,
+            ..CsvArguments::default()
+        };
         let mut paths = None;
         let mut ignore_given = None;
         for argument in &args {
@@ -326,12 +340,17 @@ impl Binder<'_> {
                     let size: i64 = text(&value)?
                         .parse()
                         .map_err(|_| binder_error("buffer_size must be an integer"))?;
-                    if size < 0 {
-                        return Err(binder_error(
-                            "Invalid value for BUFFER_SIZE parameter: it cannot be smaller than 0",
+                    if size <= 0 {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            "Buffer Size option must be higher than 0",
                         ));
                     }
-                    options.buffer_size = Some(size as usize);
+                    let size = size as usize;
+                    if let Some(line) = options.max_line_size.filter(|line| *line > size) {
+                        return Err(buffer_below_line_size(size, line));
+                    }
+                    options.buffer_size = Some(size);
                 }
                 "maximum_line_size" | "max_line_size" => {
                     let size: i64 = text(&value)?
@@ -342,7 +361,17 @@ impl Binder<'_> {
                             "Invalid value for MAX_LINE_SIZE parameter: it cannot be smaller than 0",
                         ));
                     }
-                    options.max_line_size = Some(size as usize);
+                    let size = size as usize;
+                    if let Some(buffer) = options.buffer_size.filter(|buffer| size > *buffer) {
+                        return Err(buffer_below_line_size(buffer, size));
+                    }
+                    // `CSVReaderOptions::Verify`: a larger line size makes the buffers larger
+                    if options.buffer_size.is_none() && size > 2_000_000 && size.checked_mul(16).is_none() {
+                        return Err(binder_error(format!(
+                            "MAX_LINE_SIZE option was set to {size}, which is too large"
+                        )));
+                    }
+                    options.max_line_size = Some(size);
                 }
                 "strict_mode" => options.strict_mode = is_true(&value, &option)?,
                 "new_line" => {
@@ -418,6 +447,7 @@ impl Binder<'_> {
                              one.",
                         ));
                     }
+                    result.files_to_sniff = if files == -1 { usize::MAX } else { files as usize };
                 }
                 "allow_empty" => {
                     shown = false;
@@ -512,11 +542,7 @@ impl Binder<'_> {
                 }
                 "filename" => {
                     shown = false;
-                    result.filename = match value.data() {
-                        ValueData::Bool(true) => Some("filename".to_string()),
-                        ValueData::Bool(false) => None,
-                        _ => Some(text(&value)?),
-                    };
+                    result.filename = filename_option(&value, &option)?;
                 }
                 "force_match" if name == "sniff_csv" => shown = false,
                 "store_rejects" => result.store_rejects = Some(is_true(&value, &option)?),
@@ -640,9 +666,11 @@ impl Binder<'_> {
         }
         for (column, ty) in &arguments.types_by_name {
             let Some(i) = sniffed.names.iter().position(|n| n.eq_ignore_ascii_case(column)) else {
-                return Err(binder_error(format!(
-                    "COLUMN_TYPES error: Columns with names: \"{column}\" do not exist in the CSV File"
-                )));
+                // with `union_by_name` a column only has to be in one of the files
+                if arguments.union_by_name {
+                    continue;
+                }
+                return Err(missing_column_types(column));
             };
             sniffed.types[i] = ty.clone();
         }
@@ -653,15 +681,42 @@ impl Binder<'_> {
         if !sniffed.types.iter().any(|ty| ty.id() == LogicalTypeId::Timestamp) {
             sniffed.timestamp_format = arguments.options.timestamp_format.clone();
         }
-        // a column nothing says anything of, `ReadSingleCSVFileBind`
-        if !arguments.union_by_name {
-            for ty in &mut sniffed.types {
-                if ty.id() == LogicalTypeId::SqlNull {
-                    *ty = LogicalType::VARCHAR;
-                }
-            }
-        }
         Ok((sniffed, data))
+    }
+
+    /// `CSVSchemaDiscovery::SchemaDiscovery`: the files after the first are sniffed until enough lines are, or
+    /// `files_to_sniff` files, and the types of those with rows are merged into the first's.
+    fn merge_sniffed_schemas(arguments: &CsvArguments, first: &Sniffed, types: &mut [LogicalType]) -> Result<()> {
+        let rows_read = |sniffed: &Sniffed| {
+            sniffed
+                .lines_sniffed
+                .saturating_sub(sniffed.skip + usize::from(sniffed.header))
+        };
+        let required = arguments.options.sample_size;
+        let mut total = first.lines_sniffed;
+        let mut best_rows = rows_read(first);
+        let count = arguments.files.len().min(arguments.files_to_sniff);
+        for path in arguments.files.iter().take(count).skip(1) {
+            if total >= required {
+                break;
+            }
+            let (file, data) = Self::csv_sniff(arguments, path)?;
+            total += file.lines_sniffed;
+            let rows = rows_read(&file);
+            if data.is_empty() || rows == 0 {
+                continue;
+            }
+            if best_rows == 0 {
+                // a schema without data rows gives way to one that has them
+                for (slot, ty) in types.iter_mut().zip(&file.types) {
+                    *slot = ty.clone();
+                }
+                best_rows = rows;
+                continue;
+            }
+            merge_schema_types(types, &file.types);
+        }
+        Ok(())
     }
 
     /// `ReadCSVBind`.
@@ -692,6 +747,13 @@ impl Binder<'_> {
                 }
                 sniffed.push(file);
             }
+            if let Some((column, _)) = arguments
+                .types_by_name
+                .iter()
+                .find(|(column, _)| !names.iter().any(|n| n.eq_ignore_ascii_case(column)))
+            {
+                return Err(missing_column_types(column));
+            }
             for ty in &mut types {
                 if ty.id() == LogicalTypeId::SqlNull {
                     *ty = LogicalType::VARCHAR;
@@ -713,6 +775,10 @@ impl Binder<'_> {
                 });
             }
         } else {
+            if arguments.columns.is_none() {
+                Self::merge_sniffed_schemas(&arguments, &first, &mut types)?;
+            }
+            replace_null_with_varchar(&mut types);
             for path in &arguments.files {
                 files.push(CsvFile {
                     path: path.clone(),
@@ -980,7 +1046,8 @@ impl Binder<'_> {
             ));
         }
         let path = &arguments.files[0];
-        let (sniffed, _) = Self::csv_sniff(&arguments, path)?;
+        let (mut sniffed, _) = Self::csv_sniff(&arguments, path)?;
+        replace_null_with_varchar(&mut sniffed.types);
         let dialect = &sniffed.dialect;
         let new_line = new_line_identifier(&sniffed.dialect);
         let shown = |byte: Option<u8>| byte.map_or("(empty)".to_string(), |b| char::from(b).to_string());
@@ -1488,7 +1555,7 @@ impl Binder<'_> {
         let copy_options = self.copy_options(info)?;
         Self::check_copy_options(&copy_options, false)?;
         if self.copy_json {
-            options.json_names = Some(bound.names.clone());
+            options.json_names = Some(unique_names(&bound.names));
             options.header = false;
             options.new_line = "\n".to_string();
             options.suffix = "\n".to_string();
@@ -1592,7 +1659,7 @@ impl Binder<'_> {
         let plan = LogicalOperator::new(
             LogicalOperatorKind::CopyToFile {
                 path,
-                names: bound.names.clone(),
+                names: unique_names(&bound.names),
                 options,
                 compression,
             },
@@ -2319,4 +2386,88 @@ pub(super) fn copy_result(output: &crate::execution::parquet::CopyOutputOptions)
     } else {
         (vec!["Count".to_string()], StatementReturnType::ChangedRows)
     }
+}
+
+/// The names COPY TO writes: `QueryResult::DeduplicateColumns` of the select list.
+fn unique_names(names: &[String]) -> Vec<String> {
+    let mut names = names.to_vec();
+    super::star::deduplicate_columns(&mut names);
+    names
+}
+
+fn missing_column_types(column: &str) -> Error {
+    binder_error(format!(
+        "COLUMN_TYPES error: Columns with names: \"{column}\" do not exist in the CSV File"
+    ))
+}
+
+/// `CSVSchema::ReplaceNullWithVarchar`: a column nothing says anything of.
+fn replace_null_with_varchar(types: &mut [LogicalType]) {
+    for ty in types {
+        if ty.id() == LogicalTypeId::SqlNull {
+            *ty = LogicalType::VARCHAR;
+        }
+    }
+}
+
+/// `CSVSchema::CanWeCastIt`, for the types the sniffer detects.
+fn can_we_cast_it(source: LogicalTypeId, destination: LogicalTypeId) -> bool {
+    use LogicalTypeId as T;
+    if destination == T::Varchar || source == destination {
+        return true;
+    }
+    match source {
+        T::SqlNull => true,
+        T::TinyInt => matches!(
+            destination,
+            T::SmallInt | T::Integer | T::BigInt | T::Decimal | T::HugeInt | T::Bignum | T::Float | T::Double
+        ),
+        T::SmallInt => matches!(
+            destination,
+            T::Integer | T::BigInt | T::Decimal | T::HugeInt | T::Bignum | T::Float | T::Double
+        ),
+        T::Integer => matches!(
+            destination,
+            T::BigInt | T::Decimal | T::HugeInt | T::Bignum | T::Float | T::Double
+        ),
+        T::BigInt => matches!(destination, T::Decimal | T::HugeInt | T::Bignum | T::Float | T::Double),
+        T::HugeInt | T::UHugeInt => matches!(destination, T::Bignum | T::Double),
+        T::Bignum | T::Float => destination == T::Double,
+        _ => false,
+    }
+}
+
+/// `CSVSchema::MergeSchemas`, of the types (null padding does not add columns: the scan has the first's).
+fn merge_schema_types(types: &mut [LogicalType], other: &[LogicalType]) {
+    for (this, other) in types.iter_mut().zip(other) {
+        if this == other {
+            continue;
+        }
+        let (this_id, other_id) = (this.id(), other.id());
+        if can_we_cast_it(this_id, other_id) {
+            *this = other.clone();
+        } else if !can_we_cast_it(other_id, this_id) {
+            let candidates = [
+                LogicalType::BOOLEAN,
+                LogicalType::BIGINT,
+                LogicalType::HUGEINT,
+                LogicalType::new(LogicalTypeId::Bignum),
+                LogicalType::DOUBLE,
+                LogicalType::VARCHAR,
+            ];
+            if let Some(ty) = candidates
+                .into_iter()
+                .find(|ty| can_we_cast_it(this_id, ty.id()) && can_we_cast_it(other_id, ty.id()))
+            {
+                *this = ty;
+            }
+        }
+    }
+}
+
+fn buffer_below_line_size(buffer: usize, line: usize) -> Error {
+    Error::new(
+        ErrorKind::InvalidInput,
+        format!("Buffer Size of {buffer} must be a higher value than the maximum line size {line}"),
+    )
 }

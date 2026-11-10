@@ -296,6 +296,8 @@ pub struct Sniffed {
     pub timestamp_format: Option<String>,
     /// `sniffer_user_mismatch_error`
     pub mismatch: String,
+    /// `CSVSniffer::LinesSniffed`
+    pub lines_sniffed: usize,
 }
 
 /// A chunk of rows as text, cut to the columns.
@@ -1232,6 +1234,7 @@ pub fn sniff(
                 date_format: options.date_format.clone(),
                 timestamp_format: options.timestamp_format.clone(),
                 mismatch: String::new(),
+                lines_sniffed: 0,
             });
         }
         // `MinimalSniff`: the dialect is known, so the first row says how many columns there are
@@ -1424,6 +1427,7 @@ pub fn sniff(
         date_format: date_format.or_else(|| options.date_format.clone()),
         timestamp_format: timestamp_format.or_else(|| options.timestamp_format.clone()),
         mismatch,
+        lines_sniffed: sniffer.lines_sniffed,
     })
 }
 
