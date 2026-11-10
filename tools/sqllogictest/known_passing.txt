@@ -2393,6 +2393,7 @@ test/sql/optimizer/anti_join_empty_rhs_projection_map.test
 test/sql/optimizer/any_extremum_rewrite.test
 test/sql/optimizer/distinct_sibling_column_pruning.test
 test/sql/optimizer/distinctness_statistics.test
+test/sql/optimizer/distinctness_statistics_nested.test
 test/sql/optimizer/expression/date_trunc_non_interval_parts.test
 test/sql/optimizer/expression/enum_compare_null.test
 test/sql/optimizer/expression/list_comprehension_casts.test
@@ -2747,6 +2748,7 @@ test/sql/show_select/test_describe_all.test
 test/sql/show_select/test_describe_quoted.test
 test/sql/show_select/test_show_select.test
 test/sql/show_select/test_summarize_quoted.test
+test/sql/sql_export/aggregate_results.test
 test/sql/sql_export/basic_plan_shapes.test
 test/sql/sql_export/ci_reconstruction.test
 test/sql/sql_export/collation_results.test
@@ -2755,13 +2757,16 @@ test/sql/sql_export/compressed_materialization_sql_export.test
 test/sql/sql_export/copy_empty_filename_pattern.test
 test/sql/sql_export/correlated_sql_export.test
 test/sql/sql_export/cte_names.test
+test/sql/sql_export/explain_sql_scopes.test
 test/sql/sql_export/grouped_mark_roundtrip.test
 test/sql/sql_export/grouped_tuple_mark_roundtrip.test
 test/sql/sql_export/json_ordering.test
 test/sql/sql_export/legacy_source_serialization.test
 test/sql/sql_export/mark_collation.test
 test/sql/sql_export/mark_condition_shapes.test
+test/sql/sql_export/mark_export_effects.test
 test/sql/sql_export/mark_results.test
+test/sql/sql_export/named_scalar_arguments.test
 test/sql/sql_export/nested_values.test
 test/sql/sql_export/null_safe_mark_roundtrip.test
 test/sql/sql_export/numbered_scan_results.test

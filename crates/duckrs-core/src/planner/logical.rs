@@ -168,6 +168,8 @@ pub enum LogicalOperatorKind {
         /// USING KEY: what each column is; empty without one
         key: Vec<CteKeyColumn>,
         recursive: Box<LogicalOperator>,
+        /// `recursive` before its column bindings were resolved, for `EXPLAIN (SQL)`
+        unresolved: Box<LogicalOperator>,
     },
     /// `LogicalCTERef` of a recursive CTE, inside of its recursive part: the rows of the last round.
     WorkingTable {

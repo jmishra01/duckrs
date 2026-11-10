@@ -757,7 +757,8 @@ impl Binder<'_> {
                 subquery: Arc::new(BoundSubquery {
                     kind,
                     plan,
-                    raw: (!volatile).then_some(raw),
+                    // flattening leaves a volatile one alone; `EXPLAIN (SQL)` reads it
+                    raw: Some(raw),
                     correlated: bindings,
                     volatile,
                     error_on_multiple_rows: self.options.scalar_subquery_error,

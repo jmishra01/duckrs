@@ -381,6 +381,7 @@ impl Binder<'_> {
         let recursive = self.cast_plan(recursive, &types, columns);
         let plan = if used.load(Ordering::Relaxed) || !key.is_empty() {
             let mut recursive = optimize(recursive, self.options.optimizer);
+            let unresolved = Box::new(recursive.clone());
             resolve_column_bindings(&mut recursive)?;
             LogicalOperator::new(
                 LogicalOperatorKind::RecursiveCte {
@@ -391,6 +392,7 @@ impl Binder<'_> {
                     recurring,
                     key,
                     recursive: Box::new(recursive),
+                    unresolved,
                 },
                 vec![anchor.plan],
             )
