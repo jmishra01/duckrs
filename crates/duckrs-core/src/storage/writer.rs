@@ -1236,7 +1236,10 @@ impl<'a> Writer<'a> {
                 let first = valid.next().map(|(value, _)| value);
                 valid.all(|(value, _)| Some(value) == first)
             };
-            if stats.bounds.is_some_and(|(min, max)| min == max) && physical != PhysicalType::Interval && same_bits() {
+            // an all-NULL segment is constant too: its empty statistics have the minimum above the maximum
+            let all_null = !valid_rows.iter().any(|valid| *valid);
+            let constant = all_null || (stats.bounds.is_some_and(|(min, max)| min == max) && same_bits());
+            if constant && physical != PhysicalType::Interval {
                 segments.push(SegmentOut {
                     tuple_count: rows,
                     block_id: -1,

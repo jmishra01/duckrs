@@ -90,6 +90,11 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] files in older storage versions: `ATTACH (STORAGE_VERSION ...)`, `storage_compatibility_version`, the
     header numbers, C++'s version gates in the generated and hand-written serializers, compressions by version
   - [x] DICTIONARY and FSST segments for files before v1.3.0; reading and writing ZSTD segments
+  - [x] compression chosen as `DetectBestCompressionMethod` does, by the `final_analyze` score of each method in
+    C++'s order (UNCOMPRESSED, RLE, BITPACKING, ROARING for validity and booleans), logged as C++ logs it;
+    bitpacking with all of C++'s modes (CONSTANT_DELTA, DELTA_FOR) and types (BOOL, HUGEINT, UHUGEINT)
+  - [ ] the scores of the string methods (DICT_FSST, FSST, DICTIONARY, ZSTD, uncompressed strings), EMPTY validity
+    where DICT_FSST covers the NULLs, the analyze of ALP and ALPRD (scored by their encoded size for now)
   - [ ] the ART layouts of files before v2.0.0 (an index in such a file is refused for now)
   - [ ] dense row id rewriting of files before v2.0.0 (`rowid_gaps/old_storage_*`): row groups stay as they are
   - [x] unshredded VARIANT columns, in the file and the WAL

@@ -597,6 +597,15 @@ struct FileRunner<'a> {
 }
 
 impl<'a> FileRunner<'a> {
+    /// `storage_compatibility_version` of the database open now.
+    fn current_storage_version(&mut self) -> Option<String> {
+        let con = self.con.as_mut()?;
+        let result = con
+            .query("SELECT current_setting('storage_compatibility_version')")
+            .ok()?;
+        result.rows.first()?.first()?.clone()
+    }
+
     fn open(&mut self) -> Result<(), String> {
         self.named.clear();
         self.con = None;
@@ -810,8 +819,13 @@ impl<'a> FileRunner<'a> {
                 }
                 self.db_path = path;
                 self.read_only = *read_only;
-                // `LoadCommand`: a load without a version goes back to the default
-                self.storage_version = version.clone();
+                // `LoadCommand`: a load without a version takes that of the database before it
+                self.storage_version = match version {
+                    Some(version) => Some(version.clone()),
+                    // only a new file is made in it: a read-only load opens what is there
+                    None if !*read_only => self.current_storage_version(),
+                    None => None,
+                };
                 match self.open() {
                     Ok(()) => Flow::Next,
                     Err(e) => self
