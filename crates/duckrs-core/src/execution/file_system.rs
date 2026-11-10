@@ -17,7 +17,8 @@ fn has_glob(text: &str) -> bool {
 }
 
 /// `Glob` of `file_system.cpp`: `*`, `?` and `[...]`, within one path segment.
-fn glob_match(name: &[u8], pattern: &[u8]) -> bool {
+/// `Glob`: whether `name` matches `pattern` of `*`, `?` and `[...]`.
+pub fn glob_match(name: &[u8], pattern: &[u8]) -> bool {
     let Some((&first, rest)) = pattern.split_first() else {
         return name.is_empty();
     };

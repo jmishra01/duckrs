@@ -93,36 +93,68 @@ impl OptimizerOptions {
 }
 
 /// `Optimizer::Optimize`, in DuckDB's order of these passes.
-pub fn optimize(mut plan: LogicalOperator, options: OptimizerOptions) -> LogicalOperator {
+pub fn optimize(plan: LogicalOperator, options: OptimizerOptions) -> LogicalOperator {
+    optimize_timed(plan, options, &mut Vec::new())
+}
+
+/// [`optimize`], with how long each optimizer took (`Optimizer::RunOptimizer`'s profiling), by
+/// the name C++ gives it.
+pub fn optimize_timed(
+    mut plan: LogicalOperator,
+    options: OptimizerOptions,
+    timings: &mut Vec<(&'static str, std::time::Duration)>,
+) -> LogicalOperator {
+    let mut run =
+        |name: &'static str, plan: LogicalOperator, pass: &mut dyn FnMut(LogicalOperator) -> LogicalOperator| {
+            let start = std::time::Instant::now();
+            let plan = pass(plan);
+            timings.push((name, start.elapsed()));
+            plan
+        };
     if options.expression_rewriter {
-        rewriter::rewrite_plan(&mut plan);
+        plan = run("expression_rewriter", plan, &mut |mut plan| {
+            rewriter::rewrite_plan(&mut plan);
+            plan
+        });
     }
     if options.filter_pushdown {
-        plan = filter_pushdown::push_down(plan);
+        plan = run("filter_pushdown", plan, &mut filter_pushdown::push_down);
     }
     if options.deliminator {
-        deliminator::deliminate(&mut plan);
+        plan = run("deliminator", plan, &mut |mut plan| {
+            deliminator::deliminate(&mut plan);
+            plan
+        });
     }
     if options.filter_pushdown {
         filter_pushdown::convert_mark_joins(&mut plan);
     }
     if options.join_order {
-        plan = join_order::reorder_joins(plan);
+        plan = run("join_order", plan, &mut join_order::reorder_joins);
     }
     if options.statistics_propagation {
-        statistics::propagate_statistics(&mut plan);
+        plan = run("statistics_propagation", plan, &mut |mut plan| {
+            statistics::propagate_statistics(&mut plan);
+            plan
+        });
     }
     if options.empty_result_pullup {
-        plan = empty_result_pullup::pull_up(plan);
+        plan = run("empty_result_pullup", plan, &mut empty_result_pullup::pull_up);
     }
-    top_n::push_limits(&mut plan);
-    top_n::top_n(&mut plan);
+    plan = run("top_n", plan, &mut |mut plan| {
+        top_n::push_limits(&mut plan);
+        top_n::top_n(&mut plan);
+        plan
+    });
     // a column only a scan's filter reads need not leave the scan
     if options.filter_pushdown {
         scan_filters::push_into_scans(&mut plan);
     }
     if options.unused_columns {
-        unused_columns::remove_unused_columns(&mut plan);
+        plan = run("unused_columns", plan, &mut |mut plan| {
+            unused_columns::remove_unused_columns(&mut plan);
+            plan
+        });
     }
     index_scan::plan_index_scans(&mut plan, &options);
     plan
