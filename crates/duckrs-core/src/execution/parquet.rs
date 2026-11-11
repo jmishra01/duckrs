@@ -193,6 +193,13 @@ fn corrupt_file_error(path: &str, message: &str) -> Option<Error> {
             .next()
             .and_then(|rest| rest.split(' ').next())
             .unwrap_or_default();
+        if converted == "INTERVAL" {
+            return error(
+                ErrorKind::DataCorruption,
+                "INTERVAL converted type can only be set for value of Type::FIXED_LEN_BYTE_ARRAY of length 12"
+                    .to_string(),
+            );
+        }
         return error(
             ErrorKind::Io,
             format!("{converted} converted type can only be set for value of Type::{physical}"),
@@ -1132,6 +1139,19 @@ fn batch_chunk(
         }
         if file_type == ty {
             columns.push(vector);
+        } else if file_type.id() == LogicalTypeId::Varchar && ty.id() == LogicalTypeId::Blob {
+            // text read as BLOB keeps its bytes, which a cast would read as escapes
+            let mut blobs = Vector::new(ty.clone(), count);
+            for row in 0..count {
+                let value = vector.get_value(row);
+                let blob = if value.is_null() {
+                    Value::null(ty.clone())
+                } else {
+                    Value::blob(value.try_to_string()?.into_bytes())
+                };
+                blobs.set_value(row, &blob)?;
+            }
+            columns.push(blobs);
         } else {
             let mut cast = Vector::new(ty.clone(), count);
             cast_vector(&vector, &mut cast, count, CastMode::Strict)

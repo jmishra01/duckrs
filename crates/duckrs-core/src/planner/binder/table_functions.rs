@@ -92,6 +92,20 @@ impl Binder<'_> {
         if subquery {
             return Err(binder_error("Table function cannot contain subqueries"));
         }
+        // a parameter of a table macro being created: its value is known when the macro is used
+        let mut macro_parameter = false;
+        duckrs_parser::transformer::visit_expr_mut(&mut expr.clone(), &mut |e: &mut Expr| {
+            macro_parameter |= matches!(
+                &e.kind,
+                duckrs_parser::ast::ExprKind::Constant(literal) if literal.text == super::macros::CREATE_PARAMETER_MARK
+            );
+        });
+        if macro_parameter {
+            return Err(Error::new(
+                ErrorKind::ParameterNotResolved,
+                "Parameter types could not be resolved",
+            ));
+        }
         let mut binder = self.child_binder();
         binder.table_function_argument = true;
         binder.aggregate_error = "Table function cannot contain aggregates!";

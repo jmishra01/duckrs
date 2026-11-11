@@ -1952,6 +1952,7 @@ impl Binder<'_> {
                             | "parquet_file_metadata"
                             | "parquet_bloom_probe"
                             | "parquet_page_index"
+                            | "parquet_full_metadata"
                     )
                 {
                     return self.bind_parquet_metadata(call, table_ref);

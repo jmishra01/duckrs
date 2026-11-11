@@ -108,6 +108,7 @@ impl Binder<'_> {
         let mut int96_as = crate::execution::parquet::Int96As::Timestamp;
         let mut utf8_validation = crate::execution::parquet::Utf8Validation::Strict;
         let mut schema_value = None;
+        let mut allow_empty = false;
         let (mut copy_names, mut copy_types): (Option<Vec<String>>, Option<Vec<LogicalType>>) = (None, None);
         for argument in &args {
             let value = self.constant_argument(&argument.expr)?;
@@ -149,6 +150,7 @@ impl Binder<'_> {
                     }
                     utf8_validation = crate::execution::parquet::Utf8Validation::parse(&value.try_to_string()?)?;
                 }
+                "allow_empty" => allow_empty = is_true(&value, &option)?,
                 "explicit_cardinality" | "can_have_nan" => {}
                 "schema" => schema_value = Some(value),
                 // what COPY ... FROM passes on of the table it loads into
@@ -187,7 +189,7 @@ impl Binder<'_> {
         for pattern in &patterns {
             self.check_file_access(pattern)?;
             let found = file_system::glob_or_directory(pattern, "parquet");
-            if found.is_empty() {
+            if found.is_empty() && !allow_empty {
                 return Err(Error::new(
                     ErrorKind::Io,
                     format!("No files found that match the pattern \"{pattern}\""),
@@ -195,11 +197,13 @@ impl Binder<'_> {
             }
             files.extend(found);
         }
-        if files.is_empty() {
+        // `allow_empty` and no file: one column, and nothing in it
+        let empty = files.is_empty() && allow_empty;
+        if files.is_empty() && !empty {
             return Err(binder_error(format!("{name} needs at least one file to read")));
         }
         let schema = match &schema_value {
-            Some(value) => {
+            Some(value) if !empty => {
                 if union_by_name {
                     return Err(binder_error("'schema' cannot be combined with union_by_name=true"));
                 }
@@ -213,16 +217,17 @@ impl Binder<'_> {
                 crate::execution::parquet::check_schema(&files[0], binary_as_string, int96_as, &columns)?;
                 Some(Arc::new(columns))
             }
-            None => None,
+            _ => None,
         };
         let (mut names, mut types) = match &schema {
+            None if empty => (vec!["empty".to_string()], vec![LogicalType::BOOLEAN]),
             Some(columns) => (
                 columns.iter().map(|c| c.name.clone()).collect(),
                 columns.iter().map(|c| c.ty.clone()).collect(),
             ),
             None => file_schema(&files[0], binary_as_string, int96_as)?,
         };
-        if union_by_name {
+        if union_by_name && !empty {
             for path in &files[1..] {
                 let (file_names, file_types) = file_schema(path, binary_as_string, int96_as)?;
                 for (column, ty) in file_names.iter().zip(&file_types) {
@@ -430,6 +435,29 @@ impl Binder<'_> {
                 ));
             }
             files.extend(found);
+        }
+        // `FullMetadataProcessor`: a row per file, with the rows of each of the others as a list
+        if name == "parquet_full_metadata" {
+            let parts: Vec<String> = files
+                .iter()
+                .map(|file| {
+                    // the errors of the file are those of reading its metadata
+                    metadata_rows(file)?;
+                    let path = string_literal(file);
+                    let list = |function: &str| {
+                        format!("(SELECT coalesce(list(t), []) FROM {function}({path}) t) AS {function}")
+                    };
+                    Ok(format!(
+                        "SELECT {}, {}, {}, {}",
+                        list("parquet_file_metadata"),
+                        list("parquet_metadata"),
+                        list("parquet_schema"),
+                        list("parquet_kv_metadata")
+                    ))
+                })
+                .collect::<Result<_>>()?;
+            let select = parse_select(&parts.join(" UNION ALL "), "Expected a single SELECT statement")?;
+            return self.bind_rewritten(&select, table_ref, &name);
         }
         let (columns, empty) = match name.as_str() {
             "parquet_metadata" => (METADATA_COLUMNS, METADATA_EMPTY),
@@ -718,6 +746,13 @@ impl Binder<'_> {
                         };
                         writer.key_values.push((key.clone(), bytes));
                     }
+                }
+                _ if !super::copy::is_copy_option(PARQUET_COPY_OPTIONS, &name) => {
+                    return Err(super::copy::unrecognized_copy_option(
+                        &name,
+                        "parquet",
+                        PARQUET_COPY_OPTIONS,
+                    ));
                 }
                 _ => return Err(crate::unported(format!("the COPY option {name} for Parquet"))),
             }
@@ -1041,3 +1076,35 @@ fn parse_field_ids(
     }
     Ok(ids)
 }
+
+/// `ParquetCopyOptions`.
+const PARQUET_COPY_OPTIONS: &[&str] = &[
+    "compression",
+    "codec",
+    "field_ids",
+    "kv_metadata",
+    "encryption_config",
+    "dictionary_size_limit",
+    "string_dictionary_page_size_limit",
+    "data_page_size_limit",
+    "bloom_filter_false_positive_ratio",
+    "debug_use_openssl",
+    "write_bloom_filter",
+    "bloom_filter_fallback_max_bytes",
+    "write_page_index",
+    "compression_level",
+    "parquet_version",
+    "binary_as_string",
+    "file_row_number",
+    "can_have_nan",
+    "int96_as",
+    "geoparquet_version",
+    "shredding",
+    "write_timestamp_as_int96",
+    "timestamp_is_adjusted_to_utc",
+    "row_group_size",
+    "chunk_size",
+    "row_group_size_bytes",
+    "row_groups_per_file",
+    "dictionary_compression_ratio_threshold",
+];
