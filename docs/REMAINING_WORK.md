@@ -296,11 +296,15 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] threads for tables in their file (a row group per morsel) and for both inputs of delim joins
   - [x] reading the file: one-load bit unpacking, contiguous vector copies, shared strings in scan buffers,
     one string buffer per segment scan, `Vector::set_strs`
-  - [ ] dictionary vectors for dictionary-compressed strings (as C++ emits them), group keys without a
-    byte key per row, aggregate states not behind an enum per row, filters on compressed data
+  - [x] dictionary vectors for DICT_FSST string columns, comparisons and group lookups on their entries
+  - [x] a partitioned, parallel aggregate finalize for many groups; a Top-N boundary
+  - [x] vectorized decimal scale-ups, date parts, CASE results; LIKE with substring search
+  - [ ] the hash join probe (C++'s salt/pointer table), group keys without a byte key per row, aggregate
+    states not behind an enum per row, filters on compressed data, morsels smaller than a row group
 - [ ] 48. v1 gate: TPC-H SF10 geometric mean ≤ 1.5× C++ DuckDB, and no query slower than 3×. The runner
   prints the gate after `--engine=both`. On TPC-H SF1 (8 threads, all 22 answers correct) duckrs is at
-  2.56× (Q19 5.1×; Q02 0.95×), from 12.7× at the start of item 47
+  1.79× (none above 3×: Q21 2.9×, Q10 2.7×; Q02 0.6×), from 12.7× at the start of item 47. SF10 is not
+  measured yet
 
 ## Phase 14: Extensions (not started)
 
