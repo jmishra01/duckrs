@@ -831,7 +831,89 @@ pub(super) fn integer_value(input: i128, target: &LogicalType) -> Result<Value> 
 }
 
 /// Casts from or to DECIMAL, row by row.
+/// The value of row `index` of a decimal's data, whatever its physical type.
+fn decimal_at(data: &duckrs_common::vector::UnifiedFormat, physical: PhysicalType, index: usize) -> i128 {
+    match physical {
+        PhysicalType::Int16 => i128::from(data.data::<i16>()[index]),
+        PhysicalType::Int32 => i128::from(data.data::<i32>()[index]),
+        PhysicalType::Int64 => i128::from(data.data::<i64>()[index]),
+        _ => data.data::<i128>()[index],
+    }
+}
+
+/// `DecimalScaleUpCheck` / `DecimalScaleUp` on whole vectors: a decimal to a decimal of the same or a
+/// larger scale, as integers multiplied by a power of ten. `false` (and nothing written) when a value
+/// does not fit, which the cast by value then reports.
+fn decimal_scale_up(source: &Vector, result: &mut Vector, count: usize) -> Result<bool> {
+    let (Some((_, from_scale)), Some((to_width, to_scale))) = (
+        source.logical_type().decimal_properties(),
+        result.logical_type().decimal_properties(),
+    ) else {
+        return Ok(false);
+    };
+    if to_scale < from_scale || to_width > 38 {
+        return Ok(false);
+    }
+    let factor = 10i128.pow(u32::from(to_scale - from_scale));
+    let limit = 10i128.pow(u32::from(to_width));
+    let (source_physical, target_physical) = (source.physical_type(), result.physical_type());
+    if !matches!(
+        source_physical,
+        PhysicalType::Int16 | PhysicalType::Int32 | PhysicalType::Int64 | PhysicalType::Int128
+    ) {
+        return Ok(false);
+    }
+    let constant = source.vector_type() == duckrs_common::vector::VectorType::Constant;
+    let rows = if constant { 1 } else { count };
+    let data = source.to_unified(rows);
+    let mut values = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let index = data.sel.get(row);
+        if !data.validity.is_valid(index) {
+            values.push(None);
+            continue;
+        }
+        match decimal_at(&data, source_physical, index).checked_mul(factor) {
+            Some(value) if value.abs() < limit => values.push(Some(value)),
+            _ => return Ok(false),
+        }
+    }
+    result.prepare_flat(rows.max(1));
+    macro_rules! write {
+        ($t:ty) => {{
+            let out = result.data_mut::<$t>();
+            for (row, value) in values.iter().enumerate() {
+                if let Some(value) = value {
+                    out[row] = *value as $t;
+                }
+            }
+        }};
+    }
+    match target_physical {
+        PhysicalType::Int16 => write!(i16),
+        PhysicalType::Int32 => write!(i32),
+        PhysicalType::Int64 => write!(i64),
+        PhysicalType::Int128 => write!(i128),
+        _ => return Ok(false),
+    }
+    for (row, value) in values.iter().enumerate() {
+        if value.is_none() {
+            result.set_null(row, true);
+        }
+    }
+    if constant {
+        result.set_constant();
+    }
+    Ok(true)
+}
+
 fn decimal_cast(source: &Vector, result: &mut Vector, count: usize, mode: CastMode) -> Result<()> {
+    if source.logical_type().id() == LogicalTypeId::Decimal
+        && result.logical_type().id() == LogicalTypeId::Decimal
+        && decimal_scale_up(source, result, count)?
+    {
+        return Ok(());
+    }
     let target = result.logical_type().clone();
     let constant = source.vector_type() == duckrs_common::vector::VectorType::Constant;
     let rows = if constant { 1 } else { count };

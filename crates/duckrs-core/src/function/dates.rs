@@ -272,9 +272,66 @@ fn date_part_call(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+/// `DatePart::YearOperator` and the like on a whole vector of finite dates into BIGINT: the parts
+/// from the days, without a value per row. `false` (nothing written) for anything else.
+fn date_parts_of_dates(args: &DataChunk, result: &mut Vector, part: DatePart) -> Result<bool> {
+    use duckrs_common::types::Date;
+    if !matches!(
+        part,
+        DatePart::Year | DatePart::Month | DatePart::Day | DatePart::Quarter
+    ) || args.columns()[0].logical_type().id() != LogicalTypeId::Date
+        || result.logical_type().id() != LogicalTypeId::BigInt
+    {
+        return Ok(false);
+    }
+    let input = &args.columns()[0];
+    let constant = input.vector_type() == duckrs_common::vector::VectorType::Constant;
+    let rows = if constant { 1 } else { args.len() };
+    let data = input.to_unified(rows);
+    let days = data.data::<i32>();
+    let mut values = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let index = data.sel.get(row);
+        if !data.validity.is_valid(index) {
+            values.push(None);
+            continue;
+        }
+        let date = Date(days[index]);
+        if !date.is_finite() {
+            return Ok(false);
+        }
+        let (year, month, day) = date.to_ymd();
+        values.push(Some(i64::from(match part {
+            DatePart::Year => year,
+            DatePart::Month => month,
+            DatePart::Day => day,
+            _ => (month - 1) / 3 + 1,
+        })));
+    }
+    result.prepare_flat(rows.max(1));
+    let out = result.data_mut::<i64>();
+    for (row, value) in values.iter().enumerate() {
+        if let Some(value) = value {
+            out[row] = *value;
+        }
+    }
+    for (row, value) in values.iter().enumerate() {
+        if value.is_none() {
+            result.set_null(row, true);
+        }
+    }
+    if constant {
+        result.set_constant();
+    }
+    Ok(true)
+}
+
 macro_rules! part_function {
     ($name:ident, $part:ident) => {
         fn $name(args: &DataChunk, result: &mut Vector) -> Result<()> {
+            if date_parts_of_dates(args, result, DatePart::$part)? {
+                return Ok(());
+            }
             let ty = result.logical_type().clone();
             strict_rows(args, result, |row| part_value(DatePart::$part, &row[0], &ty))
         }
