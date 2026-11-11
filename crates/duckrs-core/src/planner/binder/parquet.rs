@@ -106,6 +106,7 @@ impl Binder<'_> {
         let mut filename = None;
         let mut hive_options = super::copy::HiveOptions::default();
         let mut int96_as = crate::execution::parquet::Int96As::Timestamp;
+        let mut utf8_validation = crate::execution::parquet::Utf8Validation::Strict;
         let mut schema_value = None;
         for argument in &args {
             let value = self.constant_argument(&argument.expr)?;
@@ -139,6 +140,12 @@ impl Binder<'_> {
                             )));
                         }
                     };
+                }
+                "utf8_validation" => {
+                    if value.is_null() {
+                        return Err(binder_error("Parquet utf8_validation cannot be empty!"));
+                    }
+                    utf8_validation = crate::execution::parquet::Utf8Validation::parse(&value.try_to_string()?)?;
                 }
                 "explicit_cardinality" | "can_have_nan" => {}
                 "schema" => schema_value = Some(value),
@@ -229,6 +236,10 @@ impl Binder<'_> {
         }
         let mut hive = Vec::new();
         let mut hive_overrides = Vec::new();
+        // with `schema`, hive partitioning is asked for (hive_partitioning or hive_types) rather than detected
+        if schema.is_some() && hive_options.wanted.is_none() && hive_options.types.is_empty() {
+            hive_options.wanted = Some(false);
+        }
         for (key, ty) in super::copy::hive_partition_columns(&files, &hive_options)? {
             match names.iter().position(|n| n.eq_ignore_ascii_case(&key)) {
                 // a column of the file as well: the path gives its values, and its type
@@ -292,6 +303,7 @@ impl Binder<'_> {
             types,
             binary_as_string,
             int96_as,
+            utf8_validation,
             union_by_name,
             file_row_number,
             filename: filename.is_some(),

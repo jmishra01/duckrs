@@ -1163,6 +1163,25 @@ pub(crate) fn make_valid(bytes: &[u8], flag: char) -> String {
     }
 }
 
+/// `Utf8Proc::RemoveInvalid`: the bytes of each invalid sequence left out.
+pub(crate) fn remove_invalid(bytes: &[u8]) -> String {
+    let mut result = String::with_capacity(bytes.len());
+    let mut rest = bytes;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(valid) => {
+                result.push_str(valid);
+                return result;
+            }
+            Err(error) => {
+                let (valid, after) = rest.split_at(error.valid_up_to());
+                result.push_str(std::str::from_utf8(valid).expect("checked"));
+                rest = &after[error.error_len().unwrap_or(after.len())..];
+            }
+        }
+    }
+}
+
 /// `CSVGlobalState::FillRejectsTable`.
 fn flush_rejects(scan: &CsvScanData, state: &mut CsvScanState) -> Result<()> {
     let Some(rejects) = &scan.rejects else {

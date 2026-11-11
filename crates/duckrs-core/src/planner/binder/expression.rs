@@ -1470,6 +1470,16 @@ impl Binder<'_> {
                         .collect::<Result<Vec<_>>>()?;
                     return bind_nested_function(&function.name.name, names, children);
                 }
+                // `AliasFun`: the name of its argument
+                if function.name.name.eq_ignore_ascii_case("alias")
+                    && function.name.qualification.iter().all(String::is_empty)
+                    && let [argument] = function.args.as_slice()
+                    && argument.name.is_empty()
+                {
+                    self.bind_expression(&argument.expr)?;
+                    let name = super::statements::expression_name(&argument.expr);
+                    return Ok(BoundExpr::constant(Value::varchar(name)));
+                }
                 // the macros of the system catalog (`DefaultFunctionGenerator`), where no function has
                 // the name
                 if BuiltinFunctions::get().scalar(&function.name.name).is_none() {
