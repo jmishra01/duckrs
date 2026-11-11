@@ -6,7 +6,9 @@ use super::copy::{is_true, strings};
 use super::table_functions::{named_argument, parse_select};
 use super::{Binder, Binding, binder_error};
 use crate::execution::file_system::{self, Compression, read_file};
-use crate::execution::json_scan::{Formats, JsonFormat, JsonScanData, infer, read_records, record_error, refine_type};
+use crate::execution::json_scan::{
+    Formats, JsonFormat, JsonScanData, infer_with, read_records, record_error, refine_type,
+};
 use crate::function::json::{Json, TABLE_IN_OUT_COLUMNS, json_type};
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
@@ -31,6 +33,7 @@ impl Binder<'_> {
     /// `ReadJSONBind`.
     pub(super) fn bind_read_json(&mut self, call: &FunctionExpr, table_ref: &TableRef) -> Result<LogicalOperator> {
         let name = call.name.name.to_lowercase();
+        let single = name == "read_single_json_file";
         let objects = name.contains("objects");
         let mut format = if name.contains("ndjson") {
             JsonFormat::NewlineDelimited
@@ -43,6 +46,7 @@ impl Binder<'_> {
         let mut columns: Option<Vec<(String, LogicalType)>> = None;
         let (mut auto_detect, mut ignore_errors) = (None, false);
         let (mut sample_size, mut maximum_depth) = (20480usize, -1i64);
+        let mut map_inference = true;
         let mut formats = Formats {
             missing_keys_are_null: true,
             map_threshold: Some(200),
@@ -58,8 +62,19 @@ impl Binder<'_> {
                 if paths.is_some() {
                     return Err(binder_error(format!("{name} takes one positional parameter")));
                 }
+                if single && value.is_null() {
+                    return Err(binder_error("read_single_json_file requires a non-NULL file name"));
+                }
                 if value.is_null() {
                     return Err(binder_error(format!("{name} cannot take NULL list as parameter")));
+                }
+                // `ReadSingleJSONFileBind`: one file, by its name
+                if single && value.logical_type().id() != LogicalTypeId::Varchar {
+                    return Err(binder_error(format!(
+                        "read_single_json_file reads a single file - given as a VARCHAR path or as a file struct, not \
+                         as {}",
+                        value.logical_type()
+                    )));
                 }
                 paths = Some(strings(&value)?);
                 continue;
@@ -73,12 +88,28 @@ impl Binder<'_> {
             };
             match option.as_str() {
                 "format" | "json_format" => format = format_of(&value.try_to_string()?)?,
+                // records is tri-state, and a boolean is one of its two others
                 "records" => {
-                    records = match value.try_to_string()?.to_lowercase().as_str() {
+                    let text = match value.logical_type().id() {
+                        LogicalTypeId::Boolean => value.try_to_string()?,
+                        LogicalTypeId::Varchar => value.try_to_string()?,
+                        _ => {
+                            return Err(binder_error(format!(
+                                "read_json \"records\" parameter must be a string ('auto', 'true' or 'false') or a \
+                                 boolean, not {}",
+                                value.logical_type()
+                            )));
+                        }
+                    };
+                    records = match text.as_str() {
                         "auto" => None,
                         "true" => Some(true),
                         "false" => Some(false),
-                        _ => return Err(binder_error("\"records\" must be one of ['auto', 'true', 'false']")),
+                        _ => {
+                            return Err(binder_error(
+                                "read_json requires \"records\" to be one of ['auto', 'true', 'false'].",
+                            ));
+                        }
                     };
                 }
                 "lines" => {
@@ -129,12 +160,14 @@ impl Binder<'_> {
                 "dateformat" | "date_format" => formats.date = Some(value.try_to_string()?),
                 "timestampformat" | "timestamp_format" => formats.timestamp = Some(value.try_to_string()?),
                 "compression" => compression = Compression::parse(&value.try_to_string()?)?,
+                // -1 (`DConstants::INVALID_INDEX`): no objects become MAPs
+                "map_inference_threshold" => map_inference = number()? != -1,
                 "maximum_object_size"
-                | "map_inference_threshold"
                 | "field_appearance_threshold"
                 | "maximum_sample_files"
                 | "convert_strings_to_integers" => {}
                 "union_by_name" => union_by_name = is_true(&value, &option)?,
+                "case_insensitive_keys" => formats.case_insensitive = is_true(&value, &option)?,
                 "hive_partitioning" | "hive_types" | "hive_type" | "hive_types_autocast" | "hive_type_autocast" => {
                     self.take_hive_option(&mut hive_options, &option, &value)?;
                 }
@@ -148,7 +181,19 @@ impl Binder<'_> {
         let mut files = Vec::new();
         for pattern in &patterns {
             self.check_file_access(pattern)?;
-            let found = file_system::glob_or_directory(pattern, "json");
+            let found = if single {
+                // the file itself, never a pattern
+                if std::path::Path::new(pattern).is_file() {
+                    vec![pattern.clone()]
+                } else {
+                    return Err(Error::new(
+                        ErrorKind::Io,
+                        format!("Cannot open file \"{pattern}\": No such file or directory"),
+                    ));
+                }
+            } else {
+                file_system::glob_or_directory(pattern, "json")
+            };
             if found.is_empty() {
                 return Err(Error::new(
                     ErrorKind::Io,
@@ -160,7 +205,7 @@ impl Binder<'_> {
         let auto_detect = auto_detect.unwrap_or(columns.is_none());
         if !auto_detect && columns.is_none() && !objects {
             return Err(binder_error(
-                "read_json \"columns\" parameter is required when auto_detect is false",
+                "When auto_detect=false, read_json requires columns to be specified through the \"columns\" parameter.",
             ));
         }
         let (names, types, use_records) = if objects {
@@ -175,7 +220,7 @@ impl Binder<'_> {
                 let (found, _) = read_records(&data, format);
                 for record in found {
                     match record {
-                        Ok(record) => sampled.push(record),
+                        Ok((record, _)) => sampled.push(record),
                         Err(_) if ignore_errors => {}
                         Err(error) => return Err(record_error(path, &data, &error)),
                     }
@@ -188,26 +233,41 @@ impl Binder<'_> {
                 }
             }
             let references: Vec<&Json> = sampled.iter().collect();
-            let structure = infer(&references);
-            let ty = structure.logical_type(maximum_depth);
+            let structure = infer_with(&references, formats.case_insensitive);
+            let ty = structure.logical_type_with(maximum_depth, map_inference);
             let ty = refine_type(ty, &references, &formats);
             let is_object = ty.id() == LogicalTypeId::Struct;
             let use_records = records.unwrap_or(is_object);
             if use_records && !is_object {
                 if records == Some(true) {
                     return Err(binder_error(
-                        "read_json requires records of objects to be read with records=true",
+                        "json_read expected records, but got non-record JSON instead.\n Try setting records='auto' or \
+                         records='false'.",
                     ));
                 }
-                (vec!["json".to_string()], vec![ty], false)
+                (
+                    vec!["json".to_string()],
+                    vec![remove_duplicate_struct_keys(&ty, ignore_errors)?],
+                    false,
+                )
             } else if use_records {
-                let (names, types) = ty.struct_children().iter().cloned().unzip();
+                let (names, types): (Vec<String>, Vec<LogicalType>) = ty.struct_children().iter().cloned().unzip();
+                let types = types
+                    .iter()
+                    .map(|ty| remove_duplicate_struct_keys(ty, ignore_errors))
+                    .collect::<Result<_>>()?;
                 (names, types, true)
             } else {
-                (vec!["json".to_string()], vec![ty], false)
+                (
+                    vec!["json".to_string()],
+                    vec![remove_duplicate_struct_keys(&ty, ignore_errors)?],
+                    false,
+                )
             }
         };
-        let mut output_names = names.clone();
+        // `BindTableFunction`: names of keys that differ in case only are made unique; the scan
+        // still reads each key by its own name
+        let mut output_names = super::copy::unique_names(&names);
         let mut output_types = types.clone();
         if let Some(column) = &filename {
             output_names.push(column.clone());
@@ -245,6 +305,7 @@ impl Binder<'_> {
             names,
             types,
             ignore_errors,
+            auto_detect,
             case_insensitive: formats.case_insensitive,
             date_format: formats.date,
             timestamp_format: formats.timestamp,
@@ -302,4 +363,38 @@ impl Binder<'_> {
         binding.types.truncate(visible);
         Ok(plan)
     }
+}
+
+/// `RemoveDuplicateStructKeys`: of fields that are the same name in another case, the first; the
+/// others are an error unless errors are ignored.
+fn remove_duplicate_struct_keys(ty: &LogicalType, ignore_errors: bool) -> Result<LogicalType> {
+    Ok(match ty.id() {
+        LogicalTypeId::Struct => {
+            let mut fields: Vec<(String, LogicalType)> = Vec::new();
+            for (name, child) in ty.struct_children() {
+                if fields.iter().any(|(seen, _)| seen.eq_ignore_ascii_case(name)) {
+                    if ignore_errors {
+                        continue;
+                    }
+                    return Err(Error::not_implemented(format!(
+                        "Duplicate name {name} in struct auto-detected in JSON, try ignore_errors=true"
+                    )));
+                }
+                fields.push((name.clone(), remove_duplicate_struct_keys(child, ignore_errors)?));
+            }
+            LogicalType::struct_type(fields)
+        }
+        LogicalTypeId::Map => {
+            let entry = ty.child_type().map(LogicalType::struct_children).unwrap_or_default();
+            LogicalType::map(
+                remove_duplicate_struct_keys(&entry[0].1, ignore_errors)?,
+                remove_duplicate_struct_keys(&entry[1].1, ignore_errors)?,
+            )
+        }
+        LogicalTypeId::List => LogicalType::list(remove_duplicate_struct_keys(
+            ty.child_type().expect("a LIST has a child"),
+            ignore_errors,
+        )?),
+        _ => ty.clone(),
+    })
 }

@@ -200,9 +200,12 @@ fn dollar_path(text: &str) -> Result<Path> {
                 while matches!(bytes.get(at), Some(b'0'..=b'9')) {
                     at += 1;
                 }
-                let index = text[start..at].parse::<usize>().ok();
+                // `ReadInteger`: at most 19 digits, then the closing bracket
+                let index = (at - start <= 19)
+                    .then(|| text[start..at].parse::<usize>().ok())
+                    .flatten();
                 let (Some(index), Some(b']')) = (index, bytes.get(at)) else {
-                    return Err(path_error(text, at));
+                    return Err(path_error(text, start));
                 };
                 at += 1;
                 steps.push(if reverse {
@@ -497,6 +500,18 @@ pub fn transform_with(json: &Json, ty: &LogicalType, strict: bool, formats: &For
     }
     let transform = |json: &Json, ty: &LogicalType, strict: bool| transform_with(json, ty, strict, formats);
     let fail = |json: &Json| -> Result<Value> {
+        // `TransformDecimal`: of the value, what `ValToString` writes of it
+        if strict && ty.id() == LogicalTypeId::Decimal {
+            let mut text = json.text();
+            if text.len() > 50 {
+                let mut end = 50;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text = format!("{}...", &text[..end]);
+            }
+            return Err(invalid(format!("Failed to cast value to decimal: {text}")));
+        }
         if strict {
             Err(invalid(format!("Unable to cast '{}' to {ty}", json.text())))
         } else {
@@ -505,6 +520,11 @@ pub fn transform_with(json: &Json, ty: &LogicalType, strict: bool, formats: &For
     };
     if matches!(json, Json::Null) {
         return Ok(Value::null(ty.clone()));
+    }
+    // `ReadRawNumber`: numbers kept as text for a DECIMAL read as the default flags would read them
+    // into anything that has no DECIMAL in it
+    if !contains_decimal(ty) && has_raw_number(json) {
+        return transform_with(&reread_raw_numbers(json.clone()), ty, strict, formats);
     }
     if is_json_type(ty) {
         return Value::varchar(json.text()).reinterpret(ty);
@@ -516,17 +536,15 @@ pub fn transform_with(json: &Json, ty: &LogicalType, strict: bool, formats: &For
     match (ty.id(), json) {
         (LogicalTypeId::SqlNull, _) => Ok(Value::null(ty.clone())),
         (LogicalTypeId::Varchar, Json::Str(text)) => Ok(Value::varchar(text.as_str())),
+        // `TransformToBlob`: a string is cast, anything else is the bytes of its text
+        (LogicalTypeId::Blob, Json::Str(_)) => fail_or_cast(json, ty, strict),
+        (LogicalTypeId::Blob, other) => Value::new(ty.clone(), ValueData::Bytes(other.text().into_bytes())),
         (LogicalTypeId::Varchar, other) => Ok(Value::varchar(other.text())),
         (LogicalTypeId::Struct, Json::Object(items)) => {
             let mut fields = Vec::with_capacity(ty.struct_children().len());
             for (name, child) in ty.struct_children() {
-                let found = if formats.case_insensitive {
-                    items.iter().find(|(k, _)| k.eq_ignore_ascii_case(name))
-                } else {
-                    items.iter().find(|(k, _)| k == name)
-                };
-                match found {
-                    Some((_, item)) => fields.push(transform(item, child, strict)?),
+                match object_member(json, items, name, formats)? {
+                    Some(item) => fields.push(transform(item, child, strict)?),
                     None if strict && !formats.missing_keys_are_null => {
                         return Err(invalid(format!("Object {} does not have key \"{name}\"", json.text())));
                     }
@@ -567,6 +585,42 @@ pub fn transform_with(json: &Json, ty: &LogicalType, strict: bool, formats: &For
             }
             Value::new(ty.clone(), ValueData::List(values))
         }
+        // `TransformValueIntoUnion`: an object of one key, the member it names
+        (LogicalTypeId::Union, _) => {
+            let error = |message: String| -> Result<Value> {
+                if strict {
+                    Err(invalid(message))
+                } else {
+                    Ok(Value::null(ty.clone()))
+                }
+            };
+            let Json::Object(items) = json else {
+                return error(format!(
+                    "Expected an object representing a union, got {}",
+                    yyjson_type_desc(json)
+                ));
+            };
+            let (key, item) = match items.as_slice() {
+                [] => return error("Found empty object, instead of union".to_string()),
+                [entry] => (&entry.0, &entry.1),
+                _ => return error("Found object containing more than one key, instead of union".to_string()),
+            };
+            // the first child of a UNION is its tag
+            let members = &ty.struct_children()[1..];
+            let Some(tag) = members.iter().position(|(name, _)| name == key) else {
+                return error(format!("Found object containing unknown key, instead of union: {key}"));
+            };
+            let member = transform(item, &members[tag].1, strict)?;
+            let mut fields = vec![Value::utinyint(tag as u8)];
+            for (at, (_, member_type)) in members.iter().enumerate() {
+                fields.push(if at == tag {
+                    member.clone()
+                } else {
+                    Value::null(member_type.clone())
+                });
+            }
+            Value::new(ty.clone(), ValueData::Struct(fields))
+        }
         (LogicalTypeId::Struct | LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Map, _) => fail(json),
         (_, Json::Array(_) | Json::Object(_)) => fail(json),
         (_, Json::Bool(flag)) => match cast_value(&Value::boolean(*flag), ty) {
@@ -593,6 +647,125 @@ pub fn transform_with(json: &Json, ty: &LogicalType, strict: bool, formats: &For
             Some(value) => Ok(value),
             None => fail(json),
         },
+    }
+}
+
+/// `TransformObjectInternal`'s key lookup: the value of the member `name` (by its spelling, or any
+/// with `case_insensitive_keys`); the first of several, which is an error with `error_duplicate_key`.
+pub fn object_member<'a>(
+    object: &Json,
+    items: &'a [(String, Json)],
+    name: &str,
+    formats: &Formats,
+) -> Result<Option<&'a Json>> {
+    let matches = |key: &str| {
+        if formats.case_insensitive {
+            key.eq_ignore_ascii_case(name)
+        } else {
+            key == name
+        }
+    };
+    let mut found = items.iter().filter(|(key, _)| matches(key));
+    let first = found.next();
+    if formats.error_duplicate_key
+        && let Some((duplicate, _)) = found.next()
+    {
+        let mut text = object.text();
+        if text.len() > 50 {
+            let mut end = 50;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text = format!("{}...", &text[..end]);
+        }
+        return Err(invalid(format!("Object {text} has duplicate key \"{duplicate}\"")));
+    }
+    Ok(first.map(|(_, value)| value))
+}
+
+/// A string cast to `ty`, or NULL or an error if it isn't one.
+fn fail_or_cast(json: &Json, ty: &LogicalType, strict: bool) -> Result<Value> {
+    let Json::Str(text) = json else {
+        return Ok(Value::null(ty.clone()));
+    };
+    match cast_value(&Value::varchar(text.as_str()), ty) {
+        Some(value) => Ok(value),
+        None if strict => Err(invalid(format!("Unable to cast '{}' to {ty}", json.text()))),
+        None => Ok(Value::null(ty.clone())),
+    }
+}
+
+/// `JSONCommon::NumbersAsRaw`: whether a type has a DECIMAL in it.
+pub fn contains_decimal(ty: &LogicalType) -> bool {
+    match ty.id() {
+        LogicalTypeId::Decimal => true,
+        LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Map => {
+            ty.child_type().is_some_and(contains_decimal)
+        }
+        LogicalTypeId::Struct | LogicalTypeId::Union => {
+            ty.struct_children().iter().any(|(_, child)| contains_decimal(child))
+        }
+        _ => false,
+    }
+}
+
+/// A number kept as text that the default flags read as a number (not a big one, kept as text too).
+fn rereads(json: &Json) -> Option<Json> {
+    match json {
+        Json::Raw(text) => match parse(text) {
+            Ok(number @ (Json::UInt(_) | Json::Int(_) | Json::Real(_))) => Some(number),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether a value has a number in it that `rereads`.
+fn has_raw_number(json: &Json) -> bool {
+    let mut stack = vec![json];
+    while let Some(value) = stack.pop() {
+        match value {
+            Json::Array(items) => stack.extend(items),
+            Json::Object(items) => stack.extend(items.iter().map(|(_, v)| v)),
+            other if rereads(other).is_some() => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The value with each number that `rereads` read again.
+fn reread_raw_numbers(json: Json) -> Json {
+    if let Some(number) = rereads(&json) {
+        return number;
+    }
+    json.map_containers(|container| match container.into_array() {
+        Ok(items) => Json::Array(items.into_iter().map(|item| rereads(&item).unwrap_or(item)).collect()),
+        Err(container) => match container.into_object() {
+            Ok(items) => Json::Object(
+                items
+                    .into_iter()
+                    .map(|(key, item)| (key, rereads(&item).unwrap_or(item)))
+                    .collect(),
+            ),
+            Err(other) => other,
+        },
+    })
+}
+
+/// `yyjson_get_type_desc`.
+fn yyjson_type_desc(json: &Json) -> &'static str {
+    match json {
+        Json::Null => "null",
+        Json::Bool(true) => "true",
+        Json::Bool(false) => "false",
+        Json::UInt(_) => "uint",
+        Json::Int(_) => "sint",
+        Json::Real(_) => "real",
+        Json::Raw(_) => "raw",
+        Json::Str(_) => "string",
+        Json::Array(_) => "array",
+        Json::Object(_) => "object",
     }
 }
 
@@ -639,6 +812,19 @@ pub enum Structure {
 
 impl Structure {
     pub fn of(json: &Json) -> Structure {
+        Self::of_with(json, false)
+    }
+
+    /// `JSONStructure::ExtractStructure`, with `case_insensitive` keys that differ in case one key,
+    /// named by its first spelling (`case_insensitive_keys`).
+    pub fn of_with(json: &Json, case_insensitive: bool) -> Structure {
+        let same = |a: &str, b: &str| {
+            if case_insensitive {
+                a.eq_ignore_ascii_case(b)
+            } else {
+                a == b
+            }
+        };
         match json {
             Json::Null => Structure::Null,
             Json::Bool(_) => Structure::Scalar("BOOLEAN"),
@@ -649,16 +835,16 @@ impl Structure {
             Json::Array(items) => {
                 let mut element = Structure::Null;
                 for item in items {
-                    element = element.merge(Structure::of(item));
+                    element = element.merge_with(Structure::of_with(item, case_insensitive), case_insensitive);
                 }
                 Structure::List(Box::new(element))
             }
             Json::Object(items) => {
                 let mut fields: Vec<(String, Structure)> = Vec::with_capacity(items.len());
                 for (key, value) in items {
-                    let structure = Structure::of(value);
-                    match fields.iter_mut().find(|(k, _)| k == key) {
-                        Some((_, existing)) => *existing = existing.clone().merge(structure),
+                    let structure = Structure::of_with(value, case_insensitive);
+                    match fields.iter_mut().find(|(k, _)| same(k, key)) {
+                        Some((_, existing)) => *existing = existing.clone().merge_with(structure, case_insensitive),
                         None => fields.push((key.clone(), structure)),
                     }
                 }
@@ -668,6 +854,17 @@ impl Structure {
     }
 
     pub fn merge(self, other: Structure) -> Structure {
+        self.merge_with(other, false)
+    }
+
+    pub fn merge_with(self, other: Structure, case_insensitive: bool) -> Structure {
+        let same = |a: &str, b: &str| {
+            if case_insensitive {
+                a.eq_ignore_ascii_case(b)
+            } else {
+                a == b
+            }
+        };
         match (self, other) {
             (Structure::Null, other) | (other, Structure::Null) => other,
             (Structure::Scalar(a), Structure::Scalar(b)) => {
@@ -680,11 +877,11 @@ impl Structure {
                     _ => Structure::Mixed,
                 }
             }
-            (Structure::List(a), Structure::List(b)) => Structure::List(Box::new(a.merge(*b))),
+            (Structure::List(a), Structure::List(b)) => Structure::List(Box::new(a.merge_with(*b, case_insensitive))),
             (Structure::Object(mut a), Structure::Object(b)) => {
                 for (key, value) in b {
-                    match a.iter_mut().find(|(k, _)| *k == key) {
-                        Some((_, existing)) => *existing = existing.clone().merge(value),
+                    match a.iter_mut().find(|(k, _)| same(k, &key)) {
+                        Some((_, existing)) => *existing = existing.clone().merge_with(value, case_insensitive),
                         None => a.push((key, value)),
                     }
                 }
@@ -699,6 +896,8 @@ impl Structure {
             Structure::Null => Json::Str("NULL".to_string()),
             Structure::Scalar(name) => Json::Str((*name).to_string()),
             Structure::List(element) => Json::Array(vec![element.to_json()]),
+            // an empty object has no structure of its own
+            Structure::Object(fields) if fields.is_empty() => Json::Str("JSON".to_string()),
             Structure::Object(fields) => Json::Object(fields.iter().map(|(k, v)| (k.clone(), v.to_json())).collect()),
             Structure::Mixed => Json::Str("JSON".to_string()),
         }
@@ -706,6 +905,11 @@ impl Structure {
 
     /// `JSONStructure::StructureToType`
     pub fn logical_type(&self, depth: i64) -> LogicalType {
+        self.logical_type_with(depth, true)
+    }
+
+    /// `StructureToType`, with `maps` whether `map_inference_threshold` lets objects be MAPs.
+    pub fn logical_type_with(&self, depth: i64, maps: bool) -> LogicalType {
         if depth == 0 {
             return json_type();
         }
@@ -716,12 +920,16 @@ impl Structure {
             Structure::Scalar("UBIGINT" | "BIGINT") => LogicalType::BIGINT,
             Structure::Scalar("DOUBLE") => LogicalType::DOUBLE,
             Structure::Scalar(_) => LogicalType::VARCHAR,
-            Structure::List(element) => LogicalType::list(element.logical_type(depth - 1)),
+            Structure::List(element) => LogicalType::list(element.logical_type_with(depth - 1, maps)),
+            // `StructureToTypeObject`: an empty object is a MAP of what it could hold
+            Structure::Object(fields) if fields.is_empty() && maps => {
+                LogicalType::map(LogicalType::VARCHAR, json_type())
+            }
             Structure::Object(fields) if fields.is_empty() => json_type(),
             Structure::Object(fields) => LogicalType::struct_type(
                 fields
                     .iter()
-                    .map(|(k, v)| (k.clone(), v.logical_type(depth - 1)))
+                    .map(|(k, v)| (k.clone(), v.logical_type_with(depth - 1, maps)))
                     .collect(),
             ),
         }
@@ -842,8 +1050,8 @@ fn document(value: &Value) -> Result<Option<Json>> {
 /// A value to put in a document: text that is JSON is that JSON.
 fn inserted(value: &Value) -> Result<Json> {
     if value.logical_type().id() == LogicalTypeId::Varchar && !value.is_null() {
-        let text = value.try_to_string()?;
-        return Ok(parse(&text).unwrap_or(Json::Str(text)));
+        // the value is a JSON argument: text that isn't JSON fails its cast
+        return parsed(&value.try_to_string()?);
     }
     value_to_json(value)
 }
@@ -1100,33 +1308,63 @@ fn to_json(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
-/// `yyjson_merge_patch`: what the patch doesn't name, then what it does.
+/// `yyjson_merge_patch`: what the patch doesn't name, then what it does. Without recursion: each
+/// object of the patch that merges into one of the target is a frame of its own.
 fn merge_patch(target: Json, patch: &Json) -> Json {
+    struct Frame<'a> {
+        key: String,
+        merged: Vec<(String, Json)>,
+        /// the members of the target that the patch names, for what it names them as
+        patched: Vec<(String, Json)>,
+        patch: std::slice::Iter<'a, (String, Json)>,
+    }
+    fn open<'a>(key: String, target: Json, wanted: &'a [(String, Json)]) -> Frame<'a> {
+        let named = |key: &str| wanted.iter().any(|(k, _)| k == key);
+        let (patched, merged) = target
+            .into_object()
+            .unwrap_or_default()
+            .into_iter()
+            .partition(|(key, _)| named(key));
+        Frame {
+            key,
+            merged,
+            patched,
+            patch: wanted.iter(),
+        }
+    }
     let Json::Object(wanted) = patch else {
         return patch.clone();
     };
-    let mut existing = match target {
-        Json::Object(items) => items,
-        _ => Vec::new(),
-    };
-    let mut merged = Vec::with_capacity(existing.len() + wanted.len());
-    let named = |key: &str| wanted.iter().any(|(k, _)| k == key);
-    let mut patched = Vec::new();
-    for (key, value) in existing.drain(..) {
-        if named(&key) {
-            patched.push((key, value));
-        } else {
-            merged.push((key, value));
+    let mut stack = vec![open(String::new(), target, wanted)];
+    loop {
+        let frame = stack.last_mut().expect("open");
+        match frame.patch.next() {
+            Some((_, Json::Null)) => {}
+            Some((key, value @ Json::Object(wanted))) => {
+                let old = frame
+                    .patched
+                    .iter()
+                    .position(|(k, _)| k == key)
+                    .map_or(Json::Null, |i| frame.patched.remove(i).1);
+                let _ = value;
+                stack.push(open(key.clone(), old, wanted));
+            }
+            Some((key, value)) => {
+                if let Some(i) = frame.patched.iter().position(|(k, _)| k == key) {
+                    frame.patched.remove(i);
+                }
+                frame.merged.push((key.clone(), value.clone()));
+            }
+            None => {
+                let done = stack.pop().expect("open");
+                let merged = Json::Object(done.merged);
+                match stack.last_mut() {
+                    Some(parent) => parent.merged.push((done.key, merged)),
+                    None => return merged,
+                }
+            }
         }
     }
-    for (key, value) in wanted {
-        if matches!(value, Json::Null) {
-            continue;
-        }
-        let old = patched.iter().position(|(k, _)| k == key).map(|i| patched.remove(i).1);
-        merged.push((key.clone(), merge_patch(old.unwrap_or(Json::Null), value)));
-    }
-    Json::Object(merged)
 }
 
 fn json_merge_patch(args: &DataChunk, result: &mut Vector) -> Result<()> {
@@ -1146,31 +1384,62 @@ fn json_merge_patch(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
-/// `DeepMerge`: a merge where a NULL in the patch keeps what was there, and objects merge all the way down.
+/// `DeepMerge`: a merge where a NULL in the patch keeps what was there, and objects merge all the way
+/// down. Without recursion: each pair of objects that merge is a frame of its own.
 fn deep_merge(original: Json, patch: Json) -> Json {
-    let (Json::Object(original), Json::Object(patch)) = (original.clone(), &patch) else {
-        return if matches!(patch, Json::Null) { original } else { patch };
-    };
-    let find = |items: &[(String, Json)], key: &str| items.iter().position(|(k, _)| k == key);
-    let mut merged = Vec::with_capacity(original.len() + patch.len());
-    for (key, value) in &original {
-        match find(patch, key) {
-            Some(at) if !matches!(patch[at].1, Json::Null) => {}
-            _ => merged.push((key.clone(), value.clone())),
-        }
+    struct Frame {
+        key: String,
+        merged: Vec<(String, Json)>,
+        /// the members of the original that a member of the patch replaces
+        replaced: Vec<(String, Json)>,
+        patch: std::vec::IntoIter<(String, Json)>,
     }
-    for (key, value) in patch {
-        if matches!(value, Json::Null) {
-            continue;
-        }
-        let old = find(&original, key).map(|at| original[at].1.clone());
-        let value = match old {
-            Some(old @ Json::Object(_)) if matches!(value, Json::Object(_)) => deep_merge(old, value.clone()),
-            _ => value.clone(),
+    fn open(key: String, original: Vec<(String, Json)>, patch: Vec<(String, Json)>) -> Frame {
+        let replaces = |key: &str| {
+            patch
+                .iter()
+                .find(|(k, _)| k == key)
+                .is_some_and(|(_, value)| !matches!(value, Json::Null))
         };
-        merged.push((key.clone(), value));
+        let (replaced, merged) = original.into_iter().partition(|(key, _)| replaces(key));
+        Frame {
+            key,
+            merged,
+            replaced,
+            patch: patch.into_iter(),
+        }
     }
-    Json::Object(merged)
+    let (original, patch) = match (original.into_object(), patch.into_object()) {
+        (Ok(original), Ok(patch)) => (original, patch),
+        (original, Err(Json::Null)) => return original.map_or_else(|o| o, Json::Object),
+        (_, patch) => return patch.map_or_else(|p| p, Json::Object),
+    };
+    let mut stack = vec![open(String::new(), original, patch)];
+    loop {
+        let frame = stack.last_mut().expect("open");
+        match frame.patch.next() {
+            Some((_, Json::Null)) => {}
+            Some((key, value)) => {
+                let old = frame
+                    .replaced
+                    .iter_mut()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, old)| std::mem::replace(old, Json::Null));
+                match (old.map(Json::into_object), value.into_object()) {
+                    (Some(Ok(old)), Ok(value)) => stack.push(open(key, old, value)),
+                    (_, value) => frame.merged.push((key, value.map_or_else(|v| v, Json::Object))),
+                }
+            }
+            None => {
+                let done = stack.pop().expect("open");
+                let merged = Json::Object(done.merged);
+                match stack.last_mut() {
+                    Some(parent) => parent.merged.push((done.key, merged)),
+                    None => return merged,
+                }
+            }
+        }
+    }
 }
 
 fn json_deep_merge(args: &DataChunk, result: &mut Vector) -> Result<()> {
@@ -1192,27 +1461,51 @@ fn json_deep_merge(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
-/// `ComputeDiff`: the merge patch that makes `old` into `new`, both objects; `None` if they are the same.
+/// `ComputeDiff`: the merge patch that makes `old` into `new`, both objects; `None` if they are the
+/// same. Without recursion: each pair of objects under the same key is a frame of its own.
 fn object_diff(old: &[(String, Json)], new: &[(String, Json)]) -> Option<Json> {
-    let mut diff = Vec::new();
-    for (key, _) in old {
-        if !new.iter().any(|(k, _)| k == key) {
-            diff.push((key.clone(), Json::Null));
+    struct Frame<'a> {
+        key: &'a str,
+        diff: Vec<(String, Json)>,
+        old: &'a [(String, Json)],
+        new: std::slice::Iter<'a, (String, Json)>,
+    }
+    fn open<'a>(key: &'a str, old: &'a [(String, Json)], new: &'a [(String, Json)]) -> Frame<'a> {
+        let diff = old
+            .iter()
+            .filter(|(key, _)| !new.iter().any(|(k, _)| k == key))
+            .map(|(key, _)| (key.clone(), Json::Null))
+            .collect();
+        Frame {
+            key,
+            diff,
+            old,
+            new: new.iter(),
         }
     }
-    for (key, value) in new {
-        let before = old.iter().find(|(k, _)| k == key).map(|(_, v)| v);
-        match (before, value) {
-            (Some(Json::Object(before)), Json::Object(after)) => {
-                if let Some(child) = object_diff(before, after) {
-                    diff.push((key.clone(), child));
+    let mut stack = vec![open("", old, new)];
+    loop {
+        let frame = stack.last_mut().expect("open");
+        match frame.new.next() {
+            Some((key, value)) => {
+                let before = frame.old.iter().find(|(k, _)| k == key).map(|(_, v)| v);
+                match (before, value) {
+                    (Some(Json::Object(before)), Json::Object(after)) => stack.push(open(key, before, after)),
+                    (Some(before), after) if before == after => {}
+                    _ => frame.diff.push((key.clone(), value.clone())),
                 }
             }
-            (Some(before), after) if before == after => {}
-            _ => diff.push((key.clone(), value.clone())),
+            None => {
+                let done = stack.pop().expect("open");
+                let diff = (!done.diff.is_empty()).then_some(Json::Object(done.diff));
+                match (stack.last_mut(), diff) {
+                    (Some(parent), Some(diff)) => parent.diff.push((done.key.to_string(), diff)),
+                    (Some(_), None) => {}
+                    (None, diff) => return diff,
+                }
+            }
         }
     }
-    (!diff.is_empty()).then_some(Json::Object(diff))
 }
 
 fn json_merge_patch_diff(args: &DataChunk, result: &mut Vector) -> Result<()> {
@@ -1220,9 +1513,10 @@ fn json_merge_patch_diff(args: &DataChunk, result: &mut Vector) -> Result<()> {
         let Some(new) = document(&row[1])? else {
             return Ok(nothing(&json_type()));
         };
-        let diff = match (document(&row[0])?, &new) {
+        let old = document(&row[0])?;
+        let diff = match (&old, &new) {
             (Some(Json::Object(old)), Json::Object(after)) => {
-                object_diff(&old, after).unwrap_or(Json::Object(Vec::new()))
+                object_diff(old, after).unwrap_or(Json::Object(Vec::new()))
             }
             _ => new,
         };
@@ -1232,16 +1526,13 @@ fn json_merge_patch_diff(args: &DataChunk, result: &mut Vector) -> Result<()> {
 
 /// `SortKeys`: the keys of every object in byte order.
 fn sort_keys(json: Json) -> Json {
-    match json {
-        Json::Object(items) => {
-            let mut items: Vec<(String, Json)> =
-                items.into_iter().map(|(key, value)| (key, sort_keys(value))).collect();
+    json.map_containers(|container| match container.into_object() {
+        Ok(mut items) => {
             items.sort_by(|(a, _), (b, _)| a.as_bytes().cmp(b.as_bytes()));
             Json::Object(items)
         }
-        Json::Array(items) => Json::Array(items.into_iter().map(sort_keys).collect()),
-        other => other,
-    }
+        Err(other) => other,
+    })
 }
 
 fn json_normalize(args: &DataChunk, result: &mut Vector) -> Result<()> {
@@ -1254,17 +1545,15 @@ fn json_normalize(args: &DataChunk, result: &mut Vector) -> Result<()> {
 }
 
 fn strip_nulls(json: Json) -> Json {
-    match json {
-        Json::Object(items) => Json::Object(
+    json.map_containers(|container| match container.into_object() {
+        Ok(items) => Json::Object(
             items
                 .into_iter()
                 .filter(|(_, value)| !matches!(value, Json::Null))
-                .map(|(key, value)| (key, strip_nulls(value)))
                 .collect(),
         ),
-        Json::Array(items) => Json::Array(items.into_iter().map(strip_nulls).collect()),
-        other => other,
-    }
+        Err(other) => other,
+    })
 }
 
 fn json_strip_nulls(args: &DataChunk, result: &mut Vector) -> Result<()> {
@@ -1316,44 +1605,134 @@ struct Modify {
     replace: bool,
 }
 
+/// `ResolveArrayPosition`: where an array step is in an array of `len` items, at most its end.
+fn array_position(step: &Step, len: usize) -> Option<usize> {
+    let position = match step {
+        Step::Index(index) => *index,
+        Step::ReverseIndex(index) => len.checked_sub(*index)?,
+        Step::Append => len,
+        _ => return None,
+    };
+    (position <= len).then_some(position)
+}
+
+/// `ApplyModify` at the last step of a path, in its parent: whether it changed it.
+fn apply_modify(parent: &mut Json, step: &Step, value: &Json, modify: &Modify) -> bool {
+    match (parent, step) {
+        (Json::Object(items), Step::Key(key)) => match items.iter().position(|(k, _)| k == key) {
+            Some(at) if modify.replace => {
+                items[at].1 = value.clone();
+                true
+            }
+            None if modify.insert => {
+                items.push((key.clone(), value.clone()));
+                true
+            }
+            _ => false,
+        },
+        (Json::Array(items), step) if !matches!(step, Step::Key(_)) => {
+            let Some(position) = array_position(step, items.len()) else {
+                return false;
+            };
+            if position < items.len() {
+                if modify.replace {
+                    items[position] = value.clone();
+                }
+                modify.replace
+            } else {
+                if modify.insert {
+                    items.push(value.clone());
+                }
+                modify.insert
+            }
+        }
+        _ => false,
+    }
+}
+
+/// `ModifyDocumentElements`: the value at the path set, inserted or replaced. Setting and inserting
+/// make the containers that are missing on the way, as SQLite does, but only if the value goes in.
 fn set_path(json: &mut Json, steps: &[Step], value: &Json, modify: Modify) {
-    let Some((step, rest)) = steps.split_first() else {
+    let Some((last, parents)) = steps.split_last() else {
         if modify.replace {
             *json = value.clone();
         }
         return;
     };
-    match (json, step) {
-        (Json::Object(items), Step::Key(key)) => match items.iter().position(|(k, _)| k == key) {
-            Some(position) => set_path(&mut items[position].1, rest, value, modify),
-            None if modify.insert => {
-                // the objects on the way to it come into being
-                let mut inner = value.clone();
-                for step in rest.iter().rev() {
-                    let Step::Key(key) = step else {
-                        return;
-                    };
-                    inner = Json::Object(vec![(key.clone(), inner)]);
-                }
-                items.push((key.clone(), inner));
+    // `ResolveParent`: the positions of the parents that are there
+    let mut positions = Vec::with_capacity(parents.len());
+    let mut current: &Json = json;
+    let mut missing = None;
+    for (i, step) in parents.iter().enumerate() {
+        let child = match (current, step) {
+            (Json::Object(items), Step::Key(key)) => items.iter().position(|(k, _)| k == key),
+            (Json::Array(items), step) if !matches!(step, Step::Key(_)) => {
+                let Some(position) = array_position(step, items.len()) else {
+                    return;
+                };
+                (position < items.len()).then_some(position)
             }
-            None => {}
-        },
-        (Json::Array(items), Step::Append) if rest.is_empty() && modify.insert => items.push(value.clone()),
-        (Json::Array(items), Step::Index(_) | Step::ReverseIndex(_)) => {
-            let position = match step {
-                Step::Index(index) => Some(*index),
-                Step::ReverseIndex(index) => items.len().checked_sub(*index),
-                _ => None,
-            };
-            match position {
-                Some(position) if position < items.len() => set_path(&mut items[position], rest, value, modify),
-                Some(_) if rest.is_empty() && modify.insert => items.push(value.clone()),
-                _ => {}
-            }
-        }
-        _ => {}
+            _ => return,
+        };
+        let Some(at) = child else {
+            missing = Some(i);
+            break;
+        };
+        positions.push(at);
+        current = match current {
+            Json::Object(items) => &items[at].1,
+            Json::Array(items) => &items[at],
+            _ => unreachable!("a container"),
+        };
     }
+    let mut target: &mut Json = json;
+    for at in positions {
+        target = match target {
+            Json::Object(items) => &mut items[at].1,
+            Json::Array(items) => &mut items[at],
+            _ => unreachable!("a container"),
+        };
+    }
+    let Some(missing) = missing else {
+        apply_modify(target, last, value, &modify);
+        return;
+    };
+    if !modify.insert {
+        return;
+    }
+    // the chain of containers that is missing, built inside out, each made by the step after it
+    let container = |step: &Step| match step {
+        Step::Key(_) => Json::Object(Vec::new()),
+        _ => Json::Array(Vec::new()),
+    };
+    let mut chain = container(last);
+    if !apply_modify(&mut chain, last, value, &modify) {
+        return;
+    }
+    for at in (missing + 1..parents.len()).rev() {
+        let mut parent = container(&steps[at]);
+        if !apply_modify(
+            &mut parent,
+            &steps[at],
+            &chain,
+            &Modify {
+                insert: true,
+                replace: false,
+            },
+        ) {
+            return;
+        }
+        chain = parent;
+    }
+    apply_modify(
+        target,
+        &steps[missing],
+        &chain,
+        &Modify {
+            insert: true,
+            replace: false,
+        },
+    );
 }
 
 fn modify_rows(args: &DataChunk, result: &mut Vector, modify: Modify) -> Result<()> {
@@ -1459,8 +1838,16 @@ fn json_pretty(args: &DataChunk, result: &mut Vector) -> Result<()> {
 
 fn transform_rows(args: &DataChunk, result: &mut Vector, strict: bool) -> Result<()> {
     let ty = result.logical_type().clone();
+    // `JSONCommon::NumbersAsRaw`: a DECIMAL reads numbers from their text
+    let raw = contains_decimal(&ty);
     row_wise(args, result, |row| {
-        let Some(json) = document(&row[0])? else {
+        let json = if raw && !row[0].is_null() && row[0].logical_type().id() == LogicalTypeId::Varchar {
+            let text = row[0].try_to_string()?;
+            Some(parse_with(&text, true).map_err(|e| invalid(parse_error_text(&text, &e)))?)
+        } else {
+            document(&row[0])?
+        };
+        let Some(json) = json else {
             return Ok(nothing(&ty));
         };
         transform(&json, &ty, strict)
@@ -1901,7 +2288,9 @@ fn json_tree_rows(args: &DataChunk, result: &mut Vector) -> Result<()> {
 fn projjson_crs(text: &str) -> Option<(String, String)> {
     let json = parse(text).ok()?;
     let Json::Object(root) = &json else { return None };
-    let member = |object: &[(String, Json)], key: &str| object.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+    fn member<'a>(object: &'a [(String, Json)], key: &str) -> Option<&'a Json> {
+        object.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
     let Some(Json::Str(kind)) = member(root, "type") else {
         return None;
     };
@@ -1916,7 +2305,7 @@ fn projjson_crs(text: &str) -> Option<(String, String)> {
         "TemporalCRS",
         "ParametricCRS",
     ];
-    if !TYPES.iter().any(|t| t.eq_ignore_ascii_case(&kind)) {
+    if !TYPES.iter().any(|t| t.eq_ignore_ascii_case(kind)) {
         return None;
     }
     let target = if kind.eq_ignore_ascii_case("BoundCRS") {
@@ -1925,17 +2314,17 @@ fn projjson_crs(text: &str) -> Option<(String, String)> {
             _ => return None,
         }
     } else {
-        root.clone()
+        root
     };
-    let mut identifier = match member(&target, "name") {
-        Some(Json::Str(name)) => name,
+    let mut identifier = match member(target, "name") {
+        Some(Json::Str(name)) => name.clone(),
         _ => String::new(),
     };
-    if let Some(Json::Object(id)) = member(&target, "id")
-        && let Some(Json::Str(authority)) = member(&id, "authority")
+    if let Some(Json::Object(id)) = member(target, "id")
+        && let Some(Json::Str(authority)) = member(id, "authority")
     {
-        identifier = authority;
-        match member(&id, "code") {
+        identifier = authority.clone();
+        match member(id, "code") {
             Some(Json::Int(code)) => identifier += &format!(":{code}"),
             Some(Json::UInt(code)) => identifier += &format!(":{code}"),
             Some(Json::Str(code)) => identifier += &format!(":{code}"),

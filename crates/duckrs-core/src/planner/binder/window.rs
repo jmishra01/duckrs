@@ -60,10 +60,69 @@ fn window_function(name: &str) -> Option<WindowFunction> {
 }
 
 impl Binder<'_> {
+    /// `UnfoldWindowMacroExpression`: a macro of the JSON functions used as a window function is its
+    /// body, with the window on the one aggregate in it.
+    fn window_macro(window: &WindowExpr) -> Result<Option<duckrs_parser::ast::Expr>> {
+        use duckrs_parser::ast::ExprKind;
+        if !window.name.qualification.is_empty() {
+            return Ok(None);
+        }
+        let args: Vec<String> = window.args.iter().map(|a| format!("({})", a.expr)).collect();
+        let Some(text) = crate::function::json::macro_text(&window.name.name, &args) else {
+            return Ok(None);
+        };
+        let select = super::table_functions::parse_select(&format!("SELECT {text}"), "Expected an expression")?;
+        let duckrs_parser::ast::QueryNodeKind::Select(node) = &select.node.kind else {
+            return Ok(None);
+        };
+        let Some(body) = node.select_list.first() else {
+            return Ok(None);
+        };
+        let mut body = body.clone();
+        let is_aggregate = |e: &duckrs_parser::ast::Expr| matches!(&e.kind, ExprKind::Function(f) if BuiltinFunctions::get().aggregate(&f.name.name).is_some());
+        let mut count = 0;
+        duckrs_parser::transformer::visit_expr_mut(&mut body, &mut |e| count += usize::from(is_aggregate(e)));
+        if count != 1 {
+            return Err(binder_error(
+                "Window function macro bodies must contain exactly one aggregate function",
+            ));
+        }
+        duckrs_parser::transformer::visit_expr_mut(&mut body, &mut |e| {
+            if !is_aggregate(e) {
+                return;
+            }
+            let ExprKind::Function(aggregate) = &e.kind else { return };
+            let mut over = window.clone();
+            over.name = aggregate.name.clone();
+            over.args = aggregate.args.clone();
+            over.distinct = window.distinct || aggregate.distinct;
+            over.filter = match (window.filter.clone(), aggregate.filter.clone()) {
+                (Some(a), Some(b)) => Some(Box::new(
+                    ExprKind::Conjunction {
+                        and: true,
+                        children: vec![*a, *b],
+                    }
+                    .into(),
+                )),
+                (a, b) => a.or(b),
+            };
+            if !aggregate.order_by.is_empty() {
+                over.arg_orders = aggregate.order_by.clone();
+            }
+            let alias = std::mem::take(&mut e.alias);
+            *e = ExprKind::Window(Box::new(over)).into();
+            e.alias = alias;
+        });
+        Ok(Some(body))
+    }
+
     /// `BaseSelectBinder::BindWindowExpression`.
     pub(super) fn bind_window(&mut self, window: &WindowExpr) -> Result<BoundExpr> {
         if self.windows.is_none() {
             return Err(binder_error(self.window_error));
+        }
+        if let Some(body) = Self::window_macro(window)? {
+            return self.bind_expression(&body);
         }
         if self.aggregates.as_ref().is_some_and(|state| state.inside_aggregate) {
             return Err(binder_error(

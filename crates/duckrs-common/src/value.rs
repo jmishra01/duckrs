@@ -359,6 +359,16 @@ impl Value {
             return Ok("NULL".into());
         }
         let ty = self.ty.id();
+        // `CastJSONListToVarchar`: the documents of a JSON[] as they are
+        if let (ValueData::List(items), LogicalTypeId::List) = (&self.data, ty)
+            && self
+                .ty
+                .child_type()
+                .is_some_and(|child| child.id() == LogicalTypeId::Varchar && child.alias() == Some("JSON"))
+        {
+            let texts = items.iter().map(Value::try_to_string).collect::<Result<Vec<_>>>()?;
+            return Ok(format!("[{}]", texts.join(", ")));
+        }
         Ok(match (&self.data, ty) {
             (_, LogicalTypeId::Enum) => {
                 let position = match self.data {

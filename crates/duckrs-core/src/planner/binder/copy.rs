@@ -180,7 +180,72 @@ impl Binder<'_> {
         if name.eq_ignore_ascii_case("null") {
             return Ok(LogicalType::SQLNULL);
         }
-        let select = parse_select(&format!("SELECT NULL::{name}"), "Expected a type")?;
+        // `TransformStringToUnboundType`: text that isn't a type, with the types it is most like
+        let select = parse_select(&format!("SELECT NULL::{name}"), "Expected a type").map_err(|error| {
+            if error.kind != ErrorKind::Parser {
+                return error;
+            }
+            const SUGGESTED: &[&str] = &[
+                "BIGINT",
+                "INT8",
+                "LONG",
+                "BIT",
+                "BITSTRING",
+                "BLOB",
+                "BYTEA",
+                "BINARY,",
+                "VARBINARY",
+                "BOOLEAN",
+                "BOOL",
+                "LOGICAL",
+                "DATE",
+                "DECIMAL(prec, scale)",
+                "DOUBLE",
+                "FLOAT8",
+                "FLOAT",
+                "FLOAT4",
+                "REAL",
+                "HUGEINT",
+                "INTEGER",
+                "INT4",
+                "INT",
+                "SIGNED",
+                "INTERVAL",
+                "SMALLINT",
+                "INT2",
+                "SHORT",
+                "TIME",
+                "TIMESTAMPTZ",
+                "TIMESTAMP",
+                "DATETIME",
+                "TINYINT",
+                "INT1",
+                "UBIGINT",
+                "UHUGEINT",
+                "UINTEGER",
+                "USMALLINT",
+                "UTINYINT",
+                "UUID",
+                "VARCHAR",
+                "CHAR",
+                "BPCHAR",
+                "TEXT",
+                "STRING",
+                "MAP(INTEGER, VARCHAR)",
+                "UNION(num INTEGER, text VARCHAR)",
+            ];
+            let scores = SUGGESTED
+                .iter()
+                .map(|t| (t.to_string(), duckrs_common::string_util::similarity_rating(t, name)))
+                .collect();
+            let mut message = format!(
+                "Value \"{name}\" can not be converted to a DuckDB Type.\nPossible examples as suggestions: \n"
+            );
+            for suggestion in duckrs_common::string_util::top_n_strings(scores) {
+                message += &format!("* {suggestion}\n");
+            }
+            Error::new(ErrorKind::InvalidInput, message)
+        })?;
         let bound = self.child_binder().bind_select_statement(&select)?;
         bound
             .types
@@ -1348,7 +1413,8 @@ impl Binder<'_> {
                 None => Value::boolean(true),
             };
             // `BindCopyOption`; SHREDDING says itself what it takes
-            if value.is_null() && !name.eq_ignore_ascii_case("shredding") {
+            // JSON's COPY says itself which of its options cannot be NULL (`ThrowJSONCopyNullException`)
+            if value.is_null() && !name.eq_ignore_ascii_case("shredding") && !self.copy_json {
                 return Err(binder_error(format!(
                     "NULL is not supported as a valid option for COPY option \"{name}\""
                 )));
@@ -1361,7 +1427,8 @@ impl Binder<'_> {
                 [literal] => self.constant_argument(&Expr::constant(literal.clone()))?,
                 _ => return Err(crate::unported(format!("the COPY option {name} with several values"))),
             };
-            if value.is_null() && !name.eq_ignore_ascii_case("shredding") {
+            // JSON's COPY says itself which of its options cannot be NULL (`ThrowJSONCopyNullException`)
+            if value.is_null() && !name.eq_ignore_ascii_case("shredding") && !self.copy_json {
                 return Err(binder_error(format!(
                     "NULL is not supported as a valid option for COPY option \"{name}\""
                 )));
@@ -1774,6 +1841,33 @@ impl Binder<'_> {
         let mut compression = Compression::Auto;
         let bound = self.bind_select_statement(&select)?;
         let copy_options = self.copy_options(info)?;
+        if self.copy_json {
+            // `GetSingleJSONCopyValue` and `GetSingleJSONCopyString`
+            for (name, value) in &copy_options {
+                if value.is_null() {
+                    return Err(binder_error(format!(
+                        "COPY (FORMAT JSON) parameter {name} cannot be NULL."
+                    )));
+                }
+                let text_option = matches!(
+                    name.as_str(),
+                    "dateformat"
+                        | "date_format"
+                        | "timestampformat"
+                        | "timestamp_format"
+                        | "file_extension"
+                        | "filename_pattern"
+                        | "encoding"
+                        | "compression"
+                );
+                if text_option && value.logical_type().id() != LogicalTypeId::Varchar {
+                    return Err(binder_error(format!(
+                        "COPY (FORMAT JSON) parameter {name} expects a VARCHAR argument, but got {}.",
+                        value.logical_type()
+                    )));
+                }
+            }
+        }
         Self::check_copy_options(&copy_options, false)?;
         if self.copy_json {
             options.json_names = Some(unique_names(&bound.names));

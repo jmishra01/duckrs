@@ -8,7 +8,7 @@ use super::csv_sniffer::{Parsing, can_cast};
 use super::file_system::{Compression, read_file};
 use super::physical::{PhysicalOperator, SourceState};
 use crate::function::dates::strptime_micros;
-use crate::function::json::{Json, ParseError, Structure, json_type, parse_prefix, transform_with};
+use crate::function::json::{Json, ParseError, Structure, json_type, parse_prefix_with, transform_with};
 use duckrs_common::types::{LogicalType, Timestamp};
 use duckrs_common::value::Value;
 use duckrs_common::vector::{DataChunk, Vector};
@@ -16,8 +16,9 @@ use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
 use std::sync::Arc;
 
 /// `JSONFormat`
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum JsonFormat {
+    #[default]
     Auto,
     Unstructured,
     NewlineDelimited,
@@ -37,6 +38,8 @@ pub struct JsonScanData {
     pub names: Vec<String>,
     pub types: Vec<LogicalType>,
     pub ignore_errors: bool,
+    /// for the hint of a transform error
+    pub auto_detect: bool,
     pub case_insensitive: bool,
     pub date_format: Option<String>,
     pub timestamp_format: Option<String>,
@@ -58,8 +61,9 @@ impl JsonScanData {
     }
 }
 
-/// A record of a file, or why it isn't one, by the byte where that shows.
-pub type Record = std::result::Result<Json, ParseError>;
+/// A record of a file and the bytes it is (the unit `read_json_objects` gives), or why it isn't
+/// one, by the byte where that shows.
+pub type Record = std::result::Result<(Json, std::ops::Range<usize>), ParseError>;
 
 fn is_space(c: u8) -> bool {
     matches!(c, b' ' | b'\t' | b'\n' | b'\r')
@@ -72,7 +76,7 @@ fn skip_space(data: &[u8], mut at: usize) -> usize {
     at
 }
 
-fn lines_of(data: &[u8]) -> Vec<Record> {
+fn lines_of(data: &[u8], raw: bool) -> Vec<Record> {
     let mut records = Vec::new();
     let mut start = 0;
     while start < data.len() {
@@ -82,8 +86,8 @@ fn lines_of(data: &[u8]) -> Vec<Record> {
             .map_or(data.len(), |i| start + i);
         let first = skip_space(&data[..end], start);
         if first < end {
-            records.push(match parse_prefix(&data[..end], first) {
-                Ok((value, stop)) if skip_space(&data[..end], stop) == end => Ok(value),
+            records.push(match parse_prefix_with(&data[..end], first, raw) {
+                Ok((value, stop)) if skip_space(&data[..end], stop) == end => Ok((value, first..stop)),
                 Ok((_, stop)) => Err(ParseError {
                     position: stop,
                     message: "unexpected content after document",
@@ -96,13 +100,13 @@ fn lines_of(data: &[u8]) -> Vec<Record> {
     records
 }
 
-fn concatenated(data: &[u8]) -> Vec<Record> {
+fn concatenated(data: &[u8], raw: bool) -> Vec<Record> {
     let mut records = Vec::new();
     let mut at = skip_space(data, 0);
     while at < data.len() {
-        match parse_prefix(data, at) {
+        match parse_prefix_with(data, at, raw) {
             Ok((value, end)) => {
-                records.push(Ok(value));
+                records.push(Ok((value, at..end)));
                 at = skip_space(data, end);
                 // a comma between values is fine in C++'s unstructured format
                 if data.get(at) == Some(&b',') {
@@ -118,47 +122,167 @@ fn concatenated(data: &[u8]) -> Vec<Record> {
     records
 }
 
-fn array_items(data: &[u8]) -> Vec<Record> {
+/// The errors of `JSONReader`'s array format, which are of the file and not of a record.
+const NOT_AN_ARRAY: &str = "expected top-level JSON array";
+const NO_CLOSING_BRACKET: &str = "missing closing brace";
+const TRAILING_DATA: &str = "empty array with trailing data";
+
+fn array_items(data: &[u8], raw: bool) -> Vec<Record> {
     let start = skip_space(data, 0);
     if start == data.len() {
         return Vec::new();
     }
-    match parse_prefix(data, start) {
-        Ok((Json::Array(items), end)) if skip_space(data, end) == data.len() => items.into_iter().map(Ok).collect(),
-        Ok(_) => vec![Err(ParseError {
+    let not_an_array = || {
+        vec![Err(ParseError {
             position: start,
-            message: "expected top-level JSON array",
-        })],
-        Err(error) => vec![Err(error)],
+            message: NOT_AN_ARRAY,
+        })]
+    };
+    if data[start] != b'[' {
+        return not_an_array();
     }
+    // each item on its own, for the bytes it is
+    let mut records = Vec::new();
+    let mut at = skip_space(data, start + 1);
+    if at == data.len() {
+        return vec![Err(ParseError {
+            position: at,
+            message: NO_CLOSING_BRACKET,
+        })];
+    }
+    if data[at] == b']' {
+        if skip_space(data, at + 1) != data.len() {
+            return vec![Err(ParseError {
+                position: at,
+                message: TRAILING_DATA,
+            })];
+        }
+        return records;
+    }
+    loop {
+        match data.get(at) {
+            Some(b']') => break,
+            None => {
+                return vec![Err(ParseError {
+                    position: at,
+                    message: "unexpected end of data",
+                })];
+            }
+            _ => {}
+        }
+        let end = match parse_prefix_with(data, at, raw) {
+            Ok((value, end)) => {
+                records.push(Ok((value, at..end)));
+                end
+            }
+            Err(error) => return vec![Err(error)],
+        };
+        at = skip_space(data, end);
+        match data.get(at) {
+            Some(b',') => at = skip_space(data, at + 1),
+            Some(b']') => break,
+            None => {
+                return vec![Err(ParseError {
+                    position: at,
+                    message: "unexpected end of data",
+                })];
+            }
+            _ => {
+                return vec![Err(ParseError {
+                    position: at,
+                    message: "unexpected character, expected a comma or a closing bracket",
+                })];
+            }
+        }
+    }
+    if skip_space(data, at + 1) != data.len() {
+        return not_an_array();
+    }
+    records
 }
 
 /// The records of a file, and the format they turned out to have.
 pub fn read_records(data: &[u8], format: JsonFormat) -> (Vec<Record>, JsonFormat) {
-    let data = data.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(data);
-    match format {
-        JsonFormat::Array => (array_items(data), JsonFormat::Array),
-        JsonFormat::NewlineDelimited => (lines_of(data), JsonFormat::NewlineDelimited),
-        JsonFormat::Unstructured => (concatenated(data), JsonFormat::Unstructured),
-        JsonFormat::Auto => {
-            let first = skip_space(data, 0);
-            if data.get(first) == Some(&b'[') {
-                let items = array_items(data);
-                if items.iter().all(Record::is_ok) {
-                    return (items, JsonFormat::Array);
-                }
+    read_records_with(data, format, false)
+}
+
+/// `read_records`, with `raw` every number kept as its text (`JSONCommon::NumbersAsRaw`).
+pub fn read_records_with(data: &[u8], format: JsonFormat, raw: bool) -> (Vec<Record>, JsonFormat) {
+    let bom = data.starts_with(&[0xef, 0xbb, 0xbf]);
+    let (mut records, format) = records_of(if bom { &data[3..] } else { data }, format, raw);
+    if bom {
+        for record in &mut records {
+            match record {
+                Ok((_, span)) => *span = span.start + 3..span.end + 3,
+                Err(error) => error.position += 3,
             }
-            let lines = lines_of(data);
-            if lines.iter().all(Record::is_ok) {
-                return (lines, JsonFormat::NewlineDelimited);
-            }
-            (concatenated(data), JsonFormat::Unstructured)
         }
+    }
+    (records, format)
+}
+
+fn records_of(data: &[u8], format: JsonFormat, raw: bool) -> (Vec<Record>, JsonFormat) {
+    match format {
+        JsonFormat::Array => (array_items(data, raw), JsonFormat::Array),
+        JsonFormat::NewlineDelimited => (lines_of(data, raw), JsonFormat::NewlineDelimited),
+        JsonFormat::Unstructured => (concatenated(data, raw), JsonFormat::Unstructured),
+        JsonFormat::Auto => match detect_format(data) {
+            JsonFormat::Array => (array_items(data, raw), JsonFormat::Array),
+            JsonFormat::NewlineDelimited => (lines_of(data, raw), JsonFormat::NewlineDelimited),
+            _ => (concatenated(data, raw), JsonFormat::Unstructured),
+        },
+    }
+}
+
+/// `DetectFormatAndRecordType`, of the format: a first line that is a document makes the file
+/// newline-delimited (or an array, if it is all of it); else it is an array if it starts as one.
+fn detect_format(data: &[u8]) -> JsonFormat {
+    let first = skip_space(data, 0);
+    if let Some(newline) = data.iter().position(|&c| c == b'\n') {
+        let line_size = skip_space(data, newline);
+        if let Ok((json, end)) = parse_prefix_with(&data[..line_size], first, false)
+            && skip_space(&data[..line_size], end) == line_size
+        {
+            return if matches!(json, Json::Array(_)) && line_size == data.len() {
+                JsonFormat::Array
+            } else {
+                JsonFormat::NewlineDelimited
+            };
+        }
+    }
+    match data.get(first) {
+        None | Some(b'{') => JsonFormat::Unstructured,
+        Some(b'[') => match parse_prefix_with(data, first, false) {
+            // more than one top-level array is not an array
+            Ok((_, end)) if skip_space(data, end) != data.len() => JsonFormat::Unstructured,
+            _ => JsonFormat::Array,
+        },
+        Some(_) => JsonFormat::Unstructured,
     }
 }
 
 /// `JSONReader::ThrowParseError`
 pub fn record_error(path: &str, data: &[u8], error: &ParseError) -> Error {
+    let file_error = |message: String| Error::new(ErrorKind::InvalidInput, message);
+    match error.message {
+        NOT_AN_ARRAY => {
+            let first = data.get(error.position).map_or(' ', |&c| c as char);
+            return file_error(format!(
+                "Expected top-level JSON array with format='array', but first character is '{first}' in file \"{path}\".\n Try setting format='auto' or format='newline_delimited'."
+            ));
+        }
+        NO_CLOSING_BRACKET => {
+            return file_error(format!(
+                "Missing closing brace ']' in JSON array with format='array' in file \"{path}\""
+            ));
+        }
+        TRAILING_DATA => {
+            return file_error(format!(
+                "Empty array with trailing data when parsing JSON array with format='array' in file \"{path}\""
+            ));
+        }
+        _ => {}
+    }
     let line = data[..error.position.min(data.len())]
         .iter()
         .filter(|&&c| c == b'\n')
@@ -176,9 +300,14 @@ pub fn record_error(path: &str, data: &[u8], error: &ParseError) -> Error {
 
 /// `JSONStructure` of the records, with what strings turn out to hold.
 pub fn infer(records: &[&Json]) -> Structure {
+    infer_with(records, false)
+}
+
+/// `infer`, with `case_insensitive_keys`.
+pub fn infer_with(records: &[&Json], case_insensitive: bool) -> Structure {
     let mut structure = Structure::Null;
     for record in records {
-        structure = structure.merge(Structure::of(record));
+        structure = structure.merge_with(Structure::of_with(record, case_insensitive), case_insensitive);
     }
     structure
 }
@@ -264,6 +393,8 @@ pub struct Formats {
     pub timestamp: Option<String>,
     pub missing_keys_are_null: bool,
     pub case_insensitive: bool,
+    /// `error_duplicate_key`: an object with a key twice is an error (the scan's, unless it ignores errors)
+    pub error_duplicate_key: bool,
     /// objects with more keys than this are MAPs (`map_inference_threshold`); `None` turns that off
     pub map_threshold: Option<usize>,
 }
@@ -276,6 +407,13 @@ fn string_fits(text: &str, ty: &LogicalType, formats: &Formats) -> bool {
     };
     if let Some(format) = format {
         return strptime_micros(text, format).is_ok();
+    }
+    // `DefaultTryCast(.., strict)`: a strict UUID is 32 digits and 4 hyphens (`BaseUUID::FromString`)
+    if ty.id() == duckrs_common::types::LogicalTypeId::Uuid {
+        let bytes = text.as_bytes();
+        if bytes.len() != 36 || [8, 13, 18, 23].iter().any(|&at| bytes[at] != b'-') {
+            return false;
+        }
     }
     let parsing = Parsing {
         decimal_separator: b'.',
@@ -306,12 +444,62 @@ pub struct JsonScanState {
     file: usize,
     data: Vec<u8>,
     records: Option<std::vec::IntoIter<Record>>,
+    /// the format the file turned out to have, and how many of its records were read
+    format: JsonFormat,
+    record: usize,
     virtual_rows: crate::execution::multi_file::VirtualRows,
 }
 
-fn record_row(scan: &JsonScanData, record: &Json, formats: &Formats, strict: bool) -> Result<Option<Vec<Value>>> {
+/// `JSONCommon::ValToString`: a value written, cut after `max_len` bytes.
+fn val_to_string(value: &Json, max_len: usize) -> String {
+    let text = value.text();
+    if text.len() <= max_len {
+        return text;
+    }
+    let mut end = max_len;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
+}
+
+/// `JSONReader::AddTransformError`: where in which file a record failed, with what to try.
+fn transform_error(scan: &JsonScanData, path: &str, format: JsonFormat, record: usize, error: Error) -> Error {
+    if error.kind != ErrorKind::InvalidInput && error.kind != ErrorKind::Conversion {
+        return error;
+    }
+    let unit = if format == JsonFormat::NewlineDelimited {
+        "line"
+    } else {
+        "record/value"
+    };
+    let hint = if scan.auto_detect {
+        "\nTry increasing 'sample_size', reducing 'maximum_depth', specifying 'columns', 'format' or 'records' \
+         manually, setting 'ignore_errors' to true, or setting 'union_by_name' to true when reading multiple files \
+         with a different structure."
+    } else {
+        "\nTry setting 'auto_detect' to true, specifying 'format' or 'records' manually, or setting 'ignore_errors' \
+         to true."
+    };
+    Error::new(
+        ErrorKind::InvalidInput,
+        format!(
+            "JSON transform error in file \"{path}\", in {unit} {record}: {}{hint}",
+            error.message
+        ),
+    )
+}
+
+fn record_row(
+    scan: &JsonScanData,
+    record: &Json,
+    text: &[u8],
+    formats: &Formats,
+    strict: bool,
+) -> Result<Option<Vec<Value>>> {
+    // `ReadJSONObjectsFunction`: the bytes of the record as they are
     if scan.objects {
-        return Value::varchar(record.text())
+        return Value::varchar(String::from_utf8_lossy(text).into_owned())
             .reinterpret(&json_type())
             .map(|v| Some(vec![v]));
     }
@@ -326,21 +514,17 @@ fn record_row(scan: &JsonScanData, record: &Json, formats: &Formats, strict: boo
         return Err(Error::new(
             ErrorKind::InvalidInput,
             format!(
-                "Expected OBJECT, but got {}: {}\nTry increasing \"sample_size\" or setting \"records\" to false",
+                "Expected OBJECT, but got {}: {}",
                 record.kind_name(),
-                record.text()
+                val_to_string(record, 50)
             ),
         ));
     };
     let mut row = Vec::with_capacity(scan.names.len());
     for (name, ty) in scan.names.iter().zip(&scan.types) {
-        let found = if formats.case_insensitive {
-            items.iter().find(|(k, _)| k.eq_ignore_ascii_case(name))
-        } else {
-            items.iter().find(|(k, _)| k == name)
-        };
+        let found = crate::function::json::object_member(record, items, name, formats)?;
         let value = match found {
-            Some((_, item)) => match transform_with(item, ty, strict, formats) {
+            Some(item) => match transform_with(item, ty, strict, formats) {
                 Ok(value) => value,
                 Err(_) if scan.ignore_errors => return Ok(None),
                 Err(error) => return Err(error),
@@ -400,6 +584,7 @@ impl PhysicalOperator for PhysicalJsonScan {
             timestamp: scan.timestamp_format.clone(),
             missing_keys_are_null: true,
             case_insensitive: scan.case_insensitive,
+            error_duplicate_key: !scan.ignore_errors,
             map_threshold: None,
         };
         let strict = !scan.ignore_errors;
@@ -409,20 +594,33 @@ impl PhysicalOperator for PhysicalJsonScan {
             };
             if state.records.is_none() {
                 state.data = read_file(path, scan.compression)?;
-                let (records, _) = read_records(&state.data, scan.format);
+                // `JSONCommon::NumbersAsRaw`: a DECIMAL reads numbers from their text
+                let raw = scan.types.iter().any(crate::function::json::contains_decimal);
+                let (records, format) = read_records_with(&state.data, scan.format, raw);
                 state.records = Some(records.into_iter());
+                state.format = format;
+                state.record = 0;
             }
             let records = state.records.as_mut().expect("just read");
             let mut rows = Vec::with_capacity(STANDARD_VECTOR_SIZE);
             while rows.len() < STANDARD_VECTOR_SIZE {
                 match records.next() {
                     None => break,
-                    Some(Ok(record)) => {
-                        if let Some(row) = record_row(scan, &record, &formats, strict)? {
+                    Some(Ok((record, span))) => {
+                        state.record += 1;
+                        let text = &state.data[span];
+                        let row = record_row(scan, &record, text, &formats, strict)
+                            .map_err(|error| transform_error(scan, path, state.format, state.record, error))?;
+                        if let Some(row) = row {
                             rows.push(row);
                         }
                     }
-                    Some(Err(_)) if scan.ignore_errors => {}
+                    // a record that isn't JSON is a row of NULLs (the NULL value it is read as)
+                    // only lines can be skipped: elsewhere nothing says where the next record starts
+                    Some(Err(_)) if scan.ignore_errors && state.format == JsonFormat::NewlineDelimited => {
+                        state.record += 1;
+                        rows.push(scan.types.iter().map(|ty| Value::null(ty.clone())).collect());
+                    }
                     Some(Err(error)) => return Err(record_error(path, &state.data, &error)),
                 }
             }
