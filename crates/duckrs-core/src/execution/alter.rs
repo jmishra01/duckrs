@@ -45,6 +45,9 @@ fn execute_table_alter(alter: BoundTableAlter) -> Result<()> {
     drop(source);
     let mut table = TableCatalogEntry::new(old.schema.clone(), alter.name, alter.columns, rows, alter.constraints);
     table.generated = alter.generated;
+    table
+        .row_group_rows
+        .store(old.row_group_size(), std::sync::atomic::Ordering::Relaxed);
     let table = Arc::new(table);
     // C++ writes a column of a new type to new row groups, without the gaps
     let retyped =

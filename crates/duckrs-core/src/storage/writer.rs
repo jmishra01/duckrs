@@ -2028,7 +2028,7 @@ impl<'a> Writer<'a> {
         let ids = table.row_ids(total);
         let cursor = table
             .source()
-            .map(|source| TableCursor::new(source, columns.clone(), types.clone()));
+            .map(|source| TableCursor::new(source, columns.clone(), types.clone(), table.row_group_size()));
         let memory = if cursor.is_none() { Some(table.rows()?) } else { None };
         let mut rows = PositionedRows {
             cursor,

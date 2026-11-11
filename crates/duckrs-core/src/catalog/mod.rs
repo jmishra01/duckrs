@@ -225,13 +225,16 @@ pub struct TableCursor {
     buffer: ColumnDataCollection,
     /// The number of the first chunk of `buffer`.
     first_chunk: usize,
+    /// The rows of a row group of the table.
+    group_rows: usize,
 }
 
 impl TableCursor {
-    pub fn new(source: Arc<dyn TableSource>, columns: Vec<usize>, types: Vec<LogicalType>) -> Self {
-        let aligned = Self::is_aligned(&*source);
+    pub fn new(source: Arc<dyn TableSource>, columns: Vec<usize>, types: Vec<LogicalType>, group_rows: usize) -> Self {
+        let aligned = Self::is_aligned(&*source, group_rows);
         let buffer = ColumnDataCollection::new(types.clone());
         Self {
+            group_rows,
             source,
             columns,
             types,
@@ -243,21 +246,22 @@ impl TableCursor {
     }
 
     /// Whether the groups of a source are the groups of a table in memory.
-    pub fn is_aligned(source: &dyn TableSource) -> bool {
+    pub fn is_aligned(source: &dyn TableSource, group_rows: usize) -> bool {
         let groups = source.group_count();
         (0..groups).all(|g| {
             let rows = source.group_rows(g);
-            rows == ROW_GROUP_ROWS || (g + 1 == groups && rows <= ROW_GROUP_ROWS)
+            rows == group_rows || (g + 1 == groups && rows <= group_rows)
         })
     }
 
     /// Chunk `index`, of chunks asked for in order.
     pub fn chunk(&mut self, index: usize) -> Result<DataChunk> {
-        let group = index / (ROW_GROUP_ROWS / STANDARD_VECTOR_SIZE);
+        let chunks_per_group = (self.group_rows / STANDARD_VECTOR_SIZE).max(1);
+        let group = index / chunks_per_group;
         if self.aligned && group >= self.next_group {
             self.buffer = ColumnDataCollection::new(self.types.clone());
             self.next_group = group;
-            self.first_chunk = group * (ROW_GROUP_ROWS / STANDARD_VECTOR_SIZE);
+            self.first_chunk = group * chunks_per_group;
         }
         loop {
             let local = index - self.first_chunk;
@@ -321,6 +325,8 @@ pub struct TableCatalogEntry {
     pub log: Mutex<TableLog>,
     /// The tables with a foreign key to this one.
     pub referenced_by: Mutex<Vec<Weak<TableCatalogEntry>>>,
+    /// The rows of each of its row groups (`ROW_GROUP_SIZE` of its database).
+    pub row_group_rows: std::sync::atomic::AtomicUsize,
     /// The keys of each `TableConstraint::Unique`, in order, when somebody needed them since
     /// the rows last moved. Whoever rewrites `storage` must reset this.
     pub unique_keys: Mutex<Option<Vec<UniqueKeys>>>,
@@ -368,9 +374,9 @@ impl TableStatistics {
     }
 
     /// Rows from this one on aren't what zones were made of.
-    fn rows_changed_from(&mut self, position: usize) {
+    fn rows_changed_from(&mut self, position: usize, group_rows: usize) {
         self.distinct = None;
-        let groups = position / crate::execution::zone_map::ROW_GROUP_SIZE;
+        let groups = position / group_rows.max(1);
         for zones in self.zones.values_mut() {
             if zones.len() > groups {
                 Arc::make_mut(zones).truncate(groups);
@@ -379,10 +385,10 @@ impl TableStatistics {
     }
 
     /// `removed`, in order, are gone.
-    fn rows_removed(&mut self, removed: &[usize]) {
+    fn rows_removed(&mut self, removed: &[usize], group_rows: usize) {
         self.unreported = false;
         let Some(first) = removed.first() else { return };
-        self.rows_changed_from(*first);
+        self.rows_changed_from(*first, group_rows);
         self.covered -= removed.partition_point(|position| *position < self.covered);
         self.updated
             .retain_mut(|position| match removed.binary_search(position) {
@@ -557,6 +563,7 @@ impl TableCatalogEntry {
             origin: None,
             row_ids: Mutex::default(),
             versions: Arc::default(),
+            row_group_rows: std::sync::atomic::AtomicUsize::new(ROW_GROUP_ROWS),
         }
     }
 
@@ -591,7 +598,7 @@ impl TableCatalogEntry {
         if let Some(source) = self.source() {
             let ty = self.columns[column].ty.clone();
             let chunks = self.row_count().div_ceil(STANDARD_VECTOR_SIZE);
-            let mut cursor = TableCursor::new(source, vec![column], vec![ty]);
+            let mut cursor = TableCursor::new(source, vec![column], vec![ty], self.row_group_size());
             for index in 0..chunks {
                 let chunk = cursor.chunk(index)?;
                 body(index, chunk.column(0), chunk.len());
@@ -767,7 +774,7 @@ impl TableCatalogEntry {
         statistics.unreported = false;
         let positions: Vec<usize> = positions.into_iter().collect();
         if let Some(first) = positions.iter().min() {
-            statistics.rows_changed_from(*first);
+            statistics.rows_changed_from(*first, self.row_group_size());
         }
         // without any statistics they'd only pile up
         if statistics.columns.is_some() {
@@ -779,11 +786,21 @@ impl TableCatalogEntry {
     pub fn rows_appended(&self, first_new_row: usize) {
         let mut statistics = self.statistics.lock();
         statistics.unreported = false;
-        statistics.rows_changed_from(first_new_row);
+        statistics.rows_changed_from(first_new_row, self.row_group_size());
     }
 
     /// What `unique_keys` holds the keys of, in that order.
     /// The columns in the order a query sees them.
+    /// The rows of a row group of this table.
+    pub fn row_group_size(&self) -> usize {
+        self.row_group_rows.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The chunks of a full row group of this table.
+    pub fn chunks_per_row_group(&self) -> usize {
+        (self.row_group_size() / STANDARD_VECTOR_SIZE).max(1)
+    }
+
     pub fn logical_columns(&self) -> Vec<LogicalColumn<'_>> {
         let mut result: Vec<LogicalColumn<'_>> = self
             .columns
@@ -859,7 +876,7 @@ impl TableCatalogEntry {
             storage.truncate(rows);
             let mut statistics = self.statistics.lock();
             statistics.unreported = false;
-            statistics.rows_changed_from(rows);
+            statistics.rows_changed_from(rows, self.row_group_size());
             statistics.covered = statistics.covered.min(rows);
             statistics.updated.retain(|position| *position < rows);
         }
@@ -1111,6 +1128,8 @@ pub struct SchemaCatalogEntry {
     types: RwLock<BTreeMap<String, LogicalType>>,
     /// the triggers of the tables of the schema, by name
     triggers: RwLock<BTreeMap<String, Arc<TriggerCatalogEntry>>>,
+    /// the rows of a row group of the tables of its database (`ROW_GROUP_SIZE`), shared with the catalog
+    row_group_rows: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// What to do when an entry being created already exists (`OnCreateConflict`).
@@ -1151,7 +1170,12 @@ impl SchemaCatalogEntry {
 
     /// The schema at `path`, nested in the one before it if there is one.
     fn at_path(path: Vec<String>) -> Self {
+        Self::at_path_in(path, Arc::new(std::sync::atomic::AtomicUsize::new(ROW_GROUP_ROWS)))
+    }
+
+    fn at_path_in(path: Vec<String>, row_group_rows: Arc<std::sync::atomic::AtomicUsize>) -> Self {
         Self {
+            row_group_rows,
             name: path.last().cloned().unwrap_or_default(),
             path,
             tables: RwLock::new(BTreeMap::new()),
@@ -1184,7 +1208,7 @@ impl SchemaCatalogEntry {
 
     /// An empty schema at the same place.
     pub(crate) fn empty_like(&self) -> Self {
-        Self::at_path(self.path.clone())
+        Self::at_path_in(self.path.clone(), self.row_group_rows.clone())
     }
 
     /// `DuckSchemaEntry::CreateType`.
@@ -1379,6 +1403,10 @@ impl SchemaCatalogEntry {
             constraints,
         );
         table.generated = generated;
+        table.row_group_rows.store(
+            self.row_group_rows.load(std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let table = Arc::new(table);
         Self::register_foreign_keys(&tables, &table);
         tables.insert(key(name), TableOrView::Table(table.clone()));
@@ -1725,6 +1753,8 @@ pub struct Catalog {
     forked: bool,
     /// The storage version of the file the catalog is in, if it is in one
     storage_version: RwLock<Option<duckrs_common::serializer::StorageVersion>>,
+    /// `ROW_GROUP_SIZE`: the rows of a row group of its tables, which its schemas share
+    pub(crate) row_group_rows: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 thread_local! {
@@ -1935,16 +1965,18 @@ impl Catalog {
             versions: Mutex::default(),
             forked: false,
             storage_version: RwLock::new(None),
+            row_group_rows: Arc::new(std::sync::atomic::AtomicUsize::new(ROW_GROUP_ROWS)),
         };
+        for name in [DEFAULT_SCHEMA, TEMP_SCHEMA] {
+            let schema = SchemaCatalogEntry::at_path_in(vec![name.to_string()], catalog.row_group_rows.clone());
+            catalog.schemas.write().insert(key(name), Arc::new(schema));
+        }
         catalog
-            .schemas
-            .write()
-            .insert(key(DEFAULT_SCHEMA), Arc::new(SchemaCatalogEntry::new(DEFAULT_SCHEMA)));
-        catalog
-            .schemas
-            .write()
-            .insert(key(TEMP_SCHEMA), Arc::new(SchemaCatalogEntry::new(TEMP_SCHEMA)));
-        catalog
+    }
+
+    /// `ROW_GROUP_SIZE` of the database: the tables created from now on have row groups of this many rows.
+    pub fn set_row_group_rows(&self, rows: usize) {
+        self.row_group_rows.store(rows, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// `DuckCatalog::CreateSchema`.
@@ -1983,7 +2015,13 @@ impl Catalog {
                 OnCreateConflict::Replace => dependency_check(&schemas, &schemas[&schema_key])?,
             }
         }
-        schemas.insert(schema_key, Arc::new(SchemaCatalogEntry::at_path(path.to_vec())));
+        schemas.insert(
+            schema_key,
+            Arc::new(SchemaCatalogEntry::at_path_in(
+                path.to_vec(),
+                self.row_group_rows.clone(),
+            )),
+        );
         Ok(())
     }
 

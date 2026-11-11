@@ -2536,6 +2536,9 @@ test/sql/merge/merge_multi_match_error.test
 test/sql/merge/merge_not_matched_by_source_join_order.test
 test/sql/optimizer/anti_join_empty_rhs_projection_map.test
 test/sql/optimizer/any_extremum_rewrite.test
+test/sql/optimizer/boolean_row_group_pruning.test
+test/sql/optimizer/case_zonemap_pruning.test
+test/sql/optimizer/coalesce_zonemap_pruning.test
 test/sql/optimizer/distinct_sibling_column_pruning.test
 test/sql/optimizer/distinctness_statistics.test
 test/sql/optimizer/distinctness_statistics_nested.test
@@ -2572,6 +2575,7 @@ test/sql/optimizer/predicate_factoring.test
 test/sql/optimizer/pushdown_extract_multiple_filters.test
 test/sql/optimizer/remove_unused_columns_nested_struct_cast.test
 test/sql/optimizer/rewrite_nan_null.test
+test/sql/optimizer/sign_row_group_pruning.test
 test/sql/optimizer/string_stats_merge_truncated_prefix.test
 test/sql/optimizer/struct_extract_struct_pack_collation.test
 test/sql/optimizer/test_common_subplan_aggregate_columns.test

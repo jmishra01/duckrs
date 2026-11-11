@@ -28,30 +28,43 @@ pub const ROW_GROUP_SIZE: usize = 122_880;
 /// The chunks of a row group, which all but the last chunk of a table fill.
 pub const CHUNKS_PER_ROW_GROUP: usize = ROW_GROUP_SIZE / STANDARD_VECTOR_SIZE;
 
-/// The row groups of `rows` rows.
-pub fn row_group_count(rows: usize) -> usize {
-    rows.div_ceil(ROW_GROUP_SIZE)
+/// The row groups of `rows` rows of `table`.
+pub fn row_group_count(table: &TableCatalogEntry, rows: usize) -> usize {
+    rows.div_ceil(table.row_group_size().max(1))
 }
 
 /// Functions whose result does not go down when their argument goes up.
-const MONOTONE_FUNCTIONS: &[&str] = &["floor", "ceil", "ceiling", "year", "decade", "century", "millennium"];
+const MONOTONE_FUNCTIONS: &[&str] = &[
+    "floor",
+    "ceil",
+    "ceiling",
+    "year",
+    "decade",
+    "century",
+    "millennium",
+    "sign",
+];
 
 /// The zones of a column, by the keys in which its values sort as they do in a comparison.
 fn compute_zones(table: &TableCatalogEntry, column: usize, known: &[ColumnZone]) -> Vec<ColumnZone> {
     if !has_ordered_statistics(&table.columns[column].ty) {
         return Vec::new();
     }
-    if let Some(source) = table.source().filter(|source| TableCursor::is_aligned(&**source)) {
+    if let Some(source) = table
+        .source()
+        .filter(|source| TableCursor::is_aligned(&**source, table.row_group_size()))
+    {
         // what the file knows of its row groups: a query need not read those that it doesn't want
         return source.zones(column).unwrap_or_default();
     }
     let mut zones = known.to_vec();
-    let first_chunk = known.len() * CHUNKS_PER_ROW_GROUP;
+    let chunks_per_group = table.chunks_per_row_group();
+    let first_chunk = known.len() * chunks_per_group;
     let read = table.for_each_chunk(column, |index, vector, count| {
         if index < first_chunk {
             return;
         }
-        if index % CHUNKS_PER_ROW_GROUP == 0 {
+        if index % chunks_per_group == 0 {
             zones.push(ColumnZone::default());
         }
         let zone = zones.last_mut().expect("just pushed one");
@@ -100,7 +113,7 @@ fn compute_zones(table: &TableCatalogEntry, column: usize, known: &[ColumnZone])
 
 /// `compute_zones`, once per state of the rows.
 fn zones_of(table: &TableCatalogEntry, column: usize) -> Arc<Vec<ColumnZone>> {
-    let groups = row_group_count(table.row_count());
+    let groups = row_group_count(table, table.row_count());
     let (version, known) = {
         let mut cached = table.statistics.lock();
         if cached.unreported {
@@ -141,8 +154,9 @@ impl Group<'_> {
     fn zone(&self, index: usize) -> Option<ColumnZone> {
         let column = *self.column_ids.get(index)?;
         if column == COLUMN_IDENTIFIER_ROW_ID {
-            let first = self.group * ROW_GROUP_SIZE;
-            let last = (first + ROW_GROUP_SIZE).min(self.rows).checked_sub(1)?;
+            let size = self.table.row_group_size();
+            let first = self.group * size;
+            let last = (first + size).min(self.rows).checked_sub(1)?;
             let ids = self.table.row_ids(self.rows);
             return Some(ColumnZone {
                 min: Some(Value::bigint(ids.id(first) as i64)),
@@ -178,7 +192,160 @@ impl Group<'_> {
             {
                 self.through(expr, &children[0])
             }
+            BoundExprKind::Constant(value) if value.is_null() => Range::Null,
+            BoundExprKind::Constant(value) => Range::Bounds(value.clone(), value.clone()),
+            // `PropagateCaseExpression`: what any branch gives
+            BoundExprKind::Case { checks, else_expr } => {
+                let branches = checks.iter().map(|(_, then)| then).chain(std::iter::once(&**else_expr));
+                self.union(branches)
+            }
+            BoundExprKind::Function { function, children, .. } => self.function_range(expr, &function.name, children),
+            BoundExprKind::Operator {
+                op: BoundOperator::Coalesce,
+                children,
+            } => self.union(children.iter()),
             _ => Range::Unknown,
+        }
+    }
+
+    /// The range of what is any of `exprs`.
+    fn union<'e>(&self, exprs: impl Iterator<Item = &'e BoundExpr>) -> Range {
+        let is = |op, a: &Value, b: &Value| compare_values(op, a, b) == Some(true);
+        let mut result = Range::Null;
+        for expr in exprs {
+            result = match (result, self.range(expr)) {
+                (Range::Unknown, _) | (_, Range::Unknown) => return Range::Unknown,
+                (Range::Null, other) | (other, Range::Null) => other,
+                (Range::Bounds(a_min, a_max), Range::Bounds(b_min, b_max)) => Range::Bounds(
+                    if is(ComparisonOp::LessThan, &b_min, &a_min) {
+                        b_min
+                    } else {
+                        a_min
+                    },
+                    if is(ComparisonOp::GreaterThan, &b_max, &a_max) {
+                        b_max
+                    } else {
+                        a_max
+                    },
+                ),
+            };
+        }
+        result
+    }
+
+    /// The statistics of a function of the columns (`FunctionStatistics` of `coalesce`, `greatest`, `least`, the
+    /// arithmetic operators and the date parts).
+    fn function_range(&self, expr: &BoundExpr, name: &str, children: &[BoundExpr]) -> Range {
+        let is = |op, a: &Value, b: &Value| compare_values(op, a, b) == Some(true);
+        let constant = |e: &BoundExpr| match &e.kind {
+            BoundExprKind::Constant(value) if !value.is_null() => Some(value.clone()),
+            _ => None,
+        };
+        let sign = |value: &Value| -> Option<Ordering> {
+            let zero = crate::execution::parquet::try_cast_value(&Value::integer(0), value.logical_type())?;
+            if is(ComparisonOp::GreaterThan, value, &zero) {
+                Some(Ordering::Greater)
+            } else if is(ComparisonOp::LessThan, value, &zero) {
+                Some(Ordering::Less)
+            } else {
+                Some(Ordering::Equal)
+            }
+        };
+        match (name, children) {
+            ("coalesce", _) => self.union(children.iter()),
+            // a prefix of a string sorts as the string does
+            ("left" | "substring" | "substr", [_, ..])
+                if children[1..].iter().all(|c| constant(c).is_some())
+                    && (name == "left"
+                        || constant(&children[1]).and_then(|v| v.try_to_string().ok()).as_deref() == Some("1")) =>
+            {
+                self.monotone(expr, 0, true)
+            }
+            ("greatest" | "least", [_, ..]) => {
+                let greatest = name == "greatest";
+                let mut bounds: Option<(Value, Value)> = None;
+                for child in children {
+                    let Range::Bounds(min, max) = self.range(child) else {
+                        return Range::Unknown;
+                    };
+                    bounds = Some(match bounds {
+                        None => (min, max),
+                        Some((a, b)) => {
+                            let pick = |x: Value, y: Value| {
+                                let op = if greatest {
+                                    ComparisonOp::GreaterThan
+                                } else {
+                                    ComparisonOp::LessThan
+                                };
+                                if is(op, &y, &x) { y } else { x }
+                            };
+                            (pick(a, min), pick(b, max))
+                        }
+                    });
+                }
+                bounds.map_or(Range::Unknown, |(min, max)| Range::Bounds(min, max))
+            }
+            // a function of one column and a constant that keeps or reverses the order of values
+            ("+" | "-" | "*" | "/" | "//", [left, right]) => {
+                let (varying, increasing) = match (constant(left), constant(right)) {
+                    (None, Some(c)) => match (name, sign(&c)) {
+                        ("+" | "-", _) => (0, true),
+                        ("*" | "/" | "//", Some(Ordering::Greater)) => (0, true),
+                        ("*" | "/" | "//", Some(Ordering::Less)) => (0, false),
+                        _ => return Range::Unknown,
+                    },
+                    (Some(c), None) => match (name, sign(&c)) {
+                        ("+", _) => (1, true),
+                        ("-", _) => (1, false),
+                        ("*", Some(Ordering::Greater)) => (1, true),
+                        ("*", Some(Ordering::Less)) => (1, false),
+                        _ => return Range::Unknown,
+                    },
+                    _ => return Range::Unknown,
+                };
+                self.monotone(expr, varying, increasing)
+            }
+            // `DatePart::MonthOperator` and the like: within one year, the parts of the bounds
+            ("month" | "quarter", [child]) => match self.range(child) {
+                Range::Bounds(min, max) => {
+                    // the year of a DATE or TIMESTAMP is the start of its text
+                    let year = |value: &Value| {
+                        value
+                            .try_to_string()
+                            .ok()
+                            .map(|text| text.chars().take(4).collect::<String>())
+                    };
+                    if year(&min).is_some() && year(&min) == year(&max) {
+                        self.monotone(expr, 0, true)
+                    } else {
+                        Range::Unknown
+                    }
+                }
+                other => other,
+            },
+            _ => Range::Unknown,
+        }
+    }
+
+    /// The range of `expr`, whose child `varying` is the one that changes, in or against the order of its values.
+    fn monotone(&self, expr: &BoundExpr, varying: usize, increasing: bool) -> Range {
+        let BoundExprKind::Function { children, .. } = &expr.kind else {
+            return Range::Unknown;
+        };
+        let at = |value: &Value| {
+            let mut call = expr.clone();
+            if let BoundExprKind::Function { children, .. } = &mut call.kind {
+                children[varying] = BoundExpr::constant(value.clone());
+            }
+            try_evaluate_scalar(&call).filter(|result| !result.is_null())
+        };
+        match self.range(&children[varying]) {
+            Range::Bounds(min, max) => match (at(&min), at(&max)) {
+                (Some(low), Some(high)) if increasing => Range::Bounds(low, high),
+                (Some(low), Some(high)) => Range::Bounds(high, low),
+                _ => Range::Unknown,
+            },
+            other => other,
         }
     }
 
@@ -205,11 +372,59 @@ impl Group<'_> {
         match &expr.kind {
             BoundExprKind::Conjunction { and: true, children } => children.iter().any(|c| self.never_true(c)),
             BoundExprKind::Conjunction { and: false, children } => children.iter().all(|c| self.never_true(c)),
+            // `(x > 5) = true`: the comparison itself
+            BoundExprKind::Comparison {
+                op: ComparisonOp::Equal | ComparisonOp::NotDistinctFrom,
+                left,
+                right,
+            } if left.return_type.id() == LogicalTypeId::Boolean
+                && matches!(
+                    left.kind,
+                    BoundExprKind::Comparison { .. }
+                        | BoundExprKind::Between { .. }
+                        | BoundExprKind::Conjunction { .. }
+                )
+                && matches!(&right.kind, BoundExprKind::Constant(value) if value.data() == &duckrs_common::value::ValueData::Bool(true)) =>
+            {
+                self.never_true(left)
+            }
             BoundExprKind::Comparison { op, left, right } => match (&left.kind, &right.kind) {
+                // `IS NOT DISTINCT FROM` a value is `=` it, but for NULLs
+                (_, BoundExprKind::Constant(constant))
+                    if *op == ComparisonOp::NotDistinctFrom && !constant.is_null() =>
+                {
+                    self.comparison_fails(ComparisonOp::Equal, left, constant)
+                }
                 (_, BoundExprKind::Constant(constant)) => self.comparison_fails(*op, left, constant),
                 (BoundExprKind::Constant(constant), _) => self.comparison_fails(flipped(*op), right, constant),
-                _ => false,
+                // two expressions of the columns: their ranges (`PropagateComparison`)
+                _ => self.ranges_fail(*op, left, right),
             },
+            // `prefix(s, 'ab')` / `starts_with`: s from 'ab' up to what follows all strings that start with it
+            BoundExprKind::Function { function, children, .. }
+                if matches!(function.name.as_str(), "prefix" | "starts_with") && children.len() == 2 =>
+            {
+                let BoundExprKind::Constant(prefix) = &children[1].kind else {
+                    return false;
+                };
+                let Ok(prefix) = prefix.try_to_string() else {
+                    return false;
+                };
+                if prefix.is_empty() {
+                    return false;
+                }
+                let Range::Bounds(min, max) = self.range(&children[0]) else {
+                    return matches!(self.range(&children[0]), Range::Null);
+                };
+                let (Ok(min), Ok(max)) = (min.try_to_string(), max.try_to_string()) else {
+                    return false;
+                };
+                let (min, max, prefix) = (min.as_bytes(), max.as_bytes(), prefix.as_bytes());
+                // every string of the group sorts after the prefix's range, or before it
+                let after = min > prefix && !min.starts_with(prefix);
+                let before = max < prefix;
+                after || before
+            }
             BoundExprKind::Between { input, lower, upper } => {
                 let bound = |bound: &BoundExpr, op| match &bound.kind {
                     BoundExprKind::Constant(constant) => self.comparison_fails(op, input, constant),
@@ -228,6 +443,29 @@ impl Group<'_> {
                     _ => false,
                 }
             }
+            _ => false,
+        }
+    }
+
+    /// Whether `left op right` can not hold for any two values of their ranges.
+    fn ranges_fail(&self, op: ComparisonOp, left: &BoundExpr, right: &BoundExpr) -> bool {
+        let is = |op, a: &Value, b: &Value| compare_values(op, a, b) == Some(true);
+        let (Range::Bounds(l_min, l_max), Range::Bounds(r_min, r_max)) = (self.range(left), self.range(right)) else {
+            return false;
+        };
+        match op {
+            ComparisonOp::Equal => {
+                is(ComparisonOp::LessThan, &l_max, &r_min) || is(ComparisonOp::GreaterThan, &l_min, &r_max)
+            }
+            ComparisonOp::NotEqual => {
+                is(ComparisonOp::Equal, &l_min, &l_max)
+                    && is(ComparisonOp::Equal, &r_min, &r_max)
+                    && is(ComparisonOp::Equal, &l_min, &r_min)
+            }
+            ComparisonOp::LessThan => is(ComparisonOp::GreaterThanOrEqual, &l_min, &r_max),
+            ComparisonOp::LessThanOrEqual => is(ComparisonOp::GreaterThan, &l_min, &r_max),
+            ComparisonOp::GreaterThan => is(ComparisonOp::LessThanOrEqual, &l_max, &r_min),
+            ComparisonOp::GreaterThanOrEqual => is(ComparisonOp::LessThan, &l_max, &r_min),
             _ => false,
         }
     }
@@ -279,7 +517,7 @@ pub fn groups_to_scan(
     filter: Option<&BoundExpr>,
     rows: usize,
 ) -> Vec<bool> {
-    let groups = row_group_count(rows);
+    let groups = row_group_count(table, rows);
     let Some(filter) = filter else {
         return vec![true; groups];
     };

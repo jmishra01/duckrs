@@ -136,7 +136,8 @@ impl TableCatalogEntry {
     /// end gets its id when something asks for it.
     pub fn rows_moved(&self, removed: &[usize], count: usize) {
         let ids = self.row_ids(count);
-        self.statistics.lock().rows_removed(removed);
+        let group_rows = self.row_group_size();
+        self.statistics.lock().rows_removed(removed, group_rows);
         {
             let rewrites = self.rewrite_count();
             let mut trees = self.index_trees.lock();
@@ -461,6 +462,7 @@ impl Catalog {
         let start = tick();
         let transaction = start;
         let mut catalog = Catalog::new(&self.name);
+        catalog.row_group_rows = self.row_group_rows.clone();
         catalog.forked = true;
         let catalog = Arc::new(catalog);
         *catalog.database_list.write() = self.database_list.read().clone();

@@ -11,7 +11,6 @@ use super::table_functions::parse_select;
 use super::{Binder, ShowBehavior, binder_error};
 use crate::catalog::{SchemaCatalogEntry, SegmentInfo, TEMP_SCHEMA, TableCatalogEntry, TableConstraint, TableOrView};
 use crate::execution::expression_executor::evaluate_scalar;
-use crate::execution::zone_map::ROW_GROUP_SIZE;
 use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{COLUMN_IDENTIFIER_ROW_ID, LogicalOperator, LogicalOperatorKind};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
@@ -176,9 +175,9 @@ const SYSTEM_TABLES: [&str; 13] = [
 /// its validity, in one segment.
 fn memory_segments(table: &TableCatalogEntry) -> Vec<SegmentInfo> {
     let rows = table.row_count() as u64;
-    let size = ROW_GROUP_SIZE as u64;
+    let size = table.row_group_size() as u64;
     let mut segments = Vec::new();
-    for (group, start) in (0..rows).step_by(ROW_GROUP_SIZE).enumerate() {
+    for (group, start) in (0..rows).step_by(table.row_group_size().max(1)).enumerate() {
         for (column, definition) in table.columns.iter().enumerate() {
             let parts = [
                 (format!("[{column}]"), definition.ty.to_string()),
