@@ -693,6 +693,12 @@ const INFALLIBLE_FUNCTIONS: &[&str] = &[
 ];
 
 /// `Expression::CanThrow`, leaning towards true.
+/// `ExpressionBarrier::Contains`.
+pub(crate) fn contains_barrier(expr: &BoundExpr) -> bool {
+    matches!(&expr.kind, BoundExprKind::Function { function, .. } if function.name == "__internal_barrier")
+        || expr.children().into_iter().any(contains_barrier)
+}
+
 pub(crate) fn can_throw(expr: &BoundExpr) -> bool {
     let own = match &expr.kind {
         BoundExprKind::Subquery { .. } | BoundExprKind::ListLambda { .. } | BoundExprKind::Sequence { .. } => true,

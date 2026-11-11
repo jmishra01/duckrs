@@ -266,6 +266,31 @@ fn stats_function() -> ScalarFunctionSet {
     set
 }
 
+/// `BarrierFun`: its argument, unchanged; optimizations keep what is in it together.
+fn barrier_function() -> ScalarFunctionSet {
+    fn barrier(args: &DataChunk, result: &mut Vector) -> Result<()> {
+        *result = args.columns()[0].clone();
+        Ok(())
+    }
+    fn resolve(function: &ScalarFunction, arguments: &[LogicalType]) -> Result<ScalarFunction> {
+        Ok(ScalarFunction::new(
+            function.name.clone(),
+            arguments.to_vec(),
+            arguments.first().cloned().unwrap_or(LogicalType::SQLNULL),
+            function.function,
+        ))
+    }
+    let mut set = ScalarFunctionSet::new("__internal_barrier");
+    let function = ScalarFunction::new(
+        "__internal_barrier",
+        vec![LogicalType::new(LogicalTypeId::Any)],
+        LogicalType::new(LogicalTypeId::Any),
+        barrier,
+    );
+    set.add(function.with_resolve_types(resolve));
+    set
+}
+
 /// The `stats` function once the propagator knows the statistics: they are its second argument.
 pub fn stats_with_value(argument: LogicalType) -> ScalarFunction {
     fn filled(args: &DataChunk, result: &mut Vector) -> Result<()> {
@@ -356,6 +381,8 @@ impl BuiltinFunctions {
             functions.scalar.insert(set.name.clone(), set);
             let typeof_set = typeof_function();
             functions.scalar.insert(typeof_set.name.clone(), typeof_set);
+            let barrier_set = barrier_function();
+            functions.scalar.insert(barrier_set.name.clone(), barrier_set);
             let stats_set = stats_function();
             functions.scalar.insert(stats_set.name.clone(), stats_set);
             for set in aggregates::aggregate_functions() {

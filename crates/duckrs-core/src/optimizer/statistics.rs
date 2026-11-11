@@ -1020,6 +1020,108 @@ impl StatisticsPropagator {
             *expr = value.with_alias(alias);
             return stats.swap_remove(0);
         }
+        let as_int = |value: &Option<Value>| value.as_ref()?.try_to_string().ok()?.parse::<i128>().ok();
+        let int_value = |n: i128| {
+            let cast = BoundExpr::constant(Value::hugeint(n)).cast_to(&return_type, false);
+            crate::execution::expression_executor::try_evaluate_scalar(&cast)
+                .filter(|v| v.logical_type() == &return_type)
+        };
+        // `PropagateAbsStats`: of integers whose smallest value is not the type's minimum
+        if function.name == "abs" && children.len() == 1 && return_type.is_integral() {
+            let child = &stats[0];
+            let (Some(low), Some(high)) = (as_int(&child.min), as_int(&child.max)) else {
+                return unknown();
+            };
+            let type_min = int_value(i128::MIN).is_none() && int_value(low - 1).is_none();
+            if type_min {
+                return unknown();
+            }
+            // `PropagateAbsStats`: of values that are never negative, abs is the value itself
+            if low >= 0 {
+                let child_stats = child.clone();
+                let alias = expr.alias.clone();
+                let BoundExprKind::Function { children, .. } = &mut expr.kind else {
+                    unreachable!()
+                };
+                let value = children.swap_remove(0);
+                *expr = value.with_alias(alias);
+                return child_stats;
+            }
+            let Some(negated_low) = low.checked_neg() else {
+                return unknown();
+            };
+            let (min, max) = if low >= 0 {
+                (low, high)
+            } else if high <= 0 {
+                (-high, negated_low)
+            } else {
+                (0, negated_low.max(high))
+            };
+            return Stats {
+                min: int_value(min),
+                max: int_value(max),
+                can_be_null: child.can_be_null,
+                can_be_valid: child.can_be_valid,
+                geometry: None,
+            };
+        }
+        if children.len() == 2 && return_type.is_integral() && matches!(function.name.as_str(), "%" | "//") {
+            let (left, right) = (&stats[0], &stats[1]);
+            // `ModuloFullRange`: a dividend without statistics spans its type
+            let (lmin, lmax) = match (as_int(&left.min), as_int(&left.max)) {
+                (Some(min), Some(max)) => (min, max),
+                _ if function.name == "%" => match integer_range(&return_type) {
+                    Some(range) => range,
+                    None => return unknown(),
+                },
+                _ => return unknown(),
+            };
+            let (Some(rmin), Some(rmax)) = (as_int(&right.min), as_int(&right.max)) else {
+                return unknown();
+            };
+            let zero_divisor = rmin <= 0 && rmax >= 0;
+            let can_be_null = left.can_be_null || right.can_be_null || zero_divisor;
+            let bounds = if function.name == "%" {
+                // `SignedModuloBounds`; a divisor range with 0 in it raises, so nothing is derived
+                if zero_divisor {
+                    None
+                } else {
+                    let (mut min, mut max) = (lmin.min(0), lmax.max(0));
+                    let (Some(abs_min), Some(abs_max)) = (rmin.checked_abs(), rmax.checked_abs()) else {
+                        return unknown();
+                    };
+                    let max_abs = abs_min.max(abs_max);
+                    let min_abs = if zero_divisor { 0 } else { abs_min.min(abs_max) };
+                    if !zero_divisor && -min_abs < lmin && lmax < min_abs {
+                        (min, max) = (lmin, lmax);
+                    } else {
+                        let bound = max_abs - 1;
+                        min = min.max(-bound);
+                        max = max.min(bound);
+                    }
+                    Some((min, max))
+                }
+            } else if zero_divisor {
+                // `DividePropagateStatistics`: a divisor range with 0 in it says nothing
+                None
+            } else {
+                let corners: Option<Vec<i128>> = [(lmin, rmin), (lmin, rmax), (lmax, rmin), (lmax, rmax)]
+                    .iter()
+                    .map(|(a, b)| a.checked_div(*b))
+                    .collect();
+                corners.map(|c| (*c.iter().min().expect("four"), *c.iter().max().expect("four")))
+            };
+            let Some((min, max)) = bounds else {
+                return unknown();
+            };
+            return Stats {
+                min: int_value(min),
+                max: int_value(max),
+                can_be_null,
+                can_be_valid: true,
+                geometry: None,
+            };
+        }
         if !*is_operator || children.len() != 2 || !return_type.is_integral() {
             return unknown();
         }
@@ -1418,6 +1520,22 @@ impl StatisticsPropagator {
             _ => {}
         }
     }
+}
+
+/// The smallest and largest value of an integer type that fits in an `i128`.
+fn integer_range(ty: &LogicalType) -> Option<(i128, i128)> {
+    use LogicalTypeId::*;
+    Some(match ty.id() {
+        TinyInt => (i128::from(i8::MIN), i128::from(i8::MAX)),
+        SmallInt => (i128::from(i16::MIN), i128::from(i16::MAX)),
+        Integer => (i128::from(i32::MIN), i128::from(i32::MAX)),
+        BigInt => (i128::from(i64::MIN), i128::from(i64::MAX)),
+        UTinyInt => (0, i128::from(u8::MAX)),
+        USmallInt => (0, i128::from(u16::MAX)),
+        UInteger => (0, i128::from(u32::MAX)),
+        UBigInt => (0, i128::from(u64::MAX)),
+        _ => return None,
+    })
 }
 
 /// The most rows an operator can give, where that is known (`NodeStatistics::max_cardinality`).

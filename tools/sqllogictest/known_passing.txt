@@ -538,6 +538,7 @@ test/optimizer/remove_duplicate_groups_with_stats.test
 test/optimizer/remove_unused_filter_column.test
 test/optimizer/reported_bugs/in_vs_where.test
 test/optimizer/row_number_virtual_column_local.test
+test/optimizer/statistics/constant_or_null_conjunction_effects.test
 test/optimizer/statistics/large_join_cardinality.test
 test/optimizer/statistics/positive_join_cardinality.test
 test/optimizer/statistics/statistics_aggregate.test
@@ -2537,6 +2538,7 @@ test/sql/merge/merge_multi_match_error.test
 test/sql/merge/merge_not_matched_by_source_join_order.test
 test/sql/optimizer/anti_join_empty_rhs_projection_map.test
 test/sql/optimizer/any_extremum_rewrite.test
+test/sql/optimizer/barrier_row_group_pruning.test
 test/sql/optimizer/boolean_row_group_pruning.test
 test/sql/optimizer/case_zonemap_pruning.test
 test/sql/optimizer/coalesce_zonemap_pruning.test

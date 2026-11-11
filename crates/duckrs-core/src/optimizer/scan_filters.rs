@@ -7,7 +7,7 @@
 //! runs late, so that the passes before it see filters as operators, and only takes what can run
 //! ahead of the filters that stay: nothing that can fail.
 
-use super::rewriter::{can_throw, split_conjuncts};
+use super::rewriter::{can_throw, contains_barrier, split_conjuncts};
 use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind as K};
 
@@ -50,8 +50,21 @@ pub fn push_into_scans(op: &mut LogicalOperator) {
     for expr in std::mem::take(expressions) {
         split_conjuncts(expr, &mut conjuncts);
     }
+    let (barred, conjuncts): (Vec<BoundExpr>, Vec<BoundExpr>) = conjuncts.into_iter().partition(contains_barrier);
     for conjunct in conjuncts {
         if can_move_into_scan(&conjunct, &scan) {
+            filters.push(conjunct);
+        } else {
+            expressions.push(conjunct);
+        }
+    }
+    // `PushdownBarrierFilters`: into the scan, after the filters there, only if no other filter stays on top
+    for conjunct in barred {
+        let mut columns = Vec::new();
+        let mut outer = false;
+        columns_of(&conjunct, &mut columns, &mut outer);
+        let one_column = !columns.is_empty() && columns.iter().all(|c| *c == columns[0]) && scan.contains(&columns[0]);
+        if expressions.is_empty() && one_column && !outer && !conjunct.is_volatile() {
             filters.push(conjunct);
         } else {
             expressions.push(conjunct);

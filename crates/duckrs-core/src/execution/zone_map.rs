@@ -253,6 +253,7 @@ impl Group<'_> {
         };
         match (name, children) {
             ("coalesce", _) => self.union(children.iter()),
+            ("__internal_barrier", [child]) => self.range(child),
             // a prefix of a string sorts as the string does
             ("left" | "substring" | "substr", [_, ..])
                 if children[1..].iter().all(|c| constant(c).is_some())
@@ -299,6 +300,17 @@ impl Group<'_> {
                         ("-", _) => (1, false),
                         ("*", Some(Ordering::Greater)) => (1, true),
                         ("*", Some(Ordering::Less)) => (1, false),
+                        // a constant that isn't negative over divisors that are all positive: the larger the divisor,
+                        // the smaller the quotient
+                        ("/" | "//", Some(Ordering::Greater | Ordering::Equal)) => {
+                            let Range::Bounds(min, _) = self.range(right) else {
+                                return Range::Unknown;
+                            };
+                            if sign(&min) != Some(Ordering::Greater) {
+                                return Range::Unknown;
+                            }
+                            (1, false)
+                        }
                         _ => return Range::Unknown,
                     },
                     _ => return Range::Unknown,
@@ -370,6 +382,12 @@ impl Group<'_> {
     /// Whether no row of the group can make `expr` true.
     fn never_true(&self, expr: &BoundExpr) -> bool {
         match &expr.kind {
+            // `BarrierStats`: the statistics of what is in it
+            BoundExprKind::Function { function, children, .. }
+                if function.name == "__internal_barrier" && children.len() == 1 =>
+            {
+                self.never_true(&children[0])
+            }
             BoundExprKind::Conjunction { and: true, children } => children.iter().any(|c| self.never_true(c)),
             BoundExprKind::Conjunction { and: false, children } => children.iter().all(|c| self.never_true(c)),
             // `(x > 5) = true`: the comparison itself
