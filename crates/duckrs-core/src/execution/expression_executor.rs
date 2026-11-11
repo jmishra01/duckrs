@@ -228,6 +228,59 @@ fn conjunction(children: &[Vector], and: bool, count: usize) -> Vector {
     result
 }
 
+/// An OR of `x = constant` with the same `x` (how `x IN (...)` binds): `x` is evaluated once and
+/// compared with each constant, instead of once per comparison (C++ evaluates `IN` with its input once).
+fn execute_in_list(children: &[BoundExpr], input: &DataChunk, count: usize) -> Result<Option<Vector>> {
+    use duckrs_parser::ast::ComparisonOp;
+    if children.len() < 2 {
+        return Ok(None);
+    }
+    let mut left_text: Option<String> = None;
+    let mut constants = Vec::with_capacity(children.len());
+    for child in children {
+        let BoundExprKind::Comparison {
+            op: ComparisonOp::Equal,
+            left,
+            right,
+        } = &child.kind
+        else {
+            return Ok(None);
+        };
+        let BoundExprKind::Constant(_) = right.kind else {
+            return Ok(None);
+        };
+        if left.is_volatile() || matches!(left.kind, BoundExprKind::Reference(_) | BoundExprKind::Constant(_)) {
+            // nothing to save on a column itself
+            return Ok(None);
+        }
+        let text = format!("{left:?}");
+        match &left_text {
+            Some(first) if *first != text => return Ok(None),
+            Some(_) => {}
+            None => left_text = Some(text),
+        }
+        constants.push((right.as_ref(), child.return_type.clone()));
+    }
+    let BoundExprKind::Comparison { left, .. } = &children[0].kind else {
+        return Ok(None);
+    };
+    let value = execute(left, input)?;
+    if value.logical_type().id() == LogicalTypeId::SqlNull {
+        return Ok(None);
+    }
+    let mut results = Vec::with_capacity(constants.len());
+    for (constant, return_type) in constants {
+        let constant = execute(constant, input)?;
+        if constant.logical_type() != value.logical_type() {
+            return Ok(None);
+        }
+        let mut result = Vector::new(return_type, count.max(1));
+        compare(&value, &constant, &mut result, count, ComparisonType::Equal)?;
+        results.push(result);
+    }
+    Ok(Some(conjunction(&results, false, count)))
+}
+
 /// `IS NULL` / `IS NOT NULL`: never NULL themselves.
 fn null_check(input: &Vector, count: usize, is_null: bool) -> Vector {
     let constant = input.vector_type() == VectorType::Constant;
@@ -353,7 +406,18 @@ fn execute_case(
 /// The result of a subquery for correlated values with this key, which runs the first time
 /// something asks. An error stays too: TRY runs a failed chunk again.
 fn subquery_result(subquery: &BoundSubquery, key: &[u8], values: &[Value]) -> Arc<Result<SubqueryResult>> {
-    let cached = !subquery.volatile || values.is_empty();
+    if values.is_empty() {
+        // an uncorrelated subquery runs once, while the threads of a parallel pipeline that ask for
+        // it at the same time wait
+        let mut results = subquery.results.lock();
+        if let Some(result) = results.get(key) {
+            return result.clone();
+        }
+        let result = Arc::new(run_subquery(subquery, values));
+        results.insert(key.to_vec(), result.clone());
+        return result;
+    }
+    let cached = !subquery.volatile;
     if cached && let Some(result) = subquery.results.lock().get(key) {
         return result.clone();
     }
@@ -752,6 +816,9 @@ pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
             Ok(result)
         }
         BoundExprKind::Conjunction { and, children } => {
+            if !*and && let Some(result) = execute_in_list(children, input, count)? {
+                return Ok(result);
+            }
             let children = children.iter().map(|c| execute(c, input)).collect::<Result<Vec<_>>>()?;
             Ok(conjunction(&children, *and, count))
         }

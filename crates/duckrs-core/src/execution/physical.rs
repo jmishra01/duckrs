@@ -732,11 +732,18 @@ impl PhysicalOperator for PhysicalTableScan {
 }
 
 /// Whether threads can evaluate `expr` at once. What is volatile gives other results in another
-/// order, and what runs a plan of its own is not known to be safe from several threads.
+/// order, and a correlated subquery runs a plan for each row it gets.
 pub(super) fn parallel_expression(expr: &BoundExpr) -> bool {
     use crate::planner::expression::BoundExprKind;
     fn has_subquery(expr: &BoundExpr) -> bool {
-        matches!(expr.kind, BoundExprKind::Subquery { .. }) || expr.children().into_iter().any(has_subquery)
+        // an uncorrelated subquery runs once and every thread reads what it gave
+        let correlated = match &expr.kind {
+            BoundExprKind::Subquery {
+                subquery, correlated, ..
+            } => subquery.volatile || !correlated.is_empty() || !subquery.correlated.is_empty(),
+            _ => false,
+        };
+        correlated || expr.children().into_iter().any(has_subquery)
     }
     !expr.is_volatile() && !has_subquery(expr)
 }
