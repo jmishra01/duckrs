@@ -221,7 +221,7 @@ struct TableScanState {
     next_index_row: usize,
     /// A filtered scan of a table in its file, a row group at a time: the next group, and the chunks
     /// of the last one that are still to come.
-    filtered: Option<(usize, std::collections::VecDeque<DataChunk>)>,
+    filtered: Option<(usize, Vec<usize>, std::collections::VecDeque<DataChunk>)>,
 }
 
 /// What a scan reads of a file. `column_ids` lists all columns for the filter and the projection to
@@ -365,15 +365,19 @@ impl PhysicalTableScan {
     /// when the groups of the file are those of the table (all full but the last).
     fn parallel_file_source(&self, source: Arc<dyn TableSource>) -> Option<(SharedSourceState, usize)> {
         let group_rows = self.table.row_group_size();
-        if !group_rows.is_multiple_of(STANDARD_VECTOR_SIZE) || !TableCursor::is_aligned(&*source, group_rows) {
-            return None;
-        }
         let groups = source.group_count();
         if groups < MIN_PARALLEL_ROW_GROUPS {
             return None;
         }
         let rows = self.table.row_count();
-        let wanted = groups_to_scan(&self.table, &self.column_ids, self.filter.as_ref(), rows);
+        // the zone maps are per group of the table, which are those of the file only when they line up
+        let aligned = group_rows.is_multiple_of(STANDARD_VECTOR_SIZE) && TableCursor::is_aligned(&*source, group_rows);
+        let wanted = if aligned {
+            groups_to_scan(&self.table, &self.column_ids, self.filter.as_ref(), rows)
+        } else {
+            Vec::new()
+        };
+        let starts = group_starts(&*source);
         let ids = self.table.row_ids(rows);
         let (read, types, columns) = self.file_columns();
         let scan = FileScan {
@@ -389,6 +393,7 @@ impl PhysicalTableScan {
                 ids,
                 rows,
                 groups: wanted,
+                starts,
             }),
             groups,
         ))
@@ -510,6 +515,19 @@ struct ParallelFileScan {
     ids: Arc<RowIds>,
     rows: usize,
     groups: Vec<bool>,
+    /// the first row of each group of the file
+    starts: Vec<usize>,
+}
+
+/// The first row of each group of a source: groups of a file written on threads need not be full.
+fn group_starts(source: &dyn TableSource) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(source.group_count());
+    let mut start = 0;
+    for group in 0..source.group_count() {
+        starts.push(start);
+        start += source.group_rows(group);
+    }
+    starts
 }
 
 /// What the threads of a [`PhysicalTableScan`] share.
@@ -559,17 +577,16 @@ impl PhysicalOperator for PhysicalTableScan {
         if !state.groups.get(index).is_none_or(|g| *g) {
             return Ok(());
         }
+        let group_start = state.starts[index];
         if self.filter.is_some() {
             let group_rows = state.source.group_rows(index);
-            let first_row = index * self.table.chunks_per_row_group() * STANDARD_VECTOR_SIZE;
-            let rows = group_rows.min(state.rows.saturating_sub(first_row));
-            return self.scan_group_filtered(&*state.source, index, first_row, rows, &state.ids, emit);
+            let rows = group_rows.min(state.rows.saturating_sub(group_start));
+            return self.scan_group_filtered(&*state.source, index, group_start, rows, &state.ids, emit);
         }
         let mut group = ColumnDataCollection::new(state.types.clone());
         group.append_shared(&state.source.read_group(index, &state.read)?);
-        let first_chunk = index * self.table.chunks_per_row_group();
         for (local, chunk) in group.chunks().enumerate() {
-            let first_row = (first_chunk + local) * STANDARD_VECTOR_SIZE;
+            let first_row = group_start + local * STANDARD_VECTOR_SIZE;
             let count = chunk.len().min(state.rows.saturating_sub(first_row));
             if count == 0 {
                 break;
@@ -620,15 +637,9 @@ impl PhysicalOperator for PhysicalTableScan {
         let cursor = source.clone().map(|source| self.file_scan(source));
         let ids = self.table.row_ids(remaining);
         // a filter on a table in its file is applied while its row groups are read
-        let group_rows = self.table.row_group_size();
         let filtered = source
-            .filter(|source| {
-                self.filter.is_some()
-                    && self.index_rows.is_none()
-                    && group_rows.is_multiple_of(STANDARD_VECTOR_SIZE)
-                    && TableCursor::is_aligned(&**source, group_rows)
-            })
-            .map(|_| (0, std::collections::VecDeque::new()));
+            .filter(|_| self.filter.is_some() && self.index_rows.is_none())
+            .map(|source| (0, group_starts(&*source), std::collections::VecDeque::new()));
         Box::new(TableScanState {
             ids,
             next: 0,
@@ -660,9 +671,12 @@ impl PhysicalOperator for PhysicalTableScan {
         if let Some(rows) = &self.index_rows {
             return self.next_index_chunk(rows, next_index_row);
         }
-        if let Some((next_group, pending)) = filtered {
+        if let Some((next_group, starts, pending)) = filtered {
             let source = self.table.source().expect("a filtered scan reads a file");
             let rows = *remaining;
+            let group_rows = self.table.row_group_size();
+            let aligned =
+                group_rows.is_multiple_of(STANDARD_VECTOR_SIZE) && TableCursor::is_aligned(&*source, group_rows);
             loop {
                 if let Some(chunk) = pending.pop_front() {
                     return Ok(Some(chunk));
@@ -672,8 +686,8 @@ impl PhysicalOperator for PhysicalTableScan {
                 }
                 let group = *next_group;
                 *next_group += 1;
-                let first_row = group * self.table.chunks_per_row_group() * STANDARD_VECTOR_SIZE;
-                if first_row >= rows || !groups.get(group).is_none_or(|g| *g) {
+                let first_row = starts[group];
+                if first_row >= rows || (aligned && !groups.get(group).is_none_or(|g| *g)) {
                     continue;
                 }
                 let group_rows = source.group_rows(group).min(rows - first_row);

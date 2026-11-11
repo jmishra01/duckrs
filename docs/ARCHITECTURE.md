@@ -867,6 +867,11 @@ cargo run --release -p benchmark --features reference -- --engine=both --threads
 cargo bench -p duckrs --bench kernels
 ```
 
+Larger scale factors go through `--sf N`. duckrs cannot load TPC-H SF10 itself (an append keeps the rows of
+its table in memory), so SF10 is measured on the file C++ writes: run the reference engine once
+(`--engine=reference --sf 10`), copy `duckdb_benchmark_data/reference/tpch_sf10.duckdb` to
+`duckdb_benchmark_data/duckrs/`, then `--engine=both --sf 10`. There are no SF10 answers to check.
+
 ## Testing
 
 The DuckDB sqllogictest corpus is the acceptance oracle. `tools/sqllogictest` runs it against
