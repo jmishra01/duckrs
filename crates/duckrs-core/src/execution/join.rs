@@ -32,7 +32,7 @@ use crate::planner::expression::BoundExpr;
 use crate::planner::logical::JoinCondition;
 use crate::storage::log_writer::can_serialize;
 use duckrs_common::column_data::ColumnDataCollection;
-use duckrs_common::sort_key::{KeyHasher, RowKey, RowKeyMap, create_row_keys};
+use duckrs_common::sort_key::{KeyHasher, RowKey, create_row_keys};
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, SelectionVector, StringCopy, Vector};
@@ -188,9 +188,18 @@ const MIN_PARALLEL_BUILD_ROWS: usize = 100_000;
 /// The partition of a key. The tables read the low and the high bits of the hash, so the
 /// partition is in the middle ones.
 fn partition_of(key: &RowKey) -> usize {
+    partition_of_hash(key_hash(key))
+}
+
+fn partition_of_hash(hash: u64) -> usize {
+    (hash >> 32) as usize % PARTITIONS
+}
+
+/// The hash of a key, which picks both its partition and its slot in the partition's table.
+fn key_hash(key: &RowKey) -> u64 {
     let mut hasher = KeyHasher::default();
     key.hash(&mut hasher);
-    (hasher.finish() >> 32) as usize % PARTITIONS
+    hasher.finish()
 }
 
 /// A key of the build side, with its partition (always 0 when one thread sinks), or `None` when a key that is not null-safe is NULL.
@@ -251,27 +260,71 @@ impl JoinBuild {
     }
 }
 
-/// The keys of a partition of the build side.
+/// The keys of a partition of the build side: a table of the distinct keys by their hash, and the
+/// build rows of each in one array (those of key `g` at `offsets[g]..offsets[g + 1]`, in order).
 #[derive(Debug, Default)]
 struct Partition {
-    /// key -> index in `rows`
-    groups: RowKeyMap<usize>,
-    /// the build rows of each key
-    rows: Vec<Vec<u32>>,
+    /// the group of each distinct key, found by its hash
+    table: hashbrown::HashTable<u32>,
+    keys: Vec<RowKey>,
+    hashes: Vec<u64>,
+    offsets: Vec<u32>,
+    rows: Vec<u32>,
 }
 
 impl Partition {
     fn new(keys: Vec<(RowKey, u32)>) -> Self {
         let mut partition = Self::default();
+        let mut group_of = Vec::with_capacity(keys.len());
+        let mut sizes: Vec<u32> = Vec::new();
+        let mut rows_in_order = Vec::with_capacity(keys.len());
         for (key, row) in keys {
-            let next = partition.rows.len();
-            let group = *partition.groups.entry(key).or_insert(next);
-            if group == next {
-                partition.rows.push(Vec::new());
-            }
-            partition.rows[group].push(row);
+            let hash = key_hash(&key);
+            let group = match partition.table.find(hash, |&g| partition.keys[g as usize] == key) {
+                Some(&group) => group,
+                None => {
+                    let group = partition.keys.len() as u32;
+                    let hashes = &partition.hashes;
+                    partition.table.insert_unique(hash, group, |&g| hashes[g as usize]);
+                    partition.keys.push(key);
+                    partition.hashes.push(hash);
+                    sizes.push(0);
+                    group
+                }
+            };
+            sizes[group as usize] += 1;
+            group_of.push(group);
+            rows_in_order.push(row);
         }
+        // the rows of each key together, in the order they came in
+        let mut offsets = Vec::with_capacity(sizes.len() + 1);
+        let mut total = 0u32;
+        offsets.push(0);
+        for size in &sizes {
+            total += size;
+            offsets.push(total);
+        }
+        let mut next: Vec<u32> = offsets[..sizes.len()].to_vec();
+        let mut rows = vec![0u32; rows_in_order.len()];
+        for (group, row) in group_of.into_iter().zip(rows_in_order) {
+            rows[next[group as usize] as usize] = row;
+            next[group as usize] += 1;
+        }
+        partition.offsets = offsets;
+        partition.rows = rows;
         partition
+    }
+
+    /// The group of `key`, whose hash is `hash`.
+    fn group(&self, hash: u64, key: &RowKey) -> Option<usize> {
+        self.table
+            .find(hash, |&g| self.keys[g as usize] == *key)
+            .map(|&g| g as usize)
+    }
+
+    /// The build rows of a group.
+    fn rows(&self, group: usize) -> &[u32] {
+        &self.rows[self.offsets[group] as usize..self.offsets[group + 1] as usize]
     }
 }
 
@@ -296,12 +349,12 @@ struct FinishedBuild {
 impl FinishedBuild {
     /// The partition and the group of `key`, if a build row has it.
     fn find(&self, key: &RowKey) -> Option<(usize, usize)> {
-        // one thread puts every key in the first partition, and then hashing twice is waste
-        let partition = if self.partitioned { partition_of(key) } else { 0 };
+        // the hash picks the partition and the slot in its table both
+        let hash = key_hash(key);
+        let partition = if self.partitioned { partition_of_hash(hash) } else { 0 };
         self.partitions[partition]
-            .groups
-            .get(key)
-            .map(|&group| (partition, group))
+            .group(hash, key)
+            .map(|group| (partition, group))
     }
 
     fn set_matched(&self, row: u32) {
@@ -897,7 +950,7 @@ impl PhysicalJoin {
             let row = probe.row;
             let chain: &[u32] = match probe.groups[row] {
                 Some((partition, group)) if !(self.first_match_only() && probe.found[row]) => {
-                    &build.partitions[partition].rows[group]
+                    build.partitions[partition].rows(group)
                 }
                 _ => &[],
             };

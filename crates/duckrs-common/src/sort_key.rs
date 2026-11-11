@@ -314,7 +314,11 @@ impl RowKey {
 
 impl PartialEq for RowKey {
     fn eq(&self, other: &Self) -> bool {
-        self.as_bytes() == other.as_bytes()
+        match (self, other) {
+            // the bytes past `len` are zero in every inline key, so the arrays compare as the keys do
+            (Self::Inline { len: a, bytes: x }, Self::Inline { len: b, bytes: y }) => a == b && x == y,
+            _ => self.as_bytes() == other.as_bytes(),
+        }
     }
 }
 
