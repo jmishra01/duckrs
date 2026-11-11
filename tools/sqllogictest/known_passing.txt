@@ -386,8 +386,10 @@ test/issues/rigger/test_514.test
 test/issues/rigger/test_515.test
 test/issues/rigger/test_516.test
 test/issues/rigger/test_517.test
+test/issues/rigger/test_518.test
 test/issues/rigger/test_521.test
 test/issues/rigger/test_522.test
+test/issues/rigger/test_523.test
 test/issues/rigger/test_525.test
 test/issues/rigger/test_526.test
 test/issues/rigger/test_527.test
@@ -444,6 +446,7 @@ test/ldbc/ldbc-empty.test
 test/optimizer/case_simplification.test
 test/optimizer/case_simplification_errors.test
 test/optimizer/column_lifetime_analyzer/must_visit_operator_expressions_first.test
+test/optimizer/column_lifetime_analyzer/summary_column_lifetime.test
 test/optimizer/common_subplan_nested_cte.test
 test/optimizer/compare_blob.test
 test/optimizer/comparison_simplification_narrowing_casts.test
@@ -491,6 +494,7 @@ test/optimizer/joins/left_join_reordering/test_reordering_left_joins.test
 test/optimizer/joins/no_cross_product_reordering.test
 test/optimizer/joins/no_duplicate_elimination_join.test
 test/optimizer/joins/not_equal_join_cardinality_estimation.test
+test/optimizer/joins/order_optimizer_bindings.test
 test/optimizer/joins/pushdown_semi_anti.test
 test/optimizer/joins/range_join_cardinality_estimation.test
 test/optimizer/joins/relation_statistics_bindings.test
@@ -1982,6 +1986,8 @@ test/sql/function/numeric/test_mod.test
 test/sql/function/numeric/test_mod_min_negative_one.test
 test/sql/function/numeric/test_modulo_min_by_minus_one.test
 test/sql/function/numeric/test_nextafter.test
+test/sql/function/numeric/test_pg_math.test
+test/sql/function/numeric/test_pow.test
 test/sql/function/numeric/test_random.test
 test/sql/function/numeric/test_round.test
 test/sql/function/numeric/test_round_double_exact_midpoint.test
@@ -2591,6 +2597,7 @@ test/sql/optimizer/test_common_subplan_aggregate_columns.test
 test/sql/optimizer/test_common_subplan_cte_binding_order.test
 test/sql/optimizer/test_common_subplan_nested_bindings.test
 test/sql/optimizer/test_common_subplan_overlapping_columns.test
+test/sql/optimizer/test_common_subplan_projection_columns.test
 test/sql/optimizer/test_common_subplan_projection_maps.test
 test/sql/optimizer/test_common_subplan_repeatability_readers.test
 test/sql/optimizer/test_common_subplan_scan_filters.test

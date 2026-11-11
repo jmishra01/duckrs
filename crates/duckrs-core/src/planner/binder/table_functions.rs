@@ -161,6 +161,35 @@ impl Binder<'_> {
         let args: Vec<FunctionArgument> = call.args.iter().map(named_argument).collect();
         let sql = match name.as_str() {
             "unnest" => format!("SELECT {function} AS unnest"),
+            // `SummaryTableFunction`: a row's values as text, then the row
+            "summary" => {
+                let [input] = args.as_slice() else {
+                    return Ok(None);
+                };
+                let duckrs_parser::ast::ExprKind::Subquery { subquery, .. } = &input.expr.kind else {
+                    return Ok(None);
+                };
+                let mut binder = self.child_binder();
+                let bound = binder.bind_select_statement(subquery)?;
+                let names: Vec<String> = (0..bound.names.len()).map(|i| format!("\"__summary_{i}\"")).collect();
+                let text = names
+                    .iter()
+                    .map(|n| format!("coalesce({n}::VARCHAR, 'NULL')"))
+                    .collect::<Vec<_>>()
+                    .join(" || ', ' || ");
+                let text = if text.is_empty() { "''".to_string() } else { text };
+                let originals: Vec<String> = bound
+                    .names
+                    .iter()
+                    .zip(&names)
+                    .map(|(original, n)| format!("{n} AS \"{}\"", original.replace('"', "\"\"")))
+                    .collect();
+                let mut select = format!("SELECT '[' || {text} || ']' AS summary");
+                for column in originals {
+                    select += &format!(", {column}");
+                }
+                format!("{select} FROM ({subquery}) __summary({})", names.join(", "))
+            }
             // the table macro of `default_table_functions.cpp`
             "duckdb_logs_parsed" => {
                 let [log_type] = args.as_slice() else {

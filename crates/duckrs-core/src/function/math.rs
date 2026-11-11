@@ -89,13 +89,13 @@ unary!(cot, x => {
 });
 unary!(asin, x => {
     if !(-1.0..=1.0).contains(&x) {
-        return Err(out_of_range("ASIN is undefined outside [-1,1]"));
+        return Err(Error::new(ErrorKind::InvalidInput, "ASIN is undefined outside [-1,1]"));
     }
     x.asin()
 });
 unary!(acos, x => {
     if !(-1.0..=1.0).contains(&x) {
-        return Err(out_of_range("ACOS is undefined outside [-1,1]"));
+        return Err(Error::new(ErrorKind::InvalidInput, "ACOS is undefined outside [-1,1]"));
     }
     x.acos()
 });
@@ -112,7 +112,7 @@ unary!(acosh, x => {
 });
 unary!(atanh, x => {
     if !(-1.0..=1.0).contains(&x) {
-        return Err(out_of_range("ATANH is undefined outside [-1,1]"));
+        return Err(Error::new(ErrorKind::InvalidInput, "ATANH is undefined outside [-1,1]"));
     }
     x.atanh()
 });
@@ -137,7 +137,7 @@ fn log_base(args: &DataChunk, result: &mut Vector) -> Result<()> {
         let (base, x) = (float(&row[0]), float(&row[1]));
         let base = logarithm(base)?;
         if base == 1.0 {
-            return Err(out_of_range("divison by zero in based logarithm"));
+            return Err(out_of_range("division by zero in based logarithm"));
         }
         Ok(Value::double(logarithm(x)?.ln() / base.ln()))
     })
@@ -468,6 +468,52 @@ fn lcm(args: &DataChunk, result: &mut Vector) -> Result<()> {
         i64::try_from(result)
             .map(Value::bigint)
             .map_err(|_| out_of_range("lcm value is out of range"))
+    })
+}
+
+unary!(ieee_sqrt, x => x.sqrt());
+unary!(ieee_sin, x => x.sin());
+unary!(ieee_cos, x => x.cos());
+unary!(ieee_tan, x => x.tan());
+unary!(ieee_cot, x => 1.0 / x.tan());
+unary!(ieee_asin, x => x.asin());
+unary!(ieee_acos, x => x.acos());
+unary!(ieee_atanh, x => x.atanh());
+unary!(ieee_ln, x => x.ln());
+unary!(ieee_log10, x => x.log10());
+unary!(ieee_log2, x => x.log2());
+
+fn ieee_log_base(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| {
+        let (base, x) = (float(&row[0]), float(&row[1]));
+        Ok(Value::double(x.log10() / base.log10()))
+    })
+}
+
+fn ieee_pow(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| {
+        Ok(Value::double(float(&row[0]).powf(float(&row[1]))))
+    })
+}
+
+/// `BindIEEEFloatingUnary` / `BindIEEEFloatingBinary`: with `ieee_floating_point_ops` on, the function of this name
+/// and arity gives NaN and infinities where it would otherwise raise.
+pub fn ieee_variant(name: &str, arity: usize) -> Option<ScalarCallback> {
+    Some(match (name, arity) {
+        ("sqrt", 1) => ieee_sqrt,
+        ("sin", 1) => ieee_sin,
+        ("cos", 1) => ieee_cos,
+        ("tan", 1) => ieee_tan,
+        ("cot", 1) => ieee_cot,
+        ("asin", 1) => ieee_asin,
+        ("acos", 1) => ieee_acos,
+        ("atanh", 1) => ieee_atanh,
+        ("ln", 1) => ieee_ln,
+        ("log10" | "log", 1) => ieee_log10,
+        ("log2", 1) => ieee_log2,
+        ("log", 2) => ieee_log_base,
+        ("pow" | "power" | "**" | "^", 2) => ieee_pow,
+        _ => return None,
     })
 }
 

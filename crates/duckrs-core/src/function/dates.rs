@@ -777,6 +777,15 @@ fn make_time(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+/// `MakeTimestampNsFun`: nanoseconds since the epoch.
+fn make_timestamp_ns(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| {
+        let nanos = i64::try_from(row[0].as_i128().expect("a BIGINT"))
+            .map_err(|_| conversion("Timestamp nanoseconds out of range"))?;
+        Value::new(LogicalType::new(LogicalTypeId::TimestampNs), ValueData::Int64(nanos))
+    })
+}
+
 fn make_timestamp(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
         if row.len() == 1 {
@@ -1830,6 +1839,14 @@ pub fn date_functions() -> Vec<ScalarFunctionSet> {
             ),
             (vec![i.clone()], L::TIMESTAMP, make_timestamp),
         ],
+    );
+    add(
+        "make_timestamp_ns",
+        vec![(
+            vec![L::BIGINT],
+            L::new(LogicalTypeId::TimestampNs),
+            make_timestamp_ns as ScalarCallback,
+        )],
     );
     add(
         "to_timestamp",

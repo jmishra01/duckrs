@@ -1549,6 +1549,19 @@ impl Binder<'_> {
                             let mut bound = bind_scalar_function(set, children, function.is_operator, &fold)?;
                             // `BindDivisionByZero` / `BindBinaryFloatingPoint`: a zero divisor gives NULL with
                             // error_on_division_by_zero off; IEEE floats give inf and NaN, else what integers give
+                            // `BindIEEEFloatingUnary`: the IEEE function, where it has one
+                            if self.options.ieee_floating_point_ops
+                                && let BoundExprKind::Function { function, children, .. } = &mut bound.kind
+                                && function.return_type.id() == LogicalTypeId::Double
+                                && let Some(callback) = crate::function::math::ieee_variant(&set.name, children.len())
+                            {
+                                *function = Arc::new(crate::function::ScalarFunction::new(
+                                    function.name.clone(),
+                                    function.arguments.clone(),
+                                    function.return_type.clone(),
+                                    callback,
+                                ));
+                            }
                             if checked && let BoundExprKind::Function { function, .. } = &mut bound.kind {
                                 let floating =
                                     matches!(function.return_type.id(), LogicalTypeId::Float | LogicalTypeId::Double);
