@@ -257,6 +257,49 @@ fn slice_rows(input: &DataChunk, rows: &[u32]) -> DataChunk {
 
 /// Writes `source[i]` to `result[rows[i]]`.
 fn scatter(source: &Vector, rows: &[u32], result: &mut Vector) -> Result<()> {
+    if source.logical_type() == result.logical_type() && result.vector_type() == duckrs_common::vector::VectorType::Flat
+    {
+        let u = source.to_unified(rows.len());
+        macro_rules! typed {
+            ($t:ty) => {{
+                let data = u.data::<$t>();
+                for (i, &row) in rows.iter().enumerate() {
+                    let index = u.sel.get(i);
+                    if u.validity.is_valid(index) {
+                        result.data_mut::<$t>()[row as usize] = data[index];
+                    } else {
+                        result.set_null(row as usize, true);
+                    }
+                }
+                return Ok(());
+            }};
+        }
+        match source.physical_type() {
+            PhysicalType::Bool => typed!(bool),
+            PhysicalType::Int8 => typed!(i8),
+            PhysicalType::Int16 => typed!(i16),
+            PhysicalType::Int32 => typed!(i32),
+            PhysicalType::Int64 => typed!(i64),
+            PhysicalType::Int128 => typed!(i128),
+            PhysicalType::UInt8 => typed!(u8),
+            PhysicalType::UInt16 => typed!(u16),
+            PhysicalType::UInt32 => typed!(u32),
+            PhysicalType::UInt64 => typed!(u64),
+            PhysicalType::UInt128 => typed!(u128),
+            PhysicalType::Float => typed!(f32),
+            PhysicalType::Double => typed!(f64),
+            PhysicalType::Varchar => {
+                for (i, &row) in rows.iter().enumerate() {
+                    match u.validity.is_valid(u.sel.get(i)) {
+                        true => result.set_str(row as usize, u.str_at(i)),
+                        false => result.set_null(row as usize, true),
+                    }
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
     for (i, &row) in rows.iter().enumerate() {
         result.set_value(row as usize, &source.get_value(i))?;
     }
@@ -288,8 +331,16 @@ fn execute_case(
         if !matched.is_empty() {
             let values = execute(then, &slice_rows(&rows, &positions))?;
             scatter(&values, &matched, &mut result)?;
-            let chosen: std::collections::HashSet<u32> = matched.into_iter().collect();
-            remaining.retain(|row| !chosen.contains(row));
+            // the rows chosen are at `positions` of `remaining`, in order
+            let mut keep = vec![true; remaining.len()];
+            for &position in &positions {
+                keep[position as usize] = false;
+            }
+            let mut position = 0;
+            remaining.retain(|_| {
+                position += 1;
+                keep[position - 1]
+            });
         }
     }
     if !remaining.is_empty() {
