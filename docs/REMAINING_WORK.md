@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 4211 of 6367 test files pass (**69.6%** of the 6048 that run). The v1 target is ≥ 90%.
+- Overall: 4221 of 6367 test files pass (**69.8%** of the 6048 that run). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -170,6 +170,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
     arithmetic with constants, month/quarter, prefix, left, sign, two-column comparisons
   - [x] statistics of least/greatest, of sum (rows times the bounds), min and max; `constant_or_null` keeps both
     sides as C++
+  - [x] `__internal_barrier` and its pushdown rules; statistics of abs, `//` and `%`;
+    `error_on_division_by_zero` and `ieee_floating_point_ops` for division and modulo
+  - [ ] `ieee_floating_point_ops` for log, pow, gamma and the other math functions; secure views
   - [ ] string statistics (contains, suffix, upper/lower, length), struct/list/map extracts, `vector_type`,
     EXPLAIN ANALYZE metrics of other operators (~190 EXPLAIN-shape files under `test/optimizer`, `sql/optimizer`)
 - [ ] 16. Join order and cardinality estimation (`optimizer/joins`: 14 failing)

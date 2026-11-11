@@ -56,6 +56,10 @@ pub struct ScalarFunction {
     pub return_type: LogicalType,
     pub function: ScalarCallback,
     pub resolve_types: Option<ResolveTypesCallback>,
+    /// `error_on_division_by_zero = false` (`BindDivisionByZero`): a zero divisor gives NULL
+    pub null_on_zero: bool,
+    /// `ieee_floating_point_ops = false` (`BindBinaryFloatingPoint`): a zero divisor is an error
+    pub error_on_zero: bool,
 }
 
 impl ScalarFunction {
@@ -71,6 +75,21 @@ impl ScalarFunction {
             return_type,
             function,
             resolve_types: None,
+            null_on_zero: false,
+            error_on_zero: false,
+        }
+    }
+
+    /// This overload, with a zero divisor giving NULL, or an error.
+    pub fn with_zero_check(&self, null: bool) -> Self {
+        Self {
+            name: self.name.clone(),
+            arguments: self.arguments.clone(),
+            return_type: self.return_type.clone(),
+            function: self.function,
+            resolve_types: self.resolve_types,
+            null_on_zero: null,
+            error_on_zero: !null,
         }
     }
 

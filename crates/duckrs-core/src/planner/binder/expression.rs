@@ -1542,8 +1542,23 @@ impl Binder<'_> {
                     (name, _) => match bind_decimal_round(name, &children)? {
                         Some(bound) => bound,
                         None => {
-                            let bound =
-                                bind_scalar_function(set, children, function.is_operator, &try_evaluate_scalar)?;
+                            let division = matches!(set.name.as_str(), "/" | "//" | "%" | "mod" | "divide" | "fmod");
+                            let checked = division
+                                && (!self.options.error_on_division_by_zero || !self.options.ieee_floating_point_ops);
+                            let fold = |e: &BoundExpr| if checked { None } else { try_evaluate_scalar(e) };
+                            let mut bound = bind_scalar_function(set, children, function.is_operator, &fold)?;
+                            // `BindDivisionByZero` / `BindBinaryFloatingPoint`: a zero divisor gives NULL with
+                            // error_on_division_by_zero off; IEEE floats give inf and NaN, else what integers give
+                            if checked && let BoundExprKind::Function { function, .. } = &mut bound.kind {
+                                let floating =
+                                    matches!(function.return_type.id(), LogicalTypeId::Float | LogicalTypeId::Double);
+                                let null = !self.options.error_on_division_by_zero;
+                                if !floating && null {
+                                    *function = Arc::new(function.with_zero_check(true));
+                                } else if floating && !self.options.ieee_floating_point_ops {
+                                    *function = Arc::new(function.with_zero_check(null));
+                                }
+                            }
                             self.bind_sequence_function(bound)?
                         }
                     },

@@ -1068,6 +1068,8 @@ impl ClientContext {
                 _ => ShowBehavior::Auto,
             },
             file_access: self.file_access(),
+            error_on_division_by_zero: self.setting_text("error_on_division_by_zero") != "false",
+            ieee_floating_point_ops: self.setting_text("ieee_floating_point_ops") != "false",
         }
     }
 
