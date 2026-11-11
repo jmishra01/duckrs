@@ -283,14 +283,17 @@ fn scan_dictionary_column(
     rows: usize,
     valid: &[bool],
 ) -> Result<Vector> {
-    let mut entries: Vec<Vec<u8>> = vec![Vec::new()];
+    let mut entries = StringRows::default();
+    entries.push_empty(1);
     let mut selection: Vec<u32> = Vec::with_capacity(rows);
     for pointer in &column.pointers {
         let handle = segment(buffer, pointer)?;
         let (strings, indices) = decode_dict_fsst(&handle[pointer.offset..], pointer.tuple_count)?;
         // entry i of the segment (i > 0) is entry base + i here; 0 stays the NULL
         let base = entries.len() as u32 - 1;
-        entries.extend(strings.into_iter().skip(1));
+        for string in strings.iter().skip(1) {
+            entries.push(string);
+        }
         selection.extend(
             indices
                 .into_iter()
@@ -306,7 +309,7 @@ fn scan_dictionary_column(
         }
     }
     let mut dictionary = Vector::new(ty.clone(), entries.len());
-    dictionary.set_strs(entries.iter().map(Vec::as_slice));
+    dictionary.set_strs(entries.iter());
     dictionary.set_null(0, true);
     dictionary.slice(&SelectionVector::from_vec(selection), rows);
     Ok(dictionary)

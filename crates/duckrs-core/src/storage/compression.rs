@@ -173,7 +173,28 @@ fn packed_size(count: usize, width: usize) -> usize {
 /// `count` packed values.
 fn unpack(data: &[u8], count: usize, width: usize, what: &str) -> Result<Vec<u128>> {
     bytes(data, 0, packed_size(count, width), what)?;
+    if width <= 57 {
+        let mask = if width == 0 { 0 } else { u64::MAX >> (64 - width) };
+        return Ok((0..count)
+            .map(|i| u128::from(load_bits(data, i * width, mask)))
+            .collect());
+    }
     Ok((0..count).map(|i| read_bits(data, i * width, width)).collect())
+}
+
+/// The bits from `bit` on that `mask` keeps (at most 57 of them): one load of the 8 bytes there.
+fn load_bits(data: &[u8], bit: usize, mask: u64) -> u64 {
+    let at = bit / 8;
+    let word = match data.get(at..at + 8) {
+        Some(word) => u64::from_le_bytes(word.try_into().expect("8 bytes")),
+        None => {
+            let mut word = [0u8; 8];
+            let available = data.len().saturating_sub(at).min(8);
+            word[..available].copy_from_slice(&data[at..at + available]);
+            u64::from_le_bytes(word)
+        }
+    };
+    (word >> (bit % 8)) & mask
 }
 
 /// [`unpack`] of values of at most 57 bits into values of at most 8 bytes, with the frame (and for
@@ -198,13 +219,7 @@ fn unpack_narrow(
     let start = out.len();
     out.resize(start + rows * width, 0);
     let target = &mut out[start..];
-    let load = |bit: usize| -> u64 {
-        let at = bit / 8;
-        let mut word = [0u8; 8];
-        let available = packed.len().saturating_sub(at).min(8);
-        word[..available].copy_from_slice(&packed[at..at + available]);
-        (u64::from_le_bytes(word) >> (bit % 8)) & mask
-    };
+    let load = |bit: usize| -> u64 { load_bits(packed, bit, mask) };
     macro_rules! write_all {
         ($ty:ty) => {{
             for (row, slot) in target.chunks_exact_mut(std::mem::size_of::<$ty>()).enumerate() {
@@ -354,6 +369,13 @@ impl StringRows {
     pub fn push(&mut self, string: impl AsRef<[u8]>) {
         self.bytes.extend_from_slice(string.as_ref());
         self.ends.push(self.bytes.len());
+    }
+
+    /// A string that `write` puts at the end of the buffer.
+    pub fn push_with(&mut self, write: impl FnOnce(&mut Vec<u8>) -> Result<()>) -> Result<()> {
+        write(&mut self.bytes)?;
+        self.ends.push(self.bytes.len());
+        Ok(())
     }
 
     /// `count` empty strings (the rows of NULLs).
@@ -662,9 +684,16 @@ fn fsst_import(data: &[u8]) -> Result<Option<FsstDecoder>> {
 
 impl FsstDecoder {
     /// `duckdb_fsst_decompress`.
+    #[cfg(test)]
     fn decompress(&self, input: &[u8]) -> Result<Vec<u8>> {
-        const ESCAPE: u8 = 255;
         let mut result = Vec::with_capacity(input.len() * 2);
+        self.decompress_into(input, &mut result)?;
+        Ok(result)
+    }
+
+    /// [`Self::decompress`], onto the end of `result`.
+    fn decompress_into(&self, input: &[u8], result: &mut Vec<u8>) -> Result<()> {
+        const ESCAPE: u8 = 255;
         let mut bytes = input.iter();
         while let Some(&code) = bytes.next() {
             if code == ESCAPE {
@@ -677,7 +706,7 @@ impl FsstDecoder {
                 result.extend_from_slice(&self.symbols[code][..usize::from(self.lengths[code])]);
             }
         }
-        Ok(result)
+        Ok(())
     }
 }
 
@@ -735,14 +764,17 @@ pub fn scan_fsst(segment: &[u8], count: usize, out: &mut StringRows) -> Result<(
             .len()
             .checked_sub(offset)
             .ok_or_else(|| out_of_bounds("an FSST string"))?;
-        let string = decoder.decompress(&dictionary[from..from + length])?;
-        // what's longer goes to overflow blocks, so no valid segment has one of these
-        if string.len() > STRING_BLOCK_LIMIT {
-            return Err(corrupted(
-                "Failed to decompress FSST string - decoded size exceeds the output buffer",
-            ));
-        }
-        out.push(string);
+        out.push_with(|bytes| {
+            let start = bytes.len();
+            decoder.decompress_into(&dictionary[from..from + length], bytes)?;
+            // what's longer goes to overflow blocks, so no valid segment has one of these
+            if bytes.len() - start > STRING_BLOCK_LIMIT {
+                return Err(corrupted(
+                    "Failed to decompress FSST string - decoded size exceeds the output buffer",
+                ));
+            }
+            Ok(())
+        })?;
     }
     Ok(())
 }
@@ -1217,15 +1249,14 @@ pub fn scan_dict_fsst(segment: &[u8], count: usize, out: &mut StringRows, nulls:
         if index == 0 {
             nulls.push(out.len());
         }
-        let string = strings.get(index as usize);
-        out.push(string.ok_or_else(|| corrupted("Corrupted DICT_FSST segment: dictionary index is out of range"))?);
+        out.push(strings.get(index as usize));
     }
     Ok(())
 }
 
 /// A DICT_FSST segment as its dictionary and, per row, the entry it has (0 is NULL): what a scan
 /// turns into a dictionary vector (`DictFSSTCompressionStorage::StringScan` emits one too).
-pub fn decode_dict_fsst(segment: &[u8], count: usize) -> Result<(Vec<Vec<u8>>, Vec<u32>)> {
+pub fn decode_dict_fsst(segment: &[u8], count: usize) -> Result<(StringRows, Vec<u32>)> {
     const HEADER_SIZE: usize = 16;
     const DICTIONARY: u8 = 0;
     const DICT_FSST: u8 = 1;
@@ -1282,7 +1313,7 @@ pub fn decode_dict_fsst(segment: &[u8], count: usize) -> Result<(Vec<Vec<u8>>, V
     } else {
         None
     };
-    let mut strings = Vec::with_capacity(dict_count.min(1 << 16));
+    let mut strings = StringRows::with_capacity(dict_count.min(1 << 16));
     let mut offset = 0usize;
     for &length in &lengths {
         let length = length as usize;
@@ -1291,10 +1322,10 @@ pub fn decode_dict_fsst(segment: &[u8], count: usize) -> Result<(Vec<Vec<u8>>, V
             .and_then(|end| dictionary.get(offset..end))
             .ok_or_else(|| corrupted("Corrupted DICT_FSST segment: string lengths exceed the dictionary size"))?;
         offset += length;
-        strings.push(match &decoder {
-            Some(decoder) => decoder.decompress(entry)?,
-            None => entry.to_vec(),
-        });
+        match &decoder {
+            Some(decoder) => strings.push_with(|out| decoder.decompress_into(entry, out))?,
+            None => strings.push(entry),
+        }
     }
     if mode == FSST_ONLY {
         return Ok((strings, (1..=count as u32).collect()));

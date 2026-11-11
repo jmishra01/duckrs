@@ -95,7 +95,46 @@ fn compare_strings(left: &Vector, right: &Vector, result: &mut Vector, count: us
     }
 }
 
+/// A comparison of a dictionary vector with a constant, on the entries of the dictionary rather than
+/// on every row (`ExpressionExecutor` on dictionary vectors): the result is a dictionary of booleans.
+fn compare_dictionary(
+    left: &Vector,
+    right: &Vector,
+    result: &mut Vector,
+    count: usize,
+    op: ComparisonType,
+) -> Result<bool> {
+    use duckrs_common::vector::VectorType;
+    let constant = |v: &Vector| v.vector_type() == VectorType::Constant;
+    let (dictionary, left_is_dictionary) = match (left.dictionary(), right.dictionary()) {
+        (Some(d), None) if constant(right) => (d, true),
+        (None, Some(d)) if constant(left) => (d, false),
+        _ => return Ok(false),
+    };
+    let (sel, child) = dictionary;
+    if child.vector_type() != VectorType::Flat {
+        return Ok(false);
+    }
+    let entries = child.capacity();
+    if entries >= count {
+        return Ok(false);
+    }
+    let mut on_entries = Vector::new(LogicalType::BOOLEAN, entries);
+    if left_is_dictionary {
+        compare(child, right, &mut on_entries, entries, op)?;
+    } else {
+        compare(left, child, &mut on_entries, entries, op)?;
+    }
+    on_entries.flatten(entries);
+    on_entries.slice(sel, count);
+    *result = on_entries;
+    Ok(true)
+}
+
 fn compare(left: &Vector, right: &Vector, result: &mut Vector, count: usize, op: ComparisonType) -> Result<()> {
+    if compare_dictionary(left, right, result, count, op)? {
+        return Ok(());
+    }
     match left.physical_type() {
         PhysicalType::Bool => compare_typed::<bool>(left, right, result, count, op),
         PhysicalType::Int8 => compare_typed::<i8>(left, right, result, count, op),

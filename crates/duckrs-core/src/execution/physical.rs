@@ -2243,10 +2243,15 @@ pub struct PhysicalAggregate {
     pub children: Vec<Box<dyn PhysicalOperator>>,
     grouping_sets: Vec<GroupingSet>,
     state: Mutex<Vec<AggregateSinkState>>,
+    /// the states of threads that are put together by partition when the aggregate finishes
+    locals: Mutex<Vec<AggregateSinkState>>,
     output: Mutex<Vec<DataChunk>>,
     /// where rows go past the memory limit, for an aggregate that can spill
     spill: Option<AggregateSpill>,
 }
+
+/// From how many groups the states of threads are put together by partition, on threads.
+const PARTITIONED_MERGE_GROUPS: usize = 10_000;
 
 /// How many partitions the rows of an aggregate past the memory limit go into.
 const AGGREGATE_PARTITIONS: usize = 64;
@@ -2433,6 +2438,7 @@ impl PhysicalAggregate {
             spill: None,
             grouping_sets: sets,
             state: Mutex::new(state),
+            locals: Mutex::default(),
             output: Mutex::default(),
         }
         .with_spill()
@@ -2938,9 +2944,14 @@ impl PhysicalOperator for PhysicalAggregate {
         self.sink_chunk(chunk, states, self.spill.as_ref().map(|s| &s.target))
     }
     fn combine_local(&self, local: LocalSinkState) -> Result<()> {
-        let local = *local
+        let mut local = *local
             .downcast::<Vec<AggregateSinkState>>()
             .expect("aggregate local state");
+        // a state that never spilled waits for the others, to be put together by partition
+        if self.partitioned_merge() && local.len() == 1 && !local[0].full {
+            self.locals.lock().push(local.remove(0));
+            return Ok(());
+        }
         let mut states = self.state.lock();
         for (state, local) in states.iter_mut().zip(local) {
             self.merge_groups(state, local)?;
@@ -2949,6 +2960,24 @@ impl PhysicalOperator for PhysicalAggregate {
     }
     fn finalize(&self) -> Result<()> {
         let mut states = self.state.lock();
+        let locals = std::mem::take(&mut *self.locals.lock());
+        if !locals.is_empty() {
+            let groups: usize = locals.iter().map(|l| l.group_count).sum();
+            let untouched = states[0].group_count == 0 && !states[0].full;
+            if untouched && locals.len() > 1 && groups >= PARTITIONED_MERGE_GROUPS {
+                let output = self.merge_partitioned(locals)?;
+                if let Some(spill) = &self.spill {
+                    spill.spilled.store(false, Ordering::Relaxed);
+                    spill.pending.lock().clear();
+                    temporary::current().release(spill.reserved.swap(0, Ordering::Relaxed));
+                }
+                *self.output.lock() = output;
+                return Ok(());
+            }
+            for local in locals {
+                self.merge_groups(&mut states[0], local)?;
+            }
+        }
         let mut output = Vec::new();
         if let Some(spill) = &self.spill {
             let threads = spill.threads.load(Ordering::Relaxed);
@@ -3020,6 +3049,121 @@ impl PhysicalAggregate {
             .map(|a| Self::aggregate_input(a, chunk))
             .collect::<Result<Vec<_>>>()?;
         Ok((vectors, inputs))
+    }
+
+    /// Whether the states of threads can wait to be put together by partition: one grouping set with
+    /// groups, and aggregates that keep nothing apart (DISTINCT, ORDER BY).
+    fn partitioned_merge(&self) -> bool {
+        self.grouping_sets.len() == 1
+            && !self.grouping_sets[0].groups.is_empty()
+            && self.aggregates.iter().all(|a| !a.distinct && a.order_by.is_empty())
+    }
+
+    /// `RadixPartitionedHashTable::Finalize` on threads: the groups of each thread's state go into
+    /// partitions by the hash of their key, then each partition is put together and gives its output
+    /// on a thread of its own. The groups come out in partition order.
+    fn merge_partitioned(&self, locals: Vec<AggregateSinkState>) -> Result<Vec<DataChunk>> {
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let partitions = (threads * 2).next_power_of_two();
+        // split each thread's state, on threads
+        let split: Vec<Vec<AggregateSinkState>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = locals
+                .into_iter()
+                .map(|local| scope.spawn(move || self.split_state(local, partitions)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("an aggregate split thread"))
+                .collect::<Result<Vec<_>>>()
+        })?;
+        // partition p of every thread, together
+        let mut by_partition: Vec<Vec<AggregateSinkState>> = (0..partitions).map(|_| Vec::new()).collect();
+        for parts in split {
+            for (p, part) in parts.into_iter().enumerate() {
+                if part.group_count > 0 {
+                    by_partition[p].push(part);
+                }
+            }
+        }
+        let set = &self.grouping_sets[0];
+        let outputs: Vec<Vec<DataChunk>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = by_partition
+                .into_iter()
+                .filter(|parts| !parts.is_empty())
+                .map(|parts| {
+                    scope.spawn(move || -> Result<Vec<DataChunk>> {
+                        let mut parts = parts.into_iter();
+                        let mut merged = parts.next().expect("a part");
+                        for part in parts {
+                            self.merge_groups(&mut merged, part)?;
+                        }
+                        let mut output = Vec::new();
+                        self.set_output(set, &merged, &mut output)?;
+                        Ok(output)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("an aggregate merge thread"))
+                .collect::<Result<Vec<_>>>()
+        })?;
+        Ok(outputs.into_iter().flatten().collect())
+    }
+
+    /// The groups of `state` in `partitions` states, by the hash of their key.
+    fn split_state(&self, state: AggregateSinkState, partitions: usize) -> Result<Vec<AggregateSinkState>> {
+        use std::hash::{BuildHasher, BuildHasherDefault};
+        let AggregateSinkState {
+            group_ids,
+            group_values,
+            group_count,
+            states,
+            ..
+        } = state;
+        let types = group_values.types().to_vec();
+        let mut parts: Vec<AggregateSinkState> = (0..partitions)
+            .map(|_| {
+                let mut part = AggregateSinkState::new(types.clone(), &self.aggregates);
+                part.states.iter_mut().for_each(Vec::clear);
+                part
+            })
+            .collect();
+        let hasher = BuildHasherDefault::<duckrs_common::sort_key::KeyHasher>::default();
+        let mut keys: Vec<Option<RowKey>> = vec![None; group_count];
+        let mut partition_of = vec![0usize; group_count];
+        for (key, id) in group_ids {
+            partition_of[id] = (hasher.hash_one(&key) >> 32) as usize & (partitions - 1);
+            keys[id] = Some(key);
+        }
+        // the values of the groups, chunk by chunk, into their partitions
+        let mut first = 0;
+        for chunk in group_values.chunks() {
+            let mut rows: Vec<Vec<u32>> = vec![Vec::new(); partitions];
+            for row in 0..chunk.len() {
+                rows[partition_of[first + row]].push(row as u32);
+            }
+            for (p, rows) in rows.into_iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
+                let count = rows.len();
+                let mut values = chunk.clone();
+                values.slice(&SelectionVector::from_vec(rows), count);
+                parts[p].group_values.append(&values);
+            }
+            first += chunk.len();
+        }
+        // the keys and states, in the order of the values
+        for (id, key) in keys.into_iter().enumerate() {
+            let part = &mut parts[partition_of[id]];
+            let next = part.group_count;
+            part.group_ids.insert(key.expect("a key per group"), next);
+            part.group_count += 1;
+        }
+        for (i, sourced) in states.into_iter().enumerate() {
+            for (id, source) in sourced.into_iter().enumerate() {
+                parts[partition_of[id]].states[i].push(source);
+            }
+        }
+        Ok(parts)
     }
 
     /// `CombineStates`: the groups of a thread go into `state`.
