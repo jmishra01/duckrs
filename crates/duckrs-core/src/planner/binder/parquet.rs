@@ -106,7 +106,10 @@ impl Binder<'_> {
         let mut filename = None;
         let mut hive_options = super::copy::HiveOptions::default();
         let mut int96_as = crate::execution::parquet::Int96As::Timestamp;
+        let mut utf8_validation = crate::execution::parquet::Utf8Validation::Strict;
         let mut schema_value = None;
+        let mut allow_empty = false;
+        let (mut copy_names, mut copy_types): (Option<Vec<String>>, Option<Vec<LogicalType>>) = (None, None);
         for argument in &args {
             let value = self.constant_argument(&argument.expr)?;
             if argument.name.is_empty() {
@@ -129,19 +132,37 @@ impl Binder<'_> {
                 "file_row_number" => file_row_number = is_true(&value, &option)?,
                 "int96_as" => {
                     use crate::execution::parquet::Int96As;
-                    int96_as = match value.try_to_string()?.to_lowercase().as_str() {
+                    let text = value.try_to_string()?;
+                    int96_as = match text.to_lowercase().as_str() {
                         "timestamp" => Int96As::Timestamp,
                         "timestamp_ns" => Int96As::TimestampNs,
                         "struct" => Int96As::Struct,
-                        other => {
+                        _ => {
                             return Err(binder_error(format!(
-                                "int96_as must be 'timestamp', 'timestamp_ns' or 'struct', not '{other}'"
+                                "Unrecognized int96_as '{text}' (supported: 'timestamp', 'timestamp_ns', 'struct')"
                             )));
                         }
                     };
                 }
+                "utf8_validation" => {
+                    if value.is_null() {
+                        return Err(binder_error("Parquet utf8_validation cannot be empty!"));
+                    }
+                    utf8_validation = crate::execution::parquet::Utf8Validation::parse(&value.try_to_string()?)?;
+                }
+                "allow_empty" => allow_empty = is_true(&value, &option)?,
                 "explicit_cardinality" | "can_have_nan" => {}
                 "schema" => schema_value = Some(value),
+                // what COPY ... FROM passes on of the table it loads into
+                "__copy_names" => copy_names = Some(strings(&value)?),
+                "__copy_types" => {
+                    copy_types = Some(
+                        strings(&value)?
+                            .iter()
+                            .map(|name| self.csv_type(name))
+                            .collect::<Result<_>>()?,
+                    );
+                }
                 // options of COPY TO, which reading doesn't have
                 "write_page_index"
                 | "write_bloom_filter"
@@ -168,7 +189,7 @@ impl Binder<'_> {
         for pattern in &patterns {
             self.check_file_access(pattern)?;
             let found = file_system::glob_or_directory(pattern, "parquet");
-            if found.is_empty() {
+            if found.is_empty() && !allow_empty {
                 return Err(Error::new(
                     ErrorKind::Io,
                     format!("No files found that match the pattern \"{pattern}\""),
@@ -176,11 +197,13 @@ impl Binder<'_> {
             }
             files.extend(found);
         }
-        if files.is_empty() {
+        // `allow_empty` and no file: one column, and nothing in it
+        let empty = files.is_empty() && allow_empty;
+        if files.is_empty() && !empty {
             return Err(binder_error(format!("{name} needs at least one file to read")));
         }
         let schema = match &schema_value {
-            Some(value) => {
+            Some(value) if !empty => {
                 if union_by_name {
                     return Err(binder_error("'schema' cannot be combined with union_by_name=true"));
                 }
@@ -194,16 +217,17 @@ impl Binder<'_> {
                 crate::execution::parquet::check_schema(&files[0], binary_as_string, int96_as, &columns)?;
                 Some(Arc::new(columns))
             }
-            None => None,
+            _ => None,
         };
         let (mut names, mut types) = match &schema {
+            None if empty => (vec!["empty".to_string()], vec![LogicalType::BOOLEAN]),
             Some(columns) => (
                 columns.iter().map(|c| c.name.clone()).collect(),
                 columns.iter().map(|c| c.ty.clone()).collect(),
             ),
             None => file_schema(&files[0], binary_as_string, int96_as)?,
         };
-        if union_by_name {
+        if union_by_name && !empty {
             for path in &files[1..] {
                 let (file_names, file_types) = file_schema(path, binary_as_string, int96_as)?;
                 for (column, ty) in file_names.iter().zip(&file_types) {
@@ -217,6 +241,39 @@ impl Binder<'_> {
                 }
             }
         }
+        // COPY ... FROM: the columns of the table are the types to read (`return_types` of the bind)
+        let mut table_columns = Vec::new();
+        if let (Some(copy_names), Some(copy_types)) = (&copy_names, &copy_types) {
+            if copy_types.len() != types.len() {
+                let schema_text = |names: &[String], types: &[LogicalType]| {
+                    names
+                        .iter()
+                        .zip(types)
+                        .map(|(name, ty)| format!("{name} {ty}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let file_string = if union_by_name {
+                    files.join(",")
+                } else {
+                    files[0].clone()
+                };
+                return Err(Error::new(
+                    ErrorKind::Conversion,
+                    format!(
+                        "Failed to read file(s) \"{file_string}\" - column count mismatch: expected {} columns but \
+                         found {}\nTable schema: {}\nParquet schema: {}\n\nPossible solutions:\n* Manually specify \
+                         which columns to insert using \"INSERT INTO tbl SELECT ... FROM read_parquet(...)\"",
+                        copy_types.len(),
+                        types.len(),
+                        schema_text(copy_names, copy_types),
+                        schema_text(&names, &types),
+                    ),
+                ));
+            }
+            types = copy_types.clone();
+            table_columns = copy_names.clone();
+        }
         let mut output_names = names.clone();
         let mut output_types = types.clone();
         if file_row_number {
@@ -229,6 +286,10 @@ impl Binder<'_> {
         }
         let mut hive = Vec::new();
         let mut hive_overrides = Vec::new();
+        // with `schema`, hive partitioning is asked for (hive_partitioning or hive_types) rather than detected
+        if schema.is_some() && hive_options.wanted.is_none() && hive_options.types.is_empty() {
+            hive_options.wanted = Some(false);
+        }
         for (key, ty) in super::copy::hive_partition_columns(&files, &hive_options)? {
             match names.iter().position(|n| n.eq_ignore_ascii_case(&key)) {
                 // a column of the file as well: the path gives its values, and its type
@@ -292,6 +353,8 @@ impl Binder<'_> {
             types,
             binary_as_string,
             int96_as,
+            utf8_validation,
+            table_columns,
             union_by_name,
             file_row_number,
             filename: filename.is_some(),
@@ -373,6 +436,29 @@ impl Binder<'_> {
             }
             files.extend(found);
         }
+        // `FullMetadataProcessor`: a row per file, with the rows of each of the others as a list
+        if name == "parquet_full_metadata" {
+            let parts: Vec<String> = files
+                .iter()
+                .map(|file| {
+                    // the errors of the file are those of reading its metadata
+                    metadata_rows(file)?;
+                    let path = string_literal(file);
+                    let list = |function: &str| {
+                        format!("(SELECT coalesce(list(t), []) FROM {function}({path}) t) AS {function}")
+                    };
+                    Ok(format!(
+                        "SELECT {}, {}, {}, {}",
+                        list("parquet_file_metadata"),
+                        list("parquet_metadata"),
+                        list("parquet_schema"),
+                        list("parquet_kv_metadata")
+                    ))
+                })
+                .collect::<Result<_>>()?;
+            let select = parse_select(&parts.join(" UNION ALL "), "Expected a single SELECT statement")?;
+            return self.bind_rewritten(&select, table_ref, &name);
+        }
         let (columns, empty) = match name.as_str() {
             "parquet_metadata" => (METADATA_COLUMNS, METADATA_EMPTY),
             "parquet_page_index" => (PAGE_INDEX_COLUMNS, PAGE_INDEX_EMPTY),
@@ -423,9 +509,58 @@ impl Binder<'_> {
         } else {
             info.select_list.clone()
         };
+        // `ParseCopyOption`: the options of reading go to the scan, as do the columns it loads into
+        let types: Vec<String> = columns
+            .iter()
+            .map(|name| {
+                table
+                    .columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(name))
+                    .map(|c| c.ty.to_string())
+                    .ok_or_else(|| {
+                        binder_error(format!(
+                            "Table \"{}\" does not have a column named \"{name}\"",
+                            info.table.name
+                        ))
+                    })
+            })
+            .collect::<Result<_>>()?;
+        let list = |items: &[String]| {
+            format!(
+                "[{}]",
+                items
+                    .iter()
+                    .map(|item| string_literal(item))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let mut arguments = format!(", __copy_names := {}, __copy_types := {}", list(&columns), list(&types));
+        for (name, value) in self.copy_options(info)? {
+            match name.as_str() {
+                "format" | "compression" | "codec" | "row_group_size" | "debug_use_openssl" | "prefetch_strategy" => {}
+                "binary_as_string" | "can_have_nan" | "utf8_validation" | "int96_as" => {
+                    if value.is_null() {
+                        return Err(binder_error(format!("Parquet {name} cannot be empty!")));
+                    }
+                    let literal = match value.logical_type().id() {
+                        LogicalTypeId::Boolean => value.try_to_string()?,
+                        _ => string_literal(&value.try_to_string()?),
+                    };
+                    arguments.push_str(&format!(", {name} := {literal}"));
+                }
+                _ => {
+                    return Err(Error::new(
+                        ErrorKind::NotImplemented,
+                        format!("Unsupported option for COPY FROM: {name}"),
+                    ));
+                }
+            }
+        }
         let select = parse_select(
             &format!(
-                "SELECT * FROM read_parquet({}, hive_partitioning := false)",
+                "SELECT * FROM read_parquet({}, hive_partitioning := false{arguments})",
                 string_literal(path)
             ),
             "Expected a single SELECT statement",
@@ -611,6 +746,13 @@ impl Binder<'_> {
                         };
                         writer.key_values.push((key.clone(), bytes));
                     }
+                }
+                _ if !super::copy::is_copy_option(PARQUET_COPY_OPTIONS, &name) => {
+                    return Err(super::copy::unrecognized_copy_option(
+                        &name,
+                        "parquet",
+                        PARQUET_COPY_OPTIONS,
+                    ));
                 }
                 _ => return Err(crate::unported(format!("the COPY option {name} for Parquet"))),
             }
@@ -934,3 +1076,35 @@ fn parse_field_ids(
     }
     Ok(ids)
 }
+
+/// `ParquetCopyOptions`.
+const PARQUET_COPY_OPTIONS: &[&str] = &[
+    "compression",
+    "codec",
+    "field_ids",
+    "kv_metadata",
+    "encryption_config",
+    "dictionary_size_limit",
+    "string_dictionary_page_size_limit",
+    "data_page_size_limit",
+    "bloom_filter_false_positive_ratio",
+    "debug_use_openssl",
+    "write_bloom_filter",
+    "bloom_filter_fallback_max_bytes",
+    "write_page_index",
+    "compression_level",
+    "parquet_version",
+    "binary_as_string",
+    "file_row_number",
+    "can_have_nan",
+    "int96_as",
+    "geoparquet_version",
+    "shredding",
+    "write_timestamp_as_int96",
+    "timestamp_is_adjusted_to_utc",
+    "row_group_size",
+    "chunk_size",
+    "row_group_size_bytes",
+    "row_groups_per_file",
+    "dictionary_compression_ratio_threshold",
+];

@@ -44,6 +44,10 @@ pub struct ParquetScanData {
     pub binary_as_string: bool,
     /// `int96_as`
     pub int96_as: Int96As,
+    /// `utf8_validation`
+    pub utf8_validation: Utf8Validation,
+    /// with COPY ... FROM, the columns of the table the columns of the files are loaded into
+    pub table_columns: Vec<String>,
     pub union_by_name: bool,
     pub file_row_number: bool,
     pub filename: bool,
@@ -145,6 +149,14 @@ fn corrupt_file_error(path: &str, message: &str) -> Option<Error> {
             ),
         );
     }
+    if (message.contains("Invalid DECIMAL precision:") || message.contains("Invalid DECIMAL scale:"))
+        && let Some((precision, scale)) = invalid_decimal(path)
+    {
+        return error(
+            ErrorKind::Io,
+            format!("Invalid DECIMAL precision {precision} and scale {scale}"),
+        );
+    }
     if message.contains("Invalid DECIMAL: scale") && numbers.len() >= 2 {
         return error(
             ErrorKind::Io,
@@ -181,6 +193,13 @@ fn corrupt_file_error(path: &str, message: &str) -> Option<Error> {
             .next()
             .and_then(|rest| rest.split(' ').next())
             .unwrap_or_default();
+        if converted == "INTERVAL" {
+            return error(
+                ErrorKind::DataCorruption,
+                "INTERVAL converted type can only be set for value of Type::FIXED_LEN_BYTE_ARRAY of length 12"
+                    .to_string(),
+            );
+        }
         return error(
             ErrorKind::Io,
             format!("{converted} converted type can only be set for value of Type::{physical}"),
@@ -239,6 +258,165 @@ fn open_builder(path: &str) -> Result<ParquetRecordBatchReaderBuilder<File>> {
     })?;
     check_variant_groups(builder.parquet_schema().root_schema(), path)?;
     Ok(builder)
+}
+
+/// A FIXED_LEN_BYTE_ARRAY(12) annotated INTERVAL.
+fn is_interval(ty: &parquet::schema::types::Type) -> bool {
+    ty.is_primitive()
+        && ty.get_physical_type() == parquet::basic::Type::FIXED_LEN_BYTE_ARRAY
+        && ty.get_basic_info().converted_type() == parquet::basic::ConvertedType::INTERVAL
+}
+
+fn has_interval(ty: &parquet::schema::types::Type) -> bool {
+    if ty.is_group() {
+        ty.get_fields().iter().any(|field| has_interval(field))
+    } else {
+        is_interval(ty)
+    }
+}
+
+/// [`open_builder`] with some annotations taken out of the schema the crate converts, so that it reads the bytes:
+/// - with `strings`, those of STRING columns, which it would check are UTF-8, for a repairing `utf8_validation`
+/// - those of INTERVALs, whose months its intervals (DayTime) leave out
+fn open_builder_as_bytes(path: &str, strings: bool) -> Result<ParquetRecordBatchReaderBuilder<File>> {
+    use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+    use parquet::basic::{ConvertedType, LogicalType as Logical};
+    use parquet::file::metadata::{FileMetaData, ParquetMetaData};
+    use parquet::schema::types::{SchemaDescriptor, Type as SchemaType, TypePtr};
+    fn strip(ty: &TypePtr, strings: bool) -> parquet::errors::Result<TypePtr> {
+        let info = ty.get_basic_info();
+        if ty.is_group() {
+            let fields = ty
+                .get_fields()
+                .iter()
+                .map(|field| strip(field, strings))
+                .collect::<parquet::errors::Result<Vec<_>>>()?;
+            let mut builder = SchemaType::group_type_builder(info.name())
+                .with_fields(fields)
+                .with_logical_type(info.logical_type_ref().cloned())
+                .with_converted_type(info.converted_type());
+            if info.has_repetition() {
+                builder = builder.with_repetition(info.repetition());
+            }
+            if info.has_id() {
+                builder = builder.with_id(Some(info.id()));
+            }
+            return Ok(Arc::new(builder.build()?));
+        }
+        let is_string = strings
+            && ty.get_physical_type() == parquet::basic::Type::BYTE_ARRAY
+            && (matches!(info.logical_type_ref(), Some(Logical::String))
+                || info.converted_type() == ConvertedType::UTF8);
+        if !is_string && !is_interval(ty) {
+            return Ok(Arc::clone(ty));
+        }
+        let mut builder =
+            SchemaType::primitive_type_builder(info.name(), ty.get_physical_type()).with_repetition(info.repetition());
+        if let SchemaType::PrimitiveType { type_length, .. } = ty.as_ref() {
+            builder = builder.with_length(*type_length);
+        }
+        if info.has_id() {
+            builder = builder.with_id(Some(info.id()));
+        }
+        Ok(Arc::new(builder.build()?))
+    }
+    let builder = open_builder(path)?;
+    let metadata = builder.metadata();
+    let file = metadata.file_metadata();
+    let root = guarded(path, || {
+        strip(&file.schema_descr().root_schema_ptr(), strings).map_err(|e| read_error(path, "Invalid Parquet file", e))
+    })?;
+    let file_metadata = FileMetaData::new(
+        file.version(),
+        file.num_rows(),
+        file.created_by().map(str::to_string),
+        file.key_value_metadata().cloned(),
+        Arc::new(SchemaDescriptor::new(root)),
+        file.column_orders().cloned(),
+    );
+    let stripped = ParquetMetaData::new(file_metadata, metadata.row_groups().to_vec());
+    let options = ArrowReaderOptions::new().with_skip_arrow_metadata(true);
+    let reader_metadata = ArrowReaderMetadata::try_new(Arc::new(stripped), options)
+        .map_err(|e| read_error(path, "Invalid Parquet file", e))?;
+    let file = File::open(path).map_err(|e| Error::new(ErrorKind::Io, format!("Cannot open file \"{path}\": {e}")))?;
+    Ok(ParquetRecordBatchReaderBuilder::new_with_metadata(
+        file,
+        reader_metadata,
+    ))
+}
+
+/// The types the crate is told to read some columns as (its schema hints):
+/// - INT96 timestamps as microseconds where `int96_as` makes TIMESTAMPs of them, as
+///   `ImpalaTimestampToMicroseconds` does: the crate's nanoseconds overflow before 1677 and after 2262
+/// - INTERVALs with their months, which the crate's default (DayTime) leaves out
+fn with_schema_hints(
+    path: &str,
+    builder: ParquetRecordBatchReaderBuilder<File>,
+    special: &[Special],
+    int96_as: Int96As,
+) -> Result<ParquetRecordBatchReaderBuilder<File>> {
+    use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+    fn hint(ty: &DataType) -> Option<DataType> {
+        match ty {
+            DataType::Interval(adt::IntervalUnit::DayTime) => Some(DataType::Interval(adt::IntervalUnit::MonthDayNano)),
+            DataType::List(child) => Some(DataType::List(Arc::new(hint_field(child)?))),
+            DataType::LargeList(child) => Some(DataType::LargeList(Arc::new(hint_field(child)?))),
+            DataType::Struct(fields) => {
+                let mut changed = false;
+                let fields: Vec<Field> = fields
+                    .iter()
+                    .map(|f| match hint_field(f) {
+                        Some(f) => {
+                            changed = true;
+                            f
+                        }
+                        None => f.as_ref().clone(),
+                    })
+                    .collect();
+                changed.then(|| DataType::Struct(fields.into()))
+            }
+            DataType::Map(entries, sorted) => Some(DataType::Map(Arc::new(hint_field(entries)?), *sorted)),
+            _ => None,
+        }
+    }
+    fn hint_field(field: &Field) -> Option<Field> {
+        hint(field.data_type()).map(|ty| field.clone().with_data_type(ty))
+    }
+    let schema = builder.schema();
+    let mut changed = false;
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            if special.get(index) == Some(&Special::Int96) && int96_as == Int96As::Timestamp {
+                changed = true;
+                return field
+                    .as_ref()
+                    .clone()
+                    .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, None));
+            }
+            if special.get(index) == Some(&Special::Variant) {
+                return field.as_ref().clone();
+            }
+            match hint_field(field) {
+                Some(hinted) => {
+                    changed = true;
+                    hinted
+                }
+                None => field.as_ref().clone(),
+            }
+        })
+        .collect();
+    if !changed {
+        return Ok(builder);
+    }
+    let hinted = Arc::new(adt::Schema::new_with_metadata(fields, schema.metadata().clone()));
+    let options = ArrowReaderOptions::new().with_schema(hinted);
+    let metadata = ArrowReaderMetadata::try_new(Arc::clone(builder.metadata()), options)
+        .map_err(|e| read_error(path, "Invalid Parquet file", e))?;
+    let file = File::open(path).map_err(|e| Error::new(ErrorKind::Io, format!("Cannot open file \"{path}\": {e}")))?;
+    Ok(ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata))
 }
 
 /// `VariantColumnReader`: a VARIANT group starts with its `metadata` and `value`.
@@ -336,6 +514,68 @@ fn logical_type(field: &Field, binary_as_string: bool) -> Result<LogicalType> {
     })
 }
 
+/// `CheckParquetTime`: a TIME (not one in UTC, which wraps) is within a day, 24:00:00 included.
+fn check_time(raw: i64, day: i64, ty: &LogicalType) -> Result<()> {
+    if ty.id() == LogicalTypeId::TimeTz || (0..=day).contains(&raw) {
+        return Ok(());
+    }
+    Err(invalid(format!(
+        "Invalid TIME value {raw} in Parquet file - TIME values must be within a day"
+    )))
+}
+
+/// `ParquetWrapTime`: a TIMETZ of any number of microseconds, as the time of day it falls on.
+fn time_tz_value(micros: i64) -> Value {
+    Value::time_tz(TimeTz::new(Time(micros.rem_euclid(86_400_000_000)), 0))
+}
+
+/// `StringColumnReader::Utf8ValidationOption`: what reading invalid UTF-8 into a VARCHAR does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Utf8Validation {
+    /// an error
+    #[default]
+    Strict,
+    /// each invalid byte becomes `?` (`Utf8Proc::MakeValid`)
+    Replace,
+    /// invalid bytes are left out (`Utf8Proc::RemoveInvalid`)
+    Ignore,
+}
+
+impl Utf8Validation {
+    /// `GetUtf8ValidationOption`
+    pub fn parse(text: &str) -> Result<Self> {
+        match text.to_lowercase().as_str() {
+            "strict" => Ok(Self::Strict),
+            "replace" => Ok(Self::Replace),
+            "ignore" => Ok(Self::Ignore),
+            _ => Err(Error::new(
+                ErrorKind::Binder,
+                format!(
+                    "utf8_validation option \"{text}\" not recognized, must be one of 'strict', 'replace', 'ignore'"
+                ),
+            )),
+        }
+    }
+
+    /// `RepairsInvalidUTF8`: the values no longer lie within the statistics of the stored bytes.
+    pub fn repairs(self) -> bool {
+        self != Self::Strict
+    }
+}
+
+thread_local! {
+    /// The `utf8_validation` of the scan converting values on this thread.
+    static UTF8_VALIDATION: std::cell::Cell<Utf8Validation> = const { std::cell::Cell::new(Utf8Validation::Strict) };
+}
+
+/// Runs `f` with the values it converts repaired as `mode` says.
+fn with_utf8_validation<T>(mode: Utf8Validation, f: impl FnOnce() -> T) -> T {
+    let previous = UTF8_VALIDATION.with(|cell| cell.replace(mode));
+    let result = f();
+    UTF8_VALIDATION.with(|cell| cell.set(previous));
+    result
+}
+
 /// What `read_parquet` makes of INT96 columns (`int96_as`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Int96As {
@@ -347,10 +587,10 @@ pub enum Int96As {
     Struct,
 }
 
-/// A TIME, or with `ty` TIMETZ, a TIME in UTC (`ParquetIntToTimeTZ`).
+/// A TIME, or with `ty` TIMETZ, a TIME in UTC wrapped into the day (`ParquetIntToTimeTZ`).
 fn time_value(micros: i64, ty: &LogicalType) -> Value {
     if ty.id() == LogicalTypeId::TimeTz {
-        Value::time_tz(TimeTz::new(Time(micros), 0))
+        time_tz_value(micros)
     } else {
         Value::time(Time(micros))
     }
@@ -366,6 +606,8 @@ enum Special {
     TimeUtc,
     /// a group annotated as VARIANT
     Variant,
+    /// annotated UNKNOWN: a column of NULLs, whatever its physical type
+    Null,
 }
 
 fn special_columns(builder: &ParquetRecordBatchReaderBuilder<File>) -> Vec<Special> {
@@ -386,6 +628,7 @@ fn special_columns(builder: &ParquetRecordBatchReaderBuilder<File>) -> Vec<Speci
             }
             match field.get_basic_info().logical_type_ref() {
                 Some(parquet::basic::LogicalType::Time(time)) if time.is_adjusted_to_u_t_c => Special::TimeUtc,
+                Some(parquet::basic::LogicalType::Unknown) => Special::Null,
                 _ => Special::None,
             }
         })
@@ -405,6 +648,9 @@ fn column_type(
     }
     if special.get(index) == Some(&Special::Variant) {
         return Ok(LogicalType::new(LogicalTypeId::Variant));
+    }
+    if special.get(index) == Some(&Special::Null) {
+        return Ok(LogicalType::SQLNULL);
     }
     if special.get(index) == Some(&Special::Int96) {
         return Ok(match int96_as {
@@ -472,14 +718,30 @@ pub fn check_schema(
 }
 
 fn utf8(bytes: &[u8]) -> Result<Value> {
-    std::str::from_utf8(bytes)
-        .map(Value::varchar)
-        .map_err(|_| invalid("Invalid string encoding found in Parquet file: value is not valid UTF8!"))
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return Ok(Value::varchar(text));
+    }
+    match UTF8_VALIDATION.with(std::cell::Cell::get) {
+        Utf8Validation::Strict => Err(invalid(
+            "Invalid string encoding found in Parquet file: value is not valid UTF8!",
+        )),
+        Utf8Validation::Replace => Ok(Value::varchar(super::csv::make_valid(bytes, '?'))),
+        Utf8Validation::Ignore => Ok(Value::varchar(super::csv::remove_invalid(bytes))),
+    }
 }
 
 fn binary_value(bytes: &[u8], ty: &LogicalType) -> Result<Value> {
     match ty.id() {
         LogicalTypeId::Varchar => utf8(bytes),
+        // months, days and milliseconds (`ParquetIntervalUtils`)
+        LogicalTypeId::Interval if bytes.len() == 12 => {
+            let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"));
+            Ok(Value::interval(Interval {
+                months: word(0) as i32,
+                days: word(4) as i32,
+                micros: i64::from(word(8)) * 1000,
+            }))
+        }
         LogicalTypeId::Uuid => {
             let raw = <[u8; 16]>::try_from(bytes).map_err(|_| invalid("A UUID in a Parquet file is not 16 bytes"))?;
             Ok(Value::uuid((u128::from_be_bytes(raw) ^ (1 << 127)) as i128))
@@ -538,7 +800,7 @@ pub(super) fn field_value(array: &dyn Array, row: usize, ty: &LogicalType) -> Re
 }
 
 fn array_value(array: &dyn Array, row: usize, ty: &LogicalType) -> Result<Value> {
-    if array.is_null(row) {
+    if array.is_null(row) || ty.id() == LogicalTypeId::SqlNull {
         return Ok(Value::null(ty.clone()));
     }
     if ty.id() == LogicalTypeId::Variant
@@ -577,20 +839,28 @@ fn array_value(array: &dyn Array, row: usize, ty: &LogicalType) -> Result<Value>
         }
         DataType::Time32(TimeUnit::Second) => {
             let seconds = array.as_primitive::<adt::Time32SecondType>().value(row);
+            check_time(i64::from(seconds), 86_400, ty)?;
             time_value(i64::from(seconds) * 1_000_000, ty)
         }
         DataType::Time32(_) => {
             let millis = array.as_primitive::<adt::Time32MillisecondType>().value(row);
+            check_time(i64::from(millis), 86_400_000, ty)?;
             time_value(i64::from(millis) * 1_000, ty)
         }
         DataType::Time64(TimeUnit::Nanosecond) => {
             let nanos = array.as_primitive::<adt::Time64NanosecondType>().value(row);
             if ty.id() == LogicalTypeId::TimeNs {
+                check_time(nanos, 86_400_000_000_000, ty)?;
                 return Value::new(ty.clone(), ValueData::Int64(nanos));
             }
+            check_time(nanos, 86_400_000_000_000, ty)?;
             time_value(nanos.div_euclid(1_000), ty)
         }
-        DataType::Time64(_) => time_value(array.as_primitive::<adt::Time64MicrosecondType>().value(row), ty),
+        DataType::Time64(_) => {
+            let micros = array.as_primitive::<adt::Time64MicrosecondType>().value(row);
+            check_time(micros, 86_400_000_000, ty)?;
+            time_value(micros, ty)
+        }
         DataType::Timestamp(unit, _) => {
             let raw = match unit {
                 TimeUnit::Second => array.as_primitive::<adt::TimestampSecondType>().value(row),
@@ -709,9 +979,17 @@ impl std::fmt::Debug for ParquetScanState {
 }
 
 fn open_file(scan: &ParquetScanData, state: &mut ParquetScanState, path: &str) -> Result<()> {
-    let builder = open_builder(path)?.with_batch_size(STANDARD_VECTOR_SIZE);
+    let typed = open_builder(path)?;
+    let strip = scan.utf8_validation.repairs() || has_interval(typed.parquet_schema().root_schema());
+    let builder = if strip {
+        open_builder_as_bytes(path, scan.utf8_validation.repairs())?
+    } else {
+        open_builder(path)?
+    };
     let int96 = special_columns(&builder);
-    let schema = Arc::clone(builder.schema());
+    let builder = with_schema_hints(path, builder, &int96, scan.int96_as)?.with_batch_size(STANDARD_VECTOR_SIZE);
+    // the types of the columns are those of the file, whatever the reader is told to read strings as
+    let schema = Arc::clone(typed.schema());
     let names = deduplicate_names(schema.fields().iter().map(|f| f.name()));
     let mut mapping = Vec::with_capacity(scan.names.len());
     let mut file_types = Vec::with_capacity(scan.names.len());
@@ -828,6 +1106,11 @@ fn batch_chunk(
     let count = batch.num_rows();
     let mut columns = Vec::with_capacity(scan.types.len() + 2);
     for (index, ty) in scan.types.iter().enumerate() {
+        // a hive partition that is a column of the file as well: the path gives its values (below)
+        if scan.hive_overrides.iter().any(|(column, _)| *column == index) {
+            columns.push(constant_column(ty, &Value::null(ty.clone()), count)?);
+            continue;
+        }
         let Some(column) = state.mapping[index] else {
             let default = match &scan.schema {
                 Some(schema) => schema[index].default.clone(),
@@ -856,9 +1139,23 @@ fn batch_chunk(
         }
         if file_type == ty {
             columns.push(vector);
+        } else if file_type.id() == LogicalTypeId::Varchar && ty.id() == LogicalTypeId::Blob {
+            // text read as BLOB keeps its bytes, which a cast would read as escapes
+            let mut blobs = Vector::new(ty.clone(), count);
+            for row in 0..count {
+                let value = vector.get_value(row);
+                let blob = if value.is_null() {
+                    Value::null(ty.clone())
+                } else {
+                    Value::blob(value.try_to_string()?.into_bytes())
+                };
+                blobs.set_value(row, &blob)?;
+            }
+            columns.push(blobs);
         } else {
             let mut cast = Vector::new(ty.clone(), count);
-            cast_vector(&vector, &mut cast, count, CastMode::Strict)?;
+            cast_vector(&vector, &mut cast, count, CastMode::Strict)
+                .map_err(|error| cast_error(scan, index, path, file_type, ty, error))?;
             columns.push(cast);
         }
     }
@@ -883,6 +1180,50 @@ fn batch_chunk(
         columns[*column] = constant_column(&scan.types[*column], &value, count)?;
     }
     Ok(DataChunk::from_columns(columns, count))
+}
+
+/// `GetExtendedMultiFileError`: a value of a file that does not cast to the type the scan reads.
+fn cast_error(
+    scan: &ParquetScanData,
+    index: usize,
+    path: &str,
+    from: &LogicalType,
+    to: &LogicalType,
+    error: Error,
+) -> Error {
+    if error.kind == ErrorKind::Internal {
+        return error;
+    }
+    let name = &scan.names[index];
+    let extended = if scan.table_columns.is_empty() {
+        format!(
+            "In file \"{path}\" the column \"{name}\" has type {from}, but we are trying to read it as type {to}.\nThis \
+             can happen when reading multiple Parquet files. The schema information is taken from the first Parquet file \
+             by default. Possible solutions:\n* Enable the union_by_name=True option to combine the schema of all \
+             Parquet files (https://duckdb.org/docs/current/data/multiple_files/combining_schemas)\n* Use a COPY \
+             statement to automatically derive types from an existing table."
+        )
+    } else {
+        let target = scan
+            .table_columns
+            .get(index)
+            .map(|column| format!("\"{column}\" "))
+            .unwrap_or_default();
+        format!(
+            "In file \"{path}\" the column \"{name}\" has type {from}, but we are trying to load it into column \
+             {target}with type {to}.\nThis means the Parquet schema does not match the schema of the table.\nPossible \
+             solutions:\n* Insert by name instead of by position using \"INSERT INTO tbl BY NAME SELECT * FROM \
+             read_parquet(...)\"\n* Manually specify which columns to insert using \"INSERT INTO tbl SELECT ... FROM \
+             read_parquet(...)\""
+        )
+    };
+    Error::new(
+        ErrorKind::Conversion,
+        format!(
+            "Error while reading file \"{path}\": failed to cast column \"{name}\" from type {from} to {to}: : {}\n\n{extended}",
+            error.message
+        ),
+    )
 }
 
 /// The `read_parquet` table function.
@@ -919,7 +1260,9 @@ impl PhysicalOperator for PhysicalParquetScan {
                 Some(batch) => {
                     let batch = batch.map_err(|e| read_error(path, "Could not read", e))?;
                     if batch.num_rows() > 0 {
-                        let chunk = batch_chunk(&self.scan, state, &batch, path)?;
+                        let chunk = with_utf8_validation(self.scan.utf8_validation, || {
+                            batch_chunk(&self.scan, state, &batch, path)
+                        })?;
                         return crate::execution::multi_file::append_virtual_columns(
                             chunk,
                             &self.scan.virtual_columns,
@@ -1919,6 +2262,11 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
                 continue;
             };
             let column = descriptor.column(leaf);
+            // repaired strings no longer lie within the bounds of the stored bytes
+            if scan.utf8_validation.repairs() && ty.id() == LogicalTypeId::Varchar {
+                file_stats.push(None);
+                continue;
+            }
             use parquet::basic::Type as Physical;
             // NaNs are left out of float bounds, but are the largest values to DuckDB; INT96 bounds compare bytes
             let bounded = !matches!(
@@ -1957,7 +2305,12 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
                         Physical::BYTE_ARRAY | Physical::FIXED_LEN_BYTE_ARRAY
                     );
                 let bound = |bytes: Option<&[u8]>, exact: bool| -> Option<Value> {
-                    let text = statistic_text(&column, bytes?)?;
+                    let bytes = bytes?;
+                    // `StringStatsAreValid`: exact bounds of a VARCHAR that are not UTF-8 are bogus
+                    if ty.id() == LogicalTypeId::Varchar && std::str::from_utf8(bytes).is_err() {
+                        return None;
+                    }
+                    let text = statistic_text(&column, bytes)?;
                     if !exact || deprecated {
                         return None;
                     }
@@ -2084,7 +2437,7 @@ fn statistic_text(column: &parquet::schema::types::ColumnDescriptor, bytes: &[u8
                         return None;
                     }
                     if time.is_adjusted_to_u_t_c {
-                        shown(Value::time_tz(TimeTz::new(Time(micros), 0)))
+                        shown(time_tz_value(micros))
                     } else {
                         shown(Value::time(Time(micros)))
                     }
@@ -2126,13 +2479,19 @@ fn statistic_text(column: &parquet::schema::types::ColumnDescriptor, bytes: &[u8
                 }
                 (_, ConvertedType::TIMESTAMP_MILLIS) => shown(Value::timestamp(Timestamp(value.checked_mul(1000)?))),
                 (_, ConvertedType::TIMESTAMP_MICROS) => shown(Value::timestamp(Timestamp(value))),
+                (Some(Logical::Time(time)), _) if time.unit == Unit::NANOS && !time.is_adjusted_to_u_t_c => {
+                    (0..=1000 * MICROS_PER_DAY).contains(&value).then(|| {
+                        shown(Value::new(LogicalType::new(LogicalTypeId::TimeNs), ValueData::Int64(value)).ok()?)
+                    })?
+                }
                 (Some(Logical::Time(time)), _) => {
                     let micros = match time.unit {
+                        Unit::NANOS if time.is_adjusted_to_u_t_c => value.rem_euclid(1000 * MICROS_PER_DAY) / 1000,
                         Unit::NANOS => value / 1000,
                         _ => value,
                     };
                     if time.is_adjusted_to_u_t_c {
-                        shown(Value::time_tz(TimeTz::new(Time(micros), 0)))
+                        shown(time_tz_value(micros))
                     } else if (0..=MICROS_PER_DAY).contains(&micros) {
                         shown(Value::time(Time(micros)))
                     } else {
@@ -2215,15 +2574,31 @@ fn half_to_f32(bits: u16) -> f32 {
 /// `parquet_metadata`: a row of SQL per column of a row group.
 pub fn metadata_rows(path: &str) -> Result<Vec<String>> {
     let (metadata, _) = read_metadata(path)?;
+    let raw = raw_chunks(path);
     let mut rows = Vec::new();
     for (group, row_group) in metadata.row_groups().iter().enumerate() {
         for (column, chunk) in row_group.columns().iter().enumerate() {
             let (_, _, nulls, distinct) = chunk.statistics().map_or((None, None, None, None), statistics_text);
             let descriptor = chunk.column_descr();
             let stat = |bytes: Option<&[u8]>| bytes.and_then(|b| statistic_text(descriptor, b));
-            let min = stat(chunk.statistics().and_then(Statistics::min_bytes_opt));
-            let max = stat(chunk.statistics().and_then(Statistics::max_bytes_opt));
-            let encodings: Vec<String> = chunk.encodings().map(|e| e.to_string()).collect();
+            let raw_chunk = raw.as_ref().and_then(|raw| raw.get(group)?.get(column).cloned());
+            let (min, max, min_value, max_value) = match &raw_chunk {
+                // `stats_min` / `stats_max` are the deprecated bounds, `stats_min_value` / ... the others
+                Some(raw) => (
+                    stat(raw.min.as_deref()),
+                    stat(raw.max.as_deref()),
+                    stat(raw.min_value.as_deref()),
+                    stat(raw.max_value.as_deref()),
+                ),
+                None => {
+                    let min = stat(chunk.statistics().and_then(Statistics::min_bytes_opt));
+                    let max = stat(chunk.statistics().and_then(Statistics::max_bytes_opt));
+                    (min.clone(), max.clone(), min, max)
+                }
+            };
+            let encodings: Vec<String> = raw_chunk
+                .and_then(|raw| raw.encodings)
+                .unwrap_or_else(|| chunk.encodings().map(|e| e.to_string()).collect());
             let encoding_stats = match chunk.page_encoding_stats() {
                 Some(all) => {
                     let items: Vec<String> = all
@@ -2254,12 +2629,12 @@ pub fn metadata_rows(path: &str) -> Result<Vec<String>> {
                 chunk.num_values(),
                 sql_text(&chunk.column_path().parts().join(", ")),
                 sql_text(&chunk.column_type().to_string()),
-                sql_or_null(min.clone()),
-                sql_or_null(max.clone()),
-                sql_number(nulls),
-                sql_number(distinct),
                 sql_or_null(min),
                 sql_or_null(max),
+                sql_number(nulls),
+                sql_number(distinct),
+                sql_or_null(min_value),
+                sql_or_null(max_value),
                 sql_text(chunk.compression().to_string().split('(').next().unwrap_or_default()),
                 sql_text(&encodings.join(", ")),
                 sql_number(chunk.dictionary_page_offset()),
@@ -2326,16 +2701,105 @@ fn logical_type_text(logical: &parquet::basic::LogicalType) -> Option<String> {
     })
 }
 
-/// The repetition of the root of the schema, which the crate leaves out.
-fn root_repetition(path: &str) -> Option<String> {
+/// The footer of a file as Thrift values, for what the crate leaves out.
+fn raw_footer(path: &str) -> Option<ThriftValue> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = File::open(path).ok()?;
     let size = file.seek(SeekFrom::End(0)).ok()?;
     file.seek(SeekFrom::Start(size.checked_sub(8)?)).ok()?;
     let mut tail = [0u8; 8];
     file.read_exact(&mut tail).ok()?;
+    if &tail[4..] != b"PAR1" {
+        return None;
+    }
     let length = i32::from_le_bytes(tail[..4].try_into().ok()?);
-    let footer = read_thrift_struct(&mut file, size as i64 - 8 - i64::from(length), length)?;
+    read_thrift_struct(&mut file, size as i64 - 8 - i64::from(length), length)
+}
+
+/// What the crate leaves out of a column chunk's metadata: its encodings in the order the file lists them (the
+/// crate keeps a set), and its deprecated and current bounds apart (the crate keeps one of them).
+#[derive(Default, Clone)]
+struct RawChunk {
+    encodings: Option<Vec<String>>,
+    min: Option<Vec<u8>>,
+    max: Option<Vec<u8>>,
+    min_value: Option<Vec<u8>>,
+    max_value: Option<Vec<u8>>,
+}
+
+fn raw_chunks(path: &str) -> Option<Vec<Vec<RawChunk>>> {
+    let footer = raw_footer(path)?;
+    let name = |code: i64| {
+        match code {
+            0 => "PLAIN",
+            2 => "PLAIN_DICTIONARY",
+            3 => "RLE",
+            4 => "BIT_PACKED",
+            5 => "DELTA_BINARY_PACKED",
+            6 => "DELTA_LENGTH_BYTE_ARRAY",
+            7 => "DELTA_BYTE_ARRAY",
+            8 => "RLE_DICTIONARY",
+            9 => "BYTE_STREAM_SPLIT",
+            _ => return None,
+        }
+        .to_string()
+        .into()
+    };
+    let bytes = |value: Option<&ThriftValue>| match value {
+        Some(ThriftValue::Binary(bytes)) => Some(bytes.clone()),
+        _ => None,
+    };
+    footer
+        .field(4)?
+        .items()
+        .iter()
+        .map(|group| {
+            Some(
+                group
+                    .field(1)?
+                    .items()
+                    .iter()
+                    .map(|chunk| {
+                        let Some(meta) = chunk.field(3) else {
+                            return RawChunk::default();
+                        };
+                        let encodings = meta
+                            .field(2)
+                            .and_then(|codes| codes.items().iter().map(|code| name(code.int()?)).collect());
+                        let stats = meta.field(12);
+                        let stat = |id: i16| bytes(stats.and_then(|stats| stats.field(id)));
+                        RawChunk {
+                            encodings,
+                            max: stat(1),
+                            min: stat(2),
+                            max_value: stat(5),
+                            min_value: stat(6),
+                        }
+                    })
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// The precision and scale of the first DECIMAL of the schema that C++ refuses, which the crate's errors leave out.
+fn invalid_decimal(path: &str) -> Option<(i64, i64)> {
+    let footer = raw_footer(path)?;
+    footer.field(2)?.items().iter().find_map(|element| {
+        let (precision, scale) = match element.field(10).and_then(|logical| logical.field(5)) {
+            Some(decimal) => (decimal.field(2)?.int()?, decimal.field(1)?.int()?),
+            None if element.field(6).and_then(ThriftValue::int) == Some(5) => {
+                (element.field(8)?.int()?, element.field(7)?.int()?)
+            }
+            None => return None,
+        };
+        (precision < 1 || scale < 0 || scale > precision).then_some((precision, scale))
+    })
+}
+
+/// The repetition of the root of the schema, which the crate leaves out.
+fn root_repetition(path: &str) -> Option<String> {
+    let footer = raw_footer(path)?;
     let root = footer.field(2)?.items().first()?;
     Some(
         match root.field(3)?.int()? {
@@ -2347,7 +2811,75 @@ fn root_repetition(path: &str) -> Option<String> {
     )
 }
 
-fn schema_rows(ty: &Type, path: &str, column: &mut i64, rows: &mut Vec<String>) {
+/// `CollectElementTypes`: the DuckDB type of each element of the schema, in its order, a group collapsed into
+/// its only child having the type of that child.
+fn element_types(root: &Type, types: &[LogicalType]) -> Vec<Option<String>> {
+    fn children(ty: &Type) -> &[parquet::schema::types::TypePtr] {
+        if ty.is_group() { ty.get_fields() } else { &[] }
+    }
+    fn count(ty: &Type) -> usize {
+        1 + children(ty).iter().map(|field| count(field)).sum::<usize>()
+    }
+    fn set(out: &mut [Option<String>], at: usize, ty: &LogicalType) {
+        if out[at].is_none() {
+            out[at] = Some(ty.to_string());
+        }
+    }
+    /// `at` is the index of `node`, which has the type `ty`.
+    fn assign(node: &Type, at: usize, ty: &LogicalType, out: &mut [Option<String>]) {
+        set(out, at, ty);
+        let fields = children(node);
+        if fields.is_empty() {
+            return;
+        }
+        match ty.id() {
+            LogicalTypeId::List | LogicalTypeId::Array => {
+                let Some(element) = ty.child_type() else { return };
+                let child = &fields[0];
+                let grand = children(child);
+                let collapsed = !child.is_primitive()
+                    && child.get_basic_info().repetition() == parquet::basic::Repetition::REPEATED
+                    && grand.len() == 1
+                    && child.name() != "array"
+                    && !child.name().ends_with("_tuple");
+                if collapsed {
+                    set(out, at + 1, element);
+                    assign(&grand[0], at + 2, element, out);
+                } else {
+                    assign(child, at + 1, element, out);
+                }
+            }
+            LogicalTypeId::Map => {
+                let Some(entry) = ty.child_type() else { return };
+                let entries = entry.struct_children();
+                let child = &fields[0];
+                let mut next = at + 2;
+                for (field, (_, field_ty)) in children(child).iter().zip(entries) {
+                    set(out, at + 1, field_ty);
+                    assign(field, next, field_ty, out);
+                    next += count(field);
+                }
+            }
+            LogicalTypeId::Struct => {
+                let mut next = at + 1;
+                for (field, (_, field_ty)) in fields.iter().zip(ty.struct_children()) {
+                    assign(field, next, field_ty, out);
+                    next += count(field);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = vec![None; count(root)];
+    let mut next = 1;
+    for (field, ty) in root.get_fields().iter().zip(types) {
+        assign(field, next, ty, &mut out);
+        next += count(field);
+    }
+    out
+}
+
+fn schema_rows(ty: &Type, path: &str, column: &mut i64, rows: &mut Vec<String>, types: &[Option<String>]) {
     let info = ty.get_basic_info();
     let repetition = if *column == 0 {
         root_repetition(path)
@@ -2378,7 +2910,7 @@ fn schema_rows(ty: &Type, path: &str, column: &mut i64, rows: &mut Vec<String>) 
     // `column_id`: the index of the element in the schema
     *column += 1;
     rows.push(format!(
-        "({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, NULL, {})",
+        "({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
         sql_text(path),
         sql_text(info.name()),
         sql_or_null(physical),
@@ -2390,11 +2922,12 @@ fn schema_rows(ty: &Type, path: &str, column: &mut i64, rows: &mut Vec<String>) 
         sql_number(precision.filter(|p| *p >= 0)),
         sql_number(id),
         sql_or_null(logical),
+        sql_or_null(types.get(*column as usize - 1).cloned().flatten()),
         sql_number(id_of_column),
     ));
     if let Type::GroupType { fields, .. } = ty {
         for field in fields {
-            schema_rows(field, path, column, rows);
+            schema_rows(field, path, column, rows, types);
         }
     }
 }
@@ -2403,7 +2936,11 @@ fn schema_rows(ty: &Type, path: &str, column: &mut i64, rows: &mut Vec<String>) 
 pub fn schema_table_rows(path: &str) -> Result<Vec<String>> {
     let (metadata, _) = read_metadata(path)?;
     let mut rows = Vec::new();
-    schema_rows(metadata.file_metadata().schema(), path, &mut 0, &mut rows);
+    let root = metadata.file_metadata().schema();
+    let types = file_schema(path, false, Int96As::default())
+        .map(|(_, types)| element_types(root, &types))
+        .unwrap_or_default();
+    schema_rows(root, path, &mut 0, &mut rows, &types);
     Ok(rows)
 }
 

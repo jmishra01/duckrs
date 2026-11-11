@@ -59,7 +59,7 @@ pub(super) fn not_implemented(what: &str) -> Error {
 }
 
 /// `ParsedExpression::GetName`: the alias, a column's own name, or the expression's SQL.
-fn expression_name(expr: &Expr) -> String {
+pub(super) fn expression_name(expr: &Expr) -> String {
     if !expr.alias.is_empty() {
         return expr.alias.clone();
     }
@@ -1952,6 +1952,7 @@ impl Binder<'_> {
                             | "parquet_file_metadata"
                             | "parquet_bloom_probe"
                             | "parquet_page_index"
+                            | "parquet_full_metadata"
                     )
                 {
                     return self.bind_parquet_metadata(call, table_ref);

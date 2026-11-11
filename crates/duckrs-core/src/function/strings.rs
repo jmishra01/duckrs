@@ -691,15 +691,36 @@ fn encode(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| Ok(Value::blob(bytes_of(&row[0]).to_vec())))
 }
 
+const DECODE_ERROR: &str = "Failure in decode: could not convert blob to UTF8 string, the blob contained invalid UTF8 \
+     characters. \nUse try(decode(BLOB)) to return NULL and continue instead of returning an error. Specify \
+     decode(BLOB, 'replace') to replace invalid characters with '?'. Specify decode(BLOB, 'ignore') to remove invalid \
+     characters when encountered.";
+
 fn decode(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
-        let text = std::str::from_utf8(bytes_of(&row[0])).map_err(|_| {
-            Error::new(
-                ErrorKind::Conversion,
-                "Failure in decode: could not convert blob to UTF8 string, the blob contained invalid UTF8 characters",
-            )
-        })?;
+        let text =
+            std::str::from_utf8(bytes_of(&row[0])).map_err(|_| Error::new(ErrorKind::Conversion, DECODE_ERROR))?;
         Ok(Value::varchar(text))
+    })
+}
+
+/// `BinaryDecodeFunction`: invalid UTF-8 an error, replaced by `?` or left out, as the second argument says.
+fn decode_with(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| {
+        let bytes = bytes_of(&row[0]);
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            return Ok(Value::varchar(text));
+        }
+        let option = row[1].try_to_string()?;
+        match option.to_lowercase().as_str() {
+            "strict" => Err(Error::new(ErrorKind::Conversion, DECODE_ERROR)),
+            "replace" => Ok(Value::varchar(crate::execution::csv::make_valid(bytes, '?'))),
+            "ignore" => Ok(Value::varchar(crate::execution::csv::remove_invalid(bytes))),
+            _ => Err(Error::new(
+                ErrorKind::Conversion,
+                format!("decode error behavior specifier \"{option}\" not recognized"),
+            )),
+        }
     })
 }
 
@@ -868,7 +889,6 @@ pub fn string_functions() -> Vec<ScalarFunctionSet> {
         ("md5", vec![blob.clone()], v.clone(), md5),
         ("~~~", vec![v.clone(), v.clone()], b.clone(), glob),
         ("encode", vec![v.clone()], blob.clone(), encode),
-        ("decode", vec![blob.clone()], v.clone(), decode),
         ("to_base64", vec![blob.clone()], v.clone(), to_base64),
         ("base64", vec![blob.clone()], v.clone(), to_base64),
         ("from_base64", vec![v.clone()], blob.clone(), from_base64),
@@ -878,6 +898,13 @@ pub fn string_functions() -> Vec<ScalarFunctionSet> {
     for (name, arguments, return_type, callback) in simple {
         sets.push(set_of(name, vec![(arguments, return_type, callback)]));
     }
+    sets.push(set_of(
+        "decode",
+        vec![
+            (vec![blob.clone()], v.clone(), decode as ScalarCallback),
+            (vec![blob.clone(), v.clone()], v.clone(), decode_with),
+        ],
+    ));
     for name in ["hex", "to_hex"] {
         sets.push(set_of(
             name,

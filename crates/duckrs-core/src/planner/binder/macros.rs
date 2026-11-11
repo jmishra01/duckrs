@@ -531,8 +531,29 @@ impl Binder<'_> {
                     if parameter_found {
                         return Err(binder_error("Parameter expressions within macro's are not supported!"));
                     }
-                    replace_in_query(&mut body, &parameters, &nulls);
-                    binder.bind_select_statement(&SelectStatement { node: body })?;
+                    // the parameters are NULLs marked as such: a table function's argument made of one can't be
+                    // known yet (`ParameterNotResolvedException`), and binding is put off until the macro is used
+                    let marked: Vec<Expr> = function
+                        .parameters
+                        .iter()
+                        .map(|parameter| {
+                            let null = Expr::from(ExprKind::Constant(Literal {
+                                kind: LiteralKind::Null,
+                                text: CREATE_PARAMETER_MARK.to_string(),
+                            }));
+                            match &parameter.parameter_type {
+                                Some(ty) => cast_to(null, ty),
+                                None => null,
+                            }
+                        })
+                        .collect();
+                    replace_in_query(&mut body, &parameters, &marked);
+                    match binder.bind_select_statement(&SelectStatement { node: body }) {
+                        Err(error) if error.kind == ErrorKind::ParameterNotResolved => {}
+                        result => {
+                            result?;
+                        }
+                    }
                 }
             }
         }

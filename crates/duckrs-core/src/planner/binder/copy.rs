@@ -1933,6 +1933,9 @@ impl Binder<'_> {
                 "compression" => compression = Compression::parse(&text(&value)?)?,
                 // the file ends up the same, unless a write fails half way
                 "use_tmp_file" => {}
+                _ if !is_copy_option(CSV_COPY_OPTIONS, &name) => {
+                    return Err(unrecognized_copy_option(&name, "csv", CSV_COPY_OPTIONS));
+                }
                 _ => return Err(crate::unported(format!("the COPY option {name}"))),
             }
         }
@@ -2803,5 +2806,102 @@ fn buffer_below_line_size(buffer: usize, line: usize) -> Error {
     Error::new(
         ErrorKind::InvalidInput,
         format!("Buffer Size of {buffer} must be a higher value than the maximum line size {line}"),
+    )
+}
+
+/// The options every COPY TO has (`GetFullCopyOptionsList`).
+const GENERIC_COPY_OPTIONS: &[&str] = &[
+    "use_tmp_file",
+    "overwrite_or_ignore",
+    "overwrite",
+    "append",
+    "filename_pattern",
+    "file_extension",
+    "per_thread_output",
+    "row_group_size",
+    "row_group_size_bytes",
+    "row_groups_per_file",
+    "file_size_bytes",
+    "partition_by",
+    "order_by",
+    "return_files",
+    "preserve_order",
+    "return_stats",
+    "return_column_types",
+    "write_partition_columns",
+    "write_empty_file",
+    "hive_file_pattern",
+];
+
+/// `CSVListCopyOptions`.
+const CSV_COPY_OPTIONS: &[&str] = &[
+    "auto_detect",
+    "sample_size",
+    "skip",
+    "max_line_size",
+    "maximum_line_size",
+    "ignore_errors",
+    "buffer_size",
+    "decimal_separator",
+    "null_padding",
+    "parallel",
+    "allow_quoted_nulls",
+    "store_rejects",
+    "force_not_null",
+    "rejects_table",
+    "rejects_scan",
+    "rejects_limit",
+    "encoding",
+    "thousands",
+    "force_quote",
+    "prefix",
+    "suffix",
+    "new_line",
+    "date_format",
+    "dateformat",
+    "timestamp_format",
+    "timestampformat",
+    "quote",
+    "comment",
+    "delim",
+    "delimiter",
+    "sep",
+    "separator",
+    "escape",
+    "header",
+    "nullstr",
+    "null",
+    "compression",
+    "strict_mode",
+];
+
+/// Whether a COPY function with the options `own` has `option`, its own or one every COPY has.
+pub(super) fn is_copy_option(own: &[&str], option: &str) -> bool {
+    let option = option.to_lowercase();
+    own.iter().chain(GENERIC_COPY_OPTIONS).any(|known| *known == option)
+}
+
+/// `BindCopyOptions`: an option the COPY function does not have, with the closest ones it does.
+pub(super) fn unrecognized_copy_option(option: &str, format: &str, own: &[&str]) -> Error {
+    let target = option.to_lowercase();
+    let mut names: Vec<&str> = own.iter().chain(GENERIC_COPY_OPTIONS).copied().collect();
+    names.sort_unstable();
+    names.dedup();
+    let scores = names
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.to_string(),
+                duckrs_common::string_util::similarity_rating(candidate, &target),
+            )
+        })
+        .collect();
+    let candidates = duckrs_common::string_util::top_n_strings(scores);
+    Error::new(
+        ErrorKind::NotImplemented,
+        format!(
+            "Unrecognized option {option} for {format}\n{}",
+            duckrs_common::string_util::candidates_message(&candidates, "Candidate options")
+        ),
     )
 }

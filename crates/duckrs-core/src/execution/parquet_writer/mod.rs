@@ -269,10 +269,9 @@ impl Target {
     /// What dictionaries tell values apart by: NaNs are one value, and so are the zeros (`float_na_equal`).
     fn key(&self) -> Vec<u8> {
         match self {
+            // `float_na_equal`: NaNs are one entry, zeros of either sign are not
             Target::F32(v) if v.is_nan() => f32::NAN.to_le_bytes().to_vec(),
-            Target::F32(v) if *v == 0.0 => 0f32.to_le_bytes().to_vec(),
             Target::F64(v) if v.is_nan() => f64::NAN.to_le_bytes().to_vec(),
-            Target::F64(v) if *v == 0.0 => 0f64.to_le_bytes().to_vec(),
             other => {
                 let mut out = Vec::new();
                 other.plain(&mut out);

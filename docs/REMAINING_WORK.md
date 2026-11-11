@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 4126 of 6367 test files pass (**68.2%** of the 6049 that run). The v1 target is ≥ 90%.
+- Overall: 4156 of 6367 test files pass (**68.7%** of the 6049 that run). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -47,7 +47,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] the agreement of `columns` with `types`, unnamed after named arguments, subqueries, aggregates and windows
     in table function arguments; rejects-table lines made valid UTF-8 as `Utf8Proc::MakeValid` does
   - [ ] the other CSV sniffer, rejects-table and error-message differences (about 40 files under `sql/copy/csv` fail)
-- [ ] 2. JSON: `read_json`/`read_json_auto`, the JSON type, JSON functions (`sql/json`: 42 failing, 71.0%)
+- [ ] 2. JSON: `read_json`/`read_json_auto`, the JSON type, JSON functions (`sql/json`: 41 failing, 71.7%)
   - [x] `json_normalize`, `json_deep_merge`, `json_merge_patch_diff`
   - [x] `json_each` / `json_tree`, with columns as arguments (LATERAL) and the hidden `json`, `root`, `rowid`
   - [x] escaped quotes and backslashes in quoted JSON path keys; no wildcards in `json_set`/`json_remove`/...
@@ -75,7 +75,19 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] `case_insensitive_keys`, duplicate keys as errors, `RemoveDuplicateStructKeys`, keys that differ in case made
     unique column names; `read_single_json_file`; the format detected from the first line (`DetectFormatAndRecordType`)
   - [ ] map inference (`map_inference_threshold`, `field_appearance_threshold`): objects with many or inconsistent keys
-- [ ] 3. Parquet reader/writer: missing types, filter pushdown, delta encoding (`test/parquet`: 28 failing, `corrupt`: 5)
+- [ ] 3. Parquet reader/writer: missing types, filter pushdown, delta encoding (`test/parquet`: 22 failing, `corrupt`: 5)
+  - [x] `utf8_validation` (`strict`, `replace`, `ignore`): strings read as bytes and repaired, their bounds not used;
+    exact VARCHAR bounds that are not UTF-8 ignored; `decode(BLOB, error_option)`
+  - [x] TIME values outside a day are errors, TIMETZ wraps into the day; INT96 timestamps read as microseconds (no
+    overflow before 1677); INTERVALs read with their months; UNKNOWN-annotated columns are `"NULL"`
+  - [x] `parquet_metadata`: encodings in file order, deprecated and current bounds apart, TIME(NANOS) bounds;
+    `parquet_schema`'s `duckdb_type`; `parquet_full_metadata`; invalid DECIMAL precision/scale errors as C++
+  - [x] COPY ... FROM passes reader options on and reads into the table's types, with C++'s count and cast
+    errors; multi-file cast errors as C++; VARCHAR read as BLOB by its bytes (`union_by_name`)
+  - [x] `allow_empty`; `schema` turns off hive detection; hive columns that are file columns aren't cast from it;
+    unknown COPY options of Parquet and CSV with C++'s suggestions; signed zeros apart in dictionaries
+  - [ ] INT96 out of range (the crate wraps), `timestamp_ns` saturation, legacy `ConvertedType` 24, `stats()` of
+    VARCHAR, recursive `UNNEST` of structs (`metadata_full`), `WITH ORDINALITY`
   - [x] `parquet_metadata` stats in the column's DuckDB type (decimals, UUID, TIMETZ, INT96, blobs; NULL for infinities and out-of-range values)
   - [x] `int96_as` (`timestamp` by default, `timestamp_ns`, `struct`)
   - [x] the native Parquet writer (`execution/parquet_writer`): DuckDB's encodings, dictionaries, pages, statistics, bloom filters and footer, written with our own Thrift; TIMETZ as TIME in UTC
