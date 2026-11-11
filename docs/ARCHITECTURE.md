@@ -298,8 +298,9 @@ predicate check each pair of a key's rows, where C++ hashes on the comparison. T
 Threads for aggregates and joins, and spilling for sorts, aggregates and hash joins. A pipeline runs on the `threads` setting's threads,
 all of the machine's by default, when it has all of these:
 
-- a source of morsels: a table in memory of at least 2 row groups, so that small tables stay in order and their
-  floating point sums the same on each run. A table still in its file does not qualify;
+- a source of morsels: a table of at least 2 row groups, so that small tables stay in order and their floating
+  point sums the same on each run. In memory a morsel is a chunk; a table still in its file has a morsel per row
+  group (`parallel_chunks` gives its chunks), when the groups of the file are full but for the last;
 - operators that any thread can run in any order: filters, projections, column selections, and the probe of a hash or
   blockwise nested loop join (`PhysicalJoin`). Once its build side is finished it does not change, apart from the flags
   of the build rows that found a match, which are atomic, so threads probe it without a lock;
@@ -311,6 +312,8 @@ all of the machine's by default, when it has all of these:
     one of 64 partitions. `finalize` looks up the keys of each partition in a table of its own, on as many threads as
     sank, once there are 100,000 build rows. Threads cut the time of a large build side most, as looking up keys takes
     nearly all of it. One thread puts all keys in one partition, so that probing does not hash a key twice;
+  - both inputs of `PhysicalDelimJoin` (`parallel_sink_input`): the left rows go into a collection per thread,
+    put together in morsel order, and the right side is the build of its join;
   - `PhysicalResultCollector`, as `PhysicalBatchCollector`: `sink_local` is told the morsel of each chunk, and the
     rows of each morsel go into the result in morsel order, which is the order of one thread.
 

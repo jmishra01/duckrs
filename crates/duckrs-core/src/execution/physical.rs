@@ -94,6 +94,19 @@ pub trait PhysicalOperator: fmt::Debug + Send + Sync {
     fn parallel_chunk(&self, _state: &SharedSourceState, _index: usize) -> Result<Option<DataChunk>> {
         unreachable!("{} is not a parallel source", self.name())
     }
+    /// The chunks of morsel `index`, in order: a morsel of a source whose morsels are larger than a
+    /// chunk (a row group of a database file) gives several.
+    fn parallel_chunks(
+        &self,
+        state: &SharedSourceState,
+        index: usize,
+        emit: &mut dyn FnMut(DataChunk) -> Result<()>,
+    ) -> Result<()> {
+        match self.parallel_chunk(state, index)? {
+            Some(chunk) => emit(chunk),
+            None => Ok(()),
+        }
+    }
 
     // Operator interface: one input chunk becomes one output chunk
     fn execute(&self, _input: DataChunk) -> Result<DataChunk> {
@@ -144,6 +157,25 @@ pub trait PhysicalOperator: fmt::Debug + Send + Sync {
     }
     fn combine_local(&self, _local: LocalSinkState) -> Result<()> {
         unreachable!("{} is not a parallel sink", self.name())
+    }
+    /// [`Self::parallel_sink`] for one of the inputs of a sink with several (a delim join).
+    fn parallel_sink_input(&self, _input: usize) -> bool {
+        self.sink_children().len() == 1 && self.parallel_sink()
+    }
+    fn local_sink_state_input(&self, _input: usize) -> LocalSinkState {
+        self.local_sink_state()
+    }
+    fn sink_local_input(
+        &self,
+        _input: usize,
+        local: &mut LocalSinkState,
+        batch: usize,
+        chunk: &DataChunk,
+    ) -> Result<()> {
+        self.sink_local(local, batch, chunk)
+    }
+    fn combine_local_input(&self, _input: usize, local: LocalSinkState) -> Result<()> {
+        self.combine_local(local)
     }
     /// Which child feeds the sink. Joins are sinks for their right child, and the left child
     /// streams through them.
@@ -284,6 +316,17 @@ impl PhysicalTableScan {
     }
 
     fn file_scan(&self, source: Arc<dyn TableSource>) -> FileScan {
+        let (read, types, columns) = self.file_columns();
+        FileScan {
+            cursor: TableCursor::new(source, read, types, self.table.row_group_size()),
+            columns,
+        }
+    }
+
+    /// The columns a scan of the file reads, their types, and per entry of `column_ids` where a
+    /// chunk of them has it (or a vector that nothing reads).
+    #[allow(clippy::type_complexity, reason = "the three parts of a FileScan")]
+    fn file_columns(&self) -> (Vec<usize>, Vec<LogicalType>, Vec<Result<usize, Vector>>) {
         let mut used = vec![self.projection.is_none(); self.column_ids.len()];
         for &position in self.projection.iter().flatten() {
             used[position] = true;
@@ -312,11 +355,54 @@ impl PhysicalTableScan {
             }
         }
         let types = read.iter().map(|&c| self.table.columns[c].ty.clone()).collect();
-        FileScan {
-            cursor: TableCursor::new(source, read, types, self.table.row_group_size()),
-            columns,
-        }
+        (read, types, columns)
     }
+
+    /// [`PhysicalOperator::parallel_source`] of a table still in its file: a morsel is a row group,
+    /// when the groups of the file are those of the table (all full but the last).
+    fn parallel_file_source(&self, source: Arc<dyn TableSource>) -> Option<(SharedSourceState, usize)> {
+        let group_rows = self.table.row_group_size();
+        if !group_rows.is_multiple_of(STANDARD_VECTOR_SIZE) || !TableCursor::is_aligned(&*source, group_rows) {
+            return None;
+        }
+        let groups = source.group_count();
+        if groups < MIN_PARALLEL_ROW_GROUPS {
+            return None;
+        }
+        let rows = self.table.row_count();
+        let wanted = groups_to_scan(&self.table, &self.column_ids, self.filter.as_ref(), rows);
+        let ids = self.table.row_ids(rows);
+        let (read, types, columns) = self.file_columns();
+        let scan = FileScan {
+            cursor: TableCursor::new(source.clone(), read.clone(), types.clone(), group_rows),
+            columns,
+        };
+        Some((
+            Box::new(ParallelFileScan {
+                source,
+                read,
+                types,
+                scan,
+                ids,
+                rows,
+                groups: wanted,
+            }),
+            groups,
+        ))
+    }
+}
+
+/// What the threads of a [`PhysicalTableScan`] of a table in its file share.
+struct ParallelFileScan {
+    source: Arc<dyn TableSource>,
+    /// the columns of the table that are read, and their types
+    read: Vec<usize>,
+    types: Vec<LogicalType>,
+    /// where the chunks have each column (its cursor is not used)
+    scan: FileScan,
+    ids: Arc<RowIds>,
+    rows: usize,
+    groups: Vec<bool>,
 }
 
 /// What the threads of a [`PhysicalTableScan`] share.
@@ -335,11 +421,11 @@ impl PhysicalOperator for PhysicalTableScan {
         "TABLE_SCAN"
     }
     fn parallel_source(&self) -> Option<(SharedSourceState, usize)> {
-        if self.index_rows.is_some() || self.table.source().is_some() {
+        if self.index_rows.is_some() || !self.filter.as_ref().is_none_or(parallel_expression) {
             return None;
         }
-        if !self.filter.as_ref().is_none_or(parallel_expression) {
-            return None;
+        if let Some(source) = self.table.source() {
+            return self.parallel_file_source(source);
         }
         let rows = self.table.row_count();
         let chunks = rows.div_ceil(STANDARD_VECTOR_SIZE);
@@ -349,6 +435,42 @@ impl PhysicalOperator for PhysicalTableScan {
         let groups = groups_to_scan(&self.table, &self.column_ids, self.filter.as_ref(), rows);
         let ids = self.table.row_ids(rows);
         Some((Box::new(ParallelTableScan { ids, rows, groups }), chunks))
+    }
+    fn parallel_chunks(
+        &self,
+        state: &SharedSourceState,
+        index: usize,
+        emit: &mut dyn FnMut(DataChunk) -> Result<()>,
+    ) -> Result<()> {
+        let Some(state) = state.downcast_ref::<ParallelFileScan>() else {
+            return match self.parallel_chunk(state, index)? {
+                Some(chunk) => emit(chunk),
+                None => Ok(()),
+            };
+        };
+        // a row group of the file, in chunks
+        if !state.groups.get(index).is_none_or(|g| *g) {
+            return Ok(());
+        }
+        let mut group = ColumnDataCollection::new(state.types.clone());
+        group.append(&state.source.read_group(index, &state.read)?);
+        let first_chunk = index * self.table.chunks_per_row_group();
+        for (local, chunk) in group.chunks().enumerate() {
+            let first_row = (first_chunk + local) * STANDARD_VECTOR_SIZE;
+            let count = chunk.len().min(state.rows.saturating_sub(first_row));
+            if count == 0 {
+                break;
+            }
+            let columns = self.scan_columns(chunk, &state.ids, first_row, Some(&state.scan))?;
+            let mut result = DataChunk::from_columns(columns, chunk.len());
+            if count < chunk.len() {
+                result.slice(&SelectionVector::from_vec((0..count as u32).collect()), count);
+            }
+            if let Some(result) = self.finish_chunk(result)? {
+                emit(result)?;
+            }
+        }
+        Ok(())
     }
     fn parallel_chunk(&self, state: &SharedSourceState, index: usize) -> Result<Option<DataChunk>> {
         let state: &ParallelTableScan = state.downcast_ref().expect("parallel scan state");

@@ -513,8 +513,7 @@ impl Pipeline<'_> {
     /// What threads can read, if the whole pipeline can run on them.
     fn parallel_source(&self, threads: usize) -> Option<(SharedSourceState, usize)> {
         if threads < 2
-            || self.sink.sink_children().len() != 1
-            || !self.sink.parallel_sink()
+            || !self.sink.parallel_sink_input(self.input)
             || !self.operators.iter().all(|op| op.parallel_operator())
         {
             return None;
@@ -530,7 +529,7 @@ impl Pipeline<'_> {
         let memory = temporary::current();
         let query_profiler = profiler::current();
         let worker = || -> Result<()> {
-            let mut local = self.sink.local_sink_state();
+            let mut local = self.sink.local_sink_state_input(self.input);
             let mut states: Vec<OperatorState> = self.operators.iter().map(|op| op.operator_state()).collect();
             while !failed.load(Ordering::Relaxed) {
                 let index = next.fetch_add(1, Ordering::Relaxed);
@@ -538,17 +537,19 @@ impl Pipeline<'_> {
                     break;
                 }
                 let profiler = profiler::current();
-                let (chunk, time) = profiler::timed(profiler.as_deref(), || self.source.parallel_chunk(&shared, index));
-                if let Some(chunk) = chunk? {
+                let mut started = std::time::Instant::now();
+                self.source.parallel_chunks(&shared, index, &mut |chunk| {
                     if let Some(profiler) = &profiler {
-                        profiler.record(self.source, time, &chunk, profiler::is_scan(self.source));
+                        profiler.record(self.source, started.elapsed(), &chunk, profiler::is_scan(self.source));
                     }
                     self.push_into(chunk, 0, &mut states, &mut |chunk| {
-                        self.sink.sink_local(&mut local, index, chunk)
+                        self.sink.sink_local_input(self.input, &mut local, index, chunk)
                     })?;
-                }
+                    started = std::time::Instant::now();
+                    Ok(())
+                })?;
             }
-            self.sink.combine_local(local)
+            self.sink.combine_local_input(self.input, local)
         };
         std::thread::scope(|scope| {
             for _ in 0..threads.min(morsels) {

@@ -295,7 +295,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
 - [ ] 47. Faster kernels: monomorphized code, SIMD, a perfect hash aggregate, the salt/pointer hash table design
 - [ ] 48. v1 gate: TPC-H SF10 geometric mean ≤ 1.5× C++ DuckDB, and no query slower than 3×. The runner
   prints the gate after `--engine=both`. On TPC-H SF1 (8 threads, all 22 answers correct) duckrs is at
-  12.7× (Q19 48×); with one thread at 5.6× (Q1), 6.1× (Q6), 18× (Q19): the queries run on one thread
+  3.76× (Q19 10×), from 12.7× before tables in their file and both inputs of a delim join ran on threads
 
 ## Phase 14: Extensions (not started)
 

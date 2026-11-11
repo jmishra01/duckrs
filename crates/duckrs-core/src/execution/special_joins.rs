@@ -10,6 +10,7 @@ use super::physical::{
     OperatorResult, OperatorState, PhysicalEmptyResult, PhysicalOperator, SourceState, check_buffered,
     check_buffered_rows, group_keys,
 };
+use crate::execution::LocalSinkState;
 use crate::planner::expression::BoundExpr;
 use crate::planner::logical::JoinCondition;
 use duckrs_common::column_data::ColumnDataCollection;
@@ -381,6 +382,8 @@ pub struct PhysicalDelimJoin {
     pub children: Vec<Box<dyn PhysicalOperator>>,
     pub join: PhysicalJoin,
     pub left: Mutex<ColumnDataCollection>,
+    /// the left rows threads gathered, by the morsel they came from
+    left_batches: Mutex<Vec<(usize, ColumnDataCollection)>>,
     pub delim: Arc<Mutex<ColumnDataCollection>>,
 }
 
@@ -415,6 +418,7 @@ impl PhysicalDelimJoin {
             children,
             join,
             left,
+            left_batches: Mutex::default(),
             delim,
         }
     }
@@ -450,10 +454,59 @@ impl PhysicalOperator for PhysicalDelimJoin {
         left.append(chunk);
         check_buffered(&left)
     }
+    /// `PhysicalLeftDelimJoin::Sink` keeps a collection per thread for the left side, and the right
+    /// side is the build of the join, which threads can do.
+    fn parallel_sink_input(&self, input: usize) -> bool {
+        input == 0 || self.join.parallel_sink()
+    }
+    fn local_sink_state_input(&self, input: usize) -> LocalSinkState {
+        if input == 1 {
+            return self.join.local_sink_state();
+        }
+        Box::new(Vec::<(usize, ColumnDataCollection)>::new())
+    }
+    fn sink_local_input(
+        &self,
+        input: usize,
+        local: &mut LocalSinkState,
+        batch: usize,
+        chunk: &DataChunk,
+    ) -> Result<()> {
+        if input == 1 {
+            return self.join.sink_local(local, batch, chunk);
+        }
+        let batches: &mut Vec<(usize, ColumnDataCollection)> = local.downcast_mut().expect("delim join local state");
+        if batches.last().is_none_or(|(last, _)| *last != batch) {
+            batches.push((batch, ColumnDataCollection::new(self.children[0].types().to_vec())));
+        }
+        batches.last_mut().expect("just pushed").1.append(chunk);
+        Ok(())
+    }
+    fn combine_local_input(&self, input: usize, local: LocalSinkState) -> Result<()> {
+        if input == 1 {
+            return self.join.combine_local(local);
+        }
+        let batches = *local
+            .downcast::<Vec<(usize, ColumnDataCollection)>>()
+            .expect("delim join local state");
+        self.left_batches.lock().extend(batches);
+        Ok(())
+    }
     fn finish_input(&self, input: usize) -> Result<()> {
         if input != 0 {
             return Ok(());
         }
+        // the rows threads gathered, in the order of their morsels: the order of one thread
+        let mut batches = std::mem::take(&mut *self.left_batches.lock());
+        let mut left = self.left.lock();
+        if !batches.is_empty() {
+            batches.sort_by_key(|(batch, _)| *batch);
+            for (_, rows) in batches {
+                left.combine(rows);
+            }
+            check_buffered(&left)?;
+        }
+        drop(left);
         let left = self.left.lock();
         let types: Vec<LogicalType> = self
             .join
