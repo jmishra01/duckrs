@@ -959,6 +959,39 @@ impl ClientContext {
             },
             search_path: self.search_path.iter().map(|entry| entry.schema.clone()).collect(),
             current_query: self.current_query.clone(),
+            open_database: {
+                let home = self.home.clone();
+                Arc::new(move |path: &str| {
+                    // `DatabaseFilePathManager`: a file that is attached is not attached again
+                    let canonical = std::fs::canonicalize(path).ok();
+                    let mut databases = vec![home.clone()];
+                    databases.extend(home.attached.read().values().cloned());
+                    for existing in databases {
+                        let Some(file) = &existing.file else { continue };
+                        let same = canonical.as_ref().map_or(file.path == Path::new(path), |c| {
+                            std::fs::canonicalize(&file.path).is_ok_and(|p| p == *c)
+                        });
+                        if same {
+                            return Err(Error::new(
+                                ErrorKind::ResourceInUse,
+                                format!(
+                                    "Unique file handle conflict: Cannot attach __duckdb_reader - the database file \
+                                     \"{path}\" is already attached by database \"{}\"",
+                                    existing.name
+                                ),
+                            ));
+                        }
+                    }
+                    let options = AttachOptions {
+                        read_only: true,
+                        settings: Some(home.settings.clone()),
+                        ..AttachOptions::default()
+                    };
+                    let database = DatabaseInstance::open_with(Path::new(path), &options)?;
+                    let catalog = database.catalog.clone();
+                    Ok((catalog, database as Arc<dyn std::any::Any + Send + Sync>))
+                })
+            },
             settings: Box::new(move || settings::list_settings(&list_db.settings.read(), &list_session)),
             database_files: Box::new(move || {
                 let mut databases = vec![files_db.clone()];
@@ -1108,6 +1141,7 @@ impl ClientContext {
             let catalog = self.catalog();
             let mut binder = Binder::with_options(&catalog, self.bind_options());
             binder.parameters = Some(parameters.clone());
+            binder.session = Some(self.session_values());
             let bound = match dml_cte::split(&statement) {
                 Some((ctes, rest)) => self.bind_dml_ctes(&ctes, &rest, &parameters),
                 None => binder.bind(&statement).map(drop),

@@ -2068,6 +2068,7 @@ test/sql/function/string/test_translate.test
 test/sql/function/string/test_trim.test
 test/sql/function/string/test_unicode.test
 test/sql/function/table/query_function_null.test
+test/sql/function/table/read_duckdb_empty_projection.test
 test/sql/function/test_scalar_executor.test
 test/sql/function/time/epoch.test
 test/sql/function/time/make_time_nan.test
@@ -3230,6 +3231,15 @@ test/sql/storage/partial_blocks/partial_block_tail_memory.test
 test/sql/storage/piecemeal_delete_checkpoint_compress.test
 test/sql/storage/prefetch/async_native_scan_positional.test
 test/sql/storage/prefetch/async_native_scan_read_ahead_concurrent.test
+test/sql/storage/read_duckdb/read_duckdb_basic.test
+test/sql/storage/read_duckdb/read_duckdb_generated.test
+test/sql/storage/read_duckdb/read_duckdb_index.test
+test/sql/storage/read_duckdb/read_duckdb_schema.test
+test/sql/storage/read_duckdb/read_duckdb_suggested.test
+test/sql/storage/read_duckdb/read_duckdb_top_n.test
+test/sql/storage/read_duckdb/read_duckdb_transaction.test
+test/sql/storage/read_duckdb/read_duckdb_union_by_name.test
+test/sql/storage/read_duckdb/read_duckdb_virtual_columns.test
 test/sql/storage/revert_append_after_checkpoint_new_row_group.test
 test/sql/storage/revert_append_nested_list.test
 test/sql/storage/row_group_fetch_bulk.test

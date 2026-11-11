@@ -16,6 +16,7 @@ mod merge;
 mod on_conflict;
 mod parquet;
 mod pivot;
+pub mod read_duckdb;
 mod show;
 mod star;
 mod statements;
@@ -552,9 +553,14 @@ pub struct SessionValues {
     pub search_path: Vec<String>,
     /// `current_query()`
     pub current_query: String,
+    /// `read_duckdb`: a database file opened read-only for the statement (`AttachDatabase`, hidden)
+    pub open_database: OpenDatabase,
     /// `DatabaseManager::IsAttachedDatabaseFile`: the files of the attached databases
     pub database_files: Box<dyn Fn() -> Vec<std::path::PathBuf> + Send + Sync>,
 }
+
+/// Opens a database file read-only: its catalog, and what keeps it open.
+pub type OpenDatabase = Arc<dyn Fn(&str) -> Result<(Arc<Catalog>, Arc<dyn std::any::Any + Send + Sync>)> + Send + Sync>;
 
 /// `current_setting`.
 pub type SettingLookup = Box<dyn Fn(&str) -> Result<Value> + Send + Sync>;
@@ -734,6 +740,8 @@ pub struct Binder<'a> {
     /// The schema unqualified tables are looked up in before the default one: the schema of the
     /// view being bound (`GetSearchPath`).
     search_schema: Option<String>,
+    /// the database files `read_duckdb` opened, by the names its query gives them
+    foreign_databases: Vec<read_duckdb::ForeignDatabase>,
     /// the subquery being bound is the columns of another, as a row for `(a, b) IN (...)`
     row_subquery: bool,
     /// The table macros being bound, innermost last (`bound_macros`).
@@ -820,6 +828,7 @@ impl<'a> Binder<'a> {
             left_of_join: Vec::new(),
             bound_views: Vec::new(),
             search_schema: None,
+            foreign_databases: Vec::new(),
             row_subquery: false,
             bound_macros: Vec::new(),
             macro_arguments: Vec::new(),
@@ -904,6 +913,7 @@ impl<'a> Binder<'a> {
         binder.bound_macros = self.bound_macros.clone();
         binder.macro_arguments = self.macro_arguments.clone();
         binder.search_schema = self.search_schema.clone();
+        binder.foreign_databases = self.foreign_databases.clone();
         binder.parameters = self.parameters.clone();
         binder.ctes = self.ctes.clone();
         binder.ctes_being_bound = self.ctes_being_bound.clone();
