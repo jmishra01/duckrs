@@ -293,9 +293,14 @@ Each item gives the number of failing files in `test/` that it should fix, where
   are carried out with the generators of the checkout (`tools/tpch`, `tools/tpcds`)
   - [ ] ClickBench (its data is downloaded) and storing the nightly numbers over time
 - [ ] 47. Faster kernels: monomorphized code, SIMD, a perfect hash aggregate, the salt/pointer hash table design
+  - [x] threads for tables in their file (a row group per morsel) and for both inputs of delim joins
+  - [x] reading the file: one-load bit unpacking, contiguous vector copies, shared strings in scan buffers,
+    one string buffer per segment scan, `Vector::set_strs`
+  - [ ] dictionary vectors for dictionary-compressed strings (as C++ emits them), group keys without a
+    byte key per row, aggregate states not behind an enum per row, filters on compressed data
 - [ ] 48. v1 gate: TPC-H SF10 geometric mean ≤ 1.5× C++ DuckDB, and no query slower than 3×. The runner
   prints the gate after `--engine=both`. On TPC-H SF1 (8 threads, all 22 answers correct) duckrs is at
-  3.76× (Q19 10×), from 12.7× before tables in their file and both inputs of a delim join ran on threads
+  2.56× (Q19 5.1×; Q02 0.95×), from 12.7× at the start of item 47
 
 ## Phase 14: Extensions (not started)
 
