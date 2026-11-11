@@ -2334,11 +2334,14 @@ test/sql/json/copy_json_null_options.test
 test/sql/json/issues/internal_issue1035.test
 test/sql/json/issues/internal_issue2732.test
 test/sql/json/issues/internal_issue3146.test
+test/sql/json/issues/internal_issue3197.test
 test/sql/json/issues/internal_issue391.test
 test/sql/json/issues/internal_issue4014.test
 test/sql/json/issues/internal_issue4389.test
 test/sql/json/issues/internal_issue4403.test
+test/sql/json/issues/internal_issue4794.test
 test/sql/json/issues/internal_issue5288.test
+test/sql/json/issues/issue10751and11152.test
 test/sql/json/issues/issue10866.test
 test/sql/json/issues/issue11804.test
 test/sql/json/issues/issue12861.test
@@ -2361,6 +2364,7 @@ test/sql/json/issues/issue22764.test
 test/sql/json/issues/issue23114.test
 test/sql/json/issues/issue25415.test
 test/sql/json/issues/issue27414.test
+test/sql/json/issues/issue6722.test
 test/sql/json/issues/issue8695.test
 test/sql/json/issues/large_quoted_string_constant.test
 test/sql/json/issues/map_inference_threshold_internal_exception.test
@@ -2421,6 +2425,7 @@ test/sql/json/test_json_deserialize_missing_refs.test
 test/sql/json/test_json_deserialize_pointer.test
 test/sql/json/test_json_empty_object.test
 test/sql/json/test_json_export.test
+test/sql/json/test_json_group_window_macro.test
 test/sql/json/test_json_macros.test
 test/sql/json/test_json_path_long_index.test
 test/sql/json/test_json_persistence.test

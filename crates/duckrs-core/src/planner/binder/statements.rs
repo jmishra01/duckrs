@@ -1931,6 +1931,7 @@ impl Binder<'_> {
                             | "read_json_objects"
                             | "read_json_objects_auto"
                             | "read_ndjson_objects"
+                            | "read_single_json_file"
                     )
                 {
                     return self.bind_read_json(call, table_ref);

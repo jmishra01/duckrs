@@ -543,13 +543,8 @@ pub fn transform_with(json: &Json, ty: &LogicalType, strict: bool, formats: &For
         (LogicalTypeId::Struct, Json::Object(items)) => {
             let mut fields = Vec::with_capacity(ty.struct_children().len());
             for (name, child) in ty.struct_children() {
-                let found = if formats.case_insensitive {
-                    items.iter().find(|(k, _)| k.eq_ignore_ascii_case(name))
-                } else {
-                    items.iter().find(|(k, _)| k == name)
-                };
-                match found {
-                    Some((_, item)) => fields.push(transform(item, child, strict)?),
+                match object_member(json, items, name, formats)? {
+                    Some(item) => fields.push(transform(item, child, strict)?),
                     None if strict && !formats.missing_keys_are_null => {
                         return Err(invalid(format!("Object {} does not have key \"{name}\"", json.text())));
                     }
@@ -653,6 +648,39 @@ pub fn transform_with(json: &Json, ty: &LogicalType, strict: bool, formats: &For
             None => fail(json),
         },
     }
+}
+
+/// `TransformObjectInternal`'s key lookup: the value of the member `name` (by its spelling, or any
+/// with `case_insensitive_keys`); the first of several, which is an error with `error_duplicate_key`.
+pub fn object_member<'a>(
+    object: &Json,
+    items: &'a [(String, Json)],
+    name: &str,
+    formats: &Formats,
+) -> Result<Option<&'a Json>> {
+    let matches = |key: &str| {
+        if formats.case_insensitive {
+            key.eq_ignore_ascii_case(name)
+        } else {
+            key == name
+        }
+    };
+    let mut found = items.iter().filter(|(key, _)| matches(key));
+    let first = found.next();
+    if formats.error_duplicate_key
+        && let Some((duplicate, _)) = found.next()
+    {
+        let mut text = object.text();
+        if text.len() > 50 {
+            let mut end = 50;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text = format!("{}...", &text[..end]);
+        }
+        return Err(invalid(format!("Object {text} has duplicate key \"{duplicate}\"")));
+    }
+    Ok(first.map(|(_, value)| value))
 }
 
 /// A string cast to `ty`, or NULL or an error if it isn't one.
@@ -784,6 +812,19 @@ pub enum Structure {
 
 impl Structure {
     pub fn of(json: &Json) -> Structure {
+        Self::of_with(json, false)
+    }
+
+    /// `JSONStructure::ExtractStructure`, with `case_insensitive` keys that differ in case one key,
+    /// named by its first spelling (`case_insensitive_keys`).
+    pub fn of_with(json: &Json, case_insensitive: bool) -> Structure {
+        let same = |a: &str, b: &str| {
+            if case_insensitive {
+                a.eq_ignore_ascii_case(b)
+            } else {
+                a == b
+            }
+        };
         match json {
             Json::Null => Structure::Null,
             Json::Bool(_) => Structure::Scalar("BOOLEAN"),
@@ -794,16 +835,16 @@ impl Structure {
             Json::Array(items) => {
                 let mut element = Structure::Null;
                 for item in items {
-                    element = element.merge(Structure::of(item));
+                    element = element.merge_with(Structure::of_with(item, case_insensitive), case_insensitive);
                 }
                 Structure::List(Box::new(element))
             }
             Json::Object(items) => {
                 let mut fields: Vec<(String, Structure)> = Vec::with_capacity(items.len());
                 for (key, value) in items {
-                    let structure = Structure::of(value);
-                    match fields.iter_mut().find(|(k, _)| k == key) {
-                        Some((_, existing)) => *existing = existing.clone().merge(structure),
+                    let structure = Structure::of_with(value, case_insensitive);
+                    match fields.iter_mut().find(|(k, _)| same(k, key)) {
+                        Some((_, existing)) => *existing = existing.clone().merge_with(structure, case_insensitive),
                         None => fields.push((key.clone(), structure)),
                     }
                 }
@@ -813,6 +854,17 @@ impl Structure {
     }
 
     pub fn merge(self, other: Structure) -> Structure {
+        self.merge_with(other, false)
+    }
+
+    pub fn merge_with(self, other: Structure, case_insensitive: bool) -> Structure {
+        let same = |a: &str, b: &str| {
+            if case_insensitive {
+                a.eq_ignore_ascii_case(b)
+            } else {
+                a == b
+            }
+        };
         match (self, other) {
             (Structure::Null, other) | (other, Structure::Null) => other,
             (Structure::Scalar(a), Structure::Scalar(b)) => {
@@ -825,11 +877,11 @@ impl Structure {
                     _ => Structure::Mixed,
                 }
             }
-            (Structure::List(a), Structure::List(b)) => Structure::List(Box::new(a.merge(*b))),
+            (Structure::List(a), Structure::List(b)) => Structure::List(Box::new(a.merge_with(*b, case_insensitive))),
             (Structure::Object(mut a), Structure::Object(b)) => {
                 for (key, value) in b {
-                    match a.iter_mut().find(|(k, _)| *k == key) {
-                        Some((_, existing)) => *existing = existing.clone().merge(value),
+                    match a.iter_mut().find(|(k, _)| same(k, &key)) {
+                        Some((_, existing)) => *existing = existing.clone().merge_with(value, case_insensitive),
                         None => a.push((key, value)),
                     }
                 }

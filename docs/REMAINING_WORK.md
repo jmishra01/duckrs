@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 4121 of 6367 test files pass (**68.1%** of the 6049 that run). The v1 target is ≥ 90%.
+- Overall: 4126 of 6367 test files pass (**68.2%** of the 6049 that run). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -47,7 +47,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] the agreement of `columns` with `types`, unnamed after named arguments, subqueries, aggregates and windows
     in table function arguments; rejects-table lines made valid UTF-8 as `Utf8Proc::MakeValid` does
   - [ ] the other CSV sniffer, rejects-table and error-message differences (about 40 files under `sql/copy/csv` fail)
-- [ ] 2. JSON: `read_json`/`read_json_auto`, the JSON type, JSON functions (`sql/json`: 46 failing, 68.3%)
+- [ ] 2. JSON: `read_json`/`read_json_auto`, the JSON type, JSON functions (`sql/json`: 42 failing, 71.0%)
   - [x] `json_normalize`, `json_deep_merge`, `json_merge_patch_diff`
   - [x] `json_each` / `json_tree`, with columns as arguments (LATERAL) and the hidden `json`, `root`, `rowid`
   - [x] escaped quotes and backslashes in quoted JSON path keys; no wildcards in `json_set`/`json_remove`/...
@@ -71,7 +71,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] `json_serialize_plan`: needs a serializer of logical plans
   - [ ] VALUES lists with expected types (`ExpressionListRef.expected_types`), UNION constants from serialized values
   - [ ] GeoJSON (`read_json` geojson, `ST_AsGeoJSON`, `json_geometry_format`): needs the GEOMETRY type
-  - [ ] `json_group_object`/`json_group_array` as window functions (they are macros today)
+  - [x] `json_group_object`/`json_group_array` as window functions (`UnfoldWindowMacroExpression`)
+  - [x] `case_insensitive_keys`, duplicate keys as errors, `RemoveDuplicateStructKeys`, keys that differ in case made
+    unique column names; `read_single_json_file`; the format detected from the first line (`DetectFormatAndRecordType`)
+  - [ ] map inference (`map_inference_threshold`, `field_appearance_threshold`): objects with many or inconsistent keys
 - [ ] 3. Parquet reader/writer: missing types, filter pushdown, delta encoding (`test/parquet`: 28 failing, `corrupt`: 5)
   - [x] `parquet_metadata` stats in the column's DuckDB type (decimals, UUID, TIMETZ, INT96, blobs; NULL for infinities and out-of-range values)
   - [x] `int96_as` (`timestamp` by default, `timestamp_ns`, `struct`)

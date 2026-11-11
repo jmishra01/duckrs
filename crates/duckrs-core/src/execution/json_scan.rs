@@ -226,23 +226,38 @@ fn records_of(data: &[u8], format: JsonFormat, raw: bool) -> (Vec<Record>, JsonF
         JsonFormat::Array => (array_items(data, raw), JsonFormat::Array),
         JsonFormat::NewlineDelimited => (lines_of(data, raw), JsonFormat::NewlineDelimited),
         JsonFormat::Unstructured => (concatenated(data, raw), JsonFormat::Unstructured),
-        JsonFormat::Auto => {
-            let first = skip_space(data, 0);
-            if data.get(first) == Some(&b'[') {
-                let items = array_items(data, raw);
-                let broken = items.iter().any(
-                    |item| matches!(item, Err(e) if e.message == NO_CLOSING_BRACKET || e.message == TRAILING_DATA),
-                );
-                if broken || items.iter().all(Record::is_ok) {
-                    return (items, JsonFormat::Array);
-                }
-            }
-            let lines = lines_of(data, raw);
-            if lines.iter().all(Record::is_ok) {
-                return (lines, JsonFormat::NewlineDelimited);
-            }
-            (concatenated(data, raw), JsonFormat::Unstructured)
+        JsonFormat::Auto => match detect_format(data) {
+            JsonFormat::Array => (array_items(data, raw), JsonFormat::Array),
+            JsonFormat::NewlineDelimited => (lines_of(data, raw), JsonFormat::NewlineDelimited),
+            _ => (concatenated(data, raw), JsonFormat::Unstructured),
+        },
+    }
+}
+
+/// `DetectFormatAndRecordType`, of the format: a first line that is a document makes the file
+/// newline-delimited (or an array, if it is all of it); else it is an array if it starts as one.
+fn detect_format(data: &[u8]) -> JsonFormat {
+    let first = skip_space(data, 0);
+    if let Some(newline) = data.iter().position(|&c| c == b'\n') {
+        let line_size = skip_space(data, newline);
+        if let Ok((json, end)) = parse_prefix_with(&data[..line_size], first, false)
+            && skip_space(&data[..line_size], end) == line_size
+        {
+            return if matches!(json, Json::Array(_)) && line_size == data.len() {
+                JsonFormat::Array
+            } else {
+                JsonFormat::NewlineDelimited
+            };
         }
+    }
+    match data.get(first) {
+        None | Some(b'{') => JsonFormat::Unstructured,
+        Some(b'[') => match parse_prefix_with(data, first, false) {
+            // more than one top-level array is not an array
+            Ok((_, end)) if skip_space(data, end) != data.len() => JsonFormat::Unstructured,
+            _ => JsonFormat::Array,
+        },
+        Some(_) => JsonFormat::Unstructured,
     }
 }
 
@@ -285,9 +300,14 @@ pub fn record_error(path: &str, data: &[u8], error: &ParseError) -> Error {
 
 /// `JSONStructure` of the records, with what strings turn out to hold.
 pub fn infer(records: &[&Json]) -> Structure {
+    infer_with(records, false)
+}
+
+/// `infer`, with `case_insensitive_keys`.
+pub fn infer_with(records: &[&Json], case_insensitive: bool) -> Structure {
     let mut structure = Structure::Null;
     for record in records {
-        structure = structure.merge(Structure::of(record));
+        structure = structure.merge_with(Structure::of_with(record, case_insensitive), case_insensitive);
     }
     structure
 }
@@ -373,6 +393,8 @@ pub struct Formats {
     pub timestamp: Option<String>,
     pub missing_keys_are_null: bool,
     pub case_insensitive: bool,
+    /// `error_duplicate_key`: an object with a key twice is an error (the scan's, unless it ignores errors)
+    pub error_duplicate_key: bool,
     /// objects with more keys than this are MAPs (`map_inference_threshold`); `None` turns that off
     pub map_threshold: Option<usize>,
 }
@@ -500,13 +522,9 @@ fn record_row(
     };
     let mut row = Vec::with_capacity(scan.names.len());
     for (name, ty) in scan.names.iter().zip(&scan.types) {
-        let found = if formats.case_insensitive {
-            items.iter().find(|(k, _)| k.eq_ignore_ascii_case(name))
-        } else {
-            items.iter().find(|(k, _)| k == name)
-        };
+        let found = crate::function::json::object_member(record, items, name, formats)?;
         let value = match found {
-            Some((_, item)) => match transform_with(item, ty, strict, formats) {
+            Some(item) => match transform_with(item, ty, strict, formats) {
                 Ok(value) => value,
                 Err(_) if scan.ignore_errors => return Ok(None),
                 Err(error) => return Err(error),
@@ -566,6 +584,7 @@ impl PhysicalOperator for PhysicalJsonScan {
             timestamp: scan.timestamp_format.clone(),
             missing_keys_are_null: true,
             case_insensitive: scan.case_insensitive,
+            error_duplicate_key: !scan.ignore_errors,
             map_threshold: None,
         };
         let strict = !scan.ignore_errors;
