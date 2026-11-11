@@ -25,12 +25,14 @@ pub mod profiler;
 pub mod temporary;
 pub mod zone_map;
 
+use crate::planner::expression::{BoundAggregate, BoundExpr, BoundExprKind};
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
 use duckrs_common::Result;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::vector::DataChunk;
 use parking_lot::Mutex;
 use physical::*;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -238,14 +240,51 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             grouping_sets,
             grouping_functions,
             ..
-        } => Box::new(PhysicalAggregate::new(
-            types,
-            groups,
-            aggregates,
-            &grouping_sets,
-            &grouping_functions,
-            children,
-        )),
+        } => match distinct_in_two_steps(&groups, &aggregates, &grouping_sets, &grouping_functions) {
+            Some(argument) => {
+                // the groups with each distinct value once, then the aggregates of those
+                let mut inner_groups = groups.clone();
+                inner_groups.push(argument.clone());
+                let inner_types = inner_groups.iter().map(|g| g.return_type.clone()).collect();
+                let inner = PhysicalAggregate::new(inner_types, inner_groups, Vec::new(), &[], &[], children);
+                let outer_groups = groups
+                    .iter()
+                    .enumerate()
+                    .map(|(i, g)| BoundExpr {
+                        alias: g.alias.clone(),
+                        ..BoundExpr::new(BoundExprKind::Reference(i), g.return_type.clone())
+                    })
+                    .collect();
+                let value = BoundExpr {
+                    alias: argument.alias.clone(),
+                    ..BoundExpr::new(BoundExprKind::Reference(groups.len()), argument.return_type.clone())
+                };
+                let aggregates = aggregates
+                    .into_iter()
+                    .map(|a| BoundAggregate {
+                        children: vec![value.clone()],
+                        distinct: false,
+                        ..a
+                    })
+                    .collect();
+                Box::new(PhysicalAggregate::new(
+                    types,
+                    outer_groups,
+                    aggregates,
+                    &[],
+                    &[],
+                    vec![Box::new(inner)],
+                ))
+            }
+            None => Box::new(PhysicalAggregate::new(
+                types,
+                groups,
+                aggregates,
+                &grouping_sets,
+                &grouping_functions,
+                children,
+            )),
+        },
         LogicalOperatorKind::Window { windows, .. } => Box::new(window::PhysicalWindow::new(types, windows, children)),
         LogicalOperatorKind::Order { orders } => order_plan(orders, None, children.remove(0)),
         LogicalOperatorKind::TopN { orders, limit, offset } => {
@@ -646,6 +685,31 @@ fn build_pipelines<'a>(sink: &'a dyn PhysicalOperator, pipelines: &mut Vec<Pipel
 }
 
 /// Runs a plan with resolved column bindings, and returns its rows.
+/// The argument of aggregates that are all DISTINCT on the same one, with nothing else that keeps
+/// rows apart, which can then run as a grouping by the groups and the argument and then the
+/// aggregates without DISTINCT over that: what DISTINCT keeps apart keeps no thread from the work.
+fn distinct_in_two_steps(
+    groups: &[BoundExpr],
+    aggregates: &[BoundAggregate],
+    grouping_sets: &[BTreeSet<usize>],
+    grouping_functions: &[Vec<usize>],
+) -> Option<BoundExpr> {
+    let all_groups = grouping_sets.is_empty() || (grouping_sets.len() == 1 && grouping_sets[0].len() == groups.len());
+    if !all_groups || !grouping_functions.is_empty() || !groups.iter().all(physical::parallel_expression) {
+        return None;
+    }
+    let argument = aggregates.first()?.children.first()?;
+    let same = |a: &BoundAggregate| {
+        a.distinct
+            && a.filter.is_none()
+            && a.order_by.is_empty()
+            && a.distinct_key.is_none()
+            && a.children.len() == 1
+            && format!("{:?}", a.children[0]) == format!("{argument:?}")
+    };
+    (aggregates.iter().all(same) && physical::parallel_expression(argument)).then(|| argument.clone())
+}
+
 pub fn run_plan(plan: LogicalOperator) -> Result<ColumnDataCollection> {
     let collector = PhysicalResultCollector::new(create_plan(plan));
     // what the statement runs on its own (e.g. statistics) is not part of its profile
