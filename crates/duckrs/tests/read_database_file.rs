@@ -410,12 +410,12 @@ fn a_read_only_file_takes_no_writes() {
 }
 
 #[test]
-fn writes_to_a_file_fail_instead_of_getting_lost() {
+fn writes_to_a_file_take_effect() {
     let db = Database::open(writable_copy("compatible.db"), false).unwrap();
     let mut connection = db.connect().unwrap();
-    let error: Error = connection.query("DROP TABLE other.t").unwrap_err();
-    assert_eq!(error.kind, ErrorKind::NotImplemented);
-    assert_eq!(connection.query("SELECT count(*) FROM other.t").unwrap().row_count(), 1);
+    connection.query("DROP TABLE other.t").unwrap();
+    let error: Error = connection.query("SELECT count(*) FROM other.t").unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Catalog);
 }
 
 #[test]

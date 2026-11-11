@@ -268,6 +268,50 @@ fn scan_strings(
     }
 }
 
+/// Whether every segment of a string column is DICT_FSST, so that its rows can be a dictionary vector.
+fn dictionary_column(column: &PersistentColumn) -> bool {
+    !column.pointers.is_empty() && column.pointers.iter().all(|p| p.compression == COMPRESSION_DICT_FSST)
+}
+
+/// A string column of DICT_FSST segments as a dictionary vector: the entries of every segment's
+/// dictionary in one vector (with a NULL first), and per row the entry it has. No string is copied
+/// per row.
+fn scan_dictionary_column(
+    buffer: &BufferManager,
+    column: &PersistentColumn,
+    ty: &LogicalType,
+    rows: usize,
+    valid: &[bool],
+) -> Result<Vector> {
+    let mut entries: Vec<Vec<u8>> = vec![Vec::new()];
+    let mut selection: Vec<u32> = Vec::with_capacity(rows);
+    for pointer in &column.pointers {
+        let handle = segment(buffer, pointer)?;
+        let (strings, indices) = decode_dict_fsst(&handle[pointer.offset..], pointer.tuple_count)?;
+        // entry i of the segment (i > 0) is entry base + i here; 0 stays the NULL
+        let base = entries.len() as u32 - 1;
+        entries.extend(strings.into_iter().skip(1));
+        selection.extend(
+            indices
+                .into_iter()
+                .map(|index| if index == 0 { 0 } else { base + index }),
+        );
+    }
+    if selection.len() != rows {
+        return Err(corrupt("the segments of a string column do not have its rows"));
+    }
+    for (row, &valid) in valid.iter().enumerate() {
+        if !valid {
+            selection[row] = 0;
+        }
+    }
+    let mut dictionary = Vector::new(ty.clone(), entries.len());
+    dictionary.set_strs(entries.iter().map(Vec::as_slice));
+    dictionary.set_null(0, true);
+    dictionary.slice(&SelectionVector::from_vec(selection), rows);
+    Ok(dictionary)
+}
+
 fn scan_validity_column(buffer: &BufferManager, column: &PersistentColumn, rows: usize) -> Result<Vec<bool>> {
     check_rows(column, rows)?;
     let mut valid = Vec::with_capacity(rows);
@@ -389,6 +433,27 @@ fn scan_struct(buffer: &BufferManager, column: &PersistentColumn, ty: &LogicalTy
 
 /// `ColumnData::Scan` of all of a column, which is `rows` long.
 fn scan_column(buffer: &BufferManager, column: &PersistentColumn, ty: &LogicalType, rows: usize) -> Result<Vector> {
+    scan_column_as(buffer, column, ty, rows, false)
+}
+
+/// [`scan_column`] of a column of the table itself, which may come out as a dictionary vector (the
+/// children of nested columns are filled in place, so they stay flat).
+fn scan_table_column(
+    buffer: &BufferManager,
+    column: &PersistentColumn,
+    ty: &LogicalType,
+    rows: usize,
+) -> Result<Vector> {
+    scan_column_as(buffer, column, ty, rows, true)
+}
+
+fn scan_column_as(
+    buffer: &BufferManager,
+    column: &PersistentColumn,
+    ty: &LogicalType,
+    rows: usize,
+    top_level: bool,
+) -> Result<Vector> {
     let validity = column
         .validity
         .as_ref()
@@ -420,6 +485,9 @@ fn scan_column(buffer: &BufferManager, column: &PersistentColumn, ty: &LogicalTy
         PhysicalType::List => scan_list(buffer, column, ty, rows)?,
         PhysicalType::Array => scan_array(buffer, column, ty, rows)?,
         PhysicalType::Struct => scan_struct(buffer, column, ty, rows)?,
+        PhysicalType::Varchar if top_level && dictionary_column(column) => {
+            return scan_dictionary_column(buffer, column, ty, rows, &valid);
+        }
         PhysicalType::Varchar => {
             let mut strings = StringRows::with_capacity(rows);
             let mut nulls = Vec::new();
@@ -654,7 +722,7 @@ impl TableSource for DiskTable {
         let mut vectors = Vec::with_capacity(columns.len());
         for &column in columns {
             let stored = self.persistent_column(group, column)?;
-            vectors.push(scan_column(
+            vectors.push(scan_table_column(
                 &self.buffer,
                 &stored,
                 &self.table.columns[column].ty,

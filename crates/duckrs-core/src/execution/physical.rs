@@ -2681,6 +2681,9 @@ impl PhysicalAggregate {
             return Ok(vec![0; count]);
         }
         let columns: Vec<&Vector> = set.groups.iter().map(|&g| &vectors[g]).collect();
+        if let Some(ids) = self.find_dictionary_groups(set, vectors, &columns, count, state)? {
+            return Ok(ids);
+        }
         let keys = create_row_keys(&columns, count)?;
         let mut new_rows = Vec::new();
         let mut ids = Vec::with_capacity(keys.len());
@@ -2708,6 +2711,85 @@ impl PhysicalAggregate {
             }
         }
         Ok(ids)
+    }
+
+    /// [`Self::find_groups`] when every group column is a dictionary vector of a small dictionary
+    /// (a string column read from its file): the entries of the dictionaries a row has name its group,
+    /// so each combination in the chunk is looked up once, and the rows find theirs in a table.
+    fn find_dictionary_groups(
+        &self,
+        set: &GroupingSet,
+        vectors: &[Vector],
+        columns: &[&Vector],
+        count: usize,
+        state: &mut AggregateSinkState,
+    ) -> Result<Option<Vec<usize>>> {
+        const MAX_COMBINATIONS: usize = 1 << 16;
+        let mut dictionaries = Vec::with_capacity(columns.len());
+        let mut combinations = 1usize;
+        for column in columns {
+            let Some((sel, child)) = column.dictionary() else {
+                return Ok(None);
+            };
+            if child.vector_type() != duckrs_common::vector::VectorType::Flat {
+                return Ok(None);
+            }
+            let entries = child.capacity().max(1);
+            combinations = match combinations.checked_mul(entries) {
+                Some(c) if c <= MAX_COMBINATIONS => c,
+                _ => return Ok(None),
+            };
+            dictionaries.push((sel, entries));
+        }
+        // the combination of each row, and the first row of each combination
+        let mut codes = vec![0u32; count];
+        for (sel, entries) in &dictionaries {
+            for (row, code) in codes.iter_mut().enumerate() {
+                *code = *code * *entries as u32 + sel.get(row) as u32;
+            }
+        }
+        let mut first_row = vec![u32::MAX; combinations];
+        let mut representatives = Vec::new();
+        for (row, &code) in codes.iter().enumerate() {
+            if first_row[code as usize] == u32::MAX {
+                first_row[code as usize] = row as u32;
+                representatives.push(row as u32);
+            }
+        }
+        // the groups of the combinations, as the rows that have them find theirs
+        let mut sliced: Vec<Vector> = columns.iter().map(|c| (*c).clone()).collect();
+        let selection = SelectionVector::from_vec(representatives.clone());
+        for vector in &mut sliced {
+            vector.slice(&selection, representatives.len());
+        }
+        let references: Vec<&Vector> = sliced.iter().collect();
+        let keys = create_row_keys(&references, representatives.len())?;
+        let mut group_of = vec![0usize; combinations];
+        let mut new_rows = Vec::new();
+        for (&row, key) in representatives.iter().zip(keys) {
+            let next = state.group_count;
+            let id = *state.group_ids.entry(key).or_insert(next);
+            if id == next {
+                state.group_count += 1;
+                new_rows.push(row);
+            }
+            group_of[codes[row as usize] as usize] = id;
+        }
+        if !new_rows.is_empty() {
+            let new_count = new_rows.len();
+            let columns = set.groups.iter().map(|&g| vectors[g].clone()).collect();
+            let mut values = DataChunk::from_columns(columns, count);
+            values.slice(&SelectionVector::from_vec(new_rows), new_count);
+            state.bytes += temporary::estimated_bytes(&values) + new_count * self.bytes_per_group();
+            state.group_values.append(&values);
+            if self.spill.is_none() {
+                check_buffered(&state.group_values)?;
+            }
+            for (states, aggregate) in state.states.iter_mut().zip(&self.aggregates) {
+                states.resize(state.group_count, aggregate.function.kind.initial_state());
+            }
+        }
+        Ok(Some(codes.into_iter().map(|code| group_of[code as usize]).collect()))
     }
 
     fn aggregate_input(aggregate: &BoundAggregate, chunk: &DataChunk) -> Result<AggregateInput> {
@@ -3003,10 +3085,18 @@ impl PhysicalAggregate {
     ) -> Result<()> {
         for (set, state) in self.grouping_sets.iter().zip(states.iter_mut()) {
             let ids = self.find_groups(set, vectors, chunk.len(), state)?;
+            // the rows of the aggregates without a filter are the same: made once
+            let all_rows: Vec<(usize, usize)> = ids.iter().copied().enumerate().collect();
             for (i, (aggregate, input)) in self.aggregates.iter().zip(inputs).enumerate() {
+                if input.filtered.is_none() && input.distinct_keys.is_none() && input.order_keys.is_none() {
+                    aggregate
+                        .function
+                        .update(input.input.as_ref(), chunk.len(), &all_rows, &mut state.states[i])?;
+                    continue;
+                }
                 let mut rows: Vec<(usize, usize)> = match &input.filtered {
                     Some(filtered) => filtered.iter().map(|&row| (row, ids[row])).collect(),
-                    None => ids.iter().copied().enumerate().collect(),
+                    None => all_rows.clone(),
                 };
                 if let Some(keys) = &input.distinct_keys {
                     // each value counts once per group

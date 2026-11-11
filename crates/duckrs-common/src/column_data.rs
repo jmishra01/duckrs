@@ -65,7 +65,32 @@ impl ColumnDataCollection {
     /// [`Self::append`], with the strings left in the buffers of `chunk`, which the collection then
     /// keeps alive: for a collection that only cuts rows into chunks (the row group a scan read).
     pub fn append_shared(&mut self, chunk: &DataChunk) {
-        self.append_with(chunk, StringCopy::Reference);
+        assert_eq!(chunk.types(), self.types, "appended chunk has the wrong types");
+        let mut done = 0;
+        // a partial last chunk is topped up by copying, into flat vectors
+        if let Some(last) = self.chunks.last_mut()
+            && last.len() < STANDARD_VECTOR_SIZE
+        {
+            let filled = last.len();
+            for column in last.columns_mut() {
+                if column.vector_type() != crate::vector::VectorType::Flat {
+                    column.flatten(filled);
+                }
+            }
+            let n = chunk.len().min(STANDARD_VECTOR_SIZE - filled);
+            for (column, source) in last.columns_mut().iter_mut().zip(chunk.columns()) {
+                column.copy_range_from(source, 0, n, filled, StringCopy::Reference);
+            }
+            last.set_len(filled + n);
+            done = n;
+        }
+        // the rest is cut into chunks that share the values of `chunk` where they can
+        while done < chunk.len() {
+            let n = (chunk.len() - done).min(STANDARD_VECTOR_SIZE);
+            self.chunks.push(chunk.range(done, n));
+            done += n;
+        }
+        self.count += chunk.len();
     }
 
     fn append_with(&mut self, chunk: &DataChunk, strings: StringCopy) {

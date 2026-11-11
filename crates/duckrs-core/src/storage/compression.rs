@@ -1212,6 +1212,20 @@ pub fn scan_roaring(segment: &[u8], count: usize, out: &mut Vec<bool>) -> Result
 /// such a segment takes care of NULLs by itself, and its validity is an empty segment that says
 /// nothing.
 pub fn scan_dict_fsst(segment: &[u8], count: usize, out: &mut StringRows, nulls: &mut Vec<usize>) -> Result<()> {
+    let (strings, indices) = decode_dict_fsst(segment, count)?;
+    for index in indices {
+        if index == 0 {
+            nulls.push(out.len());
+        }
+        let string = strings.get(index as usize);
+        out.push(string.ok_or_else(|| corrupted("Corrupted DICT_FSST segment: dictionary index is out of range"))?);
+    }
+    Ok(())
+}
+
+/// A DICT_FSST segment as its dictionary and, per row, the entry it has (0 is NULL): what a scan
+/// turns into a dictionary vector (`DictFSSTCompressionStorage::StringScan` emits one too).
+pub fn decode_dict_fsst(segment: &[u8], count: usize) -> Result<(Vec<Vec<u8>>, Vec<u32>)> {
     const HEADER_SIZE: usize = 16;
     const DICTIONARY: u8 = 0;
     const DICT_FSST: u8 = 1;
@@ -1283,19 +1297,15 @@ pub fn scan_dict_fsst(segment: &[u8], count: usize, out: &mut StringRows, nulls:
         });
     }
     if mode == FSST_ONLY {
-        for string in &strings[1..=count] {
-            out.push(string);
-        }
-        return Ok(());
+        return Ok((strings, (1..=count as u32).collect()));
     }
-    for index in indices {
-        if index == 0 {
-            nulls.push(out.len());
-        }
-        let string = strings.get(index as usize);
-        out.push(string.ok_or_else(|| corrupted("Corrupted DICT_FSST segment: dictionary index is out of range"))?);
+    let indices: Vec<u32> = indices.into_iter().map(|index| index as u32).collect();
+    if indices.iter().any(|&index| index as usize >= strings.len()) {
+        return Err(corrupted(
+            "Corrupted DICT_FSST segment: dictionary index is out of range",
+        ));
     }
-    Ok(())
+    Ok((strings, indices))
 }
 
 #[cfg(test)]
