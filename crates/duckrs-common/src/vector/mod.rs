@@ -414,6 +414,22 @@ impl Vector {
         self.validity_mut().set_valid(i);
     }
 
+    /// [`Self::set_str`] of rows `0..` from `strings`, with the buffer and the data taken once.
+    pub fn set_strs<'a>(&mut self, strings: impl IntoIterator<Item = &'a [u8]>) {
+        let buffer = self.string_buffer();
+        let values: Vec<StringT> = strings.into_iter().map(|bytes| buffer.add(bytes)).collect();
+        if self.capacity() < values.len() {
+            self.resize(values.len());
+        }
+        // SAFETY: the strings are inlined or point into this vector's own string buffer.
+        unsafe { self.string_data_mut()[..values.len()].copy_from_slice(&values) };
+        if !self.validity().all_valid() {
+            for row in 0..values.len() {
+                self.validity_mut().set_valid(row);
+            }
+        }
+    }
+
     /// Keeps `buffer` alive for as long as this vector's string buffer, so strings pointing into
     /// it may be stored here (through `string_data_mut`).
     pub(crate) fn keep_buffer_alive(&mut self, buffer: &Arc<StringBuffer>) {

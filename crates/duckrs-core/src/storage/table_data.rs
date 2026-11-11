@@ -235,13 +235,13 @@ fn scan_fixed(
 fn scan_strings(
     buffer: &BufferManager,
     pointer: &DataPointer,
-    out: &mut Vec<Vec<u8>>,
+    out: &mut StringRows,
     nulls: &mut Vec<usize>,
 ) -> Result<()> {
     let count = pointer.tuple_count;
     if pointer.compression == COMPRESSION_CONSTANT {
         // only all-NULL segments get here: strings don't have constant segments
-        out.resize(out.len() + count, Vec::new());
+        out.push_empty(count);
         return Ok(());
     }
     let handle = segment(buffer, pointer)?;
@@ -421,15 +421,13 @@ fn scan_column(buffer: &BufferManager, column: &PersistentColumn, ty: &LogicalTy
         PhysicalType::Array => scan_array(buffer, column, ty, rows)?,
         PhysicalType::Struct => scan_struct(buffer, column, ty, rows)?,
         PhysicalType::Varchar => {
-            let mut strings = Vec::with_capacity(rows);
+            let mut strings = StringRows::with_capacity(rows);
             let mut nulls = Vec::new();
             for pointer in &column.pointers {
                 scan_strings(buffer, pointer, &mut strings, &mut nulls)?;
             }
             let mut vector = Vector::new(ty.clone(), rows);
-            for (row, string) in strings.iter().enumerate() {
-                vector.set_str(row, string);
-            }
+            vector.set_strs(strings.iter());
             for row in nulls {
                 vector.set_null(row, true);
             }
