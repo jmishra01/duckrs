@@ -2835,6 +2835,20 @@ impl ClientContext {
             Statement::Alter(info) => {
                 self.check_trigger_alter(info)?;
                 let catalog = self.catalog();
+                // the views that read an entry keep it from changing, but for these
+                let keeps_reads = matches!(
+                    info.kind,
+                    AlterKind::AddColumn { .. }
+                        | AlterKind::SetDefault { .. }
+                        | AlterKind::SetComment { .. }
+                        | AlterKind::SetColumnComment { .. }
+                );
+                if !keeps_reads
+                    && let Ok(schema) = catalog.schema_with_entry(schema_of(&info.name)?.as_deref(), &info.name.name)
+                    && schema.get_entry(&info.name.name).is_some()
+                {
+                    check_alter_dependents(&catalog, &schema.ident(), &info.name.name)?;
+                }
                 let mut binder = Binder::new(&catalog);
                 let alter = binder.bind_alter(info)?;
                 execute_alter(alter)?;
@@ -3251,22 +3265,40 @@ impl ClientContext {
         if *secure {
             return Err(crate::unported("CREATE SECURE VIEW"));
         }
-        // without them a view does not hold on to what it reads, which is the setting's whole point
-        if self.setting_text("enable_view_dependencies") == "true" {
-            return Err(crate::unported("view dependencies"));
-        }
+        let with_dependencies = self.setting_text("enable_view_dependencies") == "true";
         let catalog = self.catalog();
         let schema = catalog.schema_for(create_schema_of(info)?.as_deref())?;
         let on_conflict = on_create_conflict(info.on_conflict);
         // IF NOT EXISTS for a view that exists does not look at the query
         let exists = matches!(schema.get_entry(&info.name.name), Some(TableOrView::View(_)));
         let skip_binding = *defer_binding || (on_conflict == OnCreateConflict::Ignore && exists);
+        let mut dependencies = Vec::new();
         if !skip_binding {
             let mut binder = Binder::with_options(&catalog, self.bind_options());
             binder.session = Some(self.session_values());
-            binder.bind_create_view(query, aliases, &schema.ident())?;
+            let read = binder.bind_create_view(query, aliases, &schema.ident())?;
+            if with_dependencies {
+                dependencies = read;
+            }
         }
-        schema.create_view(&info.name.name, (**query).clone(), aliases.clone(), on_conflict)
+        // `DependencyManager::CreateObject`: a replacement may not read what it replaces
+        if on_conflict == OnCreateConflict::Replace
+            && dependencies
+                .iter()
+                .any(|(s, n)| s.eq_ignore_ascii_case(&schema.ident()) && n.eq_ignore_ascii_case(&info.name.name))
+        {
+            return Err(Error::new(
+                ErrorKind::Catalog,
+                "CREATE OR REPLACE is not allowed to depend on itself",
+            ));
+        }
+        schema.create_view(
+            &info.name.name,
+            (**query).clone(),
+            aliases.clone(),
+            on_conflict,
+            dependencies,
+        )
     }
 
     /// `CREATE MACRO` (`Binder::BindCreateFunctionInfo` + `DuckSchemaEntry::CreateFunction`).
@@ -3398,6 +3430,7 @@ impl ClientContext {
                     Ok(schema) => {
                         if schema.get_entry(&info.name.name).is_some() {
                             self.drop_trigger_dependents(&catalog, &info.name.name, kind, info.cascade)?;
+                            drop_view_dependents(&catalog, &schema.ident(), &info.name.name, kind, info.cascade)?;
                         }
                         let dropped = schema.drop_entry(&info.name.name, type_name)?;
                         if dropped && kind == "TABLE" {
@@ -4087,7 +4120,12 @@ mod tests {
         );
         run(&mut c, "DROP VIEW IF EXISTS w");
         run(&mut c, "SET enable_view_dependencies = true");
-        assert!(error(&mut c, "CREATE VIEW d AS SELECT 1").contains("view dependencies is not yet ported"));
+        // with dependencies a view holds on to what it reads
+        run(&mut c, "CREATE TABLE dep_t (i INTEGER)");
+        run(&mut c, "CREATE VIEW d AS SELECT * FROM dep_t");
+        assert!(error(&mut c, "DROP TABLE dep_t").contains("view \"d\" depends on table \"dep_t\""));
+        run(&mut c, "DROP TABLE dep_t CASCADE");
+        assert!(error(&mut c, "SELECT * FROM d").contains("does not exist"));
         run(&mut c, "SET enable_view_dependencies = false");
         // a view looks in its own schema first
         run(&mut c, "CREATE SCHEMA s");
@@ -7800,4 +7838,62 @@ impl SearchEntry {
             .collect::<Vec<_>>()
             .join(",")
     }
+}
+
+/// The views that read the table or view `name` of `schema`, and those that read them in turn.
+fn view_dependents(
+    catalog: &Catalog,
+    schema: &str,
+    name: &str,
+) -> Vec<(Arc<crate::catalog::SchemaCatalogEntry>, String)> {
+    let mut found: Vec<(Arc<crate::catalog::SchemaCatalogEntry>, String)> = Vec::new();
+    let mut pending = vec![(schema.to_string(), name.to_string())];
+    while let Some((schema, name)) = pending.pop() {
+        for entry_schema in catalog.schemas() {
+            for entry in entry_schema.tables_and_views() {
+                let TableOrView::View(view) = entry else { continue };
+                if view.depends_on(&schema, &name)
+                    && !found
+                        .iter()
+                        .any(|(s, n)| s.ident() == entry_schema.ident() && *n == view.name)
+                {
+                    pending.push((view.schema.clone(), view.name.clone()));
+                    found.push((entry_schema.clone(), view.name.clone()));
+                }
+            }
+        }
+    }
+    found
+}
+
+/// `DependencyManager::DropObject` for the views that read what is dropped: dropped with CASCADE, an error
+/// without.
+fn drop_view_dependents(catalog: &Catalog, schema: &str, name: &str, kind: &str, cascade: bool) -> Result<()> {
+    let dependents = view_dependents(catalog, schema, name);
+    if dependents.is_empty() {
+        return Ok(());
+    }
+    if !cascade {
+        let mut message = format!("Cannot drop entry \"{name}\" because there are entries that depend on it.\n");
+        for (_, view) in &dependents {
+            message += &format!("view \"{view}\" depends on {} \"{name}\".\n", kind.to_lowercase());
+        }
+        message += "Use DROP...CASCADE to drop all dependents.";
+        return Err(Error::new(ErrorKind::Dependency, message));
+    }
+    for (schema, view) in dependents {
+        schema.drop_entry(&view, "View")?;
+    }
+    Ok(())
+}
+
+/// `DependencyManager::AlterObject`: an entry that views read changes only in ways that keep what they read.
+fn check_alter_dependents(catalog: &Catalog, schema: &str, name: &str) -> Result<()> {
+    if view_dependents(catalog, schema, name).is_empty() {
+        return Ok(());
+    }
+    Err(Error::new(
+        ErrorKind::Dependency,
+        format!("Cannot alter entry \"{name}\" because there are entries that depend on it."),
+    ))
 }

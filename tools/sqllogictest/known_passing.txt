@@ -178,6 +178,7 @@ test/fuzzer/pedro/update_join_statistics.test
 test/fuzzer/pedro/utf8_invalid_unicode.test
 test/fuzzer/pedro/vacuum_unsupported_type.test
 test/fuzzer/pedro/verify_parallelism_batch_index.test
+test/fuzzer/pedro/view_not_rebound_error.test
 test/fuzzer/pedro/wal_rename_table.test
 test/fuzzer/pedro/window_function_timeout.test
 test/fuzzer/pedro/window_self_reference.test
@@ -769,6 +770,7 @@ test/sql/aggregate/having/having_without_groupby.test
 test/sql/aggregate/having/test_having.test
 test/sql/aggregate/having/test_scalar_having.test
 test/sql/aggregate/qualify/test_qualify_macro.test
+test/sql/aggregate/qualify/test_qualify_view.test
 test/sql/aggregate/qualify/test_qualify_view_no_view_dependencies.test
 test/sql/aggregate/sparse_clustered_aggregation.test
 test/sql/aggregate/tiled_aggregate_initialization.test
@@ -1095,6 +1097,7 @@ test/sql/catalog/test_unicode_schema.test
 test/sql/catalog/view/deferred_binding.test
 test/sql/catalog/view/nested_view_search_path.test
 test/sql/catalog/view/recursive_view.test
+test/sql/catalog/view/recursive_view_with_dependencies.test
 test/sql/catalog/view/test_loosely_qualified_view_sql.test
 test/sql/catalog/view/test_stacked_view.test
 test/sql/catalog/view/test_view.test
@@ -1103,7 +1106,9 @@ test/sql/catalog/view/test_view_delete_update.test
 test/sql/catalog/view/test_view_drop_concurrent.test
 test/sql/catalog/view/test_view_duplicate_columns.test
 test/sql/catalog/view/test_view_schema_change.test
+test/sql/catalog/view/test_view_schema_change_with_dependencies.test
 test/sql/catalog/view/test_view_sql.test
+test/sql/catalog/view/test_view_sql_with_dependencies.test
 test/sql/catalog/view/view_if_not_exists.test
 test/sql/collate/collate_filter_pushdown.test
 test/sql/collate/collate_group_subquery.test
@@ -2969,6 +2974,8 @@ test/sql/storage/catalog/test_store_rename_table.test
 test/sql/storage/catalog/test_store_rename_view.test
 test/sql/storage/catalog/test_store_sequences.test
 test/sql/storage/catalog/test_store_temporary.test
+test/sql/storage/catalog/test_view_explicit_aliases.test
+test/sql/storage/catalog/test_view_storage.test
 test/sql/storage/catalog/test_view_storage_no_view_dependencies.test
 test/sql/storage/checkpoint/checkpoint_in_transaction.test
 test/sql/storage/checkpoint/checkpoint_rolled_back_use.test
@@ -3389,7 +3396,9 @@ test/sql/storage/wal/wal_test_updates.test
 test/sql/storage/wal/wal_timestamp_storage.test
 test/sql/storage/wal/wal_uhugeint_storage.test
 test/sql/storage/wal/wal_uuid_storage.test
+test/sql/storage/wal/wal_view_explicit_aliases.test
 test/sql/storage/wal/wal_view_explicit_aliases_no_view_dependencies.test
+test/sql/storage/wal/wal_view_storage.test
 test/sql/storage/wal/wal_view_storage_no_view_dependencies.test
 test/sql/storage_version/storage_hyperloglog.test
 test/sql/storage_version/storage_version_bump.test

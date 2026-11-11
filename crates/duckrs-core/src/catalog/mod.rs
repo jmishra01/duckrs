@@ -881,9 +881,18 @@ pub struct ViewCatalogEntry {
     pub query: SelectStatement,
     /// the names listed in `CREATE VIEW v (a, b)`
     pub aliases: Vec<String>,
+    /// with `enable_view_dependencies`, the tables and views (schema and name) it reads
+    pub dependencies: Vec<(String, String)>,
 }
 
 impl ViewCatalogEntry {
+    /// Whether it reads the table or view `name` of `schema`.
+    pub fn depends_on(&self, schema: &str, name: &str) -> bool {
+        self.dependencies
+            .iter()
+            .any(|(s, n)| s.eq_ignore_ascii_case(schema) && n.eq_ignore_ascii_case(name))
+    }
+
     /// `ViewCatalogEntry::ToSQL`.
     pub fn to_sql(&self) -> String {
         let mut sql = String::from("CREATE VIEW ");
@@ -1323,6 +1332,7 @@ impl SchemaCatalogEntry {
             name: new_name.to_string(),
             query: view.query.clone(),
             aliases: view.aliases.clone(),
+            dependencies: view.dependencies.clone(),
         };
         tables.insert(key(new_name), TableOrView::View(Arc::new(view)));
         Ok(())
@@ -1382,6 +1392,7 @@ impl SchemaCatalogEntry {
         query: SelectStatement,
         aliases: Vec<String>,
         on_conflict: OnCreateConflict,
+        dependencies: Vec<(String, String)>,
     ) -> Result<()> {
         let mut tables = self.tables.write();
         if Self::check_conflict(&tables, name, "View", on_conflict)? {
@@ -1390,6 +1401,7 @@ impl SchemaCatalogEntry {
                 name: name.to_string(),
                 query,
                 aliases,
+                dependencies,
             };
             tables.insert(key(name), TableOrView::View(Arc::new(view)));
         }

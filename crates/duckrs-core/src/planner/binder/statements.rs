@@ -1841,7 +1841,10 @@ impl Binder<'_> {
                     }
                 }
                 let table = match entry? {
-                    TableOrView::Table(table) => table,
+                    TableOrView::Table(table) => {
+                        self.note_read(&table.schema, &table.name);
+                        table
+                    }
                     TableOrView::View(view) => return self.bind_view(table_ref, view),
                 };
                 let alias = if table_ref.alias.is_empty() {
@@ -2080,6 +2083,7 @@ impl Binder<'_> {
     /// query, bound on its own, so that it sees nothing of this query, and looking in the view's
     /// schema first.
     fn bind_view(&mut self, table_ref: &TableRef, view: Arc<ViewCatalogEntry>) -> Result<LogicalOperator> {
+        self.note_read(&view.schema, &view.name);
         if self.bound_views.iter().any(|bound| Arc::ptr_eq(bound, &view)) {
             return Err(binder_error(format!(
                 "infinite recursion detected: attempting to recursively bind view {}",
