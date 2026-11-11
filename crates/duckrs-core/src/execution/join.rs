@@ -28,7 +28,7 @@ use super::physical::{
     parallel_expression,
 };
 use super::temporary::{PartitionedSpill, SpillFile, current, estimated_bytes};
-use crate::planner::expression::BoundExpr;
+use crate::planner::expression::{BoundExpr, BoundExprKind};
 use crate::planner::logical::JoinCondition;
 use crate::storage::log_writer::can_serialize;
 use duckrs_common::column_data::ColumnDataCollection;
@@ -1150,7 +1150,18 @@ impl PhysicalOperator for PhysicalJoin {
         if let Some(spill) = &self.spill {
             *spill.build_files.lock() = spill.build.take()?;
         }
+        let complete = build.spilled_rows == 0;
         let finished = Self::finish_build(&mut build, threads, total_count, has_null_key);
+        for condition in &self.conditions {
+            if let Some(filter) = &condition.filter {
+                match condition.right.kind {
+                    BoundExprKind::Reference(column) => {
+                        filter.set(finished.data.column(column), finished.count, complete)
+                    }
+                    _ => filter.set(&Vector::constant(&Value::boolean(true)), 0, false),
+                }
+            }
+        }
         self.finished
             .set(finished)
             .map_err(|_| Error::new(ErrorKind::Internal, "a join build side was finished twice"))

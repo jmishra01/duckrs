@@ -129,6 +129,13 @@ pub enum BoundExprKind {
     ColumnRef { binding: ColumnBinding, depth: usize },
     /// `BoundReferenceExpression`: a column of the input chunk, by index.
     Reference(usize),
+    /// A dynamic filter a hash join pushes into a scan below its probe side (`JoinFilterPushdown`):
+    /// whether `child` can equal a key of the build side. Until the build side is done, or when
+    /// it lets most rows through, every row passes.
+    JoinFilter {
+        child: Box<BoundExpr>,
+        filter: Arc<crate::execution::join_filter::JoinFilter>,
+    },
     /// `BoundCastExpression` to the expression's return type.
     Cast { child: Box<BoundExpr>, try_cast: bool },
     /// `BoundComparisonExpression`: both sides have the same type.
@@ -314,7 +321,7 @@ impl BoundExpr {
     pub fn children(&self) -> Vec<&BoundExpr> {
         match &self.kind {
             BoundExprKind::Constant(_) | BoundExprKind::ColumnRef { .. } | BoundExprKind::Reference(_) => Vec::new(),
-            BoundExprKind::Cast { child, .. } => vec![child],
+            BoundExprKind::Cast { child, .. } | BoundExprKind::JoinFilter { child, .. } => vec![child],
             BoundExprKind::Subquery { child, correlated, .. } => child.iter().map(|c| &**c).chain(correlated).collect(),
             BoundExprKind::Comparison { left, right, .. } => vec![left, right],
             BoundExprKind::Between { input, lower, upper } => vec![input, lower, upper],
@@ -346,7 +353,7 @@ impl BoundExpr {
     pub fn children_mut(&mut self) -> Vec<&mut BoundExpr> {
         match &mut self.kind {
             BoundExprKind::Constant(_) | BoundExprKind::ColumnRef { .. } | BoundExprKind::Reference(_) => Vec::new(),
-            BoundExprKind::Cast { child, .. } => vec![child],
+            BoundExprKind::Cast { child, .. } | BoundExprKind::JoinFilter { child, .. } => vec![child],
             BoundExprKind::Subquery { child, correlated, .. } => {
                 child.iter_mut().map(|c| &mut **c).chain(correlated).collect()
             }
@@ -473,6 +480,7 @@ impl fmt::Display for BoundExpr {
                 }
             }
             BoundExprKind::ColumnRef { .. } | BoundExprKind::Reference(_) => f.write_str(&self.alias),
+            BoundExprKind::JoinFilter { child, .. } => write!(f, "optional: Dynamic Filter ({child})"),
             BoundExprKind::Cast { child, try_cast } => {
                 let name = if *try_cast { "TRY_CAST" } else { "CAST" };
                 write!(f, "{name}({child} AS {})", self.return_type)

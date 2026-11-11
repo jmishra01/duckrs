@@ -767,6 +767,19 @@ pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
     let count = input.len();
     match &expr.kind {
         BoundExprKind::Constant(value) => Ok(Vector::constant(value)),
+        BoundExprKind::JoinFilter { child, filter } => {
+            let values = execute(child, input)?;
+            let Some(kept) = filter.select(&values, count) else {
+                return Ok(Vector::constant(&Value::boolean(true)));
+            };
+            let mut result = Vector::new(LogicalType::BOOLEAN, count);
+            result.prepare_flat(count);
+            let data = result.data_mut::<bool>();
+            for row in kept {
+                data[row as usize] = true;
+            }
+            Ok(result)
+        }
         BoundExprKind::ListLambda {
             kind,
             list,
@@ -975,6 +988,19 @@ pub fn select(expr: &BoundExpr, input: &DataChunk) -> Result<(SelectionVector, u
         }
         let count = remaining.len();
         return Ok((SelectionVector::from_vec(remaining), count));
+    }
+    if let BoundExprKind::JoinFilter { child, filter } = &expr.kind {
+        let values = execute(child, input)?;
+        return Ok(match filter.select(&values, input.len()) {
+            Some(kept) => {
+                let count = kept.len();
+                (SelectionVector::from_vec(kept), count)
+            }
+            None => (
+                SelectionVector::from_vec((0..input.len() as u32).collect()),
+                input.len(),
+            ),
+        });
     }
     let result = execute(expr, input)?;
     Ok(executor::select::<bool>(&result, input.len(), |b| b))

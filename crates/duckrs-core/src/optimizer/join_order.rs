@@ -578,6 +578,7 @@ impl Tree {
                         left: *a,
                         right: *b,
                         null_safe: op == ComparisonOp::NotDistinctFrom,
+                        filter: None,
                     });
                 }
                 (_, kind) => residual.push(BoundExpr::new(kind, predicate.expr.return_type)),

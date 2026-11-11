@@ -605,6 +605,7 @@ fn extract_join_conditions(
                     left: (**l).clone(),
                     right: (**r).clone(),
                     null_safe,
+                    filter: None,
                 });
                 continue;
             }

@@ -308,7 +308,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
 - [ ] 48. v1 gate: TPC-H SF10 geometric mean ≤ 1.5× C++ DuckDB, and no query slower than 3×. The runner
   prints the gate after `--engine=both`. On TPC-H SF1 (8 threads, all 22 answers correct) duckrs is at
   1.53× (none above 3×: Q21 2.7×; Q02 0.5×, Q08 0.95×), from 12.7× at the start of item 47.
-  SF10, both engines on the file C++ wrote: 2.50× (Q21 4.1×, Q05 3.8×, Q11 3.5×, Q09 3.3×, Q22 3.3×; Q13 1.1×). duckrs
+  SF10, both engines on the file C++ wrote: 1.90× with join filters (Q21 3.5×, Q19 3.3×, Q04 3.0×, Q10 3.0×; Q02 1.0×). duckrs
   cannot load SF10 itself: an append keeps the rows of its table in memory (more than 2 GiB fails), where
   C++ writes full row groups to blocks as they fill (optimistic writes)
 

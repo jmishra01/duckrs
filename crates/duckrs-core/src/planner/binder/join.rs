@@ -236,12 +236,14 @@ pub(super) fn extract_join_conditions(
                 left: *first,
                 right: *second,
                 null_safe,
+                filter: None,
             });
         } else if only(&first, &right_tables, &left_tables) && only(&second, &left_tables, &right_tables) {
             conditions.push(JoinCondition {
                 left: *second,
                 right: *first,
                 null_safe,
+                filter: None,
             });
         } else {
             residual.push(BoundExpr::new(

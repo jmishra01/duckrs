@@ -14,6 +14,7 @@ pub mod expression_executor;
 pub mod external_sort;
 pub mod file_system;
 pub mod join;
+pub mod join_filter;
 pub mod json_scan;
 pub mod multi_file;
 pub mod parquet;
@@ -62,12 +63,12 @@ fn create_column_select(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
         .collect();
     if let LogicalOperatorKind::Projection { expressions, .. } = &mut child.kind {
         *expressions = positions.iter().map(|&p| expressions[p].clone()).collect();
-        return create_plan(child);
+        return create_physical(child);
     }
     Box::new(PhysicalColumnSelect {
         types,
         positions,
-        children: vec![create_plan(child)],
+        children: vec![create_physical(child)],
     })
 }
 
@@ -140,12 +141,18 @@ fn order_plan(
 }
 
 /// `PhysicalPlanGenerator::CreatePlan`.
-pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
+pub fn create_plan(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
+    join_filter::push_join_filters(&mut op);
+    create_physical(op)
+}
+
+/// [`create_plan`] once the join filters are in place.
+fn create_physical(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
     if matches!(op.kind, LogicalOperatorKind::ColumnSelect { .. }) {
         return create_column_select(op);
     }
     let types = op.types();
-    let mut children: Vec<Box<dyn PhysicalOperator>> = op.children.into_iter().map(create_plan).collect();
+    let mut children: Vec<Box<dyn PhysicalOperator>> = op.children.into_iter().map(create_physical).collect();
     match op.kind {
         LogicalOperatorKind::Get {
             table,

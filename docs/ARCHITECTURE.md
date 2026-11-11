@@ -236,6 +236,15 @@ while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` 
 - **Scan filters** move a conjunct from a `FILTER` directly on a scan into it, if it reads one
   column of that scan, is not volatile and cannot fail. It runs last, so the other passes see plain
   filters.
+- **Join filters** (`execution::join_filter`) are added as the physical plan is made, so EXPLAIN,
+  which shows the logical plan, leaves them out. An INNER, SEMI, RIGHT SEMI or RIGHT hash join
+  follows each equality on an integer or date column of its left side down through filters,
+  projections and the sides of joins that keep that column's values unchanged, to a scan of a
+  table of 65,536 rows or more. There it adds a filter. When the build side is done, the filter
+  gets its keys' min and max and a blocked Bloom filter of them; until then, and once it has
+  passed more than 80% of a million rows, it lets every row through. A build side that spilled,
+  or has more than 16M keys, gives no keys. Plans under a recursive CTE get none, as their
+  operators run again.
 - **Zone maps** (`execution::zone_map`) keep the bounds of a column per 122,880-row group. They are
   worked out per column when a filter on a table of two groups or more first asks, and dropped by
   `write_storage`. A scan skips a group only if no row of it can pass: comparisons with constants,

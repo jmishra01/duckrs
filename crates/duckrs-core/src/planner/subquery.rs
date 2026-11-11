@@ -189,6 +189,7 @@ fn flatten_in(expr: &BoundExpr, left: &mut LogicalOperator, next_table_index: &m
                 left: (**child).clone(),
                 right,
                 null_safe: false,
+                filter: None,
             }],
             None,
         ),
@@ -326,6 +327,7 @@ fn flatten_subquery(expr: &BoundExpr, left: &mut LogicalOperator, next_table_ind
             left: value.clone(),
             right: BoundExpr::column_ref(*binding, value.return_type.clone(), ""),
             null_safe: true,
+            filter: None,
         })
         .collect();
     let (join_type, mark_index, predicate) = match kind {
@@ -764,6 +766,7 @@ impl Flatten<'_> {
                 left,
                 right,
                 null_safe: true,
+                filter: None,
             })
             .collect()
     }
