@@ -533,8 +533,10 @@ impl Binder<'_> {
                 )
             }
             "\"schemas\"" => {
-                let select = "SELECT database_name, schema_name, schema_name = current_schema() AS \"current\" \
-                              FROM duckdb_schemas() WHERE NOT internal ORDER BY ALL";
+                let select = "SELECT schema.database_name, schema.schema_name, ((SELECT current_schema() = \
+                              schema.schema_name) AND (SELECT current_database() = schema.database_name)) \"current\" \
+                              FROM duckdb_schemas() schema JOIN duckdb_databases() dbs USING (database_oid) \
+                              WHERE dbs.internal = false ORDER BY ALL";
                 let select = parse_select(select, "Expected a single SELECT statement")?;
                 self.bind_rewritten(&select, table_ref, "__show_select")
             }

@@ -32,6 +32,55 @@ pub use trigger::{TriggerCatalogEntry, TriggerEvent, TriggerForEach, TriggerTimi
 pub const DEFAULT_CATALOG: &str = "memory";
 /// The schema used when a name is not qualified (`DEFAULT_SCHEMA`).
 pub const DEFAULT_SCHEMA: &str = "main";
+
+/// The part of a connection's `CatalogSearchPath` that is about the catalog a statement runs in: the schema
+/// what is created without a schema goes into (`GetDefaultSchema`), and the schemas a name without one is looked
+/// up in, after the temporary one (`GetSchemasForCatalog`). The client sets it while it runs a statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchPath {
+    pub default: String,
+    pub schemas: Vec<String>,
+}
+
+impl Default for SearchPath {
+    fn default() -> Self {
+        Self {
+            default: DEFAULT_SCHEMA.to_string(),
+            schemas: vec![DEFAULT_SCHEMA.to_string()],
+        }
+    }
+}
+
+thread_local! {
+    static SEARCH_PATH: std::cell::RefCell<SearchPath> = std::cell::RefCell::new(SearchPath::default());
+}
+
+/// Sets the search path of this thread until it is dropped, when the one before comes back.
+pub struct SearchPathGuard(Option<SearchPath>);
+
+impl SearchPathGuard {
+    pub fn set(path: SearchPath) -> Self {
+        Self(Some(SEARCH_PATH.with(|current| current.replace(path))))
+    }
+}
+
+impl Drop for SearchPathGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.0.take() {
+            SEARCH_PATH.with(|current| *current.borrow_mut() = previous);
+        }
+    }
+}
+
+/// The schema of what is named without one (`CatalogSearchPath::GetDefaultSchema`).
+pub fn default_schema() -> String {
+    SEARCH_PATH.with(|path| path.borrow().default.clone())
+}
+
+/// The schemas a name without one is looked up in, after the temporary one.
+pub fn search_schemas() -> Vec<String> {
+    SEARCH_PATH.with(|path| path.borrow().schemas.clone())
+}
 /// Where temporary objects live, ahead of the other schemas on the search path. DuckDB has a
 /// `temp` catalog per connection; here it is one schema, which connections share.
 pub const TEMP_SCHEMA: &str = "temp";
@@ -832,9 +881,18 @@ pub struct ViewCatalogEntry {
     pub query: SelectStatement,
     /// the names listed in `CREATE VIEW v (a, b)`
     pub aliases: Vec<String>,
+    /// with `enable_view_dependencies`, the tables and views (schema and name) it reads
+    pub dependencies: Vec<(String, String)>,
 }
 
 impl ViewCatalogEntry {
+    /// Whether it reads the table or view `name` of `schema`.
+    pub fn depends_on(&self, schema: &str, name: &str) -> bool {
+        self.dependencies
+            .iter()
+            .any(|(s, n)| s.eq_ignore_ascii_case(schema) && n.eq_ignore_ascii_case(name))
+    }
+
     /// `ViewCatalogEntry::ToSQL`.
     pub fn to_sql(&self) -> String {
         let mut sql = String::from("CREATE VIEW ");
@@ -1274,6 +1332,7 @@ impl SchemaCatalogEntry {
             name: new_name.to_string(),
             query: view.query.clone(),
             aliases: view.aliases.clone(),
+            dependencies: view.dependencies.clone(),
         };
         tables.insert(key(new_name), TableOrView::View(Arc::new(view)));
         Ok(())
@@ -1333,6 +1392,7 @@ impl SchemaCatalogEntry {
         query: SelectStatement,
         aliases: Vec<String>,
         on_conflict: OnCreateConflict,
+        dependencies: Vec<(String, String)>,
     ) -> Result<()> {
         let mut tables = self.tables.write();
         if Self::check_conflict(&tables, name, "View", on_conflict)? {
@@ -1341,6 +1401,7 @@ impl SchemaCatalogEntry {
                 name: name.to_string(),
                 query,
                 aliases,
+                dependencies,
             };
             tables.insert(key(name), TableOrView::View(Arc::new(view)));
         }
@@ -2004,7 +2065,8 @@ impl Catalog {
 
     /// The schema an object qualified with `schema` (or not, with `None`) lives in.
     pub fn schema_for(&self, schema: Option<&str>) -> Result<Arc<SchemaCatalogEntry>> {
-        let name = schema.unwrap_or(DEFAULT_SCHEMA);
+        let default = default_schema();
+        let name = schema.unwrap_or(&default);
         self.get_schema(name)
             .ok_or_else(|| self.missing_schema(&self.schemas.read(), name))
     }
@@ -2036,7 +2098,7 @@ impl Catalog {
             None => [TEMP_SCHEMA]
                 .iter()
                 .chain(search_first.iter())
-                .chain([&DEFAULT_SCHEMA])
+                .chain(search_schemas().iter().map(String::as_str).collect::<Vec<_>>().iter())
                 .find_map(|schema| self.get_schema(schema)?.get_entry(name)),
         };
         entry.ok_or_else(|| self.missing_table(schema, search_first, name))
@@ -2046,12 +2108,13 @@ impl Catalog {
     /// off the search path, qualified, when that one is much closer.
     fn missing_table(&self, schema: Option<&str>, search_first: Option<&str>, name: &str) -> Error {
         const UNSEEN_PENALTY: f64 = 0.2;
-        let searched: Vec<&str> = match schema {
-            Some(schema) => vec![schema],
+        let searched: Vec<String> = match schema {
+            Some(schema) => vec![schema.to_string()],
             None => [TEMP_SCHEMA]
                 .into_iter()
-                .chain(search_first)
-                .chain([DEFAULT_SCHEMA])
+                .map(str::to_string)
+                .chain(search_first.map(str::to_string))
+                .chain(search_schemas())
                 .collect(),
         };
         let schemas = self.schemas();
@@ -2108,7 +2171,7 @@ impl Catalog {
             None => [TEMP_SCHEMA]
                 .iter()
                 .chain(search_first.iter())
-                .chain([&DEFAULT_SCHEMA])
+                .chain(search_schemas().iter().map(String::as_str).collect::<Vec<_>>().iter())
                 .find_map(|schema| self.get_schema(schema)?.get_sequence(name)),
         };
         entry.ok_or_else(|| missing_entry("Sequence", name))
@@ -2127,7 +2190,7 @@ impl Catalog {
             None => [TEMP_SCHEMA]
                 .iter()
                 .chain(search_first.iter())
-                .chain([&DEFAULT_SCHEMA])
+                .chain(search_schemas().iter().map(String::as_str).collect::<Vec<_>>().iter())
                 .find_map(|schema| self.get_schema(schema)?.get_macro(name, table_macro)),
         })
     }
@@ -2144,7 +2207,7 @@ impl Catalog {
             None => [TEMP_SCHEMA]
                 .iter()
                 .chain(search_first.iter())
-                .chain([&DEFAULT_SCHEMA])
+                .chain(search_schemas().iter().map(String::as_str).collect::<Vec<_>>().iter())
                 .find_map(|schema| self.get_schema(schema)?.get_type(name)),
         })
     }

@@ -852,7 +852,7 @@ impl<'a> Replay<'a> {
                 aliases,
             } => {
                 let schema = self.catalog.schema_for(Some(&schema))?;
-                schema.create_view(&name, *query, aliases, OnCreateConflict::Error)?;
+                schema.create_view(&name, *query, aliases, OnCreateConflict::Error, Vec::new())?;
             }
             StoredEntry::Macro {
                 schema,

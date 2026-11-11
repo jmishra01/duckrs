@@ -16,6 +16,7 @@ mod merge;
 mod on_conflict;
 mod parquet;
 mod pivot;
+pub mod read_duckdb;
 mod show;
 mod star;
 mod statements;
@@ -548,9 +549,18 @@ pub struct SessionValues {
     pub default_collation: String,
     /// `duckdb_settings()`
     pub settings: SettingList,
+    /// `CatalogSearchPath::GetSetPaths`: the schemas of the search path that was set
+    pub search_path: Vec<String>,
+    /// `current_query()`
+    pub current_query: String,
+    /// `read_duckdb`: a database file opened read-only for the statement (`AttachDatabase`, hidden)
+    pub open_database: OpenDatabase,
     /// `DatabaseManager::IsAttachedDatabaseFile`: the files of the attached databases
     pub database_files: Box<dyn Fn() -> Vec<std::path::PathBuf> + Send + Sync>,
 }
+
+/// Opens a database file read-only: its catalog, and what keeps it open.
+pub type OpenDatabase = Arc<dyn Fn(&str) -> Result<(Arc<Catalog>, Arc<dyn std::any::Any + Send + Sync>)> + Send + Sync>;
 
 /// `current_setting`.
 pub type SettingLookup = Box<dyn Fn(&str) -> Result<Value> + Send + Sync>;
@@ -730,6 +740,10 @@ pub struct Binder<'a> {
     /// The schema unqualified tables are looked up in before the default one: the schema of the
     /// view being bound (`GetSearchPath`).
     search_schema: Option<String>,
+    /// the database files `read_duckdb` opened, by the names its query gives them
+    foreign_databases: Vec<read_duckdb::ForeignDatabase>,
+    /// the tables and views (schema and name) that what is bound reads, for the dependencies of a view
+    read_entries: Arc<std::sync::Mutex<Vec<(String, String)>>>,
     /// the subquery being bound is the columns of another, as a row for `(a, b) IN (...)`
     row_subquery: bool,
     /// The table macros being bound, innermost last (`bound_macros`).
@@ -816,6 +830,8 @@ impl<'a> Binder<'a> {
             left_of_join: Vec::new(),
             bound_views: Vec::new(),
             search_schema: None,
+            foreign_databases: Vec::new(),
+            read_entries: Arc::default(),
             row_subquery: false,
             bound_macros: Vec::new(),
             macro_arguments: Vec::new(),
@@ -847,7 +863,12 @@ impl<'a> Binder<'a> {
     }
 
     /// `Binder::BindView` + `BindCreateViewInfo`: checks the query of a view being created.
-    pub fn bind_create_view(&mut self, query: &ast::SelectStatement, aliases: &[String], schema: &str) -> Result<()> {
+    pub fn bind_create_view(
+        &mut self,
+        query: &ast::SelectStatement,
+        aliases: &[String],
+        schema: &str,
+    ) -> Result<Vec<(String, String)>> {
         // a DML or COPY body would run each time the view is read
         for (_, cte) in &query.node.cte_map.0 {
             match cte.query.kind {
@@ -869,7 +890,17 @@ impl<'a> Binder<'a> {
         if aliases.len() > bound.names.len() {
             return Err(binder_error("More VIEW aliases than columns in query result"));
         }
-        Ok(())
+        let mut read = self.read_entries.lock().expect("not poisoned").clone();
+        read.dedup();
+        Ok(read)
+    }
+
+    /// That what is bound reads the table or view `name` of `schema`.
+    fn note_read(&self, schema: &str, name: &str) {
+        let mut read = self.read_entries.lock().expect("not poisoned");
+        if !read.iter().any(|(s, n)| s == schema && n == name) {
+            read.push((schema.to_string(), name.to_string()));
+        }
     }
 
     /// `error`, unless the column it did not find is one a LATERAL join could read.
@@ -900,6 +931,8 @@ impl<'a> Binder<'a> {
         binder.bound_macros = self.bound_macros.clone();
         binder.macro_arguments = self.macro_arguments.clone();
         binder.search_schema = self.search_schema.clone();
+        binder.foreign_databases = self.foreign_databases.clone();
+        binder.read_entries = self.read_entries.clone();
         binder.parameters = self.parameters.clone();
         binder.ctes = self.ctes.clone();
         binder.ctes_being_bound = self.ctes_being_bound.clone();
@@ -958,6 +991,13 @@ fn statement_kind(statement: &Statement) -> String {
 pub fn bind_constant_expression(catalog: &Catalog, expr: &duckrs_parser::ast::Expr) -> Result<BoundExpr> {
     let mut binder = Binder::new(catalog);
     binder.bind_expression(expr)
+}
+
+impl Binder<'_> {
+    /// An expression without a FROM clause, as the value of a SET.
+    pub fn bind_value_expression(&mut self, expr: &duckrs_parser::ast::Expr) -> Result<BoundExpr> {
+        self.bind_expression(expr)
+    }
 }
 
 // Ported from `ExpressionBinder::PushCollation` and the collation handling of

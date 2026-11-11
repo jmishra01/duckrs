@@ -1617,6 +1617,8 @@ pub(super) fn is_system_function(name: &str) -> bool {
                 | "to_aggregate_state"
                 | "current_database"
                 | "current_schema"
+                | "current_schemas"
+                | "current_query"
                 | "txid_current"
                 | "current_transaction_id"
                 | "current_connection_id"
@@ -1863,10 +1865,56 @@ impl Binder<'_> {
         let name = function.name.name.to_lowercase();
         // `CurrentDatabaseFunction`: the database the connection uses
         if name == "current_database" && function.args.is_empty() {
-            return Ok(Some(BoundExpr::constant(Value::varchar(self.catalog.name.clone()))));
+            let database = self
+                .session
+                .as_ref()
+                .map_or_else(|| self.catalog.name.clone(), |s| s.database.clone());
+            return Ok(Some(BoundExpr::constant(Value::varchar(database))));
         }
         if name == "current_schema" && function.args.is_empty() {
-            return Ok(Some(BoundExpr::constant(Value::varchar("main"))));
+            // `CatalogSearchPath::GetDefault`: the first schema that was set
+            let schema = self
+                .session
+                .as_ref()
+                .and_then(|session| session.search_path.first().cloned())
+                .unwrap_or_else(crate::catalog::default_schema);
+            return Ok(Some(BoundExpr::constant(Value::varchar(schema))));
+        }
+        if name == "current_query"
+            && function.args.is_empty()
+            && let Some(session) = &self.session
+        {
+            return Ok(Some(BoundExpr::constant(Value::varchar(session.current_query.clone()))));
+        }
+        // `CurrentSchemasBind`: the schemas that were set, or with `include_implicit` the whole search path
+        if name == "current_schemas" && function.args.len() == 1 {
+            let argument = self.bind_expression(&function.args[0].expr)?;
+            if argument.return_type.id() != LogicalTypeId::Boolean {
+                return Err(binder_error("current_schemas requires a boolean input"));
+            }
+            let value = crate::execution::expression_executor::evaluate_scalar(&argument)?;
+            let list_type = LogicalType::list(LogicalType::VARCHAR);
+            if value.is_null() {
+                return Ok(Some(BoundExpr::constant(Value::null(list_type))));
+            }
+            let set = self
+                .session
+                .as_ref()
+                .map(|session| session.search_path.clone())
+                .unwrap_or_default();
+            let schemas: Vec<String> = if matches!(value.data(), duckrs_common::value::ValueData::Bool(true)) {
+                std::iter::once("main".to_string())
+                    .chain(set)
+                    .chain(["main", "main", "pg_catalog"].map(str::to_string))
+                    .collect()
+            } else {
+                set
+            };
+            let items = schemas.into_iter().map(Value::varchar).collect();
+            return Ok(Some(BoundExpr::constant(Value::new(
+                list_type,
+                duckrs_common::value::ValueData::List(items),
+            )?)));
         }
         if matches!(name.as_str(), "txid_current" | "current_transaction_id") && function.args.is_empty() {
             return Ok(Some(BoundExpr::constant(Value::ubigint(self.options.transaction_id))));

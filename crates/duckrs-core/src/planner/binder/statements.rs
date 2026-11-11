@@ -1687,6 +1687,22 @@ impl Binder<'_> {
                     }
                     return self.bind_read_json(&call, &file_ref);
                 }
+                // `ReadDuckDBTableFunction::ReplacementScan`
+                if name.qualification.is_empty()
+                    && [".db", ".ddb", ".duckdb"]
+                        .iter()
+                        .any(|ext| lower.ends_with(ext) || lower.contains(&format!("{ext}?")))
+                {
+                    let call = ast::FunctionExpr::new(
+                        "read_duckdb",
+                        vec![Expr::constant(ast::Literal::string(name.name.clone()))],
+                    );
+                    let mut file_ref = table_ref.clone();
+                    if file_ref.alias.is_empty() && !name.name.contains(['*', '?', '[']) {
+                        file_ref.alias = name.name.rsplit('/').next().unwrap_or(&name.name).to_string();
+                    }
+                    return self.bind_read_duckdb(&call, &file_ref);
+                }
                 if name.qualification.is_empty()
                     && lower.ends_with(".parquet")
                     && !crate::execution::file_system::glob_or_directory(&name.name, "parquet").is_empty()
@@ -1747,11 +1763,25 @@ impl Binder<'_> {
                 {
                     return self.bind_cte_reference(table_ref, index);
                 }
-                let entry = self.catalog.get_entry(
-                    self.schema_of(name)?.as_deref(),
-                    self.search_schema.as_deref(),
-                    &name.name,
-                );
+                // a table of a database file that `read_duckdb` opened
+                let foreign = name.qualification.first().and_then(|first| {
+                    self.foreign_databases
+                        .iter()
+                        .find(|f| f.name.eq_ignore_ascii_case(first))
+                        .cloned()
+                });
+                let entry = match &foreign {
+                    Some(foreign) => {
+                        foreign
+                            .catalog
+                            .get_entry(name.qualification.get(1).map(String::as_str), None, &name.name)
+                    }
+                    None => self.catalog.get_entry(
+                        self.schema_of(name)?.as_deref(),
+                        self.search_schema.as_deref(),
+                        &name.name,
+                    ),
+                };
                 if entry.is_err()
                     && name.qualification.is_empty()
                     && self
@@ -1764,7 +1794,13 @@ impl Binder<'_> {
                         name.name
                     )));
                 }
-                if entry.is_err() && name.qualification.is_empty() && Self::is_system_table(&name.name) {
+                // a bare name of a system table function binds the function, unless a view of the system
+                // catalog has that name (`duckdb_databases` hides the internal databases)
+                if entry.is_err()
+                    && name.qualification.is_empty()
+                    && Self::is_system_table(&name.name)
+                    && crate::catalog::defaults::default_view(None, &name.name).is_none()
+                {
                     return self.bind_system_table(table_ref, &name.name);
                 }
                 // `BindBaseTableRef`: a file that is there, but that no reader is for
@@ -1805,7 +1841,10 @@ impl Binder<'_> {
                     }
                 }
                 let table = match entry? {
-                    TableOrView::Table(table) => table,
+                    TableOrView::Table(table) => {
+                        self.note_read(&table.schema, &table.name);
+                        table
+                    }
                     TableOrView::View(view) => return self.bind_view(table_ref, view),
                 };
                 let alias = if table_ref.alias.is_empty() {
@@ -1944,6 +1983,12 @@ impl Binder<'_> {
                 }
                 if let ExprKind::Function(call) = &function.kind
                     && call.name.qualification.is_empty()
+                    && call.name.name.eq_ignore_ascii_case("read_duckdb")
+                {
+                    return self.bind_read_duckdb(call, table_ref);
+                }
+                if let ExprKind::Function(call) = &function.kind
+                    && call.name.qualification.is_empty()
                     && matches!(
                         call.name.name.to_lowercase().as_str(),
                         "parquet_metadata"
@@ -2038,6 +2083,7 @@ impl Binder<'_> {
     /// query, bound on its own, so that it sees nothing of this query, and looking in the view's
     /// schema first.
     fn bind_view(&mut self, table_ref: &TableRef, view: Arc<ViewCatalogEntry>) -> Result<LogicalOperator> {
+        self.note_read(&view.schema, &view.name);
         if self.bound_views.iter().any(|bound| Arc::ptr_eq(bound, &view)) {
             return Err(binder_error(format!(
                 "infinite recursion detected: attempting to recursively bind view {}",

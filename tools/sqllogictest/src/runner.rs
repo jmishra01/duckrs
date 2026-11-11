@@ -618,6 +618,51 @@ impl<'a> FileRunner<'a> {
         Ok(())
     }
 
+    /// `RestartCommand`: the database opened again, with the settings and the search path of the connection
+    /// before.
+    fn restart(&mut self) -> Result<(), String> {
+        const SETTINGS: &str = "SELECT name, value FROM duckdb_settings()";
+        let read = |con: &mut Box<dyn Connection>| -> Vec<(String, Option<String>)> {
+            con.query(SETTINGS)
+                .map(|output| {
+                    output
+                        .rows
+                        .into_iter()
+                        .filter_map(|row| Some((row.first()?.clone()?, row.get(1)?.clone())))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let (before, search_path) = match self.con.as_mut() {
+            Some(con) => {
+                let search_path = con
+                    .query("SELECT current_setting('search_path')")
+                    .ok()
+                    .and_then(|output| output.rows.first()?.first()?.clone());
+                (read(con), search_path)
+            }
+            None => (Vec::new(), None),
+        };
+        self.open()?;
+        let con = self.con.as_mut().expect("database is open");
+        let fresh = read(con);
+        let quote = |text: &str| format!("'{}'", text.replace('\'', "''"));
+        for (name, value) in before {
+            let Some(value) = value else { continue };
+            let unchanged = fresh
+                .iter()
+                .any(|(n, v)| *n == name && v.as_deref() == Some(value.as_str()));
+            if !unchanged {
+                // what the new database does not take stays as it is
+                let _ = con.query(&format!("SET {name} = {}", quote(&value)));
+            }
+        }
+        if let Some(path) = search_path.filter(|path| !path.is_empty()) {
+            let _ = con.query(&format!("SET search_path = {}", quote(&path)));
+        }
+        Ok(())
+    }
+
     fn run_records(&mut self, records: &[Record], loops: &mut Vec<ActiveLoop>) -> Flow {
         for record in records {
             if self.shared.stop.load(Ordering::SeqCst) {
@@ -835,7 +880,7 @@ impl<'a> FileRunner<'a> {
             }
             Record::Restart | Record::Reconnect => {
                 let result = if matches!(record, Record::Restart) {
-                    self.open()
+                    self.restart()
                 } else {
                     let db = self.db.as_ref().expect("database is open");
                     db.connect().map(|con| self.con = Some(con))
