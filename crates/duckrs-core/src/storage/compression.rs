@@ -694,18 +694,32 @@ impl FsstDecoder {
     /// [`Self::decompress`], onto the end of `result`.
     fn decompress_into(&self, input: &[u8], result: &mut Vec<u8>) -> Result<()> {
         const ESCAPE: u8 = 255;
+        // every code gives at most 8 bytes: room for all of them, and whole symbols are written
+        // (8 bytes at a time) with only their length kept
+        result.reserve(input.len() * 8 + 8);
+        let base = result.as_mut_ptr();
+        let mut length = result.len();
         let mut bytes = input.iter();
         while let Some(&code) = bytes.next() {
             if code == ESCAPE {
-                let &literal = bytes
-                    .next()
-                    .ok_or_else(|| corrupted("Failed to decompress FSST string - escape code has no following byte"))?;
-                result.push(literal);
+                let &literal = bytes.next().ok_or_else(|| {
+                    // SAFETY: the bytes up to `length` were written below, within the capacity.
+                    unsafe { result.set_len(length) };
+                    corrupted("Failed to decompress FSST string - escape code has no following byte")
+                })?;
+                // SAFETY: `length` + 1 is within the capacity reserved above (8 bytes per code).
+                unsafe { base.add(length).write(literal) };
+                length += 1;
             } else {
                 let code = usize::from(code);
-                result.extend_from_slice(&self.symbols[code][..usize::from(self.lengths[code])]);
+                // SAFETY: `length` + 8 is within the capacity reserved above (8 bytes per code, and
+                // 8 more), and a symbol is 8 bytes, of which the first `lengths[code]` count.
+                unsafe { std::ptr::copy_nonoverlapping(self.symbols[code].as_ptr(), base.add(length), 8) };
+                length += usize::from(self.lengths[code]);
             }
         }
+        // SAFETY: the bytes up to `length` were written above, within the capacity.
+        unsafe { result.set_len(length) };
         Ok(())
     }
 }

@@ -1840,10 +1840,13 @@ pub struct PhysicalOrder {
     pub data: Mutex<ColumnDataCollection>,
     /// the runs of a sort past the memory limit; a Top-N keeps few rows and does not spill
     spill: Option<Mutex<SortSpill>>,
+    /// a Top-N's boundary (`TopNHeap`'s boundary value): the sort key of the last row it keeps, once
+    /// it has as many rows as it needs, so that rows that sort after it are not kept
+    boundary: Mutex<Option<Vec<u8>>>,
 }
 
 /// A Top-N sorts what it has when it has twice what it needs, and at least this.
-const TOP_N_MIN_BUFFERED_ROWS: u64 = 1 << 16;
+const TOP_N_MIN_BUFFERED_ROWS: u64 = 1 << 12;
 
 /// The rows of a collection after the first `offset`, at most `count` of them.
 fn rows_of_collection(collection: &ColumnDataCollection, offset: u64, count: u64) -> ColumnDataCollection {
@@ -1877,9 +1880,20 @@ impl PhysicalOrder {
             top,
             data: Mutex::new(ColumnDataCollection::new(types.clone())),
             spill: (top.is_none() && SortSpill::can_spill(&types)).then(Mutex::default),
+            boundary: Mutex::default(),
             types,
             children: vec![child],
         }
+    }
+
+    /// The sort key of each row of `chunk`.
+    fn sort_keys(&self, chunk: &DataChunk) -> Result<Vec<Vec<u8>>> {
+        let columns: Vec<(&Vector, OrderModifiers)> = self
+            .orders
+            .iter()
+            .map(|&(column, m)| (chunk.column(column), m))
+            .collect();
+        create_sort_keys(&columns, chunk.len())
     }
 }
 
@@ -1897,16 +1911,48 @@ impl PhysicalOperator for PhysicalOrder {
         true
     }
     fn sink(&self, chunk: &DataChunk) -> Result<()> {
-        let mut data = self.data.lock();
-        data.append(chunk);
-        if let Some(spill) = &self.spill {
-            return spill.lock().sink(&mut data, chunk, &self.orders);
+        let Some((limit, offset)) = self.top else {
+            let mut data = self.data.lock();
+            data.append(chunk);
+            if let Some(spill) = &self.spill {
+                return spill.lock().sink(&mut data, chunk, &self.orders);
+            }
+            return check_buffered(&data);
+        };
+        let keep = limit.saturating_add(offset);
+        // rows that sort after the boundary never get in: a tie comes after the rows kept, as the
+        // sort keeps ties in order
+        let mut boundary = self.boundary.lock();
+        let mut rows = std::borrow::Cow::Borrowed(chunk);
+        if let Some(bound) = boundary.as_ref() {
+            let keys = self.sort_keys(chunk)?;
+            let selected: Vec<u32> = keys
+                .iter()
+                .enumerate()
+                .filter(|(_, key)| key.as_slice() < bound.as_slice())
+                .map(|(row, _)| row as u32)
+                .collect();
+            if selected.is_empty() {
+                return Ok(());
+            }
+            if selected.len() < chunk.len() {
+                let count = selected.len();
+                let mut sliced = chunk.clone();
+                sliced.slice(&SelectionVector::from_vec(selected), count);
+                rows = std::borrow::Cow::Owned(sliced);
+            }
         }
-        // what is behind the first rows now never gets back in, as the sort keeps ties in order
-        if let Some((limit, offset)) = self.top {
-            let keep = limit.saturating_add(offset);
-            if data.len() as u64 > keep.saturating_mul(2).max(TOP_N_MIN_BUFFERED_ROWS) {
-                *data = rows_of_collection(&sort_collection(&data, &self.orders)?, 0, keep);
+        let mut data = self.data.lock();
+        data.append(&rows);
+        // what is behind the first rows now never gets back in
+        if keep > 0 && data.len() as u64 > keep.saturating_mul(2).max(TOP_N_MIN_BUFFERED_ROWS) {
+            *data = rows_of_collection(&sort_collection(&data, &self.orders)?, 0, keep);
+            if data.len() as u64 == keep {
+                let last = data.chunk(data.chunk_count() - 1);
+                let row = last.len() - 1;
+                let mut one = last.clone();
+                one.slice(&SelectionVector::from_vec(vec![row as u32]), 1);
+                *boundary = self.sort_keys(&one)?.pop();
             }
         }
         check_buffered(&data)
