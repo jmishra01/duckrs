@@ -555,9 +555,18 @@ pub struct SessionValues {
     pub current_query: String,
     /// `read_duckdb`: a database file opened read-only for the statement (`AttachDatabase`, hidden)
     pub open_database: OpenDatabase,
+    /// the rows an `Appender` flushes: the names and types of its columns, and its chunks
+    pub appended: Option<AppendedRows>,
     /// `DatabaseManager::IsAttachedDatabaseFile`: the files of the attached databases
     pub database_files: Box<dyn Fn() -> Vec<std::path::PathBuf> + Send + Sync>,
 }
+
+/// The rows of an `Appender`, for `__internal_appender_chunks`.
+pub type AppendedRows = (
+    Vec<String>,
+    Vec<LogicalType>,
+    Arc<Vec<duckrs_common::vector::DataChunk>>,
+);
 
 /// Opens a database file read-only: its catalog, and what keeps it open.
 pub type OpenDatabase = Arc<dyn Fn(&str) -> Result<(Arc<Catalog>, Arc<dyn std::any::Any + Send + Sync>)> + Send + Sync>;

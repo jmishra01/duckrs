@@ -762,6 +762,8 @@ pub struct ClientContext {
     search_path: Vec<SearchEntry>,
     /// `ClientContext::GetCurrentQuery`: the text of the query that runs
     current_query: String,
+    /// the rows of an `Appender` that is flushing
+    appended: Option<crate::planner::binder::AppendedRows>,
     /// its temporary objects, which the `temp` catalog holds in C++
     temp: Arc<SchemaCatalogEntry>,
     /// the connection's logger (`ClientContext::logger`), which `write_log` finds by its id
@@ -893,6 +895,7 @@ impl ClientContext {
             variables: HashMap::new(),
             search_path: Vec::new(),
             current_query: String::new(),
+            appended: None,
             temp: SessionTemp::new_schema(),
             log_target,
             log_target_id,
@@ -975,6 +978,7 @@ impl ClientContext {
             },
             search_path: self.search_path.iter().map(|entry| entry.schema.clone()).collect(),
             current_query: self.current_query.clone(),
+            appended: self.appended.clone(),
             open_database: {
                 let home = self.home.clone();
                 Arc::new(move |path: &str| {
@@ -1088,6 +1092,53 @@ impl ClientContext {
     }
 
     /// `ClientContext::Query`: runs every statement in `sql` and returns the last result.
+    /// `ClientContext::TableInfo`: the name and type of each column of a table, for an `Appender`.
+    pub fn table_columns(&self, schema: Option<&str>, table: &str) -> Result<Vec<(String, LogicalType)>> {
+        let catalog = self.catalog();
+        let _search_path = crate::catalog::SearchPathGuard::set(self.search_path_for(&self.db.name.clone()));
+        let entry = catalog.get_table(schema, table).map_err(|_| {
+            Error::new(
+                ErrorKind::Catalog,
+                format!(
+                    "Table \"{}{table}\" could not be found",
+                    schema.map(|s| format!("{s}.")).unwrap_or_default()
+                ),
+            )
+        })?;
+        Ok(entry
+            .columns
+            .iter()
+            .map(|column| (column.name.to_string(), column.ty.clone()))
+            .collect())
+    }
+
+    /// `ClientContext::Append`: rows of the table's types into the table, as an INSERT of them.
+    pub fn append(
+        &mut self,
+        schema: Option<&str>,
+        table: &str,
+        columns: Vec<(String, LogicalType)>,
+        chunks: Vec<duckrs_common::vector::DataChunk>,
+    ) -> Result<()> {
+        let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+        let target = match schema {
+            Some(schema) => format!("{}.{}", quote(schema), quote(table)),
+            None => quote(table),
+        };
+        let column_list = columns
+            .iter()
+            .map(|(name, _)| quote(name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (names, types): (Vec<String>, Vec<LogicalType>) = columns.into_iter().unzip();
+        self.appended = Some((names, types, Arc::new(chunks)));
+        let result = self.query(&format!(
+            "INSERT INTO {target} ({column_list}) SELECT * FROM __internal_appender_chunks()"
+        ));
+        self.appended = None;
+        result.map(drop)
+    }
+
     pub fn query(&mut self, sql: &str) -> Result<MaterializedQueryResult> {
         let _temp = SessionTemp::enter(&self.temp);
         let statements = match duckrs_parser::parse_ast_with_text(sql, &self.parser_options()) {
@@ -7927,7 +7978,7 @@ fn stored_group_rows(source: &dyn crate::catalog::TableSource) -> Option<usize> 
     }
     let first = source.group_rows(0);
     // a scan maps chunks to groups, so a group is whole chunks
-    if first == 0 || first % duckrs_common::STANDARD_VECTOR_SIZE != 0 {
+    if first == 0 || !first.is_multiple_of(duckrs_common::STANDARD_VECTOR_SIZE) {
         return None;
     }
     ((1..groups - 1).all(|g| source.group_rows(g) == first) && source.group_rows(groups - 1) <= first).then_some(first)

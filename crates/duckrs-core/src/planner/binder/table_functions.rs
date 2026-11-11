@@ -301,6 +301,38 @@ impl Binder<'_> {
             }
             "test_all_types" => return self.bind_test_all_types(&args, table_ref).map(Some),
             "test_vector_types" => return self.bind_test_vector_types(&args, table_ref).map(Some),
+            // the rows of an `Appender` that is flushing (`ClientContext::Append`)
+            "__internal_appender_chunks" => {
+                let Some((names, types, chunks)) = self.session.as_ref().and_then(|session| session.appended.clone())
+                else {
+                    return Ok(None);
+                };
+                let alias = if table_ref.alias.is_empty() {
+                    name.clone()
+                } else {
+                    table_ref.alias.clone()
+                };
+                let names = Self::alias_columns(table_ref, &alias, names)?;
+                let table_index = self.generate_table_index();
+                self.bind_context.add_binding(super::Binding {
+                    alias,
+                    schema: None,
+                    table_index,
+                    names,
+                    types: types.clone(),
+                    row_id: None,
+                    virtual_columns: Vec::new(),
+                    generated: Vec::new(),
+                });
+                return Ok(Some(LogicalOperator::new(
+                    LogicalOperatorKind::ChunkGet {
+                        table_index,
+                        types,
+                        chunks,
+                    },
+                    vec![],
+                )));
+            }
             _ => return Ok(None),
         };
         let select = parse_select(&sql, "Expected a single SELECT statement")?;
