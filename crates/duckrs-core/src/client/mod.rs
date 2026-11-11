@@ -515,6 +515,29 @@ fn for_each_table_name(statement: &mut Statement, f: &mut impl FnMut(&mut Qualif
                 in_table(&mut join.right, f);
             }
             K::Subquery(query) => in_query(&mut query.node, f),
+            // `pragma_table_info('db.t')`: the table is named by the text
+            K::TableFunction { function, .. } => {
+                if let ExprKind::Function(call) = &mut function.kind
+                    && call.name.qualification.is_empty()
+                    && matches!(
+                        call.name.name.to_lowercase().as_str(),
+                        "pragma_table_info" | "pragma_show"
+                    )
+                    && let [argument] = call.args.as_mut_slice()
+                    && let ExprKind::Constant(literal) = &mut argument.expr.kind
+                    && literal.kind == duckrs_parser::ast::LiteralKind::String
+                {
+                    let mut parts: Vec<String> = literal.text.split('.').map(str::to_string).collect();
+                    let mut name = QualifiedName {
+                        name: parts.pop().unwrap_or_default(),
+                        qualification: parts,
+                    };
+                    f(&mut name);
+                    let mut parts = name.qualification;
+                    parts.push(name.name);
+                    literal.text = parts.join(".");
+                }
+            }
             _ => {}
         }
     }
@@ -561,6 +584,10 @@ fn for_each_table_name(statement: &mut Statement, f: &mut impl FnMut(&mut Qualif
         Statement::Alter(info) => f(&mut info.name),
         Statement::Explain { statement, .. } => for_each_table_name(statement, f),
         Statement::Vacuum { table: Some(table), .. } => in_table(table, f),
+        Statement::Copy(info) => match &mut info.select {
+            Some(query) => in_query(query, f),
+            None => f(&mut info.table),
+        },
         _ => {}
     }
 }
@@ -604,9 +631,37 @@ fn parameter_names(sql: &str) -> Vec<String> {
     names
 }
 
+/// The name of the type `e` casts to, if it names one.
+fn cast_type_name(e: &Expr) -> Option<&QualifiedName> {
+    match &e.kind {
+        ExprKind::Cast {
+            target: duckrs_parser::ast::CastType::Parsed(target),
+            ..
+        } => match &target.kind {
+            ExprKind::Type(ty) => Some(&ty.name),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// A column named with its database, which a statement that runs there doesn't have any more.
 fn strip_database(statement: &mut Statement, database: &str) {
     let mut strip = |e: &mut Expr| match &mut e.kind {
+        ExprKind::Cast {
+            target: duckrs_parser::ast::CastType::Parsed(target),
+            ..
+        } => {
+            if let ExprKind::Type(ty) = &mut target.kind
+                && ty
+                    .name
+                    .qualification
+                    .first()
+                    .is_some_and(|first| first.eq_ignore_ascii_case(database))
+            {
+                ty.name.qualification.remove(0);
+            }
+        }
         ExprKind::ColumnRef(parts) if parts.len() > 2 && parts[0].eq_ignore_ascii_case(database) => {
             parts.remove(0);
         }
@@ -687,6 +742,10 @@ pub struct ClientContext {
     parameters: Option<Arc<ParameterValues>>,
     /// what SET VARIABLE set (`ClientConfig::user_variables`), by lower-case name
     variables: HashMap<String, Value>,
+    /// `CatalogSearchPath::set_paths`: what `SET schema`, `SET search_path` and `USE` set
+    search_path: Vec<SearchEntry>,
+    /// `ClientContext::GetCurrentQuery`: the text of the query that runs
+    current_query: String,
     /// its temporary objects, which the `temp` catalog holds in C++
     temp: Arc<SchemaCatalogEntry>,
     /// the connection's logger (`ClientContext::logger`), which `write_log` finds by its id
@@ -812,6 +871,8 @@ impl ClientContext {
             prepared_statements: HashMap::new(),
             parameters: None,
             variables: HashMap::new(),
+            search_path: Vec::new(),
+            current_query: String::new(),
             temp: SessionTemp::new_schema(),
             log_target,
             log_target_id,
@@ -884,7 +945,16 @@ impl ClientContext {
             query_id: self.query_id,
             default_collation: self.setting_text("default_collation"),
             variables: self.variables.clone(),
-            setting: Box::new(move |name| settings::get_setting(name, &db.settings.read(), &session)),
+            setting: {
+                let (schema, search_path) = (self.default_schema_setting(), SearchEntry::list_text(&self.search_path));
+                Box::new(move |name| match name.to_lowercase().as_str() {
+                    "schema" => Ok(Value::varchar(schema.clone())),
+                    "search_path" => Ok(Value::varchar(search_path.clone())),
+                    _ => settings::get_setting(name, &db.settings.read(), &session),
+                })
+            },
+            search_path: self.search_path.iter().map(|entry| entry.schema.clone()).collect(),
+            current_query: self.current_query.clone(),
             settings: Box::new(move || settings::list_settings(&list_db.settings.read(), &list_session)),
             database_files: Box::new(move || {
                 let mut databases = vec![files_db.clone()];
@@ -979,6 +1049,7 @@ impl ClientContext {
             types: Vec::new(),
             collection: ColumnDataCollection::new(Vec::new()),
         };
+        self.current_query = sql.to_string();
         for (statement, text) in &statements {
             self.begin_statement_logging(text)?;
             let target = self.log_target.clone();
@@ -1369,6 +1440,25 @@ impl ClientContext {
             self.db = previous;
             return result;
         }
+        let _search_path = crate::catalog::SearchPathGuard::set(self.search_path_for(&self.db.name.clone()));
+        // the default database can be gone, as when its ATTACH was rolled back
+        if !Arc::ptr_eq(&self.db, &self.home)
+            && !self
+                .home
+                .attached
+                .read()
+                .values()
+                .any(|database| Arc::ptr_eq(database, &self.db))
+            && !matches!(
+                statement,
+                Statement::SetVariable { .. } | Statement::ResetVariable { .. } | Statement::Transaction { .. }
+            )
+        {
+            return Err(Error::new(
+                ErrorKind::Catalog,
+                format!("Catalog with name {} does not exist!", self.db.name),
+            ));
+        }
         match statement {
             // the statements a PIVOT was rewritten into: the last one has the result
             Statement::Multi(statements) => {
@@ -1570,6 +1660,12 @@ impl ClientContext {
                     {
                         names.push(function.name.clone());
                     }
+                    // a type of the database, as in `NULL::db.mood`
+                    if let Some(ty) = cast_type_name(e)
+                        && !ty.qualification.is_empty()
+                    {
+                        names.push(ty.clone());
+                    }
                 })
             });
         }
@@ -1596,43 +1692,141 @@ impl ClientContext {
         Some((database, routed))
     }
 
-    /// `USE`: the database, and a schema in it if it isn't the default one.
-    fn use_database(&mut self, target: &str) -> Result<bool> {
-        let parts: Vec<&str> = target.split('.').map(|part| part.trim_matches('"')).collect();
-        let Some(database) = self.find_database(parts[0]) else {
-            return Ok(false);
-        };
-        if parts.get(1).is_some_and(|schema| !schema.eq_ignore_ascii_case("main")) {
-            return Ok(false);
-        }
-        self.db = database;
-        Ok(true)
-    }
-
-    /// `CatalogSearchPath::Set`: the error of a `catalog.schema` that names neither, as when it is
-    /// a nested schema.
-    fn search_path_error(&self, setting: &str, target: &str) -> Option<Error> {
-        let parts: Vec<&str> = target.split('.').map(|part| part.trim_matches('"')).collect();
-        let [first, second] = parts.as_slice() else {
-            return None;
-        };
-        if self
-            .find_database(first)
-            .is_some_and(|database| database.catalog.get_schema(second).is_some())
-        {
-            return None;
-        }
+    /// `CatalogSearchPath::Set`: the entries of `target` (one for `SET schema`), each a schema of the default
+    /// database, a database (its default schema), or both; the first is where unqualified names go.
+    fn set_search_path(&mut self, setting: &str, target: &str) -> Result<()> {
+        let schema_only = setting.eq_ignore_ascii_case("schema");
         let set = format!("SET {}", setting.to_lowercase());
-        if self.catalog().get_schema(&crate::catalog::schema_key(&parts)).is_some() {
-            return Some(Error::new(
-                ErrorKind::NotImplemented,
-                format!("{set}: \"{target}\" is a nested schema - nested schemas cannot be used in the search path"),
+        let parsed = if schema_only {
+            vec![SearchEntry::parse(target)?]
+        } else {
+            SearchEntry::parse_list(target)?
+        };
+        // the catalog of an entry that names only a schema: that of the default entry
+        let (default_catalog, default_database) = match self.search_path.first() {
+            Some(entry) => (entry.catalog.clone(), entry.database.clone()),
+            None => (String::new(), self.db.name.clone()),
+        };
+        let mut entries = Vec::with_capacity(parsed.len());
+        for (catalog, schema) in parsed {
+            // the catalogs of the temporary and the system schemas, and the schemas of the system catalog
+            let internal = ["temp", "system"]
+                .iter()
+                .find(|name| name.eq_ignore_ascii_case(&schema));
+            if catalog.is_empty()
+                && let Some(internal) = internal
+            {
+                entries.push(SearchEntry {
+                    catalog: internal.to_string(),
+                    database: internal.to_string(),
+                    schema: crate::catalog::DEFAULT_SCHEMA.to_string(),
+                });
+                continue;
+            }
+            let system_schema = ["pg_catalog", "information_schema"]
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&schema));
+            if system_schema && (catalog.is_empty() || catalog.eq_ignore_ascii_case("system")) {
+                entries.push(SearchEntry {
+                    catalog: if catalog.is_empty() {
+                        String::new()
+                    } else {
+                        "system".to_string()
+                    },
+                    database: "system".to_string(),
+                    schema,
+                });
+                continue;
+            }
+            if catalog.is_empty() {
+                let in_default = self
+                    .find_database(&default_database)
+                    .is_some_and(|database| database.catalog.get_schema(&schema).is_some());
+                if in_default {
+                    entries.push(SearchEntry {
+                        catalog: default_catalog.clone(),
+                        database: default_database.clone(),
+                        schema,
+                    });
+                    continue;
+                }
+                // a database: its default schema
+                if let Some(database) = self.find_database(&schema) {
+                    entries.push(SearchEntry {
+                        catalog: database.name.clone(),
+                        database: database.name.clone(),
+                        schema: crate::catalog::DEFAULT_SCHEMA.to_string(),
+                    });
+                    continue;
+                }
+            } else if let Some(database) = self.find_database(&catalog)
+                && database.catalog.get_schema(&schema).is_some()
+            {
+                entries.push(SearchEntry {
+                    catalog: database.name.clone(),
+                    database: database.name.clone(),
+                    schema,
+                });
+                continue;
+            }
+            let shown = SearchEntry::entry_text(&catalog, &schema);
+            if !catalog.is_empty()
+                && self
+                    .catalog()
+                    .get_schema(&crate::catalog::schema_key(&[catalog.as_str(), schema.as_str()]))
+                    .is_some()
+            {
+                return Err(Error::new(
+                    ErrorKind::NotImplemented,
+                    format!("{set}: \"{shown}\" is a nested schema - nested schemas cannot be used in the search path"),
+                ));
+            }
+            return Err(Error::new(
+                ErrorKind::Catalog,
+                format!("{set}: No catalog + schema named \"{shown}\" found."),
             ));
         }
-        Some(Error::new(
-            ErrorKind::Catalog,
-            format!("{set}: No catalog + schema named \"{target}\" found."),
-        ))
+        if schema_only {
+            let catalog = &entries[0].catalog;
+            if catalog.eq_ignore_ascii_case(TEMP_SCHEMA) || catalog.eq_ignore_ascii_case("system") {
+                return Err(Error::new(
+                    ErrorKind::Catalog,
+                    format!("{set} cannot be set to internal schema \"{catalog}\""),
+                ));
+            }
+        }
+        // the default entry's database is the default database (`DatabaseManager::GetDefaultDatabase`)
+        if let Some(first) = entries.first()
+            && let Some(database) = self.find_database(&first.database)
+        {
+            self.db = database;
+        }
+        self.search_path = entries;
+        Ok(())
+    }
+
+    /// `SchemaSetting::GetSetting`: the schema of the default entry.
+    fn default_schema_setting(&self) -> String {
+        self.search_path.first().map_or_else(
+            || crate::catalog::DEFAULT_SCHEMA.to_string(),
+            |entry| entry.schema.clone(),
+        )
+    }
+
+    /// The search path of the database `database`, for the catalog's lookups.
+    fn search_path_for(&self, database: &str) -> crate::catalog::SearchPath {
+        let mut schemas: Vec<String> = self
+            .search_path
+            .iter()
+            .filter(|entry| entry.database.eq_ignore_ascii_case(database))
+            .map(|entry| entry.schema.clone())
+            .collect();
+        let default = match self.search_path.first() {
+            Some(entry) if entry.database.eq_ignore_ascii_case(database) => entry.schema.clone(),
+            _ => crate::catalog::DEFAULT_SCHEMA.to_string(),
+        };
+        schemas.push(crate::catalog::DEFAULT_SCHEMA.to_string());
+        crate::catalog::SearchPath { default, schemas }
     }
 
     /// `PhysicalAttach`.
@@ -1643,12 +1837,34 @@ impl ClientContext {
         }
         let path = evaluate_scalar(&bind_constant_expression(&self.catalog(), &info.path)?)?.try_to_string()?;
         let mut options = AttachOptions::default();
-        for (name, value) in &info.options {
+        // the options given as expressions, such as `TYPE getvariable('t')`, by their values
+        let mut given: Vec<(String, duckrs_parser::ast::Literal)> = info.options.clone();
+        for (name, expression) in &info.parsed_options {
+            let catalog = self.catalog();
+            let mut binder = Binder::with_options(&catalog, self.bind_options());
+            binder.session = Some(self.session_values());
+            let value = evaluate_scalar(&binder.bind_value_expression(expression)?)?;
+            given.push((
+                name.clone(),
+                duckrs_parser::ast::Literal {
+                    kind: duckrs_parser::ast::LiteralKind::String,
+                    text: value.try_to_string()?,
+                },
+            ));
+        }
+        for (name, value) in &given {
             let text = value.text.to_lowercase();
             match name.to_lowercase().as_str() {
                 "readonly" | "read_only" => options.read_only = text != "false",
                 "readwrite" | "read_write" => options.read_only = text == "false",
                 "type" if text == "duckdb" => {}
+                // `DatabaseManager::GetDatabaseType`: a storage extension of that name
+                "type" => {
+                    return Err(Error::new(
+                        ErrorKind::Io,
+                        format!("Extension \"{text}\" not found. A storage extension named {text} is not loaded"),
+                    ));
+                }
                 // `StorageCompatibility::FromString`
                 "storage_version" => {
                     let given = value.text.clone();
@@ -1693,12 +1909,25 @@ impl ClientContext {
                     }
                     options.row_group_size = Some(size);
                 }
-                other => return Err(crate::unported(format!("ATTACH with {other}"))),
+                // `AttachOptions` and `StorageOptions::Initialize` have these
+                other @ ("recovery_mode"
+                | "default_table"
+                | "hidden"
+                | "vacuum_rebuild_indexes"
+                | "access_mode"
+                | "encryption_key"
+                | "encryption_cipher"
+                | "compress"
+                | "debug_encryption_version"
+                | "io_mode"
+                | "mmap_reserve_size") => return Err(crate::unported(format!("ATTACH with {other}"))),
+                other => {
+                    return Err(Error::new(
+                        ErrorKind::Binder,
+                        format!("Unrecognized option for attach \"{other}\""),
+                    ));
+                }
             }
-        }
-        if !info.parsed_options.is_empty() {
-            let names: Vec<&str> = info.parsed_options.iter().map(|(name, _)| name.as_str()).collect();
-            return Err(crate::unported(format!("ATTACH with {}", names.join(", "))));
         }
         let in_memory = path.is_empty() || path == ":memory:";
         // the storage extension opens the file through the opener file system
@@ -1718,6 +1947,9 @@ impl ClientContext {
             info.name.clone()
         } else if in_memory {
             DEFAULT_CATALOG.to_string()
+        } else if ["main", "temp", "system"].iter().any(|r| r.eq_ignore_ascii_case(&stem)) {
+            // `AttachedDatabase::ExtractDatabaseName`
+            format!("{stem}_db")
         } else {
             stem
         };
@@ -1741,6 +1973,13 @@ impl ClientContext {
             return Err(Error::new(
                 ErrorKind::Catalog,
                 "Cannot launch in-memory database in read-only mode!",
+            ));
+        }
+        // `DatabaseHandle`: a file that isn't there can't be opened read-only
+        if !in_memory && options.read_only && !Path::new(&path).exists() {
+            return Err(Error::new(
+                ErrorKind::Io,
+                format!("Cannot open database \"{path}\" in read-only mode: database does not exist"),
             ));
         }
         // `DatabaseFilePathManager::InsertDatabasePath`: one file, one read-write attachment
@@ -2257,21 +2496,25 @@ impl ClientContext {
                 self.variables.remove(&name.to_lowercase());
                 return Ok(Self::success());
             }
+            // `SchemaSetting` / `SearchPathSetting`, and USE, which is SET schema
             Statement::SetVariable { name, value, .. }
-                if name.eq_ignore_ascii_case("schema")
-                    && let Ok(target) = evaluate_scalar(&bind_constant_expression(&self.catalog(), value)?)
-                        .and_then(|value| value.try_to_string())
-                    && self.use_database(&target)? =>
+                if name.eq_ignore_ascii_case("schema") || name.eq_ignore_ascii_case("search_path") =>
             {
+                // the value can read the session, as `current_setting('search_path')` does
+                let catalog = self.catalog();
+                let mut binder = Binder::with_options(&catalog, self.bind_options());
+                binder.session = Some(self.session_values());
+                let target = evaluate_scalar(&binder.bind_value_expression(value)?)?.try_to_string()?;
+                self.set_search_path(name, &target)?;
                 return Ok(Self::success());
             }
-            Statement::SetVariable { name, value, .. }
-                if (name.eq_ignore_ascii_case("schema") || name.eq_ignore_ascii_case("search_path"))
-                    && let Ok(target) = evaluate_scalar(&bind_constant_expression(&self.catalog(), value)?)
-                        .and_then(|value| value.try_to_string())
-                    && let Some(error) = self.search_path_error(name, &target) =>
+            Statement::ResetVariable { name, .. }
+                if name.eq_ignore_ascii_case("schema") || name.eq_ignore_ascii_case("search_path") =>
             {
-                return Err(error);
+                // `CatalogSearchPath::Reset`
+                self.search_path.clear();
+                self.db = self.home.clone();
+                return Ok(Self::success());
             }
             Statement::Attach(info) => {
                 self.attach(info)?;
@@ -2435,6 +2678,13 @@ impl ClientContext {
                 };
                 if let Some(sql) = sql {
                     let query = duckrs_parser::parse_ast(&sql)?.remove(0);
+                    // `PRAGMA table_info('db.t')` runs in the database it names
+                    if let Some((database, routed)) = self.route_to_database(&query) {
+                        let previous = std::mem::replace(&mut self.db, database);
+                        let result = self.execute_statement(&routed);
+                        self.db = previous;
+                        return result;
+                    }
                     return self.execute_statement(&query);
                 }
                 if ["enable_logging", "disable_logging", "truncate_duckdb_logs"]
@@ -3126,7 +3376,15 @@ impl ClientContext {
                     }
                 }
                 path.push(info.name.name.clone());
-                catalog.drop_schema(&crate::catalog::schema_key(&path), info.if_exists, info.cascade)
+                catalog.drop_schema(&crate::catalog::schema_key(&path), info.if_exists, info.cascade)?;
+                // a dropped schema leaves the search path (`CatalogSearchPath::RefreshSetPaths`)
+                let database = self.db.name.clone();
+                let dropped = crate::catalog::schema_key(&path);
+                self.search_path.retain(|entry| {
+                    !(entry.database.eq_ignore_ascii_case(&database)
+                        && crate::catalog::schema_key(&[entry.schema.as_str()]) == dropped)
+                });
+                Ok(())
             }
             other => Err(crate::unported(format!("DROP {other}"))),
         }
@@ -7310,5 +7568,131 @@ mod tests {
             ),
             [["5000"]]
         );
+    }
+}
+
+/// `CatalogSearchEntry`: a schema of the search path, with the catalog it was given (or took from the default
+/// entry, empty for the default database) and the database that is.
+#[derive(Debug, Clone)]
+struct SearchEntry {
+    catalog: String,
+    database: String,
+    schema: String,
+}
+
+impl SearchEntry {
+    /// `CatalogSearchEntry::ParseInternal`: `[catalog.]schema`, parts optionally double-quoted, up to a comma.
+    fn parse_one(input: &[char], at: &mut usize) -> Result<(String, String)> {
+        let mut parts: Vec<String> = Vec::new();
+        let mut entry = String::new();
+        let parser = |message: &str| Error::new(ErrorKind::Parser, message.to_string());
+        loop {
+            let mut finished = false;
+            while *at < input.len() {
+                match input[*at] {
+                    '"' => {
+                        *at += 1;
+                        let mut closed = false;
+                        while *at < input.len() {
+                            if input[*at] == '"' {
+                                if input.get(*at + 1) == Some(&'"') {
+                                    entry.push('"');
+                                    *at += 2;
+                                    continue;
+                                }
+                                *at += 1;
+                                closed = true;
+                                break;
+                            }
+                            entry.push(input[*at]);
+                            *at += 1;
+                        }
+                        if !closed {
+                            return Err(parser("Unterminated quote in qualified name!"));
+                        }
+                    }
+                    '.' => break,
+                    ',' => {
+                        finished = true;
+                        break;
+                    }
+                    c => {
+                        entry.push(c);
+                        *at += 1;
+                    }
+                }
+            }
+            if *at >= input.len() {
+                finished = true;
+            }
+            if entry.is_empty() {
+                return Err(parser("Unexpected dot - empty CatalogSearchEntry"));
+            }
+            if parts.len() == 2 {
+                return Err(parser(
+                    "Too many dots - expected [schema] or [catalog.schema] for CatalogSearchEntry",
+                ));
+            }
+            parts.push(std::mem::take(&mut entry));
+            *at += 1;
+            if finished {
+                break;
+            }
+        }
+        Ok(match parts.len() {
+            1 => (String::new(), parts.remove(0)),
+            _ => (parts.remove(0), parts.remove(0)),
+        })
+    }
+
+    /// `CatalogSearchEntry::Parse`.
+    fn parse(input: &str) -> Result<(String, String)> {
+        let chars: Vec<char> = input.chars().collect();
+        let mut at = 0;
+        let entry = Self::parse_one(&chars, &mut at)?;
+        if at < chars.len() {
+            return Err(Error::new(
+                ErrorKind::Parser,
+                format!("Failed to convert entry \"{input}\" to CatalogSearchEntry - expected a single entry"),
+            ));
+        }
+        Ok(entry)
+    }
+
+    /// `CatalogSearchEntry::ParseList`.
+    fn parse_list(input: &str) -> Result<Vec<(String, String)>> {
+        let chars: Vec<char> = input.chars().collect();
+        let mut at = 0;
+        let mut entries = Vec::new();
+        while at < chars.len() {
+            entries.push(Self::parse_one(&chars, &mut at)?);
+        }
+        Ok(entries)
+    }
+
+    /// `CatalogSearchEntry::WriteOptionallyQuoted`.
+    fn quoted(name: &str) -> String {
+        if name.contains(['.', ',', '"']) {
+            format!("\"{}\"", name.replace('"', "\"\""))
+        } else {
+            name.to_string()
+        }
+    }
+
+    fn entry_text(catalog: &str, schema: &str) -> String {
+        if catalog.is_empty() {
+            Self::quoted(schema)
+        } else {
+            format!("{}.{}", Self::quoted(catalog), Self::quoted(schema))
+        }
+    }
+
+    /// `CatalogSearchEntry::ListToString`.
+    fn list_text(entries: &[SearchEntry]) -> String {
+        entries
+            .iter()
+            .map(|entry| Self::entry_text(&entry.catalog, &entry.schema))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 }

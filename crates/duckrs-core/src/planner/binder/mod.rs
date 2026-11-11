@@ -548,6 +548,10 @@ pub struct SessionValues {
     pub default_collation: String,
     /// `duckdb_settings()`
     pub settings: SettingList,
+    /// `CatalogSearchPath::GetSetPaths`: the schemas of the search path that was set
+    pub search_path: Vec<String>,
+    /// `current_query()`
+    pub current_query: String,
     /// `DatabaseManager::IsAttachedDatabaseFile`: the files of the attached databases
     pub database_files: Box<dyn Fn() -> Vec<std::path::PathBuf> + Send + Sync>,
 }
@@ -958,6 +962,13 @@ fn statement_kind(statement: &Statement) -> String {
 pub fn bind_constant_expression(catalog: &Catalog, expr: &duckrs_parser::ast::Expr) -> Result<BoundExpr> {
     let mut binder = Binder::new(catalog);
     binder.bind_expression(expr)
+}
+
+impl Binder<'_> {
+    /// An expression without a FROM clause, as the value of a SET.
+    pub fn bind_value_expression(&mut self, expr: &duckrs_parser::ast::Expr) -> Result<BoundExpr> {
+        self.bind_expression(expr)
+    }
 }
 
 // Ported from `ExpressionBinder::PushCollation` and the collation handling of
