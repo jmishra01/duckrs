@@ -6,7 +6,7 @@
 use crate::STANDARD_VECTOR_SIZE;
 use crate::types::LogicalType;
 use crate::value::Value;
-use crate::vector::{DataChunk, SelectionVector, StringCopy};
+use crate::vector::{DataChunk, StringCopy};
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -59,6 +59,16 @@ impl ColumnDataCollection {
 
     /// Appends the rows of `chunk`, topping up the last chunk before starting a new one.
     pub fn append(&mut self, chunk: &DataChunk) {
+        self.append_with(chunk, StringCopy::Deep);
+    }
+
+    /// [`Self::append`], with the strings left in the buffers of `chunk`, which the collection then
+    /// keeps alive: for a collection that only cuts rows into chunks (the row group a scan read).
+    pub fn append_shared(&mut self, chunk: &DataChunk) {
+        self.append_with(chunk, StringCopy::Reference);
+    }
+
+    fn append_with(&mut self, chunk: &DataChunk, strings: StringCopy) {
         assert_eq!(chunk.types(), self.types, "appended chunk has the wrong types");
         let mut done = 0;
         while done < chunk.len() {
@@ -68,9 +78,8 @@ impl ColumnDataCollection {
             let target = self.chunks.last_mut().expect("just ensured");
             let offset = target.len();
             let n = (chunk.len() - done).min(STANDARD_VECTOR_SIZE - offset);
-            let sel = SelectionVector::from_vec((done..done + n).map(|i| i as u32).collect());
             for (column, source) in target.columns_mut().iter_mut().zip(chunk.columns()) {
-                column.copy_from(source, &sel, n, offset, StringCopy::Deep);
+                column.copy_range_from(source, done, n, offset, strings);
             }
             target.set_len(offset + n);
             done += n;
@@ -212,7 +221,7 @@ impl fmt::Display for ColumnDataCollection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vector::Vector;
+    use crate::vector::{SelectionVector, Vector};
 
     fn chunk_of(start: i32, n: usize) -> DataChunk {
         let mut chunk = DataChunk::with_capacity(&[LogicalType::INTEGER, LogicalType::VARCHAR], n.max(1));
@@ -340,5 +349,28 @@ mod tests {
         assert_eq!(c.len(), 6000);
         c.reset();
         assert!(c.is_empty());
+    }
+
+    #[test]
+    fn shared_appends_keep_strings_and_nulls() {
+        let mut source = Vector::new(LogicalType::VARCHAR, 5000);
+        for row in 0..5000 {
+            if row % 7 == 0 {
+                source.set_null(row, true);
+            } else {
+                source.set_str(row, format!("a string longer than twelve bytes {row}").as_bytes());
+            }
+        }
+        let chunk = DataChunk::from_columns(vec![source], 5000);
+        let mut shared = ColumnDataCollection::new(vec![LogicalType::VARCHAR]);
+        shared.append_shared(&chunk);
+        let mut deep = ColumnDataCollection::new(vec![LogicalType::VARCHAR]);
+        deep.append(&chunk);
+        drop(chunk);
+        assert_eq!(shared.len(), 5000);
+        for row in [0, 1, 2047, 2048, 4999] {
+            assert_eq!(shared.get_value(0, row), deep.get_value(0, row));
+        }
+        assert!(shared.get_value(0, 2051).is_null());
     }
 }

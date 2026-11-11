@@ -280,10 +280,10 @@ impl TableCursor {
             let skipped = local.min(full);
             let mut kept = ColumnDataCollection::new(self.types.clone());
             for chunk in self.buffer.chunks().skip(skipped) {
-                kept.append(chunk);
+                kept.append_shared(chunk);
             }
             self.first_chunk += skipped;
-            kept.append(&self.source.read_group(self.next_group, &self.columns)?);
+            kept.append_shared(&self.source.read_group(self.next_group, &self.columns)?);
             self.buffer = kept;
             self.next_group += 1;
         }

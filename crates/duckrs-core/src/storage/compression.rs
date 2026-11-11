@@ -176,6 +176,55 @@ fn unpack(data: &[u8], count: usize, width: usize, what: &str) -> Result<Vec<u12
     Ok((0..count).map(|i| read_bits(data, i * width, width)).collect())
 }
 
+/// [`unpack`] of values of at most 57 bits into values of at most 8 bytes, with the frame (and for
+/// DELTA_FOR the running sum) added: each value is read with one unaligned load of the 8 bytes at its
+/// first byte, and written at its width.
+#[allow(clippy::too_many_arguments, reason = "the parts of a FOR group")]
+fn unpack_narrow(
+    packed: &[u8],
+    rows: usize,
+    packed_width: usize,
+    frame: u64,
+    delta: bool,
+    mut carry: u64,
+    width: usize,
+    out: &mut Vec<u8>,
+) {
+    let mask = if packed_width == 0 {
+        0
+    } else {
+        u64::MAX >> (64 - packed_width)
+    };
+    let start = out.len();
+    out.resize(start + rows * width, 0);
+    let target = &mut out[start..];
+    let load = |bit: usize| -> u64 {
+        let at = bit / 8;
+        let mut word = [0u8; 8];
+        let available = packed.len().saturating_sub(at).min(8);
+        word[..available].copy_from_slice(&packed[at..at + available]);
+        (u64::from_le_bytes(word) >> (bit % 8)) & mask
+    };
+    macro_rules! write_all {
+        ($ty:ty) => {{
+            for (row, slot) in target.chunks_exact_mut(std::mem::size_of::<$ty>()).enumerate() {
+                let mut value = load(row * packed_width).wrapping_add(frame);
+                if delta {
+                    carry = value.wrapping_add(carry);
+                    value = carry;
+                }
+                slot.copy_from_slice(&(value as $ty).to_le_bytes());
+            }
+        }};
+    }
+    match width {
+        1 => write_all!(u8),
+        2 => write_all!(u16),
+        4 => write_all!(u32),
+        _ => write_all!(u64),
+    }
+}
+
 /// `BitpackingScanPartial`. A segment is groups of 2048 values, each with its own mode, and a table
 /// at the end of where they are, last group first.
 pub fn scan_bitpacking(segment: &[u8], count: usize, width: usize, out: &mut Vec<u8>) -> Result<()> {
@@ -256,6 +305,21 @@ pub fn scan_bitpacking(segment: &[u8], count: usize, width: usize, out: &mut Vec
                     (0, width * 2)
                 };
                 let packed = data.get(header..).ok_or_else(|| out_of_bounds("a bitpacking group"))?;
+                if packed_width <= 57 && width <= 8 {
+                    // the common case: each value is in the 8 bytes at its first byte
+                    bytes(packed, 0, packed_size(rows, packed_width), "a bitpacking group")?;
+                    unpack_narrow(
+                        packed,
+                        rows,
+                        packed_width,
+                        frame as u64,
+                        mode == DELTA_FOR,
+                        carry as u64,
+                        width,
+                        out,
+                    );
+                    continue;
+                }
                 for value in unpack(packed, rows, packed_width, "a bitpacking group")? {
                     let value = value.wrapping_add(frame);
                     if mode == DELTA_FOR {

@@ -453,7 +453,7 @@ impl PhysicalOperator for PhysicalTableScan {
             return Ok(());
         }
         let mut group = ColumnDataCollection::new(state.types.clone());
-        group.append(&state.source.read_group(index, &state.read)?);
+        group.append_shared(&state.source.read_group(index, &state.read)?);
         let first_chunk = index * self.table.chunks_per_row_group();
         for (local, chunk) in group.chunks().enumerate() {
             let first_row = (first_chunk + local) * STANDARD_VECTOR_SIZE;
