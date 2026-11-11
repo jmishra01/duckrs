@@ -145,7 +145,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] unshredded VARIANT columns, in the file and the WAL
   - [ ] shredded VARIANT columns (~20 files), shredded GEOMETRY columns, Patas and Chimp segments (8), `read_duckdb` (8)
   - [ ] string and list-length statistics for `stats()` (~10 files), per-column `USING COMPRESSION`
-- [ ] 10. `ATTACH`/`DETACH` and multi-database features (`sql/attach`: 48 failing, 51.0%)
+- [ ] 10. `ATTACH`/`DETACH` and multi-database features (`sql/attach`: 47 failing, 52.5%)
   - [x] the search path (`CatalogSearchPath`): `SET schema`, `SET search_path`, `USE`, RESET; unqualified names
     looked up along it and created in its default schema; `current_schema(s)`, `current_query()`, SHOW SCHEMAS
   - [x] COPY, casts to a database's types and `PRAGMA table_info('db.t')` run in the database they name
