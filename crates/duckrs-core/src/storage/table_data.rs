@@ -714,7 +714,98 @@ impl DiskTable {
     }
 }
 
+impl DiskTable {
+    /// [`TableSource::fetch_rows`] of a fixed-width column of a group without deletes: the rows read
+    /// from their segments, those that can be read on their own (constant, uncompressed, bit-packed)
+    /// without decoding the others. `None` for what this does not cover.
+    fn fetch_fixed_rows(&self, group: usize, column: usize, rows: &[u32]) -> Result<Option<Vector>> {
+        let ty = &self.table.columns[column].ty;
+        let physical = ty.physical_type();
+        let Some(width) = fixed_width(physical) else {
+            return Ok(None);
+        };
+        if self.alive[group].is_some() || ty.id() == LogicalTypeId::Variant || physical == PhysicalType::Bool {
+            return Ok(None);
+        }
+        let stored = self.persistent_column(group, column)?;
+        let group_rows = self.table.row_groups[group].tuple_count as usize;
+        check_rows(&stored, group_rows)?;
+        let mut data = Vec::with_capacity(rows.len() * width);
+        let mut start = 0usize;
+        let mut at = 0usize;
+        let mut local = Vec::new();
+        for pointer in &stored.pointers {
+            let count = pointer.tuple_count;
+            local.clear();
+            while at < rows.len() && (rows[at] as usize) < start + count {
+                local.push(rows[at] - start as u32);
+                at += 1;
+            }
+            if !local.is_empty() {
+                match pointer.compression {
+                    COMPRESSION_CONSTANT => scan_constant(&pointer.statistics, local.len(), width, &mut data)?,
+                    COMPRESSION_UNCOMPRESSED => {
+                        let handle = segment(&self.buffer, pointer)?;
+                        let segment = &handle[pointer.offset..];
+                        for &row in &local {
+                            data.extend_from_slice(bytes(segment, row as usize * width, width, "a value")?);
+                        }
+                    }
+                    COMPRESSION_BITPACKING => {
+                        let handle = segment(&self.buffer, pointer)?;
+                        bitpacking_rows(&handle[pointer.offset..], count, width, &local, &mut data)?;
+                    }
+                    _ => {
+                        let mut all = Vec::with_capacity(count * width);
+                        scan_fixed(&self.buffer, pointer, physical, width, &mut all)?;
+                        for &row in &local {
+                            data.extend_from_slice(bytes(&all, row as usize * width, width, "a value")?);
+                        }
+                    }
+                }
+            }
+            start += count;
+        }
+        if at < rows.len() {
+            return Err(corrupt("a row past the rows of a column"));
+        }
+        let mut vector = Vector::new(ty.clone(), rows.len().max(1));
+        fill_vector(&mut vector, &data)?;
+        // the NULLs, if the statistics of the validity allow any
+        let validity = stored
+            .validity
+            .as_ref()
+            .ok_or_else(|| corrupt("a column has no validity"))?;
+        if validity.pointers.iter().any(|p| p.statistics.has_null) {
+            let valid = scan_validity_column(&self.buffer, validity, group_rows)?;
+            for (position, &row) in rows.iter().enumerate() {
+                if !valid[row as usize] {
+                    vector.set_null(position, true);
+                }
+            }
+        }
+        Ok(Some(vector))
+    }
+}
+
 impl TableSource for DiskTable {
+    fn fetch_rows(&self, group: usize, column: usize, rows: &[u32]) -> Result<Vector> {
+        // rows one by one only pay off when few are wanted; otherwise the column is decoded whole
+        let group_rows = self.table.row_groups[group].tuple_count as usize;
+        if rows.len() * 4 <= group_rows
+            && let Some(vector) = self.fetch_fixed_rows(group, column, rows)?
+        {
+            return Ok(vector);
+        }
+        let chunk = self.read_group(group, &[column])?;
+        let mut vector = chunk.column(0).clone();
+        // all the rows, in order: the column as it is
+        let all = rows.len() == chunk.len() && rows.iter().enumerate().all(|(i, &row)| row as usize == i);
+        if !all {
+            vector.slice(&SelectionVector::from_vec(rows.to_vec()), rows.len());
+        }
+        Ok(vector)
+    }
     fn row_count(&self) -> usize {
         self.rows
     }

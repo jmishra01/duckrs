@@ -11,7 +11,7 @@ use duckrs_common::STANDARD_VECTOR_SIZE;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::string_util::similarity_rating;
 use duckrs_common::types::{LogicalType, LogicalTypeId};
-use duckrs_common::vector::{DataChunk, Vector};
+use duckrs_common::vector::{DataChunk, SelectionVector, Vector};
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast::{Expr, MacroFunction, SelectStatement, sql_identifier, sql_quoted_identifier};
 use parking_lot::{Mutex, RwLock};
@@ -145,6 +145,19 @@ pub trait TableSource: std::fmt::Debug + Send + Sync {
     fn group_rows(&self, group: usize) -> usize;
     /// The rows of a group, with `columns` of the table in that order.
     fn read_group(&self, group: usize, columns: &[usize]) -> Result<DataChunk>;
+    /// Rows `rows` (ascending) of `column` of a group (`ColumnData::Select`): what a scan reads once a
+    /// filter has left only some rows. Unless the source can read rows on their own, the group's column
+    /// is read and the rows taken from it.
+    fn fetch_rows(&self, group: usize, column: usize, rows: &[u32]) -> Result<Vector> {
+        let chunk = self.read_group(group, &[column])?;
+        let mut vector = chunk.column(0).clone();
+        // all the rows, in order: the column as it is
+        let all = rows.len() == chunk.len() && rows.iter().enumerate().all(|(i, &row)| row as usize == i);
+        if !all {
+            vector.slice(&SelectionVector::from_vec(rows.to_vec()), rows.len());
+        }
+        Ok(vector)
+    }
     /// All of it.
     fn read_all(&self) -> Result<ColumnDataCollection>;
     /// What the file says about the values of the table's columns, without reading them.

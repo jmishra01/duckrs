@@ -219,6 +219,9 @@ struct TableScanState {
     cursor: Option<FileScan>,
     /// How far an index scan got in `index_rows`.
     next_index_row: usize,
+    /// A filtered scan of a table in its file, a row group at a time: the next group, and the chunks
+    /// of the last one that are still to come.
+    filtered: Option<(usize, std::collections::VecDeque<DataChunk>)>,
 }
 
 /// What a scan reads of a file. `column_ids` lists all columns for the filter and the projection to
@@ -392,6 +395,110 @@ impl PhysicalTableScan {
     }
 }
 
+/// The positions in `column_ids` that an expression reads.
+fn referenced_positions(expr: &BoundExpr) -> Vec<usize> {
+    let mut positions = Vec::new();
+    expr.clone().walk_mut(&mut |e| {
+        if let BoundExprKind::Reference(position) = e.kind
+            && !positions.contains(&position)
+        {
+            positions.push(position);
+        }
+    });
+    positions
+}
+
+impl PhysicalTableScan {
+    /// `TableScanState` with table filters, on a row group of a table in its file: the conjuncts of the
+    /// filter one by one (those of one column first), each reading its columns only for the rows the ones
+    /// before kept (`ColumnData::Select`), then the columns of the output for the rows left, in chunks.
+    #[allow(clippy::too_many_arguments, reason = "the parts of a scan of one row group")]
+    fn scan_group_filtered(
+        &self,
+        source: &dyn TableSource,
+        group: usize,
+        first_row: usize,
+        group_rows: usize,
+        ids: &RowIds,
+        emit: &mut dyn FnMut(DataChunk) -> Result<()>,
+    ) -> Result<()> {
+        let filter = self.filter.as_ref().expect("a filtered scan has a filter");
+        let mut conjuncts: Vec<(&BoundExpr, Vec<usize>)> = match &filter.kind {
+            BoundExprKind::Conjunction { and: true, children } => {
+                children.iter().map(|c| (c, referenced_positions(c))).collect()
+            }
+            _ => vec![(filter, referenced_positions(filter))],
+        };
+        conjuncts.sort_by_key(|(_, positions)| positions.len());
+        let type_of = |position: usize| -> LogicalType {
+            match self.column_ids[position] {
+                COLUMN_IDENTIFIER_ROW_ID => LogicalType::BIGINT,
+                column => self.table.columns[column].ty.clone(),
+            }
+        };
+        let fetch = |position: usize, selection: &[u32]| -> Result<Vector> {
+            match self.column_ids[position] {
+                COLUMN_IDENTIFIER_ROW_ID => {
+                    let mut ids = ids.vector(first_row, group_rows)?;
+                    ids.slice(&SelectionVector::from_vec(selection.to_vec()), selection.len());
+                    Ok(ids)
+                }
+                column => source.fetch_rows(group, column, selection),
+            }
+        };
+        let mut selection: Vec<u32> = (0..group_rows as u32).collect();
+        let mut fetched: Vec<Option<Vector>> = vec![None; self.column_ids.len()];
+        for (conjunct, positions) in conjuncts {
+            for &position in &positions {
+                if fetched[position].is_none() {
+                    fetched[position] = Some(fetch(position, &selection)?);
+                }
+            }
+            let mut kept: Vec<u32> = Vec::with_capacity(selection.len());
+            for start in (0..selection.len()).step_by(STANDARD_VECTOR_SIZE) {
+                let count = STANDARD_VECTOR_SIZE.min(selection.len() - start);
+                let columns = (0..self.column_ids.len())
+                    .map(|position| match &fetched[position] {
+                        Some(vector) => vector.range(start, count),
+                        None => Vector::constant_null(type_of(position)),
+                    })
+                    .collect();
+                let chunk = DataChunk::from_columns(columns, count);
+                let (sel, matched) = select(conjunct, &chunk)?;
+                kept.extend((0..matched).map(|i| (start + sel.get(i)) as u32));
+            }
+            if kept.len() < selection.len() {
+                let keep = SelectionVector::from_vec(kept.clone());
+                for vector in fetched.iter_mut().flatten() {
+                    vector.slice(&keep, kept.len());
+                }
+                selection = kept.iter().map(|&k| selection[k as usize]).collect();
+            }
+            if selection.is_empty() {
+                return Ok(());
+            }
+        }
+        let output: Vec<usize> = match &self.projection {
+            Some(positions) => positions.clone(),
+            None => (0..self.column_ids.len()).collect(),
+        };
+        for &position in &output {
+            if fetched[position].is_none() {
+                fetched[position] = Some(fetch(position, &selection)?);
+            }
+        }
+        for start in (0..selection.len()).step_by(STANDARD_VECTOR_SIZE) {
+            let count = STANDARD_VECTOR_SIZE.min(selection.len() - start);
+            let columns = output
+                .iter()
+                .map(|&position| fetched[position].as_ref().expect("fetched above").range(start, count))
+                .collect();
+            emit(DataChunk::from_columns(columns, count))?;
+        }
+        Ok(())
+    }
+}
+
 /// What the threads of a [`PhysicalTableScan`] of a table in its file share.
 struct ParallelFileScan {
     source: Arc<dyn TableSource>,
@@ -452,6 +559,12 @@ impl PhysicalOperator for PhysicalTableScan {
         if !state.groups.get(index).is_none_or(|g| *g) {
             return Ok(());
         }
+        if self.filter.is_some() {
+            let group_rows = state.source.group_rows(index);
+            let first_row = index * self.table.chunks_per_row_group() * STANDARD_VECTOR_SIZE;
+            let rows = group_rows.min(state.rows.saturating_sub(first_row));
+            return self.scan_group_filtered(&*state.source, index, first_row, rows, &state.ids, emit);
+        }
         let mut group = ColumnDataCollection::new(state.types.clone());
         group.append_shared(&state.source.read_group(index, &state.read)?);
         let first_chunk = index * self.table.chunks_per_row_group();
@@ -503,8 +616,19 @@ impl PhysicalOperator for PhysicalTableScan {
     fn source_state(&self) -> SourceState {
         let remaining = self.table.row_count();
         let groups = groups_to_scan(&self.table, &self.column_ids, self.filter.as_ref(), remaining);
-        let cursor = self.table.source().map(|source| self.file_scan(source));
+        let source = self.table.source();
+        let cursor = source.clone().map(|source| self.file_scan(source));
         let ids = self.table.row_ids(remaining);
+        // a filter on a table in its file is applied while its row groups are read
+        let group_rows = self.table.row_group_size();
+        let filtered = source
+            .filter(|source| {
+                self.filter.is_some()
+                    && self.index_rows.is_none()
+                    && group_rows.is_multiple_of(STANDARD_VECTOR_SIZE)
+                    && TableCursor::is_aligned(&**source, group_rows)
+            })
+            .map(|_| (0, std::collections::VecDeque::new()));
         Box::new(TableScanState {
             ids,
             next: 0,
@@ -512,6 +636,7 @@ impl PhysicalOperator for PhysicalTableScan {
             groups,
             cursor,
             next_index_row: 0,
+            filtered,
         })
     }
     fn row_groups_scanned(&self) -> Option<(usize, usize)> {
@@ -530,9 +655,33 @@ impl PhysicalOperator for PhysicalTableScan {
             groups,
             cursor,
             next_index_row,
+            filtered,
         } = state.downcast_mut().expect("table scan state");
         if let Some(rows) = &self.index_rows {
             return self.next_index_chunk(rows, next_index_row);
+        }
+        if let Some((next_group, pending)) = filtered {
+            let source = self.table.source().expect("a filtered scan reads a file");
+            let rows = *remaining;
+            loop {
+                if let Some(chunk) = pending.pop_front() {
+                    return Ok(Some(chunk));
+                }
+                if *next_group >= source.group_count() {
+                    return Ok(None);
+                }
+                let group = *next_group;
+                *next_group += 1;
+                let first_row = group * self.table.chunks_per_row_group() * STANDARD_VECTOR_SIZE;
+                if first_row >= rows || !groups.get(group).is_none_or(|g| *g) {
+                    continue;
+                }
+                let group_rows = source.group_rows(group).min(rows - first_row);
+                self.scan_group_filtered(&*source, group, first_row, group_rows, ids, &mut |chunk| {
+                    pending.push_back(chunk);
+                    Ok(())
+                })?;
+            }
         }
         while *remaining > 0 {
             // all chunks but the last are full, so that a chunk tells where its rows are

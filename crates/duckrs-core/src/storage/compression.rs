@@ -70,7 +70,7 @@ fn out_of_bounds(what: &str) -> Error {
 }
 
 /// A sub-slice, which fails rather than panics if the file is damaged.
-fn bytes<'a>(data: &'a [u8], offset: usize, size: usize, what: &str) -> Result<&'a [u8]> {
+pub(super) fn bytes<'a>(data: &'a [u8], offset: usize, size: usize, what: &str) -> Result<&'a [u8]> {
     offset
         .checked_add(size)
         .and_then(|end| data.get(offset..end))
@@ -238,6 +238,116 @@ fn unpack_narrow(
         4 => write_all!(u32),
         _ => write_all!(u64),
     }
+}
+
+/// `BitpackingFetchRow` for many rows: the values of `rows` (ascending, from the segment's start) of a
+/// bit-packed segment, read one by one where the mode allows (CONSTANT, CONSTANT_DELTA and FOR of up to
+/// 57 bits); otherwise the segment is decoded once and the rows taken from it.
+pub fn bitpacking_rows(segment: &[u8], count: usize, width: usize, rows: &[u32], out: &mut Vec<u8>) -> Result<()> {
+    const HEADER_SIZE: usize = 8;
+    const CONSTANT: u32 = 2;
+    const CONSTANT_DELTA: u32 = 3;
+    const FOR: u32 = 5;
+    let mut decoded: Option<Vec<u8>> = None;
+    let mut take_decoded = |row: usize, out: &mut Vec<u8>| -> Result<()> {
+        if decoded.is_none() {
+            let mut all = Vec::with_capacity(count * width);
+            scan_bitpacking(segment, count, width, &mut all)?;
+            decoded = Some(all);
+        }
+        let all = decoded.as_ref().expect("just decoded");
+        out.extend_from_slice(bytes(all, row * width, width, "a bitpacked value")?);
+        Ok(())
+    };
+    let group_count = count.div_ceil(METADATA_GROUP_SIZE);
+    let metadata_end = u64_at(segment, 0, "the header of a bitpacked segment")? as usize;
+    let table_start = metadata_end
+        .checked_sub(group_count * 4)
+        .filter(|&start| start >= HEADER_SIZE)
+        .ok_or_else(|| corrupted("Corrupted bitpacking segment: offset is outside the segment"))?;
+    let bits = width * 8;
+    let mask = if bits == 128 { u128::MAX } else { (1 << bits) - 1 };
+    let number = |data: &[u8], at: usize| -> Result<u128> {
+        let mut value = [0; 16];
+        value[..width].copy_from_slice(bytes(data, at, width, "a value of a bitpacking group")?);
+        Ok(u128::from_le_bytes(value))
+    };
+    // the FOR group of the last row: its index, frame, width and packed values
+    let mut current: Option<(usize, u128, usize, &[u8])> = None;
+    for &row in rows {
+        let row = row as usize;
+        if row >= count {
+            return Err(out_of_bounds("a bitpacked row"));
+        }
+        let index = row / METADATA_GROUP_SIZE;
+        let local = row % METADATA_GROUP_SIZE;
+        if let Some((group, frame, packed_width, packed)) = current
+            && group == index
+        {
+            let packed_mask = if packed_width == 0 {
+                0
+            } else {
+                u64::MAX >> (64 - packed_width)
+            };
+            let value = u128::from(load_bits(packed, local * packed_width, packed_mask)).wrapping_add(frame);
+            out.extend_from_slice(&(value & mask).to_le_bytes()[..width]);
+            continue;
+        }
+        let encoded = u32_at(
+            segment,
+            table_start + (group_count - 1 - index) * 4,
+            "bitpacking metadata",
+        )?;
+        let (offset, mode) = ((encoded & 0xFFFFFF) as usize, encoded >> 24);
+        let end = if index + 1 < group_count {
+            (u32_at(
+                segment,
+                table_start + (group_count - 2 - index) * 4,
+                "bitpacking metadata",
+            )? & 0xFFFFFF) as usize
+        } else {
+            table_start
+        };
+        if offset < HEADER_SIZE || offset > end || end > table_start {
+            return Err(corrupted(
+                "Corrupted bitpacking segment: group offsets do not describe a range in the data region",
+            ));
+        }
+        let data = &segment[offset..end];
+        let value = match mode {
+            CONSTANT => number(data, 0)?,
+            CONSTANT_DELTA => {
+                let (frame, delta) = (number(data, 0)?, number(data, width)?);
+                delta.wrapping_mul(local as u128).wrapping_add(frame)
+            }
+            FOR if width <= 8 => {
+                let frame = number(data, 0)?;
+                let packed_width = number(data, width)? as usize;
+                if packed_width > 57 {
+                    take_decoded(row, out)?;
+                    continue;
+                }
+                let packed = data
+                    .get(width * 2..)
+                    .ok_or_else(|| out_of_bounds("a bitpacking group"))?;
+                let rows_here = METADATA_GROUP_SIZE.min(count - index * METADATA_GROUP_SIZE);
+                bytes(packed, 0, packed_size(rows_here, packed_width), "a bitpacking group")?;
+                current = Some((index, frame, packed_width, packed));
+                let packed_mask = if packed_width == 0 {
+                    0
+                } else {
+                    u64::MAX >> (64 - packed_width)
+                };
+                u128::from(load_bits(packed, local * packed_width, packed_mask)).wrapping_add(frame)
+            }
+            _ => {
+                take_decoded(row, out)?;
+                continue;
+            }
+        };
+        out.extend_from_slice(&(value & mask).to_le_bytes()[..width]);
+    }
+    Ok(())
 }
 
 /// `BitpackingScanPartial`. A segment is groups of 2048 values, each with its own mode, and a table
