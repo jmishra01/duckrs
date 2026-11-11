@@ -1,0 +1,6 @@
+┌─────────────────┐
+│    databases    │
+│                 │
+│ memory (memory) │
+│ other  (memory) │
+└─────────────────┘

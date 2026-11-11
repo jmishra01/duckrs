@@ -1921,7 +1921,9 @@ impl Binder<'_> {
                         // C++ backs each UNIQUE, PRIMARY KEY and FOREIGN KEY with an index
                         Value::bigint((table.indexes.read().len() + backing_indexes) as i64),
                         Value::bigint(checks as i64),
-                        null_text(),
+                        // `TableCatalogEntry::ToSQL`
+                        crate::storage::table_create_sql(&listed.schema, table)
+                            .map_or_else(|_| null_text(), |sql| text(&sql)),
                     ]);
                 }
                 (

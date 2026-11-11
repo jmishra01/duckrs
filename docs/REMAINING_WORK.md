@@ -254,7 +254,25 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] the `query_tree` text output, `duckdb_available_metrics()`, `enable_profiling()` / `disable_profiling()`
     as table functions, the profiler log entries
 - [ ] 41. **C API** (`duckrs-capi`): implement `duckdb.h`, then pass `test/api/capi/*`. There is no code for this yet.
-- [ ] 42. **CLI shell**: rustyline, `.mode` box renderer, `.timer`, `.read`, `.import`, autocomplete. There is no code for this yet.
+- [ ] 42. **CLI shell** (`crates/duckrs-cli`, the `duckrs` binary). Against `tools/shell/tests` it passes
+  150 of `test_shell_basics` (C++ 1.5.6: 141), all of `test_dump`, `test_errors`, `test_import`,
+  `test_table_metadata_rendering` and `test_shell_rendering`
+  - [x] batch and interactive input (rustyline, history in `~/.duckdb_history`, highlighting as you type),
+    the command-line options, `-c`/`-s`/`-cmd`/`-f`/`-init`/`~/.duckdbrc`, bail, echo, safe mode
+  - [x] every output mode: duckbox (`box_renderer.rs`, a port of `box_renderer.cpp`), box, column, table,
+    markdown, latex, line, list, tabs, csv, html, tcl, ascii, quote, json, jsonlines, insert, trash
+  - [x] the dot commands but those listed below; `.tables`, `.databases` and DESCRIBE draw table
+    metadata (`shell_render_table_metadata.cpp`); error and SQL highlighting (`shell_highlight.cpp`)
+  - [x] `_` as the last result (through the new `Connection::add_replacement_scan`); opening or attaching a
+    Parquet, CSV or JSON file (`OpenFileStorageExtension`); COPY to and from stdin, stdout and stderr
+  - [ ] EXPLAIN and `query_tree` profiling need the engine's text tree renderer (`text_tree_renderer.cpp`),
+    which prints `RANGE` boxes where the engine prints an indented plan
+  - [ ] `getenv` and `shell_history` (functions the shell extension registers; needs item 49), `-serve` /
+    `-connect` (the quack protocol), agent mode, `.manual`, `.edit`, `.excel`, `.log`, the pager,
+    `.progress_bar`, `.prompt`, autocomplete, highlighting of duckbox results, the `.help` layout,
+    `pragma_version` / `version()` (the shell prints the crate version)
+  - [ ] engine gaps the tests reach: `SET TimeZone` (ICU, item 50), `integer_division`,
+    `preserve_identifier_case`, `lock_configuration`, CSV cardinality estimates for pipes
 - [ ] 43. **Rust API** (`crates/duckrs`)
   - [x] `Appender` (rows into a table, flushed as an INSERT: constraints, triggers and the WAL as for any INSERT)
   - [x] Arrow `RecordBatch` export with C++'s default types (`Connection::query_arrow`, `record_batches`)

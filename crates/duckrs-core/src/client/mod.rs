@@ -190,10 +190,42 @@ impl DatabaseInstance {
         Self::open_with(path, &options)
     }
 
+    /// `OpenFileStorageAttach`: a data file a reader reads (Parquet, CSV, JSON) opens as an in-memory
+    /// database with the views `file` and the file's stem, which read it.
+    fn open_data_file(path: &Path, options: &AttachOptions) -> Result<Arc<Self>> {
+        let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        // `x.csv.gz`: the stem without the format either
+        let name = name.split('.').next().unwrap_or(&name).to_string();
+        let mut db = Self::with_file_access(None);
+        db.name.clone_from(&name);
+        if let Some(settings) = &options.settings {
+            db.settings = settings.clone();
+        }
+        let schema = db
+            .catalog
+            .get_schema(crate::catalog::DEFAULT_SCHEMA)
+            .ok_or_else(|| Error::new(ErrorKind::Internal, "an in-memory database has a main schema"))?;
+        let file = path.to_string_lossy().replace('\'', "''");
+        let Some(Statement::Select(query)) = duckrs_parser::parse_ast(&format!("SELECT * FROM '{file}'"))?.pop() else {
+            return Err(Error::new(ErrorKind::Internal, "SELECT * FROM a file is a query"));
+        };
+        let mut views = vec!["file".to_string()];
+        if !name.eq_ignore_ascii_case("file") {
+            views.push(name);
+        }
+        for view in views {
+            schema.create_view(&view, query.clone(), Vec::new(), OnCreateConflict::Error, Vec::new())?;
+        }
+        Ok(Arc::new(db))
+    }
+
     /// `open_file` with what `ATTACH` can ask for.
     pub fn open_with(path: &Path, options: &AttachOptions) -> Result<Arc<Self>> {
         crate::function::json::register_projjson_parser();
         let read_only = options.read_only;
+        if storage::is_open_file(path) {
+            return Self::open_data_file(path, options);
+        }
         if read_only && !storage::is_database_file(path) {
             return Ok(Self::new());
         }
@@ -764,6 +796,8 @@ pub struct ClientContext {
     current_query: String,
     /// the rows of an `Appender` that is flushing
     appended: Option<crate::planner::binder::AppendedRows>,
+    /// `DBConfig::replacement_scans` of this connection
+    replacement_scans: crate::planner::binder::ReplacementScans,
     /// its temporary objects, which the `temp` catalog holds in C++
     temp: Arc<SchemaCatalogEntry>,
     /// the connection's logger (`ClientContext::logger`), which `write_log` finds by its id
@@ -775,14 +809,17 @@ pub struct ClientContext {
     statement_transaction: u64,
     /// `ClientConfig::enable_profiler`: whether queries are profiled, in the `enable_profiling` format
     profiling: bool,
-    /// what the plan of the statement being profiled did: its phases and its operators
     /// the tables whose triggers are running, which run no triggers again (`trigger_expanded_tables`)
     trigger_tables: Vec<String>,
-    pending_profile: Option<(
-        Vec<(String, std::time::Duration)>,
-        Option<crate::execution::profiler::ProfileNode>,
-    )>,
+    /// what the plan of the statement being profiled did: its phases and its operators
+    pending_profile: Option<PendingProfile>,
 }
+
+/// The phases (with their times) and the operator tree of a profiled statement.
+type PendingProfile = (
+    Vec<(String, std::time::Duration)>,
+    Option<crate::execution::profiler::ProfileNode>,
+);
 
 /// A transaction started with BEGIN.
 #[derive(Debug)]
@@ -896,6 +933,7 @@ impl ClientContext {
             search_path: Vec::new(),
             current_query: String::new(),
             appended: None,
+            replacement_scans: Default::default(),
             temp: SessionTemp::new_schema(),
             log_target,
             log_target_id,
@@ -979,6 +1017,7 @@ impl ClientContext {
             search_path: self.search_path.iter().map(|entry| entry.schema.clone()).collect(),
             current_query: self.current_query.clone(),
             appended: self.appended.clone(),
+            replacement_scans: self.replacement_scans.0.clone(),
             open_database: {
                 let home = self.home.clone();
                 Arc::new(move |path: &str| {
@@ -1110,6 +1149,11 @@ impl ClientContext {
             .iter()
             .map(|column| (column.name.to_string(), column.ty.clone()))
             .collect())
+    }
+
+    /// Adds a replacement scan: tables the catalog does not have that `scan` gives rows for.
+    pub fn add_replacement_scan(&mut self, scan: crate::planner::binder::ReplacementScan) {
+        self.replacement_scans.0.push(scan);
     }
 
     /// `ClientContext::Append`: rows of the table's types into the table, as an INSERT of them.

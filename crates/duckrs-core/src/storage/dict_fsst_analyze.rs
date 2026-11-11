@@ -279,7 +279,7 @@ impl State {
     fn try_add_index_only(&mut self) -> bool {
         loop {
             let mut growth = 0;
-            if self.mode != Mode::EncodedAllUnique && self.tuple_count % 32 == 0 {
+            if self.mode != Mode::EncodedAllUnique && self.tuple_count.is_multiple_of(32) {
                 growth = packed_size(32, self.indices_width);
             }
             if self.required + growth <= self.available() {

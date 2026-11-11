@@ -1,0 +1,9 @@
+ ─ thisisanenormousdatabasenamethatmightoverflowthetablerenderingmechanism ─ 
+ ────────────────────────────────── main ─────────────────────────────────── 
+┌───────────┐
+│    tbl    │
+│           │
+│ i integer │
+│           │
+│  0 rows   │
+└───────────┘

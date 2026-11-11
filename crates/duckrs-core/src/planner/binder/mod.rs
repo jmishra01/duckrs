@@ -557,6 +557,8 @@ pub struct SessionValues {
     pub open_database: OpenDatabase,
     /// the rows an `Appender` flushes: the names and types of its columns, and its chunks
     pub appended: Option<AppendedRows>,
+    /// the client's replacement scans: rows for a table name the catalog does not have
+    pub replacement_scans: Vec<ReplacementScan>,
     /// `DatabaseManager::IsAttachedDatabaseFile`: the files of the attached databases
     pub database_files: Box<dyn Fn() -> Vec<std::path::PathBuf> + Send + Sync>,
 }
@@ -567,6 +569,20 @@ pub type AppendedRows = (
     Vec<LogicalType>,
     Arc<Vec<duckrs_common::vector::DataChunk>>,
 );
+
+/// `ReplacementScan`: for a table name, the rows to read in its place (names, types and chunks), if
+/// the scan has any.
+pub type ReplacementScan = Arc<dyn Fn(&str) -> Option<Result<AppendedRows>> + Send + Sync>;
+
+/// The replacement scans of a connection.
+#[derive(Clone, Default)]
+pub struct ReplacementScans(pub Vec<ReplacementScan>);
+
+impl std::fmt::Debug for ReplacementScans {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ReplacementScans({})", self.0.len())
+    }
+}
 
 /// Opens a database file read-only: its catalog, and what keeps it open.
 pub type OpenDatabase = Arc<dyn Fn(&str) -> Result<(Arc<Catalog>, Arc<dyn std::any::Any + Send + Sync>)> + Send + Sync>;

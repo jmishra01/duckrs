@@ -1,0 +1,37 @@
+ ────────────────────────────────────────────── memory ─────────────────────────────────────────────── 
+ ─────────────────────────────────────────────── main ──────────────────────────────────────────────── 
+┌─────────────────────────┐┌─────────────────────────┐┌───────────────────────┐┌──────────────────────┐
+│        lineitem         ││         orders          ││         part          ││       customer       │
+│                         ││                         ││                       ││                      │
+│ l_orderkey      bigint  ││ o_orderkey      bigint  ││ p_partkey     bigint  ││ c_custkey    bigint  │
+│ l_partkey       bigint  ││ o_custkey       bigint  ││ p_name        varchar ││ c_name       varchar │
+│ l_suppkey       bigint  ││ o_orderstatus   varchar ││ p_mfgr        varchar ││ c_address    varchar │
+│ l_linenumber    bigint  ││ o_totalprice    decimal ││ p_brand       varchar ││ c_nationkey  integer │
+│ l_quantity      decimal ││ o_orderdate     date    ││ p_type        varchar ││ c_phone      varchar │
+│ l_extendedprice decimal ││ o_orderpriority varchar ││ p_size        integer ││ c_acctbal    decimal │
+│ l_discount      decimal ││ o_clerk         varchar ││ p_container   varchar ││ c_mktsegment varchar │
+│ l_tax           decimal ││ o_shippriority  integer ││ p_retailprice decimal ││ c_comment    varchar │
+│ l_returnflag    varchar ││ o_comment       varchar ││ p_comment     varchar ││                      │
+│ l_linestatus    varchar ││                         ││                       ││        0 rows        │
+│ l_shipdate      date    ││         0 rows          ││        0 rows         │└──────────────────────┘
+│ l_commitdate    date    │└─────────────────────────┘└───────────────────────┘
+│ l_receiptdate   date    │                                                    
+│ l_shipinstruct  varchar │                                                    
+│ l_shipmode      varchar │                                                    
+│ l_comment       varchar │                                                    
+│                         │                                                    
+│         0 rows          │                                                    
+└─────────────────────────┘                                                    
+┌─────────────────────┐┌───────────────────────┐┌─────────────────────┐┌─────────────────────┐
+│      supplier       ││       partsupp        ││       nation        ││       region        │
+│                     ││                       ││                     ││                     │
+│ s_suppkey   bigint  ││ ps_partkey    bigint  ││ n_nationkey integer ││ r_regionkey integer │
+│ s_name      varchar ││ ps_suppkey    bigint  ││ n_name      varchar ││ r_name      varchar │
+│ s_address   varchar ││ ps_availqty   bigint  ││ n_regionkey integer ││ r_comment   varchar │
+│ s_nationkey integer ││ ps_supplycost decimal ││ n_comment   varchar ││                     │
+│ s_phone     varchar ││ ps_comment    varchar ││                     ││       0 rows        │
+│ s_acctbal   decimal ││                       ││       0 rows        │└─────────────────────┘
+│ s_comment   varchar ││        0 rows         │└─────────────────────┘
+│                     │└───────────────────────┘                       
+│       0 rows        │                                                
+└─────────────────────┘                                                

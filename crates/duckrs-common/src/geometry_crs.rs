@@ -218,11 +218,8 @@ impl WktParser<'_> {
             let mut children = Vec::new();
             for (open, close) in [(b'[', b']'), (b'(', b')')] {
                 if self.try_match(open) {
-                    loop {
-                        match self.node()? {
-                            Some(child) => children.push(child),
-                            None => break,
-                        }
+                    while let Some(child) = self.node()? {
+                        children.push(child);
                         if !self.try_match(b',') {
                             break;
                         }

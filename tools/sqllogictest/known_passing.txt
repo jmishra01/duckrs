@@ -813,6 +813,7 @@ test/sql/alter/add_pk/test_add_same_pk_twice.test
 test/sql/alter/add_unique/test_add_unique_wal.test
 test/sql/alter/alter_col/test_drop_not_null_primary_key.test
 test/sql/alter/alter_col/test_not_null_in_tran.test
+test/sql/alter/alter_col/test_set_collate.test
 test/sql/alter/alter_col/test_set_not_null.test
 test/sql/alter/alter_col/test_set_not_null_after_delete.test
 test/sql/alter/alter_table_if_exists_tostring.test
@@ -910,6 +911,7 @@ test/sql/attach/attach_null.test
 test/sql/attach/attach_or_replace.test
 test/sql/attach/attach_persistent.test
 test/sql/attach/attach_pragma_storage_info.test
+test/sql/attach/attach_prefetch_header.test
 test/sql/attach/attach_read_only_transaction.test
 test/sql/attach/attach_reserved.test
 test/sql/attach/attach_row_group_size.test
@@ -2116,6 +2118,7 @@ test/sql/generated_columns/virtual/foreign_key.test
 test/sql/generated_columns/virtual/foreign_key_extensive.test
 test/sql/generated_columns/virtual/from_generated_column.test
 test/sql/generated_columns/virtual/gcol_duckdb_columns.test
+test/sql/generated_columns/virtual/group_by.test
 test/sql/generated_columns/virtual/implicit_type.test
 test/sql/generated_columns/virtual/insert.test
 test/sql/generated_columns/virtual/not_referencing_columns.test
@@ -2731,6 +2734,7 @@ test/sql/peg_parser/transformer/between_asymmetric.test
 test/sql/peg_parser/transformer/is_predicate_operators.test
 test/sql/peg_parser/transformer/trim.test
 test/sql/peg_parser/transformer/use_statement.test
+test/sql/peg_parser/unterminated_literals.test
 test/sql/pg_catalog/pg_attribute.test
 test/sql/pg_catalog/pg_database.test
 test/sql/pg_catalog/pg_enum.test
@@ -3524,6 +3528,7 @@ test/sql/table_function/information_schema_types.test
 test/sql/table_function/range_cardinality_extremes.test
 test/sql/table_function/range_function_different_iterators.test
 test/sql/table_function/range_timestamp_lateral_empty.test
+test/sql/table_function/sqlite_master_quotes.test
 test/sql/table_function/test_information_schema_columns.test
 test/sql/table_function/test_range_function.test
 test/sql/table_function/test_repeat_function.test

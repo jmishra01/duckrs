@@ -121,7 +121,7 @@ impl Tokens<'_> {
             if unterminated {
                 let comment = &self.sql[start..end];
                 return Err(syntax_error(format!(
-                    "syntax error: unterminated /* comment at or near \"{comment}\""
+                    "unterminated /* comment at or near \"{comment}\""
                 )));
             }
             if end >= start + 2 && bytes[start] == b'/' && bytes[start + 1] == b'*' {
@@ -380,7 +380,7 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token>> {
         State::Operator => t.push_operator(last_pos, n)?,
         State::DollarQuotedString => t.push(last_pos, n, Some(TokenType::StringLiteral), true)?,
         State::StringLiteral => return Err(syntax_error("unterminated string literal")),
-        State::QuotedIdentifier => return Err(syntax_error("syntax error: unterminated quoted identifier")),
+        State::QuotedIdentifier => return Err(syntax_error("unterminated quoted identifier")),
         State::Keyword | State::Standard | State::Numeric if last_pos < n => {
             let word = &sql[last_pos..];
             let ty = match state {

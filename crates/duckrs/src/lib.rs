@@ -110,6 +110,18 @@ impl Connection {
         })
     }
 
+    /// Adds a replacement scan (`DBConfig::replacement_scans`): for a table name the catalog does not have,
+    /// `scan` may give the rows to read instead, as column names, types and chunks.
+    pub fn add_replacement_scan(
+        &mut self,
+        scan: impl Fn(&str) -> Option<Result<(Vec<String>, Vec<LogicalType>, std::sync::Arc<Vec<DataChunk>>)>>
+        + Send
+        + Sync
+        + 'static,
+    ) {
+        self.context.add_replacement_scan(std::sync::Arc::new(scan));
+    }
+
     /// Runs a prepared statement with values for its parameters, in order.
     pub fn execute(&mut self, statement: &PreparedStatement, values: &[Value]) -> Result<QueryResult> {
         self.context.execute_prepared(&statement.data, values)

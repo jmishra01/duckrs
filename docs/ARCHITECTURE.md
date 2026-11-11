@@ -32,7 +32,7 @@ has an obvious Rust home:
 | `duckrs-main` | `src/main` | 3, 12 | `duckrs-core::client` |
 | `duckrs` | public API facade | 0 | crate |
 | `duckrs-capi` | `src/main/capi`, `duckdb.h` | 12 | |
-| `duckrs-cli` | `tools/shell` | 12 | |
+| `duckrs-cli` | `tools/shell` | 12 | crate (the `duckrs` binary) |
 | `sqllogictest` | `test/sqlite` | 0 | crate |
 
 Dependencies point downward only:
@@ -806,6 +806,36 @@ Not ported: `json_serialize_sql` and its kin, `json_serialize_plan`, GeoJSON, `j
 4096 levels, which C++ doesn't limit, and the parser recurses.
 
 The gate is not met: `test/sql/copy` is at about 51% against 85%, now that the Parquet tests in it run.
+
+## Shell (`duckrs-cli`)
+
+The `duckrs` binary ports `tools/shell`. `main.rs` holds `ShellState`: the command-line options
+(two passes, as C++: those needed to open the database, then the rest after the init file),
+`ProcessInput` (lines are gathered until a statement ends in a `;` outside quotes and comments,
+and a line starting with `.` is a dot command), and `ExecuteStatement`. Each statement runs on its
+own through `Connection::query`. The statement's kind (from `duckrs_parser`) decides whether its
+result is rows to show: DDL, `SET` and the like answer with an empty `Success` column, and INSERT,
+UPDATE and DELETE with a `Count` that only `.changes` reports.
+
+- `commands.rs`: the dot commands, in the C++ table order, found by prefix with the same minimum
+  lengths (`.sep` is `.separator`).
+- `renderers.rs`: the output modes other than duckbox (`ColumnRenderer` and `RowRenderer`): column,
+  table, markdown, box, latex, line, list, tabs, csv, html, tcl, ascii, quote, json, jsonlines, insert.
+- `box_renderer.rs`: `src/common/box_renderer.cpp`, the default duckbox mode.
+- `table_metadata.rs`: `shell_render_table_metadata.cpp`, used by `.tables`, `.databases` and DESCRIBE.
+- `highlight.rs`: `shell_highlight.cpp`: colours for errors and results.
+
+Two engine hooks exist for the shell. `Connection::add_replacement_scan` gives rows for a table
+name the catalog does not have; the shell uses it for `_`, the last result (`ShellScanLastResult`).
+Opening or attaching a Parquet, CSV or JSON file makes an in-memory database with the views `file`
+and the file's stem (`OpenFileStorageExtension`), in `DatabaseInstance::open_with`.
+
+Interactive input goes through `rustyline`, with the history in `~/.duckdb_history` (or
+`$DUCKDB_HISTORY`). The shell's pytest suite (`duckdb/tools/shell/tests`) runs against the binary:
+
+```
+cd ../duckdb && PYTHONPATH=. pytest tools/shell/tests --shell-binary ../duckrs/target/release/duckrs
+```
 
 ## Testing
 
