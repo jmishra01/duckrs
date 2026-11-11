@@ -537,15 +537,17 @@ impl Pipeline<'_> {
                     break;
                 }
                 let profiler = profiler::current();
-                let mut started = std::time::Instant::now();
+                let mut started = profiler.as_ref().map(|_| std::time::Instant::now());
                 self.source.parallel_chunks(&shared, index, &mut |chunk| {
-                    if let Some(profiler) = &profiler {
+                    if let (Some(profiler), Some(started)) = (&profiler, started) {
                         profiler.record(self.source, started.elapsed(), &chunk, profiler::is_scan(self.source));
                     }
                     self.push_into(chunk, 0, &mut states, &mut |chunk| {
                         self.sink.sink_local_input(self.input, &mut local, index, chunk)
                     })?;
-                    started = std::time::Instant::now();
+                    if started.is_some() {
+                        started = Some(std::time::Instant::now());
+                    }
                     Ok(())
                 })?;
             }

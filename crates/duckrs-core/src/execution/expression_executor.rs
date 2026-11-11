@@ -845,8 +845,11 @@ pub fn select(expr: &BoundExpr, input: &DataChunk) -> Result<(SelectionVector, u
             if remaining.is_empty() {
                 break;
             }
-            let rows = slice_rows(input, &remaining);
-            let (selected, count) = select(child, &rows)?;
+            let (selected, count) = if remaining.len() == input.len() {
+                select(child, input)?
+            } else {
+                select(child, &slice_rows(input, &remaining))?
+            };
             if count == remaining.len() {
                 continue;
             }

@@ -340,8 +340,26 @@ fn scan_validity_column(buffer: &BufferManager, column: &PersistentColumn, rows:
 /// Stores `data`'s values in a vector of native values of type `T`.
 fn fill<T: NativeType, const N: usize>(vector: &mut Vector, data: &[u8], read: impl Fn(&[u8; N]) -> T) {
     let target = vector.data_mut::<T>();
+    // a little-endian machine stores the integers and floats as the file does: one copy
+    if cfg!(target_endian = "little") && std::mem::size_of::<T>() == N && N != 1 {
+        let count = target.len().min(data.len() / N);
+        // SAFETY: `T` here is an integer or a float of N bytes (fill_vector does Bool and Interval
+        // apart), so any N bytes are a valid `T`, and `count` values fit in both `target` and `data`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), target.as_mut_ptr().cast::<u8>(), count * N);
+        }
+        return;
+    }
     for (target, source) in target.iter_mut().zip(data.chunks_exact(N)) {
         *target = read(source.try_into().expect("N bytes"));
+    }
+}
+
+/// [`fill`] for INTERVAL, whose three fields go one by one.
+fn fill_interval(vector: &mut Vector, data: &[u8], read: impl Fn(&[u8; 16]) -> Interval) {
+    let target = vector.data_mut::<Interval>();
+    for (target, source) in target.iter_mut().zip(data.chunks_exact(16)) {
+        *target = read(source.try_into().expect("16 bytes"));
     }
 }
 
@@ -361,7 +379,7 @@ pub(super) fn fill_vector(vector: &mut Vector, data: &[u8]) -> Result<()> {
         PhysicalType::Double => fill::<f64, 8>(vector, data, |b| f64::from_le_bytes(*b)),
         PhysicalType::Int128 => fill::<i128, 16>(vector, data, |b| i128::from_le_bytes(*b)),
         PhysicalType::UInt128 => fill::<u128, 16>(vector, data, |b| u128::from_le_bytes(*b)),
-        PhysicalType::Interval => fill::<Interval, 16>(vector, data, |b| Interval {
+        PhysicalType::Interval => fill_interval(vector, data, |b| Interval {
             months: i32::from_le_bytes(b[..4].try_into().expect("4 bytes")),
             days: i32::from_le_bytes(b[4..8].try_into().expect("4 bytes")),
             micros: i64::from_le_bytes(b[8..].try_into().expect("8 bytes")),
@@ -461,7 +479,14 @@ fn scan_column_as(
         .validity
         .as_ref()
         .ok_or_else(|| corrupt("a column has no validity"))?;
-    let valid = scan_validity_column(buffer, validity, rows)?;
+    // the statistics of the validity segments say whether there are NULLs to read
+    let no_nulls = ty.id() != LogicalTypeId::Variant && validity.pointers.iter().all(|p| !p.statistics.has_null);
+    let valid = if no_nulls {
+        check_rows(validity, rows)?;
+        Vec::new()
+    } else {
+        scan_validity_column(buffer, validity, rows)?
+    };
     if ty.id() == LogicalTypeId::Variant {
         let unshredded = duckrs_common::variant::unshredded_type();
         let child = column
