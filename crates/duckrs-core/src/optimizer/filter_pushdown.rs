@@ -10,7 +10,9 @@
 //! filters; its transitive filters and ranges are not ported.
 
 use super::conjunction_of;
-use super::rewriter::{can_throw, expressions_equal, fold_boolean, rewrite_expression, split_conjuncts};
+use super::rewriter::{
+    can_throw, contains_barrier, expressions_equal, fold_boolean, rewrite_expression, split_conjuncts,
+};
 use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{JoinCondition, LogicalOperator, LogicalOperatorKind};
 use duckrs_common::value::Value;
@@ -128,6 +130,22 @@ impl FilterPushdown {
     }
 
     fn rewrite(mut self, mut op: LogicalOperator) -> LogicalOperator {
+        // `BarrierCanPassThrough`: an operator that can remove rows keeps the barred filters on top of it
+        let passes = matches!(
+            op.kind,
+            LogicalOperatorKind::Filter { .. }
+                | LogicalOperatorKind::Projection { .. }
+                | LogicalOperatorKind::Order { .. }
+                | LogicalOperatorKind::Get { .. }
+        );
+        if !passes && self.filters.iter().any(|f| contains_barrier(&f.filter)) {
+            let (barred, rest): (Vec<Filter>, Vec<Filter>) = std::mem::take(&mut self.filters)
+                .into_iter()
+                .partition(|f| contains_barrier(&f.filter));
+            self.filters = rest;
+            let result = self.rewrite(op);
+            return add_filter_operator(result, barred.into_iter().map(|f| f.filter).collect());
+        }
         match &op.kind {
             LogicalOperatorKind::Aggregate { .. } => self.pushdown_aggregate(op),
             LogicalOperatorKind::Filter { .. } => {
@@ -379,7 +397,13 @@ impl FilterPushdown {
         let projected = expressions.clone();
         let mut below = FilterPushdown::default();
         let mut remaining = Vec::new();
+        let mut barred = Vec::new();
         for mut f in self.filters {
+            // a barrier goes below only if all the others do, so that it is evaluated after them
+            if contains_barrier(&f.filter) {
+                barred.push(f);
+                continue;
+            }
             let mut columns = Vec::new();
             visit_columns(&mut f.filter, &mut |e| {
                 if let BoundExprKind::ColumnRef { binding, .. } = e.kind {
@@ -401,16 +425,39 @@ impl FilterPushdown {
             let mut filter = f.filter;
             replace_columns(&mut filter, &mut |e| {
                 if let BoundExprKind::ColumnRef { binding, .. } = e.kind {
-                    let alias = std::mem::take(&mut e.alias);
+                    // the filter reads what the projection reads, by its own name
                     *e = projected[binding.column_index].clone();
-                    if !alias.is_empty() {
-                        e.alias = alias;
-                    }
                 }
             });
             if !below.add_filter(filter) {
                 return empty_result(&op);
             }
+        }
+        for mut f in barred {
+            let mut columns = Vec::new();
+            visit_columns(&mut f.filter, &mut |e| {
+                if let BoundExprKind::ColumnRef { binding, .. } = e.kind {
+                    columns.push(binding);
+                }
+            });
+            let stays = !remaining.is_empty()
+                || columns.iter().any(|b| {
+                    let entry = projected.get(b.column_index);
+                    b.table_index != table_index
+                        || entry.is_none_or(|e| e.is_volatile() || contains_subquery(e) || can_throw(e))
+                });
+            if stays {
+                remaining.push(f.filter);
+                continue;
+            }
+            let mut filter = f.filter;
+            replace_columns(&mut filter, &mut |e| {
+                if let BoundExprKind::ColumnRef { binding, .. } = e.kind {
+                    // the filter reads what the projection reads, by its own name
+                    *e = projected[binding.column_index].clone();
+                }
+            });
+            below.filters.push(Filter::new(filter));
         }
         let child = op.children.remove(0);
         op.children.push(below.rewrite(child));
@@ -497,7 +544,9 @@ fn replace_set_operation_bindings(filter: &mut BoundExpr, table_index: usize, bi
 }
 
 /// `FilterPushdown::AddLogicalFilter`.
-fn add_filter_operator(op: LogicalOperator, expressions: Vec<BoundExpr>) -> LogicalOperator {
+fn add_filter_operator(op: LogicalOperator, mut expressions: Vec<BoundExpr>) -> LogicalOperator {
+    // the barred filters run after the others
+    expressions.sort_by_key(contains_barrier);
     if expressions.is_empty() {
         return op;
     }

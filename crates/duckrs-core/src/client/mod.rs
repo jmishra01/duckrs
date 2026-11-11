@@ -253,6 +253,22 @@ impl DatabaseInstance {
         } else {
             None
         };
+        // `ROW_GROUP_SIZE`: the row groups the tables get from now on; those in the file keep the size they have
+        let group_rows = options
+            .row_group_size
+            .unwrap_or(crate::execution::zone_map::ROW_GROUP_SIZE as u64) as usize;
+        db.catalog.set_row_group_rows(group_rows);
+        for schema in db.catalog.schemas() {
+            for entry in schema.tables_and_views() {
+                if let TableOrView::Table(table) = entry {
+                    let rows = table
+                        .source()
+                        .and_then(|source| stored_group_rows(&*source))
+                        .unwrap_or(group_rows);
+                    table.row_group_rows.store(rows, AtomicOrdering::Relaxed);
+                }
+            }
+        }
         let log = Mutex::new(WriteAheadLog::new(&db.catalog).with_version(storage_version));
         db.catalog.set_storage_version(storage_version);
         db.file = Some(DatabaseFile {
@@ -1052,6 +1068,8 @@ impl ClientContext {
                 _ => ShowBehavior::Auto,
             },
             file_access: self.file_access(),
+            error_on_division_by_zero: self.setting_text("error_on_division_by_zero") != "false",
+            ieee_floating_point_ops: self.setting_text("ieee_floating_point_ops") != "false",
         }
     }
 
@@ -2111,6 +2129,9 @@ impl ClientContext {
             let mut database = DatabaseInstance::with_file_access(None);
             database.name.clone_from(&name);
             database.settings = self.home.settings.clone();
+            if let Some(rows) = options.row_group_size {
+                database.catalog.set_row_group_rows(rows as usize);
+            }
             Arc::new(database)
         } else {
             options.settings = Some(self.home.settings.clone());
@@ -7896,4 +7917,18 @@ fn check_alter_dependents(catalog: &Catalog, schema: &str, name: &str) -> Result
         ErrorKind::Dependency,
         format!("Cannot alter entry \"{name}\" because there are entries that depend on it."),
     ))
+}
+
+/// The rows of the row groups of a table in a file, if all but the last have the same number.
+fn stored_group_rows(source: &dyn crate::catalog::TableSource) -> Option<usize> {
+    let groups = source.group_count();
+    if groups < 2 {
+        return None;
+    }
+    let first = source.group_rows(0);
+    // a scan maps chunks to groups, so a group is whole chunks
+    if first == 0 || first % duckrs_common::STANDARD_VECTOR_SIZE != 0 {
+        return None;
+    }
+    ((1..groups - 1).all(|g| source.group_rows(g) == first) && source.group_rows(groups - 1) <= first).then_some(first)
 }

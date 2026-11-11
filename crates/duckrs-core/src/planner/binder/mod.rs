@@ -597,6 +597,10 @@ pub struct BindOptions {
     pub optimizer: OptimizerOptions,
     /// what files can be read and written, with `enable_external_access` off
     pub file_access: Option<crate::execution::file_system::FileAccess>,
+    /// `error_on_division_by_zero`
+    pub error_on_division_by_zero: bool,
+    /// `ieee_floating_point_ops`
+    pub ieee_floating_point_ops: bool,
 }
 
 /// What `SHOW name` looks for (`ShowBehaviorType`).
@@ -619,6 +623,8 @@ impl Default for BindOptions {
             show_behavior: ShowBehavior::Auto,
             optimizer: OptimizerOptions::default(),
             file_access: None,
+            error_on_division_by_zero: true,
+            ieee_floating_point_ops: true,
         }
     }
 }

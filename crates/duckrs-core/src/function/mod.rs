@@ -56,6 +56,10 @@ pub struct ScalarFunction {
     pub return_type: LogicalType,
     pub function: ScalarCallback,
     pub resolve_types: Option<ResolveTypesCallback>,
+    /// `error_on_division_by_zero = false` (`BindDivisionByZero`): a zero divisor gives NULL
+    pub null_on_zero: bool,
+    /// `ieee_floating_point_ops = false` (`BindBinaryFloatingPoint`): a zero divisor is an error
+    pub error_on_zero: bool,
 }
 
 impl ScalarFunction {
@@ -71,6 +75,21 @@ impl ScalarFunction {
             return_type,
             function,
             resolve_types: None,
+            null_on_zero: false,
+            error_on_zero: false,
+        }
+    }
+
+    /// This overload, with a zero divisor giving NULL, or an error.
+    pub fn with_zero_check(&self, null: bool) -> Self {
+        Self {
+            name: self.name.clone(),
+            arguments: self.arguments.clone(),
+            return_type: self.return_type.clone(),
+            function: self.function,
+            resolve_types: self.resolve_types,
+            null_on_zero: null,
+            error_on_zero: !null,
         }
     }
 
@@ -266,6 +285,31 @@ fn stats_function() -> ScalarFunctionSet {
     set
 }
 
+/// `BarrierFun`: its argument, unchanged; optimizations keep what is in it together.
+fn barrier_function() -> ScalarFunctionSet {
+    fn barrier(args: &DataChunk, result: &mut Vector) -> Result<()> {
+        *result = args.columns()[0].clone();
+        Ok(())
+    }
+    fn resolve(function: &ScalarFunction, arguments: &[LogicalType]) -> Result<ScalarFunction> {
+        Ok(ScalarFunction::new(
+            function.name.clone(),
+            arguments.to_vec(),
+            arguments.first().cloned().unwrap_or(LogicalType::SQLNULL),
+            function.function,
+        ))
+    }
+    let mut set = ScalarFunctionSet::new("__internal_barrier");
+    let function = ScalarFunction::new(
+        "__internal_barrier",
+        vec![LogicalType::new(LogicalTypeId::Any)],
+        LogicalType::new(LogicalTypeId::Any),
+        barrier,
+    );
+    set.add(function.with_resolve_types(resolve));
+    set
+}
+
 /// The `stats` function once the propagator knows the statistics: they are its second argument.
 pub fn stats_with_value(argument: LogicalType) -> ScalarFunction {
     fn filled(args: &DataChunk, result: &mut Vector) -> Result<()> {
@@ -356,6 +400,8 @@ impl BuiltinFunctions {
             functions.scalar.insert(set.name.clone(), set);
             let typeof_set = typeof_function();
             functions.scalar.insert(typeof_set.name.clone(), typeof_set);
+            let barrier_set = barrier_function();
+            functions.scalar.insert(barrier_set.name.clone(), barrier_set);
             let stats_set = stats_function();
             functions.scalar.insert(stats_set.name.clone(), stats_set);
             for set in aggregates::aggregate_functions() {

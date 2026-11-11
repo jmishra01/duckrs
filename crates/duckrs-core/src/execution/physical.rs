@@ -12,7 +12,7 @@
 use super::constraints;
 use super::expression_executor::{execute, select};
 use super::upsert::upsert;
-use super::zone_map::{CHUNKS_PER_ROW_GROUP, groups_to_scan};
+use super::zone_map::groups_to_scan;
 use crate::catalog::{
     ColumnDefinition, GeneratedColumn, OnCreateConflict, RowIds, SchemaCatalogEntry, TableCatalogEntry,
     TableConstraint, TableCursor, TableSource,
@@ -313,7 +313,7 @@ impl PhysicalTableScan {
         }
         let types = read.iter().map(|&c| self.table.columns[c].ty.clone()).collect();
         FileScan {
-            cursor: TableCursor::new(source, read, types),
+            cursor: TableCursor::new(source, read, types, self.table.row_group_size()),
             columns,
         }
     }
@@ -343,7 +343,7 @@ impl PhysicalOperator for PhysicalTableScan {
         }
         let rows = self.table.row_count();
         let chunks = rows.div_ceil(STANDARD_VECTOR_SIZE);
-        if chunks < MIN_PARALLEL_ROW_GROUPS * CHUNKS_PER_ROW_GROUP {
+        if chunks < MIN_PARALLEL_ROW_GROUPS * super::zone_map::CHUNKS_PER_ROW_GROUP {
             return None;
         }
         let groups = groups_to_scan(&self.table, &self.column_ids, self.filter.as_ref(), rows);
@@ -352,7 +352,11 @@ impl PhysicalOperator for PhysicalTableScan {
     }
     fn parallel_chunk(&self, state: &SharedSourceState, index: usize) -> Result<Option<DataChunk>> {
         let state: &ParallelTableScan = state.downcast_ref().expect("parallel scan state");
-        if !state.groups.get(index / CHUNKS_PER_ROW_GROUP).is_none_or(|g| *g) {
+        if !state
+            .groups
+            .get(index / self.table.chunks_per_row_group())
+            .is_none_or(|g| *g)
+        {
             return Ok(None);
         }
         let first_row = index * STANDARD_VECTOR_SIZE;
@@ -412,7 +416,7 @@ impl PhysicalOperator for PhysicalTableScan {
             // all chunks but the last are full, so that a chunk tells where its rows are
             let index = *next;
             let first_row = index * STANDARD_VECTOR_SIZE;
-            let wanted = groups.get(index / CHUNKS_PER_ROW_GROUP).is_none_or(|g| *g);
+            let wanted = groups.get(index / self.table.chunks_per_row_group()).is_none_or(|g| *g);
             *next += 1;
             if !wanted {
                 *remaining -= STANDARD_VECTOR_SIZE.min(*remaining);

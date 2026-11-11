@@ -353,10 +353,12 @@ test/issues/monetdb/test_round_bug.test
 test/issues/monetdb/test_simple_round.test
 test/issues/rigger/big_sum_cast_bug.test
 test/issues/rigger/collate_union.test
+test/issues/rigger/complex_division.test
 test/issues/rigger/date_get_value.test
 test/issues/rigger/decimal_int_between.test
 test/issues/rigger/delete_empty_result.test
 test/issues/rigger/division_by_rowid.test
+test/issues/rigger/division_by_zero_null.test
 test/issues/rigger/double_bigint_cast_overflow.test
 test/issues/rigger/expression_equality_bug.test
 test/issues/rigger/hugeint_div_by_zero.test
@@ -384,8 +386,10 @@ test/issues/rigger/test_514.test
 test/issues/rigger/test_515.test
 test/issues/rigger/test_516.test
 test/issues/rigger/test_517.test
+test/issues/rigger/test_518.test
 test/issues/rigger/test_521.test
 test/issues/rigger/test_522.test
+test/issues/rigger/test_523.test
 test/issues/rigger/test_525.test
 test/issues/rigger/test_526.test
 test/issues/rigger/test_527.test
@@ -442,6 +446,7 @@ test/ldbc/ldbc-empty.test
 test/optimizer/case_simplification.test
 test/optimizer/case_simplification_errors.test
 test/optimizer/column_lifetime_analyzer/must_visit_operator_expressions_first.test
+test/optimizer/column_lifetime_analyzer/summary_column_lifetime.test
 test/optimizer/common_subplan_nested_cte.test
 test/optimizer/compare_blob.test
 test/optimizer/comparison_simplification_narrowing_casts.test
@@ -489,6 +494,7 @@ test/optimizer/joins/left_join_reordering/test_reordering_left_joins.test
 test/optimizer/joins/no_cross_product_reordering.test
 test/optimizer/joins/no_duplicate_elimination_join.test
 test/optimizer/joins/not_equal_join_cardinality_estimation.test
+test/optimizer/joins/order_optimizer_bindings.test
 test/optimizer/joins/pushdown_semi_anti.test
 test/optimizer/joins/range_join_cardinality_estimation.test
 test/optimizer/joins/relation_statistics_bindings.test
@@ -538,6 +544,7 @@ test/optimizer/remove_duplicate_groups_with_stats.test
 test/optimizer/remove_unused_filter_column.test
 test/optimizer/reported_bugs/in_vs_where.test
 test/optimizer/row_number_virtual_column_local.test
+test/optimizer/statistics/constant_or_null_conjunction_effects.test
 test/optimizer/statistics/large_join_cardinality.test
 test/optimizer/statistics/positive_join_cardinality.test
 test/optimizer/statistics/statistics_aggregate.test
@@ -553,6 +560,7 @@ test/optimizer/statistics/statistics_join_arbitrary_condition.test
 test/optimizer/statistics/statistics_join_multicolumn.test
 test/optimizer/statistics/statistics_join_null.test
 test/optimizer/statistics/statistics_join_ungrouped_aggregate_limit.test
+test/optimizer/statistics/statistics_least_greatest.test
 test/optimizer/statistics/statistics_root_replaced.test
 test/optimizer/statistics/statistics_unsigned_arithmetic_pruning.test
 test/optimizer/statistics/statistics_unsigned_cast.test
@@ -1973,9 +1981,13 @@ test/sql/function/numeric/test_even.test
 test/sql/function/numeric/test_floor_ceil.test
 test/sql/function/numeric/test_gcd_lcm.test
 test/sql/function/numeric/test_geomean.test
+test/sql/function/numeric/test_invalid_math.test
+test/sql/function/numeric/test_mod.test
 test/sql/function/numeric/test_mod_min_negative_one.test
 test/sql/function/numeric/test_modulo_min_by_minus_one.test
 test/sql/function/numeric/test_nextafter.test
+test/sql/function/numeric/test_pg_math.test
+test/sql/function/numeric/test_pow.test
 test/sql/function/numeric/test_random.test
 test/sql/function/numeric/test_round.test
 test/sql/function/numeric/test_round_double_exact_midpoint.test
@@ -2536,6 +2548,10 @@ test/sql/merge/merge_multi_match_error.test
 test/sql/merge/merge_not_matched_by_source_join_order.test
 test/sql/optimizer/anti_join_empty_rhs_projection_map.test
 test/sql/optimizer/any_extremum_rewrite.test
+test/sql/optimizer/barrier_row_group_pruning.test
+test/sql/optimizer/boolean_row_group_pruning.test
+test/sql/optimizer/case_zonemap_pruning.test
+test/sql/optimizer/coalesce_zonemap_pruning.test
 test/sql/optimizer/distinct_sibling_column_pruning.test
 test/sql/optimizer/distinctness_statistics.test
 test/sql/optimizer/distinctness_statistics_nested.test
@@ -2554,6 +2570,7 @@ test/sql/optimizer/expression/test_in_clause_simplification.test
 test/sql/optimizer/expression/test_indistinct_aggregates.test
 test/sql/optimizer/expression/test_move_constants.test
 test/sql/optimizer/expression/test_move_constants_overflow.test
+test/sql/optimizer/expression/test_nop_arithmetic.test
 test/sql/optimizer/expression/test_time_ns_cast_comparison.test
 test/sql/optimizer/expression/test_timestamp_offset.test
 test/sql/optimizer/expression/uncommitted_appends_fold_guard.test
@@ -2572,12 +2589,15 @@ test/sql/optimizer/predicate_factoring.test
 test/sql/optimizer/pushdown_extract_multiple_filters.test
 test/sql/optimizer/remove_unused_columns_nested_struct_cast.test
 test/sql/optimizer/rewrite_nan_null.test
+test/sql/optimizer/sign_row_group_pruning.test
 test/sql/optimizer/string_stats_merge_truncated_prefix.test
 test/sql/optimizer/struct_extract_struct_pack_collation.test
+test/sql/optimizer/sum_aggregate_stats_propagation.test
 test/sql/optimizer/test_common_subplan_aggregate_columns.test
 test/sql/optimizer/test_common_subplan_cte_binding_order.test
 test/sql/optimizer/test_common_subplan_nested_bindings.test
 test/sql/optimizer/test_common_subplan_overlapping_columns.test
+test/sql/optimizer/test_common_subplan_projection_columns.test
 test/sql/optimizer/test_common_subplan_projection_maps.test
 test/sql/optimizer/test_common_subplan_repeatability_readers.test
 test/sql/optimizer/test_common_subplan_scan_filters.test
@@ -3636,6 +3656,7 @@ test/sql/types/bignum/issue25939.test
 test/sql/types/bignum/test_big_bignum.test
 test/sql/types/bignum/test_bignum_boundaries.test
 test/sql/types/bignum/test_bignum_comparisons.test
+test/sql/types/bignum/test_bignum_divide.test
 test/sql/types/bignum/test_bignum_double.test
 test/sql/types/bignum/test_bignum_float_combine.test
 test/sql/types/bignum/test_bignum_float_string_cast.test
@@ -3644,6 +3665,7 @@ test/sql/types/bignum/test_bignum_from_non_finite.test
 test/sql/types/bignum/test_bignum_hugeint.test
 test/sql/types/bignum/test_bignum_implicit_cast.test
 test/sql/types/bignum/test_bignum_large_varchar.test
+test/sql/types/bignum/test_bignum_modulo.test
 test/sql/types/bignum/test_bignum_multiply.test
 test/sql/types/bignum/test_bignum_not_cast.test
 test/sql/types/bignum/test_bignum_subtract.test
@@ -3901,6 +3923,7 @@ test/sql/types/nested/test_deeply_nested_types.test
 test/sql/types/nested/unnest_range_plan.test
 test/sql/types/null/test_boolean_null.test
 test/sql/types/null/test_is_null.test
+test/sql/types/null/test_null.test
 test/sql/types/null/test_null_aggr.test
 test/sql/types/null/test_null_cast.test
 test/sql/types/numeric/arithmetic_vector_types.test

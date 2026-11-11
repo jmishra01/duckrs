@@ -708,7 +708,40 @@ pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
             })
         }
         BoundExprKind::Function { function, children, .. } => {
-            let arguments = children.iter().map(|c| execute(c, input)).collect::<Result<Vec<_>>>()?;
+            let mut arguments = children.iter().map(|c| execute(c, input)).collect::<Result<Vec<_>>>()?;
+            // `BinaryNumericDivideWrapper<true>`: a row divided by zero is NULL
+            if (function.null_on_zero || function.error_on_zero) && arguments.len() == 2 {
+                let divisor = &arguments[1];
+                let ty = divisor.logical_type().clone();
+                let zero = crate::execution::parquet::try_cast_value(&Value::integer(0), &ty);
+                let mut nulled = Vector::new(ty.clone(), count.max(1));
+                let mut changed = false;
+                for row in 0..count {
+                    let value = divisor.get_value(row);
+                    let is_zero = zero.as_ref().is_some_and(|zero| {
+                        crate::optimizer::statistics::compare_values(
+                            duckrs_parser::ast::ComparisonOp::Equal,
+                            &value,
+                            zero,
+                        ) == Some(true)
+                    });
+                    if is_zero && function.error_on_zero {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "Division by zero in expression {expr}. Use TRY(...) to return NULL for this \
+                                 expression, or SET error_on_division_by_zero=false to return NULL for all divisions \
+                                 by zero."
+                            ),
+                        ));
+                    }
+                    changed |= is_zero;
+                    nulled.set_value(row, &if is_zero { Value::null(ty.clone()) } else { value })?;
+                }
+                if changed {
+                    arguments[1] = nulled;
+                }
+            }
             let arguments = DataChunk::from_columns(arguments, count);
             let mut result = Vector::new(expr.return_type.clone(), count.max(1));
             (function.function)(&arguments, &mut result).map_err(|error| {

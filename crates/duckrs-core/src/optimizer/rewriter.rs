@@ -682,9 +682,23 @@ const INFALLIBLE_FUNCTIONS: &[&str] = &[
     "year",
     "month",
     "day",
+    "quarter",
+    "sign",
+    "left",
+    "dayofmonth",
+    "dayofweek",
+    "dayofyear",
+    "hour",
+    "minute",
 ];
 
 /// `Expression::CanThrow`, leaning towards true.
+/// `ExpressionBarrier::Contains`.
+pub(crate) fn contains_barrier(expr: &BoundExpr) -> bool {
+    matches!(&expr.kind, BoundExprKind::Function { function, .. } if function.name == "__internal_barrier")
+        || expr.children().into_iter().any(contains_barrier)
+}
+
 pub(crate) fn can_throw(expr: &BoundExpr) -> bool {
     let own = match &expr.kind {
         BoundExprKind::Subquery { .. } | BoundExprKind::ListLambda { .. } | BoundExprKind::Sequence { .. } => true,
@@ -694,7 +708,13 @@ pub(crate) fn can_throw(expr: &BoundExpr) -> bool {
                 && children
                     .iter()
                     .all(|c| matches!(c.return_type.id(), LogicalTypeId::Float | LogicalTypeId::Double));
-            !floating && !INFALLIBLE_FUNCTIONS.contains(&function.name.as_str())
+            // a division by a constant that is neither 0 nor -1 can't divide by zero or overflow
+            let safe_division = matches!(function.name.as_str(), "/" | "//" | "%")
+                && children.len() == 2
+                && matches!(&children[1].kind, BoundExprKind::Constant(value)
+                    if !value.is_null()
+                        && value.try_to_string().ok().and_then(|t| t.parse::<f64>().ok()).is_some_and(|v| v != 0.0 && v != -1.0));
+            !floating && !safe_division && !INFALLIBLE_FUNCTIONS.contains(&function.name.as_str())
         }
         _ => false,
     };

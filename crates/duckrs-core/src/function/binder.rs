@@ -149,7 +149,7 @@ pub fn bind_scalar_function(
     // `FunctionNullHandling::SPECIAL_HANDLING`: the function decides what a NULL argument means
     let special_nulls = matches!(
         function.name.as_str(),
-        "string_split" | "str_split" | "string_to_array" | "split" | "stats"
+        "string_split" | "str_split" | "string_to_array" | "split" | "stats" | "__internal_barrier"
     );
     if special_nulls {
         let function = match function.resolve_types {
