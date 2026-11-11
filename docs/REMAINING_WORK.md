@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 4200 of 6367 test files pass (**69.4%** of the 6048 that run). The v1 target is ≥ 90%.
+- Overall: 4211 of 6367 test files pass (**69.6%** of the 6048 that run). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -166,6 +166,12 @@ Each item gives the number of failing files in `test/` that it should fix, where
 
 - [ ] 14. Filter pushdown and pullup (`optimizer/pushdown`: 29 failing, 32.6%)
 - [ ] 15. Statistics propagation (`optimizer/statistics`: 32 failing, 37.3%)
+  - [x] row groups of the database's `ROW_GROUP_SIZE`; zone maps through CASE, COALESCE, greatest/least,
+    arithmetic with constants, month/quarter, prefix, left, sign, two-column comparisons
+  - [x] statistics of least/greatest, of sum (rows times the bounds), min and max; `constant_or_null` keeps both
+    sides as C++
+  - [ ] string statistics (contains, suffix, upper/lower, length), struct/list/map extracts, `vector_type`,
+    EXPLAIN ANALYZE metrics of other operators (~190 EXPLAIN-shape files under `test/optimizer`, `sql/optimizer`)
 - [ ] 16. Join order and cardinality estimation (`optimizer/joins`: 14 failing)
 - [ ] 17. Column lifetime, unused columns, TopN, expression rewriter (small dirs under `test/optimizer`)
 - [ ] 18. Optimizer-dependent SQL tests (`sql/optimizer`: 114 failing, 32.7%)

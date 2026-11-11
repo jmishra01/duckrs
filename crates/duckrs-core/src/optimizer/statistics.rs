@@ -20,7 +20,7 @@ use crate::execution::run_plan;
 use crate::function::binder::bind_aggregate_function;
 use crate::function::{BuiltinFunctions, constant_or_null};
 use crate::planner::column_binding_resolver::resolve_column_bindings;
-use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, ColumnBinding};
+use crate::planner::expression::{BoundAggregate, BoundExpr, BoundExprKind, BoundOperator, ColumnBinding};
 use crate::planner::logical::{COLUMN_IDENTIFIER_ROW_ID, LogicalOperator, LogicalOperatorKind as K};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::Value;
@@ -770,13 +770,12 @@ impl StatisticsPropagator {
             return unknown();
         }
         if let Some(answer) = decide(op, &left_stats, &right_stats) {
-            let mut sides = Vec::new();
-            if left_stats.can_be_null {
-                sides.push((**left).clone());
-            }
-            if right_stats.can_be_null {
-                sides.push((**right).clone());
-            }
+            // `FILTER_TRUE_OR_NULL` / `FILTER_FALSE_OR_NULL`: NULL with either side, which both stay
+            let sides = if left_stats.can_be_null || right_stats.can_be_null {
+                vec![(**left).clone(), (**right).clone()]
+            } else {
+                Vec::new()
+            };
             Self::settle(expr, answer, sides, in_filter);
         }
         Stats {
@@ -939,6 +938,56 @@ impl StatisticsPropagator {
             unreachable!()
         };
         let mut stats: Vec<Stats> = children.iter_mut().map(|c| self.expression(c, false)).collect();
+        // `PropagateLeastGreatestStats`: one of the inputs; only those that are never NULL anchor the far side
+        if matches!(function.name.as_str(), "least" | "greatest")
+            && !children.is_empty()
+            && return_type.is_numeric()
+            && stats.iter().all(|s| s.min.is_some() && s.max.is_some())
+        {
+            let least = function.name == "least";
+            let pick = |a: Option<Value>, b: Option<Value>, keep_smaller: bool| {
+                if keep_smaller { smaller(a, b) } else { larger(a, b) }
+            };
+            let (mut loose, mut anchored, mut fallback): (Option<Value>, Option<Value>, Option<Value>) =
+                (None, None, None);
+            let mut has_nonnull = false;
+            for child in &stats {
+                let (loose_value, anchored_value) = if least {
+                    (child.min.clone(), child.max.clone())
+                } else {
+                    (child.max.clone(), child.min.clone())
+                };
+                loose = if loose.is_none() {
+                    loose_value.clone()
+                } else {
+                    pick(loose, loose_value, least)
+                };
+                fallback = if fallback.is_none() {
+                    anchored_value.clone()
+                } else {
+                    pick(fallback, anchored_value.clone(), !least)
+                };
+                if !child.can_be_null {
+                    has_nonnull = true;
+                    anchored = if anchored.is_none() {
+                        anchored_value
+                    } else {
+                        pick(anchored, anchored_value, least)
+                    };
+                }
+            }
+            if !has_nonnull {
+                anchored = fallback;
+            }
+            let (min, max) = if least { (loose, anchored) } else { (anchored, loose) };
+            return Stats {
+                min,
+                max,
+                can_be_null: !has_nonnull,
+                can_be_valid: true,
+                geometry: None,
+            };
+        }
         // `StatsPropagateStats`: `stats()` gets the statistics of its argument as a constant
         if function.name == "stats" && children.len() == 1 {
             let argument = children[0].return_type.clone();
@@ -1331,13 +1380,22 @@ impl StatisticsPropagator {
             }
             K::Aggregate {
                 group_index,
+                aggregate_index,
                 groups,
                 grouping_sets,
+                aggregates,
                 ..
             } if grouping_sets.len() <= 1 && grouping_sets.iter().all(|set| set.len() == groups.len()) => {
                 for (index, group) in groups.iter().enumerate() {
                     if let BoundExprKind::ColumnRef { binding, depth: 0 } = &group.kind {
                         self.aliases.insert(ColumnBinding::new(*group_index, index), *binding);
+                    }
+                }
+                let (aggregate_index, aggregates) = (*aggregate_index, aggregates.clone());
+                let rows = max_cardinality(&op.children[0]);
+                for (index, aggregate) in aggregates.iter().enumerate() {
+                    if let Some(stats) = self.aggregate_stats(aggregate, rows) {
+                        self.stats.insert(ColumnBinding::new(aggregate_index, index), stats);
                     }
                 }
             }
@@ -1359,6 +1417,59 @@ impl StatisticsPropagator {
             }
             _ => {}
         }
+    }
+}
+
+/// The most rows an operator can give, where that is known (`NodeStatistics::max_cardinality`).
+fn max_cardinality(op: &LogicalOperator) -> Option<u64> {
+    match &op.kind {
+        K::Get { table, .. } => Some(table.row_count() as u64),
+        K::Filter { .. } | K::Projection { .. } => op.children.first().and_then(max_cardinality),
+        _ => None,
+    }
+}
+
+impl StatisticsPropagator {
+    /// `SumPropagateStats`: a sum of integers lies between the smallest and largest value times the rows.
+    fn aggregate_stats(&mut self, aggregate: &BoundAggregate, rows: Option<u64>) -> Option<Stats> {
+        if aggregate.children.len() != 1 {
+            return None;
+        }
+        let child = &aggregate.children[0];
+        // `MinMaxPropagateStats`: the smallest or largest value is one of the values
+        if matches!(aggregate.function.name.as_str(), "min" | "max") && aggregate.return_type == child.return_type {
+            let mut stats = self.expression(&mut child.clone(), false);
+            stats.can_be_null = true;
+            return (stats.min.is_some() && stats.max.is_some()).then_some(stats);
+        }
+        if aggregate.function.name != "sum" || aggregate.distinct {
+            return None;
+        }
+        let boolean = child.return_type.id() == LogicalTypeId::Boolean;
+        if !(child.return_type.is_integral() || boolean) || !aggregate.return_type.is_integral() {
+            return None;
+        }
+        let rows = i128::from(rows?);
+        let stats = self.expression(&mut child.clone(), false);
+        let as_int = |value: &Option<Value>| match value.as_ref()?.data() {
+            duckrs_common::value::ValueData::Bool(b) => Some(i128::from(*b)),
+            _ => value.as_ref()?.try_to_string().ok()?.parse::<i128>().ok(),
+        };
+        let (low, high) = (as_int(&stats.min)?, as_int(&stats.max)?);
+        let (wide_low, wide_high) = (low.checked_mul(rows)?, high.checked_mul(rows)?);
+        let min = if low <= 0 { wide_low } else { low };
+        let max = if high >= 0 { wide_high } else { high };
+        let cast = |n: i128| {
+            let value = BoundExpr::constant(Value::hugeint(n)).cast_to(&aggregate.return_type, false);
+            crate::execution::expression_executor::try_evaluate_scalar(&value)
+        };
+        Some(Stats {
+            min: cast(min),
+            max: cast(max),
+            can_be_null: true,
+            can_be_valid: true,
+            geometry: None,
+        })
     }
 }
 
