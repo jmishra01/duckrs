@@ -255,7 +255,13 @@ Each item gives the number of failing files in `test/` that it should fix, where
     as table functions, the profiler log entries
 - [ ] 41. **C API** (`duckrs-capi`): implement `duckdb.h`, then pass `test/api/capi/*`. There is no code for this yet.
 - [ ] 42. **CLI shell**: rustyline, `.mode` box renderer, `.timer`, `.read`, `.import`, autocomplete. There is no code for this yet.
-- [ ] 43. **Rust API**: `Appender`, streaming results, Arrow `RecordBatch` export, `Relation` API. There is no code for this yet.
+- [ ] 43. **Rust API** (`crates/duckrs`)
+  - [x] `Appender` (rows into a table, flushed as an INSERT: constraints, triggers and the WAL as for any INSERT)
+  - [x] Arrow `RecordBatch` export with C++'s default types (`Connection::query_arrow`, `record_batches`)
+  - [x] `Relation`: table, values, filter, project, aggregate, order, limit, distinct, joins, set operations, as SQL
+  - [x] results a chunk at a time (`Connection::stream` / `fetch`), from the materialized result
+  - [ ] results streamed while the query runs (the executor materializes them); appending Arrow batches;
+    `Relation` from Rust closures and its own query plans rather than SQL text
 - [ ] 44. Connection tests (`sql/connect`: 2 failing, 5 skipped)
 
 ## Phase 13: Performance (not started)

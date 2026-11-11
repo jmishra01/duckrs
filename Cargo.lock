@@ -731,6 +731,7 @@ dependencies = [
 name = "duckrs"
 version = "0.0.1"
 dependencies = [
+ "arrow",
  "duckrs-common",
  "duckrs-core",
 ]
