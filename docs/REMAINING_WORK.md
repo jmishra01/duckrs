@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 4156 of 6367 test files pass (**68.7%** of the 6049 that run). The v1 target is ≥ 90%.
+- Overall: 4186 of 6367 test files pass (**69.2%** of the 6048 that run). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -145,7 +145,15 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] unshredded VARIANT columns, in the file and the WAL
   - [ ] shredded VARIANT columns (~20 files), shredded GEOMETRY columns, Patas and Chimp segments (8), `read_duckdb` (8)
   - [ ] string and list-length statistics for `stats()` (~10 files), per-column `USING COMPRESSION`
-- [ ] 10. `ATTACH`/`DETACH` and multi-database features (`sql/attach`: 69 failing, 30.3%)
+- [ ] 10. `ATTACH`/`DETACH` and multi-database features (`sql/attach`: 48 failing, 51.0%)
+  - [x] the search path (`CatalogSearchPath`): `SET schema`, `SET search_path`, `USE`, RESET; unqualified names
+    looked up along it and created in its default schema; `current_schema(s)`, `current_query()`, SHOW SCHEMAS
+  - [x] COPY, casts to a database's types and `PRAGMA table_info('db.t')` run in the database they name
+  - [x] ATTACH options as expressions, unknown options and TYPEs refused, `OR REPLACE`, access-mode conflicts,
+    a rollback detaches what the transaction attached; one database written per transaction
+  - [ ] statements that read one database and write another (`CREATE TABLE db2.t AS SELECT ... FROM db1.t`),
+    temp tables and sequences of the default database in a statement routed to another, views binding across
+    databases, DETACH of the default database
   - [ ] `ENCRYPTION_KEY`, `COMPRESS`, `RECOVERY_MODE`, `IO_MODE` and the other ATTACH options
 - [x] 11. Files that C++ DuckDB v69 can read and write (`sql/storage_version`: all pass)
 - [ ] 12. `VACUUM` (`sql/vacuum`: 1 failing)

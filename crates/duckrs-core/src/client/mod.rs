@@ -779,6 +779,10 @@ struct ActiveTransaction {
     invalidation_policy: String,
     /// What it sees of each database it touched. Going away is what rolls it back.
     forks: Vec<(Arc<DatabaseInstance>, Fork)>,
+    /// the databases it attached, which a rollback detaches again
+    attached: Vec<Arc<DatabaseInstance>>,
+    /// `MetaTransaction::modified_database`: the one database it wrote to
+    modified: Option<Arc<DatabaseInstance>>,
 }
 
 impl ActiveTransaction {
@@ -1212,6 +1216,8 @@ impl ClientContext {
                     invalidated: false,
                     invalidation_policy: self.setting_text("default_transaction_invalidation_policy"),
                     forks: Vec::new(),
+                    attached: Vec::new(),
+                    modified: None,
                 });
                 if self
                     .setting_text("immediate_transaction_mode")
@@ -1260,6 +1266,10 @@ impl ClientContext {
                 let Some(transaction) = self.transaction.take() else {
                     return Err(error("cannot rollback - no transaction is active"));
                 };
+                // what the transaction attached is not attached any more; what it detached stays detached
+                let mut attached = self.home.attached.write();
+                attached.retain(|_, database| !transaction.attached.iter().any(|a| Arc::ptr_eq(a, database)));
+                drop(attached);
                 self.end_transaction(transaction);
             }
         }
@@ -1524,6 +1534,26 @@ impl ClientContext {
         }
         self.start_on_database();
         let writes_temporary_table = self.writes_temporary_table(statement);
+        // `MetaTransaction::ModifyDatabase`: a transaction writes to one database (and the temporary one)
+        if write
+            && !writes_temporary_table
+            && let Some(transaction) = &mut self.transaction
+        {
+            match &transaction.modified {
+                None => transaction.modified = Some(self.db.clone()),
+                Some(modified) if !Arc::ptr_eq(modified, &self.db) => {
+                    return Err(Error::new(
+                        ErrorKind::Transaction,
+                        format!(
+                            "Attempting to write to database {} in a transaction that has already modified database {} \
+                             - a single transaction can only write to a single attached database.",
+                            self.db.name, modified.name
+                        ),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
         // what a failed statement outside of a transaction undoes: INSERT is the one that can
         // fail halfway through
         let mut appending = None;
@@ -1837,6 +1867,7 @@ impl ClientContext {
         }
         let path = evaluate_scalar(&bind_constant_expression(&self.catalog(), &info.path)?)?.try_to_string()?;
         let mut options = AttachOptions::default();
+        let mut mode_given = false;
         // the options given as expressions, such as `TYPE getvariable('t')`, by their values
         let mut given: Vec<(String, duckrs_parser::ast::Literal)> = info.options.clone();
         for (name, expression) in &info.parsed_options {
@@ -1855,8 +1886,14 @@ impl ClientContext {
         for (name, value) in &given {
             let text = value.text.to_lowercase();
             match name.to_lowercase().as_str() {
-                "readonly" | "read_only" => options.read_only = text != "false",
-                "readwrite" | "read_write" => options.read_only = text == "false",
+                "readonly" | "read_only" => {
+                    options.read_only = text != "false";
+                    mode_given = true;
+                }
+                "readwrite" | "read_write" => {
+                    options.read_only = text == "false";
+                    mode_given = true;
+                }
                 "type" if text == "duckdb" => {}
                 // `DatabaseManager::GetDatabaseType`: a storage extension of that name
                 "type" => {
@@ -1960,9 +1997,40 @@ impl ClientContext {
                 format!("Attached database name \"{name}\" cannot be used because it is a reserved name"),
             ));
         }
-        if self.find_database(&name).is_some() {
+        if let Some(existing) = self.find_database(&name) {
+            // `DatabaseManager::AttachDatabase`: an attachment of the other access mode is not this one
+            let existing_read_only = matches!(existing.file_access, Some(FileAccess::ReadOnly(_)));
+            if info.on_conflict != Conflict::Error && mode_given && existing_read_only != options.read_only {
+                let mode = |read_only: bool| if read_only { "READ_ONLY" } else { "READ_WRITE" };
+                return Err(Error::new(
+                    ErrorKind::Binder,
+                    format!(
+                        "Database {name} is already attached in {} mode, cannot re-attach in {} mode",
+                        mode(existing_read_only),
+                        mode(options.read_only)
+                    ),
+                ));
+            }
             if info.on_conflict == Conflict::Ignore {
                 return Ok(());
+            }
+            // `HasConflictingAttachOptions`: the same file stays; another one takes its place
+            if info.on_conflict == Conflict::Replace {
+                let same = match &existing.file {
+                    Some(file) => match (std::fs::canonicalize(&file.path), std::fs::canonicalize(&path)) {
+                        (Ok(a), Ok(b)) => a == b,
+                        _ => file.path == Path::new(&path),
+                    },
+                    None => in_memory,
+                };
+                if same {
+                    return Ok(());
+                }
+                self.detach(&name, false)?;
+                return self.attach(&duckrs_parser::ast::AttachInfo {
+                    on_conflict: Conflict::Error,
+                    ..info.clone()
+                });
             }
             return Err(Error::new(
                 ErrorKind::Binder,
@@ -2025,6 +2093,9 @@ impl ClientContext {
         database
             .checkpoint_on_shutdown
             .store(on_shutdown, AtomicOrdering::SeqCst);
+        if let Some(transaction) = &mut self.transaction {
+            transaction.attached.push(database.clone());
+        }
         self.home.attached.write().insert(name.to_lowercase(), database);
         Ok(())
     }
