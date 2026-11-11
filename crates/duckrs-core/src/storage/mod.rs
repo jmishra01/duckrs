@@ -32,6 +32,31 @@ use std::sync::Arc;
 const BUFFER_MEMORY: usize = 256 << 20;
 
 /// Whether there is a database in the file: a new database starts as a missing or empty file.
+/// `DBPathAndType::CheckMagicBytes`: a file that is not a DuckDB (or SQLite) database but that one of
+/// the replacement scans reads (`parquet`, `csv`, `tsv`, `json`, `jsonl`, `ndjson`, maybe compressed).
+pub fn is_open_file(path: &Path) -> bool {
+    use std::io::Read;
+    let mut header = [0u8; 16];
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let read = file.read(&mut header).unwrap_or(0);
+    if read >= 12 && &header[8..12] == b"DUCK" || read >= 16 && &header == b"SQLite format 3\0" {
+        return false;
+    }
+    if read >= 4 && &header[..4] == b"PAR1" {
+        return true;
+    }
+    let lower = path.to_string_lossy().to_lowercase();
+    let lower = [".gz", ".zst"]
+        .iter()
+        .find_map(|c| lower.strip_suffix(c))
+        .unwrap_or(&lower);
+    ["parquet", "csv", "tsv", "json", "jsonl", "ndjson"]
+        .iter()
+        .any(|suffix| lower.ends_with(&format!(".{suffix}")))
+}
+
 pub fn is_database_file(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| m.len() > 0)
 }

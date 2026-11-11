@@ -1334,9 +1334,6 @@ impl Binder<'_> {
         if !matches!(format.as_str(), "csv" | "tsv" | "auto" | "json" | "ndjson" | "jsonl") {
             return Err(crate::unported(format!("COPY with the format {format}")));
         }
-        if matches!(path.as_str(), "/dev/stdin" | "/dev/stdout" | "/dev/stderr") {
-            return Err(crate::unported("COPY to and from standard streams"));
-        }
         self.copy_json = matches!(format.as_str(), "json" | "ndjson" | "jsonl");
         Ok((path, format == "tsv"))
     }

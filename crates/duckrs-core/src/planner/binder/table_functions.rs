@@ -307,36 +307,48 @@ impl Binder<'_> {
                 else {
                     return Ok(None);
                 };
-                let alias = if table_ref.alias.is_empty() {
-                    name.clone()
-                } else {
-                    table_ref.alias.clone()
-                };
-                let names = Self::alias_columns(table_ref, &alias, names)?;
-                let table_index = self.generate_table_index();
-                self.bind_context.add_binding(super::Binding {
-                    alias,
-                    schema: None,
-                    table_index,
-                    names,
-                    types: types.clone(),
-                    row_id: None,
-                    virtual_columns: Vec::new(),
-                    generated: Vec::new(),
-                });
-                return Ok(Some(LogicalOperator::new(
-                    LogicalOperatorKind::ChunkGet {
-                        table_index,
-                        types,
-                        chunks,
-                    },
-                    vec![],
-                )));
+                return self.bind_chunks(table_ref, &name, names, types, chunks).map(Some);
             }
             _ => return Ok(None),
         };
         let select = parse_select(&sql, "Expected a single SELECT statement")?;
         self.bind_rewritten(&select, table_ref, &name).map(Some)
+    }
+
+    /// `ColumnDataRef`: rows the client holds, read as a table called `name` (or the alias).
+    pub(super) fn bind_chunks(
+        &mut self,
+        table_ref: &TableRef,
+        name: &str,
+        names: Vec<String>,
+        types: Vec<LogicalType>,
+        chunks: std::sync::Arc<Vec<duckrs_common::vector::DataChunk>>,
+    ) -> Result<LogicalOperator> {
+        let alias = if table_ref.alias.is_empty() {
+            name.to_string()
+        } else {
+            table_ref.alias.clone()
+        };
+        let names = Self::alias_columns(table_ref, &alias, names)?;
+        let table_index = self.generate_table_index();
+        self.bind_context.add_binding(super::Binding {
+            alias,
+            schema: None,
+            table_index,
+            names,
+            types: types.clone(),
+            row_id: None,
+            virtual_columns: Vec::new(),
+            generated: Vec::new(),
+        });
+        Ok(LogicalOperator::new(
+            LogicalOperatorKind::ChunkGet {
+                table_index,
+                types,
+                chunks,
+            },
+            vec![],
+        ))
     }
 
     /// `TestVectorTypesBind` and `TestVectorTypesInit`: a column `test_vector`, `test_vector2`, ...

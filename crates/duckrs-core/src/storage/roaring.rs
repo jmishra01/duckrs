@@ -47,7 +47,7 @@ fn create_metadata(count: usize, zeros: usize, ones: usize, runs: usize) -> Cont
     let non_null_array_cost = cost(ones, COMPRESSED_ARRAY_THRESHOLD, 2, 1);
     let lowest_array_cost = null_array_cost.min(non_null_array_cost);
     let lowest_run_cost = cost(runs, COMPRESSED_RUN_THRESHOLD, 4, 2);
-    let bitset_cost = count.next_multiple_of(64) / 64 * 8;
+    let bitset_cost = count.div_ceil(64) * 8;
     if lowest_array_cost.min(lowest_run_cost) > bitset_cost {
         return Container::Bitset;
     }

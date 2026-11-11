@@ -302,10 +302,10 @@ impl Collect<'_> {
 
 /// Puts the scans with their new types into the plan.
 fn replace_scans(op: &mut LogicalOperator, pushed: &HashMap<usize, (Arc<CsvScanData>, HashMap<usize, LogicalType>)>) {
-    if let LogicalOperatorKind::CsvScan { table_index, scan } = &mut op.kind {
-        if let Some((new_scan, _)) = pushed.get(table_index) {
-            *scan = Arc::clone(new_scan);
-        }
+    if let LogicalOperatorKind::CsvScan { table_index, scan } = &mut op.kind
+        && let Some((new_scan, _)) = pushed.get(table_index)
+    {
+        *scan = Arc::clone(new_scan);
     }
     for child in inner_plans(op) {
         replace_scans(child, pushed);

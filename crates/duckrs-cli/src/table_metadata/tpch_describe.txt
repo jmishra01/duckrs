@@ -1,0 +1,20 @@
+┌──────────────────────────────────┐
+│             lineitem             │
+│                                  │
+│ l_orderkey      bigint  not null │
+│ l_partkey       bigint  not null │
+│ l_suppkey       bigint  not null │
+│ l_linenumber    bigint  not null │
+│ l_quantity      decimal not null │
+│ l_extendedprice decimal not null │
+│ l_discount      decimal not null │
+│ l_tax           decimal not null │
+│ l_returnflag    varchar not null │
+│ l_linestatus    varchar not null │
+│ l_shipdate      date    not null │
+│ l_commitdate    date    not null │
+│ l_receiptdate   date    not null │
+│ l_shipinstruct  varchar not null │
+│ l_shipmode      varchar not null │
+│ l_comment       varchar not null │
+└──────────────────────────────────┘

@@ -1,0 +1,19 @@
+┌─────────────────────────────────────────────────┐
+│                      wide                       │
+│                                                 │
+│ col0  integer    col1  integer    col2  integer │
+│ col3  integer    col4  integer    col5  integer │
+│ col6  integer    col7  integer    col8  integer │
+│ col9  integer    col10 integer    col11 integer │
+│ col12 integer    col13 integer    col14 integer │
+│ col15 integer    col16 integer    col17 integer │
+│ col18 integer    col19 integer    col20 integer │
+│ col21 integer    col22 integer    col23 integer │
+│ col24 integer    col25 integer    col26 integer │
+│ col27 integer    col28 integer    col29 integer │
+│ col30 integer    col31 integer    col32 integer │
+│ col33 integer    col34 integer    col35 integer │
+│ col36 integer    col37 integer    col38 integer │
+│ col39 integer    col40 integer    col41 integer │
+│ col42 integer    col43 integer    col44 integer │
+└─────────────────────────────────────────────────┘

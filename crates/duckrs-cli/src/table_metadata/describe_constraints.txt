@@ -1,0 +1,8 @@
+┌───────────────────────┐
+│           t           │
+│                       │
+│ i integer not null    │
+│ s varchar not null    │
+│ d decimal default 1.5 │
+│ u integer unique      │
+└───────────────────────┘

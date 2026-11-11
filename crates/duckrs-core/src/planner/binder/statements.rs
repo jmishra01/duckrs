@@ -1794,6 +1794,20 @@ impl Binder<'_> {
                         name.name
                     )));
                 }
+                // the replacement scans the client registered (`DBConfig::replacement_scans`)
+                if entry.is_err() && name.qualification.is_empty() && foreign.is_none() {
+                    let scans = self
+                        .session
+                        .as_ref()
+                        .map(|session| session.replacement_scans.clone())
+                        .unwrap_or_default();
+                    for scan in scans {
+                        if let Some(rows) = scan(&name.name) {
+                            let (names, types, chunks) = rows?;
+                            return self.bind_chunks(table_ref, &name.name, names, types, chunks);
+                        }
+                    }
+                }
                 // a bare name of a system table function binds the function, unless a view of the system
                 // catalog has that name (`duckdb_databases` hides the internal databases)
                 if entry.is_err()

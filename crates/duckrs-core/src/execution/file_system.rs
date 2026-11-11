@@ -114,9 +114,24 @@ fn walk(directory: &str, segments: &[&str], result: &mut Vec<String>) {
 }
 
 /// `FileSystem::Glob`: the files that `pattern` names, sorted.
+/// `LocalFileSystem::IsPipe`.
+pub fn is_pipe(path: &str) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        std::fs::metadata(path).is_ok_and(|m| m.file_type().is_fifo())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 pub fn glob(pattern: &str) -> Vec<String> {
     if !has_glob(pattern) {
-        return if Path::new(pattern).is_file() {
+        // `LocalFileSystem::Glob`: a file that exists, or a pipe (`IsPipe`, e.g. `/dev/stdin`)
+        return if Path::new(pattern).is_file() || is_pipe(pattern) {
             vec![pattern.to_string()]
         } else {
             Vec::new()
@@ -259,10 +274,10 @@ mod tests {
 
 /// `FileSystem::ExpandPath`: a leading `~` is the home directory.
 pub fn expand_path(path: &str) -> String {
-    if path == "~" || path.starts_with("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{home}{}", &path[1..]);
-        }
+    if (path == "~" || path.starts_with("~/"))
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return format!("{home}{}", &path[1..]);
     }
     path.to_string()
 }
