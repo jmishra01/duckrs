@@ -34,6 +34,7 @@ has an obvious Rust home:
 | `duckrs-capi` | `src/main/capi`, `duckdb.h` | 12 | |
 | `duckrs-cli` | `tools/shell` | 12 | crate (the `duckrs` binary) |
 | `sqllogictest` | `test/sqlite` | 0 | crate |
+| `benchmark` | `benchmark` | 13 | crate (`benchmark_runner`) |
 
 Dependencies point downward only:
 `common → parser → catalog → function → planner → optimizer → storage/transaction → execution → parallel → main → duckrs`.
@@ -835,6 +836,26 @@ Interactive input goes through `rustyline`, with the history in `~/.duckdb_histo
 
 ```
 cd ../duckdb && PYTHONPATH=. pytest tools/shell/tests --shell-binary ../duckrs/target/release/duckrs
+```
+
+## Benchmarks (`tools/benchmark`)
+
+`benchmark_runner` ports `benchmark/benchmark_runner.cpp` and `interpreted_benchmark.cpp`. It runs in a
+DuckDB checkout (`--root-dir`, `../duckdb` by default), finds the `.benchmark` files whose path or group
+matches the pattern, and for each: opens the database (or its cache under `duckdb_benchmark_data/<engine>/`),
+runs `load`, a cold run and `--timed-runs` timed runs of `run`, and checks each result. It drives the
+engines of the sqllogictest crate; `Connection::query_timed` times the engine and not the conversion of
+the values to text. With `--features reference --engine=both` it also times the C++ library and prints
+the ratios, their geometric mean and the v1 gate.
+
+Neither engine here has the `tpch` or `tpcds` extension, so `CALL dbgen(sf=N)` and `CALL dsdgen(sf=N)`
+in a load are done by the runner: `tools/tpch/build_dbgen.sh` and `tools/tpcds/build_dsdgen.sh` build
+the generators of the checkout, whose `.tbl` files are copied into tables of the extensions' columns.
+
+```
+cargo run --release -p benchmark -- 'benchmark/tpch/sf1/.*'
+cargo run --release -p benchmark --features reference -- --engine=both --threads=8 'benchmark/micro/.*'
+cargo bench -p duckrs --bench kernels
 ```
 
 ## Testing

@@ -1,0 +1,25 @@
+[package]
+name = "benchmark"
+description = "Runs DuckDB's .benchmark files against duckrs or the C++ reference engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+# Time the C++ DuckDB library as well (compiles DuckDB from source on first build).
+reference = ["sqllogictest/reference"]
+
+[[bin]]
+name = "benchmark_runner"
+path = "src/main.rs"
+
+[dependencies]
+sqllogictest = { path = "../sqllogictest" }
+regex.workspace = true
+walkdir.workspace = true
+
+[lints]
+workspace = true

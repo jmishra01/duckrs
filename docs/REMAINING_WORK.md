@@ -284,10 +284,18 @@ Each item gives the number of failing files in `test/` that it should fix, where
 
 ## Phase 13: Performance (not started)
 
-- [ ] 45. Criterion benchmarks for the kernels (only `duckrs-common/benches/executor.rs` exists)
-- [ ] 46. Nightly TPC-H, TPC-DS and ClickBench runs against C++ DuckDB at the baseline
+- [x] 45. Benchmarks: `tools/benchmark` (`benchmark_runner`) ports DuckDB's runner and reads its
+  `.benchmark` files (templates, includes, arguments, caches, `result`/`result_query`/`assert`); the
+  Criterion benches `duckrs-common/benches/executor.rs` (vector kernels) and `duckrs/benches/kernels.rs`
+  (scan, filter, aggregates, join, sort, top-N, window, casts on a million rows)
+- [ ] 46. Nightly runs against C++ DuckDB: `.github/workflows/benchmarks.yml` times TPC-H SF1, TPC-DS SF1 and
+  micro benchmarks on both engines (`--engine=both`, the `reference` feature); `CALL dbgen` / `CALL dsdgen`
+  are carried out with the generators of the checkout (`tools/tpch`, `tools/tpcds`)
+  - [ ] ClickBench (its data is downloaded) and storing the nightly numbers over time
 - [ ] 47. Faster kernels: monomorphized code, SIMD, a perfect hash aggregate, the salt/pointer hash table design
-- [ ] 48. v1 gate: TPC-H SF10 geometric mean ≤ 1.5× C++ DuckDB, and no query slower than 3×
+- [ ] 48. v1 gate: TPC-H SF10 geometric mean ≤ 1.5× C++ DuckDB, and no query slower than 3×. The runner
+  prints the gate after `--engine=both`. On TPC-H SF1 (8 threads, all 22 answers correct) duckrs is at
+  12.7× (Q19 48×); with one thread at 5.6× (Q1), 6.1× (Q6), 18× (Q19): the queries run on one thread
 
 ## Phase 14: Extensions (not started)
 

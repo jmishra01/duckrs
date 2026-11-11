@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/duckrs", "crates/duckrs-cli", "crates/duckrs-common", "crates/duckrs-core", "crates/duckrs-parser", "tools/sqllogictest"]
+members = ["crates/duckrs", "crates/duckrs-cli", "crates/duckrs-common", "crates/duckrs-core", "crates/duckrs-parser", "tools/benchmark", "tools/sqllogictest"]
 
 [workspace.package]
 version = "0.0.1"
