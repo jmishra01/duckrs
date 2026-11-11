@@ -108,6 +108,7 @@ impl Binder<'_> {
         let mut int96_as = crate::execution::parquet::Int96As::Timestamp;
         let mut utf8_validation = crate::execution::parquet::Utf8Validation::Strict;
         let mut schema_value = None;
+        let (mut copy_names, mut copy_types): (Option<Vec<String>>, Option<Vec<LogicalType>>) = (None, None);
         for argument in &args {
             let value = self.constant_argument(&argument.expr)?;
             if argument.name.is_empty() {
@@ -130,13 +131,14 @@ impl Binder<'_> {
                 "file_row_number" => file_row_number = is_true(&value, &option)?,
                 "int96_as" => {
                     use crate::execution::parquet::Int96As;
-                    int96_as = match value.try_to_string()?.to_lowercase().as_str() {
+                    let text = value.try_to_string()?;
+                    int96_as = match text.to_lowercase().as_str() {
                         "timestamp" => Int96As::Timestamp,
                         "timestamp_ns" => Int96As::TimestampNs,
                         "struct" => Int96As::Struct,
-                        other => {
+                        _ => {
                             return Err(binder_error(format!(
-                                "int96_as must be 'timestamp', 'timestamp_ns' or 'struct', not '{other}'"
+                                "Unrecognized int96_as '{text}' (supported: 'timestamp', 'timestamp_ns', 'struct')"
                             )));
                         }
                     };
@@ -149,6 +151,16 @@ impl Binder<'_> {
                 }
                 "explicit_cardinality" | "can_have_nan" => {}
                 "schema" => schema_value = Some(value),
+                // what COPY ... FROM passes on of the table it loads into
+                "__copy_names" => copy_names = Some(strings(&value)?),
+                "__copy_types" => {
+                    copy_types = Some(
+                        strings(&value)?
+                            .iter()
+                            .map(|name| self.csv_type(name))
+                            .collect::<Result<_>>()?,
+                    );
+                }
                 // options of COPY TO, which reading doesn't have
                 "write_page_index"
                 | "write_bloom_filter"
@@ -223,6 +235,39 @@ impl Binder<'_> {
                     }
                 }
             }
+        }
+        // COPY ... FROM: the columns of the table are the types to read (`return_types` of the bind)
+        let mut table_columns = Vec::new();
+        if let (Some(copy_names), Some(copy_types)) = (&copy_names, &copy_types) {
+            if copy_types.len() != types.len() {
+                let schema_text = |names: &[String], types: &[LogicalType]| {
+                    names
+                        .iter()
+                        .zip(types)
+                        .map(|(name, ty)| format!("{name} {ty}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let file_string = if union_by_name {
+                    files.join(",")
+                } else {
+                    files[0].clone()
+                };
+                return Err(Error::new(
+                    ErrorKind::Conversion,
+                    format!(
+                        "Failed to read file(s) \"{file_string}\" - column count mismatch: expected {} columns but \
+                         found {}\nTable schema: {}\nParquet schema: {}\n\nPossible solutions:\n* Manually specify \
+                         which columns to insert using \"INSERT INTO tbl SELECT ... FROM read_parquet(...)\"",
+                        copy_types.len(),
+                        types.len(),
+                        schema_text(copy_names, copy_types),
+                        schema_text(&names, &types),
+                    ),
+                ));
+            }
+            types = copy_types.clone();
+            table_columns = copy_names.clone();
         }
         let mut output_names = names.clone();
         let mut output_types = types.clone();
@@ -304,6 +349,7 @@ impl Binder<'_> {
             binary_as_string,
             int96_as,
             utf8_validation,
+            table_columns,
             union_by_name,
             file_row_number,
             filename: filename.is_some(),
@@ -435,9 +481,58 @@ impl Binder<'_> {
         } else {
             info.select_list.clone()
         };
+        // `ParseCopyOption`: the options of reading go to the scan, as do the columns it loads into
+        let types: Vec<String> = columns
+            .iter()
+            .map(|name| {
+                table
+                    .columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(name))
+                    .map(|c| c.ty.to_string())
+                    .ok_or_else(|| {
+                        binder_error(format!(
+                            "Table \"{}\" does not have a column named \"{name}\"",
+                            info.table.name
+                        ))
+                    })
+            })
+            .collect::<Result<_>>()?;
+        let list = |items: &[String]| {
+            format!(
+                "[{}]",
+                items
+                    .iter()
+                    .map(|item| string_literal(item))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let mut arguments = format!(", __copy_names := {}, __copy_types := {}", list(&columns), list(&types));
+        for (name, value) in self.copy_options(info)? {
+            match name.as_str() {
+                "format" | "compression" | "codec" | "row_group_size" | "debug_use_openssl" | "prefetch_strategy" => {}
+                "binary_as_string" | "can_have_nan" | "utf8_validation" | "int96_as" => {
+                    if value.is_null() {
+                        return Err(binder_error(format!("Parquet {name} cannot be empty!")));
+                    }
+                    let literal = match value.logical_type().id() {
+                        LogicalTypeId::Boolean => value.try_to_string()?,
+                        _ => string_literal(&value.try_to_string()?),
+                    };
+                    arguments.push_str(&format!(", {name} := {literal}"));
+                }
+                _ => {
+                    return Err(Error::new(
+                        ErrorKind::NotImplemented,
+                        format!("Unsupported option for COPY FROM: {name}"),
+                    ));
+                }
+            }
+        }
         let select = parse_select(
             &format!(
-                "SELECT * FROM read_parquet({}, hive_partitioning := false)",
+                "SELECT * FROM read_parquet({}, hive_partitioning := false{arguments})",
                 string_literal(path)
             ),
             "Expected a single SELECT statement",

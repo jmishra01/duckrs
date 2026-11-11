@@ -914,7 +914,9 @@ impl Structure {
             return json_type();
         }
         match self {
-            Structure::Null | Structure::Mixed => json_type(),
+            // only NULLs were seen (`case LogicalTypeId::SQLNULL`)
+            Structure::Null => LogicalType::SQLNULL,
+            Structure::Mixed => json_type(),
             Structure::Scalar("BOOLEAN") => LogicalType::BOOLEAN,
             // `refine_type` makes those that don't fit a HUGEINT
             Structure::Scalar("UBIGINT" | "BIGINT") => LogicalType::BIGINT,

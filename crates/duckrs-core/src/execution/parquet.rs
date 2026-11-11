@@ -46,6 +46,8 @@ pub struct ParquetScanData {
     pub int96_as: Int96As,
     /// `utf8_validation`
     pub utf8_validation: Utf8Validation,
+    /// with COPY ... FROM, the columns of the table the columns of the files are loaded into
+    pub table_columns: Vec<String>,
     pub union_by_name: bool,
     pub file_row_number: bool,
     pub filename: bool,
@@ -251,20 +253,36 @@ fn open_builder(path: &str) -> Result<ParquetRecordBatchReaderBuilder<File>> {
     Ok(builder)
 }
 
-/// [`open_builder`] with the strings of the file read as bytes, which the crate would check are UTF-8: the
-/// schema the reader converts has no STRING annotations, so a repairing `utf8_validation` sees every value.
-fn open_builder_as_bytes(path: &str) -> Result<ParquetRecordBatchReaderBuilder<File>> {
+/// A FIXED_LEN_BYTE_ARRAY(12) annotated INTERVAL.
+fn is_interval(ty: &parquet::schema::types::Type) -> bool {
+    ty.is_primitive()
+        && ty.get_physical_type() == parquet::basic::Type::FIXED_LEN_BYTE_ARRAY
+        && ty.get_basic_info().converted_type() == parquet::basic::ConvertedType::INTERVAL
+}
+
+fn has_interval(ty: &parquet::schema::types::Type) -> bool {
+    if ty.is_group() {
+        ty.get_fields().iter().any(|field| has_interval(field))
+    } else {
+        is_interval(ty)
+    }
+}
+
+/// [`open_builder`] with some annotations taken out of the schema the crate converts, so that it reads the bytes:
+/// - with `strings`, those of STRING columns, which it would check are UTF-8, for a repairing `utf8_validation`
+/// - those of INTERVALs, whose months its intervals (DayTime) leave out
+fn open_builder_as_bytes(path: &str, strings: bool) -> Result<ParquetRecordBatchReaderBuilder<File>> {
     use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
     use parquet::basic::{ConvertedType, LogicalType as Logical};
     use parquet::file::metadata::{FileMetaData, ParquetMetaData};
     use parquet::schema::types::{SchemaDescriptor, Type as SchemaType, TypePtr};
-    fn strip(ty: &TypePtr) -> parquet::errors::Result<TypePtr> {
+    fn strip(ty: &TypePtr, strings: bool) -> parquet::errors::Result<TypePtr> {
         let info = ty.get_basic_info();
         if ty.is_group() {
             let fields = ty
                 .get_fields()
                 .iter()
-                .map(strip)
+                .map(|field| strip(field, strings))
                 .collect::<parquet::errors::Result<Vec<_>>>()?;
             let mut builder = SchemaType::group_type_builder(info.name())
                 .with_fields(fields)
@@ -278,13 +296,18 @@ fn open_builder_as_bytes(path: &str) -> Result<ParquetRecordBatchReaderBuilder<F
             }
             return Ok(Arc::new(builder.build()?));
         }
-        let is_string =
-            matches!(info.logical_type_ref(), Some(Logical::String)) || info.converted_type() == ConvertedType::UTF8;
-        if !is_string || ty.get_physical_type() != parquet::basic::Type::BYTE_ARRAY {
+        let is_string = strings
+            && ty.get_physical_type() == parquet::basic::Type::BYTE_ARRAY
+            && (matches!(info.logical_type_ref(), Some(Logical::String))
+                || info.converted_type() == ConvertedType::UTF8);
+        if !is_string && !is_interval(ty) {
             return Ok(Arc::clone(ty));
         }
         let mut builder =
             SchemaType::primitive_type_builder(info.name(), ty.get_physical_type()).with_repetition(info.repetition());
+        if let SchemaType::PrimitiveType { type_length, .. } = ty.as_ref() {
+            builder = builder.with_length(*type_length);
+        }
         if info.has_id() {
             builder = builder.with_id(Some(info.id()));
         }
@@ -294,7 +317,7 @@ fn open_builder_as_bytes(path: &str) -> Result<ParquetRecordBatchReaderBuilder<F
     let metadata = builder.metadata();
     let file = metadata.file_metadata();
     let root = guarded(path, || {
-        strip(&file.schema_descr().root_schema_ptr()).map_err(|e| read_error(path, "Invalid Parquet file", e))
+        strip(&file.schema_descr().root_schema_ptr(), strings).map_err(|e| read_error(path, "Invalid Parquet file", e))
     })?;
     let file_metadata = FileMetaData::new(
         file.version(),
@@ -313,6 +336,80 @@ fn open_builder_as_bytes(path: &str) -> Result<ParquetRecordBatchReaderBuilder<F
         file,
         reader_metadata,
     ))
+}
+
+/// The types the crate is told to read some columns as (its schema hints):
+/// - INT96 timestamps as microseconds where `int96_as` makes TIMESTAMPs of them, as
+///   `ImpalaTimestampToMicroseconds` does: the crate's nanoseconds overflow before 1677 and after 2262
+/// - INTERVALs with their months, which the crate's default (DayTime) leaves out
+fn with_schema_hints(
+    path: &str,
+    builder: ParquetRecordBatchReaderBuilder<File>,
+    special: &[Special],
+    int96_as: Int96As,
+) -> Result<ParquetRecordBatchReaderBuilder<File>> {
+    use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+    fn hint(ty: &DataType) -> Option<DataType> {
+        match ty {
+            DataType::Interval(adt::IntervalUnit::DayTime) => Some(DataType::Interval(adt::IntervalUnit::MonthDayNano)),
+            DataType::List(child) => Some(DataType::List(Arc::new(hint_field(child)?))),
+            DataType::LargeList(child) => Some(DataType::LargeList(Arc::new(hint_field(child)?))),
+            DataType::Struct(fields) => {
+                let mut changed = false;
+                let fields: Vec<Field> = fields
+                    .iter()
+                    .map(|f| match hint_field(f) {
+                        Some(f) => {
+                            changed = true;
+                            f
+                        }
+                        None => f.as_ref().clone(),
+                    })
+                    .collect();
+                changed.then(|| DataType::Struct(fields.into()))
+            }
+            DataType::Map(entries, sorted) => Some(DataType::Map(Arc::new(hint_field(entries)?), *sorted)),
+            _ => None,
+        }
+    }
+    fn hint_field(field: &Field) -> Option<Field> {
+        hint(field.data_type()).map(|ty| field.clone().with_data_type(ty))
+    }
+    let schema = builder.schema();
+    let mut changed = false;
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            if special.get(index) == Some(&Special::Int96) && int96_as == Int96As::Timestamp {
+                changed = true;
+                return field
+                    .as_ref()
+                    .clone()
+                    .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, None));
+            }
+            if special.get(index) == Some(&Special::Variant) {
+                return field.as_ref().clone();
+            }
+            match hint_field(field) {
+                Some(hinted) => {
+                    changed = true;
+                    hinted
+                }
+                None => field.as_ref().clone(),
+            }
+        })
+        .collect();
+    if !changed {
+        return Ok(builder);
+    }
+    let hinted = Arc::new(adt::Schema::new_with_metadata(fields, schema.metadata().clone()));
+    let options = ArrowReaderOptions::new().with_schema(hinted);
+    let metadata = ArrowReaderMetadata::try_new(Arc::clone(builder.metadata()), options)
+        .map_err(|e| read_error(path, "Invalid Parquet file", e))?;
+    let file = File::open(path).map_err(|e| Error::new(ErrorKind::Io, format!("Cannot open file \"{path}\": {e}")))?;
+    Ok(ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata))
 }
 
 /// `VariantColumnReader`: a VARIANT group starts with its `metadata` and `value`.
@@ -502,6 +599,8 @@ enum Special {
     TimeUtc,
     /// a group annotated as VARIANT
     Variant,
+    /// annotated UNKNOWN: a column of NULLs, whatever its physical type
+    Null,
 }
 
 fn special_columns(builder: &ParquetRecordBatchReaderBuilder<File>) -> Vec<Special> {
@@ -522,6 +621,7 @@ fn special_columns(builder: &ParquetRecordBatchReaderBuilder<File>) -> Vec<Speci
             }
             match field.get_basic_info().logical_type_ref() {
                 Some(parquet::basic::LogicalType::Time(time)) if time.is_adjusted_to_u_t_c => Special::TimeUtc,
+                Some(parquet::basic::LogicalType::Unknown) => Special::Null,
                 _ => Special::None,
             }
         })
@@ -541,6 +641,9 @@ fn column_type(
     }
     if special.get(index) == Some(&Special::Variant) {
         return Ok(LogicalType::new(LogicalTypeId::Variant));
+    }
+    if special.get(index) == Some(&Special::Null) {
+        return Ok(LogicalType::SQLNULL);
     }
     if special.get(index) == Some(&Special::Int96) {
         return Ok(match int96_as {
@@ -623,6 +726,15 @@ fn utf8(bytes: &[u8]) -> Result<Value> {
 fn binary_value(bytes: &[u8], ty: &LogicalType) -> Result<Value> {
     match ty.id() {
         LogicalTypeId::Varchar => utf8(bytes),
+        // months, days and milliseconds (`ParquetIntervalUtils`)
+        LogicalTypeId::Interval if bytes.len() == 12 => {
+            let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"));
+            Ok(Value::interval(Interval {
+                months: word(0) as i32,
+                days: word(4) as i32,
+                micros: i64::from(word(8)) * 1000,
+            }))
+        }
         LogicalTypeId::Uuid => {
             let raw = <[u8; 16]>::try_from(bytes).map_err(|_| invalid("A UUID in a Parquet file is not 16 bytes"))?;
             Ok(Value::uuid((u128::from_be_bytes(raw) ^ (1 << 127)) as i128))
@@ -681,7 +793,7 @@ pub(super) fn field_value(array: &dyn Array, row: usize, ty: &LogicalType) -> Re
 }
 
 fn array_value(array: &dyn Array, row: usize, ty: &LogicalType) -> Result<Value> {
-    if array.is_null(row) {
+    if array.is_null(row) || ty.id() == LogicalTypeId::SqlNull {
         return Ok(Value::null(ty.clone()));
     }
     if ty.id() == LogicalTypeId::Variant
@@ -860,19 +972,17 @@ impl std::fmt::Debug for ParquetScanState {
 }
 
 fn open_file(scan: &ParquetScanData, state: &mut ParquetScanState, path: &str) -> Result<()> {
-    let builder = if scan.utf8_validation.repairs() {
-        open_builder_as_bytes(path)?
+    let typed = open_builder(path)?;
+    let strip = scan.utf8_validation.repairs() || has_interval(typed.parquet_schema().root_schema());
+    let builder = if strip {
+        open_builder_as_bytes(path, scan.utf8_validation.repairs())?
     } else {
         open_builder(path)?
     };
-    let builder = builder.with_batch_size(STANDARD_VECTOR_SIZE);
     let int96 = special_columns(&builder);
+    let builder = with_schema_hints(path, builder, &int96, scan.int96_as)?.with_batch_size(STANDARD_VECTOR_SIZE);
     // the types of the columns are those of the file, whatever the reader is told to read strings as
-    let schema = if scan.utf8_validation.repairs() {
-        Arc::clone(open_builder(path)?.schema())
-    } else {
-        Arc::clone(builder.schema())
-    };
+    let schema = Arc::clone(typed.schema());
     let names = deduplicate_names(schema.fields().iter().map(|f| f.name()));
     let mut mapping = Vec::with_capacity(scan.names.len());
     let mut file_types = Vec::with_capacity(scan.names.len());
@@ -989,6 +1099,11 @@ fn batch_chunk(
     let count = batch.num_rows();
     let mut columns = Vec::with_capacity(scan.types.len() + 2);
     for (index, ty) in scan.types.iter().enumerate() {
+        // a hive partition that is a column of the file as well: the path gives its values (below)
+        if scan.hive_overrides.iter().any(|(column, _)| *column == index) {
+            columns.push(constant_column(ty, &Value::null(ty.clone()), count)?);
+            continue;
+        }
         let Some(column) = state.mapping[index] else {
             let default = match &scan.schema {
                 Some(schema) => schema[index].default.clone(),
@@ -1019,7 +1134,8 @@ fn batch_chunk(
             columns.push(vector);
         } else {
             let mut cast = Vector::new(ty.clone(), count);
-            cast_vector(&vector, &mut cast, count, CastMode::Strict)?;
+            cast_vector(&vector, &mut cast, count, CastMode::Strict)
+                .map_err(|error| cast_error(scan, index, path, file_type, ty, error))?;
             columns.push(cast);
         }
     }
@@ -1044,6 +1160,50 @@ fn batch_chunk(
         columns[*column] = constant_column(&scan.types[*column], &value, count)?;
     }
     Ok(DataChunk::from_columns(columns, count))
+}
+
+/// `GetExtendedMultiFileError`: a value of a file that does not cast to the type the scan reads.
+fn cast_error(
+    scan: &ParquetScanData,
+    index: usize,
+    path: &str,
+    from: &LogicalType,
+    to: &LogicalType,
+    error: Error,
+) -> Error {
+    if error.kind == ErrorKind::Internal {
+        return error;
+    }
+    let name = &scan.names[index];
+    let extended = if scan.table_columns.is_empty() {
+        format!(
+            "In file \"{path}\" the column \"{name}\" has type {from}, but we are trying to read it as type {to}.\nThis \
+             can happen when reading multiple Parquet files. The schema information is taken from the first Parquet file \
+             by default. Possible solutions:\n* Enable the union_by_name=True option to combine the schema of all \
+             Parquet files (https://duckdb.org/docs/current/data/multiple_files/combining_schemas)\n* Use a COPY \
+             statement to automatically derive types from an existing table."
+        )
+    } else {
+        let target = scan
+            .table_columns
+            .get(index)
+            .map(|column| format!("\"{column}\" "))
+            .unwrap_or_default();
+        format!(
+            "In file \"{path}\" the column \"{name}\" has type {from}, but we are trying to load it into column \
+             {target}with type {to}.\nThis means the Parquet schema does not match the schema of the table.\nPossible \
+             solutions:\n* Insert by name instead of by position using \"INSERT INTO tbl BY NAME SELECT * FROM \
+             read_parquet(...)\"\n* Manually specify which columns to insert using \"INSERT INTO tbl SELECT ... FROM \
+             read_parquet(...)\""
+        )
+    };
+    Error::new(
+        ErrorKind::Conversion,
+        format!(
+            "Error while reading file \"{path}\": failed to cast column \"{name}\" from type {from} to {to}: : {}\n\n{extended}",
+            error.message
+        ),
+    )
 }
 
 /// The `read_parquet` table function.
