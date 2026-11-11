@@ -300,13 +300,15 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] a partitioned, parallel aggregate finalize for many groups; a Top-N boundary
   - [x] vectorized decimal scale-ups, date parts, CASE results; LIKE with substring search
   - [x] join partitions as one hash table of distinct keys (one hash per key) with their rows in one array
+  - [x] filters applied while a row group is read from its file, conjunct by conjunct, reading the other
+    columns only for the rows that pass (`TableSource::fetch_rows`)
   - [ ] the rest of the hash join probe (C++'s salted pointers, prefetching), group keys without a byte
-    key per row, aggregate states not behind an enum per row, filters applied while a row group is decoded
-    (decoding only the vectors whose rows pass), morsels smaller than a row group
+    key per row, aggregate states not behind an enum per row, selective reads of dictionary strings and of
+    DELTA_FOR / RLE / ALP segments, morsels smaller than a row group
 - [ ] 48. v1 gate: TPC-H SF10 geometric mean ≤ 1.5× C++ DuckDB, and no query slower than 3×. The runner
   prints the gate after `--engine=both`. On TPC-H SF1 (8 threads, all 22 answers correct) duckrs is at
-  1.74× (none above 3×: Q21 2.7×, Q06 2.6×; Q02 0.55×, Q08 0.96×), from 12.7× at the start of item 47.
-  SF10 is not measured yet
+  1.53× (none above 3×: Q21 2.7×; Q02 0.5×, Q08 0.95×), from 12.7× at the start of item 47. SF10 is not
+  measured yet
 
 ## Phase 14: Extensions (not started)
 

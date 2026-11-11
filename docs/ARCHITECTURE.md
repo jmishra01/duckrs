@@ -317,6 +317,12 @@ all of the machine's by default, when it has all of these:
   - `PhysicalResultCollector`, as `PhysicalBatchCollector`: `sink_local` is told the morsel of each chunk, and the
     rows of each morsel go into the result in morsel order, which is the order of one thread.
 
+A scan with a filter of a table in its file reads a row group at a time (`scan_group_filtered`): the
+conjuncts of the filter go one by one, those of one column first, and each reads its columns only for the
+rows the ones before kept (`TableSource::fetch_rows`, C++'s `ColumnData::Select`); the columns of the
+output are read last, for the rows left. `DiskTable` reads single rows of constant, uncompressed and
+bit-packed segments when at most a quarter of a group's rows are wanted, and decodes the column otherwise.
+
 Expressions that are volatile or run a subquery keep a pipeline on one thread. Threads are `std::thread::scope` per
 pipeline, not a scheduler, and there are no events or blocked tasks. `examples/parallel_aggregate.rs` gives 2.9x to 5.5x on
 8 threads, once a query has been warmed: its first run builds what later ones find cached, and that is single threaded.
