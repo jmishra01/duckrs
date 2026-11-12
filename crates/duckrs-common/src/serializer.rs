@@ -1818,7 +1818,8 @@ impl Deserialize for LogicalType {
                         state.arguments,
                         LogicalType::SQLNULL,
                     )
-                    .with_state_constants(state.constants));
+                    .with_state_constants(state.constants)
+                    .with_state_orders(state.orders));
                 }
                 Ok(if alias.is_empty() { base } else { base.with_alias(alias) })
             })
@@ -1831,6 +1832,7 @@ struct StateProperties {
     function: String,
     arguments: Vec<LogicalType>,
     constants: Vec<Option<Value>>,
+    orders: Vec<crate::types::StateOrder>,
 }
 
 /// `ExtensionTypeInfo::Serialize`: an AGGREGATE_STATE keeps the function's name and the types of its arguments,
@@ -1878,10 +1880,40 @@ fn write_extension_info(ty: &LogicalType, s: &mut BinarySerializer) {
         Value::new(LogicalType::list(entry), ValueData::List(items))
     }
     .expect("a list of parameters");
-    let properties = [
+    let mut properties = vec![
         ("function_name", Value::varchar(function.to_string())),
         ("parameters", parameters),
     ];
+    // `CreateSortedAggregateStateType`: the ORDER BY spec, as to_aggregate_state takes it
+    let orders = ty.aggregate_state_orders();
+    if !orders.is_empty() {
+        let entry = LogicalType::struct_type(vec![
+            ("column".into(), LogicalType::UINTEGER),
+            ("order".into(), LogicalType::VARCHAR),
+        ]);
+        let items = orders
+            .iter()
+            .map(|order| {
+                let text = format!(
+                    "{} {}",
+                    if order.descending { "DESCENDING" } else { "ASCENDING" },
+                    if order.nulls_first { "NULLS_FIRST" } else { "NULLS_LAST" }
+                );
+                Value::new(
+                    entry.clone(),
+                    ValueData::Struct(vec![
+                        Value::new(LogicalType::UINTEGER, ValueData::UInt32(order.column)).expect("a UINTEGER"),
+                        Value::varchar(text),
+                    ]),
+                )
+                .expect("an ORDER BY entry")
+            })
+            .collect();
+        properties.push((
+            "order_bys",
+            Value::new(LogicalType::list(entry), ValueData::List(items)).expect("a list"),
+        ));
+    }
     s.begin_property(103, "extension_info", true);
     s.begin_nullable(true);
     s.write_object_value(|s| {
@@ -1964,10 +1996,29 @@ fn read_extension_info(d: &mut BinaryDeserializer<'_>) -> Result<Option<StatePro
         if constants.iter().all(Option::is_none) {
             constants.clear();
         }
+        let mut orders = Vec::new();
+        if let Some(order_bys) = find("order_bys")
+            && let ValueData::List(entries) = order_bys.data()
+        {
+            for entry in entries {
+                let ValueData::Struct(parts) = entry.data() else {
+                    continue;
+                };
+                let [column, order] = parts.as_slice() else { continue };
+                let (descending, nulls_first) = crate::types::parse_order_modifiers(&order.try_to_string()?)
+                    .ok_or_else(|| serialization_error("Invalid ORDER BY entry of an aggregate state"))?;
+                orders.push(crate::types::StateOrder {
+                    column: column.as_i128().unwrap_or(0) as u32,
+                    descending,
+                    nulls_first,
+                });
+            }
+        }
         Ok(Some(StateProperties {
             function: function.try_to_string()?,
             arguments,
             constants,
+            orders,
         }))
     })
 }

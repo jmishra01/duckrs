@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 4394 of 6367 test files pass (**72.7%** of the 6047 that run). The v1 target is ≥ 90%.
+- Overall: 4399 of 6367 test files pass (**72.7%** of the 6047 that run). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -250,7 +250,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] TYPE columns and casts, `create_sort_key`, `index_key`, `variant_normalize`,
     `strptime` edge cases, `list_contains` and the other templated list functions' type deduction,
     the external-resource and profiling table functions
-- [ ] 31. Aggregates (`sql/aggregate`: 62 failing, 71.4%; target ≥ 90%)
+- [ ] 31. Aggregates (`sql/aggregate`: 57 failing, 73.7%; target ≥ 90%)
   - [x] `histogram(x, bins)` and `histogram_exact`, with the "other values" bucket; stddev and variance are
     infinite rather than out of range
   - [x] `EXPORT_STATE` in C++'s layouts for the aggregates duckrs computes from their rows
@@ -259,9 +259,11 @@ Each item gives the number of failing files in `test/` that it should fix, where
     and the quantiles; constants the arguments were bound to (separator, fraction) kept in the state type and
     checked on COMBINE; `to_aggregate_state` with constant parameters and TYPE signatures; states in database
     files keep their `extension_info` and are bound again when read; aggregates C++ cannot export refuse to
-  - [ ] the sketches of approx_count_distinct, approx_quantile and approx_top_k, ordered aggregate states
-    (`list(x ORDER BY ...)`, ORDER BY in `to_aggregate_state`), the order DISTINCT states combine in, the states
-    of files before v1.5 (`LEGACY_AGGREGATE_STATE`)
+  - [x] ordered aggregate states (`list(x ORDER BY y) EXPORT_STATE`): the rows buffered with their keys, the ORDER
+    BY in the state type and its `order_bys` in files, sorted and aggregated when finalized, buffers appended by
+    COMBINE; `to_aggregate_state` with an ORDER BY spec and its checks
+  - [ ] the sketches of approx_count_distinct, approx_quantile and approx_top_k, `lttb`, the states of files before
+    v1.5 (`LEGACY_AGGREGATE_STATE`)
 - [ ] 32. Window functions (`sql/window`: 19 failing, 79.1%; target ≥ 85%)
 - [ ] 33. `pragma_*` functions and PRAGMA statements (`sql/pragma`: 29 failing, 50.0%)
   - [x] SHOW TABLES over the search path, SHOW TABLES FROM a database, a schema or both

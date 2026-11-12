@@ -667,11 +667,13 @@ test/sql/aggregate/aggregate_state_export/avg_time_export_state.test
 test/sql/aggregate/aggregate_state_export/avg_timestamp_export_state.test
 test/sql/aggregate/aggregate_state_export/bool_and_export_state.test
 test/sql/aggregate/aggregate_state_export/combine_aggr_count_overflow.test
+test/sql/aggregate/aggregate_state_export/count_export_state.test
 test/sql/aggregate/aggregate_state_export/finalize_null_fields.test
 test/sql/aggregate/aggregate_state_export/first_last_export_state.test
 test/sql/aggregate/aggregate_state_export/kahan_avg_export_state.test
 test/sql/aggregate/aggregate_state_export/list_export_state.test
 test/sql/aggregate/aggregate_state_export/minmax_export_state.test
+test/sql/aggregate/aggregate_state_export/ordered_aggregate_export_state.test
 test/sql/aggregate/aggregate_state_export/ordered_export_empty_state.test
 test/sql/aggregate/aggregate_state_export/ordered_export_state_layout.test
 test/sql/aggregate/aggregate_state_export/product_export_state.test
@@ -681,6 +683,9 @@ test/sql/aggregate/aggregate_state_export/test_aggregate_state_type.test
 test/sql/aggregate/aggregate_state_export/test_combine_aggr.test
 test/sql/aggregate/aggregate_state_export/test_corr_state_export.test
 test/sql/aggregate/aggregate_state_export/test_covar_export_state.test
+test/sql/aggregate/aggregate_state_export/test_export_state_distinct.test
+test/sql/aggregate/aggregate_state_export/test_sorted_aggregate_state_bounds.test
+test/sql/aggregate/aggregate_state_export/test_sorted_aggregate_state_types.test
 test/sql/aggregate/aggregate_state_export/test_state_export_opaque.test
 test/sql/aggregate/aggregate_state_export/test_stddev_export_state.test
 test/sql/aggregate/aggregate_state_export/to_aggregate_state_argument_types.test

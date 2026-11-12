@@ -481,6 +481,13 @@ fn state_to_value(kind: AggregateKind, state: &AggregateState, ty: &LogicalType)
         S::List(Some(values)) if !values.is_empty() => Value::new(layout.clone(), ValueData::List(values.clone()))?,
         S::Extreme(None) | S::Value(None) | S::List(_) => Value::null(layout.clone()),
         S::Rows(rows) => match kind {
+            // the buffer of an ordered aggregate, in arrival order
+            AggregateKind::Holistic(super::holistic::Holistic::Sorted) if rows.is_empty() => {
+                Value::null(layout.clone())
+            }
+            AggregateKind::Holistic(super::holistic::Holistic::Sorted) => {
+                Value::new(layout.clone(), ValueData::List(rows.clone()))?
+            }
             AggregateKind::Holistic(holistic) => super::holistic_states::from_rows(holistic, rows, &layout)?,
             _ => return Err(state_failure()),
         },
@@ -765,6 +772,9 @@ pub fn write_state(kind: AggregateKind, state: &AggregateState, ty: &LogicalType
 
 /// `finalize`: the result of the aggregate from a state.
 pub fn finalize_state(value: &Value, ty: &LogicalType) -> Result<Value> {
+    if !ty.aggregate_state_orders().is_empty() {
+        return finalize_sorted(value, ty);
+    }
     let (.., arguments, _) = ty.aggregate_state_info().ok_or_else(state_failure)?;
     let (function, result) = resolve_state(ty)?;
     if value.is_null() {
@@ -780,11 +790,145 @@ pub fn finalize_state(value: &Value, ty: &LogicalType) -> Result<Value> {
     function.finalize(&read_state(function.kind, value, ty)?, &result, arguments.first())
 }
 
+/// `SortedAggregateFunction::Finalize` of an exported state: the buffered rows sorted by their keys, then given to
+/// the aggregate in that order. The argument columns come first in a row, and are read as the signature's types;
+/// an argument bound to a constant is that constant.
+fn finalize_sorted(value: &Value, ty: &LogicalType) -> Result<Value> {
+    use crate::planner::expression::BoundExpr;
+    let (name, _, arguments, _) = ty.aggregate_state_info().ok_or_else(state_failure)?;
+    let constants = ty.aggregate_state_constants();
+    let set = super::BuiltinFunctions::get()
+        .aggregate(name)
+        .ok_or_else(state_failure)?;
+    // an ANY argument is of the type of its buffered column
+    let columns: Vec<LogicalType> = ty
+        .state_layout()
+        .child_type()
+        .map(|row| row.struct_children().iter().map(|(_, t)| t.clone()).collect())
+        .unwrap_or_default();
+    let arguments: Vec<LogicalType> = arguments
+        .iter()
+        .enumerate()
+        .map(|(at, argument)| match (argument.id(), columns.get(at)) {
+            (LogicalTypeId::Any, Some(column)) => column.clone(),
+            _ => argument.clone(),
+        })
+        .collect();
+    let placeholders = arguments
+        .iter()
+        .enumerate()
+        .map(|(at, argument)| match constants.get(at).cloned().flatten() {
+            Some(constant) => BoundExpr::constant(constant).cast_to(argument, false),
+            None => BoundExpr::constant(Value::null(argument.clone())),
+        })
+        .collect();
+    let bound = super::binder::bind_aggregate_function(set, placeholders, None, false)?;
+    // an empty buffer (NULL) is the aggregate of no rows: count's is 0
+    let empty = Vec::new();
+    let items = match value.data() {
+        ValueData::List(items) => items,
+        _ => &empty,
+    };
+    // `SortedAggregateFunction::SortRows`: stable, by each key in turn
+    let orders = ty.aggregate_state_orders();
+    let column = |item: &Value, at: u32| match item.data() {
+        ValueData::Struct(fields) => fields.get(at as usize).cloned().unwrap_or_else(Value::sql_null),
+        _ => Value::sql_null(),
+    };
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    let mut failure = None;
+    order.sort_by(|&a, &b| {
+        for key in orders {
+            let (x, y) = (column(&items[a], key.column), column(&items[b], key.column));
+            let ordering = match (x.is_null(), y.is_null()) {
+                (true, true) => std::cmp::Ordering::Equal,
+                (true, false) => {
+                    if key.nulls_first {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Greater
+                    }
+                }
+                (false, true) => {
+                    if key.nulls_first {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Less
+                    }
+                }
+                (false, false) => {
+                    let ordering = super::holistic::compare(&x, &y, x.logical_type()).unwrap_or_else(|error| {
+                        failure.get_or_insert(error);
+                        std::cmp::Ordering::Equal
+                    });
+                    if key.descending { ordering.reverse() } else { ordering }
+                }
+            };
+            if ordering != std::cmp::Ordering::Equal {
+                return ordering;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    // the arguments of each row, as the aggregate takes them
+    let argument_of = |item: &Value, at: usize, ty: &LogicalType| -> Result<Value> {
+        let value = match constants.get(at).cloned().flatten() {
+            Some(constant) => constant,
+            None => column(item, at as u32),
+        };
+        if value.logical_type() == ty || ty.id() == LogicalTypeId::Any {
+            Ok(value)
+        } else {
+            crate::execution::parquet::cast_value(&value, ty)
+        }
+    };
+    let function = bound.function.clone();
+    let mut states = vec![function.kind.initial_state()];
+    if let Some(child) = bound.children.first() {
+        let input_type = child.return_type.clone();
+        let packed = matches!(function.kind, AggregateKind::Holistic(_)) && arguments.len() > 1;
+        let mut input = Vector::new(input_type.clone(), order.len().max(1));
+        for (row, &at) in order.iter().enumerate() {
+            let value = if packed {
+                let fields = input_type
+                    .struct_children()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, field))| argument_of(&items[at], i, field))
+                    .collect::<Result<Vec<_>>>()?;
+                Value::new(input_type.clone(), ValueData::Struct(fields))?
+            } else {
+                argument_of(&items[at], 0, &input_type)?
+            };
+            input.set_value(row, &value)?;
+        }
+        let rows: Vec<(usize, usize)> = (0..order.len()).map(|row| (row, 0)).collect();
+        function.update(Some(&input), order.len(), &rows, &mut states)?;
+    } else {
+        let rows: Vec<(usize, usize)> = (0..order.len()).map(|row| (row, 0)).collect();
+        function.update(None, order.len(), &rows, &mut states)?;
+    }
+    function.finalize(&states[0], &bound.return_type, arguments.first())
+}
+
 /// `combine` and `combine_aggr`: a state of the rows of two others.
 pub fn combine_state_values(left: &Value, right: &Value, ty: &LogicalType) -> Result<Value> {
     // `AggregateStateCombine`: a NULL state is an empty one, and two of them stay NULL
     if left.is_null() && right.is_null() {
         return Ok(Value::null(ty.clone()));
+    }
+    // the buffers of an ordered aggregate together: they are sorted when finalized, which merges their orders
+    if !ty.aggregate_state_orders().is_empty() {
+        let mut rows = Vec::new();
+        for side in [left, right] {
+            if let ValueData::List(items) = side.data() {
+                rows.extend(items.iter().cloned());
+            }
+        }
+        return Value::new(ty.clone(), ValueData::List(rows));
     }
     let function = state_function(ty)?;
     if !ty.is_aggregate_state() && (left.is_null() || right.is_null()) {
@@ -821,7 +965,7 @@ pub fn combine_state_values(left: &Value, right: &Value, ty: &LogicalType) -> Re
 /// `CombineAggrFinalize` of a group no state was combined into: the empty state, which is NULL
 /// for the states of duckrs's own form.
 pub fn empty_state_value(ty: &LogicalType) -> Result<Value> {
-    if !ty.is_aggregate_state() {
+    if !ty.is_aggregate_state() || !ty.aggregate_state_orders().is_empty() {
         return Ok(Value::null(ty.clone()));
     }
     let kind = state_function(ty)?.kind;
@@ -1034,8 +1178,106 @@ pub fn bind_to_aggregate_state(
         };
         argument_types.push(ty);
     }
+    // `ParseOrderBys`: the ORDER BY of an ordered aggregate's state, by the columns of its buffered rows
+    let order_value = if children.len() > 4 {
+        evaluate_scalar(&children[4])?
+    } else {
+        Value::sql_null()
+    };
+    let mut orders: Vec<duckrs_common::types::StateOrder> = Vec::new();
     if children.len() > 4 {
-        return Err(crate::unported("ordered aggregate states in to_aggregate_state"));
+        let state_type = &children[0].return_type;
+        let column_count = match state_type.child_type() {
+            Some(row) if state_type.id() == LogicalTypeId::List && row.id() == LogicalTypeId::Struct => {
+                row.struct_children().len()
+            }
+            _ => {
+                return Err(binder(
+                    "to_aggregate_state: an ordered aggregate state value must be a LIST of STRUCTs (the buffer of \
+                     values), e.g. [{'v0': ...}, ...]"
+                        .into(),
+                ));
+            }
+        };
+        if argument_types.is_empty() {
+            return Err(binder(format!(
+                "to_aggregate_state: aggregate \"{name}\" has no arguments and cannot have an ordered aggregate state"
+            )));
+        }
+        if argument_types.len() > column_count {
+            return Err(binder(format!(
+                "to_aggregate_state: argument count {} exceeds the number of state columns ({column_count})",
+                argument_types.len()
+            )));
+        }
+        if order_value.is_null() {
+            return Err(binder(
+                "to_aggregate_state: an ordered aggregate state must have at least one ORDER BY key".into(),
+            ));
+        }
+        let ValueData::List(entries) = order_value.data() else {
+            return Err(binder(
+                "to_aggregate_state: the ORDER BY argument must be a list of {column, order} structs, e.g. \
+                 [{'column': 1, 'order': 'DESC NULLS LAST'}]"
+                    .into(),
+            ));
+        };
+        for entry in entries {
+            let ValueData::Struct(values) = entry.data() else {
+                return Err(binder(
+                    "to_aggregate_state: each ORDER BY entry must be a {column, order} struct".into(),
+                ));
+            };
+            let fields = entry.logical_type().struct_children();
+            let field = |name: &str| {
+                fields
+                    .iter()
+                    .position(|(n, _)| n == name)
+                    .map(|at| values[at].clone())
+                    .unwrap_or_else(Value::sql_null)
+            };
+            let (column, order) = (field("column"), field("order"));
+            if column.is_null() || order.is_null() {
+                return Err(binder(
+                    "to_aggregate_state: each ORDER BY entry must have a non-NULL 'column' and 'order'".into(),
+                ));
+            }
+            if order.logical_type().id() != LogicalTypeId::Varchar {
+                return Err(binder(
+                    "to_aggregate_state: the 'order' of an ORDER BY entry must be a string, e.g. 'DESC NULLS LAST'"
+                        .into(),
+                ));
+            }
+            let column = crate::execution::parquet::cast_value(&column, &LogicalType::UINTEGER)?
+                .as_i128()
+                .unwrap_or(0) as u64;
+            if column >= column_count as u64 {
+                return Err(binder(format!(
+                    "to_aggregate_state: ORDER BY column {column} is out of range (the state has {column_count} \
+                     columns)"
+                )));
+            }
+            let (descending, nulls_first) = duckrs_common::types::parse_order_modifiers(&order.try_to_string()?)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Parser,
+                        format!(
+                            "Unrecognized order modifier \"{}\"",
+                            order.try_to_string().unwrap_or_default()
+                        ),
+                    )
+                })?;
+            orders.push(duckrs_common::types::StateOrder {
+                column: column as u32,
+                descending,
+                nulls_first,
+            });
+        }
+        if orders.is_empty() {
+            return Err(binder(
+                "to_aggregate_state: an ordered aggregate state must have at least one ORDER BY key".into(),
+            ));
+        }
     }
     // `ParseConstantParameters`: one entry per argument, NULL for one not bound to a constant
     let mut constants: Vec<Option<Value>> = Vec::new();
@@ -1126,6 +1368,38 @@ pub fn bind_to_aggregate_state(
             list(&argument_types)
         )));
     }
+    if !orders.is_empty() {
+        // `CreateSortedAggregateStateType`: the buffered rows as given, the arguments read as the signature's types
+        let constants = constants
+            .into_iter()
+            .map(|c| {
+                c.map(|v| crate::execution::parquet::cast_value(&v, &LogicalType::VARCHAR))
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let constants = if constants.iter().any(Option::is_some) {
+            constants
+        } else {
+            Vec::new()
+        };
+        let layout = children[0].return_type.clone();
+        let state_type = LogicalType::aggregate_state_of(
+            &layout,
+            &bound.function.name,
+            duckrs_common::types::UNRESOLVED_OVERLOAD,
+            argument_types.clone(),
+            bound.return_type.clone(),
+        )
+        .with_state_constants(constants)
+        .with_state_orders(orders);
+        let data = children.swap_remove(0);
+        return Ok(super::nested::bound_function(
+            "to_aggregate_state",
+            vec![data],
+            state_type,
+            to_aggregate_state,
+        ));
+    }
     if state_layout(bound.function.kind, &bound_arguments, &bound.return_type).is_none() {
         return Err(crate::unported(format!(
             "to_aggregate_state of {}",
@@ -1164,7 +1438,9 @@ fn to_aggregate_state(args: &duckrs_common::vector::DataChunk, result: &mut Vect
             return Ok(Value::null(ty.clone()));
         }
         // `validate_state`: what the fields of the layout cannot say
-        if let AggregateKind::Holistic(holistic) = function.kind {
+        if let AggregateKind::Holistic(holistic) = function.kind
+            && ty.aggregate_state_orders().is_empty()
+        {
             super::holistic_states::validate(
                 holistic,
                 &arguments,

@@ -2260,6 +2260,8 @@ impl Binder<'_> {
                 aggregate.distinct_key = Some(key);
             }
         }
+        // the keys as written, which an exported ordered state buffers
+        let written_order: Vec<(BoundExpr, duckrs_common::sort_key::OrderModifiers)> = order_by.clone();
         // `BindAggregate`: the rows are ordered as the collation of their sort keys says
         aggregate.order_by = order_by
             .into_iter()
@@ -2313,14 +2315,60 @@ impl Binder<'_> {
             } else {
                 Vec::new()
             };
-            let (exported, ty) = crate::function::aggregates::export_state(
-                &aggregate.function,
-                &aggregate.return_type,
-                &types,
-                constants,
-            )?;
-            aggregate.function = Arc::new(exported);
-            aggregate.return_type = ty;
+            if !aggregate.order_by.is_empty() {
+                // `CreateSortedAggregateStateType`: the rows buffered as they arrive, the arguments and then the keys
+                // that are not one of them, and sorted when the state is finalized
+                let mut buffered: Vec<BoundExpr> = arguments.to_vec();
+                let mut orders = Vec::with_capacity(written_order.len());
+                for (expr, modifiers) in &written_order {
+                    let key = format!("{:?}", expr.kind);
+                    let column = match buffered.iter().position(|b| format!("{:?}", b.kind) == key) {
+                        Some(column) => column,
+                        None => {
+                            buffered.push(expr.clone());
+                            buffered.len() - 1
+                        }
+                    };
+                    orders.push(duckrs_common::types::StateOrder {
+                        column: column as u32,
+                        descending: modifiers.order == duckrs_common::sort_key::OrderType::Descending,
+                        nulls_first: modifiers.nulls == duckrs_common::sort_key::NullOrder::NullsFirst,
+                    });
+                }
+                let names = (0..buffered.len()).map(|i| format!("v{i}")).collect();
+                let pack = crate::function::nested::bind_struct_pack(names, buffered)?;
+                let ty = LogicalType::aggregate_state_of(
+                    &LogicalType::list(pack.return_type.clone()),
+                    &aggregate.function.name,
+                    duckrs_common::types::UNRESOLVED_OVERLOAD,
+                    types,
+                    aggregate.return_type.clone(),
+                )
+                .with_state_constants(constants)
+                .with_state_orders(orders);
+                let sorted = crate::function::aggregates::AggregateFunction {
+                    name: aggregate.function.name.clone(),
+                    arguments: vec![LogicalType::new(LogicalTypeId::Any)],
+                    return_type: ty.clone(),
+                    kind: crate::function::aggregates::AggregateKind::Holistic(
+                        crate::function::holistic::Holistic::Sorted,
+                    ),
+                    export: Some(ty.clone()),
+                };
+                aggregate.function = Arc::new(sorted);
+                aggregate.children = vec![pack];
+                aggregate.order_by.clear();
+                aggregate.return_type = ty;
+            } else {
+                let (exported, ty) = crate::function::aggregates::export_state(
+                    &aggregate.function,
+                    &aggregate.return_type,
+                    &types,
+                    constants,
+                )?;
+                aggregate.function = Arc::new(exported);
+                aggregate.return_type = ty;
+            }
         }
         let state = self.aggregates.as_mut().expect("still bound");
         state.inside_aggregate = false;

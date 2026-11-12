@@ -80,6 +80,9 @@ pub enum Holistic {
     RegrSxx,
     RegrSyy,
     RegrSxy,
+    /// `SortedAggregateFunction` for EXPORT_STATE: the rows of an ordered aggregate, buffered as they arrive, with
+    /// their sort keys; they are sorted when the state is finalized
+    Sorted,
 }
 
 /// The type of `quantile_cont` and `median` of a column of type `input`.
@@ -1214,6 +1217,8 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
             Value::hugeint(count as i128)
         }
         Histogram => histogram(rows, ty)?,
+        Sorted if rows.is_empty() => null(),
+        Sorted => Value::new(ty.state_layout(), ValueData::List(rows.to_vec()))?,
         HistogramBins => binned_histogram(rows, ty, false)?,
         HistogramExact => binned_histogram(rows, ty, true)?,
         ApproxCountDistinct => Value::bigint(distinct_count(rows)?),
