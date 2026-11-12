@@ -166,6 +166,35 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             }
             info
         }
+        K::ParquetScan { scan, .. } => {
+            // `PhysicalTableScan::ParamsToString` of a function without `to_string`
+            let mut info = entry("Function", scan.function_name.to_uppercase());
+            let mut names: Vec<String> = scan.names.clone();
+            if scan.file_row_number {
+                names.push("file_row_number".to_string());
+            }
+            if scan.filename {
+                names.push("filename".to_string());
+            }
+            names.extend(scan.hive.iter().map(|(name, _)| name.clone()));
+            names.extend(scan.virtual_columns.iter().map(|c| c.name().to_string()));
+            let projected = names
+                .into_iter()
+                .enumerate()
+                .filter(|(at, _)| scan.projected.as_ref().is_none_or(|p| p.get(*at).copied().unwrap_or(true)))
+                .map(|(_, name)| name);
+            info.extend(entry("Projections", lines(projected)));
+            if !scan.filters.is_empty() {
+                info.extend(entry("Filters", lines(scan.filters.iter().map(filter_text))));
+            }
+            if !scan.file_filters.is_empty() {
+                info.extend(entry("File Filters", scan.file_filters.clone()));
+                if let Some(total) = scan.total_files {
+                    info.extend(entry("Scanning Files", format!("{}/{total}", scan.files.len())));
+                }
+            }
+            info
+        }
         K::Filter { expressions } => {
             let key = if physical { "Expression" } else { "Expressions" };
             entry(key, lines(expressions.iter().map(|e| e.to_string())))
@@ -271,6 +300,8 @@ pub(super) fn physical_tree(
     }
     let name = match logical.map(|l| &l.kind) {
         Some(K::Get { .. }) => "SEQ_SCAN".to_string(),
+        // `PhysicalTableScan::GetName`
+        Some(K::ParquetScan { scan, .. }) => scan.function_name.to_uppercase(),
         _ => op.name().to_string(),
     };
     let mut info: Vec<(String, String)> = match logical {

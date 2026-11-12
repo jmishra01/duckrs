@@ -60,9 +60,55 @@ pub struct ParquetScanData {
     pub read: Option<Vec<bool>>,
     /// the hive partitions that are also columns of the files, by the position of the column
     pub hive_overrides: Vec<(usize, String)>,
+    /// the name the function was called by, which EXPLAIN shows (`read_parquet`, `parquet_scan`)
+    pub function_name: String,
+    /// `table_filters`: conditions on one column each, over the columns of [`Self::output_types`]
+    pub filters: Vec<crate::planner::expression::BoundExpr>,
+    /// by output column, those the operators above read (`projection_ids`), once unused columns are known
+    pub projected: Option<Vec<bool>>,
+    /// `ExtraOperatorInfo::file_filters`: the filters that left files out, as text
+    pub file_filters: String,
+    /// `ExtraOperatorInfo::total_files`: how many files there were before that
+    pub total_files: Option<usize>,
 }
 
 impl ParquetScanData {
+    /// The output column at `at` as `HivePartitioning::GetKnownColumnValues` knows it: a hive partition or the
+    /// file name, which have one value for each file.
+    fn known_column(&self, at: usize) -> Option<KnownColumn<'_>> {
+        if let Some((_, key)) = self.hive_overrides.iter().find(|(column, _)| *column == at) {
+            return Some(KnownColumn::Hive(key, &self.types[at]));
+        }
+        let mut next = self.names.len() + usize::from(self.file_row_number);
+        if self.filename {
+            if at == next {
+                return Some(KnownColumn::Filename);
+            }
+            next += 1;
+        }
+        if let Some((key, ty)) = at.checked_sub(next).and_then(|i| self.hive.get(i)) {
+            return Some(KnownColumn::Hive(key, ty));
+        }
+        next += self.hive.len();
+        match at.checked_sub(next).and_then(|i| self.virtual_columns.get(i)) {
+            Some(crate::execution::multi_file::VirtualColumn::Filename) => Some(KnownColumn::Filename),
+            _ => None,
+        }
+    }
+
+    /// Whether the output column at `at` has one value for each file, which [`Self::known_value`] gives.
+    pub fn is_known_per_file(&self, at: usize) -> bool {
+        self.known_column(at).is_some()
+    }
+
+    /// The value of the output column at `at` in the file at `path`, if it has one for the whole file.
+    pub fn known_value(&self, at: usize, path: &str) -> Option<Value> {
+        match self.known_column(at)? {
+            KnownColumn::Filename => Some(Value::varchar(path)),
+            KnownColumn::Hive(key, ty) => super::csv::hive_value(path, key, ty).ok(),
+        }
+    }
+
     pub fn output_types(&self) -> Vec<LogicalType> {
         let mut types = self.types.clone();
         if self.file_row_number {
@@ -75,6 +121,13 @@ impl ParquetScanData {
         types.extend(crate::execution::multi_file::virtual_types(&self.virtual_columns));
         types
     }
+}
+
+/// A column with one value for each file.
+enum KnownColumn<'a> {
+    Filename,
+    /// the key of the partition, and the type of the column
+    Hive(&'a str, &'a LogicalType),
 }
 
 /// The numbers in `text`, in order.
@@ -978,7 +1031,169 @@ impl std::fmt::Debug for ParquetScanState {
     }
 }
 
-fn open_file(scan: &ParquetScanData, state: &mut ParquetScanState, path: &str) -> Result<()> {
+/// The row groups of the file whose statistics do not rule out every row of them, and how many there are; `None`
+/// where all of them are read (`ParquetReader::PrepareRowGroupBuffer`).
+fn row_groups_to_scan(
+    scan: &ParquetScanData,
+    filter: Option<&crate::planner::expression::BoundExpr>,
+    metadata: &ParquetMetaData,
+    path: &str,
+) -> Option<Vec<usize>> {
+    let filter = filter?;
+    // the rows are numbered as they are read
+    let mut numbers = Vec::new();
+    if scan.file_row_number {
+        numbers.push(scan.names.len());
+    }
+    let first_virtual = scan.output_types().len() - scan.virtual_columns.len();
+    for (at, column) in scan.virtual_columns.iter().enumerate() {
+        if *column == crate::execution::multi_file::VirtualColumn::FileRowNumber {
+            numbers.push(first_virtual + at);
+        }
+    }
+    fn reads(expr: &crate::planner::expression::BoundExpr, columns: &[usize]) -> bool {
+        matches!(expr.kind, crate::planner::expression::BoundExprKind::Reference(at) if columns.contains(&at))
+            || expr.children().into_iter().any(|child| reads(child, columns))
+    }
+    let filtered = reads(filter, &numbers);
+    let projected = |at: &usize| scan.projected.as_ref().is_none_or(|p| p.get(*at).copied().unwrap_or(true));
+    if filtered || numbers.iter().any(projected) {
+        return None;
+    }
+    let leaves: Vec<Option<usize>> = (0..scan.names.len())
+        .map(|column| statistics_leaf(scan, metadata, column))
+        .collect();
+    let normalized = normalized_interval_blooms(metadata);
+    let mut file = None;
+    let selected = metadata
+        .row_groups()
+        .iter()
+        .enumerate()
+        .filter(|(_, group)| {
+            let zone = |at: usize| -> Option<crate::catalog::ColumnZone> {
+                if let Some(leaf) = leaves.get(at) {
+                    let zone = group_zone(scan, metadata, group, (*leaf)?, at)?;
+                    return (!zone.unknown).then_some(zone);
+                }
+                let value = scan.known_value(at, path)?;
+                Some(crate::catalog::ColumnZone {
+                    has_null: value.is_null(),
+                    min: (!value.is_null()).then(|| value.clone()),
+                    max: (!value.is_null()).then_some(value),
+                    unknown: false,
+                })
+            };
+            !crate::execution::zone_map::never_true(&zone, filter)
+                && !bloom_rules_out(scan, &leaves, group, filter, &mut file, path, normalized)
+        })
+        .map(|(at, _)| at)
+        .collect();
+    Some(selected)
+}
+
+/// Whether the bloom filters of the row group rule out every row `expr` is true for: an equality of a column and
+/// a constant, or conjunctions of those (`ParquetReader::CheckBloomFilters`).
+fn bloom_rules_out(
+    scan: &ParquetScanData,
+    leaves: &[Option<usize>],
+    group: &parquet::file::metadata::RowGroupMetaData,
+    expr: &crate::planner::expression::BoundExpr,
+    file: &mut Option<File>,
+    path: &str,
+    normalized: bool,
+) -> bool {
+    use crate::planner::expression::BoundExprKind as E;
+    match &expr.kind {
+        E::Conjunction { and: true, children } => {
+            if children
+                .iter()
+                .any(|child| bloom_rules_out(scan, leaves, group, child, file, path, normalized))
+            {
+                return true;
+            }
+            // `x >= c AND x <= c` is `x = c` (what `FilterCombiner` makes of it)
+            use duckrs_parser::ast::ComparisonOp as C;
+            fn bound(expr: &crate::planner::expression::BoundExpr, wanted: C) -> Option<(usize, Value)> {
+                match &expr.kind {
+                    E::Comparison { op, left, right } if *op == wanted => match (&left.kind, &right.kind) {
+                        (E::Reference(column), E::Constant(value)) => Some((*column, value.clone())),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            }
+            children.iter().filter_map(|c| bound(c, C::GreaterThanOrEqual)).any(|(column, low)| {
+                let matched = children
+                    .iter()
+                    .filter_map(|c| bound(c, C::LessThanOrEqual))
+                    .any(|(other, high)| other == column && high == low);
+                let ty = scan.types.get(column).cloned().unwrap_or(LogicalType::SQLNULL);
+                let equal = crate::planner::expression::BoundExpr::new(
+                    E::Comparison {
+                        op: C::Equal,
+                        left: Box::new(crate::planner::expression::BoundExpr::new(E::Reference(column), ty)),
+                        right: Box::new(crate::planner::expression::BoundExpr::constant(low)),
+                    },
+                    LogicalType::BOOLEAN,
+                );
+                matched && bloom_rules_out(scan, leaves, group, &equal, file, path, normalized)
+            })
+        }
+        E::Conjunction { and: false, children } => children
+            .iter()
+            .all(|child| bloom_rules_out(scan, leaves, group, child, file, path, normalized)),
+        // `x BETWEEN c AND c` is `x = c`
+        E::Between { input, lower, upper } => match (&input.kind, &lower.kind, &upper.kind) {
+            (E::Reference(_), E::Constant(low), E::Constant(high)) if low == high => {
+                let equal = crate::planner::expression::BoundExpr::new(
+                    E::Comparison {
+                        op: duckrs_parser::ast::ComparisonOp::Equal,
+                        left: input.clone(),
+                        right: lower.clone(),
+                    },
+                    LogicalType::BOOLEAN,
+                );
+                bloom_rules_out(scan, leaves, group, &equal, file, path, normalized)
+            }
+            _ => false,
+        },
+        // NULL is never in a bloom filter, and `IS NOT DISTINCT FROM` a value that isn't NULL is `=` it
+        E::Comparison {
+            op: duckrs_parser::ast::ComparisonOp::Equal | duckrs_parser::ast::ComparisonOp::NotDistinctFrom,
+            left,
+            right,
+        } => {
+            let (column, value) = match (&left.kind, &right.kind) {
+                (E::Reference(column), E::Constant(value)) | (E::Constant(value), E::Reference(column)) => {
+                    (*column, value)
+                }
+                _ => return false,
+            };
+            let Some(Some(leaf)) = leaves.get(column) else {
+                return false;
+            };
+            let ty = &scan.types[column];
+            let Some(value) = try_cast_value(value, ty).filter(|v| !v.is_null()) else {
+                return false;
+            };
+            if file.is_none() {
+                *file = File::open(path).ok();
+            }
+            let Some(file) = file.as_mut() else {
+                return false;
+            };
+            bloom_excludes(file, group.column(*leaf), ty, &value, normalized).unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+fn open_file(
+    scan: &ParquetScanData,
+    filter: Option<&crate::planner::expression::BoundExpr>,
+    state: &mut ParquetScanState,
+    path: &str,
+) -> Result<()> {
     let typed = open_builder(path)?;
     let strip = scan.utf8_validation.repairs() || has_interval(typed.parquet_schema().root_schema());
     let builder = if strip {
@@ -1062,6 +1277,10 @@ fn open_file(scan: &ParquetScanData, state: &mut ParquetScanState, path: &str) -
             let mask = parquet::arrow::ProjectionMask::roots(builder.parquet_schema(), roots);
             builder.with_projection(mask)
         }
+        None => builder,
+    };
+    let builder = match row_groups_to_scan(scan, filter, builder.metadata(), path) {
+        Some(selected) => builder.with_row_groups(selected),
         None => builder,
     };
     state.reader = Some(guarded(path, || {
@@ -1231,6 +1450,8 @@ fn cast_error(
 pub struct PhysicalParquetScan {
     pub types: Vec<LogicalType>,
     pub scan: Arc<ParquetScanData>,
+    /// the conjunction of the scan's filters
+    pub filter: Option<crate::planner::expression::BoundExpr>,
 }
 
 impl PhysicalOperator for PhysicalParquetScan {
@@ -1246,6 +1467,17 @@ impl PhysicalOperator for PhysicalParquetScan {
     fn source_state(&self) -> SourceState {
         Box::new(ParquetScanState::default())
     }
+    fn row_groups_scanned(&self) -> Option<(usize, usize)> {
+        self.filter.as_ref()?;
+        let (mut scanned, mut total) = (0, 0);
+        for path in &self.scan.files {
+            let (metadata, _) = read_metadata(path).ok()?;
+            let groups = metadata.num_row_groups();
+            total += groups;
+            scanned += row_groups_to_scan(&self.scan, self.filter.as_ref(), &metadata, path).map_or(groups, |g| g.len());
+        }
+        (total > 0).then_some((scanned, total))
+    }
     fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
         let state: &mut ParquetScanState = state.downcast_mut().expect("parquet scan state");
         loop {
@@ -1253,7 +1485,7 @@ impl PhysicalOperator for PhysicalParquetScan {
                 return Ok(None);
             };
             if state.reader.is_none() {
-                open_file(&self.scan, state, path)?;
+                open_file(&self.scan, self.filter.as_ref(), state, path)?;
             }
             let reader = state.reader.as_mut().expect("just opened");
             match guarded(path, || Ok(reader.next()))? {
@@ -1263,14 +1495,23 @@ impl PhysicalOperator for PhysicalParquetScan {
                         let chunk = with_utf8_validation(self.scan.utf8_validation, || {
                             batch_chunk(&self.scan, state, &batch, path)
                         })?;
-                        return crate::execution::multi_file::append_virtual_columns(
+                        let mut chunk = crate::execution::multi_file::append_virtual_columns(
                             chunk,
                             &self.scan.virtual_columns,
                             path,
                             state.file,
                             &mut state.virtual_rows,
-                        )
-                        .map(Some);
+                        )?;
+                        if let Some(filter) = &self.filter {
+                            let (sel, matched) = crate::execution::expression_executor::select(filter, &chunk)?;
+                            if matched == 0 {
+                                continue;
+                            }
+                            if matched != chunk.len() {
+                                chunk.slice(&sel, matched);
+                            }
+                        }
+                        return Ok(Some(chunk));
                     }
                 }
                 None => {
@@ -2226,6 +2467,20 @@ fn statistics_text(stats: &Statistics) -> (Option<String>, Option<String>, Optio
     )
 }
 
+/// `ParquetMultiFileInfo::GetCardinality`: the rows of the one file, or of the first for each file, at least 1000
+/// (there are no file sizes to tell more by).
+pub fn scan_cardinality(scan: &ParquetScanData) -> Option<u64> {
+    let Some(first) = scan.files.first() else {
+        return Some(0);
+    };
+    let (metadata, _) = read_metadata(first).ok()?;
+    let rows = metadata.file_metadata().num_rows().max(0) as u64;
+    if scan.files.len() == 1 {
+        return Some(rows);
+    }
+    Some(rows.max(1000) * scan.files.len() as u64)
+}
+
 /// The most files whose footers statistics are read from (`parquet_metadata_cache` aside, each is a read).
 const MAX_FILES_FOR_STATISTICS: usize = 64;
 
@@ -2241,38 +2496,12 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
         let Ok((metadata, _)) = read_metadata(path) else {
             return unknown;
         };
-        let descriptor = metadata.file_metadata().schema_descr();
         let mut file_stats = Vec::with_capacity(scan.names.len());
-        for (name, ty) in scan.names.iter().zip(&scan.types) {
-            if scan
-                .hive_overrides
-                .iter()
-                .any(|(_, key)| key.eq_ignore_ascii_case(name))
-            {
-                file_stats.push(None);
-                continue;
-            }
-            // a top-level column that is a leaf
-            let leaf = (0..descriptor.num_columns()).find(|&i| {
-                let path = descriptor.column(i).path().parts().to_vec();
-                path.len() == 1 && path[0].eq_ignore_ascii_case(name)
-            });
-            let Some(leaf) = leaf else {
+        for column in 0..scan.names.len() {
+            let Some(leaf) = statistics_leaf(scan, &metadata, column) else {
                 file_stats.push(None);
                 continue;
             };
-            let column = descriptor.column(leaf);
-            // repaired strings no longer lie within the bounds of the stored bytes
-            if scan.utf8_validation.repairs() && ty.id() == LogicalTypeId::Varchar {
-                file_stats.push(None);
-                continue;
-            }
-            use parquet::basic::Type as Physical;
-            // NaNs are left out of float bounds, but are the largest values to DuckDB; INT96 bounds compare bytes
-            let bounded = !matches!(
-                column.physical_type(),
-                Physical::FLOAT | Physical::DOUBLE | Physical::INT96
-            ) && !matches!(ty.id(), LogicalTypeId::Float | LogicalTypeId::Double);
             let mut stats = crate::catalog::ColumnStatistics {
                 min: None,
                 max: None,
@@ -2280,45 +2509,17 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
                 can_be_valid: false,
                 geometry: None,
             };
-            let mut bounds_known = bounded;
+            let mut bounds_known = true;
             let mut usable = true;
             for group in metadata.row_groups() {
-                let chunk = group.column(leaf);
-                let Some(statistics) = chunk.statistics() else {
+                let Some(zone) = group_zone(scan, &metadata, group, leaf, column) else {
                     usable = false;
                     break;
                 };
-                let rows = group.num_rows() as u64;
-                let Some(nulls) = statistics.null_count_opt() else {
-                    usable = false;
-                    break;
-                };
-                stats.can_be_null |= nulls > 0;
-                stats.can_be_valid |= nulls < rows;
-                if nulls >= rows {
-                    continue;
-                }
-                // byte arrays with only the deprecated bounds may be ordered as signed bytes
-                let deprecated = statistics.is_min_max_deprecated()
-                    && matches!(
-                        column.physical_type(),
-                        Physical::BYTE_ARRAY | Physical::FIXED_LEN_BYTE_ARRAY
-                    );
-                let bound = |bytes: Option<&[u8]>, exact: bool| -> Option<Value> {
-                    let bytes = bytes?;
-                    // `StringStatsAreValid`: exact bounds of a VARCHAR that are not UTF-8 are bogus
-                    if ty.id() == LogicalTypeId::Varchar && std::str::from_utf8(bytes).is_err() {
-                        return None;
-                    }
-                    let text = statistic_text(&column, bytes)?;
-                    if !exact || deprecated {
-                        return None;
-                    }
-                    try_cast_value(&Value::varchar(text), ty)
-                };
-                let min = bound(statistics.min_bytes_opt(), statistics.min_is_exact());
-                let max = bound(statistics.max_bytes_opt(), statistics.max_is_exact());
-                match (min, max) {
+                stats.can_be_null |= zone.has_null;
+                stats.can_be_valid |= zone.min.is_some() || zone.unknown;
+                match (zone.min, zone.max) {
+                    _ if zone.unknown => bounds_known = false,
                     (Some(min), Some(max)) if bounds_known => {
                         let less = |a: &Value, b: &Value| {
                             crate::optimizer::statistics::compare_values(
@@ -2334,7 +2535,8 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
                             stats.max = Some(max);
                         }
                     }
-                    _ => bounds_known = false,
+                    // only NULLs
+                    _ => {}
                 }
             }
             if !bounds_known {
@@ -2379,6 +2581,81 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
         return unknown;
     }
     result
+}
+
+/// The leaf of the file that the scan's column `column` reads and whose statistics are its own: a top-level column
+/// that is a leaf, not overridden by a hive partition, and not repaired as it is read.
+fn statistics_leaf(scan: &ParquetScanData, metadata: &ParquetMetaData, column: usize) -> Option<usize> {
+    let (name, ty) = (scan.names.get(column)?, &scan.types[column]);
+    if scan.schema.is_some() || scan.hive_overrides.iter().any(|(_, key)| key.eq_ignore_ascii_case(name)) {
+        return None;
+    }
+    // repaired strings no longer lie within the bounds of the stored bytes
+    if scan.utf8_validation.repairs() && ty.id() == LogicalTypeId::Varchar {
+        return None;
+    }
+    let descriptor = metadata.file_metadata().schema_descr();
+    (0..descriptor.num_columns()).find(|&i| {
+        let path = descriptor.column(i).path().parts().to_vec();
+        path.len() == 1 && path[0].eq_ignore_ascii_case(name)
+    })
+}
+
+/// What the statistics of row group `group` say of the scan's column `column`, stored in `leaf`: `None` where
+/// there are none, `unknown` where they have no bounds DuckDB can use.
+fn group_zone(
+    scan: &ParquetScanData,
+    metadata: &ParquetMetaData,
+    group: &parquet::file::metadata::RowGroupMetaData,
+    leaf: usize,
+    column: usize,
+) -> Option<crate::catalog::ColumnZone> {
+    use parquet::basic::Type as Physical;
+    let ty = &scan.types[column];
+    let descriptor = metadata.file_metadata().schema_descr().column(leaf);
+    let statistics = group.column(leaf).statistics()?;
+    let rows = group.num_rows() as u64;
+    let nulls = statistics.null_count_opt()?;
+    let mut zone = crate::catalog::ColumnZone {
+        has_null: nulls > 0,
+        ..crate::catalog::ColumnZone::default()
+    };
+    if nulls >= rows {
+        return Some(zone);
+    }
+    // NaNs are left out of float bounds, but are the largest values to DuckDB; INT96 bounds compare bytes
+    let bounded = !matches!(
+        descriptor.physical_type(),
+        Physical::FLOAT | Physical::DOUBLE | Physical::INT96
+    ) && !matches!(ty.id(), LogicalTypeId::Float | LogicalTypeId::Double);
+    // byte arrays with only the deprecated bounds may be ordered as signed bytes
+    let deprecated = statistics.is_min_max_deprecated()
+        && matches!(
+            descriptor.physical_type(),
+            Physical::BYTE_ARRAY | Physical::FIXED_LEN_BYTE_ARRAY
+        );
+    let bound = |bytes: Option<&[u8]>, exact: bool| -> Option<Value> {
+        let bytes = bytes?;
+        // `StringStatsAreValid`: exact bounds of a VARCHAR that are not UTF-8 are bogus
+        if ty.id() == LogicalTypeId::Varchar && std::str::from_utf8(bytes).is_err() {
+            return None;
+        }
+        let text = statistic_text(&descriptor, bytes)?;
+        if !exact || deprecated {
+            return None;
+        }
+        try_cast_value(&Value::varchar(text), ty)
+    };
+    let min = bound(statistics.min_bytes_opt(), statistics.min_is_exact());
+    let max = bound(statistics.max_bytes_opt(), statistics.max_is_exact());
+    match (min, max) {
+        (Some(min), Some(max)) if bounded => {
+            zone.min = Some(min);
+            zone.max = Some(max);
+        }
+        _ => zone.unknown = true,
+    }
+    Some(zone)
 }
 
 /// `ParquetStatisticsUtils::ConvertValueInternal`, as text: a statistic of a column, by the DuckDB type that the
@@ -3208,6 +3485,51 @@ pub fn page_index_rows(path: &str) -> Result<Vec<String>> {
     Ok(rows)
 }
 
+/// Whether the file says its interval bloom filters hash normalized intervals.
+fn normalized_interval_blooms(metadata: &ParquetMetaData) -> bool {
+    metadata.file_metadata().key_value_metadata().is_some_and(|kvs| {
+        kvs.iter()
+            .any(|kv| kv.key == "duckdb.interval_bloom_filter" && kv.value.as_deref() == Some("normalized-v1"))
+    })
+}
+
+/// Whether the bloom filter of the column chunk rules out `value`, of the type `ty` the column is read as
+/// (`ParquetStatisticsUtils::BloomFilterExcludes`).
+fn bloom_excludes(
+    file: &mut File,
+    chunk: &parquet::file::metadata::ColumnChunkMetaData,
+    ty: &LogicalType,
+    value: &Value,
+    normalized: bool,
+) -> Result<bool> {
+    let Some(offset) = chunk.bloom_filter_offset().filter(|offset| *offset > 0) else {
+        return Ok(false);
+    };
+    let (mut probe, mut probe_type) = (value.clone(), ty.clone());
+    // the unit the file stores timestamps in
+    if ty.id() == LogicalTypeId::Timestamp
+        && let Some(parquet::basic::LogicalType::Timestamp(ts)) = chunk.column_descr().logical_type_ref()
+    {
+        let micros = probe.as_i128().unwrap_or(0) as i64;
+        match ts.unit {
+            parquet::basic::TimeUnit::MILLIS => {
+                probe_type = LogicalType::new(LogicalTypeId::TimestampMs);
+                probe = Value::new(probe_type.clone(), ValueData::Int64(micros.div_euclid(1000)))?;
+            }
+            parquet::basic::TimeUnit::NANOS => {
+                probe_type = LogicalType::new(LogicalTypeId::TimestampNs);
+                probe = Value::new(probe_type.clone(), ValueData::Int64(micros.saturating_mul(1000)))?;
+            }
+            _ => {}
+        }
+    }
+    let Some(hash) = crate::execution::parquet_writer::bloom_probe_hash(&probe_type, &probe, normalized)? else {
+        return Ok(false);
+    };
+    let length = chunk.bloom_filter_length().map(i64::from);
+    Ok(read_bloom_filter(file, offset as u64, length).is_some_and(|filter| !filter.contains(hash)))
+}
+
 /// `parquet_bloom_probe`: for each row group of a file, whether the bloom filter of `column` rules `value` out
 /// (`ParquetBloomProbeProcessor`), as rows of SQL.
 pub fn bloom_probe_rows(path: &str, column: &str, value: &Value) -> Result<Vec<String>> {
@@ -3217,16 +3539,8 @@ pub fn bloom_probe_rows(path: &str, column: &str, value: &Value) -> Result<Vec<S
         return Err(invalid(format!("Column {column} not found in {path}")));
     };
     let ty = &types[index];
-    let mut source = Vector::new(value.logical_type().clone(), 1);
-    source.set_value(0, value)?;
-    let mut cast = Vector::new(ty.clone(), 1);
-    crate::function::cast::cast_vector(&source, &mut cast, 1, crate::function::cast::CastMode::Strict)?;
-    let mut probe = cast.get_value(0);
-    let mut probe_type = ty.clone();
-    let normalized = metadata.file_metadata().key_value_metadata().is_some_and(|kvs| {
-        kvs.iter()
-            .any(|kv| kv.key == "duckdb.interval_bloom_filter" && kv.value.as_deref() == Some("normalized-v1"))
-    });
+    let probe = cast_value(value, ty)?;
+    let normalized = normalized_interval_blooms(&metadata);
     let mut file =
         File::open(path).map_err(|e| Error::new(ErrorKind::Io, format!("Cannot open file \"{path}\": {e}")))?;
     let mut rows = Vec::new();
@@ -3238,40 +3552,36 @@ pub fn bloom_probe_rows(path: &str, column: &str, value: &Value) -> Result<Vec<S
         else {
             continue;
         };
-        // the unit the file stores timestamps in
-        if group == 0
-            && ty.id() == LogicalTypeId::Timestamp
-            && let Some(parquet::basic::LogicalType::Timestamp(ts)) = chunk.column_descr().logical_type_ref()
-        {
-            let micros = probe.as_i128().unwrap_or(0) as i64;
-            match ts.unit {
-                parquet::basic::TimeUnit::MILLIS => {
-                    probe_type = LogicalType::new(LogicalTypeId::TimestampMs);
-                    probe = Value::new(probe_type.clone(), ValueData::Int64(micros.div_euclid(1000)))?;
-                }
-                parquet::basic::TimeUnit::NANOS => {
-                    probe_type = LogicalType::new(LogicalTypeId::TimestampNs);
-                    probe = Value::new(probe_type.clone(), ValueData::Int64(micros.saturating_mul(1000)))?;
-                }
-                _ => {}
-            }
-        }
-        let hash = crate::execution::parquet_writer::bloom_probe_hash(&probe_type, &probe, normalized)?;
-        let excludes = match (hash, chunk.bloom_filter_offset()) {
-            (Some(hash), Some(offset)) => match read_bloom_filter(&mut file, offset as u64) {
-                Some(filter) => !filter.contains(hash),
-                None => false,
-            },
-            _ => false,
-        };
+        let excludes = bloom_excludes(&mut file, chunk, ty, &probe, normalized)?;
         rows.push(format!("({}, {group}::BIGINT, {excludes})", sql_text(path)));
     }
     Ok(rows)
 }
 
 /// A bloom filter of a file: its `BloomFilterHeader`, then `numBytes` of bits.
-fn read_bloom_filter(file: &mut File, offset: u64) -> Option<crate::execution::parquet_writer::BloomFilter> {
+/// The bloom filter at `offset`, of `length` bytes with its header where the column says so; `None` where it is
+/// not one DuckDB can use or doesn't fit in the file (the checks of `ParquetStatisticsUtils::BloomFilterExcludes`).
+fn read_bloom_filter(
+    file: &mut File,
+    offset: u64,
+    length: Option<i64>,
+) -> Option<crate::execution::parquet_writer::BloomFilter> {
     use std::io::{Read, Seek, SeekFrom};
+    let file_size = file.metadata().ok()?.len();
+    if offset == 0 || offset >= file_size {
+        return None;
+    }
+    let length = match length {
+        Some(length) if length <= 0 => return None,
+        Some(length) => {
+            let length = length as u64;
+            if length > file_size || offset > file_size - length {
+                return None;
+            }
+            Some(length)
+        }
+        None => None,
+    };
     file.seek(SeekFrom::Start(offset)).ok()?;
     let mut header = vec![0u8; 64];
     let read = file.read(&mut header).ok()?;
@@ -3344,8 +3654,18 @@ fn read_bloom_filter(file: &mut File, offset: u64) -> Option<crate::execution::p
         }
     }
     let size = num_bytes?;
+    // `ParquetBloomBlock`s of 32 bytes
+    let data_start = offset + at as u64;
+    if size == 0 || size % 32 != 0 || size as u64 > file_size || data_start > file_size - size as u64 {
+        return None;
+    }
+    if let Some(length) = length
+        && (at as u64 > length || size as u64 != length - at as u64)
+    {
+        return None;
+    }
     let mut data = vec![0u8; size];
-    file.seek(SeekFrom::Start(offset + at as u64)).ok()?;
+    file.seek(SeekFrom::Start(data_start)).ok()?;
     file.read_exact(&mut data).ok()?;
     Some(crate::execution::parquet_writer::BloomFilter { data })
 }

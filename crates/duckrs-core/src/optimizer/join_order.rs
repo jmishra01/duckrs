@@ -749,6 +749,34 @@ impl JoinOrderOptimizer {
                 let cardinality = filter_cardinality(&filters, &stats);
                 stats.scaled(cardinality)
             }
+            K::ParquetScan { table_index, scan } => {
+                let Some(rows) = crate::execution::parquet::scan_cardinality(scan) else {
+                    return RelationStats {
+                        cardinality: UNKNOWN_CARDINALITY,
+                        distinct: HashMap::new(),
+                    };
+                };
+                // the range of an integral column's values bounds how many distinct ones it has
+                let distinct = crate::execution::parquet::scan_statistics(scan)
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(column, stats)| {
+                        let stats = stats?;
+                        if scan.types[column].id() == duckrs_common::types::LogicalTypeId::Decimal {
+                            return None;
+                        }
+                        let (min, max) = (stats.min?.as_i128()?, stats.max?.as_i128()?);
+                        let range = max.checked_sub(min)?.checked_add(1)?;
+                        Some((ColumnBinding::new(*table_index, column), (range as f64).min(rows as f64)))
+                    })
+                    .collect();
+                let stats = RelationStats {
+                    cardinality: rows as f64,
+                    distinct,
+                };
+                let cardinality = filter_cardinality(&scan.filters, &stats);
+                stats.scaled(cardinality)
+            }
             K::Range { count, .. } => RelationStats {
                 cardinality: *count as f64,
                 distinct: HashMap::new(),

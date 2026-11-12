@@ -49,10 +49,20 @@ fn visit(op: &mut LogicalOperator, by_position: bool, used: &mut HashSet<ColumnB
     if let K::ParquetScan { table_index, scan } = &mut op.kind
         && !by_position
     {
+        let mut filtered = HashSet::new();
+        for filter in &scan.filters {
+            collect_columns(filter, &mut filtered);
+        }
         let read: Vec<bool> = (0..scan.names.len())
+            .map(|column| ColumnBinding::new(*table_index, column))
+            .map(|column| used.contains(&column) || filtered.contains(&column))
+            .collect();
+        let projected = (0..scan.output_types().len())
             .map(|column| used.contains(&ColumnBinding::new(*table_index, column)))
             .collect();
-        std::sync::Arc::make_mut(scan).read = Some(read);
+        let scan = std::sync::Arc::make_mut(scan);
+        scan.read = Some(read);
+        scan.projected = Some(projected);
     }
     if let K::Projection {
         table_index,

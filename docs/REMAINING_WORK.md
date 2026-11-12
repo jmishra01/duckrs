@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 4228 of 6367 test files pass (**69.9%** of the 6047 that run). The v1 target is ≥ 90%.
+- Overall: 4240 of 6367 test files pass (**70.1%** of the 6047 that run). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -106,8 +106,15 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] encryption, UNION and GEOMETRY columns
   - [ ] rotation inside partitions groups rows into files differently from C++ (`partitioned_file_rotation`)
   - [x] reading a directory path, as `FALLBACK_GLOB` globs `dir/**/*.ext` (also for CSV and JSON)
-  - [ ] reader side: row-group pruning by bloom filters and page indexes, `bound_schema` (needs struct field
-    projection and `EXPLAIN (SQL)`), `maximum_files_for_stats`
+  - [x] filters pushed into the scan (`table_filters`), run as each batch is read; row groups their statistics
+    or bloom filters rule out are skipped (the zone map checks of tables), shown as `Row Groups Scanned` in EXPLAIN
+    ANALYZE; the scan shown as C++'s `PhysicalTableScan` (`Function`, `Projections`, `Filters`); its estimate
+    from the footers (`GetCardinality`)
+  - [x] hive partitions and file names pruned before the scan (`ApplyFiltersToFileList`): `File Filters`,
+    `Scanning Files`
+  - [ ] reader side: pruning by page indexes and by bloom filters of nested values, filters through functions with
+    statistics of their own (`list_contains`, `map_extract`, ...), `bound_schema` (needs struct field
+    projection and `EXPLAIN (SQL)`), `maximum_files_for_stats`; the same pushdown into CSV and JSON scans
   - [ ] corrupt files C++ rejects that the crate reads (INT96 out of range, WKB types, page index row counts)
   - [ ] prefetch / read-ahead metrics and EXPLAIN shapes of Parquet scans (~20 files)
   - [x] duplicate column names (`_1`, `_2`, ... when read, deduplicated when written) and nameless columns (`C0`, ...)
