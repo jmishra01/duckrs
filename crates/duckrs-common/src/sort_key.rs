@@ -302,7 +302,9 @@ impl RowKey {
                     bytes[*len as usize..end].copy_from_slice(new);
                     *len = end as u8;
                 } else {
-                    let mut heap = bytes[..*len as usize].to_vec();
+                    // room for the columns still to come, so that they do not each move the key
+                    let mut heap = Vec::with_capacity((end + end / 2).max(64));
+                    heap.extend_from_slice(&bytes[..*len as usize]);
                     heap.extend_from_slice(new);
                     *self = Self::Heap(heap);
                 }
