@@ -572,6 +572,14 @@ fn epoch_ms_to_timestamp(args: &DataChunk, result: &mut Vector) -> Result<()> {
 
 fn nanosecond(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
+        // `NanosecondsOperator`: the nanoseconds of the minute, exactly for the types that keep them
+        if matches!(
+            row[0].logical_type().id(),
+            LogicalTypeId::TimeNs | LogicalTypeId::TimestampNs
+        ) && let Some(nanos) = row[0].as_i128()
+        {
+            return Ok(Value::bigint(nanos.rem_euclid(60_000_000_000) as i64));
+        }
         Ok(match moment(&row[0]) {
             Some(m) => match part_of(DatePart::Microseconds, m)? {
                 Part::Integer(v) => Value::bigint(v * 1000),
@@ -1012,13 +1020,12 @@ fn make_timestamp(args: &DataChunk, result: &mut Vector) -> Result<()> {
 
 fn to_timestamp(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
-        let seconds = seconds_of(&row[0]);
-        if !seconds.is_finite() || seconds.abs() > 9.2e12 {
-            return Err(out_of_range(format!(
-                "Could not convert epoch seconds to TIMESTAMP WITH TIME ZONE: {seconds}"
-            )));
+        // `EpochSecOperator`: the microseconds have to fit a BIGINT
+        let micros = (seconds_of(&row[0]) * 1e6).round_ties_even();
+        if !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&micros) {
+            return Err(conversion("Epoch seconds out of range for TIMESTAMP WITH TIME ZONE"));
         }
-        Ok(Value::timestamp_tz(Timestamp((seconds * 1e6).round() as i64)))
+        Ok(Value::timestamp_tz(Timestamp(micros as i64)))
     })
 }
 
@@ -1974,11 +1981,27 @@ pub fn date_functions() -> Vec<ScalarFunctionSet> {
         ("epoch", epoch, d.clone()),
         ("julian", julian, d.clone()),
     ];
+    // `GetTimePartFunction`: the parts of a time of day take a TIME_NS too
+    let time_parts = [
+        "hour",
+        "minute",
+        "second",
+        "millisecond",
+        "microsecond",
+        "nanosecond",
+        "epoch",
+        "timezone",
+        "timezone_hour",
+        "timezone_minute",
+    ];
     for (name, callback, ty) in parts {
         let mut overloads: Vec<(Vec<LogicalType>, LogicalType, ScalarCallback)> = inputs
             .iter()
             .map(|input| (vec![input.clone()], ty.clone(), *callback))
             .collect();
+        if time_parts.contains(name) {
+            overloads.push((vec![L::new(LogicalTypeId::TimeNs)], ty.clone(), *callback));
+        }
         // PG also defines timezone(INTERVAL, TIME_TZ) => TIME_TZ
         if *name == "timezone" {
             overloads.push((vec![L::INTERVAL, time_tz.clone()], time_tz.clone(), timezone_of_time_tz));
@@ -2075,6 +2098,11 @@ pub fn date_functions() -> Vec<ScalarFunctionSet> {
             ),
             (vec![i.clone()], L::TIMESTAMP, make_timestamp),
         ],
+    );
+    // `MakeTimestampMsFun`: `EpochMillisOperator::Inverse`
+    add(
+        "make_timestamp_ms",
+        vec![(vec![L::BIGINT], L::TIMESTAMP, epoch_ms_to_timestamp as ScalarCallback)],
     );
     add(
         "make_timestamp_ns",

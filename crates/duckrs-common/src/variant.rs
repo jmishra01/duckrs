@@ -20,6 +20,33 @@ pub enum VariantNode {
     Array(Vec<VariantNode>),
 }
 
+/// Dropping a deeply nested value one level at a time, as the drop glue's recursion would overflow
+/// the stack.
+impl Drop for VariantNode {
+    fn drop(&mut self) {
+        let mut pending: Vec<VariantNode> = match self {
+            Self::Object(children) if children.iter().any(|(_, c)| c.is_nested()) => {
+                std::mem::take(children).into_iter().map(|(_, c)| c).collect()
+            }
+            Self::Array(items) if items.iter().any(VariantNode::is_nested) => std::mem::take(items),
+            _ => return,
+        };
+        while let Some(mut node) = pending.pop() {
+            match &mut node {
+                Self::Object(children) => pending.extend(std::mem::take(children).into_iter().map(|(_, c)| c)),
+                Self::Array(items) => pending.append(items),
+                _ => {}
+            }
+        }
+    }
+}
+
+impl VariantNode {
+    fn is_nested(&self) -> bool {
+        matches!(self, Self::Object(_) | Self::Array(_))
+    }
+}
+
 const NULL_TAG: u8 = 0;
 const OBJECT_TAG: u8 = 1;
 const ARRAY_TAG: u8 = 2;
@@ -185,24 +212,43 @@ impl VariantNode {
         out
     }
 
+    /// The values in order, nested ones from a stack of their own rather than by recursion.
     fn write(&self, out: &mut Vec<u8>) {
+        enum Next<'a> {
+            Node(&'a VariantNode),
+            Key(&'a str),
+        }
+        let write_len = |out: &mut Vec<u8>, length: usize| out.extend_from_slice(&(length as u32).to_le_bytes());
+        let mut pending = vec![Next::Node(self)];
+        while let Some(next) = pending.pop() {
+            match next {
+                Next::Key(key) => {
+                    write_len(out, key.len());
+                    out.extend_from_slice(key.as_bytes());
+                }
+                Next::Node(Self::Object(children)) => {
+                    out.push(OBJECT_TAG);
+                    write_len(out, children.len());
+                    for (key, child) in children.iter().rev() {
+                        pending.push(Next::Node(child));
+                        pending.push(Next::Key(key));
+                    }
+                }
+                Next::Node(Self::Array(items)) => {
+                    out.push(ARRAY_TAG);
+                    write_len(out, items.len());
+                    pending.extend(items.iter().rev().map(Next::Node));
+                }
+                Next::Node(other) => other.write_scalar(out),
+            }
+        }
+    }
+
+    fn write_scalar(&self, out: &mut Vec<u8>) {
         let write_len = |out: &mut Vec<u8>, length: usize| out.extend_from_slice(&(length as u32).to_le_bytes());
         match self {
             Self::Null => out.push(NULL_TAG),
-            Self::Object(children) => {
-                out.push(OBJECT_TAG);
-                write_len(out, children.len());
-                for (key, child) in children {
-                    write_len(out, key.len());
-                    out.extend_from_slice(key.as_bytes());
-                    child.write(out);
-                }
-            }
-            Self::Array(items) => {
-                out.push(ARRAY_TAG);
-                write_len(out, items.len());
-                items.iter().for_each(|item| item.write(out));
-            }
+            Self::Object(_) | Self::Array(_) => unreachable!("written by write"),
             Self::Scalar(value) => {
                 out.push(SCALAR_TAG);
                 let ty = value.logical_type();
@@ -277,28 +323,63 @@ impl Reader<'_> {
         Ok(u32::from_le_bytes(self.take::<4>()?) as usize)
     }
 
+    /// One value, its nested ones read with a stack of their own rather than by recursion.
     fn node(&mut self) -> Result<VariantNode> {
-        let [tag] = self.take::<1>()?;
-        match tag {
-            NULL_TAG => Ok(VariantNode::Null),
-            OBJECT_TAG => {
-                let size = self.length()?;
-                let mut children = Vec::with_capacity(size);
-                for _ in 0..size {
-                    let length = self.length()?;
-                    let key = String::from_utf8_lossy(self.slice(length)?).into_owned();
-                    children.push((key, self.node()?));
+        // an object or array being read: what it has so far and how many more children it has
+        enum Open {
+            Object(Vec<(String, VariantNode)>, usize, String),
+            Array(Vec<VariantNode>, usize),
+        }
+        let mut open: Vec<Open> = Vec::new();
+        loop {
+            // the key of the next child of an object comes before it
+            if let Some(Open::Object(children, remaining, key)) = open.last_mut()
+                && *remaining > children.len()
+            {
+                let length = self.length()?;
+                *key = String::from_utf8_lossy(self.slice(length)?).into_owned();
+            }
+            let [tag] = self.take::<1>()?;
+            let mut done = match tag {
+                NULL_TAG => VariantNode::Null,
+                OBJECT_TAG => match self.length()? {
+                    0 => VariantNode::Object(Vec::new()),
+                    size => {
+                        open.push(Open::Object(Vec::with_capacity(size.min(1024)), size, String::new()));
+                        continue;
+                    }
+                },
+                ARRAY_TAG => match self.length()? {
+                    0 => VariantNode::Array(Vec::new()),
+                    size => {
+                        open.push(Open::Array(Vec::with_capacity(size.min(1024)), size));
+                        continue;
+                    }
+                },
+                _ => VariantNode::Scalar(self.scalar()?),
+            };
+            // hand the finished value to its parent, closing every parent it completes
+            loop {
+                match open.last_mut() {
+                    None => return Ok(done),
+                    Some(Open::Object(children, size, key)) => {
+                        children.push((std::mem::take(key), done));
+                        if children.len() < *size {
+                            break;
+                        }
+                    }
+                    Some(Open::Array(items, size)) => {
+                        items.push(done);
+                        if items.len() < *size {
+                            break;
+                        }
+                    }
                 }
-                Ok(VariantNode::Object(children))
+                done = match open.pop().expect("checked above") {
+                    Open::Object(children, ..) => VariantNode::Object(children),
+                    Open::Array(items, _) => VariantNode::Array(items),
+                };
             }
-            ARRAY_TAG => {
-                let size = self.length()?;
-                (0..size)
-                    .map(|_| self.node())
-                    .collect::<Result<Vec<_>>>()
-                    .map(VariantNode::Array)
-            }
-            _ => self.scalar().map(VariantNode::Scalar),
         }
     }
 

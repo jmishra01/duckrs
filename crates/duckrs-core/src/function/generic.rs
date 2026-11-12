@@ -721,8 +721,9 @@ fn list_generate_series(args: &DataChunk, result: &mut Vector) -> Result<()> {
 }
 
 /// Whether `name` is the `unnest` of a select list.
+/// `IsUnnestFunction`: UNNEST, or UNLIST.
 pub fn is_unnest(name: &str) -> bool {
-    name.eq_ignore_ascii_case("unnest")
+    name.eq_ignore_ascii_case("unnest") || name.eq_ignore_ascii_case("unlist")
 }
 
 /// Whether `expr` is an unnest the select node has yet to take out of its expressions.
@@ -770,6 +771,8 @@ pub fn is_generic_function(name: &str) -> bool {
             "array_slice"
                 | "list_slice"
                 | "len"
+                | "char_length"
+                | "character_length"
                 | "array_length"
                 | "cardinality"
                 | "concat"
@@ -889,7 +892,7 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
                 array_length_of_dimension,
             ))
         }
-        "len" | "array_length" | "length" => {
+        "len" | "array_length" | "length" | "char_length" | "character_length" => {
             let child = as_list(single(&children)?);
             let id = child.return_type.id();
             if id == LogicalTypeId::Bit && lower == "length" {

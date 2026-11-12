@@ -226,18 +226,18 @@ fn variant_typeof(args: &DataChunk, result: &mut Vector) -> Result<()> {
 }
 
 /// One step of `variant_extract`: a child, or nothing.
-fn extract_child(node: &VariantNode, key: &Value) -> Option<VariantNode> {
-    match (node, key.data()) {
+/// The child at `key`, moved out of `node` (a clone of a deep child would recurse).
+fn extract_child(node: VariantNode, key: &Value) -> Option<VariantNode> {
+    let mut node = node;
+    match (&mut node, key.data()) {
         (VariantNode::Object(children), ValueData::Bytes(key)) => {
             let key = String::from_utf8_lossy(key);
-            children
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(&key))
-                .map(|(_, c)| c.clone())
+            let at = children.iter().position(|(k, _)| k.eq_ignore_ascii_case(&key))?;
+            Some(children.swap_remove(at).1)
         }
         (VariantNode::Array(items), _) => {
-            let index = key.as_i128().filter(|i| *i >= 1)?;
-            items.get(index as usize - 1).cloned()
+            let index = key.as_i128().filter(|i| *i >= 1)? as usize;
+            (index <= items.len()).then(|| items.swap_remove(index - 1))
         }
         _ => None,
     }
@@ -248,7 +248,7 @@ fn variant_extract(args: &DataChunk, result: &mut Vector) -> Result<()> {
         if row[0].is_null() || row[1].is_null() {
             return Ok(Value::null(variant_type()));
         }
-        Ok(match extract_child(&decode(&row[0])?, &row[1]) {
+        Ok(match extract_child(decode(&row[0])?, &row[1]) {
             // a NULL inside of a VARIANT is NULL once it is taken out
             Some(VariantNode::Null) | None => Value::null(variant_type()),
             Some(node) => variant_value(&node),
@@ -267,13 +267,13 @@ fn variant_keys(args: &DataChunk, result: &mut Vector) -> Result<()> {
         if let Some(key) = row.get(1)
             && !key.is_null()
         {
-            let Some(child) = extract_child(&node, key) else {
+            let Some(child) = extract_child(node, key) else {
                 return Ok(Value::null(ty.clone()));
             };
             node = child;
         }
-        let keys = match node {
-            VariantNode::Object(children) => children.into_iter().map(|(k, _)| Value::varchar(k)).collect(),
+        let keys = match &node {
+            VariantNode::Object(children) => children.iter().map(|(k, _)| Value::varchar(k)).collect(),
             _ => Vec::new(),
         };
         Value::list(LogicalType::VARCHAR, keys)
@@ -283,7 +283,7 @@ fn variant_keys(args: &DataChunk, result: &mut Vector) -> Result<()> {
 fn variant_array_length(args: &DataChunk, result: &mut Vector) -> Result<()> {
     // `WriteArrayLengthsResult`: 0 for what is no array, NULL for what is not there
     over_paths(args, result, &LogicalType::UBIGINT, &|node| {
-        Ok(match node {
+        Ok(match &node {
             Some(VariantNode::Array(items)) => Value::ubigint(items.len() as u64),
             Some(_) => Value::ubigint(0),
             None => Value::null(LogicalType::UBIGINT),
@@ -458,8 +458,12 @@ fn resolve_path(node: VariantNode, key: &str) -> Option<VariantNode> {
     if key.is_empty() {
         return Some(node);
     }
-    match node {
-        VariantNode::Object(children) => children.into_iter().find(|(k, _)| k == key).map(|(_, child)| child),
+    let mut node = node;
+    match &mut node {
+        VariantNode::Object(children) => std::mem::take(children)
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, child)| child),
         _ => None,
     }
 }

@@ -422,7 +422,14 @@ impl Binder<'_> {
         if let ExprKind::Star(star) = &expr.kind
             && is_plain_star(&expr)
         {
-            result.extend(self.generate_all_columns(star)?);
+            // `ReplaceStarExpression`: an alias of the star names every column it stands for
+            let alias = &expr.alias;
+            result.extend(self.generate_all_columns(star)?.into_iter().map(|mut column| {
+                if !alias.is_empty() {
+                    column.alias.clone_from(alias);
+                }
+                column
+            }));
             return Ok(());
         }
         let (found, unpacked) = self.find_columns(&mut expr)?;

@@ -791,12 +791,48 @@ pub fn json_cast(source: &Vector, result: &mut Vector, count: usize, mode: CastM
             }
         } else {
             let text = value.try_to_string()?;
-            let json = parsed(&text)?;
-            transform(&json, &to, !matches!(mode, CastMode::Try))?
+            let strict = !matches!(mode, CastMode::Try);
+            with_stack_for(&text, || transform(&parsed(&text)?, &to, strict))?
         };
         result.set_value(row, &converted)?;
     }
     Ok(())
+}
+
+/// Parsing, transforming and dropping a document recurse once per level it nests, so a deep one runs
+/// on a thread whose stack is as deep as the document (yyjson and `ConvertJSON` take no stack per level).
+fn with_stack_for<T: Send>(text: &str, work: impl FnOnce() -> Result<T> + Send) -> Result<T> {
+    const SHALLOW: usize = 512;
+    let mut depth = 0usize;
+    let mut deepest = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for byte in text.bytes() {
+        match byte {
+            _ if escaped => escaped = false,
+            b'\\' if in_string => escaped = true,
+            b'"' => in_string = !in_string,
+            b'[' | b'{' if !in_string => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            b']' | b'}' if !in_string => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    if deepest <= SHALLOW {
+        return work();
+    }
+    // a few kilobytes per level for the parser, the transform and the drop
+    let stack = 8 * 1024 * 1024 + deepest * 16 * 1024;
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(stack)
+            .spawn_scoped(scope, work)
+            .map_err(|error| Error::new(ErrorKind::Internal, format!("could not start a thread: {error}")))?
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
 }
 
 /// `json_structure`, and what `read_json` infers.

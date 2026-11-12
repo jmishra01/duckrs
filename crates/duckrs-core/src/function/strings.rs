@@ -718,6 +718,45 @@ fn md5_digest(input: &[u8]) -> [u8; 16] {
     digest
 }
 
+/// `MD5Number128Operator`: the digest's bytes as a little-endian UHUGEINT.
+fn md5_number(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| {
+        Ok(Value::uhugeint(u128::from_le_bytes(md5_digest(bytes_of(&row[0])))))
+    })
+}
+
+/// `OverlayFunction`: `replacement` in place of `count` characters (by default as many as it has) from
+/// character `start`.
+fn overlay(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    row_wise(args, result, |row| {
+        if row.iter().any(Value::is_null) {
+            return Ok(Value::null(LogicalType::VARCHAR));
+        }
+        let input = row[0].try_to_string()?;
+        let replacement = row[1].try_to_string()?;
+        let start = row[2].as_i128().unwrap_or(0) as i64;
+        let mut count = replacement.chars().count() as i64;
+        if let Some(given) = row.get(3).and_then(Value::as_i128)
+            && given >= 0
+        {
+            count = given as i64;
+        }
+        // `CharPosToByte`: the byte where the 1-based character starts, clamped to the string
+        let byte_of = |position: i64| -> usize {
+            if position <= 1 {
+                return 0;
+            }
+            input
+                .char_indices()
+                .nth((position - 1) as usize)
+                .map_or(input.len(), |(at, _)| at)
+        };
+        let end = if count > 0 && start > i64::MAX - count { i64::MAX } else { start + count };
+        let (from, to) = (byte_of(start), byte_of(end));
+        Ok(Value::varchar(format!("{}{replacement}{}", &input[..from], &input[to..])))
+    })
+}
+
 fn md5(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
         Ok(Value::varchar(hex_text(&md5_digest(bytes_of(&row[0]))).to_lowercase()))
@@ -930,6 +969,15 @@ pub fn string_functions() -> Vec<ScalarFunctionSet> {
         ),
         ("md5", vec![v.clone()], v.clone(), md5),
         ("md5", vec![blob.clone()], v.clone(), md5),
+        ("md5_number", vec![v.clone()], LogicalType::UHUGEINT, md5_number),
+        ("md5_number", vec![blob.clone()], LogicalType::UHUGEINT, md5_number),
+        ("overlay", vec![v.clone(), v.clone(), LogicalType::BIGINT], v.clone(), overlay),
+        (
+            "overlay",
+            vec![v.clone(), v.clone(), LogicalType::BIGINT, LogicalType::BIGINT],
+            v.clone(),
+            overlay,
+        ),
         ("~~~", vec![v.clone(), v.clone()], b.clone(), glob),
         ("encode", vec![v.clone()], blob.clone(), encode),
         ("to_base64", vec![blob.clone()], v.clone(), to_base64),

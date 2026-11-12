@@ -1799,7 +1799,12 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
         "struct_keys" => {
             if children
                 .first()
-                .is_some_and(|c| !matches!(c.return_type.id(), LogicalTypeId::Struct | LogicalTypeId::Unknown))
+                .is_some_and(|c| {
+                    !matches!(
+                        c.return_type.id(),
+                        LogicalTypeId::Struct | LogicalTypeId::Unknown | LogicalTypeId::SqlNull
+                    )
+                })
             {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,

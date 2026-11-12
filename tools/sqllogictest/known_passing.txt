@@ -2138,7 +2138,9 @@ test/sql/function/string/hex.test
 test/sql/function/string/hex_bignum.test
 test/sql/function/string/hive_partition_component.test
 test/sql/function/string/like_unicode.test
+test/sql/function/string/md5.test
 test/sql/function/string/null_byte.test
+test/sql/function/string/overlay.test
 test/sql/function/string/parse_formatted_bytes.test
 test/sql/function/string/parse_formatted_bytes_exact.test
 test/sql/function/string/parse_path_separator.test
@@ -2181,6 +2183,7 @@ test/sql/function/string/test_issue_1812.test
 test/sql/function/string/test_jaccard.test
 test/sql/function/string/test_jaro_winkler.test
 test/sql/function/string/test_left.test
+test/sql/function/string/test_length.test
 test/sql/function/string/test_levenshtein.test
 test/sql/function/string/test_like.test
 test/sql/function/string/test_like_escape.test
@@ -2224,6 +2227,7 @@ test/sql/function/time/test_date_part.test
 test/sql/function/time/test_extract.test
 test/sql/function/timestamp/age.test
 test/sql/function/timestamp/date_sub_diff.test
+test/sql/function/timestamp/epoch.test
 test/sql/function/timestamp/strptime_year_day_366.test
 test/sql/function/timestamp/test_date_diff_epoch.test
 test/sql/function/timestamp/test_extract.test
@@ -4117,6 +4121,7 @@ test/sql/types/nested/list/test_list_slice.test
 test/sql/types/nested/list/test_list_slice_negative_step.test
 test/sql/types/nested/list/test_list_slice_numeric_limits.test
 test/sql/types/nested/list/test_list_slice_step.test
+test/sql/types/nested/list/test_nested_list.test
 test/sql/types/nested/list/test_scalar_list.test
 test/sql/types/nested/map/map_error.test
 test/sql/types/nested/map/map_from_entries/column.test
@@ -4151,6 +4156,7 @@ test/sql/types/nested/struct/struct_is_null.test
 test/sql/types/nested/struct/struct_of_lists_where.test
 test/sql/types/nested/struct/struct_subquery.test
 test/sql/types/nested/struct/test_struct.test
+test/sql/types/nested/struct/test_struct_keys.test
 test/sql/types/nested/struct/test_struct_values.test
 test/sql/types/nested/test_deeply_nested_types.test
 test/sql/types/nested/unnest_range_plan.test
@@ -4295,6 +4301,7 @@ test/sql/types/unsigned/test_unsigned_verify.test
 test/sql/types/uuid/test_uuid_cast.test
 test/sql/types/uuid/test_uuid_uhugeint_cast.test
 test/sql/types/variant/debug_shred_empty_object.test
+test/sql/types/variant/json_cast_depth.test
 test/sql/types/variant/json_cast_depth_thread.test
 test/sql/types/variant/list_to_variant_null_after_value.test
 test/sql/types/variant/map_extract_variant_values.test
@@ -4451,6 +4458,7 @@ test/sql/window/test_thread_count.test
 test/sql/window/test_tpcc_results.test
 test/sql/window/test_tpcds_q49.test
 test/sql/window/test_value_exclude.test
+test/sql/window/test_value_orderby.test
 test/sql/window/test_wide_orderby.test
 test/sql/window/test_window_agg_stats_propagation.test
 test/sql/window/test_window_binding.test
