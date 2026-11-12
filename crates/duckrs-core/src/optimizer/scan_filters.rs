@@ -97,6 +97,19 @@ pub fn push_into_scans(op: &mut LogicalOperator) {
             expressions.push(conjunct);
         }
     }
+    // `TryCreateMultiColumnExpressionFilter`: a filter on several columns of a table stays, and a copy tells the
+    // scan which row groups none of its rows pass in
+    if let K::Get { zone_filters, .. } = &mut op.children[0].kind {
+        for expr in expressions.iter() {
+            let mut columns = Vec::new();
+            let mut outer = false;
+            columns_of(expr, &mut columns, &mut outer);
+            let several = columns.iter().any(|c| *c != columns[0]);
+            if several && !outer && columns.iter().all(|c| scan.contains(c)) && !expr.is_volatile() {
+                zone_filters.push(expr.clone());
+            }
+        }
+    }
     if expressions.is_empty() {
         *op = op.children.remove(0);
     }

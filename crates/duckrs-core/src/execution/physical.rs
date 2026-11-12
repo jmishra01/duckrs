@@ -242,6 +242,8 @@ pub struct PhysicalTableScan {
     pub types: Vec<LogicalType>,
     /// what rows must meet, on `column_ids`
     pub filter: Option<BoundExpr>,
+    /// what no row of a row group the scan skips meets: `filter`, and the filters on several columns above it
+    pub prune: Option<BoundExpr>,
     /// the rows to read, in order, instead of all of them
     pub index_rows: Option<Arc<Vec<usize>>>,
 }
@@ -373,7 +375,7 @@ impl PhysicalTableScan {
         // the zone maps are per group of the table, which are those of the file only when they line up
         let aligned = group_rows.is_multiple_of(STANDARD_VECTOR_SIZE) && TableCursor::is_aligned(&*source, group_rows);
         let wanted = if aligned {
-            groups_to_scan(&self.table, &self.column_ids, self.filter.as_ref(), rows)
+            groups_to_scan(&self.table, &self.column_ids, self.prune.as_ref(), rows)
         } else {
             Vec::new()
         };
@@ -581,7 +583,7 @@ impl PhysicalOperator for PhysicalTableScan {
         if chunks < MIN_PARALLEL_ROW_GROUPS * super::zone_map::CHUNKS_PER_ROW_GROUP {
             return None;
         }
-        let groups = groups_to_scan(&self.table, &self.column_ids, self.filter.as_ref(), rows);
+        let groups = groups_to_scan(&self.table, &self.column_ids, self.prune.as_ref(), rows);
         let ids = self.table.row_ids(rows);
         Some((Box::new(ParallelTableScan { ids, rows, groups }), chunks))
     }
@@ -656,7 +658,7 @@ impl PhysicalOperator for PhysicalTableScan {
     /// (so that `INSERT INTO t FROM t` ends): the next chunk and how many rows remain.
     fn source_state(&self) -> SourceState {
         let remaining = self.table.row_count();
-        let groups = groups_to_scan(&self.table, &self.column_ids, self.filter.as_ref(), remaining);
+        let groups = groups_to_scan(&self.table, &self.column_ids, self.prune.as_ref(), remaining);
         let source = self.table.source();
         let cursor = source.clone().map(|source| self.file_scan(source));
         let ids = self.table.row_ids(remaining);
@@ -679,7 +681,7 @@ impl PhysicalOperator for PhysicalTableScan {
             return None;
         }
         let rows = self.table.row_count();
-        let groups = groups_to_scan(&self.table, &self.column_ids, self.filter.as_ref(), rows);
+        let groups = groups_to_scan(&self.table, &self.column_ids, self.prune.as_ref(), rows);
         (!groups.is_empty()).then(|| (groups.iter().filter(|g| **g).count(), groups.len()))
     }
     fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {

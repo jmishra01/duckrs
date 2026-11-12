@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 4245 of 6367 test files pass (**70.2%** of the 6047 that run). The v1 target is ≥ 90%.
+- Overall: 4246 of 6367 test files pass (**70.2%** of the 6047 that run). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -186,8 +186,12 @@ Each item gives the number of failing files in `test/` that it should fix, where
     within a year or month, casts between timestamp units, bare BOOLEAN columns, `NOT`, `(cmp) = false` /
     `IS FALSE`, `IS DISTINCT FROM`, `IS NOT DISTINCT FROM NULL`; a filter that can fail goes into the scan when it
     is the only one (`PushdownGet`)
-  - [ ] zone maps of filters on several columns (`a != b`, `x < 1 OR s > 'a'`: `FinishPushdown`), BOOLEAN
-    groups with NULLs in a file, INTERVAL and TIMESTAMPTZ_NS bounds, week, division by a column
+  - [x] zone maps of filters on several columns of a table (`a != b`, `x < 1 OR y > 5`): a copy in the scan
+    that only skips row groups (`PushMultiColumnFilter`); NULLs of a row group in a file from its validity
+    statistics
+  - [ ] VARCHAR bounds of tables in a file (C++'s 8-byte prefixes and `StringStats::CheckZonemap`), string
+    comparisons that C++'s prefixes can't decide but exact bounds do (`a = b` prunes more here), INTERVAL and
+    TIMESTAMPTZ_NS bounds, week, division by a column
   - [ ] secure views (7 files), the scalar aggregate merger (`scalar_aggregate_merge_threshold`, 3),
     `json_serialize_plan`, gamma's errors without IEEE
   - [ ] string statistics (contains, suffix, upper/lower, length), struct/list/map extracts, `vector_type`,

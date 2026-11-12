@@ -1882,6 +1882,7 @@ impl Binder<'_> {
                         column_ids,
                         filters: Vec::new(),
                         projection: None,
+                        zone_filters: Vec::new(),
                         index_rows: None,
                     },
                     vec![],

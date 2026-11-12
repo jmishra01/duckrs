@@ -961,11 +961,23 @@ impl TableSource for DiskTable {
         let mut zones = Vec::with_capacity(self.table.row_groups.len());
         for group in 0..self.table.row_groups.len() {
             let stored = self.persistent_column(group, column)?;
-            // nulls are in the validity column, so any group might have some
+            // nulls are in the validity column: what its statistics say, if there is one
+            let (has_null, has_valid) = match &stored.validity {
+                Some(validity) => (
+                    validity.pointers.iter().any(|p| p.statistics.has_null),
+                    validity.pointers.iter().any(|p| p.statistics.has_no_null),
+                ),
+                None => (true, true),
+            };
             let mut zone = ColumnZone {
-                has_null: true,
+                has_null,
                 ..ColumnZone::default()
             };
+            // only NULLs: there are no bounds to know
+            if !has_valid {
+                zones.push(zone);
+                continue;
+            }
             for pointer in &stored.pointers {
                 let (min, max) = (
                     self.bound(column, pointer.statistics.min.as_ref())?,
