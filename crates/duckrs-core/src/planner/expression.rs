@@ -472,11 +472,26 @@ impl fmt::Display for BoundExpr {
         match &self.kind {
             BoundExprKind::Constant(value) if value.is_null() => f.write_str("NULL"),
             BoundExprKind::Constant(value) => {
+                use duckrs_common::types::LogicalTypeId as T;
                 let text = value.try_to_string().unwrap_or_default();
-                if value.logical_type().id() == duckrs_common::types::LogicalTypeId::Varchar {
-                    write!(f, "'{}'", text.replace('\'', "''"))
-                } else {
-                    f.write_str(&text)
+                // `Value::ToSQLString`
+                match value.logical_type().id() {
+                    T::Varchar | T::Enum => write!(f, "'{}'", text.replace('\'', "''")),
+                    T::Uuid
+                    | T::Date
+                    | T::Time
+                    | T::TimeNs
+                    | T::Timestamp
+                    | T::TimeTz
+                    | T::TimestampTz
+                    | T::TimestampTzNs
+                    | T::TimestampSec
+                    | T::TimestampMs
+                    | T::TimestampNs
+                    | T::Interval
+                    | T::Blob
+                    | T::Bit => write!(f, "'{text}'::{}", value.logical_type()),
+                    _ => f.write_str(&text),
                 }
             }
             BoundExprKind::ColumnRef { .. } | BoundExprKind::Reference(_) => f.write_str(&self.alias),

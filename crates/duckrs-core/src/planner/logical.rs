@@ -723,6 +723,9 @@ impl LogicalOperator {
             }
             LogicalOperatorKind::MarkJoin { predicate, .. } => predicate.iter_mut().collect(),
             LogicalOperatorKind::Get { filters, .. } => filters.iter_mut().collect(),
+            LogicalOperatorKind::ParquetScan { scan, .. } => {
+                std::sync::Arc::make_mut(scan).filters.iter_mut().collect()
+            }
             LogicalOperatorKind::MergeInto {
                 actions,
                 row_id,

@@ -1254,7 +1254,7 @@ impl Exporter<'_> {
                 };
                 Body::Select(Select::new(TableRef::empty(), values))
             }
-            Op::ParquetScan { scan, .. } => self.parquet_scan(scan)?,
+            Op::ParquetScan { scan, table_index } => self.parquet_scan(scan, *table_index)?,
             Op::CsvScan { .. } | Op::JsonScan { .. } => {
                 return Err("The file scan has no SQL export".into());
             }
@@ -1383,7 +1383,7 @@ impl Exporter<'_> {
     }
 
     /// `read_parquet` of the files it read (`ReconstructSQLSource`), for a scan of only their columns.
-    fn parquet_scan(&mut self, scan: &crate::execution::parquet::ParquetScanData) -> Res<Body> {
+    fn parquet_scan(&mut self, scan: &crate::execution::parquet::ParquetScanData, table_index: usize) -> Res<Body> {
         use crate::execution::parquet::Int96As;
         if scan.file_row_number
             || scan.filename
@@ -1426,7 +1426,18 @@ impl Exporter<'_> {
                 column.name().to_string(),
             ])));
         }
-        Ok(Body::Select(Select::new(from, columns)))
+        // the filters pushed into the scan (`table_filters`)
+        let mut scope = Scope::default();
+        for ((position, column), ty) in columns.iter().enumerate().zip(scan.output_types()) {
+            scope
+                .columns
+                .insert(ColumnBinding::new(table_index, position), (column.clone(), ty));
+        }
+        let mut select = Select::new(from, columns);
+        for filter in &scan.filters {
+            select.filters.push(self.expr(&scope, filter)?);
+        }
+        Ok(Body::Select(select))
     }
 
     fn filter(&mut self, child: Relation, expressions: &[BoundExpr]) -> Res<Body> {

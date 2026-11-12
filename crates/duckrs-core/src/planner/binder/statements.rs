@@ -1707,8 +1707,9 @@ impl Binder<'_> {
                     && lower.ends_with(".parquet")
                     && !crate::execution::file_system::glob_or_directory(&name.name, "parquet").is_empty()
                 {
+                    // `ParquetScanReplacement`
                     let call = ast::FunctionExpr::new(
-                        "read_parquet",
+                        "parquet_scan",
                         vec![Expr::constant(ast::Literal::string(name.name.clone()))],
                     );
                     let mut file_ref = table_ref.clone();

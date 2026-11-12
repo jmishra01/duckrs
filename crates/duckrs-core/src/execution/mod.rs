@@ -171,7 +171,14 @@ fn create_physical(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
         }),
         LogicalOperatorKind::CsvScan { scan, .. } => Box::new(PhysicalCsvScan { types, scan }),
         LogicalOperatorKind::JsonScan { scan, .. } => Box::new(json_scan::PhysicalJsonScan { types, scan }),
-        LogicalOperatorKind::ParquetScan { scan, .. } => Box::new(parquet::PhysicalParquetScan { types, scan }),
+        LogicalOperatorKind::ParquetScan { scan, .. } => {
+            let filter = (!scan.filters.is_empty()).then(|| crate::optimizer::conjunction_of(scan.filters.clone()));
+            Box::new(parquet::PhysicalParquetScan {
+                types,
+                scan,
+                filter,
+            })
+        }
         LogicalOperatorKind::CopyToParquet { path, names, options } => Box::new(parquet::PhysicalCopyToParquet::new(
             types, path, names, options, children,
         )),

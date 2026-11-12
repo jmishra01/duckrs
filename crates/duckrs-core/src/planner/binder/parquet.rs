@@ -363,6 +363,11 @@ impl Binder<'_> {
             schema,
             read: None,
             hive_overrides,
+            function_name: call.name.name.to_lowercase(),
+            filters: Vec::new(),
+            projected: None,
+            file_filters: String::new(),
+            total_files: None,
         };
         Ok(LogicalOperator::new(
             LogicalOperatorKind::ParquetScan {

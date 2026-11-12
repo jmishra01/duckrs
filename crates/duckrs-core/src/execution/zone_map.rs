@@ -142,31 +142,39 @@ enum Range {
     Bounds(Value, Value),
 }
 
-/// The zones of a scan's output columns for one group.
+/// The zones of a scan's output columns for one group: what is known of the column at each position.
 struct Group<'a> {
-    table: &'a TableCatalogEntry,
-    column_ids: &'a [usize],
-    group: usize,
-    rows: usize,
+    zone: &'a dyn Fn(usize) -> Option<ColumnZone>,
+}
+
+/// The zone of the output column `index` of a scan of `table` reading `column_ids`, in row group `group`.
+fn table_zone(table: &TableCatalogEntry, column_ids: &[usize], group: usize, rows: usize, index: usize) -> Option<ColumnZone> {
+    let column = *column_ids.get(index)?;
+    if column == COLUMN_IDENTIFIER_ROW_ID {
+        let size = table.row_group_size();
+        let first = group * size;
+        let last = (first + size).min(rows).checked_sub(1)?;
+        let ids = table.row_ids(rows);
+        return Some(ColumnZone {
+            min: Some(Value::bigint(ids.id(first) as i64)),
+            max: Some(Value::bigint(ids.id(last) as i64)),
+            ..ColumnZone::default()
+        });
+    }
+    let zones = zones_of(table, column);
+    let zone = zones.get(group)?;
+    (!zone.unknown).then(|| zone.clone())
+}
+
+/// Whether no row can make `filter` true, where `zone` gives what is known of the column at each position of
+/// the rows `filter` reads (`ExpressionFilter::CheckStatistics`).
+pub fn never_true(zone: &dyn Fn(usize) -> Option<ColumnZone>, filter: &BoundExpr) -> bool {
+    Group { zone }.never_true(filter)
 }
 
 impl Group<'_> {
     fn zone(&self, index: usize) -> Option<ColumnZone> {
-        let column = *self.column_ids.get(index)?;
-        if column == COLUMN_IDENTIFIER_ROW_ID {
-            let size = self.table.row_group_size();
-            let first = self.group * size;
-            let last = (first + size).min(self.rows).checked_sub(1)?;
-            let ids = self.table.row_ids(self.rows);
-            return Some(ColumnZone {
-                min: Some(Value::bigint(ids.id(first) as i64)),
-                max: Some(Value::bigint(ids.id(last) as i64)),
-                ..ColumnZone::default()
-            });
-        }
-        let zones = zones_of(self.table, column);
-        let zone = zones.get(self.group)?;
-        (!zone.unknown).then(|| zone.clone())
+        (self.zone)(index)
     }
 
     fn column_range(&self, index: usize) -> Range {
@@ -544,13 +552,8 @@ pub fn groups_to_scan(
     }
     (0..groups)
         .map(|group| {
-            let group = Group {
-                table,
-                column_ids,
-                group,
-                rows,
-            };
-            !group.never_true(filter)
+            let zone = |index| table_zone(table, column_ids, group, rows, index);
+            !never_true(&zone, filter)
         })
         .collect()
 }

@@ -99,6 +99,8 @@ fn apply_rules(expr: &mut BoundExpr, in_filter: bool) -> bool {
         || constant_order_normalization(expr)
         || like_optimizations(expr)
         || empty_needle_removal(expr)
+        || least_greatest_simplification(expr)
+        || not_constant_or_null_simplification(expr)
         || move_constants(expr)
         || case_simplification(expr)
         || conjunction_simplification(expr, in_filter)
@@ -1002,6 +1004,62 @@ fn empty_needle_removal(expr: &mut BoundExpr) -> bool {
     }
     let input = children[0].clone();
     *expr = crate::function::constant_or_null(vec![BoundExpr::constant(Value::boolean(true)), input]);
+    true
+}
+
+/// `LeastGreatestSimplificationRule`: `least(x, x)` and `greatest(x, x)` are `x`.
+fn least_greatest_simplification(expr: &mut BoundExpr) -> bool {
+    let BoundExprKind::Function { function, children, .. } = &expr.kind else {
+        return false;
+    };
+    if !matches!(function.name.as_str(), "least" | "greatest") || children.len() != 2 {
+        return false;
+    }
+    if children[0].is_volatile() || !expressions_equal(&children[0], &children[1]) {
+        return false;
+    }
+    let mut child = children[0].clone();
+    // `Expression::PreserveReturnType`
+    if child.return_type != expr.return_type {
+        child = BoundExpr::new(
+            BoundExprKind::Cast {
+                child: Box::new(child),
+                try_cast: false,
+            },
+            expr.return_type.clone(),
+        );
+    }
+    *expr = child;
+    true
+}
+
+/// `NotConstantOrNullSimplificationRule`: `NOT constant_or_null(v, e...)` is `constant_or_null(NOT v, e...)`.
+fn not_constant_or_null_simplification(expr: &mut BoundExpr) -> bool {
+    let BoundExprKind::Operator {
+        op: BoundOperator::Not,
+        children,
+    } = &expr.kind
+    else {
+        return false;
+    };
+    let [call] = children.as_slice() else {
+        return false;
+    };
+    let BoundExprKind::Function { function, children, .. } = &call.kind else {
+        return false;
+    };
+    if function.name != "constant_or_null" || call.return_type != LogicalType::BOOLEAN || children.len() < 2 {
+        return false;
+    }
+    let BoundExprKind::Constant(value) = &children[0].kind else {
+        return false;
+    };
+    let duckrs_common::value::ValueData::Bool(value) = *value.data() else {
+        return false;
+    };
+    let mut arguments = vec![BoundExpr::constant(Value::boolean(!value))];
+    arguments.extend(children[1..].iter().cloned());
+    *expr = crate::function::constant_or_null(arguments);
     true
 }
 

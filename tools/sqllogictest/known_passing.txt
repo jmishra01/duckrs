@@ -542,6 +542,7 @@ test/optimizer/pushdown/join_filter_pushdown_sample.test
 test/optimizer/pushdown/lateral_projection_evaluation.test
 test/optimizer/pushdown/no_mark_to_semi_if_mark_index_is_projected.test
 test/optimizer/pushdown/prefix_pushdown_null_constant.test
+test/optimizer/pushdown/pushdown_in_to_parquet.test
 test/optimizer/pushdown/pushdown_unnest_into_cte.test
 test/optimizer/pushdown/pushdown_window_decreasing_partition.test
 test/optimizer/pushdown/test_pushdown_cte_group_by_all.test
@@ -1549,6 +1550,7 @@ test/sql/copy/parquet/parquet_filter_narrowing_cast.test
 test/sql/copy/parquet/parquet_fixed_length_blob_dict.test
 test/sql/copy/parquet/parquet_go.test
 test/sql/copy/parquet/parquet_hive2.test
+test/sql/copy/parquet/parquet_hive_column_alias.test
 test/sql/copy/parquet/parquet_hive_empty.test
 test/sql/copy/parquet/parquet_hive_null.test
 test/sql/copy/parquet/parquet_hive_override_stats.test
@@ -1568,6 +1570,7 @@ test/sql/copy/parquet/parquet_no_stats.test
 test/sql/copy/parquet/parquet_nullbyte.test
 test/sql/copy/parquet/parquet_pandas_date.test
 test/sql/copy/parquet/parquet_prefetch_overlapping_ranges.test
+test/sql/copy/parquet/parquet_pruned_first_file_cardinality.test
 test/sql/copy/parquet/parquet_schema_hive_partitioning.test
 test/sql/copy/parquet/parquet_schema_lossy_filter_pushdown.test
 test/sql/copy/parquet/parquet_schema_num_children_fix.test

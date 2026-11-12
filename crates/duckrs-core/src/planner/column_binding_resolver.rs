@@ -75,6 +75,8 @@ pub fn resolve_column_bindings(op: &mut LogicalOperator) -> Result<()> {
         (0..column_ids.len())
             .map(|column| ColumnBinding::new(*table_index, column))
             .collect()
+    } else if let LogicalOperatorKind::ParquetScan { .. } = &op.kind {
+        op.column_bindings()
     } else {
         op.children.iter().flat_map(|c| c.column_bindings()).collect()
     };

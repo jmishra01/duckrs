@@ -42,14 +42,24 @@ pub fn push_into_scans(op: &mut LogicalOperator) {
     let K::Filter { expressions } = &mut op.kind else {
         return;
     };
-    let scan = op.children[0].column_bindings();
-    let K::Get { filters, .. } = &mut op.children[0].kind else {
+    if !matches!(op.children[0].kind, K::Get { .. } | K::ParquetScan { .. }) {
         return;
-    };
+    }
+    let scan = op.children[0].column_bindings();
     let mut conjuncts = Vec::new();
     for expr in std::mem::take(expressions) {
         split_conjuncts(expr, &mut conjuncts);
     }
+    let filters = match &mut op.children[0].kind {
+        K::Get { filters, .. } => filters,
+        // `MultiFileFunction` has `filter_pushdown`; these run as the file is read
+        K::ParquetScan { scan: data, .. } => {
+            let data = std::sync::Arc::make_mut(data);
+            prune_files(data, &scan, &mut conjuncts);
+            &mut data.filters
+        }
+        _ => unreachable!("checked above"),
+    };
     let (barred, conjuncts): (Vec<BoundExpr>, Vec<BoundExpr>) = conjuncts.into_iter().partition(contains_barrier);
     for conjunct in conjuncts {
         if can_move_into_scan(&conjunct, &scan) {
@@ -73,4 +83,66 @@ pub fn push_into_scans(op: &mut LogicalOperator) {
     if expressions.is_empty() {
         *op = op.children.remove(0);
     }
+}
+
+/// `HivePartitioning::ApplyFiltersToFileList`: the filters that only read the hive partitions and the file name
+/// are worked out for each file, those of the files they are false for are left out, and the filters that could
+/// be worked out for every file are no longer needed.
+fn prune_files(
+    scan: &mut crate::execution::parquet::ParquetScanData,
+    bindings: &[ColumnBinding],
+    conjuncts: &mut Vec<BoundExpr>,
+) {
+    let known: Vec<usize> = (0..bindings.len()).filter(|&at| scan.is_known_per_file(at)).collect();
+    if known.is_empty() || conjuncts.is_empty() {
+        return;
+    }
+    let mut keep = vec![true; scan.files.len()];
+    let mut file_filters = String::new();
+    conjuncts.retain(|conjunct| {
+        let mut columns = Vec::new();
+        let mut outer = false;
+        columns_of(conjunct, &mut columns, &mut outer);
+        let on_known = |binding: &ColumnBinding| {
+            bindings.iter().position(|b| b == binding).is_some_and(|at| known.contains(&at))
+        };
+        if columns.is_empty() || outer || conjunct.is_volatile() || !columns.iter().all(on_known) {
+            return true;
+        }
+        let mut preserved = false;
+        let mut applied = false;
+        for (file, keep) in scan.files.iter().zip(keep.iter_mut()) {
+            let mut copy = conjunct.clone();
+            let mut known_values = true;
+            copy.walk_mut(&mut |e| {
+                if let BoundExprKind::ColumnRef { binding, depth: 0 } = &e.kind {
+                    let at = bindings.iter().position(|b| b == binding).expect("a column of the scan");
+                    match scan.known_value(at, file) {
+                        Some(value) => *e = BoundExpr::constant(value),
+                        None => known_values = false,
+                    }
+                }
+            });
+            let result = known_values
+                .then(|| crate::execution::expression_executor::try_evaluate_scalar(&copy))
+                .flatten();
+            match result {
+                None => preserved = true,
+                Some(value) if value.is_null() || value.data() == &duckrs_common::value::ValueData::Bool(false) => {
+                    *keep = false;
+                    applied = true;
+                }
+                Some(_) => {}
+            }
+        }
+        if applied {
+            file_filters.push_str(&conjunct.to_string());
+        }
+        preserved
+    });
+    let total = scan.files.len();
+    let mut keep = keep.into_iter();
+    scan.files.retain(|_| keep.next().unwrap_or(true));
+    scan.file_filters.push_str(&file_filters);
+    scan.total_files = Some(total);
 }
