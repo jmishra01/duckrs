@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 4413 of 6367 test files pass (**72.9%** of the 6047 that run). The v1 target is ≥ 90%.
+- Overall: 4423 of 6367 test files pass (**73.1%** of the 6047 that run). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -250,6 +250,8 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] `variant_exists`, `variant_extract_string`, `variant_array_length` at a path; `binom`, `replace_type`,
     `invoke`; `timezone(INTERVAL, TIMETZ)`; fmod floored and refusing a zero divisor as C++ does; the decade
     truncated; `last_day` of the last month; a `date_part` of an infinity is NULL whatever the part
+  - [x] window functions in `duckdb_functions()`; GROUP BY ALL refuses a window; a string slice with a step is
+    refused when bound, and slice bounds are cast to BIGINT
   - [ ] TYPE columns and casts, `create_sort_key`, `index_key`, `variant_normalize`,
     `strptime` edge cases, `list_contains` and the other templated list functions' type deduction,
     the external-resource and profiling table functions
@@ -257,8 +259,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] `histogram(x, bins)` and `histogram_exact`, with the "other values" bucket; stddev and variance are
     infinite rather than out of range; the moments, covariances, regressions and Kahan sums computed with C++'s
     update and finalize, so their results are C++'s to the bit
-  - [ ] `approx_quantile` (an exact quantile here), `approx_count_distinct`'s HyperLogLog, the memory limits of
-    quantiles and of window builds (7 files)
+  - [x] `approx_count_distinct` with C++'s HyperLogLog (`HyperLogLogP<10>` and Ertl's estimator), its exported
+    sketch and the checks on importing one
+  - [ ] `approx_quantile` (an exact quantile here), the memory limits of quantiles and of window builds (7 files)
   - [x] `EXPORT_STATE` in C++'s layouts for the aggregates duckrs computes from their rows
     (`function/holistic_states.rs`): bool_and/or, product, string_agg, the stddev/variance family, covar, corr,
     skewness, kurtosis, fsum/favg, the regr_* family, arg_min/arg_max, the TIMESTAMP/TIME/TIMETZ/INTERVAL averages

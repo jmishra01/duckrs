@@ -80,6 +80,11 @@ pub fn layout(kind: Holistic, arguments: &[LogicalType], result: &LogicalType) -
         AvgInterval => struct_of(&[("count", LogicalType::BIGINT), ("value", LogicalType::INTERVAL)]),
         // `QuantileStateLayout`: the values buffered, `StateListType<StateInputType<0>>`
         QuantileCont | QuantileDisc | Median | Mad => LogicalType::list(arguments.first()?.clone()),
+        // `ApproxCountDistinctExportType`: the sketch itself
+        ApproxCountDistinct => struct_of(&[
+            ("precision", LogicalType::UTINYINT),
+            ("registers", LogicalType::list(LogicalType::UTINYINT)),
+        ]),
         // `uint64_t`
         RegrCount => LogicalType::UBIGINT,
         // `RegrState`
@@ -424,6 +429,7 @@ enum State {
     /// infinities as its value (`TimestampAverageOperation`)
     AvgDiscrete(u64, i128),
     AvgInterval(i64, duckrs_common::types::Interval),
+    Sketch(super::hyperloglog::HyperLogLog),
     /// the values a quantile buffers, NULLs left out
     Buffer(Vec<Value>),
     /// the row recorded, as its argument and its "by" value, NULLs included
@@ -446,6 +452,7 @@ fn empty(kind: Holistic) -> State {
         Fsum => State::Kahan(None),
         Skewness => State::Moments(Moments::default(), false),
         RegrCount => State::RegrCount(0),
+        ApproxCountDistinct => State::Sketch(super::hyperloglog::HyperLogLog::default()),
         QuantileCont | QuantileDisc | Median | Mad => State::Buffer(Vec::new()),
         AvgTimestamp | AvgTimeTz => State::AvgDiscrete(0, 0),
         AvgInterval => State::AvgInterval(0, duckrs_common::types::Interval::default()),
@@ -565,6 +572,23 @@ fn may_start(kind: Holistic, arg: &Value, by: &Value) -> bool {
 fn fold(kind: Holistic, rows: &[Value]) -> Result<State> {
     use Holistic::*;
     let mut state = empty(kind);
+    // `ApproxCountDistinctUpdateFunction`: the hashes of the values, as `VectorOperations::Hash` gives them
+    if let State::Sketch(sketch) = &mut state {
+        let values: Vec<&Value> = rows.iter().filter(|v| !v.is_null()).collect();
+        if let Some(first) = values.first() {
+            let mut vector = duckrs_common::vector::Vector::new(first.logical_type().clone(), values.len());
+            for (at, value) in values.iter().enumerate() {
+                vector.set_value(at, value)?;
+            }
+            let hashes = duckrs_common::hash::hash_vector(&vector, values.len())?;
+            for at in 0..values.len() {
+                if let Some(hash) = hashes.get_value(at).as_i128() {
+                    sketch.insert(hash as u64);
+                }
+            }
+        }
+        return Ok(state);
+    }
     for row in rows {
         match &mut state {
             State::ArgExtreme(current) => {
@@ -636,6 +660,7 @@ fn fold(kind: Holistic, rows: &[Value]) -> Result<State> {
                 let Some(input) = number(row) else { continue };
                 moments.update(input);
             }
+            State::Sketch(_) => unreachable!("folded above"),
             State::Buffer(values) => {
                 let input = match row.data() {
                     ValueData::Struct(fields) => &fields[0],
@@ -754,6 +779,53 @@ fn read(kind: Holistic, value: &Value) -> Result<State> {
         }
         State::Moments(_, fourth) => State::Moments(Moments::read(value)?, fourth),
         State::RegrCount(_) => State::RegrCount(unsigned(value)?),
+        // `ApproxCountDistinctImportState`
+        State::Sketch(_) => {
+            let invalid = |message: String| Error::new(ErrorKind::InvalidInput, message);
+            let [precision, registers] = fields(value)? else {
+                return Err(failure());
+            };
+            let ValueData::List(registers) = registers.data() else {
+                return Err(invalid(
+                    "Invalid approx_count_distinct state - the state fields cannot be NULL".into(),
+                ));
+            };
+            if precision.is_null() {
+                return Err(invalid(
+                    "Invalid approx_count_distinct state - the state fields cannot be NULL".into(),
+                ));
+            }
+            let precision = precision.as_i128().unwrap_or(0);
+            if precision != super::hyperloglog::PRECISION as i128 {
+                return Err(invalid(format!(
+                    "Invalid approx_count_distinct state - expected precision {}, got {precision}",
+                    super::hyperloglog::PRECISION
+                )));
+            }
+            if registers.len() != super::hyperloglog::M {
+                return Err(invalid(format!(
+                    "Invalid approx_count_distinct state - expected {} registers, got {}",
+                    super::hyperloglog::M,
+                    registers.len()
+                )));
+            }
+            let mut sketch = super::hyperloglog::HyperLogLog::default();
+            for (at, register) in registers.iter().enumerate() {
+                let Some(value) = register.as_i128() else {
+                    return Err(invalid(
+                        "Invalid approx_count_distinct state - the registers cannot be NULL".into(),
+                    ));
+                };
+                let limit = super::hyperloglog::HyperLogLog::MAX_REGISTER;
+                if value > i128::from(limit) {
+                    return Err(invalid(format!(
+                        "Invalid approx_count_distinct state - register value {value} exceeds {limit}"
+                    )));
+                }
+                sketch.registers[at] = value as u8;
+            }
+            State::Sketch(sketch)
+        }
         State::Buffer(_) => match value.data() {
             ValueData::List(items) => {
                 // `reject_null_elements`: the finalize assumes every buffered value is valid
@@ -858,6 +930,29 @@ fn write(state: &State, ty: &LogicalType) -> Result<Value> {
         State::Corr(covar, dev_x, dev_y) => corr_value(covar, dev_x, dev_y),
         State::Moments(moments, fourth) => moments.value(*fourth),
         State::RegrCount(count) => Value::ubigint(*count),
+        // an empty sketch is exported as it is: approx_count_distinct of no values is 0, not NULL
+        State::Sketch(sketch) => Value::struct_value(vec![
+            (
+                "precision".into(),
+                Value::new(
+                    LogicalType::UTINYINT,
+                    ValueData::UInt8(super::hyperloglog::PRECISION as u8),
+                )?,
+            ),
+            (
+                "registers".into(),
+                Value::new(
+                    LogicalType::list(LogicalType::UTINYINT),
+                    ValueData::List(
+                        sketch
+                            .registers
+                            .iter()
+                            .map(|r| Value::new(LogicalType::UTINYINT, ValueData::UInt8(*r)))
+                            .collect::<Result<Vec<_>>>()?,
+                    ),
+                )?,
+            ),
+        ]),
         State::Buffer(values) if values.is_empty() => return Ok(Value::null(ty.clone())),
         State::Buffer(values) => {
             let element = ty.child_type().cloned().unwrap_or(LogicalType::SQLNULL);
@@ -1054,6 +1149,7 @@ pub fn combine(
             *sum = add_intervals(*sum, v)?;
         }
         (State::Buffer(target), State::Buffer(source)) => target.extend(source),
+        (State::Sketch(target), State::Sketch(source)) => target.merge(&source),
         (State::RegrCount(target), State::RegrCount(source)) => {
             *target = target.checked_add(source).ok_or_else(overflow)?;
         }
@@ -1110,6 +1206,7 @@ pub fn finalize(kind: Holistic, value: &Value, result: &LogicalType, constants: 
     use Holistic::*;
     let null = || Value::null(result.clone());
     Ok(match read(kind, value)? {
+        State::Sketch(sketch) => Value::bigint(sketch.count()),
         State::Buffer(values) => {
             // the rows the quantile would have seen: the values, with the fraction it was bound to
             let rows: Vec<Value> = match constants.get(1).cloned().flatten() {

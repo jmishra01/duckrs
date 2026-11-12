@@ -1417,6 +1417,66 @@ impl Binder<'_> {
                         )?);
                     }
                 }
+                // `WindowFunctionExtractor`: the window functions of `function_list.cpp`, with their signatures
+                let match_recognize_result = format!(
+                    "{}",
+                    LogicalType::list(LogicalType::struct_type(
+                        [
+                            ("classifier", LogicalType::VARCHAR),
+                            ("match_number", LogicalType::UBIGINT),
+                            ("is_match_start", LogicalType::BOOLEAN),
+                            ("is_match_end", LogicalType::BOOLEAN),
+                            ("match_start", LogicalType::UBIGINT),
+                            ("match_end", LogicalType::UBIGINT),
+                            ("is_excluded", LogicalType::BOOLEAN),
+                            ("is_empty", LogicalType::BOOLEAN),
+                            ("row_index", LogicalType::UBIGINT),
+                        ]
+                        .into_iter()
+                        .map(|(n, t)| (n.to_string(), t))
+                        .collect()
+                    ))
+                );
+                // (name, (parameter, type) pairs, return type)
+                type WindowSignature<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str);
+                let windows: [WindowSignature; 14] = [
+                    ("cume_dist", &[], "DOUBLE"),
+                    ("dense_rank", &[], "BIGINT"),
+                    ("fill", &[("expr", "ANY")], "ANY"),
+                    ("first_value", &[("expr", "ANY")], "ANY"),
+                    ("lag", &[("col", "T"), ("offset", "BIGINT"), ("default", "ANY")], "T"),
+                    ("last_value", &[("expr", "ANY")], "ANY"),
+                    ("lead", &[("col", "T"), ("offset", "BIGINT"), ("default", "ANY")], "T"),
+                    ("match_recognize", &[("columns", "ANY")], ""),
+                    ("nth_value", &[("expr", "ANY"), ("n", "BIGINT")], "ANY"),
+                    ("ntile", &[("num_buckets", "BIGINT")], "BIGINT"),
+                    ("percent_rank", &[], "DOUBLE"),
+                    ("rank", &[], "BIGINT"),
+                    ("rank_dense", &[], "BIGINT"),
+                    ("row_number", &[], "BIGINT"),
+                ];
+                for (name, parameters, ret) in windows {
+                    let ret = if name == "match_recognize" {
+                        match_recognize_result.as_str()
+                    } else {
+                        ret
+                    };
+                    functions_ref.push((
+                        32,
+                        "system".into(),
+                        2,
+                        "main".into(),
+                        name.to_string(),
+                        "window",
+                        text(ret),
+                        strings(parameters.iter().map(|(n, _)| text(n)).collect())?,
+                        strings(parameters.iter().map(|(_, t)| text(t)).collect())?,
+                        null_text(),
+                        Value::boolean(false),
+                        true,
+                        text("CONSISTENT"),
+                    ));
+                }
                 // `MacroExtractor` and `TableMacroExtractor`
                 let mut macro_rows = |database: &str,
                                       database_oid: i64,

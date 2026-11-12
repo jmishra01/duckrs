@@ -4,6 +4,7 @@
 test/common/test_cast_hugeint.test
 test/fuzzer/afl/alter_if_exists.test
 test/fuzzer/afl/analyze_empty_table.test
+test/fuzzer/afl/case_map_cast.test
 test/fuzzer/afl/decimal_string_roundtrip.test
 test/fuzzer/afl/generate_series_null.test
 test/fuzzer/afl/grouping_empty_table.test
@@ -14,6 +15,7 @@ test/fuzzer/afl/limit_out_of_range.test
 test/fuzzer/afl/non_foldable_parameter.test
 test/fuzzer/afl/random_join.test
 test/fuzzer/afl/self_referential_alias.test
+test/fuzzer/afl/window_function_binder_error.test
 test/fuzzer/afl/window_type_mismatch.test
 test/fuzzer/duckfuzz/arg_minmax_by_decimal.test
 test/fuzzer/duckfuzz/array_const_columndatacopy.test
@@ -663,11 +665,13 @@ test/parquet/variant/variant_to_parquet_variant.test
 test/parquet/variant/variant_write_partially_shredded.test
 test/planner/projection_binding.test
 test/sql/aggregate/aggregate_state_export/aggregate_state_union.test
+test/sql/aggregate/aggregate_state_export/approx_count_distinct_export_state.test
 test/sql/aggregate/aggregate_state_export/arg_min_max_export_state.test
 test/sql/aggregate/aggregate_state_export/avg_time_export_state.test
 test/sql/aggregate/aggregate_state_export/avg_timestamp_export_state.test
 test/sql/aggregate/aggregate_state_export/bool_and_export_state.test
 test/sql/aggregate/aggregate_state_export/combine_aggr_count_overflow.test
+test/sql/aggregate/aggregate_state_export/combine_aggr_fallible.test
 test/sql/aggregate/aggregate_state_export/count_export_state.test
 test/sql/aggregate/aggregate_state_export/finalize_null_fields.test
 test/sql/aggregate/aggregate_state_export/first_last_export_state.test
@@ -721,6 +725,7 @@ test/sql/aggregate/aggregates/test_any_value.test
 test/sql/aggregate/aggregates/test_any_value_noninlined.test
 test/sql/aggregate/aggregates/test_approx_quantile_decimal.test
 test/sql/aggregate/aggregates/test_approx_quantile_timestamp_infinity.test
+test/sql/aggregate/aggregates/test_approximate_distinct_count.test
 test/sql/aggregate/aggregates/test_arg_min_max_null.test
 test/sql/aggregate/aggregates/test_avg.test
 test/sql/aggregate/aggregates/test_avg_timestamp_infinity.test
@@ -797,6 +802,7 @@ test/sql/aggregate/group/group_by_all.test
 test/sql/aggregate/group/group_by_all_collation.test
 test/sql/aggregate/group/group_by_all_having.test
 test/sql/aggregate/group/group_by_all_order.test
+test/sql/aggregate/group/group_by_all_window.test
 test/sql/aggregate/group/group_by_limits.test
 test/sql/aggregate/group/perfect_hash_max_values.test
 test/sql/aggregate/group/test_group_by.test
@@ -2641,6 +2647,7 @@ test/sql/match_recognize/test_match_recognize_anchors.test
 test/sql/match_recognize/test_match_recognize_backtracking.test
 test/sql/match_recognize/test_match_recognize_backtracking_long.test
 test/sql/match_recognize/test_match_recognize_classifier.test
+test/sql/match_recognize/test_match_recognize_clauses.test
 test/sql/match_recognize/test_match_recognize_composition.test
 test/sql/match_recognize/test_match_recognize_cursors.test
 test/sql/match_recognize/test_match_recognize_errors.test
@@ -2651,6 +2658,7 @@ test/sql/match_recognize/test_match_recognize_nulls.test
 test/sql/match_recognize/test_match_recognize_parallel.test
 test/sql/match_recognize/test_match_recognize_pattern.test
 test/sql/match_recognize/test_match_recognize_permute.test
+test/sql/match_recognize/test_match_recognize_scope.test
 test/sql/match_recognize/test_match_recognize_series.test
 test/sql/match_recognize/test_match_recognize_session_model.test
 test/sql/match_recognize/test_match_recognize_shapes.test
@@ -3671,6 +3679,7 @@ test/sql/subquery/test_neumann.test
 test/sql/table_function/database_oid.test
 test/sql/table_function/duckdb_constraints_issue11284.test
 test/sql/table_function/duckdb_constraints_issue12863.test
+test/sql/table_function/duckdb_functions_window.test
 test/sql/table_function/duckdb_optimizers.test
 test/sql/table_function/duckdb_sequences.test
 test/sql/table_function/duckdb_settings_extension.test
@@ -4054,6 +4063,7 @@ test/sql/types/nested/list/test_list_index.test
 test/sql/types/nested/list/test_list_slice.test
 test/sql/types/nested/list/test_list_slice_negative_step.test
 test/sql/types/nested/list/test_list_slice_numeric_limits.test
+test/sql/types/nested/list/test_list_slice_step.test
 test/sql/types/nested/list/test_scalar_list.test
 test/sql/types/nested/map/map_from_entries/column.test
 test/sql/types/nested/map/map_from_entries/column_null_entry.test

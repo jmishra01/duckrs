@@ -1071,7 +1071,8 @@ pub fn export_state(
                 .map(|(bound, declared)| {
                     // the aggregates duckrs computes from their rows bind their ANY parameters to the types they get,
                     // as C++'s binds of them do
-                    let holistic = matches!(function.kind, AggregateKind::Holistic(_));
+                    let holistic = matches!(function.kind, AggregateKind::Holistic(_))
+                        && function.kind != AggregateKind::Holistic(super::holistic::Holistic::ApproxCountDistinct);
                     if declared.id() == LogicalTypeId::Any && !holistic {
                         declared
                     } else {

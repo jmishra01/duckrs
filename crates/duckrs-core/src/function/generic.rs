@@ -142,9 +142,17 @@ fn bind_array_slice(children: Vec<BoundExpr>) -> Result<BoundExpr> {
     if !(3..=4).contains(&children.len()) {
         return Err(no_match("array_slice", &children));
     }
+    let stepped = children.len() == 4;
     let mut children = children.into_iter();
     let input = as_list(children.next().expect("checked"));
     let ty = input.return_type.clone();
+    if stepped && matches!(ty.id(), LogicalTypeId::Varchar | LogicalTypeId::Blob) {
+        return Err(Error::new(
+            ErrorKind::NotImplemented,
+            "Slice with steps has not been implemented for string types, you can consider rewriting your query as \
+             follows:\n SELECT array_to_string((str_split(string, '')[begin:end:step], '');",
+        ));
+    }
     let return_type = match ty.id() {
         LogicalTypeId::List => ty,
         LogicalTypeId::Varchar => LogicalType::VARCHAR,
@@ -167,10 +175,9 @@ fn bind_array_slice(children: Vec<BoundExpr>) -> Result<BoundExpr> {
                 return Err(binder_error("The upper and lower bounds of the slice must be a BIGINT"));
             }
             arguments.push(bound);
-        } else if bound.return_type.is_numeric() || bound.return_type.id() == LogicalTypeId::SqlNull {
-            arguments.push(bound.cast_to(&LogicalType::BIGINT, false));
         } else {
-            return Err(binder_error("The upper and lower bounds of the slice must be a BIGINT"));
+            // anything else is cast to the BIGINT the bounds are (`ArraySliceResolveTypes`)
+            arguments.push(bound.cast_to(&LogicalType::BIGINT, false));
         }
     }
     Ok(bound_function("array_slice", arguments, return_type, array_slice))

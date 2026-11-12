@@ -931,6 +931,10 @@ impl Binder<'_> {
                     if aggregates.bound_aggregate {
                         return Err(binder_error("Cannot mix aggregates with non-aggregated columns!"));
                     }
+                    // a window over aggregates is fine, a window over a group is not
+                    if matches!(expr.kind, ExprKind::Window(_)) {
+                        return Err(binder_error("Cannot group on a window clause"));
+                    }
                     group_by_all.push(i);
                 }
                 aggregates.bound_columns.clear();

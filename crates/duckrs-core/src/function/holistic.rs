@@ -1007,6 +1007,7 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
             | RegrSxy
             | RegrAvgX
             | RegrAvgY
+            | ApproxCountDistinct
     ) && let Some(layout) = super::holistic_states::layout(kind, &[], ty)
     {
         let state = super::holistic_states::from_rows(kind, rows, &layout)?;
