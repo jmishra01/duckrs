@@ -32,6 +32,7 @@ pub(crate) mod regexp;
 mod remap_struct;
 mod string_nested;
 mod strings;
+pub(crate) mod strptime;
 #[allow(dead_code)]
 mod tdigest;
 pub mod test_all_types;

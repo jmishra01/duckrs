@@ -656,7 +656,8 @@ fn fold(kind: Holistic, rows: &[Value]) -> Result<State> {
                     continue;
                 }
                 let separator = match separator {
-                    Some(separator) if separator.is_null() => String::new(),
+                    // `StringAggBind`: a NULL separator leaves the bound one, a comma
+                    Some(separator) if separator.is_null() => ",".to_string(),
                     Some(separator) => separator.try_to_string()?,
                     None => ",".to_string(),
                 };

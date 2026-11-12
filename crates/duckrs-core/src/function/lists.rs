@@ -260,9 +260,8 @@ fn list_resize(args: &DataChunk, result: &mut Vector) -> Result<()> {
         if row[0].is_null() {
             return Ok(Value::null(ty.clone()));
         }
-        let Some(size) = row[1].as_i128() else {
-            return Value::new(ty.clone(), ValueData::List(items(&row[0]).to_vec()));
-        };
+        // `ListResizeFunction`: a NULL size is 0
+        let size = row[1].as_i128().unwrap_or(0);
         if size < 0 {
             return Err(Error::new(ErrorKind::OutOfRange, "Cannot resize list to negative size"));
         }
@@ -457,6 +456,10 @@ fn bind_list_aggr(name: &str, aggregate: Option<&str>, children: Vec<BoundExpr>)
         ));
     };
     if children.iter().any(|child| !child.is_foldable()) {
+        // `BindListAggregate` binds the aggregate first, whose bind may refuse the argument itself
+        let mut arguments = vec![BoundExpr::constant(Value::null(element.clone()))];
+        arguments.extend(children.iter().cloned());
+        bind_aggregate_function(set, arguments, None, false)?;
         return Err(Error::new(
             ErrorKind::InvalidInput,
             format!("Aggregate function {function} is not supported for list_aggr: extra arguments must be constant"),

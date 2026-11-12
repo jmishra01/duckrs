@@ -8,7 +8,7 @@ use super::nested::bound_function;
 use super::{ScalarCallback, ScalarFunction, ScalarFunctionSet};
 use crate::execution::expression_executor::evaluate_scalar;
 use crate::planner::expression::BoundExpr;
-use duckrs_common::types::LogicalType;
+use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, Vector};
 use duckrs_common::{Error, ErrorKind, Result};
@@ -102,7 +102,7 @@ unary!(acos, x => {
     }
     x.acos()
 });
-unary!(atan, x => finite(x)?.atan());
+unary!(atan, x => x.atan());
 unary!(sinh, x => x.sinh());
 unary!(cosh, x => x.cosh());
 unary!(tanh, x => x.tanh());
@@ -426,19 +426,31 @@ fn round_integer(args: &DataChunk, result: &mut Vector) -> Result<()> {
         if precision >= 0 {
             return Ok(row[0].clone());
         }
-        if precision < -38 {
-            return Value::new(ty.clone(), ValueData::Int64(0));
+        // `Hugeint::CACHED_POWERS_OF_TEN`
+        if precision <= -39 {
+            return super::cast::integer_value(0, &ty);
         }
         let power = 10i128.pow((-precision) as u32);
         let half = power / 2;
-        let rounded = if value >= 0 {
-            (value + half) / power * power
-        } else {
-            (value - half) / power * power
+        let (mut rounded, remainder) = (value / power, value % power);
+        if remainder >= half {
+            rounded += 1;
+        } else if remainder <= -half {
+            rounded -= 1;
+        }
+        let overflow = || out_of_range("Overflow in round of integer");
+        let rounded = rounded.checked_mul(power).ok_or_else(overflow)?;
+        let (min, max) = match ty.id() {
+            LogicalTypeId::TinyInt => (i128::from(i8::MIN), i128::from(i8::MAX)),
+            LogicalTypeId::SmallInt => (i128::from(i16::MIN), i128::from(i16::MAX)),
+            LogicalTypeId::Integer => (i128::from(i32::MIN), i128::from(i32::MAX)),
+            LogicalTypeId::BigInt => (i128::from(i64::MIN), i128::from(i64::MAX)),
+            _ => (i128::MIN, i128::MAX),
         };
-        i64::try_from(rounded)
-            .map_err(|_| out_of_range("Overflow in round of integer"))
-            .and_then(|v| Value::new(ty.clone(), ValueData::Int64(v)))
+        if !(min..=max).contains(&rounded) {
+            return Err(overflow());
+        }
+        super::cast::integer_value(rounded, &ty)
     })
 }
 
@@ -569,7 +581,13 @@ pub fn math_functions() -> Vec<ScalarFunctionSet> {
     pi_set.add(ScalarFunction::new("pi", vec![], LogicalType::DOUBLE, pi));
     sets.push(pi_set);
     let mut round = ScalarFunctionSet::new("round");
-    for ty in [LogicalType::BIGINT, LogicalType::HUGEINT] {
+    for ty in [
+        LogicalType::TINYINT,
+        LogicalType::SMALLINT,
+        LogicalType::INTEGER,
+        LogicalType::BIGINT,
+        LogicalType::HUGEINT,
+    ] {
         round.add(ScalarFunction::new(
             "round",
             vec![ty.clone(), LogicalType::INTEGER],

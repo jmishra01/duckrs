@@ -6005,8 +6005,9 @@ mod tests {
         assert_eq!(run(&mut context, sql), [["45123456"]]);
         run(&mut context, "CREATE TABLE ns (t TIMESTAMP_NS)");
         run(&mut context, "INSERT INTO ns VALUES ('2020-01-01 01:23:45.123456789')");
+        // `GetTimePartFunction` has a TIMESTAMP_NS overload, so this is microsecond, exactly
         let sql = "SELECT EXTRACT(microseconds FROM t) FROM ns";
-        assert!(explain(&mut context, sql).contains("date_part"), "{sql}");
+        assert!(explain(&mut context, sql).contains("microsecond(t)"), "{sql}");
         assert_eq!(run(&mut context, sql), [["45123456"]]);
         // NULL stays, and what has no function of its own stays date_part
         assert_eq!(run(&mut context, "SELECT year(t) FROM d WHERE t IS NULL"), [["NULL"]]);

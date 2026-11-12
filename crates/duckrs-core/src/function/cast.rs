@@ -1147,11 +1147,11 @@ pub fn cast_vector(source: &Vector, result: &mut Vector, count: usize, mode: Cas
     if to.id() == LogicalTypeId::Varchar {
         return to_varchar(source, result, count);
     }
-    if from.id() == LogicalTypeId::Geometry || to.id() == LogicalTypeId::Geometry {
-        return super::geometry::geometry_cast(source, result, count, mode);
-    }
     if from.id() == LogicalTypeId::Variant || to.id() == LogicalTypeId::Variant {
         return variant::variant_cast(source, result, count, mode);
+    }
+    if from.id() == LogicalTypeId::Geometry || to.id() == LogicalTypeId::Geometry {
+        return super::geometry::geometry_cast(source, result, count, mode);
     }
     if from.is_nested() || to.is_nested() {
         return nested_casts::nested_cast(source, result, count, mode);

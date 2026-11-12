@@ -5,6 +5,7 @@
 //! Date and time functions. They run row by row; the vectorized loops come with Phase 13. Time
 //! zones wait for the ICU port: a TIMESTAMPTZ reads as UTC here.
 
+use super::strptime::{ParseError, Spec, StrpFormat, format_error};
 use super::binder::bind_scalar_function;
 use super::bit_functions::strict_rows;
 use super::nested::bound_function;
@@ -491,10 +492,51 @@ fn micros_of(moment: Moment) -> Option<i64> {
 fn epoch_scaled(args: &DataChunk, result: &mut Vector, scale: i128) -> Result<()> {
     let ty = result.logical_type().clone();
     strict_rows(args, result, |row| {
-        Ok(match moment(&row[0]).and_then(micros_of) {
-            Some(micros) => Value::bigint((i128::from(micros) * scale / 1000) as i64),
-            None => Value::null(ty.clone()),
-        })
+        let id = row[0].logical_type().id();
+        // a TIMESTAMP_NS keeps its nanoseconds
+        if scale == 1_000_000
+            && matches!(id, LogicalTypeId::TimestampNs | LogicalTypeId::TimestampTzNs)
+            && let Some(raw) = row[0].as_i128().map(|raw| raw as i64)
+        {
+            if raw == i64::MAX || raw == -i64::MAX {
+                return Ok(Value::null(ty.clone()));
+            }
+            return Ok(Value::bigint(raw));
+        }
+        let Some(m) = moment(&row[0]) else {
+            return Ok(Value::null(ty.clone()));
+        };
+        // `Date::EpochMilliseconds`, and the `TryMultiplyOperator` of the finer units
+        if let Moment::Date(days) = m {
+            let (per_day, unit) = match scale {
+                1 => (MICROS_PER_DAY / 1000, "milliseconds"),
+                1000 => (MICROS_PER_DAY, "microseconds"),
+                _ => (MICROS_PER_DAY * 1000, "nanoseconds"),
+            };
+            return i64::from(days)
+                .checked_mul(per_day)
+                .map(Value::bigint)
+                .ok_or_else(|| conversion(format!("Could not convert DATE ({}) to {unit}", Date(days))));
+        }
+        let Some(micros) = micros_of(m) else {
+            return Ok(Value::null(ty.clone()));
+        };
+        Ok(Value::bigint(match scale {
+            // `CastTimestampPrecisionOperation` to milliseconds rounds away from the epoch
+            1 if !matches!(m, Moment::Date(_)) => {
+                let half = micros / 500;
+                (if half < 0 { half - 1 } else { half + 1 }) / 2
+            }
+            1 => micros / 1000,
+            1000 => micros,
+            _ => micros.checked_mul(1000).ok_or_else(|| match m {
+                Moment::Date(days) => conversion(format!(
+                    "Could not convert DATE ({}) to nanoseconds",
+                    Date(days)
+                )),
+                _ => conversion("Could not convert Timestamp(US) to Timestamp(NS)".to_string()),
+            })?,
+        }))
     })
 }
 
@@ -565,7 +607,7 @@ fn make_date_from_epoch(args: &DataChunk, result: &mut Vector) -> Result<()> {
 fn epoch_ms_to_timestamp(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
         let millis = row[0].as_i128().expect("a BIGINT");
-        let micros = i64::try_from(millis * 1000).map_err(|_| conversion("Epoch milliseconds out of range"))?;
+        let micros = i64::try_from(millis * 1000).map_err(|_| conversion("Could not convert Timestamp(MS) to Timestamp(US)"))?;
         Ok(Value::timestamp(Timestamp(micros)))
     })
 }
@@ -1192,6 +1234,26 @@ fn shifted(value: &Value, interval: Interval, ty: &LogicalType) -> Result<Value>
         let moved = (time + interval.micros).rem_euclid(MICROS_PER_DAY);
         return Ok(Value::time(Time(moved)));
     }
+    // `Interval::TryAdd(timestamp_ns_t)`: the microseconds move, the nanoseconds stay
+    if ty.id() == LogicalTypeId::TimestampNs {
+        let Some(raw) = value.as_i128().map(|raw| raw as i64) else {
+            return Ok(Value::null(ty.clone()));
+        };
+        if raw == i64::MAX || raw == -i64::MAX {
+            return Value::new(ty.clone(), ValueData::Int64(raw));
+        }
+        let failed = || out_of_range("Cannot add interval to timestamp_ns");
+        let (micros, nanos) = (raw.div_euclid(1000), raw.rem_euclid(1000));
+        let moved = add_interval(micros, interval).map_err(|_| failed())?;
+        // `Timestamp::TryCombineUnits`
+        let combined = moved.checked_mul(1000).and_then(|w| w.checked_add(nanos)).or_else(|| {
+            if moved >= 0 {
+                return None;
+            }
+            (moved + 1).checked_mul(1000).and_then(|w| w.checked_add(nanos - 1000))
+        });
+        return Value::new(ty.clone(), ValueData::Int64(combined.ok_or_else(failed)?));
+    }
     let Some(moment) = moment(value) else {
         return match value.as_i128() {
             Some(raw) => {
@@ -1483,6 +1545,11 @@ fn interval_divided(args: &DataChunk, result: &mut Vector) -> Result<()> {
 
 /// `StrfTimeFormat`.
 pub(crate) fn strftime_text(format: &str, days: i32, time: i64, zoned: bool) -> Result<String> {
+    strftime_text_nanos(format, days, time, 0, zoned)
+}
+
+/// `StrfTimeFormat` with the nanoseconds past the microsecond of a TIMESTAMP_NS.
+fn strftime_text_nanos(format: &str, days: i32, time: i64, nanos: i64, zoned: bool) -> Result<String> {
     let (year, month, day) = Date(days).to_ymd();
     let hour = time / MICROS_PER_HOUR;
     let minute = (time / MICROS_PER_MINUTE) % 60;
@@ -1529,7 +1596,7 @@ pub(crate) fn strftime_text(format: &str, days: i32, time: i64, zoned: bool) -> 
             'e' => out += &format!("{day:2}"),
             'f' => out += &format!("{fraction:06}"),
             'g' => out += &format!("{:03}", fraction / 1000),
-            'n' => out += &format!("{:09}", fraction * 1000),
+            'n' => out += &format!("{:09}", fraction * 1000 + nanos),
             'H' => out += &pad(hour, 2),
             'I' => out += &pad(hour12, 2),
             'j' => out += &pad(i64::from(doy), 3),
@@ -1577,236 +1644,120 @@ fn strftime(args: &DataChunk, result: &mut Vector) -> Result<()> {
             return Ok(Value::varchar(value.try_to_string()?));
         };
         let zoned = value.logical_type().id() == LogicalTypeId::TimestampTz;
-        Ok(Value::varchar(strftime_text(
+        let nanos = match value.logical_type().id() {
+            LogicalTypeId::TimestampNs => value.as_i128().map_or(0, |raw| (raw as i64).rem_euclid(1000)),
+            _ => 0,
+        };
+        Ok(Value::varchar(strftime_text_nanos(
             &format.try_to_string()?,
             days,
             time,
+            nanos,
             zoned,
         )?))
     })
 }
 
-/// `StrpTimeFormat::Parse`.
+/// `StrpTimeFormat::Parse` and `ParseResult::TryToTimestamp`.
 pub(crate) fn strptime_micros(input: &str, format: &str) -> std::result::Result<i64, String> {
-    strptime_parse(input, format, false)
+    let format = StrpFormat::new(format).map_err(|e| format!("Failed to parse format specifier {format}: {e}"))?;
+    let mut error = ParseError::default();
+    let parsed = format.parse(input, false, &mut error).ok_or(error.message)?;
+    parsed.try_timestamp().ok_or_else(|| "Date out of range".to_string())
 }
 
 /// `StrpTimeFormat::Parse` with `strict`: a year of one digit is no year.
 pub(crate) fn strptime_strict(input: &str, format: &str) -> bool {
-    strptime_parse(input, format, true).is_ok()
-}
-
-fn strptime_parse(input: &str, format: &str, strict: bool) -> std::result::Result<i64, String> {
-    let chars: Vec<char> = input.chars().collect();
-    let mut at = 0;
-    let (mut year, mut month, mut day) = (1900i64, 1i64, 1i64);
-    let (mut hour, mut minute, mut second, mut micros) = (0i64, 0i64, 0i64, 0i64);
-    let mut pm: Option<bool> = None;
-    let mut offset = 0i64;
-    let mut yday: Option<i64> = None;
-    let number = |at: &mut usize, width: usize| -> Option<i64> {
-        let start = *at;
-        while *at < chars.len() && *at - start < width && chars[*at].is_ascii_digit() {
-            *at += 1;
-        }
-        chars[start..*at].iter().collect::<String>().parse().ok()
+    let Ok(format) = StrpFormat::new(format) else {
+        return false;
     };
-    let name = |at: &mut usize, names: &[&str], short: bool| -> Option<usize> {
-        for (i, candidate) in names.iter().enumerate() {
-            let text = if short { &candidate[..3] } else { candidate };
-            let size = text.len();
-            if *at + size <= chars.len() {
-                let found: String = chars[*at..*at + size].iter().collect();
-                if found.eq_ignore_ascii_case(text) {
-                    *at += size;
-                    return Some(i);
-                }
+    format
+        .parse(input, true, &mut ParseError::default())
+        .and_then(|parsed| parsed.try_timestamp())
+        .is_some()
+}
+
+fn formats_of(value: &Value) -> Result<Vec<StrpFormat>> {
+    let texts = match value.data() {
+        ValueData::List(items) => {
+            if items.is_empty() {
+                return Err(Error::new(ErrorKind::InvalidInput, "strptime format list must not be empty"));
             }
+            items.iter().map(Value::try_to_string).collect::<Result<Vec<_>>>()?
         }
-        None
+        _ => vec![value.try_to_string()?],
     };
-    let mut pattern = format.chars().peekable();
-    while let Some(c) = pattern.next() {
-        if c.is_whitespace() {
-            while at < chars.len() && chars[at].is_whitespace() {
-                at += 1;
-            }
-            continue;
-        }
-        if c != '%' {
-            if chars.get(at) != Some(&c) {
-                return Err(format!("Literal does not match, expected {c}"));
-            }
-            at += 1;
-            continue;
-        }
-        if pattern.peek() == Some(&'-') {
-            pattern.next();
-        }
-        let specifier = pattern.next().ok_or("Trailing format character %")?;
-        let bad = |what: &str| format!("Expected {what}");
-        match specifier {
-            'Y' => {
-                let negative = chars.get(at) == Some(&'-');
-                if negative {
-                    at += 1;
-                }
-                // a number right after it has to leave its digits alone
-                let mut following = pattern.clone();
-                let adjacent = following.next() == Some('%')
-                    && following
-                        .next()
-                        .is_some_and(|next| matches!(next, 'd' | 'e' | 'm' | 'H' | 'I' | 'M' | 'S' | 'y' | 'j'));
-                let start = at;
-                year = number(&mut at, if adjacent { 4 } else { 7 }).ok_or_else(|| bad("a number"))?;
-                if strict && at - start < 2 {
-                    return Err(bad("a year of two digits"));
-                }
-                if negative {
-                    year = -year;
-                }
-            }
-            'y' => {
-                let start = at;
-                let short = number(&mut at, 2).ok_or_else(|| bad("a number"))?;
-                if strict && at - start < 2 {
-                    return Err(bad("a year of two digits"));
-                }
-                year = if short < 69 { 2000 + short } else { 1900 + short };
-            }
-            'm' => month = number(&mut at, 2).ok_or_else(|| bad("a number"))?,
-            'd' | 'e' => {
-                while chars.get(at) == Some(&' ') {
-                    at += 1;
-                }
-                day = number(&mut at, 2).ok_or_else(|| bad("a number"))?;
-            }
-            'H' | 'I' => hour = number(&mut at, 2).ok_or_else(|| bad("a number"))?,
-            'M' => minute = number(&mut at, 2).ok_or_else(|| bad("a number"))?,
-            'S' => second = number(&mut at, 2).ok_or_else(|| bad("a number"))?,
-            'j' => yday = Some(number(&mut at, 3).ok_or_else(|| bad("a number"))?),
-            'f' | 'g' | 'n' => {
-                let width = match specifier {
-                    'g' => 3,
-                    'n' => 9,
-                    _ => 6,
-                };
-                let start = at;
-                let digits = number(&mut at, width).ok_or_else(|| bad("a number"))?;
-                let read = (at - start) as u32;
-                let scaled = digits * 10i64.pow(9 - read.min(9));
-                micros = scaled / 1000;
-            }
-            'p' => {
-                let text: String = chars.iter().skip(at).take(2).collect::<String>().to_uppercase();
-                match text.as_str() {
-                    "AM" => pm = Some(false),
-                    "PM" => pm = Some(true),
-                    _ => return Err(bad("AM/PM")),
-                }
-                at += 2;
-            }
-            'b' | 'h' => month = name(&mut at, &MONTH_NAMES, true).ok_or_else(|| bad("a month"))? as i64 + 1,
-            'B' => month = name(&mut at, &MONTH_NAMES, false).ok_or_else(|| bad("a month"))? as i64 + 1,
-            'a' => {
-                name(&mut at, &DAY_NAMES, true).ok_or_else(|| bad("a day"))?;
-            }
-            'A' => {
-                name(&mut at, &DAY_NAMES, false).ok_or_else(|| bad("a day"))?;
-            }
-            'z' => {
-                let sign = match chars.get(at) {
-                    Some('+') => 1,
-                    Some('-') => -1,
-                    Some('Z') => {
-                        at += 1;
-                        continue;
-                    }
-                    _ => return Err(bad("+HH[MM] or -HH[MM]")),
-                };
-                at += 1;
-                let hours = number(&mut at, 2).ok_or_else(|| bad("a number"))?;
-                if chars.get(at) == Some(&':') {
-                    at += 1;
-                }
-                let minutes = number(&mut at, 2).unwrap_or(0);
-                offset = sign * (hours * 60 + minutes);
-            }
-            '%' => {
-                if chars.get(at) != Some(&'%') {
-                    return Err(bad("%"));
-                }
-                at += 1;
-            }
-            other => return Err(format!("Unsupported format specifier %{other}")),
-        }
-    }
-    if at < chars.len() {
-        return Err("Full specifier did not match: trailing characters".into());
-    }
-    if let Some(is_pm) = pm {
-        if !(1..=12).contains(&hour) {
-            return Err("Hour out of range, expected a value between 1 and 12".into());
-        }
-        hour = hour % 12 + if is_pm { 12 } else { 0 };
-    }
-    let year = i32::try_from(year).map_err(|_| "Year out of range")?;
-    if let Some(yday) = yday {
-        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-        if !(1..=if leap { 366 } else { 365 }).contains(&yday) {
-            return Err("Day of the year out of range".into());
-        }
-    }
-    let date = match yday {
-        Some(yday) => Date::from_ymd(year, 1, 1).map(|d| Date(d.0 + yday as i32 - 1)),
-        None => Date::from_ymd(year, month as i32, day as i32),
-    }
-    .ok_or("Date out of range")?;
-    if !(0..=24).contains(&hour) || !(0..60).contains(&minute) || !(0..=60).contains(&second) {
-        return Err("Time out of range".into());
-    }
-    let time = hour * MICROS_PER_HOUR + minute * MICROS_PER_MINUTE + second * MICROS_PER_SEC + micros;
-    i64::from(date.0)
-        .checked_mul(MICROS_PER_DAY)
-        .and_then(|m| m.checked_add(time - offset * MICROS_PER_MINUTE))
-        .ok_or_else(|| "Timestamp out of range".to_string())
+    texts
+        .iter()
+        .map(|text| {
+            StrpFormat::new(text).map_err(|e| {
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("Failed to parse format specifier {text}: {e}"),
+                )
+            })
+        })
+        .collect()
 }
 
-fn formats_of(value: &Value) -> Result<Vec<String>> {
-    match value.data() {
-        ValueData::List(items) => items.iter().map(Value::try_to_string).collect(),
-        _ => Ok(vec![value.try_to_string()?]),
+/// `StrpTimeFunction::Bind`: a format with nanoseconds makes a TIMESTAMP_NS, one with a UTC offset
+/// a TIMESTAMP WITH TIME ZONE.
+pub(crate) fn strptime_return_type(format: &Value) -> Result<Option<LogicalType>> {
+    if format.is_null() {
+        return Ok(None);
     }
+    let formats = formats_of(format)?;
+    let nanos = formats.iter().any(|f| f.has(Spec::NanosecondPadded));
+    let offset = formats.iter().any(|f| f.has(Spec::UtcOffset));
+    Ok(match (nanos, offset) {
+        (true, true) => Some(LogicalType::new(LogicalTypeId::TimestampTzNs)),
+        (true, false) => Some(LogicalType::new(LogicalTypeId::TimestampNs)),
+        (false, true) => Some(LogicalType::new(LogicalTypeId::TimestampTz)),
+        (false, false) => None,
+    })
 }
 
-fn strptime_row(row: &[Value], strict: bool) -> Result<Value> {
+fn strptime_row(row: &[Value], strict: bool, ty: &LogicalType) -> Result<Value> {
     let input = row[0].try_to_string()?;
     let formats = formats_of(&row[1])?;
-    let mut last = String::new();
+    let nanos = matches!(ty.id(), LogicalTypeId::TimestampNs | LogicalTypeId::TimestampTzNs);
+    let mut error = ParseError::default();
     for format in &formats {
-        match strptime_micros(&input, format) {
-            Ok(micros) => return Ok(Value::timestamp(Timestamp(micros))),
-            Err(reason) => last = reason,
+        let Some(parsed) = format.parse(&input, false, &mut error) else {
+            continue;
+        };
+        let value = if strict {
+            Some(if nanos {
+                parsed.timestamp_ns().map_err(conversion)?
+            } else {
+                parsed.timestamp().map_err(|(_, message)| conversion(message))?
+            })
+        } else if nanos {
+            parsed.try_timestamp_ns()
+        } else {
+            parsed.try_timestamp()
+        };
+        if let Some(value) = value {
+            return Value::new(ty.clone(), ValueData::Int64(value));
         }
     }
     if strict {
         return Err(Error::new(
             ErrorKind::InvalidInput,
-            format!(
-                "Could not parse string \"{input}\" according to format specifier \"{}\"\n{last}",
-                formats.first().map_or("", String::as_str)
-            ),
+            format_error(&input, &formats[0].text, &error),
         ));
     }
-    Ok(Value::null(LogicalType::TIMESTAMP))
+    Ok(Value::null(ty.clone()))
 }
 
 fn strptime(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    strict_rows(args, result, |row| strptime_row(row, true))
+    let ty = result.logical_type().clone();
+    strict_rows(args, result, |row| strptime_row(row, true, &ty))
 }
 
 fn try_strptime(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    strict_rows(args, result, |row| strptime_row(row, false))
+    let ty = result.logical_type().clone();
+    strict_rows(args, result, |row| strptime_row(row, false, &ty))
 }
 
 /// The function of its own that a `date_part` of `name` amounts to, if it has one. An unknown name
@@ -2000,6 +1951,7 @@ pub fn date_functions() -> Vec<ScalarFunctionSet> {
             .map(|input| (vec![input.clone()], ty.clone(), *callback))
             .collect();
         if time_parts.contains(name) {
+            overloads.push((vec![L::new(LogicalTypeId::TimestampNs)], ty.clone(), *callback));
             overloads.push((vec![L::new(LogicalTypeId::TimeNs)], ty.clone(), *callback));
         }
         // PG also defines timezone(INTERVAL, TIME_TZ) => TIME_TZ
@@ -2012,6 +1964,7 @@ pub fn date_functions() -> Vec<ScalarFunctionSet> {
         .iter()
         .map(|input| (vec![input.clone()], i.clone(), epoch_ms as ScalarCallback))
         .collect();
+    epoch_overloads.push((vec![L::new(LogicalTypeId::TimestampNs)], i.clone(), epoch_ms));
     epoch_overloads.push((vec![i.clone()], L::TIMESTAMP, epoch_ms_to_timestamp));
     // `GetTimePartFunction`: INTERVAL and TIME too
     for ty in [L::INTERVAL, L::TIME] {
@@ -2030,6 +1983,10 @@ pub fn date_functions() -> Vec<ScalarFunctionSet> {
             .iter()
             .map(|input| (vec![input.clone()], i.clone(), callback))
             .collect();
+        overloads.push((vec![L::new(LogicalTypeId::TimestampNs)], i.clone(), callback));
+        if name == "epoch_ns" {
+            overloads.push((vec![L::new(LogicalTypeId::TimestampTzNs)], i.clone(), callback));
+        }
         for ty in [L::INTERVAL, L::TIME] {
             overloads.push((vec![ty], i.clone(), of_interval));
         }
@@ -2151,7 +2108,7 @@ pub fn date_functions() -> Vec<ScalarFunctionSet> {
         vec![(vec![d.clone()], L::INTERVAL, to_milliseconds as ScalarCallback)],
     );
     let mut format_overloads: Vec<(Vec<LogicalType>, LogicalType, ScalarCallback)> = Vec::new();
-    for input in [L::DATE, L::TIMESTAMP, tz.clone()] {
+    for input in [L::DATE, L::TIMESTAMP, L::new(LogicalTypeId::TimestampNs), tz.clone()] {
         format_overloads.push((vec![input.clone(), v.clone()], v.clone(), strftime as ScalarCallback));
         format_overloads.push((vec![v.clone(), input], v.clone(), strftime));
     }
@@ -2172,6 +2129,9 @@ pub fn date_functions() -> Vec<ScalarFunctionSet> {
         ],
     );
     let ts = L::TIMESTAMP;
+    let ts_ns = L::new(LogicalTypeId::TimestampNs);
+    let ts_s = L::new(LogicalTypeId::TimestampSec);
+    let ts_ms = L::new(LogicalTypeId::TimestampMs);
     let time_tz = LogicalType::new(LogicalTypeId::TimeTz);
     add(
         "+",
@@ -2182,6 +2142,12 @@ pub fn date_functions() -> Vec<ScalarFunctionSet> {
             (vec![L::INTERVAL, L::DATE], ts.clone(), interval_plus_moment),
             (vec![ts.clone(), L::INTERVAL], ts.clone(), moment_plus_interval),
             (vec![L::INTERVAL, ts.clone()], ts.clone(), interval_plus_moment),
+            (vec![ts_s.clone(), L::INTERVAL], ts.clone(), moment_plus_interval),
+            (vec![L::INTERVAL, ts_s.clone()], ts.clone(), interval_plus_moment),
+            (vec![ts_ms.clone(), L::INTERVAL], ts.clone(), moment_plus_interval),
+            (vec![L::INTERVAL, ts_ms.clone()], ts.clone(), interval_plus_moment),
+            (vec![ts_ns.clone(), L::INTERVAL], ts_ns.clone(), moment_plus_interval),
+            (vec![L::INTERVAL, ts_ns.clone()], ts_ns.clone(), interval_plus_moment),
             (vec![tz.clone(), L::INTERVAL], tz.clone(), moment_plus_interval),
             (vec![L::INTERVAL, tz.clone()], tz.clone(), interval_plus_moment),
             (vec![L::TIME, L::INTERVAL], L::TIME, moment_plus_interval),
@@ -2210,6 +2176,9 @@ pub fn date_functions() -> Vec<ScalarFunctionSet> {
             (vec![L::DATE, L::INTEGER], L::DATE, date_minus_integer),
             (vec![L::DATE, L::INTERVAL], ts.clone(), moment_minus_interval),
             (vec![ts.clone(), L::INTERVAL], ts.clone(), moment_minus_interval),
+            (vec![ts_s.clone(), L::INTERVAL], ts.clone(), moment_minus_interval),
+            (vec![ts_ms.clone(), L::INTERVAL], ts.clone(), moment_minus_interval),
+            (vec![ts_ns.clone(), L::INTERVAL], ts_ns.clone(), moment_minus_interval),
             (vec![tz.clone(), L::INTERVAL], tz.clone(), moment_minus_interval),
             (vec![L::TIME, L::INTERVAL], L::TIME, moment_minus_interval),
             (

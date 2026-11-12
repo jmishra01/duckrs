@@ -1724,8 +1724,24 @@ impl Binder<'_> {
                             !format.is_foldable() && format.return_type.id() != LogicalTypeId::Unknown
                         } =>
                     {
-                        let name = if set.name == "strftime" { "strftime" } else { "strptime" };
-                        return Err(binder_error(format!("{name} format must be a constant")));
+                        // `BindScalarFunctionInput::GetConstant` of the named "format" parameter
+                        return Err(binder_error(format!(
+                            "The format argument in function {} must be a constant expression",
+                            set.name
+                        )));
+                    }
+                    // `StrpTimeFunction::Bind`: the format decides the type of the result
+                    ("strptime" | "try_strptime", [_, format]) if format.is_foldable() => {
+                        let ty = match try_evaluate_scalar(format) {
+                            Some(value) => crate::function::dates::strptime_return_type(&value)?,
+                            None => None,
+                        };
+                        let mut call =
+                            bind_scalar_function(set, children, function.is_operator, &|e| try_evaluate_scalar(e))?;
+                        if let Some(ty) = ty {
+                            call.return_type = ty;
+                        }
+                        call
                     }
                     // `RegexpExtractAllStruct` / `RegexExtractBind`: a list of group names makes a STRUCT
                     ("regexp_extract" | "regexp_extract_all", [_, _, groups, ..])

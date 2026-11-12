@@ -72,6 +72,8 @@ struct KeyColumn {
     is_bit: bool,
     is_timetz: bool,
     is_variant: bool,
+    /// `create_sort_key` encodes an INTERVAL as its fields are; sorting normalizes them
+    raw_interval: bool,
     null_byte: u8,
     valid_byte: u8,
     kind: Kind,
@@ -86,6 +88,10 @@ enum Kind {
 
 impl KeyColumn {
     fn new(input: &Vector, count: usize, modifiers: OrderModifiers) -> Result<Self> {
+        Self::new_with(input, count, modifiers, false)
+    }
+
+    fn new_with(input: &Vector, count: usize, modifiers: OrderModifiers, raw_interval: bool) -> Result<Self> {
         let (null_byte, valid_byte) = match modifiers.nulls {
             NullOrder::NullsFirst => (NULL_FIRST_BYTE, NULL_LAST_BYTE),
             NullOrder::NullsLast => (NULL_LAST_BYTE, NULL_FIRST_BYTE),
@@ -114,15 +120,16 @@ impl KeyColumn {
                     .expect("flattened")
                     .struct_children()
                     .iter()
-                    .map(|c| KeyColumn::new(c, count, child_modifiers))
+                    .map(|c| KeyColumn::new_with(c, count, child_modifiers, raw_interval))
                     .collect::<Result<_>>()?,
             ),
             PhysicalType::List => {
                 let v = vector.as_ref().expect("flattened");
-                Kind::List(Box::new(KeyColumn::new(
+                Kind::List(Box::new(KeyColumn::new_with(
                     v.list_child(),
                     v.list_size(),
                     child_modifiers,
+                    raw_interval,
                 )?))
             }
             PhysicalType::Array => {
@@ -130,7 +137,12 @@ impl KeyColumn {
                 let size = v.logical_type().array_size().expect("ARRAY has a size") as usize;
                 Kind::Array {
                     size,
-                    child: Box::new(KeyColumn::new(v.array_child(), count * size, child_modifiers)?),
+                    child: Box::new(KeyColumn::new_with(
+                        v.array_child(),
+                        count * size,
+                        child_modifiers,
+                        raw_interval,
+                    )?),
                 }
             }
             PhysicalType::Bit | PhysicalType::Unknown | PhysicalType::Invalid => {
@@ -148,6 +160,7 @@ impl KeyColumn {
             is_bit: input.logical_type().id() == LogicalTypeId::Bit,
             is_timetz: input.logical_type().id() == LogicalTypeId::TimeTz,
             is_variant: input.logical_type().id() == LogicalTypeId::Variant,
+            raw_interval,
             null_byte,
             valid_byte,
             kind,
@@ -233,7 +246,12 @@ impl KeyColumn {
             PhysicalType::Interval => {
                 // The layout of Radix::EncodeData<interval_t>, over the normalized fields, so that
                 // '1 month' and '30 days' order and group as equals (issue #25108).
-                let (months, days, micros) = self.format.data::<Interval>()[idx].normalize();
+                let interval = self.format.data::<Interval>()[idx];
+                let (months, days, micros) = if self.raw_interval {
+                    (i64::from(interval.months), i64::from(interval.days), interval.micros)
+                } else {
+                    interval.normalize()
+                };
                 let months = months.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
                 for mut bytes in [
                     months.to_be_bytes().to_vec(),
@@ -468,9 +486,24 @@ fn encode_double(x: f64) -> u64 {
 
 /// Builds one sort key per row from several ORDER BY columns (`CreateSortKeyHelpers::CreateSortKey`).
 pub fn create_sort_keys(columns: &[(&Vector, OrderModifiers)], count: usize) -> Result<Vec<Vec<u8>>> {
+    sort_keys_of(columns, count, false)
+}
+
+/// The keys of the `create_sort_key` function, which encodes values as they are: an INTERVAL by
+/// its fields, not normalized.
+pub fn create_raw_sort_keys(columns: &[(&Vector, OrderModifiers)], count: usize) -> Result<Vec<Vec<u8>>> {
+    sort_keys_of(columns, count, true)
+}
+
+fn sort_keys_of(columns: &[(&Vector, OrderModifiers)], count: usize, raw_interval: bool) -> Result<Vec<Vec<u8>>> {
     let prepared = columns
         .iter()
-        .map(|(v, m)| Ok((KeyColumn::new(v, count, *m)?, m.order == OrderType::Descending)))
+        .map(|(v, m)| {
+            Ok((
+                KeyColumn::new_with(v, count, *m, raw_interval)?,
+                m.order == OrderType::Descending,
+            ))
+        })
         .collect::<Result<Vec<_>>>()?;
     Ok((0..count)
         .map(|r| {

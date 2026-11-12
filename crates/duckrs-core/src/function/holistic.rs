@@ -1083,7 +1083,8 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
                     None => out = Some(text),
                     Some(joined) => {
                         match values.get(1) {
-                            Some(separator) if separator.is_null() => {}
+                            // `StringAggBind`: a NULL separator leaves the bound one, a comma
+                            Some(separator) if separator.is_null() => joined.push(','),
                             Some(separator) => *joined += &separator.try_to_string()?,
                             None => joined.push(','),
                         }

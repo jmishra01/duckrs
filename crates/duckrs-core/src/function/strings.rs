@@ -597,7 +597,8 @@ fn ilike_escape(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
         let input: Vec<char> = text(&row[0]).to_lowercase().chars().collect();
         let pattern: Vec<char> = text(&row[1]).to_lowercase().chars().collect();
-        let escape = escape_of(&row[2])?;
+        // the pattern is lowercased, so the escape character is as well
+        let escape = escape_of(&row[2])?.map(|c| c.to_ascii_lowercase());
         Ok(Value::boolean(like_match(&input, &pattern, escape)?))
     })
 }

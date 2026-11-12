@@ -428,7 +428,11 @@ pub fn formatted_value(text: &str, ty: &LogicalType, formats: &Formats) -> Optio
     match ty.id() {
         Id::Date => {
             let micros = strptime_micros(text, formats.date.as_deref()?).ok()?;
-            Some(Value::date(Timestamp(micros).date()))
+            Some(Value::date(match micros {
+                i64::MAX => duckrs_common::types::Date::INFINITY,
+                m if m == -i64::MAX => duckrs_common::types::Date::NINFINITY,
+                m => Timestamp(m).date(),
+            }))
         }
         Id::Timestamp => {
             let micros = strptime_micros(text, formats.timestamp.as_deref()?).ok()?;

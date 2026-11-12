@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 4484 of 6367 test files pass (**74.2%** of the 6045 that run). The v1 target is ≥ 90%.
+- Overall: 4514 of 6367 test files pass (**74.7%** of the 6045 that run). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -241,7 +241,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
 
 ## Phase 5: Functions
 
-- [ ] 30. Scalar and table functions (`sql/function`: 101 failing, 76.2%; `sql/table_function`: 33 failing)
+- [ ] 30. Scalar and table functions (`sql/function`: 77 failing, 81.4%; `sql/table_function`: 33 failing)
   - [x] `remap_struct`, `struct_values`, `parse_formatted_bytes`, `equi_width_bins`, `is_histogram_other_bin`;
     `date_part` of a list of parts, the time zone parts of TIMESTAMP and TIME, `date_trunc` of an INTERVAL by
     ISO year, week and day parts; `list_where` past the end of the list; `map_concat`'s type from its non-empty
@@ -277,8 +277,16 @@ Each item gives the number of failing files in `test/` that it should fix, where
     `md5_number`, `make_timestamp_ms`, `char_length` and `character_length`, `unlist`; `to_timestamp`'s range as
     `EpochSecOperator` checks it; the time parts of TIME_NS (`nanosecond` exactly); `SELECT * AS x` names every
     column x; `struct_keys(NULL)`
-  - [ ] TYPE columns and casts, `create_sort_key`, `index_key`, `variant_normalize`,
-    `strptime` edge cases, `list_contains` and the other templated list functions' type deduction,
+  - [x] `strptime` and `try_strptime` as `StrpTimeFormat` parses (`function/strptime.rs`): week numbers (`%U`, `%W`),
+    ISO years, weeks and weekdays (`%G`, `%V`, `%u`), `infinity`/`epoch` specials, TIMESTAMP_NS and TIMESTAMPTZ
+    results for `%n` and `%z`, C++'s error text; `strftime` of TIMESTAMP_NS; TIMESTAMP_NS ± INTERVAL keeping its
+    nanoseconds, and TIMESTAMP_S/MS ± INTERVAL as TIMESTAMP; `time_bucket` as the `TimeBucket` operators (month
+    offsets, overflow checks); `epoch_ms` rounding and the epoch functions' range errors; `round` of every integer
+    type; `create_sort_key` (BIGINT or BLOB, intervals as stored); `variant_type`, `variant_contains`,
+    `variant_normalize`, `variant_keys` as a path function; `normalized_interval` as `interval_t::Normalize`;
+    `ilike_escape`'s escape lowercased; `map_concat` of NULLs; `list_resize` to a NULL size; a NULL `string_agg`
+    separator in `list_aggr`; `atan(inf)`
+  - [ ] TYPE columns and casts, `index_key`, JSON date-format detection, `list_contains` and the other templated list functions' type deduction,
     the external-resource and profiling table functions; `duckdb_constraints()` lists a primary key's implied
     NOT NULL after the declared constraints (the catalog keeps NOT NULL per column, not in order); a view's
     columns as bound when it was created
@@ -303,7 +311,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
     COMBINE; `to_aggregate_state` with an ORDER BY spec and its checks
   - [ ] the sketches of approx_count_distinct, approx_quantile and approx_top_k, `lttb`, the states of files before
     v1.5 (`LEGACY_AGGREGATE_STATE`)
-- [ ] 32. Window functions (`sql/window`: 19 failing, 79.1%; target ≥ 85%)
+- [ ] 32. Window functions (`sql/window`: 18 failing, 80.2%; target ≥ 85%)
 - [ ] 33. `pragma_*` functions and PRAGMA statements (`sql/pragma`: 20 failing, 65.5%)
   - [x] SHOW TABLES over the search path, SHOW TABLES FROM a database, a schema or both
   - [x] PRAGMA version, platform, functions, database_size, storage_info and metadata_info as the queries C++
@@ -321,7 +329,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] shredded GEOMETRY columns, and the spatial extension's format of files before v1.5.0
   - [x] `GeometryStats`: in `stats()`, in database files (extent, types, flags), and `vertex_extract`'s bounds
   - [ ] `ST_GeomFromWKB`'s types from BLOB min/max (duckrs keeps no string statistics), GeoParquet, the spatial extension's blob format
-- [ ] 34. Remaining type and cast failures (`sql/types`: 73 failing, 86.2%; `sql/cast`: 5 failing)
+- [ ] 34. Remaining type and cast failures (`sql/types`: 66 failing, 87.5%; `sql/cast`: 5 failing)
   - [x] UNNEST with `recursive`, `max_depth` and `keep_parent_names`, of structs at the root of a select list,
     refused nested; a cast to NULL of anything that is NULL
 - [ ] 35. The VARIANT type (`sql/variant`: 2 failing)
