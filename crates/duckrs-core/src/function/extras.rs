@@ -63,7 +63,7 @@ const STRING_FUNCTIONS: [&str; 22] = [
     "path_join",
 ];
 
-const OTHER_FUNCTIONS: [&str; 52] = [
+const OTHER_FUNCTIONS: [&str; 54] = [
     "finalize",
     "combine",
     "gamma",
@@ -71,6 +71,7 @@ const OTHER_FUNCTIONS: [&str; 52] = [
     "nextafter",
     "fmod",
     "factorial",
+    "binom",
     "even",
     "time_bucket",
     "normalized_interval",
@@ -114,6 +115,7 @@ const OTHER_FUNCTIONS: [&str; 52] = [
     "map_contains",
     "map_concat",
     "cast_to_type",
+    "replace_type",
     "can_cast_implicitly",
     "from_binary",
 ];
@@ -659,7 +661,55 @@ fn fmod(args: &DataChunk, result: &mut Vector) -> Result<()> {
         let (Some(x), Some(y)) = (number(&row[0]), number(&row[1])) else {
             return Ok(Value::null(LogicalType::DOUBLE));
         };
-        Ok(Value::double(x % y))
+        // `FlooredModuloOperator`: the remainder with the sign of the divisor, and a zero that is positive
+        let remainder = x % y;
+        let floored = if remainder == 0.0 {
+            0.0
+        } else if (remainder < 0.0) != (y < 0.0) {
+            remainder + y
+        } else {
+            remainder
+        };
+        Ok(Value::double(floored))
+    })
+}
+
+// Ported from `BinomOperator` of duckdb/extension/core_functions/scalar/math/numeric.cpp @ rust-port-baseline
+/// `binom(n, k)`: the binomial coefficient, with the common factors taken out before each multiplication.
+fn binom(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    fn gcd(mut a: i128, mut b: i128) -> i128 {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a.abs()
+    }
+    row_wise(args, result, |row| {
+        let (Some(n), Some(k)) = (row[0].as_i128(), row[1].as_i128()) else {
+            return Ok(Value::null(LogicalType::HUGEINT));
+        };
+        if n < 0 || k < 0 {
+            return Err(Error::new(
+                ErrorKind::OutOfRange,
+                "binom with negative input is undefined",
+            ));
+        }
+        if n < k {
+            return Ok(Value::hugeint(0));
+        }
+        let k = k.min(n - k);
+        let mut ret: i128 = 1;
+        for i in 1..=k {
+            let (mut numerator, mut denominator) = (n - k + i, i);
+            let divisor = gcd(numerator, denominator);
+            numerator /= divisor;
+            denominator /= divisor;
+            let divisor = gcd(ret, denominator);
+            ret /= divisor;
+            ret = ret
+                .checked_mul(numerator)
+                .ok_or_else(|| Error::new(ErrorKind::OutOfRange, "Value out of range"))?;
+        }
+        Ok(Value::hugeint(ret))
     })
 }
 
@@ -678,7 +728,7 @@ fn factorial(args: &DataChunk, result: &mut Vector) -> Result<()> {
         for factor in 2..=n {
             product = product
                 .checked_mul(factor)
-                .ok_or_else(|| Error::new(ErrorKind::OutOfRange, "Overflow in HUGEINT multiplication"))?;
+                .ok_or_else(|| Error::new(ErrorKind::OutOfRange, "Value out of range"))?;
         }
         Ok(Value::hugeint(product))
     })
@@ -1118,6 +1168,37 @@ fn is_histogram_other_bin(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+/// `TypeVisitor::VisitReplace`: `ty` with every type in it that is `from` made `to`.
+fn replace_type(ty: &LogicalType, from: &LogicalType, to: &LogicalType) -> LogicalType {
+    if ty == from {
+        return to.clone();
+    }
+    let replace = |t: &LogicalType| replace_type(t, from, to);
+    match ty.id() {
+        LogicalTypeId::List => LogicalType::list(replace(ty.child_type().expect("a LIST has a child"))),
+        LogicalTypeId::Array => LogicalType::array(
+            replace(ty.child_type().expect("an ARRAY has a child")),
+            ty.array_size().unwrap_or(0),
+        ),
+        LogicalTypeId::Map => LogicalType::map_from_entry(replace(ty.child_type().expect("a MAP has entries"))),
+        LogicalTypeId::Struct => LogicalType::struct_type(
+            ty.struct_children()
+                .iter()
+                .map(|(n, t)| (n.clone(), replace(t)))
+                .collect(),
+        ),
+        LogicalTypeId::Tuple => LogicalType::tuple(ty.struct_children().iter().map(|(_, t)| replace(t)).collect()),
+        LogicalTypeId::Union => LogicalType::union_type(
+            ty.struct_children()
+                .iter()
+                .skip(1)
+                .map(|(n, t)| (n.clone(), replace(t)))
+                .collect(),
+        ),
+        _ => ty.clone(),
+    }
+}
+
 /// `struct_values`: the fields of a STRUCT, as a TUPLE.
 fn struct_values(args: &DataChunk, result: &mut Vector) -> Result<()> {
     let ty = result.logical_type().clone();
@@ -1464,6 +1545,13 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
         "lgamma" => simple(1, 1, d.clone(), lgamma, casted(children, &d)),
         "even" => simple(1, 1, d.clone(), even, casted(children, &d)),
         "fmod" => simple(2, 2, d.clone(), fmod, casted(children, &d)),
+        "binom" => simple(
+            2,
+            2,
+            LogicalType::HUGEINT,
+            binom,
+            casted(children, &LogicalType::INTEGER),
+        ),
         "factorial" => simple(
             1,
             1,
@@ -1795,6 +1883,26 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
         "cast_to_type" => {
             count_args(&lower, &children, 2, 2)?;
             let ty = children[1].return_type.clone();
+            if ty.id() == LogicalTypeId::SqlNull {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "cast_to_type cannot be used to cast to NULL",
+                ));
+            }
+            Ok(children.remove(0).cast_to(&ty, false))
+        }
+        // Ported from duckdb/extension/core_functions/scalar/generic/replace_type.cpp @ rust-port-baseline
+        // `replace_type(x, from, to)`: x cast to its type with every `from` in it made `to`
+        "replace_type" => {
+            count_args(&lower, &children, 3, 3)?;
+            let (from, to) = (children[1].return_type.clone(), children[2].return_type.clone());
+            if to.id() == LogicalTypeId::SqlNull {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "replace_type cannot be used to replace type with NULL",
+                ));
+            }
+            let ty = replace_type(&children[0].return_type, &from, &to);
             Ok(children.remove(0).cast_to(&ty, false))
         }
         "can_cast_implicitly" => {

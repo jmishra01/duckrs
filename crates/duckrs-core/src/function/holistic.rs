@@ -621,6 +621,12 @@ fn arg_extreme_nulls(rows: &[Value], ty: &LogicalType, greatest: bool, nulls_las
 }
 
 fn positive_n(value: &Value, name: &str) -> Result<usize> {
+    if value.is_null() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("Invalid input for {name}: n value cannot be NULL"),
+        ));
+    }
     let n = value.as_i128().unwrap_or(0);
     if n <= 0 {
         return Err(Error::new(
@@ -975,6 +981,37 @@ fn bits(rows: &[Value], ty: &LogicalType, combine: fn(u128, u128) -> u128) -> Re
 /// `StateFinalize`.
 pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value> {
     use Holistic::*;
+    // the aggregates whose state is C++'s: the rows folded and finalized as C++ updates and finalizes it, so the
+    // result is C++'s to the last bit
+    if matches!(
+        kind,
+        StddevSamp
+            | StddevPop
+            | VarSamp
+            | VarPop
+            | Sem
+            | CovarPop
+            | CovarSamp
+            | Corr
+            | Skewness
+            | Kurtosis
+            | KurtosisPop
+            | Fsum
+            | Favg
+            | Product
+            | RegrSlope
+            | RegrIntercept
+            | RegrR2
+            | RegrSxx
+            | RegrSyy
+            | RegrSxy
+            | RegrAvgX
+            | RegrAvgY
+    ) && let Some(layout) = super::holistic_states::layout(kind, &[], ty)
+    {
+        let state = super::holistic_states::from_rows(kind, rows, &layout)?;
+        return super::holistic_states::finalize(kind, &state, ty, &[]);
+    }
     let null = || Value::null(ty.clone());
     Ok(match kind {
         StringAgg => {

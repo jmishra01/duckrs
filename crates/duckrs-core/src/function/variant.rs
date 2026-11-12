@@ -281,13 +281,12 @@ fn variant_keys(args: &DataChunk, result: &mut Vector) -> Result<()> {
 }
 
 fn variant_array_length(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    row_wise(args, result, |row| {
-        if row[0].is_null() {
-            return Ok(Value::null(LogicalType::BIGINT));
-        }
-        Ok(match decode(&row[0])? {
-            VariantNode::Array(items) => Value::bigint(items.len() as i64),
-            _ => Value::null(LogicalType::BIGINT),
+    // `WriteArrayLengthsResult`: 0 for what is no array, NULL for what is not there
+    over_paths(args, result, &LogicalType::UBIGINT, &|node| {
+        Ok(match node {
+            Some(VariantNode::Array(items)) => Value::ubigint(items.len() as u64),
+            Some(_) => Value::ubigint(0),
+            None => Value::null(LogicalType::UBIGINT),
         })
     })
 }
@@ -300,6 +299,8 @@ pub fn is_variant_function(name: &str) -> bool {
             | "variant_extract"
             | "variant_keys"
             | "variant_array_length"
+            | "variant_exists"
+            | "variant_extract_string"
             | "variant_to_parquet_variant"
             | "variant_bytes_to_variant"
     )
@@ -334,6 +335,12 @@ pub fn bind_variant_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
     let lower = name.to_ascii_lowercase();
     if lower == "variant_to_parquet_variant" || lower == "variant_bytes_to_variant" {
         return bind_parquet_variant_function(&lower, children);
+    }
+    if matches!(
+        lower.as_str(),
+        "variant_exists" | "variant_extract_string" | "variant_array_length"
+    ) {
+        return bind_path_function(&lower, children);
     }
     let mut children = children.into_iter();
     let (Some(child), key, None) = (children.next(), children.next(), children.next()) else {
@@ -372,6 +379,144 @@ pub fn bind_variant_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             "{lower} expects either one VARIANT column argument, or a VARIANT column and a path"
         ))),
     }
+}
+
+// Ported from duckdb/src/function/scalar/variant/{variant_path_function,variant_bind_utils,variant_exists,
+// variant_extract_string,variant_array_length}.cpp @ rust-port-baseline
+
+/// `VariantPathFunction::CreateFunctionSet` + `VariantBindUtils::VariantPathBind`: a function of a VARIANT at a path
+/// (one key of an object, or the value itself for an empty one), or at each of a list of paths.
+fn bind_path_function(name: &str, children: Vec<BoundExpr>) -> Result<BoundExpr> {
+    let (callback, element): (super::ScalarCallback, LogicalType) = match name {
+        "variant_exists" => (variant_exists, LogicalType::BOOLEAN),
+        "variant_extract_string" => (variant_extract_string, LogicalType::VARCHAR),
+        _ => (variant_array_length, LogicalType::UBIGINT),
+    };
+    let mut children = children;
+    // only variant_array_length is a function of the value itself as well
+    if children.len() == 1 && name != "variant_array_length" {
+        return Err(binder_error(format!(
+            "No function matches the given name and argument types '{name}({})'. You might need to add explicit \
+             type casts.",
+            super::binder::expression_return_type(&children[0])
+        )));
+    }
+    if children.len() != 1 && children.len() != 2 {
+        return Err(binder_error(format!(
+            "{name} expects either one VARIANT column argument, or two VARIANT column and VARCHAR path arguments"
+        )));
+    }
+    children[0] = as_variant(children[0].clone());
+    if children.len() == 1 {
+        return Ok(bound_function(name, children, element, callback));
+    }
+    let path = &children[1];
+    let path_type = path.return_type.clone();
+    // a NULL path makes the function NULL, as any NULL argument does
+    if path_type.id() == LogicalTypeId::SqlNull {
+        return Ok(BoundExpr::constant(Value::null(element)));
+    }
+    let list = match path_type.id() {
+        LogicalTypeId::Varchar => false,
+        LogicalTypeId::List
+            if matches!(
+                path_type.child_type().map(LogicalType::id),
+                Some(LogicalTypeId::Varchar | LogicalTypeId::SqlNull)
+            ) =>
+        {
+            true
+        }
+        // no overload takes it (`FunctionBinder::BindFunction`)
+        _ => {
+            return Err(binder_error(format!(
+                "No function matches the given name and argument types '{name}({}, {})'. You might need to add \
+                 explicit type casts.",
+                children[0].return_type,
+                super::binder::expression_return_type(&children[1])
+            )));
+        }
+    };
+    if !path.is_foldable() {
+        return Err(binder_error(format!("{name} expects the path to be a constant")));
+    }
+    let value = crate::execution::expression_executor::evaluate_scalar(path)?;
+    if value.is_null() {
+        return Err(binder_error(format!("{name} does not accept NULL paths")));
+    }
+    if let ValueData::List(items) = value.data()
+        && items.iter().any(Value::is_null)
+    {
+        return Err(binder_error(format!("'{name}' does not accept NULL paths")));
+    }
+    children[1] = BoundExpr::constant(value);
+    let ty = if list { LogicalType::list(element) } else { element };
+    Ok(bound_function(name, children, ty, callback))
+}
+
+/// `VariantPathFunction::ResolvePath`: the value at a key of an object, if it is there.
+fn resolve_path(node: VariantNode, key: &str) -> Option<VariantNode> {
+    if key.is_empty() {
+        return Some(node);
+    }
+    match node {
+        VariantNode::Object(children) => children.into_iter().find(|(k, _)| k == key).map(|(_, child)| child),
+        _ => None,
+    }
+}
+
+/// Each row's value at the path (or the paths) of a path function, as `write` makes it.
+fn over_paths(
+    args: &DataChunk,
+    result: &mut Vector,
+    element: &LogicalType,
+    write: &dyn Fn(Option<VariantNode>) -> Result<Value>,
+) -> Result<()> {
+    let ty = result.logical_type().clone();
+    row_wise(args, result, |row| {
+        if row[0].is_null() {
+            return Ok(Value::null(ty.clone()));
+        }
+        let node = decode(&row[0])?;
+        match row.get(1).map(Value::data) {
+            None => write(Some(node)),
+            Some(ValueData::List(paths)) => {
+                let items = paths
+                    .iter()
+                    .map(|path| write(resolve_path(node.clone(), &path.try_to_string()?)))
+                    .collect::<Result<Vec<_>>>()?;
+                Value::list(element.clone(), items)
+            }
+            Some(_) => write(resolve_path(node, &row[1].try_to_string()?)),
+        }
+    })
+}
+
+fn variant_exists(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    over_paths(args, result, &LogicalType::BOOLEAN, &|node| {
+        Ok(Value::boolean(node.is_some()))
+    })
+}
+
+/// `VariantStringWriter`: a VARCHAR as it is, anything else as its JSON, and a JSON string without its quotes.
+fn variant_extract_string(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    over_paths(args, result, &LogicalType::VARCHAR, &|node| {
+        let node = match node {
+            None | Some(VariantNode::Null) => return Ok(Value::null(LogicalType::VARCHAR)),
+            Some(node) => node,
+        };
+        if let VariantNode::Scalar(value) = &node
+            && value.logical_type().id() == LogicalTypeId::Varchar
+        {
+            return Ok(Value::varchar(value.try_to_string()?));
+        }
+        let json = super::json::value_to_json(&variant_value(&node))?;
+        if let duckrs_common::json::Json::Str(text) = &json {
+            return Ok(Value::varchar(text.clone()));
+        }
+        let mut out = String::new();
+        json.write(&mut out);
+        Ok(Value::varchar(out))
+    })
 }
 
 /// `variant_to_parquet_variant` and `variant_bytes_to_variant` of the Parquet extension.

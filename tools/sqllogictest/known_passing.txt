@@ -266,6 +266,7 @@ test/issues/general/test_17310.test
 test/issues/general/test_17446.test
 test/issues/general/test_17700.test
 test/issues/general/test_17757.test
+test/issues/general/test_18163.test
 test/issues/general/test_18543.test
 test/issues/general/test_18703.test
 test/issues/general/test_18803.test
@@ -705,6 +706,7 @@ test/sql/aggregate/aggregates/first_last_alloc_reuse.test
 test/sql/aggregate/aggregates/histogram_exact.test
 test/sql/aggregate/aggregates/histogram_table_function.test
 test/sql/aggregate/aggregates/max_n_all_types_grouped.test
+test/sql/aggregate/aggregates/minmax_n_fallible.test
 test/sql/aggregate/aggregates/mode_rewrite_memory.test
 test/sql/aggregate/aggregates/quantile_fallible.test
 test/sql/aggregate/aggregates/quantile_fallible_decimal_param.test
@@ -741,6 +743,7 @@ test/sql/aggregate/aggregates/test_histogram_3529.test
 test/sql/aggregate/aggregates/test_incorrect_aggregate.test
 test/sql/aggregate/aggregates/test_kahan_avg.test
 test/sql/aggregate/aggregates/test_kahan_combine.test
+test/sql/aggregate/aggregates/test_kahan_precision.test
 test/sql/aggregate/aggregates/test_kahan_sum.test
 test/sql/aggregate/aggregates/test_kurtosis.test
 test/sql/aggregate/aggregates/test_last.test
@@ -759,6 +762,7 @@ test/sql/aggregate/aggregates/test_quantile_disc.test
 test/sql/aggregate/aggregates/test_quantile_disc_double.test
 test/sql/aggregate/aggregates/test_quantile_timestamp_exact.test
 test/sql/aggregate/aggregates/test_quantile_timetz.test
+test/sql/aggregate/aggregates/test_regression.test
 test/sql/aggregate/aggregates/test_reservoir_quantile_decimal.test
 test/sql/aggregate/aggregates/test_scalar_aggr.test
 test/sql/aggregate/aggregates/test_sem.test
@@ -1920,6 +1924,7 @@ test/sql/function/date/date_trunc_min_date.test
 test/sql/function/date/date_trunc_stats.test
 test/sql/function/date/date_trunc_stats_out_of_range.test
 test/sql/function/date/strftime_iso_year_range.test
+test/sql/function/date/test_date_part.test
 test/sql/function/date/test_extract.test
 test/sql/function/date/test_extract_edge_cases.test
 test/sql/function/date/test_extract_month.test
@@ -1940,6 +1945,7 @@ test/sql/function/generic/case_short_circuit.test
 test/sql/function/generic/case_varchar.test
 test/sql/function/generic/case_when_comparison.test
 test/sql/function/generic/case_when_list.test
+test/sql/function/generic/cast_to_type.test
 test/sql/function/generic/constant_argument_errors.test
 test/sql/function/generic/constant_or_null.test
 test/sql/function/generic/error.test
@@ -1947,6 +1953,7 @@ test/sql/function/generic/fold_constant_arguments.test
 test/sql/function/generic/hash_func.test
 test/sql/function/generic/least_greatest_enum.test
 test/sql/function/generic/least_greatest_types.test
+test/sql/function/generic/replace_type.test
 test/sql/function/generic/table_func_varargs.test
 test/sql/function/generic/test_boolean_test.test
 test/sql/function/generic/test_if.test
@@ -2061,8 +2068,11 @@ test/sql/function/numeric/bit_count_hugeint.test
 test/sql/function/numeric/decimal_mod.test
 test/sql/function/numeric/round_null_beyond_width.test
 test/sql/function/numeric/test_arithmetic_aliases.test
+test/sql/function/numeric/test_binom.test
 test/sql/function/numeric/test_bit_count.test
 test/sql/function/numeric/test_even.test
+test/sql/function/numeric/test_factorial.test
+test/sql/function/numeric/test_fdiv_fmod.test
 test/sql/function/numeric/test_floor_ceil.test
 test/sql/function/numeric/test_gcd_lcm.test
 test/sql/function/numeric/test_geomean.test
@@ -2189,6 +2199,8 @@ test/sql/function/timestamp/test_strftime_timestamp.test
 test/sql/function/timestamp/test_strptime_nonascii.test
 test/sql/function/timetz/test_extract.test
 test/sql/function/uuid/test_uuid.test
+test/sql/function/variant/variant_array_length.test
+test/sql/function/variant/variant_exists.test
 test/sql/function/variant/variant_extract_try_cast.test
 test/sql/function/variant/variant_shredded_extract_nested.test
 test/sql/generated_columns/stored/basic.test
@@ -3063,6 +3075,7 @@ test/sql/sql_export/ci_reconstruction.test
 test/sql/sql_export/collation_results.test
 test/sql/sql_export/composition_q1.test
 test/sql/sql_export/compressed_materialization_sql_export.test
+test/sql/sql_export/constant_values.test
 test/sql/sql_export/copy_empty_filename_pattern.test
 test/sql/sql_export/correlated_sql_export.test
 test/sql/sql_export/cte_names.test
@@ -3094,6 +3107,7 @@ test/sql/sql_export/sql_export_join_scopes.test
 test/sql/sql_export/sql_export_quantiles.test
 test/sql/sql_export/table_row_number_sql_export.test
 test/sql/sql_export/union_value.test
+test/sql/sql_export/variant_key_order.test
 test/sql/storage/alter/alter_add_col_defaultexpr_sequence.test
 test/sql/storage/alter/alter_based_on_unfinished_insert_fails.test
 test/sql/storage/alter/alter_column_constraint.test

@@ -1533,6 +1533,40 @@ impl Binder<'_> {
                     }
                     return Ok(BoundExpr::constant(type_value(&child.return_type)));
                 }
+                // `invoke(lambda x, y: body, a, b)`: the body with the arguments for its parameters
+                if function.name.name.eq_ignore_ascii_case("invoke")
+                    && function.name.qualification.is_empty()
+                    && let Some(first) = function.args.first()
+                    && let ExprKind::Lambda { lhs, expr: body, .. } = &first.expr.kind
+                {
+                    fn names(lhs: &Expr, out: &mut Vec<String>) {
+                        match &lhs.kind {
+                            ExprKind::ColumnRef(n) => out.push(n[0].clone()),
+                            ExprKind::Function(f) => f.args.iter().for_each(|a| names(&a.expr, out)),
+                            ExprKind::Operator { children, .. } => children.iter().for_each(|c| names(c, out)),
+                            _ => {}
+                        }
+                    }
+                    let mut parameters = Vec::new();
+                    names(lhs, &mut parameters);
+                    // an argument is known by its parameter's name in the body (what `alias(x)` gives)
+                    let arguments: Vec<Expr> = function.args[1..]
+                        .iter()
+                        .zip(&parameters)
+                        .map(|(a, name)| a.expr.clone().with_alias(name.clone()))
+                        .collect();
+                    if parameters.len() != function.args.len() - 1 {
+                        return Err(binder_error(format!(
+                            "The lambda of invoke takes {} parameters, but {} arguments were given",
+                            parameters.len(),
+                            function.args.len() - 1
+                        )));
+                    }
+                    let mut body = (**body).clone();
+                    super::macros::replace_in_expr(&mut body, &parameters, &arguments);
+                    body.alias = expr.alias.clone();
+                    return self.bind_expression(&body);
+                }
                 // `make_type(name, ...)`: the type the name and its parameters make, as a TYPE
                 if function.name.name.eq_ignore_ascii_case("make_type") && function.name.qualification.is_empty() {
                     return self.bind_make_type(function);
@@ -1553,7 +1587,28 @@ impl Binder<'_> {
                         .iter()
                         .map(|a| self.bind_expression(&a.expr))
                         .collect::<Result<Vec<_>>>()?;
-                    return crate::function::extras::bind_function(&function.name.name, &names, children);
+                    // a parameter's type is only known when the statement runs (`ParameterNotResolvedException`)
+                    let preparing = self.parameters.as_ref().is_some_and(|p| p.values.is_none());
+                    let typed_by_argument = matches!(
+                        function.name.name.to_lowercase().as_str(),
+                        "cast_to_type" | "replace_type"
+                    );
+                    if preparing
+                        && typed_by_argument
+                        && children.iter().any(|c| c.return_type.id() == LogicalTypeId::SqlNull)
+                    {
+                        return Ok(BoundExpr::constant(Value::sql_null()));
+                    }
+                    let mut bound = crate::function::extras::bind_function(&function.name.name, &names, children)?;
+                    // `BindBinaryFloatingPoint` of fmod and fdiv: a zero divisor is an error without IEEE semantics,
+                    // or NULL with error_on_division_by_zero off
+                    if matches!(function.name.name.to_lowercase().as_str(), "fmod" | "fdiv")
+                        && !self.options.ieee_floating_point_ops
+                        && let BoundExprKind::Function { function, .. } = &mut bound.kind
+                    {
+                        *function = Arc::new(function.with_zero_check(!self.options.error_on_division_by_zero));
+                    }
+                    return Ok(bound);
                 }
                 if crate::function::json_serialize::is_serialize_function(&function.name.name) {
                     let names: Vec<String> = function.args.iter().map(|a| a.name.clone()).collect();

@@ -132,7 +132,8 @@ fn date_part_of(part: DatePart, days: i32, time: i64) -> Result<Part> {
         DatePart::Year => year,
         DatePart::Month => month,
         DatePart::Day => day,
-        DatePart::Decade => year.div_euclid(10),
+        // `DecadeOperator`: the year divided by 10, truncated
+        DatePart::Decade => year / 10,
         DatePart::Century => bc_aware(100),
         DatePart::Millennium => bc_aware(1000),
         DatePart::Quarter => (month - 1) / 3 + 1,
@@ -238,7 +239,11 @@ fn part_value(part: DatePart, value: &Value, ty: &LogicalType) -> Result<Value> 
         id,
         LogicalTypeId::TimestampTz | LogicalTypeId::TimestampTzNs | LogicalTypeId::TimeTz
     ) {
-        // `TimezoneOperator`: a DATE or an INTERVAL has no time zone to ask about, anything else is at +00
+        // `TimezoneOperator`: a DATE or an INTERVAL has no time zone to ask about, anything else is at +00; an
+        // infinity has no parts at all
+        if !value.is_null() && id != LogicalTypeId::Interval && moment(value).is_none() {
+            return Ok(Value::null(ty.clone()));
+        }
         if matches!(id, LogicalTypeId::Date | LogicalTypeId::Interval) {
             let name = match part {
                 DatePart::Timezone => "timezone",
@@ -358,6 +363,19 @@ fn struct_date_part(args: &DataChunk, result: &mut Vector) -> Result<()> {
         }
         let mut values = Vec::with_capacity(parts.len());
         for (part, field) in parts.iter().zip(&field_types) {
+            // `DatePart::StructOperator`: a DATE has its time zone parts as 0, where the scalar parts refuse them
+            let zone = matches!(
+                part,
+                DatePart::Timezone | DatePart::TimezoneHour | DatePart::TimezoneMinute
+            );
+            if zone && row[1].logical_type().id() == LogicalTypeId::Date {
+                values.push(if moment(&row[1]).is_some() {
+                    Value::bigint(0)
+                } else {
+                    Value::null(field.clone())
+                });
+                continue;
+            }
             values.push(part_value(*part, &row[1], field)?);
         }
         Value::new(ty.clone(), ValueData::Struct(values))
@@ -367,6 +385,10 @@ fn struct_date_part(args: &DataChunk, result: &mut Vector) -> Result<()> {
 fn date_part_call(args: &DataChunk, result: &mut Vector) -> Result<()> {
     let ty = result.logical_type().clone();
     strict_rows(args, result, |row| {
+        // an infinity has no parts, whatever the specifier says
+        if !row[1].is_null() && moment(&row[1]).is_none() {
+            return Ok(Value::null(ty.clone()));
+        }
         part_value(parse_part(&row[0].try_to_string()?)?, &row[1], &ty)
     })
 }
@@ -570,7 +592,16 @@ fn last_day(args: &DataChunk, result: &mut Vector) -> Result<()> {
             return Ok(Value::null(LogicalType::DATE));
         };
         let (year, month, _) = Date(days).to_ymd();
-        let last = Date::from_ymd(year, month, Date::month_days(year, month)).expect("a day of the month");
+        // `LastDayOperator`: the day before the first of the next month, which must be a date itself
+        let (next_year, next_month) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+        if Date::from_ymd(next_year, next_month, 1).is_none() {
+            return Err(Error::new(
+                ErrorKind::OutOfRange,
+                format!("Date out of range: {next_year}-{next_month}-1"),
+            ));
+        }
+        let last = Date::from_ymd(year, month, Date::month_days(year, month))
+            .ok_or_else(|| Error::new(ErrorKind::OutOfRange, format!("Date out of range: {year}-{month}")))?;
         Ok(Value::date(last))
     })
 }
@@ -1857,6 +1888,33 @@ pub fn bind_date_function(name: &str, children: Vec<BoundExpr>) -> Result<BoundE
     Ok(bound_function("date_trunc", args, ty, date_trunc))
 }
 
+/// `TimezoneOperator::Operation(interval_t, dtime_tz_t)`: the time at +00, moved by the interval, at that offset.
+fn timezone_of_time_tz(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    const MAX_OFFSET: i64 = 16 * 60 * 60 - 1;
+    strict_rows(args, result, |row| {
+        let (ValueData::Interval(interval), ValueData::Int64(bits)) = (row[0].data(), row[1].data()) else {
+            return Ok(Value::null(LogicalType::new(LogicalTypeId::TimeTz)));
+        };
+        let offset = interval.micros / MICROS_PER_SEC;
+        if !(-MAX_OFFSET..=MAX_OFFSET).contains(&offset) {
+            return Err(Error::new(
+                ErrorKind::OutOfRange,
+                format!(
+                    "Timezone offset out of range: {}",
+                    Value::interval(*interval).try_to_string()?
+                ),
+            ));
+        }
+        let value = TimeTz(*bits as u64);
+        let utc = (value.time().0 - i64::from(value.offset()) * MICROS_PER_SEC).rem_euclid(MICROS_PER_DAY);
+        let time = (utc + interval.micros).rem_euclid(MICROS_PER_DAY);
+        Ok(Value::time_tz(TimeTz::new(
+            duckrs_common::types::Time(time),
+            offset as i32,
+        )))
+    })
+}
+
 pub fn date_functions() -> Vec<ScalarFunctionSet> {
     use LogicalType as L;
     let tz = L::new(LogicalTypeId::TimestampTz);
@@ -1905,13 +1963,15 @@ pub fn date_functions() -> Vec<ScalarFunctionSet> {
         ("julian", julian, d.clone()),
     ];
     for (name, callback, ty) in parts {
-        add(
-            name,
-            inputs
-                .iter()
-                .map(|input| (vec![input.clone()], ty.clone(), *callback))
-                .collect(),
-        );
+        let mut overloads: Vec<(Vec<LogicalType>, LogicalType, ScalarCallback)> = inputs
+            .iter()
+            .map(|input| (vec![input.clone()], ty.clone(), *callback))
+            .collect();
+        // PG also defines timezone(INTERVAL, TIME_TZ) => TIME_TZ
+        if *name == "timezone" {
+            overloads.push((vec![L::INTERVAL, time_tz.clone()], time_tz.clone(), timezone_of_time_tz));
+        }
+        add(name, overloads);
     }
     let mut epoch_overloads: Vec<(Vec<LogicalType>, LogicalType, ScalarCallback)> = date_inputs
         .iter()
