@@ -455,15 +455,14 @@ fn bind_enum_range_boundary(children: Vec<BoundExpr>) -> Result<BoundExpr> {
 fn bind_map(children: Vec<BoundExpr>) -> Result<BoundExpr> {
     match <[BoundExpr; 2]>::try_from(children) {
         Ok([keys, values]) => {
-            let element = |child: &BoundExpr, what: &str| match child.return_type.id() {
+            // `MapFun`: (LIST(K), LIST(V)), so anything else matches no overload
+            let no_match = || super::lists::no_match("map", &[keys.clone(), values.clone()]);
+            let element = |child: &BoundExpr| match child.return_type.id() {
                 LogicalTypeId::List | LogicalTypeId::Array => Ok(child.return_type.child_type().unwrap().clone()),
                 LogicalTypeId::SqlNull => Ok(LogicalType::SQLNULL),
-                _ => Err(binder_error(format!(
-                    "MAP {what} must be a LIST, not {}",
-                    child.return_type
-                ))),
+                _ => Err(no_match()),
             };
-            let (key, value) = (element(&keys, "keys")?, element(&values, "values")?);
+            let (key, value) = (element(&keys)?, element(&values)?);
             let keys = keys.cast_to(&LogicalType::list(key.clone()), false);
             let values = values.cast_to(&LogicalType::list(value.clone()), false);
             Ok(bound_function(
@@ -562,10 +561,9 @@ fn bind_struct_extract(child: BoundExpr, key: BoundExpr) -> Result<BoundExpr> {
     if super::json::is_json_type(&ty) {
         return super::json::bind_function("json_extract", vec![child, key], &|_| Ok(LogicalType::VARCHAR));
     }
+    // the overloads take a STRUCT, which no other type casts to
     if !matches!(ty.id(), LogicalTypeId::Struct | LogicalTypeId::Tuple) {
-        return Err(binder_error(format!(
-            "struct_extract can only be used on a STRUCT, not on {ty}"
-        )));
+        return Err(super::lists::no_match("struct_extract", &[child, key]));
     }
     if ty.struct_children().is_empty() {
         return Err(binder_error("Can't extract something from an empty struct"));

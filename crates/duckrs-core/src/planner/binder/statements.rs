@@ -1002,6 +1002,21 @@ impl Binder<'_> {
                 let qualify = self.qualified_with_aliases(qualify, &state);
                 let bound = self.bind_expression(&qualify);
                 self.alias_fallback.clear();
+                // `QualifyBinder::BindColumnRef`: a column that is neither in FROM nor an alias
+                let bound = bound.map_err(|error| {
+                    let missing = error
+                        .message
+                        .strip_prefix("Referenced column \"")
+                        .and_then(|rest| rest.split_once("\" not found in FROM clause!"))
+                        .map(|(name, _)| name.to_string());
+                    match missing {
+                        Some(name) => binder_error(format!(
+                            "Referenced column {} not found in FROM clause and can't find in alias map.",
+                            ast::sql_identifier(&name)
+                        )),
+                        None => error,
+                    }
+                });
                 Some(bound?.cast_to(&LogicalType::BOOLEAN, false))
             }
             None => None,
@@ -1198,7 +1213,7 @@ impl Binder<'_> {
             ResultModifier::Distinct(targets) => {
                 let mut indexes = Vec::with_capacity(targets.len());
                 for target in targets {
-                    indexes.push(self.bind_order_expression(target, select_list, state)?);
+                    indexes.push(self.bind_order_expression(target, select_list, state, "DISTINCT ON")?);
                 }
                 PreparedModifier::DistinctOn(indexes)
             }
@@ -1217,7 +1232,7 @@ impl Binder<'_> {
                     if matches!(node.expr.kind, ExprKind::Star(_)) {
                         return Err(not_implemented("ORDER BY with a star expression"));
                     }
-                    let index = self.bind_order_expression(&node.expr, select_list, state)?;
+                    let index = self.bind_order_expression(&node.expr, select_list, state, "ORDER BY")?;
                     orders.push((self.options.resolve_order(node.order, node.nulls), index));
                 }
                 PreparedModifier::Order(orders)
@@ -1300,10 +1315,11 @@ impl Binder<'_> {
     /// `OrderBinder::Bind`: the select list entry an ORDER BY expression refers to, appending
     /// the expression to the select list when it is not there.
     fn bind_order_expression(
-        &self,
+        &mut self,
         expr: &Expr,
         select_list: &mut Vec<Expr>,
         state: &mut SelectBindState,
+        component: &str,
     ) -> Result<usize> {
         // `OrderBinder::Bind(CollateExpression)`: a collation over a position or alias applies to
         // the select list entry it names, which is sorted by as a hidden entry
@@ -1315,7 +1331,7 @@ impl Binder<'_> {
                     ExprKind::Constant(_) | ExprKind::Positional(_) | ExprKind::ColumnRef(_)
                 ) =>
             {
-                let index = self.bind_order_expression(child, select_list, state)?;
+                let index = self.bind_order_expression(child, select_list, state, component)?;
                 match state.original_expressions.get(index) {
                     Some(entry) => {
                         let mut target = entry.clone();
@@ -1335,10 +1351,10 @@ impl Binder<'_> {
             ExprKind::Constant(literal) => {
                 // ORDER BY an integer refers to a select list entry; other constants are an error
                 if literal.kind != LiteralKind::Integer {
-                    return Err(binder_error(
-                        "ORDER BY non-integer literal has no effect.\n* SET order_by_non_integer_literal=true to \
-                         allow this behavior.",
-                    ));
+                    return Err(binder_error(format!(
+                        "{component} non-integer literal has no effect.\n* SET order_by_non_integer_literal=true to \
+                         allow this behavior."
+                    )));
                 }
                 let value: i64 = literal.text.replace('_', "").parse().unwrap_or(i64::MAX);
                 return Ok(if value <= 0 {
@@ -1384,6 +1400,10 @@ impl Binder<'_> {
         let key = without_aliases(&qualified);
         if let Some((_, i)) = state.projection_map.iter().rev().find(|(e, _)| *e == key) {
             return Ok(*i);
+        }
+        // `BindSelectNode`: a struct UNNEST expands only as an entry of the select list itself
+        if self.struct_unnest_fields(&qualified).is_some() {
+            return Err(binder_error("UNNEST of struct cannot be used in ORDER BY/DISTINCT ON clause"));
         }
         let index = select_list.len();
         state.projection_map.push((key, index));

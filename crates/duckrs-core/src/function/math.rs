@@ -51,7 +51,7 @@ fn binary_set(name: &str, callback: ScalarCallback) -> ScalarFunctionSet {
 fn finite(value: f64) -> Result<f64> {
     if value.is_infinite() {
         return Err(out_of_range(format!(
-            "input value {value} is out of range for numeric function"
+            "input value {value:.6} is out of range for numeric function"
         )));
     }
     Ok(value)
@@ -80,12 +80,15 @@ unary!(exp, x => x.exp());
 unary!(sin, x => finite(x)?.sin());
 unary!(cos, x => finite(x)?.cos());
 unary!(tan, x => finite(x)?.tan());
+// `NoInfiniteNoZeroDoubleWrapper` over `CoTanOperator`
 unary!(cot, x => {
-    let tangent = finite(x)?.tan();
-    if tangent == 0.0 || tangent.is_nan() {
-        return Err(out_of_range("cannot take cotangent of zero"));
+    let x = finite(x)?;
+    if x == 0.0 {
+        return Err(out_of_range(format!(
+            "input value {x:.6} is out of range for numeric function cotangent"
+        )));
     }
-    1.0 / tangent
+    1.0 / x.tan()
 });
 unary!(asin, x => {
     if !(-1.0..=1.0).contains(&x) {
@@ -104,12 +107,8 @@ unary!(sinh, x => x.sinh());
 unary!(cosh, x => x.cosh());
 unary!(tanh, x => x.tanh());
 unary!(asinh, x => x.asinh());
-unary!(acosh, x => {
-    if x < 1.0 {
-        return Err(out_of_range("ACOSH is undefined below 1"));
-    }
-    x.acosh()
-});
+// `AcoshOperator`: NaN below 1
+unary!(acosh, x => x.acosh());
 unary!(atanh, x => {
     if !(-1.0..=1.0).contains(&x) {
         return Err(Error::new(ErrorKind::InvalidInput, "ATANH is undefined outside [-1,1]"));

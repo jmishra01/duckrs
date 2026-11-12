@@ -610,7 +610,11 @@ fn url_decode(args: &DataChunk, result: &mut Vector) -> Result<()> {
         }
         String::from_utf8(out)
             .map(Value::varchar)
-            .map_err(|_| invalid("Failed to decode string: invalid UTF-8"))
+            .map_err(|_| {
+                invalid(format!(
+                    "Failed to decode string \"{input}\" using URL decoding - decoded value is invalid UTF8"
+                ))
+            })
     })
 }
 
@@ -1145,6 +1149,22 @@ fn struct_fields(value: &Value) -> &[Value] {
 }
 
 /// A STRUCT from all its arguments: what the result type says goes where.
+/// `struct_concat` of unnamed structs: their fields one after the other.
+fn concat_tuples(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let ty = result.logical_type().clone();
+    row_wise(args, result, |row| {
+        let mut fields = Vec::new();
+        for value in row {
+            match value.data() {
+                ValueData::Struct(values) => fields.extend(values.iter().cloned()),
+                // a NULL struct gives NULL fields
+                _ => fields.extend(value.logical_type().struct_children().iter().map(|(_, ty)| Value::null(ty.clone()))),
+            }
+        }
+        Value::new(ty.clone(), ValueData::Struct(fields))
+    })
+}
+
 fn rebuild_struct(args: &DataChunk, result: &mut Vector) -> Result<()> {
     let ty = result.logical_type().clone();
     row_wise(args, result, |row| {
@@ -1671,8 +1691,22 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
         "equi_width_bins" => super::binning::bind(children),
         "is_histogram_other_bin" => simple(1, 1, LogicalType::BOOLEAN, is_histogram_other_bin, children),
         "struct_insert" | "struct_update" => {
-            if children.is_empty() || children[0].return_type.id() != LogicalTypeId::Struct {
-                return Err(binder_error(format!("{lower} expects a STRUCT as its first argument")));
+            // `StructInsertBind` and `StructUpdateBind`
+            if children.is_empty() {
+                return Err(super::lists::no_match(&lower, &children));
+            }
+            let named = names.iter().skip(1).filter(|n| !n.is_empty());
+            for (at, name) in named.clone().enumerate() {
+                if named.clone().take(at).any(|n| n.eq_ignore_ascii_case(name)) {
+                    return Err(binder_error(format!("Duplicate named argument {name} in '{lower}'")));
+                }
+            }
+            if children[0].return_type.id() != LogicalTypeId::Struct {
+                return Err(invalid(format!("The first argument to {lower} must be a STRUCT")));
+            }
+            if children.len() < 2 {
+                let verb = if lower == "struct_insert" { "insert" } else { "update" };
+                return Err(invalid(format!("Can't {verb} nothing into a STRUCT")));
             }
             let mut fields = children[0].return_type.struct_children().to_vec();
             let added: Vec<(String, BoundExpr)> = names.iter().skip(1).cloned().zip(children.drain(1..)).collect();
@@ -1708,23 +1742,42 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
                 ));
             }
             let mut fields: Vec<(String, LogicalType)> = Vec::new();
-            for child in &children {
-                if child.return_type.id() != LogicalTypeId::Struct {
-                    return Err(binder_error("struct_concat expects STRUCTs"));
+            let mut has_unnamed = false;
+            for (position, child) in children.iter().enumerate() {
+                if !matches!(child.return_type.id(), LogicalTypeId::Struct | LogicalTypeId::Tuple) {
+                    return Err(invalid(format!(
+                        "struct_concat: Argument at position \"{}\" is not a STRUCT",
+                        position + 1
+                    )));
                 }
                 for (name, ty) in child.return_type.struct_children() {
-                    if fields.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) {
-                        return Err(binder_error(format!("Duplicate struct entry name \"{name}\"")));
+                    if let Some((existing, _)) =
+                        fields.iter().find(|(n, _)| !name.is_empty() && n.eq_ignore_ascii_case(name))
+                    {
+                        let quoted = |n: &str| format!("\"{}\"", n.replace('"', "\"\""));
+                        return Err(invalid(if existing == name {
+                            format!("struct_concat: Arguments contain duplicate STRUCT entry {}", quoted(name))
+                        } else {
+                            format!(
+                                "struct_concat: Arguments contain case-insensitive duplicate STRUCT entry {} and {}",
+                                quoted(name),
+                                quoted(existing)
+                            )
+                        }));
                     }
+                    has_unnamed |= name.is_empty();
                     fields.push((name.clone(), ty.clone()));
                 }
             }
-            Ok(bound_function(
-                &lower,
-                children,
-                LogicalType::struct_type(fields),
-                rebuild_struct,
-            ))
+            if has_unnamed && fields.iter().any(|(name, _)| !name.is_empty()) {
+                return Err(invalid("struct_concat: Cannot mix named and unnamed STRUCTs"));
+            }
+            // all-unnamed inputs make an unnamed TUPLE
+            if has_unnamed {
+                let ty = LogicalType::tuple(fields.into_iter().map(|(_, ty)| ty).collect());
+                return Ok(bound_function(&lower, children, ty, concat_tuples));
+            }
+            Ok(bound_function(&lower, children, LogicalType::struct_type(fields), rebuild_struct))
         }
         "struct_keys" => {
             if children

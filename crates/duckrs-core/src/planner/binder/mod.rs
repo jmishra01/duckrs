@@ -17,6 +17,7 @@ mod merge;
 mod on_conflict;
 mod parquet;
 mod pivot;
+pub(crate) use pivot::has_subquery;
 pub mod read_duckdb;
 mod show;
 mod star;

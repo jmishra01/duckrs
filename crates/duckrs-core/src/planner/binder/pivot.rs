@@ -77,7 +77,7 @@ fn restore_aggregate(expr: &mut Expr, aggregate: &Expr) {
     }
 }
 
-pub(super) fn has_subquery(expr: &Expr) -> bool {
+pub(crate) fn has_subquery(expr: &Expr) -> bool {
     let mut found = false;
     visit_expr_mut(&mut expr.clone(), &mut |e| {
         found |= matches!(e.kind, ExprKind::Subquery { .. })

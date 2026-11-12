@@ -697,6 +697,7 @@ test/sql/aggregate/aggregate_state_export/test_export_state_distinct.test
 test/sql/aggregate/aggregate_state_export/test_sorted_aggregate_state_bounds.test
 test/sql/aggregate/aggregate_state_export/test_sorted_aggregate_state_types.test
 test/sql/aggregate/aggregate_state_export/test_state_export_opaque.test
+test/sql/aggregate/aggregate_state_export/test_state_export_quantile.test
 test/sql/aggregate/aggregate_state_export/test_state_export_string_agg.test
 test/sql/aggregate/aggregate_state_export/test_stddev_export_state.test
 test/sql/aggregate/aggregate_state_export/to_aggregate_state_argument_types.test
@@ -814,6 +815,7 @@ test/sql/aggregate/group/group_by_limits.test
 test/sql/aggregate/group/perfect_hash_max_values.test
 test/sql/aggregate/group/test_group_by.test
 test/sql/aggregate/group/test_group_by_alias.test
+test/sql/aggregate/group/test_group_by_error.test
 test/sql/aggregate/group/test_group_by_large_string.test
 test/sql/aggregate/group/test_group_by_multi_column.test
 test/sql/aggregate/group/test_group_by_nested.test
@@ -833,6 +835,7 @@ test/sql/aggregate/having/having_alias.test
 test/sql/aggregate/having/having_without_groupby.test
 test/sql/aggregate/having/test_having.test
 test/sql/aggregate/having/test_scalar_having.test
+test/sql/aggregate/qualify/test_qualify.test
 test/sql/aggregate/qualify/test_qualify_macro.test
 test/sql/aggregate/qualify/test_qualify_view.test
 test/sql/aggregate/qualify/test_qualify_view_no_view_dependencies.test
@@ -1967,14 +1970,17 @@ test/sql/function/generic/fold_constant_arguments.test
 test/sql/function/generic/hash_func.test
 test/sql/function/generic/least_greatest_enum.test
 test/sql/function/generic/least_greatest_types.test
+test/sql/function/generic/make_type_empty_name.test
 test/sql/function/generic/replace_type.test
 test/sql/function/generic/table_func_varargs.test
+test/sql/function/generic/test_between.test
 test/sql/function/generic/test_boolean_test.test
 test/sql/function/generic/test_if.test
 test/sql/function/generic/test_if_null.test
 test/sql/function/generic/test_in.test
 test/sql/function/generic/test_least_greatest.test
 test/sql/function/generic/test_null_if.test
+test/sql/function/generic/test_set.test
 test/sql/function/generic/test_sleep.test
 test/sql/function/generic/test_stats.test
 test/sql/function/interval/date_part_monotonicity.test
@@ -2078,6 +2084,8 @@ test/sql/function/list/list_where.test
 test/sql/function/list/list_zip.test
 test/sql/function/list/repeat_list.test
 test/sql/function/nested/test_issue_5437.test
+test/sql/function/nested/test_struct_insert.test
+test/sql/function/nested/test_struct_update.test
 test/sql/function/numeric/abs.test
 test/sql/function/numeric/bit_count_hugeint.test
 test/sql/function/numeric/decimal_mod.test
@@ -2103,6 +2111,7 @@ test/sql/function/numeric/test_round.test
 test/sql/function/numeric/test_round_double_exact_midpoint.test
 test/sql/function/numeric/test_round_even.test
 test/sql/function/numeric/test_sign_bit.test
+test/sql/function/numeric/test_trigo.test
 test/sql/function/numeric/test_trunc.test
 test/sql/function/numeric/test_trunc_precision.test
 test/sql/function/numeric/test_type_resolution.test
@@ -2196,6 +2205,7 @@ test/sql/function/string/test_to_base.test
 test/sql/function/string/test_translate.test
 test/sql/function/string/test_trim.test
 test/sql/function/string/test_unicode.test
+test/sql/function/string/test_url_encode.test
 test/sql/function/table/query_function_null.test
 test/sql/function/table/read_duckdb_empty_projection.test
 test/sql/function/test_scalar_executor.test
@@ -3721,6 +3731,7 @@ test/sql/table_function/range_cardinality_extremes.test
 test/sql/table_function/range_function_different_iterators.test
 test/sql/table_function/range_timestamp.test
 test/sql/table_function/range_timestamp_lateral_empty.test
+test/sql/table_function/sqlite_master_connections.test
 test/sql/table_function/sqlite_master_quotes.test
 test/sql/table_function/test_information_schema_columns.test
 test/sql/table_function/test_range_function.test
@@ -3946,6 +3957,7 @@ test/sql/types/enum/test_enum_storage.test
 test/sql/types/enum/test_enum_structs.test
 test/sql/types/enum/test_enum_table.test
 test/sql/types/enum/test_enum_temp_tbl.test
+test/sql/types/enum/test_enums_and_built_in_types.test
 test/sql/types/float/infinity_test.test
 test/sql/types/float/nan_aggregate.test
 test/sql/types/float/nan_aggregates.test
@@ -4005,6 +4017,7 @@ test/sql/types/interval/interval_epoch_overflow.test
 test/sql/types/interval/interval_multiply_overflow.test
 test/sql/types/interval/interval_ten_digit_hours.test
 test/sql/types/interval/interval_try_cast.test
+test/sql/types/interval/test_interval.test
 test/sql/types/interval/test_interval_addition.test
 test/sql/types/interval/test_interval_between.test
 test/sql/types/interval/test_interval_no_normalize_dedup.test
@@ -4094,6 +4107,7 @@ test/sql/types/nested/list/test_list_slice_negative_step.test
 test/sql/types/nested/list/test_list_slice_numeric_limits.test
 test/sql/types/nested/list/test_list_slice_step.test
 test/sql/types/nested/list/test_scalar_list.test
+test/sql/types/nested/map/map_error.test
 test/sql/types/nested/map/map_from_entries/column.test
 test/sql/types/nested/map/map_from_entries/column_null_entry.test
 test/sql/types/nested/map/map_from_entries/data_types.test
@@ -4171,6 +4185,7 @@ test/sql/types/struct/struct_cast.test
 test/sql/types/struct/struct_cast_parent_path_order.test
 test/sql/types/struct/struct_cast_superset.test
 test/sql/types/struct/struct_comparison.test
+test/sql/types/struct/struct_concat.test
 test/sql/types/struct/struct_contains.test
 test/sql/types/struct/struct_contains_types.test
 test/sql/types/struct/struct_cross_product.test
@@ -4224,6 +4239,7 @@ test/sql/types/timestamp/test_timestamp_ms.test
 test/sql/types/timestamp/test_timestamp_round_to_lower_precision_overflow.test
 test/sql/types/timestamp/test_timestamp_types.test
 test/sql/types/timestamp/test_timestamp_tz.test
+test/sql/types/timestamp/timestamp_limits.test
 test/sql/types/timestamp/timestamp_offset_boundaries.test
 test/sql/types/timestamp/timestamp_precision.test
 test/sql/types/timestamp/timestamp_round_out_of_range.test

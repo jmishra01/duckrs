@@ -921,7 +921,7 @@ fn read(kind: Holistic, value: &Value) -> Result<State> {
                 if items.iter().any(Value::is_null) {
                     return Err(Error::new(
                         ErrorKind::InvalidInput,
-                        "Invalid aggregate state - the list of values cannot contain NULL",
+                        "Invalid aggregate state - the list cannot contain NULL values",
                     ));
                 }
                 State::Buffer(items.clone())

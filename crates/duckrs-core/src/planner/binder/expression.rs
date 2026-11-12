@@ -309,12 +309,8 @@ impl Binder<'_> {
             ));
         }
         let name = name.try_to_string()?;
-        if name.is_empty() {
-            return Err(Error::new(
-                ErrorKind::Parser,
-                "Zero-length identifier in qualified name",
-            ));
-        }
+        // `QualifiedName::TryParse` of the name
+        parse_qualified_name(&name)?;
         let upper = name.to_uppercase();
         let parameter = |(alias, value): &(String, Value)| -> Result<String> {
             let text = match value.logical_type().id() {
@@ -1407,6 +1403,16 @@ impl Binder<'_> {
                     let equal = Expr::comparison(ComparisonOp::Equal, left.expr.clone(), right.expr.clone());
                     return self.bind_case(&[(equal, Expr::constant(Literal::null()))], &left.expr);
                 }
+                // `BindBetweenFun`: the function BETWEEN binds to is internal
+                if function.name.name.eq_ignore_ascii_case("__between") && function.args.len() == 3 {
+                    for argument in &function.args {
+                        self.bind_expression(&argument.expr)?;
+                    }
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        "Between function cannot be called directly",
+                    ));
+                }
                 if function.name.name.eq_ignore_ascii_case("if") {
                     let [condition, then, otherwise] = function.args.as_slice() else {
                         return Err(binder_error("if expects three arguments"));
@@ -1591,7 +1597,7 @@ impl Binder<'_> {
                     let preparing = self.parameters.as_ref().is_some_and(|p| p.values.is_none());
                     let typed_by_argument = matches!(
                         function.name.name.to_lowercase().as_str(),
-                        "cast_to_type" | "replace_type"
+                        "cast_to_type" | "replace_type" | "struct_concat" | "struct_insert" | "struct_update"
                     );
                     if preparing
                         && typed_by_argument
@@ -1745,7 +1751,14 @@ impl Binder<'_> {
                                     callback,
                                 ));
                             }
-                            if checked && let BoundExprKind::Function { function, .. } = &mut bound.kind {
+                            // `BindIntervalDivide`: an INTERVAL divided by zero, whatever the IEEE setting
+                            if set.name == "/"
+                                && let BoundExprKind::Function { function, .. } = &mut bound.kind
+                                && function.return_type.id() == LogicalTypeId::Interval
+                            {
+                                *function =
+                                    Arc::new(function.with_zero_check(!self.options.error_on_division_by_zero));
+                            } else if checked && let BoundExprKind::Function { function, .. } = &mut bound.kind {
                                 let floating =
                                     matches!(function.return_type.id(), LogicalTypeId::Float | LogicalTypeId::Double);
                                 let null = !self.options.error_on_division_by_zero;
@@ -1787,7 +1800,16 @@ impl Binder<'_> {
                 BoundExpr::constant(value.cloned().unwrap_or_else(Value::sql_null))
             }
             ExprKind::Star(_) => return Err(binder_error("STAR expression is not supported here")),
-            ExprKind::Default => return Err(binder_error("DEFAULT is not allowed here!")),
+            ExprKind::Default => {
+                // `WhereBinder`, `GroupBinder` and `TableFunctionBinder` name their clause
+                let clause = ["WHERE clause", "GROUP BY clause", "Table function"]
+                    .into_iter()
+                    .find(|clause| self.aggregate_error == format!("{clause} cannot contain aggregates!"));
+                return Err(binder_error(match clause {
+                    Some(clause) => format!("{clause} cannot contain DEFAULT clause"),
+                    None => "DEFAULT is not allowed here!".to_string(),
+                }));
+            }
             ExprKind::Window(window) => return self.bind_window(window),
             other => {
                 let name = format!("{other:?}");

@@ -2823,8 +2823,19 @@ impl ClientContext {
                 return Ok(Self::success());
             }
             Statement::SetVariable { name, value, scope } => {
-                // `Binder::Bind(SetVariableStatement)` + `PhysicalSet`
-                let value = evaluate_scalar(&bind_constant_expression(&self.catalog(), value)?)?;
+                // `Binder::Bind(SetVariableStatement)` + `PhysicalSet`; the value binds with a
+                // `ConstantBinder`, where a name that is no SQL value function is refused
+                if crate::planner::binder::has_subquery(value) {
+                    return Err(Error::new(ErrorKind::Binder, "SET value cannot contain subqueries"));
+                }
+                let bound = bind_constant_expression(&self.catalog(), value).map_err(|error| {
+                    if error.message.contains("was not found because the FROM clause is missing") {
+                        Error::new(ErrorKind::Binder, "SET value cannot contain column names")
+                    } else {
+                        error
+                    }
+                })?;
+                let value = evaluate_scalar(&bound)?;
                 if name.eq_ignore_ascii_case("current_transaction_invalidation_policy")
                     && let Some(transaction) = &mut self.transaction
                 {
@@ -3633,6 +3644,8 @@ impl ClientContext {
 
     /// `DROP TABLE`, `VIEW`, `SEQUENCE`, `MACRO` and `SCHEMA` (`Catalog::DropEntry`).
     fn drop_entry(&mut self, info: &DropInfo) -> Result<()> {
+        let internal_entry =
+            |name: &str| Error::new(ErrorKind::Catalog, format!("Cannot drop internal catalog entry {name}!"));
         let catalog = self.catalog();
         let temporary = catalog.schema_for(Some(TEMP_SCHEMA))?;
         let in_temp = info.name.qualification.is_empty()
@@ -3679,6 +3692,13 @@ impl ClientContext {
                     Err(_) if info.if_exists => false,
                     Err(error) => return Err(error),
                 };
+                // `Binder::Bind(DropStatement)`: the views of the system catalog are internal
+                if !dropped
+                    && kind == "VIEW"
+                    && crate::catalog::defaults::default_view(schema.as_deref(), &info.name.name).is_some()
+                {
+                    return Err(internal_entry(&info.name.name));
+                }
                 if !dropped && !info.if_exists {
                     return Err(missing_entry(type_name, &info.name.name));
                 }
@@ -3733,6 +3753,10 @@ impl ClientContext {
                     Err(_) if info.if_exists => false,
                     Err(error) => return Err(error),
                 };
+                // the built-in types are internal entries of the system catalog
+                if !dropped && schema.is_none() && duckrs_parser::ast::is_builtin_type_name(&info.name.name) {
+                    return Err(internal_entry(&info.name.name));
+                }
                 if !dropped && !info.if_exists {
                     return Err(missing_entry("Type", &info.name.name));
                 }

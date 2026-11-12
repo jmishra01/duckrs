@@ -1116,20 +1116,24 @@ fn to_milliseconds(args: &DataChunk, result: &mut Vector) -> Result<()> {
 /// `Interval::Add` for a timestamp.
 pub(crate) fn add_interval(micros: i64, interval: Interval) -> Result<i64> {
     let overflow = || out_of_range("Overflow in interval addition");
+    // `Timestamp::FromDatetime`: the moment has to fit, and be finite
+    let out_of_timestamp_range = || Error::new(ErrorKind::Conversion, "Date and time not in timestamp range");
+    // `Interval::Add(date_t, interval_t)`
+    let date_out_of_range = || out_of_range("Date out of range");
     let mut micros = micros;
     if interval.months != 0 {
         let days = micros.div_euclid(MICROS_PER_DAY) as i32;
         let time = micros.rem_euclid(MICROS_PER_DAY);
         let (year, month, day) = Date(days).to_ymd();
         let total = i64::from(year) * 12 + i64::from(month) - 1 + i64::from(interval.months);
-        let year = i32::try_from(total.div_euclid(12)).map_err(|_| overflow())?;
+        let year = i32::try_from(total.div_euclid(12)).map_err(|_| date_out_of_range())?;
         let month = total.rem_euclid(12) as i32 + 1;
         let day = day.min(Date::month_days(year, month));
-        let date = Date::from_ymd(year, month, day).ok_or_else(overflow)?;
+        let date = Date::from_ymd(year, month, day).ok_or_else(date_out_of_range)?;
         micros = i64::from(date.0)
             .checked_mul(MICROS_PER_DAY)
             .and_then(|m| m.checked_add(time))
-            .ok_or_else(overflow)?;
+            .ok_or_else(out_of_timestamp_range)?;
     }
     micros
         .checked_add(
@@ -1138,7 +1142,8 @@ pub(crate) fn add_interval(micros: i64, interval: Interval) -> Result<i64> {
                 .ok_or_else(overflow)?,
         )
         .and_then(|m| m.checked_add(interval.micros))
-        .ok_or_else(overflow)
+        .filter(|m| Timestamp(*m).is_finite())
+        .ok_or_else(out_of_timestamp_range)
 }
 
 fn negated(interval: Interval) -> Interval {
