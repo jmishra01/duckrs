@@ -71,7 +71,7 @@ impl LogScope {
 }
 
 /// `StringUtil::StringToEnum`: the value named `text`, case-insensitively.
-fn enum_from<T: Copy>(values: &[(T, &str)], enum_name: &str, text: &str) -> Result<T> {
+pub(crate) fn enum_from<T: Copy>(values: &[(T, &str)], enum_name: &str, text: &str) -> Result<T> {
     if let Some((value, _)) = values.iter().find(|(_, name)| name.eq_ignore_ascii_case(text)) {
         return Ok(*value);
     }

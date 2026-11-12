@@ -486,7 +486,7 @@ fn log_index(
     index: &Arc<IndexCatalogEntry>,
     block_size: usize,
 ) -> Result<()> {
-    let mut tree = TableIndex::of_index(table, index, block_size);
+    let mut tree = TableIndex::of_index(table, index, block_size, records.1);
     {
         let log = table.log.lock();
         let mut first = 0;

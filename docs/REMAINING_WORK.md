@@ -147,7 +147,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] before v1.3.0, DICTIONARY and FSST by score (their analyze samples at random; the smaller encoding is
     taken), the analyze of ALP and ALPRD (scored by their encoded size), DICT_FSST and FSST segment layouts
     as C++ writes them (`dict_fsst_count_bound`, `dict_fsst_boolean_selection`, `string/blob`)
-  - [ ] the ART layouts of files before v2.0.0 (an index in such a file is refused for now)
+  - [x] the ART layouts of files before v2.0.0, in checkpoints and the WAL: from v1.2.0 the current nodes with
+    the 264-byte `Node256Leaf` (`GetNode256LeafSegmentSize`), before it `ART::TransformToDeprecated` (chains of
+    `Leaf` of 4 row ids, 15-byte prefixes, 6 allocators); the `storage_version` option is the file's
   - [ ] dense row id rewriting of files before v2.0.0 (`rowid_gaps/old_storage_*`): row groups stay as they are
   - [x] unshredded VARIANT columns, in the file and the WAL
   - [ ] shredded VARIANT columns (~20 files), shredded GEOMETRY columns, Patas and Chimp segments (8), `read_duckdb` (8)
@@ -164,7 +166,8 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] statements that read one database and write another (`CREATE TABLE db2.t AS SELECT ... FROM db1.t`),
     temp tables and sequences of the default database in a statement routed to another, views binding across
     databases, DETACH of the default database
-  - [ ] `ENCRYPTION_KEY`, `COMPRESS`, `RECOVERY_MODE`, `IO_MODE` and the other ATTACH options
+  - [x] `RECOVERY_MODE` (`NO_WAL_WRITES` keeps commits out of the log until a checkpoint)
+  - [ ] `ENCRYPTION_KEY`, `COMPRESS`, `IO_MODE` and the other ATTACH options
 - [x] 11. Files that C++ DuckDB v69 can read and write (`sql/storage_version`: all pass)
 - [ ] 12. `VACUUM` (`sql/vacuum`: 1 failing)
 - [ ] 13. Crash-recovery fuzzing: kill the process during writes, then reopen and verify

@@ -3751,7 +3751,10 @@ impl PhysicalOperator for PhysicalUpdate {
         let mut storage = self.table.write_storage()?;
         let mut rewritten = ColumnDataCollection::new(storage.types().to_vec());
         let mut changed = ColumnDataCollection::new(storage.types().to_vec());
-        let key_update = moves_rows || !self.table.referenced_by.lock().is_empty();
+        let referenced = !self.table.referenced_by.lock().is_empty();
+        let key_update = moves_rows || referenced;
+        // what a DELETE and an INSERT take away: the rows as they were
+        let mut deleted = ColumnDataCollection::new(storage.types().to_vec());
         let mut batches = Vec::new();
         for (index, chunk) in storage.chunks().enumerate() {
             let first_row = index * STANDARD_VECTOR_SIZE;
@@ -3801,6 +3804,11 @@ impl PhysicalOperator for PhysicalUpdate {
                 let mut part = updated.clone();
                 part.slice(&SelectionVector::from_vec(picked.clone()), count);
                 changed.append(&part);
+                if moves_rows && referenced {
+                    let mut old = chunk.clone();
+                    old.slice(&SelectionVector::from_vec(picked.clone()), count);
+                    deleted.append(&old);
+                }
                 if self.returning && moves_rows {
                     let mut old = chunk.clone();
                     old.slice(&SelectionVector::from_vec(picked), count);
@@ -3815,6 +3823,11 @@ impl PhysicalOperator for PhysicalUpdate {
             for chunk in changed.chunks() {
                 rewritten.append(chunk);
             }
+        }
+        if !deleted.is_empty() {
+            // `VerifyDeleteConstraints` of the DELETE half: a referenced row can't be deleted, even
+            // to come back as it was, which C++ calls over-eager and doesn't fix for foreign keys
+            constraints::verify_delete(&self.table, &storage, &deleted)?;
         }
         if key_update {
             constraints::verify_key_update(&self.table, &storage, &rewritten, &changed)?;
