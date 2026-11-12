@@ -37,6 +37,8 @@ fn unknown() -> Stats {
         can_be_null: true,
         can_be_valid: true,
         geometry: None,
+        strings: None,
+        distinct: None,
     }
 }
 
@@ -203,8 +205,20 @@ fn compute_ordered_statistics(table: &Arc<TableCatalogEntry>, positions: Option<
             aggregates.push(aggregate("min", reference.clone())?);
             aggregates.push(aggregate("max", reference.clone())?);
         }
+        // `StatsWriter<string_t>`: the shortest, longest and total length, whether there is unicode, and for a
+        // BLOB the bounds, which aren't ordered statistics otherwise
+        let strings = matches!(column.ty.id(), LogicalTypeId::Varchar | LogicalTypeId::Blob).then(|| aggregates.len());
+        if strings.is_some() {
+            let length = string_length(reference.clone());
+            aggregates.push(aggregate("min", length.clone())?);
+            aggregates.push(aggregate("max", length.clone())?);
+            aggregates.push(aggregate("sum", length)?);
+            aggregates.push(aggregate("bool_or", has_unicode(reference.clone()))?);
+            aggregates.push(aggregate("min", reference.clone())?);
+            aggregates.push(aggregate("max", reference.clone())?);
+        }
         aggregates.push(aggregate("count", reference)?);
-        columns.push((ordered, aggregates.len() - 1));
+        columns.push((ordered, aggregates.len() - 1, strings));
     }
     let rows = columns.len();
     let count_star = functions.aggregate("count_star")?;
@@ -239,8 +253,24 @@ fn compute_ordered_statistics(table: &Arc<TableCatalogEntry>, positions: Option<
     let as_count = |value: Value| value.try_to_string().ok()?.parse::<u64>().ok();
     let total = as_count(result.get_value(count_column, 0))?;
     let mut statistics = Vec::with_capacity(rows);
-    for (index, (ordered, count_at)) in columns.into_iter().enumerate() {
+    for (index, (ordered, count_at, strings_at)) in columns.into_iter().enumerate() {
         let valid = as_count(result.get_value(count_at, 0))?;
+        let strings = strings_at.map(|at| {
+            let number = |offset: usize| as_count(result.get_value(at + offset, 0));
+            let bytes = |offset: usize| match result.get_value(at + offset, 0).data() {
+                duckrs_common::value::ValueData::Bytes(bytes) => {
+                    Some(bytes[..bytes.len().min(crate::catalog::StringStatistics::PREFIX_SIZE)].to_vec())
+                }
+                _ => None,
+            };
+            crate::catalog::StringStatistics {
+                bounds: bytes(4).zip(bytes(5)),
+                has_unicode: result.get_value(at + 3, 0).data() == &duckrs_common::value::ValueData::Bool(true),
+                min_length: number(0).or(Some(u64::from(u32::MAX))),
+                max_length: number(1).or(Some(0)),
+                total_length: number(2).or(Some(0)),
+            }
+        });
         let bound = |at: usize| {
             let value = result.get_value(at, 0);
             let usable = ordered && !value.is_null() && value.logical_type() == &table.columns[index].ty;
@@ -252,6 +282,8 @@ fn compute_ordered_statistics(table: &Arc<TableCatalogEntry>, positions: Option<
             can_be_null: valid < total,
             can_be_valid: valid > 0,
             geometry: None,
+            strings,
+            distinct: None,
         });
     }
     Some(statistics)
@@ -262,7 +294,7 @@ fn compute_ordered_statistics(table: &Arc<TableCatalogEntry>, positions: Option<
 /// it, and rows that went don't take anything away, as in C++.
 pub(super) fn table_statistics(table: &Arc<TableCatalogEntry>) -> Option<Arc<Vec<Stats>>> {
     let rows = table.row_count();
-    let (version, known, new_rows) = {
+    let (version, known, new_rows, updated) = {
         let mut cached = table.statistics.lock();
         if cached.unreported {
             cached.forget();
@@ -270,14 +302,15 @@ pub(super) fn table_statistics(table: &Arc<TableCatalogEntry>) -> Option<Arc<Vec
         match cached.columns.clone() {
             Some(columns) if cached.covered >= rows && cached.updated.is_empty() => return Some(columns),
             Some(columns) => {
+                let updated = !cached.updated.is_empty();
                 let mut positions = std::mem::take(&mut cached.updated);
                 positions.extend(cached.covered..rows);
                 positions.retain(|position| *position < rows);
                 positions.sort_unstable();
                 positions.dedup();
-                (cached.version, Some(columns), positions)
+                (cached.version, Some(columns), positions, updated)
             }
-            None => (cached.version, None, Vec::new()),
+            None => (cached.version, None, Vec::new(), false),
         }
     };
     let merged = match known {
@@ -286,7 +319,19 @@ pub(super) fn table_statistics(table: &Arc<TableCatalogEntry>) -> Option<Arc<Vec
                 table.statistics.lock().forget();
                 return None;
             };
-            known.iter().cloned().zip(new).map(|(a, b)| union(a, b)).collect()
+            // `total_string_length` can't take the place of the old lengths of rows that were updated
+            known
+                .iter()
+                .cloned()
+                .zip(new)
+                .map(|(a, b)| union(a, b))
+                .map(|mut stats| {
+                    if updated && let Some(strings) = &mut stats.strings {
+                        strings.total_length = None;
+                    }
+                    stats
+                })
+                .collect()
         }
         None => {
             let mut columns = compute_statistics(table, None)?;
@@ -582,7 +627,67 @@ fn union(a: Stats, b: Stats) -> Stats {
             }
             _ => None,
         },
+        strings: match (a_valid, b_valid, a.strings, b.strings) {
+            (true, false, strings, _) | (false, true, _, strings) => strings,
+            (_, _, Some(a), Some(b)) => Some(a.merge(&b, true)),
+            _ => None,
+        },
+        distinct: None,
     }
+}
+
+/// The length in bytes of a string, as `strlen` without a value per row, for what a table's statistics say.
+fn string_length(input: BoundExpr) -> BoundExpr {
+    fn run(args: &duckrs_common::vector::DataChunk, result: &mut duckrs_common::vector::Vector) -> duckrs_common::Result<()> {
+        let count = args.len();
+        let strings = args.column(0).to_unified(count);
+        result.prepare_flat(count.max(1));
+        for row in 0..count {
+            if strings.is_valid(row) {
+                result.data_mut::<i64>()[row] = strings.str_at(row).len() as i64;
+            } else {
+                result.set_null(row, true);
+            }
+        }
+        Ok(())
+    }
+    internal_call("__string_length", input, LogicalType::BIGINT, run)
+}
+
+/// Whether a VARCHAR has anything but ASCII in it (`Utf8Proc::Analyze`); never for a BLOB.
+fn has_unicode(input: BoundExpr) -> BoundExpr {
+    fn run(args: &duckrs_common::vector::DataChunk, result: &mut duckrs_common::vector::Vector) -> duckrs_common::Result<()> {
+        let count = args.len();
+        let varchar = args.column(0).logical_type().id() == LogicalTypeId::Varchar;
+        let strings = args.column(0).to_unified(count);
+        result.prepare_flat(count.max(1));
+        for row in 0..count {
+            if strings.is_valid(row) {
+                result.data_mut::<bool>()[row] = varchar && !strings.str_at(row).is_ascii();
+            } else {
+                result.set_null(row, true);
+            }
+        }
+        Ok(())
+    }
+    internal_call("__string_has_unicode", input, LogicalType::BOOLEAN, run)
+}
+
+fn internal_call(
+    name: &str,
+    input: BoundExpr,
+    return_type: LogicalType,
+    run: fn(&duckrs_common::vector::DataChunk, &mut duckrs_common::vector::Vector) -> duckrs_common::Result<()>,
+) -> BoundExpr {
+    let function = crate::function::ScalarFunction::new(name, vec![input.return_type.clone()], return_type.clone(), run);
+    BoundExpr::new(
+        BoundExprKind::Function {
+            function: Arc::new(function),
+            children: vec![input],
+            is_operator: false,
+        },
+        return_type,
+    )
 }
 
 /// A plan in which a table index appears twice, as from a copy of a subquery, cannot have what is
@@ -676,9 +781,17 @@ impl StatisticsPropagator {
                 can_be_valid: false,
                 geometry: Some(duckrs_common::geometry::GeometryStats::empty())
                     .filter(|_| expr.return_type.id() == LogicalTypeId::Geometry),
+                    strings: None,
+                    distinct: None,
             },
             BoundExprKind::Constant(value) => {
                 let geometry = geometry_stats_of(value);
+                let strings = match (expr.return_type.id(), value.data()) {
+                    (id @ (LogicalTypeId::Varchar | LogicalTypeId::Blob), duckrs_common::value::ValueData::Bytes(bytes)) => {
+                        Some(crate::catalog::StringStatistics::of_constant(bytes, id == LogicalTypeId::Varchar))
+                    }
+                    _ => None,
+                };
                 let value = has_ordered_statistics(&expr.return_type).then(|| value.clone());
                 Stats {
                     min: value.clone(),
@@ -686,6 +799,8 @@ impl StatisticsPropagator {
                     can_be_null: false,
                     can_be_valid: true,
                     geometry,
+                    strings,
+                    distinct: None,
                 }
             }
             BoundExprKind::ColumnRef { binding, depth: 0 } => {
@@ -989,13 +1104,24 @@ impl StatisticsPropagator {
                 can_be_null: !has_nonnull,
                 can_be_valid: true,
                 geometry: None,
+                strings: None,
+                distinct: None,
             };
         }
         // `StatsPropagateStats`: `stats()` gets the statistics of its argument as a constant
         if function.name == "stats" && children.len() == 1 {
             let argument = children[0].return_type.clone();
+            // `DistinctStatistics` of a table's column: only what a column of it is has them
+            let mut argument_stats = stats[0].clone();
+            if let BoundExprKind::ColumnRef { binding, depth: 0 } = &children[0].kind
+                && let Some((table, column)) = self.sources.get(&self.base_of(*binding)).cloned()
+            {
+                argument_stats.distinct = table_distinct_counts(&table)
+                    .and_then(|counts| counts.columns.get(column).copied().flatten())
+                    .filter(|count| *count > 0);
+            }
             if crate::function::stats_supported(&argument)
-                && let Some(value) = stats_struct(&stats[0], &argument)
+                && let Some(value) = stats_struct(&argument_stats, &argument)
             {
                 *function = Arc::new(crate::function::stats_with_value(argument));
                 children.push(BoundExpr::constant(value));
@@ -1066,6 +1192,8 @@ impl StatisticsPropagator {
                 can_be_null: child.can_be_null,
                 can_be_valid: child.can_be_valid,
                 geometry: None,
+                strings: None,
+                distinct: None,
             };
         }
         if children.len() == 2 && return_type.is_integral() && matches!(function.name.as_str(), "%" | "//") {
@@ -1123,6 +1251,8 @@ impl StatisticsPropagator {
                 can_be_null,
                 can_be_valid: true,
                 geometry: None,
+                strings: None,
+                distinct: None,
             };
         }
         if !*is_operator || children.len() != 2 || !return_type.is_integral() {
@@ -1590,6 +1720,8 @@ impl StatisticsPropagator {
             can_be_null: true,
             can_be_valid: true,
             geometry: None,
+            strings: None,
+            distinct: None,
         })
     }
 }
@@ -1599,7 +1731,26 @@ impl StatisticsPropagator {
 /// (`StatsPropagateStats`). duckrs keeps no distinct counts, so there is no `approx_unique`.
 fn stats_struct(stats: &Stats, ty: &LogicalType) -> Option<Value> {
     let mut fields = Vec::new();
-    if let (Some(min), Some(max)) = (&stats.min, &stats.max)
+    // `StringStats::ToStruct`
+    if matches!(ty.id(), LogicalTypeId::Varchar | LogicalTypeId::Blob) {
+        let strings = stats.strings.as_ref()?;
+        if let Some((min, max)) = &strings.bounds {
+            // `Blob::ToString`
+            let text = |bytes: &[u8]| Value::varchar(duckrs_common::string_cast::format_blob(bytes));
+            fields.push(("min".to_string(), text(min)));
+            fields.push(("max".to_string(), text(max)));
+        }
+        fields.push(("has_unicode".to_string(), Value::boolean(strings.has_unicode)));
+        for (name, value) in [
+            ("min_string_length", strings.min_length),
+            ("max_string_length", strings.max_length),
+            ("total_string_length", strings.total_length),
+        ] {
+            if let Some(value) = value {
+                fields.push((name.to_string(), Value::ubigint(value)));
+            }
+        }
+    } else if let (Some(min), Some(max)) = (&stats.min, &stats.max)
         && ty.id() != LogicalTypeId::SqlNull
     {
         fields.push(("min".to_string(), min.clone()));
@@ -1638,6 +1789,9 @@ fn stats_struct(stats: &Stats, ty: &LogicalType) -> Option<Value> {
     }
     fields.push(("has_null".to_string(), Value::boolean(stats.can_be_null)));
     fields.push(("has_no_null".to_string(), Value::boolean(stats.can_be_valid)));
+    if let Some(distinct) = stats.distinct {
+        fields.push(("approx_unique".to_string(), Value::ubigint(distinct)));
+    }
     let variant = LogicalType::new(LogicalTypeId::Variant);
     let source = duckrs_common::vector::Vector::constant(&Value::struct_value(fields));
     let mut result = duckrs_common::vector::Vector::new(variant, 1);

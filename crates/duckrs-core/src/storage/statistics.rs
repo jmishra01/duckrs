@@ -81,18 +81,24 @@ pub struct StringBounds {
     pub min_exact: bool,
     pub max: Vec<u8>,
     pub max_exact: bool,
+    pub has_unicode: bool,
+    pub min_length: Option<u64>,
+    pub max_length: Option<u64>,
+    pub total_length: Option<u64>,
 }
 
 /// `StringStatsData::LEGACY_MAX_STRING_MINMAX_SIZE` and `CURRENT_MAX_STRING_MINMAX_SIZE`.
 const LEGACY_MINMAX_SIZE: usize = 8;
 const CURRENT_MINMAX_SIZE: usize = 12;
+/// `StringStatsData::MAXIMUM_MIN_STRING_LENGTH`
+const MAXIMUM_MIN_STRING_LENGTH: u32 = (1 << 21) - 1;
 
 /// `StringStats::Deserialize`: the bounds, `None` without any (`NO_STATS`, `EMPTY_STATS`).
 fn string_stats(d: &mut BinaryDeserializer<'_>) -> Result<Option<StringBounds>> {
     let legacy_min = d.read_optional_property::<RawBytes>(200, "min")?;
     let legacy_max = d.read_optional_property::<RawBytes>(201, "max")?;
     if let (Some(min), Some(max)) = (legacy_min, legacy_max) {
-        d.read_property::<bool>(202, "has_unicode")?;
+        let has_unicode = d.read_property::<bool>(202, "has_unicode")?;
         let has_max_length = d.read_property::<bool>(203, "has_max_string_length")?;
         let max_length = d.read_property::<u32>(204, "max_string_length")? as usize;
         let (min, max) = (min.0, max.0);
@@ -116,26 +122,42 @@ fn string_stats(d: &mut BinaryDeserializer<'_>) -> Result<Option<StringBounds>> 
             min_exact: exact,
             max: trimmed(max),
             max_exact: exact,
+            has_unicode,
+            min_length: None,
+            max_length: has_max_length.then_some(max_length as u64),
+            total_length: None,
         }));
     }
-    d.read_optional_property::<u32>(204, "max_string_length")?;
+    let max_length = d.read_optional_property::<u32>(204, "max_string_length")?;
     let min_max = d.read_optional_property::<RawBytes>(205, "min_max")?;
     let packed = d.read_property::<u32>(206, "packed_field")?;
-    d.read_optional_property::<u64>(207, "total_string_length")?;
+    let total_length = d.read_optional_property::<u64>(207, "total_string_length")?;
+    // `StringStatsField::GetMinStringLength`: 0 for not set, the length plus one, or the most it can hold
+    let min_length = match (packed >> 11) & ((1 << 21) - 1) {
+        0 => None,
+        MAXIMUM_MIN_STRING_LENGTH => Some(u64::from(u32::MAX)),
+        length => Some(u64::from(length - 1)),
+    };
+    let has_unicode = packed & 1 == 0;
+    let max_length = max_length.filter(|length| *length != u32::MAX).map(u64::from);
     // `StringStatsField`
     let Some(min_max) = min_max.filter(|m| m.0.len() == 2 * CURRENT_MINMAX_SIZE) else {
         return Ok(None);
     };
-    let min_length = ((packed >> 3) & 0xF) as usize;
-    let max_length = ((packed >> 7) & 0xF) as usize;
-    if min_length > CURRENT_MINMAX_SIZE || max_length > CURRENT_MINMAX_SIZE {
+    let min_size = ((packed >> 3) & 0xF) as usize;
+    let max_size = ((packed >> 7) & 0xF) as usize;
+    if min_size > CURRENT_MINMAX_SIZE || max_size > CURRENT_MINMAX_SIZE {
         return Ok(None);
     }
     Ok(Some(StringBounds {
-        min: min_max.0[..min_length].to_vec(),
+        min: min_max.0[..min_size].to_vec(),
         min_exact: packed & (1 << 1) != 0,
-        max: min_max.0[CURRENT_MINMAX_SIZE..CURRENT_MINMAX_SIZE + max_length].to_vec(),
+        max: min_max.0[CURRENT_MINMAX_SIZE..CURRENT_MINMAX_SIZE + max_size].to_vec(),
         max_exact: packed & (1 << 2) != 0,
+        has_unicode,
+        min_length,
+        max_length,
+        total_length,
     }))
 }
 

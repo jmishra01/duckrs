@@ -250,8 +250,10 @@ pub fn typeof_constant(argument: &LogicalType) -> Value {
 /// numeric ones (`NumericStats`), which is what duckrs keeps. The others (strings, nested
 /// types, VARIANT) have statistics of more kinds than duckrs works out.
 pub fn stats_supported(ty: &LogicalType) -> bool {
-    matches!(ty.id(), LogicalTypeId::SqlNull | LogicalTypeId::Geometry)
-        || (crate::optimizer::statistics::has_ordered_statistics(ty) && ty.id() != LogicalTypeId::Varchar)
+    matches!(
+        ty.id(),
+        LogicalTypeId::SqlNull | LogicalTypeId::Geometry | LogicalTypeId::Varchar | LogicalTypeId::Blob
+    ) || crate::optimizer::statistics::has_ordered_statistics(ty)
 }
 
 /// `stats(expression)`: the statistics of its argument, which the statistics propagator works
@@ -280,6 +282,40 @@ fn stats_function() -> ScalarFunctionSet {
         vec![LogicalType::new(LogicalTypeId::Any)],
         LogicalType::new(LogicalTypeId::Variant),
         unfilled,
+    );
+    set.add(function.with_resolve_types(resolve));
+    set
+}
+
+// Ported from duckdb/extension/core_functions/scalar/debug/vector_type.cpp @ rust-port-baseline
+
+/// `vector_type(col)`: how its argument is held (`EnumUtil::ToString(VectorType)`), as a constant.
+fn vector_type_function() -> ScalarFunctionSet {
+    fn run(args: &DataChunk, result: &mut Vector) -> Result<()> {
+        use duckrs_common::vector::VectorType;
+        let name = match args.columns()[0].vector_type() {
+            VectorType::Flat => "FLAT_VECTOR",
+            VectorType::Constant => "CONSTANT_VECTOR",
+            VectorType::Dictionary => "DICTIONARY_VECTOR",
+            VectorType::Sequence => "SEQUENCE_VECTOR",
+        };
+        *result = Vector::constant(&Value::varchar(name));
+        Ok(())
+    }
+    fn resolve(function: &ScalarFunction, arguments: &[LogicalType]) -> Result<ScalarFunction> {
+        Ok(ScalarFunction::new(
+            function.name.clone(),
+            arguments.to_vec(),
+            function.return_type.clone(),
+            function.function,
+        ))
+    }
+    let mut set = ScalarFunctionSet::new("vector_type");
+    let function = ScalarFunction::new(
+        "vector_type",
+        vec![LogicalType::new(LogicalTypeId::Any)],
+        LogicalType::VARCHAR,
+        run,
     );
     set.add(function.with_resolve_types(resolve));
     set
@@ -402,6 +438,8 @@ impl BuiltinFunctions {
             functions.scalar.insert(typeof_set.name.clone(), typeof_set);
             let barrier_set = barrier_function();
             functions.scalar.insert(barrier_set.name.clone(), barrier_set);
+            let vector_type_set = vector_type_function();
+            functions.scalar.insert(vector_type_set.name.clone(), vector_type_set);
             let stats_set = stats_function();
             functions.scalar.insert(stats_set.name.clone(), stats_set);
             for set in aggregates::aggregate_functions() {

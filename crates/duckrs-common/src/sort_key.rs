@@ -8,6 +8,7 @@
 use crate::column_data::ColumnDataCollection;
 use crate::types::{Interval, ListEntry, LogicalTypeId, PhysicalType};
 use crate::vector::{DataChunk, SelectionVector, UnifiedFormat, Vector};
+use crate::value::{Value, ValueData};
 use crate::{Error, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +71,7 @@ struct KeyColumn {
     is_varchar: bool,
     is_bit: bool,
     is_timetz: bool,
+    is_variant: bool,
     null_byte: u8,
     valid_byte: u8,
     kind: Kind,
@@ -145,6 +147,7 @@ impl KeyColumn {
             is_varchar: input.logical_type().id() == LogicalTypeId::Varchar,
             is_bit: input.logical_type().id() == LogicalTypeId::Bit,
             is_timetz: input.logical_type().id() == LogicalTypeId::TimeTz,
+            is_variant: input.logical_type().id() == LogicalTypeId::Variant,
             null_byte,
             valid_byte,
             kind,
@@ -244,6 +247,18 @@ impl KeyColumn {
             PhysicalType::Varchar if self.is_bit => {
                 // BIT orders by its bits, not by its padded bytes
                 out.extend(crate::types::bit::byte_comparable(self.format.str_at(r)));
+                out.push(STRING_DELIMITER);
+            }
+            // `variant_comparator`, the collation of VARIANT: by the meaning of the value, not its bytes
+            PhysicalType::Varchar if self.is_variant => {
+                let bytes = self.format.str_at(r);
+                let key = variant_comparator_key(bytes).unwrap_or_else(|_| bytes.to_vec());
+                for b in key {
+                    if b <= BLOB_ESCAPE {
+                        out.push(BLOB_ESCAPE);
+                    }
+                    out.push(b);
+                }
                 out.push(STRING_DELIMITER);
             }
             PhysicalType::Varchar if self.is_varchar => {
@@ -514,3 +529,241 @@ pub fn sort_collection(
 
 #[cfg(test)]
 mod tests;
+
+// Ported from duckdb/src/function/scalar/variant/variant_comparator.cpp and
+// duckdb/src/include/duckdb/common/types/variant_comparison.hpp @ rust-port-baseline
+
+/// `VariantComparisonType`: the rank of a value, which orders values of different types.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum VariantRank {
+    Boolean = 1,
+    Number,
+    Real,
+    Varchar,
+    Blob,
+    Uuid,
+    Timestamp,
+    TimestampTz,
+    Time,
+    TimeTz,
+    Interval,
+    Geometry,
+    Bitstring,
+    Array,
+    Object,
+    Null,
+}
+
+/// `CreateVariantComparator` of one VARIANT, in its encoding: a key that orders values as their meaning does.
+pub fn variant_comparator_key(bytes: &[u8]) -> Result<Vec<u8>> {
+    let node = crate::variant::VariantNode::decode(bytes)?;
+    let mut out = Vec::new();
+    encode_variant_node(&node, &mut out)?;
+    Ok(out)
+}
+
+/// `EncodeVariantValue`.
+fn encode_variant_node(node: &crate::variant::VariantNode, out: &mut Vec<u8>) -> Result<()> {
+    use crate::variant::VariantNode as N;
+    const DELIMITER: u8 = 0;
+    match node {
+        N::Null => out.push(VariantRank::Null as u8),
+        N::Array(children) => {
+            out.push(VariantRank::Array as u8);
+            for child in children {
+                encode_variant_node(child, out)?;
+            }
+            out.push(DELIMITER);
+        }
+        N::Object(fields) => {
+            out.push(VariantRank::Object as u8);
+            // by key, so that the order objects were written in doesn't matter
+            let mut fields: Vec<_> = fields.iter().collect();
+            fields.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+            for (key, value) in fields {
+                encode_variant_string(key.as_bytes(), true, out);
+                encode_variant_node(value, out)?;
+            }
+            out.push(DELIMITER);
+        }
+        N::Scalar(value) => encode_variant_scalar(value, out)?,
+    }
+    Ok(())
+}
+
+fn encode_variant_string(bytes: &[u8], varchar: bool, out: &mut Vec<u8>) {
+    if varchar {
+        out.extend(bytes.iter().map(|b| b.wrapping_add(1)));
+    } else {
+        for &b in bytes {
+            if b <= BLOB_ESCAPE {
+                out.push(BLOB_ESCAPE);
+            }
+            out.push(b);
+        }
+    }
+    out.push(STRING_DELIMITER);
+}
+
+fn encode_i128(v: i128, out: &mut Vec<u8>) {
+    let mut upper = ((v >> 64) as i64).to_be_bytes();
+    upper[0] ^= 0x80;
+    out.extend_from_slice(&upper);
+    out.extend_from_slice(&(v as u64).to_be_bytes());
+}
+
+fn encode_i64(v: i64, out: &mut Vec<u8>) {
+    out.extend_from_slice(&((v as u64) ^ (1 << 63)).to_be_bytes());
+}
+
+fn encode_variant_scalar(value: &Value, out: &mut Vec<u8>) -> Result<()> {
+    use LogicalTypeId as T;
+    let integer = |value: &Value| -> i128 {
+        match value.data() {
+            ValueData::Int32(v) => i128::from(*v),
+            ValueData::Int64(v) => i128::from(*v),
+            ValueData::UInt64(v) => i128::from(*v),
+            ValueData::Int128(v) => *v,
+            _ => 0,
+        }
+    };
+    let id = value.logical_type().id();
+    match id {
+        T::Boolean => {
+            out.push(VariantRank::Boolean as u8);
+            out.push(u8::from(value.data() == &ValueData::Bool(true)));
+        }
+        T::TinyInt
+        | T::SmallInt
+        | T::Integer
+        | T::BigInt
+        | T::HugeInt
+        | T::UTinyInt
+        | T::USmallInt
+        | T::UInteger
+        | T::UBigInt
+        | T::UHugeInt
+        | T::Decimal
+        | T::Bignum => {
+            out.push(VariantRank::Number as u8);
+            encode_variant_number(&value.try_to_string()?, out);
+        }
+        T::Float | T::Double => {
+            out.push(VariantRank::Real as u8);
+            let real = match value.data() {
+                ValueData::Float(v) => f64::from(*v),
+                ValueData::Double(v) => *v,
+                _ => 0.0,
+            };
+            out.extend_from_slice(&encode_double(real).to_be_bytes());
+        }
+        T::Varchar => {
+            out.push(VariantRank::Varchar as u8);
+            if let ValueData::Bytes(bytes) = value.data() {
+                encode_variant_string(bytes, true, out);
+            }
+        }
+        T::Blob | T::Geometry => {
+            out.push(if id == T::Blob { VariantRank::Blob } else { VariantRank::Geometry } as u8);
+            if let ValueData::Bytes(bytes) = value.data() {
+                encode_variant_string(bytes, false, out);
+            }
+        }
+        T::Uuid => {
+            out.push(VariantRank::Uuid as u8);
+            encode_i128(integer(value), out);
+        }
+        // nanoseconds since the epoch; a DATE is its midnight
+        T::Date | T::TimestampSec | T::TimestampMs | T::Timestamp | T::TimestampNs => {
+            out.push(VariantRank::Timestamp as u8);
+            let factor: i128 = match id {
+                T::Date => 86_400_000_000_000,
+                T::TimestampSec => 1_000_000_000,
+                T::TimestampMs => 1_000_000,
+                T::Timestamp => 1_000,
+                _ => 1,
+            };
+            encode_i128(integer(value).saturating_mul(factor), out);
+        }
+        T::TimestampTz | T::TimestampTzNs => {
+            out.push(VariantRank::TimestampTz as u8);
+            let factor: i128 = if id == T::TimestampTz { 1_000 } else { 1 };
+            encode_i128(integer(value).saturating_mul(factor), out);
+        }
+        // nanoseconds since midnight
+        T::Time | T::TimeNs => {
+            out.push(VariantRank::Time as u8);
+            let factor: i64 = if id == T::Time { 1_000 } else { 1 };
+            encode_i64((integer(value) as i64).saturating_mul(factor), out);
+        }
+        T::TimeTz => {
+            out.push(VariantRank::TimeTz as u8);
+            let bits = integer(value) as u64;
+            let (micros, offset) = (bits >> 24, bits & 0xFF_FFFF);
+            out.extend_from_slice(&(((micros + offset * 1_000_000) << 24) | offset).to_be_bytes());
+        }
+        T::Interval => {
+            out.push(VariantRank::Interval as u8);
+            if let ValueData::Interval(interval) = value.data() {
+                let (months, days, micros) = interval.normalize();
+                let months = months.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+                for mut bytes in [
+                    months.to_be_bytes().to_vec(),
+                    (days as i32).to_be_bytes().to_vec(),
+                    micros.to_be_bytes().to_vec(),
+                ] {
+                    bytes[0] ^= 0x80;
+                    out.extend_from_slice(&bytes);
+                }
+            }
+        }
+        T::Bit => {
+            out.push(VariantRank::Bitstring as u8);
+            if let ValueData::Bytes(bits) = value.data() {
+                out.extend(crate::types::bit::byte_comparable(bits));
+            }
+            out.push(STRING_DELIMITER);
+        }
+        other => {
+            return Err(crate::Error::new(
+                crate::ErrorKind::NotImplemented,
+                format!("Variant type {} is not supported in variant_comparator", other.name()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `VariantEncodeNumber` of `VariantGetNumberKey`: the value as `d1.d2... * 10^adjexp`, from its decimal text, so
+/// that equal numbers of any width or scale have the same key and others order by their value.
+fn encode_variant_number(text: &str, out: &mut Vec<u8>) {
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
+    let all: Vec<u8> = whole.bytes().chain(fraction.bytes()).filter(u8::is_ascii_digit).collect();
+    let Some(first) = all.iter().position(|d| *d != b'0') else {
+        // zero: the class says it all
+        out.push(1);
+        return;
+    };
+    let last = all.iter().rposition(|d| *d != b'0').expect("a digit that isn't 0");
+    // the position of the first significant digit relative to the decimal point
+    let adjusted_exponent = whole.len() as i64 - 1 - first as i64;
+    out.push(if negative { 0 } else { 2 });
+    let emit = |b: u8, out: &mut Vec<u8>| out.push(if negative { !b } else { b });
+    if (-127..=126).contains(&adjusted_exponent) {
+        emit((adjusted_exponent + 128) as u8, out);
+    } else {
+        emit(if adjusted_exponent < 0 { 0x00 } else { 0xFF }, out);
+        for b in ((adjusted_exponent as u64) ^ (1 << 63)).to_be_bytes() {
+            emit(b, out);
+        }
+    }
+    for d in &all[first..=last] {
+        emit(d - b'0' + 1, out);
+    }
+    emit(0, out);
+}
