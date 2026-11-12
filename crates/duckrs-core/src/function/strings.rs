@@ -237,13 +237,40 @@ fn right(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+/// A test of two strings on their bytes, row by row; a NULL on either side gives NULL. False, with
+/// nothing done, if an argument is not a vector of strings.
+pub(super) fn string_predicate(args: &DataChunk, result: &mut Vector, f: impl Fn(&[u8], &[u8]) -> bool) -> bool {
+    use duckrs_common::types::PhysicalType;
+    let is_strings = |v: &Vector| v.physical_type() == PhysicalType::Varchar;
+    if args.column_count() != 2 || !is_strings(args.column(0)) || !is_strings(args.column(1)) {
+        return false;
+    }
+    let count = args.len();
+    let (left, right) = (args.column(0).to_unified(count), args.column(1).to_unified(count));
+    result.prepare_flat(count.max(1));
+    for row in 0..count {
+        if left.is_valid(row) && right.is_valid(row) {
+            result.data_mut::<bool>()[row] = f(left.str_at(row), right.str_at(row));
+        } else {
+            result.set_null(row, true);
+        }
+    }
+    true
+}
+
 fn starts_with(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    if string_predicate(args, result, |text, prefix| text.starts_with(prefix)) {
+        return Ok(());
+    }
     strict_rows(args, result, |row| {
         Ok(Value::boolean(bytes_of(&row[0]).starts_with(bytes_of(&row[1]))))
     })
 }
 
 fn ends_with(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    if string_predicate(args, result, |text, suffix| text.ends_with(suffix)) {
+        return Ok(());
+    }
     strict_rows(args, result, |row| {
         Ok(Value::boolean(bytes_of(&row[0]).ends_with(bytes_of(&row[1]))))
     })

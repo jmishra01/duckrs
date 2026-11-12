@@ -2711,7 +2711,18 @@ impl PhysicalAggregate {
     /// room to grow, and its states, whose vectors do too, with what a state may keep apart.
     fn bytes_per_group(&self) -> usize {
         let key = std::mem::size_of::<RowKey>() + std::mem::size_of::<usize>();
-        2 * key + self.aggregates.len() * (2 * std::mem::size_of::<AggregateState>() + 32)
+        // a state that holds a value has it behind a pointer, with its sort key for a minimum
+        let apart: usize = self
+            .aggregates
+            .iter()
+            .map(|a| match a.function.kind.initial_state() {
+                AggregateState::Extreme(_) | AggregateState::Value(_) => {
+                    2 * (std::mem::size_of::<Value>() + std::mem::size_of::<Vec<u8>>())
+                }
+                _ => 0,
+            })
+            .sum();
+        2 * key + self.aggregates.len() * (2 * std::mem::size_of::<AggregateState>() + 32) + apart
     }
 
     /// Roughly what the states hold for each input row, besides the groups: rows that an
@@ -2721,7 +2732,7 @@ impl PhysicalAggregate {
             .iter()
             .filter(|a| a.distinct || !a.order_by.is_empty() || !a.function.kind.is_order_independent())
             .count()
-            * 32
+            * (std::mem::size_of::<Value>() + 16)
     }
 
     /// Sinks `chunk` into `states`. Past the memory limit, the rows of groups the state does not

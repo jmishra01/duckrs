@@ -441,6 +441,10 @@ fn chr(args: &DataChunk, result: &mut Vector) -> Result<()> {
 }
 
 pub(super) fn contains(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let found = |text: &[u8], needle: &[u8]| memchr::memmem::find(text, needle).is_some();
+    if super::strings::string_predicate(args, result, found) {
+        return Ok(());
+    }
     strict_rows(args, result, |row| {
         Ok(Value::boolean(
             row[0].try_to_string()?.contains(&row[1].try_to_string()?),

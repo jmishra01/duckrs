@@ -106,3 +106,34 @@ fn an_or_across_a_join_filters_each_side() {
         assert_eq!(rows(&mut actual, query), rows(&mut expected, query), "{query}");
     }
 }
+
+/// Join order adds the equalities that follow from others (`a.k = b.k AND a.k = c.k` gives
+/// `b.k = c.k`) and keeps one of a set at each join. The rows must be those of the joins as written,
+/// also where two columns of one table are in a set, which no join makes equal.
+#[test]
+fn implied_equalities_keep_the_rows() {
+    let db = Database::open_in_memory().unwrap();
+    let mut expected = db.connect().unwrap();
+    for (table, modulus) in [("a", 50), ("b", 70), ("c", 30), ("d", 40)] {
+        expected
+            .query(&format!(
+                "CREATE TABLE {table} AS SELECT CASE WHEN i % 11 = 0 THEN NULL ELSE i % {modulus} END AS k, \
+                 i % 7 AS j, i AS v FROM range(400) r(i)"
+            ))
+            .unwrap();
+    }
+    expected.query("SET disabled_optimizers='join_order'").unwrap();
+    let mut actual = db.connect().unwrap();
+    for query in [
+        "SELECT count(*), sum(a.v + b.v + c.v) FROM a, b, c WHERE a.k = b.k AND a.k = c.k",
+        "SELECT count(*), sum(a.v + b.v + c.v + d.v) FROM a, b, c, d WHERE a.k = b.k AND b.k = c.k AND c.k = d.k AND d.v < 300",
+        // two columns of one table in the set
+        "SELECT count(*), sum(a.v + b.v) FROM a JOIN b ON a.k = b.k AND a.k = b.j",
+        "SELECT count(*), sum(a.v + b.v + c.v) FROM a, b, c WHERE a.k = b.k AND a.k = b.j AND b.j = c.k",
+        "SELECT count(*), sum(a.v + b.v + c.v) FROM a, b, c WHERE a.k = b.k AND a.j = b.k AND a.k = c.k",
+        // two sets
+        "SELECT count(*), sum(a.v + b.v + c.v) FROM a, b, c WHERE a.k = b.k AND a.k = c.k AND a.j = b.j AND b.j = c.j",
+    ] {
+        assert_eq!(rows(&mut actual, query), rows(&mut expected, query), "{query}");
+    }
+}

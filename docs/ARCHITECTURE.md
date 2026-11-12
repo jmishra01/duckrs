@@ -226,6 +226,11 @@ while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` 
   and DPhyp, or Greedy Operator Ordering from 12 relations on, picks the order with the lowest sum
   of estimated join sizes. Each conjunct goes on the lowest join that has its relations, and of
   each join the side with the fewest rows is on the right, which is the side a hash join builds.
+  Columns equal to the same column are equal to each other, so the equalities that follow are
+  added before the search (`add_implied_equalities`): with `l_partkey = p_partkey` and
+  `l_partkey = ps_partkey`, `partsupp` can join `part` first, as in TPC-H Q9. A join then takes one
+  equality of each set of equal columns. That holds only where each column of the set is of
+  another relation, so a set with two columns of one relation is left as written.
   Column positions change, so a tree stays as it is under what reads its columns by position
   (set operations, DML, `DISTINCT`, the root); those have a projection below them in practice.
   Estimates use the total domain of each equivalence class and DuckDB's selectivities, from
@@ -258,6 +263,12 @@ while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` 
   and on as many threads as the query has (`run_plan_on_threads`; the count travels with
   `QueryMemory`). The other threads wait for the result. A subquery that runs per row has one
   thread. C++ plans these as joins instead.
+- **Aggregate states** are 48 bytes: the value of a `min`, `max`, `first` and the like is behind a
+  pointer, so that a sum or a count, which most states are, does not carry room for one. The
+  memory an aggregate counts against the limit adds those values, and the rows a holistic
+  aggregate keeps at the size of a `Value`.
+- **`starts_with`, `ends_with` and `contains`** on strings compare bytes; `LIKE 'x%'`, `'%x'` and
+  `'%x%'` are rewritten to them.
 - **Merging thread states of an aggregate**: the parts a thread's state is split into carry their
   keys in order and no hash table, and the table of each partition is sized once. Each group is
   still moved three times (thread, part, partition), which is most of TPC-H Q18.
