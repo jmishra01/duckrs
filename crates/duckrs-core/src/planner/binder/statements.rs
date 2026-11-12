@@ -223,7 +223,7 @@ pub(crate) fn range_parameters(values: &[i128], generate_series: bool) -> Result
 }
 
 /// `BindContext::AliasColumnNames`: column aliases first, and duplicate names made unique.
-fn alias_column_names(table: &str, names: &[String], aliases: &[String]) -> Result<Vec<String>> {
+pub(super) fn alias_column_names(table: &str, names: &[String], aliases: &[String]) -> Result<Vec<String>> {
     if aliases.len() > names.len() {
         return Err(binder_error(format!(
             "table {} has {} columns available but {} columns specified",
@@ -2069,7 +2069,7 @@ impl Binder<'_> {
             }
             TableRefKind::Pivot(pivot) => self.bind_pivot(table_ref, pivot),
             TableRefKind::Show(show) => self.bind_show_ref(table_ref, show),
-            _ => Err(not_implemented("this kind of table reference")),
+            TableRefKind::MatchRecognize(mr) => self.bind_match_recognize(table_ref, mr),
         }
     }
 

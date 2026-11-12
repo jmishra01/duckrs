@@ -1875,9 +1875,14 @@ impl ClientContext {
         };
         // a statement runs in one database here: reading another works, but a write to another would quietly go to
         // the first in its place
-        let reads_only = matches!(statement, Statement::Select(_) | Statement::Explain { .. } | Statement::Pragma { .. });
+        let reads_only = matches!(
+            statement,
+            Statement::Select(_) | Statement::Explain { .. } | Statement::Pragma { .. }
+        );
         if !reads_only && named.iter().any(|other| !Arc::ptr_eq(other, &database)) {
-            return Err(crate::unported("statements that write to one database and read another"));
+            return Err(crate::unported(
+                "statements that write to one database and read another",
+            ));
         }
         let prefix = database.name.clone();
         for_each_table_name(&mut routed, &mut |name| {
@@ -5842,7 +5847,10 @@ mod tests {
         let plan = explain(&mut context, "SELECT i FROM t WHERE s::INTEGER = 3");
         assert!(!plan.contains("Filter\n") && plan.contains("Filters:"), "{plan}");
         let plan = explain(&mut context, "SELECT i FROM t WHERE s::INTEGER = 3 AND i > j");
-        assert!(plan.contains("Filter\n") && plan.contains("CAST(s AS INTEGER) = 3"), "{plan}");
+        assert!(
+            plan.contains("Filter\n") && plan.contains("CAST(s AS INTEGER) = 3"),
+            "{plan}"
+        );
         // what differs per call, or reads the query around it, stays an operator
         let plan = explain(&mut context, "SELECT i FROM t WHERE i < random() * 100");
         assert!(plan.contains("Filter\n"), "{plan}");

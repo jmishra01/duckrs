@@ -503,7 +503,9 @@ impl ClientContext {
             schema_statements(&catalog, &tables).and_then(|statements| {
                 for statement in statements {
                     let statement = match statement.strip_prefix("CREATE SCHEMA ") {
-                        Some(rest) if !rest.starts_with("IF NOT EXISTS") => format!("CREATE SCHEMA IF NOT EXISTS {rest}"),
+                        Some(rest) if !rest.starts_with("IF NOT EXISTS") => {
+                            format!("CREATE SCHEMA IF NOT EXISTS {rest}")
+                        }
                         _ => statement,
                     };
                     self.run_in_statement(&statement)?;

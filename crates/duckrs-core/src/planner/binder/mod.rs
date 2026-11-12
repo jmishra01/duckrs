@@ -12,6 +12,7 @@ mod join;
 mod json;
 mod lambda;
 mod macros;
+mod match_recognize;
 mod merge;
 mod on_conflict;
 mod parquet;

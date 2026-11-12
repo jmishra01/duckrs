@@ -480,9 +480,7 @@ impl StringStatistics {
     /// `StringStats::Merge`, of the statistics of two sets of rows.
     pub fn merge(&self, other: &Self, add_totals: bool) -> Self {
         let bounds = match (&self.bounds, &other.bounds) {
-            (Some((a_min, a_max)), Some((b_min, b_max))) => {
-                Some((a_min.min(b_min).clone(), a_max.max(b_max).clone()))
-            }
+            (Some((a_min, a_max)), Some((b_min, b_max))) => Some((a_min.min(b_min).clone(), a_max.max(b_max).clone())),
             _ => None,
         };
         let both = |a: Option<u64>, b: Option<u64>, f: fn(u64, u64) -> u64| a.zip(b).map(|(a, b)| f(a, b));
@@ -492,7 +490,9 @@ impl StringStatistics {
             min_length: both(self.min_length, other.min_length, u64::min),
             max_length: both(self.max_length, other.max_length, u64::max),
             total_length: if add_totals {
-                self.total_length.zip(other.total_length).and_then(|(a, b)| a.checked_add(b))
+                self.total_length
+                    .zip(other.total_length)
+                    .and_then(|(a, b)| a.checked_add(b))
             } else {
                 None
             },

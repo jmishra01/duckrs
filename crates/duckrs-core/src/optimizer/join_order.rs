@@ -767,7 +767,10 @@ impl JoinOrderOptimizer {
                         }
                         let (min, max) = (stats.min?.as_i128()?, stats.max?.as_i128()?);
                         let range = max.checked_sub(min)?.checked_add(1)?;
-                        Some((ColumnBinding::new(*table_index, column), (range as f64).min(rows as f64)))
+                        Some((
+                            ColumnBinding::new(*table_index, column),
+                            (range as f64).min(rows as f64),
+                        ))
                     })
                     .collect();
                 let stats = RelationStats {

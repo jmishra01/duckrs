@@ -169,7 +169,9 @@ pub fn read_statistics(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>)
         d.read_property::<u64>(102, "distinct_count")?;
         let mut geometry = None;
         let mut strings = None;
-        let bounds = d.read_object(103, "type_stats", |d| read_type_stats(d, ty, &mut geometry, &mut strings))?;
+        let bounds = d.read_object(103, "type_stats", |d| {
+            read_type_stats(d, ty, &mut geometry, &mut strings)
+        })?;
         Ok(BaseStatistics {
             has_null,
             has_no_null,

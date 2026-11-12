@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 4295 of 6367 test files pass (**71.0%** of the 6047 that run). The v1 target is ≥ 90%.
+- Overall: 4319 of 6367 test files pass (**71.4%** of the 6047 that run). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -214,7 +214,14 @@ Each item gives the number of failing files in `test/` that it should fix, where
 
 ## Phase 6: SQL surface
 
-- [ ] 21. `MATCH_RECOGNIZE` (`sql/match_recognize`: 29 failing, 0%)
+- [ ] 21. `MATCH_RECOGNIZE` (`sql/match_recognize`: 24 of 29 pass)
+  - [x] its own operator (`execution/match_recognize.rs`): C++'s pattern program and memoised matcher, PARTITION BY /
+    ORDER BY, MEASURES with RUNNING / FINAL, navigation, CLASSIFIER(), MATCH_NUMBER(), aggregates over the match
+    (DISTINCT, FILTER, ORDER BY, through macros), ONE ROW / ALL ROWS (WITH UNMATCHED ROWS, OMIT EMPTY MATCHES),
+    AFTER MATCH SKIP, SUBSET, exclusion, anchors, PERMUTE, DEFINE AUTO; the binder's errors; the memo counts
+    against `memory_limit`
+  - [ ] `max_execution_time` (not in duckrs at all; `limits` runs into the timeout), window functions in
+    `duckdb_functions()` (`clauses`, `scope`), UNNEST in a measure, `->` resolved as a JSON operator in a measure
 - [ ] 22. Triggers (`sql/trigger`: 26 of 28 pass)
   - [x] CREATE / DROP TRIGGER with the checks of `BindCreateTriggerInfo`, `duckdb_triggers()`, BEFORE and
     AFTER statement triggers, AFTER row triggers with NEW / OLD, REFERENCING transition tables,

@@ -638,7 +638,10 @@ fn union(a: Stats, b: Stats) -> Stats {
 
 /// The length in bytes of a string, as `strlen` without a value per row, for what a table's statistics say.
 fn string_length(input: BoundExpr) -> BoundExpr {
-    fn run(args: &duckrs_common::vector::DataChunk, result: &mut duckrs_common::vector::Vector) -> duckrs_common::Result<()> {
+    fn run(
+        args: &duckrs_common::vector::DataChunk,
+        result: &mut duckrs_common::vector::Vector,
+    ) -> duckrs_common::Result<()> {
         let count = args.len();
         let strings = args.column(0).to_unified(count);
         result.prepare_flat(count.max(1));
@@ -656,7 +659,10 @@ fn string_length(input: BoundExpr) -> BoundExpr {
 
 /// Whether a VARCHAR has anything but ASCII in it (`Utf8Proc::Analyze`); never for a BLOB.
 fn has_unicode(input: BoundExpr) -> BoundExpr {
-    fn run(args: &duckrs_common::vector::DataChunk, result: &mut duckrs_common::vector::Vector) -> duckrs_common::Result<()> {
+    fn run(
+        args: &duckrs_common::vector::DataChunk,
+        result: &mut duckrs_common::vector::Vector,
+    ) -> duckrs_common::Result<()> {
         let count = args.len();
         let varchar = args.column(0).logical_type().id() == LogicalTypeId::Varchar;
         let strings = args.column(0).to_unified(count);
@@ -679,7 +685,8 @@ fn internal_call(
     return_type: LogicalType,
     run: fn(&duckrs_common::vector::DataChunk, &mut duckrs_common::vector::Vector) -> duckrs_common::Result<()>,
 ) -> BoundExpr {
-    let function = crate::function::ScalarFunction::new(name, vec![input.return_type.clone()], return_type.clone(), run);
+    let function =
+        crate::function::ScalarFunction::new(name, vec![input.return_type.clone()], return_type.clone(), run);
     BoundExpr::new(
         BoundExprKind::Function {
             function: Arc::new(function),
@@ -781,15 +788,19 @@ impl StatisticsPropagator {
                 can_be_valid: false,
                 geometry: Some(duckrs_common::geometry::GeometryStats::empty())
                     .filter(|_| expr.return_type.id() == LogicalTypeId::Geometry),
-                    strings: None,
-                    distinct: None,
+                strings: None,
+                distinct: None,
             },
             BoundExprKind::Constant(value) => {
                 let geometry = geometry_stats_of(value);
                 let strings = match (expr.return_type.id(), value.data()) {
-                    (id @ (LogicalTypeId::Varchar | LogicalTypeId::Blob), duckrs_common::value::ValueData::Bytes(bytes)) => {
-                        Some(crate::catalog::StringStatistics::of_constant(bytes, id == LogicalTypeId::Varchar))
-                    }
+                    (
+                        id @ (LogicalTypeId::Varchar | LogicalTypeId::Blob),
+                        duckrs_common::value::ValueData::Bytes(bytes),
+                    ) => Some(crate::catalog::StringStatistics::of_constant(
+                        bytes,
+                        id == LogicalTypeId::Varchar,
+                    )),
                     _ => None,
                 };
                 let value = has_ordered_statistics(&expr.return_type).then(|| value.clone());

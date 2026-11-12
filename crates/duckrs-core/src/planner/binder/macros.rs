@@ -155,7 +155,7 @@ fn into_subqueries(expr: &mut Expr, op: &mut dyn FnMut(&mut Expr)) {
 }
 
 /// `ExpressionBinder::ReplaceMacroParameters` over a scalar macro's body.
-fn replace_in_expr(body: &mut Expr, parameters: &[String], arguments: &[Expr]) {
+pub(super) fn replace_in_expr(body: &mut Expr, parameters: &[String], arguments: &[Expr]) {
     mark_all(body, parameters);
     visit_expr_mut(body, &mut |e| into_subqueries(e, &mut |e| replace_marked(e, arguments)));
 }
@@ -175,7 +175,7 @@ fn cast_to(expr: Expr, target: &CastType) -> Expr {
     .into()
 }
 
-fn parameter_names(function: &MacroFunction) -> Vec<String> {
+pub(super) fn parameter_names(function: &MacroFunction) -> Vec<String> {
     function.parameters.iter().map(|p| p.name.clone()).collect()
 }
 
@@ -235,7 +235,7 @@ impl Binder<'_> {
 
     /// `MacroFunction::BindMacroFunction`: picks the overload, and returns it with an argument
     /// for each of its parameters, in order.
-    fn bind_macro_function<'m>(
+    pub(super) fn bind_macro_function<'m>(
         &mut self,
         entry: &'m MacroCatalogEntry,
         call: &FunctionExpr,

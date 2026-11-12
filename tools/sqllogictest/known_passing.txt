@@ -1,15 +1,6 @@
 # Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
 # stop passing. Regenerate with:
 #   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
-#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
-# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
-# stop passing. Regenerate with:
-#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
-# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
-# stop passing. Regenerate with:
-#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
-# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
-# stop passing. Regenerate with:
 test/common/test_cast_hugeint.test
 test/fuzzer/afl/alter_if_exists.test
 test/fuzzer/afl/analyze_empty_table.test
@@ -2580,6 +2571,30 @@ test/sql/logging/logging_file_truncate_rewrite.test
 test/sql/logging/logging_non_queryable_storage.test
 test/sql/logging/logging_types.test
 test/sql/logging/test_logging_function.test
+test/sql/match_recognize/test_match_recognize.test
+test/sql/match_recognize/test_match_recognize_aggregate_idioms.test
+test/sql/match_recognize/test_match_recognize_aggregates.test
+test/sql/match_recognize/test_match_recognize_anchors.test
+test/sql/match_recognize/test_match_recognize_backtracking.test
+test/sql/match_recognize/test_match_recognize_backtracking_long.test
+test/sql/match_recognize/test_match_recognize_classifier.test
+test/sql/match_recognize/test_match_recognize_composition.test
+test/sql/match_recognize/test_match_recognize_cursors.test
+test/sql/match_recognize/test_match_recognize_errors.test
+test/sql/match_recognize/test_match_recognize_idioms.test
+test/sql/match_recognize/test_match_recognize_names.test
+test/sql/match_recognize/test_match_recognize_navigation.test
+test/sql/match_recognize/test_match_recognize_nulls.test
+test/sql/match_recognize/test_match_recognize_parallel.test
+test/sql/match_recognize/test_match_recognize_pattern.test
+test/sql/match_recognize/test_match_recognize_permute.test
+test/sql/match_recognize/test_match_recognize_series.test
+test/sql/match_recognize/test_match_recognize_session_model.test
+test/sql/match_recognize/test_match_recognize_shapes.test
+test/sql/match_recognize/test_match_recognize_spec.test
+test/sql/match_recognize/test_match_recognize_standard.test
+test/sql/match_recognize/test_match_recognize_stock.test
+test/sql/match_recognize/test_match_recognize_vectors.test
 test/sql/merge/merge_into.test
 test/sql/merge/merge_into_bind_matching_columns.test
 test/sql/merge/merge_into_by_source.test
