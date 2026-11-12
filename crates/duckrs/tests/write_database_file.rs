@@ -287,7 +287,9 @@ fn a_log_brings_back_keys_and_indexes() {
         run(&mut connection, "INSERT INTO parent VALUES (30000, 'new', 'note', 1)");
         run(&mut connection, "DELETE FROM pairs WHERE a = 1");
         run(&mut connection, "UPDATE pairs SET c = 0 WHERE a = 2");
-        run(&mut connection, "UPDATE parent SET note = 'changed' WHERE id = 3");
+        // a row no child references: `note` has an index, so the update deletes and inserts the row, which
+        // C++'s over-eager check refuses for a referenced one
+        run(&mut connection, "UPDATE parent SET note = 'changed' WHERE id = 300");
         run(&mut connection, "DROP INDEX by_c");
         run(&mut connection, "CREATE INDEX by_a ON pairs (a)");
         run(&mut connection, "CREATE TABLE later (i INTEGER PRIMARY KEY)");
