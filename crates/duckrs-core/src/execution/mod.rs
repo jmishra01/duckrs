@@ -724,6 +724,14 @@ pub fn run_plan(plan: LogicalOperator) -> Result<ColumnDataCollection> {
     Ok(collector.result.into_inner())
 }
 
+/// [`run_plan`] for a plan that is part of the query, on as many threads as the query has.
+pub fn run_plan_on_threads(plan: LogicalOperator) -> Result<ColumnDataCollection> {
+    let collector = PhysicalResultCollector::new(create_plan(plan));
+    let threads = temporary::current().threads();
+    profiler::with_profiler(None, || execute_plan_with(&collector, threads))?;
+    Ok(collector.result.into_inner())
+}
+
 /// `Executor::Initialize` + `Execute`: runs a plan whose root is a sink.
 pub fn execute_plan(root: &dyn PhysicalOperator) -> Result<()> {
     execute_plan_with(root, 1)

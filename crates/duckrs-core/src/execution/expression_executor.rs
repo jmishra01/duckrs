@@ -268,6 +268,43 @@ fn execute_in_list(children: &[BoundExpr], input: &DataChunk, count: usize) -> R
     if value.logical_type().id() == LogicalTypeId::SqlNull {
         return Ok(None);
     }
+    if value.physical_type() == PhysicalType::Varchar && value.logical_type().id() == LogicalTypeId::Varchar {
+        // strings: each row against the constants, in one pass over the rows
+        let mut strings: Vec<Vec<u8>> = Vec::with_capacity(constants.len());
+        for (constant, _) in &constants {
+            let BoundExprKind::Constant(constant) = &constant.kind else {
+                unreachable!("looked at above")
+            };
+            if constant.is_null() || *constant.logical_type() != *value.logical_type() {
+                return Ok(None);
+            }
+            let vector = Vector::constant(constant);
+            match vector.str_at(0) {
+                Some(bytes) => strings.push(bytes.to_vec()),
+                None => return Ok(None),
+            }
+        }
+        let rows = if all_constant(&[&value]) { 1 } else { count };
+        let unified = value.to_unified(rows);
+        let mut result = Vector::new(LogicalType::BOOLEAN, rows.max(1));
+        let mut nulls = Vec::new();
+        {
+            let out = result.data_mut::<bool>();
+            for (row, slot) in out.iter_mut().enumerate().take(rows) {
+                if unified.is_valid(row) {
+                    let string = unified.str_at(row);
+                    *slot = strings.iter().any(|s| s.as_slice() == string);
+                } else {
+                    nulls.push(row);
+                }
+            }
+        }
+        nulls.into_iter().for_each(|row| result.set_null(row, true));
+        if rows == 1 && count != 1 {
+            result.set_constant();
+        }
+        return Ok(Some(result));
+    }
     let mut results = Vec::with_capacity(constants.len());
     for (constant, return_type) in constants {
         let constant = execute(constant, input)?;
@@ -439,7 +476,12 @@ fn run_subquery(subquery: &BoundSubquery, values: &[Value]) -> Result<SubqueryRe
             .collect();
         plan.substitute_columns(&columns);
     }
-    let collection = run_plan(plan)?;
+    // a subquery that runs once has the threads of the query; one that runs per row does not
+    let collection = if values.is_empty() {
+        crate::execution::run_plan_on_threads(plan)?
+    } else {
+        run_plan(plan)?
+    };
     let mut result = SubqueryResult {
         rows: collection.len() as u64,
         first: None,

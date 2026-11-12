@@ -914,6 +914,9 @@ fn decimal_cast(source: &Vector, result: &mut Vector, count: usize, mode: CastMo
     {
         return Ok(());
     }
+    if decimal_to_double(source, result, count) {
+        return Ok(());
+    }
     let target = result.logical_type().clone();
     let constant = source.vector_type() == duckrs_common::vector::VectorType::Constant;
     let rows = if constant { 1 } else { count };
@@ -934,6 +937,52 @@ fn decimal_cast(source: &Vector, result: &mut Vector, count: usize, mode: CastMo
         result.set_constant();
     }
     Ok(())
+}
+
+/// A DECIMAL as a DOUBLE: its integer over a power of ten (`DecimalToDouble`), which is the
+/// nearest DOUBLE where both are exact. False, with nothing done, where one is not.
+fn decimal_to_double(source: &Vector, result: &mut Vector, count: usize) -> bool {
+    let Some((_, scale)) = source.logical_type().decimal_properties() else {
+        return false;
+    };
+    let physical = source.physical_type();
+    if result.logical_type().id() != LogicalTypeId::Double
+        || scale > 22
+        || !matches!(
+            physical,
+            PhysicalType::Int16 | PhysicalType::Int32 | PhysicalType::Int64
+        )
+    {
+        return false;
+    }
+    let constant = source.vector_type() == duckrs_common::vector::VectorType::Constant;
+    let rows = if constant { 1 } else { count };
+    let data = source.to_unified(rows);
+    let divisor = 10f64.powi(i32::from(scale));
+    let mut values = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let index = data.sel.get(row);
+        if !data.validity.is_valid(index) {
+            values.push(None);
+            continue;
+        }
+        let value = decimal_at(&data, physical, index);
+        if value.unsigned_abs() >= 1 << 53 {
+            return false;
+        }
+        values.push(Some(value as f64 / divisor));
+    }
+    result.prepare_flat(rows.max(1));
+    for (row, value) in values.iter().enumerate() {
+        match value {
+            Some(value) => result.data_mut::<f64>()[row] = *value,
+            None => result.set_null(row, true),
+        }
+    }
+    if constant {
+        result.set_constant();
+    }
+    true
 }
 
 /// Whether [`decimal_cast`] covers a cast.

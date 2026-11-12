@@ -37,6 +37,8 @@ pub struct QueryMemory {
     max_temp_size: Option<u64>,
     temp_size: AtomicU64,
     next_file: AtomicUsize,
+    /// how many threads the query may run a pipeline on, for what it runs on the side (a subquery)
+    threads: AtomicUsize,
 }
 
 impl QueryMemory {
@@ -49,7 +51,16 @@ impl QueryMemory {
             max_temp_size,
             temp_size: AtomicU64::new(0),
             next_file: AtomicUsize::new(0),
+            threads: AtomicUsize::new(1),
         })
+    }
+
+    pub fn set_threads(&self, threads: usize) {
+        self.threads.store(threads.max(1), Ordering::Relaxed);
+    }
+
+    pub fn threads(&self) -> usize {
+        self.threads.load(Ordering::Relaxed)
     }
 
     /// The limit of the settings' defaults: 80% of the machine's memory, and `.tmp`.

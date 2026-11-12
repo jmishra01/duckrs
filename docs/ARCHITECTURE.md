@@ -254,6 +254,10 @@ while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` 
   filter that has its keys, then conjuncts on numbers, then those that read strings. A comparison
   of an integer, date or decimal column with a constant, and BETWEEN two constants, select rows
   directly (`select_column_constant`), without a vector of booleans.
+- **Uncorrelated subqueries** that stay expressions run once, on the first chunk that needs them,
+  and on as many threads as the query has (`run_plan_on_threads`; the count travels with
+  `QueryMemory`). The other threads wait for the result. A subquery that runs per row has one
+  thread. C++ plans these as joins instead.
 - **Merging thread states of an aggregate**: the parts a thread's state is split into carry their
   keys in order and no hash table, and the table of each partition is sized once. Each group is
   still moved three times (thread, part, partition), which is most of TPC-H Q18.
