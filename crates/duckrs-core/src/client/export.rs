@@ -446,6 +446,118 @@ impl ClientContext {
         Ok(Self::success())
     }
 
+    /// `Binder::Bind(CopyDatabaseStatement)`: with `schema_only` the entries of `from` created in `to`
+    /// (`BindCopyDatabaseSchema`), otherwise the rows of each of its tables inserted into the table of the same name
+    /// there (`BindCopyDatabaseData`). A statement runs in one database here, so the rows are read in the one and
+    /// appended in the other.
+    pub(super) fn copy_database(&mut self, from: &str, to: &str, schema_only: bool) -> Result<MaterializedQueryResult> {
+        let find = |context: &Self, name: &str| {
+            context
+                .find_database(name)
+                .ok_or_else(|| Error::new(ErrorKind::Binder, format!("Catalog \"{name}\" does not exist!")))
+        };
+        let source = find(self, from)?;
+        if to.eq_ignore_ascii_case("system") {
+            return Err(binder_error("Cannot copy to the system catalog"));
+        }
+        let target = find(self, to)?;
+        if Arc::ptr_eq(&source, &target) {
+            return Err(binder_error(format!(
+                "Cannot copy from {from} to {to} - FROM and TO databases are the same"
+            )));
+        }
+        // `RegisterDBModify` of the target
+        target.check_writable(&Statement::CopyDatabase {
+            from: from.to_string(),
+            to: to.to_string(),
+            schema_only,
+        })?;
+        let previous = std::mem::replace(&mut self.db, source.clone());
+        let result = self.copy_database_from(&target, schema_only);
+        self.db = previous;
+        result
+    }
+
+    /// [`Self::copy_database`], with `self.db` the database copied from.
+    fn copy_database_from(
+        &mut self,
+        target: &Arc<super::DatabaseInstance>,
+        schema_only: bool,
+    ) -> Result<MaterializedQueryResult> {
+        let catalog = self.catalog();
+        let mut tables = Vec::new();
+        for schema in catalog.schemas() {
+            if schema.name.eq_ignore_ascii_case(TEMP_SCHEMA) {
+                continue;
+            }
+            for entry in schema.tables_and_views() {
+                if let crate::catalog::TableOrView::Table(table) = entry {
+                    tables.push((schema.clone(), table));
+                }
+            }
+        }
+        let tables = reorder_tables(tables);
+        let source = std::mem::replace(&mut self.db, target.clone());
+        let result = if schema_only {
+            // `IGNORE_ON_CONFLICT` for the schemas, as the target may have them already
+            schema_statements(&catalog, &tables).and_then(|statements| {
+                for statement in statements {
+                    let statement = match statement.strip_prefix("CREATE SCHEMA ") {
+                        Some(rest) if !rest.starts_with("IF NOT EXISTS") => format!("CREATE SCHEMA IF NOT EXISTS {rest}"),
+                        _ => statement,
+                    };
+                    self.run_in_statement(&statement)?;
+                }
+                Ok(())
+            })
+        } else {
+            let mut copied = Ok(());
+            for (schema, table) in &tables {
+                let columns: Vec<(String, duckrs_common::types::LogicalType)> =
+                    table.columns.iter().map(|c| (c.name.clone(), c.ty.clone())).collect();
+                let names: Vec<String> = columns.iter().map(|(name, _)| sql_identifier(name)).collect();
+                let select = format!("SELECT {} FROM {}", names.join(", "), table_name(schema, &table.name));
+                self.db = source.clone();
+                let rows = self.run_in_statement(&select);
+                self.db = target.clone();
+                let rows = match rows {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        copied = Err(error);
+                        break;
+                    }
+                };
+                let chunks: Vec<_> = rows.collection.chunks().cloned().collect();
+                // `ClientContext::Append`, within this statement
+                let (names, types): (Vec<String>, Vec<_>) = columns.into_iter().unzip();
+                let column_list: Vec<String> = names.iter().map(|name| sql_identifier(name)).collect();
+                self.appended = Some((names, types, Arc::new(chunks)));
+                let inserted = self.run_in_statement(&format!(
+                    "INSERT INTO {} ({}) SELECT * FROM __internal_appender_chunks()",
+                    table_name(schema, &table.name),
+                    column_list.join(", ")
+                ));
+                self.appended = None;
+                if let Err(error) = inserted {
+                    copied = Err(error);
+                    break;
+                }
+            }
+            copied
+        };
+        self.db = source;
+        result.map(|()| Self::success())
+    }
+
+    /// The statements of `sql`, run as part of the statement that is running.
+    fn run_in_statement(&mut self, sql: &str) -> Result<MaterializedQueryResult> {
+        let mut result = Self::success();
+        for statement in duckrs_parser::parse_ast_with(sql, &self.parser_options())? {
+            result = self.execute_statement(&statement)?;
+        }
+        Ok(result)
+    }
+
     /// `PragmaImportDatabase`: runs `schema.sql`, then the COPY statements of `load.sql` on the
     /// files next to it.
     pub(super) fn import_database(&mut self, directory: &str) -> Result<MaterializedQueryResult> {

@@ -761,7 +761,7 @@ impl ClientContext {
 
     /// Binds `statement` as it would run, in the database it names.
     fn bind_body(&mut self, statement: &Statement) -> Result<()> {
-        if let Some((database, routed)) = self.route_to_database(statement) {
+        if let Some((database, routed)) = self.route_to_database(statement)? {
             let previous = std::mem::replace(&mut self.db, database);
             let result = self.bind_body(&routed);
             self.db = previous;
