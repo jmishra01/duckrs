@@ -158,17 +158,22 @@ fn create_physical(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             table,
             column_ids,
             filters,
+            zone_filters,
             projection,
             index_rows,
             ..
-        } => Box::new(PhysicalTableScan {
-            table,
-            column_ids,
-            projection,
-            types,
-            filter: (!filters.is_empty()).then(|| crate::optimizer::conjunction_of(filters)),
-            index_rows,
-        }),
+        } => {
+            let all: Vec<_> = filters.iter().chain(&zone_filters).cloned().collect();
+            Box::new(PhysicalTableScan {
+                table,
+                column_ids,
+                projection,
+                types,
+                filter: (!filters.is_empty()).then(|| crate::optimizer::conjunction_of(filters)),
+                prune: (!all.is_empty()).then(|| crate::optimizer::conjunction_of(all)),
+                index_rows,
+            })
+        }
         LogicalOperatorKind::CsvScan { scan, .. } => Box::new(PhysicalCsvScan { types, scan }),
         LogicalOperatorKind::JsonScan { scan, .. } => Box::new(json_scan::PhysicalJsonScan { types, scan }),
         LogicalOperatorKind::ParquetScan { scan, .. } => {

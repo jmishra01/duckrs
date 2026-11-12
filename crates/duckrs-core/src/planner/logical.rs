@@ -29,6 +29,9 @@ pub enum LogicalOperatorKind {
         column_ids: Vec<usize>,
         /// conditions on `column_ids`, each on one column, that rows must meet (`TableFilterSet`)
         filters: Vec<BoundExpr>,
+        /// `multi_column_filters`: conditions on several of `column_ids`, copies of filters that stay above the
+        /// scan, which only tell it which row groups it need not read
+        zone_filters: Vec<BoundExpr>,
         /// `projection_ids`: the positions in `column_ids` that it outputs, without one all of them.
         /// A column keeps its binding either way.
         projection: Option<Vec<usize>>,
@@ -722,7 +725,9 @@ impl LogicalOperator {
                 result
             }
             LogicalOperatorKind::MarkJoin { predicate, .. } => predicate.iter_mut().collect(),
-            LogicalOperatorKind::Get { filters, .. } => filters.iter_mut().collect(),
+            LogicalOperatorKind::Get {
+                filters, zone_filters, ..
+            } => filters.iter_mut().chain(zone_filters.iter_mut()).collect(),
             LogicalOperatorKind::ParquetScan { scan, .. } => {
                 std::sync::Arc::make_mut(scan).filters.iter_mut().collect()
             }

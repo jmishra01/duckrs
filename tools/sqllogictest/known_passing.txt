@@ -2577,6 +2577,7 @@ test/sql/optimizer/anti_join_empty_rhs_projection_map.test
 test/sql/optimizer/any_extremum_rewrite.test
 test/sql/optimizer/barrier_row_group_pruning.test
 test/sql/optimizer/boolean_row_group_pruning.test
+test/sql/optimizer/boolean_wrapper_pushdown.test
 test/sql/optimizer/case_zonemap_pruning.test
 test/sql/optimizer/coalesce_zonemap_pruning.test
 test/sql/optimizer/distinct_sibling_column_pruning.test
@@ -2601,8 +2602,10 @@ test/sql/optimizer/expression/test_nop_arithmetic.test
 test/sql/optimizer/expression/test_time_ns_cast_comparison.test
 test/sql/optimizer/expression/test_timestamp_offset.test
 test/sql/optimizer/expression/uncommitted_appends_fold_guard.test
+test/sql/optimizer/false_or_null_segment_pruning.test
 test/sql/optimizer/joins/join_order_deep_setop_chain.test
 test/sql/optimizer/late_materialization_pushdown_extract.test
+test/sql/optimizer/monotone_function_zonemap_pruning.test
 test/sql/optimizer/monotone_preimage_tinyint_boundaries.test
 test/sql/optimizer/plan/test_anti_join_empty_child.test
 test/sql/optimizer/plan/test_anti_join_projection_map.test
@@ -2617,8 +2620,10 @@ test/sql/optimizer/pushdown_extract_multiple_filters.test
 test/sql/optimizer/remove_unused_columns_nested_struct_cast.test
 test/sql/optimizer/rewrite_nan_null.test
 test/sql/optimizer/sign_row_group_pruning.test
+test/sql/optimizer/string_row_group_pruning.test
 test/sql/optimizer/string_stats_merge_truncated_prefix.test
 test/sql/optimizer/struct_extract_struct_pack_collation.test
+test/sql/optimizer/struct_segment_pruning.test
 test/sql/optimizer/sum_aggregate_stats_propagation.test
 test/sql/optimizer/test_common_subplan_aggregate_columns.test
 test/sql/optimizer/test_common_subplan_cte_binding_order.test
@@ -2632,6 +2637,7 @@ test/sql/optimizer/test_common_subplan_self_join.test
 test/sql/optimizer/test_duplicate_groups_optimizer.test
 test/sql/optimizer/test_not_comparison_simplification.test
 test/sql/optimizer/test_rollup_column_pruning.test
+test/sql/optimizer/test_rowid_pruning.test
 test/sql/optimizer/test_rowid_pushdown_deletes.test
 test/sql/optimizer/test_rowid_vector_pruning_results.test
 test/sql/optimizer/topn_window_elimination_argument_order.test

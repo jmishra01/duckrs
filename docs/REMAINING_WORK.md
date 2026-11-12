@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 4240 of 6367 test files pass (**70.1%** of the 6047 that run). The v1 target is ≥ 90%.
+- Overall: 4246 of 6367 test files pass (**70.2%** of the 6047 that run). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -184,6 +184,19 @@ Each item gives the number of failing files in `test/` that it should fix, where
     `error_on_division_by_zero` and `ieee_floating_point_ops` for division and modulo
   - [x] `ieee_floating_point_ops` for sqrt, log, pow and the trigonometric functions; `summary()`;
     `make_timestamp_ns`
+  - [x] zone maps through the functions C++ declares monotone (`ArgProperties`: atan, sqrt, ln, round,
+    date_trunc, date_diff, epoch_*, normalized_interval, ...), power of what is never negative, dayofyear and day
+    within a year or month, casts between timestamp units, bare BOOLEAN columns, `NOT`, `(cmp) = false` /
+    `IS FALSE`, `IS DISTINCT FROM`, `IS NOT DISTINCT FROM NULL`; a filter that can fail goes into the scan when it
+    is the only one (`PushdownGet`)
+  - [x] zone maps of filters on several columns of a table (`a != b`, `x < 1 OR y > 5`): a copy in the scan
+    that only skips row groups (`PushMultiColumnFilter`); NULLs of a row group in a file from its validity
+    statistics
+  - [x] VARCHAR bounds of tables in a file: string statistics read (legacy 8-byte and current 12-byte forms) and
+    written as `StatsWriter<string_t>` and `StringStats::Serialize` do, with unicode, lengths and totals
+  - [ ] string comparisons that C++'s prefixes can't decide but exact bounds do (`a = b` prunes more here), an
+    OR of columns proven false is an empty result here where C++ scans no row groups, INTERVAL and TIMESTAMPTZ_NS
+    bounds, week, division by a column
   - [ ] secure views (7 files), the scalar aggregate merger (`scalar_aggregate_merge_threshold`, 3),
     `json_serialize_plan`, gamma's errors without IEEE
   - [ ] string statistics (contains, suffix, upper/lower, length), struct/list/map extracts, `vector_type`,

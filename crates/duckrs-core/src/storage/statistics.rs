@@ -28,6 +28,8 @@ pub struct BaseStatistics {
     pub max: Option<[u8; 16]>,
     /// of a GEOMETRY that the file has the `GeometryStats` of
     pub geometry: Option<duckrs_common::geometry::GeometryStats>,
+    /// of a VARCHAR, the bounds the file has
+    pub strings: Option<StringBounds>,
 }
 
 fn numeric_value(d: &mut BinaryDeserializer<'_>, physical: PhysicalType) -> Result<Option<[u8; 16]>> {
@@ -72,20 +74,69 @@ fn numeric_value(d: &mut BinaryDeserializer<'_>, physical: PhysicalType) -> Resu
     Ok(Some(result))
 }
 
-fn string_stats(d: &mut BinaryDeserializer<'_>) -> Result<()> {
+/// The bounds of a VARCHAR column's values: prefixes of them where `exact` is false (`StringStatsData`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StringBounds {
+    pub min: Vec<u8>,
+    pub min_exact: bool,
+    pub max: Vec<u8>,
+    pub max_exact: bool,
+}
+
+/// `StringStatsData::LEGACY_MAX_STRING_MINMAX_SIZE` and `CURRENT_MAX_STRING_MINMAX_SIZE`.
+const LEGACY_MINMAX_SIZE: usize = 8;
+const CURRENT_MINMAX_SIZE: usize = 12;
+
+/// `StringStats::Deserialize`: the bounds, `None` without any (`NO_STATS`, `EMPTY_STATS`).
+fn string_stats(d: &mut BinaryDeserializer<'_>) -> Result<Option<StringBounds>> {
     let legacy_min = d.read_optional_property::<RawBytes>(200, "min")?;
     let legacy_max = d.read_optional_property::<RawBytes>(201, "max")?;
-    if legacy_min.is_some() && legacy_max.is_some() {
+    if let (Some(min), Some(max)) = (legacy_min, legacy_max) {
         d.read_property::<bool>(202, "has_unicode")?;
-        d.read_property::<bool>(203, "has_max_string_length")?;
-        d.read_property::<u32>(204, "max_string_length")?;
-    } else {
-        d.read_optional_property::<u32>(204, "max_string_length")?;
-        d.read_optional_property::<RawBytes>(205, "min_max")?;
-        d.read_property::<u32>(206, "packed_field")?;
-        d.read_optional_property::<u64>(207, "total_string_length")?;
+        let has_max_length = d.read_property::<bool>(203, "has_max_string_length")?;
+        let max_length = d.read_property::<u32>(204, "max_string_length")? as usize;
+        let (min, max) = (min.0, max.0);
+        if min.len() != LEGACY_MINMAX_SIZE || max.len() != LEGACY_MINMAX_SIZE {
+            return Ok(None);
+        }
+        // `LegacyGetMinMaxType`
+        if min[0] > max[0] || (min.iter().all(|b| *b == 0) && max.iter().all(|b| *b == 0xFF)) {
+            return Ok(None);
+        }
+        let exact = has_max_length
+            && max_length <= LEGACY_MINMAX_SIZE
+            && (max_length == 0 || (min[max_length - 1] != 0 && max[max_length - 1] != 0));
+        // `LegacyReadMinMax`: without the zeros that pad it
+        let trimmed = |bytes: Vec<u8>| {
+            let end = bytes.iter().rposition(|b| *b != 0).map_or(0, |at| at + 1);
+            bytes[..end].to_vec()
+        };
+        return Ok(Some(StringBounds {
+            min: trimmed(min),
+            min_exact: exact,
+            max: trimmed(max),
+            max_exact: exact,
+        }));
     }
-    Ok(())
+    d.read_optional_property::<u32>(204, "max_string_length")?;
+    let min_max = d.read_optional_property::<RawBytes>(205, "min_max")?;
+    let packed = d.read_property::<u32>(206, "packed_field")?;
+    d.read_optional_property::<u64>(207, "total_string_length")?;
+    // `StringStatsField`
+    let Some(min_max) = min_max.filter(|m| m.0.len() == 2 * CURRENT_MINMAX_SIZE) else {
+        return Ok(None);
+    };
+    let min_length = ((packed >> 3) & 0xF) as usize;
+    let max_length = ((packed >> 7) & 0xF) as usize;
+    if min_length > CURRENT_MINMAX_SIZE || max_length > CURRENT_MINMAX_SIZE {
+        return Ok(None);
+    }
+    Ok(Some(StringBounds {
+        min: min_max.0[..min_length].to_vec(),
+        min_exact: packed & (1 << 1) != 0,
+        max: min_max.0[CURRENT_MINMAX_SIZE..CURRENT_MINMAX_SIZE + max_length].to_vec(),
+        max_exact: packed & (1 << 2) != 0,
+    }))
 }
 
 /// `BaseStatistics::Deserialize`, as a value. `ty` is the column's type, or `None` for validity.
@@ -95,13 +146,15 @@ pub fn read_statistics(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>)
         let has_no_null = d.read_property(101, "has_no_null")?;
         d.read_property::<u64>(102, "distinct_count")?;
         let mut geometry = None;
-        let bounds = d.read_object(103, "type_stats", |d| read_type_stats(d, ty, &mut geometry))?;
+        let mut strings = None;
+        let bounds = d.read_object(103, "type_stats", |d| read_type_stats(d, ty, &mut geometry, &mut strings))?;
         Ok(BaseStatistics {
             has_null,
             has_no_null,
             min: bounds.map(|(min, _)| min),
             max: bounds.and_then(|(_, max)| max),
             geometry,
+            strings,
         })
     })
 }
@@ -113,6 +166,7 @@ fn read_type_stats(
     d: &mut BinaryDeserializer<'_>,
     ty: Option<&LogicalType>,
     geometry: &mut Option<duckrs_common::geometry::GeometryStats>,
+    strings: &mut Option<StringBounds>,
 ) -> Result<Bounds> {
     let Some(ty) = ty.filter(|ty| ty.id() != LogicalTypeId::SqlNull) else {
         return Ok(None);
@@ -132,7 +186,7 @@ fn read_type_stats(
     // types and flags, none of which is used yet
     if ty.id() == LogicalTypeId::Geometry {
         if d.has_property(200)? {
-            return string_stats(d).map(|()| None);
+            return string_stats(d).map(|_| None);
         }
         let mut stats = duckrs_common::geometry::GeometryStats::empty();
         let bounds = d.read_object_field(300, "extent", |d| {
@@ -162,7 +216,10 @@ fn read_type_stats(
     }
     let physical = ty.physical_type();
     match physical {
-        PhysicalType::Varchar => string_stats(d).map(|()| None),
+        PhysicalType::Varchar => {
+            *strings = string_stats(d)?;
+            Ok(None)
+        }
         PhysicalType::Struct => {
             let children = ty.struct_children();
             let mut i = 0;

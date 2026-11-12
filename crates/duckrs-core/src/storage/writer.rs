@@ -110,6 +110,63 @@ struct Stats {
     bounds: Option<([u8; 16], [u8; 16])>,
     /// of a GEOMETRY column or segment
     geometry: Option<duckrs_common::geometry::GeometryStats>,
+    /// of a VARCHAR or BLOB column or segment; without them, `NO_STATS`
+    strings: Option<StringStatsOut>,
+}
+
+/// `StringStatsData` as `StatsWriter<string_t>` works it out: the bounds in full (a serialization keeps a
+/// prefix), `None` for a segment of only NULLs (`EMPTY_STATS`).
+#[derive(Debug, Clone)]
+struct StringStatsOut {
+    bounds: Option<(Vec<u8>, Vec<u8>)>,
+    has_unicode: bool,
+    max_length: u32,
+    min_length: u32,
+    total_length: Option<u64>,
+}
+
+impl StringStatsOut {
+    fn of(strings: impl Iterator<Item = Vec<u8>>, varchar: bool) -> Self {
+        let mut result = Self {
+            bounds: None,
+            has_unicode: false,
+            max_length: 0,
+            min_length: u32::MAX,
+            total_length: Some(0),
+        };
+        for string in strings {
+            let length = u32::try_from(string.len()).unwrap_or(u32::MAX);
+            result.max_length = result.max_length.max(length);
+            result.min_length = result.min_length.min(length);
+            result.total_length = result.total_length.and_then(|t| t.checked_add(string.len() as u64));
+            result.has_unicode |= varchar && string.iter().any(|b| *b >= 0x80);
+            result.bounds = Some(match result.bounds.take() {
+                None => (string.clone(), string),
+                Some((min, max)) => (
+                    if string < min { string.clone() } else { min },
+                    if string > max { string } else { max },
+                ),
+            });
+        }
+        result
+    }
+
+    /// `StringStats::Merge`
+    fn merge(&mut self, other: &Self) {
+        self.bounds = match (self.bounds.take(), &other.bounds) {
+            (Some((a_min, a_max)), Some((b_min, b_max))) => {
+                Some((a_min.min(b_min.clone()), a_max.max(b_max.clone())))
+            }
+            (a, b) => a.or_else(|| b.clone()),
+        };
+        self.has_unicode |= other.has_unicode;
+        self.max_length = self.max_length.max(other.max_length);
+        self.min_length = self.min_length.min(other.min_length);
+        self.total_length = match (self.total_length, other.total_length) {
+            (Some(a), Some(b)) => a.checked_add(b),
+            _ => None,
+        };
+    }
 }
 
 impl Stats {
@@ -119,6 +176,7 @@ impl Stats {
             has_no_null: true,
             bounds: None,
             geometry: None,
+            strings: None,
         }
     }
 
@@ -128,6 +186,7 @@ impl Stats {
             has_no_null: valid.iter().any(|v| *v),
             bounds: None,
             geometry: None,
+            strings: None,
         }
     }
 
@@ -140,6 +199,13 @@ impl Stats {
                 Some(a)
             }
             (a, b) => a.or(b),
+        };
+        self.strings = match (self.strings.take(), &other.strings) {
+            (Some(mut a), Some(b)) => {
+                a.merge(b);
+                Some(a)
+            }
+            (a, b) => a.or_else(|| b.clone()),
         };
         self.bounds = match (self.bounds, other.bounds) {
             (Some(a), Some(b)) => {
@@ -300,6 +366,85 @@ fn write_bound(s: &mut BinarySerializer, field: u16, tag: &str, physical: Physic
     });
 }
 
+/// `StringStats::Serialize`, of no stats (`NO_STATS`) without `strings`.
+fn write_string_stats(s: &mut BinarySerializer, strings: Option<&StringStatsOut>) {
+    const LEGACY_SIZE: usize = 8;
+    const CURRENT_SIZE: usize = 12;
+    const MAXIMUM_MIN_STRING_LENGTH: u32 = (1 << 21) - 1;
+    if !s.should_serialize(StorageVersion::V2_0_0) {
+        // `LegacyConstructMinMax`: no stats are the lowest min and the highest max, empty ones the other way
+        // around, and bounds their first bytes padded with zeros
+        let legacy = |bound: Option<&Vec<u8>>, fill: u8| -> [u8; LEGACY_SIZE] {
+            let mut result = [fill; LEGACY_SIZE];
+            if let Some(bound) = bound {
+                result = [0; LEGACY_SIZE];
+                let size = bound.len().min(LEGACY_SIZE);
+                result[..size].copy_from_slice(&bound[..size]);
+            }
+            result
+        };
+        let (min, max) = match strings {
+            None => ([0u8; LEGACY_SIZE], [0xFF; LEGACY_SIZE]),
+            Some(strings) => (
+                legacy(strings.bounds.as_ref().map(|(min, _)| min), 0xFF),
+                legacy(strings.bounds.as_ref().map(|(_, max)| max), 0x00),
+            ),
+        };
+        for (field, bytes) in [(200, min), (201, max)] {
+            s.write_field(field);
+            s.write_varint_unsigned(LEGACY_SIZE as u64);
+            s.write_raw(&bytes);
+        }
+        s.write_property(202, "has_unicode", &strings.is_none_or(|strings| strings.has_unicode));
+        s.write_property(203, "has_max_string_length", &strings.is_some());
+        s.write_property(204, "max_string_length", &strings.map_or(0, |strings| strings.max_length));
+        return;
+    }
+    // what `StringStatsField` says of no bounds, no lengths and that there can be unicode
+    let Some(strings) = strings else {
+        s.write_property(206, "packed_field", &0u32);
+        return;
+    };
+    // `StringStatsField`
+    let mut packed = 0u32;
+    if !strings.has_unicode {
+        packed |= 1;
+    }
+    s.write_property(204, "max_string_length", &strings.max_length);
+    match &strings.bounds {
+        Some((min, max)) => {
+            let mut blob = [0u8; 2 * CURRENT_SIZE];
+            let (min_size, max_size) = (min.len().min(CURRENT_SIZE), max.len().min(CURRENT_SIZE));
+            blob[..min_size].copy_from_slice(&min[..min_size]);
+            blob[CURRENT_SIZE..CURRENT_SIZE + max_size].copy_from_slice(&max[..max_size]);
+            s.write_field(205);
+            s.write_varint_unsigned(blob.len() as u64);
+            s.write_raw(&blob);
+            // exact where nothing was cut off
+            if min.len() <= CURRENT_SIZE {
+                packed |= 1 << 1;
+            }
+            if max.len() <= CURRENT_SIZE {
+                packed |= 1 << 2;
+            }
+            packed |= (min_size as u32) << 3;
+            packed |= (max_size as u32) << 7;
+        }
+        // empty: the exact-or-empty flags without bounds
+        None => packed |= (1 << 1) | (1 << 2),
+    }
+    let min_length = if strings.min_length >= MAXIMUM_MIN_STRING_LENGTH {
+        MAXIMUM_MIN_STRING_LENGTH
+    } else {
+        strings.min_length + 1
+    };
+    packed |= min_length << 11;
+    s.write_property(206, "packed_field", &packed);
+    if let Some(total) = strings.total_length {
+        s.write_property(207, "total_string_length", &total);
+    }
+}
+
 /// `BaseStatistics::Serialize`. `ty` is `None` for a validity column.
 fn write_stats(s: &mut BinarySerializer, ty: Option<&LogicalType>, stats: &Stats) {
     s.write_property(100, "has_null", &stats.has_null);
@@ -343,19 +488,7 @@ fn write_stats(s: &mut BinarySerializer, ty: Option<&LogicalType>, stats: &Stats
             s.write_object_value(|s| write_stats(s, ty, &Stats::unknown()));
         };
         match ty.physical_type() {
-            // `LegacyConstructMinMax` of no stats: the lowest min and the highest max
-            PhysicalType::Varchar if !s.should_serialize(StorageVersion::V2_0_0) => {
-                for (field, byte) in [(200, 0u8), (201, 0xFF)] {
-                    s.write_field(field);
-                    s.write_varint_unsigned(8);
-                    s.write_raw(&[byte; 8]);
-                }
-                s.write_property(202, "has_unicode", &true);
-                s.write_property(203, "has_max_string_length", &false);
-                s.write_property(204, "max_string_length", &0u32);
-            }
-            // what `StringStatsField` says of no bounds, no lengths and that there can be unicode
-            PhysicalType::Varchar => s.write_property(206, "packed_field", &0u32),
+            PhysicalType::Varchar => write_string_stats(s, stats.strings.as_ref()),
             // INTERVAL stats are only serialized in v2.0.0 and later
             PhysicalType::Interval if !s.should_serialize(StorageVersion::V2_0_0) => {}
             PhysicalType::Struct => {
@@ -1845,6 +1978,24 @@ impl<'a> Writer<'a> {
             }
             if segments.is_empty() {
                 stats.geometry = Some(duckrs_common::geometry::GeometryStats::empty());
+            }
+        }
+        // `StatsWriter<string_t>::Update` of each value, by the segment it is in
+        if matches!(ty.id(), LogicalTypeId::Varchar | LogicalTypeId::Blob) {
+            let varchar = ty.id() == LogicalTypeId::Varchar;
+            let mut values = parts.iter().flat_map(|part| {
+                let data = part.vector.data::<StringT>();
+                (0..part.count).map(move |row| {
+                    // SAFETY: the row is valid, so its string lives in the heap of the vector
+                    part.vector.is_valid(row).then(|| unsafe { data[row].as_bytes() }.to_vec())
+                })
+            });
+            for segment in &mut segments {
+                let strings: Vec<Vec<u8>> = values.by_ref().take(segment.tuple_count).flatten().collect();
+                segment.stats.strings = Some(StringStatsOut::of(strings.into_iter(), varchar));
+            }
+            if segments.is_empty() {
+                stats.strings = Some(StringStatsOut::of(std::iter::empty(), varchar));
             }
         }
         for segment in &segments {
