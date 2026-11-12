@@ -2355,6 +2355,7 @@ impl Binder<'_> {
                     crate::function::holistic::Holistic::StringAgg
                         | crate::function::holistic::Holistic::QuantileCont
                         | crate::function::holistic::Holistic::QuantileDisc
+                        | crate::function::holistic::Holistic::ApproxQuantile
                 )
             );
             let constants: Vec<Option<Value>> = if takes_constants && arguments.len() > 1 {

@@ -232,7 +232,11 @@ fn holistic_functions() -> Vec<AggregateFunctionSet> {
         of(&["quantile_cont"], quantile(QuantileCont)),
         of(&["quantile_disc", "quantile"], quantile(QuantileDisc)),
         of(
-            &["approx_quantile", "reservoir_quantile"],
+            &["approx_quantile"],
+            vec![(vec![any(), any()], any(), kind(ApproxQuantile))],
+        ),
+        of(
+            &["reservoir_quantile"],
             vec![(vec![any(), any()], any(), kind(QuantileDisc))],
         ),
         of(&["mad"], {
@@ -1023,6 +1027,17 @@ pub fn repeat_state(state: &Value, times: i128, ty: &LogicalType) -> Result<Valu
     Ok(result)
 }
 
+/// A constant parameter of `to_aggregate_state`, as a value of the type of its argument in the signature (what the
+/// argument is bound to: string_agg's separator is a VARCHAR, approx_quantile's fraction a FLOAT).
+fn constant_of(value: Value, argument: Option<&LogicalType>) -> Result<Value> {
+    match argument {
+        Some(ty) if ty.id() != LogicalTypeId::Any && value.logical_type() != ty => {
+            crate::execution::parquet::cast_value(&value, ty)
+        }
+        _ => Ok(value),
+    }
+}
+
 /// `ExportAggregateFunction::Bind`: the aggregate gives its state.
 pub fn export_state(
     function: &AggregateFunction,
@@ -1373,10 +1388,8 @@ pub fn bind_to_aggregate_state(
         // `CreateSortedAggregateStateType`: the buffered rows as given, the arguments read as the signature's types
         let constants = constants
             .into_iter()
-            .map(|c| {
-                c.map(|v| crate::execution::parquet::cast_value(&v, &LogicalType::VARCHAR))
-                    .transpose()
-            })
+            .enumerate()
+            .map(|(at, c)| c.map(|v| constant_of(v, argument_types.get(at))).transpose())
             .collect::<Result<Vec<_>>>()?;
         let constants = if constants.iter().any(Option::is_some) {
             constants
@@ -1410,10 +1423,8 @@ pub fn bind_to_aggregate_state(
     let constants = if constants.iter().any(Option::is_some) {
         constants
             .into_iter()
-            .map(|c| {
-                c.map(|v| crate::execution::parquet::cast_value(&v, &LogicalType::VARCHAR))
-                    .transpose()
-            })
+            .enumerate()
+            .map(|(at, c)| c.map(|v| constant_of(v, argument_types.get(at))).transpose())
             .collect::<Result<_>>()?
     } else {
         Vec::new()

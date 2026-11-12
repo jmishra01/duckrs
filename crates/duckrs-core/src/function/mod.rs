@@ -19,6 +19,7 @@ pub(crate) mod geometry;
 pub(crate) mod holistic;
 mod holistic_states;
 mod hyperloglog;
+// the whole of C++'s TDigest is ported; approx_quantile uses part of it
 pub mod json;
 pub mod json_serialize;
 mod lists;
@@ -31,6 +32,8 @@ pub(crate) mod regexp;
 mod remap_struct;
 mod string_nested;
 mod strings;
+#[allow(dead_code)]
+mod tdigest;
 pub mod test_all_types;
 pub mod test_vector_types;
 pub(crate) mod time_casts;

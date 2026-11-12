@@ -666,6 +666,7 @@ test/parquet/variant/variant_write_partially_shredded.test
 test/planner/projection_binding.test
 test/sql/aggregate/aggregate_state_export/aggregate_state_union.test
 test/sql/aggregate/aggregate_state_export/approx_count_distinct_export_state.test
+test/sql/aggregate/aggregate_state_export/approx_quantile_export_state.test
 test/sql/aggregate/aggregate_state_export/arg_min_max_export_state.test
 test/sql/aggregate/aggregate_state_export/avg_time_export_state.test
 test/sql/aggregate/aggregate_state_export/avg_timestamp_export_state.test
@@ -692,6 +693,7 @@ test/sql/aggregate/aggregate_state_export/test_export_state_distinct.test
 test/sql/aggregate/aggregate_state_export/test_sorted_aggregate_state_bounds.test
 test/sql/aggregate/aggregate_state_export/test_sorted_aggregate_state_types.test
 test/sql/aggregate/aggregate_state_export/test_state_export_opaque.test
+test/sql/aggregate/aggregate_state_export/test_state_export_string_agg.test
 test/sql/aggregate/aggregate_state_export/test_stddev_export_state.test
 test/sql/aggregate/aggregate_state_export/to_aggregate_state_argument_types.test
 test/sql/aggregate/aggregate_state_export/vector_minmax_export_state.test
@@ -725,6 +727,7 @@ test/sql/aggregate/aggregates/test_any_value.test
 test/sql/aggregate/aggregates/test_any_value_noninlined.test
 test/sql/aggregate/aggregates/test_approx_quantile_decimal.test
 test/sql/aggregate/aggregates/test_approx_quantile_timestamp_infinity.test
+test/sql/aggregate/aggregates/test_approx_quantile_timetz.test
 test/sql/aggregate/aggregates/test_approximate_distinct_count.test
 test/sql/aggregate/aggregates/test_arg_min_max_null.test
 test/sql/aggregate/aggregates/test_avg.test
@@ -3076,6 +3079,7 @@ test/sql/show_select/summarize_subquery.test
 test/sql/show_select/test_describe_all.test
 test/sql/show_select/test_describe_quoted.test
 test/sql/show_select/test_show_select.test
+test/sql/show_select/test_summarize.test
 test/sql/show_select/test_summarize_quoted.test
 test/sql/sql_export/aggregate_results.test
 test/sql/sql_export/basic_plan_shapes.test

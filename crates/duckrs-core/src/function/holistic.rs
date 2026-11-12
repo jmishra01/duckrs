@@ -80,9 +80,51 @@ pub enum Holistic {
     RegrSxx,
     RegrSyy,
     RegrSxy,
+    /// `approx_quantile`: a t-digest of the values ([`super::holistic_states`])
+    ApproxQuantile,
     /// `SortedAggregateFunction` for EXPORT_STATE: the rows of an ordered aggregate, buffered as they arrive, with
     /// their sort keys; they are sorted when the state is finalized
     Sorted,
+}
+
+/// `ApproxQuantileFun::GetFunctions`: the type of the overload `approx_quantile` of an `input` binds to, of one
+/// quantile or of a list of them. The input is cast to it, and the result is of it.
+pub fn approx_quantile_type(input: &LogicalType, list: bool) -> Result<LogicalType> {
+    use LogicalTypeId as L;
+    Ok(match input.id() {
+        L::Decimal => input.clone(),
+        L::TinyInt if list => LogicalType::new(L::TinyInt),
+        L::TinyInt | L::UTinyInt | L::SmallInt => LogicalType::SMALLINT,
+        L::USmallInt | L::Integer => LogicalType::INTEGER,
+        L::UInteger | L::BigInt => LogicalType::BIGINT,
+        L::UBigInt | L::HugeInt => LogicalType::HUGEINT,
+        L::Float if list => LogicalType::FLOAT,
+        L::Float | L::Double | L::SqlNull | L::IntegerLiteral => {
+            if input.id() == L::IntegerLiteral {
+                LogicalType::INTEGER
+            } else {
+                LogicalType::DOUBLE
+            }
+        }
+        L::Date | L::Time | L::TimeTz | L::Timestamp | L::TimestampTz => input.clone(),
+        L::TimeNs | L::TimestampNs | L::TimestampTzNs if !list => input.clone(),
+        // the list overloads have no nanoseconds: the implicit cast to the microsecond types
+        L::TimeNs => LogicalType::TIME,
+        L::TimestampNs => LogicalType::TIMESTAMP,
+        L::TimestampTzNs => LogicalType::new(L::TimestampTz),
+        // `GetApproxQuantileWidenedTimestamp`: the TIMESTAMP implementation, which keeps their range
+        L::TimestampSec | L::TimestampMs => LogicalType::TIMESTAMP,
+        _ => {
+            return Err(Error::new(
+                ErrorKind::Binder,
+                format!(
+                    "No function matches the given name and argument types 'approx_quantile({input}, {})'. You might \
+                     need to add explicit type casts.",
+                    if list { "FLOAT[]" } else { "FLOAT" }
+                ),
+            ));
+        }
+    })
 }
 
 /// The type of `quantile_cont` and `median` of a column of type `input`.
@@ -111,6 +153,7 @@ impl Holistic {
             (Median, Some(ty)) => interpolated_type(ty),
             (QuantileCont, Some(ty)) => quantile(interpolated_type(ty)),
             (QuantileDisc, Some(ty)) => quantile(ty.clone()),
+            (ApproxQuantile, Some(ty)) => quantile(ty.clone()),
             (Histogram | HistogramBins | HistogramExact, Some(ty)) => {
                 LogicalType::map(ty.clone(), LogicalType::UBIGINT)
             }
@@ -138,6 +181,11 @@ fn number(value: &Value) -> Option<f64> {
         _ if value.logical_type().id() == LogicalTypeId::Decimal => value.try_to_string().ok()?.parse().ok(),
         _ => value.as_i128().map(|v| v as f64),
     }
+}
+
+/// A number of any numeric type, as a double.
+pub(super) fn number_of(value: &Value) -> Option<f64> {
+    number(value)
 }
 
 fn numbers(rows: &[Value]) -> Vec<f64> {
@@ -1008,10 +1056,18 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
             | RegrAvgX
             | RegrAvgY
             | ApproxCountDistinct
+            | ApproxQuantile
     ) && let Some(layout) = super::holistic_states::layout(kind, &[], ty)
     {
         let state = super::holistic_states::from_rows(kind, rows, &layout)?;
-        return super::holistic_states::finalize(kind, &state, ty, &[]);
+        // what the arguments after the first are, which the rows carry (approx_quantile's fractions)
+        let constants: Vec<Option<Value>> = match rows.first().map(Value::data) {
+            Some(ValueData::Struct(values)) if kind == ApproxQuantile => {
+                values.iter().map(|v| Some(v.clone())).collect()
+            }
+            _ => Vec::new(),
+        };
+        return super::holistic_states::finalize(kind, &state, ty, &constants);
     }
     let null = || Value::null(ty.clone());
     Ok(match kind {
@@ -1255,6 +1311,7 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
             Value::hugeint(count as i128)
         }
         Histogram => histogram(rows, ty)?,
+        ApproxQuantile => unreachable!("computed from its t-digest above"),
         Sorted if rows.is_empty() => null(),
         Sorted => Value::new(ty.state_layout(), ValueData::List(rows.to_vec()))?,
         HistogramBins => binned_histogram(rows, ty, false)?,

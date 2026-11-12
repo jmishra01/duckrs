@@ -80,6 +80,16 @@ pub fn layout(kind: Holistic, arguments: &[LogicalType], result: &LogicalType) -
         AvgInterval => struct_of(&[("count", LogicalType::BIGINT), ("value", LogicalType::INTERVAL)]),
         // `QuantileStateLayout`: the values buffered, `StateListType<StateInputType<0>>`
         QuantileCont | QuantileDisc | Median | Mad => LogicalType::list(arguments.first()?.clone()),
+        // `ApproxQuantileExportType`: the count, the exact bounds and the centroids of the t-digest
+        ApproxQuantile => struct_of(&[
+            ("count", LogicalType::UBIGINT),
+            ("min", d.clone()),
+            ("max", d.clone()),
+            (
+                "centroids",
+                LogicalType::list(struct_of(&[("mean", d.clone()), ("weight", d.clone())])),
+            ),
+        ]),
         // `ApproxCountDistinctExportType`: the sketch itself
         ApproxCountDistinct => struct_of(&[
             ("precision", LogicalType::UTINYINT),
@@ -430,6 +440,8 @@ enum State {
     AvgDiscrete(u64, i128),
     AvgInterval(i64, duckrs_common::types::Interval),
     Sketch(super::hyperloglog::HyperLogLog),
+    /// `ApproxQuantileState`: the values seen, their digest, and the fractions asked for when they came as rows
+    Digest(u64, super::tdigest::TDigest, Option<Value>),
     /// the values a quantile buffers, NULLs left out
     Buffer(Vec<Value>),
     /// the row recorded, as its argument and its "by" value, NULLs included
@@ -453,6 +465,7 @@ fn empty(kind: Holistic) -> State {
         Skewness => State::Moments(Moments::default(), false),
         RegrCount => State::RegrCount(0),
         ApproxCountDistinct => State::Sketch(super::hyperloglog::HyperLogLog::default()),
+        ApproxQuantile => State::Digest(0, super::tdigest::TDigest::new(DIGEST_COMPRESSION), None),
         QuantileCont | QuantileDisc | Median | Mad => State::Buffer(Vec::new()),
         AvgTimestamp | AvgTimeTz => State::AvgDiscrete(0, 0),
         AvgInterval => State::AvgInterval(0, duckrs_common::types::Interval::default()),
@@ -572,6 +585,26 @@ fn may_start(kind: Holistic, arg: &Value, by: &Value) -> bool {
 fn fold(kind: Holistic, rows: &[Value]) -> Result<State> {
     use Holistic::*;
     let mut state = empty(kind);
+    // `ApproxQuantileOperation::Operation`: the values that are finite as doubles
+    if let State::Digest(count, digest, fractions) = &mut state {
+        for row in rows {
+            let ValueData::Struct(values) = row.data() else {
+                continue;
+            };
+            if fractions.is_none() {
+                *fractions = values.get(1).cloned();
+            }
+            let Some(value) = encode_quantile_input(&values[0]) else {
+                continue;
+            };
+            if !value.is_finite() {
+                continue;
+            }
+            digest.add_value(value);
+            *count += 1;
+        }
+        return Ok(state);
+    }
     // `ApproxCountDistinctUpdateFunction`: the hashes of the values, as `VectorOperations::Hash` gives them
     if let State::Sketch(sketch) = &mut state {
         let values: Vec<&Value> = rows.iter().filter(|v| !v.is_null()).collect();
@@ -660,7 +693,7 @@ fn fold(kind: Holistic, rows: &[Value]) -> Result<State> {
                 let Some(input) = number(row) else { continue };
                 moments.update(input);
             }
-            State::Sketch(_) => unreachable!("folded above"),
+            State::Sketch(_) | State::Digest(..) => unreachable!("folded above"),
             State::Buffer(values) => {
                 let input = match row.data() {
                     ValueData::Struct(fields) => &fields[0],
@@ -779,6 +812,62 @@ fn read(kind: Holistic, value: &Value) -> Result<State> {
         }
         State::Moments(_, fourth) => State::Moments(Moments::read(value)?, fourth),
         State::RegrCount(_) => State::RegrCount(unsigned(value)?),
+        // `ApproxQuantileImportState`
+        State::Digest(..) => {
+            let invalid = |message: &str| {
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("Invalid approx_quantile state - {message}"),
+                )
+            };
+            let [count, min, max, centroids] = fields(value)? else {
+                return Err(failure());
+            };
+            let ValueData::List(centroids) = centroids.data() else {
+                return Err(invalid("the state fields cannot be NULL"));
+            };
+            if count.is_null() || min.is_null() || max.is_null() {
+                return Err(invalid("the state fields cannot be NULL"));
+            }
+            let count = unsigned(count)?;
+            if count != 0 && centroids.is_empty() {
+                return Err(invalid("non-zero count requires at least one centroid"));
+            }
+            let mut parsed: Vec<super::tdigest::Centroid> = Vec::with_capacity(centroids.len());
+            let mut total = 0.0;
+            for centroid in centroids {
+                let ValueData::Struct(parts) = centroid.data() else {
+                    return Err(invalid("the centroids cannot be NULL"));
+                };
+                let [mean, weight] = parts.as_slice() else {
+                    return Err(failure());
+                };
+                if mean.is_null() || weight.is_null() {
+                    return Err(invalid("the centroids cannot be NULL"));
+                }
+                let (mean, weight) = (double(mean)?, double(weight)?);
+                if mean.is_nan() || !weight.is_finite() || weight <= 0.0 {
+                    return Err(invalid("centroids must have a mean and a positive finite weight"));
+                }
+                if parsed.last().is_some_and(|last| mean < last.mean()) {
+                    return Err(invalid("centroids must be sorted by their mean"));
+                }
+                total += weight;
+                parsed.push(super::tdigest::Centroid::new(mean, weight));
+            }
+            if !total.is_finite() {
+                return Err(invalid("the total centroid weight must be finite"));
+            }
+            let (min, max) = (double(min)?, double(max)?);
+            if min.is_nan() || max.is_nan() {
+                return Err(invalid("min and max cannot be NaN"));
+            }
+            State::Digest(
+                count,
+                super::tdigest::TDigest::from_parts(DIGEST_COMPRESSION, min, max, parsed),
+                None,
+            )
+        }
         // `ApproxCountDistinctImportState`
         State::Sketch(_) => {
             let invalid = |message: String| Error::new(ErrorKind::InvalidInput, message);
@@ -930,6 +1019,32 @@ fn write(state: &State, ty: &LogicalType) -> Result<Value> {
         State::Corr(covar, dev_x, dev_y) => corr_value(covar, dev_x, dev_y),
         State::Moments(moments, fourth) => moments.value(*fourth),
         State::RegrCount(count) => Value::ubigint(*count),
+        // `ApproxQuantileExportState`: no values is NULL; the unprocessed values are folded in first
+        State::Digest(0, ..) => return Ok(Value::null(ty.clone())),
+        State::Digest(count, digest, _) => {
+            let mut digest = digest.clone();
+            digest.compress();
+            let centroid = struct_of(&[("mean", LogicalType::DOUBLE), ("weight", LogicalType::DOUBLE)]);
+            let centroids = digest
+                .processed()
+                .iter()
+                .map(|c| {
+                    Value::new(
+                        centroid.clone(),
+                        ValueData::Struct(vec![Value::double(c.mean()), Value::double(c.weight())]),
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Value::struct_value(vec![
+                ("count".into(), Value::ubigint(*count)),
+                ("min".into(), Value::double(digest.min())),
+                ("max".into(), Value::double(digest.max())),
+                (
+                    "centroids".into(),
+                    Value::new(LogicalType::list(centroid), ValueData::List(centroids))?,
+                ),
+            ])
+        }
         // an empty sketch is exported as it is: approx_count_distinct of no values is 0, not NULL
         State::Sketch(sketch) => Value::struct_value(vec![
             (
@@ -1068,6 +1183,97 @@ pub fn validate(kind: Holistic, arguments: &[LogicalType], value: &Value) -> Res
     Ok(())
 }
 
+/// The compression `ApproxQuantileOperation` builds its digests with.
+const DIGEST_COMPRESSION: f64 = 100.0;
+
+/// `ApproxQuantileCoding::Encode`: a value as the double the digest keeps; `None` for a NULL.
+fn encode_quantile_input(value: &Value) -> Option<f64> {
+    use LogicalTypeId as L;
+    if value.is_null() {
+        return None;
+    }
+    match (value.logical_type().id(), value.data()) {
+        (L::Float, ValueData::Float(v)) => Some(f64::from(*v)),
+        (L::Double, ValueData::Double(v)) => Some(*v),
+        // the sort key of a TIMETZ, which orders the instants
+        (L::TimeTz, ValueData::Int64(bits)) => Some(duckrs_common::types::TimeTz(*bits as u64).sort_key() as f64),
+        _ => value.as_i128().map(|v| v as f64),
+    }
+}
+
+/// `ApproxQuantileCoding::Decode`: the double the digest gives, as a value of `ty`, clamped to what the type holds
+/// since the result is approximate.
+fn decode_quantile_output(source: f64, ty: &LogicalType) -> Result<Value> {
+    use LogicalTypeId as L;
+    // `TryCast` of a double to an integer rounds to the nearest, ties to even
+    let integer = |min: i128, max: i128| -> i128 {
+        let rounded = source.round_ties_even();
+        // a cast of a double to i128 saturates, so the bounds are compared exactly
+        if rounded.is_nan() {
+            0
+        } else {
+            (rounded as i128).clamp(min, max)
+        }
+    };
+    let physical = |ty: &LogicalType| match ty.physical_type() {
+        duckrs_common::types::PhysicalType::Int8 => (i128::from(i8::MIN), i128::from(i8::MAX)),
+        duckrs_common::types::PhysicalType::Int16 => (i128::from(i16::MIN), i128::from(i16::MAX)),
+        duckrs_common::types::PhysicalType::Int32 => (i128::from(i32::MIN), i128::from(i32::MAX)),
+        duckrs_common::types::PhysicalType::Int64 => (i128::from(i64::MIN), i128::from(i64::MAX)),
+        _ => (i128::MIN, i128::MAX),
+    };
+    Ok(match ty.id() {
+        L::Double => Value::double(source),
+        L::Float => Value::float(source as f32),
+        L::Time => {
+            let micros = integer(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+            Value::new(ty.clone(), ValueData::Int64(micros.clamp(0, Interval_MICROS_PER_DAY)))?
+        }
+        L::TimeTz => {
+            use duckrs_common::types::{Time, TimeTz};
+            const MAX_OFFSET: i64 = 16 * 60 * 60 - 1;
+            let sort_key = integer(0, i128::from(u64::MAX)) as u64;
+            let micros = (sort_key >> 24) as i64 - MAX_OFFSET * 1_000_000;
+            let micros = micros.rem_euclid(Interval_MICROS_PER_DAY);
+            Value::time_tz(TimeTz::new(Time(micros), 0))
+        }
+        // the infinities are the largest and smallest timestamps
+        L::Timestamp | L::TimestampTz | L::TimestampNs | L::TimestampTzNs | L::TimestampSec | L::TimestampMs => {
+            let value = integer(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+            Value::new(ty.clone(), ValueData::Int64(value.clamp(-i64::MAX, i64::MAX)))?
+        }
+        L::Decimal => {
+            let (min, max) = physical(ty);
+            let mut value = integer(min, max);
+            let width = ty.decimal_properties().map_or(18, |(w, _)| w);
+            let limit = 10i128.pow(u32::from(width)) - 1;
+            value = value.clamp(-limit, limit);
+            let data = match ty.physical_type() {
+                duckrs_common::types::PhysicalType::Int16 => ValueData::Int16(value as i16),
+                duckrs_common::types::PhysicalType::Int32 => ValueData::Int32(value as i32),
+                duckrs_common::types::PhysicalType::Int64 => ValueData::Int64(value as i64),
+                _ => ValueData::Int128(value),
+            };
+            Value::new(ty.clone(), data)?
+        }
+        _ => {
+            let (min, max) = physical(ty);
+            let value = integer(min, max);
+            let data = match ty.physical_type() {
+                duckrs_common::types::PhysicalType::Int8 => ValueData::Int8(value as i8),
+                duckrs_common::types::PhysicalType::Int16 => ValueData::Int16(value as i16),
+                duckrs_common::types::PhysicalType::Int32 => ValueData::Int32(value as i32),
+                duckrs_common::types::PhysicalType::Int64 => ValueData::Int64(value as i64),
+                _ => ValueData::Int128(value),
+            };
+            Value::new(ty.clone(), data)?
+        }
+    })
+}
+
+#[allow(non_upper_case_globals)]
+const Interval_MICROS_PER_DAY: i64 = duckrs_common::types::Interval::MICROS_PER_DAY;
+
 /// The state of `rows`, as a value of the layout `ty`.
 pub fn from_rows(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value> {
     write(&fold(kind, rows)?, ty)
@@ -1150,6 +1356,13 @@ pub fn combine(
         }
         (State::Buffer(target), State::Buffer(source)) => target.extend(source),
         (State::Sketch(target), State::Sketch(source)) => target.merge(&source),
+        // `ApproxQuantileOperation::Combine`
+        (State::Digest(count, digest, _), State::Digest(source_count, source, _)) => {
+            if source_count != 0 {
+                *count = count.checked_add(source_count).ok_or_else(overflow)?;
+                digest.merge(&source);
+            }
+        }
         (State::RegrCount(target), State::RegrCount(source)) => {
             *target = target.checked_add(source).ok_or_else(overflow)?;
         }
@@ -1207,6 +1420,25 @@ pub fn finalize(kind: Holistic, value: &Value, result: &LogicalType, constants: 
     let null = || Value::null(result.clone());
     Ok(match read(kind, value)? {
         State::Sketch(sketch) => Value::bigint(sketch.count()),
+        // `ApproxQuantileScalarOperation::Finalize` and `ApproxQuantileListOperation::Finalize`
+        State::Digest(0, ..) => null(),
+        State::Digest(_, mut digest, fractions) => {
+            let fractions = constants.get(1).cloned().flatten().or(fractions).ok_or_else(failure)?;
+            digest.compress();
+            // the fractions are FLOATs, as the bind data keeps them
+            let mut at = |q: &Value, ty: &LogicalType| -> Result<Value> {
+                let q = super::holistic::number_of(q).ok_or_else(failure)? as f32;
+                decode_quantile_output(digest.quantile(f64::from(q)), ty)
+            };
+            match (result.id(), fractions.data()) {
+                (LogicalTypeId::List, ValueData::List(items)) => {
+                    let element = result.child_type().cloned().unwrap_or(LogicalType::DOUBLE);
+                    let values = items.iter().map(|q| at(q, &element)).collect::<Result<Vec<_>>>()?;
+                    Value::new(result.clone(), ValueData::List(values))?
+                }
+                _ => at(&fractions, result)?,
+            }
+        }
         State::Buffer(values) => {
             // the rows the quantile would have seen: the values, with the fraction it was bound to
             let rows: Vec<Value> = match constants.get(1).cloned().flatten() {

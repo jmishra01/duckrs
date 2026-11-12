@@ -307,7 +307,13 @@ fn check_scalar_constant_parameters(name: &str, children: &[BoundExpr]) -> Resul
 /// The bind callbacks of the aggregates with a parameter that has to be constant.
 fn check_constant_parameters(name: &str, children: &mut [BoundExpr]) -> Result<()> {
     match (name, children) {
+        // `StringAggBind`: of VARCHARs, to which anything else is cast
+        ("string_agg" | "listagg" | "group_concat", [input]) => {
+            *input = input.clone().cast_to(&LogicalType::VARCHAR, false);
+            Ok(())
+        }
         ("string_agg" | "listagg" | "group_concat", [input, separator]) => {
+            *input = input.clone().cast_to(&LogicalType::VARCHAR, false);
             if constant_parameter(name, separator, 1, true)?.is_some_and(|value| value.is_null()) {
                 *input = BoundExpr::constant(Value::null(LogicalType::VARCHAR));
             }
@@ -324,6 +330,49 @@ fn check_constant_parameters(name: &str, children: &mut [BoundExpr]) -> Result<(
         ("bitstring_agg", [_, min, max]) => {
             constant_parameter(name, min, 1, true)?;
             constant_parameter(name, max, 2, true)?;
+            Ok(())
+        }
+        // `BindApproxQuantile` + `CheckApproxQuantile`: fractions in [0, 1], kept as FLOAT
+        ("approx_quantile", [input, parameter]) => {
+            let Some(value) = constant_parameter(name, parameter, 1, true)? else {
+                return Ok(());
+            };
+            let as_float = |v: &Value| -> Result<f32> {
+                if v.is_null() {
+                    return Err(binder_error(
+                        "APPROXIMATE QUANTILE parameter cannot be NULL".to_string(),
+                    ));
+                }
+                let cast = crate::execution::parquet::cast_value(v, &LogicalType::FLOAT)?;
+                let ValueData::Float(q) = cast.data() else {
+                    return Err(binder_error(
+                        "APPROXIMATE QUANTILE parameter cannot be NULL".to_string(),
+                    ));
+                };
+                if q.is_nan() {
+                    return Err(binder_error("APPROXIMATE QUANTILE parameter cannot be NaN".to_string()));
+                }
+                if !(0.0..=1.0).contains(q) {
+                    return Err(binder_error(
+                        "APPROXIMATE QUANTILE can only take parameters in range [0, 1]".to_string(),
+                    ));
+                }
+                Ok(*q)
+            };
+            let list = matches!(parameter.return_type.id(), LogicalTypeId::List | LogicalTypeId::Array);
+            let fractions = match value.data() {
+                ValueData::List(items) if list => {
+                    let floats = items
+                        .iter()
+                        .map(|i| as_float(i).map(Value::float))
+                        .collect::<Result<Vec<_>>>()?;
+                    Value::list(LogicalType::FLOAT, floats)?
+                }
+                _ => Value::float(as_float(&value)?),
+            };
+            *parameter = BoundExpr::constant(fractions);
+            let target = super::holistic::approx_quantile_type(&expression_return_type(input), list)?;
+            *input = input.clone().cast_to(&target, false);
             Ok(())
         }
         ("quantile_cont" | "quantile_disc" | "quantile", [_]) => Err(binder_error(

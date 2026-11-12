@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 4423 of 6367 test files pass (**73.1%** of the 6047 that run). The v1 target is ≥ 90%.
+- Overall: 4427 of 6367 test files pass (**73.2%** of the 6047 that run). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -261,7 +261,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
     update and finalize, so their results are C++'s to the bit
   - [x] `approx_count_distinct` with C++'s HyperLogLog (`HyperLogLogP<10>` and Ertl's estimator), its exported
     sketch and the checks on importing one
-  - [ ] `approx_quantile` (an exact quantile here), the memory limits of quantiles and of window builds (7 files)
+  - [x] `approx_quantile` with C++'s t-digest (compression 100, `function/tdigest.rs`): the overloads' types, the
+    values encoded as doubles and decoded with clamping as `ApproxQuantileCoding` does, FLOAT fractions, its exported
+    state of centroids and the checks on importing one; `string_agg` casts its input to VARCHAR
+  - [ ] the memory limits of quantiles and of window builds (7 files)
   - [x] `EXPORT_STATE` in C++'s layouts for the aggregates duckrs computes from their rows
     (`function/holistic_states.rs`): bool_and/or, product, string_agg, the stddev/variance family, covar, corr,
     skewness, kurtosis, fsum/favg, the regr_* family, arg_min/arg_max, the TIMESTAMP/TIME/TIMETZ/INTERVAL averages
