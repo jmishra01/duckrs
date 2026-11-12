@@ -828,7 +828,12 @@ fn date_sub(args: &DataChunk, result: &mut Vector) -> Result<()> {
                 micros_of(end).expect("a date or a timestamp"),
             ),
         };
-        let difference = end - start;
+        // `Interval::GetDifferenceInUnits`: in HUGEINT where the microseconds do not fit
+        let difference = i128::from(end) - i128::from(start);
+        let units = |per_unit: i64| {
+            i64::try_from(difference / i128::from(per_unit))
+                .map_err(|_| out_of_range("Overflow in the difference of two timestamps"))
+        };
         let months = || whole_months(start, end);
         Ok(Value::bigint(match part {
             DatePart::Millennium => months() / 12000,
@@ -837,15 +842,15 @@ fn date_sub(args: &DataChunk, result: &mut Vector) -> Result<()> {
             DatePart::Year | DatePart::IsoYear => months() / 12,
             DatePart::Quarter => months() / 3,
             DatePart::Month => months(),
-            DatePart::Week | DatePart::YearWeek => difference / (7 * MICROS_PER_DAY),
+            DatePart::Week | DatePart::YearWeek => units(7 * MICROS_PER_DAY)?,
             DatePart::Day | DatePart::Dow | DatePart::IsoDow | DatePart::Doy | DatePart::JulianDay => {
-                difference / MICROS_PER_DAY
+                units(MICROS_PER_DAY)?
             }
-            DatePart::Hour => difference / MICROS_PER_HOUR,
-            DatePart::Minute => difference / MICROS_PER_MINUTE,
-            DatePart::Second | DatePart::Epoch => difference / MICROS_PER_SEC,
-            DatePart::Milliseconds => difference / 1000,
-            DatePart::Microseconds => difference,
+            DatePart::Hour => units(MICROS_PER_HOUR)?,
+            DatePart::Minute => units(MICROS_PER_MINUTE)?,
+            DatePart::Second | DatePart::Epoch => units(MICROS_PER_SEC)?,
+            DatePart::Milliseconds => units(1000)?,
+            DatePart::Microseconds => units(1)?,
             other => return Err(unsupported_part("timestamp", other)),
         }))
     })
@@ -1330,17 +1335,19 @@ fn time_plus_date(args: &DataChunk, result: &mut Vector) -> Result<()> {
 
 fn timestamp_minus_timestamp(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
+        // `Interval::GetDifference`
         let (Some(left), Some(right)) = (moment(&row[0]).and_then(micros_of), moment(&row[1]).and_then(micros_of))
         else {
-            return Err(out_of_range("Timestamp difference is out of bounds"));
+            return Err(Error::new(ErrorKind::InvalidInput, "Cannot subtract infinite timestamps"));
         };
-        let difference = left
-            .checked_sub(right)
-            .ok_or_else(|| out_of_range("Timestamp difference is out of bounds"))?;
+        // the days between two finite timestamps always fit, even when their microseconds do not
+        let difference = i128::from(left) - i128::from(right);
+        let per_day = i128::from(MICROS_PER_DAY);
+        let out_of_bounds = || Error::new(ErrorKind::Conversion, "Timestamp difference is out of bounds");
         Ok(Value::interval(Interval {
             months: 0,
-            days: (difference / MICROS_PER_DAY) as i32,
-            micros: difference % MICROS_PER_DAY,
+            days: i32::try_from(difference / per_day).map_err(|_| out_of_bounds())?,
+            micros: i64::try_from(difference % per_day).map_err(|_| out_of_bounds())?,
         }))
     })
 }

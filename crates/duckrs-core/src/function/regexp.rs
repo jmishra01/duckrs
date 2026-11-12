@@ -221,27 +221,41 @@ fn regexp_replace(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
-fn group_of(row: &[Value]) -> Result<usize> {
-    let group = row.get(2).and_then(Value::as_i128).unwrap_or(0);
-    usize::try_from(group).map_err(|_| Error::new(ErrorKind::InvalidInput, "Group index must be non-negative"))
+/// The group argument: 0 without one, `None` when it is NULL.
+fn group_of(row: &[Value]) -> Option<i128> {
+    match row.get(2) {
+        None => Some(0),
+        Some(value) if value.logical_type().id() == duckrs_common::types::LogicalTypeId::Varchar => Some(0),
+        Some(value) => value.as_i128(),
+    }
 }
 
 fn regexp_extract(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    strict_rows(args, result, |row| {
+    row_wise(args, result, |row| {
+        // a NULL group is no NULL result
+        if row.iter().take(2).any(Value::is_null) {
+            return Ok(Value::null(LogicalType::VARCHAR));
+        }
         let options = options_for(row, 3, false, true)?;
         let regex = compile(&text(&row[1]), options, false)?;
-        let group = group_of(row)?;
-        if group >= regex.captures_len() {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "Group index field field must be less than or equal to the number of capture groups",
-            ));
-        }
-        let input = text(&row[0]);
-        let Some(captures) = regex.captures(&input) else {
-            return Ok(Value::varchar(if options.keep { input.as_str() } else { "" }));
+        // `RegexExtractBind`: a NULL group never captures
+        let group = match group_of(row) {
+            Some(group) if !(0..=9).contains(&group) => {
+                return Err(Error::new(ErrorKind::InvalidInput, "Group index must be between 0 and 9!"));
+            }
+            Some(group) => group,
+            None => -1,
         };
-        Ok(Value::varchar(captures.get(group).map_or("", |m| m.as_str())))
+        let input = text(&row[0]);
+        let no_match = || Value::varchar(if options.keep { input.as_str() } else { "" });
+        // `ExtractCaptureGroup`: a group the pattern does not have is no match
+        if group < 0 || group as usize >= regex.captures_len() {
+            return Ok(no_match());
+        }
+        let Some(captures) = regex.captures(&input) else {
+            return Ok(no_match());
+        };
+        Ok(Value::varchar(captures.get(group as usize).map_or("", |m| m.as_str())))
     })
 }
 
@@ -252,13 +266,26 @@ fn regexp_extract_all(args: &DataChunk, result: &mut Vector) -> Result<()> {
             return Ok(Value::null(ty.clone()));
         }
         let regex = compile(&text(&row[1]), options_for(row, 3, false, false)?, false)?;
-        let group = group_of(row)?;
-        if group >= regex.captures_len() {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "Group index field field must be less than or equal to the number of capture groups",
-            ));
+        // `GetGroupIndex`: a NULL group makes the result NULL
+        let Some(group) = group_of(row) else {
+            return Ok(Value::null(ty.clone()));
+        };
+        // `ExtractAllMatches`: a negative group matches nothing, and one the pattern does not have
+        // is an error once something matches
+        if group < 0 {
+            return Value::list(LogicalType::VARCHAR, Vec::new());
         }
+        let groups = regex.captures_len() - 1;
+        if group as usize > groups {
+            if regex.is_match(&text(&row[0])) {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("Pattern has {groups} groups. Cannot access group {group}"),
+                ));
+            }
+            return Value::list(LogicalType::VARCHAR, Vec::new());
+        }
+        let group = group as usize;
         let input = text(&row[0]);
         // `ExtractAllMatches`: an empty match moves one character on, and one at the end is the last
         let mut items = Vec::new();
@@ -268,7 +295,8 @@ fn regexp_extract_all(args: &DataChunk, result: &mut Vector) -> Result<()> {
                 break;
             };
             let matched = captures.get(0).expect("the whole match");
-            items.push(Value::varchar(captures.get(group).map_or("", |m| m.as_str())));
+            // a group that took no part in the match is NULL
+            items.push(captures.get(group).map_or(Value::null(LogicalType::VARCHAR), |m| Value::varchar(m.as_str())));
             start = matched.end();
             if matched.is_empty() {
                 start += input[start..].chars().next().map_or(1, char::len_utf8);

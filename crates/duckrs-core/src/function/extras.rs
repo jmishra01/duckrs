@@ -130,14 +130,12 @@ pub fn is_extra_function(name: &str) -> bool {
 fn separators(row: &[Value], at: usize) -> Result<&'static [char]> {
     match row.get(at) {
         None => Ok(&['/', '\\']),
+        // `GetSeparator`: anything else, NULL too, is both slashes
+        Some(value) if value.is_null() => Ok(&['/', '\\']),
         Some(value) => match value.try_to_string()?.as_str() {
             "system" | "forward_slash" => Ok(&['/']),
             "backslash" => Ok(&['\\']),
-            "both_slash" => Ok(&['/', '\\']),
-            other => Err(invalid(format!(
-                "Invalid separator: {other}. Valid separators are: 'system', 'both_slash', 'backslash', \
-                 'forward_slash'"
-            ))),
+            _ => Ok(&['/', '\\']),
         },
     }
 }
@@ -148,10 +146,14 @@ fn parse_filename(args: &DataChunk, result: &mut Vector) -> Result<()> {
             return Ok(Value::null(LogicalType::VARCHAR));
         }
         let path = text(&row[0])?;
-        let (trim, separator) = match row.get(1).map(|v| v.data()) {
-            Some(ValueData::Bool(trim)) => (*trim, 2),
-            Some(_) => (false, 1),
-            None => (false, 1),
+        // `GetPathOptionArguments`: (path, trim_extension, separator), or one of the two
+        let as_bool = |value: &Value| -> Result<bool> {
+            Ok(!value.is_null() && crate::execution::parquet::cast_value(value, &LogicalType::BOOLEAN)? == Value::boolean(true))
+        };
+        let (trim, separator) = match row.len() {
+            3 => (as_bool(&row[1])?, 2),
+            2 if row[1].logical_type().id() == LogicalTypeId::Boolean => (as_bool(&row[1])?, 2),
+            _ => (false, 1),
         };
         let split = separators(row, separator)?;
         let name = path.rsplit(split).next().unwrap_or_default();
@@ -181,6 +183,7 @@ fn parse_path(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+/// `TrimPathFunction<true>`: up to the first separator (a leading one is kept), or nothing.
 fn parse_dirname(args: &DataChunk, result: &mut Vector) -> Result<()> {
     row_wise(args, result, |row| {
         if row[0].is_null() {
@@ -188,17 +191,16 @@ fn parse_dirname(args: &DataChunk, result: &mut Vector) -> Result<()> {
         }
         let path = text(&row[0])?;
         let split = separators(row, 1)?;
-        let parts: Vec<&str> = path.split(split).filter(|p| !p.is_empty()).collect();
-        if path.starts_with(split) && parts.len() <= 1 {
-            return Ok(Value::varchar(&path[..1]));
-        }
-        if parts.len() <= 1 {
-            return Ok(Value::varchar(""));
-        }
-        Ok(Value::varchar(parts[parts.len() - 2]))
+        let end = match path.find(split) {
+            Some(0) => 1,
+            Some(at) => at,
+            None => 0,
+        };
+        Ok(Value::varchar(&path[..end]))
     })
 }
 
+/// `ParseDirpathFunction`: up to the last separator, or the separator that is the whole path.
 fn parse_dirpath(args: &DataChunk, result: &mut Vector) -> Result<()> {
     row_wise(args, result, |row| {
         if row[0].is_null() {
@@ -206,12 +208,12 @@ fn parse_dirpath(args: &DataChunk, result: &mut Vector) -> Result<()> {
         }
         let path = text(&row[0])?;
         let split = separators(row, 1)?;
-        let trimmed = path.trim_end_matches(split);
-        Ok(match trimmed.rfind(split) {
-            Some(0) => Value::varchar(&path[..1]),
-            Some(at) => Value::varchar(trimmed[..at].trim_end_matches(split)),
-            None => Value::varchar(""),
-        })
+        let end = match path.rfind(split) {
+            Some(0) if path.len() == 1 => 1,
+            Some(at) => at,
+            None => 0,
+        };
+        Ok(Value::varchar(&path[..end]))
     })
 }
 
@@ -624,12 +626,30 @@ fn unary_double(args: &DataChunk, result: &mut Vector, f: fn(f64) -> f64) -> Res
     })
 }
 
+/// `GammaOperator`: zero has no gamma.
 fn gamma(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    unary_double(args, result, libm::tgamma)
+    row_wise(args, result, |row| {
+        let ValueData::Double(x) = *row[0].data() else {
+            return Ok(Value::null(LogicalType::DOUBLE));
+        };
+        if x == 0.0 {
+            return Err(Error::new(ErrorKind::OutOfRange, "cannot take gamma of zero"));
+        }
+        Ok(Value::double(libm::tgamma(x)))
+    })
 }
 
+/// `LogGammaOperator`: zero has no log gamma.
 fn lgamma(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    unary_double(args, result, libm::lgamma)
+    row_wise(args, result, |row| {
+        let ValueData::Double(x) = *row[0].data() else {
+            return Ok(Value::null(LogicalType::DOUBLE));
+        };
+        if x == 0.0 {
+            return Err(Error::new(ErrorKind::OutOfRange, "cannot take log gamma of zero"));
+        }
+        Ok(Value::double(libm::lgamma(x)))
+    })
 }
 
 fn even(args: &DataChunk, result: &mut Vector) -> Result<()> {
@@ -1449,10 +1469,7 @@ fn state_combine(args: &DataChunk, result: &mut Vector) -> Result<()> {
 
 fn count_args(name: &str, children: &[BoundExpr], low: usize, high: usize) -> Result<()> {
     if children.len() < low || children.len() > high {
-        return Err(binder_error(format!(
-            "No function matches the given name and argument types of '{name}'. You might need to add explicit type \
-             casts."
-        )));
+        return Err(super::lists::no_match(name, children));
     }
     Ok(())
 }

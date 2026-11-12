@@ -2399,7 +2399,11 @@ impl Binder<'_> {
         } else {
             table_ref.alias.clone()
         };
-        let names = Self::alias_columns(table_ref, &alias, vec![name])?;
+        // `BindTableFunctionInternal`: aliases past the function's columns are ignored
+        let mut names = vec![name];
+        for (name, alias) in names.iter_mut().zip(&table_ref.column_name_alias) {
+            name.clone_from(alias);
+        }
         let table_index = self.generate_table_index();
         self.bind_context.add_binding(Binding {
             alias,

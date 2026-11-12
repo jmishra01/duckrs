@@ -26,7 +26,7 @@ const ARRAY_TAG: u8 = 2;
 const SCALAR_TAG: u8 = 3;
 
 /// The scalar types a VARIANT holds, by the code they are stored with. DECIMAL has its own code.
-const SCALAR_TYPES: [LogicalTypeId; 29] = {
+const SCALAR_TYPES: [LogicalTypeId; 30] = {
     use LogicalTypeId::*;
     [
         Boolean,
@@ -58,6 +58,8 @@ const SCALAR_TYPES: [LogicalTypeId; 29] = {
         Interval,
         Bignum,
         Bit,
+        // `VariantLogicalType::GEOMETRY`: the geometry's blob
+        Geometry,
     ]
 };
 const DECIMAL_CODE: u8 = 255;

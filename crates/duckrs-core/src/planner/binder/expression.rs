@@ -1606,6 +1606,19 @@ impl Binder<'_> {
                         return Ok(BoundExpr::constant(Value::sql_null()));
                     }
                     let mut bound = crate::function::extras::bind_function(&function.name.name, &names, children)?;
+                    // `BindIEEEFloatingUnary` of the functions bound here
+                    if self.options.ieee_floating_point_ops
+                        && let BoundExprKind::Function { function: bound_function, children, .. } = &mut bound.kind
+                        && let Some(callback) =
+                            crate::function::math::ieee_variant(&bound_function.name, children.len())
+                    {
+                        *bound_function = Arc::new(crate::function::ScalarFunction::new(
+                            bound_function.name.clone(),
+                            bound_function.arguments.clone(),
+                            bound_function.return_type.clone(),
+                            callback,
+                        ));
+                    }
                     // `BindBinaryFloatingPoint` of fmod and fdiv: a zero divisor is an error without IEEE semantics,
                     // or NULL with error_on_division_by_zero off
                     if matches!(function.name.name.to_lowercase().as_str(), "fmod" | "fdiv")
@@ -1719,6 +1732,24 @@ impl Binder<'_> {
                         if children.len() <= 4 && groups.return_type.id() == LogicalTypeId::List =>
                     {
                         crate::function::regexp::bind_regexp_struct(&set.name, children)?
+                    }
+                    // `RegexExtractBind`: the third argument is a constant, the group or the options
+                    ("regexp_extract", [_, _, group]) if !group.is_foldable() => {
+                        return Err(binder_error(
+                            "Argument #3 in function regexp_extract must be a constant expression",
+                        ));
+                    }
+                    ("regexp_extract", [_, _, options])
+                        if matches!(
+                            options.return_type.id(),
+                            LogicalTypeId::Varchar | LogicalTypeId::StringLiteral
+                        ) =>
+                    {
+                        let mut children = children;
+                        let options = children.pop().expect("three arguments");
+                        children.push(BoundExpr::constant(Value::integer(0)));
+                        children.push(options);
+                        bind_scalar_function(set, children, function.is_operator, &|e| try_evaluate_scalar(e))?
                     }
                     // `OperatorAddFun`: list_concat is an overload of `+`
                     ("+", [left, right])

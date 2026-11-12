@@ -144,7 +144,10 @@ impl Binder<'_> {
         } else {
             table_ref.alias.clone()
         };
-        self.add_query_binding(alias, bound, &table_ref.column_name_alias)
+        // `BindTableFunctionInternal`: aliases past the function's columns are ignored
+        let aliases = &table_ref.column_name_alias;
+        let aliases = &aliases[..aliases.len().min(bound.names.len())];
+        self.add_query_binding(alias, bound, aliases)
     }
 
     /// The table functions this module knows. `None` leaves `call` to the caller.

@@ -384,11 +384,21 @@ fn list_aggr(args: &DataChunk, result: &mut Vector) -> Result<()> {
         let bound = bind_aggregate_function(set, children, None, false)?;
         let values = items(&row[0]);
         let input_type = bound.children[0].return_type.clone();
+        // the parameters the aggregate was bound with (its own defaults too), packed with each item
+        let packed = match &bound.children[0].kind {
+            crate::planner::expression::BoundExprKind::Function { function, .. } if function.name == "struct_pack" => {
+                Some(evaluate_scalar(&bound.children[0])?)
+            }
+            _ => None,
+        };
         let mut vector = Vector::new(input_type.clone(), values.len().max(1));
         for (at, value) in values.iter().enumerate() {
-            let value = if row.len() > 2 {
+            let value = if let Some(packed) = &packed {
+                let ValueData::Struct(parameters) = packed.data() else {
+                    unreachable!("a struct_pack of constants");
+                };
                 let mut fields = vec![cast_value(value, &input_type.struct_children()[0].1)?];
-                fields.extend(row[2..].iter().cloned());
+                fields.extend(parameters[1..].iter().cloned());
                 Value::new(input_type.clone(), ValueData::Struct(fields))?
             } else {
                 cast_value(value, &input_type)?

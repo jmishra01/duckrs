@@ -149,7 +149,14 @@ pub fn bind_scalar_function(
     // `FunctionNullHandling::SPECIAL_HANDLING`: the function decides what a NULL argument means
     let special_nulls = matches!(
         function.name.as_str(),
-        "string_split" | "str_split" | "string_to_array" | "split" | "stats" | "__internal_barrier" | "vector_type"
+        "string_split"
+            | "str_split"
+            | "string_to_array"
+            | "split"
+            | "stats"
+            | "__internal_barrier"
+            | "vector_type"
+            | "regexp_extract"
     );
     if special_nulls {
         let function = match function.resolve_types {
@@ -334,7 +341,8 @@ fn check_constant_parameters(name: &str, children: &mut [BoundExpr]) -> Result<(
         }
         // `BindApproxQuantile` + `CheckApproxQuantile`: fractions in [0, 1], kept as FLOAT
         ("approx_quantile", [input, parameter]) => {
-            let Some(value) = constant_parameter(name, parameter, 1, true)? else {
+            // `GetNonNullConstant`
+            let Some(value) = constant_parameter(name, parameter, 1, false)? else {
                 return Ok(());
             };
             let as_float = |v: &Value| -> Result<f32> {
@@ -385,6 +393,59 @@ fn check_constant_parameters(name: &str, children: &mut [BoundExpr]) -> Result<(
             }
         }
         _ => Ok(()),
+    }
+}
+
+/// `BindReservoirQuantile`: the quantile (0.5 by default) and the sample size (8192 by default) are
+/// constants. duckrs keeps every row, so the quantile is exact and the sample size only checked.
+fn reservoir_quantile_parameters(children: &mut Vec<BoundExpr>) -> Result<()> {
+    const NAME: &str = "reservoir_quantile";
+    if children.len() == 1 {
+        children.push(BoundExpr::constant(Value::double(0.5)));
+    }
+    if children.len() == 3 {
+        let size = children.pop().expect("three arguments");
+        if let Some(value) = constant_parameter(NAME, &size, 2, false)? {
+            let size = crate::execution::parquet::cast_value(&value, &LogicalType::INTEGER)?
+                .as_i128()
+                .unwrap_or(0);
+            if size <= 0 {
+                return Err(binder_error(
+                    "Size of the RESERVOIR_QUANTILE sample must be bigger than 0".to_string(),
+                ));
+            }
+        }
+    }
+    let [_, quantile] = children.as_slice() else {
+        return Ok(());
+    };
+    // `CheckReservoirQuantile`
+    let Some(value) = constant_parameter(NAME, quantile, 1, true)? else {
+        return Ok(());
+    };
+    let check = |value: &Value| -> Result<()> {
+        if value.is_null() {
+            return Err(binder_error(
+                "RESERVOIR_QUANTILE QUANTILE parameter cannot be NULL".to_string(),
+            ));
+        }
+        let cast = crate::execution::parquet::cast_value(value, &LogicalType::DOUBLE)?;
+        let ValueData::Double(quantile) = *cast.data() else {
+            return Ok(());
+        };
+        if quantile.is_nan() {
+            return Err(binder_error("RESERVOIR_QUANTILE parameter cannot be NaN".to_string()));
+        }
+        if !(0.0..=1.0).contains(&quantile) {
+            return Err(binder_error(
+                "RESERVOIR_QUANTILE can only take parameters in the range [0, 1]".to_string(),
+            ));
+        }
+        Ok(())
+    };
+    match value.data() {
+        ValueData::List(items) => items.iter().try_for_each(check),
+        _ => check(&value),
     }
 }
 
@@ -443,6 +504,9 @@ pub fn bind_aggregate_function(
     distinct: bool,
 ) -> Result<BoundAggregate> {
     let mut children = children;
+    if set.name == "reservoir_quantile" {
+        reservoir_quantile_parameters(&mut children)?;
+    }
     check_constant_parameters(&set.name, &mut children)?;
     if matches!(set.name.as_str(), "histogram" | "histogram_exact") && children.len() == 2 {
         children = histogram_bin_arguments(&set.name, children)?;

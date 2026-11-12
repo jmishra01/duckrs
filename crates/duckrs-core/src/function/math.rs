@@ -495,6 +495,10 @@ fn ieee_pow(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+// `IEEEGammaOperator` and `IEEELogGammaOperator`
+unary!(ieee_gamma, x => libm::tgamma(x));
+unary!(ieee_lgamma, x => libm::lgamma(x));
+
 /// `BindIEEEFloatingUnary` / `BindIEEEFloatingBinary`: with `ieee_floating_point_ops` on, the function of this name
 /// and arity gives NaN and infinities where it would otherwise raise.
 pub fn ieee_variant(name: &str, arity: usize) -> Option<ScalarCallback> {
@@ -512,6 +516,8 @@ pub fn ieee_variant(name: &str, arity: usize) -> Option<ScalarCallback> {
         ("log2", 1) => ieee_log2,
         ("log", 2) => ieee_log_base,
         ("pow" | "power" | "**" | "^", 2) => ieee_pow,
+        ("gamma", 1) => ieee_gamma,
+        ("lgamma", 1) => ieee_lgamma,
         _ => return None,
     })
 }

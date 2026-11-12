@@ -547,6 +547,10 @@ fn bind_union_extract(child: BoundExpr, key: &BoundExpr) -> Result<BoundExpr> {
 
 /// `StructExtractResolveTypes` with a constant key.
 fn bind_struct_extract(child: BoundExpr, key: BoundExpr) -> Result<BoundExpr> {
+    bind_struct_extract_with(child, key, false)
+}
+
+fn bind_struct_extract_with(child: BoundExpr, key: BoundExpr, at: bool) -> Result<BoundExpr> {
     let ty = child.return_type.clone();
     if ty.id() == LogicalTypeId::Union {
         return bind_union_extract(child, &key);
@@ -581,7 +585,7 @@ fn bind_struct_extract(child: BoundExpr, key: BoundExpr) -> Result<BoundExpr> {
         }
         struct_field_by_name(&ty, &key.try_to_string()?)?
     } else {
-        if ty.id() != LogicalTypeId::Tuple {
+        if ty.id() != LogicalTypeId::Tuple && !at {
             return Err(binder_error(
                 "struct_extract with an integer key can only be used on unnamed structs, use a string key instead",
             ));
@@ -665,7 +669,9 @@ pub fn bind_nested_function(name: &str, names: Vec<String>, children: Vec<BoundE
                 "union_extract" if !matches!(child.return_type.id(), LogicalTypeId::Union | LogicalTypeId::Unknown) => {
                     Err(binder_error("union_extract can only take a union parameter"))
                 }
-                "struct_extract" | "struct_extract_at" | "union_extract" => bind_struct_extract(child, key),
+                // `GetExtractAtFunction`: a position into any struct
+                "struct_extract_at" => bind_struct_extract_with(child, key, true),
+                "struct_extract" | "union_extract" => bind_struct_extract(child, key),
                 _ => bind_extract(&lower, child, key),
             }
         }
