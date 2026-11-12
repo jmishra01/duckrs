@@ -2108,17 +2108,10 @@ impl<'a> Writer<'a> {
         for position in parents_first(&tables) {
             let table = &tables[position];
             let info = table_info(&name, schema, table)?;
-            let mut indexes = TableIndex::all_of(table, self.block_size);
-            // `ART::GetSerializationFormat`: older versions have layouts of their own, which aren't written here
-            if !indexes.is_empty() && self.version < StorageVersion::V2_0_0 {
-                return Err(Error::not_implemented(format!(
-                    "writing an index to a database file of storage version {} is not yet ported to duckrs",
-                    self.version.display_name(false)
-                )));
-            }
+            let mut indexes = TableIndex::all_of(table, self.block_size, self.version);
             let (pointer, rows, next_row_id) = self.write_table_data(table, &mut indexes)?;
             let mut storage = Vec::with_capacity(indexes.len());
-            for index in &indexes {
+            for index in &mut indexes {
                 storage.push(index.storage_info(|data| {
                     let (block_id, offset) = self.place(data)?;
                     Ok(g::BlockPointer { block_id, offset })

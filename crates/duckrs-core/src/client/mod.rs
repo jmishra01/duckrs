@@ -96,6 +96,8 @@ pub struct AttachOptions {
     pub row_group_size: Option<u64>,
     /// `STORAGE_VERSION`, as given and as known
     pub storage_version: Option<(String, duckrs_common::serializer::StorageVersion)>,
+    /// `RecoveryMode::NO_WAL_WRITES`: commits don't go into the log, so only checkpoints keep them.
+    pub no_wal_writes: bool,
     /// Those of the database that it is attached to, as a log is replayed with them.
     settings: Option<Arc<RwLock<SettingValues>>>,
 }
@@ -111,6 +113,8 @@ struct DatabaseFile {
     row_group_size: u64,
     /// `StorageManager::GetStorageVersion`: what checkpoints write
     storage_version: duckrs_common::serializer::StorageVersion,
+    /// `RecoveryMode::NO_WAL_WRITES`
+    no_wal_writes: bool,
 }
 
 /// Why a database that came from a file takes no writes.
@@ -163,6 +167,7 @@ impl DatabaseInstance {
             block_size: None,
             row_group_size: None,
             storage_version: None,
+            no_wal_writes: false,
             settings: None,
         };
         Self::open_with(path, &options)
@@ -185,6 +190,7 @@ impl DatabaseInstance {
             block_size: None,
             row_group_size: None,
             storage_version: Some((version.to_string(), known)),
+            no_wal_writes: false,
             settings: None,
         };
         Self::open_with(path, &options)
@@ -312,6 +318,7 @@ impl DatabaseInstance {
                 .row_group_size
                 .unwrap_or(crate::execution::zone_map::ROW_GROUP_SIZE as u64),
             storage_version,
+            no_wal_writes: options.no_wal_writes,
         });
         // a log that was replayed can end in anything a crash leaves, so it isn't added to: its
         // records go to the file, and the next commit starts a new one
@@ -338,6 +345,11 @@ impl DatabaseInstance {
         let identifier = blocks.main_header().db_identifier;
         // `AutomaticCheckpoint`: what the log held before this commit
         let entries = log.entries();
+        // `DuckTransaction::ShouldWriteToWAL`: the changes wait for a checkpoint
+        if file.no_wal_writes {
+            self.changed.store(true, AtomicOrdering::SeqCst);
+            return Ok(());
+        }
         if !log.commit(
             &file.path,
             &self.catalog,
@@ -2093,9 +2105,13 @@ impl ClientContext {
                     }
                     options.row_group_size = Some(size);
                 }
+                "recovery_mode" => {
+                    // `RecoveryMode`
+                    let modes = [(false, "DEFAULT"), (true, "NO_WAL_WRITES")];
+                    options.no_wal_writes = crate::logging::enum_from(&modes, "RecoveryMode", &value.text)?;
+                }
                 // `AttachOptions` and `StorageOptions::Initialize` have these
-                other @ ("recovery_mode"
-                | "default_table"
+                other @ ("default_table"
                 | "hidden"
                 | "vacuum_rebuild_indexes"
                 | "access_mode"

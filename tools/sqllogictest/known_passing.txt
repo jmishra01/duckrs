@@ -1180,6 +1180,7 @@ test/sql/constraints/foreignkey/test_fk_concurrency_conflicts.test
 test/sql/constraints/foreignkey/test_fk_create_or_replace.test
 test/sql/constraints/foreignkey/test_fk_create_type.test
 test/sql/constraints/foreignkey/test_fk_cross_schema.test
+test/sql/constraints/foreignkey/test_fk_eager_constraint_checking.test
 test/sql/constraints/foreignkey/test_fk_export.test
 test/sql/constraints/foreignkey/test_fk_key_multiple_key_actions.test
 test/sql/constraints/foreignkey/test_fk_multiple.test
@@ -2199,6 +2200,8 @@ test/sql/index/art/insert_update_delete/test_art_simple_update.test
 test/sql/index/art/insert_update_delete/test_art_update.test
 test/sql/index/art/insert_update_delete/test_art_update_other_column.test
 test/sql/index/art/insert_update_delete/test_art_update_same_value.test
+test/sql/index/art/insert_update_delete/test_art_update_with_dict_fsst.test
+test/sql/index/art/insert_update_delete/test_art_update_with_dict_fsst_and_replay.test
 test/sql/index/art/issues/test_art_fuzzer.test
 test/sql/index/art/issues/test_art_fuzzer_persisted.test
 test/sql/index/art/issues/test_art_issue_21394.test
@@ -2219,6 +2222,8 @@ test/sql/index/art/nodes/test_art_node_16.test
 test/sql/index/art/nodes/test_art_node_256.test
 test/sql/index/art/nodes/test_art_node_4.test
 test/sql/index/art/nodes/test_art_node_48.test
+test/sql/index/art/nodes/test_art_prefix_transform_deprecated_create.test
+test/sql/index/art/nodes/test_art_prefix_transform_deprecated_gated.test
 test/sql/index/art/nodes/test_art_prefixes_restart.test
 test/sql/index/art/nodes/test_art_sparse_merge.test
 test/sql/index/art/scan/test_art_adaptive_scan.test
@@ -2242,6 +2247,7 @@ test/sql/index/art/scan/test_in_filter_index_scan.test
 test/sql/index/art/scan/test_not_distinct_index_scan.test
 test/sql/index/art/scan/test_or_equality_index_scan.test
 test/sql/index/art/scan/test_random_uuid.test
+test/sql/index/art/storage/test_art_allocator_bitmap_checkpoint.test
 test/sql/index/art/storage/test_art_buffered_replays_chunk_edges.test
 test/sql/index/art/storage/test_art_buffered_replays_interleaved.test
 test/sql/index/art/storage/test_art_buffered_replays_interval_merging.test
@@ -2251,6 +2257,7 @@ test/sql/index/art/storage/test_art_import.test
 test/sql/index/art/storage/test_art_import_export.test
 test/sql/index/art/storage/test_art_list_sort_checkpoint_on_close.test
 test/sql/index/art/storage/test_art_names.test
+test/sql/index/art/storage/test_art_node256_leaf_layout.test
 test/sql/index/art/storage/test_art_readonly.test
 test/sql/index/art/storage/test_art_storage.test
 test/sql/index/art/storage/test_art_storage_long_prefixes.test
@@ -3193,6 +3200,7 @@ test/sql/storage/compression/simple_compression.test
 test/sql/storage/compression/string/big_strings.test
 test/sql/storage/compression/string/empty.test
 test/sql/storage/compression/string/filter_pushdown.test
+test/sql/storage/compression/string/index_fetch.test
 test/sql/storage/compression/string/medium.test
 test/sql/storage/compression/string/simple.test
 test/sql/storage/compression/string/string_corrupt_dict_end.test
@@ -3297,6 +3305,7 @@ test/sql/storage/rowid_gaps/indexed_checkpoint_drop_row_group.test
 test/sql/storage/rowid_gaps/indexed_dense_vacuum_merge.test
 test/sql/storage/rowid_gaps/indexed_geometry_vacuum_remap.test
 test/sql/storage/rowid_gaps/indexed_incremental_vacuum_remap.test
+test/sql/storage/rowid_gaps/indexed_old_storage_keeps_deleted_row_group.test
 test/sql/storage/rowid_gaps/indexed_remap_duplicate_key_across_tasks.test
 test/sql/storage/rowid_gaps/indexed_remap_merges_across_gap.test
 test/sql/storage/rowid_gaps/indexed_remap_partial_chunk.test
@@ -3359,6 +3368,7 @@ test/sql/storage/types/test_uhugeint_storage.test
 test/sql/storage/types/test_unsigned_storage.test
 test/sql/storage/types/test_uuid.storage.test
 test/sql/storage/types/variant/append_shredded.test
+test/sql/storage/types/variant/index_fetch.test
 test/sql/storage/types/variant/struct_of_variant.test
 test/sql/storage/types/variant/test_all_types.test
 test/sql/storage/types/variant/test_all_types_single_table.test
@@ -3797,6 +3807,7 @@ test/sql/types/geo/geometry_shred_deletes.test
 test/sql/types/geo/geometry_shred_empty.test
 test/sql/types/geo/geometry_shred_fetch.test
 test/sql/types/geo/geometry_shred_list.test
+test/sql/types/geo/geometry_shred_pk_append.test
 test/sql/types/geo/geometry_stats.test
 test/sql/types/geo/geometry_stats_prune.test
 test/sql/types/geo/geometry_stats_prune_nan.test

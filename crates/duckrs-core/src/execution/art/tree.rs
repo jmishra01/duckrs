@@ -31,6 +31,12 @@ const NODE_16_CHILDREN: usize = 24;
 const NODE_48_CHILDREN: usize = 264;
 /// Of `Node4`, `Node256` and `Node256Leaf`, whose first field is padded.
 const ALIGNED_FIELD: usize = 8;
+/// `Prefix::DEPRECATED_COUNT`: what a prefix holds in files from before v1.2.0.
+pub const DEPRECATED_PREFIX_COUNT: usize = 15;
+/// `Leaf::LEAF_SIZE`: the row ids of a deprecated `Leaf`, after its count and padding.
+const DEPRECATED_LEAF_CAPACITY: usize = 4;
+const DEPRECATED_LEAF_ROW_IDS: usize = 8;
+const DEPRECATED_LEAF_NEXT: usize = 40;
 
 /// Where a node pointer is kept.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -83,6 +89,21 @@ impl Art {
     pub fn new(prefix_count: usize, block_size: usize, unique: bool) -> Self {
         Self::from_parts(
             FixedSizeAllocator::for_nodes(prefix_count, block_size),
+            NodePtr::EMPTY,
+            unique,
+        )
+    }
+
+    /// A new tree whose `Node256Leaf` segments are `node_256_leaf_size` bytes, which files from
+    /// before v2.0.0 have larger.
+    pub fn with_node_256_leaf_size(
+        prefix_count: usize,
+        node_256_leaf_size: usize,
+        block_size: usize,
+        unique: bool,
+    ) -> Self {
+        Self::from_parts(
+            FixedSizeAllocator::for_nodes_with(prefix_count, node_256_leaf_size, block_size),
             NodePtr::EMPTY,
             unique,
         )
@@ -556,6 +577,166 @@ impl Art {
         bytes.copy_within(2 + position..1 + count, 1 + position);
         bytes[0] -= 1;
         Ok(bytes[0])
+    }
+
+    // The format of files from before v1.2.0
+
+    /// `ART::TransformToDeprecated`: rows that share a key go into chains of `Leaf`, and prefixes
+    /// hold `DEPRECATED_PREFIX_COUNT` bytes. What comes out is only good for writing to a file.
+    pub fn transform_to_deprecated(&mut self) -> Result<()> {
+        let mut deprecated = (self.prefix_count != DEPRECATED_PREFIX_COUNT).then(|| {
+            FixedSizeAllocator::new(
+                DEPRECATED_PREFIX_COUNT + PREFIX_METADATA_SIZE,
+                self.allocators[0].block_size(),
+            )
+        });
+        // `ARTScanPreorder`: the children of a node are handled before the last of them is popped
+        let mut stack = Vec::new();
+        if self.root.is_set() {
+            stack.extend(self.deprecate_child(Slot::Root, &mut deprecated)?);
+        }
+        while let Some(node) = stack.pop() {
+            if !matches!(
+                node.node_type(),
+                Some(NodeType::Node4 | NodeType::Node16 | NodeType::Node48 | NodeType::Node256)
+            ) {
+                continue;
+            }
+            for byte in self.bytes_of(node)? {
+                let slot = self
+                    .child_slot(node, byte)?
+                    .ok_or_else(|| corrupted("a byte of an ART has no child"))?;
+                stack.extend(self.deprecate_child(slot, &mut deprecated)?);
+            }
+        }
+        if let Some(allocator) = deprecated {
+            debug_assert_eq!(self.allocators[0].segment_count(), 0);
+            self.allocators[0] = allocator;
+            self.prefix_count = DEPRECATED_PREFIX_COUNT;
+        }
+        Ok(())
+    }
+
+    /// The child handler of `NodePtr::TransformToDeprecated`: the node to go on with, if any.
+    fn deprecate_child(&mut self, slot: Slot, deprecated: &mut Option<FixedSizeAllocator>) -> Result<Option<NodePtr>> {
+        let child = self.read(slot)?;
+        if child.is_gate() {
+            let leaf = self.deprecate_leaf(child)?;
+            self.write(slot, leaf)?;
+            return Ok(None);
+        }
+        Ok(match child.node_type() {
+            Some(NodeType::Prefix) => match deprecated {
+                Some(allocator) => self.deprecate_prefix(slot, child, allocator)?,
+                None => self.prefix_endpoint(child)?,
+            },
+            Some(NodeType::LeafInlined | NodeType::Leaf) => None,
+            Some(_) => Some(child),
+            None => return Err(corrupted("an ART has a node of no known type")),
+        })
+    }
+
+    /// `PrefixHandle::TransformToDeprecated` when prefixes stay as they are: the gate at the end of
+    /// a chain becomes leaves, and the node after it comes back.
+    fn prefix_endpoint(&mut self, mut current: NodePtr) -> Result<Option<NodePtr>> {
+        while Self::is_prefix(current) && !current.is_gate() {
+            let slot = self.prefix_slot(current);
+            let child = self.read(slot)?;
+            if child.is_set() && child.is_gate() {
+                let leaf = self.deprecate_leaf(child)?;
+                self.write(slot, leaf)?;
+                return Ok(None);
+            }
+            current = child;
+        }
+        Ok(Some(current))
+    }
+
+    /// `PrefixHandle::TransformToDeprecated` into `allocator`: the chain in `slot` is rebuilt there.
+    fn deprecate_prefix(
+        &mut self,
+        slot: Slot,
+        node: NodePtr,
+        allocator: &mut FixedSizeAllocator,
+    ) -> Result<Option<NodePtr>> {
+        let rebuilt = Self::new_deprecated_prefix(allocator)?;
+        let mut tail = rebuilt;
+        let mut source = node;
+        while Self::is_prefix(source) && !source.is_gate() {
+            for byte in self.prefix_bytes(source)?.to_vec() {
+                tail = Self::append_deprecated(allocator, tail, byte)?;
+            }
+            let child = self.prefix_child(source)?;
+            Self::set_deprecated_child(allocator, tail, child)?;
+            self.free_node(source)?;
+            source = child;
+        }
+        self.write(slot, rebuilt)?;
+        if source.is_set() && source.is_gate() {
+            let leaf = self.deprecate_leaf(source)?;
+            Self::set_deprecated_child(allocator, tail, leaf)?;
+            return Ok(None);
+        }
+        Ok(Some(source))
+    }
+
+    /// `PrefixHandle::NewDeprecated`.
+    fn new_deprecated_prefix(allocator: &mut FixedSizeAllocator) -> Result<NodePtr> {
+        let node = NodePtr::new(allocator.allocate(), NodeType::Prefix);
+        allocator.get_mut(node.0)?.fill(0);
+        Ok(node)
+    }
+
+    /// `PrefixHandle::TransformToDeprecatedAppend`: the prefix that has the byte comes back.
+    fn append_deprecated(allocator: &mut FixedSizeAllocator, tail: NodePtr, byte: u8) -> Result<NodePtr> {
+        let bytes = allocator.get_mut(tail.0)?;
+        let count = usize::from(bytes[DEPRECATED_PREFIX_COUNT]);
+        if count != DEPRECATED_PREFIX_COUNT {
+            bytes[count] = byte;
+            bytes[DEPRECATED_PREFIX_COUNT] += 1;
+            return Ok(tail);
+        }
+        let next = Self::new_deprecated_prefix(allocator)?;
+        Self::set_deprecated_child(allocator, tail, next)?;
+        Self::append_deprecated(allocator, next, byte)
+    }
+
+    fn set_deprecated_child(allocator: &mut FixedSizeAllocator, prefix: NodePtr, child: NodePtr) -> Result<()> {
+        let at = DEPRECATED_PREFIX_COUNT + 1;
+        allocator.get_mut(prefix.0)?[at..at + 8].copy_from_slice(&child.0.bits().to_le_bytes());
+        Ok(())
+    }
+
+    /// `Leaf::TransformToDeprecated`: the rows below a gate, in order, `DEPRECATED_LEAF_CAPACITY` to
+    /// a `Leaf`. The first of them comes back.
+    fn deprecate_leaf(&mut self, gate: NodePtr) -> Result<NodePtr> {
+        let mut rows = Vec::new();
+        self.rows_below(gate, &mut Vec::new(), &mut rows)?;
+        rows.sort_unstable();
+        rows.dedup();
+        self.free_tree(gate)?;
+        let index = NodeType::Leaf.allocator_index().expect("a leaf has an allocator");
+        let mut first = NodePtr::EMPTY;
+        let mut previous: Option<NodePtr> = None;
+        for chunk in rows.chunks(DEPRECATED_LEAF_CAPACITY) {
+            let leaf = NodePtr::new(self.allocators[index].allocate(), NodeType::Leaf);
+            let bytes = self.allocators[index].get_mut(leaf.0)?;
+            bytes.fill(0);
+            bytes[0] = chunk.len() as u8;
+            for (position, row) in chunk.iter().enumerate() {
+                let at = DEPRECATED_LEAF_ROW_IDS + position * 8;
+                bytes[at..at + 8].copy_from_slice(&row.to_le_bytes());
+            }
+            match previous {
+                None => first = leaf,
+                Some(previous) => {
+                    let bytes = self.allocators[index].get_mut(previous.0)?;
+                    bytes[DEPRECATED_LEAF_NEXT..DEPRECATED_LEAF_NEXT + 8].copy_from_slice(&leaf.0.bits().to_le_bytes());
+                }
+            }
+            previous = Some(leaf);
+        }
+        Ok(first)
     }
 
     // Prefixes
@@ -1221,6 +1402,83 @@ mod tests {
             Conflict::None
         );
         assert_eq!(art.lookup(&key).unwrap(), [1, 2]);
+    }
+
+    /// The keys and rows of a tree in the format of files before v1.2.0.
+    fn deprecated_scan(art: &Art, node: NodePtr, path: &mut Vec<u8>, out: &mut Vec<(Vec<u8>, Vec<i64>)>) {
+        let length = path.len();
+        match node.node_type().unwrap() {
+            NodeType::LeafInlined => out.push((path.clone(), vec![node.row_id()])),
+            NodeType::Leaf => {
+                let mut rows = Vec::new();
+                let mut leaf = node;
+                while leaf.is_set() {
+                    assert_eq!(leaf.node_type(), Some(NodeType::Leaf));
+                    let bytes = art.allocators[1].get(leaf.0).unwrap();
+                    let count = usize::from(bytes[0]);
+                    assert!((1..=DEPRECATED_LEAF_CAPACITY).contains(&count));
+                    for position in 0..count {
+                        let at = DEPRECATED_LEAF_ROW_IDS + position * 8;
+                        rows.push(i64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()));
+                    }
+                    let next = &bytes[DEPRECATED_LEAF_NEXT..DEPRECATED_LEAF_NEXT + 8];
+                    leaf = NodePtr(IndexPointer::from_bits(u64::from_le_bytes(next.try_into().unwrap())));
+                }
+                out.push((path.clone(), rows));
+            }
+            NodeType::Prefix => {
+                assert!(!node.is_gate());
+                path.extend_from_slice(art.prefix_bytes(node).unwrap());
+                deprecated_scan(art, art.prefix_child(node).unwrap(), path, out);
+            }
+            _ => {
+                assert!(!node.is_gate());
+                for (byte, child) in art.children(node).unwrap() {
+                    path.push(byte);
+                    deprecated_scan(art, child, path, out);
+                    path.pop();
+                }
+            }
+        }
+        path.truncate(length);
+    }
+
+    #[test]
+    fn a_tree_goes_into_the_deprecated_format() {
+        for prefix_count in [7, DEPRECATED_PREFIX_COUNT] {
+            let mut art = Art::new(prefix_count, BLOCK_SIZE, false);
+            let mut row = 0;
+            for number in 0..400u16 {
+                let key = ArtKey::of_string(format!("a fairly long shared prefix/{number}").as_bytes());
+                // one row inlined, and up to 300 below a gate, past every size of leaf node
+                for _ in 0..[1, 2, 5, 9, 300][usize::from(number % 5)] {
+                    art.insert(&key, row, AppendMode::Default).unwrap();
+                    row += 1;
+                }
+            }
+            let expected = art.scan().unwrap();
+            art.transform_to_deprecated().unwrap();
+            assert_eq!(
+                art.allocators[0].segment_size(),
+                DEPRECATED_PREFIX_COUNT + PREFIX_METADATA_SIZE
+            );
+            for ty in [NodeType::Node7Leaf, NodeType::Node15Leaf, NodeType::Node256Leaf] {
+                assert_eq!(
+                    art.allocators[ty.allocator_index().unwrap()].segment_count(),
+                    0,
+                    "{ty:?}"
+                );
+            }
+            let mut found = Vec::new();
+            deprecated_scan(&art, art.root, &mut Vec::new(), &mut found);
+            assert_eq!(found, expected, "{prefix_count}");
+            let leaves: usize = expected
+                .iter()
+                .filter(|(_, rows)| rows.len() > 1)
+                .map(|(_, rows)| rows.len().div_ceil(4))
+                .sum();
+            assert_eq!(art.allocators[1].segment_count(), leaves);
+        }
     }
 
     #[test]

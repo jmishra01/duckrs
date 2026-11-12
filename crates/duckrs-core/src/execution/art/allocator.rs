@@ -21,7 +21,8 @@ pub const NODE_256_SIZE: usize = 2056;
 pub const NODE_7_LEAF_SIZE: usize = 8;
 pub const NODE_15_LEAF_SIZE: usize = 16;
 pub const NODE_256_LEAF_SIZE: usize = 40;
-/// `LegacyNode256Leaf`: what files from before v2.0.0 have.
+/// `LegacyNode256Leaf`: what files from before v2.0.0 have, as `GetNode256LeafSegmentSize` keeps
+/// its mask of 256 words and padding.
 pub const LEGACY_NODE_256_LEAF_SIZE: usize = 264;
 /// `Prefix::METADATA_SIZE`: a child pointer and a count after the bytes of a prefix.
 pub const PREFIX_METADATA_SIZE: usize = 9;
@@ -176,12 +177,23 @@ impl FixedSizeAllocator {
 
     /// An allocator per type of node, in the order of `NodeType::allocator_index`.
     pub fn for_nodes(prefix_count: usize, block_size: usize) -> Vec<Self> {
-        let sizes = segment_sizes(prefix_count);
+        Self::for_nodes_with(prefix_count, NODE_256_LEAF_SIZE, block_size)
+    }
+
+    /// `ART::ART` for a new index: `node_256_leaf_size` is what `GetNode256LeafSegmentSize` says
+    /// for the version of the file.
+    pub fn for_nodes_with(prefix_count: usize, node_256_leaf_size: usize, block_size: usize) -> Vec<Self> {
+        let mut sizes = segment_sizes(prefix_count);
+        sizes[8] = node_256_leaf_size;
         sizes.into_iter().map(|size| Self::new(size, block_size)).collect()
     }
 
     pub fn segment_size(&self) -> usize {
         self.segment_size
+    }
+
+    pub fn block_size(&self) -> usize {
+        self.block_size
     }
 
     pub fn available_segments_per_buffer(&self) -> usize {
