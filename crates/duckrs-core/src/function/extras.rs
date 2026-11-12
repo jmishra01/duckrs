@@ -63,7 +63,7 @@ const STRING_FUNCTIONS: [&str; 22] = [
     "path_join",
 ];
 
-const OTHER_FUNCTIONS: [&str; 46] = [
+const OTHER_FUNCTIONS: [&str; 52] = [
     "finalize",
     "combine",
     "gamma",
@@ -93,7 +93,12 @@ const OTHER_FUNCTIONS: [&str; 46] = [
     "list_negative_dot_product",
     "array_negative_dot_product",
     "array_cross_product",
+    "<->",
+    "<=>",
     "struct_insert",
+    "remap_struct",
+    "equi_width_bins",
+    "is_histogram_other_bin",
     "struct_update",
     "timetz_byte_comparable",
     "struct_contains",
@@ -101,6 +106,7 @@ const OTHER_FUNCTIONS: [&str; 46] = [
     "struct_position",
     "struct_indexof",
     "struct_keys",
+    "struct_values",
     "struct_concat",
     "map_extract",
     "element_at",
@@ -962,7 +968,7 @@ fn pair_of_lists(row: &[Value], name: &str) -> Result<Option<(Vec<f64>, Vec<f64>
     };
     if a.len() != b.len() {
         return Err(invalid(format!(
-            "{name}: list dimensions must be equal, got left length {} and right length {}",
+            "{name}: list dimensions must be equal, got left length '{}' and right length '{}'",
             a.len(),
             b.len()
         )));
@@ -980,6 +986,10 @@ fn over_pairs(args: &DataChunk, result: &mut Vector, name: &'static str, f: fn(&
         let Some((a, b)) = pair_of_lists(row, name)? else {
             return Ok(Value::null(ty.clone()));
         };
+        // `ALLOW_EMPTY`: the cosine of nothing is nothing
+        if a.is_empty() && name.contains("cosine") {
+            return Ok(Value::null(ty.clone()));
+        }
         let score = f(&a, &b);
         Ok(if ty.id() == LogicalTypeId::Float {
             Value::float(score as f32)
@@ -989,13 +999,22 @@ fn over_pairs(args: &DataChunk, result: &mut Vector, name: &'static str, f: fn(&
     })
 }
 
+/// `CosineSimilarityOp`: rescaled by the largest values when the sums overflow or underflow.
 fn cosine(a: &[f64], b: &[f64]) -> f64 {
-    let bottom = (inner(a, a) * inner(b, b)).sqrt();
-    if bottom == 0.0 {
-        0.0
-    } else {
-        (inner(a, b) / bottom).clamp(-1.0, 1.0)
+    let clamp = |v: f64| if v.is_nan() { v } else { v.clamp(-1.0, 1.0) };
+    let (distance, left, right) = (inner(a, b), inner(a, a), inner(b, b));
+    let product = left * right;
+    if distance.is_finite() && product.is_finite() && product >= f64::MIN_POSITIVE {
+        return clamp(distance / product.sqrt());
     }
+    let max = |v: &[f64]| v.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+    let (max_l, max_r) = (max(a), max(b));
+    if max_l == 0.0 || max_r == 0.0 || !max_l.is_finite() || !max_r.is_finite() {
+        return f64::NAN;
+    }
+    let a: Vec<f64> = a.iter().map(|x| x / max_l).collect();
+    let b: Vec<f64> = b.iter().map(|x| x / max_r).collect();
+    clamp(inner(&a, &b) / (inner(&a, &a) * inner(&b, &b)).sqrt())
 }
 
 fn cosine_similarity(args: &DataChunk, result: &mut Vector) -> Result<()> {
@@ -1076,6 +1095,37 @@ fn rebuild_struct(args: &DataChunk, result: &mut Vector) -> Result<()> {
             fields.push(found.map_or_else(|| Value::null(child.clone()), |(_, v)| v.clone()));
         }
         Value::new(ty.clone(), ValueData::Struct(fields))
+    })
+}
+
+// Ported from duckdb/extension/core_functions/aggregate/nested/binned_histogram.cpp @ rust-port-baseline
+/// `IsHistogramOtherBinFunction`: whether a value is the key of the "other values" bucket of a histogram.
+fn is_histogram_other_bin(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let ty = args.column(0).logical_type().clone();
+    let other = super::holistic::other_bucket_value(&ty)?;
+    row_wise(args, result, |row| {
+        let Some(other) = &other else {
+            // a NULL constant is NULL whatever the function
+            if ty.id() == LogicalTypeId::SqlNull {
+                return Ok(Value::null(LogicalType::BOOLEAN));
+            }
+            return Ok(Value::boolean(false));
+        };
+        if row[0].is_null() {
+            return Ok(Value::null(LogicalType::BOOLEAN));
+        }
+        Ok(Value::boolean(super::holistic::not_distinct(&row[0], other, &ty)?))
+    })
+}
+
+/// `struct_values`: the fields of a STRUCT, as a TUPLE.
+fn struct_values(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let ty = result.logical_type().clone();
+    row_wise(args, result, |row| {
+        if row[0].is_null() {
+            return Ok(Value::null(ty.clone()));
+        }
+        Value::new(ty.clone(), ValueData::Struct(struct_fields(&row[0]).to_vec()))
     })
 }
 
@@ -1292,27 +1342,72 @@ fn casted(children: Vec<BoundExpr>, ty: &LogicalType) -> Vec<BoundExpr> {
 }
 
 /// A list or array of numbers, as a list of what they are computed in.
+/// The overload of a distance function of `extension/core_functions/scalar/list/list_distance.cpp` and
+/// `scalar/array/array_functions.cpp`: FLOAT for lists of FLOAT, DOUBLE otherwise.
 fn vector_arguments(name: &str, children: Vec<BoundExpr>) -> Result<(Vec<BoundExpr>, LogicalType)> {
     count_args(name, &children, 2, 2)?;
-    let element = |child: &BoundExpr| child.return_type.child_type().cloned();
-    let numeric = |child: &BoundExpr| {
-        matches!(child.return_type.id(), LogicalTypeId::List | LogicalTypeId::Array)
-            && element(child).is_some_and(|ty| ty.is_numeric())
+    #[derive(PartialEq)]
+    enum Fit {
+        Ambiguous,
+        Null,
+        Float,
+        Other,
+        No,
+    }
+    let fit = |child: &BoundExpr| match super::binder::expression_return_type(child).id() {
+        LogicalTypeId::StringLiteral | LogicalTypeId::Unknown => Fit::Ambiguous,
+        LogicalTypeId::SqlNull => Fit::Null,
+        LogicalTypeId::List | LogicalTypeId::Array => match child.return_type.child_type() {
+            Some(ty) if ty.id() == LogicalTypeId::SqlNull => Fit::Null,
+            Some(ty) if ty.id() == LogicalTypeId::Float => Fit::Float,
+            Some(ty) if ty.is_numeric() => Fit::Other,
+            _ => Fit::No,
+        },
+        _ => Fit::No,
     };
-    if !children.iter().all(numeric) {
+    let fits: Vec<Fit> = children.iter().map(fit).collect();
+    if fits.contains(&Fit::No) {
+        return Err(binder_error(format!(
+            "No function matches the given name and argument types '{name}({})'. You might need to add explicit type \
+             casts.",
+            children
+                .iter()
+                .map(|c| super::binder::expression_return_type(c).to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    if fits.contains(&Fit::Ambiguous) {
         return Err(binder_error(format!(
             "{name}: Could not choose a best candidate function"
         )));
     }
-    let float = element(&children[0]).is_some_and(|ty| ty.id() == LogicalTypeId::Float)
-        && element(&children[1]).is_some_and(|ty| ty.id() == LogicalTypeId::Float);
-    let ty = if float { LogicalType::FLOAT } else { LogicalType::DOUBLE };
+    // `ArrayGenericBinaryBind`: arrays of one size
+    if name.starts_with("array_") {
+        let sizes: Vec<Option<u32>> = children.iter().map(|c| c.return_type.array_size()).collect();
+        if let [Some(left), Some(right)] = sizes.as_slice()
+            && left != right
+        {
+            return Err(binder_error(format!(
+                "{name}: Array arguments must be of the same size"
+            )));
+        }
+    }
+    let ty = if fits.contains(&Fit::Other) {
+        LogicalType::DOUBLE
+    } else {
+        LogicalType::FLOAT
+    };
     Ok((children, ty))
 }
 
 /// Binds a function of [`is_extra_function`]; `names` are the names of its arguments.
 pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>) -> Result<BoundExpr> {
-    let lower = name.to_ascii_lowercase();
+    let lower = match name.to_ascii_lowercase().as_str() {
+        "<->" => "list_distance".to_string(),
+        "<=>" => "list_cosine_distance".to_string(),
+        other => other.to_string(),
+    };
     let (v, d) = (LogicalType::VARCHAR, LogicalType::DOUBLE);
     let list_of_text = LogicalType::list(LogicalType::VARCHAR);
     let simple = |low, high, ty: LogicalType, callback: super::ScalarCallback, children: Vec<BoundExpr>| {
@@ -1458,11 +1553,16 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
             };
             Ok(bound_function(&lower, children, ty, callback))
         }
+        // `ArrayCrossProductFun`: FLOAT[3] or DOUBLE[3]
         "array_cross_product" => {
-            count_args(&lower, &children, 2, 2)?;
-            let ty = children[0].return_type.clone();
+            let (children, element) = vector_arguments(&lower, children)?;
+            let ty = LogicalType::array(element, 3);
+            let children = children.into_iter().map(|c| c.cast_to(&ty, false)).collect();
             Ok(bound_function(&lower, children, ty, array_cross_product))
         }
+        "remap_struct" => super::remap_struct::bind(children),
+        "equi_width_bins" => super::binning::bind(children),
+        "is_histogram_other_bin" => simple(1, 1, LogicalType::BOOLEAN, is_histogram_other_bin, children),
         "struct_insert" | "struct_update" => {
             if children.is_empty() || children[0].return_type.id() != LogicalTypeId::Struct {
                 return Err(binder_error(format!("{lower} expects a STRUCT as its first argument")));
@@ -1531,6 +1631,23 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
             }
             simple(1, 1, list_of_text, struct_keys, children)
         }
+        // Ported from duckdb/extension/core_functions/scalar/struct/struct_values.cpp @ rust-port-baseline
+        "struct_values" => {
+            count_args(&lower, &children, 1, 1)?;
+            let ty = children[0].return_type.clone();
+            match ty.id() {
+                LogicalTypeId::SqlNull => Ok(BoundExpr::constant(Value::sql_null())),
+                LogicalTypeId::Struct | LogicalTypeId::Tuple => {
+                    let tuple = LogicalType::tuple(ty.struct_children().iter().map(|(_, t)| t.clone()).collect());
+                    Ok(bound_function(&lower, children, tuple, struct_values))
+                }
+                _ => Err(binder_error(format!(
+                    "No function matches the given name and argument types 'struct_values({})'. You might need \
+                     to add explicit type casts.\n\tCandidate functions:\n\tstruct_values(STRUCT) -> TUPLE\n",
+                    super::binder::expression_return_type(&children[0])
+                ))),
+            }
+        }
         "struct_contains" | "struct_has" | "struct_position" | "struct_indexof" => {
             count_args(&lower, &children, 2, 2)?;
             let position = matches!(lower.as_str(), "struct_position" | "struct_indexof");
@@ -1551,7 +1668,13 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
             };
             let parts = entry.struct_children();
             let (key, value) = (parts[0].1.clone(), parts[1].1.clone());
-            let wanted = children.remove(1).cast_to(&key, false);
+            // the key of an empty map is no type to cast to
+            let wanted = children.remove(1);
+            let wanted = if key.id() == LogicalTypeId::SqlNull {
+                wanted
+            } else {
+                wanted.cast_to(&key, false)
+            };
             children.push(wanted);
             Ok(match lower.as_str() {
                 "map_contains" => bound_function(&lower, children, LogicalType::BOOLEAN, map_contains),
@@ -1559,19 +1682,68 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
                 _ => bound_function(&lower, children, LogicalType::list(value), map_extract),
             })
         }
+        // `MapConcatBind`: the type of the maps that are neither NULL nor empty
         "map_concat" => {
-            let Some(ty) = children.first().map(|c| c.return_type.clone()) else {
-                return Err(binder_error("map_concat expects at least one argument"));
-            };
-            Ok(bound_function(&lower, casted(children, &ty), ty, map_concat))
+            if children.len() < 2 {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "The provided amount of arguments is incorrect, please provide 2 or more maps",
+                ));
+            }
+            let mut expected = LogicalType::SQLNULL;
+            let mut is_null = true;
+            for child in &children {
+                let map = &child.return_type;
+                if map.id() == LogicalTypeId::SqlNull {
+                    continue;
+                }
+                if map.id() != LogicalTypeId::Map {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        "MAP_CONCAT only takes map arguments",
+                    ));
+                }
+                is_null = false;
+                let empty = map.child_type().is_some_and(|entry| {
+                    entry
+                        .struct_children()
+                        .iter()
+                        .all(|(_, t)| t.id() == LogicalTypeId::SqlNull)
+                });
+                if empty {
+                    continue;
+                }
+                if expected.id() == LogicalTypeId::SqlNull {
+                    expected = map.clone();
+                } else if *map != expected {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "'value' type of map differs between arguments, expected '{expected}', found '{map}' instead"
+                        ),
+                    ));
+                }
+            }
+            if expected.id() == LogicalTypeId::SqlNull && !is_null {
+                expected = LogicalType::map(LogicalType::SQLNULL, LogicalType::SQLNULL);
+            }
+            if expected.id() == LogicalTypeId::SqlNull {
+                return Ok(BoundExpr::constant(Value::sql_null()));
+            }
+            Ok(bound_function(
+                &lower,
+                casted(children, &expected),
+                expected,
+                map_concat,
+            ))
         }
         "finalize" => {
             count_args(&lower, &children, 1, 1)?;
             let ty = children[0].return_type.clone();
-            let Some((.., result)) = ty.aggregate_state_info() else {
+            if ty.aggregate_state_info().is_none() {
                 return Err(binder_error(format!("Can only finalize {ty}, not AGGREGATE_STATE")));
-            };
-            let result = result.clone();
+            }
+            let (_, result) = super::aggregates::resolve_state(&ty)?;
             Ok(bound_function(&lower, children, result, state_finalize))
         }
         "combine" => {
@@ -1583,6 +1755,35 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
             }
             if other.id() != LogicalTypeId::SqlNull && ty != other {
                 let name = |t: &LogicalType| t.aggregate_state_info().map_or(t.to_string(), |i| i.0.to_string());
+                // the same function and signature: bound to different constants (`BindAggregateState`)
+                if let (Some(left), Some(right)) = (ty.aggregate_state_info(), other.aggregate_state_info())
+                    && left.0 == right.0
+                {
+                    let parameters = |t: &LogicalType| {
+                        let (_, _, arguments, _) = t.aggregate_state_info().expect("a state");
+                        let constants = t.aggregate_state_constants();
+                        let entries: Vec<String> = arguments
+                            .iter()
+                            .enumerate()
+                            .map(|(at, argument)| match constants.get(at).cloned().flatten() {
+                                Some(constant) => {
+                                    format!(
+                                        "{{'type': {argument}, 'value': {}}}",
+                                        constant.try_to_string().unwrap_or_default()
+                                    )
+                                }
+                                None => argument.to_string(),
+                            })
+                            .collect();
+                        format!("[{}]", entries.join(", "))
+                    };
+                    return Err(binder_error(format!(
+                        "Cannot COMBINE aggregate states of \"{}\" that were created with different parameters: {} <> {}",
+                        left.0,
+                        parameters(&ty),
+                        parameters(&other)
+                    )));
+                }
                 return Err(binder_error(format!(
                     "Cannot COMBINE aggregate states from different functions, {} <> {}",
                     name(&ty),

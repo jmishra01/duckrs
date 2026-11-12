@@ -1047,6 +1047,7 @@ fn unimplemented_cast(source: &LogicalType, target: &LogicalType) -> Error {
 pub fn has_cast(source: &LogicalType, target: &LogicalType) -> bool {
     source == target
         || source.id() == LogicalTypeId::SqlNull
+        || target.id() == LogicalTypeId::SqlNull
         || target.id() == LogicalTypeId::Varchar
         || (is_numeric_or_bool(source) && is_numeric_or_bool(target))
         || (source.id() == LogicalTypeId::Varchar && is_numeric_or_bool(target))
@@ -1119,6 +1120,22 @@ pub fn cast_vector(source: &Vector, result: &mut Vector, count: usize, mode: Cas
         return Ok(());
     }
     if from.id() == LogicalTypeId::SqlNull {
+        *result = Vector::constant_null(to);
+        return Ok(());
+    }
+    // `TryVectorNullCast`: only a NULL is a NULL
+    if to.id() == LogicalTypeId::SqlNull {
+        let rows = if source.vector_type() == duckrs_common::vector::VectorType::Constant {
+            count.min(1)
+        } else {
+            count
+        };
+        let data = source.to_unified(rows.max(1));
+        if mode == CastMode::Strict && (0..rows).any(|row| data.validity.is_valid(data.sel.get(row))) {
+            return Err(conversion_error(format!(
+                "Unimplemented type for cast ({from} -> {to})"
+            )));
+        }
         *result = Vector::constant_null(to);
         return Ok(());
     }

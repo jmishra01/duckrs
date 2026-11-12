@@ -5595,7 +5595,12 @@ mod tests {
             run(&mut context, "SELECT unnest([1, 2]), unnest(['a'])"),
             [["1", "a"], ["2", "NULL"]]
         );
-        assert_eq!(run(&mut context, "SELECT unnest(unnest([[1], [2]]))"), [["1"], ["2"]]);
+        // an UNNEST of an UNNEST is refused; the levels are asked for with `recursive` (`UnnestBinder`)
+        assert_eq!(
+            run(&mut context, "SELECT unnest([[1], [2]], recursive := true)"),
+            [["1"], ["2"]]
+        );
+        assert!(context.query("SELECT unnest(unnest([[1], [2]]))").is_err());
         assert_eq!(
             run(&mut context, "SELECT list(i ORDER BY i DESC) FROM t"),
             [["[3, 2, 1]"]]

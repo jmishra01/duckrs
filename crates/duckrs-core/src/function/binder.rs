@@ -339,6 +339,52 @@ fn check_constant_parameters(name: &str, children: &mut [BoundExpr]) -> Result<(
     }
 }
 
+/// The `T` and `LIST(T)` of `histogram(arg T, bins LIST(T))`: the type both have in common, and DOUBLE for a
+/// DECIMAL (`GetHistogramBinFunction`).
+fn histogram_bin_arguments(name: &str, mut children: Vec<BoundExpr>) -> Result<Vec<BoundExpr>> {
+    let arg = expression_return_type(&children[0]);
+    let bins = expression_return_type(&children[1]);
+    let element = match bins.id() {
+        LogicalTypeId::List | LogicalTypeId::Array => bins.child_type().cloned(),
+        LogicalTypeId::SqlNull => Some(LogicalType::SQLNULL),
+        _ => None,
+    };
+    // a VARCHAR next to a type that is not a string is no type both have, as a template deduces it
+    let varchar = |t: &LogicalType| t.id() == LogicalTypeId::Varchar;
+    let stringy = |t: &LogicalType| {
+        matches!(
+            t.id(),
+            LogicalTypeId::Varchar | LogicalTypeId::StringLiteral | LogicalTypeId::SqlNull
+        )
+    };
+    let common = element
+        .filter(|e| (stringy(e) || !varchar(&arg)) && (stringy(&arg) || !varchar(e)))
+        .and_then(|e| super::combine_types::try_max_logical_type(&arg, &e));
+    let Some(mut common) = common.map(|t| super::combine_types::normalize_type(&t)) else {
+        let deduction = match bins.child_type() {
+            Some(element) => format!(
+                "\n\tCannot deduce template type 'T', it was inferred to be:\n  - '{arg}', from first occurrence\n  - \
+                 '{element}', which is incompatible with the previously inferred type"
+            ),
+            None => String::new(),
+        };
+        return Err(binder_error(format!(
+            "No function matches the given name and argument types '{name}({arg}, {bins})'. You might need to add \
+             explicit type casts.{deduction}"
+        )));
+    };
+    if common.id() == LogicalTypeId::Decimal {
+        common = LogicalType::DOUBLE;
+    }
+    if common.id() == LogicalTypeId::SqlNull {
+        common = LogicalType::INTEGER;
+    }
+    let list = LogicalType::list(common.clone());
+    let bins = children.pop().expect("two arguments");
+    let arg = children.pop().expect("two arguments");
+    Ok(vec![arg.cast_to(&common, false), bins.cast_to(&list, false)])
+}
+
 /// `FunctionBinder::BindAggregateFunction`: selects the overload and casts the arguments. ANY
 /// and DECIMAL parameters take the argument as it is, and may decide the return type.
 pub fn bind_aggregate_function(
@@ -349,6 +395,9 @@ pub fn bind_aggregate_function(
 ) -> Result<BoundAggregate> {
     let mut children = children;
     check_constant_parameters(&set.name, &mut children)?;
+    if matches!(set.name.as_str(), "histogram" | "histogram_exact") && children.len() == 2 {
+        children = histogram_bin_arguments(&set.name, children)?;
+    }
     let arguments: Vec<LogicalType> = children.iter().map(expression_return_type).collect();
     let function: Arc<AggregateFunction> = select_overload(&set.name, &set.functions, |f| &f.arguments, &arguments)?;
     let children: Vec<BoundExpr> = children

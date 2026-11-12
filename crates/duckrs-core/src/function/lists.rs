@@ -327,20 +327,16 @@ fn list_where(args: &DataChunk, result: &mut Vector) -> Result<()> {
     let ty = result.logical_type().clone();
     strict_rows(args, result, |row| {
         let (values, mask) = (items(&row[0]), items(&row[1]));
-        if values.len() != mask.len() {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "list_where: The list and the mask must have the same length",
-            ));
-        }
         if mask.iter().any(Value::is_null) {
             return Err(null_selection());
         }
-        let picked = values
+        // `SetSelectionVectorWhere`: a TRUE past the end of the list selects a NULL
+        let element = ty.child_type().cloned().unwrap_or(LogicalType::SQLNULL);
+        let picked = mask
             .iter()
-            .zip(mask)
+            .enumerate()
             .filter(|(_, keep)| matches!(keep.data(), ValueData::Bool(true)))
-            .map(|(value, _)| value.clone())
+            .map(|(at, _)| values.get(at).cloned().unwrap_or_else(|| Value::null(element.clone())))
             .collect();
         Value::new(ty.clone(), ValueData::List(picked))
     })
@@ -609,6 +605,25 @@ pub fn bind_list_function(name: &str, children: Vec<BoundExpr>) -> Result<BoundE
             Ok(bound_function("flatten", vec![list], ty, flatten))
         }
         "list_resize" | "array_resize" => {
+            // a NULL list resizes to NULL, whatever the fill
+            if children
+                .first()
+                .is_some_and(|c| c.return_type.id() == LogicalTypeId::SqlNull)
+                && (2..=3).contains(&children.len())
+            {
+                return Ok(BoundExpr::constant(Value::sql_null()));
+            }
+            if let Some(first) = children.first()
+                && !matches!(
+                    first.return_type.id(),
+                    LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Unknown
+                )
+            {
+                return Err(Error::new(
+                    ErrorKind::Binder,
+                    format!("\"{lower}\" can only operate on LISTs"),
+                ));
+            }
             let (list, element) = list_arg(&children)?;
             if !(2..=3).contains(&children.len()) {
                 return Err(no_match(&lower, &children));

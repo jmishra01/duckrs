@@ -292,6 +292,16 @@ fn ascii(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+// Ported from duckdb/extension/core_functions/scalar/string/parse_formatted_bytes.cpp @ rust-port-baseline
+/// `parse_formatted_bytes('1.5 KiB')`: the bytes a size as `memory_limit` spells it stands for.
+fn parse_formatted_bytes(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| {
+        crate::execution::temporary::parse_formatted_bytes(&text(&row[0]))
+            .map(Value::ubigint)
+            .map_err(|message| duckrs_common::Error::new(duckrs_common::ErrorKind::InvalidInput, message))
+    })
+}
+
 fn unicode(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
         Ok(Value::integer(text(&row[0]).chars().next().map_or(-1, |c| c as i32)))
@@ -887,6 +897,12 @@ pub fn string_functions() -> Vec<ScalarFunctionSet> {
         ("strpos", vec![v.clone(), v.clone()], i.clone(), instr),
         ("position", vec![v.clone(), v.clone()], i.clone(), instr),
         ("ascii", vec![v.clone()], LogicalType::INTEGER, ascii),
+        (
+            "parse_formatted_bytes",
+            vec![v.clone()],
+            LogicalType::UBIGINT,
+            parse_formatted_bytes,
+        ),
         ("unicode", vec![v.clone()], LogicalType::INTEGER, unicode),
         ("ord", vec![v.clone()], LogicalType::INTEGER, unicode),
         (

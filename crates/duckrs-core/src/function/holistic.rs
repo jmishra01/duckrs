@@ -60,6 +60,10 @@ pub enum Holistic {
     CombineAggr,
     CountIf,
     Histogram,
+    /// `histogram(x, bins)`: how many values fall at or below each bin and above the one before
+    HistogramBins,
+    /// `histogram_exact(x, bins)`: how many values equal each bin
+    HistogramExact,
     ApproxCountDistinct,
     Fsum,
     Favg,
@@ -76,6 +80,9 @@ pub enum Holistic {
     RegrSxx,
     RegrSyy,
     RegrSxy,
+    /// `SortedAggregateFunction` for EXPORT_STATE: the rows of an ordered aggregate, buffered as they arrive, with
+    /// their sort keys; they are sorted when the state is finalized
+    Sorted,
 }
 
 /// The type of `quantile_cont` and `median` of a column of type `input`.
@@ -104,7 +111,9 @@ impl Holistic {
             (Median, Some(ty)) => interpolated_type(ty),
             (QuantileCont, Some(ty)) => quantile(interpolated_type(ty)),
             (QuantileDisc, Some(ty)) => quantile(ty.clone()),
-            (Histogram, Some(ty)) => LogicalType::map(ty.clone(), LogicalType::UBIGINT),
+            (Histogram | HistogramBins | HistogramExact, Some(ty)) => {
+                LogicalType::map(ty.clone(), LogicalType::UBIGINT)
+            }
             (
                 Mode | BitAnd | BitOr | BitXor | ArgMin | ArgMax | ArgMinNull | ArgMaxNull | ArgMinNullsLast
                 | ArgMaxNullsLast | AvgTimestamp | AvgTimeTz,
@@ -780,6 +789,140 @@ fn histogram(rows: &[Value], ty: &LogicalType) -> Result<Value> {
     Value::new(ty.clone(), ValueData::List(entries))
 }
 
+// Ported from duckdb/extension/core_functions/aggregate/nested/binned_histogram.cpp @ rust-port-baseline
+/// `HistogramBinFunction`: the counts per bin of the bins the first row gives, and of the values above all of them
+/// (or, `exact`, equal to none of them) under the key of the "other values" bucket.
+fn binned_histogram(rows: &[Value], ty: &LogicalType, exact: bool) -> Result<Value> {
+    let chosen: Vec<&Value> = rows.iter().filter(|row| !fields(row)[0].is_null()).collect();
+    let Some(first) = chosen.first() else {
+        return Ok(Value::null(ty.clone()));
+    };
+    let bins = &fields(first)[1];
+    let ValueData::List(boundaries) = bins.data() else {
+        return Err(Error::new(ErrorKind::Binder, "Histogram bin list cannot be NULL"));
+    };
+    if boundaries.iter().any(Value::is_null) {
+        return Err(Error::new(ErrorKind::Binder, "Histogram bin entry cannot be NULL"));
+    }
+    let key_type = ty
+        .child_type()
+        .and_then(|entry| entry.struct_children().first())
+        .map(|(_, t)| t.clone())
+        .unwrap_or(LogicalType::SQLNULL);
+    let mut boundaries = sorted(boundaries.clone())?;
+    let mut keys = sort_keys(&boundaries, &key_type)?;
+    let mut at = 1;
+    while at < boundaries.len() {
+        if keys[at] == keys[at - 1] {
+            boundaries.remove(at);
+            keys.remove(at);
+        } else {
+            at += 1;
+        }
+    }
+    let mut counts = vec![0u64; boundaries.len() + 1];
+    let values: Vec<Value> = chosen.iter().map(|row| fields(row)[0].clone()).collect();
+    for key in sort_keys(&values, &key_type)? {
+        let bin = keys.partition_point(|k| *k < key);
+        let bin = if exact && keys.get(bin) != Some(&key) {
+            keys.len()
+        } else {
+            bin
+        };
+        counts[bin] += 1;
+    }
+    let entry_type = ty.child_type().expect("a MAP has entries").clone();
+    let mut entries = Vec::with_capacity(counts.len());
+    for (boundary, count) in boundaries.iter().zip(&counts) {
+        entries.push(Value::new(
+            entry_type.clone(),
+            ValueData::Struct(vec![boundary.clone(), Value::ubigint(*count)]),
+        )?);
+    }
+    let others = counts[boundaries.len()];
+    if others > 0
+        && let Some(other) = other_bucket_value(&key_type)?
+    {
+        let other_key = sort_keys(std::slice::from_ref(&other), &key_type)?;
+        if keys.iter().any(|k| *k == other_key[0]) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "Histogram bin {} collides with the key of the \"other values\" bucket, which has entries - use a \
+                     different bin value",
+                    BoundExpr::constant(other.clone())
+                ),
+            ));
+        }
+        entries.push(Value::new(
+            entry_type,
+            ValueData::Struct(vec![other, Value::ubigint(others)]),
+        )?);
+    }
+    Value::new(ty.clone(), ValueData::List(entries))
+}
+
+/// How two values of `ty` order, as their sort keys do.
+pub(super) fn compare(left: &Value, right: &Value, ty: &LogicalType) -> Result<std::cmp::Ordering> {
+    let keys = sort_keys(&[left.clone(), right.clone()], ty)?;
+    Ok(keys[0].cmp(&keys[1]))
+}
+
+/// `Value::NotDistinctFrom` of two values of `ty`.
+pub(super) fn not_distinct(left: &Value, right: &Value, ty: &LogicalType) -> Result<bool> {
+    let keys = sort_keys(&[left.clone(), right.clone()], ty)?;
+    Ok(keys[0] == keys[1])
+}
+
+/// `SupportsOtherBucket` + `OtherBucketValue`: the key the values in no bin are counted under, if the type has one.
+pub(super) fn other_bucket_value(ty: &LogicalType) -> Result<Option<Value>> {
+    use LogicalTypeId as L;
+    if ty.alias().is_some() {
+        return Ok(None);
+    }
+    let cast = |text: &str| crate::execution::parquet::cast_value(&Value::varchar(text), ty).map(Some);
+    match ty.id() {
+        L::TinyInt => Ok(Some(Value::tinyint(i8::MAX))),
+        L::SmallInt => Ok(Some(Value::smallint(i16::MAX))),
+        L::Integer => Ok(Some(Value::integer(i32::MAX))),
+        L::BigInt => Ok(Some(Value::bigint(i64::MAX))),
+        L::HugeInt => Ok(Some(Value::hugeint(i128::MAX))),
+        L::UTinyInt => Ok(Some(Value::new(ty.clone(), ValueData::UInt8(u8::MAX))?)),
+        L::USmallInt => Ok(Some(Value::new(ty.clone(), ValueData::UInt16(u16::MAX))?)),
+        L::UInteger => Ok(Some(Value::new(ty.clone(), ValueData::UInt32(u32::MAX))?)),
+        L::UBigInt => Ok(Some(Value::ubigint(u64::MAX))),
+        L::UHugeInt => Ok(Some(Value::new(ty.clone(), ValueData::UInt128(u128::MAX))?)),
+        L::Decimal => {
+            let (width, scale) = ty.decimal_properties().unwrap_or((18, 3));
+            let digits = "9".repeat(usize::from(width - scale));
+            let fraction = "9".repeat(usize::from(scale));
+            let text = if scale == 0 {
+                digits
+            } else {
+                format!("{digits}.{fraction}")
+            };
+            cast(&text)
+        }
+        L::Time => cast("24:00:00"),
+        L::TimeTz => cast("24:00:00-15:59:59"),
+        L::Date | L::Timestamp | L::TimestampTz | L::TimestampSec | L::TimestampMs | L::TimestampNs => cast("infinity"),
+        L::Float => Ok(Some(Value::float(f32::INFINITY))),
+        L::Double => Ok(Some(Value::double(f64::INFINITY))),
+        L::Varchar => Ok(Some(Value::varchar(""))),
+        L::Blob => Ok(Some(Value::blob(Vec::new()))),
+        L::Struct => {
+            let fields = ty
+                .struct_children()
+                .iter()
+                .map(|(_, t)| Value::null(t.clone()))
+                .collect();
+            Ok(Some(Value::new(ty.clone(), ValueData::Struct(fields))?))
+        }
+        L::List => Ok(Some(Value::new(ty.clone(), ValueData::List(Vec::new()))?)),
+        _ => Ok(None),
+    }
+}
+
 fn distinct_count(rows: &[Value]) -> Result<i64> {
     let values: Vec<Value> = rows.iter().filter(|v| !v.is_null()).cloned().collect();
     let Some(first) = values.first() else {
@@ -908,10 +1051,9 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
             let (n, _, square, _, _) = moments(&values);
             let variance = square / if sample { n - 1.0 } else { n };
             match kind {
-                StddevSamp => checked("STDDEV_SAMP", variance.sqrt())?,
-                StddevPop => checked("STDDEV_POP", variance.sqrt())?,
-                VarSamp => checked("VARSAMP", variance)?,
-                _ => checked("VARPOP", variance)?,
+                // IEEE-754: an overflowing variance is infinite (`STDDevBaseOperation`)
+                StddevSamp | StddevPop => Value::double(variance.sqrt()),
+                _ => Value::double(variance),
             }
         }
         Sem => {
@@ -920,7 +1062,7 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
                 return Ok(null());
             }
             let (n, _, square, _, _) = moments(&values);
-            checked("SEM", (square / n).sqrt() / n.sqrt())?
+            Value::double((square / n).sqrt() / n.sqrt())
         }
         AvgInterval => {
             let (mut months, mut days, mut micros, mut count) = (0i32, 0i32, 0i64, 0i64);
@@ -1075,6 +1217,10 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
             Value::hugeint(count as i128)
         }
         Histogram => histogram(rows, ty)?,
+        Sorted if rows.is_empty() => null(),
+        Sorted => Value::new(ty.state_layout(), ValueData::List(rows.to_vec()))?,
+        HistogramBins => binned_histogram(rows, ty, false)?,
+        HistogramExact => binned_histogram(rows, ty, true)?,
         ApproxCountDistinct => Value::bigint(distinct_count(rows)?),
         Fsum | Favg => {
             let values = numbers(rows);

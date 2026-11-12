@@ -398,12 +398,34 @@ impl Binder<'_> {
 
     /// `PragmaShowTables`: the names on the search path.
     fn show_tables(&mut self, table_ref: &TableRef, schema: Option<&str>) -> Result<LogicalOperator> {
+        self.show_tables_matching(table_ref, &|binder, listed| match schema {
+            Some(schema) => listed.schema.name.eq_ignore_ascii_case(schema),
+            // `in_search_path(database_name, schema_name)`
+            None => binder.in_search_path(&listed.database, &listed.schema.name),
+        })
+    }
+
+    /// `PragmaShowTables(database, schema)`: the tables and views of a database, or of one of its schemas.
+    fn show_tables_from(
+        &mut self,
+        table_ref: &TableRef,
+        database: &str,
+        schema: Option<&str>,
+    ) -> Result<LogicalOperator> {
+        self.show_tables_matching(table_ref, &|_, listed| {
+            listed.database.eq_ignore_ascii_case(database)
+                && schema.is_none_or(|schema| listed.schema.name.eq_ignore_ascii_case(schema))
+        })
+    }
+
+    fn show_tables_matching(
+        &mut self,
+        table_ref: &TableRef,
+        wanted: &dyn Fn(&Self, &ListedEntry) -> bool,
+    ) -> Result<LogicalOperator> {
         let mut names: Vec<String> = Vec::new();
         for listed in self.listed_entries() {
-            let wanted = match schema {
-                Some(schema) => listed.schema.name.eq_ignore_ascii_case(schema),
-                None => true,
-            };
+            let wanted = wanted(self, &listed);
             if wanted {
                 names.push(listed.entry.name().to_string());
             }
@@ -501,21 +523,46 @@ impl Binder<'_> {
             return self.bind_describe_query(table_ref, query);
         }
         if show.show_type == ShowType::ShowFrom {
-            let schema = if show.schema.is_empty() {
-                show.catalog.clone()
-            } else {
-                show.schema.clone()
-            };
-            if self.catalog.get_schema(&schema).is_none() {
-                return Err(duckrs_common::Error::new(
-                    ErrorKind::Catalog,
-                    format!(
-                        "SHOW TABLES FROM: No catalog + schema named \"{}.{schema}\" found.",
-                        self.catalog.name
-                    ),
-                ));
+            let current = self
+                .session
+                .as_ref()
+                .map_or_else(|| self.catalog.name.clone(), |session| session.database.clone());
+            let (mut catalog, mut schema) = (show.catalog.clone(), show.schema.clone());
+            if schema.is_empty() {
+                std::mem::swap(&mut catalog, &mut schema);
             }
-            return self.show_tables(table_ref, Some(&schema));
+            let databases: Vec<String> = self.catalog.databases().iter().map(|d| d.name.clone()).collect();
+            let is_database = |name: &str| databases.iter().any(|d| d.eq_ignore_ascii_case(name));
+            // `BindSchemaOrCatalog`: a lone name that is a database and no schema of this one names the database
+            if catalog.is_empty() && self.catalog.get_schema(&schema).is_none() && is_database(&schema) {
+                catalog = std::mem::take(&mut schema);
+            }
+            let schema_exists = |binder: &Self, database: &str, schema: &str| {
+                if database.eq_ignore_ascii_case(&current) {
+                    return binder.catalog.get_schema(schema).is_some();
+                }
+                let mut found = false;
+                binder
+                    .catalog
+                    .with_database(database, &mut |c| found = c.get_schema(schema).is_some());
+                found
+            };
+            let not_found = |database: &str, schema: &str| {
+                duckrs_common::Error::new(
+                    ErrorKind::Catalog,
+                    format!("SHOW TABLES FROM: No catalog + schema named \"{database}.{schema}\" found."),
+                )
+            };
+            if catalog.is_empty() {
+                if !schema_exists(self, &current, &schema) {
+                    return Err(not_found(&current, &schema));
+                }
+                catalog = current.clone();
+            } else if !schema.is_empty() && (!is_database(&catalog) || !schema_exists(self, &catalog, &schema)) {
+                return Err(not_found(&catalog, &schema));
+            }
+            let schema = (!schema.is_empty()).then_some(schema);
+            return self.show_tables_from(table_ref, &catalog, schema.as_deref());
         }
         let Some(name) = &show.name else {
             return self.show_all_tables(table_ref);
@@ -901,6 +948,31 @@ impl Binder<'_> {
             }
         }
         result
+    }
+
+    /// `CatalogSearchPath::SchemaInSearchPath`: `temp.main`, the schemas that were set, and `main` of the database
+    /// statements run in.
+    fn in_search_path(&self, database: &str, schema: &str) -> bool {
+        if database.eq_ignore_ascii_case("temp") || schema.eq_ignore_ascii_case(TEMP_SCHEMA) {
+            return true;
+        }
+        let current = self
+            .session
+            .as_ref()
+            .map_or_else(|| self.catalog.name.clone(), |session| session.database.clone());
+        let set = self.session.as_ref().map(|s| s.search_path.clone()).unwrap_or_default();
+        let in_current = database.eq_ignore_ascii_case(&current);
+        if in_current && schema.eq_ignore_ascii_case("main") {
+            return true;
+        }
+        set.iter().any(|path| match path.split_once('.') {
+            Some((db, s)) => db.eq_ignore_ascii_case(database) && s.eq_ignore_ascii_case(schema),
+            // a schema of the database statements run in, or a database whose default schema it is
+            None => {
+                (in_current && path.eq_ignore_ascii_case(schema))
+                    || (path.eq_ignore_ascii_case(database) && schema.eq_ignore_ascii_case("main"))
+            }
+        })
     }
 
     /// `Catalog::GetAllSchemas`: the schemas of all databases, by database and then name, with

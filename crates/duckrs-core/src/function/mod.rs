@@ -5,6 +5,7 @@
 
 pub mod aggregates;
 pub mod binder;
+mod binning;
 mod bit_casts;
 mod bit_functions;
 pub mod cast;
@@ -16,6 +17,7 @@ pub mod extras;
 pub mod generic;
 pub(crate) mod geometry;
 pub(crate) mod holistic;
+mod holistic_states;
 pub mod json;
 pub mod json_serialize;
 mod lists;
@@ -25,6 +27,7 @@ mod nested_casts;
 pub(crate) mod operators;
 mod printf;
 pub(crate) mod regexp;
+mod remap_struct;
 mod string_nested;
 mod strings;
 pub mod test_all_types;

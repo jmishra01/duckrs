@@ -287,6 +287,67 @@ impl Binder<'_> {
     /// parameters, `VARCHAR(n)` and `DECIMAL(width, scale)`.
     /// A type of a database file that names a type of the catalog: its SQL is what would name it
     /// in a query.
+    /// `BindMakeTypeFunctionExpression`: the arguments, constants, spelled as the type they make, then bound.
+    fn bind_make_type(&mut self, function: &ast::FunctionExpr) -> Result<BoundExpr> {
+        let mut arguments = Vec::with_capacity(function.args.len());
+        for argument in &function.args {
+            let bound = self.bind_expression(&argument.expr)?;
+            if !bound.is_foldable() {
+                return Err(binder_error(
+                    "make_type function arguments must be constant expressions",
+                ));
+            }
+            let value = crate::execution::expression_executor::evaluate_scalar(&bound)?;
+            arguments.push((argument.name.clone(), value));
+        }
+        let Some((_, name)) = arguments.first() else {
+            return Err(binder_error("make_type function requires at least one argument"));
+        };
+        if name.logical_type().id() != LogicalTypeId::Varchar || name.is_null() {
+            return Err(binder_error(
+                "make_type function first argument must be the type name as VARCHAR",
+            ));
+        }
+        let name = name.try_to_string()?;
+        if name.is_empty() {
+            return Err(Error::new(
+                ErrorKind::Parser,
+                "Zero-length identifier in qualified name",
+            ));
+        }
+        let upper = name.to_uppercase();
+        let parameter = |(alias, value): &(String, Value)| -> Result<String> {
+            let text = match value.logical_type().id() {
+                LogicalTypeId::Type => value.try_to_string()?,
+                LogicalTypeId::Varchar => format!("'{}'", value.try_to_string()?.replace('\'', "''")),
+                _ => value.try_to_string()?,
+            };
+            Ok(if alias.is_empty() {
+                text
+            } else {
+                format!("{} {text}", quote_identifier(alias))
+            })
+        };
+        let parameters = arguments[1..].iter().map(parameter).collect::<Result<Vec<_>>>()?;
+        if upper == "STRUCT" && arguments[1..].iter().any(|(alias, _)| alias.is_empty()) {
+            let types: Vec<String> = arguments[1..]
+                .iter()
+                .map(|(_, v)| v.logical_type().to_string())
+                .collect();
+            return Err(binder_error(format!(
+                "Type \"STRUCT\" does not accept type parameters ({})",
+                types.join(", ")
+            )));
+        }
+        let text = match (upper.as_str(), parameters.as_slice()) {
+            (_, []) => quote_identifier(&name),
+            ("LIST", [child]) => format!("{child}[]"),
+            _ => format!("{}({})", quote_identifier(&name), parameters.join(", ")),
+        };
+        let ty = self.bind_named_type(&LogicalType::unbound(text))?;
+        Ok(BoundExpr::constant(type_value(&ty)))
+    }
+
     fn bind_named_type(&self, ty: &LogicalType) -> Result<LogicalType> {
         let statements = duckrs_parser::parse_ast(&format!("SELECT CAST(NULL AS {ty})"))?;
         if let [ast::Statement::Select(select)] = statements.as_slice()
@@ -1352,15 +1413,55 @@ impl Binder<'_> {
                     };
                     return self.bind_case(&[(condition.expr.clone(), then.expr.clone())], &otherwise.expr);
                 }
-                if is_generic_function(&function.name.name) || is_unnest(&function.name.name) {
+                if is_unnest(&function.name.name) && function.args.len() > 1 {
+                    // the levels the options ask for, as one UNNEST each
+                    let (max_depth, _) = self.unnest_options(function)?;
+                    let argument = &function.args[0].expr;
+                    let ty = self.bind_expression(argument)?.return_type;
+                    let (lists, structs) = super::statements::unnest_depths(&ty, max_depth);
+                    if structs > 0 {
+                        return Err(binder_error(
+                            "UNNEST() on a struct column can only be applied as the root element of a SELECT \
+                             expression",
+                        ));
+                    }
+                    let mut nested = argument.clone();
+                    for _ in 0..lists.max(1) {
+                        let mut unnest = function.clone();
+                        unnest.name.name = super::statements::UNNEST_LEVEL.into();
+                        unnest.args = vec![duckrs_parser::ast::FunctionArgument::positional(nested)];
+                        nested = Expr::from(ExprKind::Function(unnest));
+                    }
+                    nested.alias = expr.alias.clone();
+                    return self.bind_expression(&nested);
+                }
+                let level = function.name.name == super::statements::UNNEST_LEVEL;
+                if level || is_unnest(&function.name.name) {
+                    if !level && self.unnest_level > 0 {
+                        return Err(binder_error(
+                            "Nested UNNEST calls are not supported - use UNNEST(x, recursive := true) to unnest \
+                             multiple levels",
+                        ));
+                    }
+                    if !level {
+                        self.unnest_level += 1;
+                    }
+                    let children = function
+                        .args
+                        .iter()
+                        .map(|a| self.bind_expression(&a.expr))
+                        .collect::<Result<Vec<_>>>();
+                    if !level {
+                        self.unnest_level -= 1;
+                    }
+                    return bind_unnest(children?);
+                }
+                if is_generic_function(&function.name.name) {
                     let children = function
                         .args
                         .iter()
                         .map(|a| self.bind_expression(&a.expr))
                         .collect::<Result<Vec<_>>>()?;
-                    if is_unnest(&function.name.name) {
-                        return bind_unnest(children);
-                    }
                     return bind_generic_function(&function.name.name, children);
                 }
                 if ["st_crs", "st_setcrs"]
@@ -1416,6 +1517,25 @@ impl Binder<'_> {
                     && function.name.qualification.is_empty()
                 {
                     return self.bind_parse_log_message(function);
+                }
+                // Ported from duckdb/extension/core_functions/scalar/generic/type_functions.cpp @ rust-port-baseline
+                // `get_type(x)`: the type of `x`, as a TYPE
+                if function.name.name.eq_ignore_ascii_case("get_type")
+                    && function.name.qualification.is_empty()
+                    && function.args.len() == 1
+                {
+                    let child = self.bind_expression(&function.args[0].expr)?;
+                    if child.return_type.id() == LogicalTypeId::Unknown {
+                        return Err(Error::new(
+                            ErrorKind::ParameterNotResolved,
+                            "Parameter types could not be resolved",
+                        ));
+                    }
+                    return Ok(BoundExpr::constant(type_value(&child.return_type)));
+                }
+                // `make_type(name, ...)`: the type the name and its parameters make, as a TYPE
+                if function.name.name.eq_ignore_ascii_case("make_type") && function.name.qualification.is_empty() {
+                    return self.bind_make_type(function);
                 }
                 if function.name.name.eq_ignore_ascii_case("to_aggregate_state") {
                     let children = function
@@ -2140,6 +2260,8 @@ impl Binder<'_> {
                 aggregate.distinct_key = Some(key);
             }
         }
+        // the keys as written, which an exported ordered state buffers
+        let written_order: Vec<(BoundExpr, duckrs_common::sort_key::OrderModifiers)> = order_by.clone();
         // `BindAggregate`: the rows are ordered as the collation of their sort keys says
         aggregate.order_by = order_by
             .into_iter()
@@ -2156,11 +2278,97 @@ impl Binder<'_> {
                      set of distinct values, so combining states would produce incorrect results",
                 ));
             }
-            let arguments: Vec<LogicalType> = aggregate.children.iter().map(|c| c.return_type.clone()).collect();
-            let (exported, ty) =
-                crate::function::aggregates::export_state(&aggregate.function, &aggregate.return_type, &arguments)?;
-            aggregate.function = Arc::new(exported);
-            aggregate.return_type = ty;
+            // the arguments of an aggregate that keeps its rows arrive packed into one STRUCT
+            let packed = matches!(
+                aggregate.function.kind,
+                crate::function::aggregates::AggregateKind::Holistic(_)
+            ) && aggregate.function.arguments.len() > 1;
+            let arguments: &[BoundExpr] = match aggregate.children.as_slice() {
+                [
+                    BoundExpr {
+                        kind: BoundExprKind::Function { children, .. },
+                        ..
+                    },
+                ] if packed => children,
+                children => children,
+            };
+            let types: Vec<LogicalType> = arguments.iter().map(|c| c.return_type.clone()).collect();
+            // `EncodeStateParameters`: the constants the arguments after the first were bound to
+            let takes_constants = matches!(
+                aggregate.function.kind,
+                crate::function::aggregates::AggregateKind::Holistic(
+                    crate::function::holistic::Holistic::StringAgg
+                        | crate::function::holistic::Holistic::QuantileCont
+                        | crate::function::holistic::Holistic::QuantileDisc
+                )
+            );
+            let constants: Vec<Option<Value>> = if takes_constants && arguments.len() > 1 {
+                arguments
+                    .iter()
+                    .enumerate()
+                    .map(|(at, argument)| {
+                        (at > 0 && argument.is_foldable())
+                            .then(|| crate::execution::expression_executor::evaluate_scalar(argument))
+                            .transpose()
+                    })
+                    .collect::<Result<_>>()?
+            } else {
+                Vec::new()
+            };
+            if !aggregate.order_by.is_empty() {
+                // `CreateSortedAggregateStateType`: the rows buffered as they arrive, the arguments and then the keys
+                // that are not one of them, and sorted when the state is finalized
+                let mut buffered: Vec<BoundExpr> = arguments.to_vec();
+                let mut orders = Vec::with_capacity(written_order.len());
+                for (expr, modifiers) in &written_order {
+                    let key = format!("{:?}", expr.kind);
+                    let column = match buffered.iter().position(|b| format!("{:?}", b.kind) == key) {
+                        Some(column) => column,
+                        None => {
+                            buffered.push(expr.clone());
+                            buffered.len() - 1
+                        }
+                    };
+                    orders.push(duckrs_common::types::StateOrder {
+                        column: column as u32,
+                        descending: modifiers.order == duckrs_common::sort_key::OrderType::Descending,
+                        nulls_first: modifiers.nulls == duckrs_common::sort_key::NullOrder::NullsFirst,
+                    });
+                }
+                let names = (0..buffered.len()).map(|i| format!("v{i}")).collect();
+                let pack = crate::function::nested::bind_struct_pack(names, buffered)?;
+                let ty = LogicalType::aggregate_state_of(
+                    &LogicalType::list(pack.return_type.clone()),
+                    &aggregate.function.name,
+                    duckrs_common::types::UNRESOLVED_OVERLOAD,
+                    types,
+                    aggregate.return_type.clone(),
+                )
+                .with_state_constants(constants)
+                .with_state_orders(orders);
+                let sorted = crate::function::aggregates::AggregateFunction {
+                    name: aggregate.function.name.clone(),
+                    arguments: vec![LogicalType::new(LogicalTypeId::Any)],
+                    return_type: ty.clone(),
+                    kind: crate::function::aggregates::AggregateKind::Holistic(
+                        crate::function::holistic::Holistic::Sorted,
+                    ),
+                    export: Some(ty.clone()),
+                };
+                aggregate.function = Arc::new(sorted);
+                aggregate.children = vec![pack];
+                aggregate.order_by.clear();
+                aggregate.return_type = ty;
+            } else {
+                let (exported, ty) = crate::function::aggregates::export_state(
+                    &aggregate.function,
+                    &aggregate.return_type,
+                    &types,
+                    constants,
+                )?;
+                aggregate.function = Arc::new(exported);
+                aggregate.return_type = ty;
+            }
         }
         let state = self.aggregates.as_mut().expect("still bound");
         state.inside_aggregate = false;
@@ -2647,5 +2855,25 @@ mod tests {
         assert_eq!(ty(".5"), LogicalType::decimal(1, 1));
         assert_eq!(ty("1e3"), LogicalType::DOUBLE);
         assert_eq!(number_to_value("-0.25").unwrap().try_to_string().unwrap(), "-0.25");
+    }
+}
+
+/// `Value::TYPE`: a type as a value of the TYPE type, which keeps it serialized.
+pub(crate) fn type_value(ty: &LogicalType) -> Value {
+    let bytes = duckrs_common::serializer::BinarySerializer::serialize(
+        ty,
+        duckrs_common::serializer::SerializationOptions::default(),
+    );
+    Value::new(LogicalType::new(LogicalTypeId::Type), ValueData::Bytes(bytes)).expect("TYPE is stored as bytes")
+}
+
+/// An identifier as SQL spells it: quoted unless it needs no quotes.
+fn quote_identifier(name: &str) -> String {
+    let plain = name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if plain {
+        name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
     }
 }

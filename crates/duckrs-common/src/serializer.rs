@@ -1610,7 +1610,7 @@ impl Serialize for LogicalType {
             s.write_object_value(|s| {
                 s.write_property(100, "type", &TypeInfoType(info_type));
                 s.write_property_with_default(101, "alias", self.alias().unwrap_or(""));
-                s.write_property_with_default(103, "extension_info", &None::<u8>);
+                write_extension_info(self, s);
                 match info_type {
                     type_info::DECIMAL => {
                         let (w, sc) = self.decimal_properties().expect("DECIMAL has properties");
@@ -1676,12 +1676,14 @@ impl Deserialize for LogicalType {
                 let TypeInfoType(info_type) = d.read_property(100, "type")?;
                 let alias: String = d.read_property_with_default(101, "alias")?;
                 d.read_deleted_property::<Vec<Value>>(102, "modifiers")?;
-                if d.is_json() && d.has_named_property(103, "extension_info")? {
+                let mut state: Option<StateProperties> = None;
+                if d.has_named_property(103, "extension_info")? {
                     d.set_tag("extension_info");
+                    if !d.is_json() {
+                        d.next_field()?;
+                    }
                     if d.begin_nullable()? {
-                        return Err(Error::not_implemented(
-                            "deserializing extension type info is not supported yet",
-                        ));
+                        state = read_extension_info(d)?;
                     }
                 }
                 // `LogicalType::Deserialize`: info of parameters the type doesn't have
@@ -1805,10 +1807,220 @@ impl Deserialize for LogicalType {
                         )));
                     }
                 };
+                // an AGGREGATE_STATE: the layout, aliased, with the function and signature to re-bind it by
+                if let Some(state) = state
+                    && alias == "AGGREGATE_STATE"
+                {
+                    return Ok(LogicalType::aggregate_state_of(
+                        &base,
+                        &state.function,
+                        crate::types::UNRESOLVED_OVERLOAD,
+                        state.arguments,
+                        LogicalType::SQLNULL,
+                    )
+                    .with_state_constants(state.constants)
+                    .with_state_orders(state.orders));
+                }
                 Ok(if alias.is_empty() { base } else { base.with_alias(alias) })
             })
         })
     }
+}
+
+/// What the `extension_info` of an AGGREGATE_STATE says (`EncodeStateParameters`).
+struct StateProperties {
+    function: String,
+    arguments: Vec<LogicalType>,
+    constants: Vec<Option<Value>>,
+    orders: Vec<crate::types::StateOrder>,
+}
+
+/// `ExtensionTypeInfo::Serialize`: an AGGREGATE_STATE keeps the function's name and the types of its arguments,
+/// with the constants some were bound to, in its `properties`; other types have no extension info.
+fn write_extension_info(ty: &LogicalType, s: &mut BinarySerializer) {
+    let Some((function, _, arguments, _)) = ty.aggregate_state_info().filter(|_| ty.is_aggregate_state()) else {
+        s.write_property_with_default(103, "extension_info", &None::<u8>);
+        return;
+    };
+    let constants = ty.aggregate_state_constants();
+    let type_value = |t: &LogicalType| {
+        Value::new(
+            LogicalType::new(LogicalTypeId::Type),
+            ValueData::Bytes(BinarySerializer::serialize(t, SerializationOptions::default())),
+        )
+        .expect("TYPE is stored as bytes")
+    };
+    let parameters = if constants.iter().all(Option::is_none) {
+        let items = arguments.iter().map(type_value).collect();
+        Value::new(
+            LogicalType::list(LogicalType::new(LogicalTypeId::Type)),
+            ValueData::List(items),
+        )
+    } else {
+        let variant = LogicalType::new(LogicalTypeId::Variant);
+        let entry = LogicalType::struct_type(vec![
+            ("type".into(), LogicalType::new(LogicalTypeId::Type)),
+            ("value".into(), variant.clone()),
+        ]);
+        let items = arguments
+            .iter()
+            .enumerate()
+            .map(|(at, argument)| {
+                let value = match constants.get(at).cloned().flatten() {
+                    Some(constant) => crate::variant::VariantNode::from_value(&constant)
+                        .map(|node| Value::new(variant.clone(), ValueData::Bytes(node.encode())))
+                        .and_then(|v| v)
+                        .unwrap_or_else(|_| Value::null(variant.clone())),
+                    None => Value::null(variant.clone()),
+                };
+                Value::new(entry.clone(), ValueData::Struct(vec![type_value(argument), value]))
+                    .expect("a (type, value) pair")
+            })
+            .collect();
+        Value::new(LogicalType::list(entry), ValueData::List(items))
+    }
+    .expect("a list of parameters");
+    let mut properties = vec![
+        ("function_name", Value::varchar(function.to_string())),
+        ("parameters", parameters),
+    ];
+    // `CreateSortedAggregateStateType`: the ORDER BY spec, as to_aggregate_state takes it
+    let orders = ty.aggregate_state_orders();
+    if !orders.is_empty() {
+        let entry = LogicalType::struct_type(vec![
+            ("column".into(), LogicalType::UINTEGER),
+            ("order".into(), LogicalType::VARCHAR),
+        ]);
+        let items = orders
+            .iter()
+            .map(|order| {
+                let text = format!(
+                    "{} {}",
+                    if order.descending { "DESCENDING" } else { "ASCENDING" },
+                    if order.nulls_first { "NULLS_FIRST" } else { "NULLS_LAST" }
+                );
+                Value::new(
+                    entry.clone(),
+                    ValueData::Struct(vec![
+                        Value::new(LogicalType::UINTEGER, ValueData::UInt32(order.column)).expect("a UINTEGER"),
+                        Value::varchar(text),
+                    ]),
+                )
+                .expect("an ORDER BY entry")
+            })
+            .collect();
+        properties.push((
+            "order_bys",
+            Value::new(LogicalType::list(entry), ValueData::List(items)).expect("a list"),
+        ));
+    }
+    s.begin_property(103, "extension_info", true);
+    s.begin_nullable(true);
+    s.write_object_value(|s| {
+        s.write_list(101, "properties", properties.len(), |s, i| {
+            s.write_object_value(|s| {
+                s.write_property(0, "key", properties[i].0);
+                s.write_property(1, "value", &properties[i].1);
+            });
+        });
+    });
+    s.end_property();
+}
+
+/// The value a constant parameter stored as a VARIANT is: a scalar, or a list or struct of them.
+fn variant_constant(node: &crate::variant::VariantNode) -> Result<Value> {
+    use crate::variant::VariantNode;
+    Ok(match node {
+        VariantNode::Null => Value::sql_null(),
+        VariantNode::Scalar(value) => value.clone(),
+        VariantNode::Array(items) => {
+            let items = items.iter().map(variant_constant).collect::<Result<Vec<_>>>()?;
+            let child = items.first().map_or(LogicalType::SQLNULL, |v| v.logical_type().clone());
+            Value::new(LogicalType::list(child), ValueData::List(items))?
+        }
+        VariantNode::Object(fields) => Value::struct_value(
+            fields
+                .iter()
+                .map(|(name, node)| Ok((name.clone(), variant_constant(node)?)))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+    })
+}
+
+/// `ExtensionTypeInfo::Deserialize`, of an AGGREGATE_STATE; `None` for the extension info of anything else.
+fn read_extension_info(d: &mut BinaryDeserializer<'_>) -> Result<Option<StateProperties>> {
+    d.read_object_value(|d| {
+        d.read_deleted_property::<Vec<Value>>(100, "modifiers")?;
+        let mut pairs: Vec<(String, Value)> = Vec::new();
+        if d.has_named_property(101, "properties")? {
+            pairs = d.read_list(101, "properties", |d| {
+                d.read_object_value(|d| {
+                    let key: String = d.read_property(0, "key")?;
+                    let value: Value = d.read_property(1, "value")?;
+                    Ok((key, value))
+                })
+            })?;
+        }
+        let find = |name: &str| pairs.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+        let (Some(function), Some(parameters)) = (find("function_name"), find("parameters")) else {
+            return Ok(None);
+        };
+        let ValueData::List(entries) = parameters.data() else {
+            return Ok(None);
+        };
+        let read_type = |value: &Value| -> Result<LogicalType> {
+            match value.data() {
+                ValueData::Bytes(bytes) => BinaryDeserializer::deserialize(bytes),
+                _ => Err(serialization_error("Aggregate state parameter should be a type")),
+            }
+        };
+        let mut arguments = Vec::with_capacity(entries.len());
+        let mut constants = Vec::with_capacity(entries.len());
+        for entry in entries {
+            match entry.data() {
+                ValueData::Struct(pair) if pair.len() == 2 => {
+                    arguments.push(read_type(&pair[0])?);
+                    constants.push(match pair[1].data() {
+                        ValueData::Bytes(bytes) if !pair[1].is_null() => {
+                            Some(variant_constant(&crate::variant::VariantNode::decode(bytes)?)?)
+                        }
+                        _ => None,
+                    });
+                }
+                _ => {
+                    arguments.push(read_type(entry)?);
+                    constants.push(None);
+                }
+            }
+        }
+        if constants.iter().all(Option::is_none) {
+            constants.clear();
+        }
+        let mut orders = Vec::new();
+        if let Some(order_bys) = find("order_bys")
+            && let ValueData::List(entries) = order_bys.data()
+        {
+            for entry in entries {
+                let ValueData::Struct(parts) = entry.data() else {
+                    continue;
+                };
+                let [column, order] = parts.as_slice() else { continue };
+                let (descending, nulls_first) = crate::types::parse_order_modifiers(&order.try_to_string()?)
+                    .ok_or_else(|| serialization_error("Invalid ORDER BY entry of an aggregate state"))?;
+                orders.push(crate::types::StateOrder {
+                    column: column.as_i128().unwrap_or(0) as u32,
+                    descending,
+                    nulls_first,
+                });
+            }
+        }
+        Ok(Some(StateProperties {
+            function: function.try_to_string()?,
+            arguments,
+            constants,
+            orders,
+        }))
+    })
 }
 
 /// `UnboundTypeInfo::Deserialize`: a parsed expression, or the name of a "USER" type before v1.5.0.

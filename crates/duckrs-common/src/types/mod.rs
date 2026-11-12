@@ -393,13 +393,77 @@ impl std::hash::Hash for TypeInfo {
 
 /// Which aggregate an `AGGREGATE_STATE` is of: the function's name, its overload, what it was
 /// bound with and what it gives (the `function_name` and `parameters` of C++'s extension info).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 struct StateInfo {
     function: Arc<str>,
     overload: u32,
     arguments: Vec<LogicalType>,
     result: LogicalType,
+    /// the constants arguments were bound to, as string_agg's separator (the `(type, value)` pairs of the
+    /// `parameters`)
+    constants: Vec<Option<crate::value::Value>>,
+    /// for the state of an ordered aggregate (`CreateSortedAggregateStateType`): the column of the buffered rows each
+    /// key sorts on, descending or not, NULLs first or not
+    orders: Vec<StateOrder>,
 }
+
+/// `OrderModifiers::Parse`: whether `ASC NULLS LAST` and the like is descending, and puts NULLs first; `None` for
+/// what is no order. The words may be spelled out (`DESCENDING`) and joined by underscores (`NULLS_FIRST`).
+pub fn parse_order_modifiers(text: &str) -> Option<(bool, bool)> {
+    let normalized = text.trim().to_uppercase().replace('_', " ");
+    let words: Vec<&str> = normalized.split_whitespace().collect();
+    let (descending, rest) = match words.first() {
+        Some(&("ASC" | "ASCENDING")) => (false, &words[1..]),
+        Some(&("DESC" | "DESCENDING")) => (true, &words[1..]),
+        _ => (false, &words[..]),
+    };
+    let nulls_first = match rest {
+        [] => false,
+        ["NULLS", "FIRST"] => true,
+        ["NULLS", "LAST"] => false,
+        _ => return None,
+    };
+    Some((descending, nulls_first))
+}
+
+/// One ORDER BY key of the state of an ordered aggregate (`SortedAggregateStateOrder`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StateOrder {
+    pub column: u32,
+    pub descending: bool,
+    pub nulls_first: bool,
+}
+
+impl StateInfo {
+    fn constants_key(&self) -> String {
+        format!("{:?}", self.constants)
+    }
+}
+
+/// C++ compares the `properties` of the extension info: the function's name and its parameters. The overload and the
+/// result are duckrs's, and a state read from a file has them only once the aggregate is bound again.
+impl PartialEq for StateInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.function == other.function
+            && self.arguments == other.arguments
+            && self.constants_key() == other.constants_key()
+            && self.orders == other.orders
+    }
+}
+
+impl Eq for StateInfo {}
+
+impl std::hash::Hash for StateInfo {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.function.hash(state);
+        self.arguments.hash(state);
+        self.constants_key().hash(state);
+        self.orders.hash(state);
+    }
+}
+
+/// The overload of a state whose aggregate is still to be bound again (read from a database file).
+pub const UNRESOLVED_OVERLOAD: u32 = u32::MAX;
 
 /// A SQL type. Cheap to clone: parameters live behind an `Arc`.
 #[derive(Clone)]
@@ -579,6 +643,8 @@ impl LogicalType {
             overload,
             arguments,
             result,
+            constants: Vec::new(),
+            orders: Vec::new(),
         });
         ty
     }
@@ -598,6 +664,42 @@ impl LogicalType {
                 .and_then(|info| info.state.as_ref())
                 .map(|s| (&*s.function, s.overload, s.arguments.as_slice(), &s.result)),
         }
+    }
+
+    /// A state of [`Self::aggregate_state_of`] whose arguments were bound to these constants.
+    pub fn with_state_constants(mut self, constants: Vec<Option<crate::value::Value>>) -> Self {
+        if let Some(info) = self.info.as_mut()
+            && let Some(state) = Arc::make_mut(info).state.as_mut()
+        {
+            state.constants = constants;
+        }
+        self
+    }
+
+    /// A state of an ordered aggregate: the buffered rows, sorted by these keys when the state is finalized.
+    pub fn with_state_orders(mut self, orders: Vec<StateOrder>) -> Self {
+        if let Some(info) = self.info.as_mut()
+            && let Some(state) = Arc::make_mut(info).state.as_mut()
+        {
+            state.orders = orders;
+        }
+        self
+    }
+
+    /// The ORDER BY keys of the state of an ordered aggregate; none for any other state.
+    pub fn aggregate_state_orders(&self) -> &[StateOrder] {
+        self.info
+            .as_ref()
+            .and_then(|info| info.state.as_ref())
+            .map_or(&[], |s| s.orders.as_slice())
+    }
+
+    /// The constants the arguments of a state of [`Self::aggregate_state_of`] were bound to.
+    pub fn aggregate_state_constants(&self) -> &[Option<crate::value::Value>] {
+        self.info
+            .as_ref()
+            .and_then(|info| info.state.as_ref())
+            .map_or(&[], |s| s.constants.as_slice())
     }
 
     /// `LogicalType::IsAggregateState`: a state with C++'s layout ([`Self::aggregate_state_of`]).

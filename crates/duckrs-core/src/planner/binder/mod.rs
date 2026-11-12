@@ -784,6 +784,8 @@ pub struct Binder<'a> {
     macro_arguments: Vec<(String, ast::Expr)>,
     /// How many scalar macros the expression being bound is nested in.
     macro_depth: usize,
+    /// how many UNNESTs a user wrote the expression being bound is inside (`UnnestBinder::unnest_level`)
+    unnest_level: usize,
     /// The parameters of the prepared statement being bound, if it is one.
     pub parameters: Option<Arc<ParameterValues>>,
     /// The CTEs in scope, innermost last, with how many outer contexts they can see.
@@ -868,6 +870,7 @@ impl<'a> Binder<'a> {
             bound_macros: Vec::new(),
             macro_arguments: Vec::new(),
             macro_depth: 0,
+            unnest_level: 0,
             parameters: None,
             ctes: Vec::new(),
             ctes_being_bound: Vec::new(),
