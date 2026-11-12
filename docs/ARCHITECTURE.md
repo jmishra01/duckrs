@@ -244,6 +244,19 @@ while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` 
   order a SEMI or ANTI join whose right side is estimated larger than its left becomes RIGHT SEMI
   or RIGHT ANTI with the sides swapped. The large side then only probes and can take a join filter.
   The pass estimates, which reads table statistics, only for a plan that has such a join.
+  For inner joins, join order puts the side with fewer estimated rows on the right. After unused
+  columns are gone, a second look swaps the sides where the right rows are at least three times
+  as wide as the left ones and rows times width says so (TPC-H Q10 then probes with `customer`
+  and its five strings, 428,000 rows of 1,500,000 after the join filter). C++ always goes by rows
+  times width; with these estimates that builds on all of `orders` in Q9. Joins under something
+  that reads columns by position stay as they are.
+- **Scan filter order**: a scan runs the conjuncts of fewest columns first, and among those a join
+  filter that has its keys, then conjuncts on numbers, then those that read strings. A comparison
+  of an integer, date or decimal column with a constant, and BETWEEN two constants, select rows
+  directly (`select_column_constant`), without a vector of booleans.
+- **Merging thread states of an aggregate**: the parts a thread's state is split into carry their
+  keys in order and no hash table, and the table of each partition is sized once. Each group is
+  still moved three times (thread, part, partition), which is most of TPC-H Q18.
 - **An OR across a join**: for a filter on both sides of an inner join that is an OR, each side gets
   the OR of the conjuncts of each alternative that read only that side, if every alternative has
   one (`(p AND l) OR (p' AND l')` gives `p OR p'` and `l OR l'`). The filter itself stays on the

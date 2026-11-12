@@ -163,6 +163,9 @@ pub fn optimize_timed(
             plan
         });
     }
+    if options.join_order && options.unused_columns {
+        build_side::choose_by_width(&mut plan);
+    }
     index_scan::plan_index_scans(&mut plan, &options);
     // casts in SELECT pushed into file readers, e.g. `SELECT num::UHUGEINT FROM read_csv(...)`
     if options.type_pushdown {

@@ -1002,8 +1002,94 @@ pub fn select(expr: &BoundExpr, input: &DataChunk) -> Result<(SelectionVector, u
             ),
         });
     }
+    if let Some(selected) = select_column_constant(expr, input)? {
+        return Ok(selected);
+    }
     let result = execute(expr, input)?;
     Ok(executor::select::<bool>(&result, input.len(), |b| b))
+}
+
+/// The rows for which a column of integers compares as asked with a constant, or is between two:
+/// what most filters of a scan are. The comparison is known outside the loop over the rows, and no
+/// vector of booleans is made. `None` for anything else.
+fn select_column_constant(expr: &BoundExpr, input: &DataChunk) -> Result<Option<(SelectionVector, usize)>> {
+    use duckrs_parser::ast::ComparisonOp as C;
+    let constant = |e: &BoundExpr| matches!(e.kind, BoundExprKind::Constant(_));
+    let (column, op, low, high) = match &expr.kind {
+        BoundExprKind::Comparison { op, left, right } => match (&left.kind, &right.kind) {
+            (BoundExprKind::Reference(column), BoundExprKind::Constant(_)) => (*column, *op, right.as_ref(), None),
+            (BoundExprKind::Constant(_), BoundExprKind::Reference(column)) => {
+                let flipped = match op {
+                    C::LessThan => C::GreaterThan,
+                    C::GreaterThan => C::LessThan,
+                    C::LessThanOrEqual => C::GreaterThanOrEqual,
+                    C::GreaterThanOrEqual => C::LessThanOrEqual,
+                    other => *other,
+                };
+                (*column, flipped, left.as_ref(), None)
+            }
+            _ => return Ok(None),
+        },
+        BoundExprKind::Between {
+            input: value,
+            lower,
+            upper,
+        } => match value.kind {
+            BoundExprKind::Reference(column) if constant(lower) && constant(upper) => {
+                (column, C::GreaterThanOrEqual, lower.as_ref(), Some(upper.as_ref()))
+            }
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    let values = input.column(column);
+    let count = input.len();
+    let low = execute(low, input)?;
+    let high = high.map(|high| execute(high, input)).transpose()?;
+    let same_type = |v: &Vector| v.logical_type() == values.logical_type();
+    if !same_type(&low) || !high.as_ref().is_none_or(same_type) {
+        return Ok(None);
+    }
+    fn run<T: NativeType + PartialOrd>(
+        values: &Vector,
+        count: usize,
+        op: C,
+        low: &Vector,
+        high: Option<&Vector>,
+    ) -> Option<(SelectionVector, usize)> {
+        let constant = |v: &Vector| {
+            let unified = v.to_unified(1);
+            let at = unified.sel.get(0);
+            unified.validity.is_valid(at).then(|| unified.data::<T>()[at])
+        };
+        let low = constant(low)?;
+        if let Some(high) = high {
+            let high = constant(high)?;
+            return Some(executor::select::<T>(values, count, |a| a >= low && a <= high));
+        }
+        Some(match op {
+            C::Equal => executor::select::<T>(values, count, |a| a == low),
+            C::NotEqual => executor::select::<T>(values, count, |a| a != low),
+            C::LessThan => executor::select::<T>(values, count, |a| a < low),
+            C::LessThanOrEqual => executor::select::<T>(values, count, |a| a <= low),
+            C::GreaterThan => executor::select::<T>(values, count, |a| a > low),
+            C::GreaterThanOrEqual => executor::select::<T>(values, count, |a| a >= low),
+            _ => return None,
+        })
+    }
+    let high = high.as_ref();
+    Ok(match values.physical_type() {
+        PhysicalType::Int8 => run::<i8>(values, count, op, &low, high),
+        PhysicalType::Int16 => run::<i16>(values, count, op, &low, high),
+        PhysicalType::Int32 => run::<i32>(values, count, op, &low, high),
+        PhysicalType::Int64 => run::<i64>(values, count, op, &low, high),
+        PhysicalType::Int128 => run::<i128>(values, count, op, &low, high),
+        PhysicalType::UInt8 => run::<u8>(values, count, op, &low, high),
+        PhysicalType::UInt16 => run::<u16>(values, count, op, &low, high),
+        PhysicalType::UInt32 => run::<u32>(values, count, op, &low, high),
+        PhysicalType::UInt64 => run::<u64>(values, count, op, &low, high),
+        _ => None,
+    })
 }
 
 /// `ExpressionExecutor::TryEvaluateScalar`: the value of an expression without columns, or

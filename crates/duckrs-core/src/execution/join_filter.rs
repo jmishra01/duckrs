@@ -161,6 +161,11 @@ impl JoinFilter {
         }
     }
 
+    /// Whether the filter has the keys of its join and still drops rows with them.
+    pub fn is_active(&self) -> bool {
+        !self.off.load(Ordering::Relaxed) && self.keys.get().is_some_and(Option::is_some)
+    }
+
     /// The rows of `count` of `values` that can match a build key, or `None` if all of them can.
     pub fn select(&self, values: &Vector, count: usize) -> Option<Vec<u32>> {
         if self.off.load(Ordering::Relaxed) {

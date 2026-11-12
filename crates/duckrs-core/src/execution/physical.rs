@@ -434,7 +434,27 @@ impl PhysicalTableScan {
             }
             _ => vec![(filter, referenced_positions(filter))],
         };
-        conjuncts.sort_by_key(|(_, positions)| positions.len());
+        // of those of as many columns, a join filter that has its keys goes first: it hashes an integer
+        // and often drops most rows. Then come those of numbers, then those that read strings
+        let cost = |conjunct: &BoundExpr, positions: &[usize]| match &conjunct.kind {
+            BoundExprKind::JoinFilter { filter, .. } => {
+                if filter.is_active() {
+                    0
+                } else {
+                    3
+                }
+            }
+            _ if positions.iter().all(|&position| {
+                self.column_ids[position] == COLUMN_IDENTIFIER_ROW_ID
+                    || self.table.columns[self.column_ids[position]].ty.id()
+                        != duckrs_common::types::LogicalTypeId::Varchar
+            }) =>
+            {
+                1
+            }
+            _ => 2,
+        };
+        conjuncts.sort_by_key(|(conjunct, positions)| (positions.len(), cost(conjunct, positions)));
         let type_of = |position: usize| -> LogicalType {
             match self.column_ids[position] {
                 COLUMN_IDENTIFIER_ROW_ID => LogicalType::BIGINT,
@@ -453,6 +473,10 @@ impl PhysicalTableScan {
         };
         let mut selection: Vec<u32> = (0..group_rows as u32).collect();
         let mut fetched: Vec<Option<Vector>> = vec![None; self.column_ids.len()];
+        // what stands in a chunk for a column no filter has read yet
+        let unread: Vec<Vector> = (0..self.column_ids.len())
+            .map(|position| Vector::constant_null(type_of(position)))
+            .collect();
         for (conjunct, positions) in conjuncts {
             for &position in &positions {
                 if fetched[position].is_none() {
@@ -465,7 +489,7 @@ impl PhysicalTableScan {
                 let columns = (0..self.column_ids.len())
                     .map(|position| match &fetched[position] {
                         Some(vector) => vector.range(start, count),
-                        None => Vector::constant_null(type_of(position)),
+                        None => unread[position].clone(),
                     })
                     .collect();
                 let chunk = DataChunk::from_columns(columns, count);
@@ -2567,6 +2591,9 @@ impl GroupingSet {
 #[derive(Debug)]
 struct AggregateSinkState {
     group_ids: RowKeyMap<usize>,
+    /// for a state split off another to be merged: the keys of its groups in their order, in
+    /// place of `group_ids`, which nothing looks anything up in
+    ordered_keys: Vec<RowKey>,
     group_values: ColumnDataCollection,
     group_count: usize,
     /// per aggregate, the states of the groups
@@ -2588,6 +2615,7 @@ impl AggregateSinkState {
         let group_count = usize::from(group_types.is_empty());
         Self {
             group_ids: RowKeyMap::default(),
+            ordered_keys: Vec::new(),
             group_values: ColumnDataCollection::new(group_types),
             group_count,
             states: aggregates
@@ -3308,8 +3336,11 @@ impl PhysicalAggregate {
                 .filter(|parts| !parts.is_empty())
                 .map(|parts| {
                     scope.spawn(move || -> Result<Vec<DataChunk>> {
-                        let mut parts = parts.into_iter();
-                        let mut merged = parts.next().expect("a part");
+                        let types = parts[0].group_values.types().to_vec();
+                        let mut merged = AggregateSinkState::new(types, &self.aggregates);
+                        let groups = parts.iter().map(|part| part.group_count).sum();
+                        merged.group_ids.reserve(groups);
+                        merged.states.iter_mut().for_each(|states| states.reserve_exact(groups));
                         for part in parts {
                             self.merge_groups(&mut merged, part)?;
                         }
@@ -3348,21 +3379,28 @@ impl PhysicalAggregate {
         let hasher = BuildHasherDefault::<duckrs_common::sort_key::KeyHasher>::default();
         let mut keys: Vec<Option<RowKey>> = vec![None; group_count];
         let mut partition_of = vec![0usize; group_count];
+        let mut counts = vec![0usize; partitions];
         for (key, id) in group_ids {
             partition_of[id] = (hasher.hash_one(&key) >> 32) as usize & (partitions - 1);
+            counts[partition_of[id]] += 1;
             keys[id] = Some(key);
+        }
+        // each part is as large as it gets from the start, so that nothing is copied to grow
+        for (part, count) in parts.iter_mut().zip(&counts) {
+            part.ordered_keys.reserve_exact(*count);
+            part.states.iter_mut().for_each(|states| states.reserve_exact(*count));
         }
         // the values of the groups, chunk by chunk, into their partitions
         let mut first = 0;
+        let mut rows: Vec<Vec<u32>> = vec![Vec::new(); partitions];
         for chunk in group_values.chunks() {
-            let mut rows: Vec<Vec<u32>> = vec![Vec::new(); partitions];
             for row in 0..chunk.len() {
                 rows[partition_of[first + row]].push(row as u32);
             }
-            for (p, rows) in rows.into_iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
+            for (p, rows) in rows.iter_mut().enumerate().filter(|(_, rows)| !rows.is_empty()) {
                 let count = rows.len();
                 let mut values = chunk.clone();
-                values.slice(&SelectionVector::from_vec(rows), count);
+                values.slice(&SelectionVector::from_vec(std::mem::take(rows)), count);
                 parts[p].group_values.append(&values);
             }
             first += chunk.len();
@@ -3370,8 +3408,7 @@ impl PhysicalAggregate {
         // the keys and states, in the order of the values
         for (id, key) in keys.into_iter().enumerate() {
             let part = &mut parts[partition_of[id]];
-            let next = part.group_count;
-            part.group_ids.insert(key.expect("a key per group"), next);
+            part.ordered_keys.push(key.expect("a key per group"));
             part.group_count += 1;
         }
         for (i, sourced) in states.into_iter().enumerate() {
@@ -3386,23 +3423,30 @@ impl PhysicalAggregate {
     fn merge_groups(&self, state: &mut AggregateSinkState, local: AggregateSinkState) -> Result<()> {
         let AggregateSinkState {
             group_ids,
+            ordered_keys,
             group_values,
             group_count,
             states,
             ..
         } = local;
+        let groups_before = state.group_count;
         // a set without groups has its one group on both sides
         let mut targets = vec![0; group_count];
-        if !group_ids.is_empty() {
-            let mut keys: Vec<Option<RowKey>> = vec![None; group_count];
-            for (key, id) in group_ids {
-                keys[id] = Some(key);
-            }
+        if !group_ids.is_empty() || !ordered_keys.is_empty() {
+            let mut keys: Box<dyn Iterator<Item = RowKey>> = if ordered_keys.is_empty() {
+                let mut keys: Vec<Option<RowKey>> = vec![None; group_count];
+                for (key, id) in group_ids {
+                    keys[id] = Some(key);
+                }
+                Box::new(keys.into_iter().map(|key| key.expect("a key per group")))
+            } else {
+                Box::new(ordered_keys.into_iter())
+            };
             let mut first = 0;
             for chunk in group_values.chunks() {
                 let mut new_rows = Vec::new();
                 for row in 0..chunk.len() {
-                    let key = keys[first + row].take().expect("a key per group");
+                    let key = keys.next().expect("a key per group");
                     let next = state.group_count;
                     let id = *state.group_ids.entry(key).or_insert(next);
                     if id == next {
@@ -3411,7 +3455,9 @@ impl PhysicalAggregate {
                     }
                     targets[first + row] = id;
                 }
-                if !new_rows.is_empty() {
+                if new_rows.len() == chunk.len() {
+                    state.group_values.append(chunk);
+                } else if !new_rows.is_empty() {
                     let new_count = new_rows.len();
                     let mut values = chunk.clone();
                     values.slice(&SelectionVector::from_vec(new_rows), new_count);
@@ -3429,6 +3475,11 @@ impl PhysicalAggregate {
             merged.resize(state.group_count, kind.initial_state());
             for (group, source) in sourced.into_iter().enumerate() {
                 let slot = &mut merged[targets[group]];
+                if targets[group] >= groups_before && !group_values.types().is_empty() {
+                    // a group that is new here has no state yet, and no other group of `local` is it
+                    *slot = source;
+                    continue;
+                }
                 let current = std::mem::replace(slot, kind.initial_state());
                 *slot = combine_states(kind, current, source)?;
             }
