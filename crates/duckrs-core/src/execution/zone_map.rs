@@ -45,6 +45,50 @@ const MONOTONE_FUNCTIONS: &[&str] = &[
     "sign",
 ];
 
+/// `ArgProperties` of the functions that declare one: the argument whose order the result follows (`true`) or
+/// reverses (`false`) while the others are constant (`PropagateMonotoneBounds`).
+const MONOTONE_ARGUMENTS: &[(&str, usize, bool)] = &[
+    ("atan", 0, true),
+    ("asinh", 0, true),
+    ("cbrt", 0, true),
+    ("degrees", 0, true),
+    ("radians", 0, true),
+    ("ln", 0, true),
+    ("log10", 0, true),
+    ("log2", 0, true),
+    ("sinh", 0, true),
+    ("sqrt", 0, true),
+    ("tanh", 0, true),
+    ("trunc", 0, true),
+    ("round", 0, true),
+    ("round_even", 0, true),
+    ("roundbankers", 0, true),
+    ("epoch", 0, true),
+    ("epoch_ms", 0, true),
+    ("epoch_us", 0, true),
+    ("epoch_ns", 0, true),
+    ("era", 0, true),
+    ("isoyear", 0, true),
+    ("last_day", 0, true),
+    ("normalized_interval", 0, true),
+    ("to_timestamp", 0, true),
+    ("make_date", 0, true),
+    ("make_timestamp", 0, true),
+    ("make_timestamp_ns", 0, true),
+    ("make_timestamp_ms", 0, true),
+    ("date_trunc", 1, true),
+    ("datetrunc", 1, true),
+    ("time_bucket", 1, true),
+    ("date_diff", 1, false),
+    ("date_diff", 2, true),
+    ("datediff", 1, false),
+    ("datediff", 2, true),
+    ("date_sub", 1, false),
+    ("date_sub", 2, true),
+    ("datesub", 1, false),
+    ("datesub", 2, true),
+];
+
 /// The zones of a column, by the keys in which its values sort as they do in a comparison.
 fn compute_zones(table: &TableCatalogEntry, column: usize, known: &[ColumnZone]) -> Vec<ColumnZone> {
     if !has_ordered_statistics(&table.columns[column].ty) {
@@ -133,6 +177,19 @@ fn zones_of(table: &TableCatalogEntry, column: usize) -> Arc<Vec<ColumnZone>> {
     zones
 }
 
+/// The argument of a call of `name` that its result follows, in order or reversed, while the others are constant.
+fn monotone_argument(name: &str, children: &[BoundExpr]) -> Option<(usize, bool)> {
+    MONOTONE_ARGUMENTS
+        .iter()
+        .find(|(function, at, _)| {
+            *function == name
+                && *at < children.len()
+                && !children[*at].is_foldable()
+                && children.iter().enumerate().all(|(i, c)| i == *at || c.is_foldable())
+        })
+        .map(|&(_, at, increasing)| (at, increasing))
+}
+
 /// The values an expression can have in a group.
 enum Range {
     /// nothing is known
@@ -192,6 +249,14 @@ impl Group<'_> {
     fn range(&self, expr: &BoundExpr) -> Range {
         match &expr.kind {
             BoundExprKind::Reference(index) => self.column_range(*index),
+            BoundExprKind::Cast { child, .. } if child.return_type == expr.return_type => self.range(child),
+            // a timestamp in another unit sorts the same; a value that doesn't fit leaves the range unknown
+            BoundExprKind::Cast { child, try_cast: false }
+                if (is_timestamp(&child.return_type) && is_timestamp(&expr.return_type))
+                    || (is_timestamp_tz(&child.return_type) && is_timestamp_tz(&expr.return_type)) =>
+            {
+                self.through(expr, child)
+            }
             BoundExprKind::Cast { child, try_cast: false } if keeps_order(&child.return_type, &expr.return_type) => {
                 self.through(expr, child)
             }
@@ -199,6 +264,12 @@ impl Group<'_> {
                 if children.len() == 1 && MONOTONE_FUNCTIONS.contains(&function.name.as_str()) =>
             {
                 self.through(expr, &children[0])
+            }
+            BoundExprKind::Function { function, children, .. }
+                if monotone_argument(&function.name, children).is_some() =>
+            {
+                let (varying, increasing) = monotone_argument(&function.name, children).expect("checked");
+                self.monotone(expr, varying, increasing)
             }
             BoundExprKind::Constant(value) if value.is_null() => Range::Null,
             BoundExprKind::Constant(value) => Range::Bounds(value.clone(), value.clone()),
@@ -261,6 +332,13 @@ impl Group<'_> {
         };
         match (name, children) {
             ("coalesce", _) => self.union(children.iter()),
+            // `PowerStats`: a power above 0 of what is never negative grows with it
+            ("power" | "pow", [base, exponent])
+                if constant(exponent).is_some_and(|e| sign(&e) == Some(Ordering::Greater))
+                    && matches!(self.range(base), Range::Bounds(min, _) if sign(&min) != Some(Ordering::Less)) =>
+            {
+                self.monotone(expr, 0, true)
+            }
             ("__internal_barrier", [child]) => self.range(child),
             // a prefix of a string sorts as the string does
             ("left" | "substring" | "substr", [_, ..])
@@ -326,14 +404,15 @@ impl Group<'_> {
                 self.monotone(expr, varying, increasing)
             }
             // `DatePart::MonthOperator` and the like: within one year, the parts of the bounds
-            ("month" | "quarter", [child]) => match self.range(child) {
+            ("month" | "quarter" | "dayofyear" | "doy" | "day" | "dayofmonth", [child]) => match self.range(child) {
                 Range::Bounds(min, max) => {
-                    // the year of a DATE or TIMESTAMP is the start of its text
+                    // the year of a DATE or TIMESTAMP is the start of its text, the month follows it
+                    let within = if matches!(name, "day" | "dayofmonth") { 7 } else { 4 };
                     let year = |value: &Value| {
                         value
                             .try_to_string()
                             .ok()
-                            .map(|text| text.chars().take(4).collect::<String>())
+                            .map(|text| text.chars().take(within).collect::<String>())
                     };
                     if year(&min).is_some() && year(&min) == year(&max) {
                         self.monotone(expr, 0, true)
@@ -396,6 +475,19 @@ impl Group<'_> {
             {
                 self.never_true(&children[0])
             }
+            // a BOOLEAN column itself: no row of the group is true
+            BoundExprKind::Reference(index) if expr.return_type.id() == LogicalTypeId::Boolean => {
+                self.zone(*index).is_some_and(|zone| match &zone.max {
+                    None => true,
+                    Some(max) => max.data() == &duckrs_common::value::ValueData::Bool(false),
+                })
+            }
+            BoundExprKind::Operator {
+                op: BoundOperator::Not,
+                children,
+            } if children.len() == 1 && negated(without_noop_casts(&children[0])).is_some() => {
+                self.never_true(&negated(without_noop_casts(&children[0])).expect("checked"))
+            }
             BoundExprKind::Conjunction { and: true, children } => children.iter().any(|c| self.never_true(c)),
             BoundExprKind::Conjunction { and: false, children } => children.iter().all(|c| self.never_true(c)),
             // `(x > 5) = true`: the comparison itself
@@ -405,14 +497,59 @@ impl Group<'_> {
                 right,
             } if left.return_type.id() == LogicalTypeId::Boolean
                 && matches!(
-                    left.kind,
+                    without_noop_casts(left).kind,
                     BoundExprKind::Comparison { .. }
                         | BoundExprKind::Between { .. }
                         | BoundExprKind::Conjunction { .. }
+                        | BoundExprKind::Reference(_)
                 )
                 && matches!(&right.kind, BoundExprKind::Constant(value) if value.data() == &duckrs_common::value::ValueData::Bool(true)) =>
             {
-                self.never_true(left)
+                self.never_true(without_noop_casts(left))
+            }
+            // `(x > 5) = false` and `(x > 5) IS FALSE`: the comparison never false
+            BoundExprKind::Comparison {
+                op: ComparisonOp::Equal | ComparisonOp::NotDistinctFrom,
+                left,
+                right,
+            } if left.return_type.id() == LogicalTypeId::Boolean
+                && matches!(&right.kind, BoundExprKind::Constant(value) if value.data() == &duckrs_common::value::ValueData::Bool(false))
+                && !matches!(without_noop_casts(left).kind, BoundExprKind::Reference(_))
+                && negated(without_noop_casts(left)).is_some() =>
+            {
+                self.never_true(&negated(without_noop_casts(left)).expect("checked"))
+            }
+            // `x IS DISTINCT FROM c`: every row of the group is `c`
+            BoundExprKind::Comparison {
+                op: ComparisonOp::DistinctFrom,
+                left,
+                right,
+            } => match (&left.kind, &right.kind) {
+                (_, BoundExprKind::Constant(constant)) | (BoundExprKind::Constant(constant), _) if !constant.is_null() => {
+                    let column = if matches!(left.kind, BoundExprKind::Constant(_)) { right } else { left };
+                    let zone = match &column.kind {
+                        BoundExprKind::Reference(index) => self.zone(*index),
+                        _ => None,
+                    };
+                    let is = |a: &Value| compare_values(ComparisonOp::Equal, a, constant) == Some(true);
+                    zone.is_some_and(|zone| {
+                        !zone.has_null && zone.min.as_ref().is_some_and(is) && zone.max.as_ref().is_some_and(is)
+                    })
+                }
+                _ => false,
+            },
+            // `x IS NOT DISTINCT FROM NULL`: a group without NULLs
+            BoundExprKind::Comparison {
+                op: ComparisonOp::NotDistinctFrom,
+                left,
+                right,
+            } if matches!(&right.kind, BoundExprKind::Constant(value) if value.is_null())
+                && matches!(left.kind, BoundExprKind::Reference(_)) =>
+            {
+                let BoundExprKind::Reference(index) = left.kind else {
+                    unreachable!("checked")
+                };
+                self.zone(index).is_some_and(|zone| !zone.has_null)
             }
             BoundExprKind::Comparison { op, left, right } => match (&left.kind, &right.kind) {
                 // `IS NOT DISTINCT FROM` a value is `=` it, but for NULLs
@@ -516,6 +653,61 @@ impl Group<'_> {
             (ComparisonOp::GreaterThanOrEqual, Range::Bounds(_, max)) => is(ComparisonOp::LessThan, &max, constant),
         }
     }
+}
+
+/// A timestamp of any unit, without a time zone.
+fn is_timestamp(ty: &LogicalType) -> bool {
+    use LogicalTypeId::*;
+    matches!(ty.id(), TimestampSec | TimestampMs | Timestamp | TimestampNs)
+}
+
+/// A timestamp with a time zone, of any unit.
+fn is_timestamp_tz(ty: &LogicalType) -> bool {
+    matches!(ty.id(), LogicalTypeId::TimestampTz | LogicalTypeId::TimestampTzNs)
+}
+
+/// `expr` without the casts around it that change nothing.
+fn without_noop_casts(mut expr: &BoundExpr) -> &BoundExpr {
+    while let BoundExprKind::Cast { child, .. } = &expr.kind
+        && child.return_type == expr.return_type
+    {
+        expr = child;
+    }
+    expr
+}
+
+/// `NOT expr` for a comparison of values (true, false or NULL as `expr` is), or a conjunction of them; `None` for
+/// anything else.
+fn negated(expr: &BoundExpr) -> Option<BoundExpr> {
+    let kind = match &expr.kind {
+        BoundExprKind::Comparison { op, left, right } => {
+            let op = match op {
+                ComparisonOp::Equal => ComparisonOp::NotEqual,
+                ComparisonOp::NotEqual => ComparisonOp::Equal,
+                ComparisonOp::LessThan => ComparisonOp::GreaterThanOrEqual,
+                ComparisonOp::GreaterThanOrEqual => ComparisonOp::LessThan,
+                ComparisonOp::GreaterThan => ComparisonOp::LessThanOrEqual,
+                ComparisonOp::LessThanOrEqual => ComparisonOp::GreaterThan,
+                _ => return None,
+            };
+            BoundExprKind::Comparison {
+                op,
+                left: left.clone(),
+                right: right.clone(),
+            }
+        }
+        BoundExprKind::Reference(_) if expr.return_type.id() == LogicalTypeId::Boolean => BoundExprKind::Comparison {
+            op: ComparisonOp::Equal,
+            left: Box::new(expr.clone()),
+            right: Box::new(BoundExpr::constant(Value::boolean(false))),
+        },
+        BoundExprKind::Conjunction { and, children } => BoundExprKind::Conjunction {
+            and: !and,
+            children: children.iter().map(negated).collect::<Option<Vec<_>>>()?,
+        },
+        _ => return None,
+    };
+    Some(BoundExpr::new(kind, expr.return_type.clone()))
 }
 
 /// `a op b` as `b op a`.

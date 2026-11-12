@@ -5,7 +5,7 @@
 //! chunk as it is read. In-memory scans have no zone maps yet, so all this gains is that no
 //! operator is left to pass the rows on, and that the columns only they read stay in the scan. It
 //! runs late, so that the passes before it see filters as operators, and only takes what can run
-//! ahead of the filters that stay: nothing that can fail.
+//! ahead of the filters that stay: nothing that can fail, unless it is the only filter.
 
 use super::rewriter::{can_throw, contains_barrier, split_conjuncts};
 use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
@@ -29,6 +29,15 @@ fn can_move_into_scan(expr: &BoundExpr, scan: &[ColumnBinding]) -> bool {
     columns_of(expr, &mut columns, &mut outer);
     let one_column = !columns.is_empty() && columns.iter().all(|c| *c == columns[0]);
     one_column && !outer && scan.contains(&columns[0]) && !expr.is_volatile() && !can_throw(expr)
+}
+
+/// [`can_move_into_scan`], for a filter that may fail.
+fn can_move_ignoring_errors(expr: &BoundExpr, scan: &[ColumnBinding]) -> bool {
+    let mut columns = Vec::new();
+    let mut outer = false;
+    columns_of(expr, &mut columns, &mut outer);
+    let one_column = !columns.is_empty() && columns.iter().all(|c| *c == columns[0]);
+    one_column && !outer && scan.contains(&columns[0]) && !expr.is_volatile()
 }
 
 /// Moves the filters directly on scans into them.
@@ -67,6 +76,14 @@ pub fn push_into_scans(op: &mut LogicalOperator) {
         } else {
             expressions.push(conjunct);
         }
+    }
+    // `PushdownGet`: a filter that can fail goes into the scan too when it is the only one left, as then there is
+    // no other filter it would run ahead of
+    if let [only] = expressions.as_slice()
+        && barred.is_empty()
+        && can_move_ignoring_errors(only, &scan)
+    {
+        filters.push(expressions.pop().expect("one filter"));
     }
     // `PushdownBarrierFilters`: into the scan, after the filters there, only if no other filter stays on top
     for conjunct in barred {

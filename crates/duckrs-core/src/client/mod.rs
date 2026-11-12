@@ -5797,9 +5797,12 @@ mod tests {
         assert_eq!(run(&mut context, "SELECT i FROM t WHERE j = 100"), [["4000"]]);
         run(&mut context, "DELETE FROM t WHERE i >= 10");
         assert_eq!(run(&mut context, "SELECT count(*) FROM t"), [["10"]]);
-        // what can fail, or differ per call, or reads the query around it, stays an operator
+        // what can fail goes into the scan only as the one filter there is (`PushdownGet`)
         let plan = explain(&mut context, "SELECT i FROM t WHERE s::INTEGER = 3");
-        assert!(plan.contains("Filter\n"), "{plan}");
+        assert!(!plan.contains("Filter\n") && plan.contains("Filters:"), "{plan}");
+        let plan = explain(&mut context, "SELECT i FROM t WHERE s::INTEGER = 3 AND i > j");
+        assert!(plan.contains("Filter\n") && plan.contains("CAST(s AS INTEGER) = 3"), "{plan}");
+        // what differs per call, or reads the query around it, stays an operator
         let plan = explain(&mut context, "SELECT i FROM t WHERE i < random() * 100");
         assert!(plan.contains("Filter\n"), "{plan}");
         let rows = run(
