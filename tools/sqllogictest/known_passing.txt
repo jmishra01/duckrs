@@ -1,6 +1,9 @@
 # Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
 # stop passing. Regenerate with:
 #   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
+#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
+# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
+# stop passing. Regenerate with:
 test/common/test_cast_hugeint.test
 test/fuzzer/afl/alter_if_exists.test
 test/fuzzer/afl/analyze_empty_table.test
@@ -446,6 +449,7 @@ test/ldbc/ldbc-empty.test
 test/optimizer/case_simplification.test
 test/optimizer/case_simplification_errors.test
 test/optimizer/column_lifetime_analyzer/must_visit_operator_expressions_first.test
+test/optimizer/column_lifetime_analyzer/no_unnecessary_projections.test
 test/optimizer/column_lifetime_analyzer/summary_column_lifetime.test
 test/optimizer/common_subplan_nested_cte.test
 test/optimizer/compare_blob.test
@@ -2390,7 +2394,9 @@ test/sql/join/semianti/10406-anti-on-ints-strings.test
 test/sql/join/semianti/constant_comparison_join.test
 test/sql/join/semianti/mix_equality_inequality.test
 test/sql/join/semianti/plan_blockwise_NL_join_with_mutliple_conditions.test
+test/sql/join/semianti/right_anti.test
 test/sql/join/semianti/right_match_scan.test
+test/sql/join/semianti/right_semi.test
 test/sql/join/semianti/semijoin.test
 test/sql/join/semianti/test_semianti_join_filter_pushdown.test
 test/sql/join/semianti/test_simple_anti_join.test

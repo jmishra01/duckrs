@@ -13,7 +13,7 @@ use super::conjunction_of;
 use super::rewriter::{
     can_throw, contains_barrier, expressions_equal, fold_boolean, rewrite_expression, split_conjuncts,
 };
-use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
+use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, ColumnBinding};
 use crate::planner::logical::{JoinCondition, LogicalOperator, LogicalOperatorKind};
 use duckrs_common::value::Value;
 use duckrs_parser::ast::{ComparisonOp, JoinType};
@@ -284,7 +284,16 @@ impl FilterPushdown {
             match join_side(&f.tables, &left_tables, &right_tables) {
                 JoinSide::Left => left.filters.push(f),
                 JoinSide::Right => right.filters.push(f),
-                JoinSide::Both => join_expressions.push(f.filter),
+                JoinSide::Both => {
+                    // the filter stays on the join, so these only have to keep what it keeps
+                    if let Some(filter) = side_of_disjunction(&f.filter, &left_tables) {
+                        left.add_filter(filter);
+                    }
+                    if let Some(filter) = side_of_disjunction(&f.filter, &right_tables) {
+                        right.add_filter(filter);
+                    }
+                    join_expressions.push(f.filter);
+                }
                 JoinSide::None => above.push(f.filter),
             }
         }
@@ -529,6 +538,39 @@ impl FilterPushdown {
     }
 }
 
+/// What `(a1 AND b1) OR (a2 AND b2)` says of the side `a` of a join alone: `a1 OR a2`, which each row
+/// has that the whole has. `None` if some alternative says nothing of that side.
+fn side_of_disjunction(expr: &BoundExpr, side: &BTreeSet<usize>) -> Option<BoundExpr> {
+    let BoundExprKind::Conjunction { and: false, children } = &expr.kind else {
+        return None;
+    };
+    let mut alternatives = Vec::with_capacity(children.len());
+    for child in children {
+        let mut conjuncts = Vec::new();
+        split_conjuncts(child.clone(), &mut conjuncts);
+        conjuncts.retain(|conjunct| {
+            let mut tables = BTreeSet::new();
+            expression_tables(conjunct, &mut tables);
+            !tables.is_empty()
+                && tables.is_subset(side)
+                && !conjunct.is_volatile()
+                && !can_throw(conjunct)
+                && !contains_subquery(conjunct)
+        });
+        if conjuncts.is_empty() {
+            return None;
+        }
+        alternatives.push(conjunction_of(conjuncts));
+    }
+    Some(BoundExpr::new(
+        BoundExprKind::Conjunction {
+            and: false,
+            children: alternatives,
+        },
+        duckrs_common::types::LogicalType::BOOLEAN,
+    ))
+}
+
 fn contains_subquery(expr: &BoundExpr) -> bool {
     matches!(expr.kind, BoundExprKind::Subquery { .. }) || expr.children().into_iter().any(contains_subquery)
 }
@@ -626,11 +668,26 @@ fn count_columns(plan: &mut LogicalOperator, reads: &mut HashMap<ColumnBinding, 
 
 /// `PushdownMarkJoin`: a filter on only the marker of a MARK join makes it a SEMI join, as false
 /// and NULL both lose the row. `CheckMarkToSemi`: that takes the marker away, so nothing else may
-/// read it.
+/// read it. A filter on `NOT marker` makes it an ANTI join where the marker is never NULL.
 pub(super) fn convert_mark_joins(plan: &mut LogicalOperator) {
     let mut reads = HashMap::new();
     count_columns(plan, &mut reads);
     mark_to_semi(plan, &reads);
+}
+
+/// Whether an expression is true or false for any row: a test for NULL, or such tests together.
+fn never_null(expr: &BoundExpr) -> bool {
+    match &expr.kind {
+        BoundExprKind::Conjunction { children, .. } => children.iter().all(never_null),
+        BoundExprKind::Operator {
+            op: BoundOperator::IsNull | BoundOperator::IsNotNull,
+            ..
+        } => true,
+        BoundExprKind::Comparison { op, .. } => {
+            matches!(op, ComparisonOp::DistinctFrom | ComparisonOp::NotDistinctFrom)
+        }
+        _ => false,
+    }
 }
 
 fn mark_to_semi(op: &mut LogicalOperator, reads: &HashMap<ColumnBinding, usize>) {
@@ -646,7 +703,7 @@ fn mark_to_semi(op: &mut LogicalOperator, reads: &HashMap<ColumnBinding, usize>)
     let LogicalOperatorKind::MarkJoin {
         table_index,
         conditions,
-        predicate: None,
+        predicate,
     } = &mut op.children[0].kind
     else {
         return;
@@ -654,15 +711,26 @@ fn mark_to_semi(op: &mut LogicalOperator, reads: &HashMap<ColumnBinding, usize>)
     let marker = ColumnBinding::new(*table_index, 0);
     let is_marker =
         |e: &BoundExpr| matches!(e.kind, BoundExprKind::ColumnRef { binding, depth: 0 } if binding == marker);
-    if conditions.is_empty() || reads.get(&marker) != Some(&1) || !expressions.iter().any(is_marker) {
+    let is_not_marker = |e: &BoundExpr| matches!(&e.kind, BoundExprKind::Operator { op: BoundOperator::Not, children } if is_marker(&children[0]));
+    if conditions.is_empty() || reads.get(&marker) != Some(&1) {
         return;
     }
-    let conditions = std::mem::take(conditions);
-    expressions.retain(|e| !is_marker(e));
+    let join_type = if expressions.iter().any(is_marker) {
+        JoinType::Semi
+    } else if expressions.iter().any(is_not_marker)
+        && conditions.iter().all(|condition| condition.null_safe)
+        && predicate.as_ref().is_none_or(never_null)
+    {
+        JoinType::Anti
+    } else {
+        return;
+    };
+    let (conditions, predicate) = (std::mem::take(conditions), predicate.take());
+    expressions.retain(|e| !is_marker(e) && !is_not_marker(e));
     op.children[0].kind = LogicalOperatorKind::Join {
-        join_type: JoinType::Semi,
+        join_type,
         conditions,
-        predicate: None,
+        predicate,
     };
     if expressions.is_empty() {
         *op = op.children.remove(0);

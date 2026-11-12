@@ -203,11 +203,16 @@ while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` 
   a multiplicative hash and not SipHash. Other operators use the slower `group_keys`.
 - The **deliminator** (`optimizer/deliminator.rs`) runs right after filter pushdown. An equality
   join with `DelimGet` only filters, so it goes, and an IS NOT NULL stands in for what `=` dropped.
-  When the query filters the outer rows the deepest such join stays, as DuckDB does, so most of
-  TPC-H keeps its delim joins: the distinct values make the subquery read less. A join with no
-  `DelimGet` left is an ordinary one, except SINGLE, which stays a `DelimJoin` because that operator
-  raises the error for two rows. SINGLE becomes LEFT when an aggregate proves one row per key.
-  Joins with an inequality stay, since those are predicates here. With a scalar subquery whose
+  When the query filters the outer rows the deepest such join stays, as DuckDB does: the distinct
+  values make the subquery read less. That is not so for `EXISTS` and `NOT EXISTS` in a WHERE
+  clause with only filters and projections above the join: without `DelimGet` they are SEMI and
+  ANTI joins, whose join filter cuts the scan of the subquery the same way, so that join goes too
+  (TPC-H Q4, Q21, Q22). A join with no `DelimGet` left is an ordinary one, except SINGLE, which
+  stays a `DelimJoin` because that operator raises the error for two rows. SINGLE becomes LEFT when
+  an aggregate proves one row per key. An inequality with a column of `DelimGet` (`l2.l_suppkey <>
+  l1.l_suppkey` in Q21) is a predicate of the join here; for a MARK `DelimJoin` it moves up in
+  place of the condition on that outer value, as `outer IS NOT NULL AND inner IS DISTINCT FROM
+  outer` over a subquery filtered to `inner IS NOT NULL`, which is never NULL. With a scalar subquery whose
   result is NULL on no rows anyway, flattening also joins the aggregate with `DelimGet` by INNER
   and not LEFT, which is what lets this pass drop that join.
 - **Statistics** (`optimizer/statistics.rs`) follow C++ in what they decide, not in where they come
@@ -231,15 +236,25 @@ while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` 
   hash of the one key; the other uncorrelated subqueries stay expressions, which run once. A filter
   on only the marker makes it a SEMI join, if nothing else reads the marker. That is a pass of its
   own after filter pushdown, which counts the reads, where C++ flags the joins up front. `NOT IN`
-  stays MARK, since a NULL on either side changes its answer. In a tree of joins, a SEMI or ANTI
-  join that reads one relation goes down to it.
+  stays MARK, since a NULL on either side changes its answer; a filter on `NOT marker` makes an
+  ANTI join only where every condition is `IS NOT DISTINCT FROM` and the predicate is made of tests
+  that are never NULL, which is what the deliminator leaves of `NOT EXISTS`. In a tree of joins, a
+  SEMI or ANTI join that reads one relation goes down to it.
+- **Build sides** (`optimizer/build_side.rs`): a hash join builds its right side, so before join
+  order a SEMI or ANTI join whose right side is estimated larger than its left becomes RIGHT SEMI
+  or RIGHT ANTI with the sides swapped. The large side then only probes and can take a join filter.
+  The pass estimates, which reads table statistics, only for a plan that has such a join.
+- **An OR across a join**: for a filter on both sides of an inner join that is an OR, each side gets
+  the OR of the conjuncts of each alternative that read only that side, if every alternative has
+  one (`(p AND l) OR (p' AND l')` gives `p OR p'` and `l OR l'`). The filter itself stays on the
+  join. TPC-H Q19 reads 4,754 parts of 2,000,000 that way at SF10.
 - **Scan filters** move a conjunct from a `FILTER` directly on a scan into it, if it reads one
   column of that scan, is not volatile and cannot fail. It runs last, so the other passes see plain
   filters.
 - **Join filters** (`execution::join_filter`) are added as the physical plan is made, so EXPLAIN,
-  which shows the logical plan, leaves them out. An INNER, SEMI, RIGHT SEMI or RIGHT hash join
+  which shows the logical plan, leaves them out. An INNER, SEMI, RIGHT SEMI, RIGHT ANTI or RIGHT hash join
   follows each equality on an integer or date column of its left side down through filters,
-  projections and the sides of joins that keep that column's values unchanged, to a scan of a
+  projections, column selections and the sides of joins that keep that column's values unchanged, to a scan of a
   table of 65,536 rows or more. There it adds a filter. When the build side is done, the filter
   gets its keys' min and max and a blocked Bloom filter of them; until then, and once it has
   passed more than 80% of a million rows, it lets every row through. A build side that spilled,

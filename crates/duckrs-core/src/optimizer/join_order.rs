@@ -752,6 +752,10 @@ impl JoinOrderOptimizer {
                     let cardinality = left.cardinality * DEFAULT_SELECTIVITY;
                     return left.scaled(cardinality);
                 }
+                if matches!(join_type, JoinType::RightSemi | JoinType::RightAnti) {
+                    let cardinality = right.cardinality * DEFAULT_SELECTIVITY;
+                    return right.scaled(cardinality);
+                }
                 let (left_rows, right_rows) = (left.cardinality, right.cardinality);
                 left.distinct.extend(right.distinct);
                 let domain_of = |expr: &BoundExpr| {
@@ -1033,7 +1037,7 @@ fn filter_fraction(cardinality: f64, fraction: f64) -> f64 {
     if cardinality <= 0.0 {
         return 0.0;
     }
-    (cardinality * fraction).floor().clamp(1.0, cardinality)
+    (cardinality * fraction).floor().clamp(1.0, cardinality.max(1.0))
 }
 
 /// `EstimateFilterRows` for one conjunct: the rows it keeps, and whether it is modeled.

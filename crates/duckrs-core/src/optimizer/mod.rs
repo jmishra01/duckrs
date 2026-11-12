@@ -7,7 +7,8 @@
 //! Plans reach the optimizer before `resolve_column_bindings`. A subquery has a plan of its own,
 //! which the binder resolves, so it runs the optimizer on that plan itself.
 
-pub mod deliminator;
+pub mod build_side;
+mod deliminator;
 pub mod empty_result_pullup;
 pub mod filter_pushdown;
 mod index_scan;
@@ -135,6 +136,7 @@ pub fn optimize_timed(
         filter_pushdown::convert_mark_joins(&mut plan);
     }
     if options.join_order {
+        build_side::choose_build_sides(&mut plan);
         plan = run("join_order", plan, &mut join_order::reorder_joins);
     }
     if options.statistics_propagation {

@@ -198,7 +198,7 @@ pub fn push_join_filters(op: &mut LogicalOperator) {
         push_join_filters(child);
     }
     let LogicalOperatorKind::Join {
-        join_type: JoinType::Inner | JoinType::Semi | JoinType::RightSemi | JoinType::Right,
+        join_type: JoinType::Inner | JoinType::Semi | JoinType::RightSemi | JoinType::RightAnti | JoinType::Right,
         conditions,
         ..
     } = &mut op.kind
@@ -256,6 +256,19 @@ fn push_into(op: &mut LogicalOperator, column: usize, key: &BoundExpr, filter: &
         }
         LogicalOperatorKind::Filter { expressions } => {
             !expressions.iter().any(BoundExpr::is_volatile) && push_into(&mut op.children[0], column, key, filter)
+        }
+        LogicalOperatorKind::ColumnSelect { keep } => {
+            let Some(kept) = keep.get(column) else {
+                return false;
+            };
+            match op.children[0]
+                .column_bindings()
+                .iter()
+                .position(|binding| binding == kept)
+            {
+                Some(child_column) => push_into(&mut op.children[0], child_column, key, filter),
+                None => false,
+            }
         }
         LogicalOperatorKind::Projection { expressions, .. } => match expressions.get(column).map(|e| &e.kind) {
             Some(BoundExprKind::Reference(child_column)) => {
