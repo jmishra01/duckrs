@@ -70,6 +70,14 @@ pub trait Connection: Send {
     /// must be rendered like DuckDB's `ErrorData::Message()`, e.g. `Binder Error: ...`.
     fn query(&mut self, sql: &str) -> Result<QueryOutput, String>;
 
+    /// [`Connection::query`], with how long the engine took to run it (not counting turning the
+    /// values into text): what a benchmark times.
+    fn query_timed(&mut self, sql: &str) -> Result<(QueryOutput, std::time::Duration), String> {
+        let started = std::time::Instant::now();
+        let output = self.query(sql)?;
+        Ok((output, started.elapsed()))
+    }
+
     /// Handles `require <extension>`; returns whether the extension is available.
     fn load_extension(&mut self, name: &str) -> bool {
         self.query(&format!("LOAD {name}")).is_ok()
@@ -120,7 +128,13 @@ struct DuckrsConnection(duckrs::Connection);
 
 impl Connection for DuckrsConnection {
     fn query(&mut self, sql: &str) -> Result<QueryOutput, String> {
+        self.query_timed(sql).map(|(output, _)| output)
+    }
+
+    fn query_timed(&mut self, sql: &str) -> Result<(QueryOutput, std::time::Duration), String> {
+        let started = std::time::Instant::now();
         let result = self.0.query(sql).map_err(|e| e.to_string())?;
+        let elapsed = started.elapsed();
         let types = result.types.iter().map(column_type).collect();
         let mut rows = Vec::with_capacity(result.row_count());
         for row in 0..result.row_count() {
@@ -135,11 +149,14 @@ impl Connection for DuckrsConnection {
             }
             rows.push(cells);
         }
-        Ok(QueryOutput {
-            names: result.names,
-            types,
-            rows,
-        })
+        Ok((
+            QueryOutput {
+                names: result.names,
+                types,
+                rows,
+            },
+            elapsed,
+        ))
     }
 
     fn load_extension(&mut self, name: &str) -> bool {
@@ -307,6 +324,8 @@ mod reference {
         output: QueryOutput,
         unrenderable: bool,
         is_select: bool,
+        /// how long `duckdb_query` took
+        elapsed: std::time::Duration,
     }
 
     impl ReferenceConnection {
@@ -317,7 +336,9 @@ mod reference {
             // SAFETY: the connection is open, sql is NUL-terminated, and result is destroyed on
             // every path below. Strings from duckdb_value_string are freed with duckdb_free.
             unsafe {
+                let started = std::time::Instant::now();
                 let state = ffi::duckdb_query(self.0, sql.as_ptr(), &mut result);
+                let elapsed = started.elapsed();
                 if state != ffi::DuckDBSuccess {
                     let error = ffi::duckdb_result_error(&mut result);
                     let message = if error.is_null() {
@@ -364,6 +385,7 @@ mod reference {
                     output,
                     unrenderable,
                     is_select,
+                    elapsed,
                 })
             }
         }
@@ -371,7 +393,12 @@ mod reference {
 
     impl Connection for ReferenceConnection {
         fn query(&mut self, sql: &str) -> Result<QueryOutput, String> {
+            self.query_timed(sql).map(|(output, _)| output)
+        }
+
+        fn query_timed(&mut self, sql: &str) -> Result<(QueryOutput, std::time::Duration), String> {
             let raw = self.run(sql)?;
+            let elapsed = raw.elapsed;
             let mut output = raw.output;
             if raw.unrenderable && raw.is_select {
                 // The C++ runner renders values with a VARCHAR cast, so re-run the SELECT with
@@ -385,7 +412,7 @@ mod reference {
                     output.rows = cast.output.rows;
                 }
             }
-            Ok(output)
+            Ok((output, elapsed))
         }
     }
 }

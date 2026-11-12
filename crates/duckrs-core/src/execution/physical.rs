@@ -94,6 +94,19 @@ pub trait PhysicalOperator: fmt::Debug + Send + Sync {
     fn parallel_chunk(&self, _state: &SharedSourceState, _index: usize) -> Result<Option<DataChunk>> {
         unreachable!("{} is not a parallel source", self.name())
     }
+    /// The chunks of morsel `index`, in order: a morsel of a source whose morsels are larger than a
+    /// chunk (a row group of a database file) gives several.
+    fn parallel_chunks(
+        &self,
+        state: &SharedSourceState,
+        index: usize,
+        emit: &mut dyn FnMut(DataChunk) -> Result<()>,
+    ) -> Result<()> {
+        match self.parallel_chunk(state, index)? {
+            Some(chunk) => emit(chunk),
+            None => Ok(()),
+        }
+    }
 
     // Operator interface: one input chunk becomes one output chunk
     fn execute(&self, _input: DataChunk) -> Result<DataChunk> {
@@ -145,6 +158,25 @@ pub trait PhysicalOperator: fmt::Debug + Send + Sync {
     fn combine_local(&self, _local: LocalSinkState) -> Result<()> {
         unreachable!("{} is not a parallel sink", self.name())
     }
+    /// [`Self::parallel_sink`] for one of the inputs of a sink with several (a delim join).
+    fn parallel_sink_input(&self, _input: usize) -> bool {
+        self.sink_children().len() == 1 && self.parallel_sink()
+    }
+    fn local_sink_state_input(&self, _input: usize) -> LocalSinkState {
+        self.local_sink_state()
+    }
+    fn sink_local_input(
+        &self,
+        _input: usize,
+        local: &mut LocalSinkState,
+        batch: usize,
+        chunk: &DataChunk,
+    ) -> Result<()> {
+        self.sink_local(local, batch, chunk)
+    }
+    fn combine_local_input(&self, _input: usize, local: LocalSinkState) -> Result<()> {
+        self.combine_local(local)
+    }
     /// Which child feeds the sink. Joins are sinks for their right child, and the left child
     /// streams through them.
     fn sink_child(&self) -> usize {
@@ -187,6 +219,9 @@ struct TableScanState {
     cursor: Option<FileScan>,
     /// How far an index scan got in `index_rows`.
     next_index_row: usize,
+    /// A filtered scan of a table in its file, a row group at a time: the next group, and the chunks
+    /// of the last one that are still to come.
+    filtered: Option<(usize, Vec<usize>, std::collections::VecDeque<DataChunk>)>,
 }
 
 /// What a scan reads of a file. `column_ids` lists all columns for the filter and the projection to
@@ -284,6 +319,17 @@ impl PhysicalTableScan {
     }
 
     fn file_scan(&self, source: Arc<dyn TableSource>) -> FileScan {
+        let (read, types, columns) = self.file_columns();
+        FileScan {
+            cursor: TableCursor::new(source, read, types, self.table.row_group_size()),
+            columns,
+        }
+    }
+
+    /// The columns a scan of the file reads, their types, and per entry of `column_ids` where a
+    /// chunk of them has it (or a vector that nothing reads).
+    #[allow(clippy::type_complexity, reason = "the three parts of a FileScan")]
+    fn file_columns(&self) -> (Vec<usize>, Vec<LogicalType>, Vec<Result<usize, Vector>>) {
         let mut used = vec![self.projection.is_none(); self.column_ids.len()];
         for &position in self.projection.iter().flatten() {
             used[position] = true;
@@ -312,11 +358,200 @@ impl PhysicalTableScan {
             }
         }
         let types = read.iter().map(|&c| self.table.columns[c].ty.clone()).collect();
-        FileScan {
-            cursor: TableCursor::new(source, read, types, self.table.row_group_size()),
-            columns,
-        }
+        (read, types, columns)
     }
+
+    /// [`PhysicalOperator::parallel_source`] of a table still in its file: a morsel is a row group,
+    /// when the groups of the file are those of the table (all full but the last).
+    fn parallel_file_source(&self, source: Arc<dyn TableSource>) -> Option<(SharedSourceState, usize)> {
+        let group_rows = self.table.row_group_size();
+        let groups = source.group_count();
+        if groups < MIN_PARALLEL_ROW_GROUPS {
+            return None;
+        }
+        let rows = self.table.row_count();
+        // the zone maps are per group of the table, which are those of the file only when they line up
+        let aligned = group_rows.is_multiple_of(STANDARD_VECTOR_SIZE) && TableCursor::is_aligned(&*source, group_rows);
+        let wanted = if aligned {
+            groups_to_scan(&self.table, &self.column_ids, self.filter.as_ref(), rows)
+        } else {
+            Vec::new()
+        };
+        let starts = group_starts(&*source);
+        let ids = self.table.row_ids(rows);
+        let (read, types, columns) = self.file_columns();
+        let scan = FileScan {
+            cursor: TableCursor::new(source.clone(), read.clone(), types.clone(), group_rows),
+            columns,
+        };
+        Some((
+            Box::new(ParallelFileScan {
+                source,
+                read,
+                types,
+                scan,
+                ids,
+                rows,
+                groups: wanted,
+                starts,
+            }),
+            groups,
+        ))
+    }
+}
+
+/// The positions in `column_ids` that an expression reads.
+fn referenced_positions(expr: &BoundExpr) -> Vec<usize> {
+    let mut positions = Vec::new();
+    expr.clone().walk_mut(&mut |e| {
+        if let BoundExprKind::Reference(position) = e.kind
+            && !positions.contains(&position)
+        {
+            positions.push(position);
+        }
+    });
+    positions
+}
+
+impl PhysicalTableScan {
+    /// `TableScanState` with table filters, on a row group of a table in its file: the conjuncts of the
+    /// filter one by one (those of one column first), each reading its columns only for the rows the ones
+    /// before kept (`ColumnData::Select`), then the columns of the output for the rows left, in chunks.
+    #[allow(clippy::too_many_arguments, reason = "the parts of a scan of one row group")]
+    fn scan_group_filtered(
+        &self,
+        source: &dyn TableSource,
+        group: usize,
+        first_row: usize,
+        group_rows: usize,
+        ids: &RowIds,
+        emit: &mut dyn FnMut(DataChunk) -> Result<()>,
+    ) -> Result<()> {
+        let filter = self.filter.as_ref().expect("a filtered scan has a filter");
+        let mut conjuncts: Vec<(&BoundExpr, Vec<usize>)> = match &filter.kind {
+            BoundExprKind::Conjunction { and: true, children } => {
+                children.iter().map(|c| (c, referenced_positions(c))).collect()
+            }
+            _ => vec![(filter, referenced_positions(filter))],
+        };
+        // of those of as many columns, a join filter that has its keys goes first: it hashes an integer
+        // and often drops most rows. Then come those of numbers, then those that read strings
+        let cost = |conjunct: &BoundExpr, positions: &[usize]| match &conjunct.kind {
+            BoundExprKind::JoinFilter { filter, .. } => {
+                if filter.is_active() {
+                    0
+                } else {
+                    3
+                }
+            }
+            _ if positions.iter().all(|&position| {
+                self.column_ids[position] == COLUMN_IDENTIFIER_ROW_ID
+                    || self.table.columns[self.column_ids[position]].ty.id()
+                        != duckrs_common::types::LogicalTypeId::Varchar
+            }) =>
+            {
+                1
+            }
+            _ => 2,
+        };
+        conjuncts.sort_by_key(|(conjunct, positions)| (positions.len(), cost(conjunct, positions)));
+        let type_of = |position: usize| -> LogicalType {
+            match self.column_ids[position] {
+                COLUMN_IDENTIFIER_ROW_ID => LogicalType::BIGINT,
+                column => self.table.columns[column].ty.clone(),
+            }
+        };
+        let fetch = |position: usize, selection: &[u32]| -> Result<Vector> {
+            match self.column_ids[position] {
+                COLUMN_IDENTIFIER_ROW_ID => {
+                    let mut ids = ids.vector(first_row, group_rows)?;
+                    ids.slice(&SelectionVector::from_vec(selection.to_vec()), selection.len());
+                    Ok(ids)
+                }
+                column => source.fetch_rows(group, column, selection),
+            }
+        };
+        let mut selection: Vec<u32> = (0..group_rows as u32).collect();
+        let mut fetched: Vec<Option<Vector>> = vec![None; self.column_ids.len()];
+        // what stands in a chunk for a column no filter has read yet
+        let unread: Vec<Vector> = (0..self.column_ids.len())
+            .map(|position| Vector::constant_null(type_of(position)))
+            .collect();
+        for (conjunct, positions) in conjuncts {
+            for &position in &positions {
+                if fetched[position].is_none() {
+                    fetched[position] = Some(fetch(position, &selection)?);
+                }
+            }
+            let mut kept: Vec<u32> = Vec::with_capacity(selection.len());
+            for start in (0..selection.len()).step_by(STANDARD_VECTOR_SIZE) {
+                let count = STANDARD_VECTOR_SIZE.min(selection.len() - start);
+                let columns = (0..self.column_ids.len())
+                    .map(|position| match &fetched[position] {
+                        Some(vector) => vector.range(start, count),
+                        None => unread[position].clone(),
+                    })
+                    .collect();
+                let chunk = DataChunk::from_columns(columns, count);
+                let (sel, matched) = select(conjunct, &chunk)?;
+                kept.extend((0..matched).map(|i| (start + sel.get(i)) as u32));
+            }
+            if kept.len() < selection.len() {
+                let keep = SelectionVector::from_vec(kept.clone());
+                for vector in fetched.iter_mut().flatten() {
+                    vector.slice(&keep, kept.len());
+                }
+                selection = kept.iter().map(|&k| selection[k as usize]).collect();
+            }
+            if selection.is_empty() {
+                return Ok(());
+            }
+        }
+        let output: Vec<usize> = match &self.projection {
+            Some(positions) => positions.clone(),
+            None => (0..self.column_ids.len()).collect(),
+        };
+        for &position in &output {
+            if fetched[position].is_none() {
+                fetched[position] = Some(fetch(position, &selection)?);
+            }
+        }
+        for start in (0..selection.len()).step_by(STANDARD_VECTOR_SIZE) {
+            let count = STANDARD_VECTOR_SIZE.min(selection.len() - start);
+            let columns = output
+                .iter()
+                .map(|&position| fetched[position].as_ref().expect("fetched above").range(start, count))
+                .collect();
+            emit(DataChunk::from_columns(columns, count))?;
+        }
+        Ok(())
+    }
+}
+
+/// What the threads of a [`PhysicalTableScan`] of a table in its file share.
+struct ParallelFileScan {
+    source: Arc<dyn TableSource>,
+    /// the columns of the table that are read, and their types
+    read: Vec<usize>,
+    types: Vec<LogicalType>,
+    /// where the chunks have each column (its cursor is not used)
+    scan: FileScan,
+    ids: Arc<RowIds>,
+    rows: usize,
+    groups: Vec<bool>,
+    /// the first row of each group of the file
+    starts: Vec<usize>,
+}
+
+/// The first row of each group of a source: groups of a file written on threads need not be full.
+fn group_starts(source: &dyn TableSource) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(source.group_count());
+    let mut start = 0;
+    for group in 0..source.group_count() {
+        starts.push(start);
+        start += source.group_rows(group);
+    }
+    starts
 }
 
 /// What the threads of a [`PhysicalTableScan`] share.
@@ -335,11 +570,11 @@ impl PhysicalOperator for PhysicalTableScan {
         "TABLE_SCAN"
     }
     fn parallel_source(&self) -> Option<(SharedSourceState, usize)> {
-        if self.index_rows.is_some() || self.table.source().is_some() {
+        if self.index_rows.is_some() || !self.filter.as_ref().is_none_or(parallel_expression) {
             return None;
         }
-        if !self.filter.as_ref().is_none_or(parallel_expression) {
-            return None;
+        if let Some(source) = self.table.source() {
+            return self.parallel_file_source(source);
         }
         let rows = self.table.row_count();
         let chunks = rows.div_ceil(STANDARD_VECTOR_SIZE);
@@ -349,6 +584,47 @@ impl PhysicalOperator for PhysicalTableScan {
         let groups = groups_to_scan(&self.table, &self.column_ids, self.filter.as_ref(), rows);
         let ids = self.table.row_ids(rows);
         Some((Box::new(ParallelTableScan { ids, rows, groups }), chunks))
+    }
+    fn parallel_chunks(
+        &self,
+        state: &SharedSourceState,
+        index: usize,
+        emit: &mut dyn FnMut(DataChunk) -> Result<()>,
+    ) -> Result<()> {
+        let Some(state) = state.downcast_ref::<ParallelFileScan>() else {
+            return match self.parallel_chunk(state, index)? {
+                Some(chunk) => emit(chunk),
+                None => Ok(()),
+            };
+        };
+        // a row group of the file, in chunks
+        if !state.groups.get(index).is_none_or(|g| *g) {
+            return Ok(());
+        }
+        let group_start = state.starts[index];
+        if self.filter.is_some() {
+            let group_rows = state.source.group_rows(index);
+            let rows = group_rows.min(state.rows.saturating_sub(group_start));
+            return self.scan_group_filtered(&*state.source, index, group_start, rows, &state.ids, emit);
+        }
+        let mut group = ColumnDataCollection::new(state.types.clone());
+        group.append_shared(&state.source.read_group(index, &state.read)?);
+        for (local, chunk) in group.chunks().enumerate() {
+            let first_row = group_start + local * STANDARD_VECTOR_SIZE;
+            let count = chunk.len().min(state.rows.saturating_sub(first_row));
+            if count == 0 {
+                break;
+            }
+            let columns = self.scan_columns(chunk, &state.ids, first_row, Some(&state.scan))?;
+            let mut result = DataChunk::from_columns(columns, chunk.len());
+            if count < chunk.len() {
+                result.slice(&SelectionVector::from_vec((0..count as u32).collect()), count);
+            }
+            if let Some(result) = self.finish_chunk(result)? {
+                emit(result)?;
+            }
+        }
+        Ok(())
     }
     fn parallel_chunk(&self, state: &SharedSourceState, index: usize) -> Result<Option<DataChunk>> {
         let state: &ParallelTableScan = state.downcast_ref().expect("parallel scan state");
@@ -381,8 +657,13 @@ impl PhysicalOperator for PhysicalTableScan {
     fn source_state(&self) -> SourceState {
         let remaining = self.table.row_count();
         let groups = groups_to_scan(&self.table, &self.column_ids, self.filter.as_ref(), remaining);
-        let cursor = self.table.source().map(|source| self.file_scan(source));
+        let source = self.table.source();
+        let cursor = source.clone().map(|source| self.file_scan(source));
         let ids = self.table.row_ids(remaining);
+        // a filter on a table in its file is applied while its row groups are read
+        let filtered = source
+            .filter(|_| self.filter.is_some() && self.index_rows.is_none())
+            .map(|source| (0, group_starts(&*source), std::collections::VecDeque::new()));
         Box::new(TableScanState {
             ids,
             next: 0,
@@ -390,6 +671,7 @@ impl PhysicalOperator for PhysicalTableScan {
             groups,
             cursor,
             next_index_row: 0,
+            filtered,
         })
     }
     fn row_groups_scanned(&self) -> Option<(usize, usize)> {
@@ -408,9 +690,36 @@ impl PhysicalOperator for PhysicalTableScan {
             groups,
             cursor,
             next_index_row,
+            filtered,
         } = state.downcast_mut().expect("table scan state");
         if let Some(rows) = &self.index_rows {
             return self.next_index_chunk(rows, next_index_row);
+        }
+        if let Some((next_group, starts, pending)) = filtered {
+            let source = self.table.source().expect("a filtered scan reads a file");
+            let rows = *remaining;
+            let group_rows = self.table.row_group_size();
+            let aligned =
+                group_rows.is_multiple_of(STANDARD_VECTOR_SIZE) && TableCursor::is_aligned(&*source, group_rows);
+            loop {
+                if let Some(chunk) = pending.pop_front() {
+                    return Ok(Some(chunk));
+                }
+                if *next_group >= source.group_count() {
+                    return Ok(None);
+                }
+                let group = *next_group;
+                *next_group += 1;
+                let first_row = starts[group];
+                if first_row >= rows || (aligned && !groups.get(group).is_none_or(|g| *g)) {
+                    continue;
+                }
+                let group_rows = source.group_rows(group).min(rows - first_row);
+                self.scan_group_filtered(&*source, group, first_row, group_rows, ids, &mut |chunk| {
+                    pending.push_back(chunk);
+                    Ok(())
+                })?;
+            }
         }
         while *remaining > 0 {
             // all chunks but the last are full, so that a chunk tells where its rows are
@@ -447,11 +756,18 @@ impl PhysicalOperator for PhysicalTableScan {
 }
 
 /// Whether threads can evaluate `expr` at once. What is volatile gives other results in another
-/// order, and what runs a plan of its own is not known to be safe from several threads.
+/// order, and a correlated subquery runs a plan for each row it gets.
 pub(super) fn parallel_expression(expr: &BoundExpr) -> bool {
     use crate::planner::expression::BoundExprKind;
     fn has_subquery(expr: &BoundExpr) -> bool {
-        matches!(expr.kind, BoundExprKind::Subquery { .. }) || expr.children().into_iter().any(has_subquery)
+        // an uncorrelated subquery runs once and every thread reads what it gave
+        let correlated = match &expr.kind {
+            BoundExprKind::Subquery {
+                subquery, correlated, ..
+            } => subquery.volatile || !correlated.is_empty() || !subquery.correlated.is_empty(),
+            _ => false,
+        };
+        correlated || expr.children().into_iter().any(has_subquery)
     }
     !expr.is_volatile() && !has_subquery(expr)
 }
@@ -1718,10 +2034,13 @@ pub struct PhysicalOrder {
     pub data: Mutex<ColumnDataCollection>,
     /// the runs of a sort past the memory limit; a Top-N keeps few rows and does not spill
     spill: Option<Mutex<SortSpill>>,
+    /// a Top-N's boundary (`TopNHeap`'s boundary value): the sort key of the last row it keeps, once
+    /// it has as many rows as it needs, so that rows that sort after it are not kept
+    boundary: Mutex<Option<Vec<u8>>>,
 }
 
 /// A Top-N sorts what it has when it has twice what it needs, and at least this.
-const TOP_N_MIN_BUFFERED_ROWS: u64 = 1 << 16;
+const TOP_N_MIN_BUFFERED_ROWS: u64 = 1 << 12;
 
 /// The rows of a collection after the first `offset`, at most `count` of them.
 fn rows_of_collection(collection: &ColumnDataCollection, offset: u64, count: u64) -> ColumnDataCollection {
@@ -1755,9 +2074,20 @@ impl PhysicalOrder {
             top,
             data: Mutex::new(ColumnDataCollection::new(types.clone())),
             spill: (top.is_none() && SortSpill::can_spill(&types)).then(Mutex::default),
+            boundary: Mutex::default(),
             types,
             children: vec![child],
         }
+    }
+
+    /// The sort key of each row of `chunk`.
+    fn sort_keys(&self, chunk: &DataChunk) -> Result<Vec<Vec<u8>>> {
+        let columns: Vec<(&Vector, OrderModifiers)> = self
+            .orders
+            .iter()
+            .map(|&(column, m)| (chunk.column(column), m))
+            .collect();
+        create_sort_keys(&columns, chunk.len())
     }
 }
 
@@ -1775,16 +2105,48 @@ impl PhysicalOperator for PhysicalOrder {
         true
     }
     fn sink(&self, chunk: &DataChunk) -> Result<()> {
-        let mut data = self.data.lock();
-        data.append(chunk);
-        if let Some(spill) = &self.spill {
-            return spill.lock().sink(&mut data, chunk, &self.orders);
+        let Some((limit, offset)) = self.top else {
+            let mut data = self.data.lock();
+            data.append(chunk);
+            if let Some(spill) = &self.spill {
+                return spill.lock().sink(&mut data, chunk, &self.orders);
+            }
+            return check_buffered(&data);
+        };
+        let keep = limit.saturating_add(offset);
+        // rows that sort after the boundary never get in: a tie comes after the rows kept, as the
+        // sort keeps ties in order
+        let mut boundary = self.boundary.lock();
+        let mut rows = std::borrow::Cow::Borrowed(chunk);
+        if let Some(bound) = boundary.as_ref() {
+            let keys = self.sort_keys(chunk)?;
+            let selected: Vec<u32> = keys
+                .iter()
+                .enumerate()
+                .filter(|(_, key)| key.as_slice() < bound.as_slice())
+                .map(|(row, _)| row as u32)
+                .collect();
+            if selected.is_empty() {
+                return Ok(());
+            }
+            if selected.len() < chunk.len() {
+                let count = selected.len();
+                let mut sliced = chunk.clone();
+                sliced.slice(&SelectionVector::from_vec(selected), count);
+                rows = std::borrow::Cow::Owned(sliced);
+            }
         }
-        // what is behind the first rows now never gets back in, as the sort keeps ties in order
-        if let Some((limit, offset)) = self.top {
-            let keep = limit.saturating_add(offset);
-            if data.len() as u64 > keep.saturating_mul(2).max(TOP_N_MIN_BUFFERED_ROWS) {
-                *data = rows_of_collection(&sort_collection(&data, &self.orders)?, 0, keep);
+        let mut data = self.data.lock();
+        data.append(&rows);
+        // what is behind the first rows now never gets back in
+        if keep > 0 && data.len() as u64 > keep.saturating_mul(2).max(TOP_N_MIN_BUFFERED_ROWS) {
+            *data = rows_of_collection(&sort_collection(&data, &self.orders)?, 0, keep);
+            if data.len() as u64 == keep {
+                let last = data.chunk(data.chunk_count() - 1);
+                let row = last.len() - 1;
+                let mut one = last.clone();
+                one.slice(&SelectionVector::from_vec(vec![row as u32]), 1);
+                *boundary = self.sort_keys(&one)?.pop();
             }
         }
         check_buffered(&data)
@@ -2121,10 +2483,15 @@ pub struct PhysicalAggregate {
     pub children: Vec<Box<dyn PhysicalOperator>>,
     grouping_sets: Vec<GroupingSet>,
     state: Mutex<Vec<AggregateSinkState>>,
+    /// the states of threads that are put together by partition when the aggregate finishes
+    locals: Mutex<Vec<AggregateSinkState>>,
     output: Mutex<Vec<DataChunk>>,
     /// where rows go past the memory limit, for an aggregate that can spill
     spill: Option<AggregateSpill>,
 }
+
+/// From how many groups the states of threads are put together by partition, on threads.
+const PARTITIONED_MERGE_GROUPS: usize = 10_000;
 
 /// How many partitions the rows of an aggregate past the memory limit go into.
 const AGGREGATE_PARTITIONS: usize = 64;
@@ -2224,6 +2591,9 @@ impl GroupingSet {
 #[derive(Debug)]
 struct AggregateSinkState {
     group_ids: RowKeyMap<usize>,
+    /// for a state split off another to be merged: the keys of its groups in their order, in
+    /// place of `group_ids`, which nothing looks anything up in
+    ordered_keys: Vec<RowKey>,
     group_values: ColumnDataCollection,
     group_count: usize,
     /// per aggregate, the states of the groups
@@ -2245,6 +2615,7 @@ impl AggregateSinkState {
         let group_count = usize::from(group_types.is_empty());
         Self {
             group_ids: RowKeyMap::default(),
+            ordered_keys: Vec::new(),
             group_values: ColumnDataCollection::new(group_types),
             group_count,
             states: aggregates
@@ -2311,6 +2682,7 @@ impl PhysicalAggregate {
             spill: None,
             grouping_sets: sets,
             state: Mutex::new(state),
+            locals: Mutex::default(),
             output: Mutex::default(),
         }
         .with_spill()
@@ -2339,7 +2711,18 @@ impl PhysicalAggregate {
     /// room to grow, and its states, whose vectors do too, with what a state may keep apart.
     fn bytes_per_group(&self) -> usize {
         let key = std::mem::size_of::<RowKey>() + std::mem::size_of::<usize>();
-        2 * key + self.aggregates.len() * (2 * std::mem::size_of::<AggregateState>() + 32)
+        // a state that holds a value has it behind a pointer, with its sort key for a minimum
+        let apart: usize = self
+            .aggregates
+            .iter()
+            .map(|a| match a.function.kind.initial_state() {
+                AggregateState::Extreme(_) | AggregateState::Value(_) => {
+                    2 * (std::mem::size_of::<Value>() + std::mem::size_of::<Vec<u8>>())
+                }
+                _ => 0,
+            })
+            .sum();
+        2 * key + self.aggregates.len() * (2 * std::mem::size_of::<AggregateState>() + 32) + apart
     }
 
     /// Roughly what the states hold for each input row, besides the groups: rows that an
@@ -2349,7 +2732,7 @@ impl PhysicalAggregate {
             .iter()
             .filter(|a| a.distinct || !a.order_by.is_empty() || !a.function.kind.is_order_independent())
             .count()
-            * 32
+            * (std::mem::size_of::<Value>() + 16)
     }
 
     /// Sinks `chunk` into `states`. Past the memory limit, the rows of groups the state does not
@@ -2559,6 +2942,9 @@ impl PhysicalAggregate {
             return Ok(vec![0; count]);
         }
         let columns: Vec<&Vector> = set.groups.iter().map(|&g| &vectors[g]).collect();
+        if let Some(ids) = self.find_dictionary_groups(set, vectors, &columns, count, state)? {
+            return Ok(ids);
+        }
         let keys = create_row_keys(&columns, count)?;
         let mut new_rows = Vec::new();
         let mut ids = Vec::with_capacity(keys.len());
@@ -2586,6 +2972,85 @@ impl PhysicalAggregate {
             }
         }
         Ok(ids)
+    }
+
+    /// [`Self::find_groups`] when every group column is a dictionary vector of a small dictionary
+    /// (a string column read from its file): the entries of the dictionaries a row has name its group,
+    /// so each combination in the chunk is looked up once, and the rows find theirs in a table.
+    fn find_dictionary_groups(
+        &self,
+        set: &GroupingSet,
+        vectors: &[Vector],
+        columns: &[&Vector],
+        count: usize,
+        state: &mut AggregateSinkState,
+    ) -> Result<Option<Vec<usize>>> {
+        const MAX_COMBINATIONS: usize = 1 << 16;
+        let mut dictionaries = Vec::with_capacity(columns.len());
+        let mut combinations = 1usize;
+        for column in columns {
+            let Some((sel, child)) = column.dictionary() else {
+                return Ok(None);
+            };
+            if child.vector_type() != duckrs_common::vector::VectorType::Flat {
+                return Ok(None);
+            }
+            let entries = child.capacity().max(1);
+            combinations = match combinations.checked_mul(entries) {
+                Some(c) if c <= MAX_COMBINATIONS => c,
+                _ => return Ok(None),
+            };
+            dictionaries.push((sel, entries));
+        }
+        // the combination of each row, and the first row of each combination
+        let mut codes = vec![0u32; count];
+        for (sel, entries) in &dictionaries {
+            for (row, code) in codes.iter_mut().enumerate() {
+                *code = *code * *entries as u32 + sel.get(row) as u32;
+            }
+        }
+        let mut first_row = vec![u32::MAX; combinations];
+        let mut representatives = Vec::new();
+        for (row, &code) in codes.iter().enumerate() {
+            if first_row[code as usize] == u32::MAX {
+                first_row[code as usize] = row as u32;
+                representatives.push(row as u32);
+            }
+        }
+        // the groups of the combinations, as the rows that have them find theirs
+        let mut sliced: Vec<Vector> = columns.iter().map(|c| (*c).clone()).collect();
+        let selection = SelectionVector::from_vec(representatives.clone());
+        for vector in &mut sliced {
+            vector.slice(&selection, representatives.len());
+        }
+        let references: Vec<&Vector> = sliced.iter().collect();
+        let keys = create_row_keys(&references, representatives.len())?;
+        let mut group_of = vec![0usize; combinations];
+        let mut new_rows = Vec::new();
+        for (&row, key) in representatives.iter().zip(keys) {
+            let next = state.group_count;
+            let id = *state.group_ids.entry(key).or_insert(next);
+            if id == next {
+                state.group_count += 1;
+                new_rows.push(row);
+            }
+            group_of[codes[row as usize] as usize] = id;
+        }
+        if !new_rows.is_empty() {
+            let new_count = new_rows.len();
+            let columns = set.groups.iter().map(|&g| vectors[g].clone()).collect();
+            let mut values = DataChunk::from_columns(columns, count);
+            values.slice(&SelectionVector::from_vec(new_rows), new_count);
+            state.bytes += temporary::estimated_bytes(&values) + new_count * self.bytes_per_group();
+            state.group_values.append(&values);
+            if self.spill.is_none() {
+                check_buffered(&state.group_values)?;
+            }
+            for (states, aggregate) in state.states.iter_mut().zip(&self.aggregates) {
+                states.resize(state.group_count, aggregate.function.kind.initial_state());
+            }
+        }
+        Ok(Some(codes.into_iter().map(|code| group_of[code as usize]).collect()))
     }
 
     fn aggregate_input(aggregate: &BoundAggregate, chunk: &DataChunk) -> Result<AggregateInput> {
@@ -2734,9 +3199,14 @@ impl PhysicalOperator for PhysicalAggregate {
         self.sink_chunk(chunk, states, self.spill.as_ref().map(|s| &s.target))
     }
     fn combine_local(&self, local: LocalSinkState) -> Result<()> {
-        let local = *local
+        let mut local = *local
             .downcast::<Vec<AggregateSinkState>>()
             .expect("aggregate local state");
+        // a state that never spilled waits for the others, to be put together by partition
+        if self.partitioned_merge() && local.len() == 1 && !local[0].full {
+            self.locals.lock().push(local.remove(0));
+            return Ok(());
+        }
         let mut states = self.state.lock();
         for (state, local) in states.iter_mut().zip(local) {
             self.merge_groups(state, local)?;
@@ -2745,6 +3215,24 @@ impl PhysicalOperator for PhysicalAggregate {
     }
     fn finalize(&self) -> Result<()> {
         let mut states = self.state.lock();
+        let locals = std::mem::take(&mut *self.locals.lock());
+        if !locals.is_empty() {
+            let groups: usize = locals.iter().map(|l| l.group_count).sum();
+            let untouched = states[0].group_count == 0 && !states[0].full;
+            if untouched && locals.len() > 1 && groups >= PARTITIONED_MERGE_GROUPS {
+                let output = self.merge_partitioned(locals)?;
+                if let Some(spill) = &self.spill {
+                    spill.spilled.store(false, Ordering::Relaxed);
+                    spill.pending.lock().clear();
+                    temporary::current().release(spill.reserved.swap(0, Ordering::Relaxed));
+                }
+                *self.output.lock() = output;
+                return Ok(());
+            }
+            for local in locals {
+                self.merge_groups(&mut states[0], local)?;
+            }
+        }
         let mut output = Vec::new();
         if let Some(spill) = &self.spill {
             let threads = spill.threads.load(Ordering::Relaxed);
@@ -2818,27 +3306,158 @@ impl PhysicalAggregate {
         Ok((vectors, inputs))
     }
 
-    /// `CombineStates`: the groups of a thread go into `state`.
-    fn merge_groups(&self, state: &mut AggregateSinkState, local: AggregateSinkState) -> Result<()> {
+    /// Whether the states of threads can wait to be put together by partition: one grouping set with
+    /// groups, and aggregates that keep nothing apart (DISTINCT, ORDER BY).
+    fn partitioned_merge(&self) -> bool {
+        self.grouping_sets.len() == 1
+            && !self.grouping_sets[0].groups.is_empty()
+            && self.aggregates.iter().all(|a| !a.distinct && a.order_by.is_empty())
+    }
+
+    /// `RadixPartitionedHashTable::Finalize` on threads: the groups of each thread's state go into
+    /// partitions by the hash of their key, then each partition is put together and gives its output
+    /// on a thread of its own. The groups come out in partition order.
+    fn merge_partitioned(&self, locals: Vec<AggregateSinkState>) -> Result<Vec<DataChunk>> {
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let partitions = (threads * 2).next_power_of_two();
+        // split each thread's state, on threads
+        let split: Vec<Vec<AggregateSinkState>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = locals
+                .into_iter()
+                .map(|local| scope.spawn(move || self.split_state(local, partitions)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("an aggregate split thread"))
+                .collect::<Result<Vec<_>>>()
+        })?;
+        // partition p of every thread, together
+        let mut by_partition: Vec<Vec<AggregateSinkState>> = (0..partitions).map(|_| Vec::new()).collect();
+        for parts in split {
+            for (p, part) in parts.into_iter().enumerate() {
+                if part.group_count > 0 {
+                    by_partition[p].push(part);
+                }
+            }
+        }
+        let set = &self.grouping_sets[0];
+        let outputs: Vec<Vec<DataChunk>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = by_partition
+                .into_iter()
+                .filter(|parts| !parts.is_empty())
+                .map(|parts| {
+                    scope.spawn(move || -> Result<Vec<DataChunk>> {
+                        let types = parts[0].group_values.types().to_vec();
+                        let mut merged = AggregateSinkState::new(types, &self.aggregates);
+                        let groups = parts.iter().map(|part| part.group_count).sum();
+                        merged.group_ids.reserve(groups);
+                        merged.states.iter_mut().for_each(|states| states.reserve_exact(groups));
+                        for part in parts {
+                            self.merge_groups(&mut merged, part)?;
+                        }
+                        let mut output = Vec::new();
+                        self.set_output(set, &merged, &mut output)?;
+                        Ok(output)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("an aggregate merge thread"))
+                .collect::<Result<Vec<_>>>()
+        })?;
+        Ok(outputs.into_iter().flatten().collect())
+    }
+
+    /// The groups of `state` in `partitions` states, by the hash of their key.
+    fn split_state(&self, state: AggregateSinkState, partitions: usize) -> Result<Vec<AggregateSinkState>> {
+        use std::hash::{BuildHasher, BuildHasherDefault};
         let AggregateSinkState {
             group_ids,
             group_values,
             group_count,
             states,
             ..
+        } = state;
+        let types = group_values.types().to_vec();
+        let mut parts: Vec<AggregateSinkState> = (0..partitions)
+            .map(|_| {
+                let mut part = AggregateSinkState::new(types.clone(), &self.aggregates);
+                part.states.iter_mut().for_each(Vec::clear);
+                part
+            })
+            .collect();
+        let hasher = BuildHasherDefault::<duckrs_common::sort_key::KeyHasher>::default();
+        let mut keys: Vec<Option<RowKey>> = vec![None; group_count];
+        let mut partition_of = vec![0usize; group_count];
+        let mut counts = vec![0usize; partitions];
+        for (key, id) in group_ids {
+            partition_of[id] = (hasher.hash_one(&key) >> 32) as usize & (partitions - 1);
+            counts[partition_of[id]] += 1;
+            keys[id] = Some(key);
+        }
+        // each part is as large as it gets from the start, so that nothing is copied to grow
+        for (part, count) in parts.iter_mut().zip(&counts) {
+            part.ordered_keys.reserve_exact(*count);
+            part.states.iter_mut().for_each(|states| states.reserve_exact(*count));
+        }
+        // the values of the groups, chunk by chunk, into their partitions
+        let mut first = 0;
+        let mut rows: Vec<Vec<u32>> = vec![Vec::new(); partitions];
+        for chunk in group_values.chunks() {
+            for row in 0..chunk.len() {
+                rows[partition_of[first + row]].push(row as u32);
+            }
+            for (p, rows) in rows.iter_mut().enumerate().filter(|(_, rows)| !rows.is_empty()) {
+                let count = rows.len();
+                let mut values = chunk.clone();
+                values.slice(&SelectionVector::from_vec(std::mem::take(rows)), count);
+                parts[p].group_values.append(&values);
+            }
+            first += chunk.len();
+        }
+        // the keys and states, in the order of the values
+        for (id, key) in keys.into_iter().enumerate() {
+            let part = &mut parts[partition_of[id]];
+            part.ordered_keys.push(key.expect("a key per group"));
+            part.group_count += 1;
+        }
+        for (i, sourced) in states.into_iter().enumerate() {
+            for (id, source) in sourced.into_iter().enumerate() {
+                parts[partition_of[id]].states[i].push(source);
+            }
+        }
+        Ok(parts)
+    }
+
+    /// `CombineStates`: the groups of a thread go into `state`.
+    fn merge_groups(&self, state: &mut AggregateSinkState, local: AggregateSinkState) -> Result<()> {
+        let AggregateSinkState {
+            group_ids,
+            ordered_keys,
+            group_values,
+            group_count,
+            states,
+            ..
         } = local;
+        let groups_before = state.group_count;
         // a set without groups has its one group on both sides
         let mut targets = vec![0; group_count];
-        if !group_ids.is_empty() {
-            let mut keys: Vec<Option<RowKey>> = vec![None; group_count];
-            for (key, id) in group_ids {
-                keys[id] = Some(key);
-            }
+        if !group_ids.is_empty() || !ordered_keys.is_empty() {
+            let mut keys: Box<dyn Iterator<Item = RowKey>> = if ordered_keys.is_empty() {
+                let mut keys: Vec<Option<RowKey>> = vec![None; group_count];
+                for (key, id) in group_ids {
+                    keys[id] = Some(key);
+                }
+                Box::new(keys.into_iter().map(|key| key.expect("a key per group")))
+            } else {
+                Box::new(ordered_keys.into_iter())
+            };
             let mut first = 0;
             for chunk in group_values.chunks() {
                 let mut new_rows = Vec::new();
                 for row in 0..chunk.len() {
-                    let key = keys[first + row].take().expect("a key per group");
+                    let key = keys.next().expect("a key per group");
                     let next = state.group_count;
                     let id = *state.group_ids.entry(key).or_insert(next);
                     if id == next {
@@ -2847,7 +3466,9 @@ impl PhysicalAggregate {
                     }
                     targets[first + row] = id;
                 }
-                if !new_rows.is_empty() {
+                if new_rows.len() == chunk.len() {
+                    state.group_values.append(chunk);
+                } else if !new_rows.is_empty() {
                     let new_count = new_rows.len();
                     let mut values = chunk.clone();
                     values.slice(&SelectionVector::from_vec(new_rows), new_count);
@@ -2865,6 +3486,11 @@ impl PhysicalAggregate {
             merged.resize(state.group_count, kind.initial_state());
             for (group, source) in sourced.into_iter().enumerate() {
                 let slot = &mut merged[targets[group]];
+                if targets[group] >= groups_before && !group_values.types().is_empty() {
+                    // a group that is new here has no state yet, and no other group of `local` is it
+                    *slot = source;
+                    continue;
+                }
                 let current = std::mem::replace(slot, kind.initial_state());
                 *slot = combine_states(kind, current, source)?;
             }
@@ -2881,10 +3507,18 @@ impl PhysicalAggregate {
     ) -> Result<()> {
         for (set, state) in self.grouping_sets.iter().zip(states.iter_mut()) {
             let ids = self.find_groups(set, vectors, chunk.len(), state)?;
+            // the rows of the aggregates without a filter are the same: made once
+            let all_rows: Vec<(usize, usize)> = ids.iter().copied().enumerate().collect();
             for (i, (aggregate, input)) in self.aggregates.iter().zip(inputs).enumerate() {
+                if input.filtered.is_none() && input.distinct_keys.is_none() && input.order_keys.is_none() {
+                    aggregate
+                        .function
+                        .update(input.input.as_ref(), chunk.len(), &all_rows, &mut state.states[i])?;
+                    continue;
+                }
                 let mut rows: Vec<(usize, usize)> = match &input.filtered {
                     Some(filtered) => filtered.iter().map(|&row| (row, ids[row])).collect(),
-                    None => ids.iter().copied().enumerate().collect(),
+                    None => all_rows.clone(),
                 };
                 if let Some(keys) = &input.distinct_keys {
                     // each value counts once per group

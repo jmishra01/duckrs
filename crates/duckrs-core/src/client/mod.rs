@@ -3141,6 +3141,7 @@ impl ClientContext {
             profiler.clear_operators();
         }
         let memory = self.query_memory()?;
+        memory.set_threads(threads);
         crate::execution::profiler::with_profiler(operator_profiler.clone(), || {
             crate::execution::temporary::with_memory(memory, || execute_plan_with(&collector, threads))
         })?;

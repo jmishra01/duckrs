@@ -284,10 +284,33 @@ Each item gives the number of failing files in `test/` that it should fix, where
 
 ## Phase 13: Performance (not started)
 
-- [ ] 45. Criterion benchmarks for the kernels (only `duckrs-common/benches/executor.rs` exists)
-- [ ] 46. Nightly TPC-H, TPC-DS and ClickBench runs against C++ DuckDB at the baseline
+- [x] 45. Benchmarks: `tools/benchmark` (`benchmark_runner`) ports DuckDB's runner and reads its
+  `.benchmark` files (templates, includes, arguments, caches, `result`/`result_query`/`assert`); the
+  Criterion benches `duckrs-common/benches/executor.rs` (vector kernels) and `duckrs/benches/kernels.rs`
+  (scan, filter, aggregates, join, sort, top-N, window, casts on a million rows)
+- [ ] 46. Nightly runs against C++ DuckDB: `.github/workflows/benchmarks.yml` times TPC-H SF1, TPC-DS SF1 and
+  micro benchmarks on both engines (`--engine=both`, the `reference` feature); `CALL dbgen` / `CALL dsdgen`
+  are carried out with the generators of the checkout (`tools/tpch`, `tools/tpcds`)
+  - [ ] ClickBench (its data is downloaded) and storing the nightly numbers over time
 - [ ] 47. Faster kernels: monomorphized code, SIMD, a perfect hash aggregate, the salt/pointer hash table design
-- [ ] 48. v1 gate: TPC-H SF10 geometric mean ≤ 1.5× C++ DuckDB, and no query slower than 3×
+  - [x] threads for tables in their file (a row group per morsel) and for both inputs of delim joins
+  - [x] reading the file: one-load bit unpacking, contiguous vector copies, shared strings in scan buffers,
+    one string buffer per segment scan, `Vector::set_strs`
+  - [x] dictionary vectors for DICT_FSST string columns, comparisons and group lookups on their entries
+  - [x] a partitioned, parallel aggregate finalize for many groups; a Top-N boundary
+  - [x] vectorized decimal scale-ups, date parts, CASE results; LIKE with substring search
+  - [x] join partitions as one hash table of distinct keys (one hash per key) with their rows in one array
+  - [x] filters applied while a row group is read from its file, conjunct by conjunct, reading the other
+    columns only for the rows that pass (`TableSource::fetch_rows`)
+  - [ ] the rest of the hash join probe (C++'s salted pointers, prefetching), group keys without a byte
+    key per row, aggregate states not behind an enum per row, selective reads of dictionary strings and of
+    DELTA_FOR / RLE / ALP segments, morsels smaller than a row group
+- [ ] 48. v1 gate: TPC-H SF10 geometric mean ≤ 1.5× C++ DuckDB, and no query slower than 3×. The runner
+  prints the gate after `--engine=both`. On TPC-H SF1 (8 threads, all 22 answers correct) duckrs is at
+  1.53× (none above 3×: Q21 2.7×; Q02 0.5×, Q08 0.95×), from 12.7× at the start of item 47.
+  SF10, both engines on the file C++ wrote: about 1.3× (1.27× and 1.37× in two runs under heavy load from other work, in which Q18 and Q14 read above 3×; Q09 is down to 1.2–1.9× from 2.5×; Q11 0.5×, Q15 0.7×, Q22 0.7×), which passes the gate on a machine that was busy with other work; measure again on a quiet one before ticking this. duckrs
+  cannot load SF10 itself: an append keeps the rows of its table in memory (more than 2 GiB fails), where
+  C++ writes full row groups to blocks as they fill (optimistic writes)
 
 ## Phase 14: Extensions (not started)
 

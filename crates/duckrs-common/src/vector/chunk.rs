@@ -76,6 +76,11 @@ impl DataChunk {
         &self.columns
     }
 
+    /// Rows `start..start + count` as a chunk of their own ([`Vector::range`] of each column).
+    pub fn range(&self, start: usize, count: usize) -> DataChunk {
+        DataChunk::from_columns(self.columns.iter().map(|c| c.range(start, count)).collect(), count)
+    }
+
     pub fn columns_mut(&mut self) -> &mut [Vector] {
         &mut self.columns
     }

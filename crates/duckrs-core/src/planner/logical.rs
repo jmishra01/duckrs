@@ -345,6 +345,8 @@ pub struct JoinCondition {
     pub right: BoundExpr,
     /// `IS NOT DISTINCT FROM`: NULLs are equal
     pub null_safe: bool,
+    /// what the join tells a scan below its left side of its keys on the right
+    pub filter: Option<std::sync::Arc<crate::execution::join_filter::JoinFilter>>,
 }
 
 /// An ORDER BY term with its resolved order and NULL order (`BoundOrderByNode`).

@@ -70,7 +70,7 @@ fn out_of_bounds(what: &str) -> Error {
 }
 
 /// A sub-slice, which fails rather than panics if the file is damaged.
-fn bytes<'a>(data: &'a [u8], offset: usize, size: usize, what: &str) -> Result<&'a [u8]> {
+pub(super) fn bytes<'a>(data: &'a [u8], offset: usize, size: usize, what: &str) -> Result<&'a [u8]> {
     offset
         .checked_add(size)
         .and_then(|end| data.get(offset..end))
@@ -173,7 +173,181 @@ fn packed_size(count: usize, width: usize) -> usize {
 /// `count` packed values.
 fn unpack(data: &[u8], count: usize, width: usize, what: &str) -> Result<Vec<u128>> {
     bytes(data, 0, packed_size(count, width), what)?;
+    if width <= 57 {
+        let mask = if width == 0 { 0 } else { u64::MAX >> (64 - width) };
+        return Ok((0..count)
+            .map(|i| u128::from(load_bits(data, i * width, mask)))
+            .collect());
+    }
     Ok((0..count).map(|i| read_bits(data, i * width, width)).collect())
+}
+
+/// The bits from `bit` on that `mask` keeps (at most 57 of them): one load of the 8 bytes there.
+fn load_bits(data: &[u8], bit: usize, mask: u64) -> u64 {
+    let at = bit / 8;
+    let word = match data.get(at..at + 8) {
+        Some(word) => u64::from_le_bytes(word.try_into().expect("8 bytes")),
+        None => {
+            let mut word = [0u8; 8];
+            let available = data.len().saturating_sub(at).min(8);
+            word[..available].copy_from_slice(&data[at..at + available]);
+            u64::from_le_bytes(word)
+        }
+    };
+    (word >> (bit % 8)) & mask
+}
+
+/// [`unpack`] of values of at most 57 bits into values of at most 8 bytes, with the frame (and for
+/// DELTA_FOR the running sum) added: each value is read with one unaligned load of the 8 bytes at its
+/// first byte, and written at its width.
+#[allow(clippy::too_many_arguments, reason = "the parts of a FOR group")]
+fn unpack_narrow(
+    packed: &[u8],
+    rows: usize,
+    packed_width: usize,
+    frame: u64,
+    delta: bool,
+    mut carry: u64,
+    width: usize,
+    out: &mut Vec<u8>,
+) {
+    let mask = if packed_width == 0 {
+        0
+    } else {
+        u64::MAX >> (64 - packed_width)
+    };
+    let start = out.len();
+    out.resize(start + rows * width, 0);
+    let target = &mut out[start..];
+    let load = |bit: usize| -> u64 { load_bits(packed, bit, mask) };
+    macro_rules! write_all {
+        ($ty:ty) => {{
+            for (row, slot) in target.chunks_exact_mut(std::mem::size_of::<$ty>()).enumerate() {
+                let mut value = load(row * packed_width).wrapping_add(frame);
+                if delta {
+                    carry = value.wrapping_add(carry);
+                    value = carry;
+                }
+                slot.copy_from_slice(&(value as $ty).to_le_bytes());
+            }
+        }};
+    }
+    match width {
+        1 => write_all!(u8),
+        2 => write_all!(u16),
+        4 => write_all!(u32),
+        _ => write_all!(u64),
+    }
+}
+
+/// `BitpackingFetchRow` for many rows: the values of `rows` (ascending, from the segment's start) of a
+/// bit-packed segment, read one by one where the mode allows (CONSTANT, CONSTANT_DELTA and FOR of up to
+/// 57 bits); otherwise the segment is decoded once and the rows taken from it.
+pub fn bitpacking_rows(segment: &[u8], count: usize, width: usize, rows: &[u32], out: &mut Vec<u8>) -> Result<()> {
+    const HEADER_SIZE: usize = 8;
+    const CONSTANT: u32 = 2;
+    const CONSTANT_DELTA: u32 = 3;
+    const FOR: u32 = 5;
+    let mut decoded: Option<Vec<u8>> = None;
+    let mut take_decoded = |row: usize, out: &mut Vec<u8>| -> Result<()> {
+        if decoded.is_none() {
+            let mut all = Vec::with_capacity(count * width);
+            scan_bitpacking(segment, count, width, &mut all)?;
+            decoded = Some(all);
+        }
+        let all = decoded.as_ref().expect("just decoded");
+        out.extend_from_slice(bytes(all, row * width, width, "a bitpacked value")?);
+        Ok(())
+    };
+    let group_count = count.div_ceil(METADATA_GROUP_SIZE);
+    let metadata_end = u64_at(segment, 0, "the header of a bitpacked segment")? as usize;
+    let table_start = metadata_end
+        .checked_sub(group_count * 4)
+        .filter(|&start| start >= HEADER_SIZE)
+        .ok_or_else(|| corrupted("Corrupted bitpacking segment: offset is outside the segment"))?;
+    let bits = width * 8;
+    let mask = if bits == 128 { u128::MAX } else { (1 << bits) - 1 };
+    let number = |data: &[u8], at: usize| -> Result<u128> {
+        let mut value = [0; 16];
+        value[..width].copy_from_slice(bytes(data, at, width, "a value of a bitpacking group")?);
+        Ok(u128::from_le_bytes(value))
+    };
+    // the FOR group of the last row: its index, frame, width and packed values
+    let mut current: Option<(usize, u128, usize, &[u8])> = None;
+    for &row in rows {
+        let row = row as usize;
+        if row >= count {
+            return Err(out_of_bounds("a bitpacked row"));
+        }
+        let index = row / METADATA_GROUP_SIZE;
+        let local = row % METADATA_GROUP_SIZE;
+        if let Some((group, frame, packed_width, packed)) = current
+            && group == index
+        {
+            let packed_mask = if packed_width == 0 {
+                0
+            } else {
+                u64::MAX >> (64 - packed_width)
+            };
+            let value = u128::from(load_bits(packed, local * packed_width, packed_mask)).wrapping_add(frame);
+            out.extend_from_slice(&(value & mask).to_le_bytes()[..width]);
+            continue;
+        }
+        let encoded = u32_at(
+            segment,
+            table_start + (group_count - 1 - index) * 4,
+            "bitpacking metadata",
+        )?;
+        let (offset, mode) = ((encoded & 0xFFFFFF) as usize, encoded >> 24);
+        let end = if index + 1 < group_count {
+            (u32_at(
+                segment,
+                table_start + (group_count - 2 - index) * 4,
+                "bitpacking metadata",
+            )? & 0xFFFFFF) as usize
+        } else {
+            table_start
+        };
+        if offset < HEADER_SIZE || offset > end || end > table_start {
+            return Err(corrupted(
+                "Corrupted bitpacking segment: group offsets do not describe a range in the data region",
+            ));
+        }
+        let data = &segment[offset..end];
+        let value = match mode {
+            CONSTANT => number(data, 0)?,
+            CONSTANT_DELTA => {
+                let (frame, delta) = (number(data, 0)?, number(data, width)?);
+                delta.wrapping_mul(local as u128).wrapping_add(frame)
+            }
+            FOR if width <= 8 => {
+                let frame = number(data, 0)?;
+                let packed_width = number(data, width)? as usize;
+                if packed_width > 57 {
+                    take_decoded(row, out)?;
+                    continue;
+                }
+                let packed = data
+                    .get(width * 2..)
+                    .ok_or_else(|| out_of_bounds("a bitpacking group"))?;
+                let rows_here = METADATA_GROUP_SIZE.min(count - index * METADATA_GROUP_SIZE);
+                bytes(packed, 0, packed_size(rows_here, packed_width), "a bitpacking group")?;
+                current = Some((index, frame, packed_width, packed));
+                let packed_mask = if packed_width == 0 {
+                    0
+                } else {
+                    u64::MAX >> (64 - packed_width)
+                };
+                u128::from(load_bits(packed, local * packed_width, packed_mask)).wrapping_add(frame)
+            }
+            _ => {
+                take_decoded(row, out)?;
+                continue;
+            }
+        };
+        out.extend_from_slice(&(value & mask).to_le_bytes()[..width]);
+    }
+    Ok(())
 }
 
 /// `BitpackingScanPartial`. A segment is groups of 2048 values, each with its own mode, and a table
@@ -256,6 +430,21 @@ pub fn scan_bitpacking(segment: &[u8], count: usize, width: usize, out: &mut Vec
                     (0, width * 2)
                 };
                 let packed = data.get(header..).ok_or_else(|| out_of_bounds("a bitpacking group"))?;
+                if packed_width <= 57 && width <= 8 {
+                    // the common case: each value is in the 8 bytes at its first byte
+                    bytes(packed, 0, packed_size(rows, packed_width), "a bitpacking group")?;
+                    unpack_narrow(
+                        packed,
+                        rows,
+                        packed_width,
+                        frame as u64,
+                        mode == DELTA_FOR,
+                        carry as u64,
+                        width,
+                        out,
+                    );
+                    continue;
+                }
                 for value in unpack(packed, rows, packed_width, "a bitpacking group")? {
                     let value = value.wrapping_add(frame);
                     if mode == DELTA_FOR {
@@ -270,6 +459,57 @@ pub fn scan_bitpacking(segment: &[u8], count: usize, width: usize, out: &mut Vec
         }
     }
     Ok(())
+}
+
+/// The strings a segment scan gives, in one buffer: their bytes one after another, and where each ends.
+#[derive(Debug, Default)]
+pub struct StringRows {
+    bytes: Vec<u8>,
+    ends: Vec<usize>,
+}
+
+impl StringRows {
+    pub fn with_capacity(rows: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(rows * 8),
+            ends: Vec::with_capacity(rows),
+        }
+    }
+
+    pub fn push(&mut self, string: impl AsRef<[u8]>) {
+        self.bytes.extend_from_slice(string.as_ref());
+        self.ends.push(self.bytes.len());
+    }
+
+    /// A string that `write` puts at the end of the buffer.
+    pub fn push_with(&mut self, write: impl FnOnce(&mut Vec<u8>) -> Result<()>) -> Result<()> {
+        write(&mut self.bytes)?;
+        self.ends.push(self.bytes.len());
+        Ok(())
+    }
+
+    /// `count` empty strings (the rows of NULLs).
+    pub fn push_empty(&mut self, count: usize) {
+        let end = self.bytes.len();
+        self.ends.extend(std::iter::repeat_n(end, count));
+    }
+
+    pub fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    pub fn get(&self, row: usize) -> &[u8] {
+        let start = if row == 0 { 0 } else { self.ends[row - 1] };
+        &self.bytes[start..self.ends[row]]
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &[u8]> {
+        (0..self.len()).map(|row| self.get(row))
+    }
 }
 
 /// Reads the block of an overflow string.
@@ -308,7 +548,7 @@ fn zstd_corrupt(message: &str) -> Error {
 /// `ZSTDStorage::StringScan`: per vector of 2048 strings their lengths and one zstd frame of them, on the page
 /// of the segment or a page of its own, and on from there through pages whose last 8 bytes say which is next.
 /// `segment` is the segment to the end of its block, and `packed` says whether others share that block.
-pub fn scan_zstd(segment: &[u8], count: usize, packed: bool, pin: &PinBlock<'_>, out: &mut Vec<Vec<u8>>) -> Result<()> {
+pub fn scan_zstd(segment: &[u8], count: usize, packed: bool, pin: &PinBlock<'_>, out: &mut StringRows) -> Result<()> {
     const INVALID_BLOCK: i64 = -1;
     let vectors = count.div_ceil(ZSTD_VECTOR_ROWS);
     let what = "the metadata of a ZSTD segment";
@@ -391,7 +631,7 @@ pub fn scan_zstd(segment: &[u8], count: usize, packed: bool, pin: &PinBlock<'_>,
         }
         let mut at = 0;
         for length in lengths {
-            out.push(data[at..at + length].to_vec());
+            out.push(&data[at..at + length]);
             at += length;
         }
     }
@@ -400,12 +640,7 @@ pub fn scan_zstd(segment: &[u8], count: usize, packed: bool, pin: &PinBlock<'_>,
 
 /// `StringScan`: offsets, counted back from the end of the dictionary. A negative one is a marker
 /// of a string that didn't fit, or NULL.
-pub fn scan_string_uncompressed(
-    segment: &[u8],
-    count: usize,
-    pin: &PinBlock<'_>,
-    out: &mut Vec<Vec<u8>>,
-) -> Result<()> {
+pub fn scan_string_uncompressed(segment: &[u8], count: usize, pin: &PinBlock<'_>, out: &mut StringRows) -> Result<()> {
     const HEADER_SIZE: usize = 8;
     const BIG_STRING_MARKER_SIZE: usize = 12;
     let dictionary_end = u32_at(segment, 4, "the header of a string segment")? as usize;
@@ -434,7 +669,7 @@ pub fn scan_string_uncompressed(
             .ok_or_else(|| out_of_bounds("a string offset"))?;
         let entry = bytes(dictionary, start, length, "a string")?;
         if offset >= 0 || length == 0 {
-            out.push(entry.to_vec());
+            out.push(entry);
         } else if length == BIG_STRING_MARKER_SIZE {
             let block = i64::from_le_bytes(entry[..8].try_into().expect("8 bytes"));
             let at = i32::from_le_bytes(entry[8..].try_into().expect("4 bytes"));
@@ -448,7 +683,7 @@ pub fn scan_string_uncompressed(
 
 /// `CompressedStringScanState`: per row a packed index of a table of offsets into a dictionary,
 /// where index 0 is NULL.
-pub fn scan_dictionary(segment: &[u8], count: usize, out: &mut Vec<Vec<u8>>) -> Result<()> {
+pub fn scan_dictionary(segment: &[u8], count: usize, out: &mut StringRows) -> Result<()> {
     const HEADER_SIZE: usize = 20;
     let what = "the header of a dictionary segment";
     let dict_size = u32_at(segment, 0, what)? as usize;
@@ -489,7 +724,7 @@ pub fn scan_dictionary(segment: &[u8], count: usize, out: &mut Vec<Vec<u8>>) -> 
     for index in unpack(selection, count, width, "dictionary selections")? {
         let index = index as usize;
         if index == 0 {
-            out.push(Vec::new());
+            out.push_empty(1);
             continue;
         }
         let (&current, &previous) = table
@@ -503,7 +738,7 @@ pub fn scan_dictionary(segment: &[u8], count: usize, out: &mut Vec<Vec<u8>>) -> 
             .len()
             .checked_sub(current as usize)
             .ok_or_else(|| corrupted("Failed to scan dictionary string - dictionary offset was out of range. Database file appears to be corrupted."))?;
-        out.push(bytes(dictionary, from, length as usize, "a dictionary string")?.to_vec());
+        out.push(bytes(dictionary, from, length as usize, "a dictionary string")?);
     }
     Ok(())
 }
@@ -559,22 +794,43 @@ fn fsst_import(data: &[u8]) -> Result<Option<FsstDecoder>> {
 
 impl FsstDecoder {
     /// `duckdb_fsst_decompress`.
+    #[cfg(test)]
     fn decompress(&self, input: &[u8]) -> Result<Vec<u8>> {
-        const ESCAPE: u8 = 255;
         let mut result = Vec::with_capacity(input.len() * 2);
+        self.decompress_into(input, &mut result)?;
+        Ok(result)
+    }
+
+    /// [`Self::decompress`], onto the end of `result`.
+    fn decompress_into(&self, input: &[u8], result: &mut Vec<u8>) -> Result<()> {
+        const ESCAPE: u8 = 255;
+        // every code gives at most 8 bytes: room for all of them, and whole symbols are written
+        // (8 bytes at a time) with only their length kept
+        result.reserve(input.len() * 8 + 8);
+        let base = result.as_mut_ptr();
+        let mut length = result.len();
         let mut bytes = input.iter();
         while let Some(&code) = bytes.next() {
             if code == ESCAPE {
-                let &literal = bytes
-                    .next()
-                    .ok_or_else(|| corrupted("Failed to decompress FSST string - escape code has no following byte"))?;
-                result.push(literal);
+                let &literal = bytes.next().ok_or_else(|| {
+                    // SAFETY: the bytes up to `length` were written below, within the capacity.
+                    unsafe { result.set_len(length) };
+                    corrupted("Failed to decompress FSST string - escape code has no following byte")
+                })?;
+                // SAFETY: `length` + 1 is within the capacity reserved above (8 bytes per code).
+                unsafe { base.add(length).write(literal) };
+                length += 1;
             } else {
                 let code = usize::from(code);
-                result.extend_from_slice(&self.symbols[code][..usize::from(self.lengths[code])]);
+                // SAFETY: `length` + 8 is within the capacity reserved above (8 bytes per code, and
+                // 8 more), and a symbol is 8 bytes, of which the first `lengths[code]` count.
+                unsafe { std::ptr::copy_nonoverlapping(self.symbols[code].as_ptr(), base.add(length), 8) };
+                length += usize::from(self.lengths[code]);
             }
         }
-        Ok(result)
+        // SAFETY: the bytes up to `length` were written above, within the capacity.
+        unsafe { result.set_len(length) };
+        Ok(())
     }
 }
 
@@ -598,7 +854,7 @@ fn invalid_fsst(message: &str) -> Error {
 
 /// `FSSTStorage::StringScan`: packed lengths of strings compressed with a table of up to 255
 /// symbols of up to 8 bytes. The strings are stored from the end of the segment down.
-pub fn scan_fsst(segment: &[u8], count: usize, out: &mut Vec<Vec<u8>>) -> Result<()> {
+pub fn scan_fsst(segment: &[u8], count: usize, out: &mut StringRows) -> Result<()> {
     const HEADER_SIZE: usize = 16;
     let what = "the header of an FSST segment";
     let dict_end = u32_at(segment, 4, what)? as usize;
@@ -620,7 +876,7 @@ pub fn scan_fsst(segment: &[u8], count: usize, out: &mut Vec<Vec<u8>>) -> Result
         if lengths.iter().any(|&length| length != 0) {
             return Err(corrupt("a nonempty FSST string has no symbol table"));
         }
-        out.resize(out.len() + count, Vec::new());
+        out.push_empty(count);
         return Ok(());
     };
     let dictionary = &table[decoder.size..];
@@ -632,14 +888,17 @@ pub fn scan_fsst(segment: &[u8], count: usize, out: &mut Vec<Vec<u8>>) -> Result
             .len()
             .checked_sub(offset)
             .ok_or_else(|| out_of_bounds("an FSST string"))?;
-        let string = decoder.decompress(&dictionary[from..from + length])?;
-        // what's longer goes to overflow blocks, so no valid segment has one of these
-        if string.len() > STRING_BLOCK_LIMIT {
-            return Err(corrupted(
-                "Failed to decompress FSST string - decoded size exceeds the output buffer",
-            ));
-        }
-        out.push(string);
+        out.push_with(|bytes| {
+            let start = bytes.len();
+            decoder.decompress_into(&dictionary[from..from + length], bytes)?;
+            // what's longer goes to overflow blocks, so no valid segment has one of these
+            if bytes.len() - start > STRING_BLOCK_LIMIT {
+                return Err(corrupted(
+                    "Failed to decompress FSST string - decoded size exceeds the output buffer",
+                ));
+            }
+            Ok(())
+        })?;
     }
     Ok(())
 }
@@ -1108,7 +1367,20 @@ pub fn scan_roaring(segment: &[u8], count: usize, out: &mut Vec<bool>) -> Result
 /// as a whole, and per row an index of it. Index 0 is NULL, and the rows that have it go to `nulls`:
 /// such a segment takes care of NULLs by itself, and its validity is an empty segment that says
 /// nothing.
-pub fn scan_dict_fsst(segment: &[u8], count: usize, out: &mut Vec<Vec<u8>>, nulls: &mut Vec<usize>) -> Result<()> {
+pub fn scan_dict_fsst(segment: &[u8], count: usize, out: &mut StringRows, nulls: &mut Vec<usize>) -> Result<()> {
+    let (strings, indices) = decode_dict_fsst(segment, count)?;
+    for index in indices {
+        if index == 0 {
+            nulls.push(out.len());
+        }
+        out.push(strings.get(index as usize));
+    }
+    Ok(())
+}
+
+/// A DICT_FSST segment as its dictionary and, per row, the entry it has (0 is NULL): what a scan
+/// turns into a dictionary vector (`DictFSSTCompressionStorage::StringScan` emits one too).
+pub fn decode_dict_fsst(segment: &[u8], count: usize) -> Result<(StringRows, Vec<u32>)> {
     const HEADER_SIZE: usize = 16;
     const DICTIONARY: u8 = 0;
     const DICT_FSST: u8 = 1;
@@ -1165,7 +1437,7 @@ pub fn scan_dict_fsst(segment: &[u8], count: usize, out: &mut Vec<Vec<u8>>, null
     } else {
         None
     };
-    let mut strings = Vec::with_capacity(dict_count.min(1 << 16));
+    let mut strings = StringRows::with_capacity(dict_count.min(1 << 16));
     let mut offset = 0usize;
     for &length in &lengths {
         let length = length as usize;
@@ -1174,27 +1446,21 @@ pub fn scan_dict_fsst(segment: &[u8], count: usize, out: &mut Vec<Vec<u8>>, null
             .and_then(|end| dictionary.get(offset..end))
             .ok_or_else(|| corrupted("Corrupted DICT_FSST segment: string lengths exceed the dictionary size"))?;
         offset += length;
-        strings.push(match &decoder {
-            Some(decoder) => decoder.decompress(entry)?,
-            None => entry.to_vec(),
-        });
+        match &decoder {
+            Some(decoder) => strings.push_with(|out| decoder.decompress_into(entry, out))?,
+            None => strings.push(entry),
+        }
     }
     if mode == FSST_ONLY {
-        out.extend_from_slice(&strings[1..=count]);
-        return Ok(());
+        return Ok((strings, (1..=count as u32).collect()));
     }
-    for index in indices {
-        if index == 0 {
-            nulls.push(out.len());
-        }
-        let string = strings.get(index as usize);
-        out.push(
-            string
-                .ok_or_else(|| corrupted("Corrupted DICT_FSST segment: dictionary index is out of range"))?
-                .clone(),
-        );
+    let indices: Vec<u32> = indices.into_iter().map(|index| index as u32).collect();
+    if indices.iter().any(|&index| index as usize >= strings.len()) {
+        return Err(corrupted(
+            "Corrupted DICT_FSST segment: dictionary index is out of range",
+        ));
     }
-    Ok(())
+    Ok((strings, indices))
 }
 
 #[cfg(test)]
@@ -1211,7 +1477,11 @@ mod tests {
 
     #[test]
     fn fsst_layouts_must_add_up_exactly() {
-        let error = |segment: &[u8]| scan_fsst(segment, 32, &mut Vec::new()).unwrap_err().to_string();
+        let error = |segment: &[u8]| {
+            scan_fsst(segment, 32, &mut StringRows::default())
+                .unwrap_err()
+                .to_string()
+        };
         // 32 lengths of 8 bits end at 48: a table anywhere else means the width is wrong
         for table_offset in [47, 49, 60] {
             assert_eq!(
@@ -1237,7 +1507,7 @@ mod tests {
 
     #[test]
     fn dictionary_layouts_must_add_up_exactly() {
-        let scan = |segment: Vec<u8>| scan_dictionary(&segment, 32, &mut Vec::new());
+        let scan = |segment: Vec<u8>| scan_dictionary(&segment, 32, &mut StringRows::default());
         // two entries take one bit, and 32 selections of one bit take 4 bytes
         assert!(scan(dictionary_segment(0, 100, 24, 2, 1)).is_ok());
         assert!(scan(dictionary_segment(0, 100, 24, 2, 2)).is_err(), "too wide");

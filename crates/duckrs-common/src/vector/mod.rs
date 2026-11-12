@@ -349,6 +349,58 @@ impl Vector {
         }
     }
 
+    /// Rows `start..start + count` as a vector of their own, sharing what it can: a dictionary keeps
+    /// its child, and a flat vector of fixed-width values or strings copies only its values (the
+    /// strings stay in this vector's buffer).
+    pub fn range(&self, start: usize, count: usize) -> Vector {
+        match &self.repr {
+            Repr::Constant(_) => self.clone(),
+            Repr::Sequence {
+                start: first,
+                increment,
+            } => Vector {
+                ty: self.ty.clone(),
+                repr: Repr::Sequence {
+                    start: first.wrapping_add(increment.wrapping_mul(start as i64)),
+                    increment: *increment,
+                },
+            },
+            Repr::Dictionary { sel, child } => Vector {
+                ty: self.ty.clone(),
+                repr: Repr::Dictionary {
+                    sel: SelectionVector::from_vec((start..start + count).map(|i| sel.get(i) as u32).collect()),
+                    child: child.clone(),
+                },
+            },
+            Repr::Flat(_)
+                if !matches!(
+                    self.physical_type(),
+                    PhysicalType::List | PhysicalType::Struct | PhysicalType::Array
+                ) =>
+            {
+                let mut result = Vector::new(self.ty.clone(), count);
+                result.copy_range_from(self, start, count, 0, copy::StringCopy::Reference);
+                result
+            }
+            Repr::Flat(_) => {
+                let mut result = self.clone();
+                result.slice(
+                    &SelectionVector::from_vec((start..start + count).map(|i| i as u32).collect()),
+                    count,
+                );
+                result
+            }
+        }
+    }
+
+    /// The selection and the child of a dictionary vector (`DictionaryVector::SelVector` / `Child`).
+    pub fn dictionary(&self) -> Option<(&SelectionVector, &Vector)> {
+        match &self.repr {
+            Repr::Dictionary { sel, child } => Some((sel, child)),
+            _ => None,
+        }
+    }
+
     /// Converts the first `count` rows to a flat vector in place (`Vector::Flatten`).
     pub fn flatten(&mut self, count: usize) {
         if matches!(self.repr, Repr::Flat(_)) {
@@ -412,6 +464,22 @@ impl Vector {
         // SAFETY: `s` is inlined or points into this vector's own string buffer.
         unsafe { self.string_data_mut()[i] = s };
         self.validity_mut().set_valid(i);
+    }
+
+    /// [`Self::set_str`] of rows `0..` from `strings`, with the buffer and the data taken once.
+    pub fn set_strs<'a>(&mut self, strings: impl IntoIterator<Item = &'a [u8]>) {
+        let buffer = self.string_buffer();
+        let values: Vec<StringT> = strings.into_iter().map(|bytes| buffer.add(bytes)).collect();
+        if self.capacity() < values.len() {
+            self.resize(values.len());
+        }
+        // SAFETY: the strings are inlined or point into this vector's own string buffer.
+        unsafe { self.string_data_mut()[..values.len()].copy_from_slice(&values) };
+        if !self.validity().all_valid() {
+            for row in 0..values.len() {
+                self.validity_mut().set_valid(row);
+            }
+        }
     }
 
     /// Keeps `buffer` alive for as long as this vector's string buffer, so strings pointing into

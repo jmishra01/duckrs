@@ -139,6 +139,101 @@ struct Predicate {
     set: u64,
     /// the relations of the two sides of a comparison, if each reads some
     sides: Option<(u64, u64)>,
+    /// for an equality of two columns: which set of columns that are all equal they belong to
+    class: Option<usize>,
+}
+
+/// Columns equal to the same column are equal to each other: with `a.x = b.y` and `a.x = c.z`,
+/// `b.y = c.z` holds too, and `b` and `c` can be joined first on it. Adds the equalities that are
+/// not there, and gives all of those of a set its number, as a join needs only one of them: each
+/// side of a join has had the equalities between its own relations, so one across makes the rest.
+fn add_implied_equalities(predicates: &mut Vec<Predicate>, relation_of: &HashMap<ColumnBinding, usize>) {
+    let plain = |expr: &BoundExpr| match expr.kind {
+        BoundExprKind::ColumnRef { binding, depth: 0 } if relation_of.contains_key(&binding) => Some(binding),
+        _ => None,
+    };
+    // the sets, each a list of columns with an expression for them
+    let mut classes: Vec<Vec<(ColumnBinding, BoundExpr)>> = Vec::new();
+    let mut members: Vec<(usize, ColumnBinding, ColumnBinding)> = Vec::new();
+    for (at, predicate) in predicates.iter().enumerate() {
+        let BoundExprKind::Comparison {
+            op: ComparisonOp::Equal,
+            left,
+            right,
+        } = &predicate.expr.kind
+        else {
+            continue;
+        };
+        let (Some(l), Some(r)) = (plain(left), plain(right)) else {
+            continue;
+        };
+        if left.return_type != right.return_type || relation_of[&l] == relation_of[&r] {
+            continue;
+        }
+        let class_of = |classes: &[Vec<(ColumnBinding, BoundExpr)>], column| {
+            classes.iter().position(|class| class.iter().any(|(c, _)| *c == column))
+        };
+        match (class_of(&classes, l), class_of(&classes, r)) {
+            (Some(a), Some(b)) if a != b => {
+                let moved = std::mem::take(&mut classes[b]);
+                classes[a].extend(moved);
+            }
+            (Some(_), Some(_)) => {}
+            (Some(a), None) => classes[a].push((r, (**right).clone())),
+            (None, Some(b)) => classes[b].push((l, (**left).clone())),
+            (None, None) => classes.push(vec![(l, (**left).clone()), (r, (**right).clone())]),
+        }
+        members.push((at, l, r));
+    }
+    let class_of = |column: ColumnBinding| {
+        classes
+            .iter()
+            .position(|class| class.iter().any(|(c, _)| *c == column))
+            .expect("each column of an equality is in a set")
+    };
+    // with two columns of one relation in a set, an equality across a join does not make the others
+    // of the set so: nothing has made those two equal. Such a set is left as it was written
+    let distinct_relations = |class: &[(ColumnBinding, BoundExpr)]| {
+        let mut relations: Vec<usize> = class.iter().map(|(column, _)| relation_of[column]).collect();
+        relations.sort_unstable();
+        relations.windows(2).all(|pair| pair[0] != pair[1])
+    };
+    let mut present: Vec<(ColumnBinding, ColumnBinding)> = Vec::new();
+    for (at, l, r) in members {
+        let class = class_of(l);
+        if distinct_relations(&classes[class]) {
+            predicates[at].class = Some(class);
+        }
+        present.push((l, r));
+    }
+    for (number, class) in classes.iter().enumerate() {
+        if !distinct_relations(class) {
+            continue;
+        }
+        for (i, (first, first_expr)) in class.iter().enumerate() {
+            for (second, second_expr) in &class[i + 1..] {
+                let (a, b) = (relation_of[first], relation_of[second]);
+                let there = present.contains(&(*first, *second)) || present.contains(&(*second, *first));
+                if a == b || there || first_expr.return_type != second_expr.return_type {
+                    continue;
+                }
+                let expr = BoundExpr::new(
+                    BoundExprKind::Comparison {
+                        op: ComparisonOp::Equal,
+                        left: Box::new(first_expr.clone()),
+                        right: Box::new(second_expr.clone()),
+                    },
+                    duckrs_common::types::LogicalType::BOOLEAN,
+                );
+                predicates.push(Predicate {
+                    expr,
+                    set: 1 << a | 1 << b,
+                    sides: Some((1 << a, 1 << b)),
+                    class: Some(number),
+                });
+            }
+        }
+    }
 }
 
 /// The columns an expression reads.
@@ -554,6 +649,8 @@ impl Tree {
         let right = self.build(right_set);
         let mut conditions = Vec::new();
         let mut residual = Vec::new();
+        // the sets of equal columns this join has an equality of already: one makes the others so
+        let mut classes = Vec::new();
         for slot in &mut self.predicates {
             let applies = slot
                 .as_ref()
@@ -562,6 +659,12 @@ impl Tree {
                 continue;
             }
             let predicate = slot.take().expect("just looked at it");
+            if let Some(class) = predicate.class {
+                if classes.contains(&class) {
+                    continue;
+                }
+                classes.push(class);
+            }
             match (predicate.sides, predicate.expr.kind) {
                 (
                     Some((first, second)),
@@ -578,6 +681,7 @@ impl Tree {
                         left: *a,
                         right: *b,
                         null_safe: op == ComparisonOp::NotDistinctFrom,
+                        filter: None,
                     });
                 }
                 (_, kind) => residual.push(BoundExpr::new(kind, predicate.expr.return_type)),
@@ -750,6 +854,10 @@ impl JoinOrderOptimizer {
                 if matches!(join_type, JoinType::Semi | JoinType::Anti) {
                     let cardinality = left.cardinality * DEFAULT_SELECTIVITY;
                     return left.scaled(cardinality);
+                }
+                if matches!(join_type, JoinType::RightSemi | JoinType::RightAnti) {
+                    let cardinality = right.cardinality * DEFAULT_SELECTIVITY;
+                    return right.scaled(cardinality);
                 }
                 let (left_rows, right_rows) = (left.cardinality, right.cardinality);
                 left.distinct.extend(right.distinct);
@@ -942,9 +1050,15 @@ impl JoinOrderOptimizer {
                     _ => None,
                 };
                 let sides = sides.filter(|(l, r)| *l != 0 && *r != 0 && l & r == 0);
-                predicates.push(Predicate { expr, set, sides });
+                predicates.push(Predicate {
+                    expr,
+                    set,
+                    sides,
+                    class: None,
+                });
             }
         }
+        add_implied_equalities(&mut predicates, &relation_of);
         let mut relations: Vec<LogicalOperator> = relations
             .into_iter()
             .zip(on_relation)
@@ -1032,7 +1146,7 @@ fn filter_fraction(cardinality: f64, fraction: f64) -> f64 {
     if cardinality <= 0.0 {
         return 0.0;
     }
-    (cardinality * fraction).floor().clamp(1.0, cardinality)
+    (cardinality * fraction).floor().clamp(1.0, cardinality.max(1.0))
 }
 
 /// `EstimateFilterRows` for one conjunct: the rows it keeps, and whether it is modeled.

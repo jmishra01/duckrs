@@ -14,6 +14,7 @@ pub mod expression_executor;
 pub mod external_sort;
 pub mod file_system;
 pub mod join;
+pub mod join_filter;
 pub mod json_scan;
 pub mod multi_file;
 pub mod parquet;
@@ -25,12 +26,14 @@ pub mod profiler;
 pub mod temporary;
 pub mod zone_map;
 
+use crate::planner::expression::{BoundAggregate, BoundExpr, BoundExprKind};
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
 use duckrs_common::Result;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::vector::DataChunk;
 use parking_lot::Mutex;
 use physical::*;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -60,12 +63,12 @@ fn create_column_select(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
         .collect();
     if let LogicalOperatorKind::Projection { expressions, .. } = &mut child.kind {
         *expressions = positions.iter().map(|&p| expressions[p].clone()).collect();
-        return create_plan(child);
+        return create_physical(child);
     }
     Box::new(PhysicalColumnSelect {
         types,
         positions,
-        children: vec![create_plan(child)],
+        children: vec![create_physical(child)],
     })
 }
 
@@ -138,12 +141,18 @@ fn order_plan(
 }
 
 /// `PhysicalPlanGenerator::CreatePlan`.
-pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
+pub fn create_plan(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
+    join_filter::push_join_filters(&mut op);
+    create_physical(op)
+}
+
+/// [`create_plan`] once the join filters are in place.
+fn create_physical(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
     if matches!(op.kind, LogicalOperatorKind::ColumnSelect { .. }) {
         return create_column_select(op);
     }
     let types = op.types();
-    let mut children: Vec<Box<dyn PhysicalOperator>> = op.children.into_iter().map(create_plan).collect();
+    let mut children: Vec<Box<dyn PhysicalOperator>> = op.children.into_iter().map(create_physical).collect();
     match op.kind {
         LogicalOperatorKind::Get {
             table,
@@ -238,14 +247,51 @@ pub fn create_plan(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             grouping_sets,
             grouping_functions,
             ..
-        } => Box::new(PhysicalAggregate::new(
-            types,
-            groups,
-            aggregates,
-            &grouping_sets,
-            &grouping_functions,
-            children,
-        )),
+        } => match distinct_in_two_steps(&groups, &aggregates, &grouping_sets, &grouping_functions) {
+            Some(argument) => {
+                // the groups with each distinct value once, then the aggregates of those
+                let mut inner_groups = groups.clone();
+                inner_groups.push(argument.clone());
+                let inner_types = inner_groups.iter().map(|g| g.return_type.clone()).collect();
+                let inner = PhysicalAggregate::new(inner_types, inner_groups, Vec::new(), &[], &[], children);
+                let outer_groups = groups
+                    .iter()
+                    .enumerate()
+                    .map(|(i, g)| BoundExpr {
+                        alias: g.alias.clone(),
+                        ..BoundExpr::new(BoundExprKind::Reference(i), g.return_type.clone())
+                    })
+                    .collect();
+                let value = BoundExpr {
+                    alias: argument.alias.clone(),
+                    ..BoundExpr::new(BoundExprKind::Reference(groups.len()), argument.return_type.clone())
+                };
+                let aggregates = aggregates
+                    .into_iter()
+                    .map(|a| BoundAggregate {
+                        children: vec![value.clone()],
+                        distinct: false,
+                        ..a
+                    })
+                    .collect();
+                Box::new(PhysicalAggregate::new(
+                    types,
+                    outer_groups,
+                    aggregates,
+                    &[],
+                    &[],
+                    vec![Box::new(inner)],
+                ))
+            }
+            None => Box::new(PhysicalAggregate::new(
+                types,
+                groups,
+                aggregates,
+                &grouping_sets,
+                &grouping_functions,
+                children,
+            )),
+        },
         LogicalOperatorKind::Window { windows, .. } => Box::new(window::PhysicalWindow::new(types, windows, children)),
         LogicalOperatorKind::Order { orders } => order_plan(orders, None, children.remove(0)),
         LogicalOperatorKind::TopN { orders, limit, offset } => {
@@ -513,8 +559,7 @@ impl Pipeline<'_> {
     /// What threads can read, if the whole pipeline can run on them.
     fn parallel_source(&self, threads: usize) -> Option<(SharedSourceState, usize)> {
         if threads < 2
-            || self.sink.sink_children().len() != 1
-            || !self.sink.parallel_sink()
+            || !self.sink.parallel_sink_input(self.input)
             || !self.operators.iter().all(|op| op.parallel_operator())
         {
             return None;
@@ -530,7 +575,7 @@ impl Pipeline<'_> {
         let memory = temporary::current();
         let query_profiler = profiler::current();
         let worker = || -> Result<()> {
-            let mut local = self.sink.local_sink_state();
+            let mut local = self.sink.local_sink_state_input(self.input);
             let mut states: Vec<OperatorState> = self.operators.iter().map(|op| op.operator_state()).collect();
             while !failed.load(Ordering::Relaxed) {
                 let index = next.fetch_add(1, Ordering::Relaxed);
@@ -538,17 +583,21 @@ impl Pipeline<'_> {
                     break;
                 }
                 let profiler = profiler::current();
-                let (chunk, time) = profiler::timed(profiler.as_deref(), || self.source.parallel_chunk(&shared, index));
-                if let Some(chunk) = chunk? {
-                    if let Some(profiler) = &profiler {
-                        profiler.record(self.source, time, &chunk, profiler::is_scan(self.source));
+                let mut started = profiler.as_ref().map(|_| std::time::Instant::now());
+                self.source.parallel_chunks(&shared, index, &mut |chunk| {
+                    if let (Some(profiler), Some(started)) = (&profiler, started) {
+                        profiler.record(self.source, started.elapsed(), &chunk, profiler::is_scan(self.source));
                     }
                     self.push_into(chunk, 0, &mut states, &mut |chunk| {
-                        self.sink.sink_local(&mut local, index, chunk)
+                        self.sink.sink_local_input(self.input, &mut local, index, chunk)
                     })?;
-                }
+                    if started.is_some() {
+                        started = Some(std::time::Instant::now());
+                    }
+                    Ok(())
+                })?;
             }
-            self.sink.combine_local(local)
+            self.sink.combine_local_input(self.input, local)
         };
         std::thread::scope(|scope| {
             for _ in 0..threads.min(morsels) {
@@ -643,10 +692,43 @@ fn build_pipelines<'a>(sink: &'a dyn PhysicalOperator, pipelines: &mut Vec<Pipel
 }
 
 /// Runs a plan with resolved column bindings, and returns its rows.
+/// The argument of aggregates that are all DISTINCT on the same one, with nothing else that keeps
+/// rows apart, which can then run as a grouping by the groups and the argument and then the
+/// aggregates without DISTINCT over that: what DISTINCT keeps apart keeps no thread from the work.
+fn distinct_in_two_steps(
+    groups: &[BoundExpr],
+    aggregates: &[BoundAggregate],
+    grouping_sets: &[BTreeSet<usize>],
+    grouping_functions: &[Vec<usize>],
+) -> Option<BoundExpr> {
+    let all_groups = grouping_sets.is_empty() || (grouping_sets.len() == 1 && grouping_sets[0].len() == groups.len());
+    if !all_groups || !grouping_functions.is_empty() || !groups.iter().all(physical::parallel_expression) {
+        return None;
+    }
+    let argument = aggregates.first()?.children.first()?;
+    let same = |a: &BoundAggregate| {
+        a.distinct
+            && a.filter.is_none()
+            && a.order_by.is_empty()
+            && a.distinct_key.is_none()
+            && a.children.len() == 1
+            && format!("{:?}", a.children[0]) == format!("{argument:?}")
+    };
+    (aggregates.iter().all(same) && physical::parallel_expression(argument)).then(|| argument.clone())
+}
+
 pub fn run_plan(plan: LogicalOperator) -> Result<ColumnDataCollection> {
     let collector = PhysicalResultCollector::new(create_plan(plan));
     // what the statement runs on its own (e.g. statistics) is not part of its profile
     profiler::with_profiler(None, || execute_plan(&collector))?;
+    Ok(collector.result.into_inner())
+}
+
+/// [`run_plan`] for a plan that is part of the query, on as many threads as the query has.
+pub fn run_plan_on_threads(plan: LogicalOperator) -> Result<ColumnDataCollection> {
+    let collector = PhysicalResultCollector::new(create_plan(plan));
+    let threads = temporary::current().threads();
+    profiler::with_profiler(None, || execute_plan_with(&collector, threads))?;
     Ok(collector.result.into_inner())
 }
 

@@ -344,10 +344,11 @@ pub enum AggregateState {
         sum: f64,
         count: u64,
     },
-    /// the sort key of the current minimum or maximum, and its value
-    Extreme(Option<(Vec<u8>, Value)>),
+    /// the sort key of the current minimum or maximum, and its value; behind a pointer, like the
+    /// value below, so that a state is no larger than a sum, which is what most states are
+    Extreme(Option<Box<(Vec<u8>, Value)>>),
     /// whether a value was taken, and the value
-    Value(Option<Value>),
+    Value(Option<Box<Value>>),
     /// the values, NULLs included; `None` before the first row
     List(Option<Vec<Value>>),
     /// what a [`Holistic`] aggregate computes its result from
@@ -459,10 +460,10 @@ fn state_to_value(kind: AggregateKind, state: &AggregateState, ty: &LogicalType)
         S::Integer { count: 0, .. } | S::Double { count: 0, .. } => Value::null(layout.clone()),
         S::Integer { sum, .. } => integer_of(*sum, &layout)?,
         S::Double { sum, .. } => Value::double(*sum),
-        S::Extreme(Some((_, value))) => value.clone(),
+        S::Extreme(Some(extreme)) => extreme.1.clone(),
         // any_value skips NULLs, so its state is still unset after one
         S::Value(Some(value)) if value.is_null() && kind == AggregateKind::AnyValue => Value::null(layout.clone()),
-        S::Value(Some(value)) => Value::struct_value(vec![("value".into(), value.clone())]),
+        S::Value(Some(value)) => Value::struct_value(vec![("value".into(), Value::clone(value))]),
         S::List(Some(values)) if !values.is_empty() => Value::new(layout.clone(), ValueData::List(values.clone()))?,
         S::Extreme(None) | S::Value(None) | S::List(_) => Value::null(layout.clone()),
         S::Rows(_) => return Err(state_failure()),
@@ -542,13 +543,13 @@ fn value_to_state(kind: AggregateKind, value: &Value, ty: &LogicalType) -> Resul
             let key = value_keys(&Vector::constant(value), 1)?
                 .pop()
                 .ok_or_else(state_failure)?;
-            *current = Some((key, value.clone()));
+            *current = Some(Box::new((key, value.clone())));
         }
         (S::Value(current), ValueData::Struct(fields)) if matches!(kind, First | Last | AnyValue) => {
             let [inner] = fields.as_slice() else {
                 return Err(state_failure());
             };
-            *current = Some(inner.clone());
+            *current = Some(Box::new(inner.clone()));
         }
         (S::List(current), ValueData::List(items)) => *current = Some(items.clone()),
         _ => return Err(state_failure()),
@@ -562,9 +563,9 @@ fn encode_state(state: &AggregateState) -> Result<Vec<u8>> {
         AggregateState::Count(n) => (0, Value::bigint(*n), Value::sql_null()),
         AggregateState::Integer { sum, count } => (1, Value::hugeint(*sum), Value::ubigint(*count)),
         AggregateState::Double { sum, count } => (2, Value::double(*sum), Value::ubigint(*count)),
-        AggregateState::Extreme(Some((key, value))) => (3, Value::blob(key.clone()), value.clone()),
+        AggregateState::Extreme(Some(extreme)) => (3, Value::blob(extreme.0.clone()), extreme.1.clone()),
         AggregateState::Extreme(None) => (4, Value::sql_null(), Value::sql_null()),
-        AggregateState::Value(Some(value)) => (5, value.clone(), Value::sql_null()),
+        AggregateState::Value(Some(value)) => (5, Value::clone(value), Value::sql_null()),
         AggregateState::Value(None) => (6, Value::sql_null(), Value::sql_null()),
         AggregateState::List(Some(values)) => (7, values_list(values)?, Value::sql_null()),
         AggregateState::List(None) => (8, Value::sql_null(), Value::sql_null()),
@@ -622,11 +623,11 @@ fn decode_state(bytes: &[u8]) -> Result<AggregateState> {
             count: count(),
         },
         Some(3) => match first.data() {
-            ValueData::Bytes(key) => AggregateState::Extreme(Some((key.clone(), second.clone()))),
+            ValueData::Bytes(key) => AggregateState::Extreme(Some(Box::new((key.clone(), second.clone())))),
             _ => return Err(state_failure()),
         },
         Some(4) => AggregateState::Extreme(None),
-        Some(5) => AggregateState::Value(Some(first.clone())),
+        Some(5) => AggregateState::Value(Some(Box::new(first.clone()))),
         Some(6) => AggregateState::Value(None),
         Some(7) => AggregateState::List(Some(list(first)?)),
         Some(8) => AggregateState::List(None),
@@ -1134,10 +1135,10 @@ impl AggregateFunction {
                     let AggregateState::Value(state) = &mut states[group] else {
                         unreachable!("a value state");
                     };
-                    *state = Some(match state.take() {
+                    *state = Some(Box::new(match state.take() {
                         Some(sum) => add_bignums(&sum, &value)?,
                         None => value,
-                    });
+                    }));
                 }
             }
             SumDouble | AvgDouble => {
@@ -1170,15 +1171,15 @@ impl AggregateFunction {
                     let AggregateState::Extreme(current) = &mut states[group] else {
                         unreachable!("a min/max state");
                     };
-                    let better = current.as_ref().is_none_or(|(key, _)| {
+                    let better = current.as_ref().is_none_or(|extreme| {
                         if self.kind == Min {
-                            keys[row] < *key
+                            keys[row] < extreme.0
                         } else {
-                            keys[row] > *key
+                            keys[row] > extreme.0
                         }
                     });
                     if better {
-                        *current = Some((keys[row].clone(), input.get_value(row)));
+                        *current = Some(Box::new((keys[row].clone(), input.get_value(row))));
                     }
                 }
             }
@@ -1191,10 +1192,10 @@ impl AggregateFunction {
                         First => current.is_none(),
                         Last => true,
                         // any_value skips NULLs
-                        _ => current.as_ref().is_none_or(Value::is_null),
+                        _ => current.as_ref().is_none_or(|value| value.is_null()),
                     };
                     if take {
-                        *current = Some(input.get_value(row));
+                        *current = Some(Box::new(input.get_value(row)));
                     }
                 }
             }
@@ -1242,7 +1243,8 @@ impl AggregateFunction {
             }
             (SumDouble, AggregateState::Double { sum, .. }) => Value::double(*sum),
             (AvgDouble, AggregateState::Double { sum, count }) => Value::double(*sum / *count as f64),
-            (_, AggregateState::Extreme(Some((_, value)))) | (_, AggregateState::Value(Some(value))) => value.clone(),
+            (_, AggregateState::Extreme(Some(extreme))) => extreme.1.clone(),
+            (_, AggregateState::Value(Some(value))) => Value::clone(value),
             (_, AggregateState::Extreme(None) | AggregateState::Value(None)) => null(),
             (kind, state) => unreachable!("{kind:?} with state {state:?}"),
         })

@@ -34,6 +34,7 @@ has an obvious Rust home:
 | `duckrs-capi` | `src/main/capi`, `duckdb.h` | 12 | |
 | `duckrs-cli` | `tools/shell` | 12 | crate (the `duckrs` binary) |
 | `sqllogictest` | `test/sqlite` | 0 | crate |
+| `benchmark` | `benchmark` | 13 | crate (`benchmark_runner`) |
 
 Dependencies point downward only:
 `common → parser → catalog → function → planner → optimizer → storage/transaction → execution → parallel → main → duckrs`.
@@ -202,11 +203,16 @@ while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` 
   a multiplicative hash and not SipHash. Other operators use the slower `group_keys`.
 - The **deliminator** (`optimizer/deliminator.rs`) runs right after filter pushdown. An equality
   join with `DelimGet` only filters, so it goes, and an IS NOT NULL stands in for what `=` dropped.
-  When the query filters the outer rows the deepest such join stays, as DuckDB does, so most of
-  TPC-H keeps its delim joins: the distinct values make the subquery read less. A join with no
-  `DelimGet` left is an ordinary one, except SINGLE, which stays a `DelimJoin` because that operator
-  raises the error for two rows. SINGLE becomes LEFT when an aggregate proves one row per key.
-  Joins with an inequality stay, since those are predicates here. With a scalar subquery whose
+  When the query filters the outer rows the deepest such join stays, as DuckDB does: the distinct
+  values make the subquery read less. That is not so for `EXISTS` and `NOT EXISTS` in a WHERE
+  clause with only filters and projections above the join: without `DelimGet` they are SEMI and
+  ANTI joins, whose join filter cuts the scan of the subquery the same way, so that join goes too
+  (TPC-H Q4, Q21, Q22). A join with no `DelimGet` left is an ordinary one, except SINGLE, which
+  stays a `DelimJoin` because that operator raises the error for two rows. SINGLE becomes LEFT when
+  an aggregate proves one row per key. An inequality with a column of `DelimGet` (`l2.l_suppkey <>
+  l1.l_suppkey` in Q21) is a predicate of the join here; for a MARK `DelimJoin` it moves up in
+  place of the condition on that outer value, as `outer IS NOT NULL AND inner IS DISTINCT FROM
+  outer` over a subquery filtered to `inner IS NOT NULL`, which is never NULL. With a scalar subquery whose
   result is NULL on no rows anyway, flattening also joins the aggregate with `DelimGet` by INNER
   and not LEFT, which is what lets this pass drop that join.
 - **Statistics** (`optimizer/statistics.rs`) follow C++ in what they decide, not in where they come
@@ -220,6 +226,11 @@ while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` 
   and DPhyp, or Greedy Operator Ordering from 12 relations on, picks the order with the lowest sum
   of estimated join sizes. Each conjunct goes on the lowest join that has its relations, and of
   each join the side with the fewest rows is on the right, which is the side a hash join builds.
+  Columns equal to the same column are equal to each other, so the equalities that follow are
+  added before the search (`add_implied_equalities`): with `l_partkey = p_partkey` and
+  `l_partkey = ps_partkey`, `partsupp` can join `part` first, as in TPC-H Q9. A join then takes one
+  equality of each set of equal columns. That holds only where each column of the set is of
+  another relation, so a set with two columns of one relation is left as written.
   Column positions change, so a tree stays as it is under what reads its columns by position
   (set operations, DML, `DISTINCT`, the root); those have a projection below them in practice.
   Estimates use the total domain of each equivalence class and DuckDB's selectivities, from
@@ -230,11 +241,53 @@ while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` 
   hash of the one key; the other uncorrelated subqueries stay expressions, which run once. A filter
   on only the marker makes it a SEMI join, if nothing else reads the marker. That is a pass of its
   own after filter pushdown, which counts the reads, where C++ flags the joins up front. `NOT IN`
-  stays MARK, since a NULL on either side changes its answer. In a tree of joins, a SEMI or ANTI
-  join that reads one relation goes down to it.
+  stays MARK, since a NULL on either side changes its answer; a filter on `NOT marker` makes an
+  ANTI join only where every condition is `IS NOT DISTINCT FROM` and the predicate is made of tests
+  that are never NULL, which is what the deliminator leaves of `NOT EXISTS`. In a tree of joins, a
+  SEMI or ANTI join that reads one relation goes down to it.
+- **Build sides** (`optimizer/build_side.rs`): a hash join builds its right side, so before join
+  order a SEMI or ANTI join whose right side is estimated larger than its left becomes RIGHT SEMI
+  or RIGHT ANTI with the sides swapped. The large side then only probes and can take a join filter.
+  The pass estimates, which reads table statistics, only for a plan that has such a join.
+  For inner joins, join order puts the side with fewer estimated rows on the right. After unused
+  columns are gone, a second look swaps the sides where the right rows are at least three times
+  as wide as the left ones and rows times width says so (TPC-H Q10 then probes with `customer`
+  and its five strings, 428,000 rows of 1,500,000 after the join filter). C++ always goes by rows
+  times width; with these estimates that builds on all of `orders` in Q9. Joins under something
+  that reads columns by position stay as they are.
+- **Scan filter order**: a scan runs the conjuncts of fewest columns first, and among those a join
+  filter that has its keys, then conjuncts on numbers, then those that read strings. A comparison
+  of an integer, date or decimal column with a constant, and BETWEEN two constants, select rows
+  directly (`select_column_constant`), without a vector of booleans.
+- **Uncorrelated subqueries** that stay expressions run once, on the first chunk that needs them,
+  and on as many threads as the query has (`run_plan_on_threads`; the count travels with
+  `QueryMemory`). The other threads wait for the result. A subquery that runs per row has one
+  thread. C++ plans these as joins instead.
+- **Aggregate states** are 48 bytes: the value of a `min`, `max`, `first` and the like is behind a
+  pointer, so that a sum or a count, which most states are, does not carry room for one. The
+  memory an aggregate counts against the limit adds those values, and the rows a holistic
+  aggregate keeps at the size of a `Value`.
+- **`starts_with`, `ends_with` and `contains`** on strings compare bytes; `LIKE 'x%'`, `'%x'` and
+  `'%x%'` are rewritten to them.
+- **Merging thread states of an aggregate**: the parts a thread's state is split into carry their
+  keys in order and no hash table, and the table of each partition is sized once. Each group is
+  still moved three times (thread, part, partition), which is most of TPC-H Q18.
+- **An OR across a join**: for a filter on both sides of an inner join that is an OR, each side gets
+  the OR of the conjuncts of each alternative that read only that side, if every alternative has
+  one (`(p AND l) OR (p' AND l')` gives `p OR p'` and `l OR l'`). The filter itself stays on the
+  join. TPC-H Q19 reads 4,754 parts of 2,000,000 that way at SF10.
 - **Scan filters** move a conjunct from a `FILTER` directly on a scan into it, if it reads one
   column of that scan, is not volatile and cannot fail. It runs last, so the other passes see plain
   filters.
+- **Join filters** (`execution::join_filter`) are added as the physical plan is made, so EXPLAIN,
+  which shows the logical plan, leaves them out. An INNER, SEMI, RIGHT SEMI, RIGHT ANTI or RIGHT hash join
+  follows each equality on an integer or date column of its left side down through filters,
+  projections, column selections and the sides of joins that keep that column's values unchanged, to a scan of a
+  table of 65,536 rows or more. There it adds a filter. When the build side is done, the filter
+  gets its keys' min and max and a blocked Bloom filter of them; until then, and once it has
+  passed more than 80% of a million rows, it lets every row through. A build side that spilled,
+  or has more than 16M keys, gives no keys. Plans under a recursive CTE get none, as their
+  operators run again.
 - **Zone maps** (`execution::zone_map`) keep the bounds of a column per 122,880-row group. They are
   worked out per column when a filter on a table of two groups or more first asks, and dropped by
   `write_storage`. A scan skips a group only if no row of it can pass: comparisons with constants,
@@ -297,8 +350,9 @@ predicate check each pair of a key's rows, where C++ hashes on the comparison. T
 Threads for aggregates and joins, and spilling for sorts, aggregates and hash joins. A pipeline runs on the `threads` setting's threads,
 all of the machine's by default, when it has all of these:
 
-- a source of morsels: a table in memory of at least 2 row groups, so that small tables stay in order and their
-  floating point sums the same on each run. A table still in its file does not qualify;
+- a source of morsels: a table of at least 2 row groups, so that small tables stay in order and their floating
+  point sums the same on each run. In memory a morsel is a chunk; a table still in its file has a morsel per row
+  group (`parallel_chunks` gives its chunks), when the groups of the file are full but for the last;
 - operators that any thread can run in any order: filters, projections, column selections, and the probe of a hash or
   blockwise nested loop join (`PhysicalJoin`). Once its build side is finished it does not change, apart from the flags
   of the build rows that found a match, which are atomic, so threads probe it without a lock;
@@ -310,8 +364,16 @@ all of the machine's by default, when it has all of these:
     one of 64 partitions. `finalize` looks up the keys of each partition in a table of its own, on as many threads as
     sank, once there are 100,000 build rows. Threads cut the time of a large build side most, as looking up keys takes
     nearly all of it. One thread puts all keys in one partition, so that probing does not hash a key twice;
+  - both inputs of `PhysicalDelimJoin` (`parallel_sink_input`): the left rows go into a collection per thread,
+    put together in morsel order, and the right side is the build of its join;
   - `PhysicalResultCollector`, as `PhysicalBatchCollector`: `sink_local` is told the morsel of each chunk, and the
     rows of each morsel go into the result in morsel order, which is the order of one thread.
+
+A scan with a filter of a table in its file reads a row group at a time (`scan_group_filtered`): the
+conjuncts of the filter go one by one, those of one column first, and each reads its columns only for the
+rows the ones before kept (`TableSource::fetch_rows`, C++'s `ColumnData::Select`); the columns of the
+output are read last, for the rows left. `DiskTable` reads single rows of constant, uncompressed and
+bit-packed segments when at most a quarter of a group's rows are wanted, and decodes the column otherwise.
 
 Expressions that are volatile or run a subquery keep a pipeline on one thread. Threads are `std::thread::scope` per
 pipeline, not a scheduler, and there are no events or blocked tasks. `examples/parallel_aggregate.rs` gives 2.9x to 5.5x on
@@ -836,6 +898,31 @@ Interactive input goes through `rustyline`, with the history in `~/.duckdb_histo
 ```
 cd ../duckdb && PYTHONPATH=. pytest tools/shell/tests --shell-binary ../duckrs/target/release/duckrs
 ```
+
+## Benchmarks (`tools/benchmark`)
+
+`benchmark_runner` ports `benchmark/benchmark_runner.cpp` and `interpreted_benchmark.cpp`. It runs in a
+DuckDB checkout (`--root-dir`, `../duckdb` by default), finds the `.benchmark` files whose path or group
+matches the pattern, and for each: opens the database (or its cache under `duckdb_benchmark_data/<engine>/`),
+runs `load`, a cold run and `--timed-runs` timed runs of `run`, and checks each result. It drives the
+engines of the sqllogictest crate; `Connection::query_timed` times the engine and not the conversion of
+the values to text. With `--features reference --engine=both` it also times the C++ library and prints
+the ratios, their geometric mean and the v1 gate.
+
+Neither engine here has the `tpch` or `tpcds` extension, so `CALL dbgen(sf=N)` and `CALL dsdgen(sf=N)`
+in a load are done by the runner: `tools/tpch/build_dbgen.sh` and `tools/tpcds/build_dsdgen.sh` build
+the generators of the checkout, whose `.tbl` files are copied into tables of the extensions' columns.
+
+```
+cargo run --release -p benchmark -- 'benchmark/tpch/sf1/.*'
+cargo run --release -p benchmark --features reference -- --engine=both --threads=8 'benchmark/micro/.*'
+cargo bench -p duckrs --bench kernels
+```
+
+Larger scale factors go through `--sf N`. duckrs cannot load TPC-H SF10 itself (an append keeps the rows of
+its table in memory), so SF10 is measured on the file C++ writes: run the reference engine once
+(`--engine=reference --sf 10`), copy `duckdb_benchmark_data/reference/tpch_sf10.duckdb` to
+`duckdb_benchmark_data/duckrs/`, then `--engine=both --sf 10`. There are no SF10 answers to check.
 
 ## Testing
 

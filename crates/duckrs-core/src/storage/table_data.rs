@@ -235,13 +235,13 @@ fn scan_fixed(
 fn scan_strings(
     buffer: &BufferManager,
     pointer: &DataPointer,
-    out: &mut Vec<Vec<u8>>,
+    out: &mut StringRows,
     nulls: &mut Vec<usize>,
 ) -> Result<()> {
     let count = pointer.tuple_count;
     if pointer.compression == COMPRESSION_CONSTANT {
         // only all-NULL segments get here: strings don't have constant segments
-        out.resize(out.len() + count, Vec::new());
+        out.push_empty(count);
         return Ok(());
     }
     let handle = segment(buffer, pointer)?;
@@ -266,6 +266,53 @@ fn scan_strings(
         }
         other => Err(not_ported(other)),
     }
+}
+
+/// Whether every segment of a string column is DICT_FSST, so that its rows can be a dictionary vector.
+fn dictionary_column(column: &PersistentColumn) -> bool {
+    !column.pointers.is_empty() && column.pointers.iter().all(|p| p.compression == COMPRESSION_DICT_FSST)
+}
+
+/// A string column of DICT_FSST segments as a dictionary vector: the entries of every segment's
+/// dictionary in one vector (with a NULL first), and per row the entry it has. No string is copied
+/// per row.
+fn scan_dictionary_column(
+    buffer: &BufferManager,
+    column: &PersistentColumn,
+    ty: &LogicalType,
+    rows: usize,
+    valid: &[bool],
+) -> Result<Vector> {
+    let mut entries = StringRows::default();
+    entries.push_empty(1);
+    let mut selection: Vec<u32> = Vec::with_capacity(rows);
+    for pointer in &column.pointers {
+        let handle = segment(buffer, pointer)?;
+        let (strings, indices) = decode_dict_fsst(&handle[pointer.offset..], pointer.tuple_count)?;
+        // entry i of the segment (i > 0) is entry base + i here; 0 stays the NULL
+        let base = entries.len() as u32 - 1;
+        for string in strings.iter().skip(1) {
+            entries.push(string);
+        }
+        selection.extend(
+            indices
+                .into_iter()
+                .map(|index| if index == 0 { 0 } else { base + index }),
+        );
+    }
+    if selection.len() != rows {
+        return Err(corrupt("the segments of a string column do not have its rows"));
+    }
+    for (row, &valid) in valid.iter().enumerate() {
+        if !valid {
+            selection[row] = 0;
+        }
+    }
+    let mut dictionary = Vector::new(ty.clone(), entries.len());
+    dictionary.set_strs(entries.iter());
+    dictionary.set_null(0, true);
+    dictionary.slice(&SelectionVector::from_vec(selection), rows);
+    Ok(dictionary)
 }
 
 fn scan_validity_column(buffer: &BufferManager, column: &PersistentColumn, rows: usize) -> Result<Vec<bool>> {
@@ -293,8 +340,26 @@ fn scan_validity_column(buffer: &BufferManager, column: &PersistentColumn, rows:
 /// Stores `data`'s values in a vector of native values of type `T`.
 fn fill<T: NativeType, const N: usize>(vector: &mut Vector, data: &[u8], read: impl Fn(&[u8; N]) -> T) {
     let target = vector.data_mut::<T>();
+    // a little-endian machine stores the integers and floats as the file does: one copy
+    if cfg!(target_endian = "little") && std::mem::size_of::<T>() == N && N != 1 {
+        let count = target.len().min(data.len() / N);
+        // SAFETY: `T` here is an integer or a float of N bytes (fill_vector does Bool and Interval
+        // apart), so any N bytes are a valid `T`, and `count` values fit in both `target` and `data`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), target.as_mut_ptr().cast::<u8>(), count * N);
+        }
+        return;
+    }
     for (target, source) in target.iter_mut().zip(data.chunks_exact(N)) {
         *target = read(source.try_into().expect("N bytes"));
+    }
+}
+
+/// [`fill`] for INTERVAL, whose three fields go one by one.
+fn fill_interval(vector: &mut Vector, data: &[u8], read: impl Fn(&[u8; 16]) -> Interval) {
+    let target = vector.data_mut::<Interval>();
+    for (target, source) in target.iter_mut().zip(data.chunks_exact(16)) {
+        *target = read(source.try_into().expect("16 bytes"));
     }
 }
 
@@ -314,7 +379,7 @@ pub(super) fn fill_vector(vector: &mut Vector, data: &[u8]) -> Result<()> {
         PhysicalType::Double => fill::<f64, 8>(vector, data, |b| f64::from_le_bytes(*b)),
         PhysicalType::Int128 => fill::<i128, 16>(vector, data, |b| i128::from_le_bytes(*b)),
         PhysicalType::UInt128 => fill::<u128, 16>(vector, data, |b| u128::from_le_bytes(*b)),
-        PhysicalType::Interval => fill::<Interval, 16>(vector, data, |b| Interval {
+        PhysicalType::Interval => fill_interval(vector, data, |b| Interval {
             months: i32::from_le_bytes(b[..4].try_into().expect("4 bytes")),
             days: i32::from_le_bytes(b[4..8].try_into().expect("4 bytes")),
             micros: i64::from_le_bytes(b[8..].try_into().expect("8 bytes")),
@@ -389,11 +454,39 @@ fn scan_struct(buffer: &BufferManager, column: &PersistentColumn, ty: &LogicalTy
 
 /// `ColumnData::Scan` of all of a column, which is `rows` long.
 fn scan_column(buffer: &BufferManager, column: &PersistentColumn, ty: &LogicalType, rows: usize) -> Result<Vector> {
+    scan_column_as(buffer, column, ty, rows, false)
+}
+
+/// [`scan_column`] of a column of the table itself, which may come out as a dictionary vector (the
+/// children of nested columns are filled in place, so they stay flat).
+fn scan_table_column(
+    buffer: &BufferManager,
+    column: &PersistentColumn,
+    ty: &LogicalType,
+    rows: usize,
+) -> Result<Vector> {
+    scan_column_as(buffer, column, ty, rows, true)
+}
+
+fn scan_column_as(
+    buffer: &BufferManager,
+    column: &PersistentColumn,
+    ty: &LogicalType,
+    rows: usize,
+    top_level: bool,
+) -> Result<Vector> {
     let validity = column
         .validity
         .as_ref()
         .ok_or_else(|| corrupt("a column has no validity"))?;
-    let valid = scan_validity_column(buffer, validity, rows)?;
+    // the statistics of the validity segments say whether there are NULLs to read
+    let no_nulls = ty.id() != LogicalTypeId::Variant && validity.pointers.iter().all(|p| !p.statistics.has_null);
+    let valid = if no_nulls {
+        check_rows(validity, rows)?;
+        Vec::new()
+    } else {
+        scan_validity_column(buffer, validity, rows)?
+    };
     if ty.id() == LogicalTypeId::Variant {
         let unshredded = duckrs_common::variant::unshredded_type();
         let child = column
@@ -420,16 +513,17 @@ fn scan_column(buffer: &BufferManager, column: &PersistentColumn, ty: &LogicalTy
         PhysicalType::List => scan_list(buffer, column, ty, rows)?,
         PhysicalType::Array => scan_array(buffer, column, ty, rows)?,
         PhysicalType::Struct => scan_struct(buffer, column, ty, rows)?,
+        PhysicalType::Varchar if top_level && dictionary_column(column) => {
+            return scan_dictionary_column(buffer, column, ty, rows, &valid);
+        }
         PhysicalType::Varchar => {
-            let mut strings = Vec::with_capacity(rows);
+            let mut strings = StringRows::with_capacity(rows);
             let mut nulls = Vec::new();
             for pointer in &column.pointers {
                 scan_strings(buffer, pointer, &mut strings, &mut nulls)?;
             }
             let mut vector = Vector::new(ty.clone(), rows);
-            for (row, string) in strings.iter().enumerate() {
-                vector.set_str(row, string);
-            }
+            vector.set_strs(strings.iter());
             for row in nulls {
                 vector.set_null(row, true);
             }
@@ -620,7 +714,98 @@ impl DiskTable {
     }
 }
 
+impl DiskTable {
+    /// [`TableSource::fetch_rows`] of a fixed-width column of a group without deletes: the rows read
+    /// from their segments, those that can be read on their own (constant, uncompressed, bit-packed)
+    /// without decoding the others. `None` for what this does not cover.
+    fn fetch_fixed_rows(&self, group: usize, column: usize, rows: &[u32]) -> Result<Option<Vector>> {
+        let ty = &self.table.columns[column].ty;
+        let physical = ty.physical_type();
+        let Some(width) = fixed_width(physical) else {
+            return Ok(None);
+        };
+        if self.alive[group].is_some() || ty.id() == LogicalTypeId::Variant || physical == PhysicalType::Bool {
+            return Ok(None);
+        }
+        let stored = self.persistent_column(group, column)?;
+        let group_rows = self.table.row_groups[group].tuple_count as usize;
+        check_rows(&stored, group_rows)?;
+        let mut data = Vec::with_capacity(rows.len() * width);
+        let mut start = 0usize;
+        let mut at = 0usize;
+        let mut local = Vec::new();
+        for pointer in &stored.pointers {
+            let count = pointer.tuple_count;
+            local.clear();
+            while at < rows.len() && (rows[at] as usize) < start + count {
+                local.push(rows[at] - start as u32);
+                at += 1;
+            }
+            if !local.is_empty() {
+                match pointer.compression {
+                    COMPRESSION_CONSTANT => scan_constant(&pointer.statistics, local.len(), width, &mut data)?,
+                    COMPRESSION_UNCOMPRESSED => {
+                        let handle = segment(&self.buffer, pointer)?;
+                        let segment = &handle[pointer.offset..];
+                        for &row in &local {
+                            data.extend_from_slice(bytes(segment, row as usize * width, width, "a value")?);
+                        }
+                    }
+                    COMPRESSION_BITPACKING => {
+                        let handle = segment(&self.buffer, pointer)?;
+                        bitpacking_rows(&handle[pointer.offset..], count, width, &local, &mut data)?;
+                    }
+                    _ => {
+                        let mut all = Vec::with_capacity(count * width);
+                        scan_fixed(&self.buffer, pointer, physical, width, &mut all)?;
+                        for &row in &local {
+                            data.extend_from_slice(bytes(&all, row as usize * width, width, "a value")?);
+                        }
+                    }
+                }
+            }
+            start += count;
+        }
+        if at < rows.len() {
+            return Err(corrupt("a row past the rows of a column"));
+        }
+        let mut vector = Vector::new(ty.clone(), rows.len().max(1));
+        fill_vector(&mut vector, &data)?;
+        // the NULLs, if the statistics of the validity allow any
+        let validity = stored
+            .validity
+            .as_ref()
+            .ok_or_else(|| corrupt("a column has no validity"))?;
+        if validity.pointers.iter().any(|p| p.statistics.has_null) {
+            let valid = scan_validity_column(&self.buffer, validity, group_rows)?;
+            for (position, &row) in rows.iter().enumerate() {
+                if !valid[row as usize] {
+                    vector.set_null(position, true);
+                }
+            }
+        }
+        Ok(Some(vector))
+    }
+}
+
 impl TableSource for DiskTable {
+    fn fetch_rows(&self, group: usize, column: usize, rows: &[u32]) -> Result<Vector> {
+        // rows one by one only pay off when few are wanted; otherwise the column is decoded whole
+        let group_rows = self.table.row_groups[group].tuple_count as usize;
+        if rows.len() * 4 <= group_rows
+            && let Some(vector) = self.fetch_fixed_rows(group, column, rows)?
+        {
+            return Ok(vector);
+        }
+        let chunk = self.read_group(group, &[column])?;
+        let mut vector = chunk.column(0).clone();
+        // all the rows, in order: the column as it is
+        let all = rows.len() == chunk.len() && rows.iter().enumerate().all(|(i, &row)| row as usize == i);
+        if !all {
+            vector.slice(&SelectionVector::from_vec(rows.to_vec()), rows.len());
+        }
+        Ok(vector)
+    }
     fn row_count(&self) -> usize {
         self.rows
     }
@@ -656,7 +841,7 @@ impl TableSource for DiskTable {
         let mut vectors = Vec::with_capacity(columns.len());
         for &column in columns {
             let stored = self.persistent_column(group, column)?;
-            vectors.push(scan_column(
+            vectors.push(scan_table_column(
                 &self.buffer,
                 &stored,
                 &self.table.columns[column].ty,

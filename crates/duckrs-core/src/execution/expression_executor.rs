@@ -95,7 +95,46 @@ fn compare_strings(left: &Vector, right: &Vector, result: &mut Vector, count: us
     }
 }
 
+/// A comparison of a dictionary vector with a constant, on the entries of the dictionary rather than
+/// on every row (`ExpressionExecutor` on dictionary vectors): the result is a dictionary of booleans.
+fn compare_dictionary(
+    left: &Vector,
+    right: &Vector,
+    result: &mut Vector,
+    count: usize,
+    op: ComparisonType,
+) -> Result<bool> {
+    use duckrs_common::vector::VectorType;
+    let constant = |v: &Vector| v.vector_type() == VectorType::Constant;
+    let (dictionary, left_is_dictionary) = match (left.dictionary(), right.dictionary()) {
+        (Some(d), None) if constant(right) => (d, true),
+        (None, Some(d)) if constant(left) => (d, false),
+        _ => return Ok(false),
+    };
+    let (sel, child) = dictionary;
+    if child.vector_type() != VectorType::Flat {
+        return Ok(false);
+    }
+    let entries = child.capacity();
+    if entries >= count {
+        return Ok(false);
+    }
+    let mut on_entries = Vector::new(LogicalType::BOOLEAN, entries);
+    if left_is_dictionary {
+        compare(child, right, &mut on_entries, entries, op)?;
+    } else {
+        compare(left, child, &mut on_entries, entries, op)?;
+    }
+    on_entries.flatten(entries);
+    on_entries.slice(sel, count);
+    *result = on_entries;
+    Ok(true)
+}
+
 fn compare(left: &Vector, right: &Vector, result: &mut Vector, count: usize, op: ComparisonType) -> Result<()> {
+    if compare_dictionary(left, right, result, count, op)? {
+        return Ok(());
+    }
     match left.physical_type() {
         PhysicalType::Bool => compare_typed::<bool>(left, right, result, count, op),
         PhysicalType::Int8 => compare_typed::<i8>(left, right, result, count, op),
@@ -189,6 +228,96 @@ fn conjunction(children: &[Vector], and: bool, count: usize) -> Vector {
     result
 }
 
+/// An OR of `x = constant` with the same `x` (how `x IN (...)` binds): `x` is evaluated once and
+/// compared with each constant, instead of once per comparison (C++ evaluates `IN` with its input once).
+fn execute_in_list(children: &[BoundExpr], input: &DataChunk, count: usize) -> Result<Option<Vector>> {
+    use duckrs_parser::ast::ComparisonOp;
+    if children.len() < 2 {
+        return Ok(None);
+    }
+    let mut left_text: Option<String> = None;
+    let mut constants = Vec::with_capacity(children.len());
+    for child in children {
+        let BoundExprKind::Comparison {
+            op: ComparisonOp::Equal,
+            left,
+            right,
+        } = &child.kind
+        else {
+            return Ok(None);
+        };
+        let BoundExprKind::Constant(_) = right.kind else {
+            return Ok(None);
+        };
+        if left.is_volatile() || matches!(left.kind, BoundExprKind::Reference(_) | BoundExprKind::Constant(_)) {
+            // nothing to save on a column itself
+            return Ok(None);
+        }
+        let text = format!("{left:?}");
+        match &left_text {
+            Some(first) if *first != text => return Ok(None),
+            Some(_) => {}
+            None => left_text = Some(text),
+        }
+        constants.push((right.as_ref(), child.return_type.clone()));
+    }
+    let BoundExprKind::Comparison { left, .. } = &children[0].kind else {
+        return Ok(None);
+    };
+    let value = execute(left, input)?;
+    if value.logical_type().id() == LogicalTypeId::SqlNull {
+        return Ok(None);
+    }
+    if value.physical_type() == PhysicalType::Varchar && value.logical_type().id() == LogicalTypeId::Varchar {
+        // strings: each row against the constants, in one pass over the rows
+        let mut strings: Vec<Vec<u8>> = Vec::with_capacity(constants.len());
+        for (constant, _) in &constants {
+            let BoundExprKind::Constant(constant) = &constant.kind else {
+                unreachable!("looked at above")
+            };
+            if constant.is_null() || *constant.logical_type() != *value.logical_type() {
+                return Ok(None);
+            }
+            let vector = Vector::constant(constant);
+            match vector.str_at(0) {
+                Some(bytes) => strings.push(bytes.to_vec()),
+                None => return Ok(None),
+            }
+        }
+        let rows = if all_constant(&[&value]) { 1 } else { count };
+        let unified = value.to_unified(rows);
+        let mut result = Vector::new(LogicalType::BOOLEAN, rows.max(1));
+        let mut nulls = Vec::new();
+        {
+            let out = result.data_mut::<bool>();
+            for (row, slot) in out.iter_mut().enumerate().take(rows) {
+                if unified.is_valid(row) {
+                    let string = unified.str_at(row);
+                    *slot = strings.iter().any(|s| s.as_slice() == string);
+                } else {
+                    nulls.push(row);
+                }
+            }
+        }
+        nulls.into_iter().for_each(|row| result.set_null(row, true));
+        if rows == 1 && count != 1 {
+            result.set_constant();
+        }
+        return Ok(Some(result));
+    }
+    let mut results = Vec::with_capacity(constants.len());
+    for (constant, return_type) in constants {
+        let constant = execute(constant, input)?;
+        if constant.logical_type() != value.logical_type() {
+            return Ok(None);
+        }
+        let mut result = Vector::new(return_type, count.max(1));
+        compare(&value, &constant, &mut result, count, ComparisonType::Equal)?;
+        results.push(result);
+    }
+    Ok(Some(conjunction(&results, false, count)))
+}
+
 /// `IS NULL` / `IS NOT NULL`: never NULL themselves.
 fn null_check(input: &Vector, count: usize, is_null: bool) -> Vector {
     let constant = input.vector_type() == VectorType::Constant;
@@ -218,6 +347,49 @@ fn slice_rows(input: &DataChunk, rows: &[u32]) -> DataChunk {
 
 /// Writes `source[i]` to `result[rows[i]]`.
 fn scatter(source: &Vector, rows: &[u32], result: &mut Vector) -> Result<()> {
+    if source.logical_type() == result.logical_type() && result.vector_type() == duckrs_common::vector::VectorType::Flat
+    {
+        let u = source.to_unified(rows.len());
+        macro_rules! typed {
+            ($t:ty) => {{
+                let data = u.data::<$t>();
+                for (i, &row) in rows.iter().enumerate() {
+                    let index = u.sel.get(i);
+                    if u.validity.is_valid(index) {
+                        result.data_mut::<$t>()[row as usize] = data[index];
+                    } else {
+                        result.set_null(row as usize, true);
+                    }
+                }
+                return Ok(());
+            }};
+        }
+        match source.physical_type() {
+            PhysicalType::Bool => typed!(bool),
+            PhysicalType::Int8 => typed!(i8),
+            PhysicalType::Int16 => typed!(i16),
+            PhysicalType::Int32 => typed!(i32),
+            PhysicalType::Int64 => typed!(i64),
+            PhysicalType::Int128 => typed!(i128),
+            PhysicalType::UInt8 => typed!(u8),
+            PhysicalType::UInt16 => typed!(u16),
+            PhysicalType::UInt32 => typed!(u32),
+            PhysicalType::UInt64 => typed!(u64),
+            PhysicalType::UInt128 => typed!(u128),
+            PhysicalType::Float => typed!(f32),
+            PhysicalType::Double => typed!(f64),
+            PhysicalType::Varchar => {
+                for (i, &row) in rows.iter().enumerate() {
+                    match u.validity.is_valid(u.sel.get(i)) {
+                        true => result.set_str(row as usize, u.str_at(i)),
+                        false => result.set_null(row as usize, true),
+                    }
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
     for (i, &row) in rows.iter().enumerate() {
         result.set_value(row as usize, &source.get_value(i))?;
     }
@@ -249,8 +421,16 @@ fn execute_case(
         if !matched.is_empty() {
             let values = execute(then, &slice_rows(&rows, &positions))?;
             scatter(&values, &matched, &mut result)?;
-            let chosen: std::collections::HashSet<u32> = matched.into_iter().collect();
-            remaining.retain(|row| !chosen.contains(row));
+            // the rows chosen are at `positions` of `remaining`, in order
+            let mut keep = vec![true; remaining.len()];
+            for &position in &positions {
+                keep[position as usize] = false;
+            }
+            let mut position = 0;
+            remaining.retain(|_| {
+                position += 1;
+                keep[position - 1]
+            });
         }
     }
     if !remaining.is_empty() {
@@ -263,7 +443,18 @@ fn execute_case(
 /// The result of a subquery for correlated values with this key, which runs the first time
 /// something asks. An error stays too: TRY runs a failed chunk again.
 fn subquery_result(subquery: &BoundSubquery, key: &[u8], values: &[Value]) -> Arc<Result<SubqueryResult>> {
-    let cached = !subquery.volatile || values.is_empty();
+    if values.is_empty() {
+        // an uncorrelated subquery runs once, while the threads of a parallel pipeline that ask for
+        // it at the same time wait
+        let mut results = subquery.results.lock();
+        if let Some(result) = results.get(key) {
+            return result.clone();
+        }
+        let result = Arc::new(run_subquery(subquery, values));
+        results.insert(key.to_vec(), result.clone());
+        return result;
+    }
+    let cached = !subquery.volatile;
     if cached && let Some(result) = subquery.results.lock().get(key) {
         return result.clone();
     }
@@ -285,7 +476,12 @@ fn run_subquery(subquery: &BoundSubquery, values: &[Value]) -> Result<SubqueryRe
             .collect();
         plan.substitute_columns(&columns);
     }
-    let collection = run_plan(plan)?;
+    // a subquery that runs once has the threads of the query; one that runs per row does not
+    let collection = if values.is_empty() {
+        crate::execution::run_plan_on_threads(plan)?
+    } else {
+        run_plan(plan)?
+    };
     let mut result = SubqueryResult {
         rows: collection.len() as u64,
         first: None,
@@ -613,6 +809,19 @@ pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
     let count = input.len();
     match &expr.kind {
         BoundExprKind::Constant(value) => Ok(Vector::constant(value)),
+        BoundExprKind::JoinFilter { child, filter } => {
+            let values = execute(child, input)?;
+            let Some(kept) = filter.select(&values, count) else {
+                return Ok(Vector::constant(&Value::boolean(true)));
+            };
+            let mut result = Vector::new(LogicalType::BOOLEAN, count);
+            result.prepare_flat(count);
+            let data = result.data_mut::<bool>();
+            for row in kept {
+                data[row as usize] = true;
+            }
+            Ok(result)
+        }
         BoundExprKind::ListLambda {
             kind,
             list,
@@ -662,6 +871,9 @@ pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
             Ok(result)
         }
         BoundExprKind::Conjunction { and, children } => {
+            if !*and && let Some(result) = execute_in_list(children, input, count)? {
+                return Ok(result);
+            }
             let children = children.iter().map(|c| execute(c, input)).collect::<Result<Vec<_>>>()?;
             Ok(conjunction(&children, *and, count))
         }
@@ -806,8 +1018,11 @@ pub fn select(expr: &BoundExpr, input: &DataChunk) -> Result<(SelectionVector, u
             if remaining.is_empty() {
                 break;
             }
-            let rows = slice_rows(input, &remaining);
-            let (selected, count) = select(child, &rows)?;
+            let (selected, count) = if remaining.len() == input.len() {
+                select(child, input)?
+            } else {
+                select(child, &slice_rows(input, &remaining))?
+            };
             if count == remaining.len() {
                 continue;
             }
@@ -816,8 +1031,107 @@ pub fn select(expr: &BoundExpr, input: &DataChunk) -> Result<(SelectionVector, u
         let count = remaining.len();
         return Ok((SelectionVector::from_vec(remaining), count));
     }
+    if let BoundExprKind::JoinFilter { child, filter } = &expr.kind {
+        let values = execute(child, input)?;
+        return Ok(match filter.select(&values, input.len()) {
+            Some(kept) => {
+                let count = kept.len();
+                (SelectionVector::from_vec(kept), count)
+            }
+            None => (
+                SelectionVector::from_vec((0..input.len() as u32).collect()),
+                input.len(),
+            ),
+        });
+    }
+    if let Some(selected) = select_column_constant(expr, input)? {
+        return Ok(selected);
+    }
     let result = execute(expr, input)?;
     Ok(executor::select::<bool>(&result, input.len(), |b| b))
+}
+
+/// The rows for which a column of integers compares as asked with a constant, or is between two:
+/// what most filters of a scan are. The comparison is known outside the loop over the rows, and no
+/// vector of booleans is made. `None` for anything else.
+fn select_column_constant(expr: &BoundExpr, input: &DataChunk) -> Result<Option<(SelectionVector, usize)>> {
+    use duckrs_parser::ast::ComparisonOp as C;
+    let constant = |e: &BoundExpr| matches!(e.kind, BoundExprKind::Constant(_));
+    let (column, op, low, high) = match &expr.kind {
+        BoundExprKind::Comparison { op, left, right } => match (&left.kind, &right.kind) {
+            (BoundExprKind::Reference(column), BoundExprKind::Constant(_)) => (*column, *op, right.as_ref(), None),
+            (BoundExprKind::Constant(_), BoundExprKind::Reference(column)) => {
+                let flipped = match op {
+                    C::LessThan => C::GreaterThan,
+                    C::GreaterThan => C::LessThan,
+                    C::LessThanOrEqual => C::GreaterThanOrEqual,
+                    C::GreaterThanOrEqual => C::LessThanOrEqual,
+                    other => *other,
+                };
+                (*column, flipped, left.as_ref(), None)
+            }
+            _ => return Ok(None),
+        },
+        BoundExprKind::Between {
+            input: value,
+            lower,
+            upper,
+        } => match value.kind {
+            BoundExprKind::Reference(column) if constant(lower) && constant(upper) => {
+                (column, C::GreaterThanOrEqual, lower.as_ref(), Some(upper.as_ref()))
+            }
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    let values = input.column(column);
+    let count = input.len();
+    let low = execute(low, input)?;
+    let high = high.map(|high| execute(high, input)).transpose()?;
+    let same_type = |v: &Vector| v.logical_type() == values.logical_type();
+    if !same_type(&low) || !high.as_ref().is_none_or(same_type) {
+        return Ok(None);
+    }
+    fn run<T: NativeType + PartialOrd>(
+        values: &Vector,
+        count: usize,
+        op: C,
+        low: &Vector,
+        high: Option<&Vector>,
+    ) -> Option<(SelectionVector, usize)> {
+        let constant = |v: &Vector| {
+            let unified = v.to_unified(1);
+            let at = unified.sel.get(0);
+            unified.validity.is_valid(at).then(|| unified.data::<T>()[at])
+        };
+        let low = constant(low)?;
+        if let Some(high) = high {
+            let high = constant(high)?;
+            return Some(executor::select::<T>(values, count, |a| a >= low && a <= high));
+        }
+        Some(match op {
+            C::Equal => executor::select::<T>(values, count, |a| a == low),
+            C::NotEqual => executor::select::<T>(values, count, |a| a != low),
+            C::LessThan => executor::select::<T>(values, count, |a| a < low),
+            C::LessThanOrEqual => executor::select::<T>(values, count, |a| a <= low),
+            C::GreaterThan => executor::select::<T>(values, count, |a| a > low),
+            C::GreaterThanOrEqual => executor::select::<T>(values, count, |a| a >= low),
+            _ => return None,
+        })
+    }
+    let high = high.as_ref();
+    Ok(match values.physical_type() {
+        PhysicalType::Int8 => run::<i8>(values, count, op, &low, high),
+        PhysicalType::Int16 => run::<i16>(values, count, op, &low, high),
+        PhysicalType::Int32 => run::<i32>(values, count, op, &low, high),
+        PhysicalType::Int64 => run::<i64>(values, count, op, &low, high),
+        PhysicalType::Int128 => run::<i128>(values, count, op, &low, high),
+        PhysicalType::UInt8 => run::<u8>(values, count, op, &low, high),
+        PhysicalType::UInt16 => run::<u16>(values, count, op, &low, high),
+        PhysicalType::UInt32 => run::<u32>(values, count, op, &low, high),
+        PhysicalType::UInt64 => run::<u64>(values, count, op, &low, high),
+        _ => None,
+    })
 }
 
 /// `ExpressionExecutor::TryEvaluateScalar`: the value of an expression without columns, or

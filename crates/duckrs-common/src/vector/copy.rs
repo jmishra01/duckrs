@@ -15,6 +15,78 @@ pub enum StringCopy {
 }
 
 impl Vector {
+    /// Copies rows `start..start + count` of `source` into rows `target_offset..` of this flat
+    /// vector: [`Self::copy_from`] with a contiguous selection, which a flat source of a fixed-width
+    /// type copies as one slice, without looking at the validity of rows that are all valid.
+    pub fn copy_range_from(
+        &mut self,
+        source: &Vector,
+        start: usize,
+        count: usize,
+        target_offset: usize,
+        strings: StringCopy,
+    ) {
+        if count == 0 {
+            return;
+        }
+        let shared_strings = source.physical_type() == PhysicalType::Varchar && strings == StringCopy::Reference;
+        let fixed = !matches!(
+            source.physical_type(),
+            PhysicalType::Varchar | PhysicalType::List | PhysicalType::Struct | PhysicalType::Array
+        );
+        if !(fixed || shared_strings)
+            || source.vector_type() != super::VectorType::Flat
+            || source.logical_type() != self.logical_type()
+        {
+            let sel = SelectionVector::from_vec((start..start + count).map(|i| i as u32).collect());
+            return self.copy_from(source, &sel, count, target_offset, strings);
+        }
+        let end = target_offset + count;
+        if self.capacity() < end {
+            self.resize(end.next_power_of_two());
+        }
+        if !source.validity().all_valid() || !self.validity().all_valid() {
+            for i in 0..count {
+                let valid = source.validity().is_valid(start + i);
+                self.validity_mut().set(target_offset + i, valid);
+            }
+        }
+        macro_rules! copy {
+            ($t:ty) => {{
+                let input = &source.data::<$t>()[start..start + count];
+                self.data_mut::<$t>()[target_offset..end].copy_from_slice(input);
+            }};
+        }
+        match self.physical_type() {
+            PhysicalType::Bool => copy!(bool),
+            PhysicalType::Int8 => copy!(i8),
+            PhysicalType::Int16 => copy!(i16),
+            PhysicalType::Int32 => copy!(i32),
+            PhysicalType::Int64 => copy!(i64),
+            PhysicalType::Int128 => copy!(i128),
+            PhysicalType::UInt8 => copy!(u8),
+            PhysicalType::UInt16 => copy!(u16),
+            PhysicalType::UInt32 => copy!(u32),
+            PhysicalType::UInt64 => copy!(u64),
+            PhysicalType::UInt128 => copy!(u128),
+            PhysicalType::Float => copy!(f32),
+            PhysicalType::Double => copy!(f64),
+            PhysicalType::Interval => copy!(Interval),
+            PhysicalType::Varchar => {
+                self.keep_strings_alive(source);
+                let input = &source.data::<StringT>()[start..start + count];
+                // SAFETY: the copied strings point into `source`'s string buffer (or are inlined),
+                // which keep_strings_alive just registered with this vector.
+                let out = unsafe { self.string_data_mut() };
+                out[target_offset..end].copy_from_slice(input);
+            }
+            _ => {
+                let sel = SelectionVector::from_vec((start..start + count).map(|i| i as u32).collect());
+                self.copy_from(source, &sel, count, target_offset, strings);
+            }
+        }
+    }
+
     /// Copies rows `sel[0..count]` of `source` (any vector type) into rows
     /// `target_offset..target_offset + count` of this flat vector, growing it if needed
     /// (`VectorOperations::Copy`). LIST children are appended to this vector's child.

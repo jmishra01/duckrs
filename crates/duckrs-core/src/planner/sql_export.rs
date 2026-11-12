@@ -2312,6 +2312,7 @@ impl Exporter<'_> {
                 }
                 return Ok(expr);
             }
+            BoundExprKind::JoinFilter { .. } => return Err("A join filter has no SQL export".into()),
             BoundExprKind::Reference(index) => {
                 let Some(expr) = self.lambdas.last().and_then(|l| l.get(*index)) else {
                     return Err("A bound reference has no SQL export".into());

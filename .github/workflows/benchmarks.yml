@@ -1,0 +1,54 @@
+name: Benchmarks
+
+# Times duckrs against the C++ DuckDB library on the same .benchmark files every night (item 46 of
+# docs/REMAINING_WORK.md). The comparison ends with the v1 gate of item 48.
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      pattern:
+        description: "benchmarks to run (a regex over the paths)"
+        default: "benchmark/tpch/sf1/.*"
+
+env:
+  CARGO_TERM_COLOR: always
+  DUCKDB_BASELINE: 4d77d9c103baca29a62af61cba9ebdc40e5d2023
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - "benchmark/tpch/sf1/.*"
+          - "benchmark/tpcds/sf1/.*"
+          - "benchmark/micro/(aggregate|join|filter|order)/.*"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out DuckDB at the baseline (benchmark files, queries, answers, generators)
+        uses: actions/checkout@v4
+        with:
+          repository: jmishra01/duckdb
+          ref: ${{ env.DUCKDB_BASELINE }}
+          path: duckdb
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: duckdb/duckdb_benchmark_data
+          key: benchmark-data-${{ env.DUCKDB_BASELINE }}-${{ strategy.job-index }}
+      - run: cargo build --release -p benchmark --features reference
+      - name: Run on both engines
+        run: >
+          ./target/release/benchmark_runner --root-dir duckdb --engine=both --threads=4
+          --out=timings.tsv '${{ github.event.inputs.pattern || matrix.suite }}' | tee comparison.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmarks-${{ strategy.job-index }}
+          path: |
+            timings.tsv
+            comparison.txt
