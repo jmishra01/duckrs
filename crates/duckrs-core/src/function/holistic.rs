@@ -859,6 +859,12 @@ fn binned_histogram(rows: &[Value], ty: &LogicalType, exact: bool) -> Result<Val
     Value::new(ty.clone(), ValueData::List(entries))
 }
 
+/// How two values of `ty` order, as their sort keys do.
+pub(super) fn compare(left: &Value, right: &Value, ty: &LogicalType) -> Result<std::cmp::Ordering> {
+    let keys = sort_keys(&[left.clone(), right.clone()], ty)?;
+    Ok(keys[0].cmp(&keys[1]))
+}
+
 /// `Value::NotDistinctFrom` of two values of `ty`.
 pub(super) fn not_distinct(left: &Value, right: &Value, ty: &LogicalType) -> Result<bool> {
     let keys = sort_keys(&[left.clone(), right.clone()], ty)?;

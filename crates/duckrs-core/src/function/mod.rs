@@ -17,6 +17,7 @@ pub mod extras;
 pub mod generic;
 pub(crate) mod geometry;
 pub(crate) mod holistic;
+mod holistic_states;
 pub mod json;
 pub mod json_serialize;
 mod lists;

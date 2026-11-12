@@ -387,6 +387,10 @@ impl Value {
             (ValueData::Float(v), _) => format_float(*v),
             (ValueData::Double(v), _) => format_double(*v),
             (ValueData::Bytes(b), LogicalTypeId::Varchar | LogicalTypeId::Char) => String::from_utf8_lossy(b).into(),
+            // `TypeValue::GetType`: the type a TYPE value keeps serialized
+            (ValueData::Bytes(b), LogicalTypeId::Type) => {
+                crate::serializer::BinaryDeserializer::deserialize::<LogicalType>(b)?.to_string()
+            }
             (ValueData::Bytes(b), LogicalTypeId::Geometry) => crate::geometry::to_wkt(b)?,
             (ValueData::Bytes(b), LogicalTypeId::Blob | LogicalTypeId::LegacyAggregateState) => format_blob(b),
             (ValueData::Bytes(b), LogicalTypeId::Bit) => crate::types::bit::bit_to_string(b),

@@ -287,6 +287,67 @@ impl Binder<'_> {
     /// parameters, `VARCHAR(n)` and `DECIMAL(width, scale)`.
     /// A type of a database file that names a type of the catalog: its SQL is what would name it
     /// in a query.
+    /// `BindMakeTypeFunctionExpression`: the arguments, constants, spelled as the type they make, then bound.
+    fn bind_make_type(&mut self, function: &ast::FunctionExpr) -> Result<BoundExpr> {
+        let mut arguments = Vec::with_capacity(function.args.len());
+        for argument in &function.args {
+            let bound = self.bind_expression(&argument.expr)?;
+            if !bound.is_foldable() {
+                return Err(binder_error(
+                    "make_type function arguments must be constant expressions",
+                ));
+            }
+            let value = crate::execution::expression_executor::evaluate_scalar(&bound)?;
+            arguments.push((argument.name.clone(), value));
+        }
+        let Some((_, name)) = arguments.first() else {
+            return Err(binder_error("make_type function requires at least one argument"));
+        };
+        if name.logical_type().id() != LogicalTypeId::Varchar || name.is_null() {
+            return Err(binder_error(
+                "make_type function first argument must be the type name as VARCHAR",
+            ));
+        }
+        let name = name.try_to_string()?;
+        if name.is_empty() {
+            return Err(Error::new(
+                ErrorKind::Parser,
+                "Zero-length identifier in qualified name",
+            ));
+        }
+        let upper = name.to_uppercase();
+        let parameter = |(alias, value): &(String, Value)| -> Result<String> {
+            let text = match value.logical_type().id() {
+                LogicalTypeId::Type => value.try_to_string()?,
+                LogicalTypeId::Varchar => format!("'{}'", value.try_to_string()?.replace('\'', "''")),
+                _ => value.try_to_string()?,
+            };
+            Ok(if alias.is_empty() {
+                text
+            } else {
+                format!("{} {text}", quote_identifier(alias))
+            })
+        };
+        let parameters = arguments[1..].iter().map(parameter).collect::<Result<Vec<_>>>()?;
+        if upper == "STRUCT" && arguments[1..].iter().any(|(alias, _)| alias.is_empty()) {
+            let types: Vec<String> = arguments[1..]
+                .iter()
+                .map(|(_, v)| v.logical_type().to_string())
+                .collect();
+            return Err(binder_error(format!(
+                "Type \"STRUCT\" does not accept type parameters ({})",
+                types.join(", ")
+            )));
+        }
+        let text = match (upper.as_str(), parameters.as_slice()) {
+            (_, []) => quote_identifier(&name),
+            ("LIST", [child]) => format!("{child}[]"),
+            _ => format!("{}({})", quote_identifier(&name), parameters.join(", ")),
+        };
+        let ty = self.bind_named_type(&LogicalType::unbound(text))?;
+        Ok(BoundExpr::constant(type_value(&ty)))
+    }
+
     fn bind_named_type(&self, ty: &LogicalType) -> Result<LogicalType> {
         let statements = duckrs_parser::parse_ast(&format!("SELECT CAST(NULL AS {ty})"))?;
         if let [ast::Statement::Select(select)] = statements.as_slice()
@@ -1457,6 +1518,25 @@ impl Binder<'_> {
                 {
                     return self.bind_parse_log_message(function);
                 }
+                // Ported from duckdb/extension/core_functions/scalar/generic/type_functions.cpp @ rust-port-baseline
+                // `get_type(x)`: the type of `x`, as a TYPE
+                if function.name.name.eq_ignore_ascii_case("get_type")
+                    && function.name.qualification.is_empty()
+                    && function.args.len() == 1
+                {
+                    let child = self.bind_expression(&function.args[0].expr)?;
+                    if child.return_type.id() == LogicalTypeId::Unknown {
+                        return Err(Error::new(
+                            ErrorKind::ParameterNotResolved,
+                            "Parameter types could not be resolved",
+                        ));
+                    }
+                    return Ok(BoundExpr::constant(type_value(&child.return_type)));
+                }
+                // `make_type(name, ...)`: the type the name and its parameters make, as a TYPE
+                if function.name.name.eq_ignore_ascii_case("make_type") && function.name.qualification.is_empty() {
+                    return self.bind_make_type(function);
+                }
                 if function.name.name.eq_ignore_ascii_case("to_aggregate_state") {
                     let children = function
                         .args
@@ -2196,9 +2276,49 @@ impl Binder<'_> {
                      set of distinct values, so combining states would produce incorrect results",
                 ));
             }
-            let arguments: Vec<LogicalType> = aggregate.children.iter().map(|c| c.return_type.clone()).collect();
-            let (exported, ty) =
-                crate::function::aggregates::export_state(&aggregate.function, &aggregate.return_type, &arguments)?;
+            // the arguments of an aggregate that keeps its rows arrive packed into one STRUCT
+            let packed = matches!(
+                aggregate.function.kind,
+                crate::function::aggregates::AggregateKind::Holistic(_)
+            ) && aggregate.function.arguments.len() > 1;
+            let arguments: &[BoundExpr] = match aggregate.children.as_slice() {
+                [
+                    BoundExpr {
+                        kind: BoundExprKind::Function { children, .. },
+                        ..
+                    },
+                ] if packed => children,
+                children => children,
+            };
+            let types: Vec<LogicalType> = arguments.iter().map(|c| c.return_type.clone()).collect();
+            // `EncodeStateParameters`: the constants the arguments after the first were bound to
+            let takes_constants = matches!(
+                aggregate.function.kind,
+                crate::function::aggregates::AggregateKind::Holistic(
+                    crate::function::holistic::Holistic::StringAgg
+                        | crate::function::holistic::Holistic::QuantileCont
+                        | crate::function::holistic::Holistic::QuantileDisc
+                )
+            );
+            let constants: Vec<Option<Value>> = if takes_constants && arguments.len() > 1 {
+                arguments
+                    .iter()
+                    .enumerate()
+                    .map(|(at, argument)| {
+                        (at > 0 && argument.is_foldable())
+                            .then(|| crate::execution::expression_executor::evaluate_scalar(argument))
+                            .transpose()
+                    })
+                    .collect::<Result<_>>()?
+            } else {
+                Vec::new()
+            };
+            let (exported, ty) = crate::function::aggregates::export_state(
+                &aggregate.function,
+                &aggregate.return_type,
+                &types,
+                constants,
+            )?;
             aggregate.function = Arc::new(exported);
             aggregate.return_type = ty;
         }
@@ -2687,5 +2807,25 @@ mod tests {
         assert_eq!(ty(".5"), LogicalType::decimal(1, 1));
         assert_eq!(ty("1e3"), LogicalType::DOUBLE);
         assert_eq!(number_to_value("-0.25").unwrap().try_to_string().unwrap(), "-0.25");
+    }
+}
+
+/// `Value::TYPE`: a type as a value of the TYPE type, which keeps it serialized.
+pub(crate) fn type_value(ty: &LogicalType) -> Value {
+    let bytes = duckrs_common::serializer::BinarySerializer::serialize(
+        ty,
+        duckrs_common::serializer::SerializationOptions::default(),
+    );
+    Value::new(LogicalType::new(LogicalTypeId::Type), ValueData::Bytes(bytes)).expect("TYPE is stored as bytes")
+}
+
+/// An identifier as SQL spells it: quoted unless it needs no quotes.
+fn quote_identifier(name: &str) -> String {
+    let plain = name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if plain {
+        name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
     }
 }

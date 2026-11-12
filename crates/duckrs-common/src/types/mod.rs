@@ -393,13 +393,45 @@ impl std::hash::Hash for TypeInfo {
 
 /// Which aggregate an `AGGREGATE_STATE` is of: the function's name, its overload, what it was
 /// bound with and what it gives (the `function_name` and `parameters` of C++'s extension info).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 struct StateInfo {
     function: Arc<str>,
     overload: u32,
     arguments: Vec<LogicalType>,
     result: LogicalType,
+    /// the constants arguments were bound to, as string_agg's separator (the `(type, value)` pairs of the
+    /// `parameters`)
+    constants: Vec<Option<crate::value::Value>>,
 }
+
+impl StateInfo {
+    fn constants_key(&self) -> String {
+        format!("{:?}", self.constants)
+    }
+}
+
+/// C++ compares the `properties` of the extension info: the function's name and its parameters. The overload and the
+/// result are duckrs's, and a state read from a file has them only once the aggregate is bound again.
+impl PartialEq for StateInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.function == other.function
+            && self.arguments == other.arguments
+            && self.constants_key() == other.constants_key()
+    }
+}
+
+impl Eq for StateInfo {}
+
+impl std::hash::Hash for StateInfo {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.function.hash(state);
+        self.arguments.hash(state);
+        self.constants_key().hash(state);
+    }
+}
+
+/// The overload of a state whose aggregate is still to be bound again (read from a database file).
+pub const UNRESOLVED_OVERLOAD: u32 = u32::MAX;
 
 /// A SQL type. Cheap to clone: parameters live behind an `Arc`.
 #[derive(Clone)]
@@ -579,6 +611,7 @@ impl LogicalType {
             overload,
             arguments,
             result,
+            constants: Vec::new(),
         });
         ty
     }
@@ -598,6 +631,24 @@ impl LogicalType {
                 .and_then(|info| info.state.as_ref())
                 .map(|s| (&*s.function, s.overload, s.arguments.as_slice(), &s.result)),
         }
+    }
+
+    /// A state of [`Self::aggregate_state_of`] whose arguments were bound to these constants.
+    pub fn with_state_constants(mut self, constants: Vec<Option<crate::value::Value>>) -> Self {
+        if let Some(info) = self.info.as_mut()
+            && let Some(state) = Arc::make_mut(info).state.as_mut()
+        {
+            state.constants = constants;
+        }
+        self
+    }
+
+    /// The constants the arguments of a state of [`Self::aggregate_state_of`] were bound to.
+    pub fn aggregate_state_constants(&self) -> &[Option<crate::value::Value>] {
+        self.info
+            .as_ref()
+            .and_then(|info| info.state.as_ref())
+            .map_or(&[], |s| s.constants.as_slice())
     }
 
     /// `LogicalType::IsAggregateState`: a state with C++'s layout ([`Self::aggregate_state_of`]).

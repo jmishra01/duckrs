@@ -1740,10 +1740,10 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
         "finalize" => {
             count_args(&lower, &children, 1, 1)?;
             let ty = children[0].return_type.clone();
-            let Some((.., result)) = ty.aggregate_state_info() else {
+            if ty.aggregate_state_info().is_none() {
                 return Err(binder_error(format!("Can only finalize {ty}, not AGGREGATE_STATE")));
-            };
-            let result = result.clone();
+            }
+            let (_, result) = super::aggregates::resolve_state(&ty)?;
             Ok(bound_function(&lower, children, result, state_finalize))
         }
         "combine" => {
@@ -1755,6 +1755,35 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
             }
             if other.id() != LogicalTypeId::SqlNull && ty != other {
                 let name = |t: &LogicalType| t.aggregate_state_info().map_or(t.to_string(), |i| i.0.to_string());
+                // the same function and signature: bound to different constants (`BindAggregateState`)
+                if let (Some(left), Some(right)) = (ty.aggregate_state_info(), other.aggregate_state_info())
+                    && left.0 == right.0
+                {
+                    let parameters = |t: &LogicalType| {
+                        let (_, _, arguments, _) = t.aggregate_state_info().expect("a state");
+                        let constants = t.aggregate_state_constants();
+                        let entries: Vec<String> = arguments
+                            .iter()
+                            .enumerate()
+                            .map(|(at, argument)| match constants.get(at).cloned().flatten() {
+                                Some(constant) => {
+                                    format!(
+                                        "{{'type': {argument}, 'value': {}}}",
+                                        constant.try_to_string().unwrap_or_default()
+                                    )
+                                }
+                                None => argument.to_string(),
+                            })
+                            .collect();
+                        format!("[{}]", entries.join(", "))
+                    };
+                    return Err(binder_error(format!(
+                        "Cannot COMBINE aggregate states of \"{}\" that were created with different parameters: {} <> {}",
+                        left.0,
+                        parameters(&ty),
+                        parameters(&other)
+                    )));
+                }
                 return Err(binder_error(format!(
                     "Cannot COMBINE aggregate states from different functions, {} <> {}",
                     name(&ty),

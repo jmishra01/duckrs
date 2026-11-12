@@ -7,8 +7,8 @@
 
 use crate::column_data::ColumnDataCollection;
 use crate::types::{Interval, ListEntry, LogicalTypeId, PhysicalType};
-use crate::vector::{DataChunk, SelectionVector, UnifiedFormat, Vector};
 use crate::value::{Value, ValueData};
+use crate::vector::{DataChunk, SelectionVector, UnifiedFormat, Vector};
 use crate::{Error, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -665,7 +665,11 @@ fn encode_variant_scalar(value: &Value, out: &mut Vec<u8>) -> Result<()> {
             }
         }
         T::Blob | T::Geometry => {
-            out.push(if id == T::Blob { VariantRank::Blob } else { VariantRank::Geometry } as u8);
+            out.push(if id == T::Blob {
+                VariantRank::Blob
+            } else {
+                VariantRank::Geometry
+            } as u8);
             if let ValueData::Bytes(bytes) = value.data() {
                 encode_variant_string(bytes, false, out);
             }
@@ -743,7 +747,11 @@ fn encode_variant_number(text: &str, out: &mut Vec<u8>) {
         None => (false, text),
     };
     let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
-    let all: Vec<u8> = whole.bytes().chain(fraction.bytes()).filter(u8::is_ascii_digit).collect();
+    let all: Vec<u8> = whole
+        .bytes()
+        .chain(fraction.bytes())
+        .filter(u8::is_ascii_digit)
+        .collect();
     let Some(first) = all.iter().position(|d| *d != b'0') else {
         // zero: the class says it all
         out.push(1);
