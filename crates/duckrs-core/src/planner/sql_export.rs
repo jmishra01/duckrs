@@ -1255,6 +1255,9 @@ impl Exporter<'_> {
                 Body::Select(Select::new(TableRef::empty(), values))
             }
             Op::ParquetScan { scan, table_index } => self.parquet_scan(scan, *table_index)?,
+            Op::MatchRecognize { .. } => {
+                return Err("MATCH_RECOGNIZE has no SQL export".into());
+            }
             Op::CsvScan { .. } | Op::JsonScan { .. } => {
                 return Err("The file scan has no SQL export".into());
             }

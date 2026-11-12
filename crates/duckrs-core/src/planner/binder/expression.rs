@@ -1496,6 +1496,14 @@ impl Binder<'_> {
                 if function.args.iter().any(|a| !a.name.is_empty()) {
                     return Err(crate::unported("named function arguments"));
                 }
+                // what the parser makes of `RUNNING f(x)`, which MATCH_RECOGNIZE takes away before binding
+                if function.name.qualification.is_empty()
+                    && matches!(function.name.name.as_str(), "__mr_running" | "__mr_final")
+                {
+                    return Err(binder_error(
+                        "RUNNING and FINAL are only meaningful in the MEASURES of a MATCH_RECOGNIZE",
+                    ));
+                }
                 let Some(set) = BuiltinFunctions::get().scalar(&function.name.name) else {
                     return Err(Error::new(
                         ErrorKind::Catalog,

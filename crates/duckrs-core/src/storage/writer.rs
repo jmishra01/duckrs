@@ -154,9 +154,7 @@ impl StringStatsOut {
     /// `StringStats::Merge`
     fn merge(&mut self, other: &Self) {
         self.bounds = match (self.bounds.take(), &other.bounds) {
-            (Some((a_min, a_max)), Some((b_min, b_max))) => {
-                Some((a_min.min(b_min.clone()), a_max.max(b_max.clone())))
-            }
+            (Some((a_min, a_max)), Some((b_min, b_max))) => Some((a_min.min(b_min.clone()), a_max.max(b_max.clone()))),
             (a, b) => a.or_else(|| b.clone()),
         };
         self.has_unicode |= other.has_unicode;
@@ -397,7 +395,11 @@ fn write_string_stats(s: &mut BinarySerializer, strings: Option<&StringStatsOut>
         }
         s.write_property(202, "has_unicode", &strings.is_none_or(|strings| strings.has_unicode));
         s.write_property(203, "has_max_string_length", &strings.is_some());
-        s.write_property(204, "max_string_length", &strings.map_or(0, |strings| strings.max_length));
+        s.write_property(
+            204,
+            "max_string_length",
+            &strings.map_or(0, |strings| strings.max_length),
+        );
         return;
     }
     // what `StringStatsField` says of no bounds, no lengths and that there can be unicode
@@ -1987,7 +1989,9 @@ impl<'a> Writer<'a> {
                 let data = part.vector.data::<StringT>();
                 (0..part.count).map(move |row| {
                     // SAFETY: the row is valid, so its string lives in the heap of the vector
-                    part.vector.is_valid(row).then(|| unsafe { data[row].as_bytes() }.to_vec())
+                    part.vector
+                        .is_valid(row)
+                        .then(|| unsafe { data[row].as_bytes() }.to_vec())
                 })
             });
             for segment in &mut segments {

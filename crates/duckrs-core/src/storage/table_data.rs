@@ -875,6 +875,8 @@ impl TableSource for DiskTable {
                     can_be_null: true,
                     can_be_valid: true,
                     geometry: None,
+                    strings: None,
+                    distinct: None,
                 };
                 let Some(stored) = stored else {
                     return Some(unknown);
@@ -885,6 +887,14 @@ impl TableSource for DiskTable {
                     can_be_null: stored.has_null,
                     can_be_valid: stored.has_no_null,
                     geometry: stored.geometry,
+                    strings: stored.strings.as_ref().map(|strings| crate::catalog::StringStatistics {
+                        bounds: Some((strings.min.clone(), strings.max.clone())),
+                        has_unicode: strings.has_unicode,
+                        min_length: strings.min_length,
+                        max_length: strings.max_length,
+                        total_length: strings.total_length,
+                    }),
+                    distinct: None,
                 })
             })
             .collect()

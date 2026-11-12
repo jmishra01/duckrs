@@ -205,7 +205,13 @@ struct Group<'a> {
 }
 
 /// The zone of the output column `index` of a scan of `table` reading `column_ids`, in row group `group`.
-fn table_zone(table: &TableCatalogEntry, column_ids: &[usize], group: usize, rows: usize, index: usize) -> Option<ColumnZone> {
+fn table_zone(
+    table: &TableCatalogEntry,
+    column_ids: &[usize],
+    group: usize,
+    rows: usize,
+    index: usize,
+) -> Option<ColumnZone> {
     let column = *column_ids.get(index)?;
     if column == COLUMN_IDENTIFIER_ROW_ID {
         let size = table.row_group_size();
@@ -525,8 +531,14 @@ impl Group<'_> {
                 left,
                 right,
             } => match (&left.kind, &right.kind) {
-                (_, BoundExprKind::Constant(constant)) | (BoundExprKind::Constant(constant), _) if !constant.is_null() => {
-                    let column = if matches!(left.kind, BoundExprKind::Constant(_)) { right } else { left };
+                (_, BoundExprKind::Constant(constant)) | (BoundExprKind::Constant(constant), _)
+                    if !constant.is_null() =>
+                {
+                    let column = if matches!(left.kind, BoundExprKind::Constant(_)) {
+                        right
+                    } else {
+                        left
+                    };
                     let zone = match &column.kind {
                         BoundExprKind::Reference(index) => self.zone(*index),
                         _ => None,

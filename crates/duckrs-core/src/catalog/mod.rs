@@ -444,6 +444,60 @@ pub struct ColumnStatistics {
     pub can_be_valid: bool,
     /// of a GEOMETRY, its `GeometryStats`, if known
     pub geometry: Option<duckrs_common::geometry::GeometryStats>,
+    /// of a VARCHAR or BLOB, its `StringStats`, if known
+    pub strings: Option<StringStatistics>,
+    /// `distinct_count`: the approximate number of distinct values of a table's column, if known
+    pub distinct: Option<u64>,
+}
+
+/// `StringStatsData`: what is known of the strings of a column besides their bounds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StringStatistics {
+    /// the bounds as `StatsWriter<string_t>` keeps them, cut to 12 bytes (`CURRENT_MAX_STRING_MINMAX_SIZE`), or
+    /// exact for a constant; `None` without any (`NO_STATS`)
+    pub bounds: Option<(Vec<u8>, Vec<u8>)>,
+    pub has_unicode: bool,
+    pub min_length: Option<u64>,
+    pub max_length: Option<u64>,
+    pub total_length: Option<u64>,
+}
+
+impl StringStatistics {
+    /// `CURRENT_MAX_STRING_MINMAX_SIZE`: what `StatsWriter<string_t>` keeps of a bound.
+    pub const PREFIX_SIZE: usize = 12;
+
+    /// `StringStats::FromConstant`: the value itself, with its length, but no total.
+    pub fn of_constant(bytes: &[u8], varchar: bool) -> Self {
+        Self {
+            bounds: Some((bytes.to_vec(), bytes.to_vec())),
+            has_unicode: varchar && !bytes.is_ascii(),
+            min_length: Some(bytes.len() as u64),
+            max_length: Some(bytes.len() as u64),
+            total_length: None,
+        }
+    }
+
+    /// `StringStats::Merge`, of the statistics of two sets of rows.
+    pub fn merge(&self, other: &Self, add_totals: bool) -> Self {
+        let bounds = match (&self.bounds, &other.bounds) {
+            (Some((a_min, a_max)), Some((b_min, b_max))) => Some((a_min.min(b_min).clone(), a_max.max(b_max).clone())),
+            _ => None,
+        };
+        let both = |a: Option<u64>, b: Option<u64>, f: fn(u64, u64) -> u64| a.zip(b).map(|(a, b)| f(a, b));
+        Self {
+            bounds,
+            has_unicode: self.has_unicode || other.has_unicode,
+            min_length: both(self.min_length, other.min_length, u64::min),
+            max_length: both(self.max_length, other.max_length, u64::max),
+            total_length: if add_totals {
+                self.total_length
+                    .zip(other.total_length)
+                    .and_then(|(a, b)| a.checked_add(b))
+            } else {
+                None
+            },
+        }
+    }
 }
 
 /// `DuckIndexEntry`. Scans read a table through one with `constraints::index_tree`, and the UNIQUE

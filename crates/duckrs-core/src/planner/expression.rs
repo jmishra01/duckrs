@@ -203,6 +203,7 @@ pub struct BoundAggregate {
 /// The functions that give something else on each call (`FunctionStability::VOLATILE`).
 pub(crate) const VOLATILE_FUNCTIONS: &[&str] = &[
     "random",
+    "vector_type",
     "write_log",
     "stats",
     "sleep_ms",

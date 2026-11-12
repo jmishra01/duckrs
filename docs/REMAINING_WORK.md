@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 4257 of 6367 test files pass (**70.4%** of the 6047 that run). The v1 target is ≥ 90%.
+- Overall: 4319 of 6367 test files pass (**71.4%** of the 6047 that run). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -122,14 +122,17 @@ Each item gives the number of failing files in `test/` that it should fix, where
 - [ ] 4. Parquet VARIANT, including shredding (`parquet/variant`: 15 failing, 68%)
   - [x] reading, writing, auto-shredding, the `SHREDDING` option, VARIANT to JSON
   - [ ] the key dictionary in insertion order (`VariantNode` keeps keys sorted, so bytes differ from C++)
-  - [ ] `vector_type`, VARIANT ordering (`variant_comparator`), `stats()` of VARIANT, case-sensitive shredded
+  - [x] `vector_type`, VARIANT ordering and comparison (`variant_comparator`)
+  - [ ] `stats()` of VARIANT, `vector_type` of shredded and unnested vectors as C++ has them, case-sensitive shredded
     extraction, `debug_delta_only_variant_encoding_enabled`
 - [ ] 5. `EXPORT DATABASE` / `IMPORT DATABASE` (`sql/export`: 4 failing, 1 skipped for ICU)
   - [x] a COPY of each table, `schema.sql` and `load.sql` as C++ writes them, IMPORT of the two, an attached source database
   - [ ] macro dependencies (`export_macros`, `export_generated_columns`), `enable_external_access`
   - [x] HUGEINT and UHUGEINT written as VARCHAR to Parquet, as `ParquetWriteSelect` does for an EXPORT
   - [ ] UNION columns in Parquet
-- [ ] 6. `COPY FROM DATABASE` (`sql/copy_database`: 12 failing, 0%)
+- [ ] 6. `COPY FROM DATABASE` (`sql/copy_database`: 11 of 12 pass)
+  - [x] `(SCHEMA)`, `(DATA)` and `PRAGMA copy_database`, read in one database and appended in the other
+  - [ ] `currval('db.schema.seq')` of a sequence in another database
 - [ ] 7. MultiFileReader: hive partitioning, `union_by_name`, filename column (`sql/multi_file`: 4 failing)
 - [ ] 8. GeoParquet (`geoparquet`: 7 failing)
 
@@ -163,7 +166,8 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] COPY, casts to a database's types and `PRAGMA table_info('db.t')` run in the database they name
   - [x] ATTACH options as expressions, unknown options and TYPEs refused, `OR REPLACE`, access-mode conflicts,
     a rollback detaches what the transaction attached; one database written per transaction
-  - [ ] statements that read one database and write another (`CREATE TABLE db2.t AS SELECT ... FROM db1.t`),
+  - [ ] statements that read one database and write another (`CREATE TABLE db2.t AS SELECT ... FROM db1.t`; refused
+    for now, as running them in one of the databases wrote to the wrong one),
     temp tables and sequences of the default database in a statement routed to another, views binding across
     databases, DETACH of the default database
   - [x] `RECOVERY_MODE` (`NO_WAL_WRITES` keeps commits out of the log until a checkpoint)
@@ -199,7 +203,8 @@ Each item gives the number of failing files in `test/` that it should fix, where
     bounds, week, division by a column
   - [ ] secure views (7 files), the scalar aggregate merger (`scalar_aggregate_merge_threshold`, 3),
     `json_serialize_plan`, gamma's errors without IEEE
-  - [ ] string statistics (contains, suffix, upper/lower, length), struct/list/map extracts, `vector_type`,
+  - [x] string statistics in `stats()`: bounds, unicode, lengths and totals of tables and constants; `approx_unique`
+  - [ ] string statistics through functions (contains, suffix, upper/lower, length), struct/list/map extracts,
     EXPLAIN ANALYZE metrics of other operators (~190 EXPLAIN-shape files under `test/optimizer`, `sql/optimizer`)
 - [ ] 16. Join order and cardinality estimation (`optimizer/joins`: 14 failing)
 - [ ] 17. Column lifetime, unused columns, TopN, expression rewriter (small dirs under `test/optimizer`)
@@ -209,7 +214,14 @@ Each item gives the number of failing files in `test/` that it should fix, where
 
 ## Phase 6: SQL surface
 
-- [ ] 21. `MATCH_RECOGNIZE` (`sql/match_recognize`: 29 failing, 0%)
+- [ ] 21. `MATCH_RECOGNIZE` (`sql/match_recognize`: 24 of 29 pass)
+  - [x] its own operator (`execution/match_recognize.rs`): C++'s pattern program and memoised matcher, PARTITION BY /
+    ORDER BY, MEASURES with RUNNING / FINAL, navigation, CLASSIFIER(), MATCH_NUMBER(), aggregates over the match
+    (DISTINCT, FILTER, ORDER BY, through macros), ONE ROW / ALL ROWS (WITH UNMATCHED ROWS, OMIT EMPTY MATCHES),
+    AFTER MATCH SKIP, SUBSET, exclusion, anchors, PERMUTE, DEFINE AUTO; the binder's errors; the memo counts
+    against `memory_limit`
+  - [ ] `max_execution_time` (not in duckrs at all; `limits` runs into the timeout), window functions in
+    `duckdb_functions()` (`clauses`, `scope`), UNNEST in a measure, `->` resolved as a JSON operator in a measure
 - [ ] 22. Triggers (`sql/trigger`: 26 of 28 pass)
   - [x] CREATE / DROP TRIGGER with the checks of `BindCreateTriggerInfo`, `duckdb_triggers()`, BEFORE and
     AFTER statement triggers, AFTER row triggers with NEW / OLD, REFERENCING transition tables,

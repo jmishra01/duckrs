@@ -101,6 +101,11 @@ pub enum LogicalOperatorKind {
         table_index: usize,
         windows: Vec<BoundWindow>,
     },
+    /// MATCH_RECOGNIZE over its child, whose expressions the operator holds already resolved.
+    MatchRecognize {
+        table_index: usize,
+        data: Arc<crate::execution::match_recognize::MatchRecognizeData>,
+    },
     /// `LogicalAggregate`: one row per distinct `groups`, with the `aggregates` of its rows. With
     /// `grouping_sets` there is such a set of rows per set, where the groups outside of the set
     /// are NULL; without any, all groups form the one set. The `grouping_functions` are the
@@ -485,6 +490,7 @@ impl LogicalOperator {
             LogicalOperatorKind::ExpressionGet { types, .. } | LogicalOperatorKind::ChunkGet { types, .. } => {
                 types.clone()
             }
+            LogicalOperatorKind::MatchRecognize { data, .. } => data.output_types.clone(),
             LogicalOperatorKind::Window { windows, .. } => {
                 let mut types = self.children[0].types();
                 types.extend(windows.iter().map(|w| w.return_type.clone()));
@@ -620,6 +626,9 @@ impl LogicalOperator {
             LogicalOperatorKind::JsonScan { table_index, scan } => numbered(*table_index, scan.output_types().len()),
             LogicalOperatorKind::ParquetScan { table_index, scan } => numbered(*table_index, scan.output_types().len()),
             LogicalOperatorKind::CsvScan { table_index, scan } => numbered(*table_index, scan.output_types().len()),
+            LogicalOperatorKind::MatchRecognize { table_index, data } => {
+                numbered(*table_index, data.output_types.len())
+            }
             LogicalOperatorKind::Window { table_index, windows } => {
                 let mut bindings = self.children[0].column_bindings();
                 bindings.extend(numbered(*table_index, windows.len()));

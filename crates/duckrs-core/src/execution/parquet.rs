@@ -1056,7 +1056,11 @@ fn row_groups_to_scan(
             || expr.children().into_iter().any(|child| reads(child, columns))
     }
     let filtered = reads(filter, &numbers);
-    let projected = |at: &usize| scan.projected.as_ref().is_none_or(|p| p.get(*at).copied().unwrap_or(true));
+    let projected = |at: &usize| {
+        scan.projected
+            .as_ref()
+            .is_none_or(|p| p.get(*at).copied().unwrap_or(true))
+    };
     if filtered || numbers.iter().any(projected) {
         return None;
     }
@@ -1122,22 +1126,25 @@ fn bloom_rules_out(
                     _ => None,
                 }
             }
-            children.iter().filter_map(|c| bound(c, C::GreaterThanOrEqual)).any(|(column, low)| {
-                let matched = children
-                    .iter()
-                    .filter_map(|c| bound(c, C::LessThanOrEqual))
-                    .any(|(other, high)| other == column && high == low);
-                let ty = scan.types.get(column).cloned().unwrap_or(LogicalType::SQLNULL);
-                let equal = crate::planner::expression::BoundExpr::new(
-                    E::Comparison {
-                        op: C::Equal,
-                        left: Box::new(crate::planner::expression::BoundExpr::new(E::Reference(column), ty)),
-                        right: Box::new(crate::planner::expression::BoundExpr::constant(low)),
-                    },
-                    LogicalType::BOOLEAN,
-                );
-                matched && bloom_rules_out(scan, leaves, group, &equal, file, path, normalized)
-            })
+            children
+                .iter()
+                .filter_map(|c| bound(c, C::GreaterThanOrEqual))
+                .any(|(column, low)| {
+                    let matched = children
+                        .iter()
+                        .filter_map(|c| bound(c, C::LessThanOrEqual))
+                        .any(|(other, high)| other == column && high == low);
+                    let ty = scan.types.get(column).cloned().unwrap_or(LogicalType::SQLNULL);
+                    let equal = crate::planner::expression::BoundExpr::new(
+                        E::Comparison {
+                            op: C::Equal,
+                            left: Box::new(crate::planner::expression::BoundExpr::new(E::Reference(column), ty)),
+                            right: Box::new(crate::planner::expression::BoundExpr::constant(low)),
+                        },
+                        LogicalType::BOOLEAN,
+                    );
+                    matched && bloom_rules_out(scan, leaves, group, &equal, file, path, normalized)
+                })
         }
         E::Conjunction { and: false, children } => children
             .iter()
@@ -1474,7 +1481,8 @@ impl PhysicalOperator for PhysicalParquetScan {
             let (metadata, _) = read_metadata(path).ok()?;
             let groups = metadata.num_row_groups();
             total += groups;
-            scanned += row_groups_to_scan(&self.scan, self.filter.as_ref(), &metadata, path).map_or(groups, |g| g.len());
+            scanned +=
+                row_groups_to_scan(&self.scan, self.filter.as_ref(), &metadata, path).map_or(groups, |g| g.len());
         }
         (total > 0).then_some((scanned, total))
     }
@@ -2508,6 +2516,8 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
                 can_be_null: false,
                 can_be_valid: false,
                 geometry: None,
+                strings: None,
+                distinct: None,
             };
             let mut bounds_known = true;
             let mut usable = true;
@@ -2587,7 +2597,12 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
 /// that is a leaf, not overridden by a hive partition, and not repaired as it is read.
 fn statistics_leaf(scan: &ParquetScanData, metadata: &ParquetMetaData, column: usize) -> Option<usize> {
     let (name, ty) = (scan.names.get(column)?, &scan.types[column]);
-    if scan.schema.is_some() || scan.hive_overrides.iter().any(|(_, key)| key.eq_ignore_ascii_case(name)) {
+    if scan.schema.is_some()
+        || scan
+            .hive_overrides
+            .iter()
+            .any(|(_, key)| key.eq_ignore_ascii_case(name))
+    {
         return None;
     }
     // repaired strings no longer lie within the bounds of the stored bytes

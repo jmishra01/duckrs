@@ -1603,7 +1603,7 @@ impl ClientContext {
     /// Runs one statement within the current transaction, or as a transaction of its own
     /// (`ClientContext::PendingStatementOrPreparedStatementInternal` + `CleanupInternal`).
     fn run_statement(&mut self, statement: &Statement) -> Result<MaterializedQueryResult> {
-        if let Some((database, routed)) = self.route_to_database(statement) {
+        if let Some((database, routed)) = self.route_to_database(statement)? {
             let previous = std::mem::replace(&mut self.db, database);
             let result = self.run_statement(&routed);
             self.db = previous;
@@ -1836,7 +1836,7 @@ impl ClientContext {
 
     /// A statement that names another database runs there, without that name. The first part of
     /// `a.b` is a schema if this database has one, as in C++.
-    fn route_to_database(&self, statement: &Statement) -> Option<(Arc<DatabaseInstance>, Statement)> {
+    fn route_to_database(&self, statement: &Statement) -> Result<Option<(Arc<DatabaseInstance>, Statement)>> {
         let mut names = Vec::new();
         let mut routed = statement.clone();
         for_each_table_name(&mut routed, &mut |name| names.push(name.clone()));
@@ -1858,15 +1858,32 @@ impl ClientContext {
                 })
             });
         }
-        let database = names.iter().find_map(|name| {
-            let first = name.qualification.first()?;
-            let is_schema = name.qualification.len() == 1
-                && (self.catalog().get_schema(first).is_some() || first.eq_ignore_ascii_case(TEMP_SCHEMA));
-            if is_schema {
-                return None;
-            }
-            self.find_database(first)
-        })?;
+        let named: Vec<Arc<DatabaseInstance>> = names
+            .iter()
+            .filter_map(|name| {
+                let first = name.qualification.first()?;
+                let is_schema = name.qualification.len() == 1
+                    && (self.catalog().get_schema(first).is_some() || first.eq_ignore_ascii_case(TEMP_SCHEMA));
+                if is_schema {
+                    return None;
+                }
+                self.find_database(first)
+            })
+            .collect();
+        let Some(database) = named.first().cloned() else {
+            return Ok(None);
+        };
+        // a statement runs in one database here: reading another works, but a write to another would quietly go to
+        // the first in its place
+        let reads_only = matches!(
+            statement,
+            Statement::Select(_) | Statement::Explain { .. } | Statement::Pragma { .. }
+        );
+        if !reads_only && named.iter().any(|other| !Arc::ptr_eq(other, &database)) {
+            return Err(crate::unported(
+                "statements that write to one database and read another",
+            ));
+        }
         let prefix = database.name.clone();
         for_each_table_name(&mut routed, &mut |name| {
             if name
@@ -1878,7 +1895,7 @@ impl ClientContext {
             }
         });
         strip_database(&mut routed, &prefix);
-        Some((database, routed))
+        Ok(Some((database, routed)))
     }
 
     /// `CatalogSearchPath::Set`: the entries of `target` (one for `SET schema`), each a schema of the default
@@ -2400,7 +2417,7 @@ impl ClientContext {
     /// The SQL of the optimized plan of `statement` (`LogicalPlanSQLExporter::Export`), or `None` for a
     /// plan without one when `allow_unsupported`.
     fn export_sql(&mut self, statement: &Statement, allow_unsupported: bool) -> Result<Option<String>> {
-        if let Some((database, routed)) = self.route_to_database(statement) {
+        if let Some((database, routed)) = self.route_to_database(statement)? {
             let previous = std::mem::replace(&mut self.db, database);
             let result = self.export_sql(&routed, allow_unsupported);
             self.db = previous;
@@ -2911,12 +2928,22 @@ impl ClientContext {
                     ("table_info" | "show", [table]) => {
                         Some(format!("SELECT * FROM pragma_{lower}({})", pragma_argument(table)))
                     }
+                    // `PragmaCopyDatabase`
+                    ("copy_database", [from, to]) => {
+                        let name = |e: &Expr| {
+                            let text = pragma_argument(e);
+                            text[1..text.len() - 1].replace("''", "'")
+                        };
+                        let (from, to) = (name(from), name(to));
+                        self.copy_database(&from, &to, true)?;
+                        return self.copy_database(&from, &to, false);
+                    }
                     _ => None,
                 };
                 if let Some(sql) = sql {
                     let query = duckrs_parser::parse_ast(&sql)?.remove(0);
                     // `PRAGMA table_info('db.t')` runs in the database it names
-                    if let Some((database, routed)) = self.route_to_database(&query) {
+                    if let Some((database, routed)) = self.route_to_database(&query)? {
                         let previous = std::mem::replace(&mut self.db, database);
                         let result = self.execute_statement(&routed);
                         self.db = previous;
@@ -3036,6 +3063,9 @@ impl ClientContext {
                 };
                 access.check(&crate::execution::file_system::expand_path(&directory), true)?;
                 return Err(crate::unported("INSTALL statements"));
+            }
+            Statement::CopyDatabase { from, to, schema_only } => {
+                return self.copy_database(from, to, *schema_only);
             }
             Statement::Deallocate(name) => {
                 self.prepared_statements.remove(&name.to_lowercase());
@@ -5817,7 +5847,10 @@ mod tests {
         let plan = explain(&mut context, "SELECT i FROM t WHERE s::INTEGER = 3");
         assert!(!plan.contains("Filter\n") && plan.contains("Filters:"), "{plan}");
         let plan = explain(&mut context, "SELECT i FROM t WHERE s::INTEGER = 3 AND i > j");
-        assert!(plan.contains("Filter\n") && plan.contains("CAST(s AS INTEGER) = 3"), "{plan}");
+        assert!(
+            plan.contains("Filter\n") && plan.contains("CAST(s AS INTEGER) = 3"),
+            "{plan}"
+        );
         // what differs per call, or reads the query around it, stays an operator
         let plan = explain(&mut context, "SELECT i FROM t WHERE i < random() * 100");
         assert!(plan.contains("Filter\n"), "{plan}");
@@ -7334,8 +7367,9 @@ mod tests {
         assert_eq!(
             run(&mut c, "SELECT stats(i), stats(d) FROM t LIMIT 1"),
             [[
-                "{'has_no_null': true, 'has_null': false, 'max': 9, 'min': 0}",
-                "{'has_no_null': true, 'has_null': true, 'max': 9.0, 'min': 1.0}"
+                // a column of a table has the count of its distinct values
+                "{'approx_unique': 10, 'has_no_null': true, 'has_null': false, 'max': 9, 'min': 0}",
+                "{'approx_unique': 5, 'has_no_null': true, 'has_null': true, 'max': 9.0, 'min': 1.0}"
             ]]
         );
         assert_eq!(
@@ -7356,7 +7390,13 @@ mod tests {
         run(&mut c, "SET enable_optimizer = false");
         assert_eq!(run(&mut c, "SELECT stats(i) FROM t LIMIT 1"), [["NULL"]]);
         run(&mut c, "SET enable_optimizer = true");
-        assert!(error(&mut c, "SELECT stats('abc')").contains("stats() of a VARCHAR value is not yet ported"));
+        assert_eq!(
+            run(&mut c, "SELECT stats('abc')"),
+            [[
+                "{'has_no_null': true, 'has_null': false, 'has_unicode': false, 'max': abc, 'max_string_length': 3, \
+                 'min': abc, 'min_string_length': 3}"
+            ]]
+        );
     }
 
     #[test]

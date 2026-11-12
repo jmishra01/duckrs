@@ -133,6 +133,12 @@ impl Binder<'_> {
             return Err(binder_error("window function calls cannot be nested"));
         }
         let name = window.name.name.to_lowercase();
+        if name == "match_recognize" {
+            return Err(binder_error(
+                "match_recognize is how the MATCH_RECOGNIZE clause is planned rather than a function to call, so it \
+                 cannot be used directly",
+            ));
+        }
         let function = window_function(&name);
         let aggregate_name = if name == "count" && window.args.is_empty() {
             "count_star"

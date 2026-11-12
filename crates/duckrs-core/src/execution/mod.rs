@@ -16,6 +16,7 @@ pub mod file_system;
 pub mod join;
 pub mod join_filter;
 pub mod json_scan;
+pub mod match_recognize;
 pub mod multi_file;
 pub mod parquet;
 pub mod parquet_schema;
@@ -178,11 +179,7 @@ fn create_physical(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
         LogicalOperatorKind::JsonScan { scan, .. } => Box::new(json_scan::PhysicalJsonScan { types, scan }),
         LogicalOperatorKind::ParquetScan { scan, .. } => {
             let filter = (!scan.filters.is_empty()).then(|| crate::optimizer::conjunction_of(scan.filters.clone()));
-            Box::new(parquet::PhysicalParquetScan {
-                types,
-                scan,
-                filter,
-            })
+            Box::new(parquet::PhysicalParquetScan { types, scan, filter })
         }
         LogicalOperatorKind::CopyToParquet { path, names, options } => Box::new(parquet::PhysicalCopyToParquet::new(
             types, path, names, options, children,
@@ -305,6 +302,9 @@ fn create_physical(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             )),
         },
         LogicalOperatorKind::Window { windows, .. } => Box::new(window::PhysicalWindow::new(types, windows, children)),
+        LogicalOperatorKind::MatchRecognize { data, .. } => {
+            Box::new(match_recognize::PhysicalMatchRecognize::new(types, data, children))
+        }
         LogicalOperatorKind::Order { orders } => order_plan(orders, None, children.remove(0)),
         LogicalOperatorKind::TopN { orders, limit, offset } => {
             order_plan(orders, Some((limit, offset)), children.remove(0))

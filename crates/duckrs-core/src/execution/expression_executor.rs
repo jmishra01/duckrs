@@ -150,7 +150,8 @@ fn compare(left: &Vector, right: &Vector, result: &mut Vector, count: usize, op:
         PhysicalType::Float => compare_typed::<f32>(left, right, result, count, op),
         PhysicalType::Double => compare_typed::<f64>(left, right, result, count, op),
         PhysicalType::Interval => compare_typed::<duckrs_common::types::Interval>(left, right, result, count, op),
-        PhysicalType::Varchar if left.logical_type().id() == LogicalTypeId::Bit => {
+        // BIT by its bits, VARIANT by what it holds (`variant_comparator`)
+        PhysicalType::Varchar if matches!(left.logical_type().id(), LogicalTypeId::Bit | LogicalTypeId::Variant) => {
             return compare_nested(left, right, result, count, op);
         }
         PhysicalType::Varchar => compare_strings(left, right, result, count, op),

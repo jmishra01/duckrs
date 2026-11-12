@@ -134,7 +134,10 @@ fn prune_files(
         let mut outer = false;
         columns_of(conjunct, &mut columns, &mut outer);
         let on_known = |binding: &ColumnBinding| {
-            bindings.iter().position(|b| b == binding).is_some_and(|at| known.contains(&at))
+            bindings
+                .iter()
+                .position(|b| b == binding)
+                .is_some_and(|at| known.contains(&at))
         };
         if columns.is_empty() || outer || conjunct.is_volatile() || !columns.iter().all(on_known) {
             return true;
@@ -146,7 +149,10 @@ fn prune_files(
             let mut known_values = true;
             copy.walk_mut(&mut |e| {
                 if let BoundExprKind::ColumnRef { binding, depth: 0 } = &e.kind {
-                    let at = bindings.iter().position(|b| b == binding).expect("a column of the scan");
+                    let at = bindings
+                        .iter()
+                        .position(|b| b == binding)
+                        .expect("a column of the scan");
                     match scan.known_value(at, file) {
                         Some(value) => *e = BoundExpr::constant(value),
                         None => known_values = false,

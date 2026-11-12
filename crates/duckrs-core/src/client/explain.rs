@@ -46,6 +46,7 @@ fn logical_name(op: &LogicalOperator) -> &'static str {
         K::DummyScan { .. } => "DUMMY_SCAN",
         K::Filter { .. } => "FILTER",
         K::Window { .. } => "WINDOW",
+        K::MatchRecognize { .. } => "MATCH_RECOGNIZE",
         K::Aggregate { .. } => "AGGREGATE",
         K::Order { .. } => "ORDER_BY",
         K::TopN { .. } => "TOP_N",
@@ -181,7 +182,11 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             let projected = names
                 .into_iter()
                 .enumerate()
-                .filter(|(at, _)| scan.projected.as_ref().is_none_or(|p| p.get(*at).copied().unwrap_or(true)))
+                .filter(|(at, _)| {
+                    scan.projected
+                        .as_ref()
+                        .is_none_or(|p| p.get(*at).copied().unwrap_or(true))
+                })
                 .map(|(_, name)| name);
             info.extend(entry("Projections", lines(projected)));
             if !scan.filters.is_empty() {
