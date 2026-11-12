@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 4319 of 6367 test files pass (**71.4%** of the 6047 that run). The v1 target is ≥ 90%.
+- Overall: 4379 of 6367 test files pass (**72.4%** of the 6047 that run). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -241,10 +241,21 @@ Each item gives the number of failing files in `test/` that it should fix, where
 
 ## Phase 5: Functions
 
-- [ ] 30. Scalar and table functions (`sql/function`: 164 failing; `sql/table_function`: 43 failing)
-- [ ] 31. Aggregates (`sql/aggregate`: 84 failing, 61.3%; target ≥ 90%)
-- [ ] 32. Window functions (`sql/window`: 20 failing, 78.0%; target ≥ 85%)
-- [ ] 33. `pragma_*` functions and PRAGMA statements (`sql/pragma`: 52 failing, 10.3%)
+- [ ] 30. Scalar and table functions (`sql/function`: 127 failing, 69.6%; `sql/table_function`: 42 failing)
+  - [x] `remap_struct`, `struct_values`, `parse_formatted_bytes`, `equi_width_bins`, `is_histogram_other_bin`;
+    `date_part` of a list of parts, the time zone parts of TIMESTAMP and TIME, `date_trunc` of an INTERVAL by
+    ISO year, week and day parts; `list_where` past the end of the list; `map_concat`'s type from its non-empty
+    maps; the distance functions' overloads, messages, `<->` and `<=>`, and the rescaled cosine
+  - [ ] the TYPE type (`get_type`, `make_type`), `create_sort_key`, `index_key`, `variant_normalize`,
+    `strptime` edge cases, `list_contains` and the other templated list functions' type deduction,
+    the external-resource and profiling table functions
+- [ ] 31. Aggregates (`sql/aggregate`: 76 failing, 65.0%; target ≥ 90%)
+  - [x] `histogram(x, bins)` and `histogram_exact`, with the "other values" bucket; stddev and variance are
+    infinite rather than out of range
+  - [ ] `EXPORT_STATE` in C++'s per-aggregate layouts (~30 files in `aggregate_state_export`)
+- [ ] 32. Window functions (`sql/window`: 19 failing, 79.1%; target ≥ 85%)
+- [ ] 33. `pragma_*` functions and PRAGMA statements (`sql/pragma`: 29 failing, 50.0%)
+  - [x] SHOW TABLES over the search path, SHOW TABLES FROM a database, a schema or both
 
 ## Phase 4: Types and casts
 
@@ -257,7 +268,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] shredded GEOMETRY columns, and the spatial extension's format of files before v1.5.0
   - [x] `GeometryStats`: in `stats()`, in database files (extent, types, flags), and `vertex_extract`'s bounds
   - [ ] `ST_GeomFromWKB`'s types from BLOB min/max (duckrs keeps no string statistics), GeoParquet, the spatial extension's blob format
-- [ ] 34. Remaining type and cast failures (`sql/types`: 146 failing, 72.4%; `sql/cast`: 6 failing)
+- [ ] 34. Remaining type and cast failures (`sql/types`: 82 failing, 84.1%; `sql/cast`: 5 failing)
+  - [x] UNNEST with `recursive`, `max_depth` and `keep_parent_names`, of structs at the root of a select list,
+    refused nested; a cast to NULL of anything that is NULL
 - [ ] 35. The VARIANT type (`sql/variant`: 2 failing)
 
 ## Phase 12: Catalog, settings, APIs and shell

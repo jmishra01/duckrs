@@ -5,6 +5,7 @@
 
 pub mod aggregates;
 pub mod binder;
+mod binning;
 mod bit_casts;
 mod bit_functions;
 pub mod cast;
@@ -25,6 +26,7 @@ mod nested_casts;
 pub(crate) mod operators;
 mod printf;
 pub(crate) mod regexp;
+mod remap_struct;
 mod string_nested;
 mod strings;
 pub mod test_all_types;

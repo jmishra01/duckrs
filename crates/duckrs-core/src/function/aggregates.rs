@@ -305,7 +305,17 @@ fn holistic_functions() -> Vec<AggregateFunctionSet> {
             &["count_if", "countif"],
             vec![(vec![b.clone()], L::HUGEINT, kind(CountIf))],
         ),
-        of(&["histogram"], same(Histogram)),
+        of(
+            &["histogram"],
+            vec![
+                (vec![any()], any(), kind(Histogram)),
+                (vec![any(), any()], any(), kind(HistogramBins)),
+            ],
+        ),
+        of(
+            &["histogram_exact"],
+            vec![(vec![any(), any()], any(), kind(HistogramExact))],
+        ),
         of(
             &["approx_count_distinct"],
             vec![(vec![any()], L::BIGINT, kind(ApproxCountDistinct))],

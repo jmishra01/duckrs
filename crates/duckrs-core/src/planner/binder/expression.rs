@@ -1352,15 +1352,55 @@ impl Binder<'_> {
                     };
                     return self.bind_case(&[(condition.expr.clone(), then.expr.clone())], &otherwise.expr);
                 }
-                if is_generic_function(&function.name.name) || is_unnest(&function.name.name) {
+                if is_unnest(&function.name.name) && function.args.len() > 1 {
+                    // the levels the options ask for, as one UNNEST each
+                    let (max_depth, _) = self.unnest_options(function)?;
+                    let argument = &function.args[0].expr;
+                    let ty = self.bind_expression(argument)?.return_type;
+                    let (lists, structs) = super::statements::unnest_depths(&ty, max_depth);
+                    if structs > 0 {
+                        return Err(binder_error(
+                            "UNNEST() on a struct column can only be applied as the root element of a SELECT \
+                             expression",
+                        ));
+                    }
+                    let mut nested = argument.clone();
+                    for _ in 0..lists.max(1) {
+                        let mut unnest = function.clone();
+                        unnest.name.name = super::statements::UNNEST_LEVEL.into();
+                        unnest.args = vec![duckrs_parser::ast::FunctionArgument::positional(nested)];
+                        nested = Expr::from(ExprKind::Function(unnest));
+                    }
+                    nested.alias = expr.alias.clone();
+                    return self.bind_expression(&nested);
+                }
+                let level = function.name.name == super::statements::UNNEST_LEVEL;
+                if level || is_unnest(&function.name.name) {
+                    if !level && self.unnest_level > 0 {
+                        return Err(binder_error(
+                            "Nested UNNEST calls are not supported - use UNNEST(x, recursive := true) to unnest \
+                             multiple levels",
+                        ));
+                    }
+                    if !level {
+                        self.unnest_level += 1;
+                    }
+                    let children = function
+                        .args
+                        .iter()
+                        .map(|a| self.bind_expression(&a.expr))
+                        .collect::<Result<Vec<_>>>();
+                    if !level {
+                        self.unnest_level -= 1;
+                    }
+                    return bind_unnest(children?);
+                }
+                if is_generic_function(&function.name.name) {
                     let children = function
                         .args
                         .iter()
                         .map(|a| self.bind_expression(&a.expr))
                         .collect::<Result<Vec<_>>>()?;
-                    if is_unnest(&function.name.name) {
-                        return bind_unnest(children);
-                    }
                     return bind_generic_function(&function.name.name, children);
                 }
                 if ["st_crs", "st_setcrs"]

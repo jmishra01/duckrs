@@ -238,10 +238,23 @@ fn part_value(part: DatePart, value: &Value, ty: &LogicalType) -> Result<Value> 
         id,
         LogicalTypeId::TimestampTz | LogicalTypeId::TimestampTzNs | LogicalTypeId::TimeTz
     ) {
-        return Err(unsupported_part(
-            if id == LogicalTypeId::Date { "date" } else { "timestamp" },
-            part,
-        ));
+        // `TimezoneOperator`: a DATE or an INTERVAL has no time zone to ask about, anything else is at +00
+        if matches!(id, LogicalTypeId::Date | LogicalTypeId::Interval) {
+            let name = match part {
+                DatePart::Timezone => "timezone",
+                DatePart::TimezoneHour => "timezone_hour",
+                _ => "timezone_minute",
+            };
+            let kind = if id == LogicalTypeId::Date { "date" } else { "interval" };
+            return Err(Error::new(
+                ErrorKind::NotImplemented,
+                format!("\"{kind}\" units \"{name}\" not recognized"),
+            ));
+        }
+        if moment(value).is_none() {
+            return Ok(Value::null(ty.clone()));
+        }
+        return Ok(Value::bigint(0));
     }
     if id == LogicalTypeId::TimeTz
         && let Some(raw) = value.as_i128()
@@ -262,6 +275,92 @@ fn part_value(part: DatePart, value: &Value, ty: &LogicalType) -> Result<Value> 
         (Part::Double(v), LogicalTypeId::Double) => Value::double(v),
         (Part::Integer(v), _) => Value::bigint(v),
         (Part::Double(v), _) => Value::bigint(v as i64),
+    })
+}
+
+/// `StructDatePart::Bind`: `date_part(['year', 'month'], x)` is a STRUCT of the parts.
+fn bind_struct_date_part(parts: &BoundExpr, value: &BoundExpr) -> Result<BoundExpr> {
+    if !parts.is_foldable() {
+        return Err(Error::new(
+            ErrorKind::Binder,
+            "date_part can only take constant lists of part names",
+        ));
+    }
+    let list = evaluate_scalar(&parts.clone().cast_to(&LogicalType::list(LogicalType::VARCHAR), false))?;
+    let ValueData::List(names) = list.data() else {
+        return Err(Error::new(
+            ErrorKind::Binder,
+            "date_part can only take constant lists of part names",
+        ));
+    };
+    if names.is_empty() {
+        return Err(Error::new(
+            ErrorKind::Binder,
+            "date_part requires non-empty lists of part names",
+        ));
+    }
+    let mut fields: Vec<(String, LogicalType)> = Vec::with_capacity(names.len());
+    for name in names {
+        if name.is_null() {
+            return Err(Error::new(ErrorKind::Binder, "NULL struct entry name in date_part"));
+        }
+        let name = name.try_to_string()?;
+        let part = parse_part(&name)?;
+        if fields.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+            return Err(Error::new(
+                ErrorKind::Binder,
+                format!("Duplicate struct entry name \"{name}\" in date_part"),
+            ));
+        }
+        let ty = match part {
+            DatePart::Epoch | DatePart::JulianDay => LogicalType::DOUBLE,
+            _ => LogicalType::BIGINT,
+        };
+        fields.push((name, ty));
+    }
+    let id = value.return_type.id();
+    let value = match id {
+        LogicalTypeId::Date
+        | LogicalTypeId::Timestamp
+        | LogicalTypeId::TimestampNs
+        | LogicalTypeId::Time
+        | LogicalTypeId::TimeNs
+        | LogicalTypeId::TimeTz
+        | LogicalTypeId::Interval
+        | LogicalTypeId::TimestampTz => value.clone(),
+        _ => value.clone().cast_to(&LogicalType::TIMESTAMP, false),
+    };
+    let names = Value::list(
+        LogicalType::VARCHAR,
+        fields.iter().map(|(n, _)| Value::varchar(n.clone())).collect(),
+    )?;
+    Ok(bound_function(
+        "date_part",
+        vec![BoundExpr::constant(names), value],
+        LogicalType::struct_type(fields),
+        struct_date_part,
+    ))
+}
+
+fn struct_date_part(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let ty = result.logical_type().clone();
+    let ValueData::List(names) = args.column(0).get_value(0).data().clone() else {
+        return Ok(());
+    };
+    let parts = names
+        .iter()
+        .map(|n| parse_part(&n.try_to_string()?))
+        .collect::<Result<Vec<_>>>()?;
+    let field_types: Vec<LogicalType> = ty.struct_children().iter().map(|(_, t)| t.clone()).collect();
+    strict_rows(args, result, |row| {
+        if row[1].is_null() {
+            return Ok(Value::null(ty.clone()));
+        }
+        let mut values = Vec::with_capacity(parts.len());
+        for (part, field) in parts.iter().zip(&field_types) {
+            values.push(part_value(*part, &row[1], field)?);
+        }
+        Value::new(ty.clone(), ValueData::Struct(values))
     })
 }
 
@@ -604,17 +703,22 @@ fn truncate_interval(part: DatePart, interval: Interval) -> Result<Interval> {
         DatePart::Millennium => months_only(12000),
         DatePart::Century => months_only(1200),
         DatePart::Decade => months_only(120),
-        DatePart::Year => months_only(12),
+        DatePart::Year | DatePart::IsoYear => months_only(12),
         DatePart::Quarter => months_only(3),
         DatePart::Month => months_only(1),
-        DatePart::Day => Interval {
+        DatePart::Week | DatePart::YearWeek => Interval {
+            months,
+            days: days / 7 * 7,
+            micros: 0,
+        },
+        DatePart::Day | DatePart::Dow | DatePart::IsoDow | DatePart::Doy | DatePart::JulianDay => Interval {
             months,
             days,
             micros: 0,
         },
         DatePart::Hour => keep(MICROS_PER_HOUR),
         DatePart::Minute => keep(MICROS_PER_MINUTE),
-        DatePart::Second => keep(MICROS_PER_SEC),
+        DatePart::Second | DatePart::Epoch => keep(MICROS_PER_SEC),
         DatePart::Milliseconds => keep(1000),
         DatePart::Microseconds => interval,
         other => return Err(unsupported_part("interval", other)),
@@ -1708,6 +1812,9 @@ pub fn bind_date_function(name: &str, children: Vec<BoundExpr>) -> Result<BoundE
             ),
         ));
     };
+    if (lower == "date_part" || lower == "datepart") && part.return_type.id() == LogicalTypeId::List {
+        return bind_struct_date_part(part, value);
+    }
     let part = part.clone().cast_to(&LogicalType::VARCHAR, false);
     let constant = if part.is_foldable() {
         let value = evaluate_scalar(&part)?;

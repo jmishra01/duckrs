@@ -759,9 +759,14 @@ impl Binder<'_> {
     fn bind_select_node(&mut self, node: &SelectNode, modifiers: &[ResultModifier]) -> Result<BoundStatement> {
         let mut plan = self.bind_table_ref(&node.from_table)?;
         let mut select_list = Vec::new();
+        // the columns of a struct UNNEST, whose names are its fields' rather than aliases of the select list
+        let mut unnested_fields = Vec::new();
         for expr in self.expand_star_expressions(&node.select_list)? {
             match self.struct_unnest_fields(&expr) {
-                Some(fields) => select_list.extend(fields),
+                Some(fields) => {
+                    unnested_fields.extend(select_list.len()..select_list.len() + fields.len());
+                    select_list.extend(fields);
+                }
                 None => select_list.push(expr),
             }
         }
@@ -774,7 +779,7 @@ impl Binder<'_> {
         for (i, expr) in select_list.iter_mut().enumerate() {
             names.push(expression_name(expr));
             self.qualify_column_names(expr);
-            if !expr.alias.is_empty() {
+            if !expr.alias.is_empty() && !unnested_fields.contains(&i) {
                 state.alias_map.push((expr.alias.clone(), i));
             }
             state.projection_map.push((without_aliases(expr), i));
@@ -1390,36 +1395,133 @@ impl Binder<'_> {
         };
         if !crate::function::generic::is_unnest(&call.name.name)
             || !call.name.qualification.is_empty()
-            || call.args.len() != 1
+            || call.args.is_empty()
             || !call.args[0].name.is_empty()
         {
             return None;
         }
+        let (max_depth, keep_parent_names) = self.unnest_options(call).ok()?;
         let argument = &call.args[0].expr;
-        let bound = self.bind_expression(argument).ok()?;
-        if bound.return_type.id() != LogicalTypeId::Struct {
+        // inside the UNNEST, where another is refused
+        self.unnest_level += 1;
+        let bound = self.bind_expression(argument);
+        self.unnest_level -= 1;
+        let bound = bound.ok()?;
+        let (list_unnests, struct_unnests) = unnest_depths(&bound.return_type, max_depth);
+        if struct_unnests == 0 {
             return None;
         }
-        let fields = bound.return_type.struct_children();
-        if fields.is_empty() {
-            return None;
+        // the list unnests, then a struct_extract per field of each struct, as far as the depth goes
+        let mut base = argument.clone();
+        for _ in 0..list_unnests {
+            let mut unnest = call.clone();
+            unnest.name.name = UNNEST_LEVEL.into();
+            unnest.args = vec![ast::FunctionArgument::positional(base)];
+            base = Expr::from(ExprKind::Function(unnest));
         }
-        Some(
-            fields
-                .iter()
-                .map(|(name, _)| {
+        let mut expressions: Vec<(Expr, LogicalType, bool)> = {
+            let ty = self.bind_expression(&base).ok()?.return_type;
+            vec![(base, ty, false)]
+        };
+        for _ in 0..struct_unnests {
+            let mut next = Vec::new();
+            let mut expanded = false;
+            for (expr, ty, extracted) in expressions {
+                if !matches!(ty.id(), LogicalTypeId::Struct | LogicalTypeId::Tuple) || ty.struct_children().is_empty() {
+                    next.push((expr, ty, extracted));
+                    continue;
+                }
+                expanded = true;
+                let tuple = ty.id() == LogicalTypeId::Tuple;
+                for (at, (name, child)) in ty.struct_children().iter().enumerate() {
                     let mut extract = call.clone();
                     extract.name.name = "struct_extract".into();
+                    let key = if tuple {
+                        Expr::constant(ast::Literal::integer((at + 1) as i64))
+                    } else {
+                        Expr::constant(ast::Literal::string(name.clone()))
+                    };
+                    let mut parent = expr.clone();
+                    let parent_alias = std::mem::take(&mut parent.alias);
                     extract.args = vec![
-                        ast::FunctionArgument::positional(argument.clone()),
-                        ast::FunctionArgument::positional(Expr::constant(ast::Literal::string(name.clone()))),
+                        ast::FunctionArgument::positional(parent),
+                        ast::FunctionArgument::positional(key),
                     ];
                     let mut field = Expr::from(ExprKind::Function(extract));
-                    field.alias = name.clone();
-                    field
-                })
-                .collect(),
-        )
+                    field.alias = if tuple {
+                        format!("element{}", at + 1)
+                    } else if keep_parent_names && extracted {
+                        format!("{parent_alias}.{name}")
+                    } else {
+                        name.clone()
+                    };
+                    next.push((field, child.clone(), true));
+                }
+            }
+            expressions = next;
+            if !expanded {
+                break;
+            }
+        }
+        Some(expressions.into_iter().map(|(e, _, _)| e).collect())
+    }
+
+    /// The options of `UNNEST(x, recursive := ..., max_depth := ..., keep_parent_names := ...)`: how many levels
+    /// it unnests, and whether the columns of a struct keep the names of the structs they are in.
+    pub(super) fn unnest_options(&mut self, call: &ast::FunctionExpr) -> Result<(usize, bool)> {
+        let mut max_depth = 1usize;
+        let mut keep_parent_names = false;
+        if call.args.len() == 1 {
+            return Ok((max_depth, keep_parent_names));
+        }
+        let mut supported = false;
+        for argument in &call.args[1..] {
+            if argument.name.is_empty() {
+                break;
+            }
+            let alias = &argument.name;
+            let bound = self.bind_expression(&argument.expr)?;
+            let mut unnests = false;
+            bound.clone().walk_mut(&mut |e| unnests |= is_unnest_call(e));
+            if !bound.is_foldable() || unnests {
+                return Err(binder_error(format!("UNNEST parameter \"{alias}\" must be a constant")));
+            }
+            let value = evaluate_scalar(&bound)?;
+            if value.is_null() {
+                return Err(binder_error(format!("UNNEST parameter \"{alias}\" cannot be NULL")));
+            }
+            let as_bool = |value: &Value| -> Result<bool> {
+                let cast = crate::execution::parquet::cast_value(value, &LogicalType::BOOLEAN)?;
+                Ok(matches!(cast.data(), duckrs_common::value::ValueData::Bool(true)))
+            };
+            match alias.to_lowercase().as_str() {
+                "recursive" => {
+                    if as_bool(&value)? {
+                        max_depth = usize::MAX;
+                    }
+                }
+                "max_depth" => {
+                    let cast = crate::execution::parquet::cast_value(&value, &LogicalType::UINTEGER)?;
+                    max_depth = match cast.data() {
+                        duckrs_common::value::ValueData::UInt32(depth) => *depth as usize,
+                        _ => 0,
+                    };
+                    if max_depth == 0 {
+                        return Err(binder_error("UNNEST cannot have a max depth of 0"));
+                    }
+                }
+                "keep_parent_names" => keep_parent_names = as_bool(&value)?,
+                _ => return Err(binder_error(format!("Unsupported parameter \"{alias}\" for unnest"))),
+            }
+            supported = true;
+        }
+        if !supported {
+            return Err(binder_error(
+                "UNNEST - unsupported extra argument, unnest only supports recursive := [true/false], max_depth := # \
+                 or keep_parent_names := [true/false]",
+            ));
+        }
+        Ok((max_depth, keep_parent_names))
     }
 
     /// `BindContext::GenerateAllColumnExpressions`: replaces `*` and `t.*` with the columns of
@@ -3114,4 +3216,29 @@ fn check_cast(from: &LogicalType, to: &LogicalType) -> Result<()> {
     } else {
         Err(crate::unported(format!("casting {from} to {to}")))
     }
+}
+
+/// The name of an UNNEST the binder writes for one level of a deeper one, which may sit inside another.
+pub(super) const UNNEST_LEVEL: &str = "__unnest_level";
+
+/// How many levels of lists, then of structs, an UNNEST of `ty` that goes `max_depth` deep takes apart.
+pub(super) fn unnest_depths(ty: &LogicalType, max_depth: usize) -> (usize, usize) {
+    if ty.id() == LogicalTypeId::SqlNull {
+        return (1, 0);
+    }
+    let mut ty = ty.clone();
+    let mut lists = 0;
+    while matches!(ty.id(), LogicalTypeId::List | LogicalTypeId::Array) {
+        ty = ty.child_type().cloned().unwrap_or(LogicalType::SQLNULL);
+        lists += 1;
+        if lists >= max_depth {
+            break;
+        }
+    }
+    let structs = if matches!(ty.id(), LogicalTypeId::Struct | LogicalTypeId::Tuple) {
+        max_depth - lists
+    } else {
+        0
+    };
+    (lists, structs)
 }

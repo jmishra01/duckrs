@@ -730,12 +730,26 @@ fn unnest_outside_of_select(_: &DataChunk, _: &mut Vector) -> Result<()> {
 /// `BindUnnest`: the select node turns this into a `LogicalUnnest`.
 pub fn bind_unnest(children: Vec<BoundExpr>) -> Result<BoundExpr> {
     let [child] = children.as_slice() else {
-        return Err(binder_error("UNNEST() requires a single argument"));
+        return Err(binder_error(if children.is_empty() {
+            "UNNEST() requires at least one argument"
+        } else {
+            "UNNEST() requires a single argument"
+        }));
     };
     let element = match child.return_type.id() {
         LogicalTypeId::List | LogicalTypeId::Array => child.return_type.child_type().expect("a child type").clone(),
         LogicalTypeId::SqlNull => LogicalType::SQLNULL,
-        _ => return Err(binder_error("UNNEST() can only be applied to lists, structs and NULL")),
+        LogicalTypeId::Struct | LogicalTypeId::Tuple => {
+            return Err(binder_error(
+                "UNNEST() on a struct column can only be applied as the root element of a SELECT expression",
+            ));
+        }
+        _ => {
+            return Err(binder_error(format!(
+                "UNNEST() can only be applied to lists, structs and NULL, not {}",
+                child.return_type
+            )));
+        }
     };
     Ok(bound_function("unnest", children, element, unnest_outside_of_select))
 }
