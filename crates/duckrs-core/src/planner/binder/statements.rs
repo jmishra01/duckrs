@@ -1726,11 +1726,85 @@ impl Binder<'_> {
         if table_ref.column_name_alias.iter().any(String::is_empty) {
             return Err(binder_error("column alias cannot be empty"));
         }
+        let before = self.bind_context.bindings.len();
         let plan = self.bind_unsampled_table_ref(table_ref)?;
+        self.apply_setof_alias(table_ref, before);
         match &table_ref.sample {
             Some(options) => bind_sample(options, plan),
             None => Ok(plan),
         }
+    }
+
+    /// `ApplyPostgresSetofAliasCompatibility` and `AddPostgresSetofColumnAlias`: the one column of a
+    /// set-returning function under an alias takes the alias as its name, and keeps the original
+    /// name bindable (but out of `*`).
+    fn apply_setof_alias(&mut self, table_ref: &TableRef, before: usize) {
+        let TableRefKind::TableFunction {
+            function,
+            with_ordinality,
+        } = &table_ref.kind
+        else {
+            return;
+        };
+        let ExprKind::Function(call) = &function.kind else {
+            return;
+        };
+        let set_returning = call.name.qualification.is_empty()
+            && matches!(call.name.name.to_lowercase().as_str(), "range" | "generate_series" | "unnest");
+        if !set_returning
+            || table_ref.alias.is_empty()
+            || !table_ref.column_name_alias.is_empty()
+            || self.bind_context.bindings.len() != before + 1
+        {
+            return;
+        }
+        let binding = self.bind_context.bindings.last_mut().expect("just added");
+        // the ordinality column comes after the function's own
+        if binding.names.len() != 1 + usize::from(*with_ordinality) || !binding.generated.is_empty() {
+            return;
+        }
+        let original = std::mem::replace(&mut binding.names[0], table_ref.alias.clone());
+        if !original.eq_ignore_ascii_case(&table_ref.alias) {
+            binding.virtual_columns.push((original, binding.types[0].clone(), 0));
+        }
+    }
+
+    /// `WITH ORDINALITY`: the rows of the function, numbered from 1 in the order it makes them (per
+    /// input row, for a lateral call), in a column `ordinality` (or `ordinality0`, ... when the
+    /// function has a column of that name already).
+    fn bind_with_ordinality(&mut self, function: &Expr, table_ref: &TableRef) -> Result<LogicalOperator> {
+        let probe = parse_ast(&format!("SELECT * FROM {function}"))?.remove(0);
+        let ast::Statement::Select(probe) = probe else {
+            unreachable!("this text is a SELECT");
+        };
+        let mut binder = self.child_binder();
+        binder.left_of_join = self.left_of_join.clone();
+        let names = binder.bind_select_statement(&probe)?.names;
+        let taken = |name: &str| {
+            names
+                .iter()
+                .chain(&table_ref.column_name_alias)
+                .any(|n| n.eq_ignore_ascii_case(name))
+        };
+        let mut ordinality = "ordinality".to_string();
+        let mut suffix = 0;
+        while taken(&ordinality) {
+            ordinality = format!("ordinality{suffix}");
+            suffix += 1;
+        }
+        let select = parse_ast(&format!(
+            "SELECT *, row_number() OVER () AS {} FROM {function}",
+            ast::sql_identifier(&ordinality)
+        ))?
+        .remove(0);
+        let ast::Statement::Select(select) = select else {
+            unreachable!("this text is a SELECT");
+        };
+        let name = match &function.kind {
+            ExprKind::Function(call) => call.name.name.clone(),
+            _ => "ordinality".to_string(),
+        };
+        self.bind_rewritten(&select, table_ref, &name)
     }
 
     fn bind_unsampled_table_ref(&mut self, table_ref: &TableRef) -> Result<LogicalOperator> {
@@ -2048,7 +2122,7 @@ impl Binder<'_> {
                 with_ordinality,
             } => {
                 if *with_ordinality {
-                    return Err(not_implemented("WITH ORDINALITY"));
+                    return self.bind_with_ordinality(function, table_ref);
                 }
                 // `Binder::BindTableFunctionParameters`
                 if let ExprKind::Function(call) = &function.kind {
@@ -2157,7 +2231,8 @@ impl Binder<'_> {
                 {
                     let value = self.constant_argument(&argument.expr)?;
                     let text = value.try_to_string()?;
-                    let mut parts: Vec<String> = text.split('.').map(str::to_string).collect();
+                    // `PragmaTableInfoBind`
+                    let mut parts = super::expression::parse_qualified_name(&text)?;
                     let table = QualifiedName {
                         name: parts.pop().unwrap_or_default(),
                         qualification: parts,
@@ -2270,14 +2345,19 @@ impl Binder<'_> {
         if call.args.is_empty() || call.args.len() > 3 || call.args.iter().any(|a| !a.name.is_empty()) {
             return Err(not_implemented("this call of a range function"));
         }
-        let mut values = Vec::with_capacity(call.args.len());
+        let mut arguments = Vec::with_capacity(call.args.len());
         for argument in &call.args {
             let mut binder = self.child_binder();
             binder.left_of_join = std::mem::take(&mut self.left_of_join);
             let bound = binder.bind_expression(&argument.expr);
             self.left_of_join = binder.left_of_join;
-            let bound = bound?;
-            let integral = bound.return_type.is_integral() || bound.return_type.id() == LogicalTypeId::SqlNull;
+            arguments.push(bound?);
+        }
+        let mut values = Vec::with_capacity(call.args.len());
+        let integral = arguments
+            .iter()
+            .all(|a| a.return_type.is_integral() || a.return_type.id() == LogicalTypeId::SqlNull);
+        for bound in arguments {
             if !bound.is_foldable() || !integral {
                 // what depends on the row around it, and dates: a list per row that unnests
                 let select = parse_ast(&format!("SELECT unnest({function}) AS {name}"))?.remove(0);

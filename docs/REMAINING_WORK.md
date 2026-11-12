@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 4427 of 6367 test files pass (**73.2%** of the 6047 that run). The v1 target is ≥ 90%.
+- Overall: 4450 of 6367 test files pass (**73.6%** of the 6046 that run). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -234,14 +234,14 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] the EXPLAIN shapes of materialized CTEs, and their runtime filters
 - [ ] 24. Subquery flattening edge cases (`sql/subquery`: 25 failing, 3 erroring)
 - [ ] 25. Joins: ASOF, positional, lateral (`sql/join`: 46 failing)
-- [ ] 26. Set operations, `SAMPLE`, `RETURNING`, `WITH ORDINALITY`, `UNNEST` (`setops` 8, `sample` 7, `returning` 2, `ordinality` 2, `unnest` 2)
+- [ ] 26. Set operations, `SAMPLE`, `RETURNING`, `WITH ORDINALITY`, `UNNEST` (`setops` 8, `sample` 7, `returning` 2, `ordinality` 0, `unnest` 2)
 - [ ] 27. SQL variables: `SET VARIABLE`, `getvariable` (`sql/variables`: 3 failing)
 - [ ] 28. `EXPLAIN` / `EXPLAIN ANALYZE` and profiling (`explain` 7, `profiling` 3, `detailed_profiler` 1)
 - [ ] 29. Query progress bar (`sql/progress`: 1 failing)
 
 ## Phase 5: Functions
 
-- [ ] 30. Scalar and table functions (`sql/function`: 118 failing, 71.8%; `sql/table_function`: 41 failing)
+- [ ] 30. Scalar and table functions (`sql/function`: 117 failing, 72.0%; `sql/table_function`: 34 failing)
   - [x] `remap_struct`, `struct_values`, `parse_formatted_bytes`, `equi_width_bins`, `is_histogram_other_bin`;
     `date_part` of a list of parts, the time zone parts of TIMESTAMP and TIME, `date_trunc` of an INTERVAL by
     ISO year, week and day parts; `list_where` past the end of the list; `map_concat`'s type from its non-empty
@@ -252,9 +252,17 @@ Each item gives the number of failing files in `test/` that it should fix, where
     truncated; `last_day` of the last month; a `date_part` of an infinity is NULL whatever the part
   - [x] window functions in `duckdb_functions()`; GROUP BY ALL refuses a window; a string slice with a step is
     refused when bound, and slice bounds are cast to BIGINT
+  - [x] `duckdb_keywords()` from the grammar's keyword lists, `duckdb_dialects()` (none) and `current_dialect`'s
+    check, `pragma_version()`, `pragma_platform()`; `standard_vector_size` in `duckdb_settings()`; every catalog's
+    `main` schema internal; `pragma_table_info` names parsed as `QualifiedName::TryParse` does
+  - [x] the Postgres setof aliasing of `range`, `generate_series` and `unnest` (the one column takes the table
+    alias, the original name stays bindable and joins USING); `WITH ORDINALITY`, numbered per input row when
+    lateral; a NULL bound of a timestamp range; infinite bounds refused
   - [ ] TYPE columns and casts, `create_sort_key`, `index_key`, `variant_normalize`,
     `strptime` edge cases, `list_contains` and the other templated list functions' type deduction,
-    the external-resource and profiling table functions
+    the external-resource and profiling table functions; `duckdb_constraints()` lists a primary key's implied
+    NOT NULL after the declared constraints (the catalog keeps NOT NULL per column, not in order); a view's
+    columns as bound when it was created
 - [ ] 31. Aggregates (`sql/aggregate`: 54 failing, 75.1%; target ≥ 90%)
   - [x] `histogram(x, bins)` and `histogram_exact`, with the "other values" bucket; stddev and variance are
     infinite rather than out of range; the moments, covariances, regressions and Kahan sums computed with C++'s
@@ -277,8 +285,11 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] the sketches of approx_count_distinct, approx_quantile and approx_top_k, `lttb`, the states of files before
     v1.5 (`LEGACY_AGGREGATE_STATE`)
 - [ ] 32. Window functions (`sql/window`: 19 failing, 79.1%; target ≥ 85%)
-- [ ] 33. `pragma_*` functions and PRAGMA statements (`sql/pragma`: 29 failing, 50.0%)
+- [ ] 33. `pragma_*` functions and PRAGMA statements (`sql/pragma`: 20 failing, 65.5%)
   - [x] SHOW TABLES over the search path, SHOW TABLES FROM a database, a schema or both
+  - [x] PRAGMA version, platform, functions, database_size, storage_info and metadata_info as the queries C++
+    rewrites them to; a pragma no function has is a Catalog Error, and one called with the wrong arguments a
+    Binder Error
 
 ## Phase 4: Types and casts
 

@@ -1855,44 +1855,58 @@ fn builtin_qualification(qualification: &[String]) -> bool {
     }
 }
 
-/// `QualifiedName::TryParse`: the dot-separated, optionally double-quoted parts of a name.
-fn parse_qualified_name(input: &str) -> Result<Vec<String>> {
-    let error = |what: &str| {
-        Error::new(
-            ErrorKind::Parser,
-            format!("Zero-length {what} in qualified name! (input: {input})"),
-        )
-    };
+/// `QualifiedName::TryParse`: the dot-separated parts of a name, each either fully double-quoted
+/// (a doubled quote is one quote) or not quoted at all.
+pub(super) fn parse_qualified_name(input: &str) -> Result<Vec<String>> {
+    let error = |message: &str| Err(Error::new(ErrorKind::Parser, format!("{message} (input: {input})")));
+    let bytes = input.as_bytes();
     let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut quoted = false;
-    let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' if quoted && chars.peek() == Some(&'"') => {
-                chars.next();
-                current.push('"');
-            }
-            '"' if quoted => {
-                if current.is_empty() {
-                    return Err(error("delimited identifier"));
+    let mut idx = 0;
+    // `TryParseComponents`
+    while idx < bytes.len() {
+        let mut entry = Vec::new();
+        if bytes[idx] == b'"' {
+            // `StringUtil::TryParseQuotedString`
+            let mut closed = None;
+            let mut i = idx + 1;
+            while i < bytes.len() {
+                if bytes[i] != b'"' {
+                    entry.push(bytes[i]);
+                } else if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    entry.push(b'"');
+                    i += 1;
+                } else {
+                    closed = Some(i + 1);
+                    break;
                 }
-                quoted = false;
+                i += 1;
             }
-            '"' if current.is_empty() => quoted = true,
-            '.' if !quoted => parts.push(std::mem::take(&mut current)),
-            _ => current.push(c),
+            let Some(next) = closed else {
+                return error("Unterminated quote in qualified name!");
+            };
+            idx = next;
+            if entry.is_empty() {
+                return error("Zero-length delimited identifier in qualified name!");
+            }
+            if idx < bytes.len() && bytes[idx] != b'.' {
+                return error("Unexpected character after a quoted identifier in a qualified name!");
+            }
+        } else {
+            while idx < bytes.len() && bytes[idx] != b'.' {
+                if bytes[idx] == b'"' {
+                    return error("Unexpected quote in the middle of a qualified name component!");
+                }
+                entry.push(bytes[idx]);
+                idx += 1;
+            }
+        }
+        parts.push(String::from_utf8_lossy(&entry).into_owned());
+        if idx < bytes.len() {
+            idx += 1;
         }
     }
-    if quoted {
-        return Err(Error::new(
-            ErrorKind::Parser,
-            format!("Unterminated quote in qualified name! (input: {input})"),
-        ));
-    }
-    parts.push(current);
-    if parts.iter().any(String::is_empty) {
-        return Err(error("identifier"));
+    if parts.is_empty() || parts.iter().any(String::is_empty) {
+        return error("Zero-length identifier in qualified name!");
     }
     Ok(parts)
 }
@@ -2894,26 +2908,6 @@ fn alias_subquery_error(name: &str) -> Error {
     ))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn numbers_are_typed_like_duckdb() {
-        let ty = |s: &str| number_to_value(s).unwrap().logical_type().clone();
-        assert_eq!(ty("42"), LogicalType::INTEGER);
-        assert_eq!(ty("-2147483648"), LogicalType::BIGINT);
-        assert_eq!(ty("3000000000"), LogicalType::BIGINT);
-        assert_eq!(ty("1_000"), LogicalType::INTEGER);
-        assert_eq!(ty("99999999999999999999"), LogicalType::HUGEINT);
-        assert_eq!(ty("1.5"), LogicalType::decimal(2, 1));
-        assert_eq!(ty("-0.25"), LogicalType::decimal(3, 2));
-        assert_eq!(ty(".5"), LogicalType::decimal(1, 1));
-        assert_eq!(ty("1e3"), LogicalType::DOUBLE);
-        assert_eq!(number_to_value("-0.25").unwrap().try_to_string().unwrap(), "-0.25");
-    }
-}
-
 /// `Value::TYPE`: a type as a value of the TYPE type, which keeps it serialized.
 pub(crate) fn type_value(ty: &LogicalType) -> Value {
     let bytes = duckrs_common::serializer::BinarySerializer::serialize(
@@ -2931,5 +2925,25 @@ fn quote_identifier(name: &str) -> String {
         name.to_string()
     } else {
         format!("\"{}\"", name.replace('"', "\"\""))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn numbers_are_typed_like_duckdb() {
+        let ty = |s: &str| number_to_value(s).unwrap().logical_type().clone();
+        assert_eq!(ty("42"), LogicalType::INTEGER);
+        assert_eq!(ty("-2147483648"), LogicalType::BIGINT);
+        assert_eq!(ty("3000000000"), LogicalType::BIGINT);
+        assert_eq!(ty("1_000"), LogicalType::INTEGER);
+        assert_eq!(ty("99999999999999999999"), LogicalType::HUGEINT);
+        assert_eq!(ty("1.5"), LogicalType::decimal(2, 1));
+        assert_eq!(ty("-0.25"), LogicalType::decimal(3, 2));
+        assert_eq!(ty(".5"), LogicalType::decimal(1, 1));
+        assert_eq!(ty("1e3"), LogicalType::DOUBLE);
+        assert_eq!(number_to_value("-0.25").unwrap().try_to_string().unwrap(), "-0.25");
     }
 }

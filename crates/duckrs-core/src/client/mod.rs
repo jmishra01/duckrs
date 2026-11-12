@@ -517,6 +517,50 @@ impl DatabaseInstance {
 
 /// Pragmas that only switch DuckDB's debug verification, profiling, progress output or
 /// checkpointing, none of which changes a result; duckrs runs them as no-ops.
+/// The pragma functions C++ registers (`PragmaFunctions` and `PragmaQueries`).
+const PRAGMA_FUNCTIONS: &[&str] = &[
+    "table_info",
+    "storage_info",
+    "metadata_info",
+    "show_tables",
+    "show_tables_expanded",
+    "show_databases",
+    "database_list",
+    "collations",
+    "show",
+    "version",
+    "extension_versions",
+    "platform",
+    "database_size",
+    "functions",
+    "import_database",
+    "copy_database",
+    "user_agent",
+    "enable_profile",
+    "enable_profiling",
+    "disable_profile",
+    "disable_profiling",
+    "enable_verification",
+    "disable_verification",
+    "verify_parallelism",
+    "disable_verify_parallelism",
+    "enable_object_cache",
+    "disable_object_cache",
+    "enable_optimizer",
+    "disable_optimizer",
+    "force_checkpoint",
+    "enable_progress_bar",
+    "disable_progress_bar",
+    "enable_print_progress_bar",
+    "disable_print_progress_bar",
+    "enable_checkpoint_on_shutdown",
+    "disable_checkpoint_on_shutdown",
+    "json_execute_serialized_sql",
+    "add_parquet_key",
+    "tpch",
+    "tpcds",
+];
+
 const NO_OP_PRAGMAS: &[&str] = &[
     "force_checkpoint",
     "enable_verification",
@@ -2925,9 +2969,19 @@ impl ClientContext {
                     ("show_tables", []) => Some("SHOW TABLES".to_string()),
                     ("show_tables_expanded", []) => Some("SHOW ALL TABLES".to_string()),
                     ("show_databases" | "database_list", []) => Some("SELECT * FROM duckdb_databases()".to_string()),
-                    ("table_info" | "show", [table]) => {
+                    ("table_info" | "show" | "storage_info", [table]) => {
                         Some(format!("SELECT * FROM pragma_{lower}({})", pragma_argument(table)))
                     }
+                    ("version" | "platform" | "database_size" | "metadata_info", []) => {
+                        Some(format!("SELECT * FROM pragma_{lower}()"))
+                    }
+                    // `PragmaFunctionsQuery`
+                    ("functions", []) => Some(
+                        "SELECT function_name AS name, upper(function_type) AS type, parameter_types AS parameters, \
+                         varargs, return_type, has_side_effects AS side_effects FROM duckdb_functions() \
+                         WHERE function_type IN ('scalar', 'aggregate') ORDER BY 1"
+                            .to_string(),
+                    ),
                     // `PragmaCopyDatabase`
                     ("copy_database", [from, to]) => {
                         let name = |e: &Expr| {
@@ -2961,6 +3015,26 @@ impl ClientContext {
                             "Pragma Function with name \"{name}\" does not exist, but a table function with the same \
                              name exists, try `CALL \"{name}\"(...)`"
                         ),
+                    ));
+                }
+                // `Binder::BindPragma`: a name no pragma function has
+                if !PRAGMA_FUNCTIONS.iter().any(|f| f.eq_ignore_ascii_case(name)) {
+                    return Err(Error::new(
+                        ErrorKind::Catalog,
+                        format!("Pragma Function with name {name} does not exist!"),
+                    ));
+                }
+                // `FunctionBinder::BindPragmaFunction`: a pragma called with the wrong arguments
+                let arity = match lower.as_str() {
+                    "table_info" | "storage_info" | "show" | "import_database" => Some(1),
+                    "copy_database" => Some(2),
+                    "metadata_info" | "json_execute_serialized_sql" | "add_parquet_key" | "tpch" | "tpcds" => None,
+                    _ => Some(0),
+                };
+                if arity.is_some_and(|arity| arity != parameters.len()) {
+                    return Err(Error::new(
+                        ErrorKind::Binder,
+                        format!("No function matches the given name and argument types '{lower}'"),
                     ));
                 }
                 return Err(crate::unported(format!("PRAGMA {name}")));

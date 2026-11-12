@@ -95,6 +95,20 @@ impl Binding {
         self.names.iter().position(|n| n.eq_ignore_ascii_case(name))
     }
 
+    /// `Binding::HasMatchingBinding`: a column, or a column alias such as the original name of a
+    /// set-returning function's column.
+    fn matches_column(&self, name: &str) -> bool {
+        self.column_index(name).is_some() || self.column_alias(name).is_some()
+    }
+
+    /// `Binding::AddColumnAlias`: another name of one of the columns (kept as a hidden column at the
+    /// column's own position, which a scan's virtual columns are never at).
+    fn column_alias(&self, name: &str) -> Option<usize> {
+        self.virtual_column(name)
+            .map(|(index, _, _)| index)
+            .filter(|index| *index < self.names.len())
+    }
+
     /// `rowid`, for a table that has no column of that name (`TableBinding::Bind`).
     fn row_id_column(&self, name: &str) -> Option<usize> {
         self.row_id.filter(|_| name.eq_ignore_ascii_case("rowid"))
@@ -202,7 +216,7 @@ impl BindContext {
     fn matching_bindings(&self, column: &str) -> Vec<&Binding> {
         self.bindings
             .iter()
-            .filter(|b| b.column_index(column).is_some())
+            .filter(|b| b.matches_column(column))
             .collect()
     }
 
@@ -400,13 +414,13 @@ impl BindContext {
         let has_table_column = |table: &str, column: &str| {
             self.bindings
                 .iter()
-                .any(|b| b.alias.eq_ignore_ascii_case(table) && b.column_index(column).is_some())
+                .any(|b| b.alias.eq_ignore_ascii_case(table) && b.matches_column(column))
         };
         let schema_table_column = |schema: &str, table: &str, column: &str| {
             self.bindings.iter().any(|b| {
                 b.alias.eq_ignore_ascii_case(table)
                     && b.schema.as_ref().is_some_and(|s| Self::schema_matches(s, schema))
-                    && b.column_index(column).is_some()
+                    && b.matches_column(column)
             })
         };
         let has_column = |column: &str| self.bindings.iter().any(|b| b.column_index(column).is_some());

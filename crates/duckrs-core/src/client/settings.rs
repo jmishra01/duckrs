@@ -57,7 +57,6 @@ const UNHONORED: &[&str] = &[
     "access_mode",
     "active_grammar_extensions",
     "allow_parser_override_extension",
-    "current_dialect",
     "dialect_compatibility_mode",
     "disable_timestamptz_casts",
     "errors_as_json",
@@ -540,6 +539,10 @@ fn on_set(setting: &SettingDefinition, value: Value) -> Result<Value> {
     let invalid = |message: String| Err(Error::new(ErrorKind::InvalidInput, message));
     let number = || value.try_to_string().ok().and_then(|s| s.parse::<f64>().ok());
     match setting.name {
+        // `CurrentDialectSetting::OnLocalSet`: there are no dialect extensions
+        "current_dialect" if !value.is_null() => {
+            return invalid(format!("Dialect \"{}\" is not installed", value.try_to_string()?));
+        }
         "threads" if number().is_some_and(|n| n < 1.0) => {
             return Err(Error::new(ErrorKind::Syntax, "Must have at least 1 thread!"));
         }
@@ -748,6 +751,10 @@ fn on_set(setting: &SettingDefinition, value: Value) -> Result<Value> {
 
 /// The default value of a setting, if it has one (`DBConfig::TryGetDefaultValue`).
 fn default_value(setting: &SettingDefinition) -> Option<Value> {
+    // `StandardVectorSizeSetting::GetSetting`
+    if setting.name == "standard_vector_size" {
+        return Some(Value::ubigint(duckrs_common::STANDARD_VECTOR_SIZE as u64));
+    }
     let text = setting.default_value?;
     let ty = input_type(setting).ok()?;
     let value = cast_value(&Value::varchar(text), &ty).ok()?;

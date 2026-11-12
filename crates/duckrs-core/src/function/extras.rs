@@ -759,6 +759,14 @@ fn temporal_values(row: &[Value], child: &LogicalType, inclusive: bool) -> Resul
     if row.iter().any(Value::is_null) {
         return Ok(Value::null(LogicalType::list(child.clone())));
     }
+    // `TimestampRangeInfo::ListLength`
+    let finite = |value: &Value| match value.logical_type().id() {
+        LogicalTypeId::Date => value.as_i128().is_none_or(|days| Date(days as i32).is_finite()),
+        _ => value.as_i128().is_none_or(|micros| Timestamp(micros as i64).is_finite()),
+    };
+    if !finite(&row[0]) || !finite(&row[1]) {
+        return Err(invalid("Interval infinite bounds not supported"));
+    }
     let (Some(start), Some(stop)) = (micros_of(&row[0]), micros_of(&row[1])) else {
         return Err(invalid("range needs a start and an end"));
     };
@@ -802,14 +810,25 @@ pub fn bind_temporal_range(
             LogicalTypeId::Date | LogicalTypeId::Timestamp | LogicalTypeId::TimestampTz
         )
     };
-    if children.len() != 3 || !temporal(&children[0].return_type) {
+    // a NULL bound takes the type of the other (`NULL` casts to any overload)
+    let bounds = &children.get(..2).unwrap_or_default();
+    let is_null = |ty: &LogicalType| ty.id() == LogicalTypeId::SqlNull;
+    if children.len() != 3
+        || !bounds.iter().any(|c| temporal(&c.return_type))
+        || !bounds.iter().all(|c| temporal(&c.return_type) || is_null(&c.return_type))
+    {
         return Ok(Err(children));
     }
-    let child = if children[0].return_type.id() == LogicalTypeId::TimestampTz {
+    let child = if bounds.iter().any(|c| c.return_type.id() == LogicalTypeId::TimestampTz) {
         LogicalType::new(LogicalTypeId::TimestampTz)
     } else {
         LogicalType::TIMESTAMP
     };
+    let children = children
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| if i < 2 && is_null(&c.return_type) { c.cast_to(&child, false) } else { c })
+        .collect();
     let lower = name.to_ascii_lowercase();
     let callback: super::ScalarCallback = if lower == "generate_series" {
         temporal_series

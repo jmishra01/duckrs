@@ -153,10 +153,53 @@ fn human_readable_bytes(bytes: u64) -> String {
     format!("{bytes} {}", if bytes == 1 { "byte" } else { "bytes" })
 }
 
+/// `DuckDB::ReleaseCodename`.
+fn release_codename(version: &str) -> &'static str {
+    // `VersioningUtils::IsReleaseVersion`
+    if version.contains("-dev") {
+        return "Development Version";
+    }
+    const NAMES: [(&str, &str); 6] = [
+        ("v1.2.", "Histrionicus"),
+        ("v1.3.", "Ossivalis"),
+        ("v1.4.", "Andium"),
+        ("v1.5.", "Variegata"),
+        ("v2.0.", "Cyanoptera"),
+        ("v2.1.", "Islandica"),
+    ];
+    NAMES
+        .iter()
+        .find(|(prefix, _)| version.starts_with(prefix))
+        .map_or("Unknown Version", |(_, name)| name)
+}
+
+/// `DuckDBPlatform`: the operating system and architecture, as extension repositories name them.
+pub(crate) fn platform() -> String {
+    let os = match std::env::consts::OS {
+        "macos" => "osx",
+        "windows" => "windows",
+        "freebsd" => "freebsd",
+        _ => "linux",
+    };
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "loongarch64" => "loong64",
+        "riscv64" => "riscv64",
+        "x86" => "i686",
+        _ => "amd64",
+    };
+    let postfix = if os == "windows" && cfg!(target_env = "gnu") { "_mingw" } else { "" };
+    format!("{os}_{arch}{postfix}")
+}
+
 const DESCRIBE_NAMES: [&str; 6] = ["column_name", "column_type", "null", "key", "default", "extra"];
 
-const SYSTEM_TABLES: [&str; 13] = [
+const SYSTEM_TABLES: [&str; 17] = [
     "duckdb_functions",
+    "duckdb_dialects",
+    "duckdb_keywords",
+    "pragma_version",
+    "pragma_platform",
     "duckdb_triggers",
     "duckdb_types",
     "duckdb_sequences",
@@ -1887,6 +1930,31 @@ impl Binder<'_> {
                     rows,
                 )
             }
+            // `DuckDBDialectsFunction`: the dialect extensions, of which there are none
+            "duckdb_dialects" => (vec![("dialect_name", varchar.clone())], Vec::new()),
+            // `DuckDBKeywordsFunction`
+            "duckdb_keywords" => (
+                vec![("keyword_name", varchar.clone()), ("keyword_category", varchar.clone())],
+                duckrs_parser::keywords::keyword_list()
+                    .into_iter()
+                    .map(|(word, category)| vec![text(&word), text(category)])
+                    .collect(),
+            ),
+            // `PragmaVersionFunction`
+            "pragma_version" => {
+                let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+                let codename = release_codename(&version);
+                (
+                    vec![
+                        ("library_version", varchar.clone()),
+                        ("source_id", varchar.clone()),
+                        ("codename", varchar.clone()),
+                    ],
+                    vec![vec![text(&version), text("duckrs"), text(codename)]],
+                )
+            }
+            // `PragmaPlatformFunction`
+            "pragma_platform" => (vec![("platform", varchar.clone())], vec![vec![text(&platform())]]),
             "pragma_database_size" => {
                 let mut rows = Vec::new();
                 for database in self.catalog.databases() {
@@ -1990,7 +2058,11 @@ impl Binder<'_> {
                         text(&listed.display),
                         null_text(),
                         Value::null(tags.clone()),
-                        Value::boolean(listed.database == "temp"),
+                        // `DuckCatalog::Initialize` makes the default schema of each catalog internal
+                        Value::boolean(
+                            listed.database == "temp"
+                                || (schema.path.len() <= 1 && listed.display.eq_ignore_ascii_case("main")),
+                        ),
                         null_text(),
                         parent_name.map_or_else(null_text, text),
                         schema
