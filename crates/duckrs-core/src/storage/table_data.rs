@@ -978,11 +978,16 @@ impl TableSource for DiskTable {
                 zones.push(zone);
                 continue;
             }
+            let varchar = self.table.columns[column].ty.id() == LogicalTypeId::Varchar;
             for pointer in &stored.pointers {
-                let (min, max) = (
-                    self.bound(column, pointer.statistics.min.as_ref())?,
-                    self.bound(column, pointer.statistics.max.as_ref())?,
-                );
+                let (min, max) = if varchar {
+                    string_bounds(pointer.statistics.strings.as_ref())
+                } else {
+                    (
+                        self.bound(column, pointer.statistics.min.as_ref())?,
+                        self.bound(column, pointer.statistics.max.as_ref())?,
+                    )
+                };
                 let (Some(min), Some(max)) = (min, max) else {
                     zone.unknown = true;
                     break;
@@ -1007,6 +1012,41 @@ impl TableSource for DiskTable {
         }
         Ok(zones)
     }
+}
+
+/// Bounds of the strings of a segment, from what its statistics keep of them: a truncated minimum is still below
+/// all of them, and a truncated maximum is raised to above all strings it is a prefix of (`StringStats::CheckZonemap`
+/// compares the prefixes instead).
+fn string_bounds(bounds: Option<&super::statistics::StringBounds>) -> (Option<Value>, Option<Value>) {
+    let Some(bounds) = bounds else {
+        return (None, None);
+    };
+    // what of a truncated bound is UTF-8, cut where a character was split
+    let text = |bytes: &[u8]| {
+        let valid = std::str::from_utf8(bytes).map_or_else(|error| error.valid_up_to(), |_| bytes.len());
+        String::from_utf8(bytes[..valid].to_vec()).ok()
+    };
+    let min = if bounds.min_exact {
+        std::str::from_utf8(&bounds.min).ok().map(str::to_string)
+    } else {
+        text(&bounds.min)
+    };
+    let max = if bounds.max_exact {
+        std::str::from_utf8(&bounds.max).ok().map(str::to_string)
+    } else {
+        // the prefix with its last ASCII character before DEL one higher sorts after every string that starts
+        // with the prefix
+        text(&bounds.max).and_then(|mut prefix| {
+            while let Some(last) = prefix.pop() {
+                if last.is_ascii() && (last as u8) < 0x7E {
+                    prefix.push((last as u8 + 1) as char);
+                    return Some(prefix);
+                }
+            }
+            None
+        })
+    };
+    (min.map(Value::varchar), max.map(Value::varchar))
 }
 
 /// `PersistentRowGroupData`: rows that a large insert wrote to the file ahead of its commit.

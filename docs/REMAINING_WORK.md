@@ -189,9 +189,11 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] zone maps of filters on several columns of a table (`a != b`, `x < 1 OR y > 5`): a copy in the scan
     that only skips row groups (`PushMultiColumnFilter`); NULLs of a row group in a file from its validity
     statistics
-  - [ ] VARCHAR bounds of tables in a file (C++'s 8-byte prefixes and `StringStats::CheckZonemap`), string
-    comparisons that C++'s prefixes can't decide but exact bounds do (`a = b` prunes more here), INTERVAL and
-    TIMESTAMPTZ_NS bounds, week, division by a column
+  - [x] VARCHAR bounds of tables in a file: string statistics read (legacy 8-byte and current 12-byte forms) and
+    written as `StatsWriter<string_t>` and `StringStats::Serialize` do, with unicode, lengths and totals
+  - [ ] string comparisons that C++'s prefixes can't decide but exact bounds do (`a = b` prunes more here), an
+    OR of columns proven false is an empty result here where C++ scans no row groups, INTERVAL and TIMESTAMPTZ_NS
+    bounds, week, division by a column
   - [ ] secure views (7 files), the scalar aggregate merger (`scalar_aggregate_merge_threshold`, 3),
     `json_serialize_plan`, gamma's errors without IEEE
   - [ ] string statistics (contains, suffix, upper/lower, length), struct/list/map extracts, `vector_type`,
