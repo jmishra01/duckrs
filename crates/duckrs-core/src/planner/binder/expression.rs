@@ -927,6 +927,41 @@ impl Binder<'_> {
             self.rewrite_qualified_count_star(&mut rewritten);
             return self.bind_expression(&rewritten);
         }
+        // a comparison operator called as a function is the comparison
+        if let ExprKind::Function(function) = &expr.kind
+            && function.name.qualification.iter().all(String::is_empty)
+            && let [left, right] = function.args.as_slice()
+            && left.name.is_empty()
+            && right.name.is_empty()
+            && !function.distinct
+            && function.order_by.is_empty()
+            && function.filter.is_none()
+        {
+            use duckrs_parser::ast::ComparisonOp as C;
+            let op = match function.name.name.to_uppercase().as_str() {
+                "=" | "==" => Some(C::Equal),
+                "!=" | "<>" => Some(C::NotEqual),
+                "<" => Some(C::LessThan),
+                ">" => Some(C::GreaterThan),
+                "<=" => Some(C::LessThanOrEqual),
+                ">=" => Some(C::GreaterThanOrEqual),
+                "IS DISTINCT FROM" => Some(C::DistinctFrom),
+                "IS NOT DISTINCT FROM" => Some(C::NotDistinctFrom),
+                _ => None,
+            };
+            if let Some(op) = op {
+                let mut comparison = Expr::comparison(op, left.expr.clone(), right.expr.clone());
+                comparison.alias = if expr.alias.is_empty() { expr.to_string() } else { expr.alias.clone() };
+                return self.bind_expression(&comparison);
+            }
+        }
+        if let ExprKind::Function(function) = &expr.kind
+            && function.name.name.eq_ignore_ascii_case("switch")
+            && function.name.qualification.iter().all(String::is_empty)
+            && (1..=3).contains(&function.args.len())
+        {
+            return self.bind_switch(function);
+        }
         if matches!(expr.kind, ExprKind::Window(_)) {
             let mut rewritten = expr.clone();
             if self.rewrite_window_count_star(&mut rewritten) {
@@ -940,6 +975,83 @@ impl Binder<'_> {
             return self.function_collations(bound);
         }
         Ok(bound)
+    }
+
+    /// `SwitchFun`: `switch([key,] cases [, default])` over a constant MAP of cases, as the CASE
+    /// expression `SwitchBindExpression` makes of it.
+    fn bind_switch(&mut self, function: &FunctionExpr) -> Result<BoundExpr> {
+        let arguments = function
+            .args
+            .iter()
+            .map(|a| self.bind_expression(&a.expr))
+            .collect::<Result<Vec<_>>>()?;
+        let is_map = |e: &BoundExpr| e.return_type.id() == LogicalTypeId::Map;
+        let map_index = match arguments.len() {
+            3 => 1,
+            2 if is_map(&arguments[1]) => 1,
+            _ => 0,
+        };
+        if !is_map(&arguments[map_index]) {
+            let types: Vec<String> = arguments
+                .iter()
+                .map(|a| crate::function::binder::expression_return_type(a).to_string())
+                .collect();
+            return Err(binder_error(format!(
+                "No function matches the given name and argument types 'switch({})'. You might need to add \
+                 explicit type casts.",
+                types.join(", ")
+            )));
+        }
+        let cases = &arguments[map_index];
+        if !cases.is_foldable() {
+            return Err(binder_error("SWITCH expected a constant map for the cases"));
+        }
+        let cases_value = evaluate_scalar(cases)?;
+        let ValueData::List(entries) = cases_value.data() else {
+            return Err(binder_error("SWITCH expected a constant map for the cases"));
+        };
+        if entries.is_empty() {
+            return Err(binder_error("No values provided for SWITCH expression"));
+        }
+        let parts = cases.return_type.child_type().expect("an entry type").struct_children().to_vec();
+        let return_type = parts[1].1.clone();
+        let base = (map_index == 1).then(|| arguments[0].clone());
+        // the template `K` of the key and the cases' keys
+        if let Some(base) = &base {
+            let (key_type, case_type) = (crate::function::binder::expression_return_type(base), parts[0].1.clone());
+            if crate::function::nested::deduce_template(&key_type, &case_type).is_none() {
+                return Err(binder_error(format!(
+                    "No function matches the given name and argument types 'switch({key_type}, {}, ..)'. You might \
+                     need to add explicit type casts.\n\tCannot deduce template type 'K', it was inferred to be:\n  \
+                     - '{key_type}', from first occurrence\n  - '{case_type}', which is incompatible with the \
+                     previously inferred type",
+                    cases.return_type
+                )));
+            }
+        }
+        let mut checks = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let ValueData::Struct(fields) = entry.data() else {
+                continue;
+            };
+            let key = BoundExpr::constant(fields[0].clone());
+            let when = match &base {
+                Some(base) => bind_comparison(ComparisonOp::Equal, base.clone(), key)?,
+                None => key.cast_to(&LogicalType::BOOLEAN, false),
+            };
+            checks.push((when, BoundExpr::constant(fields[1].clone())));
+        }
+        let else_expr = match arguments.get(map_index + 1) {
+            Some(default) => default.clone().cast_to(&return_type, false),
+            None => BoundExpr::constant(Value::null(return_type.clone())),
+        };
+        Ok(BoundExpr::new(
+            BoundExprKind::Case {
+                checks,
+                else_expr: Box::new(else_expr),
+            },
+            return_type,
+        ))
     }
 
     /// `PushArgumentCollations` and `PropagateReturnCollation` of `FunctionBinder`: the
@@ -1188,8 +1300,14 @@ impl Binder<'_> {
                         )));
                     }
                     let key = BoundExpr::constant(Value::varchar(field.clone()));
+                    // `v.key` of a VARIANT is its variant_extract, which struct_extract itself refuses
+                    let name = if bound.return_type.id() == LogicalTypeId::Variant {
+                        "array_extract"
+                    } else {
+                        "struct_extract"
+                    };
                     let children = vec![bound, key];
-                    bound = bind_nested_function("struct_extract", vec![String::new(); 2], children)?;
+                    bound = bind_nested_function(name, vec![String::new(); 2], children)?;
                 }
                 bound.with_alias(names.last().expect("a name").clone())
             }
@@ -1374,15 +1492,17 @@ impl Binder<'_> {
                 op: op @ (OperatorType::ArrayExtract | OperatorType::StructExtract),
                 children,
             } => {
-                let name = if *op == OperatorType::StructExtract {
-                    "struct_extract"
-                } else {
-                    "array_extract"
-                };
                 let bound = children
                     .iter()
                     .map(|c| self.bind_expression(c))
                     .collect::<Result<Vec<_>>>()?;
+                // `BindOperatorExpression`: `.key` of a VARIANT is its variant_extract
+                let variant = bound.first().is_some_and(|b| b.return_type.id() == LogicalTypeId::Variant);
+                let name = if *op == OperatorType::StructExtract && !variant {
+                    "struct_extract"
+                } else {
+                    "array_extract"
+                };
                 bind_nested_function(name, vec![String::new(); bound.len()], bound)?
             }
             ExprKind::Operator {

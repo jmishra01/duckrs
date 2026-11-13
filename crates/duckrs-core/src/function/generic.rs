@@ -994,6 +994,10 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             Ok(bound_function("concat_ws", children, LogicalType::VARCHAR, concat_ws))
         }
         "list_concat" | "array_concat" | "list_cat" | "array_cat" => {
+            // all NULL arguments make a NULL
+            if !children.is_empty() && children.iter().all(|c| c.return_type.id() == LogicalTypeId::SqlNull) {
+                return Ok(BoundExpr::constant(Value::sql_null()));
+            }
             let mut element = LogicalType::SQLNULL;
             for child in &children {
                 if is_list(&child.return_type) {
@@ -1069,6 +1073,10 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             let Some(first) = children.first().filter(|_| children.len() <= 3).cloned() else {
                 return Err(no_match(&lower, &children));
             };
+            // `ListNormalSortBind`: a VARIANT matches `LIST(ANY)` uncast, and is refused
+            if first.return_type.id() == LogicalTypeId::Variant {
+                return Err(binder_error("list_sort can only operate on LISTs"));
+            }
             // a NULL takes the `LIST(ANY)` parameter as a list of NULLs
             let child = if first.return_type.id() == LogicalTypeId::SqlNull {
                 first.cast_to(&LogicalType::list(LogicalType::SQLNULL), false)

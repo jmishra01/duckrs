@@ -577,6 +577,15 @@ fn bind_struct_extract_with(child: BoundExpr, key: BoundExpr, at: bool) -> Resul
     if ty.struct_children().is_empty() {
         return Err(binder_error("Can't extract something from an empty struct"));
     }
+    // a foldable key (`(-1)::BIGINT`) is a constant
+    let key = if key.is_foldable() && !matches!(key.kind, BoundExprKind::Constant(_)) {
+        match crate::execution::expression_executor::evaluate_scalar(&key) {
+            Ok(value) => BoundExpr::constant(value),
+            Err(_) => key,
+        }
+    } else {
+        key
+    };
     let BoundExprKind::Constant(key) = &key.kind else {
         return Err(binder_error(
             "Argument #2 in function struct_extract must be a constant expression",
@@ -709,6 +718,9 @@ pub fn bind_nested_function(name: &str, names: Vec<String>, children: Vec<BoundE
             match lower.as_str() {
                 "union_extract" if !matches!(child.return_type.id(), LogicalTypeId::Union | LogicalTypeId::Unknown) => {
                     Err(binder_error("union_extract can only take a union parameter"))
+                }
+                "struct_extract" | "struct_extract_at" if child.return_type.id() == LogicalTypeId::Variant => {
+                    Err(binder_error("struct_extract can only be used on a STRUCT, not on VARIANT"))
                 }
                 // `GetExtractAtFunction`: a position into any struct
                 "struct_extract_at" => bind_struct_extract_with(child, key, true),

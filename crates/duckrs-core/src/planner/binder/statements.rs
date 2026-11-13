@@ -763,6 +763,9 @@ impl Binder<'_> {
         let mut unnested_fields = Vec::new();
         for expr in self.expand_star_expressions(&node.select_list)? {
             match self.struct_unnest_fields(&expr) {
+                Some(fields) if fields.is_empty() => {
+                    return Err(binder_error("UNNEST of an empty struct is not supported"));
+                }
                 Some(fields) => {
                     unnested_fields.extend(select_list.len()..select_list.len() + fields.len());
                     select_list.extend(fields);
@@ -1451,6 +1454,10 @@ impl Binder<'_> {
             let mut next = Vec::new();
             let mut expanded = false;
             for (expr, ty, extracted) in expressions {
+                // an empty struct at the top expands to no columns at all
+                if !extracted && matches!(ty.id(), LogicalTypeId::Struct | LogicalTypeId::Tuple) && ty.struct_children().is_empty() {
+                    return Some(Vec::new());
+                }
                 if !matches!(ty.id(), LogicalTypeId::Struct | LogicalTypeId::Tuple) || ty.struct_children().is_empty() {
                     next.push((expr, ty, extracted));
                     continue;

@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 4581 of 6367 test files pass (**75.8%** of the 6044 that run). The v1 target is ≥ 90%.
+- Overall: 4591 of 6367 test files pass (**75.9%** of the 6045 that run). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -241,7 +241,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
 
 ## Phase 5: Functions
 
-- [ ] 30. Scalar and table functions (`sql/function`: 55 failing, 86.8%; `sql/table_function`: 31 failing)
+- [ ] 30. Scalar and table functions (`sql/function`: 51 failing, 87.7%; `sql/table_function`: 31 failing)
   - [x] `remap_struct`, `struct_values`, `parse_formatted_bytes`, `equi_width_bins`, `is_histogram_other_bin`;
     `date_part` of a list of parts, the time zone parts of TIMESTAMP and TIME, `date_trunc` of an INTERVAL by
     ISO year, week and day parts; `list_where` past the end of the list; `map_concat`'s type from its non-empty
@@ -302,6 +302,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
     the lambda's type); the lambda functions' arity and NULL-argument errors, UNNEST refused in a lambda;
     `enum_code` and friends of a prepared parameter; `variant_extract` of a folded key and its overloads' types;
     `regexp_extract`'s ambiguous string group; RE2 octal escapes; OR filters short-circuiting as `SelectOr`
+  - [x] `switch` as `SwitchBindExpression` (a constant MAP of cases made a CASE, its key template deduced);
+    comparison operators called as functions (`"="(a, b)`); `struct_extract` refusing a VARIANT while `.key`
+    of one is its variant_extract; `list_sort`/`list_grade_up` refusing a VARIANT; `list_concat` of NULLs;
+    a folded tuple index; UNNEST of an empty struct refused; `fill` of HUGEINT as `InterpolateOperator`
   - [ ] `stats()` of nested types and VARIANT, Parquet UNION columns, state export of `variant_group_object`;
     `list_max`/`list_min` under a collation, regex `\C`, lambdas in a subquery that see a column of their
     parameter's name
@@ -356,7 +360,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] shredded GEOMETRY columns, and the spatial extension's format of files before v1.5.0
   - [x] `GeometryStats`: in `stats()`, in database files (extent, types, flags), and `vertex_extract`'s bounds
   - [ ] `ST_GeomFromWKB`'s types from BLOB min/max (duckrs keeps no string statistics), GeoParquet, the spatial extension's blob format
-- [ ] 34. Remaining type and cast failures (`sql/types`: 44 failing, 91.7%; `sql/cast`: 2 failing)
+- [ ] 34. Remaining type and cast failures (`sql/types`: 39 failing, 92.6%; `sql/cast`: 2 failing)
   - [x] UNNEST with `recursive`, `max_depth` and `keep_parent_names`, of structs at the root of a select list,
     refused nested; a cast to NULL of anything that is NULL
   - [x] DOUBLE to VARCHAR of powers of two from 2^53 (fmt's fallback shifts its denominator by the boundary bits);

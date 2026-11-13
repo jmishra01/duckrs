@@ -2003,6 +2003,7 @@ test/sql/function/generic/test_if_null.test
 test/sql/function/generic/test_in.test
 test/sql/function/generic/test_least_greatest.test
 test/sql/function/generic/test_null_if.test
+test/sql/function/generic/test_resolve_types.test
 test/sql/function/generic/test_set.test
 test/sql/function/generic/test_sleep.test
 test/sql/function/generic/test_stats.test
@@ -2093,6 +2094,7 @@ test/sql/function/list/list_distance.test
 test/sql/function/list/list_distinct.test
 test/sql/function/list/list_functions_constant_child.test
 test/sql/function/list/list_grade_up_ties.test
+test/sql/function/list/list_grade_up_variant.test
 test/sql/function/list/list_has_any_and_has_all.test
 test/sql/function/list/list_inner_product.test
 test/sql/function/list/list_intersect.test
@@ -2119,6 +2121,7 @@ test/sql/function/list/list_value_structs.test
 test/sql/function/list/list_where.test
 test/sql/function/list/list_zip.test
 test/sql/function/list/repeat_list.test
+test/sql/function/nested/array_extract_unnamed_struct.test
 test/sql/function/nested/test_issue_5437.test
 test/sql/function/nested/test_struct_insert.test
 test/sql/function/nested/test_struct_update.test
@@ -2159,6 +2162,7 @@ test/sql/function/operator/test_arithmetic_sqllogic.test
 test/sql/function/operator/test_bitwise_ops.test
 test/sql/function/operator/test_bitwise_ops_types.test
 test/sql/function/operator/test_comparison.test
+test/sql/function/operator/test_comparison_function_call_types.test
 test/sql/function/operator/test_conjunction_nulls.test
 test/sql/function/operator/test_date_arithmetic.test
 test/sql/function/operator/test_division_overflow.test
@@ -2937,6 +2941,8 @@ test/sql/parser/qualified_underscore_digit.test
 test/sql/parser/reject_accidental_expression_syntax.test
 test/sql/parser/reject_accidental_type_syntax.test
 test/sql/parser/reject_unknown_option_values.test
+test/sql/parser/switch_case.test
+test/sql/parser/switch_null_arguments.test
 test/sql/parser/test_columns_where.test
 test/sql/parser/test_deep_expression_nesting.test
 test/sql/parser/test_long_error.test
@@ -4085,6 +4091,7 @@ test/sql/types/hugeint/test_hugeint_aggregates.test
 test/sql/types/hugeint/test_hugeint_arithmetic.test
 test/sql/types/hugeint/test_hugeint_auto_cast.test
 test/sql/types/hugeint/test_hugeint_bitwise.test
+test/sql/types/hugeint/test_hugeint_cast_from_floating_bounds.test
 test/sql/types/hugeint/test_hugeint_conversion.test
 test/sql/types/hugeint/test_hugeint_functions.test
 test/sql/types/hugeint/test_hugeint_null_value.test
@@ -4106,6 +4113,7 @@ test/sql/types/interval/test_interval_no_normalize_dedup.test
 test/sql/types/interval/test_interval_ops.test
 test/sql/types/list/list_case.test
 test/sql/types/list/list_comparison.test
+test/sql/types/list/list_concat_null.test
 test/sql/types/list/list_constant_reference.test
 test/sql/types/list/list_cross_product.test
 test/sql/types/list/list_distinct.test
@@ -4149,6 +4157,7 @@ test/sql/types/nested/array/array_case.test
 test/sql/types/nested/array/array_cast.test
 test/sql/types/nested/array/array_coverage.test
 test/sql/types/nested/array/array_fuzzer_failures.test
+test/sql/types/nested/array/array_invalid.test
 test/sql/types/nested/array/array_join_gather.test
 test/sql/types/nested/array/array_joins.test
 test/sql/types/nested/array/array_joins_2.test
@@ -4258,6 +4267,7 @@ test/sql/types/numeric/utinyint_try_cast.test
 test/sql/types/string/test_big_strings.test
 test/sql/types/string/test_unicode.test
 test/sql/types/struct/create_type_struct.test
+test/sql/types/struct/empty_struct.test
 test/sql/types/struct/empty_tuple_storage.test
 test/sql/types/struct/nested_struct_projection_pushdown.test
 test/sql/types/struct/nested_structs.test
@@ -4283,6 +4293,7 @@ test/sql/types/struct/struct_cross_product.test
 test/sql/types/struct/struct_different_names.test
 test/sql/types/struct/struct_distinct.test
 test/sql/types/struct/struct_equality_bug.test
+test/sql/types/struct/struct_extract_variant.test
 test/sql/types/struct/struct_index.test
 test/sql/types/struct/struct_key_collation_and_combine.test
 test/sql/types/struct/struct_named_cast.test

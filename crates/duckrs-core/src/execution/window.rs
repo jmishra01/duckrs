@@ -775,7 +775,26 @@ impl<'a> Evaluation<'a> {
                 window.return_type.physical_type(),
                 duckrs_common::types::PhysicalType::Float | duckrs_common::types::PhysicalType::Double
             );
-            let value = if integral && (0.0..=1.0).contains(&along_line) {
+            let hugeint = window.return_type.physical_type() == duckrs_common::types::PhysicalType::Int128;
+            let value = if hugeint && (0.0..=1.0).contains(&along_line) {
+                // `InterpolateOperator::Operation(hugeint_t)`: from the exact difference, which can overflow
+                let (Some(lo), Some(hi)) = (values[p0].as_i128(), values[p1].as_i128()) else {
+                    continue;
+                };
+                let interpolated = match hi.checked_sub(lo) {
+                    Some(delta) => {
+                        let offset = (delta as f64 * along_line) as i128;
+                        lo.checked_add(offset).ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::OutOfRange,
+                                format!("Overflow in HUGEINT addition: {lo} + {offset}"),
+                            )
+                        })?
+                    }
+                    None => (lo as f64 + (hi as f64 - lo as f64) * along_line) as i128,
+                };
+                Value::new(window.return_type.clone(), ValueData::Int128(interpolated))?
+            } else if integral && (0.0..=1.0).contains(&along_line) {
                 let ((low, low_at), (high, high_at)) = if y0 <= y1 { ((y0, p0), (y1, p1)) } else { ((y1, p1), (y0, p0)) };
                 if filled <= low {
                     values[low_at].clone()
@@ -830,7 +849,8 @@ fn like(ty: &LogicalType, number: f64) -> Result<Value> {
         }
         (None, LogicalTypeId::TimestampSec) => Some((-micros / 1e6, micros / 1e6)),
         (None, LogicalTypeId::TimestampMs) => Some((-micros / 1e3, micros / 1e3)),
-        (None, _) => range.map(|(low, high)| (low - 1.0, high + 1.0)),
+        // an integer's minimum is a double, its maximum plus one is the double past it
+        (None, _) => range.map(|(low, high)| (low.next_down(), high + 1.0)),
     };
     if let Some((low, high)) = range
         && (!rounded.is_finite() || rounded <= low || rounded >= high)

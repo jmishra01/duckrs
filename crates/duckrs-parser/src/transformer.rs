@@ -1965,7 +1965,7 @@ impl<'g> Transformer<'g> {
             Some(n) => Ok(Some(n)),
             None => Err(Error::new(
                 ErrorKind::Binder,
-                format!("Expected an integer as array bound instead of {literal}"),
+                format!("Expected an integer as array bound instead of {}", literal.text),
             )),
         }
     }

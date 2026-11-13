@@ -734,6 +734,13 @@ pub fn bind_list_function(name: &str, children: Vec<BoundExpr>) -> Result<BoundE
             Ok(bound_function("list_where", vec![list, mask], ty, list_where))
         }
         "list_grade_up" | "array_grade_up" | "grade_up" => {
+            // `ListGradeUpBind`: what is not a list (a VARIANT matches `LIST(ANY)` uncast) is refused
+            if children
+                .first()
+                .is_some_and(|c| c.return_type.id() == LogicalTypeId::Variant)
+            {
+                return Err(Error::new(ErrorKind::Binder, "list_grade_up can only operate on LISTs"));
+            }
             let (list, _) = list_arg(&children)?;
             let mut args = vec![list];
             args.extend(

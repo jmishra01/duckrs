@@ -81,7 +81,13 @@ impl Binder<'_> {
         let mut bound = BoundExpr::column_ref(ColumnBinding::new(table_index, index), ty, names[0].clone());
         for field in &names[1..] {
             let name = BoundExpr::constant(Value::varchar(field.clone()));
-            bound = bind_nested_function("struct_extract", vec![String::new(); 2], vec![bound, name])?;
+            // `.key` of a VARIANT is its variant_extract
+            let function = if bound.return_type.id() == LogicalTypeId::Variant {
+                "array_extract"
+            } else {
+                "struct_extract"
+            };
+            bound = bind_nested_function(function, vec![String::new(); 2], vec![bound, name])?;
         }
         Ok(Some(bound))
     }
