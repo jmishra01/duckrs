@@ -1568,7 +1568,7 @@ impl Binder<'_> {
             ExprKind::Parameter(_) => {
                 return Err(Error::new(
                     ErrorKind::ParameterNotAllowed,
-                    "Parameter not supported in ORDER BY clause",
+                    format!("Parameter not supported in {component} clause"),
                 ));
             }
             _ => {}

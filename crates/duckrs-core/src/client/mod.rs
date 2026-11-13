@@ -3211,7 +3211,7 @@ impl ClientContext {
                 if !options.is_empty() {
                     return Err(Error::new(
                         ErrorKind::Catalog,
-                        "WITH clause is not supported for schemas",
+                        "WITH clause is not supported for schemas in a duckdb catalog",
                     ));
                 }
                 // `Binder::ResolveCatalog`: the qualification of the new schema is its catalog, or the

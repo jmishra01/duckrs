@@ -161,7 +161,7 @@ impl Binder<'_> {
             if parsed[index].compression.is_some() {
                 return Err(binder_error(format!(
                     "Can't set a compression type on generated column {}, generated columns are not stored",
-                    parsed[index].name
+                    ast::sql_quoted_identifier(&parsed[index].name)
                 )));
             }
             let mut binder = Binder::new(self.catalog);

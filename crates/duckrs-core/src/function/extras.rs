@@ -38,7 +38,7 @@ fn number(value: &Value) -> Option<f64> {
     }
 }
 
-const STRING_FUNCTIONS: [&str; 22] = [
+pub(crate) const STRING_FUNCTIONS: [&str; 22] = [
     "hive_partition_component",
     "parse_filename",
     "parse_path",
@@ -63,7 +63,7 @@ const STRING_FUNCTIONS: [&str; 22] = [
     "path_join",
 ];
 
-const OTHER_FUNCTIONS: [&str; 56] = [
+pub(crate) const OTHER_FUNCTIONS: [&str; 56] = [
     "decimal_division",
     "create_sort_key",
     "finalize",
@@ -1722,7 +1722,11 @@ fn vector_arguments(name: &str, children: Vec<BoundExpr>) -> Result<(Vec<BoundEx
     let fits: Vec<Fit> = children.iter().map(fit).collect();
     // `ArrayGenericBinaryResolveTypes`: the array functions take what they are given, which has to
     // be an array
-    if name.starts_with("array_") && (fits.contains(&Fit::No) || fits.contains(&Fit::Ambiguous)) {
+    if name.starts_with("array_")
+        && fits.contains(&Fit::Ambiguous)
+        && !fits.iter().all(|fit| *fit == Fit::Ambiguous)
+        && !fits.contains(&Fit::No)
+    {
         return Err(Error::new(
             ErrorKind::InvalidInput,
             format!("{name}: Arguments must be arrays of FLOAT or DOUBLE"),

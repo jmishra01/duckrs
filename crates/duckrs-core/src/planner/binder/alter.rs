@@ -238,9 +238,19 @@ impl Binder<'_> {
         if let Some((path, action)) = touched
             && let [column] = path.as_slice()
             && let Some(index) = table.column_index(column)
-            && table.indexes.read().iter().any(|i| i.columns.contains(&index))
         {
-            return Err(catalog_error(format!("Cannot {action}: an index depends on it!")));
+            let indexes = table.indexes.read();
+            if indexes.iter().any(|i| i.columns.contains(&index)) {
+                return Err(catalog_error(format!("Cannot {action}: an index depends on it!")));
+            }
+            // `DataTable` of a removed column: the columns after it move
+            if matches!(info.kind, AlterKind::RemoveColumn { .. })
+                && indexes.iter().any(|i| i.columns.iter().any(|c| *c > index))
+            {
+                return Err(catalog_error(
+                    "Cannot drop this column: an index depends on a column after it!".to_string(),
+                ));
+            }
         }
         // `DependencyManager::AlterObject`
         let has_dependents = schema.is_referenced(&table) || !table.indexes.read().is_empty();
@@ -507,7 +517,7 @@ impl Binder<'_> {
                 if table.is_generated(&path[0]) {
                     return Err(binder_error(format!(
                         "Cannot SET DEFAULT for generated column {}",
-                        path[0]
+                        sql_quoted_identifier(&path[0])
                     )));
                 }
                 let index = column_index(&table, &path[0])?;

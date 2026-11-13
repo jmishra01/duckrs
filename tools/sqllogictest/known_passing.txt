@@ -184,6 +184,7 @@ test/fuzzer/pedro/temp_table_cleanup.test
 test/fuzzer/pedro/test_segv_argmax.test
 test/fuzzer/pedro/test_truncate_heap_use_after_free.test
 test/fuzzer/pedro/test_window_function_nullptr.test
+test/fuzzer/pedro/update_default_segv.test
 test/fuzzer/pedro/update_join_bind_error.test
 test/fuzzer/pedro/update_join_statistics.test
 test/fuzzer/pedro/utf8_invalid_unicode.test
@@ -830,6 +831,7 @@ test/sql/aggregate/distinct/issue9241.test
 test/sql/aggregate/distinct/rewrite/distinct_aggregate_rewrite_join_order.test
 test/sql/aggregate/distinct/rewrite/distinct_aggregate_rewrite_order_by_keys.test
 test/sql/aggregate/distinct/test_distinct.test
+test/sql/aggregate/distinct/test_distinct_on.test
 test/sql/aggregate/distinct/test_distinct_on_columns.test
 test/sql/aggregate/distinct/test_distinct_order_by.test
 test/sql/aggregate/distinct/ungrouped/test_distinct_ungrouped.test
@@ -938,6 +940,7 @@ test/sql/alter/drop_col/test_drop_col_check.test
 test/sql/alter/drop_col/test_drop_col_check_next.test
 test/sql/alter/drop_col/test_drop_col_concurrent_dml_conflict.test
 test/sql/alter/drop_col/test_drop_col_failure.test
+test/sql/alter/drop_col/test_drop_col_index.test
 test/sql/alter/drop_col/test_drop_col_not_null.test
 test/sql/alter/drop_col/test_drop_col_not_null_next.test
 test/sql/alter/drop_col/test_drop_col_operations.test
@@ -1051,6 +1054,7 @@ test/sql/binder/missing_column_error.test
 test/sql/binder/not_similar_to.test
 test/sql/binder/order_by_view.test
 test/sql/binder/qualified_alias_method_call.test
+test/sql/binder/similar_to.test
 test/sql/binder/string_literal_binding.test
 test/sql/binder/table_alias_single_quotes.test
 test/sql/binder/table_view_alias.test
@@ -1817,6 +1821,7 @@ test/sql/create/create_database.test
 test/sql/create/create_index_on_issue_13643.test
 test/sql/create/create_objects_readonly.test
 test/sql/create/create_or_replace.test
+test/sql/create/create_schema_options.test
 test/sql/create/create_table_as_error.test
 test/sql/create/create_table_as_no_data_limit.test
 test/sql/create/create_table_empty_name.test
@@ -1911,6 +1916,7 @@ test/sql/error/escape_percent_sign.test
 test/sql/error/missing_type.test
 test/sql/error/mix_aggregate_and_non_aggregate.test
 test/sql/error/subquery_single_column.test
+test/sql/error/table_function_as_scalar_function.test
 test/sql/error/test_has_error_expression.test
 test/sql/error/test_try_common_subexpression.test
 test/sql/error/test_try_constant_regex.test
@@ -2348,6 +2354,7 @@ test/sql/function/variant/variant_normalize.test
 test/sql/function/variant/variant_shredded_extract_nested.test
 test/sql/function/variant/variant_type.test
 test/sql/function/variant/variant_typeof.test
+test/sql/generated_columns/generated_column_compression.test
 test/sql/generated_columns/stored/basic.test
 test/sql/generated_columns/virtual/alter_table.test
 test/sql/generated_columns/virtual/ambiguity.test
@@ -3402,6 +3409,7 @@ test/sql/storage/compression/bitpacking/bitpacking_storage_info.test
 test/sql/storage/compression/bitpacking/bitpacking_uhugeint.test
 test/sql/storage/compression/bitpacking/force_bitpacking.test
 test/sql/storage/compression/bitpacking/struct_bitpacking.test
+test/sql/storage/compression/compression_count_sentinel.test
 test/sql/storage/compression/compression_null_block.test
 test/sql/storage/compression/compression_selection.test
 test/sql/storage/compression/compression_selection_dict_fsst.test

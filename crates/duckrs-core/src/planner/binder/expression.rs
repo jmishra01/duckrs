@@ -2135,9 +2135,88 @@ impl Binder<'_> {
                     ));
                 }
                 let Some(set) = BuiltinFunctions::get().scalar(&function.name.name) else {
+                    // `ExpressionBinder::BindFunction`: a table function, used as a scalar one
+                    const TABLE_FUNCTIONS: &[&str] = &[
+                        "read_csv",
+                        "read_csv_auto",
+                        "sniff_csv",
+                        "read_parquet",
+                        "parquet_scan",
+                        "parquet_metadata",
+                        "parquet_schema",
+                        "read_json",
+                        "read_json_auto",
+                        "read_ndjson",
+                        "read_ndjson_auto",
+                        "read_json_objects",
+                        "read_text",
+                        "read_blob",
+                        "glob",
+                        "query",
+                        "query_table",
+                        "summary",
+                        "repeat_row",
+                        "test_all_types",
+                        "test_vector_types",
+                        "pragma_table_info",
+                        "pragma_show",
+                        "pragma_storage_info",
+                        "pragma_metadata_info",
+                        "duckdb_settings",
+                        "duckdb_extensions",
+                        "duckdb_temporary_files",
+                        "duckdb_memory",
+                        "duckdb_logs",
+                        "duckdb_functions",
+                        "duckdb_keywords",
+                        "duckdb_types",
+                        "duckdb_sequences",
+                        "duckdb_databases",
+                        "duckdb_schemas",
+                        "duckdb_tables",
+                        "duckdb_views",
+                        "duckdb_columns",
+                        "duckdb_indexes",
+                        "duckdb_constraints",
+                        "duckdb_dependencies",
+                        "duckdb_optimizers",
+                        "pragma_version",
+                        "pragma_platform",
+                        "pragma_database_size",
+                    ];
+                    if function.name.qualification.iter().all(String::is_empty)
+                        && TABLE_FUNCTIONS.contains(&function.name.name.to_lowercase().as_str())
+                    {
+                        return Err(binder_error(format!(
+                            "Function {} is a table function but it was used as a scalar function. This function \
+                             has to be called in a FROM clause (similar to a table).",
+                            function.name.name
+                        )));
+                    }
+                    // `CatalogException::MissingEntry`: the most similar function of the catalog
+                    let functions = BuiltinFunctions::get();
+                    let mut best: Option<(f64, String)> = None;
+                    let names = functions
+                        .scalar_sets()
+                        .into_iter()
+                        .map(|set| set.name.clone())
+                        .chain(functions.aggregate_sets().into_iter().map(|set| set.name.clone()))
+                        .chain(
+                            crate::function::extras::STRING_FUNCTIONS
+                                .iter()
+                                .chain(crate::function::extras::OTHER_FUNCTIONS.iter())
+                                .map(|name| name.to_string()),
+                        );
+                    for name in names {
+                        let score = duckrs_common::string_util::similarity_rating(&name, &function.name.name);
+                        if score > best.as_ref().map_or(0.0, |(b, _)| *b) {
+                            best = Some((score, name));
+                        }
+                    }
+                    let hint = best.map_or_else(String::new, |(_, name)| format!("\nDid you mean \"{name}\"?"));
                     return Err(Error::new(
                         ErrorKind::Catalog,
-                        format!("Scalar Function with name {} does not exist!", function.name.name),
+                        format!("Scalar Function with name {} does not exist!{hint}", function.name.name),
                     ));
                 };
                 if function.filter.is_some() || !function.order_by.is_empty() || function.distinct {
