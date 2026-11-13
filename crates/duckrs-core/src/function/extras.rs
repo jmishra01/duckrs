@@ -2199,7 +2199,12 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
                     "cast_to_type cannot be used to cast to NULL",
                 ));
             }
-            Ok(children.remove(0).cast_to(&ty, false))
+            // a cast between collations of one type keeps the target's (`CastToTypeBind`)
+            let mut cast = children.remove(0).cast_to(&ty, false);
+            if cast.return_type.id() == ty.id() {
+                cast.return_type = ty;
+            }
+            Ok(cast)
         }
         // Ported from duckdb/extension/core_functions/scalar/generic/replace_type.cpp @ rust-port-baseline
         // `replace_type(x, from, to)`: x cast to its type with every `from` in it made `to`

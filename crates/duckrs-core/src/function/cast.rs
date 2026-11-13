@@ -608,7 +608,8 @@ fn string_to<T: CastNumber>(source: &Vector, result: &mut Vector, count: usize, 
             try_cast_string_to_double(s)?;
             let text = std::str::from_utf8(s).ok()?;
             let text = text.trim_matches(|c: char| c.is_ascii() && is_space(c as u8));
-            text.parse::<f32>().ok().map(Number::Float)
+            // the digit separators were checked with the double
+            text.replace('_', "").parse::<f32>().ok().map(Number::Float)
         }),
         PhysicalType::Double => string_to_number::<T>(source, result, count, mode, |s| {
             try_cast_string_to_double(s).map(Number::Double)

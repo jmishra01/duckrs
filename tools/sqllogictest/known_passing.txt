@@ -980,6 +980,7 @@ test/sql/attach/attach_issue7711.test
 test/sql/attach/attach_issue_21491.test
 test/sql/attach/attach_issue_7660.test
 test/sql/attach/attach_macros.test
+test/sql/attach/attach_no_wal_writes_mode.test
 test/sql/attach/attach_null.test
 test/sql/attach/attach_or_replace.test
 test/sql/attach/attach_persistent.test
@@ -1986,11 +1987,13 @@ test/sql/function/generic/case_varchar.test
 test/sql/function/generic/case_when_comparison.test
 test/sql/function/generic/case_when_list.test
 test/sql/function/generic/cast_to_type.test
+test/sql/function/generic/cast_to_type_collation.test
 test/sql/function/generic/constant_argument_errors.test
 test/sql/function/generic/constant_or_null.test
 test/sql/function/generic/error.test
 test/sql/function/generic/fold_constant_arguments.test
 test/sql/function/generic/hash_func.test
+test/sql/function/generic/invoke.test
 test/sql/function/generic/least_greatest_enum.test
 test/sql/function/generic/least_greatest_types.test
 test/sql/function/generic/make_type_empty_name.test
@@ -2920,6 +2923,7 @@ test/sql/parser/columns_issue9867.test
 test/sql/parser/columns_unpacked_empty.test
 test/sql/parser/create_macro_tostring.test
 test/sql/parser/cte_printing.test
+test/sql/parser/digit_separators.test
 test/sql/parser/division_operator_precedence.test
 test/sql/parser/dollar_quotes_internal_issue2224.test
 test/sql/parser/drop_qualified_names.test

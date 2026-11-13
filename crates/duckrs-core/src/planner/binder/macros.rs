@@ -141,7 +141,10 @@ fn replace_marked(expr: &mut Expr, arguments: &[Expr]) {
     {
         let alias = std::mem::take(&mut expr.alias);
         *expr = arguments[position.parse::<usize>().expect("a marked position")].clone();
-        expr.alias = alias;
+        // the reference's own alias, or else the argument's (which `invoke` names by its parameter)
+        if !alias.is_empty() {
+            expr.alias = alias;
+        }
     }
 }
 

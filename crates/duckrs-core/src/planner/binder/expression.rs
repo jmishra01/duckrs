@@ -1826,6 +1826,12 @@ impl Binder<'_> {
                     }
                     return Ok(BoundExpr::constant(type_value(&child.return_type)));
                 }
+                if function.name.name.eq_ignore_ascii_case("invoke")
+                    && function.name.qualification.is_empty()
+                    && function.args.first().is_some_and(|a| !matches!(a.expr.kind, ExprKind::Lambda { .. }))
+                {
+                    return Err(binder_error("Invalid lambda expression passed to 'invoke' function."));
+                }
                 // `invoke(lambda x, y: body, a, b)`: the body with the arguments for its parameters
                 if function.name.name.eq_ignore_ascii_case("invoke")
                     && function.name.qualification.is_empty()
@@ -1850,7 +1856,9 @@ impl Binder<'_> {
                         .collect();
                     if parameters.len() != function.args.len() - 1 {
                         return Err(binder_error(format!(
-                            "The lambda of invoke takes {} parameters, but {} arguments were given",
+                            "The number of lambda parameters does not match the number of arguments passed to the \
+                             'invoke' function, expected {}{}, got {}.",
+                            if parameters.len() > function.args.len() - 1 { "at least " } else { "" },
                             parameters.len(),
                             function.args.len() - 1
                         )));
@@ -1986,7 +1994,11 @@ impl Binder<'_> {
                     && argument.name.is_empty()
                 {
                     self.bind_expression(&argument.expr)?;
-                    let name = super::statements::expression_name(&argument.expr);
+                    let name = if argument.expr.alias.is_empty() {
+                        super::statements::expression_name(&argument.expr)
+                    } else {
+                        argument.expr.alias.clone()
+                    };
                     return Ok(BoundExpr::constant(Value::varchar(name)));
                 }
                 // the macros of the system catalog (`DefaultFunctionGenerator`), where no function has

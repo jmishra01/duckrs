@@ -203,7 +203,7 @@ pub fn bind_scalar_function(
     for child in &mut children {
         if let BoundExprKind::Constant(value) = &child.kind {
             if value.is_null() {
-                return Ok(BoundExpr::constant(Value::null(function.return_type.clone())));
+                return Ok(BoundExpr::constant(Value::null(folded_type(&function.return_type, &children))));
             }
             continue;
         }
@@ -213,7 +213,7 @@ pub fn bind_scalar_function(
         // an argument that cannot be evaluated stays, so that its error surfaces at execution
         if let Some(value) = fold(child) {
             if value.is_null() {
-                return Ok(BoundExpr::constant(Value::null(function.return_type.clone())));
+                return Ok(BoundExpr::constant(Value::null(folded_type(&function.return_type, &children))));
             }
             let alias = std::mem::take(&mut child.alias);
             *child = BoundExpr::constant(value).with_alias(alias);
@@ -274,6 +274,18 @@ pub fn inside_try<T>(f: impl FnOnce() -> T) -> T {
     let result = f();
     TRY_DEPTH.with(|depth| depth.set(depth.get() - 1));
     result
+}
+
+/// The type a call folded to NULL has: a VARCHAR keeps the collation of its arguments, as
+/// `PropagateReturnCollation` gives the call itself.
+fn folded_type(return_type: &LogicalType, children: &[BoundExpr]) -> LogicalType {
+    if return_type.id() != LogicalTypeId::Varchar || return_type.alias().is_some() || return_type.collation().is_some() {
+        return return_type.clone();
+    }
+    children
+        .iter()
+        .find_map(|c| (c.return_type.id() == LogicalTypeId::Varchar).then(|| c.return_type.collation()).flatten())
+        .map_or_else(|| return_type.clone(), LogicalType::varchar_collation)
 }
 
 /// The bind callbacks of the scalar functions with a parameter that has to be constant.

@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 4597 of 6367 test files pass (**76.1%** of the 6044 that run). The v1 target is ≥ 90%.
+- Overall: 4602 of 6367 test files pass (**76.1%** of the 6044 that run). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -241,7 +241,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
 - [ ] 29a. The parser and errors (`sql/parser`: 23 failing, 66.7%; `sql/error`: 12 failing, 47.8%)
   - [x] `has_error` as the HAS_ERROR operator (a macro of its name shadows it, exported as `system.main.has_error`);
     TRY and HAS_ERROR refuse volatile arguments, aggregates and windows; ORDER BY `*` and `COLUMNS(..)`, of a set
-    operation too; one `_` between digits in a DOUBLE cast (not when sniffing a CSV)
+    operation too; one `_` between digits in DOUBLE and FLOAT casts (not when sniffing a CSV), and in the test
+    runner's typed comparison; `invoke`'s errors and `alias()` of its parameters; `cast_to_type` keeping the target
+    collation; a call folded to NULL keeping its arguments' collation
   - [ ] error locations (carets), `errors_as_json`, AT clauses, `preserve_identifier_case`
 
 ## Phase 5: Functions
