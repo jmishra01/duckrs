@@ -282,7 +282,8 @@ fn over_text(args: &DataChunk, result: &mut Vector, f: fn(&str) -> Result<Value>
 fn strip_accents(args: &DataChunk, result: &mut Vector) -> Result<()> {
     over_text(args, result, |input| {
         Ok(Value::varchar(
-            input.nfd().filter(|c| !is_combining_mark(*c)).collect::<String>(),
+            // `utf8proc_remove_accents`: decompose, strip the marks, compose again
+            input.nfd().filter(|c| !is_combining_mark(*c)).nfc().collect::<String>(),
         ))
     })
 }
@@ -1750,11 +1751,34 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
         count_args(&lower, &children, low, high)?;
         Ok(bound_function(&lower, children, ty, callback))
     };
+    // a function set with these overloads, bound as `FunctionBinder::BindScalarFunction` does
+    let overloaded = |signatures: Vec<Vec<LogicalType>>, ty: LogicalType, callback: super::ScalarCallback| {
+        let mut set = super::ScalarFunctionSet::new(&lower);
+        for arguments in signatures {
+            set.add(super::ScalarFunction::new(&lower, arguments, ty.clone(), callback));
+        }
+        super::binder::bind_scalar_function(
+            &set,
+            children.clone(),
+            false,
+            &crate::execution::expression_executor::try_evaluate_scalar,
+        )
+    };
+    let b = LogicalType::BOOLEAN;
     match lower.as_str() {
-        "parse_filename" => simple(1, 3, v, parse_filename, children),
-        "parse_path" => simple(1, 2, list_of_text, parse_path, children),
-        "parse_dirname" => simple(1, 2, v, parse_dirname, children),
-        "parse_dirpath" => simple(1, 2, v, parse_dirpath, children),
+        "parse_filename" => overloaded(
+            vec![
+                vec![v.clone()],
+                vec![v.clone(), v.clone()],
+                vec![v.clone(), b.clone()],
+                vec![v.clone(), b, v.clone()],
+            ],
+            v,
+            parse_filename,
+        ),
+        "parse_path" => overloaded(vec![vec![v.clone()], vec![v.clone(), v]], list_of_text, parse_path),
+        "parse_dirname" => overloaded(vec![vec![v.clone()], vec![v.clone(), v.clone()]], v, parse_dirname),
+        "parse_dirpath" => overloaded(vec![vec![v.clone()], vec![v.clone(), v.clone()]], v, parse_dirpath),
         "path_join" => simple(1, usize::MAX, v, path_join, children),
         "hive_partition_component" => {
             count_args(&lower, &children, 2, 2)?;

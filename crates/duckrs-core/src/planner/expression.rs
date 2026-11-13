@@ -200,6 +200,9 @@ pub struct BoundAggregate {
     pub order_by: Vec<(BoundExpr, OrderModifiers)>,
     /// what DISTINCT tells rows apart by, if not the argument itself: its collated value
     pub distinct_key: Option<BoundExpr>,
+    /// the `ORDER BY` keys (by position) that are not arguments: DISTINCT tells rows apart by
+    /// them too (`MultiStageAggregateRewriter::GetOrderExpressions`)
+    pub distinct_order: Vec<usize>,
 }
 
 /// The functions that give something else on each call (`FunctionStability::VOLATILE`).

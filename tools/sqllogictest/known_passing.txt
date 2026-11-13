@@ -347,6 +347,7 @@ test/issues/general/test_5664.test
 test/issues/general/test_9380.test
 test/issues/general/test_9456.test
 test/issues/general/test_9738.test
+test/issues/general/test_9795.test
 test/issues/internal/test_5994.test
 test/issues/internal/test_7738.test
 test/issues/internal/test_9415.test
@@ -707,6 +708,7 @@ test/sql/aggregate/aggregates/approx_quantile_decimal_scalar.test
 test/sql/aggregate/aggregates/approx_quantile_ns_infinity.test
 test/sql/aggregate/aggregates/approx_quantile_parallel_finalize.test
 test/sql/aggregate/aggregates/approx_top_k.test
+test/sql/aggregate/aggregates/arg_min_max_n.test
 test/sql/aggregate/aggregates/arg_min_max_nulls_last.test
 test/sql/aggregate/aggregates/avg_interval_large_count.test
 test/sql/aggregate/aggregates/avg_quantile_lower_precision_timestamps.test
@@ -792,6 +794,7 @@ test/sql/aggregate/aggregates/test_sem.test
 test/sql/aggregate/aggregates/test_simple_filter.test
 test/sql/aggregate/aggregates/test_skewness.test
 test/sql/aggregate/aggregates/test_stddev.test
+test/sql/aggregate/aggregates/test_string_agg.test
 test/sql/aggregate/aggregates/test_string_agg_big.test
 test/sql/aggregate/aggregates/test_sum.test
 test/sql/aggregate/aggregates/test_sum_decimal_overflow.test
@@ -808,6 +811,7 @@ test/sql/aggregate/distinct/issue19616.test
 test/sql/aggregate/distinct/issue2656.test
 test/sql/aggregate/distinct/issue9241.test
 test/sql/aggregate/distinct/rewrite/distinct_aggregate_rewrite_join_order.test
+test/sql/aggregate/distinct/rewrite/distinct_aggregate_rewrite_order_by_keys.test
 test/sql/aggregate/distinct/test_distinct.test
 test/sql/aggregate/distinct/test_distinct_order_by.test
 test/sql/aggregate/distinct/ungrouped/test_distinct_ungrouped.test
@@ -819,6 +823,7 @@ test/sql/aggregate/group/aggregate_combine_row_append.test
 test/sql/aggregate/group/group_by_all.test
 test/sql/aggregate/group/group_by_all_collation.test
 test/sql/aggregate/group/group_by_all_having.test
+test/sql/aggregate/group/group_by_all_having_groups.test
 test/sql/aggregate/group/group_by_all_order.test
 test/sql/aggregate/group/group_by_all_window.test
 test/sql/aggregate/group/group_by_limits.test
@@ -1957,12 +1962,14 @@ test/sql/function/comparison/between_nested_types.test
 test/sql/function/comparison/between_physical_types.test
 test/sql/function/date/date_add.test
 test/sql/function/date/date_diff_extreme_dates.test
+test/sql/function/date/date_part_stats.test
 test/sql/function/date/date_trunc_4202.test
 test/sql/function/date/date_trunc_min_date.test
 test/sql/function/date/date_trunc_stats.test
 test/sql/function/date/date_trunc_stats_out_of_range.test
 test/sql/function/date/strftime_iso_year_range.test
 test/sql/function/date/test_date_part.test
+test/sql/function/date/test_date_trunc.test
 test/sql/function/date/test_epoch_ns_try.test
 test/sql/function/date/test_extract.test
 test/sql/function/date/test_extract_edge_cases.test
@@ -2178,10 +2185,12 @@ test/sql/function/string/hex_bignum.test
 test/sql/function/string/hive_partition_component.test
 test/sql/function/string/like_unicode.test
 test/sql/function/string/md5.test
+test/sql/function/string/nfc_normalize.test
 test/sql/function/string/null_byte.test
 test/sql/function/string/overlay.test
 test/sql/function/string/parse_formatted_bytes.test
 test/sql/function/string/parse_formatted_bytes_exact.test
+test/sql/function/string/parse_path.test
 test/sql/function/string/parse_path_separator.test
 test/sql/function/string/path_join.test
 test/sql/function/string/regex_capture.test
@@ -2269,6 +2278,7 @@ test/sql/function/time/epoch.test
 test/sql/function/time/make_time_nan.test
 test/sql/function/time/test_date_part.test
 test/sql/function/time/test_extract.test
+test/sql/function/time/test_extract_stats.test
 test/sql/function/time/test_time_bucket_time.test
 test/sql/function/timestamp/age.test
 test/sql/function/timestamp/date_sub_diff.test
@@ -3170,6 +3180,7 @@ test/sql/settings/allowed_directories.test
 test/sql/settings/allowed_paths.test
 test/sql/settings/connection_local_settings.test
 test/sql/settings/debug_deprecated_settings.test
+test/sql/settings/default_null_order_extended.test
 test/sql/settings/drop_set_schema.test
 test/sql/settings/max_memory_percentage.test
 test/sql/settings/reset/reset_threads.test
@@ -3196,6 +3207,7 @@ test/sql/show_select/test_describe_quoted.test
 test/sql/show_select/test_show_select.test
 test/sql/show_select/test_summarize.test
 test/sql/show_select/test_summarize_quoted.test
+test/sql/sql_export/aggregate_literals.test
 test/sql/sql_export/aggregate_results.test
 test/sql/sql_export/basic_plan_shapes.test
 test/sql/sql_export/catalog_invocations.test
@@ -3203,6 +3215,7 @@ test/sql/sql_export/ci_reconstruction.test
 test/sql/sql_export/collation_results.test
 test/sql/sql_export/composition_q1.test
 test/sql/sql_export/compressed_materialization_sql_export.test
+test/sql/sql_export/compression_fallbacks.test
 test/sql/sql_export/constant_values.test
 test/sql/sql_export/copy_empty_filename_pattern.test
 test/sql/sql_export/correlated_sql_export.test
@@ -3983,6 +3996,7 @@ test/sql/types/bignum/test_varchar_bignum_conversion.test
 test/sql/types/bignum/test_varchar_bignum_unhappy.test
 test/sql/types/bit/bit_issue_11211.test
 test/sql/types/bit/bit_issue_22527.test
+test/sql/types/bit/bit_sort_key_order.test
 test/sql/types/bit/bit_try_cast.test
 test/sql/types/bit/test_bit.test
 test/sql/types/bit/test_bit_bitwise_operations.test
@@ -4102,6 +4116,7 @@ test/sql/types/hugeint/test_hugeint_auto_cast.test
 test/sql/types/hugeint/test_hugeint_bitwise.test
 test/sql/types/hugeint/test_hugeint_cast_from_floating_bounds.test
 test/sql/types/hugeint/test_hugeint_conversion.test
+test/sql/types/hugeint/test_hugeint_exponent.test
 test/sql/types/hugeint/test_hugeint_functions.test
 test/sql/types/hugeint/test_hugeint_null_value.test
 test/sql/types/hugeint/test_hugeint_ops.test
@@ -4155,6 +4170,7 @@ test/sql/types/list/unnest_expand.test
 test/sql/types/list/unnest_having_qualify.test
 test/sql/types/list/unnest_non_constant_options.test
 test/sql/types/list/unnest_null_empty.test
+test/sql/types/list/unnest_table_function.test
 test/sql/types/list/unnest_types.test
 test/sql/types/map/map_cast.test
 test/sql/types/map/map_const_and_col_combination.test
@@ -4556,6 +4572,7 @@ test/sql/window/test_negative_range.test
 test/sql/window/test_no_default_window_spec.test
 test/sql/window/test_nthvalue.test
 test/sql/window/test_ntile.test
+test/sql/window/test_order_by_all.test
 test/sql/window/test_parallel_group_cleanup.test
 test/sql/window/test_partition_constant_arguments.test
 test/sql/window/test_quantile_skip_list.test

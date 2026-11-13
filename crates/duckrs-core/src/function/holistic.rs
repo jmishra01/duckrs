@@ -750,17 +750,16 @@ fn extremes(rows: &[Value], ty: &LogicalType, greatest: bool, value: usize, key:
     let n = positive_n(&fields(first)[count], name)?;
     let by: Vec<Value> = chosen.iter().map(|row| fields(row)[key].clone()).collect();
     let keys = sort_keys(&by, fields(first)[key].logical_type())?;
-    let mut order: Vec<usize> = (0..keys.len()).collect();
-    order.sort_by(|a, b| {
+    // C++ keeps a heap of the n rows: ties come out in the heap's order.
+    let order = super::std_heap::top_n(keys.len(), n, |a, b| {
         if greatest {
-            keys[*b].cmp(&keys[*a])
+            keys[*a] > keys[*b]
         } else {
-            keys[*a].cmp(&keys[*b])
+            keys[*a] < keys[*b]
         }
     });
     let items = order
         .into_iter()
-        .take(n)
         .map(|at| fields(chosen[at])[value].clone())
         .collect();
     Value::new(ty.clone(), ValueData::List(items))

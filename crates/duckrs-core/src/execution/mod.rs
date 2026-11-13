@@ -301,7 +301,7 @@ fn create_physical(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
                 children,
             )),
         },
-        LogicalOperatorKind::Window { windows, .. } => Box::new(window::PhysicalWindow::new(types, windows, children)),
+        LogicalOperatorKind::Window { windows, .. } => window::plan(types, windows, children),
         LogicalOperatorKind::MatchRecognize { data, .. } => {
             Box::new(match_recognize::PhysicalMatchRecognize::new(types, data, children))
         }
@@ -723,6 +723,7 @@ fn distinct_in_two_steps(
             && a.filter.is_none()
             && a.order_by.is_empty()
             && a.distinct_key.is_none()
+            && a.distinct_order.is_empty()
             && a.children.len() == 1
             && format!("{:?}", a.children[0]) == format!("{argument:?}")
     };

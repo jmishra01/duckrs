@@ -5659,7 +5659,7 @@ mod tests {
             ("SELECT concat_ws(',', 'a', NULL, 'b')", "a,b"),
             ("SELECT list_concat([1], [2, 3])", "[1, 2, 3]"),
             ("SELECT array_to_string([1, NULL, 2], '-')", "1-2"),
-            ("SELECT list_sort([3, NULL, 1])", "[NULL, 1, 3]"),
+            ("SELECT list_sort([3, NULL, 1])", "[1, 3, NULL]"),
             ("SELECT array_sort([3, 1], 'DESC', 'NULLS LAST')", "[3, 1]"),
             ("SELECT map_keys(MAP {'a': 1})", "[a]"),
             ("SELECT map_values(MAP {'a': 1})", "[1]"),

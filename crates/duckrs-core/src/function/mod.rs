@@ -34,6 +34,7 @@ mod string_nested;
 mod strings;
 pub(crate) mod strptime;
 #[allow(dead_code)]
+mod std_heap;
 mod tdigest;
 pub mod test_all_types;
 pub mod test_vector_types;

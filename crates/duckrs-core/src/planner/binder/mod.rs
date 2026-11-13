@@ -786,6 +786,8 @@ pub struct Binder<'a> {
     pub(super) null_extended: std::collections::HashSet<usize>,
     /// binding the argument of a TRY or HAS_ERROR, where aggregates and windows are refused
     pub(super) inside_try: bool,
+    /// binding the correlated columns of a subquery (`depth > 0` in C++'s binders)
+    pub(super) binding_correlated: bool,
     /// The views being bound, innermost last (`bound_views`).
     bound_views: Vec<Arc<ViewCatalogEntry>>,
     /// The schema unqualified tables are looked up in before the default one: the schema of the
@@ -883,6 +885,7 @@ impl<'a> Binder<'a> {
             left_of_join: Vec::new(),
             null_extended: std::collections::HashSet::new(),
             inside_try: false,
+            binding_correlated: false,
             bound_views: Vec::new(),
             search_schema: None,
             foreign_databases: Vec::new(),

@@ -3069,23 +3069,30 @@ impl PhysicalAggregate {
             .as_ref()
             .map(|key| execute(key, chunk))
             .transpose()?;
+        let order_vectors = aggregate
+            .order_by
+            .iter()
+            .map(|(expr, _)| execute(expr, chunk))
+            .collect::<Result<Vec<_>>>()?;
         let distinct_keys = match (aggregate.distinct, distinct_input.as_ref().or(input.as_ref())) {
             (true, Some(input)) => {
-                let unified = input.to_unified(chunk.len());
-                let keys = value_keys(input, chunk.len())?.into_iter().enumerate();
-                Some(keys.map(|(row, key)| unified.is_valid(row).then_some(key)).collect())
+                // NULL is one of the distinct values: the aggregate decides whether it counts
+                let mut keys = value_keys(input, chunk.len())?;
+                // the ORDER BY keys that are not arguments tell rows apart too
+                for &at in &aggregate.distinct_order {
+                    for (key, extra) in keys.iter_mut().zip(value_keys(&order_vectors[at], chunk.len())?) {
+                        key.extend_from_slice(&(extra.len() as u64).to_le_bytes());
+                        key.extend(extra);
+                    }
+                }
+                Some(keys.into_iter().map(Some).collect())
             }
             _ => None,
         };
         let order_keys = if aggregate.order_by.is_empty() {
             None
         } else {
-            let vectors = aggregate
-                .order_by
-                .iter()
-                .map(|(expr, _)| execute(expr, chunk))
-                .collect::<Result<Vec<_>>>()?;
-            let columns: Vec<(&Vector, OrderModifiers)> = vectors
+            let columns: Vec<(&Vector, OrderModifiers)> = order_vectors
                 .iter()
                 .zip(&aggregate.order_by)
                 .map(|(vector, (_, modifiers))| (vector, *modifiers))

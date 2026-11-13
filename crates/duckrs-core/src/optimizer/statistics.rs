@@ -1140,6 +1140,87 @@ impl StatisticsPropagator {
             }
             return unknown();
         }
+        // `DateTruncStatistics`: with a constant part, the bounds are those of the truncated bounds
+        if matches!(function.name.as_str(), "date_trunc" | "datetrunc")
+            && children.len() == 2
+            && return_type.id() == LogicalTypeId::Timestamp
+            && matches!(
+                children[1].return_type.id(),
+                LogicalTypeId::Date | LogicalTypeId::Timestamp
+            )
+        {
+            let part = match &children[0].kind {
+                BoundExprKind::Constant(value) if !value.is_null() => value.try_to_string().ok(),
+                _ => None,
+            };
+            let supported = part.is_some_and(|part| {
+                matches!(
+                    part.to_lowercase().as_str(),
+                    "millennium" | "millennia" | "mil" | "mils" | "millenia"
+                        | "century" | "centuries" | "cent" | "c"
+                        | "decade" | "decades" | "dec" | "decs"
+                        | "year" | "years" | "y" | "yr" | "yrs"
+                        | "quarter" | "quarters"
+                        | "month" | "months" | "mon" | "mons"
+                        | "week" | "weeks" | "w" | "weekofyear" | "yearweek"
+                        | "isoyear"
+                        | "day" | "days" | "d" | "dayofmonth"
+                        | "dow" | "dayofweek" | "weekday" | "isodow" | "doy" | "dayofyear" | "julian" | "jd"
+                        | "hour" | "hours" | "h" | "hr" | "hrs"
+                        | "minute" | "minutes" | "min" | "mins" | "m"
+                        | "second" | "seconds" | "sec" | "secs" | "s" | "epoch"
+                        | "millisecond" | "milliseconds" | "ms" | "msec" | "msecs" | "msecond" | "mseconds"
+                        | "microsecond" | "microseconds" | "us" | "usec" | "usecs" | "usecond" | "useconds"
+                )
+            });
+            let (Some(min), Some(max)) = (stats[1].min.clone(), stats[1].max.clone()) else {
+                return unknown();
+            };
+            if !supported || compare_values(ComparisonOp::GreaterThan, &min, &max) != Some(false) {
+                return unknown();
+            }
+            let truncate = |bound: Value| {
+                let call = BoundExpr {
+                    kind: BoundExprKind::Function {
+                        function: function.clone(),
+                        children: vec![children[0].clone(), BoundExpr::constant(bound)],
+                        is_operator: *is_operator,
+                    },
+                    ..BoundExpr::new(BoundExprKind::Reference(0), return_type.clone())
+                };
+                crate::execution::expression_executor::try_evaluate_scalar(&call)
+                    .filter(|value| value.logical_type().id() == LogicalTypeId::Timestamp)
+            };
+            let (Some(min), Some(max)) = (truncate(min), truncate(max)) else {
+                return unknown();
+            };
+            return Stats {
+                min: Some(min),
+                max: Some(max),
+                can_be_null: stats[0].can_be_null || stats[1].can_be_null,
+                can_be_valid: stats[0].can_be_valid && stats[1].can_be_valid,
+                geometry: None,
+                strings: None,
+                distinct: None,
+            };
+        }
+        let part = match (function.name.as_str(), children.len()) {
+            ("date_part" | "datepart", 2) => match &children[0].kind {
+                BoundExprKind::Constant(value) if !value.is_null() => value
+                    .try_to_string()
+                    .ok()
+                    .map(|part| format!("date_part:{}", part.to_lowercase())),
+                _ => None,
+            },
+            (name, 1) => Some(name.to_string()),
+            _ => None,
+        };
+        if let Some(part) = part {
+            let at = children.len() - 1;
+            if let Some(result) = date_part_stats(&part, &stats[at], &children[at].return_type, &return_type) {
+                return result;
+            }
+        }
         if function.name == "vertex_extract" && children.len() == 2 {
             let coordinate = match &children[1].kind {
                 BoundExprKind::Constant(value) => value.try_to_string().ok(),
@@ -1845,4 +1926,103 @@ mod tests {
             assert!(error < 0.05, "{values} values counted as {estimate}");
         }
     }
+}
+
+/// A date part of a constant, `name` being a unary part function or `date_part:<part>`.
+fn evaluate_part(name: &str, value: &Value) -> Option<Value> {
+    use crate::execution::expression_executor::try_evaluate_scalar;
+    let call = match name.strip_prefix("date_part:") {
+        Some(part) => crate::function::dates::bind_date_function(
+            "date_part",
+            vec![BoundExpr::constant(Value::varchar(part)), BoundExpr::constant(value.clone())],
+        )
+        .ok()?,
+        None => {
+            let set = BuiltinFunctions::get().scalar(name)?;
+            let children = vec![BoundExpr::constant(value.clone())];
+            crate::function::binder::bind_scalar_function(set, children, false, &try_evaluate_scalar).ok()?
+        }
+    };
+    try_evaluate_scalar(&call).filter(|value| !value.is_null())
+}
+
+/// `DatePart::*Operator::PropagateStatistics`: the bounds of a date part of a DATE, TIMESTAMP or
+/// TIME whose bounds are known and finite. `name` is the unary part function (or
+/// `date_part:<part>`).
+fn date_part_stats(name: &str, child: &Stats, child_type: &LogicalType, return_type: &LogicalType) -> Option<Stats> {
+    use LogicalTypeId as T;
+    let time = matches!(child_type.id(), T::Time | T::TimeNs);
+    if !time && !matches!(child_type.id(), T::Date | T::Timestamp | T::TimestampSec | T::TimestampMs | T::TimestampNs) {
+        return None;
+    }
+    let (min, max) = (child.min.clone()?, child.max.clone()?);
+    if compare_values(ComparisonOp::GreaterThan, &min, &max) != Some(false) {
+        return None;
+    }
+    let finite = |value: &Value| !value.try_to_string().is_ok_and(|text| text.contains("infinity"));
+    if !finite(&min) || !finite(&max) {
+        return None;
+    }
+    let bigint = |low: i64, high: i64| (Some(Value::bigint(low)), Some(Value::bigint(high)));
+    // the parts of the parent period, which must agree for the endpoints to be exact bounds
+    let day: &[&str] = if time { &[] } else { &["year", "month", "day"] };
+    let within = |parents: &[&str], low: i64, high: i64| -> Option<(Option<Value>, Option<Value>)> {
+        let same = parents
+            .iter()
+            .map(|parent| Some(evaluate_part(parent, &min)? == evaluate_part(parent, &max)?))
+            .collect::<Option<Vec<bool>>>()?
+            .into_iter()
+            .all(|same| same);
+        Some(if same {
+            (Some(evaluate_part(name, &min)?), Some(evaluate_part(name, &max)?))
+        } else {
+            bigint(low, high)
+        })
+    };
+    let with = |extra: &[&'static str]| -> Vec<&str> { day.iter().copied().chain(extra.iter().copied()).collect() };
+    let (low, high) = match name {
+        // `EpochOperator::PropagateStatistics<dtime_t>`: any second of the day
+        "date_part:epoch" | "epoch" if child_type.id() == T::Time => {
+            (Some(Value::double(0.0)), Some(Value::double(86_400.0)))
+        }
+        // `YearWeekOperator::PropagateStatistics`: from ISO year 0 on down the week is subtracted,
+        // and the endpoints no longer bound the values between them
+        "yearweek" | "date_part:yearweek"
+            if evaluate_part("date_part:isoyear", &min)?.as_i128().is_none_or(|year| year < 1) =>
+        {
+            return None;
+        }
+        "year" | "decade" | "century" | "millennium" | "yearweek" | "date_part:yearweek" | "date_part:isoyear" | "isoyear" | "epoch_ms"
+        | "epoch_us" | "epoch_ns" | "date_part:epoch" | "epoch" | "date_part:julian" | "julian" => {
+            (Some(evaluate_part(name, &min)?), Some(evaluate_part(name, &max)?))
+        }
+        "month" if !time => within(&["year"], 1, 12)?,
+        "day" | "dayofmonth" if !time => within(&["year", "month"], 1, 31)?,
+        "quarter" if !time => within(&["year"], 1, 4)?,
+        "dayofyear" if !time => within(&["year"], 1, 366)?,
+        "week" | "weekofyear" if !time => within(&["date_part:isoyear"], 1, 53)?,
+        "dayofweek" | "weekday" if !time => bigint(0, 6),
+        "isodow" if !time => bigint(1, 7),
+        "date_part:era" | "era" if !time => bigint(0, 1),
+        "hour" => within(day, 0, 24)?,
+        "minute" => within(&with(&["hour"]), 0, 59)?,
+        "second" => within(&with(&["hour", "minute"]), 0, 59)?,
+        "millisecond" => within(&with(&["hour", "minute"]), 0, 59_999)?,
+        "microsecond" => within(&with(&["hour", "minute"]), 0, 59_999_999)?,
+        "nanosecond" => within(&with(&["hour", "minute"]), 0, 59_999_999_999)?,
+        _ => return None,
+    };
+    let (low, high) = (low?, high?);
+    if low.logical_type() != return_type || high.logical_type() != return_type {
+        return None;
+    }
+    Some(Stats {
+        min: Some(low),
+        max: Some(high),
+        can_be_null: child.can_be_null,
+        can_be_valid: child.can_be_valid,
+        geometry: None,
+        strings: None,
+        distinct: None,
+    })
 }

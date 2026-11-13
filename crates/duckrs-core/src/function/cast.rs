@@ -223,6 +223,9 @@ struct IntegerDecimal {
     result: i128,
     decimal: i128,
     decimal_digits: u32,
+    /// `HugeIntCastData`: a fraction that does not fit a HUGEINT fails the cast instead of
+    /// being cut short
+    hugeint: bool,
 }
 
 impl IntegerDecimal {
@@ -244,14 +247,18 @@ impl IntegerDecimal {
         }
     }
 
-    fn handle_decimal(&mut self, digit: u8) {
+    fn handle_decimal(&mut self, digit: u8) -> bool {
         // digits past this position cannot affect the result for any i16 exponent
         const MAX_DECIMAL_DIGITS: u32 = 32768;
-        if self.decimal_digits == MAX_DECIMAL_DIGITS || self.decimal > (i128::MAX - digit as i128) / 10 {
-            return;
+        if self.decimal_digits == MAX_DECIMAL_DIGITS {
+            return true;
+        }
+        if self.decimal > (i128::MAX - digit as i128) / 10 {
+            return !self.hugeint;
         }
         self.decimal_digits += 1;
         self.decimal = self.decimal * 10 + digit as i128;
+        true
     }
 
     fn handle_exponent(&mut self, exponent: i16, negative: bool) -> bool {
@@ -357,7 +364,9 @@ fn integer_cast_loop(buf: &[u8], negative: bool, allow_exponent: bool, state: &m
                 let start_digit = pos;
                 while pos < len && buf[pos].is_ascii_digit() {
                     if allow_exponent {
-                        state.handle_decimal(buf[pos] - b'0');
+                        if !state.handle_decimal(buf[pos] - b'0') {
+                            return false;
+                        }
                     } else {
                         // the exponent itself takes no decimals
                         return false;
@@ -491,6 +500,15 @@ fn try_cast_string_to_uhugeint(input: &[u8]) -> Option<u128> {
 
 /// `TryIntegerCast` (non-strict): the integer a string spells, rounding a fraction.
 pub fn try_cast_string_to_integer(input: &[u8]) -> Option<i128> {
+    string_to_integer(input, false)
+}
+
+/// `TryCast::Operation(string_t, hugeint_t &)`.
+pub fn try_cast_string_to_hugeint(input: &[u8]) -> Option<i128> {
+    string_to_integer(input, true)
+}
+
+fn string_to_integer(input: &[u8], hugeint: bool) -> Option<i128> {
     let mut buf = input;
     while let [first, rest @ ..] = buf {
         if !is_space(*first) {
@@ -501,7 +519,10 @@ pub fn try_cast_string_to_integer(input: &[u8]) -> Option<i128> {
     if buf.is_empty() {
         return None;
     }
-    let mut state = IntegerDecimal::default();
+    let mut state = IntegerDecimal {
+        hugeint,
+        ..IntegerDecimal::default()
+    };
     if buf[0] == b'-' {
         return integer_cast_loop(buf, true, true, &mut state).then_some(state.result);
     }
@@ -619,6 +640,9 @@ fn string_to<T: CastNumber>(source: &Vector, result: &mut Vector, count: usize, 
             try_cast_string_to_integer(s)
                 .map(Number::Int)
                 .or_else(|| try_cast_string_to_uhugeint(s).map(Number::UHuge))
+        }),
+        PhysicalType::Int128 => string_to_number::<T>(source, result, count, mode, |s| {
+            try_cast_string_to_hugeint(s).map(Number::Int)
         }),
         _ => string_to_number::<T>(source, result, count, mode, |s| {
             try_cast_string_to_integer(s).map(Number::Int)

@@ -791,7 +791,9 @@ impl Binder<'_> {
                 [alias, name] if alias == "__outer_aggregates" => vec![name.clone()],
                 _ => column.names,
             };
+            let outer = std::mem::replace(&mut self.binding_correlated, true);
             let bound = self.bind_expression(&Expr::from(ExprKind::ColumnRef(names)));
+            self.binding_correlated = outer;
             match bound {
                 Ok(bound) => correlated.push(bound),
                 Err(error) => {
@@ -1132,6 +1134,35 @@ impl Binder<'_> {
         // `ListSortBindData`: the elements sort by their collated values, a list of them after the
         // options, and keep their own
         if matches!(function.name.as_str(), "list_sort" | "array_sort") && children.len() <= 3 {
+            // `ListNormalSortBind`: `ResolveOrder` and `ResolveNullOrder` fill in the options
+            // that are not given, from the settings
+            let option = |text: &str| BoundExpr::constant(Value::varchar(text));
+            let given = match children.get(1).map(|c| &c.kind) {
+                None => Some(ast::OrderType::Default),
+                Some(BoundExprKind::Constant(value)) if !value.is_null() => {
+                    match value.try_to_string().unwrap_or_default().to_uppercase().as_str() {
+                        "ASC" => Some(ast::OrderType::Ascending),
+                        "DESC" => Some(ast::OrderType::Descending),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some(order) = given
+                && children.len() < 3
+            {
+                let modifiers = self.options.resolve_order(order, ast::NullOrder::Default);
+                if children.len() < 2 {
+                    children.push(option(match modifiers.order {
+                        duckrs_common::sort_key::OrderType::Descending => "DESC",
+                        _ => "ASC",
+                    }));
+                }
+                children.push(option(match modifiers.nulls {
+                    duckrs_common::sort_key::NullOrder::NullsLast => "NULLS LAST",
+                    _ => "NULLS FIRST",
+                }));
+            }
             let ty = children[0].return_type.clone();
             let (keys, collated) = push_collation(
                 children[0].clone(),
@@ -1140,7 +1171,6 @@ impl Binder<'_> {
                 CollationType::AllCollations,
             )?;
             if collated {
-                let option = |text: &str| BoundExpr::constant(Value::varchar(text));
                 if children.len() < 2 {
                     children.push(option("ASC"));
                 }
@@ -2477,6 +2507,13 @@ impl Binder<'_> {
                 .iter()
                 .position(|(a, _)| a.eq_ignore_ascii_case(name))
         {
+            // (the aggregates of this query that a subquery reads are no aliases of the query)
+            if self.binding_correlated && !name.starts_with("__outer_aggregate") {
+                return Err(binder_error(format!(
+                    "Having clause cannot reference alias {} in correlated subquery",
+                    sql_quoted_identifier(name)
+                )));
+            }
             let (alias, aliased) = self.alias_fallback.remove(position);
             let bound = self.bind_expression(&aliased);
             self.alias_fallback.insert(position, (alias, aliased));
@@ -2486,6 +2523,12 @@ impl Binder<'_> {
         if !state.force_aggregates {
             return Err(binder_error(format!(
                 "column {} must appear in the GROUP BY clause or be used in an aggregate function",
+                sql_quoted_identifier(&column)
+            )));
+        }
+        if self.binding_correlated {
+            return Err(binder_error(format!(
+                "Having clause cannot reference column {} in correlated subquery and group by all",
                 sql_quoted_identifier(&column)
             )));
         }
@@ -2671,13 +2714,20 @@ impl Binder<'_> {
                 order_by.clear();
             }
         }
-        if function.distinct
-            && !order_by.iter().all(|(order, _)| {
-                children
-                    .iter()
-                    .any(|child| format!("{:?}", child.kind) == format!("{:?}", order.kind))
-            })
-        {
+        // `BaseSelectBinder::IsFunctionallyDependent`: the ORDER BY of a DISTINCT aggregate is
+        // made of its arguments and constants
+        fn functionally_dependent(expr: &BoundExpr, arguments: &[String]) -> bool {
+            if expr.is_volatile() {
+                return false;
+            }
+            if expr.is_foldable() || arguments.contains(&format!("{:?}", expr.kind)) {
+                return true;
+            }
+            let children = expr.children();
+            !children.is_empty() && children.into_iter().all(|child| functionally_dependent(child, arguments))
+        }
+        let arguments: Vec<String> = children.iter().map(|child| format!("{:?}", child.kind)).collect();
+        if function.distinct && !order_by.iter().all(|(order, _)| functionally_dependent(order, &arguments)) {
             return Err(binder_error(
                 "In a DISTINCT aggregate, ORDER BY expressions must appear in the argument list",
             ));
@@ -2716,6 +2766,32 @@ impl Binder<'_> {
                 children.insert(1, collated);
             }
         }
+        // `ArgMinMaxBase::Bind` and `ArgMinMaxNBind`: the rows compare by the collated key
+        else if matches!(
+            set.name.as_str(),
+            "arg_min"
+                | "argmin"
+                | "min_by"
+                | "arg_max"
+                | "argmax"
+                | "max_by"
+                | "arg_min_null"
+                | "arg_max_null"
+                | "arg_min_nulls_last"
+                | "arg_max_nulls_last"
+        ) && children.len() >= 2
+            && !function.export_state
+        {
+            let key = children[1].clone();
+            let ty = key.return_type.clone();
+            children[1] = crate::planner::collation::push_collation(
+                key,
+                &ty,
+                &self.default_collation(),
+                crate::planner::collation::CollationType::AllCollations,
+            )?
+            .0;
+        }
         // `FunctionBinder::BindAggregateFunction`: a DISTINCT count counts collated values
         let children = if function.distinct && set.name == "count" {
             children
@@ -2748,6 +2824,17 @@ impl Binder<'_> {
         }
         // the keys as written, which an exported ordered state buffers
         let written_order: Vec<(BoundExpr, duckrs_common::sort_key::OrderModifiers)> = order_by.clone();
+        if aggregate.distinct {
+            let arguments: Vec<String> = aggregate.children.iter().map(|c| format!("{c:?}")).collect();
+            let mut seen: Vec<String> = Vec::new();
+            for (at, (expr, _)) in written_order.iter().enumerate() {
+                let text = format!("{expr:?}");
+                if !arguments.contains(&text) && !seen.contains(&text) {
+                    seen.push(text);
+                    aggregate.distinct_order.push(at);
+                }
+            }
+        }
         // `BindAggregate`: the rows are ordered as the collation of their sort keys says
         aggregate.order_by = order_by
             .into_iter()
@@ -2861,13 +2948,14 @@ impl Binder<'_> {
         state.inside_aggregate = false;
         // equal aggregates are computed once
         let key = format!(
-            "{:?}{:?}{:?}{}{:?}{:?}",
+            "{:?}{:?}{:?}{}{:?}{:?}{:?}",
             aggregate.function,
             aggregate.children,
             aggregate.filter,
             aggregate.distinct,
             aggregate.order_by,
-            aggregate.distinct_key
+            aggregate.distinct_key,
+            aggregate.distinct_order
         );
         let index = match state.aggregate_keys.iter().position(|k| *k == key) {
             Some(index) => index,

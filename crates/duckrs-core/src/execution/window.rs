@@ -43,6 +43,92 @@ impl PhysicalWindow {
     }
 }
 
+/// `PhysicalPlanGenerator::CreatePlan(LogicalWindow &)`: the windows that share their partitions
+/// and whose orders are prefixes of one another are computed together; each such group is a
+/// window operator on top of the one before, and a projection puts the results back in place.
+/// The rows leave in the order of the last group, ties in the order the group below left them.
+pub fn plan(
+    types: Vec<LogicalType>,
+    windows: Vec<BoundWindow>,
+    mut children: Vec<Box<dyn PhysicalOperator>>,
+) -> Box<dyn PhysicalOperator> {
+    let input_width = types.len() - windows.len();
+    let text = |expr: &BoundExpr| format!("{expr:?}");
+    let partitions_equivalent = |a: &BoundWindow, b: &BoundWindow| {
+        a.partitions.len() == b.partitions.len() && {
+            let others: Vec<String> = b.partitions.iter().map(text).collect();
+            a.partitions.iter().all(|p| others.contains(&text(p)))
+        }
+    };
+    let shared_orders = |a: &BoundWindow, b: &BoundWindow| {
+        a.orders
+            .iter()
+            .zip(&b.orders)
+            .take_while(|((x, xm), (y, ym))| xm == ym && text(x) == text(y))
+            .count()
+    };
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut remaining: Vec<usize> = (0..windows.len()).collect();
+    while !remaining.is_empty() {
+        let mut over = remaining[0];
+        let mut matching = Vec::new();
+        let mut unprocessed = Vec::new();
+        for &at in &remaining {
+            if at == over && matching.is_empty() {
+                matching.push(at);
+                continue;
+            }
+            let (over_window, window) = (&windows[over], &windows[at]);
+            if !partitions_equivalent(over_window, window) {
+                unprocessed.push(at);
+                continue;
+            }
+            let prefix = shared_orders(over_window, window);
+            if prefix != over_window.orders.len().min(window.orders.len()) {
+                unprocessed.push(at);
+                continue;
+            }
+            matching.push(at);
+            if prefix < window.orders.len() {
+                over = at;
+            }
+        }
+        remaining = unprocessed;
+        groups.push(matching);
+    }
+    if groups.len() == 1 {
+        return Box::new(PhysicalWindow::new(types, windows, children));
+    }
+    let mut slots: Vec<Option<BoundWindow>> = windows.into_iter().map(Some).collect();
+    let mut layer_types = types[..input_width].to_vec();
+    let mut position = vec![0; slots.len()];
+    let mut plan: Option<Box<dyn PhysicalOperator>> = None;
+    for group in groups {
+        let mut group_windows = Vec::with_capacity(group.len());
+        for at in group {
+            position[at] = layer_types.len();
+            layer_types.push(types[input_width + at].clone());
+            group_windows.push(slots[at].take().expect("each window is in one group"));
+        }
+        let below = match plan.take() {
+            Some(op) => vec![op],
+            None => std::mem::take(&mut children),
+        };
+        plan = Some(Box::new(PhysicalWindow::new(layer_types.clone(), group_windows, below)));
+    }
+    let expressions = (0..types.len())
+        .map(|column| {
+            let source = if column < input_width { column } else { position[column - input_width] };
+            BoundExpr::new(crate::planner::expression::BoundExprKind::Reference(source), types[column].clone())
+        })
+        .collect();
+    Box::new(super::physical::PhysicalProjection {
+        types,
+        expressions,
+        children: vec![plan.expect("at least one group")],
+    })
+}
+
 impl PhysicalOperator for PhysicalWindow {
     fn name(&self) -> &'static str {
         "WINDOW"
@@ -70,8 +156,15 @@ impl PhysicalOperator for PhysicalWindow {
         // windows over the same partitions and orders share their sort
         let mut sorts: HashMap<String, Arc<Sorted>> = HashMap::new();
         let mut results = Vec::with_capacity(self.windows.len());
+        // `PhysicalWindow::order_idx`: the rows leave in the order of the window with the most orders
+        let mut most_orders = 0;
+        for (at, window) in self.windows.iter().enumerate() {
+            if window.orders.len() > self.windows[most_orders].orders.len() {
+                most_orders = at;
+            }
+        }
         let mut first_order = None;
-        for window in &self.windows {
+        for (at, window) in self.windows.iter().enumerate() {
             let key = format!("{:?}{:?}", window.partitions, window.orders);
             let sorted = match sorts.get(&key) {
                 Some(sorted) => sorted.clone(),
@@ -87,9 +180,10 @@ impl PhysicalOperator for PhysicalWindow {
                 by_row[sorted.rows[position]] = value;
             }
             results.push(by_row);
-            first_order.get_or_insert_with(|| sorted.clone());
+            if at == most_orders {
+                first_order = Some(sorted.clone());
+            }
         }
-        // the rows leave in the order of the first window, as they do in C++
         let first_order = first_order.expect("a window operator has windows");
         let mut output = self.output.lock();
         for rows in first_order.rows.chunks(STANDARD_VECTOR_SIZE) {

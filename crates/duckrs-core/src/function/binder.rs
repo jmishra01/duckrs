@@ -157,6 +157,10 @@ pub fn bind_scalar_function(
             | "__internal_barrier"
             | "vector_type"
             | "regexp_extract"
+            | "parse_filename"
+            | "parse_path"
+            | "parse_dirname"
+            | "parse_dirpath"
     );
     if special_nulls {
         let function = match function.resolve_types {
@@ -599,6 +603,7 @@ pub fn bind_aggregate_function(
         distinct,
         order_by: Vec::new(),
         distinct_key: None,
+        distinct_order: Vec::new(),
     })
 }
 

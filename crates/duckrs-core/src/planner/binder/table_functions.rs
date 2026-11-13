@@ -163,7 +163,16 @@ impl Binder<'_> {
         let name = call.name.name.to_lowercase();
         let args: Vec<FunctionArgument> = call.args.iter().map(named_argument).collect();
         let sql = match name.as_str() {
-            "unnest" => format!("SELECT {function} AS unnest"),
+            "unnest" => {
+                // `UnnestBind`: a NULL is no list (its type is not one)
+                let null = |e: &Expr| {
+                    matches!(&e.kind, duckrs_parser::ast::ExprKind::Constant(literal) if literal.kind == duckrs_parser::ast::LiteralKind::Null)
+                };
+                if call.args.len() != 1 || null(&call.args[0].expr) {
+                    return Err(binder_error("UNNEST requires a single list or array as input"));
+                }
+                format!("SELECT {function} AS unnest")
+            }
             // `SummaryTableFunction`: a row's values as text, then the row
             "summary" => {
                 let [input] = args.as_slice() else {
