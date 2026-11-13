@@ -698,6 +698,10 @@ fn range_list(args: &DataChunk, result: &mut Vector, generate_series: bool) -> R
     let ty = result.logical_type().clone();
     strict_rows(args, result, |row| {
         let values: Vec<i128> = row.iter().filter_map(Value::as_i128).collect();
+        // `ListLength`: a step of 0 is no values (the table function refuses it)
+        if values.get(2) == Some(&0) {
+            return Value::new(ty.clone(), ValueData::List(Vec::new()));
+        }
         let (start, count, increment) = range_parameters(&values, generate_series)?;
         if count >= 1 << 32 {
             return Err(Error::new(

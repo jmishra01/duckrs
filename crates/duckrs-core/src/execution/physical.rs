@@ -1719,7 +1719,7 @@ impl PhysicalLateralJoin {
                 joined.extend(chunk.columns().iter().cloned());
                 let mut joined = DataChunk::from_columns(joined, chunk.len());
                 if let Some(predicate) = &self.predicate {
-                    let (selection, selected) = select(predicate, &joined)?;
+                    let (selection, selected) = super::expression_executor::as_join_condition(|| select(predicate, &joined))?;
                     if selected != joined.len() {
                         joined.slice(&selection, selected);
                     }

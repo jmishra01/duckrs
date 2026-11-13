@@ -41,6 +41,10 @@ pub enum Holistic {
     /// `TimeTZAverageOperation`: the average instant, at +00.
     AvgTimeTz,
     Entropy,
+    /// `decimal_average`: the average at the input's scale, rounded half to even
+    DecimalAverage,
+    /// `variant_group_object(key, value)`: a VARIANT object of the rows
+    VariantGroupObject,
     ArgMin,
     ArgMax,
     /// `arg_min_null`: the row of the extreme, whether its value is NULL or not
@@ -54,6 +58,9 @@ pub enum Holistic {
     MaxN,
     ArgMinN,
     ArgMaxN,
+    /// `arg_min_nulls_last(x, by, n)`: the rows of NULL keys after all others
+    ArgMinNullsLastN,
+    ArgMaxNullsLastN,
     ApproxTopK,
     BitstringAgg,
     /// `combine_aggr`: a state of the states of its rows
@@ -159,11 +166,13 @@ impl Holistic {
             }
             (
                 Mode | BitAnd | BitOr | BitXor | ArgMin | ArgMax | ArgMinNull | ArgMaxNull | ArgMinNullsLast
-                | ArgMaxNullsLast | AvgTimestamp | AvgTimeTz,
+                | ArgMaxNullsLast | AvgTimestamp | AvgTimeTz | DecimalAverage,
                 Some(ty),
             ) => ty.clone(),
             (CombineAggr, Some(ty)) => ty.clone(),
-            (MinN | MaxN | ArgMinN | ArgMaxN | ApproxTopK, Some(ty)) => LogicalType::list(ty.clone()),
+            (MinN | MaxN | ArgMinN | ArgMaxN | ArgMinNullsLastN | ArgMaxNullsLastN | ApproxTopK, Some(ty)) => {
+                LogicalType::list(ty.clone())
+            }
             _ => declared.clone(),
         }
     }
@@ -714,6 +723,33 @@ fn extremes(rows: &[Value], ty: &LogicalType, greatest: bool, value: usize, key:
         .take(n)
         .map(|at| fields(chosen[at])[value].clone())
         .collect();
+    Value::new(ty.clone(), ValueData::List(items))
+}
+
+/// `arg_min_nulls_last(x, by, n)` and `arg_max_nulls_last`: the n rows of the least (or greatest)
+/// keys, those with a NULL key last.
+fn extremes_nulls_last(rows: &[Value], ty: &LogicalType, greatest: bool) -> Result<Value> {
+    let Some(first) = rows.first() else {
+        return Ok(Value::null(ty.clone()));
+    };
+    let n = positive_n(&fields(first)[2], "arg_min/arg_max")?;
+    let (valued, nulls): (Vec<&Value>, Vec<&Value>) = rows.iter().partition(|row| !fields(row)[1].is_null());
+    let mut ordered: Vec<&Value> = Vec::with_capacity(rows.len());
+    if let Some(head) = valued.first() {
+        let by: Vec<Value> = valued.iter().map(|row| fields(row)[1].clone()).collect();
+        let keys = sort_keys(&by, fields(head)[1].logical_type())?;
+        let mut order: Vec<usize> = (0..keys.len()).collect();
+        order.sort_by(|a, b| {
+            if greatest {
+                keys[*b].cmp(&keys[*a])
+            } else {
+                keys[*a].cmp(&keys[*b])
+            }
+        });
+        ordered.extend(order.into_iter().map(|at| valued[at]));
+    }
+    ordered.extend(nulls);
+    let items = ordered.into_iter().take(n).map(|row| fields(row)[0].clone()).collect();
     Value::new(ty.clone(), ValueData::List(items))
 }
 
@@ -1269,6 +1305,65 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
             let total = keys.len() as f64;
             Value::double(counts.values().map(|c| -(c / total) * (c / total).log2()).sum())
         }
+        DecimalAverage => {
+            // `DecimalAvgOperation`: an i128 sum and a count, then round half to even
+            let mut sum: i128 = 0;
+            let mut count: u128 = 0;
+            for row in rows.iter().filter(|v| !v.is_null()) {
+                let value = row.as_i128().unwrap_or(0);
+                sum = sum.checked_add(value).ok_or_else(|| {
+                    out_of_range("decimal_average: intermediate sum overflowed HUGEINT range")
+                })?;
+                count += 1;
+            }
+            if count == 0 {
+                return Ok(null());
+            }
+            let negative = sum < 0;
+            let magnitude = sum.unsigned_abs();
+            let (mut quotient, remainder) = (magnitude / count, magnitude % count);
+            let distance = count - remainder;
+            if distance < remainder || (distance == remainder && quotient % 2 == 1) {
+                quotient += 1;
+            }
+            let signed = if negative {
+                (quotient as i128).wrapping_neg()
+            } else {
+                quotient as i128
+            };
+            let (width, scale) = ty.decimal_properties().unwrap_or((38, 0));
+            Value::decimal(signed, width, scale)?
+        }
+        VariantGroupObject => {
+            use duckrs_common::variant::VariantNode;
+            if rows.is_empty() {
+                return Ok(null());
+            }
+            let mut children: Vec<(String, VariantNode)> = Vec::with_capacity(rows.len());
+            for row in rows {
+                let values = fields(row);
+                if values[0].is_null() {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        "variant_group_object key cannot be NULL",
+                    ));
+                }
+                let key = values[0].try_to_string()?;
+                let value = match values[1].data() {
+                    ValueData::Bytes(bytes) if !values[1].is_null() => VariantNode::decode(bytes)?,
+                    _ => VariantNode::Null,
+                };
+                children.push((key, value));
+            }
+            children.sort_by(|a, b| a.0.cmp(&b.0));
+            if let Some(pair) = children.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("variant_group_object contains duplicate key \"{}\"", pair[0].0),
+                ));
+            }
+            Value::new(ty.clone(), ValueData::Bytes(VariantNode::Object(children).encode()))?
+        }
         ArgMin => arg_extreme(rows, ty, false)?,
         ArgMax => arg_extreme(rows, ty, true)?,
         ArgMinNull => arg_extreme_nulls(rows, ty, false, false)?,
@@ -1279,6 +1374,8 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
         MaxN => extremes(rows, ty, true, 0, 0, 1)?,
         ArgMinN => extremes(rows, ty, false, 0, 1, 2)?,
         ArgMaxN => extremes(rows, ty, true, 0, 1, 2)?,
+        ArgMinNullsLastN => extremes_nulls_last(rows, ty, false)?,
+        ArgMaxNullsLastN => extremes_nulls_last(rows, ty, true)?,
         ApproxTopK => top_k(rows, ty)?,
         BitstringAgg => bitstring(rows, ty)?,
         CombineAggr => {

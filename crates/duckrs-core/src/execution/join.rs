@@ -819,7 +819,7 @@ impl PhysicalJoin {
             let mut pairs = DataChunk::from_columns(columns, count);
             let matches = match &self.predicate {
                 Some(predicate) if self.join_type == JoinType::Mark => {
-                    let result = execute(predicate, &pairs)?;
+                    let result = super::expression_executor::as_join_condition(|| execute(predicate, &pairs))?;
                     let mut selected = Vec::new();
                     for (row, left) in left.iter().enumerate() {
                         match result.get_value(row).data() {
@@ -832,7 +832,7 @@ impl PhysicalJoin {
                     Some((SelectionVector::from_vec(selected), matched))
                 }
                 Some(predicate) => {
-                    let (sel, matched) = select(predicate, &pairs)?;
+                    let (sel, matched) = super::expression_executor::as_join_condition(|| select(predicate, &pairs))?;
                     (matched != count).then_some((sel, matched))
                 }
                 None => None,

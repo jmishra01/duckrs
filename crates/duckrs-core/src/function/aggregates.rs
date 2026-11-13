@@ -143,6 +143,8 @@ pub(super) fn aggregate_functions() -> Vec<AggregateFunctionSet> {
         for ty in [
             LogicalType::TIMESTAMP,
             LogicalType::new(LogicalTypeId::TimestampTz),
+            LogicalType::new(LogicalTypeId::TimestampNs),
+            LogicalType::new(LogicalTypeId::TimestampTzNs),
             LogicalType::TIME,
         ] {
             overloads.push((
@@ -173,6 +175,22 @@ pub(super) fn aggregate_functions() -> Vec<AggregateFunctionSet> {
         AggregateFunctionSet::new("avg", avg()),
         AggregateFunctionSet::new("mean", avg()),
         AggregateFunctionSet::new("sum_no_overflow", sum()),
+        AggregateFunctionSet::new(
+            "variant_group_object",
+            vec![(
+                vec![LogicalType::VARCHAR, LogicalType::new(LogicalTypeId::Variant)],
+                LogicalType::new(LogicalTypeId::Variant),
+                AggregateKind::Holistic(super::holistic::Holistic::VariantGroupObject),
+            )],
+        ),
+        AggregateFunctionSet::new(
+            "decimal_average",
+            vec![(
+                vec![decimal()],
+                decimal(),
+                AggregateKind::Holistic(super::holistic::Holistic::DecimalAverage),
+            )],
+        ),
         AggregateFunctionSet::new("min", with_count(unary(Min), super::holistic::Holistic::MinN)),
         AggregateFunctionSet::new("max", with_count(unary(Max), super::holistic::Holistic::MaxN)),
         AggregateFunctionSet::new("list", unary(List)),
@@ -280,11 +298,17 @@ fn holistic_functions() -> Vec<AggregateFunctionSet> {
         of(&["arg_max_null"], vec![(vec![any(), any()], any(), kind(ArgMaxNull))]),
         of(
             &["arg_min_nulls_last"],
-            vec![(vec![any(), any()], any(), kind(ArgMinNullsLast))],
+            vec![
+                (vec![any(), any()], any(), kind(ArgMinNullsLast)),
+                (vec![any(), any(), any()], any(), kind(ArgMinNullsLastN)),
+            ],
         ),
         of(
             &["arg_max_nulls_last"],
-            vec![(vec![any(), any()], any(), kind(ArgMaxNullsLast))],
+            vec![
+                (vec![any(), any()], any(), kind(ArgMaxNullsLast)),
+                (vec![any(), any(), any()], any(), kind(ArgMaxNullsLastN)),
+            ],
         ),
         of(
             &["combine_aggr"],

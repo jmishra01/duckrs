@@ -60,25 +60,48 @@ fn window_function(name: &str) -> Option<WindowFunction> {
 }
 
 impl Binder<'_> {
-    /// `UnfoldWindowMacroExpression`: a macro of the JSON functions used as a window function is its
-    /// body, with the window on the one aggregate in it.
-    fn window_macro(window: &WindowExpr) -> Result<Option<duckrs_parser::ast::Expr>> {
-        use duckrs_parser::ast::ExprKind;
-        if !window.name.qualification.is_empty() {
-            return Ok(None);
-        }
+    /// The body of the macro a window function names, with its arguments in place: a macro of
+    /// the JSON functions, or a scalar macro of the catalog.
+    fn window_macro_body(&mut self, window: &WindowExpr) -> Result<Option<duckrs_parser::ast::Expr>> {
         let args: Vec<String> = window.args.iter().map(|a| format!("({})", a.expr)).collect();
-        let Some(text) = crate::function::json::macro_text(&window.name.name, &args) else {
+        if window.name.qualification.is_empty()
+            && let Some(text) = crate::function::json::macro_text(&window.name.name, &args)
+        {
+            let select = super::table_functions::parse_select(&format!("SELECT {text}"), "Expected an expression")?;
+            let duckrs_parser::ast::QueryNodeKind::Select(node) = &select.node.kind else {
+                return Ok(None);
+            };
+            return Ok(node.select_list.first().cloned());
+        }
+        let entry = match self.find_macro(&window.name, false)? {
+            Some(entry) => Some(entry),
+            None if window.name.qualification.is_empty() => {
+                crate::catalog::defaults::default_macro(None, &window.name.name, false)
+            }
+            None => None,
+        };
+        let Some(entry) = entry.filter(|entry| !entry.table_macro) else {
             return Ok(None);
         };
-        let select = super::table_functions::parse_select(&format!("SELECT {text}"), "Expected an expression")?;
-        let duckrs_parser::ast::QueryNodeKind::Select(node) = &select.node.kind else {
+        let mut call = duckrs_parser::ast::FunctionExpr::new(window.name.name.clone(), Vec::new());
+        call.name = window.name.clone();
+        call.args = window.args.clone();
+        let (function, arguments) = self.bind_macro_function(&entry, &call)?;
+        let duckrs_parser::ast::MacroBody::Scalar(body) = &function.body else {
             return Ok(None);
         };
-        let Some(body) = node.select_list.first() else {
+        let mut body = (**body).clone();
+        super::macros::replace_in_expr(&mut body, &super::macros::parameter_names(function), &arguments);
+        Ok(Some(body))
+    }
+
+    /// `UnfoldWindowMacroExpression`: a macro used as a window function is its body, with the
+    /// window on the one aggregate in it.
+    fn window_macro(&mut self, window: &WindowExpr) -> Result<Option<duckrs_parser::ast::Expr>> {
+        use duckrs_parser::ast::ExprKind;
+        let Some(mut body) = self.window_macro_body(window)? else {
             return Ok(None);
         };
-        let mut body = body.clone();
         let is_aggregate = |e: &duckrs_parser::ast::Expr| matches!(&e.kind, ExprKind::Function(f) if BuiltinFunctions::get().aggregate(&f.name.name).is_some());
         let mut count = 0;
         duckrs_parser::transformer::visit_expr_mut(&mut body, &mut |e| count += usize::from(is_aggregate(e)));
@@ -121,7 +144,7 @@ impl Binder<'_> {
         if self.windows.is_none() {
             return Err(binder_error(self.window_error));
         }
-        if let Some(body) = Self::window_macro(window)? {
+        if let Some(body) = self.window_macro(window)? {
             return self.bind_expression(&body);
         }
         if self.aggregates.as_ref().is_some_and(|state| state.inside_aggregate) {

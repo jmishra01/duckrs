@@ -123,7 +123,7 @@ impl PhysicalAsOfJoin {
         let mut row = left.to_vec();
         row.extend_from_slice(right);
         chunk.append_row(&row)?;
-        let result = execute(predicate, &chunk)?;
+        let result = super::expression_executor::as_join_condition(|| execute(predicate, &chunk))?;
         Ok(matches!(result.get_value(0).data(), ValueData::Bool(true)))
     }
 }
@@ -320,7 +320,7 @@ impl PhysicalMarkJoin {
             let mut columns = left.columns().to_vec();
             columns.extend_from_slice(chunk.columns());
             let pairs = DataChunk::from_columns(columns, count);
-            let result = execute(predicate, &pairs)?;
+            let result = super::expression_executor::as_join_condition(|| execute(predicate, &pairs))?;
             for i in 0..count {
                 match result.get_value(i).data() {
                     ValueData::Bool(true) => return Ok(Value::boolean(true)),

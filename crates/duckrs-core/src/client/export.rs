@@ -162,7 +162,8 @@ fn lossless_type(ty: &duckrs_common::types::LogicalType) -> Option<duckrs_common
                 LogicalType::map(replace(&fields[0].1), replace(&fields[1].1))
             }
             T::Struct => LogicalType::struct_type(children(ty)),
-            T::Union => LogicalType::union_type(children(ty)),
+            // past the tag, the members
+            T::Union => LogicalType::union_type(children(ty).split_off(1)),
             _ => ty.clone(),
         }
     }

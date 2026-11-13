@@ -63,7 +63,8 @@ const STRING_FUNCTIONS: [&str; 22] = [
     "path_join",
 ];
 
-const OTHER_FUNCTIONS: [&str; 55] = [
+const OTHER_FUNCTIONS: [&str; 56] = [
+    "decimal_division",
     "create_sort_key",
     "finalize",
     "combine",
@@ -1809,6 +1810,7 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
         }
         "normalized_interval" => simple(1, 1, LogicalType::INTERVAL, normalized_interval, children),
         "create_sort_key" => bind_create_sort_key(children),
+        "decimal_division" => bind_decimal_division(children),
         "timetz_byte_comparable" => simple(1, 1, LogicalType::UBIGINT, timetz_byte_comparable, children),
         // their argument is a UUID
         "uuid_extract_version" | "uuid_extract_timestamp" => {
@@ -2266,4 +2268,145 @@ fn create_sort_key(args: &DataChunk, result: &mut Vector) -> Result<()> {
         result.set_value(row, &value)?;
     }
     Ok(())
+}
+
+
+// Ported from duckdb/src/function/scalar/operator/decimal_division.cpp
+
+/// `LogicalType::GetDecimalProperties`: a DECIMAL's width and scale, an integer's as `DECIMAL(p, 0)`.
+fn decimal_properties_of(ty: &LogicalType) -> Option<(u8, u8)> {
+    use LogicalTypeId as Id;
+    Some(match ty.id() {
+        Id::Decimal => ty.decimal_properties()?,
+        Id::Boolean => (1, 0),
+        Id::TinyInt | Id::UTinyInt => (3, 0),
+        Id::SmallInt | Id::USmallInt => (5, 0),
+        Id::Integer | Id::UInteger => (10, 0),
+        Id::BigInt => (19, 0),
+        Id::UBigInt => (20, 0),
+        Id::HugeInt | Id::UHugeInt => (38, 0),
+        _ => return None,
+    })
+}
+
+/// `DecimalDivisionResolveTypes`: `e1 / e2` as SQL Server types it, or at a given scale.
+fn bind_decimal_division(children: Vec<BoundExpr>) -> Result<BoundExpr> {
+    count_args("decimal_division", &children, 2, 3)?;
+    let mut children = children;
+    let mut properties = Vec::new();
+    for child in children.iter_mut().take(2) {
+        let ty = match child.return_type.id() {
+            LogicalTypeId::StringLiteral | LogicalTypeId::Varchar => LogicalType::decimal(18, 3),
+            _ => child.return_type.clone(),
+        };
+        let Some((width, scale)) = decimal_properties_of(&ty) else {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "decimal_division: both arguments must be DECIMAL",
+            ));
+        };
+        *child = child.clone().cast_to(&LogicalType::decimal(width, scale), false);
+        properties.push((u32::from(width), u32::from(scale)));
+    }
+    let ((p1, s1), (p2, s2)) = (properties[0], properties[1]);
+    let result_scale = match children.get(2) {
+        Some(scale) => {
+            if !scale.is_foldable() {
+                return Err(Error::new(
+                    ErrorKind::Binder,
+                    "Argument #3 in function decimal_division must be a constant expression",
+                ));
+            }
+            let value = crate::execution::expression_executor::evaluate_scalar(scale)?;
+            if value.is_null() {
+                return Err(Error::new(
+                    ErrorKind::Binder,
+                    "Argument #3 in function decimal_division must not be NULL",
+                ));
+            }
+            let scale = value.as_i128().unwrap_or(-1);
+            if !(0..=38).contains(&scale) {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("decimal_division: scale must be between 0 and 38, got {scale}"),
+                ));
+            }
+            scale as u32
+        }
+        None => 6.max(s1 + p2 + 1),
+    };
+    children.truncate(2);
+    let width = i64::from(p1) - i64::from(s1) + i64::from(s2) + i64::from(result_scale);
+    if width < 1 {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("decimal_division: scale {result_scale} produces a zero-width result for these input types"),
+        ));
+    }
+    let inaccurate = |what: &str, needed: i64| {
+        Error::new(
+            ErrorKind::OutOfRange,
+            format!(
+                "Needed {what} {needed} to accurately represent the division result, but this is out of range of \
+                 the DECIMAL type. Max {what} is 38; could not perform an accurate division. Either add a cast to \
+                 DOUBLE, or add an explicit cast to a decimal with a lower scale."
+            ),
+        )
+    };
+    if result_scale > 38 {
+        return Err(inaccurate("scale", i64::from(result_scale)));
+    }
+    if width > 38 {
+        return Err(inaccurate("width", width));
+    }
+    let ty = LogicalType::decimal(width as u8, result_scale as u8);
+    Ok(bound_function("decimal_division", children, ty, decimal_division))
+}
+
+/// `DecimalDivExecute`: the quotient at the result's scale, rounded half to even.
+fn decimal_division(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let ty = result.logical_type().clone();
+    let (width, scale) = ty.decimal_properties().expect("a DECIMAL");
+    row_wise(args, result, |row| {
+        if row.iter().any(Value::is_null) {
+            return Ok(Value::null(ty.clone()));
+        }
+        let scale_of = |value: &Value| value.logical_type().decimal_properties().map_or(0, |(_, s)| i32::from(s));
+        let exponent = scale_of(&row[1]) + i32::from(scale) - scale_of(&row[0]);
+        let (a, b) = (row[0].as_i128().unwrap_or(0), row[1].as_i128().unwrap_or(0));
+        if b == 0 {
+            return Err(invalid("decimal_division: division by zero"));
+        }
+        let factor = 10i128.pow(exponent.unsigned_abs());
+        let overflow = || Error::new(ErrorKind::OutOfRange, "Overflow in HUGEINT multiplication");
+        let (numerator, divisor) = if exponent < 0 {
+            let divisor = b.checked_mul(factor).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::OutOfRange,
+                    "decimal_division: scaled divisor overflowed DECIMAL range",
+                )
+            })?;
+            (a, divisor)
+        } else {
+            (a.checked_mul(factor).ok_or_else(overflow)?, b)
+        };
+        let negative = (numerator < 0) != (divisor < 0);
+        let (n, d) = (numerator.unsigned_abs(), divisor.unsigned_abs());
+        let (mut q, remainder) = (n / d, n % d);
+        let distance = d - remainder;
+        if remainder > distance || (remainder == distance && q % 2 == 1) {
+            q += 1;
+        }
+        let out_of_range = || {
+            Error::new(
+                ErrorKind::OutOfRange,
+                "decimal_division: result out of range for result type",
+            )
+        };
+        if q >= 10u128.pow(u32::from(width)) {
+            return Err(out_of_range());
+        }
+        let q = i128::try_from(q).map_err(|_| out_of_range())?;
+        Value::decimal(if negative { -q } else { q }, width, scale)
+    })
 }

@@ -173,6 +173,9 @@ fn compare_nested(left: &Vector, right: &Vector, result: &mut Vector, count: usi
         order: OrderType::Ascending,
         nulls: NullOrder::NullsLast,
     };
+    if !null_aware && left.logical_type().id() == LogicalTypeId::Union && !JOIN_CONDITION.with(|c| c.get()) {
+        return compare_unions(left, right, result, count, op);
+    }
     let left_keys = create_sort_keys(&[(left, modifiers)], count)?;
     let right_keys = create_sort_keys(&[(right, modifiers)], count)?;
     let (lu, ru) = (left.to_unified(count), right.to_unified(count));
@@ -187,6 +190,66 @@ fn compare_nested(left: &Vector, right: &Vector, result: &mut Vector, count: usi
             continue;
         }
         result.data_mut::<bool>()[i] = op.evaluate(lnull, rnull, || left_keys[i].cmp(&right_keys[i]));
+    }
+    Ok(())
+}
+
+thread_local! {
+    /// Whether a join's condition is being evaluated: joins match UNIONs as the row matcher does,
+    /// by the whole value, not with `UnionComparator`'s NULL members.
+    static JOIN_CONDITION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` as the evaluation of a join condition.
+pub fn as_join_condition<T>(f: impl FnOnce() -> T) -> T {
+    let before = JOIN_CONDITION.with(|c| c.replace(true));
+    let result = f();
+    JOIN_CONDITION.with(|c| c.set(before));
+    result
+}
+
+/// `UnionComparator` of an SQL comparison: different tags compare as the tags, and the same tag
+/// as that member, which is NULL when the member is.
+fn compare_unions(left: &Vector, right: &Vector, result: &mut Vector, count: usize, op: ComparisonType) -> Result<()> {
+    let modifiers = OrderModifiers {
+        order: OrderType::Ascending,
+        nulls: NullOrder::NullsLast,
+    };
+    let (mut left, mut right) = (left.clone(), right.clone());
+    left.flatten(count);
+    right.flatten(count);
+    let (lu, ru) = (left.to_unified(count), right.to_unified(count));
+    let (lchildren, rchildren) = (left.struct_children(), right.struct_children());
+    let (ltags, rtags) = (lchildren[0].to_unified(count), rchildren[0].to_unified(count));
+    // the sort keys of each member on either side, made when a row first needs them
+    type MemberKeys = Option<(Vec<Vec<u8>>, Vec<Vec<u8>>)>;
+    let mut member_keys: Vec<MemberKeys> = vec![None; lchildren.len()];
+    result.prepare_flat(count.max(1));
+    for i in 0..count {
+        if !lu.validity.is_valid(lu.sel.get(i)) || !ru.validity.is_valid(ru.sel.get(i)) {
+            result.set_null(i, true);
+            continue;
+        }
+        let ltag = ltags.data::<u8>()[ltags.sel.get(i)];
+        let rtag = rtags.data::<u8>()[rtags.sel.get(i)];
+        if ltag != rtag {
+            result.data_mut::<bool>()[i] = op.evaluate(false, false, || ltag.cmp(&rtag));
+            continue;
+        }
+        let member = usize::from(ltag) + 1;
+        let (lm, rm) = (lchildren[member].to_unified(count), rchildren[member].to_unified(count));
+        if !lm.validity.is_valid(lm.sel.get(i)) || !rm.validity.is_valid(rm.sel.get(i)) {
+            result.set_null(i, true);
+            continue;
+        }
+        if member_keys[member].is_none() {
+            member_keys[member] = Some((
+                create_sort_keys(&[(&lchildren[member], modifiers)], count)?,
+                create_sort_keys(&[(&rchildren[member], modifiers)], count)?,
+            ));
+        }
+        let (lk, rk) = member_keys[member].as_ref().expect("computed");
+        result.data_mut::<bool>()[i] = op.evaluate(false, false, || lk[i].cmp(&rk[i]));
     }
     Ok(())
 }

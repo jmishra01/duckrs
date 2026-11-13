@@ -1662,6 +1662,18 @@ impl Binder<'_> {
                         .iter()
                         .map(|a| self.bind_expression(&a.expr))
                         .collect::<Result<Vec<_>>>()?;
+                    // a parameter as the key: its value is only known when the statement runs
+                    // (`ParameterNotResolvedException`)
+                    let preparing = self.parameters.as_ref().is_some_and(|p| p.values.is_none());
+                    if preparing
+                        && function.name.name.eq_ignore_ascii_case("union_extract")
+                        && function
+                            .args
+                            .get(1)
+                            .is_some_and(|a| matches!(a.expr.kind, ExprKind::Parameter(_)))
+                    {
+                        return Ok(BoundExpr::constant(Value::sql_null()));
+                    }
                     return bind_nested_function(&function.name.name, names, children);
                 }
                 // `AliasFun`: the name of its argument

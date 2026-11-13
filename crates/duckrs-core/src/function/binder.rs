@@ -508,6 +508,17 @@ pub fn bind_aggregate_function(
         reservoir_quantile_parameters(&mut children)?;
     }
     check_constant_parameters(&set.name, &mut children)?;
+    // `GetAverageAggregate`'s stub of TIMESTAMP_S, TIMESTAMP_MS and DATE: averaged as a TIMESTAMP,
+    // which holds every value they have, rather than widened to TIMESTAMP_NS
+    if matches!(set.name.as_str(), "avg" | "mean")
+        && let [input] = children.as_mut_slice()
+        && matches!(
+            input.return_type.id(),
+            LogicalTypeId::TimestampSec | LogicalTypeId::TimestampMs | LogicalTypeId::Date
+        )
+    {
+        *input = input.clone().cast_to(&LogicalType::TIMESTAMP, false);
+    }
     if matches!(set.name.as_str(), "histogram" | "histogram_exact") && children.len() == 2 {
         children = histogram_bin_arguments(&set.name, children)?;
     }

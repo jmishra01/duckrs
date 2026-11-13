@@ -706,7 +706,9 @@ test/sql/aggregate/aggregates/approx_quantile_decimal_scalar.test
 test/sql/aggregate/aggregates/approx_quantile_ns_infinity.test
 test/sql/aggregate/aggregates/approx_quantile_parallel_finalize.test
 test/sql/aggregate/aggregates/approx_top_k.test
+test/sql/aggregate/aggregates/arg_min_max_nulls_last.test
 test/sql/aggregate/aggregates/avg_interval_large_count.test
+test/sql/aggregate/aggregates/avg_quantile_lower_precision_timestamps.test
 test/sql/aggregate/aggregates/binning.test
 test/sql/aggregate/aggregates/bitagg_fallible.test
 test/sql/aggregate/aggregates/bitagg_memory_limit.test
@@ -725,6 +727,7 @@ test/sql/aggregate/aggregates/quantile_infinite_timestamp.test
 test/sql/aggregate/aggregates/skewness_fallible.test
 test/sql/aggregate/aggregates/string_agg_fallible.test
 test/sql/aggregate/aggregates/string_agg_union.test
+test/sql/aggregate/aggregates/sum_avg_overflow_fallible.test
 test/sql/aggregate/aggregates/test_aggr_string.test
 test/sql/aggregate/aggregates/test_aggregate_types.test
 test/sql/aggregate/aggregates/test_aggregate_types_scalar.test
@@ -842,6 +845,7 @@ test/sql/aggregate/qualify/test_qualify_view.test
 test/sql/aggregate/qualify/test_qualify_view_no_view_dependencies.test
 test/sql/aggregate/sparse_clustered_aggregation.test
 test/sql/aggregate/tiled_aggregate_initialization.test
+test/sql/aggregate/variant/variant_group_object_fallible.test
 test/sql/alter/add_col/test_add_col.test
 test/sql/alter/add_col/test_add_col_chain.test
 test/sql/alter/add_col/test_add_col_constraints.test
@@ -2029,6 +2033,7 @@ test/sql/function/list/aggregates/var_stddev.test
 test/sql/function/list/array_length.test
 test/sql/function/list/array_to_string_comma_default.test
 test/sql/function/list/cardinality_list.test
+test/sql/function/list/generate_series.test
 test/sql/function/list/generate_series_timestamp.test
 test/sql/function/list/generate_subscripts.test
 test/sql/function/list/lambda_constant_null.test
@@ -2256,6 +2261,7 @@ test/sql/function/variant/variant_array_length.test
 test/sql/function/variant/variant_contains.test
 test/sql/function/variant/variant_exists.test
 test/sql/function/variant/variant_extract_try_cast.test
+test/sql/function/variant/variant_group_array.test
 test/sql/function/variant/variant_keys.test
 test/sql/function/variant/variant_normalize.test
 test/sql/function/variant/variant_shredded_extract_nested.test
@@ -3953,7 +3959,9 @@ test/sql/types/decimal/cast_to_decimal.test
 test/sql/types/decimal/decimal_aggregates.test
 test/sql/types/decimal/decimal_arithmetic.test
 test/sql/types/decimal/decimal_automatic_cast.test
+test/sql/types/decimal/decimal_average.test
 test/sql/types/decimal/decimal_decimal_overflow_cast.test
+test/sql/types/decimal/decimal_division.test
 test/sql/types/decimal/decimal_exception.test
 test/sql/types/decimal/decimal_exponent.test
 test/sql/types/decimal/decimal_overflow.test
@@ -4304,11 +4312,14 @@ test/sql/types/uhugeint/uhugeint_literal.test
 test/sql/types/uhugeint/uhugeint_multiply.test
 test/sql/types/uhugeint/uhugeint_subtract_overflow.test
 test/sql/types/uhugeint/uhugeint_try_cast.test
+test/sql/types/union/struct_to_union.test
 test/sql/types/union/struct_to_union_try_cast.test
 test/sql/types/union/union_aggregate.test
 test/sql/types/union/union_ambiguous.test
 test/sql/types/union/union_cast.test
 test/sql/types/union/union_common_type.test
+test/sql/types/union/union_compare.test
+test/sql/types/union/union_extract.test
 test/sql/types/union/union_join.test
 test/sql/types/union/union_limit_offset.test
 test/sql/types/union/union_limits.test
@@ -4318,6 +4329,7 @@ test/sql/types/union/union_sort.test
 test/sql/types/union/union_struct.test
 test/sql/types/union/union_tag.test
 test/sql/types/union/union_test.test
+test/sql/types/union/union_try_cast_member_failure.test
 test/sql/types/union/union_validity.test
 test/sql/types/union/union_value.test
 test/sql/types/unsigned/test_unsigned_arithmetic.test
@@ -4439,6 +4451,7 @@ test/sql/upsert/upsert_shorthand.test
 test/sql/upsert/upsert_transaction.test
 test/sql/upsert/upsert_unique_null.test
 test/sql/vacuum/vacuum_nested_types.test
+test/sql/variant/variant_comparator.test
 test/sql/variant/variant_nested_arrays.test
 test/sql/vector_types/list_vector_types.test
 test/sql/vector_types/vector_types_errors.test
@@ -4488,6 +4501,7 @@ test/sql/window/test_value_exclude.test
 test/sql/window/test_value_orderby.test
 test/sql/window/test_wide_orderby.test
 test/sql/window/test_window_agg_stats_propagation.test
+test/sql/window/test_window_aggregate_macro.test
 test/sql/window/test_window_binding.test
 test/sql/window/test_window_binding_ctes.test
 test/sql/window/test_window_bool.test

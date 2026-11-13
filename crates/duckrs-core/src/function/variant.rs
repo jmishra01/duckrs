@@ -306,6 +306,7 @@ pub fn is_variant_function(name: &str) -> bool {
             | "variant_type"
             | "variant_contains"
             | "variant_normalize"
+            | "variant_comparator"
             | "variant_array_length"
             | "variant_exists"
             | "variant_extract_string"
@@ -391,6 +392,12 @@ pub fn bind_variant_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
         )),
         ("variant_extract", Some(key)) => bind_extract(child, key),
         ("variant_normalize", None) => Ok(bound_function(&lower, vec![child], variant_type(), variant_normalize)),
+        ("variant_comparator", None) => Ok(bound_function(
+            &lower,
+            vec![child],
+            LogicalType::BLOB,
+            variant_comparator,
+        )),
         _ => Err(binder_error(format!(
             "{lower} expects either one VARIANT column argument, or a VARIANT column and a path"
         ))),
@@ -785,5 +792,15 @@ fn variant_normalize(args: &DataChunk, result: &mut Vector) -> Result<()> {
             }
         }
         Ok(variant_value(&node))
+    })
+}
+
+/// `VariantComparatorFunction`: a BLOB that orders as the VARIANT does.
+fn variant_comparator(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    row_wise(args, result, |row| match row[0].data() {
+        ValueData::Bytes(bytes) if !row[0].is_null() => Ok(Value::blob(
+            duckrs_common::sort_key::variant_comparator_key(bytes)?,
+        )),
+        _ => Ok(Value::null(LogicalType::BLOB)),
     })
 }

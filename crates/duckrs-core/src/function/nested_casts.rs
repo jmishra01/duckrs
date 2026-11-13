@@ -228,7 +228,7 @@ fn struct_matches_union(source: &LogicalType, target: &LogicalType) -> bool {
             .iter()
             .zip(&to[1..])
             .all(|((from_name, from_type), (to_name, to_type))| {
-                from_name == to_name && (from_type == to_type || *from_type == LogicalType::VARCHAR)
+                from_name.eq_ignore_ascii_case(to_name) && (from_type == to_type || *from_type == LogicalType::VARCHAR)
             })
 }
 
@@ -238,7 +238,14 @@ fn struct_to_union(fields: &[Value], target: &LogicalType, mode: CastMode) -> Re
     let casted = fields
         .iter()
         .zip(target.struct_children())
-        .map(|(field, (_, ty))| cast_value(field, ty, mode))
+        .map(|(field, (_, ty))| {
+            let value = cast_value(field, ty, mode)?;
+            // a VARCHAR is a JSON as it is: the value takes the member's type
+            if value.logical_type() != ty {
+                return Value::new(ty.clone(), value.data().clone());
+            }
+            Ok(value)
+        })
         .collect::<Result<Vec<_>>>()?;
     let Some(tag) = casted[0].as_i128() else {
         return Err(error("One or more rows in the produced UNION have a NULL tag"));
@@ -290,7 +297,8 @@ fn union_to_union(value: &Value, fields: &[Value], target: &LogicalType, mode: C
         return Some(Ok(Value::null(target.clone())));
     };
     let tag = tag as usize;
-    let member = cast_inner(&fields[tag + 1], &to[tags[tag]].1, mode);
+    // the member is cast strictly: a TRY_CAST that fails on it loses the whole UNION
+    let member = cast_inner(&fields[tag + 1], &to[tags[tag]].1, CastMode::Strict);
     Some(match member {
         // a TRY_CAST that fails on the member loses the whole UNION
         Err(_) if mode == CastMode::Try => Ok(Value::null(target.clone())),
