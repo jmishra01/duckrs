@@ -143,6 +143,23 @@ pub fn bind_scalar_function(
     is_operator: bool,
     fold: &dyn Fn(&BoundExpr) -> Option<Value>,
 ) -> Result<BoundExpr> {
+    // `IntegerNegateBind`: the negation of a type's minimum is of the next wider type
+    if set.name == "-"
+        && let [child] = children.as_mut_slice()
+        && let BoundExprKind::Constant(value) = &child.kind
+        && !value.is_null()
+    {
+        let (minimum, wider) = match child.return_type.id() {
+            LogicalTypeId::TinyInt => (i128::from(i8::MIN), LogicalType::SMALLINT),
+            LogicalTypeId::SmallInt => (i128::from(i16::MIN), LogicalType::INTEGER),
+            LogicalTypeId::Integer => (i128::from(i32::MIN), LogicalType::BIGINT),
+            LogicalTypeId::BigInt => (i128::from(i64::MIN), LogicalType::HUGEINT),
+            _ => (0, LogicalType::SQLNULL),
+        };
+        if wider.id() != LogicalTypeId::SqlNull && value.as_i128() == Some(minimum) {
+            *child = child.clone().cast_to(&wider, false);
+        }
+    }
     let arguments: Vec<LogicalType> = children.iter().map(expression_return_type).collect();
     let function = select_function(set, &arguments)?;
     check_scalar_constant_parameters(&function.name, &children)?;

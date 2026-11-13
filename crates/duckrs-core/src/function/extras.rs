@@ -822,7 +822,11 @@ fn temporal_values(row: &[Value], child: &LogicalType, inclusive: bool) -> Resul
         if items.len() > 100_000_000 {
             return Err(invalid("Lists larger than 2^32 elements are not supported"));
         }
-        current = super::dates::add_interval(current, *step)?;
+        // the next value outside of the timestamp range ends the series
+        match super::dates::add_interval(current, *step) {
+            Ok(next) => current = next,
+            Err(_) => break,
+        }
     }
     Value::list(child.clone(), items)
 }

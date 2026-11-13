@@ -1169,6 +1169,7 @@ impl ClientContext {
             file_access: self.file_access(),
             error_on_division_by_zero: self.setting_text("error_on_division_by_zero") != "false",
             ieee_floating_point_ops: self.setting_text("ieee_floating_point_ops") != "false",
+            order_by_non_integer_literal: self.setting_text("order_by_non_integer_literal") == "true",
         }
     }
 

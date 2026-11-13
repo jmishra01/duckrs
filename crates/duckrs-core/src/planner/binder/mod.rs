@@ -384,7 +384,7 @@ impl BindContext {
                 .map(|b| (b.alias.clone(), similarity_rating(&b.alias, table)))
                 .collect();
             let name = match schema {
-                Some(schema) => format!("{schema}.{table}"),
+                Some(schema) => format!("{}.{table}", schema.replace(crate::catalog::SCHEMA_PATH_SEPARATOR, ".")),
                 None => table.to_string(),
             };
             return Err(binder_error(format!(
@@ -397,7 +397,7 @@ impl BindContext {
 
     /// `BindingAlias::Matches`: whether a qualification names the schema a binding is of. It is the
     /// end of its path: the innermost schema, the path, or the catalog and the path.
-    fn schema_matches(binding: &str, qualification: &str) -> bool {
+    pub(super) fn schema_matches(binding: &str, qualification: &str) -> bool {
         let sep = crate::catalog::SCHEMA_PATH_SEPARATOR;
         let mut full = vec![crate::catalog::DEFAULT_CATALOG];
         full.extend(binding.split(sep));
@@ -461,10 +461,13 @@ impl BindContext {
         let matching = self.bindings_of(schema, table)?;
         let mut with_column = matching.iter().filter(|b| b.column(name).is_some());
         let Some(binding) = with_column.next() else {
+            // `TableBinding::ColumnNotFoundError`
+            let names: Vec<String> = matching.iter().flat_map(|b| b.names.iter().cloned()).collect();
             return Err(binder_error(format!(
-                "Table {} does not have a column named {}",
+                "Table {} does not have a column named {}\n{}",
                 ast::sql_quoted_identifier(&matching[0].alias),
-                ast::sql_quoted_identifier(name)
+                ast::sql_quoted_identifier(name),
+                duckrs_common::string_util::candidates_error_message(&names, name, "Candidate bindings: ")
             )));
         };
         if with_column.next().is_some() {
@@ -642,6 +645,8 @@ pub struct BindOptions {
     pub error_on_division_by_zero: bool,
     /// `ieee_floating_point_ops`
     pub ieee_floating_point_ops: bool,
+    /// `order_by_non_integer_literal`
+    pub order_by_non_integer_literal: bool,
 }
 
 /// What `SHOW name` looks for (`ShowBehaviorType`).
@@ -666,6 +671,7 @@ impl Default for BindOptions {
             file_access: None,
             error_on_division_by_zero: true,
             ieee_floating_point_ops: true,
+            order_by_non_integer_literal: false,
         }
     }
 }

@@ -554,6 +554,28 @@ impl Binder<'_> {
         Ok(())
     }
 
+    /// `Binder::NormalizeFilterStarExpression`: a star in the FILTER of an aggregate or a window
+    /// expands within the filter, into a conjunction, before the select list expands.
+    pub(super) fn normalize_filter_stars(&self, expr: &mut Expr) -> Result<()> {
+        let mut error = None;
+        visit_expr_mut(expr, &mut |e| {
+            let filter = match &mut e.kind {
+                ExprKind::Function(function) => function.filter.as_mut(),
+                ExprKind::Window(window) => window.filter.as_mut(),
+                _ => None,
+            };
+            if let Some(filter) = filter
+                && error.is_none()
+            {
+                match self.bind_where_star_expression(filter) {
+                    Ok(normalized) => **filter = normalized,
+                    Err(e) => error = Some(e),
+                }
+            }
+        });
+        error.map_or(Ok(()), Err)
+    }
+
     /// `Binder::BindWhereStarExpression`.
     pub(super) fn bind_where_star_expression(&self, expr: &Expr) -> Result<Expr> {
         if let ExprKind::Conjunction { and: true, children } = &expr.kind {

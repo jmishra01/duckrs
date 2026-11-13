@@ -284,6 +284,15 @@ fn bind_array_value(children: Vec<BoundExpr>) -> Result<BoundExpr> {
 
 pub fn bind_struct_pack(names: Vec<String>, children: Vec<BoundExpr>) -> Result<BoundExpr> {
     let mut fields: Vec<(String, LogicalType)> = Vec::with_capacity(children.len());
+    // `FunctionBindError::DuplicateArgument`: a name given twice as a named argument
+    for (at, name) in names.iter().enumerate() {
+        if !name.is_empty() && names[..at].iter().any(|other| other.eq_ignore_ascii_case(name)) {
+            return Err(binder_error(format!(
+                "Duplicate named argument \"{}\" in 'struct_pack'",
+                name.replace('"', "\"\"")
+            )));
+        }
+    }
     for (name, child) in names.into_iter().zip(&children) {
         let name = if name.is_empty() { child.alias.clone() } else { name };
         if name.is_empty() {

@@ -66,7 +66,6 @@ const UNHONORED: &[&str] = &[
     "legacy_disable_null_type",
     "lock_configuration",
     "old_implicit_casting",
-    "order_by_non_integer_literal",
     "binary_as_string",
     "preserve_identifier_case",
     "regex_match_operator_semantics",

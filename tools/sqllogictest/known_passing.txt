@@ -191,6 +191,7 @@ test/fuzzer/pedro/window_function_timeout.test
 test/fuzzer/pedro/window_self_reference.test
 test/fuzzer/public/cast_index_expression.test
 test/fuzzer/public/columns_using.test
+test/fuzzer/public/distinct_on_non_integer_literal.test
 test/fuzzer/public/duplicate_alias_using.test
 test/fuzzer/public/enum_empty_type.test
 test/fuzzer/public/insert_by_name_default.test
@@ -362,6 +363,7 @@ test/issues/monetdb/test_null_matches_outer.test
 test/issues/monetdb/test_outerjoin_project.test
 test/issues/monetdb/test_round_bug.test
 test/issues/monetdb/test_simple_round.test
+test/issues/rigger/assertion_scale.test
 test/issues/rigger/big_sum_cast_bug.test
 test/issues/rigger/collate_union.test
 test/issues/rigger/complex_division.test
@@ -414,6 +416,7 @@ test/issues/rigger/test_537.test
 test/issues/rigger/test_538.test
 test/issues/rigger/test_540.test
 test/issues/rigger/test_543.test
+test/issues/rigger/test_544.test
 test/issues/rigger/test_547.test
 test/issues/rigger/test_549.test
 test/issues/rigger/test_552.test
@@ -476,6 +479,7 @@ test/optimizer/distributivity_rule.test
 test/optimizer/estimated_cardinalities_are_in_logical_plan.test
 test/optimizer/expression_rewriter/functions_that_error_are_not_reordered.test
 test/optimizer/expression_rewriter/ordered_aggregate_incorrectly_remove_order.test
+test/optimizer/filter_pushdown/filter_pushdown_into_subquery.test
 test/optimizer/filter_pushdown/like_prefix_boundary.test
 test/optimizer/grouping_expression_simplification.test
 test/optimizer/index_optimizer.test
@@ -807,12 +811,14 @@ test/sql/aggregate/distinct/grouped/combined_with_grouping.test
 test/sql/aggregate/distinct/grouped/identical_inputs.test
 test/sql/aggregate/distinct/grouped/issue_5070.test
 test/sql/aggregate/distinct/grouped/multiple_grouping_sets.test
+test/sql/aggregate/distinct/grouped/string_agg.test
 test/sql/aggregate/distinct/issue19616.test
 test/sql/aggregate/distinct/issue2656.test
 test/sql/aggregate/distinct/issue9241.test
 test/sql/aggregate/distinct/rewrite/distinct_aggregate_rewrite_join_order.test
 test/sql/aggregate/distinct/rewrite/distinct_aggregate_rewrite_order_by_keys.test
 test/sql/aggregate/distinct/test_distinct.test
+test/sql/aggregate/distinct/test_distinct_on_columns.test
 test/sql/aggregate/distinct/test_distinct_order_by.test
 test/sql/aggregate/distinct/ungrouped/test_distinct_ungrouped.test
 test/sql/aggregate/distinct/ungrouped/test_distinct_ungrouped_shared_input.test
@@ -1034,6 +1040,7 @@ test/sql/binder/qualified_alias_method_call.test
 test/sql/binder/string_literal_binding.test
 test/sql/binder/table_alias_single_quotes.test
 test/sql/binder/table_view_alias.test
+test/sql/binder/test_alias.test
 test/sql/binder/test_alias_map_in_subquery.test
 test/sql/binder/test_function_chaining_alias.test
 test/sql/binder/test_having_alias.test
@@ -1130,6 +1137,7 @@ test/sql/catalog/function/test_macro_issue_13104.test
 test/sql/catalog/function/test_macro_issue_18927.test
 test/sql/catalog/function/test_macro_issue_19119.test
 test/sql/catalog/function/test_macro_overloads.test
+test/sql/catalog/function/test_macro_parameter_named_argument.test
 test/sql/catalog/function/test_macro_relpersistence_conflict.test
 test/sql/catalog/function/test_macro_with_unknown_types.test
 test/sql/catalog/function/test_recursive_macro_no_dependency.test
@@ -1138,7 +1146,9 @@ test/sql/catalog/function/test_sequence_macro.test
 test/sql/catalog/function/test_simple_macro.test
 test/sql/catalog/function/test_subquery_macro.test
 test/sql/catalog/function/test_table_macro.test
+test/sql/catalog/function/test_table_macro_args.test
 test/sql/catalog/function/test_table_macro_complex.test
+test/sql/catalog/function/test_table_macro_groups.test
 test/sql/catalog/identifier_embedded_nul.test
 test/sql/catalog/issue_9459.test
 test/sql/catalog/nested_schema/create_nested_schema.test
@@ -1926,6 +1936,7 @@ test/sql/filter/filter_cache.test
 test/sql/filter/filter_cache_dictionary.test
 test/sql/filter/null_selection.test
 test/sql/filter/test_alias_filter.test
+test/sql/filter/test_columns_filter.test
 test/sql/filter/test_constant_comparisons.test
 test/sql/filter/test_dynamic_filter_nullable.test
 test/sql/filter/test_expression_executor_select.test
@@ -2062,6 +2073,7 @@ test/sql/function/list/array_to_string_comma_default.test
 test/sql/function/list/cardinality_list.test
 test/sql/function/list/generate_series.test
 test/sql/function/list/generate_series_timestamp.test
+test/sql/function/list/generate_series_timestamp_range_end.test
 test/sql/function/list/generate_subscripts.test
 test/sql/function/list/lambda_constant_null.test
 test/sql/function/list/lambdas/arrow/expression_iterator_cases_deprecated.test
@@ -2893,6 +2905,9 @@ test/sql/order/test_limit_cte.test
 test/sql/order/test_limit_nested_types.test
 test/sql/order/test_limit_parameter.test
 test/sql/order/test_nulls_first.test
+test/sql/order/test_order_by.test
+test/sql/order/test_order_by_exceptions.test
+test/sql/order/test_order_by_non_ordinal_literal.test
 test/sql/order/test_order_large.test
 test/sql/order/test_order_pragma.test
 test/sql/order/test_order_range_mapping.test
@@ -3026,6 +3041,7 @@ test/sql/pivot/pivot_generated.test
 test/sql/pivot/pivot_in_boolean.test
 test/sql/pivot/pivot_operator_expression.test
 test/sql/pivot/pivot_prepare.test
+test/sql/pivot/pivot_storage.test
 test/sql/pivot/pivot_struct_aggregate.test
 test/sql/pivot/pivot_subquery.test
 test/sql/pivot/pivot_value_collisions.test
@@ -3104,6 +3120,7 @@ test/sql/prepared/prepared_stale_statistics.test
 test/sql/prepared/prepared_update.test
 test/sql/prepared/test_basic_prepare.test
 test/sql/prepared/test_issue_2079.test
+test/sql/prepared/test_issue_21077.test
 test/sql/prepared/test_issue_4010.test
 test/sql/prepared/test_issue_4042.test
 test/sql/prepared/test_issue_6276.test
@@ -3146,6 +3163,7 @@ test/sql/sample/table_samples/table_sample_converts_to_block_sample.test
 test/sql/sample/table_samples/test_sample_is_destroyed_on_updates.test
 test/sql/sample/table_samples/test_sample_types.test
 test/sql/sample/test_sample_too_big.test
+test/sql/select/test_multi_column_reference.test
 test/sql/select/test_positional_reference.test
 test/sql/select/test_projection_names.test
 test/sql/select/test_schema_reference.test
@@ -3164,6 +3182,7 @@ test/sql/setops/test_full_outer_join_union.test
 test/sql/setops/test_nested_except.test
 test/sql/setops/test_pg_union.test
 test/sql/setops/test_setops.test
+test/sql/setops/test_union_binding.test
 test/sql/setops/test_union_error.test
 test/sql/setops/test_union_except_empty.test
 test/sql/setops/test_union_order.test
@@ -3172,6 +3191,7 @@ test/sql/setops/test_union_type_cast.test
 test/sql/setops/union_aggregate.test
 test/sql/setops/union_all_projection_pushdown.test
 test/sql/setops/union_limit.test
+test/sql/setops/union_order_by_expression.test
 test/sql/setops/union_pipeline.test
 test/sql/setops/union_shared_scan.test
 test/sql/setops/union_single_dedup.test
@@ -3246,6 +3266,7 @@ test/sql/sql_export/single_child_union.test
 test/sql/sql_export/source_names.test
 test/sql/sql_export/sql_export_join_scopes.test
 test/sql/sql_export/sql_export_quantiles.test
+test/sql/sql_export/structural_expressions.test
 test/sql/sql_export/table_row_number_sql_export.test
 test/sql/sql_export/union_value.test
 test/sql/sql_export/variant_key_order.test
@@ -3769,6 +3790,7 @@ test/sql/subquery/lateral/lateral_null_propagation_shortcut.test
 test/sql/subquery/lateral/lateral_qualify.test
 test/sql/subquery/lateral/lateral_values.test
 test/sql/subquery/lateral/test_lateral_join.test
+test/sql/subquery/scalar/array_order_subquery.test
 test/sql/subquery/scalar/array_subquery.test
 test/sql/subquery/scalar/coalesce_subquery.test
 test/sql/subquery/scalar/correlated_cte_definition_subquery.test

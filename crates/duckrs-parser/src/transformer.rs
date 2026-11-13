@@ -3586,6 +3586,17 @@ fn visit_all_table_ref_exprs_mut(table_ref: &mut TableRef, f: &mut impl FnMut(&m
         TableRefKind::Subquery(select) => visit_all_query_node_exprs_mut(&mut select.node, f),
         TableRefKind::TableFunction { function, .. } => visit_expr_mut(function, f),
         TableRefKind::ExpressionList(rows) => rows.iter_mut().flatten().for_each(|e| visit_expr_mut(e, f)),
+        TableRefKind::Pivot(pivot) => {
+            visit_all_table_ref_exprs_mut(&mut pivot.source, f);
+            pivot.aggregates.iter_mut().for_each(|e| visit_expr_mut(e, f));
+            for column in &mut pivot.pivots {
+                column.pivot_expressions.iter_mut().for_each(|e| visit_expr_mut(e, f));
+                column.entries.iter_mut().filter_map(|e| e.expr.as_mut()).for_each(|e| visit_expr_mut(e, f));
+                if let Some(subquery) = &mut column.subquery {
+                    visit_all_query_node_exprs_mut(subquery, f);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -3602,6 +3613,17 @@ fn visit_table_ref_exprs_mut(table_ref: &mut TableRef, f: &mut impl FnMut(&mut E
         TableRefKind::Subquery(select) => visit_query_node_exprs_mut(&mut select.node, f),
         TableRefKind::TableFunction { function, .. } => visit_expr_mut(function, f),
         TableRefKind::ExpressionList(rows) => rows.iter_mut().flatten().for_each(|e| visit_expr_mut(e, f)),
+        TableRefKind::Pivot(pivot) => {
+            visit_table_ref_exprs_mut(&mut pivot.source, f);
+            pivot.aggregates.iter_mut().for_each(|e| visit_expr_mut(e, f));
+            for column in &mut pivot.pivots {
+                column.pivot_expressions.iter_mut().for_each(|e| visit_expr_mut(e, f));
+                column.entries.iter_mut().filter_map(|e| e.expr.as_mut()).for_each(|e| visit_expr_mut(e, f));
+                if let Some(subquery) = &mut column.subquery {
+                    visit_query_node_exprs_mut(subquery, f);
+                }
+            }
+        }
         _ => {}
     }
 }

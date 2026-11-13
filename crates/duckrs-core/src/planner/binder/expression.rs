@@ -2024,7 +2024,10 @@ impl Binder<'_> {
                     && argument.name.is_empty()
                 {
                     self.bind_expression(&argument.expr)?;
-                    let name = if argument.expr.alias.is_empty() {
+                    // `AliasFunction`: the call's own alias, if it has one
+                    let name = if !expr.alias.is_empty() {
+                        expr.alias.clone()
+                    } else if argument.expr.alias.is_empty() {
                         super::statements::expression_name(&argument.expr)
                     } else {
                         argument.expr.alias.clone()
@@ -2696,7 +2699,9 @@ impl Binder<'_> {
         }
         let mut order_by = Vec::with_capacity(function.order_by.len());
         for node in &function.order_by {
-            if matches!(&node.expr.kind, ExprKind::Constant(literal) if literal.kind != LiteralKind::Integer) {
+            if !self.options.order_by_non_integer_literal
+                && matches!(&node.expr.kind, ExprKind::Constant(literal) if literal.kind != LiteralKind::Integer)
+            {
                 return Err(binder_error(
                     "ORDER BY non-integer literal has no effect.\n* SET order_by_non_integer_literal=true to allow \
                      this behavior.\n\nPerhaps you misplaced ORDER BY; ORDER BY must appear after all regular \
