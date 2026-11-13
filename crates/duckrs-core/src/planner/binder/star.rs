@@ -164,7 +164,7 @@ fn replace_columns_alias(alias: &str, column: &str, regex: Option<&Regex>) -> Re
     Ok(result)
 }
 
-fn is_qualified_count_star(expr: &Expr) -> bool {
+pub(super) fn is_qualified_count_star(expr: &Expr) -> bool {
     let ExprKind::Function(function) = &expr.kind else {
         return false;
     };
@@ -182,7 +182,7 @@ fn is_qualified_count_star(expr: &Expr) -> bool {
 
 impl Binder<'_> {
     /// `Binder::TryRewriteQualifiedCountStar`: `count(t.*)` skips the rows an outer join made up.
-    fn rewrite_qualified_count_star(&self, expr: &mut Expr) {
+    pub(super) fn rewrite_qualified_count_star(&self, expr: &mut Expr) {
         let name = expr.to_string();
         let ExprKind::Function(function) = &mut expr.kind else {
             return;
@@ -195,11 +195,50 @@ impl Binder<'_> {
             .bindings
             .iter()
             .find(|b| b.alias.eq_ignore_ascii_case(&star.relation_name));
-        match binding {
+        // `GetCountStarArgument`
+        let argument = match binding {
+            Some(binding) if !self.null_extended.contains(&binding.table_index) => None,
+            // the row id is only NULL for NULL-extended rows
             Some(binding) if binding.row_id.is_some() && binding.column_index("rowid").is_none() => {
-                function.args[0].expr = Expr::column(vec![binding.alias.clone(), "rowid".to_string()]);
+                Some(Expr::column(vec![binding.alias.clone(), "rowid".to_string()]))
             }
-            _ => {
+            // `AnyColumnNotNull`: without a row id, a row counts if any of its columns is not NULL
+            Some(binding) => {
+                use duckrs_parser::ast::OperatorType;
+                let children: Vec<Expr> = binding
+                    .names
+                    .iter()
+                    .map(|name| {
+                        let column = Expr::column(vec![binding.alias.clone(), name.clone()]);
+                        Expr::operator(OperatorType::IsNotNull, vec![column])
+                    })
+                    .collect();
+                let any = Expr::from(ExprKind::Conjunction { and: false, children });
+                Some(Expr::from(ExprKind::Case {
+                    checks: vec![(any, Expr::constant(Literal::integer(1)))],
+                    else_expr: Box::new(Expr::constant(Literal::null())),
+                }))
+            }
+            // `struct.*` of a NULL-extended relation counts the struct
+            None => {
+                let column = self
+                    .bind_context
+                    .bindings
+                    .iter()
+                    .find(|b| b.column_index(&star.relation_name).is_some());
+                match column {
+                    Some(b) if self.null_extended.contains(&b.table_index) => {
+                        Some(Expr::column(vec![star.relation_name.clone()]))
+                    }
+                    Some(_) => None,
+                    // no relation of that name: the reference fails to bind
+                    None => Some(Expr::column(vec![star.relation_name.clone(), "rowid".to_string()])),
+                }
+            }
+        };
+        match argument {
+            Some(argument) => function.args[0].expr = argument,
+            None => {
                 function.args.clear();
                 function.name.name = "count_star".to_string();
             }
@@ -207,6 +246,33 @@ impl Binder<'_> {
         if expr.alias.is_empty() {
             expr.alias = name;
         }
+    }
+
+    /// `count(t.*) OVER (..)`: the window function's arguments rewritten as an aggregate's are.
+    pub(super) fn rewrite_window_count_star(&self, expr: &mut Expr) -> bool {
+        let name = expr.to_string();
+        let ExprKind::Window(window) = &mut expr.kind else {
+            return false;
+        };
+        if window.distinct {
+            return false;
+        }
+        let mut call = FunctionExpr::new(&window.name.name, Vec::new());
+        call.args = window.args.clone();
+        let mut call = Expr::from(ExprKind::Function(call));
+        if !is_qualified_count_star(&call) {
+            return false;
+        }
+        self.rewrite_qualified_count_star(&mut call);
+        let ExprKind::Function(function) = call.kind else {
+            unreachable!("a function");
+        };
+        window.name.name = function.name.name;
+        window.args = function.args;
+        if expr.alias.is_empty() {
+            expr.alias = name;
+        }
+        true
     }
 
     /// A `*` inside of `COLUMNS` is the list of the names it stands for.
@@ -259,6 +325,9 @@ impl Binder<'_> {
             }
             if is_qualified_count_star(e) {
                 self.rewrite_qualified_count_star(e);
+                return;
+            }
+            if self.rewrite_window_count_star(e) {
                 return;
             }
             if matches!(

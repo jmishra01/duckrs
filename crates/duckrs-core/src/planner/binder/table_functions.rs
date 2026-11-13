@@ -224,7 +224,15 @@ impl Binder<'_> {
                     if argument.name.eq_ignore_ascii_case("num_rows") {
                         rows = Some(&argument.expr);
                     } else if argument.name.is_empty() {
-                        columns.push(format!("{} AS column{}", argument.expr, columns.len()));
+                        // `TableFunctionBinder`: a name is read as its text
+                        let mut expr = argument.expr.clone();
+                        duckrs_parser::transformer::visit_expr_mut(&mut expr, &mut |e: &mut Expr| {
+                            if let duckrs_parser::ast::ExprKind::ColumnRef(names) = &e.kind {
+                                let text = names.join(".");
+                                *e = Expr::constant(duckrs_parser::ast::Literal::string(text));
+                            }
+                        });
+                        columns.push(format!("{expr} AS column{}", columns.len()));
                     } else {
                         return Err(binder_error(format!(
                             "Invalid named parameter \"{}\" for function repeat_row",
@@ -232,9 +240,31 @@ impl Binder<'_> {
                         )));
                     }
                 }
+                // num_rows is a required named parameter: without it no overload matches
                 let Some(rows) = rows else {
-                    return Err(binder_error("repeat_rows requires num_rows to be specified"));
+                    let mut types = Vec::new();
+                    for argument in &args {
+                        types.push(
+                            crate::function::binder::expression_return_type(&BoundExpr::constant(
+                                self.constant_argument(&argument.expr)?,
+                            ))
+                            .to_string(),
+                        );
+                    }
+                    return Err(binder_error(format!(
+                        "No function matches the given name and argument types 'repeat_row({})'. You might need \
+                         to add explicit type casts.",
+                        types.join(", ")
+                    )));
                 };
+                // `RepeatRowFunctionBind`
+                let count = self.constant_argument(rows)?;
+                if count.is_null() {
+                    return Err(binder_error("num_rows should be an integer value >= 0"));
+                }
+                if count.as_i128().is_some_and(|n| n < 0) {
+                    return Err(binder_error("num_rows cannot be less than zero"));
+                }
                 if columns.is_empty() {
                     return Err(binder_error("repeat_rows requires at least one column to be specified"));
                 }

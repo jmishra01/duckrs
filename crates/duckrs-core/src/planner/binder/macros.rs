@@ -512,6 +512,7 @@ impl Binder<'_> {
                     binder.macro_arguments = parameters.iter().cloned().zip(nulls.iter().cloned()).collect();
                     // a macro's body may aggregate, and whether that fits shows where it is used
                     binder.aggregate_error = MACRO_AGGREGATE;
+                    binder.window_error = MACRO_AGGREGATE;
                     match binder.bind_expression(&body) {
                         // `BindCreateFunctionInfo`: what can't be bound yet is bound when it's called
                         Err(error)

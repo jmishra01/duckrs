@@ -135,6 +135,28 @@ pub fn approx_quantile_type(input: &LogicalType, list: bool) -> Result<LogicalTy
 }
 
 /// The type of `quantile_cont` and `median` of a column of type `input`.
+/// `CanInterpolate`: the numbers, the temporal types and INTERVAL.
+fn can_interpolate(ty: &LogicalType) -> bool {
+    use LogicalTypeId as L;
+    ty.is_integral()
+        || matches!(
+            ty.id(),
+            L::Float
+                | L::Double
+                | L::Decimal
+                | L::Date
+                | L::Timestamp
+                | L::TimestampTz
+                | L::TimestampTzNs
+                | L::TimestampSec
+                | L::TimestampMs
+                | L::TimestampNs
+                | L::Time
+                | L::TimeTz
+                | L::Interval
+        )
+}
+
 fn interpolated_type(input: &LogicalType) -> LogicalType {
     match input.id() {
         LogicalTypeId::Date => LogicalType::TIMESTAMP,
@@ -291,7 +313,9 @@ fn interpolate(lo: &Value, d: f64, hi: &Value, ty: &LogicalType) -> Result<Value
                 (micros % per_day) as i64,
             )))
         }
-        (ValueData::Int64(a), ValueData::Int64(b)) if ty.id() != LogicalTypeId::Double => {
+        (ValueData::Int64(a), ValueData::Int64(b))
+            if !matches!(ty.id(), LogicalTypeId::Double | LogicalTypeId::Decimal) =>
+        {
             if a == b {
                 return Ok(lo.clone());
             }
@@ -317,7 +341,23 @@ fn interpolate(lo: &Value, d: f64, hi: &Value, ty: &LogicalType) -> Result<Value
                 return Ok(lo.clone());
             };
             let (width, scale) = ty.decimal_properties().expect("a DECIMAL");
+            // a DECIMAL stored as a HUGEINT interpolates as one, from its exact difference
+            if ty.physical_type() == duckrs_common::types::PhysicalType::Int128
+                && let Some(value) = b.checked_sub(a).and_then(|delta| a.checked_add((delta as f64 * d) as i128))
+            {
+                return Value::decimal(value, width, scale);
+            }
             Value::decimal((a as f64 + (b as f64 - a as f64) * d) as i128, width, scale)
+        }
+        // `InterpolateOperator::Operation(hugeint_t)`: the offset from the exact difference, truncated
+        _ if ty.id() == LogicalTypeId::HugeInt
+            && let (Some(a), Some(b)) = (lo.as_i128(), hi.as_i128()) =>
+        {
+            let value = b
+                .checked_sub(a)
+                .and_then(|delta| a.checked_add((delta as f64 * d) as i128))
+                .unwrap_or((a as f64 + (b as f64 - a as f64) * d) as i128);
+            Value::new(ty.clone(), ValueData::Int128(value))
         }
         _ => {
             let (Some(a), Some(b)) = (number(lo), number(hi)) else {
@@ -1161,7 +1201,13 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
             }
         }
         Mode => mode(rows, ty)?,
-        Median | QuantileCont => quantiles(rows, ty, true)?,
+        // `MedianFunction`: a type that cannot be interpolated takes the discrete median. Its rows are
+        // its values (a STRUCT value is not the arguments of a quantile)
+        Median => {
+            let rows: Vec<Value> = rows.iter().map(|r| Value::struct_value(vec![("a0".into(), r.clone())])).collect();
+            quantiles(&rows, ty, can_interpolate(ty))?
+        }
+        QuantileCont => quantiles(rows, ty, true)?,
         QuantileDisc => quantiles(rows, ty, false)?,
         Mad if ty.id() == LogicalTypeId::Interval => temporal_mad(rows)?,
         Mad => {

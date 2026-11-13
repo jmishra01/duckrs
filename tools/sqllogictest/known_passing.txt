@@ -59,6 +59,7 @@ test/fuzzer/duckfuzz/order_by_positional_reference.test
 test/fuzzer/duckfuzz/qualify_column_reference.test
 test/fuzzer/duckfuzz/regex_syntax_2889.test
 test/fuzzer/duckfuzz/regexp_replace_constant.test
+test/fuzzer/duckfuzz/repeat_row_null.test
 test/fuzzer/duckfuzz/repeat_wrong_number.test
 test/fuzzer/duckfuzz/string_to_nested_cast_sample.test
 test/fuzzer/duckfuzz/strptime_const_arg.test
@@ -748,6 +749,7 @@ test/sql/aggregate/aggregates/test_bool.test
 test/sql/aggregate/aggregates/test_corr.test
 test/sql/aggregate/aggregates/test_count.test
 test/sql/aggregate/aggregates/test_count_all_types.test
+test/sql/aggregate/aggregates/test_count_qualified_star.test
 test/sql/aggregate/aggregates/test_count_star.test
 test/sql/aggregate/aggregates/test_covar.test
 test/sql/aggregate/aggregates/test_empty_aggregate.test
@@ -766,6 +768,7 @@ test/sql/aggregate/aggregates/test_last.test
 test/sql/aggregate/aggregates/test_last_noninlined.test
 test/sql/aggregate/aggregates/test_mad.test
 test/sql/aggregate/aggregates/test_mad_hugeint_range.test
+test/sql/aggregate/aggregates/test_median.test
 test/sql/aggregate/aggregates/test_minmax.test
 test/sql/aggregate/aggregates/test_minmax_14145.test
 test/sql/aggregate/aggregates/test_mode.test
@@ -774,8 +777,11 @@ test/sql/aggregate/aggregates/test_order_by_aggregate.test
 test/sql/aggregate/aggregates/test_ordered_aggregate_inner_error.test
 test/sql/aggregate/aggregates/test_perfect_ht.test
 test/sql/aggregate/aggregates/test_product.test
+test/sql/aggregate/aggregates/test_quantile_cont.test
+test/sql/aggregate/aggregates/test_quantile_cont_list.test
 test/sql/aggregate/aggregates/test_quantile_disc.test
 test/sql/aggregate/aggregates/test_quantile_disc_double.test
+test/sql/aggregate/aggregates/test_quantile_disc_list.test
 test/sql/aggregate/aggregates/test_quantile_timestamp_exact.test
 test/sql/aggregate/aggregates/test_quantile_timetz.test
 test/sql/aggregate/aggregates/test_regression.test
@@ -1109,6 +1115,7 @@ test/sql/catalog/drop_create_rollback.test
 test/sql/catalog/function/macro_typed_parameter_rendering.test
 test/sql/catalog/function/python_style_macro_parameters.test
 test/sql/catalog/function/struct_extract_macro.test
+test/sql/catalog/function/test_complex_macro.test
 test/sql/catalog/function/test_cross_catalog_macros.test
 test/sql/catalog/function/test_cte_macro.test
 test/sql/catalog/function/test_macro_correlated_cte.test
@@ -3803,6 +3810,7 @@ test/sql/table_function/sqlite_master_quotes.test
 test/sql/table_function/test_information_schema_columns.test
 test/sql/table_function/test_range_function.test
 test/sql/table_function/test_repeat_function.test
+test/sql/table_function/test_repeat_row_function.test
 test/sql/table_function/test_table_function.test
 test/sql/topn/test_top_n.test
 test/sql/topn/test_top_n_distinct_row_group_pruner.test
@@ -4167,6 +4175,7 @@ test/sql/types/nested/list/any_list.test
 test/sql/types/nested/list/array.test
 test/sql/types/nested/list/array_agg.test
 test/sql/types/nested/list/internal_issue_2457.test
+test/sql/types/nested/list/list_aggr_parameter.test
 test/sql/types/nested/list/list_aggregate_dict.test
 test/sql/types/nested/list/list_aggregates.test
 test/sql/types/nested/list/list_cast_child_offset.test
@@ -4508,6 +4517,8 @@ test/sql/window/test_dense_rank_empty_union_branch.test
 test/sql/window/test_duplicate_partition.test
 test/sql/window/test_empty_frames.test
 test/sql/window/test_evil_window.test
+test/sql/window/test_fill_logical_range.test
+test/sql/window/test_fill_orderby.test
 test/sql/window/test_fill_physical_types.test
 test/sql/window/test_fill_prefix_order.test
 test/sql/window/test_ignore_nulls.test
@@ -4553,6 +4564,7 @@ test/sql/window/test_window_constant_aggregate.test
 test/sql/window/test_window_constant_allocator.test
 test/sql/window/test_window_dbplyr.test
 test/sql/window/test_window_distinct.test
+test/sql/window/test_window_filter.test
 test/sql/window/test_window_finalize_race.test
 test/sql/window/test_window_fusion.test
 test/sql/window/test_window_interval.test

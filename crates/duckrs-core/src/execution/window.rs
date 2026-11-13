@@ -726,19 +726,35 @@ impl<'a> Evaluation<'a> {
         if let Some(keys) = &self.arg_keys {
             rows.sort_by(|a, b| keys[*a].cmp(&keys[*b]).then(a.cmp(b)));
         }
-        let point = |p: usize| Some((number(&along[p])?, number(&values[p])?));
-        let points: Vec<(usize, Option<(f64, f64)>)> = rows.iter().map(|p| (*p, point(*p))).collect();
+        // `FillValueFunction`: a value counts if it is there and finite
+        let finite = |v: &Value| number(v).filter(|n| n.is_finite());
+        let points: Vec<(usize, Option<f64>, Option<f64>)> =
+            rows.iter().map(|p| (*p, finite(&along[*p]), finite(&values[*p]))).collect();
         let start = result.len();
         result.extend(values[begin..end].iter().cloned());
-        for (at, (position, _)) in points.iter().enumerate() {
+        // the neighbours with values, up to an order value that does not count
+        let neighbours = |side: &mut dyn Iterator<Item = &(usize, Option<f64>, Option<f64>)>| {
+            let mut found = Vec::new();
+            for (p, x, y) in side {
+                let Some(x) = x else { break };
+                if let Some(y) = y {
+                    found.push(((*x, *y), *p));
+                    if found.len() == 2 {
+                        break;
+                    }
+                }
+            }
+            found
+        };
+        for (at, (position, x, _)) in points.iter().enumerate() {
             if !values[*position].is_null() {
                 continue;
             }
-            let Some(x) = number(&along[*position]) else {
+            let Some(x) = *x else {
                 continue;
             };
-            let before: Vec<(f64, f64)> = points[..at].iter().rev().filter_map(|(_, p)| *p).take(2).collect();
-            let after: Vec<(f64, f64)> = points[at + 1..].iter().filter_map(|(_, p)| *p).take(2).collect();
+            let before = neighbours(&mut points[..at].iter().rev());
+            let after = neighbours(&mut points[at + 1..].iter());
             let line = match (before.as_slice(), after.as_slice()) {
                 ([low, ..], [high, ..]) => Some((*low, *high)),
                 ([last, previous], []) => Some((*previous, *last)),
@@ -746,14 +762,32 @@ impl<'a> Evaluation<'a> {
                 ([only], []) | ([], [only]) => Some((*only, *only)),
                 _ => None,
             };
-            let Some(((x0, y0), (x1, y1))) = line else {
+            let Some((((x0, y0), p0), ((x1, y1), p1))) = line else {
                 continue;
             };
             // halved, for orders whose span doesn't fit in a double
             let span = x1 / 2.0 - x0 / 2.0;
             let along_line = if span == 0.0 { 0.0 } else { (x / 2.0 - x0 / 2.0) / span };
             let filled = y0 + (y1 - y0) * along_line;
-            result[start + (*position - begin)] = like(&window.return_type, filled)?;
+            // `FillInterpolateFunc`: an interpolated integer lies between the two values, which the
+            // double can round past
+            let integral = !matches!(
+                window.return_type.physical_type(),
+                duckrs_common::types::PhysicalType::Float | duckrs_common::types::PhysicalType::Double
+            );
+            let value = if integral && (0.0..=1.0).contains(&along_line) {
+                let ((low, low_at), (high, high_at)) = if y0 <= y1 { ((y0, p0), (y1, p1)) } else { ((y1, p1), (y0, p0)) };
+                if filled <= low {
+                    values[low_at].clone()
+                } else if filled >= high {
+                    values[high_at].clone()
+                } else {
+                    like(&window.return_type, filled)?
+                }
+            } else {
+                like(&window.return_type, filled)?
+            };
+            result[start + (*position - begin)] = value;
         }
         Ok(())
     }
@@ -772,6 +806,37 @@ fn number(value: &Value) -> Option<f64> {
 fn like(ty: &LogicalType, number: f64) -> Result<Value> {
     use duckrs_common::types::PhysicalType as P;
     let rounded = number.round();
+    // a value the type cannot hold is NULL: past an integer's range, or a DECIMAL's width
+    let range = match ty.physical_type() {
+        P::Int8 => Some((f64::from(i8::MIN), f64::from(i8::MAX))),
+        P::Int16 => Some((f64::from(i16::MIN), f64::from(i16::MAX))),
+        P::Int32 => Some((f64::from(i32::MIN), f64::from(i32::MAX))),
+        P::Int64 => Some((i64::MIN as f64, i64::MAX as f64)),
+        P::Int128 => Some((i128::MIN as f64, i128::MAX as f64)),
+        P::UInt8 => Some((0.0, f64::from(u8::MAX))),
+        P::UInt16 => Some((0.0, f64::from(u16::MAX))),
+        P::UInt32 => Some((0.0, f64::from(u32::MAX))),
+        P::UInt64 => Some((0.0, u64::MAX as f64)),
+        P::UInt128 => Some((0.0, u128::MAX as f64)),
+        _ => None,
+    };
+    // (exclusive bounds) a DECIMAL holds fewer digits than its integer, and coarse timestamps have to
+    // be timestamps in microseconds, short of the infinities
+    let micros = i64::MAX as f64;
+    let range = match (ty.decimal_properties(), ty.id()) {
+        (Some((width, _)), _) => {
+            let limit = 10f64.powi(i32::from(width));
+            Some((-limit, limit))
+        }
+        (None, LogicalTypeId::TimestampSec) => Some((-micros / 1e6, micros / 1e6)),
+        (None, LogicalTypeId::TimestampMs) => Some((-micros / 1e3, micros / 1e3)),
+        (None, _) => range.map(|(low, high)| (low - 1.0, high + 1.0)),
+    };
+    if let Some((low, high)) = range
+        && (!rounded.is_finite() || rounded <= low || rounded >= high)
+    {
+        return Ok(Value::null(ty.clone()));
+    }
     let data = match ty.physical_type() {
         P::Float => ValueData::Float(number as f32),
         P::Double => ValueData::Double(number),

@@ -431,6 +431,13 @@ fn window_arguments(
             sql_quoted_identifier(name)
         )));
     }
+    // no built-in window function sets `can_filter`
+    if window.filter.is_some() {
+        return Err(binder_error(format!(
+            "FILTER is not implemented for the window function {}",
+            sql_quoted_identifier(name)
+        )));
+    }
     if window.exclude != WindowExclude::NoOther
         && !window.arg_orders.is_empty()
         && matches!(function, Lag | Lead | Ntile | Fill | RowNumber | Rank | CumeDist)

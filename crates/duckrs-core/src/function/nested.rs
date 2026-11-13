@@ -614,7 +614,7 @@ pub(crate) fn deduce_template(first: &LogicalType, second: &LogicalType) -> Opti
     let stringy = |t: &LogicalType| {
         matches!(
             t.id(),
-            LogicalTypeId::Varchar | LogicalTypeId::StringLiteral | LogicalTypeId::SqlNull
+            LogicalTypeId::Varchar | LogicalTypeId::StringLiteral | LogicalTypeId::SqlNull | LogicalTypeId::Enum
         )
     };
     if (varchar(first) && !stringy(second)) || (varchar(second) && !stringy(first)) {

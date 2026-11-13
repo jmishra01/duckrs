@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 4569 of 6367 test files pass (**75.6%** of the 6045 that run). The v1 target is ≥ 90%.
+- Overall: 4581 of 6367 test files pass (**75.8%** of the 6044 that run). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -241,7 +241,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
 
 ## Phase 5: Functions
 
-- [ ] 30. Scalar and table functions (`sql/function`: 55 failing, 86.8%; `sql/table_function`: 33 failing)
+- [ ] 30. Scalar and table functions (`sql/function`: 55 failing, 86.8%; `sql/table_function`: 31 failing)
   - [x] `remap_struct`, `struct_values`, `parse_formatted_bytes`, `equi_width_bins`, `is_histogram_other_bin`;
     `date_part` of a list of parts, the time zone parts of TIMESTAMP and TIME, `date_trunc` of an INTERVAL by
     ISO year, week and day parts; `list_where` past the end of the list; `map_concat`'s type from its non-empty
@@ -309,7 +309,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
     the external-resource and profiling table functions; `duckdb_constraints()` lists a primary key's implied
     NOT NULL after the declared constraints (the catalog keeps NOT NULL per column, not in order); a view's
     columns as bound when it was created
-- [ ] 31. Aggregates (`sql/aggregate`: 39 failing, 82.0%; target ≥ 90%)
+- [ ] 31. Aggregates (`sql/aggregate`: 34 failing, 84.3%; target ≥ 90%)
   - [x] `histogram(x, bins)` and `histogram_exact`, with the "other values" bucket; stddev and variance are
     infinite rather than out of range; the moments, covariances, regressions and Kahan sums computed with C++'s
     update and finalize, so their results are C++'s to the bit
@@ -318,6 +318,11 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] `approx_quantile` with C++'s t-digest (compression 100, `function/tdigest.rs`): the overloads' types, the
     values encoded as doubles and decoded with clamping as `ApproxQuantileCoding` does, FLOAT fractions, its exported
     state of centroids and the checks on importing one; `string_agg` casts its input to VARCHAR
+  - [x] `count(t.*)` as `TryRewriteQualifiedCountStar` in every clause and in windows and macros, with the
+    relations outer and positional joins NULL-extend tracked, `AnyColumnNotNull` where there is no row id;
+    `median` of non-interpolatable types discrete; quantile interpolation of HUGEINTs and of DECIMALs stored as
+    integers as C++ does it; `quantile_cont`'s overloads (no INTERVAL or VARCHAR, no single argument);
+    list_aggr's "No matching aggregate function"; `list_contains` deducing its template type
   - [ ] the memory limits of quantiles and of window builds (7 files)
   - [x] `EXPORT_STATE` in C++'s layouts for the aggregates duckrs computes from their rows
     (`function/holistic_states.rs`): bool_and/or, product, string_agg, the stddev/variance family, covar, corr,
@@ -330,7 +335,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
     COMBINE; `to_aggregate_state` with an ORDER BY spec and its checks
   - [ ] the sketches of approx_count_distinct, approx_quantile and approx_top_k, `lttb`, the states of files before
     v1.5 (`LEGACY_AGGREGATE_STATE`)
-- [ ] 32. Window functions (`sql/window`: 17 failing, 81.3%; target ≥ 85%)
+- [ ] 32. Window functions (`sql/window`: 14 failing, 84.6%; target ≥ 85%)
+  - [x] `fill` as `WindowFillExecutor`: only finite values count and the search stops at an order value that
+    does not, interpolated integers clamped to their endpoints, values a type cannot hold (past a DECIMAL's
+    width, an integer's range, a coarse timestamp's) NULL; FILTER refused on window functions
 - [ ] 33. `pragma_*` functions and PRAGMA statements (`sql/pragma`: 20 failing, 65.5%)
   - [x] SHOW TABLES over the search path, SHOW TABLES FROM a database, a schema or both
   - [x] PRAGMA version, platform, functions, database_size, storage_info and metadata_info as the queries C++
@@ -348,7 +356,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] shredded GEOMETRY columns, and the spatial extension's format of files before v1.5.0
   - [x] `GeometryStats`: in `stats()`, in database files (extent, types, flags), and `vertex_extract`'s bounds
   - [ ] `ST_GeomFromWKB`'s types from BLOB min/max (duckrs keeps no string statistics), GeoParquet, the spatial extension's blob format
-- [ ] 34. Remaining type and cast failures (`sql/types`: 45 failing, 91.5%; `sql/cast`: 2 failing)
+- [ ] 34. Remaining type and cast failures (`sql/types`: 44 failing, 91.7%; `sql/cast`: 2 failing)
   - [x] UNNEST with `recursive`, `max_depth` and `keep_parent_names`, of structs at the root of a select list,
     refused nested; a cast to NULL of anything that is NULL
   - [x] DOUBLE to VARCHAR of powers of two from 2^53 (fmt's fallback shifts its denominator by the boundary bits);

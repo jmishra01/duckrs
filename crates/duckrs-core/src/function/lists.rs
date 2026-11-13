@@ -475,7 +475,17 @@ fn bind_list_aggr(name: &str, aggregate: Option<&str>, children: Vec<BoundExpr>)
     }
     let mut probe = vec![BoundExpr::constant(Value::null(element))];
     probe.extend(children.iter().cloned());
-    let return_type = bind_aggregate_function(set, probe, None, false)?.return_type;
+    // `BindListAggregate`: an aggregate without the overload is "No matching aggregate function"
+    let return_type = bind_aggregate_function(set, probe, None, false)
+        .map_err(|error| {
+            if error.message.starts_with("No function matches") {
+                Error::new(ErrorKind::Binder, format!("No matching aggregate function
+{}", error.message))
+            } else {
+                error
+            }
+        })?
+        .return_type;
     let mut arguments = vec![list, which];
     arguments.extend(children);
     Ok(bound_function(name, arguments, return_type, list_aggr))
@@ -505,6 +515,21 @@ fn bind_search(
         }
         _ => needle.return_type.clone(),
     };
+    // a VARCHAR next to a type that is not a string deduces no `T`
+    let varchar = |t: &LogicalType| t.id() == LogicalTypeId::Varchar;
+    if (varchar(&element) || varchar(&needle_type))
+        && super::nested::deduce_template(&element, &needle_type).is_none()
+    {
+        let error = no_match(name, &[list.clone(), needle.clone()]);
+        return Err(Error::new(
+            ErrorKind::Binder,
+            format!(
+                "{}\n\tCannot deduce template type 'T', it was inferred to be:\n  - '{element}', from first \
+                 occurrence\n  - '{needle_type}', which is incompatible with the previously inferred type",
+                error.message
+            ),
+        ));
+    }
     let common = match force_max_logical_type(&element, &needle_type) {
         common if common.id() == LogicalTypeId::SqlNull => LogicalType::INTEGER,
         common => common,

@@ -921,6 +921,18 @@ impl Binder<'_> {
 
     /// `ExpressionBinder::Bind`.
     pub(super) fn bind_expression(&mut self, expr: &Expr) -> Result<BoundExpr> {
+        // `TryRewriteQualifiedCountStar`, wherever an aggregate can be
+        if super::star::is_qualified_count_star(expr) {
+            let mut rewritten = expr.clone();
+            self.rewrite_qualified_count_star(&mut rewritten);
+            return self.bind_expression(&rewritten);
+        }
+        if matches!(expr.kind, ExprKind::Window(_)) {
+            let mut rewritten = expr.clone();
+            if self.rewrite_window_count_star(&mut rewritten) {
+                return self.bind_expression(&rewritten);
+            }
+        }
         let bound = self.bind_expression_inner(expr)?;
         if matches!(expr.kind, ExprKind::Function(_) | ExprKind::Operator { .. })
             && matches!(bound.kind, BoundExprKind::Function { .. })

@@ -696,8 +696,9 @@ fn fold(kind: Holistic, rows: &[Value]) -> Result<State> {
             }
             State::Sketch(_) | State::Digest(..) => unreachable!("folded above"),
             State::Buffer(values) => {
+                // the arguments of a quantile come packed; a median's row is its value
                 let input = match row.data() {
-                    ValueData::Struct(fields) => &fields[0],
+                    ValueData::Struct(fields) if kind != Median => &fields[0],
                     _ => row,
                 };
                 if !input.is_null() {

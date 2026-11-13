@@ -1142,7 +1142,15 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
                 Ok(bound) => return Ok(bound),
                 Err(children) => children,
             };
-            if children.is_empty() || children.len() > 3 {
+            // a VARCHAR (not a literal) does not cast to BIGINT implicitly
+            let castable = |c: &BoundExpr| {
+                !c.return_type.is_nested()
+                    && !matches!(
+                        super::binder::expression_return_type(c).id(),
+                        LogicalTypeId::Varchar | LogicalTypeId::Blob
+                    )
+            };
+            if children.is_empty() || children.len() > 3 || !children.iter().all(castable) {
                 return Err(no_match(&lower, &children));
             }
             let children = children

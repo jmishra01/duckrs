@@ -385,9 +385,38 @@ fn check_constant_parameters(name: &str, children: &mut [BoundExpr]) -> Result<(
             *input = input.clone().cast_to(&target, false);
             Ok(())
         }
-        ("quantile_cont" | "quantile_disc" | "quantile", [_]) => Err(binder_error(
+        // quantile_cont takes its fraction, quantile_disc has an overload without one (for deserializing)
+        (_, arguments @ [_]) | (_, arguments @ [_, _, _, ..])
+            if name == "quantile_cont" || (arguments.len() > 2 && matches!(name, "quantile_disc" | "quantile")) =>
+        {
+            let types: Vec<String> = arguments.iter().map(|c| expression_return_type(c).to_string()).collect();
+            Err(binder_error(format!(
+                "No function matches the given name and argument types '{name}({})'. You might need to add \
+                 explicit type casts.",
+                types.join(", ")
+            )))
+        }
+        ("quantile_disc" | "quantile", [_]) => Err(binder_error(
             "QUANTILE requires a range argument between [0, 1]".to_string(),
         )),
+        // the fraction is a number or a list of them: no overload takes a STRUCT; and quantile_cont has
+        // no INTERVAL overload (`GetContinuousQuantileTypes`)
+        ("quantile_cont" | "quantile_disc" | "quantile", [input, parameter])
+            if matches!(parameter.return_type.id(), LogicalTypeId::Struct | LogicalTypeId::Tuple)
+                || (name == "quantile_cont"
+                    && (input.return_type.is_nested()
+                        || matches!(
+                            input.return_type.id(),
+                            LogicalTypeId::Interval | LogicalTypeId::Varchar | LogicalTypeId::Blob
+                        ))) =>
+        {
+            Err(binder_error(format!(
+                "No function matches the given name and argument types '{name}({}, {})'. You might need to add \
+                 explicit type casts.",
+                expression_return_type(input),
+                expression_return_type(parameter)
+            )))
+        }
         ("quantile_cont" | "quantile_disc" | "quantile", [_, parameter]) => {
             match constant_parameter(name, parameter, 1, false)? {
                 Some(value) => check_quantile_parameter(&value),
@@ -466,7 +495,7 @@ fn histogram_bin_arguments(name: &str, mut children: Vec<BoundExpr>) -> Result<V
     let stringy = |t: &LogicalType| {
         matches!(
             t.id(),
-            LogicalTypeId::Varchar | LogicalTypeId::StringLiteral | LogicalTypeId::SqlNull
+            LogicalTypeId::Varchar | LogicalTypeId::StringLiteral | LogicalTypeId::SqlNull | LogicalTypeId::Enum
         )
     };
     let common = element

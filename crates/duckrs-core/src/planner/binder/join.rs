@@ -398,6 +398,17 @@ impl Binder<'_> {
 
         let left_aliases = left_context.aliases();
         let right_aliases = right_context.aliases();
+        let extends = |context: &BindContext, set: &mut std::collections::HashSet<usize>| {
+            set.extend(context.bindings.iter().map(|b| b.table_index));
+        };
+        // a positional join NULL-extends the shorter side, whichever it is
+        let positional = join.ref_type == JoinRefType::Positional;
+        if positional || matches!(join.join_type, JoinType::Left | JoinType::Outer) {
+            extends(&right_context, &mut self.null_extended);
+        }
+        if positional || matches!(join.join_type, JoinType::Right | JoinType::Outer) {
+            extends(&left_context, &mut self.null_extended);
+        }
         self.bind_context.using_columns.extend(new_sets);
         self.bind_context.add_context(left_context);
         self.bind_context.add_context(right_context);

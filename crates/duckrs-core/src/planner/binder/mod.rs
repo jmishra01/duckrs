@@ -782,6 +782,8 @@ pub struct Binder<'a> {
     /// The left sides of the joins whose right side is being bound. Their columns are out of
     /// reach until LATERAL exists, which is a missing feature and not a bad column.
     left_of_join: Vec<BindContext>,
+    /// the table indexes of the relations an outer join NULL-extends (`Binding::IsNullExtended`)
+    pub(super) null_extended: std::collections::HashSet<usize>,
     /// The views being bound, innermost last (`bound_views`).
     bound_views: Vec<Arc<ViewCatalogEntry>>,
     /// The schema unqualified tables are looked up in before the default one: the schema of the
@@ -877,6 +879,7 @@ impl<'a> Binder<'a> {
             later_select_aliases: None,
             outer_aliases: Vec::new(),
             left_of_join: Vec::new(),
+            null_extended: std::collections::HashSet::new(),
             bound_views: Vec::new(),
             search_schema: None,
             foreign_databases: Vec::new(),
