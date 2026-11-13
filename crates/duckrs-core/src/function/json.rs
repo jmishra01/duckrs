@@ -1149,14 +1149,15 @@ fn with_path(
     f: fn(Option<&Json>) -> Result<Value>,
 ) -> Result<()> {
     row_wise(args, result, |row| {
+        // a NULL path gives NULL, without reading the document
+        if row.len() > 1 && row[1].is_null() {
+            return Ok(nothing(&ty));
+        }
         let Some(json) = document(&row[0])? else {
             return Ok(nothing(&ty));
         };
         if row.len() == 1 {
             return f(Some(&json));
-        }
-        if row[1].is_null() {
-            return Ok(nothing(&ty));
         }
         map_paths(&row[1], |path| each_found(&json, path, &ty, f), &ty)
     })
@@ -1216,7 +1217,10 @@ fn wildcard_values(
 ) -> Result<()> {
     row_wise(args, result, |row| {
         let list = LogicalType::list(child.clone());
-        let (Some(json), false) = (document(&row[0])?, row[1].is_null()) else {
+        if row[1].is_null() {
+            return Ok(nothing(&list));
+        }
+        let Some(json) = document(&row[0])? else {
             return Ok(nothing(&list));
         };
         let path = parse_path(&path_text(&row[1])?)?;
@@ -2105,8 +2109,9 @@ pub fn bind_function(
             let Some(structure) = constant(&children[1])? else {
                 return Err(binder_error("JSON structure must be a constant!"));
             };
-            if structure.is_null() {
-                return Err(binder_error("JSON structure must not be NULL!"));
+            // `JSONTransformBind`: a NULL structure gives NULL
+            if structure.is_null() || children[1].return_type.id() == LogicalTypeId::SqlNull {
+                return Ok(BoundExpr::constant(Value::sql_null()));
             }
             let text = structure.try_to_string()?;
             let json = parse(&text).map_err(|e| binder_error(parse_error_text(&text, &e)))?;

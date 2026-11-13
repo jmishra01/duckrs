@@ -683,10 +683,23 @@ fn nextafter(args: &DataChunk, result: &mut Vector) -> Result<()> {
 }
 
 fn fmod(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let float = result.logical_type().id() == LogicalTypeId::Float;
     row_wise(args, result, |row| {
         let (Some(x), Some(y)) = (number(&row[0]), number(&row[1])) else {
-            return Ok(Value::null(LogicalType::DOUBLE));
+            return Ok(Value::null(if float { LogicalType::FLOAT } else { LogicalType::DOUBLE }));
         };
+        if float {
+            let (x, y) = (x as f32, y as f32);
+            let remainder = x % y;
+            let floored = if remainder == 0.0 {
+                0.0
+            } else if (remainder < 0.0) != (y < 0.0) {
+                remainder + y
+            } else {
+                remainder
+            };
+            return Ok(Value::float(floored));
+        }
         // `FlooredModuloOperator`: the remainder with the sign of the divisor, and a zero that is positive
         let remainder = x % y;
         let floored = if remainder == 0.0 {
@@ -1707,6 +1720,14 @@ fn vector_arguments(name: &str, children: Vec<BoundExpr>) -> Result<(Vec<BoundEx
         _ => Fit::No,
     };
     let fits: Vec<Fit> = children.iter().map(fit).collect();
+    // `ArrayGenericBinaryResolveTypes`: the array functions take what they are given, which has to
+    // be an array
+    if name.starts_with("array_") && (fits.contains(&Fit::No) || fits.contains(&Fit::Ambiguous)) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("{name}: Arguments must be arrays of FLOAT or DOUBLE"),
+        ));
+    }
     if fits.contains(&Fit::No) {
         return Err(binder_error(format!(
             "No function matches the given name and argument types '{name}({})'. You might need to add explicit type \
@@ -1827,7 +1848,33 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
         "gamma" => simple(1, 1, d.clone(), gamma, casted(children, &d)),
         "lgamma" => simple(1, 1, d.clone(), lgamma, casted(children, &d)),
         "even" => simple(1, 1, d.clone(), even, casted(children, &d)),
-        "fmod" => simple(2, 2, d.clone(), fmod, casted(children, &d)),
+        // `FmodFun`: an overload for FLOAT and one for DOUBLE
+        "fmod" => {
+            // the parameters are named x and y
+            if names.iter().any(|n| !n.is_empty()) && children.len() == 2 {
+                let position = |n: &String| match n.to_lowercase().as_str() {
+                    "x" => Some(0),
+                    "y" => Some(1),
+                    _ => None,
+                };
+                if let (Some(a), Some(b)) = (position(&names[0]), position(&names[1]))
+                    && a != b
+                    && a == 1
+                {
+                    children.swap(0, 1);
+                }
+            }
+            let mut set = super::ScalarFunctionSet::new("fmod");
+            for ty in [LogicalType::FLOAT, d.clone()] {
+                set.add(super::ScalarFunction::new("fmod", vec![ty.clone(), ty.clone()], ty, fmod));
+            }
+            super::binder::bind_scalar_function(
+                &set,
+                children,
+                false,
+                &crate::execution::expression_executor::try_evaluate_scalar,
+            )
+        }
         "binom" => simple(
             2,
             2,

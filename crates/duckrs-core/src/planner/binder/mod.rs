@@ -794,6 +794,8 @@ pub struct Binder<'a> {
     pub(super) inside_try: bool,
     /// binding the correlated columns of a subquery (`depth > 0` in C++'s binders)
     pub(super) binding_correlated: bool,
+    /// rebinding a subquery whose expressions of this query's groups stand for the groups
+    pub(super) subquery_group_expressions: bool,
     /// The views being bound, innermost last (`bound_views`).
     bound_views: Vec<Arc<ViewCatalogEntry>>,
     /// The schema unqualified tables are looked up in before the default one: the schema of the
@@ -892,6 +894,7 @@ impl<'a> Binder<'a> {
             null_extended: std::collections::HashSet::new(),
             inside_try: false,
             binding_correlated: false,
+            subquery_group_expressions: false,
             bound_views: Vec::new(),
             search_schema: None,
             foreign_databases: Vec::new(),

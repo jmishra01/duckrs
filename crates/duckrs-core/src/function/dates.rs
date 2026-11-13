@@ -1022,13 +1022,21 @@ fn age_of(left: &Value, right: &Value) -> Result<Value> {
     }
 }
 
+/// `Cast::Operation<int64_t, int32_t>` of a date part.
+fn int32_part(value: i128) -> Result<i32> {
+    i32::try_from(value).map_err(|_| {
+        conversion(format!(
+            "Type INT64 with value {value} can't be cast because the value is out of range for the destination type \
+             INT32"
+        ))
+    })
+}
+
+/// `MakeDateOperator`: the parts are cast to INT32 first (`Date::FromDate`).
 fn date_from_parts(year: i128, month: i128, day: i128) -> Result<Value> {
-    let date = i32::try_from(year)
-        .ok()
-        .zip(i32::try_from(month).ok())
-        .zip(i32::try_from(day).ok())
-        .and_then(|((y, m), d)| Date::from_ymd(y, m, d));
-    date.map(Value::date)
+    let (y, m, d) = (int32_part(year)?, int32_part(month)?, int32_part(day)?);
+    Date::from_ymd(y, m, d)
+        .map(Value::date)
         .ok_or_else(|| conversion(format!("Date out of range: {year}-{month}-{day}")))
 }
 
@@ -1118,11 +1126,8 @@ fn make_timestamp(args: &DataChunk, result: &mut Vector) -> Result<()> {
         }
         let part = |at: usize| row[at].as_i128().expect("a BIGINT");
         let (year, month, day) = (part(0), part(1), part(2));
-        let date = i32::try_from(year)
-            .ok()
-            .zip(i32::try_from(month).ok())
-            .zip(i32::try_from(day).ok())
-            .and_then(|((y, m), d)| Date::from_ymd(y, m, d))
+        let (y, m, d) = (int32_part(year)?, int32_part(month)?, int32_part(day)?);
+        let date = Date::from_ymd(y, m, d)
             .ok_or_else(|| conversion(format!("Date out of range: {year}-{month}-{day}")))?;
         let time = time_micros(part(3), part(4), seconds_of(&row[5]))?;
         let micros = i64::from(date.0)
@@ -1167,13 +1172,15 @@ fn current_date(args: &DataChunk, result: &mut Vector) -> Result<()> {
 }
 
 macro_rules! to_interval {
-    ($name:ident, $input:ident, $value:expr) => {
+    ($name:ident, $unit:expr, $input:ident, $value:expr) => {
         fn $name(args: &DataChunk, result: &mut Vector) -> Result<()> {
             strict_rows(args, result, |row| {
                 let $input = row[0].as_i128().expect("an integer");
-                let overflow = || out_of_range("Interval value out of range");
-                let value: Interval = $value(overflow)?;
-                Ok(Value::interval(value))
+                // `To*Operator`: "Interval value <n> <unit> out of range"
+                let value: Option<Interval> = $value;
+                value
+                    .map(Value::interval)
+                    .ok_or_else(|| out_of_range(&format!("Interval value {} {} out of range", $input, $unit)))
             })
         }
     };
@@ -1203,25 +1210,17 @@ fn micros_interval(micros: i128) -> Option<Interval> {
     })
 }
 
-to_interval!(to_years, n, |e: fn() -> Error| months_interval(n * 12).ok_or_else(e));
-to_interval!(to_quarters, n, |e: fn() -> Error| months_interval(n * 3).ok_or_else(e));
-to_interval!(to_months, n, |e: fn() -> Error| months_interval(n).ok_or_else(e));
-to_interval!(to_decades, n, |e: fn() -> Error| months_interval(n * 120).ok_or_else(e));
-to_interval!(to_centuries, n, |e: fn() -> Error| months_interval(n * 1200)
-    .ok_or_else(e));
-to_interval!(to_millennia, n, |e: fn() -> Error| months_interval(n * 12000)
-    .ok_or_else(e));
-to_interval!(to_weeks, n, |e: fn() -> Error| days_interval(n * 7).ok_or_else(e));
-to_interval!(to_days, n, |e: fn() -> Error| days_interval(n).ok_or_else(e));
-to_interval!(to_hours, n, |e: fn() -> Error| micros_interval(
-    n * i128::from(MICROS_PER_HOUR)
-)
-.ok_or_else(e));
-to_interval!(to_minutes, n, |e: fn() -> Error| micros_interval(
-    n * i128::from(MICROS_PER_MINUTE)
-)
-.ok_or_else(e));
-to_interval!(to_microseconds, n, |e: fn() -> Error| micros_interval(n).ok_or_else(e));
+to_interval!(to_years, "years", n, months_interval(n * 12));
+to_interval!(to_quarters, "quarters", n, months_interval(n * 3));
+to_interval!(to_months, "months", n, months_interval(n));
+to_interval!(to_decades, "decades", n, months_interval(n * 120));
+to_interval!(to_centuries, "centuries", n, months_interval(n * 1200));
+to_interval!(to_millennia, "millennia", n, months_interval(n * 12000));
+to_interval!(to_weeks, "weeks", n, days_interval(n * 7));
+to_interval!(to_days, "days", n, days_interval(n));
+to_interval!(to_hours, "hours", n, micros_interval(n * i128::from(MICROS_PER_HOUR)));
+to_interval!(to_minutes, "minutes", n, micros_interval(n * i128::from(MICROS_PER_MINUTE)));
+to_interval!(to_microseconds, "microseconds", n, micros_interval(n));
 
 fn to_seconds(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
@@ -1529,12 +1528,34 @@ fn interval_minus_interval(args: &DataChunk, result: &mut Vector) -> Result<()> 
     })
 }
 
+/// `MultiplyOperator::Operation(interval_t, int64_t)`: the factor is cast to INT32 for the months
+/// and the days, each part checked as `MultiplyOperatorOverflowCheck` does.
 fn scale_interval(interval: Interval, factor: i64) -> Result<Interval> {
-    let overflow = || out_of_range("Interval value is out of range");
+    let factor32 = i32::try_from(factor).map_err(|_| {
+        Error::new(
+            ErrorKind::Conversion,
+            format!(
+                "Type INT64 with value {factor} can't be cast because the value is out of range for the destination \
+                 type INT32"
+            ),
+        )
+    })?;
+    let overflow = |name: &str, left: String, right: String| {
+        out_of_range(format!("Overflow in multiplication of {name} ({left} * {right})!"))
+    };
     Ok(Interval {
-        months: i32::try_from(i64::from(interval.months) * factor).map_err(|_| overflow())?,
-        days: i32::try_from(i64::from(interval.days) * factor).map_err(|_| overflow())?,
-        micros: interval.micros.checked_mul(factor).ok_or_else(overflow)?,
+        months: interval
+            .months
+            .checked_mul(factor32)
+            .ok_or_else(|| overflow("INT32", interval.months.to_string(), factor32.to_string()))?,
+        days: interval
+            .days
+            .checked_mul(factor32)
+            .ok_or_else(|| overflow("INT32", interval.days.to_string(), factor32.to_string()))?,
+        micros: interval
+            .micros
+            .checked_mul(factor)
+            .ok_or_else(|| overflow("INT64", interval.micros.to_string(), factor.to_string()))?,
     })
 }
 

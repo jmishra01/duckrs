@@ -450,7 +450,13 @@ fn window_arguments(
             sql_quoted_identifier(name)
         )));
     }
+    // the BIGINT parameters take what casts to BIGINT implicitly (`FunctionBinder::BindFunction`)
+    let all_arguments = arguments.clone();
     let bigint = |argument: &mut BoundExpr| -> Result<()> {
+        let from = crate::function::binder::expression_return_type(argument);
+        if crate::function::cast_rules::implicit_cast(&from, &LogicalType::BIGINT) < 0 {
+            return Err(no_match(&all_arguments));
+        }
         *argument = checked_cast(argument.clone(), &LogicalType::BIGINT)?;
         Ok(())
     };

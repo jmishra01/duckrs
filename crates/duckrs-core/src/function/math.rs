@@ -458,31 +458,72 @@ fn round_integer(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
-fn gcd_of(left: i128, right: i128) -> i128 {
-    let (mut a, mut b) = (left.abs(), right.abs());
-    while b != 0 {
-        (a, b) = (b, a % b);
+/// `TryAbsOperator`: the minimum of the type has no absolute value.
+fn try_abs(value: i128, minimum: i128) -> Result<i128> {
+    if value == minimum {
+        return Err(out_of_range(format!("Overflow on abs({value})")));
     }
-    a
+    Ok(value.abs())
+}
+
+/// `GreatestCommonDivisor<T>`, for the type whose minimum is `minimum`.
+fn typed_gcd(left: i128, right: i128, minimum: i128) -> Result<i128> {
+    if (left == minimum && right == -1) || (left == -1 && right == minimum) {
+        return Ok(1);
+    }
+    let (mut a, mut b) = (left, right);
+    loop {
+        if a == 0 {
+            return try_abs(b, minimum);
+        }
+        b %= a;
+        if b == 0 {
+            return try_abs(a, minimum);
+        }
+        a %= b;
+    }
+}
+
+/// The range of the BIGINT or HUGEINT the function gives.
+fn integer_range(result: &Vector) -> (i128, i128) {
+    if result.logical_type().id() == duckrs_common::types::LogicalTypeId::HugeInt {
+        (i128::MIN, i128::MAX)
+    } else {
+        (i128::from(i64::MIN), i128::from(i64::MAX))
+    }
+}
+
+fn integer_value(result_type: &LogicalType, value: i128) -> Value {
+    if result_type.id() == duckrs_common::types::LogicalTypeId::HugeInt {
+        Value::hugeint(value)
+    } else {
+        Value::bigint(value as i64)
+    }
 }
 
 fn gcd(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let (minimum, _) = integer_range(result);
+    let ty = result.logical_type().clone();
     strict_rows(args, result, |row| {
-        let (a, b) = (row[0].as_i128().expect("a BIGINT"), row[1].as_i128().expect("a BIGINT"));
-        Ok(Value::bigint(gcd_of(a, b) as i64))
+        let (a, b) = (row[0].as_i128().expect("an integer"), row[1].as_i128().expect("an integer"));
+        Ok(integer_value(&ty, typed_gcd(a, b, minimum)?))
     })
 }
 
+/// `LeastCommonMultipleOperator`.
 fn lcm(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let (minimum, maximum) = integer_range(result);
+    let ty = result.logical_type().clone();
     strict_rows(args, result, |row| {
-        let (a, b) = (row[0].as_i128().expect("a BIGINT"), row[1].as_i128().expect("a BIGINT"));
+        let (a, b) = (row[0].as_i128().expect("an integer"), row[1].as_i128().expect("an integer"));
         if a == 0 || b == 0 {
-            return Ok(Value::bigint(0));
+            return Ok(integer_value(&ty, 0));
         }
-        let result = (a / gcd_of(a, b) * b).abs();
-        i64::try_from(result)
-            .map(Value::bigint)
-            .map_err(|_| out_of_range("lcm value is out of range"))
+        let product = a
+            .checked_mul(b / typed_gcd(a, b, minimum)?)
+            .filter(|p| (minimum..=maximum).contains(p))
+            .ok_or_else(|| out_of_range("lcm value is out of range"))?;
+        Ok(integer_value(&ty, try_abs(product, minimum)?))
     })
 }
 
@@ -630,12 +671,9 @@ pub fn math_functions() -> Vec<ScalarFunctionSet> {
     ] {
         for name in names {
             let mut set = ScalarFunctionSet::new(name);
-            set.add(ScalarFunction::new(
-                name,
-                vec![LogicalType::BIGINT, LogicalType::BIGINT],
-                LogicalType::BIGINT,
-                callback,
-            ));
+            for ty in [LogicalType::BIGINT, LogicalType::HUGEINT] {
+                set.add(ScalarFunction::new(name, vec![ty.clone(), ty.clone()], ty, callback));
+            }
             sets.push(set);
         }
     }

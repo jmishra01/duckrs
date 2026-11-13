@@ -21,6 +21,7 @@ test/fuzzer/afl/window_type_mismatch.test
 test/fuzzer/duckfuzz/arg_minmax_by_decimal.test
 test/fuzzer/duckfuzz/array_const_columndatacopy.test
 test/fuzzer/duckfuzz/array_const_null_cast.test
+test/fuzzer/duckfuzz/array_distance.test
 test/fuzzer/duckfuzz/array_group_by_sample.test
 test/fuzzer/duckfuzz/array_hash.test
 test/fuzzer/duckfuzz/array_list_gather_cast.test
@@ -44,7 +45,9 @@ test/fuzzer/duckfuzz/group_by_all_positional_ref.test
 test/fuzzer/duckfuzz/hash_constant.test
 test/fuzzer/duckfuzz/hugeint_negate_underflow.test
 test/fuzzer/duckfuzz/invalid_make_time.test
+test/fuzzer/duckfuzz/json_extract_null.test
 test/fuzzer/duckfuzz/json_extract_string_null.test
+test/fuzzer/duckfuzz/json_functions_null_params.test
 test/fuzzer/duckfuzz/julian_overflow.test
 test/fuzzer/duckfuzz/late_materialization_filter.test
 test/fuzzer/duckfuzz/limit_offset_macro_subquery.test
@@ -65,6 +68,7 @@ test/fuzzer/duckfuzz/string_to_nested_cast_sample.test
 test/fuzzer/duckfuzz/strptime_const_arg.test
 test/fuzzer/duckfuzz/temporal_avg.test
 test/fuzzer/duckfuzz/test_vector_types_double_3.test
+test/fuzzer/duckfuzz/to_weeks_overflow.test
 test/fuzzer/duckfuzz/union_dict_tag.test
 test/fuzzer/duckfuzz/unpivot_multiple_in.test
 test/fuzzer/duckfuzz/vector_type.test
@@ -211,13 +215,16 @@ test/fuzzer/public/window_subquery_error.test
 test/fuzzer/public/window_subquery_with_functions_error.test
 test/fuzzer/sqlsmith/bitstring_agg_executor.test
 test/fuzzer/sqlsmith/bitstring_agg_overflow.test
+test/fuzzer/sqlsmith/current_schemas_null.test
 test/fuzzer/sqlsmith/dayofweek_overflow.test
 test/fuzzer/sqlsmith/fuzzer_window_varchar.test
 test/fuzzer/sqlsmith/generate_series_overflow.test
 test/fuzzer/sqlsmith/interval_diff_overflow.test
+test/fuzzer/sqlsmith/interval_multiply_overflow.test
 test/fuzzer/sqlsmith/json_contains_null.test
 test/fuzzer/sqlsmith/like_null_pattern.test
 test/fuzzer/sqlsmith/mad_overflow.test
+test/fuzzer/sqlsmith/makedate_overflow.test
 test/fuzzer/sqlsmith/nested_correlated_subquery.test
 test/fuzzer/sqlsmith/nullif_map.test
 test/fuzzer/sqlsmith/nullif_map_with_config.test
@@ -230,6 +237,7 @@ test/fuzzer/sqlsmith/test_abs_overflow.test
 test/fuzzer/sqlsmith/timestamp_diff_overflow.test
 test/fuzzer/sqlsmith/timestamp_overflow.test
 test/fuzzer/sqlsmith/validity_mask_out_of_bounds.test
+test/fuzzer/sqlsmith/window-leadlag-overflow.test
 test/fuzzer/sqlsmith/window-list-value.test
 test/fuzzer/sqlsmith/window-rows-overflow.test
 test/fuzzer/sqlsmith/window_function_error.test
@@ -301,6 +309,7 @@ test/issues/general/test_23940.test
 test/issues/general/test_24049.test
 test/issues/general/test_2407.test
 test/issues/general/test_2416.test
+test/issues/general/test_24328.test
 test/issues/general/test_24442.test
 test/issues/general/test_24542.test
 test/issues/general/test_24710.test
@@ -319,6 +328,7 @@ test/issues/general/test_26274.test
 test/issues/general/test_26797_parquet.test
 test/issues/general/test_26957.test
 test/issues/general/test_27041.test
+test/issues/general/test_27102.test
 test/issues/general/test_27205.test
 test/issues/general/test_2743.test
 test/issues/general/test_3127.test
@@ -345,6 +355,8 @@ test/issues/general/test_5390.test
 test/issues/general/test_5488.test
 test/issues/general/test_5614.test
 test/issues/general/test_5664.test
+test/issues/general/test_6822.test
+test/issues/general/test_8287.test
 test/issues/general/test_9380.test
 test/issues/general/test_9456.test
 test/issues/general/test_9738.test

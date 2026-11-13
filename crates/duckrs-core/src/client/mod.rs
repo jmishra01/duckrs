@@ -3646,7 +3646,15 @@ impl ClientContext {
     /// `DROP TABLE`, `VIEW`, `SEQUENCE`, `MACRO` and `SCHEMA` (`Catalog::DropEntry`).
     fn drop_entry(&mut self, info: &DropInfo) -> Result<()> {
         let internal_entry =
-            |name: &str| Error::new(ErrorKind::Catalog, format!("Cannot drop internal catalog entry {name}!"));
+            |name: &str| {
+                Error::new(
+                    ErrorKind::Catalog,
+                    format!(
+                        "Cannot drop internal catalog entry {}!",
+                        duckrs_parser::ast::sql_quoted_identifier(name)
+                    ),
+                )
+            };
         let catalog = self.catalog();
         let temporary = catalog.schema_for(Some(TEMP_SCHEMA))?;
         let in_temp = info.name.qualification.is_empty()
@@ -3718,6 +3726,14 @@ impl ClientContext {
                     Err(_) if info.if_exists => false,
                     Err(error) => return Err(error),
                 };
+                // a function of the system catalog is an internal entry
+                let functions = crate::function::BuiltinFunctions::get();
+                if !dropped
+                    && schema.is_none()
+                    && (functions.scalar(&info.name.name).is_some() || functions.aggregate(&info.name.name).is_some())
+                {
+                    return Err(internal_entry(&info.name.name));
+                }
                 if !dropped && !info.if_exists {
                     return Err(missing_entry(macro_type_name(table_macro), &info.name.name));
                 }

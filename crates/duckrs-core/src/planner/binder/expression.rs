@@ -731,6 +731,38 @@ impl Binder<'_> {
         let mut rewritten = subquery.clone();
         // aggregates of this query's columns stand in the subquery under a name of their own
         let mut outer_aggregates: Vec<(String, Expr, LogicalType)> = Vec::new();
+        // `BaseSelectBinder::TryBindGroup` at depth > 0: an expression of the subquery that is a
+        // group of this query stands for the group
+        let group_expressions = std::mem::take(&mut self.subquery_group_expressions);
+        if group_expressions && let Some(state) = self.aggregates.as_ref() {
+            let keys: Vec<Expr> = state.group_map.iter().map(|(key, _)| key.clone()).collect();
+            let mut found: Vec<Expr> = Vec::new();
+            visit_query_node_exprs_mut(&mut rewritten.node, &mut |e| {
+                if matches!(e.kind, ExprKind::ColumnRef(_) | ExprKind::Constant(_)) {
+                    return;
+                }
+                let mut qualified = e.clone();
+                self.qualify_column_names(&mut qualified);
+                let qualified = without_aliases(&qualified);
+                if let Some(key) = keys.iter().find(|key| **key == qualified) {
+                    let at = match found.iter().position(|f| f == key) {
+                        Some(at) => at,
+                        None => {
+                            found.push(key.clone());
+                            found.len() - 1
+                        }
+                    };
+                    let alias = std::mem::take(&mut e.alias);
+                    *e = Expr::column(vec![format!("__outer_aggregate_group_{at}")]);
+                    e.alias = alias;
+                }
+            });
+            for (at, key) in found.into_iter().enumerate() {
+                let ty = self.bind_expression(&key)?.return_type;
+                outer_aggregates.push((format!("__outer_aggregate_group_{at}"), key, ty));
+            }
+        }
+        let bound_columns = self.aggregates.as_ref().map(|state| state.bound_columns.len());
         let (binder, bound) = loop {
             let mut context = self.bind_context.clone();
             if !outer_aggregates.is_empty() {
@@ -804,6 +836,21 @@ impl Binder<'_> {
             bindings.push(column.binding);
         }
         self.alias_fallback.truncate(fallback_size);
+        // a correlated column that is no group: try again with the expressions of the groups
+        if !group_expressions
+            && let (Some(before), Some(state)) = (bound_columns, self.aggregates.as_mut())
+            && state.bound_columns.len() > before
+            && !state.group_map.is_empty()
+        {
+            let added = state.bound_columns.split_off(before);
+            self.subquery_group_expressions = true;
+            let retried = self.bind_subquery(subquery, subquery_type, parsed_child, comparison);
+            self.subquery_group_expressions = false;
+            if retried.is_ok() {
+                return retried;
+            }
+            self.aggregates.as_mut().expect("checked above").bound_columns.extend(added);
+        }
         let child = child.map(|c| self.bind_expression(c)).transpose()?;
         let columns = bound.types.len();
         let row_width = child
@@ -1025,6 +1072,35 @@ impl Binder<'_> {
             }
         }
         let bound = self.bind_expression_inner(expr)?;
+        // `BindMapContainsExpression`: with a collation on the key or the map's keys, the key is
+        // looked for among the keys as a list: list_contains(map_keys(m), key)
+        if let (ExprKind::Function(call), BoundExprKind::Function { function, children, .. }) = (&expr.kind, &bound.kind)
+            && function.name == "map_contains"
+            && let [map, key] = children.as_slice()
+            && let [map_argument, key_argument] = call.args.as_slice()
+        {
+            fn has_collation(ty: &LogicalType) -> bool {
+                match ty.id() {
+                    LogicalTypeId::Varchar => ty.alias().is_none() && ty.collation().is_some_and(|c| !c.is_empty()),
+                    LogicalTypeId::List | LogicalTypeId::Array => ty.child_type().is_some_and(has_collation),
+                    _ => false,
+                }
+            }
+            let map_key = (map.return_type.id() == LogicalTypeId::Map)
+                .then(|| map.return_type.child_type().and_then(|entry| entry.struct_children().first().map(|(_, t)| t.clone())))
+                .flatten();
+            if has_collation(&key.return_type) || map_key.as_ref().is_some_and(has_collation) {
+                let keys = Expr::from(ExprKind::Function(ast::FunctionExpr::new(
+                    "map_keys",
+                    vec![map_argument.expr.clone()],
+                )));
+                let mut rewritten = ast::FunctionExpr::new("list_contains", vec![keys, key_argument.expr.clone()]);
+                rewritten.name.qualification.clear();
+                let mut rewritten = Expr::from(ExprKind::Function(rewritten));
+                rewritten.alias.clone_from(&expr.alias);
+                return self.bind_expression(&rewritten);
+            }
+        }
         if matches!(expr.kind, ExprKind::Function(_) | ExprKind::Operator { .. })
             && matches!(bound.kind, BoundExprKind::Function { .. })
         {
@@ -2574,8 +2650,15 @@ impl Binder<'_> {
         // `CurrentSchemasBind`: the schemas that were set, or with `include_implicit` the whole search path
         if name == "current_schemas" && function.args.len() == 1 {
             let argument = self.bind_expression(&function.args[0].expr)?;
-            if argument.return_type.id() != LogicalTypeId::Boolean {
+            // `CurrentSchemasResolveTypes`: a NULL takes the BOOLEAN parameter
+            if !matches!(argument.return_type.id(), LogicalTypeId::Boolean | LogicalTypeId::SqlNull) {
                 return Err(binder_error("current_schemas requires a boolean input"));
+            }
+            // `BindFunctionInput::GetConstant`
+            if !argument.is_foldable() {
+                return Err(binder_error(
+                    "The include_implicit argument in function current_schemas must be a constant expression",
+                ));
             }
             let value = crate::execution::expression_executor::evaluate_scalar(&argument)?;
             let list_type = LogicalType::list(LogicalType::VARCHAR);

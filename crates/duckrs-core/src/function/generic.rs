@@ -1530,13 +1530,19 @@ fn sign(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
-fn interval_out_of_range() -> Error {
-    Error::new(ErrorKind::OutOfRange, "Interval value out of range")
-}
-
 /// `to_years` and the like, for a unit of `months`, `days` or `micros`.
-fn to_interval(args: &DataChunk, result: &mut Vector, months: i64, days: i64, micros: i64) -> Result<()> {
+fn to_interval(args: &DataChunk, result: &mut Vector, months: i64, days: i64, micros: i64, unit: &str) -> Result<()> {
     strict_rows(args, result, |row| {
+        // `To*Operator`: "Interval value <n> <unit> out of range"
+        let interval_out_of_range = || {
+            Error::new(
+                ErrorKind::OutOfRange,
+                format!(
+                    "Interval value {} {unit} out of range",
+                    row[0].try_to_string().unwrap_or_default()
+                ),
+            )
+        };
         let number = |factor: i64| -> Result<i64> {
             match row[0].data() {
                 ValueData::Double(v) => {
@@ -1562,7 +1568,8 @@ fn to_interval(args: &DataChunk, result: &mut Vector, months: i64, days: i64, mi
 macro_rules! interval_function {
     ($($name:ident: $months:expr, $days:expr, $micros:expr;)*) => {$(
         fn $name(args: &DataChunk, result: &mut Vector) -> Result<()> {
-            to_interval(args, result, $months, $days, $micros)
+            let unit = stringify!($name).trim_start_matches("to_");
+            to_interval(args, result, $months, $days, $micros, unit)
         }
     )*};
 }
