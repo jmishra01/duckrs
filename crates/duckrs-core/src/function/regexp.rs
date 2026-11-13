@@ -39,7 +39,10 @@ fn regex_error(error: &str, pattern: &str) -> String {
         "unclosed group" => format!("missing ): {pattern}"),
         "unclosed character class" => format!("missing ]: {span}"),
         "repetition operator missing expression" => format!("no argument for repetition operator: {span}"),
-        "unrecognized escape sequence" | "invalid hexadecimal digit" | "invalid Unicode scalar value" => {
+        "unrecognized escape sequence"
+        | "invalid hexadecimal digit"
+        | "invalid Unicode scalar value"
+        | "hexadecimal literal is not a Unicode scalar value" => {
             format!("invalid escape sequence: {span}")
         }
         _ => format!("Invalid regular expression: {error}"),
@@ -99,6 +102,8 @@ fn compile(pattern: &str, options: Options, anchored: bool) -> Result<Regex> {
     let regex = RegexBuilder::new(&source)
         .case_insensitive(options.case_insensitive)
         .dot_matches_new_line(options.dot_matches_newline)
+        // RE2 reads `\123` as an octal character code
+        .octal(true)
         .build()
         .map_err(|error| Error::new(ErrorKind::InvalidInput, regex_error(&error.to_string(), pattern)))?;
     CACHE.with(|cache| cache.borrow_mut().insert(key, regex.clone()));
@@ -241,7 +246,10 @@ fn regexp_extract(args: &DataChunk, result: &mut Vector) -> Result<()> {
         // `RegexExtractBind`: a NULL group never captures
         let group = match group_of(row) {
             Some(group) if !(0..=9).contains(&group) => {
-                return Err(Error::new(ErrorKind::InvalidInput, "Group index must be between 0 and 9!"));
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "Group index must be between 0 and 9!",
+                ));
             }
             Some(group) => group,
             None => -1,
@@ -296,7 +304,11 @@ fn regexp_extract_all(args: &DataChunk, result: &mut Vector) -> Result<()> {
             };
             let matched = captures.get(0).expect("the whole match");
             // a group that took no part in the match is NULL
-            items.push(captures.get(group).map_or(Value::null(LogicalType::VARCHAR), |m| Value::varchar(m.as_str())));
+            items.push(
+                captures
+                    .get(group)
+                    .map_or(Value::null(LogicalType::VARCHAR), |m| Value::varchar(m.as_str())),
+            );
             start = matched.end();
             if matched.is_empty() {
                 start += input[start..].chars().next().map_or(1, char::len_utf8);

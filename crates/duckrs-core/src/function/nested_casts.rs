@@ -109,8 +109,17 @@ fn string_to_nested(input: &[u8], target: &LogicalType, mode: CastMode) -> Resul
             let entries = split_map(input).ok_or_else(error)?;
             let mut items = Vec::with_capacity(entries.len());
             for (key, value) in entries {
-                let key = cast_value(&varchar_part(Some(key)), &fields[0].1, mode)?;
+                // keys of type NULL are NULL: "Map keys can not be NULL."
+                let null_keys = fields[0].1.id() == LogicalTypeId::SqlNull;
+                let key = if null_keys {
+                    Value::sql_null()
+                } else {
+                    cast_value(&varchar_part(Some(key)), &fields[0].1, mode)?
+                };
                 if key.is_null() {
+                    if null_keys && mode == CastMode::Strict {
+                        return Err(Error::new(ErrorKind::InvalidInput, "Map keys can not be NULL."));
+                    }
                     return Err(error());
                 }
                 let value = cast_value(&varchar_part(value), &fields[1].1, mode)?;

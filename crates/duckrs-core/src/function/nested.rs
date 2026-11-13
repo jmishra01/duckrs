@@ -519,6 +519,11 @@ fn struct_field_by_index(ty: &LogicalType, index: i64) -> Result<usize> {
 
 /// `union_extract` with a constant key.
 fn bind_union_extract(child: BoundExpr, key: &BoundExpr) -> Result<BoundExpr> {
+    // a NULL constant folds before the bind callback resolves the return type
+    let null_constant = |e: &BoundExpr| matches!(&e.kind, BoundExprKind::Constant(value) if value.is_null());
+    if null_constant(&child) || matches!(&child.kind, BoundExprKind::Cast { child, .. } if null_constant(child)) {
+        return Ok(BoundExpr::constant(Value::sql_null()));
+    }
     let ty = child.return_type.clone();
     let BoundExprKind::Constant(key) = &key.kind else {
         return Err(binder_error("Key name for union_extract needs to be a constant string"));
@@ -602,6 +607,22 @@ fn bind_struct_extract_with(child: BoundExpr, key: BoundExpr, at: bool) -> Resul
     ))
 }
 
+/// The type a template takes from two of its occurrences (`FunctionBinder` template deduction): the type
+/// both have in common, where a VARCHAR next to a type that is not a string has none.
+pub(crate) fn deduce_template(first: &LogicalType, second: &LogicalType) -> Option<LogicalType> {
+    let varchar = |t: &LogicalType| t.id() == LogicalTypeId::Varchar;
+    let stringy = |t: &LogicalType| {
+        matches!(
+            t.id(),
+            LogicalTypeId::Varchar | LogicalTypeId::StringLiteral | LogicalTypeId::SqlNull
+        )
+    };
+    if (varchar(first) && !stringy(second)) || (varchar(second) && !stringy(first)) {
+        return None;
+    }
+    try_max_logical_type(first, second).map(|t| normalize_type(&t))
+}
+
 /// `list_extract` and `array_extract`, on anything that can be indexed.
 fn bind_extract(name: &str, child: BoundExpr, key: BoundExpr) -> Result<BoundExpr> {
     let ty = child.return_type.clone();
@@ -609,6 +630,8 @@ fn bind_extract(name: &str, child: BoundExpr, key: BoundExpr) -> Result<BoundExp
         LogicalTypeId::Struct | LogicalTypeId::Tuple | LogicalTypeId::Union | LogicalTypeId::Variant => {
             bind_struct_extract(child, key)
         }
+        // of list_extract's `(LIST, BIGINT)` and `(VARCHAR, BIGINT)`, a NULL takes the string one
+        LogicalTypeId::SqlNull if name == "list_extract" => Ok(BoundExpr::constant(Value::null(LogicalType::VARCHAR))),
         LogicalTypeId::SqlNull => Ok(BoundExpr::constant(Value::sql_null())),
         LogicalTypeId::List | LogicalTypeId::Array => {
             let element = ty.child_type().expect("a child type").clone();
@@ -618,7 +641,25 @@ fn bind_extract(name: &str, child: BoundExpr, key: BoundExpr) -> Result<BoundExp
         LogicalTypeId::Map => {
             let children = ty.child_type().expect("an entry type").struct_children();
             let (key_type, value_type) = (children[0].1.clone(), children[1].1.clone());
-            let key = key.cast_to(&key_type, false);
+            // the key of an empty map is no type to cast to: the template `K` is the key's type
+            if key_type.id() == LogicalTypeId::SqlNull {
+                return Ok(bound_function(name, vec![child, key], value_type, map_extract));
+            }
+            let arg = expression_return_type(&key);
+            let Some(common) = deduce_template(&key_type, &arg) else {
+                return Err(binder_error(format!(
+                    "No function matches the given name and argument types '{name}({ty}, {arg})'. You might need \
+                     to add explicit type casts.\n\tCannot deduce template type 'K', it was inferred to be:\n  - \
+                     '{key_type}', from first occurrence\n  - '{arg}', which is incompatible with the previously \
+                     inferred type"
+                )));
+            };
+            let child = if common == key_type {
+                child
+            } else {
+                child.cast_to(&LogicalType::map(common.clone(), value_type.clone()), false)
+            };
+            let key = key.cast_to(&common, false);
             Ok(bound_function(name, vec![child, key], value_type, map_extract))
         }
         _ if ty.physical_type() == PhysicalType::Varchar => {

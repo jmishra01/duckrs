@@ -381,6 +381,10 @@ pub fn bind_decimal_round(name: &str, children: &[BoundExpr]) -> Result<Option<B
         "trunc" => (DecimalRounding::Trunc, decimal_trunc),
         _ => return Ok(None),
     };
+    // an untyped NULL folds the call before its bind runs
+    if precision.return_type.id() == LogicalTypeId::SqlNull {
+        return Ok(Some(BoundExpr::constant(Value::sql_null())));
+    }
     if !precision.is_foldable() {
         return Err(Error::new(
             ErrorKind::Binder,

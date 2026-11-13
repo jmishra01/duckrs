@@ -7,7 +7,6 @@
 
 use super::expression::checked_cast;
 use super::{Binder, binder_error};
-use crate::function::combine_types::try_max_logical_type;
 use crate::function::nested::bind_nested_function;
 use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding, LambdaKind};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
@@ -114,17 +113,67 @@ impl Binder<'_> {
         let Some(kind) = lambda_kind(&function.name.name) else {
             return Ok(None);
         };
-        let Some(lambda) = function.args.get(1) else {
-            return Ok(None);
-        };
+        // the overloads are `(LIST, LAMBDA)`, and `(LIST, LAMBDA, ANY)` for list_reduce
+        let is_lambda = |e: &Expr| matches!(e.kind, ExprKind::Lambda { .. });
+        let arity = if kind == LambdaKind::Reduce { 2..=3 } else { 2..=2 };
+        let lambda = function.args.get(1).filter(|a| is_lambda(&a.expr));
+        let extra_lambda = function.args.iter().skip(2).any(|a| is_lambda(&a.expr));
+        if !arity.contains(&function.args.len()) || extra_lambda || lambda.is_none() {
+            let mut types = Vec::with_capacity(function.args.len());
+            for arg in &function.args {
+                types.push(if is_lambda(&arg.expr) {
+                    LogicalType::new(LogicalTypeId::Lambda)
+                } else {
+                    crate::function::binder::expression_return_type(&self.bind_expression(&arg.expr)?)
+                });
+            }
+            // a NULL casts to the lambda, which its bind then refuses
+            let list_like = |t: &LogicalType| {
+                matches!(
+                    t.id(),
+                    LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::SqlNull
+                )
+            };
+            if arity.contains(&types.len())
+                && !extra_lambda
+                && list_like(&types[0])
+                && types[1].id() == LogicalTypeId::SqlNull
+            {
+                return Err(binder_error("Invalid lambda expression!"));
+            }
+            let types: Vec<String> = types.iter().map(ToString::to_string).collect();
+            return Err(binder_error(format!(
+                "No function matches the given name and argument types '{}({})'. You might need to add explicit \
+                 type casts.",
+                function.name.name.to_lowercase(),
+                types.join(", ")
+            )));
+        }
+        let lambda = lambda.expect("checked");
         let ExprKind::Lambda { lhs, expr, .. } = &lambda.expr.kind else {
-            return Err(binder_error("Invalid lambda expression!"));
+            unreachable!("checked");
         };
         let names = parameter_names(lhs)?;
-        if kind == LambdaKind::Reduce {
-            if names.len() < 2 {
-                return Err(binder_error("list_reduce expects a function with 2 or 3 arguments"));
+        let mut list = self.bind_expression(&function.args[0].expr)?;
+        if list.return_type.id() == LogicalTypeId::SqlNull {
+            // the body still binds, so that what it references must exist
+            let table_index = self.generate_table_index();
+            self.lambda_scopes.push(LambdaScope {
+                table_index,
+                names: names.clone(),
+                types: vec![LogicalType::SQLNULL; names.len()],
+            });
+            let body = self.bind_expression(expr);
+            self.lambda_scopes.pop();
+            // (only a reference to nothing: the parameters have no type to bind the rest with)
+            if let Err(error) = body
+                && error.message.starts_with("Referenced column")
+            {
+                return Err(error);
             }
+            return Ok(Some(BoundExpr::constant(Value::sql_null())));
+        }
+        if kind == LambdaKind::Reduce {
             if names.len() > 3 {
                 return Err(binder_error(
                     "This lambda function only supports up to three lambda parameters!",
@@ -134,10 +183,6 @@ impl Binder<'_> {
             return Err(binder_error(
                 "This lambda function only supports up to two lambda parameters!",
             ));
-        }
-        let mut list = self.bind_expression(&function.args[0].expr)?;
-        if list.return_type.id() == LogicalTypeId::SqlNull {
-            return Ok(Some(BoundExpr::constant(Value::sql_null())));
         }
         if list.return_type.id() == LogicalTypeId::Array {
             let element = list.return_type.child_type().expect("a child").clone();
@@ -151,33 +196,57 @@ impl Binder<'_> {
             Some(initial) if kind == LambdaKind::Reduce => Some(self.bind_expression(&initial.expr)?),
             _ => None,
         };
-        // the initial value and the elements meet in one type
-        let accumulator = match &initial {
-            Some(initial) => try_max_logical_type(&element, &initial.return_type).ok_or_else(|| {
-                binder_error(format!(
-                    "Cannot combine the types {element} and {} of the list and the initial value",
-                    initial.return_type
-                ))
-            })?,
+        // `ListReduceBind`: the accumulator starts as the initial value (or the first element), and is
+        // the type that has both it and what the lambda gives
+        let mut accumulator = match &initial {
+            Some(initial) => initial.return_type.clone(),
             None => element.clone(),
         };
-        let initial = initial.map(|initial| initial.cast_to(&accumulator, false));
-        let mut types = if kind == LambdaKind::Reduce {
-            vec![accumulator.clone(), element.clone()]
-        } else {
-            vec![element.clone()]
-        };
-        types.push(LogicalType::BIGINT);
-        types.truncate(names.len());
         let table_index = self.generate_table_index();
-        self.lambda_scopes.push(LambdaScope {
-            table_index,
-            names,
-            types,
-        });
-        let body = self.bind_expression(expr);
-        self.lambda_scopes.pop();
-        let mut body = body?;
+        let mut rounds = 0;
+        let mut body = loop {
+            let mut types = if kind == LambdaKind::Reduce {
+                vec![accumulator.clone(), element.clone()]
+            } else {
+                vec![element.clone()]
+            };
+            types.push(LogicalType::BIGINT);
+            types.truncate(names.len());
+            self.lambda_scopes.push(LambdaScope {
+                table_index,
+                names: names.clone(),
+                types,
+            });
+            let body = self.bind_expression(expr);
+            self.lambda_scopes.pop();
+            let body = body?;
+            if kind != LambdaKind::Reduce {
+                break body;
+            }
+            // `ListReduceBind` counts the parameters once the lambda is bound
+            if names.len() < 2 {
+                return Err(binder_error("list_reduce expects a function with 2 or 3 arguments"));
+            }
+            let combined = crate::function::nested::deduce_template(&accumulator, &body.return_type);
+            let Some(combined) = combined else {
+                let what = if initial.is_some() {
+                    "initial value"
+                } else {
+                    "list element"
+                };
+                return Err(binder_error(format!(
+                    "No common super type between {what} type {accumulator} and lambda return type {}",
+                    body.return_type
+                )));
+            };
+            // the accumulator the body reads has to be the type it gives
+            rounds += 1;
+            if combined == accumulator || rounds > 3 {
+                break body;
+            }
+            accumulator = combined;
+        };
+        let initial = initial.map(|initial| initial.cast_to(&accumulator, false));
         // the chunk the body reads: its parameters, the index, then the captures
         let parameters = if kind == LambdaKind::Reduce { 3 } else { 2 };
         let mut captures: Vec<BoundExpr> = Vec::new();

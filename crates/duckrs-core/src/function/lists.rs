@@ -265,6 +265,14 @@ fn list_resize(args: &DataChunk, result: &mut Vector) -> Result<()> {
         if size < 0 {
             return Err(Error::new(ErrorKind::OutOfRange, "Cannot resize list to negative size"));
         }
+        // `VectorBuffer::GetReserveSize`: a vector holds at most 128GB
+        const MAX_VECTOR_SIZE: i128 = 1 << 37;
+        if size > MAX_VECTOR_SIZE {
+            return Err(Error::new(
+                ErrorKind::OutOfRange,
+                format!("Cannot resize vector to {size} rows: maximum allowed vector size is 128.0 GiB"),
+            ));
+        }
         let fill = row.get(2).cloned().unwrap_or_else(|| Value::null(element.clone()));
         let mut values = items(&row[0]).to_vec();
         values.resize(size as usize, fill);
@@ -589,6 +597,20 @@ pub fn bind_list_function(name: &str, children: Vec<BoundExpr>) -> Result<BoundE
             let (Some(a), Some(b)) = (element_of(&left), element_of(&right)) else {
                 return Err(no_match(&lower, &children));
             };
+            // `T` of `(LIST(T), LIST(T))`: nested elements with nothing in common deduce no type
+            let nested = |t: &LogicalType| t.is_nested();
+            let deduced = super::nested::deduce_template(&a, &b);
+            if deduced.is_none() && (nested(&a) || nested(&b)) {
+                let error = no_match(&lower, &children);
+                return Err(Error::new(
+                    ErrorKind::Binder,
+                    format!(
+                        "{}\n\tCannot deduce template type 'T', it was inferred to be:\n  - '{a}', from first \
+                         occurrence\n  - '{b}', which is incompatible with the previously inferred type",
+                        error.message
+                    ),
+                ));
+            }
             let common = LogicalType::list(force_max_logical_type(&a, &b));
             let args = vec![left.cast_to(&common, false), right.cast_to(&common, false)];
             if lower.ends_with("any") || lower == "&&" {

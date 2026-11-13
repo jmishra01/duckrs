@@ -251,17 +251,37 @@ pub fn enum_type_from(values: Vec<String>) -> Result<LogicalType> {
 }
 
 /// The type of a type parameter, for `TypeParametersToString`.
-fn type_parameter_type(expr: &Expr) -> &'static str {
+fn type_parameter_type(expr: &Expr) -> String {
     match &expr.kind {
         ExprKind::Constant(literal) => match literal.kind {
-            LiteralKind::Integer => "INTEGER",
-            LiteralKind::String => "VARCHAR",
-            LiteralKind::Null => "NULL",
-            _ => "DECIMAL",
+            LiteralKind::Integer => "INTEGER".to_string(),
+            LiteralKind::String => "VARCHAR".to_string(),
+            LiteralKind::Null => "NULL".to_string(),
+            LiteralKind::Boolean => "BOOLEAN".to_string(),
+            // the DECIMAL a number literal reads as: all its digits, and those after the point
+            _ => {
+                let text = literal.text.trim_start_matches('-');
+                let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+                let whole = whole.trim_start_matches('0');
+                let width = (whole.len() + fraction.len()).max(1);
+                format!("DECIMAL({width},{})", fraction.len())
+            }
         },
         // a negative number is a parenthesized expression here
-        _ => "INTEGER",
+        _ => "INTEGER".to_string(),
     }
+}
+
+/// `CastArgument`: a NULL type parameter is refused by its name.
+fn null_type_parameter(type_name: &str, names: &[&str], children: &[Expr]) -> Result<()> {
+    for (child, name) in children.iter().zip(names) {
+        if matches!(&child.kind, ExprKind::Constant(literal) if literal.kind == LiteralKind::Null) {
+            return Err(binder_error(format!(
+                "Type parameter \"{name}\" for type \"{type_name}\" cannot be NULL"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// `ColumnQualifier::SQLValueFunctionName`: what these words call when no column has their name.
@@ -361,31 +381,63 @@ impl Binder<'_> {
     }
 
     pub fn bind_type(&self, target: &CastType) -> Result<LogicalType> {
-        let (original, children): (&str, &[Expr]) = match target {
-            CastType::Resolved(ty) if ty.contains_unbound() => return self.bind_named_type(ty),
-            CastType::Resolved(ty) => return Ok(ty.clone()),
-            CastType::Builtin(name) => (&**name, &[]),
-            CastType::Parsed(expr) => match &expr.kind {
-                ExprKind::Type(TypeExpr { name, children }) => {
-                    if !name.qualification.is_empty() {
-                        let schema = self.schema_of(name)?;
-                        return self
-                            .catalog
-                            .get_type(schema.as_deref(), None, &name.name)?
-                            .ok_or_else(|| {
-                                Error::new(
+        let (original, children): (&str, &[Expr]) =
+            match target {
+                CastType::Resolved(ty) if ty.contains_unbound() => return self.bind_named_type(ty),
+                CastType::Resolved(ty) => return Ok(ty.clone()),
+                CastType::Builtin(name) => (&**name, &[]),
+                CastType::Parsed(expr) => match &expr.kind {
+                    ExprKind::Type(TypeExpr { name, children }) => {
+                        if !name.qualification.is_empty() {
+                            let schema = self.schema_of(name)?;
+                            // `Catalog::LookupEntry`: a missing schema is a missing type, except that a nested
+                            // schema path is named
+                            let found = self.catalog.get_type(schema.as_deref(), None, &name.name).or_else(|error| {
+                            if error.kind != ErrorKind::Catalog || !error.message.starts_with("Schema with name") {
+                                return Err(error);
+                            }
+                            if name.qualification.len() >= 2 {
+                                let schema = name.qualification.join(".");
+                                return Err(Error::new(
+                                    ErrorKind::Catalog,
+                                    format!(
+                                        "Type with name \"{schema}.{}\" does not exist because schema \"{schema}\" \
+                                         does not exist.",
+                                        name.name
+                                    ),
+                                ));
+                            }
+                            Ok(None)
+                        })?;
+                            if let Some(ty) = found {
+                                return Ok(ty);
+                            }
+                            // the built-in types are found in `main` too
+                            let in_main = name
+                                .qualification
+                                .iter()
+                                .rev()
+                                .find(|q| !q.is_empty())
+                                .is_some_and(|q| q.eq_ignore_ascii_case("main"));
+                            if !in_main || builtin_type(&name.name.to_lowercase()).is_none() {
+                                return Err(Error::new(
                                     ErrorKind::Catalog,
                                     format!("Type with name {} does not exist!", name.name),
-                                )
-                            });
+                                ));
+                            }
+                        }
+                        (name.name.as_str(), children.as_slice())
                     }
-                    (name.name.as_str(), children.as_slice())
-                }
-                _ => return Err(crate::unported(format!("type expression {expr}"))),
-            },
-        };
+                    _ => return Err(crate::unported(format!("type expression {expr}"))),
+                },
+            };
         let name = original.to_lowercase();
         if let Some(ty) = self.catalog.get_type(None, self.search_schema.as_deref(), &name)? {
+            if !children.is_empty() {
+                return Err(binder_error(format!(
+                    "Type \"{original}\" does not take any type parameters"
+                )));
+            }
             return Ok(ty);
         }
         if name == "json" {
@@ -406,13 +458,16 @@ impl Binder<'_> {
         match id {
             LogicalTypeId::Decimal => {
                 let rejected = || {
-                    let types: Vec<&str> = children.iter().map(type_parameter_type).collect();
+                    let types: Vec<String> = children.iter().map(type_parameter_type).collect();
                     binder_error(format!(
                         "Type \"DECIMAL\" does not accept type parameters ({})\nCandidates:\n    DECIMAL\n    \
                          DECIMAL(width UTINYINT, scale UTINYINT := 0)",
                         types.join(", ")
                     ))
                 };
+                if children.len() <= 2 {
+                    null_type_parameter("DECIMAL", &["width", "scale"], children)?;
+                }
                 let (width, scale) = match children {
                     [] => (18, 3),
                     [w] => (type_parameter(w).ok_or_else(rejected)?, 0),
@@ -446,8 +501,32 @@ impl Binder<'_> {
                 crate::planner::collation::test_collation(&literal.text)?;
                 Ok(LogicalType::varchar_collation(&literal.text))
             }
+            // `RegisterFloatConstructors`: FLOAT(precision) is a FLOAT or a DOUBLE
+            LogicalTypeId::Float if name == "float" && children.len() == 1 => {
+                null_type_parameter("FLOAT", &["precision"], children)?;
+                let Some(precision) = type_parameter(&children[0]) else {
+                    return Err(binder_error(format!(
+                        "Type \"FLOAT\" does not accept type parameters ({})",
+                        type_parameter_type(&children[0])
+                    )));
+                };
+                match precision {
+                    ..1 => Err(binder_error("precision for type float must be at least 1 bit")),
+                    1..=24 => Ok(LogicalType::FLOAT),
+                    25..=53 => Ok(LogicalType::DOUBLE),
+                    _ => Err(binder_error("precision for type float must be less than 54 bits")),
+                }
+            }
             // the width of a VARCHAR is accepted and ignored
             LogicalTypeId::Varchar if children.len() <= 1 => Ok(LogicalType::VARCHAR),
+            LogicalTypeId::Varchar => {
+                let types: Vec<String> = children.iter().map(type_parameter_type).collect();
+                Err(binder_error(format!(
+                    "Type \"{}\" does not accept type parameters ({})",
+                    name.to_uppercase(),
+                    types.join(", ")
+                )))
+            }
             LogicalTypeId::List
             | LogicalTypeId::Array
             | LogicalTypeId::Map
@@ -462,7 +541,7 @@ impl Binder<'_> {
                             values.push(literal.text.clone())
                         }
                         _ => {
-                            let types: Vec<&str> = children.iter().map(type_parameter_type).collect();
+                            let types: Vec<String> = children.iter().map(type_parameter_type).collect();
                             return Err(binder_error(format!(
                                 "Type \"ENUM\" does not accept type parameters ({})",
                                 types.join(", ")
@@ -480,7 +559,7 @@ impl Binder<'_> {
             // `BindGeometryType`: the CRS, as the catalog of coordinate systems identifies it
             LogicalTypeId::Geometry if !children.is_empty() => {
                 let [child] = children else {
-                    let types: Vec<&str> = children.iter().map(type_parameter_type).collect();
+                    let types: Vec<String> = children.iter().map(type_parameter_type).collect();
                     return Err(binder_error(format!(
                         "Type \"GEOMETRY\" does not accept type parameters ({})",
                         types.join(", ")
@@ -520,7 +599,7 @@ impl Binder<'_> {
         let upper = name.to_uppercase();
         let child_type = |expr: &Expr| self.bind_type(&CastType::Parsed(Box::new(expr.clone())));
         let rejected = || {
-            let types: Vec<&str> = children.iter().map(type_parameter_type).collect();
+            let types: Vec<String> = children.iter().map(type_parameter_type).collect();
             binder_error(format!(
                 "Type \"{upper}\" does not accept type parameters ({})",
                 types.join(", ")
@@ -1419,6 +1498,9 @@ impl Binder<'_> {
                     };
                     return self.bind_case(&[(condition.expr.clone(), then.expr.clone())], &otherwise.expr);
                 }
+                if is_unnest(&function.name.name) && !self.lambda_scopes.is_empty() {
+                    return Err(binder_error("UNNEST in lambda expressions is not supported"));
+                }
                 if is_unnest(&function.name.name) && function.args.len() > 1 {
                     // the levels the options ask for, as one UNNEST each
                     let (max_depth, _) = self.unnest_options(function)?;
@@ -1608,7 +1690,11 @@ impl Binder<'_> {
                     let mut bound = crate::function::extras::bind_function(&function.name.name, &names, children)?;
                     // `BindIEEEFloatingUnary` of the functions bound here
                     if self.options.ieee_floating_point_ops
-                        && let BoundExprKind::Function { function: bound_function, children, .. } = &mut bound.kind
+                        && let BoundExprKind::Function {
+                            function: bound_function,
+                            children,
+                            ..
+                        } = &mut bound.kind
                         && let Some(callback) =
                             crate::function::math::ieee_variant(&bound_function.name, children.len())
                     {
@@ -1670,6 +1756,18 @@ impl Binder<'_> {
                         && function
                             .args
                             .get(1)
+                            .is_some_and(|a| matches!(a.expr.kind, ExprKind::Parameter(_)))
+                    {
+                        return Ok(BoundExpr::constant(Value::sql_null()));
+                    }
+                    // an ENUM parameter: its type is only known when the statement runs
+                    if preparing
+                        && ["enum_code", "enum_first", "enum_last", "enum_range"]
+                            .iter()
+                            .any(|n| function.name.name.eq_ignore_ascii_case(n))
+                        && function
+                            .args
+                            .first()
                             .is_some_and(|a| matches!(a.expr.kind, ExprKind::Parameter(_)))
                     {
                         return Ok(BoundExpr::constant(Value::sql_null()));
@@ -1761,6 +1859,25 @@ impl Binder<'_> {
                     {
                         crate::function::regexp::bind_regexp_struct(&set.name, children)?
                     }
+                    // a string literal group fits `(.., INTEGER, VARCHAR)` as well as `(.., VARCHAR[], VARCHAR)`
+                    ("regexp_extract", [_, _, _, _])
+                        if matches!(
+                            &function.args[2].expr.kind,
+                            ExprKind::Constant(literal) if literal.kind == LiteralKind::String
+                        ) =>
+                    {
+                        let types: Vec<String> = children
+                            .iter()
+                            .map(|c| crate::function::binder::expression_return_type(c).to_string())
+                            .collect();
+                        return Err(binder_error(format!(
+                            "Could not choose a best candidate function for the function call \
+                             \"regexp_extract({})\". In order to select one, please add explicit type casts.\n\
+                             \tCandidate functions:\n\tregexp_extract(VARCHAR, VARCHAR, INTEGER, VARCHAR) -> \
+                             VARCHAR\n\tregexp_extract(VARCHAR, VARCHAR, VARCHAR[], VARCHAR) -> STRUCT\n",
+                            types.join(", ")
+                        )));
+                    }
                     // `RegexExtractBind`: the third argument is a constant, the group or the options
                     ("regexp_extract", [_, _, group]) if !group.is_foldable() => {
                         return Err(binder_error(
@@ -1815,8 +1932,7 @@ impl Binder<'_> {
                                 && let BoundExprKind::Function { function, .. } = &mut bound.kind
                                 && function.return_type.id() == LogicalTypeId::Interval
                             {
-                                *function =
-                                    Arc::new(function.with_zero_check(!self.options.error_on_division_by_zero));
+                                *function = Arc::new(function.with_zero_check(!self.options.error_on_division_by_zero));
                             } else if checked && let BoundExprKind::Function { function, .. } = &mut bound.kind {
                                 let floating =
                                     matches!(function.return_type.id(), LogicalTypeId::Float | LogicalTypeId::Double);

@@ -94,28 +94,37 @@ const DECIMAL_CODE: u8 = 255;
 impl VariantNode {
     /// `ConvertToVariant`.
     pub fn from_value(value: &Value) -> Result<Self> {
+        Self::from_value_with(value, &|_| None)
+    }
+
+    /// `from_value`, where `leaf` converts the values it knows (a JSON, which is parsed) itself.
+    pub fn from_value_with(value: &Value, leaf: &dyn Fn(&Value) -> Option<Result<Self>>) -> Result<Self> {
         if value.is_null() {
             return Ok(Self::Null);
         }
+        if let Some(node) = leaf(value) {
+            return node;
+        }
+        let from_value = |v: &Value| Self::from_value_with(v, leaf);
         let ty = value.logical_type();
         Ok(match (ty.id(), value.data()) {
             (LogicalTypeId::Variant, ValueData::Bytes(bytes)) => Self::decode(bytes)?,
             (LogicalTypeId::Union, ValueData::Struct(fields)) => match fields[0].as_i128() {
-                Some(tag) => Self::from_value(&fields[tag as usize + 1])?,
+                Some(tag) => from_value(&fields[tag as usize + 1])?,
                 None => Self::Null,
             },
             (LogicalTypeId::Tuple, ValueData::Struct(fields)) => {
-                Self::Array(fields.iter().map(Self::from_value).collect::<Result<_>>()?)
+                Self::Array(fields.iter().map(from_value).collect::<Result<_>>()?)
             }
             (_, ValueData::Struct(fields)) => {
                 let mut children = Vec::with_capacity(fields.len());
                 for ((name, _), field) in ty.struct_children().iter().zip(fields) {
-                    children.push((name.clone(), Self::from_value(field)?));
+                    children.push((name.clone(), from_value(field)?));
                 }
                 children.sort_by(|a, b| a.0.cmp(&b.0));
                 Self::Object(children)
             }
-            (_, ValueData::List(items)) => Self::Array(items.iter().map(Self::from_value).collect::<Result<_>>()?),
+            (_, ValueData::List(items)) => Self::Array(items.iter().map(from_value).collect::<Result<_>>()?),
             (LogicalTypeId::Enum, _) => Self::Scalar(Value::varchar(value.try_to_string()?)),
             _ => Self::Scalar(value.clone()),
         })

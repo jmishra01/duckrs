@@ -150,7 +150,8 @@ fn parse_filename(args: &DataChunk, result: &mut Vector) -> Result<()> {
         let path = text(&row[0])?;
         // `GetPathOptionArguments`: (path, trim_extension, separator), or one of the two
         let as_bool = |value: &Value| -> Result<bool> {
-            Ok(!value.is_null() && crate::execution::parquet::cast_value(value, &LogicalType::BOOLEAN)? == Value::boolean(true))
+            Ok(!value.is_null()
+                && crate::execution::parquet::cast_value(value, &LogicalType::BOOLEAN)? == Value::boolean(true))
         };
         let (trim, separator) = match row.len() {
             3 => (as_bool(&row[1])?, 2),
@@ -612,13 +613,11 @@ fn url_decode(args: &DataChunk, result: &mut Vector) -> Result<()> {
                 }
             }
         }
-        String::from_utf8(out)
-            .map(Value::varchar)
-            .map_err(|_| {
-                invalid(format!(
-                    "Failed to decode string \"{input}\" using URL decoding - decoded value is invalid UTF8"
-                ))
-            })
+        String::from_utf8(out).map(Value::varchar).map_err(|_| {
+            invalid(format!(
+                "Failed to decode string \"{input}\" using URL decoding - decoded value is invalid UTF8"
+            ))
+        })
     })
 }
 
@@ -788,7 +787,9 @@ fn temporal_values(row: &[Value], child: &LogicalType, inclusive: bool) -> Resul
     // `TimestampRangeInfo::ListLength`
     let finite = |value: &Value| match value.logical_type().id() {
         LogicalTypeId::Date => value.as_i128().is_none_or(|days| Date(days as i32).is_finite()),
-        _ => value.as_i128().is_none_or(|micros| Timestamp(micros as i64).is_finite()),
+        _ => value
+            .as_i128()
+            .is_none_or(|micros| Timestamp(micros as i64).is_finite()),
     };
     if !finite(&row[0]) || !finite(&row[1]) {
         return Err(invalid("Interval infinite bounds not supported"));
@@ -841,7 +842,9 @@ pub fn bind_temporal_range(
     let is_null = |ty: &LogicalType| ty.id() == LogicalTypeId::SqlNull;
     if children.len() != 3
         || !bounds.iter().any(|c| temporal(&c.return_type))
-        || !bounds.iter().all(|c| temporal(&c.return_type) || is_null(&c.return_type))
+        || !bounds
+            .iter()
+            .all(|c| temporal(&c.return_type) || is_null(&c.return_type))
     {
         return Ok(Err(children));
     }
@@ -853,7 +856,13 @@ pub fn bind_temporal_range(
     let children = children
         .into_iter()
         .enumerate()
-        .map(|(i, c)| if i < 2 && is_null(&c.return_type) { c.cast_to(&child, false) } else { c })
+        .map(|(i, c)| {
+            if i < 2 && is_null(&c.return_type) {
+                c.cast_to(&child, false)
+            } else {
+                c
+            }
+        })
         .collect();
     let lower = name.to_ascii_lowercase();
     let callback: super::ScalarCallback = if lower == "generate_series" {
@@ -893,7 +902,11 @@ impl Bucketed {
 }
 
 fn bucket_overflow(op: &str, ty: &str, left: impl std::fmt::Display, right: impl std::fmt::Display) -> Error {
-    let (name, sign) = if op == "+" { ("addition", "+") } else { ("subtraction", "-") };
+    let (name, sign) = if op == "+" {
+        ("addition", "+")
+    } else {
+        ("subtraction", "-")
+    };
     Error::new(
         ErrorKind::OutOfRange,
         format!("Overflow in {name} of {ty} ({left} {sign} {right})!"),
@@ -946,14 +959,15 @@ fn bucket_months(width: i32, ts: i32, origin: i32) -> Result<i32> {
         .checked_add(origin)
         .ok_or_else(|| bucket_overflow("+", "INT32", result, origin))?;
     let borrow = result < 0 && result % 12 != 0;
-    let year = if borrow { 1970 + result / 12 - 1 } else { 1970 + result / 12 };
+    let year = if borrow {
+        1970 + result / 12 - 1
+    } else {
+        1970 + result / 12
+    };
     let month = if borrow { result % 12 + 13 } else { result % 12 + 1 };
-    Date::from_ymd(year, month, 1).map(|d| d.0).ok_or_else(|| {
-        Error::new(
-            ErrorKind::Conversion,
-            format!("Date out of range: {year}-{month}-1"),
-        )
-    })
+    Date::from_ymd(year, month, 1)
+        .map(|d| d.0)
+        .ok_or_else(|| Error::new(ErrorKind::Conversion, format!("Date out of range: {year}-{month}-1")))
 }
 
 /// `Interval::Invert`
@@ -1009,7 +1023,11 @@ fn time_bucket_value(width: Interval, ts: Bucketed, arg: Option<BucketArg>) -> R
         return Err(unsupported("Period must be greater than 0"));
     }
     Ok(match arg {
-        None => Bucketed::Days(bucket_months(width.months, epoch_months(ts.days()), DEFAULT_ORIGIN_MONTHS)?),
+        None => Bucketed::Days(bucket_months(
+            width.months,
+            epoch_months(ts.days()),
+            DEFAULT_ORIGIN_MONTHS,
+        )?),
         Some(BucketArg::Origin(origin)) => Bucketed::Days(bucket_months(
             width.months,
             epoch_months(ts.days()),
@@ -1349,7 +1367,13 @@ fn concat_tuples(args: &DataChunk, result: &mut Vector) -> Result<()> {
             match value.data() {
                 ValueData::Struct(values) => fields.extend(values.iter().cloned()),
                 // a NULL struct gives NULL fields
-                _ => fields.extend(value.logical_type().struct_children().iter().map(|(_, ty)| Value::null(ty.clone()))),
+                _ => fields.extend(
+                    value
+                        .logical_type()
+                        .struct_children()
+                        .iter()
+                        .map(|(_, ty)| Value::null(ty.clone())),
+                ),
             }
         }
         Value::new(ty.clone(), ValueData::Struct(fields))
@@ -1945,12 +1969,16 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
                     )));
                 }
                 for (name, ty) in child.return_type.struct_children() {
-                    if let Some((existing, _)) =
-                        fields.iter().find(|(n, _)| !name.is_empty() && n.eq_ignore_ascii_case(name))
+                    if let Some((existing, _)) = fields
+                        .iter()
+                        .find(|(n, _)| !name.is_empty() && n.eq_ignore_ascii_case(name))
                     {
                         let quoted = |n: &str| format!("\"{}\"", n.replace('"', "\"\""));
                         return Err(invalid(if existing == name {
-                            format!("struct_concat: Arguments contain duplicate STRUCT entry {}", quoted(name))
+                            format!(
+                                "struct_concat: Arguments contain duplicate STRUCT entry {}",
+                                quoted(name)
+                            )
                         } else {
                             format!(
                                 "struct_concat: Arguments contain case-insensitive duplicate STRUCT entry {} and {}",
@@ -1971,18 +1999,20 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
                 let ty = LogicalType::tuple(fields.into_iter().map(|(_, ty)| ty).collect());
                 return Ok(bound_function(&lower, children, ty, concat_tuples));
             }
-            Ok(bound_function(&lower, children, LogicalType::struct_type(fields), rebuild_struct))
+            Ok(bound_function(
+                &lower,
+                children,
+                LogicalType::struct_type(fields),
+                rebuild_struct,
+            ))
         }
         "struct_keys" => {
-            if children
-                .first()
-                .is_some_and(|c| {
-                    !matches!(
-                        c.return_type.id(),
-                        LogicalTypeId::Struct | LogicalTypeId::Unknown | LogicalTypeId::SqlNull
-                    )
-                })
-            {
+            if children.first().is_some_and(|c| {
+                !matches!(
+                    c.return_type.id(),
+                    LogicalTypeId::Struct | LogicalTypeId::Unknown | LogicalTypeId::SqlNull
+                )
+            }) {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
                     "struct_keys() expects a STRUCT argument",
@@ -2021,6 +2051,15 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
         "map_extract" | "element_at" | "map_extract_value" | "map_contains" => {
             count_args(&lower, &children, 2, 2)?;
             let map = children[0].return_type.clone();
+            // a NULL is a `MAP("NULL", "NULL")`
+            if map.id() == LogicalTypeId::SqlNull && lower != "map_contains" {
+                let ty = if lower == "map_extract_value" {
+                    LogicalType::SQLNULL
+                } else {
+                    LogicalType::list(LogicalType::SQLNULL)
+                };
+                return Ok(BoundExpr::constant(Value::null(ty)));
+            }
             let entry = map.child_type().cloned();
             let Some(entry) = entry.filter(|_| map.id() == LogicalTypeId::Map) else {
                 return Err(binder_error(format!("{lower} expects a MAP as its first argument")));
@@ -2185,7 +2224,6 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
     }
 }
 
-
 // Ported from duckdb/src/function/scalar/create_sort_key.cpp
 
 /// `CreateSortKeyBind`: pairs of a key and a constant sort specifier. Keys of a constant size that
@@ -2208,7 +2246,10 @@ fn bind_create_sort_key(children: Vec<BoundExpr>) -> Result<BoundExpr> {
             if !child.is_foldable() {
                 return Err(Error::new(
                     ErrorKind::Binder,
-                    format!("Argument #{} in function create_sort_key must be a constant expression", i + 1),
+                    format!(
+                        "Argument #{} in function create_sort_key must be a constant expression",
+                        i + 1
+                    ),
                 ));
             }
             let value = crate::execution::expression_executor::evaluate_scalar(child)?;
@@ -2269,7 +2310,6 @@ fn create_sort_key(args: &DataChunk, result: &mut Vector) -> Result<()> {
     }
     Ok(())
 }
-
 
 // Ported from duckdb/src/function/scalar/operator/decimal_division.cpp
 
@@ -2371,7 +2411,12 @@ fn decimal_division(args: &DataChunk, result: &mut Vector) -> Result<()> {
         if row.iter().any(Value::is_null) {
             return Ok(Value::null(ty.clone()));
         }
-        let scale_of = |value: &Value| value.logical_type().decimal_properties().map_or(0, |(_, s)| i32::from(s));
+        let scale_of = |value: &Value| {
+            value
+                .logical_type()
+                .decimal_properties()
+                .map_or(0, |(_, s)| i32::from(s))
+        };
         let exponent = scale_of(&row[1]) + i32::from(scale) - scale_of(&row[0]);
         let (a, b) = (row[0].as_i128().unwrap_or(0), row[1].as_i128().unwrap_or(0));
         if b == 0 {

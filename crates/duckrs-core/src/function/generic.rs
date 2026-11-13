@@ -130,6 +130,17 @@ fn array_slice(args: &DataChunk, result: &mut Vector) -> Result<()> {
                 "Slicing with steps is not supported for strings",
             ));
         }
+        if ty.id() == LogicalTypeId::Blob {
+            // `BlobSliceOperations`: bytes, not characters
+            let ValueData::Bytes(bytes) = row[0].data() else {
+                return Ok(Value::null(ty.clone()));
+            };
+            let (begin, end) = clamp_slice(slice_bound(&row[1]), slice_bound(&row[2]), bytes.len() as i64);
+            return Value::new(
+                ty.clone(),
+                ValueData::Bytes(bytes[begin as usize..end as usize].to_vec()),
+            );
+        }
         let characters: Vec<char> = text_of(&row[0]).chars().collect();
         let (begin, end) = clamp_slice(slice_bound(&row[1]), slice_bound(&row[2]), characters.len() as i64);
         Ok(Value::varchar(
@@ -156,6 +167,7 @@ fn bind_array_slice(children: Vec<BoundExpr>) -> Result<BoundExpr> {
     let return_type = match ty.id() {
         LogicalTypeId::List => ty,
         LogicalTypeId::Varchar => LogicalType::VARCHAR,
+        LogicalTypeId::Blob => LogicalType::BLOB,
         LogicalTypeId::SqlNull => return Ok(BoundExpr::constant(Value::sql_null())),
         _ => return Err(binder_error("ARRAY_SLICE can only operate on LISTs and VARCHARs")),
     };
@@ -250,13 +262,22 @@ fn list_concat(args: &DataChunk, result: &mut Vector) -> Result<()> {
 }
 
 fn array_to_string(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    strict_rows(args, result, |row| {
+    row_wise(args, result, |row| {
+        if row[0].is_null() {
+            return Ok(Value::null(LogicalType::VARCHAR));
+        }
+        // `string_agg` with a NULL separator joins with a comma
+        let separator = if row[1].is_null() {
+            ",".to_string()
+        } else {
+            text_of(&row[1])
+        };
         let parts = items_of(&row[0])
             .iter()
             .filter(|v| !v.is_null())
             .map(Value::try_to_string)
             .collect::<Result<Vec<_>>>()?;
-        Ok(Value::varchar(parts.join(&text_of(&row[1]))))
+        Ok(Value::varchar(parts.join(&separator)))
     })
 }
 
@@ -848,7 +869,16 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
     if lower.starts_with("map_") && null_map_argument(&children)
         || lower == "cardinality" && null_map_argument(&children)
     {
-        return Ok(BoundExpr::constant(Value::sql_null()));
+        // a NULL is a `MAP("NULL", "NULL")`: the functions fold to a NULL of their return type
+        let ty = match lower.as_str() {
+            "map_keys" | "map_values" => LogicalType::list(LogicalType::SQLNULL),
+            "map_entries" => LogicalType::list(LogicalType::struct_type(vec![
+                ("key".to_string(), LogicalType::SQLNULL),
+                ("value".to_string(), LogicalType::SQLNULL),
+            ])),
+            _ => LogicalType::SQLNULL,
+        };
+        return Ok(BoundExpr::constant(Value::null(ty)));
     }
     let single = |children: &[BoundExpr]| match children {
         [child] => Ok(child.clone()),
@@ -1006,12 +1036,28 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             bind_generic_function("list_concat", arguments)
         }
         "array_to_string" => {
-            if children.len() != 2 || !is_list(&children[0].return_type) {
+            let untyped = children
+                .first()
+                .is_some_and(|c| c.return_type.id() == LogicalTypeId::SqlNull);
+            if children.len() != 2 || !(untyped || is_list(&children[0].return_type)) {
                 return Err(no_match(&lower, &children));
             }
             let mut children = children.into_iter();
-            let list = as_list(children.next().expect("checked"));
-            let separator = children.next().expect("checked").cast_to(&LogicalType::VARCHAR, false);
+            let list = children.next().expect("checked");
+            // the macro casts its argument to `VARCHAR[]`
+            let list = if untyped {
+                list.cast_to(&LogicalType::list(LogicalType::VARCHAR), false)
+            } else {
+                as_list(list)
+            };
+            let separator = children.next().expect("checked");
+            // the macro's `string_agg` takes its separator at bind time
+            if !separator.is_foldable() {
+                return Err(binder_error(
+                    "Argument #2 in function string_agg must be a constant expression",
+                ));
+            }
+            let separator = separator.cast_to(&LogicalType::VARCHAR, false);
             Ok(bound_function(
                 &lower,
                 vec![list, separator],

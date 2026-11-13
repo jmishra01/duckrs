@@ -828,8 +828,10 @@ fn execute_lambda(
                 let mut rest = items.iter().enumerate();
                 let mut accumulator = match start {
                     Some(start) => start,
+                    // the first element is the accumulator, of the accumulator's type
                     None => match rest.next() {
-                        Some((_, first)) => first.clone(),
+                        Some((_, first)) if first.logical_type() == return_type => first.clone(),
+                        Some((_, first)) => super::parquet::cast_value(first, return_type)?,
                         None => {
                             return Err(Error::new(
                                 ErrorKind::ParameterNotAllowed,
@@ -1094,6 +1096,47 @@ pub fn select(expr: &BoundExpr, input: &DataChunk) -> Result<(SelectionVector, u
         }
         let count = remaining.len();
         return Ok((SelectionVector::from_vec(remaining), count));
+    }
+    // `SelectOr`: each disjunct sees only the rows the ones before it did not select, so that a
+    // guard (`g LIKE 'ke%' OR CAST(s AS ..) = ..`) keeps the others from failing on its rows
+    if let BoundExprKind::Conjunction { and: false, children } = &expr.kind
+        && children.len() > 1
+        && !children.iter().all(|c| {
+            matches!(&c.kind, BoundExprKind::Comparison { op: duckrs_parser::ast::ComparisonOp::Equal, right, .. }
+                if matches!(right.kind, BoundExprKind::Constant(_)))
+        })
+    {
+        let mut remaining: Vec<u32> = (0..input.len() as u32).collect();
+        let mut chosen = Vec::new();
+        for child in children {
+            if remaining.is_empty() {
+                break;
+            }
+            let (selected, count) = if remaining.len() == input.len() {
+                select(child, input)?
+            } else {
+                select(child, &slice_rows(input, &remaining))?
+            };
+            if count == 0 {
+                continue;
+            }
+            let mut picked = vec![false; remaining.len()];
+            for i in 0..count {
+                picked[selected.get(i)] = true;
+            }
+            let mut rest = Vec::with_capacity(remaining.len() - count);
+            for (row, picked) in remaining.into_iter().zip(picked) {
+                if picked {
+                    chosen.push(row);
+                } else {
+                    rest.push(row);
+                }
+            }
+            remaining = rest;
+        }
+        chosen.sort_unstable();
+        let count = chosen.len();
+        return Ok((SelectionVector::from_vec(chosen), count));
     }
     if let BoundExprKind::JoinFilter { child, filter } = &expr.kind {
         let values = execute(child, input)?;

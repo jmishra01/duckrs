@@ -363,7 +363,21 @@ fn variant_node_to_json(node: &duckrs_common::variant::VariantNode) -> Result<Js
     use duckrs_common::variant::VariantNode;
     Ok(match node {
         VariantNode::Null => Json::Null,
-        VariantNode::Scalar(value) => value_to_json(value)?,
+        // `VariantToJSON::VisitFloat` writes a FLOAT as a double, `VisitDecimal` writes
+        // `Decimal::ToString` raw
+        VariantNode::Scalar(value) => match (value.logical_type().id(), value.data()) {
+            (LogicalTypeId::Float, ValueData::Float(x)) => Json::Real(f64::from(*x)),
+            (LogicalTypeId::Decimal, _) if !value.is_null() => {
+                // JSON numbers need an integer part, which `Decimal::ToString` leaves out when all
+                // digits are fractional
+                let mut text = value.try_to_string()?;
+                if let Some(at) = text.find('.').filter(|&at| at == usize::from(text.starts_with('-'))) {
+                    text.insert(at, '0');
+                }
+                Json::Raw(text)
+            }
+            _ => value_to_json(value)?,
+        },
         VariantNode::Array(items) => Json::Array(items.iter().map(variant_node_to_json).collect::<Result<_>>()?),
         VariantNode::Object(children) => Json::Object(
             children
@@ -444,6 +458,11 @@ pub fn value_to_json(value: &Value) -> Result<Json> {
         }
         _ => Json::Str(value.try_to_string()?),
     })
+}
+
+/// The VARIANT of the text of a JSON value.
+pub(super) fn json_text_to_variant(text: &str) -> Result<duckrs_common::variant::VariantNode> {
+    json_to_variant(&parsed(text)?)
 }
 
 /// `ConvertJSON` of `json_to_variant.hpp`: of a repeated key, the last value counts.

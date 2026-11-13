@@ -5,10 +5,10 @@
 //! Date and time functions. They run row by row; the vectorized loops come with Phase 13. Time
 //! zones wait for the ICU port: a TIMESTAMPTZ reads as UTC here.
 
-use super::strptime::{ParseError, Spec, StrpFormat, format_error};
 use super::binder::bind_scalar_function;
 use super::bit_functions::strict_rows;
 use super::nested::bound_function;
+use super::strptime::{ParseError, Spec, StrpFormat, format_error};
 use super::{BuiltinFunctions, ScalarCallback, ScalarFunction, ScalarFunctionSet};
 use crate::execution::expression_executor::evaluate_scalar;
 use crate::planner::expression::{BoundExpr, BoundExprKind};
@@ -178,6 +178,37 @@ fn time_part_of(part: DatePart, time: i64) -> Result<Part> {
         DatePart::Timezone | DatePart::TimezoneHour | DatePart::TimezoneMinute => 0,
         other => return Err(unsupported_part("time", other)),
     }))
+}
+
+/// `GetDatePartSpecifier`'s check of a constant specifier against the type it is taken of.
+fn check_part_for_type(name: &str, part: DatePart, ty: &LogicalType) -> Result<()> {
+    use DatePart as P;
+    let type_name = match ty.id() {
+        LogicalTypeId::Time => "time",
+        LogicalTypeId::TimeNs => "time_ns",
+        LogicalTypeId::TimeTz => "time_tz",
+        LogicalTypeId::Interval => "interval",
+        _ => return Ok(()),
+    };
+    let time = matches!(
+        part,
+        P::Microseconds | P::Milliseconds | P::Second | P::Minute | P::Hour | P::Epoch
+    );
+    let allowed = if type_name == "interval" {
+        time || matches!(
+            part,
+            P::Year | P::Month | P::Day | P::Decade | P::Century | P::Quarter | P::Millennium
+        )
+    } else {
+        time || matches!(part, P::Timezone | P::TimezoneHour | P::TimezoneMinute)
+    };
+    if allowed {
+        return Ok(());
+    }
+    Err(Error::new(
+        ErrorKind::NotImplemented,
+        format!("\"{type_name}\" units \"{name}\" not recognized"),
+    ))
 }
 
 fn unsupported_part(kind: &str, part: DatePart) -> Error {
@@ -530,10 +561,7 @@ fn epoch_scaled(args: &DataChunk, result: &mut Vector, scale: i128) -> Result<()
             1 => micros / 1000,
             1000 => micros,
             _ => micros.checked_mul(1000).ok_or_else(|| match m {
-                Moment::Date(days) => conversion(format!(
-                    "Could not convert DATE ({}) to nanoseconds",
-                    Date(days)
-                )),
+                Moment::Date(days) => conversion(format!("Could not convert DATE ({}) to nanoseconds", Date(days))),
                 _ => conversion("Could not convert Timestamp(US) to Timestamp(NS)".to_string()),
             })?,
         }))
@@ -555,8 +583,21 @@ fn epoch_ns(args: &DataChunk, result: &mut Vector) -> Result<()> {
 /// `EpochMillisOperator`, `EpochMicrosecondsOperator` and `EpochNanosecondsOperator` of an
 /// INTERVAL (`Interval::GetMilli`, `GetMicro`, `GetNanoseconds`) or a TIME.
 fn epoch_of_interval_or_time(value: &Value, unit: i64) -> Result<Value> {
-    if value.logical_type().id() == LogicalTypeId::Time {
-        let micros = value.as_i128().expect("a TIME") as i64;
+    if value.logical_type().id() == LogicalTypeId::TimeNs {
+        let nanos = value.as_i128().expect("a TIME_NS") as i64;
+        return Ok(Value::bigint(match unit {
+            1 => nanos / 1_000_000,
+            1000 => nanos / 1000,
+            _ => nanos,
+        }));
+    }
+    // of a TIMETZ its time of day, at its own offset
+    let time = match (value.logical_type().id(), value.data()) {
+        (LogicalTypeId::Time, _) => Some(value.as_i128().expect("a TIME") as i64),
+        (LogicalTypeId::TimeTz, ValueData::Int64(bits)) => Some(TimeTz(*bits as u64).time().0),
+        _ => None,
+    };
+    if let Some(micros) = time {
         return Ok(Value::bigint(match unit {
             1 => micros / 1000,
             1000 => micros,
@@ -607,7 +648,8 @@ fn make_date_from_epoch(args: &DataChunk, result: &mut Vector) -> Result<()> {
 fn epoch_ms_to_timestamp(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
         let millis = row[0].as_i128().expect("a BIGINT");
-        let micros = i64::try_from(millis * 1000).map_err(|_| conversion("Could not convert Timestamp(MS) to Timestamp(US)"))?;
+        let micros =
+            i64::try_from(millis * 1000).map_err(|_| conversion("Could not convert Timestamp(MS) to Timestamp(US)"))?;
         Ok(Value::timestamp(Timestamp(micros)))
     })
 }
@@ -702,7 +744,13 @@ fn dayname(args: &DataChunk, result: &mut Vector) -> Result<()> {
 fn truncate(part: DatePart, micros: i64) -> Result<i64> {
     let days = micros.div_euclid(MICROS_PER_DAY) as i32;
     let time = micros.rem_euclid(MICROS_PER_DAY);
-    let start_of_day = |days: i32| i64::from(days) * MICROS_PER_DAY;
+    // the start of a day before the first timestamp is out of range
+    let start_of_day = |days: i32| {
+        i64::from(days)
+            .checked_mul(MICROS_PER_DAY)
+            .filter(|&m| Timestamp(m).is_finite())
+            .ok_or_else(|| conversion("Date out of range".to_string()))
+    };
     let (year, month, _) = Date(days).to_ymd();
     let ymd = |year: i32, month: i32| {
         Date::from_ymd(year, month, 1)
@@ -717,18 +765,16 @@ fn truncate(part: DatePart, micros: i64) -> Result<i64> {
         DatePart::Year => ymd(year, 1),
         DatePart::Quarter => ymd(year, (month - 1) / 3 * 3 + 1),
         DatePart::Month => ymd(year, month),
-        DatePart::Week | DatePart::YearWeek => Ok(start_of_day(days - weekday_from_monday(days))),
+        DatePart::Week | DatePart::YearWeek => start_of_day(days - weekday_from_monday(days)),
         DatePart::IsoYear => {
             let monday = days - weekday_from_monday(days);
-            Ok(start_of_day(monday - (iso_week(monday).1 - 1) * 7))
+            start_of_day(monday - (iso_week(monday).1 - 1) * 7)
         }
-        DatePart::Day | DatePart::Dow | DatePart::IsoDow | DatePart::Doy | DatePart::JulianDay => {
-            Ok(start_of_day(days))
-        }
-        DatePart::Hour => Ok(start_of_day(days) + time / MICROS_PER_HOUR * MICROS_PER_HOUR),
-        DatePart::Minute => Ok(start_of_day(days) + time / MICROS_PER_MINUTE * MICROS_PER_MINUTE),
-        DatePart::Second | DatePart::Epoch => Ok(start_of_day(days) + time / MICROS_PER_SEC * MICROS_PER_SEC),
-        DatePart::Milliseconds => Ok(start_of_day(days) + time / 1000 * 1000),
+        DatePart::Day | DatePart::Dow | DatePart::IsoDow | DatePart::Doy | DatePart::JulianDay => start_of_day(days),
+        DatePart::Hour => Ok(start_of_day(days)? + time / MICROS_PER_HOUR * MICROS_PER_HOUR),
+        DatePart::Minute => Ok(start_of_day(days)? + time / MICROS_PER_MINUTE * MICROS_PER_MINUTE),
+        DatePart::Second | DatePart::Epoch => Ok(start_of_day(days)? + time / MICROS_PER_SEC * MICROS_PER_SEC),
+        DatePart::Milliseconds => Ok(start_of_day(days)? + time / 1000 * 1000),
         DatePart::Microseconds => Ok(micros),
         other => Err(unsupported_part("timestamp", other)),
     }
@@ -976,17 +1022,33 @@ fn age_of(left: &Value, right: &Value) -> Result<Value> {
     }
 }
 
+fn date_from_parts(year: i128, month: i128, day: i128) -> Result<Value> {
+    let date = i32::try_from(year)
+        .ok()
+        .zip(i32::try_from(month).ok())
+        .zip(i32::try_from(day).ok())
+        .and_then(|((y, m), d)| Date::from_ymd(y, m, d));
+    date.map(Value::date)
+        .ok_or_else(|| conversion(format!("Date out of range: {year}-{month}-{day}")))
+}
+
 fn make_date(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
         let part = |at: usize| row[at].as_i128().expect("a BIGINT");
-        let (year, month, day) = (part(0), part(1), part(2));
-        let date = i32::try_from(year)
-            .ok()
-            .zip(i32::try_from(month).ok())
-            .zip(i32::try_from(day).ok())
-            .and_then(|((y, m), d)| Date::from_ymd(y, m, d));
-        date.map(Value::date)
-            .ok_or_else(|| conversion(format!("Date out of range: {year}-{month}-{day}")))
+        date_from_parts(part(0), part(1), part(2))
+    })
+}
+
+/// `ExecuteStructMakeDate`: NULL if the struct or any of its parts is.
+fn make_date_from_struct(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| {
+        let ValueData::Struct(fields) = row[0].data() else {
+            return Ok(Value::null(LogicalType::DATE));
+        };
+        match (fields[0].as_i128(), fields[1].as_i128(), fields[2].as_i128()) {
+            (Some(year), Some(month), Some(day)) => date_from_parts(year, month, day),
+            _ => Ok(Value::null(LogicalType::DATE)),
+        }
     })
 }
 
@@ -994,9 +1056,16 @@ fn time_micros(hour: i128, minute: i128, seconds: f64) -> Result<i64> {
     if !seconds.is_finite() {
         return Err(conversion("Time out of range: seconds must be a finite number"));
     }
-    let whole = seconds.trunc() as i64;
-    let micros = ((seconds - seconds.trunc()) * 1e6).round() as i64;
-    let valid = (0..24).contains(&hour) && (0..60).contains(&minute) && (0..60).contains(&whole);
+    // `MakeTimeOperator`: the seconds are floored, and `Time::IsValidTime` takes a leap second as long
+    // as the time does not exceed 24:00:00
+    let whole = seconds.floor() as i64;
+    let micros = ((seconds - whole as f64) * 1e6).round() as i64;
+    let total = ((hour as i64 * 60 + minute as i64) * 60 + whole) * MICROS_PER_SEC + micros;
+    let valid = (0..24).contains(&hour)
+        && (0..60).contains(&minute)
+        && (0..=60).contains(&whole)
+        && (0..=1_000_000).contains(&micros)
+        && total <= MICROS_PER_DAY;
     let at_midnight = hour == 24 && minute == 0 && whole == 0 && micros == 0;
     if !(valid || at_midnight) {
         return Err(conversion(format!(
@@ -1029,6 +1098,10 @@ fn make_timestamp_ns(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
         let nanos = i64::try_from(row[0].as_i128().expect("a BIGINT"))
             .map_err(|_| conversion("Timestamp nanoseconds out of range"))?;
+        // `MakeTimestampOperator`: an infinity is out of range
+        if !Timestamp(nanos).is_finite() {
+            return Err(conversion(format!("Timestamp microseconds out of range: {nanos}")));
+        }
         Value::new(LogicalType::new(LogicalTypeId::TimestampNs), ValueData::Int64(nanos))
     })
 }
@@ -1055,7 +1128,8 @@ fn make_timestamp(args: &DataChunk, result: &mut Vector) -> Result<()> {
         let micros = i64::from(date.0)
             .checked_mul(MICROS_PER_DAY)
             .and_then(|m| m.checked_add(time))
-            .ok_or_else(|| conversion("Timestamp out of range"))?;
+            .filter(|&m| Timestamp(m).is_finite())
+            .ok_or_else(|| conversion("Date and time not in timestamp range"))?;
         Ok(Value::timestamp(Timestamp(micros)))
     })
 }
@@ -1407,7 +1481,10 @@ fn timestamp_minus_timestamp(args: &DataChunk, result: &mut Vector) -> Result<()
         // `Interval::GetDifference`
         let (Some(left), Some(right)) = (moment(&row[0]).and_then(micros_of), moment(&row[1]).and_then(micros_of))
         else {
-            return Err(Error::new(ErrorKind::InvalidInput, "Cannot subtract infinite timestamps"));
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Cannot subtract infinite timestamps",
+            ));
         };
         // the days between two finite timestamps always fit, even when their microseconds do not
         let difference = i128::from(left) - i128::from(right);
@@ -1681,7 +1758,10 @@ fn formats_of(value: &Value) -> Result<Vec<StrpFormat>> {
     let texts = match value.data() {
         ValueData::List(items) => {
             if items.is_empty() {
-                return Err(Error::new(ErrorKind::InvalidInput, "strptime format list must not be empty"));
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "strptime format list must not be empty",
+                ));
             }
             items.iter().map(Value::try_to_string).collect::<Result<Vec<_>>>()?
         }
@@ -1818,11 +1898,16 @@ pub fn bind_date_function(name: &str, children: Vec<BoundExpr>) -> Result<BoundE
     }
     let part = part.clone().cast_to(&LogicalType::VARCHAR, false);
     let constant = if part.is_foldable() {
-        let value = evaluate_scalar(&part)?;
-        if value.is_null() {
+        let specifier = evaluate_scalar(&part)?;
+        if specifier.is_null() {
             None
         } else {
-            Some(parse_part(&value.try_to_string()?)?)
+            let name = specifier.try_to_string()?;
+            let part = parse_part(&name)?;
+            if lower == "date_part" || lower == "datepart" {
+                check_part_for_type(&name, part, &value.return_type)?;
+            }
+            Some(part)
         }
     } else {
         None
@@ -1946,8 +2031,12 @@ pub fn date_functions() -> Vec<ScalarFunctionSet> {
         "timezone_minute",
     ];
     for (name, callback, ty) in parts {
+        // `GetGenericDatePartFunction`: the parts of a date take no time of day
         let mut overloads: Vec<(Vec<LogicalType>, LogicalType, ScalarCallback)> = inputs
             .iter()
+            .filter(|input| {
+                time_parts.contains(name) || !matches!(input.id(), LogicalTypeId::Time | LogicalTypeId::TimeTz)
+            })
             .map(|input| (vec![input.clone()], ty.clone(), *callback))
             .collect();
         if time_parts.contains(name) {
@@ -1967,7 +2056,7 @@ pub fn date_functions() -> Vec<ScalarFunctionSet> {
     epoch_overloads.push((vec![L::new(LogicalTypeId::TimestampNs)], i.clone(), epoch_ms));
     epoch_overloads.push((vec![i.clone()], L::TIMESTAMP, epoch_ms_to_timestamp));
     // `GetTimePartFunction`: INTERVAL and TIME too
-    for ty in [L::INTERVAL, L::TIME] {
+    for ty in [L::INTERVAL, L::TIME, L::new(LogicalTypeId::TimeNs), time_tz.clone()] {
         epoch_overloads.push((vec![ty], i.clone(), epoch_ms_of_interval));
     }
     add("epoch_ms", epoch_overloads);
@@ -1987,7 +2076,7 @@ pub fn date_functions() -> Vec<ScalarFunctionSet> {
         if name == "epoch_ns" {
             overloads.push((vec![L::new(LogicalTypeId::TimestampTzNs)], i.clone(), callback));
         }
-        for ty in [L::INTERVAL, L::TIME] {
+        for ty in [L::INTERVAL, L::TIME, L::new(LogicalTypeId::TimeNs), time_tz.clone()] {
             overloads.push((vec![ty], i.clone(), of_interval));
         }
         add(name, overloads);
@@ -2035,6 +2124,15 @@ pub fn date_functions() -> Vec<ScalarFunctionSet> {
                 make_date as ScalarCallback,
             ),
             (vec![L::INTEGER], L::DATE, make_date_from_epoch),
+            (
+                vec![L::struct_type(vec![
+                    ("year".to_string(), i.clone()),
+                    ("month".to_string(), i.clone()),
+                    ("day".to_string(), i.clone()),
+                ])],
+                L::DATE,
+                make_date_from_struct,
+            ),
         ],
     );
     add(

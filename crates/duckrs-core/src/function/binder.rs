@@ -184,7 +184,9 @@ pub fn bind_scalar_function(
     // if any of the arguments are NULL, the function is replaced with a NULL constant
     if children.iter().any(|c| c.return_type.id() == LogicalTypeId::SqlNull) {
         // untyped NULLs never go through type resolution
-        let incomplete = function.return_type.id() == LogicalTypeId::Decimal && !function.return_type.has_params();
+        // (`||` and `constant_or_null` give ANY until their types are resolved)
+        let incomplete = function.return_type.id() == LogicalTypeId::Decimal && !function.return_type.has_params()
+            || matches!(function.name.as_str(), "||" | "constant_or_null");
         return Ok(BoundExpr::constant(if incomplete {
             Value::sql_null()
         } else {

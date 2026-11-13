@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 4527 of 6367 test files pass (**74.9%** of the 6045 that run). The v1 target is ≥ 90%.
+- Overall: 4569 of 6367 test files pass (**75.6%** of the 6045 that run). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -241,7 +241,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
 
 ## Phase 5: Functions
 
-- [ ] 30. Scalar and table functions (`sql/function`: 75 failing, 81.8%; `sql/table_function`: 33 failing)
+- [ ] 30. Scalar and table functions (`sql/function`: 55 failing, 86.8%; `sql/table_function`: 33 failing)
   - [x] `remap_struct`, `struct_values`, `parse_formatted_bytes`, `equi_width_bins`, `is_histogram_other_bin`;
     `date_part` of a list of parts, the time zone parts of TIMESTAMP and TIME, `date_trunc` of an INTERVAL by
     ISO year, week and day parts; `list_where` past the end of the list; `map_concat`'s type from its non-empty
@@ -292,7 +292,19 @@ Each item gives the number of failing files in `test/` that it should fix, where
     losing the row when a member fails, STRUCT to UNION by case-insensitive names, a prepared `union_extract` key;
     `arg_min_nulls_last` / `arg_max_nulls_last` with n; `avg` of TIMESTAMP_NS and of TIMESTAMP_S/MS/DATE as
     TIMESTAMP; the list `range` with a step of 0; EXPORT DATABASE of UNION columns past the tag
-  - [ ] `stats()` of nested types and VARIANT, Parquet UNION columns, state export of `variant_group_object`
+  - [x] map subscripts and `list_has_any`/`list_has_all` deducing their template types (and failing as C++ does);
+    `map_keys`/`map_values`/`map_entries`/`map_extract` of an untyped NULL typed as C++ folds them; BLOB
+    `array_slice`; `array_to_string` of NULL, with a NULL separator, refusing a column separator; `bit_length` of a
+    string; `make_date` of a STRUCT; `make_time` taking a leap second; `make_timestamp` and `make_timestamp_ns`
+    refusing an infinity; `date_trunc` before the first timestamp; `epoch_ms/us/ns` of TIME_NS and TIMETZ; the date
+    parts of a date taking no TIME, and `date_part`'s unit checked against its type when bound; `list_resize` past
+    the largest vector; `list_reduce` typed as `ListReduceBind` (the accumulator from the initial value, widened to
+    the lambda's type); the lambda functions' arity and NULL-argument errors, UNNEST refused in a lambda;
+    `enum_code` and friends of a prepared parameter; `variant_extract` of a folded key and its overloads' types;
+    `regexp_extract`'s ambiguous string group; RE2 octal escapes; OR filters short-circuiting as `SelectOr`
+  - [ ] `stats()` of nested types and VARIANT, Parquet UNION columns, state export of `variant_group_object`;
+    `list_max`/`list_min` under a collation, regex `\C`, lambdas in a subquery that see a column of their
+    parameter's name
   - [ ] TYPE columns and casts, `index_key`, JSON date-format detection, `list_contains` and the other templated list functions' type deduction,
     the external-resource and profiling table functions; `duckdb_constraints()` lists a primary key's implied
     NOT NULL after the declared constraints (the catalog keeps NOT NULL per column, not in order); a view's
@@ -336,9 +348,15 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] shredded GEOMETRY columns, and the spatial extension's format of files before v1.5.0
   - [x] `GeometryStats`: in `stats()`, in database files (extent, types, flags), and `vertex_extract`'s bounds
   - [ ] `ST_GeomFromWKB`'s types from BLOB min/max (duckrs keeps no string statistics), GeoParquet, the spatial extension's blob format
-- [ ] 34. Remaining type and cast failures (`sql/types`: 60 failing, 88.7%; `sql/cast`: 5 failing)
+- [ ] 34. Remaining type and cast failures (`sql/types`: 45 failing, 91.5%; `sql/cast`: 2 failing)
   - [x] UNNEST with `recursive`, `max_depth` and `keep_parent_names`, of structs at the root of a select list,
     refused nested; a cast to NULL of anything that is NULL
+  - [x] DOUBLE to VARCHAR of powers of two from 2^53 (fmt's fallback shifts its denominator by the boundary bits);
+    VARCHAR to MAP with NULL keys; VARIANT casts as `CastVariant` (UNION targets refused, a nested value of
+    another shape cast from the value it holds, NULL map entries, JSON leaves parsed, the depth limit, FLOAT and
+    DECIMAL leaves in JSON); `FLOAT(precision)`; type parameters described as C++ does (DECIMAL and BOOLEAN
+    literals, NULL refused by name, VARCHAR with two, a user type with any); built-in types qualified by `main`, a
+    missing schema of a type as a missing type
 - [ ] 35. The VARIANT type (`sql/variant`: 2 failing)
 
 ## Phase 12: Catalog, settings, APIs and shell

@@ -234,12 +234,11 @@ mod tests {
             (0x4341c37937e07fff, "9999999999999998.0"),
             (0x4341c37937e08000, "1e+16"),
             (0x4341c37937e08001, "1.0000000000000002e+16"),
-            // fmt's fallback scales powers of two from 2^53 up wrongly: 2^81 and 2^91 print as twice
-            // their value, and the first digit of 2^807 runs past 9
+            // the powers of two from 2^53 up, which fmt's fallback scales by the bits it shifted
             (0x4340000000000000, "9007199254740992.0"),
-            (0x4500000000000000, "4.835703278458517e+24"),
-            (0x45a0000000000000, "4.951760157141521e+27"),
-            (0x7260000000000000, "A.070116948172427e+242"),
+            (0x4500000000000000, "2.4178516392292583e+24"),
+            (0x45a0000000000000, "2.4758800785707605e+27"),
+            (0x7260000000000000, "8.535058474086213e+242"),
         ];
         for (bits, expected) in cases {
             let value = f64::from_bits(*bits);

@@ -32,7 +32,11 @@ pub(super) fn to_variant(value: &Value) -> Result<Value> {
     if value.is_null() {
         return Ok(Value::null(variant_type()));
     }
-    Ok(variant_value(&VariantNode::from_value(value)?))
+    // a JSON inside a nested value is parsed, as one at the top is
+    let leaf = |v: &Value| {
+        super::json::is_json_type(v.logical_type()).then(|| super::json::json_text_to_variant(&v.try_to_string()?))
+    };
+    Ok(variant_value(&VariantNode::from_value_with(value, &leaf)?))
 }
 
 fn decode(value: &Value) -> Result<VariantNode> {
@@ -64,11 +68,63 @@ fn expected(kind: &str, node: &VariantNode) -> Failure {
     ))
 }
 
-/// `CastVariant`.
+/// `ValueConverter`: the value a VARIANT holds, as the types it has. An ARRAY of values of different
+/// types is a list of VARIANTs.
+fn node_to_value(node: &VariantNode) -> Value {
+    match node {
+        VariantNode::Null => Value::sql_null(),
+        VariantNode::Scalar(value) => value.clone(),
+        VariantNode::Array(items) => {
+            let values: Vec<Value> = items.iter().map(node_to_value).collect();
+            let same = values
+                .first()
+                .map(Value::logical_type)
+                .filter(|first| values.iter().all(|v| v.logical_type() == *first));
+            match same {
+                Some(child) => {
+                    let ty = LogicalType::list(child.clone());
+                    Value::new(ty, ValueData::List(values)).expect("a list value")
+                }
+                None => {
+                    let items = items.iter().map(variant_value).collect();
+                    Value::new(LogicalType::list(variant_type()), ValueData::List(items)).expect("a list value")
+                }
+            }
+        }
+        VariantNode::Object(children) => Value::struct_value(
+            children
+                .iter()
+                .map(|(name, child)| (name.clone(), node_to_value(child)))
+                .collect(),
+        ),
+    }
+}
+
+/// `CastVariant`, which falls back on casting the value a nested VARIANT holds when it does not have
+/// the shape of the target.
 fn convert(node: &VariantNode, target: &LogicalType) -> Conversion<Value> {
+    use LogicalTypeId as L;
+    match convert_shape(node, target) {
+        Err(Failure::Message(message))
+            if matches!(target.id(), L::Struct | L::Tuple | L::List | L::Array)
+                && !matches!(node, VariantNode::Scalar(_)) =>
+        {
+            match cast_value(&node_to_value(node), target, CastMode::Strict) {
+                Ok(cast) if !cast.is_null() => Ok(cast),
+                _ => Err(Failure::Message(message)),
+            }
+        }
+        other => other,
+    }
+}
+
+fn convert_shape(node: &VariantNode, target: &LogicalType) -> Conversion<Value> {
     use LogicalTypeId as L;
     if matches!(node, VariantNode::Null) {
         return Ok(Value::null(target.clone()));
+    }
+    if target.id() == L::Union {
+        return Err(Failure::Message("Can't convert VARIANT".to_string()));
     }
     // a string can hold the VARCHAR form of a nested value
     if let VariantNode::Scalar(value) = node
@@ -140,8 +196,9 @@ fn convert(node: &VariantNode, target: &LogicalType) -> Conversion<Value> {
                 unreachable!("a list value");
             };
             for (i, item) in items.iter().enumerate() {
+                // a NULL entry has no key
                 let ValueData::Struct(fields) = item.data() else {
-                    return Err(expected("OBJECT", node));
+                    return Err(Failure::Message("Map keys can not be NULL.".to_string()));
                 };
                 if fields[0].is_null() {
                     return Err(Failure::Error(conversion_error(
@@ -184,7 +241,9 @@ pub(super) fn from_variant(value: &Value, target: &LogicalType) -> Result<Value>
     if value.is_null() {
         return Ok(Value::null(target.clone()));
     }
-    match convert(&decode(value)?, target) {
+    let node = decode(value)?;
+    check_depth(&node)?;
+    match convert(&node, target) {
         Ok(value) => Ok(value),
         Err(Failure::Error(error)) => Err(error),
         Err(Failure::Message(message)) => Err(conversion_error(format!("{message} to '{target}'"))),
@@ -317,11 +376,37 @@ pub fn is_variant_function(name: &str) -> bool {
 
 /// `variant_extract(child, key)`, which is what `child.key` and `child[key]` bind to.
 pub(super) fn bind_extract(child: BoundExpr, key: BoundExpr) -> Result<BoundExpr> {
+    // a foldable key (`1::UINTEGER`) is a constant
+    let key = if key.is_foldable() && !matches!(key.kind, BoundExprKind::Constant(_)) {
+        BoundExpr::constant(crate::execution::expression_executor::evaluate_scalar(&key)?)
+    } else {
+        key
+    };
     let BoundExprKind::Constant(constant) = &key.kind else {
         return Err(binder_error(
             "'variant_extract' expects the second argument to be a constant",
         ));
     };
+    // the overloads take a VARCHAR key or a UINTEGER index, which an integer literal only fits if
+    // its value does
+    let index = constant.logical_type().is_integral()
+        && (constant.is_null()
+            || constant
+                .as_i128()
+                .is_some_and(|i| (0..=i128::from(u32::MAX)).contains(&i)));
+    if !(index
+        || matches!(
+            constant.logical_type().id(),
+            LogicalTypeId::Varchar | LogicalTypeId::StringLiteral | LogicalTypeId::SqlNull
+        ))
+    {
+        return Err(binder_error(format!(
+            "No function matches the given name and argument types 'variant_extract({}, {})'. You might need to \
+             add explicit type casts.",
+            child.return_type,
+            super::binder::expression_return_type(&key)
+        )));
+    }
     if constant.logical_type().is_integral() && constant.as_i128() == Some(0) {
         return Err(binder_error(
             "Extracting index 0 from VARIANT(ARRAY) is invalid, indexes are 1-based",
@@ -538,6 +623,7 @@ fn variant_extract_string(args: &DataChunk, result: &mut Vector) -> Result<()> {
         {
             return Ok(Value::varchar(value.try_to_string()?));
         }
+        check_depth(&node)?;
         let json = super::json::value_to_json(&variant_value(&node))?;
         if let duckrs_common::json::Json::Str(text) = &json {
             return Ok(Value::varchar(text.clone()));
@@ -635,7 +721,11 @@ fn number_text(unscaled: String, scale: usize) -> String {
     } else {
         format!("{whole}.{fraction}")
     };
-    if negative && text != "0" { format!("-{text}") } else { text }
+    if negative && text != "0" {
+        format!("-{text}")
+    } else {
+        text
+    }
 }
 
 fn comparable(node: &VariantNode) -> Result<Comparable> {
@@ -653,10 +743,17 @@ fn comparable(node: &VariantNode) -> Result<Comparable> {
     };
     Ok(match value.logical_type().id() {
         Id::Boolean => Comparable::Boolean(*value == Value::boolean(true)),
-        Id::TinyInt | Id::SmallInt | Id::Integer | Id::BigInt | Id::HugeInt | Id::UTinyInt | Id::USmallInt
-        | Id::UInteger | Id::UBigInt | Id::UHugeInt | Id::Bignum => {
-            Comparable::Number(number_text(value.try_to_string()?, 0))
-        }
+        Id::TinyInt
+        | Id::SmallInt
+        | Id::Integer
+        | Id::BigInt
+        | Id::HugeInt
+        | Id::UTinyInt
+        | Id::USmallInt
+        | Id::UInteger
+        | Id::UBigInt
+        | Id::UHugeInt
+        | Id::Bignum => Comparable::Number(number_text(value.try_to_string()?, 0)),
         Id::Decimal => {
             let (_, scale) = value.logical_type().decimal_properties().unwrap_or((18, 0));
             Comparable::Number(number_text(int().to_string(), usize::from(scale)))
@@ -668,7 +765,13 @@ fn comparable(node: &VariantNode) -> Result<Comparable> {
                 _ => 0.0,
             };
             // `Radix::EncodeDouble`: every NaN alike, and -0.0 is 0.0
-            let real = if real.is_nan() { f64::NAN } else if real == 0.0 { 0.0 } else { real };
+            let real = if real.is_nan() {
+                f64::NAN
+            } else if real == 0.0 {
+                0.0
+            } else {
+                real
+            };
             Comparable::Real(real.to_bits())
         }
         Id::Uuid => Comparable::Uuid(int()),
@@ -777,30 +880,36 @@ fn variant_normalize(args: &DataChunk, result: &mut Vector) -> Result<()> {
             return Ok(Value::null(variant_type()));
         }
         let node = decode(&row[0])?;
-        let mut stack = vec![(&node, 0usize)];
-        while let Some((node, depth)) = stack.pop() {
-            if depth >= 128 {
-                return Err(Error::new(
-                    ErrorKind::InvalidInput,
-                    "VARIANT exceeds maximum recursion depth of 128",
-                ));
-            }
-            match node {
-                VariantNode::Array(items) => stack.extend(items.iter().map(|item| (item, depth + 1))),
-                VariantNode::Object(children) => stack.extend(children.iter().map(|(_, child)| (child, depth + 1))),
-                _ => {}
-            }
-        }
+        check_depth(&node)?;
         Ok(variant_value(&node))
     })
+}
+
+/// `VariantVisitor::CheckDepth`: a traversal goes at most 128 levels deep.
+fn check_depth(node: &VariantNode) -> Result<()> {
+    let mut stack = vec![(node, 0usize)];
+    while let Some((node, depth)) = stack.pop() {
+        if depth >= 128 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "VARIANT exceeds maximum recursion depth of 128",
+            ));
+        }
+        match node {
+            VariantNode::Array(items) => stack.extend(items.iter().map(|item| (item, depth + 1))),
+            VariantNode::Object(children) => stack.extend(children.iter().map(|(_, child)| (child, depth + 1))),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// `VariantComparatorFunction`: a BLOB that orders as the VARIANT does.
 fn variant_comparator(args: &DataChunk, result: &mut Vector) -> Result<()> {
     row_wise(args, result, |row| match row[0].data() {
-        ValueData::Bytes(bytes) if !row[0].is_null() => Ok(Value::blob(
-            duckrs_common::sort_key::variant_comparator_key(bytes)?,
-        )),
+        ValueData::Bytes(bytes) if !row[0].is_null() => {
+            Ok(Value::blob(duckrs_common::sort_key::variant_comparator_key(bytes)?))
+        }
         _ => Ok(Value::null(LogicalType::BLOB)),
     })
 }

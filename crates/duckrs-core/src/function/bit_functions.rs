@@ -147,6 +147,12 @@ pub(super) fn bit_length(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+fn string_bit_length(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| {
+        Ok(Value::bigint(8 * bytes_of(&row[0]).len() as i64))
+    })
+}
+
 fn octet_length(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
         Ok(Value::bigint(bytes_of(&row[0]).len() as i64 - 1))
@@ -507,6 +513,13 @@ pub(super) fn bit_functions() -> Vec<ScalarFunctionSet> {
             vec![bit.clone(), integer.clone(), integer.clone()],
             bit.clone(),
             set_bit,
+        ),
+        // `BitLenOperator`: the bits of the bytes of a string
+        (
+            "bit_length",
+            vec![LogicalType::VARCHAR],
+            bigint.clone(),
+            string_bit_length,
         ),
         ("bit_length", vec![bit.clone()], bigint.clone(), bit_length),
         ("octet_length", vec![bit.clone()], bigint.clone(), octet_length),
