@@ -3292,6 +3292,15 @@ impl Binder<'_> {
             };
             let mut definition = ColumnDefinition::new(column.name.clone(), self.bind_type(ty)?);
             if let Some(default) = &column.default_value {
+                // `Binder::BindCreateTableInfo`: a stored DEFAULT can't refer to parameters
+                // (unnamed `?` parameters are found missing before binding, as in C++)
+                let mut named = false;
+                duckrs_parser::transformer::visit_expr_mut(&mut default.clone(), &mut |e: &mut Expr| {
+                    named |= matches!(&e.kind, ExprKind::Parameter(id) if !id.chars().all(|c| c.is_ascii_digit()));
+                });
+                if named {
+                    return Err(binder_error("DEFAULT values cannot contain parameters"));
+                }
                 let mut binder = Binder::new(self.catalog);
                 binder.aggregate_error = "DEFAULT value cannot contain aggregates!";
                 binder.search_schema = self.search_schema.clone();

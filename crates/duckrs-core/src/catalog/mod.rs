@@ -1038,6 +1038,9 @@ pub struct SequenceData {
 pub struct SequenceCatalogEntry {
     pub name: String,
     data: Mutex<SequenceData>,
+    /// `ALTER SEQUENCE ... OWNED BY`: the table or sequence of its schema that owns it, which
+    /// takes it along when dropped (an ownership dependency, not transactional here)
+    owner: Mutex<Option<(&'static str, String)>>,
 }
 
 impl SequenceCatalogEntry {
@@ -1412,10 +1415,16 @@ impl SchemaCatalogEntry {
         let mut tables = self.tables.write();
         tables.remove(&key(old_name));
         Self::register_foreign_keys(&tables, &table);
+        let new_name = table.name.clone();
         tables.insert(key(&table.name), TableOrView::Table(table));
+        drop(tables);
+        if !old_name.eq_ignore_ascii_case(&new_name) {
+            self.rename_owner("table", old_name, &new_name);
+        }
     }
 
     pub fn rename_view(&self, view: &ViewCatalogEntry, new_name: &str) -> Result<()> {
+        let old_name = view.name.clone();
         let mut tables = self.tables.write();
         tables.remove(&key(&view.name));
         let view = ViewCatalogEntry {
@@ -1426,6 +1435,9 @@ impl SchemaCatalogEntry {
             dependencies: view.dependencies.clone(),
         };
         tables.insert(key(new_name), TableOrView::View(Arc::new(view)));
+        drop(tables);
+        // the sequences it owns stay its own
+        self.rename_owner("view", &old_name, new_name);
         Ok(())
     }
 
@@ -1521,6 +1533,9 @@ impl SchemaCatalogEntry {
         }
         Self::check_not_referenced(&tables, existing)?;
         tables.remove(&key(name));
+        drop(tables);
+        // the sequences it owns go with it
+        self.drop_owned(if type_name == "View" { "view" } else { "table" }, name);
         Ok(true)
     }
 
@@ -1591,6 +1606,12 @@ impl SchemaCatalogEntry {
 
     /// `DuckSchemaEntry::CreateSequence`.
     pub fn create_sequence(&self, name: &str, data: SequenceData, on_conflict: OnCreateConflict) -> Result<()> {
+        // replacing drops the sequence first, which the table that owns it keeps from happening
+        if on_conflict == OnCreateConflict::Replace
+            && let Some(owner) = self.owner_of(name)
+        {
+            return Err(entries_in_use(name, "sequence", &[owner]));
+        }
         let mut sequences = self.sequences.write();
         if sequences.contains_key(&key(name)) {
             match on_conflict {
@@ -1607,14 +1628,116 @@ impl SchemaCatalogEntry {
         let sequence = SequenceCatalogEntry {
             name: name.to_string(),
             data: Mutex::new(data),
+            owner: Mutex::new(None),
         };
         sequences.insert(key(name), Arc::new(sequence));
         Ok(())
     }
 
-    /// Drops a sequence, returning whether it existed.
+    /// Drops a sequence, returning whether it existed; the sequences it owns go with it.
     pub fn drop_sequence(&self, name: &str) -> bool {
-        self.sequences.write().remove(&key(name)).is_some()
+        let existed = self.sequences.write().remove(&key(name)).is_some();
+        if existed {
+            self.drop_owned("sequence", name);
+        }
+        existed
+    }
+
+    /// The sequences that `kind` `owner` owns: dropped along with it.
+    fn drop_owned(&self, kind: &str, owner: &str) {
+        let owned: Vec<String> = self
+            .sequences
+            .read()
+            .values()
+            .filter(|s| {
+                s.owner
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|(k, o)| *k == kind && o.eq_ignore_ascii_case(owner))
+            })
+            .map(|s| s.name.clone())
+            .collect();
+        for sequence in owned {
+            self.drop_sequence(&sequence);
+        }
+    }
+
+    /// A renamed table or sequence keeps what it owns.
+    pub fn rename_owner(&self, kind: &str, old_name: &str, new_name: &str) {
+        for sequence in self.sequences.read().values() {
+            let mut owner = sequence.owner.lock();
+            if let Some((k, o)) = owner.as_mut()
+                && *k == kind
+                && o.eq_ignore_ascii_case(old_name)
+            {
+                *o = new_name.to_string();
+            }
+        }
+    }
+
+    /// `CatalogSet::AlterOwnership` + `DependencyManager::AddOwnership`: `owner_name`, a table or
+    /// else a sequence of this schema, comes to own the sequence `name`.
+    pub fn alter_ownership(&self, name: &str, owner_name: &str) -> Result<()> {
+        let dependency = |message: String| Error::new(ErrorKind::Dependency, message);
+        let Some(entry) = self.get_sequence(name) else {
+            return Err(Error::new(ErrorKind::Catalog, "Couldn't change ownership!"));
+        };
+        let owner: (&'static str, String, Option<Arc<SequenceCatalogEntry>>) =
+            match self.tables.read().get(&key(owner_name)) {
+                Some(TableOrView::Table(table)) => ("table", table.name.clone(), None),
+                Some(TableOrView::View(view)) => ("view", view.name.clone(), None),
+                None => match self.get_sequence(owner_name) {
+                    Some(sequence) => ("sequence", sequence.name.clone(), Some(sequence)),
+                    None => {
+                        return Err(Error::new(
+                            ErrorKind::Catalog,
+                            format!("CatalogElement \"{}.{owner_name}\" does not exist!", self.name),
+                        ));
+                    }
+                },
+            };
+        // the owner may not be owned itself
+        if let Some(sequence) = &owner.2
+            && let Some((_, by)) = sequence.owner.lock().as_ref()
+        {
+            return Err(dependency(format!(
+                "{} can not become the owner, it is already owned by {}",
+                sql_quoted_identifier(&owner.1),
+                sql_quoted_identifier(by)
+            )));
+        }
+        // nor may the entry own others
+        if let Some(owned) = self.sequences.read().values().find(|s| {
+            s.owner
+                .lock()
+                .as_ref()
+                .is_some_and(|(k, o)| *k == "sequence" && o.eq_ignore_ascii_case(&entry.name))
+        }) {
+            return Err(dependency(format!(
+                "{} already owns {}. Cannot have circular dependencies",
+                sql_quoted_identifier(&entry.name),
+                sql_quoted_identifier(&owned.name)
+            )));
+        }
+        let mut current = entry.owner.lock();
+        if let Some((kind, by)) = current.as_ref()
+            && !(*kind == owner.0 && by.eq_ignore_ascii_case(&owner.1))
+        {
+            return Err(dependency(format!(
+                "{} is already owned by {}",
+                sql_quoted_identifier(&entry.name),
+                sql_quoted_identifier(by)
+            )));
+        }
+        *current = Some((owner.0, owner.1));
+        Ok(())
+    }
+
+    /// The entry that owns the sequence `name`, as its kind and name, if one does.
+    fn owner_of(&self, name: &str) -> Option<(&'static str, String)> {
+        let sequence = self.get_sequence(name)?;
+        let owner = sequence.owner.lock();
+        owner.clone()
     }
 
     pub fn get_macro(&self, name: &str, table_macro: bool) -> Option<Arc<MacroCatalogEntry>> {
@@ -1763,14 +1886,32 @@ impl SchemaCatalogEntry {
         if self.get_sequence(name).is_none() {
             return Ok(false);
         }
-        let users = self.tables_using_sequence(name);
+        let mut users: Vec<(&'static str, String)> =
+            self.tables_using_sequence(name).into_iter().map(|t| ("table", t)).collect();
+        // the entry that owns it depends on it too
+        if let Some(owner) = self.owner_of(name)
+            && !users.iter().any(|(k, u)| *k == owner.0 && u.eq_ignore_ascii_case(&owner.1))
+        {
+            users.push(owner);
+        }
         if !users.is_empty() && !cascade {
-            return Err(entry_in_use(name, "sequence", &users));
+            return Err(entries_in_use(name, "sequence", &users));
         }
-        for table in &users {
-            self.drop_entry(table, "Table")?;
+        for (kind, user) in &users {
+            match *kind {
+                "sequence" => {
+                    self.drop_sequence(user);
+                }
+                "view" => {
+                    self.drop_entry(user, "View")?;
+                }
+                _ => {
+                    self.drop_entry(user, "Table")?;
+                }
+            }
         }
-        Ok(self.drop_sequence(name))
+        self.drop_sequence(name);
+        Ok(true)
     }
 
     /// `DROP TYPE`: the tables that use it stop it, or go with it under CASCADE.
@@ -2327,6 +2468,16 @@ impl Catalog {
 }
 
 /// `DependencyManager::CollectDependents`: why `name` cannot be dropped.
+/// [`entry_in_use`], for dependents of any kind.
+fn entries_in_use(name: &str, kind: &str, dependents: &[(&str, String)]) -> Error {
+    let mut message = format!("Cannot drop entry \"{name}\" because there are entries that depend on it.\n");
+    for (dependent_kind, dependent) in dependents {
+        message += &format!("{dependent_kind} \"{dependent}\" depends on {kind} \"{name}\".\n");
+    }
+    message += "Use DROP...CASCADE to drop all dependents.";
+    Error::new(ErrorKind::Dependency, message)
+}
+
 fn entry_in_use(name: &str, kind: &str, tables: &[String]) -> Error {
     let mut message = format!("Cannot drop entry \"{name}\" because there are entries that depend on it.\n");
     for table in tables {

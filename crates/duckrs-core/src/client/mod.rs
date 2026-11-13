@@ -3077,6 +3077,22 @@ impl ClientContext {
             {
                 return self.comment_on_index(info);
             }
+            // `ALTER SEQUENCE ... OWNED BY` (`ChangeOwnershipInfo`)
+            Statement::Alter(info) if matches!(info.kind, AlterKind::ChangeOwnership { .. }) => {
+                let AlterKind::ChangeOwnership { owner_name, .. } = &info.kind else {
+                    unreachable!("matched above")
+                };
+                let catalog = self.catalog();
+                let schema = catalog.schema_for(schema_of(&info.name)?.as_deref())?;
+                if schema.get_sequence(&info.name.name).is_none() {
+                    if info.if_exists {
+                        return Ok(Self::success());
+                    }
+                    return Err(crate::catalog::missing_entry("Sequence", &info.name.name));
+                }
+                schema.alter_ownership(&info.name.name, owner_name)?;
+                return Ok(Self::success());
+            }
             Statement::Alter(info) => {
                 self.check_trigger_alter(info)?;
                 let catalog = self.catalog();

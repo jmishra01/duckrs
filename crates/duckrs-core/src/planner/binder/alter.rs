@@ -209,7 +209,13 @@ impl Binder<'_> {
             };
             return Err(missing_entry(kind, &info.name.name));
         };
-        if let AlterKind::RenameView(new_name) = &info.kind {
+        // `ViewCatalogEntry::AlterEntry`: ALTER TABLE ... RENAME TO also renames a view
+        let renamed_view = match (&info.kind, &entry) {
+            (AlterKind::RenameTable(new_name), TableOrView::View(_)) => Some(new_name),
+            (AlterKind::RenameView(new_name), _) => Some(new_name),
+            _ => None,
+        };
+        if let Some(new_name) = renamed_view {
             let TableOrView::View(view) = entry else {
                 return Err(catalog_error("Can only modify view with ALTER VIEW statement".into()));
             };

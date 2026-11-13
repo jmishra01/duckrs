@@ -2303,7 +2303,7 @@ impl Binder<'_> {
             ExprKind::Star(_) => return Err(binder_error("STAR expression is not supported here")),
             ExprKind::Default => {
                 // `WhereBinder`, `GroupBinder` and `TableFunctionBinder` name their clause
-                let clause = ["WHERE clause", "GROUP BY clause", "Table function"]
+                let clause = ["WHERE clause", "GROUP BY clause", "Table function", "DEFAULT value"]
                     .into_iter()
                     .find(|clause| self.aggregate_error == format!("{clause} cannot contain aggregates!"));
                 return Err(binder_error(match clause {

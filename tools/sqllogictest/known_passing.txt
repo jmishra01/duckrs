@@ -965,6 +965,7 @@ test/sql/alter/rename_table/test_rename_table_constraints.test
 test/sql/alter/rename_table/test_rename_table_incorrect.test
 test/sql/alter/rename_table/test_rename_table_many_transactions.test
 test/sql/alter/rename_table/test_rename_table_transactions.test
+test/sql/alter/rename_table/test_rename_table_view.test
 test/sql/alter/rename_table/test_rename_table_with_dependency_check.test
 test/sql/alter/rename_table/test_rename_table_with_insert_transaction.test
 test/sql/alter/rename_view/test_rename_view_incorrect.test
@@ -1039,6 +1040,7 @@ test/sql/binder/alias_qualification_select_projection.test
 test/sql/binder/alias_qualification_where.test
 test/sql/binder/alias_where_side_effects.test
 test/sql/binder/column_value_alias_group.test
+test/sql/binder/default_expression_errors.test
 test/sql/binder/duplicate_alias.test
 test/sql/binder/empty_column_alias.test
 test/sql/binder/function_chaining_19035.test
@@ -1123,6 +1125,10 @@ test/sql/catalog/dependencies/remove_table_column_referenced_by_index.test
 test/sql/catalog/dependencies/rename_table_column_referenced_by_index.test
 test/sql/catalog/dependencies/rename_view_referenced_by_table_macro.test
 test/sql/catalog/dependencies/set_default_of_table_column_referenced_by_index.test
+test/sql/catalog/dependencies/test_alter_dependency_ownership.test
+test/sql/catalog/dependencies/test_alter_owned_by.test
+test/sql/catalog/dependencies/test_alter_owning_table.test
+test/sql/catalog/dependencies/test_concurrent_alter.test
 test/sql/catalog/dependencies/test_concurrent_drop.test
 test/sql/catalog/dependencies/test_concurrent_index_creation.test
 test/sql/catalog/dependencies/test_concurrent_schema_creation.test
@@ -1194,6 +1200,7 @@ test/sql/catalog/sequence/test_duckdb_sequences.test
 test/sql/catalog/sequence/test_sequence.test
 test/sql/catalog/sequence/test_sequence_dependency.test
 test/sql/catalog/table/create_table_as_abort.test
+test/sql/catalog/table/create_table_parameters.test
 test/sql/catalog/table/long_identifier.test
 test/sql/catalog/table/test_create_table_parallelism.test
 test/sql/catalog/table/test_default.test
