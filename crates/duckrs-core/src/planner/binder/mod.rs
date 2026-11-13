@@ -784,6 +784,8 @@ pub struct Binder<'a> {
     left_of_join: Vec<BindContext>,
     /// the table indexes of the relations an outer join NULL-extends (`Binding::IsNullExtended`)
     pub(super) null_extended: std::collections::HashSet<usize>,
+    /// binding the argument of a TRY or HAS_ERROR, where aggregates and windows are refused
+    pub(super) inside_try: bool,
     /// The views being bound, innermost last (`bound_views`).
     bound_views: Vec<Arc<ViewCatalogEntry>>,
     /// The schema unqualified tables are looked up in before the default one: the schema of the
@@ -880,6 +882,7 @@ impl<'a> Binder<'a> {
             outer_aliases: Vec::new(),
             left_of_join: Vec::new(),
             null_extended: std::collections::HashSet::new(),
+            inside_try: false,
             bound_views: Vec::new(),
             search_schema: None,
             foreign_databases: Vec::new(),

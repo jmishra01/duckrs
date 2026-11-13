@@ -572,7 +572,7 @@ impl Binder<'_> {
             let mut unused = Vec::new();
             return self.prepare_modifier(modifier, &mut unused, &mut SelectBindState::default());
         };
-        if matches!(nodes.as_slice(), [node] if matches!(node.expr.kind, ExprKind::Star(_))) {
+        if matches!(nodes.as_slice(), [node] if matches!(&node.expr.kind, ExprKind::Star(star) if star.expr.is_none())) {
             let node = &nodes[0];
             return Ok(PreparedModifier::OrderAll(
                 self.options.resolve_order(node.order, node.nulls),
@@ -580,6 +580,30 @@ impl Binder<'_> {
         }
         let mut orders = Vec::with_capacity(nodes.len());
         for node in nodes {
+            // `COLUMNS('regex')`: each column of the set operation whose name matches
+            if let ExprKind::Star(star) = &node.expr.kind
+                && let Some(pattern) = &star.expr
+            {
+                let ExprKind::Constant(literal) = &pattern.kind else {
+                    return Err(not_implemented("COLUMNS of a set operation's ORDER BY other than a regex"));
+                };
+                let regex = regex::Regex::new(&literal.text)
+                    .map_err(|e| Error::new(ErrorKind::InvalidInput, e.to_string()))?;
+                let mut matched: Vec<usize> =
+                    aliases.iter().filter(|(a, _)| regex.is_match(a)).map(|(_, i)| *i).collect();
+                matched.sort_unstable();
+                matched.dedup();
+                if matched.is_empty() {
+                    return Err(binder_error(format!(
+                        "No matching columns found that match regex \"{}\"",
+                        literal.text
+                    )));
+                }
+                for index in matched {
+                    orders.push((self.options.resolve_order(node.order, node.nulls), index));
+                }
+                continue;
+            }
             let index = match &node.expr.kind {
                 ExprKind::Constant(literal) if literal.kind == LiteralKind::Integer => {
                     let value: i64 = literal.text.replace('_', "").parse().unwrap_or(i64::MAX);
@@ -1232,11 +1256,22 @@ impl Binder<'_> {
                 }
                 let mut orders = Vec::with_capacity(nodes.len());
                 for node in nodes {
-                    if matches!(node.expr.kind, ExprKind::Star(_)) {
-                        return Err(not_implemented("ORDER BY with a star expression"));
+                    // `BindModifiers`: a star or COLUMNS orders by each column it stands for
+                    let mut has_star = false;
+                    duckrs_parser::transformer::visit_expr_mut(&mut node.expr.clone(), &mut |e: &mut Expr| {
+                        has_star |= matches!(e.kind, ExprKind::Star(_));
+                    });
+                    let targets = if has_star {
+                        let mut expanded = Vec::new();
+                        self.expand_star_expression(&node.expr, &mut expanded)?;
+                        expanded
+                    } else {
+                        vec![node.expr.clone()]
+                    };
+                    for target in &targets {
+                        let index = self.bind_order_expression(target, select_list, state, "ORDER BY")?;
+                        orders.push((self.options.resolve_order(node.order, node.nulls), index));
                     }
-                    let index = self.bind_order_expression(&node.expr, select_list, state, "ORDER BY")?;
-                    orders.push((self.options.resolve_order(node.order, node.nulls), index));
                 }
                 PreparedModifier::Order(orders)
             }

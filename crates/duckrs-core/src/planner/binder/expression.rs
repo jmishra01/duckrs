@@ -955,6 +955,60 @@ impl Binder<'_> {
                 return self.bind_expression(&comparison);
             }
         }
+        // `BindHasError`: the built-in has_error is the HAS_ERROR operator over its argument
+        if let ExprKind::Function(function) = &expr.kind
+            && function.name.name.eq_ignore_ascii_case("has_error")
+            && self.is_builtin_has_error(&function.name)?
+        {
+            if function.distinct || function.filter.is_some() || !function.order_by.is_empty() {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "Function has_error is a Scalar Function. \"DISTINCT\", \"FILTER\", and \"ORDER BY\" are \
+                     only applicable to window and aggregate functions.",
+                ));
+            }
+            if function.args.len() != 1 {
+                return Err(binder_error("Wrong number of arguments provided to HAS_ERROR expression"));
+            }
+            if !function.args[0].name.is_empty() {
+                return Err(binder_error("Named arguments are not supported in HAS_ERROR expression"));
+            }
+            // `TryBindSubqueryErrors`: ORDER BY and DISTINCT of a subquery leave no room for the error flag
+            let mut modified = false;
+            duckrs_parser::transformer::visit_expr_mut(&mut function.args[0].expr.clone(), &mut |e: &mut Expr| {
+                if let ExprKind::Subquery { subquery, .. } = &e.kind {
+                    modified |= subquery
+                        .node
+                        .modifiers
+                        .iter()
+                        .any(|m| matches!(m, ast::ResultModifier::Order(_) | ast::ResultModifier::Distinct(_)));
+                }
+            });
+            if modified {
+                return Err(binder_error(
+                    "TRY over a subquery with result modifiers is only supported when the subquery is the direct \
+                     argument of TRY",
+                ));
+            }
+            let outer = std::mem::replace(&mut self.inside_try, true);
+            let child = crate::function::binder::inside_try(|| self.bind_expression(&function.args[0].expr));
+            self.inside_try = outer;
+            let child = child?;
+            if child.is_volatile() {
+                return Err(binder_error("HAS_ERROR can not be used in combination with a volatile function"));
+            }
+            let mut bound = BoundExpr::new(
+                BoundExprKind::Operator {
+                    op: BoundOperator::HasError,
+                    children: vec![child],
+                },
+                LogicalType::BOOLEAN,
+            );
+            if !expr.alias.is_empty() {
+                bound = bound.with_alias(expr.alias.clone());
+            }
+            return Ok(bound);
+        }
         if let ExprKind::Function(function) = &expr.kind
             && function.name.name.eq_ignore_ascii_case("switch")
             && function.name.qualification.iter().all(String::is_empty)
@@ -975,6 +1029,19 @@ impl Binder<'_> {
             return self.function_collations(bound);
         }
         Ok(bound)
+    }
+
+    /// Whether `name` resolves to the built-in has_error: a macro of the same name shadows it, unless
+    /// the system catalog is named.
+    fn is_builtin_has_error(&self, name: &ast::QualifiedName) -> Result<bool> {
+        let parts: Vec<&str> = name.qualification.iter().filter(|q| !q.is_empty()).map(String::as_str).collect();
+        if parts.first().is_some_and(|c| c.eq_ignore_ascii_case("system")) {
+            return Ok(true);
+        }
+        if !matches!(parts.as_slice(), [] | ["main"]) {
+            return Ok(false);
+        }
+        Ok(self.find_macro(name, false)?.is_none())
     }
 
     /// `SwitchFun`: `switch([key,] cases [, default])` over a constant MAP of cases, as the CASE
@@ -1458,7 +1525,13 @@ impl Binder<'_> {
                 children,
             } => {
                 // what a TRY catches at runtime does not fail its binding either
-                let child = crate::function::binder::inside_try(|| self.bind_expression(&children[0]))?;
+                let outer = std::mem::replace(&mut self.inside_try, true);
+                let child = crate::function::binder::inside_try(|| self.bind_expression(&children[0]));
+                self.inside_try = outer;
+                let child = child?;
+                if child.is_volatile() {
+                    return Err(binder_error("TRY can not be used in combination with a volatile function"));
+                }
                 let ty = child.return_type.clone();
                 BoundExpr::new(
                     BoundExprKind::Operator {
@@ -2523,6 +2596,9 @@ impl Binder<'_> {
         if self.aggregate_of_outer_query(function) {
             self.pending_outer_aggregate = Some(function.clone());
             return Err(crate::unported("aggregates of the columns of an outer query"));
+        }
+        if self.inside_try {
+            return Err(binder_error("aggregates are not allowed inside the TRY expression"));
         }
         let Some(state) = self.aggregates.as_mut() else {
             return Err(binder_error(self.aggregate_error));

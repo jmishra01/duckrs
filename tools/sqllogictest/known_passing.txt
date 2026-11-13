@@ -1876,6 +1876,7 @@ test/sql/error/escape_percent_sign.test
 test/sql/error/missing_type.test
 test/sql/error/mix_aggregate_and_non_aggregate.test
 test/sql/error/subquery_single_column.test
+test/sql/error/test_has_error_expression.test
 test/sql/error/test_try_common_subexpression.test
 test/sql/error/test_try_constant_regex.test
 test/sql/error/test_try_nested_conditional.test
@@ -2789,6 +2790,7 @@ test/sql/optimizer/boolean_row_group_pruning.test
 test/sql/optimizer/boolean_wrapper_pushdown.test
 test/sql/optimizer/case_zonemap_pruning.test
 test/sql/optimizer/coalesce_zonemap_pruning.test
+test/sql/optimizer/cse_error_capture.test
 test/sql/optimizer/distinct_sibling_column_pruning.test
 test/sql/optimizer/distinctness_statistics.test
 test/sql/optimizer/distinctness_statistics_nested.test
@@ -2941,8 +2943,11 @@ test/sql/parser/qualified_underscore_digit.test
 test/sql/parser/reject_accidental_expression_syntax.test
 test/sql/parser/reject_accidental_type_syntax.test
 test/sql/parser/reject_unknown_option_values.test
+test/sql/parser/star_expression.test
 test/sql/parser/switch_case.test
 test/sql/parser/switch_null_arguments.test
+test/sql/parser/test_columns.test
+test/sql/parser/test_columns_order.test
 test/sql/parser/test_columns_where.test
 test/sql/parser/test_deep_expression_nesting.test
 test/sql/parser/test_long_error.test

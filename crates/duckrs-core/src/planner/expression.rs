@@ -52,6 +52,8 @@ pub enum BoundOperator {
     Coalesce,
     /// the argument, with NULL for the rows that fail
     Try,
+    /// `OPERATOR_HAS_ERROR`: whether evaluating the argument fails, per row
+    HasError,
 }
 
 /// What a subquery asks of its rows (`SubqueryType`).
@@ -527,6 +529,7 @@ impl fmt::Display for BoundExpr {
                     BoundOperator::IsNotNull => write!(f, "({all} IS NOT NULL)"),
                     BoundOperator::Coalesce => write!(f, "COALESCE({all})"),
                     BoundOperator::Try => write!(f, "TRY({all})"),
+                    BoundOperator::HasError => write!(f, "has_error({all})"),
                 }
             }
             BoundExprKind::Between { input, lower, upper } => write!(f, "({input} BETWEEN {lower} AND {upper})"),

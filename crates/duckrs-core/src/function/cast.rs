@@ -542,6 +542,18 @@ pub fn try_cast_string_to_double(input: &[u8]) -> Option<f64> {
     {
         return None;
     }
+    // `fast_float::parse_number_string`: one underscore between two digits is skipped
+    if text.contains('_') {
+        let bytes = text.as_bytes();
+        let separated = bytes.iter().enumerate().all(|(i, b)| {
+            *b != b'_'
+                || (i > 0 && bytes[i - 1].is_ascii_digit() && bytes.get(i + 1).is_some_and(u8::is_ascii_digit))
+        });
+        if !separated {
+            return None;
+        }
+        return text.replace('_', "").parse::<f64>().ok();
+    }
     text.parse::<f64>().ok()
 }
 

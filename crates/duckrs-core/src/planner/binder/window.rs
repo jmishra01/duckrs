@@ -141,6 +141,9 @@ impl Binder<'_> {
 
     /// `BaseSelectBinder::BindWindowExpression`.
     pub(super) fn bind_window(&mut self, window: &WindowExpr) -> Result<BoundExpr> {
+        if self.inside_try {
+            return Err(binder_error("window functions are not allowed in try"));
+        }
         if self.windows.is_none() {
             return Err(binder_error(self.window_error));
         }

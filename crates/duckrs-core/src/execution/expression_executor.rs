@@ -746,6 +746,34 @@ fn execute_try(child: &BoundExpr, return_type: &LogicalType, input: &DataChunk) 
     }
 }
 
+/// `OPERATOR_HAS_ERROR`: whether each row's evaluation fails, as TRY finds it.
+fn execute_has_error(child: &BoundExpr, input: &DataChunk) -> Result<Vector> {
+    let count = input.len();
+    let mut result = Vector::new(LogicalType::BOOLEAN, count.max(1));
+    match execute(child, input) {
+        Ok(_) => {
+            for row in 0..count {
+                result.set_value(row, &Value::boolean(false))?;
+            }
+        }
+        Err(error) if error.kind == ErrorKind::Internal => return Err(error),
+        Err(_) => {
+            for row in 0..count {
+                let failed = match execute(child, &slice_rows(input, &[row as u32])) {
+                    Ok(_) => false,
+                    Err(error) if error.kind == ErrorKind::Internal => return Err(error),
+                    Err(_) => true,
+                };
+                result.set_value(row, &Value::boolean(failed))?;
+            }
+        }
+    }
+    if count == 0 {
+        result.set_value(0, &Value::boolean(false))?;
+    }
+    Ok(result)
+}
+
 /// `OPERATOR_COALESCE`: each argument only sees the rows that are still NULL.
 fn execute_coalesce(children: &[BoundExpr], return_type: &LogicalType, input: &DataChunk) -> Result<Vector> {
     let mut result = Vector::new(return_type.clone(), input.len().max(1));
@@ -972,6 +1000,10 @@ pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
             op: BoundOperator::Try,
             children,
         } => execute_try(&children[0], &expr.return_type, input),
+        BoundExprKind::Operator {
+            op: BoundOperator::HasError,
+            children,
+        } => execute_has_error(&children[0], input),
         BoundExprKind::Operator { op, children } => {
             let child = execute(&children[0], input)?;
             Ok(match op {
@@ -982,7 +1014,9 @@ pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
                 }
                 BoundOperator::IsNull => null_check(&child, count, true),
                 BoundOperator::IsNotNull => null_check(&child, count, false),
-                BoundOperator::Coalesce | BoundOperator::Try => unreachable!("handled above"),
+                BoundOperator::Coalesce | BoundOperator::Try | BoundOperator::HasError => {
+                    unreachable!("handled above")
+                }
             })
         }
         BoundExprKind::Function { function, children, .. } => {

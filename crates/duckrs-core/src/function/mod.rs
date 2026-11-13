@@ -165,6 +165,13 @@ fn sequence_functions() -> Vec<ScalarFunctionSet> {
     sets
 }
 
+fn has_error_function(_: &DataChunk, _: &mut Vector) -> Result<()> {
+    Err(duckrs_common::Error::new(
+        duckrs_common::ErrorKind::Internal,
+        "has_error is bound as the HAS_ERROR operator and never executes as a function",
+    ))
+}
+
 /// `constant_or_null`: the first argument, or NULL where one of the others is.
 fn constant_or_null_function() -> ScalarFunctionSet {
     fn resolve(function: &ScalarFunction, arguments: &[LogicalType]) -> Result<ScalarFunction> {
@@ -442,6 +449,15 @@ impl BuiltinFunctions {
             }
             let set = constant_or_null_function();
             functions.scalar.insert(set.name.clone(), set);
+            // `HasErrorFun`: listed in the catalog, bound as the HAS_ERROR operator
+            let mut has_error = ScalarFunctionSet::new("has_error");
+            has_error.add(ScalarFunction::new(
+                "has_error",
+                vec![LogicalType::new(LogicalTypeId::Any)],
+                LogicalType::BOOLEAN,
+                has_error_function,
+            ));
+            functions.scalar.insert(has_error.name.clone(), has_error);
             let typeof_set = typeof_function();
             functions.scalar.insert(typeof_set.name.clone(), typeof_set);
             let barrier_set = barrier_function();

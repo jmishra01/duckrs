@@ -2349,12 +2349,19 @@ impl Exporter<'_> {
             }
             BoundExprKind::Operator { op, children } => {
                 let children = children.iter().map(|c| self.expr(scope, c)).collect::<Res<Vec<_>>>()?;
+                if *op == BoundOperator::HasError {
+                    // spelled out, so that a macro of the same name cannot capture the replay
+                    let mut call = FunctionExpr::new("has_error", children);
+                    call.name.qualification = vec!["system".to_string(), "main".to_string()];
+                    return Ok(Expr::from(ExprKind::Function(call)));
+                }
                 let op = match op {
                     BoundOperator::Not => OperatorType::Not,
                     BoundOperator::IsNull => OperatorType::IsNull,
                     BoundOperator::IsNotNull => OperatorType::IsNotNull,
                     BoundOperator::Coalesce => OperatorType::Coalesce,
                     BoundOperator::Try => OperatorType::Try,
+                    BoundOperator::HasError => unreachable!("exported as a function"),
                 };
                 Expr::operator(op, children)
             }

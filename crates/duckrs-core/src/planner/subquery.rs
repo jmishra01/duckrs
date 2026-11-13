@@ -127,7 +127,7 @@ fn flatten_expression(expr: &mut BoundExpr, left: &mut LogicalOperator, next_tab
     if matches!(
         expr.kind,
         BoundExprKind::Operator {
-            op: BoundOperator::Try,
+            op: BoundOperator::Try | BoundOperator::HasError,
             ..
         } | BoundExprKind::ListLambda { .. }
     ) {

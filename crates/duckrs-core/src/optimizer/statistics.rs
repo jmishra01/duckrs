@@ -836,7 +836,8 @@ impl StatisticsPropagator {
             } => self.coalesce(expr),
             // TRY has its own idea of errors, a subquery and a lambda their own columns
             BoundExprKind::Operator {
-                op: BoundOperator::Try, ..
+                op: BoundOperator::Try | BoundOperator::HasError,
+                ..
             }
             | BoundExprKind::Subquery { .. }
             | BoundExprKind::ListLambda { .. } => unknown(),
