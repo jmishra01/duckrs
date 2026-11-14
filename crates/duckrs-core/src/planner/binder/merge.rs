@@ -92,8 +92,14 @@ impl Binder<'_> {
     ) -> Result<BoundMergeAction> {
         let bound_condition = match &action.condition {
             Some(condition) => {
-                let bound = self.bind_expression(condition)?;
-                Some(bound.cast_to(&LogicalType::BOOLEAN, false))
+                // `ProjectionBinder` for the "WHERE clause" of the action
+                let errors = (
+                    std::mem::replace(&mut self.window_error, "WHERE clause cannot contain window functions!"),
+                    std::mem::replace(&mut self.aggregate_error, "WHERE clause cannot contain aggregate functions"),
+                );
+                let bound = self.bind_expression(condition);
+                (self.window_error, self.aggregate_error) = errors;
+                Some(bound?.cast_to(&LogicalType::BOOLEAN, false))
             }
             None => None,
         };

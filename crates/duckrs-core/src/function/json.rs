@@ -2122,6 +2122,30 @@ fn json_transform_strict(args: &DataChunk, result: &mut Vector) -> Result<()> {
     transform_rows(args, result, true)
 }
 
+/// The overloads of `json_extract` and `json_extract_string`: a BIGINT, VARCHAR or VARCHAR[] path.
+fn extract_overload(name: &str, children: &[BoundExpr]) -> Result<()> {
+    use LogicalTypeId as T;
+    let text = |id: T| matches!(id, T::Varchar | T::StringLiteral | T::SqlNull | T::Unknown);
+    let path = &children[1].return_type;
+    let path_fits = text(path.id())
+        || path.is_integral()
+        || matches!(path.id(), T::IntegerLiteral)
+        || (path.id() == T::List && path.child_type().is_some_and(|c| text(c.id())));
+    // (any document: what is no VARCHAR other overloads take, `->` of a STRUCT is its field)
+    if path_fits {
+        return Ok(());
+    }
+    let types: Vec<String> = children
+        .iter()
+        .map(|c| super::binder::expression_return_type(c).to_string())
+        .collect();
+    Err(binder_error(format!(
+        "No function matches the given name and argument types '{name}({})'. You might need to add explicit type \
+         casts.",
+        types.join(", ")
+    )))
+}
+
 fn expect_args(name: &str, children: &[BoundExpr], low: usize, high: usize) -> Result<()> {
     if children.len() < low || children.len() > high {
         return Err(binder_error(format!(
@@ -2201,6 +2225,7 @@ pub fn bind_function(
         }
         "json_extract" | "json_extract_path" | "->" => {
             expect_args(&lower, &children, 2, 2)?;
+            extract_overload("json_extract", &children)?;
             if path_argument(&children[1])?.is_some_and(|(_, wildcard)| wildcard) {
                 let ty = LogicalType::list(json_type());
                 return Ok(bound_function(&lower, children, ty, json_extract_wildcard));
@@ -2209,6 +2234,7 @@ pub fn bind_function(
         }
         "json_extract_string" | "json_extract_path_text" | "->>" => {
             expect_args(&lower, &children, 2, 2)?;
+            extract_overload("json_extract_string", &children)?;
             if path_argument(&children[1])?.is_some_and(|(_, wildcard)| wildcard) {
                 let ty = LogicalType::list(LogicalType::VARCHAR);
                 return Ok(bound_function(&lower, children, ty, json_extract_string_wildcard));

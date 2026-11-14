@@ -932,7 +932,18 @@ impl Binder<'_> {
         let mut state = SelectBindState::default();
         for (i, expr) in select_list.iter_mut().enumerate() {
             names.push(expression_name(expr));
+            let written = match (&expr.kind, expr.alias.is_empty()) {
+                (ExprKind::ColumnRef(parts), true) => parts.last().cloned(),
+                _ => None,
+            };
             self.qualify_column_names(expr);
+            // `ColumnQualifier::QualifyColumnName`: a column is named as the table spells it
+            if let (Some(written), ExprKind::ColumnRef(parts)) = (written, &expr.kind)
+                && let Some(column) = parts.last()
+                && column.eq_ignore_ascii_case(&written)
+            {
+                *names.last_mut().expect("just pushed") = column.clone();
+            }
             if !expr.alias.is_empty() && !unnested_fields.contains(&i) {
                 state.alias_map.push((expr.alias.clone(), i));
             }
@@ -3028,7 +3039,14 @@ impl Binder<'_> {
                         None => BoundExpr::constant(Value::null(column.ty.clone())),
                     }
                 } else {
-                    binder.bind_expression(value)?
+                    // `UpdateBinder`
+                    let errors = (
+                        std::mem::replace(&mut binder.window_error, "window functions are not allowed in UPDATE"),
+                        std::mem::replace(&mut binder.aggregate_error, "aggregate functions are not allowed in UPDATE"),
+                    );
+                    let bound = binder.bind_expression(value);
+                    (binder.window_error, binder.aggregate_error) = errors;
+                    bound?
                 };
                 expressions.push(checked_cast(bound, &column.ty)?);
             }
@@ -3176,7 +3194,14 @@ impl Binder<'_> {
                             })
                             .collect()
                     };
-                    let (types, expressions) = self.bind_values(rows, Some(&expected_types), &defaults)?;
+                    // `InsertBinder`
+                    let errors = (
+                        std::mem::replace(&mut self.window_error, "INSERT statement cannot contain window functions!"),
+                        std::mem::replace(&mut self.aggregate_error, "INSERT statement cannot contain aggregates!"),
+                    );
+                    let bound = self.bind_values(rows, Some(&expected_types), &defaults);
+                    (self.window_error, self.aggregate_error) = errors;
+                    let (types, expressions) = bound?;
                     let table_index = self.generate_table_index();
                     LogicalOperator::new(
                         LogicalOperatorKind::ExpressionGet {

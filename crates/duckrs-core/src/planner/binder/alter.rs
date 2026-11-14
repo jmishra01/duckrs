@@ -179,6 +179,19 @@ fn identity(table: &TableCatalogEntry) -> Result<Vec<BoundExpr>> {
 impl Binder<'_> {
     /// `Binder::Bind(AlterStatement)` and `AlterEntry`.
     pub fn bind_alter(&mut self, info: &AlterInfo) -> Result<BoundAlter> {
+        // `DuckCatalog::Alter` of a schema: its options are not supported
+        if let AlterKind::SetSchemaOptions(_) | AlterKind::ResetSchemaOptions(_) = &info.kind {
+            let mut path = info.name.qualification.clone();
+            path.push(info.name.name.clone());
+            if let Err(error) = self.catalog.schema_for(Some(&crate::catalog::schema_key(&path))) {
+                if info.if_exists {
+                    return Ok(BoundAlter::Nothing);
+                }
+                return Err(error);
+            }
+            let verb = if matches!(info.kind, AlterKind::SetSchemaOptions(_)) { "SET" } else { "RESET" };
+            return Err(not_implemented(&format!("{verb} (<options>) is not supported for DuckDB schemas")));
+        }
         let schema = match self
             .catalog
             .schema_with_entry(self.schema_of(&info.name)?.as_deref(), &info.name.name)
@@ -192,6 +205,18 @@ impl Binder<'_> {
             self.search_schema = Some(schema.ident());
         }
         let Some(entry) = schema.get_entry(&info.name.name) else {
+            // `Binder::Bind(AlterStatement)`: an entry of the system catalog can't change
+            let schema_name = self.schema_of(&info.name)?;
+            let system_function = matches!(
+                &info.kind,
+                AlterKind::SetComment { entry_type, .. } if matches!(*entry_type, "FUNCTION" | "MACRO" | "MACRO TABLE")
+            ) && (crate::function::BuiltinFunctions::get().scalar(&info.name.name).is_some()
+                || crate::function::BuiltinFunctions::get().aggregate(&info.name.name).is_some()
+                || crate::catalog::defaults::default_macro(schema_name.as_deref(), &info.name.name, false).is_some());
+            if system_function || crate::catalog::defaults::default_view(schema_name.as_deref(), &info.name.name).is_some()
+            {
+                return Err(binder_error("Can not comment on System Catalog entries"));
+            }
             if info.if_exists {
                 return Ok(BoundAlter::Nothing);
             }

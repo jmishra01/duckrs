@@ -160,6 +160,10 @@ impl Binder<'_> {
             ExprKind::Subquery { .. } => {
                 error.get_or_insert_with(|| "cannot use subquery in check constraint".to_string());
             }
+            // `CheckBinder::BindExpression`
+            ExprKind::Window(_) => {
+                error.get_or_insert_with(|| "window functions are not allowed in check constraints".to_string());
+            }
             ExprKind::ColumnRef(names) if names.len() == 1 && column_index(columns, &names[0]).is_none() => {
                 error.get_or_insert_with(|| {
                     format!(

@@ -1223,7 +1223,7 @@ fn flush_rejects(scan: &CsvScanData, state: &mut CsvScanState) -> Result<()> {
             .names
             .iter()
             .zip(&scan.types)
-            .map(|(name, ty)| format!("'{}': '{ty}'", name.replace('\'', "''")))
+            .map(|(name, ty)| format!("'{}': '{}'", name.replace('\'', "''"), ty.to_string().replace('\'', "''")))
             .collect();
         let new_line = new_line_identifier(&file.dialect);
         scans.push(vec![

@@ -923,6 +923,7 @@ test/sql/alter/alter_col/test_not_null_in_tran.test
 test/sql/alter/alter_col/test_set_collate.test
 test/sql/alter/alter_col/test_set_not_null.test
 test/sql/alter/alter_col/test_set_not_null_after_delete.test
+test/sql/alter/alter_schema_set_schema_options.test
 test/sql/alter/alter_table_if_exists_tostring.test
 test/sql/alter/alter_table_nullability_requires_column.test
 test/sql/alter/alter_table_set_partitioned_by.test
@@ -990,6 +991,7 @@ test/sql/alter/rename_table/test_rename_table_transactions.test
 test/sql/alter/rename_table/test_rename_table_view.test
 test/sql/alter/rename_table/test_rename_table_with_dependency_check.test
 test/sql/alter/rename_table/test_rename_table_with_insert_transaction.test
+test/sql/alter/rename_view/test_rename_view.test
 test/sql/alter/rename_view/test_rename_view_incorrect.test
 test/sql/alter/rename_view/test_rename_view_many_transactions.test
 test/sql/alter/rename_view/test_rename_view_table.test
@@ -1073,6 +1075,7 @@ test/sql/binder/column_value_alias_group.test
 test/sql/binder/default_expression_errors.test
 test/sql/binder/duplicate_alias.test
 test/sql/binder/empty_column_alias.test
+test/sql/binder/expression_binder_coverage.test
 test/sql/binder/function_chaining_19035.test
 test/sql/binder/group_by_incremental_alias.test
 test/sql/binder/group_by_qualification.test
@@ -1089,6 +1092,7 @@ test/sql/binder/table_alias_single_quotes.test
 test/sql/binder/table_view_alias.test
 test/sql/binder/test_alias.test
 test/sql/binder/test_alias_map_in_subquery.test
+test/sql/binder/test_case_insensitive_binding.test
 test/sql/binder/test_function_chaining_alias.test
 test/sql/binder/test_having_alias.test
 test/sql/binder/test_implicit_struct_pack.test
@@ -1190,6 +1194,7 @@ test/sql/catalog/function/test_macro_issue_19119.test
 test/sql/catalog/function/test_macro_overloads.test
 test/sql/catalog/function/test_macro_parameter_named_argument.test
 test/sql/catalog/function/test_macro_relpersistence_conflict.test
+test/sql/catalog/function/test_macro_type_overloads.test
 test/sql/catalog/function/test_macro_with_unknown_types.test
 test/sql/catalog/function/test_recursive_macro_no_dependency.test
 test/sql/catalog/function/test_recursive_table_macro.test
@@ -3770,6 +3775,7 @@ test/sql/storage/types/variant/variant_shredded_top_level_array_cast.test
 test/sql/storage/types/variant/variant_shredding_empty_keys.test
 test/sql/storage/types/variant/variant_shredding_inconsistent.test
 test/sql/storage/types/variant/variant_shredding_small.test
+test/sql/storage/types/variant/variant_storage_version.test
 test/sql/storage/types/variant/variant_struct_field_subquery.test
 test/sql/storage/unicode_filename.test
 test/sql/storage/unzip.test

@@ -3620,6 +3620,28 @@ impl ClientContext {
         let mut binder = Binder::with_options(&catalog, self.bind_options());
         binder.session = Some(self.session_values());
         binder.bind_create_macro(&info.name.name, macros, *table_macro, &schema.ident())?;
+        // `CheckMacroStorageVersion` and `BindCreateFunctionInfo`: what an older file can't hold
+        if let Some(version) = catalog.storage_version().filter(|_| !info.temporary) {
+            use duckrs_common::serializer::StorageVersion;
+            if version < StorageVersion::V2_1_0 && macros.iter().any(|m| m.return_type.is_some()) {
+                return Err(Error::new(
+                    ErrorKind::Binder,
+                    "Macros with a declared RETURNS type are only supported for storage versions v2.1.0 and \
+                     higher.\nUse an in-memory database, ATTACH with (STORAGE_VERSION v2.1.0), or create a TEMP macro",
+                ));
+            }
+            if version < StorageVersion::V1_4_0
+                && macros
+                    .iter()
+                    .any(|m| m.parameters.iter().any(|p| p.parameter_type.is_some()))
+            {
+                return Err(Error::new(
+                    ErrorKind::Binder,
+                    "Typed macro parameters are only supported for storage versions v1.4.0 and higher.\nUse an \
+                     in-memory database, ATTACH with (STORAGE_VERSION v1.4.0), or create a TEMP macro",
+                ));
+            }
+        }
         if on_create_conflict(info.on_conflict) == OnCreateConflict::Replace {
             macro_is_free(&schema, &info.name.name)?;
         }
