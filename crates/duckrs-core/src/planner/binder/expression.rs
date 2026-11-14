@@ -2720,6 +2720,13 @@ impl Binder<'_> {
                 .unwrap_or_else(crate::catalog::default_schema);
             return Ok(Some(BoundExpr::constant(Value::varchar(schema))));
         }
+        // `VersionFun`: the version of the library
+        if name == "version" && function.args.is_empty() && function.name.qualification.iter().all(String::is_empty) {
+            return Ok(Some(BoundExpr::constant(Value::varchar(format!(
+                "v{}",
+                env!("CARGO_PKG_VERSION")
+            )))));
+        }
         if name == "current_query"
             && function.args.is_empty()
             && let Some(session) = &self.session

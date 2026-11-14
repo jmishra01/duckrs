@@ -1451,7 +1451,18 @@ impl Binder<'_> {
     fn bind_limit_percent(&mut self, expr: &Expr, offset: u64) -> Result<PreparedModifier> {
         let mut binder = self.child_binder();
         let bound = binder.bind_expression(expr)?;
-        let value = evaluate_scalar(&bound.cast_to(&LogicalType::DOUBLE, false))?;
+        // a subquery's value is read by the operator (`Value::GetValue`), whose cast fails as invalid input
+        let mut has_subquery = false;
+        bound.clone().walk_mut(&mut |e| {
+            has_subquery |= matches!(e.kind, BoundExprKind::Subquery { .. });
+        });
+        let value = evaluate_scalar(&bound.cast_to(&LogicalType::DOUBLE, false)).map_err(|error| {
+            if has_subquery && error.kind == ErrorKind::Conversion {
+                Error::new(ErrorKind::InvalidInput, error.message)
+            } else {
+                error
+            }
+        })?;
         // NULL is all of the rows
         let percent: f64 = if value.is_null() {
             100.0
@@ -1474,6 +1485,38 @@ impl Binder<'_> {
         let bound = binder.bind_expression(expr)?;
         if !binder.correlated.lock().is_empty() {
             return Err(binder_error("Correlated columns not supported in LIMIT/OFFSET"));
+        }
+        // `BindLimitValue`: a subquery is evaluated by the LIMIT operator, whose
+        // `GetLimitValue` reads its value as an idx_t (`Value::GetValue`)
+        let mut has_subquery = false;
+        bound.clone().walk_mut(&mut |e| {
+            has_subquery |= matches!(e.kind, BoundExprKind::Subquery { .. });
+        });
+        if has_subquery {
+            const MAX_LIMIT_VALUE: u64 = 1 << 62;
+            // `Value::GetValueInternal`: a DECIMAL is read as a DOUBLE
+            let bound = if bound.return_type.id() == LogicalTypeId::Decimal {
+                bound.cast_to(&LogicalType::DOUBLE, false)
+            } else {
+                bound
+            };
+            let value = evaluate_scalar(&bound.cast_to(&LogicalType::UBIGINT, false)).map_err(|error| {
+                if error.kind == ErrorKind::Conversion {
+                    Error::new(ErrorKind::InvalidInput, error.message)
+                } else {
+                    error
+                }
+            })?;
+            if value.is_null() {
+                return Ok(if is_offset { Some(0) } else { None });
+            }
+            let value = value.as_i128().expect("a UBIGINT") as u64;
+            if value > MAX_LIMIT_VALUE {
+                return Err(binder_error(format!(
+                    "Max value {value} for LIMIT/OFFSET is {MAX_LIMIT_VALUE}"
+                )));
+            }
+            return Ok(Some(value));
         }
         let value = evaluate_scalar(&bound.cast_to(&LogicalType::BIGINT, false))?;
         if value.is_null() {

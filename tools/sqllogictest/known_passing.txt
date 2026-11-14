@@ -84,6 +84,7 @@ test/fuzzer/pedro/alter_dependencies.test
 test/fuzzer/pedro/alter_dependency_conflict.test
 test/fuzzer/pedro/alter_table_rowid.test
 test/fuzzer/pedro/alter_type_null_mix.test
+test/fuzzer/pedro/alter_virtual_column_segfault.test
 test/fuzzer/pedro/analyze_nonexistant.test
 test/fuzzer/pedro/art_concatenate_prefix.test
 test/fuzzer/pedro/art_prefix_error.test
@@ -120,6 +121,7 @@ test/fuzzer/pedro/floating_point_conversion_overflow.test
 test/fuzzer/pedro/floating_point_inequality.test
 test/fuzzer/pedro/force_external_blob.test
 test/fuzzer/pedro/forced_parallelism_empty_select.test
+test/fuzzer/pedro/foreign_key_binding_issue.test
 test/fuzzer/pedro/foreign_key_type_mismatch.test
 test/fuzzer/pedro/gcol_stack_overflow.test
 test/fuzzer/pedro/group_by_all_row_alias.test
@@ -892,6 +894,7 @@ test/sql/alter/add_col/test_add_col_not_null.test
 test/sql/alter/add_col/test_add_col_stats.test
 test/sql/alter/add_col/test_add_col_unique.test
 test/sql/alter/add_pk/test_add_multi_column_pk.test
+test/sql/alter/add_pk/test_add_pk.test
 test/sql/alter/add_pk/test_add_pk_alter_in_tx.test
 test/sql/alter/add_pk/test_add_pk_catalog_error.test
 test/sql/alter/add_pk/test_add_pk_commit.test
@@ -905,7 +908,9 @@ test/sql/alter/add_pk/test_add_pk_naming_conflict.test
 test/sql/alter/add_pk/test_add_pk_storage.test
 test/sql/alter/add_pk/test_add_pk_wal.test
 test/sql/alter/add_pk/test_add_pk_wal_generated.test
+test/sql/alter/add_pk/test_add_pk_with_generated_column.test
 test/sql/alter/add_pk/test_add_same_pk_twice.test
+test/sql/alter/add_unique/test_add_unique.test
 test/sql/alter/add_unique/test_add_unique_wal.test
 test/sql/alter/alter_col/test_drop_not_null_primary_key.test
 test/sql/alter/alter_col/test_not_null_in_tran.test
@@ -925,6 +930,7 @@ test/sql/alter/alter_type/test_alter_type_active_transaction_visibility.test
 test/sql/alter/alter_type/test_alter_type_check.test
 test/sql/alter/alter_type/test_alter_type_dependencies.test
 test/sql/alter/alter_type/test_alter_type_expression.test
+test/sql/alter/alter_type/test_alter_type_incorrect.test
 test/sql/alter/alter_type/test_alter_type_index.test
 test/sql/alter/alter_type/test_alter_type_local.test
 test/sql/alter/alter_type/test_alter_type_multi_column.test
@@ -1215,6 +1221,7 @@ test/sql/catalog/test_catalog_errors.test
 test/sql/catalog/test_create_from_select.test
 test/sql/catalog/test_if_not_exists.test
 test/sql/catalog/test_incorrect_table_creation.test
+test/sql/catalog/test_querying_from_detached_catalog.test
 test/sql/catalog/test_quoted_column_name.test
 test/sql/catalog/test_schema.test
 test/sql/catalog/test_schema_conflict.test
@@ -2169,6 +2176,7 @@ test/sql/function/list/list_value_structs.test
 test/sql/function/list/list_where.test
 test/sql/function/list/list_zip.test
 test/sql/function/list/repeat_list.test
+test/sql/function/list/test_lambda_with_struct_aliases.test
 test/sql/function/nested/array_extract_unnamed_struct.test
 test/sql/function/nested/test_issue_5437.test
 test/sql/function/nested/test_struct_insert.test
@@ -2913,10 +2921,12 @@ test/sql/optimizer/yearweek_negative_iso_year.test
 test/sql/order/hugeint_order_by_extremes.test
 test/sql/order/issue_11936.test
 test/sql/order/limit_full_outer_join.test
+test/sql/order/limit_invalid_index_value.test
 test/sql/order/limit_parameter.test
 test/sql/order/limit_percent_cardinality_overflow.test
 test/sql/order/limit_percent_view.test
 test/sql/order/limit_union.test
+test/sql/order/negative_offset.test
 test/sql/order/order_by_all.test
 test/sql/order/order_by_internal_5293.test
 test/sql/order/order_by_negative_zero.test
@@ -2927,9 +2937,11 @@ test/sql/order/order_merge_prefix.test
 test/sql/order/order_overflow.test
 test/sql/order/order_string_radix_suffix.test
 test/sql/order/order_string_word_boundaries.test
+test/sql/order/test_limit.test
 test/sql/order/test_limit_cte.test
 test/sql/order/test_limit_nested_types.test
 test/sql/order/test_limit_parameter.test
+test/sql/order/test_limit_percent.test
 test/sql/order/test_nulls_first.test
 test/sql/order/test_order_by.test
 test/sql/order/test_order_by_exceptions.test
@@ -3163,6 +3175,7 @@ test/sql/prepared/test_prepare_types.test
 test/sql/projection/coalesce_error.test
 test/sql/projection/coalesce_rowid.test
 test/sql/projection/reference_only_output.test
+test/sql/projection/select_star_exclude.test
 test/sql/projection/select_star_like.test
 test/sql/projection/select_star_rename.test
 test/sql/projection/select_star_replace.test
@@ -3181,6 +3194,7 @@ test/sql/returning/returning_delete_same_transaction.test
 test/sql/returning/returning_insert.test
 test/sql/returning/returning_large.test
 test/sql/returning/returning_update.test
+test/sql/sample/helper_operator_coverage.test
 test/sql/sample/repeatable_seed_range.test
 test/sql/sample/reservoir_sample.test
 test/sql/sample/system_sample_index_scan.test
@@ -3228,6 +3242,7 @@ test/sql/settings/connection_local_settings.test
 test/sql/settings/debug_deprecated_settings.test
 test/sql/settings/default_null_order_extended.test
 test/sql/settings/drop_set_schema.test
+test/sql/settings/enable_block_allocator.test
 test/sql/settings/max_memory_percentage.test
 test/sql/settings/reset/reset_threads.test
 test/sql/settings/set_null_settings.test

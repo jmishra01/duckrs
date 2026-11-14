@@ -767,8 +767,29 @@ pub struct SettingValues(HashMap<usize, Value>);
 /// `PhysicalSet::GetSettingScope`: the scope `SET` without a scope uses, and the checks of an
 /// explicit one. `true` means global.
 fn resolve_scope(setting: &SettingDefinition, scope: SetScope) -> Result<bool> {
+    resolve_scope_of(setting, scope, false)
+}
+
+/// [`resolve_scope`] for SET (`reset` false) or RESET. A setting with its own implementation (no
+/// generic default) has no scope to check: what it cannot do is a missing `set_local` or
+/// `set_global` callback (`PhysicalSet::SetVariable`, `PhysicalReset`).
+fn resolve_scope_of(setting: &SettingDefinition, scope: SetScope, reset: bool) -> Result<bool> {
     let invalid = |message: String| Err(Error::new(ErrorKind::InvalidInput, message));
+    let custom = setting.default_value.is_none();
+    let callback_missing = |locally: bool| {
+        let place = if locally { "locally" } else { "globally" };
+        let message = if reset {
+            format!("option \"{}\" cannot be reset {place}", setting.name)
+        } else {
+            format!("option {} cannot be set {place}", setting.name)
+        };
+        Err(Error::new(ErrorKind::Catalog, message))
+    };
     match scope {
+        SetScope::Local | SetScope::Session if custom && setting.scope == SettingScope::GlobalOnly => {
+            callback_missing(true)
+        }
+        SetScope::Global if custom && setting.scope == SettingScope::LocalOnly => callback_missing(false),
         SetScope::Automatic => Ok(matches!(
             setting.scope,
             SettingScope::GlobalOnly | SettingScope::GlobalDefault
@@ -850,7 +871,7 @@ pub fn reset_variable(
     if setting.name == "temp_directory" {
         check_temp_directory_change(global, session)?;
     }
-    if resolve_scope(setting, scope)? {
+    if resolve_scope_of(setting, scope, true)? {
         global.0.remove(&index);
     } else {
         session.0.remove(&index);
@@ -1181,7 +1202,8 @@ mod tests {
             &mut session,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("can only be set globally"), "{err}");
+        // a setting of its own implementation lacks `set_local` (`PhysicalSet::SetVariable`)
+        assert!(err.to_string().contains("option threads cannot be set locally"), "{err}");
         let err = set_variable(
             "thread",
             SetScope::Automatic,

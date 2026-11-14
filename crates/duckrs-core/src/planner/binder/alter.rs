@@ -227,6 +227,12 @@ impl Binder<'_> {
             });
         }
         let TableOrView::Table(table) = entry else {
+            // `Binder::BindAlterAddIndex`
+            if matches!(info.kind, AlterKind::AddConstraint(Constraint::Unique { .. })) {
+                return Err(binder_error(
+                    "Cannot execute the `ALTER TABLE` statement on `View`, only `Table` entries are accepted.",
+                ));
+            }
             return Err(catalog_error("Can only modify table with ALTER TABLE statement".into()));
         };
         // `DuckTableEntry::RemoveColumn` and `ChangeColumnType`
@@ -306,21 +312,47 @@ impl Binder<'_> {
 
     /// `AlterBinder`: an expression over the rows of the table.
     fn bind_alter_expression(&self, table: &TableCatalogEntry, expression: &Expr) -> Result<BoundExpr> {
+        // the parameters of lambdas, which are no columns
+        let mut lambda_parameters: Vec<String> = Vec::new();
+        visit_expr_mut(&mut expression.clone(), &mut |e: &mut Expr| {
+            if let ExprKind::Lambda { lhs, .. } = &e.kind {
+                visit_expr_mut(&mut (**lhs).clone(), &mut |p: &mut Expr| {
+                    if let ExprKind::ColumnRef(names) = &p.kind
+                        && let [name] = names.as_slice()
+                    {
+                        lambda_parameters.push(name.to_lowercase());
+                    }
+                });
+            }
+        });
         let mut error = None;
         visit_expr_mut(&mut expression.clone(), &mut |e: &mut Expr| match &e.kind {
+            ExprKind::ColumnRef(names)
+                if names.len() == 1 && lambda_parameters.contains(&names[0].to_lowercase()) => {}
             ExprKind::Subquery { .. } => {
                 error.get_or_insert_with(|| "cannot use subquery in alter statement".to_string());
             }
             ExprKind::Window(_) => {
                 error.get_or_insert_with(|| "window functions are not allowed in alter statement".to_string());
             }
-            ExprKind::ColumnRef(names) if names.len() == 1 && table.column_index(&names[0]).is_none() => {
-                error.get_or_insert_with(|| {
-                    format!(
-                        "Table does not contain column {} referenced in alter statement!",
-                        sql_quoted_identifier(&names[0])
-                    )
-                });
+            // `AlterBinder::BindColumnReference` (`BindQualifiedColumnName`): past a leading table name,
+            // the first name is the column
+            ExprKind::ColumnRef(names) => {
+                let column = match names.as_slice() {
+                    [first, second, ..] if first.eq_ignore_ascii_case(&table.name) => second,
+                    [first, ..] => first,
+                    [] => return,
+                };
+                if table.is_generated(column) {
+                    error.get_or_insert_with(|| "Using generated columns in alter statement not supported".to_string());
+                } else if table.column_index(column).is_none() {
+                    error.get_or_insert_with(|| {
+                        format!(
+                            "Table does not contain column {} referenced in alter statement!",
+                            sql_quoted_identifier(column)
+                        )
+                    });
+                }
             }
             _ => {}
         });
@@ -729,6 +761,14 @@ fn add_constraint(alter: &mut BoundTableAlter, constraint: &Constraint) -> Resul
             "No support for adding {kind} constraints with ALTER TABLE"
         )));
     };
+    // `BindUniqueConstraint`: a generated column has no values to key on
+    if let Some(generated) = columns.iter().find(|name| table.is_generated(name)) {
+        let kind = if *primary_key { "PRIMARY KEY" } else { "UNIQUE constraint" };
+        return Err(binder_error(format!(
+            "cannot create a {kind} on a generated column: {}",
+            duckrs_parser::ast::sql_identifier(generated)
+        )));
+    }
     let key = bind_unique(&table.name, &table.columns, *index, columns)?;
     check_key_types(&table.columns, &key)?;
     let quoted = sql_quoted_identifier(&table.name);

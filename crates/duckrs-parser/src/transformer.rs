@@ -1385,13 +1385,14 @@ impl<'g> Transformer<'g> {
             }
             star.relation_name = names[0].clone();
         }
+        // `QualifiedColumnEquality`: a prefix comparison, "tbl.i" being the same as "i" but not as "tbl2.i"
         let same = |a: &QualifiedColumnName, b: &QualifiedColumnName| {
             a.column.eq_ignore_ascii_case(&b.column)
-                && a.qualification.len() == b.qualification.len()
                 && a.qualification
                     .iter()
-                    .zip(&b.qualification)
-                    .all(|(x, y)| x.eq_ignore_ascii_case(y))
+                    .rev()
+                    .zip(b.qualification.iter().rev())
+                    .all(|(x, y)| x.is_empty() || y.is_empty() || x.eq_ignore_ascii_case(y))
         };
         if let Some(exclude) = self.sub(node, "ExcludeList") {
             let names = self.alt(self.req(exclude, "ExcludeNames")?)?;

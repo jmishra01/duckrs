@@ -1668,6 +1668,17 @@ impl ClientContext {
                 Statement::SetVariable { .. } | Statement::ResetVariable { .. } | Statement::Transaction { .. }
             )
         {
+            // a query binds the default catalog (`Catalog::GetCatalog`); other statements look up
+            // a schema of it
+            if matches!(statement, Statement::Select(_)) {
+                return Err(Error::new(
+                    ErrorKind::Binder,
+                    format!(
+                        "Catalog {} does not exist!",
+                        duckrs_parser::ast::sql_quoted_identifier(&self.db.name)
+                    ),
+                ));
+            }
             return Err(Error::new(
                 ErrorKind::Catalog,
                 format!("Catalog with name {} does not exist!", self.db.name),

@@ -218,7 +218,28 @@ impl Binder<'_> {
                         primary_key: *primary_key,
                     });
                 }
-                Constraint::Check(_) | Constraint::ForeignKey { .. } => {}
+                // `BindForeignKey`, in the order of the constraints: a key named twice
+                Constraint::ForeignKey { fk_columns, pk_columns, .. } => {
+                    let twice = |names: &[String]| {
+                        names
+                            .iter()
+                            .enumerate()
+                            .any(|(at, name)| names[..at].iter().any(|n| n.eq_ignore_ascii_case(name)))
+                    };
+                    if twice(pk_columns) {
+                        return Err(Error::new(
+                            ErrorKind::Parser,
+                            "duplicate primary key referenced in FOREIGN KEY constraint",
+                        ));
+                    }
+                    if twice(fk_columns) {
+                        return Err(Error::new(
+                            ErrorKind::Parser,
+                            "duplicate key specified in FOREIGN KEY constraint",
+                        ));
+                    }
+                }
+                Constraint::Check(_) => {}
             }
         }
         for constraint in &info.constraints {
