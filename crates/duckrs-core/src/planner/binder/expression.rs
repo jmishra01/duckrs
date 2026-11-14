@@ -2184,6 +2184,12 @@ impl Binder<'_> {
                         "pragma_platform",
                         "pragma_database_size",
                     ];
+                    // `ExpressionBinder::BindWindow` of a window function written without OVER
+                    if function.name.qualification.iter().all(String::is_empty)
+                        && super::window::window_function(&function.name.name.to_lowercase()).is_some()
+                    {
+                        return Err(binder_error("Window functions are not supported here"));
+                    }
                     if function.name.qualification.iter().all(String::is_empty)
                         && TABLE_FUNCTIONS.contains(&function.name.name.to_lowercase().as_str())
                     {

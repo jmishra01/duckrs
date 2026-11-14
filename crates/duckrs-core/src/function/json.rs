@@ -596,11 +596,31 @@ pub fn transform_with(json: &Json, ty: &LogicalType, strict: bool, formats: &For
             let entry = ty.child_type().cloned().unwrap_or(LogicalType::VARCHAR);
             let children = entry.struct_children();
             let mut values = Vec::with_capacity(items.len());
+            let mut keys: Vec<Value> = Vec::with_capacity(items.len());
+            // `TransformObjectToMap`: a key that does not convert is NULL without strict casting,
+            // and a map with a NULL key or the same key twice is NULL, or an error when strict
+            let mut invalid_reason = None;
             for (key, item) in items {
-                let key = cast_value(&Value::varchar(key.as_str()), &children[0].1)
-                    .ok_or_else(|| invalid(format!("Failed to cast key {key} to {}", children[0].1)))?;
+                let key = match cast_value(&Value::varchar(key.as_str()), &children[0].1) {
+                    Some(key) => key,
+                    None if strict => {
+                        return Err(invalid(format!("Failed to cast key {key} to {}", children[0].1)));
+                    }
+                    None => Value::null(children[0].1.clone()),
+                };
                 let item = transform(item, &children[1].1, strict)?;
+                if invalid_reason.is_none() {
+                    if key.is_null() {
+                        invalid_reason = Some("Map keys can not be NULL");
+                    } else if keys.contains(&key) {
+                        invalid_reason = Some("Map keys must be unique");
+                    }
+                }
+                keys.push(key.clone());
                 values.push(Value::new(entry.clone(), ValueData::Struct(vec![key, item]))?);
+            }
+            if let Some(reason) = invalid_reason {
+                return if strict { Err(invalid(reason.to_string())) } else { Ok(Value::null(ty.clone())) };
             }
             Value::new(ty.clone(), ValueData::List(values))
         }

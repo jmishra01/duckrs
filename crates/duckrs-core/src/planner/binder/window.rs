@@ -40,7 +40,7 @@ fn is_range_type(ty: &LogicalType) -> bool {
     )
 }
 
-fn window_function(name: &str) -> Option<WindowFunction> {
+pub(super) fn window_function(name: &str) -> Option<WindowFunction> {
     use WindowFunction::*;
     Some(match name {
         "row_number" => RowNumber,

@@ -249,9 +249,24 @@ impl Binder<'_> {
             if indexes.iter().any(|i| i.columns.contains(&index)) {
                 return Err(catalog_error(format!("Cannot {action}: an index depends on it!")));
             }
-            // `DataTable` of a removed column: the columns after it move
+            // `DataTable` of a removed column: the columns after it move, also those of the
+            // indexes of UNIQUE and PRIMARY KEY constraints (the constraints on the column itself
+            // were refused before)
+            let mut indexed: Vec<usize> = indexes.iter().flat_map(|i| i.columns.iter().copied()).collect();
+            for constraint in &table.constraints {
+                if let TableConstraint::Unique { columns, .. } = constraint
+                    && !columns.contains(&index)
+                {
+                    indexed.extend(columns.iter().copied());
+                }
+            }
+            let constrained = table
+                .constraints
+                .iter()
+                .any(|c| matches!(c, TableConstraint::Unique { columns, .. } if columns.contains(&index)));
             if matches!(info.kind, AlterKind::RemoveColumn { .. })
-                && indexes.iter().any(|i| i.columns.iter().any(|c| *c > index))
+                && !constrained
+                && indexed.iter().any(|c| *c > index)
             {
                 return Err(catalog_error(
                     "Cannot drop this column: an index depends on a column after it!".to_string(),

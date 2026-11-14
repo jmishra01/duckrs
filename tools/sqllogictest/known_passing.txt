@@ -461,6 +461,7 @@ test/issues/rigger/test_618.test
 test/issues/rigger/test_619.test
 test/issues/rigger/test_622.test
 test/issues/rigger/test_624.test
+test/issues/rigger/test_625.test
 test/issues/rigger/test_628.test
 test/issues/rigger/test_629.test
 test/issues/rigger/test_633.test
@@ -1177,6 +1178,7 @@ test/sql/catalog/function/test_table_macro.test
 test/sql/catalog/function/test_table_macro_args.test
 test/sql/catalog/function/test_table_macro_complex.test
 test/sql/catalog/function/test_table_macro_groups.test
+test/sql/catalog/function/test_window_macro.test
 test/sql/catalog/identifier_embedded_nul.test
 test/sql/catalog/issue_9459.test
 test/sql/catalog/nested_schema/create_nested_schema.test
@@ -2710,6 +2712,7 @@ test/sql/json/issues/map_inference_threshold_internal_exception.test
 test/sql/json/issues/ndjson_parallel_bom.test
 test/sql/json/issues/test_json_temp_8062.test
 test/sql/json/json_blob_roundtrip.test
+test/sql/json/scalar/json_to_map_invalid_keys.test
 test/sql/json/scalar/json_transform_case_insensitive_keys.test
 test/sql/json/scalar/test_json_array_length.test
 test/sql/json/scalar/test_json_arrow_expr.test

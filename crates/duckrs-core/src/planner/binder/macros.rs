@@ -500,6 +500,19 @@ impl Binder<'_> {
                     if has_parameter(body) {
                         return Err(binder_error("Parameter expressions within macro's are not supported!"));
                     }
+                    // a window function without OVER fails when it is bound, whatever its arguments
+                    let mut window = false;
+                    visit_expr_mut(&mut (**body).clone(), &mut |e| {
+                        if let ExprKind::Function(call) = &e.kind
+                            && call.name.qualification.iter().all(String::is_empty)
+                            && super::window::window_function(&call.name.name.to_lowercase()).is_some()
+                        {
+                            window = true;
+                        }
+                    });
+                    if window {
+                        return Err(binder_error("Window functions are not supported here"));
+                    }
                     let mut body = (**body).clone();
                     mark_all(&mut body, &parameters);
                     visit_expr_mut(&mut body, &mut |e| {
