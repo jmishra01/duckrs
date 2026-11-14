@@ -33,6 +33,8 @@ pub fn collation_functions(ty: &LogicalType, default: &str, kind: CollationType)
         LogicalTypeId::TimeTz => return Ok(vec!["timetz_byte_comparable"]),
         LogicalTypeId::Bit => return Ok(vec!["bitstring_byte_comparable"]),
         LogicalTypeId::Interval => return Ok(vec!["normalized_interval"]),
+        // `GetVariantCollationFunctions`
+        LogicalTypeId::Variant => return Ok(vec!["variant_comparator"]),
         _ => {}
     }
     if ty.id() != LogicalTypeId::Varchar || ty.alias().is_some() {
@@ -82,6 +84,9 @@ pub fn collation_functions(ty: &LogicalType, default: &str, kind: CollationType)
 /// `ApplyCollationFunction`: `function(source)`, keeping its alias.
 fn apply(function: &str, source: BoundExpr) -> Result<BoundExpr> {
     let alias = source.alias.clone();
+    if function == "variant_comparator" {
+        return Ok(crate::function::variant::bind_variant_function(function, vec![source])?.with_alias(alias));
+    }
     let bound = match crate::function::BuiltinFunctions::get().scalar(function) {
         Some(set) => crate::function::binder::bind_scalar_function(
             set,

@@ -187,7 +187,8 @@ enum PreparedModifier {
         percent: f64,
         offset: u64,
     },
-    Order(Vec<(OrderModifiers, usize)>),
+    /// with the collation a position of a set operation is sorted by
+    Order(Vec<(OrderModifiers, usize, Option<String>)>),
     OrderAll(OrderModifiers),
     Limit {
         limit: Option<u64>,
@@ -261,6 +262,9 @@ pub fn schema_of(name: &QualifiedName) -> Result<Option<String>> {
         path => Ok(Some(crate::catalog::schema_key(path))),
     }
 }
+
+/// The alias of a COLLATE that an ORDER BY position applies to its select list entry.
+pub(super) const ORDER_POSITION_COLLATE: &str = "\u{1}order position";
 
 impl Binder<'_> {
     /// `schema_of` in this binder's catalog, which a qualification can name by its own name, as
@@ -665,7 +669,7 @@ impl Binder<'_> {
                     )));
                 }
                 for index in matched {
-                    orders.push((self.options.resolve_order(node.order, node.nulls), index));
+                    orders.push((self.options.resolve_order(node.order, node.nulls), index, None));
                 }
                 continue;
             }
@@ -681,7 +685,17 @@ impl Binder<'_> {
                      this behavior.",
                 ));
             }
-            let index = match &node.expr.kind {
+            // `BindSelectNode`: a position with a collation
+            let (order_expr, collation) = match &node.expr.kind {
+                ExprKind::Collate { child, collation }
+                    if matches!(&child.kind, ExprKind::Constant(l) if l.kind == LiteralKind::Integer)
+                        || matches!(&child.kind, ExprKind::Positional(_)) =>
+                {
+                    (&**child, Some(collation.clone()))
+                }
+                _ => (&node.expr, None),
+            };
+            let index = match &order_expr.kind {
                 ExprKind::Constant(literal) if literal.kind == LiteralKind::Integer => {
                     let value: i64 = literal.text.replace('_', "").parse().unwrap_or(i64::MAX);
                     if value <= 0 || value as usize > types.len() {
@@ -729,7 +743,10 @@ impl Binder<'_> {
                     index
                 }
             };
-            orders.push((self.options.resolve_order(node.order, node.nulls), index));
+            if collation.is_some() && types.get(index).is_some_and(|t| t.id() != LogicalTypeId::Varchar) {
+                return Err(binder_error("COLLATE can only be applied to varchar columns"));
+            }
+            orders.push((self.options.resolve_order(node.order, node.nulls), index, collation));
         }
         Ok(PreparedModifier::Order(orders))
     }
@@ -793,11 +810,18 @@ impl Binder<'_> {
                 PreparedModifier::Order(orders) => LogicalOperatorKind::Order {
                     orders: orders
                         .into_iter()
-                        .map(|(modifiers, index)| {
-                            Ok(BoundOrderByNode {
-                                modifiers,
-                                expr: collated_column(index)?,
-                            })
+                        .map(|(modifiers, index, collation)| {
+                            let expr = match collation {
+                                Some(collation) => {
+                                    let mut expr = column(index)?;
+                                    expr.return_type = LogicalType::varchar_collation(&collation);
+                                    let ty = expr.return_type.clone();
+                                    let kind = crate::planner::collation::CollationType::AllCollations;
+                                    crate::planner::collation::push_collation(expr, &ty, &default_collation, kind)?.0
+                                }
+                                None => collated_column(index)?,
+                            };
+                            Ok(BoundOrderByNode { modifiers, expr })
                         })
                         .collect::<Result<_>>()?,
                 },
@@ -1406,7 +1430,7 @@ impl Binder<'_> {
                     };
                     for target in &targets {
                         let index = self.bind_order_expression(target, select_list, state, "ORDER BY")?;
-                        orders.push((self.options.resolve_order(node.order, node.nulls), index));
+                        orders.push((self.options.resolve_order(node.order, node.nulls), index, None));
                     }
                 }
                 PreparedModifier::Order(orders)
@@ -1556,6 +1580,11 @@ impl Binder<'_> {
                         rewritten = Expr::from(ExprKind::Collate {
                             child: Box::new(target),
                             collation: collation.clone(),
+                        })
+                        .with_alias(if matches!(&child.kind, ExprKind::Constant(_) | ExprKind::Positional(_)) {
+                            ORDER_POSITION_COLLATE
+                        } else {
+                            ""
                         });
                         &rewritten
                     }

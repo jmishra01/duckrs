@@ -449,11 +449,11 @@ impl FilterPushdown {
                     columns.push(binding);
                 }
             });
+            // a projection removes no rows, so what it computes may throw below the barrier too
             let stays = !remaining.is_empty()
                 || columns.iter().any(|b| {
                     let entry = projected.get(b.column_index);
-                    b.table_index != table_index
-                        || entry.is_none_or(|e| e.is_volatile() || contains_subquery(e) || can_throw(e))
+                    b.table_index != table_index || entry.is_none_or(|e| e.is_volatile() || contains_subquery(e))
                 });
             if stays {
                 remaining.push(f.filter);

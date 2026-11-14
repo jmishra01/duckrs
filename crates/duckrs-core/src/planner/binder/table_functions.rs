@@ -313,6 +313,10 @@ impl Binder<'_> {
                     return Err(binder_error("glob requires a pattern"));
                 };
                 let value = self.constant_argument(&pattern.expr)?;
+                // `MultiFileReader::ParseFileList`
+                if value.is_null() {
+                    return Err(Error::new(ErrorKind::Parser, "glob cannot take NULL list as parameter"));
+                }
                 // a list of patterns: the files of each, in turn
                 let patterns = match value.data() {
                     ValueData::List(items) => items.iter().map(Value::try_to_string).collect::<Result<Vec<_>>>()?,

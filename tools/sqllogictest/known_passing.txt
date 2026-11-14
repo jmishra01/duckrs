@@ -2057,6 +2057,7 @@ test/sql/function/generic/make_type_empty_name.test
 test/sql/function/generic/null_constant_return_type.test
 test/sql/function/generic/replace_type.test
 test/sql/function/generic/table_func_varargs.test
+test/sql/function/generic/test_barrier.test
 test/sql/function/generic/test_between.test
 test/sql/function/generic/test_boolean_test.test
 test/sql/function/generic/test_if.test
@@ -2136,6 +2137,8 @@ test/sql/function/list/lambdas/arrow/transform_with_index_deprecated.test
 test/sql/function/list/lambdas/arrow/warn_deprecated_arrow.test
 test/sql/function/list/lambdas/expression_iterator_cases.test
 test/sql/function/list/lambdas/filter.test
+test/sql/function/list/lambdas/lambda_aggregate_reference.test
+test/sql/function/list/lambdas/lambda_parameter_named_argument.test
 test/sql/function/list/lambdas/lambda_scope.test
 test/sql/function/list/lambdas/lambdas_and_functions.test
 test/sql/function/list/lambdas/lambdas_and_group_by.test
@@ -2333,6 +2336,7 @@ test/sql/function/string/test_trim.test
 test/sql/function/string/test_unicode.test
 test/sql/function/string/test_url_encode.test
 test/sql/function/struct/struct_extract_null_struct.test
+test/sql/function/table/multi_file_array_parameter.test
 test/sql/function/table/query_function_null.test
 test/sql/function/table/read_duckdb_empty_projection.test
 test/sql/function/table/read_duckdb_struct_children.test
@@ -4380,6 +4384,7 @@ test/sql/types/numeric/usmallint_try_cast.test
 test/sql/types/numeric/utinyint_try_cast.test
 test/sql/types/string/test_big_strings.test
 test/sql/types/string/test_unicode.test
+test/sql/types/struct/create_qualified_type_array.test
 test/sql/types/struct/create_type_struct.test
 test/sql/types/struct/empty_struct.test
 test/sql/types/struct/empty_tuple_storage.test
@@ -4428,8 +4433,10 @@ test/sql/types/struct/test_tuple.test
 test/sql/types/struct/unnamed_struct_casts.test
 test/sql/types/struct/unnamed_struct_comparison.test
 test/sql/types/struct/unnamed_struct_mix.test
+test/sql/types/struct/unnest_column_names.test
 test/sql/types/struct/unnest_struct.test
 test/sql/types/struct/unnest_struct_distinct.test
+test/sql/types/struct/unnest_struct_mix.test
 test/sql/types/struct/unnest_struct_subquery.test
 test/sql/types/struct/update_empty_row.test
 test/sql/types/test_date_cast.test
@@ -4445,9 +4452,11 @@ test/sql/types/time/test_time_ns.test
 test/sql/types/time/test_time_tz.test
 test/sql/types/time/test_time_tz_collate.test
 test/sql/types/time/time_beyond_day.test
+test/sql/types/time/time_cast_trailing_text.test
 test/sql/types/time/time_limits.test
 test/sql/types/time/time_parsing.test
 test/sql/types/time/time_try_cast.test
+test/sql/types/time/timetz_minmax_order.test
 test/sql/types/timestamp/alternative_timestamp_casts.test
 test/sql/types/timestamp/bc_timestamp.test
 test/sql/types/timestamp/test_incorrect_timestamp.test
@@ -4527,6 +4536,7 @@ test/sql/types/variant/variant_cast_parameter_stats.test
 test/sql/types/variant/variant_cast_parent_path_order.test
 test/sql/types/variant/variant_cast_stats_json.test
 test/sql/types/variant/variant_cast_type_null.test
+test/sql/types/variant/variant_casts.test
 test/sql/types/variant/variant_decimal_arithmetic.test
 test/sql/types/variant/variant_distinct.test
 test/sql/types/variant/variant_extract_json_cast_shredded.test

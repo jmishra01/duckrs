@@ -779,6 +779,8 @@ pub struct Binder<'a> {
     aggregate_error: &'static str,
     pub session: Option<Arc<SessionValues>>,
     lambda_scopes: Vec<lambda::LambdaScope>,
+    /// the lambda scopes an aggregate being bound cannot read (`inaccessible_lambda_binding_count`)
+    inaccessible_lambdas: usize,
     /// The windows of the SELECT clause being bound, when it may have any here.
     windows: Option<window::WindowBindState>,
     window_error: &'static str,
@@ -891,6 +893,7 @@ impl<'a> Binder<'a> {
             aggregate_error: "Aggregate functions are not supported here",
             session: None,
             lambda_scopes: Vec::new(),
+            inaccessible_lambdas: 0,
             windows: None,
             window_error: "Window functions are not supported here",
             inside_window: false,

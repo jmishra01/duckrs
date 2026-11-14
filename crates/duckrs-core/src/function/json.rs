@@ -495,6 +495,27 @@ fn json_to_variant(json: &Json) -> Result<duckrs_common::variant::VariantNode> {
     })
 }
 
+/// The types `JSONTransform` reads with the cast from VARCHAR (`TransformFromString`).
+fn string_cast_type(ty: &LogicalType) -> bool {
+    use LogicalTypeId as T;
+    matches!(
+        ty.id(),
+        T::Enum
+            | T::Date
+            | T::Interval
+            | T::Time
+            | T::TimeNs
+            | T::TimeTz
+            | T::Timestamp
+            | T::TimestampTz
+            | T::TimestampTzNs
+            | T::TimestampNs
+            | T::TimestampMs
+            | T::TimestampSec
+            | T::Uuid
+    )
+}
+
 /// A value cast through the engine's casts, or `None` if it doesn't fit.
 fn cast_value(value: &Value, ty: &LogicalType) -> Option<Value> {
     let mut source = Vector::new(value.logical_type().clone(), 1);
@@ -668,6 +689,19 @@ pub fn transform_with(json: &Json, ty: &LogicalType, strict: bool, formats: &For
         },
         (_, Json::Str(text)) => match cast_value(&Value::varchar(text.as_str()), ty) {
             Some(value) => Ok(value),
+            // `TransformFromString`: the error of the cast
+            None if strict && string_cast_type(ty) => {
+                let mut source = Vector::new(LogicalType::VARCHAR, 1);
+                source.set_value(0, &Value::varchar(text.as_str()))?;
+                let mut target = Vector::new(ty.clone(), 1);
+                match cast_vector(&source, &mut target, 1, CastMode::Strict) {
+                    Err(error) => Err(invalid(format!(
+                        "{}\n If this error occurred during read_json, line/object number information is approximate",
+                        error.message
+                    ))),
+                    Ok(()) => fail(json),
+                }
+            }
             None => fail(json),
         },
         (_, Json::UInt(x)) => match cast_value(&Value::ubigint(*x), ty) {

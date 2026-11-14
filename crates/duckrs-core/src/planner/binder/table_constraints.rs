@@ -135,9 +135,16 @@ impl Binder<'_> {
     /// `BindCheckConstraint`: the expression reads the columns of the new table by position.
     fn bind_check(&self, table: &str, columns: &[ColumnDefinition], check: &Expr) -> Result<BoundExpr> {
         // `CheckBinder::BindCheckColumn`: a column inside a lambda is not supported yet
+        // (a lambda that reads only its parameters binds)
         let mut lambda = false;
         visit_expr_mut(&mut check.clone(), &mut |expr: &mut Expr| {
-            lambda |= matches!(expr.kind, ExprKind::Lambda { .. });
+            if let ExprKind::Lambda { expr: body, .. } = &mut expr.kind {
+                visit_expr_mut(body, &mut |inner: &mut Expr| {
+                    if let ExprKind::ColumnRef(names) = &inner.kind {
+                        lambda |= names.iter().take(2).any(|name| column_index(columns, name).is_some());
+                    }
+                });
+            }
         });
         if lambda {
             return Err(Error::new(
@@ -148,6 +155,8 @@ impl Binder<'_> {
         let mut error = None;
         let mut parsed = check.clone();
         visit_expr_mut(&mut parsed, &mut |expr: &mut Expr| match &expr.kind {
+            // a lambda here reads only its parameters
+            ExprKind::Lambda { .. } => expr.kind = ExprKind::Default,
             ExprKind::Subquery { .. } => {
                 error.get_or_insert_with(|| "cannot use subquery in check constraint".to_string());
             }

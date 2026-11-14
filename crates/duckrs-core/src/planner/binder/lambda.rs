@@ -76,13 +76,16 @@ impl Binder<'_> {
 
     /// A column that is a parameter of a lambda in scope, with the fields of a STRUCT after it.
     pub(super) fn bind_lambda_parameter(&mut self, names: &[String]) -> Result<Option<BoundExpr>> {
-        let found = self.lambda_scopes.iter().rev().find_map(|scope| {
+        let found = self.lambda_scopes.iter().enumerate().rev().find_map(|(at, scope)| {
             let index = scope.names.iter().position(|n| n.eq_ignore_ascii_case(&names[0]))?;
-            Some((scope.table_index, index, scope.types[index].clone()))
+            Some((at, scope.table_index, index, scope.types[index].clone()))
         });
-        let Some((table_index, index, ty)) = found else {
+        let Some((at, table_index, index, ty)) = found else {
             return Ok(None);
         };
+        if at < self.inaccessible_lambdas {
+            return Err(binder_error("aggregate functions cannot reference lambda parameters"));
+        }
         let mut bound = BoundExpr::column_ref(ColumnBinding::new(table_index, index), ty, names[0].clone());
         for field in &names[1..] {
             let name = BoundExpr::constant(Value::varchar(field.clone()));

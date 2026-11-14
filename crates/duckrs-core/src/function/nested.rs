@@ -296,7 +296,16 @@ pub fn bind_struct_pack(names: Vec<String>, children: Vec<BoundExpr>) -> Result<
     for (name, child) in names.into_iter().zip(&children) {
         let name = if name.is_empty() { child.alias.clone() } else { name };
         if name.is_empty() {
-            return Err(binder_error("Need named argument for struct pack, e.g., a := b"));
+            // the overload takes only named arguments (`kwargs`)
+            let types: Vec<String> = children
+                .iter()
+                .map(|c| super::binder::expression_return_type(c).to_string())
+                .collect();
+            return Err(binder_error(format!(
+                "No function matches the given name and argument types 'struct_pack({})'. You might need to add \
+                 explicit type casts.",
+                types.join(", ")
+            )));
         }
         if fields.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
             return Err(binder_error(format!("Duplicate struct entry name \"{name}\"")));

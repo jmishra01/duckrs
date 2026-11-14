@@ -412,6 +412,25 @@ impl Binder<'_> {
                             if let Some(ty) = found {
                                 return Ok(ty);
                             }
+                            // `catalog.type`: a name that is no schema can be a database
+                            if let [catalog] = name.qualification.as_slice() {
+                                // without a session (a stored definition) the database is this one
+                                let attached = if catalog.eq_ignore_ascii_case(&self.catalog.name)
+                                    || self.session.as_ref().is_none_or(|s| s.database.eq_ignore_ascii_case(catalog))
+                                {
+                                    self.catalog.get_type(Some("main"), None, &name.name)?
+                                } else {
+                                    self.session
+                                        .as_ref()
+                                        .and_then(|session| (session.attached_catalog)(catalog))
+                                        .map(|attached| attached.get_type(Some("main"), None, &name.name))
+                                        .transpose()?
+                                        .flatten()
+                                };
+                                if let Some(ty) = attached {
+                                    return Ok(ty);
+                                }
+                            }
                             // the built-in types are found in `main` too
                             let in_main = name
                                 .qualification
@@ -449,7 +468,20 @@ impl Binder<'_> {
                 .map(|candidate| (similarity_rating(candidate, &name), *candidate))
                 .max_by(|a, b| a.0.total_cmp(&b.0))
                 .filter(|(score, _)| *score > 0.7);
-            let hint = closest.map_or_else(String::new, |(_, type_name)| format!("\nDid you mean \"{type_name}\"?"));
+            // `CreateMissingEntryException`: a type of that name in a schema off the search path
+            let mut elsewhere: Vec<String> = self
+                .catalog
+                .schemas()
+                .iter()
+                .filter(|schema| schema.get_type(&name).is_some())
+                .map(|schema| format!("{}.{original}", schema.name))
+                .collect();
+            elsewhere.sort();
+            let hint = if elsewhere.is_empty() {
+                closest.map_or_else(String::new, |(_, type_name)| format!("\nDid you mean \"{type_name}\"?"))
+            } else {
+                format!("\nDid you mean \"{}\"?", elsewhere.join(" or "))
+            };
             return Err(Error::new(
                 ErrorKind::Catalog,
                 format!("Type with name {original} does not exist!{hint}"),
@@ -661,6 +693,23 @@ impl Binder<'_> {
         let (mut own, mut outer) = (false, false);
         for argument in &function.args {
             visit_expr_mut(&mut argument.expr.clone(), &mut |e| {
+                // the parameters of a lambda in the arguments are none of the query's columns
+                if let ExprKind::Lambda { lhs, expr, .. } = &mut e.kind {
+                    let mut parameters = Vec::new();
+                    visit_expr_mut(lhs, &mut |p| {
+                        if let ExprKind::ColumnRef(names) = &p.kind {
+                            parameters.push(names[0].clone());
+                        }
+                    });
+                    visit_expr_mut(expr, &mut |inner| {
+                        if let ExprKind::ColumnRef(names) = &inner.kind
+                            && parameters.iter().any(|p| p.eq_ignore_ascii_case(&names[0]))
+                        {
+                            inner.kind = ExprKind::Default;
+                        }
+                    });
+                    **lhs = Expr::from(ExprKind::Default);
+                }
                 if let ExprKind::ColumnRef(names) = &e.kind {
                     if self.bind_context.bind_column_ref(names).is_ok() {
                         own = true;
@@ -1643,6 +1692,10 @@ impl Binder<'_> {
                     child
                 };
                 if child.return_type.id() != LogicalTypeId::Varchar || child.return_type.alias().is_some() {
+                    // `BindSelectNode`: of a position, the select list entry is no VARCHAR
+                    if expr.alias == super::statements::ORDER_POSITION_COLLATE {
+                        return Err(binder_error("COLLATE can only be applied to varchar columns"));
+                    }
                     return Err(binder_error("collations are only supported for type varchar"));
                 }
                 crate::planner::collation::test_collation(collation)?;
@@ -1891,6 +1944,40 @@ impl Binder<'_> {
                         .iter()
                         .map(|a| self.bind_expression(&a.expr))
                         .collect::<Result<Vec<_>>>()?;
+                    // `BindMinMax` under `default_collation`: the strings compare collated
+                    let lower = function.name.name.to_ascii_lowercase();
+                    let default = self.default_collation();
+                    let aggregate_name = |at: usize| match children.get(at).map(|c| &c.kind) {
+                        Some(BoundExprKind::Constant(value)) => value.try_to_string().ok(),
+                        _ => None,
+                    };
+                    let min_max = matches!(lower.as_str(), "list_max" | "list_min" | "array_max" | "array_min")
+                        || matches!(
+                            lower.as_str(),
+                            "list_aggr" | "list_aggregate" | "array_aggr" | "array_aggregate" | "aggregate"
+                        ) && children.len() == 2
+                            && aggregate_name(1)
+                                .is_some_and(|n| n.eq_ignore_ascii_case("min") || n.eq_ignore_ascii_case("max"));
+                    if min_max
+                        && !default.is_empty()
+                        && let Some(list) = children.first()
+                        && list.return_type.id() == LogicalTypeId::List
+                        && list
+                            .return_type
+                            .child_type()
+                            .is_some_and(|c| c.id() == LogicalTypeId::Varchar && c.collation().is_none())
+                    {
+                        // the aggregate's name carries the collation to `list_aggr`
+                        let collated = LogicalType::VARCHAR.with_collation(Some(&default));
+                        let name = aggregate_name(1).unwrap_or_else(|| lower[lower.len() - 3..].to_string());
+                        let list = list.clone();
+                        drop(children);
+                        let which = BoundExpr::constant(Value::varchar(name).reinterpret(&collated)?);
+                        // `arg_max` returns the item, which has no collation
+                        let mut bound = bind_generic_function("list_aggr", vec![list, which])?;
+                        bound.return_type = bound.return_type.with_collation(None);
+                        return Ok(bound);
+                    }
                     return bind_generic_function(&function.name.name, children);
                 }
                 if ["st_crs", "st_setcrs"]
@@ -2861,6 +2948,15 @@ impl Binder<'_> {
 
     /// `BaseSelectBinder::BindAggregate`.
     fn bind_aggregate(&mut self, function: &FunctionExpr) -> Result<BoundExpr> {
+        // `InaccessibleLambdaBindings`: the parameters of the lambdas around the aggregate are not
+        // values of the rows it aggregates
+        let before = std::mem::replace(&mut self.inaccessible_lambdas, self.lambda_scopes.len());
+        let result = self.bind_aggregate_call(function);
+        self.inaccessible_lambdas = before;
+        result
+    }
+
+    fn bind_aggregate_call(&mut self, function: &FunctionExpr) -> Result<BoundExpr> {
         if self.aggregate_of_outer_query(function) {
             self.pending_outer_aggregate = Some(function.clone());
             return Err(crate::unported("aggregates of the columns of an outer query"));
