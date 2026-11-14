@@ -266,10 +266,16 @@ pub fn typeof_constant(argument: &LogicalType) -> Value {
 /// numeric ones (`NumericStats`), which is what duckrs keeps. The others (strings, nested
 /// types, VARIANT) have statistics of more kinds than duckrs works out.
 pub fn stats_supported(ty: &LogicalType) -> bool {
-    matches!(
-        ty.id(),
-        LogicalTypeId::SqlNull | LogicalTypeId::Geometry | LogicalTypeId::Varchar | LogicalTypeId::Blob
-    ) || crate::optimizer::statistics::has_ordered_statistics(ty)
+    match ty.id() {
+        // the statistics of any child at least know its NULLs
+        LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Struct => true,
+        _ => {
+            matches!(
+                ty.id(),
+                LogicalTypeId::SqlNull | LogicalTypeId::Geometry | LogicalTypeId::Varchar | LogicalTypeId::Blob
+            ) || crate::optimizer::statistics::has_ordered_statistics(ty)
+        }
+    }
 }
 
 /// `stats(expression)`: the statistics of its argument, which the statistics propagator works

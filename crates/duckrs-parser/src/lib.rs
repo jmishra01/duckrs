@@ -52,12 +52,18 @@ pub fn parse_ast(sql: &str) -> Result<Vec<ast::Statement>> {
 pub struct ParserOptions {
     /// `max_expression_depth`: how deep expression trees may nest.
     pub max_expression_depth: usize,
+    /// `integer_division`: `/` divides integers as `//` does.
+    pub integer_division: bool,
+    /// `regex_match_operator_semantics = full`: `~` and friends match the whole string.
+    pub regex_full_match: bool,
 }
 
 impl Default for ParserOptions {
     fn default() -> Self {
         Self {
             max_expression_depth: transformer::DEFAULT_MAX_EXPRESSION_DEPTH,
+            integer_division: false,
+            regex_full_match: false,
         }
     }
 }
@@ -70,6 +76,8 @@ pub fn parse_ast_with(sql: &str, options: &ParserOptions) -> Result<Vec<ast::Sta
         let (_, trees) = parse_on_this_thread_with(&sql, &options)?;
         let mut transformer = transformer::Transformer::new(Grammar::duckdb());
         transformer.max_expression_depth = options.max_expression_depth;
+        transformer.integer_division = options.integer_division;
+        transformer.regex_full_match = options.regex_full_match;
         trees.iter().map(|tree| transformer.top_level_statement(tree)).collect()
     })?
 }
@@ -83,6 +91,8 @@ pub fn parse_ast_with_text(sql: &str, options: &ParserOptions) -> Result<Vec<(as
         let (text, _, trees, starts) = parse_statements(&sql, &options)?;
         let mut transformer = transformer::Transformer::new(Grammar::duckdb());
         transformer.max_expression_depth = options.max_expression_depth;
+        transformer.integer_division = options.integer_division;
+        transformer.regex_full_match = options.regex_full_match;
         trees
             .iter()
             .enumerate()

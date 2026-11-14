@@ -8,9 +8,11 @@ mod copy;
 mod create_index;
 mod expression;
 mod generated;
+mod index_key;
 mod join;
 mod json;
 mod lambda;
+pub(crate) use lambda::is_lambda_function;
 mod macros;
 mod match_recognize;
 mod merge;
@@ -580,7 +582,12 @@ pub struct SessionValues {
     pub replacement_scans: Vec<ReplacementScan>,
     /// `DatabaseManager::IsAttachedDatabaseFile`: the files of the attached databases
     pub database_files: Box<dyn Fn() -> Vec<std::path::PathBuf> + Send + Sync>,
+    /// the catalog of an attached database by name (`Catalog::GetCatalogEntry`), committed state
+    pub attached_catalog: AttachedCatalogLookup,
 }
+
+/// [`SessionValues::attached_catalog`].
+pub type AttachedCatalogLookup = Box<dyn Fn(&str) -> Option<Arc<crate::catalog::Catalog>> + Send + Sync>;
 
 /// The rows of an `Appender`, for `__internal_appender_chunks`.
 pub type AppendedRows = (

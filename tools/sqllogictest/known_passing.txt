@@ -598,6 +598,7 @@ test/optimizer/statistics/statistics_join_null.test
 test/optimizer/statistics/statistics_join_ungrouped_aggregate_limit.test
 test/optimizer/statistics/statistics_least_greatest.test
 test/optimizer/statistics/statistics_root_replaced.test
+test/optimizer/statistics/statistics_struct.test
 test/optimizer/statistics/statistics_unsigned_arithmetic_pruning.test
 test/optimizer/statistics/statistics_unsigned_cast.test
 test/optimizer/statistics/statistics_varchar.test
@@ -760,6 +761,7 @@ test/sql/aggregate/aggregates/test_approx_quantile_decimal.test
 test/sql/aggregate/aggregates/test_approx_quantile_timestamp_infinity.test
 test/sql/aggregate/aggregates/test_approx_quantile_timetz.test
 test/sql/aggregate/aggregates/test_approximate_distinct_count.test
+test/sql/aggregate/aggregates/test_arg_min_max.test
 test/sql/aggregate/aggregates/test_arg_min_max_null.test
 test/sql/aggregate/aggregates/test_avg.test
 test/sql/aggregate/aggregates/test_avg_timestamp_infinity.test
@@ -776,6 +778,7 @@ test/sql/aggregate/aggregates/test_count_star.test
 test/sql/aggregate/aggregates/test_covar.test
 test/sql/aggregate/aggregates/test_empty_aggregate.test
 test/sql/aggregate/aggregates/test_entropy.test
+test/sql/aggregate/aggregates/test_filter_clause_sharing.test
 test/sql/aggregate/aggregates/test_first_last_any_ordered.test
 test/sql/aggregate/aggregates/test_first_noninlined.test
 test/sql/aggregate/aggregates/test_group_on_expression.test
@@ -1059,6 +1062,8 @@ test/sql/binder/group_by_qualification.test
 test/sql/binder/integer_literal_binding.test
 test/sql/binder/missing_column_error.test
 test/sql/binder/not_similar_to.test
+test/sql/binder/old_implicit_cast.test
+test/sql/binder/old_implicit_cast_template.test
 test/sql/binder/order_by_view.test
 test/sql/binder/qualified_alias_method_call.test
 test/sql/binder/similar_to.test
@@ -2063,6 +2068,8 @@ test/sql/function/generic/test_resolve_types.test
 test/sql/function/generic/test_set.test
 test/sql/function/generic/test_sleep.test
 test/sql/function/generic/test_stats.test
+test/sql/function/index/index_key.test
+test/sql/function/index/index_key_persistence.test
 test/sql/function/interval/date_part_monotonicity.test
 test/sql/function/interval/test_date_part.test
 test/sql/function/interval/test_extract.test
@@ -2112,6 +2119,7 @@ test/sql/function/list/generate_subscripts.test
 test/sql/function/list/lambda_constant_null.test
 test/sql/function/list/lambdas/arrow/expression_iterator_cases_deprecated.test
 test/sql/function/list/lambdas/arrow/filter_deprecated.test
+test/sql/function/list/lambdas/arrow/lambda_scope_deprecated.test
 test/sql/function/list/lambdas/arrow/lambdas_and_functions_deprecated.test
 test/sql/function/list/lambdas/arrow/lambdas_and_group_by_deprecated.test
 test/sql/function/list/lambdas/arrow/lambdas_and_macros_deprecated.test
@@ -2119,10 +2127,13 @@ test/sql/function/list/lambdas/arrow/list_comprehension_deprecated.test
 test/sql/function/list/lambdas/arrow/reduce_deprecated.test
 test/sql/function/list/lambdas/arrow/reduce_initial_deprecated.test
 test/sql/function/list/lambdas/arrow/rhs_parameters_deprecated.test
+test/sql/function/list/lambdas/arrow/storage_deprecated.test
+test/sql/function/list/lambdas/arrow/table_functions_deprecated.test
 test/sql/function/list/lambdas/arrow/test_deprecated_lambda.test
 test/sql/function/list/lambdas/arrow/test_lambda_arrow_storage_deprecated.test
 test/sql/function/list/lambdas/arrow/transform_deprecated.test
 test/sql/function/list/lambdas/arrow/transform_with_index_deprecated.test
+test/sql/function/list/lambdas/arrow/warn_deprecated_arrow.test
 test/sql/function/list/lambdas/expression_iterator_cases.test
 test/sql/function/list/lambdas/filter.test
 test/sql/function/list/lambdas/lambda_scope.test
@@ -2138,6 +2149,7 @@ test/sql/function/list/lambdas/reduce_try_empty.test
 test/sql/function/list/lambdas/reduce_volatile.test
 test/sql/function/list/lambdas/rhs_parameters.test
 test/sql/function/list/lambdas/storage.test
+test/sql/function/list/lambdas/table_functions.test
 test/sql/function/list/lambdas/test_lambda_storage.test
 test/sql/function/list/lambdas/transform.test
 test/sql/function/list/lambdas/transform_with_index.test
@@ -2223,6 +2235,7 @@ test/sql/function/operator/test_comparison.test
 test/sql/function/operator/test_comparison_function_call_types.test
 test/sql/function/operator/test_conjunction_nulls.test
 test/sql/function/operator/test_date_arithmetic.test
+test/sql/function/operator/test_division_by_zero.test
 test/sql/function/operator/test_division_overflow.test
 test/sql/function/operator/test_in_empty_table.test
 test/sql/function/string/format_bytes.test
@@ -2243,9 +2256,12 @@ test/sql/function/string/path_join.test
 test/sql/function/string/regex_capture.test
 test/sql/function/string/regex_escape.test
 test/sql/function/string/regex_extract.test
+test/sql/function/string/regex_extract_all.test
 test/sql/function/string/regex_extract_all_struct.test
 test/sql/function/string/regex_extract_empty_group_name.test
 test/sql/function/string/regex_filter_pushdown.test
+test/sql/function/string/regex_operators.test
+test/sql/function/string/regex_operators_v1_5_view.test
 test/sql/function/string/regex_search.test
 test/sql/function/string/regexp_split_to_table.test
 test/sql/function/string/regexp_unicode_literal.test
@@ -2514,6 +2530,7 @@ test/sql/index/art/storage/test_art_wal_replay_with_buffer.test
 test/sql/index/art/storage/test_art_wal_replay_with_buffer_concurrent.test
 test/sql/index/art/test_art_empty_close_range.test
 test/sql/index/art/test_art_tx_update_key.test
+test/sql/index/art/test_index_key_rebind.test
 test/sql/index/art/types/test_art_boolean.test
 test/sql/index/art/types/test_art_coverage_types.test
 test/sql/index/art/types/test_art_double.test
@@ -3246,6 +3263,7 @@ test/sql/settings/debug_deprecated_settings.test
 test/sql/settings/default_null_order_extended.test
 test/sql/settings/drop_set_schema.test
 test/sql/settings/enable_block_allocator.test
+test/sql/settings/integer_division_setting.test
 test/sql/settings/max_memory_percentage.test
 test/sql/settings/reset/reset_threads.test
 test/sql/settings/set_null_settings.test
@@ -3312,6 +3330,7 @@ test/sql/sql_export/sql_export_join_scopes.test
 test/sql/sql_export/sql_export_quantiles.test
 test/sql/sql_export/structural_expressions.test
 test/sql/sql_export/table_row_number_sql_export.test
+test/sql/sql_export/tuple_type_constants.test
 test/sql/sql_export/union_value.test
 test/sql/sql_export/variant_key_order.test
 test/sql/sql_export/window_unnest_results.test
@@ -3676,6 +3695,7 @@ test/sql/storage/test_truncate_persistent.test
 test/sql/storage/test_unaligned_scan.test
 test/sql/storage/test_unique_index_checkpoint.test
 test/sql/storage/total_string_length_multi_row_group.test
+test/sql/storage/total_string_length_nested_types.test
 test/sql/storage/total_string_length_repeated_insert.test
 test/sql/storage/types/list/default_list.test
 test/sql/storage/types/list/empty_float_arrays.test
@@ -4218,6 +4238,7 @@ test/sql/types/list/list_null_members.test
 test/sql/types/list/list_null_members_small.test
 test/sql/types/list/list_of_struct.test
 test/sql/types/list/list_parse_recursion.test
+test/sql/types/list/list_stats.test
 test/sql/types/list/list_storage.test
 test/sql/types/list/list_test_many_deletes.test
 test/sql/types/list/list_to_varchar_cast.test
@@ -4264,6 +4285,7 @@ test/sql/types/nested/array/array_roundtrip_json.test
 test/sql/types/nested/array/array_roundtrip_parquet.test
 test/sql/types/nested/array/array_rowgroup.test
 test/sql/types/nested/array/array_simple.test
+test/sql/types/nested/array/array_statistics.test
 test/sql/types/nested/array/array_storage_3.test
 test/sql/types/nested/array/array_summarize.test
 test/sql/types/nested/array/array_try_cast.test
@@ -4397,6 +4419,7 @@ test/sql/types/struct/struct_projection_pushdown.test
 test/sql/types/struct/struct_projection_pushdown_optimizer_bug.test
 test/sql/types/struct/struct_projection_pushdown_unnamed.test
 test/sql/types/struct/struct_search_physical_types.test
+test/sql/types/struct/struct_stats.test
 test/sql/types/struct/struct_subquery.test
 test/sql/types/struct/struct_tables.test
 test/sql/types/struct/struct_unnest_recursion.test
@@ -4446,6 +4469,7 @@ test/sql/types/timestamp/timestamp_time_of_day_overflow.test
 test/sql/types/timestamp/timestamp_try_cast.test
 test/sql/types/timestamp/timestamptz_ns_casts.test
 test/sql/types/type/test_make_get_type.test
+test/sql/types/type/test_type_storage.test
 test/sql/types/type_constructors.test
 test/sql/types/type_expression_roundtrip.test
 test/sql/types/type_literal.test
@@ -4502,6 +4526,7 @@ test/sql/types/variant/variant_binary_duplicate_keys.test
 test/sql/types/variant/variant_cast_parameter_stats.test
 test/sql/types/variant/variant_cast_parent_path_order.test
 test/sql/types/variant/variant_cast_stats_json.test
+test/sql/types/variant/variant_cast_type_null.test
 test/sql/types/variant/variant_decimal_arithmetic.test
 test/sql/types/variant/variant_distinct.test
 test/sql/types/variant/variant_extract_json_cast_shredded.test

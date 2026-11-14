@@ -1076,13 +1076,28 @@ fn is_ported_scalar(ty: &LogicalType) -> bool {
     )
 }
 
+/// Whether `ty` is a TYPE or has one inside.
+pub(super) fn contains_type(ty: &LogicalType) -> bool {
+    match ty.id() {
+        LogicalTypeId::Type => true,
+        LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Map => {
+            ty.child_type().is_some_and(contains_type)
+        }
+        LogicalTypeId::Struct | LogicalTypeId::Tuple | LogicalTypeId::Union => {
+            ty.struct_children().iter().any(|(_, child)| contains_type(child))
+        }
+        _ => false,
+    }
+}
+
 fn unimplemented_cast(source: &LogicalType, target: &LogicalType) -> Error {
     crate::unported(format!("casting {source} to {target}"))
 }
 
 /// Whether [`cast_vector`] can cast `source` to `target`.
 pub fn has_cast(source: &LogicalType, target: &LogicalType) -> bool {
-    source == target
+    (target.id() == LogicalTypeId::Variant && contains_type(source))
+        || source == target
         || source.id() == LogicalTypeId::SqlNull
         || target.id() == LogicalTypeId::SqlNull
         || target.id() == LogicalTypeId::Varchar
@@ -1090,7 +1105,10 @@ pub fn has_cast(source: &LogicalType, target: &LogicalType) -> bool {
         || (source.id() == LogicalTypeId::Varchar && is_numeric_or_bool(target))
         || is_decimal_cast(source, target)
         || (is_ported_scalar(source) && is_ported_scalar(target))
-        || nested_casts::has_nested_cast(source, target, &is_ported_scalar)
+        || nested_casts::has_nested_cast(source, target, &|ty| {
+            // a TYPE member of a nested value casts to a VARIANT, as NULL
+            is_ported_scalar(ty) || ty.id() == LogicalTypeId::Type
+        })
 }
 
 /// `ReinterpretCast`, row by row.
@@ -1183,6 +1201,18 @@ pub fn cast_vector(source: &Vector, result: &mut Vector, count: usize, mode: Cas
     }
     if to.id() == LogicalTypeId::Varchar {
         return to_varchar(source, result, count);
+    }
+    // `CastFunctionSet` has no cast to VARIANT of what holds a TYPE: a NULL casts, a value does not
+    if to.id() == LogicalTypeId::Variant && contains_type(&from) {
+        let unified = source.to_unified(count);
+        result.prepare_flat(count.max(1));
+        for row in 0..count {
+            if unified.is_valid(row) && mode != CastMode::Try {
+                return Err(conversion_error(format!("Unimplemented type for cast ({from} -> VARIANT)")));
+            }
+            result.set_null(row, true);
+        }
+        return Ok(());
     }
     if from.id() == LogicalTypeId::Variant || to.id() == LogicalTypeId::Variant {
         return variant::variant_cast(source, result, count, mode);

@@ -1054,6 +1054,7 @@ impl ClientContext {
         let (db, session) = (self.home.clone(), self.settings.clone());
         let (list_db, list_session) = (self.home.clone(), self.settings.clone());
         let files_db = self.home.clone();
+        let attached_db = self.home.clone();
         Arc::new(SessionValues {
             database: self.db.name.clone(),
             log_manager: self.home.log_manager.clone(),
@@ -1116,6 +1117,16 @@ impl ClientContext {
                     .filter_map(|database| database.file.as_ref())
                     .map(|file| std::fs::canonicalize(&file.path).unwrap_or_else(|_| file.path.clone()))
                     .collect()
+            }),
+            attached_catalog: Box::new(move |name: &str| {
+                if name.eq_ignore_ascii_case(&attached_db.name) {
+                    return Some(attached_db.catalog.clone());
+                }
+                attached_db
+                    .attached
+                    .read()
+                    .get(&name.to_lowercase())
+                    .map(|database| database.catalog.clone())
             }),
         })
     }
@@ -1184,6 +1195,8 @@ impl ClientContext {
         if let Some(depth) = self.setting("max_expression_depth").and_then(|v| v.as_i128()) {
             options.max_expression_depth = depth as usize;
         }
+        options.integer_division = self.setting_text("integer_division") == "true";
+        options.regex_full_match = self.setting_text("regex_match_operator_semantics").eq_ignore_ascii_case("full");
         options
     }
 
@@ -1265,10 +1278,17 @@ impl ClientContext {
             self.pending_profile = None;
             let profiler = profiled.map(|_| Arc::new(crate::execution::profiler::OperatorProfiler::default()));
             let outcome = crate::execution::profiler::with_profiler(profiler.clone(), || {
-                crate::logging::with_file_logging(&target, || match self.verification_statement(statement) {
-                    Ok(Some(replacement)) => self.run_statement(&replacement),
-                    Ok(None) => self.run_statement(statement),
-                    Err(error) => Err(error),
+                crate::logging::with_file_logging(&target, || {
+                    let old_casting = crate::function::cast_rules::set_old_implicit_casting(
+                        self.setting_text("old_implicit_casting") == "true",
+                    );
+                    let result = match self.verification_statement(statement) {
+                        Ok(Some(replacement)) => self.run_statement(&replacement),
+                        Ok(None) => self.run_statement(statement),
+                        Err(error) => Err(error),
+                    };
+                    crate::function::cast_rules::set_old_implicit_casting(old_casting);
+                    result
                 })
             });
             self.end_statement_logging();
@@ -3121,7 +3141,7 @@ impl ClientContext {
                 {
                     check_alter_dependents(&catalog, &schema.ident(), &info.name.name)?;
                 }
-                let mut binder = Binder::new(&catalog);
+                let mut binder = Binder::with_options(&catalog, self.bind_options());
                 let alter = binder.bind_alter(info)?;
                 execute_alter(alter)?;
                 self.alter_triggers(info);
@@ -3593,12 +3613,32 @@ impl ClientContext {
         if on_create_conflict(info.on_conflict) == OnCreateConflict::Replace {
             macro_is_free(&schema, &info.name.name)?;
         }
-        schema.create_macro(
-            &info.name.name,
-            *table_macro,
-            macros.clone(),
-            on_create_conflict(info.on_conflict),
-        )
+        // what is stored is the parsed body, whose lambdas `LambdaExpression::ToString` writes with the
+        // keyword: the arrow it was created with (under `lambda_syntax`) is not checked again
+        let mut macros = macros.clone();
+        let mut to_keyword = |e: &mut Expr| {
+            duckrs_parser::transformer::visit_expr_mut(e, &mut |e: &mut Expr| {
+                // only the lambda of a function that takes one: another arrow is JSON's `->`
+                if let ExprKind::Function(function) = &mut e.kind
+                    && crate::planner::binder::is_lambda_function(&function.name.name)
+                {
+                    for argument in &mut function.args {
+                        if let ExprKind::Lambda { syntax, .. } = &mut argument.expr.kind {
+                            *syntax = duckrs_parser::ast::LambdaSyntax::Keyword;
+                        }
+                    }
+                }
+            })
+        };
+        for function in &mut macros {
+            match &mut function.body {
+                duckrs_parser::ast::MacroBody::Scalar(body) => to_keyword(body),
+                duckrs_parser::ast::MacroBody::Table(body) => {
+                    duckrs_parser::transformer::visit_query_node_exprs_mut(body, &mut to_keyword)
+                }
+            }
+        }
+        schema.create_macro(&info.name.name, *table_macro, macros, on_create_conflict(info.on_conflict))
     }
 
     /// `CREATE TYPE` (`Binder::Bind(CreateStatement)` + `PhysicalCreateType`).

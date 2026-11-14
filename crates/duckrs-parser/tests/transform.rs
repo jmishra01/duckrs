@@ -820,6 +820,7 @@ fn expression_depth_is_limited_like_duckdb() {
 
     let options = duckrs_parser::ParserOptions {
         max_expression_depth: 100,
+        ..Default::default()
     };
     let casts = format!("SELECT 1{}", "::INTEGER".repeat(150));
     let err = duckrs_parser::parse_ast_with(&casts, &options).unwrap_err().to_string();

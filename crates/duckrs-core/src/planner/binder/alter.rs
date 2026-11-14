@@ -319,7 +319,7 @@ impl Binder<'_> {
     }
 
     fn bind_default(&self, default: &Expr, ty: &LogicalType) -> Result<BoundExpr> {
-        let mut binder = Binder::new(self.catalog);
+        let mut binder = Binder::with_options(self.catalog, self.options.clone());
         binder.aggregate_error = "DEFAULT value cannot contain aggregates!";
         binder.search_schema = self.search_schema.clone();
         checked_cast(binder.bind_expression(default)?, ty)
@@ -374,7 +374,7 @@ impl Binder<'_> {
         if let Some(error) = error {
             return Err(binder_error(error));
         }
-        let mut binder = Binder::new(self.catalog);
+        let mut binder = Binder::with_options(self.catalog, self.options.clone());
         binder.aggregate_error = "aggregate functions are not allowed in alter statement";
         let table_index = binder.generate_table_index();
         binder.bind_context.add_binding(Binding {

@@ -62,13 +62,10 @@ const UNHONORED: &[&str] = &[
     "errors_as_json",
     "file_search_path",
     "home_directory",
-    "integer_division",
     "legacy_disable_null_type",
     "lock_configuration",
-    "old_implicit_casting",
     "binary_as_string",
     "preserve_identifier_case",
-    "regex_match_operator_semantics",
     "schema",
     "search_path",
     "table_function_identifier_conversion",
@@ -538,6 +535,27 @@ fn on_set(setting: &SettingDefinition, value: Value) -> Result<Value> {
     let invalid = |message: String| Err(Error::new(ErrorKind::InvalidInput, message));
     let number = || value.try_to_string().ok().and_then(|s| s.parse::<f64>().ok());
     match setting.name {
+        // `RegexMatchOperatorSemanticsSetting::OnSet`
+        "regex_match_operator_semantics" => {
+            if value.is_null() {
+                return invalid("regex_match_operator_semantics setting cannot be NULL".to_string());
+            }
+            let input = value.try_to_string()?;
+            const NAMES: [&str; 2] = ["PARTIAL", "FULL"];
+            if !NAMES.iter().any(|name| name.eq_ignore_ascii_case(&input)) {
+                let scores = NAMES
+                    .iter()
+                    .map(|name| (name.to_string(), similarity_rating(name, &input)))
+                    .collect();
+                return Err(Error::new(
+                    ErrorKind::NotImplemented,
+                    format!(
+                        "Enum value: unrecognized value \"{input}\" for enum \"RegexMatchOperatorSemantics\"\n{}",
+                        candidates_message(&top_n_strings(scores), "Candidates")
+                    ),
+                ));
+            }
+        }
         // `CurrentDialectSetting::OnLocalSet`: there are no dialect extensions
         "current_dialect" if !value.is_null() => {
             return invalid(format!("Dialect \"{}\" is not installed", value.try_to_string()?));
@@ -1219,9 +1237,9 @@ mod tests {
         );
         // a result-changing setting that is not implemented
         let err = set_variable(
-            "integer_division",
+            "preserve_identifier_case",
             SetScope::Automatic,
-            &Value::boolean(true),
+            &Value::boolean(false),
             &mut global,
             &mut session,
         )

@@ -325,6 +325,16 @@ pub(super) fn cast_value(value: &Value, target: &LogicalType, mode: CastMode) ->
 
 fn cast_inner(value: &Value, target: &LogicalType, mode: CastMode) -> Result<Value> {
     use LogicalTypeId as L;
+    // there is no TYPE to VARIANT cast: only a NULL casts
+    if target.id() == L::Variant && super::cast::contains_type(value.logical_type()) {
+        if value.is_null() {
+            return Ok(Value::null(target.clone()));
+        }
+        return Err(super::cast::conversion_error(format!(
+            "Unimplemented type for cast ({} -> VARIANT)",
+            value.logical_type()
+        )));
+    }
     if value.is_null() {
         // `ToUnionMemberCast` keeps the tag of a NULL of a member's type: the member is NULL
         let source = value.logical_type();

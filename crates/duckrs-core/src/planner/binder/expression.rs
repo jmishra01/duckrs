@@ -589,7 +589,6 @@ impl Binder<'_> {
                 }
             }
             _ if !children.is_empty() => Err(crate::unported(format!("type parameters for {}", name.to_uppercase()))),
-            LogicalTypeId::Type => Err(crate::unported(format!("the {} type", name.to_uppercase()))),
             id => Ok(LogicalType::new(id)),
         }
     }
@@ -1071,7 +1070,37 @@ impl Binder<'_> {
                 return self.bind_expression(&rewritten);
             }
         }
-        let bound = self.bind_expression_inner(expr)?;
+        // `ExpressionBinder::TryBindLambdaOrJson`: a function that takes no lambda and is given an
+        // arrow binds the arrow as JSON's `->`; when that fails too, both failures are told
+        let arrow_argument = |e: &Expr| {
+            matches!(
+                e.kind,
+                ExprKind::Lambda {
+                    syntax: ast::LambdaSyntax::Arrow,
+                    ..
+                }
+            )
+        };
+        let not_lambda_call = match &expr.kind {
+            ExprKind::Function(function) => {
+                !super::lambda::is_lambda_function(&function.name.name)
+                    && function.args.iter().any(|a| arrow_argument(&a.expr))
+            }
+            ExprKind::Operator {
+                op: ast::OperatorType::ArrayConstructor,
+                children,
+            } => children.iter().any(arrow_argument),
+            _ => false,
+        };
+        let bound = match self.bind_expression_inner(expr) {
+            Err(error) if not_lambda_call && error.kind == ErrorKind::Binder => {
+                return Err(binder_error(format!(
+                    "failed to bind function, either: This scalar function does not support lambdas!\n or: {}",
+                    error.message
+                )));
+            }
+            bound => bound?,
+        };
         // `BindMapContainsExpression`: with a collation on the key or the map's keys, the key is
         // looked for among the keys as a list: list_contains(map_keys(m), key)
         if let (ExprKind::Function(call), BoundExprKind::Function { function, children, .. }) = (&expr.kind, &bound.kind)
@@ -1439,11 +1468,12 @@ impl Binder<'_> {
                 let types = std::cell::RefCell::new(self.child_binder());
                 return crate::function::json::bind_function("->", children, &|name| types.borrow_mut().csv_type(name));
             }
-            ExprKind::ColumnRef(names) if self.table_function_argument => {
-                BoundExpr::constant(Value::varchar(names.join(".")))
-            }
+            // a lambda's parameter is one before a name of a table function's argument is its text
             ExprKind::ColumnRef(names) if !self.lambda_scopes.is_empty() && self.is_lambda_parameter(names) => {
                 return Ok(self.bind_lambda_parameter(names)?.expect("just checked"));
+            }
+            ExprKind::ColumnRef(names) if self.table_function_argument => {
+                BoundExpr::constant(Value::varchar(names.join(".")))
             }
             ExprKind::ColumnRef(names) if self.bind_context.struct_field_start(names).is_some() => {
                 let start = self
@@ -2345,8 +2375,9 @@ impl Binder<'_> {
                             {
                                 *function = Arc::new(function.with_zero_check(!self.options.error_on_division_by_zero));
                             } else if checked && let BoundExprKind::Function { function, .. } = &mut bound.kind {
-                                let floating =
-                                    matches!(function.return_type.id(), LogicalTypeId::Float | LogicalTypeId::Double);
+                                // (`//` of floats is `BindDivisionByZero`, as for integers)
+                                let floating = set.name != "//"
+                                    && matches!(function.return_type.id(), LogicalTypeId::Float | LogicalTypeId::Double);
                                 let null = !self.options.error_on_division_by_zero;
                                 if !floating && null {
                                     *function = Arc::new(function.with_zero_check(true));
@@ -2725,6 +2756,10 @@ impl Binder<'_> {
                 .and_then(|session| session.search_path.first().cloned())
                 .unwrap_or_else(crate::catalog::default_schema);
             return Ok(Some(BoundExpr::constant(Value::varchar(schema))));
+        }
+        // `IndexKeyFun`
+        if name == "index_key" && function.name.qualification.iter().all(String::is_empty) {
+            return self.bind_index_key(function).map(Some);
         }
         // `VersionFun`: the version of the library
         if name == "version" && function.args.is_empty() && function.name.qualification.iter().all(String::is_empty) {

@@ -134,6 +134,17 @@ fn find_referenced_key(
 impl Binder<'_> {
     /// `BindCheckConstraint`: the expression reads the columns of the new table by position.
     fn bind_check(&self, table: &str, columns: &[ColumnDefinition], check: &Expr) -> Result<BoundExpr> {
+        // `CheckBinder::BindCheckColumn`: a column inside a lambda is not supported yet
+        let mut lambda = false;
+        visit_expr_mut(&mut check.clone(), &mut |expr: &mut Expr| {
+            lambda |= matches!(expr.kind, ExprKind::Lambda { .. });
+        });
+        if lambda {
+            return Err(Error::new(
+                ErrorKind::NotImplemented,
+                "Lambda functions are currently not supported in CHECK constraints.",
+            ));
+        }
         let mut error = None;
         let mut parsed = check.clone();
         visit_expr_mut(&mut parsed, &mut |expr: &mut Expr| match &expr.kind {

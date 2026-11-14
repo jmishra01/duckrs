@@ -448,6 +448,9 @@ pub struct ColumnStatistics {
     pub strings: Option<StringStatistics>,
     /// `distinct_count`: the approximate number of distinct values of a table's column, if known
     pub distinct: Option<u64>,
+    /// of a LIST or ARRAY its element's (`ListStats` / `ArrayStats`), of a STRUCT each field's
+    /// (`StructStats`); empty when not known
+    pub children: Vec<ColumnStatistics>,
 }
 
 /// `StringStatsData`: what is known of the strings of a column besides their bounds.
@@ -2033,6 +2036,15 @@ impl Catalog {
     /// `CheckTypeIsSupported`: what files before a storage version can't hold.
     pub fn check_column_type(&self, ty: &LogicalType) -> Result<()> {
         use duckrs_common::serializer::StorageVersion;
+        // a TYPE can't be stored, whatever the file
+        let mut has_type = false;
+        each_type(ty, &mut |ty: &LogicalType| has_type |= ty.id() == LogicalTypeId::Type);
+        if has_type {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "A table cannot be created with a 'TYPE' column",
+            ));
+        }
         let Some(version) = self.storage_version() else {
             return Ok(());
         };
