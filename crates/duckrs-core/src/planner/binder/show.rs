@@ -194,8 +194,9 @@ pub(crate) fn platform() -> String {
 
 const DESCRIBE_NAMES: [&str; 6] = ["column_name", "column_type", "null", "key", "default", "extra"];
 
-const SYSTEM_TABLES: [&str; 17] = [
+const SYSTEM_TABLES: [&str; 18] = [
     "duckdb_functions",
+    "pragma_user_agent",
     "duckdb_dialects",
     "duckdb_keywords",
     "pragma_version",
@@ -1952,6 +1953,23 @@ impl Binder<'_> {
                     ],
                     vec![vec![text(&version), text("duckrs"), text(codename)]],
                 )
+            }
+            // `PragmaUserAgentFunction`: `DBConfig::UserAgent`
+            "pragma_user_agent" => {
+                let mut agent = format!("duckdb/v{}({})", env!("CARGO_PKG_VERSION"), platform());
+                for name in ["duckdb_api", "custom_user_agent"] {
+                    let value = self
+                        .session
+                        .as_ref()
+                        .and_then(|session| (session.setting)(name).ok())
+                        .filter(|v| !v.is_null())
+                        .and_then(|v| v.try_to_string().ok())
+                        .unwrap_or_default();
+                    if !value.is_empty() {
+                        agent = format!("{agent} {value}");
+                    }
+                }
+                (vec![("user_agent", varchar.clone())], vec![vec![text(&agent)]])
             }
             // `PragmaPlatformFunction`
             "pragma_platform" => (vec![("platform", varchar.clone())], vec![vec![text(&platform())]]),

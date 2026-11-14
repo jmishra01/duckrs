@@ -772,6 +772,10 @@ fn default_value(setting: &SettingDefinition) -> Option<Value> {
     if setting.name == "standard_vector_size" {
         return Some(Value::ubigint(duckrs_common::STANDARD_VECTOR_SIZE as u64));
     }
+    // `CustomUserAgentSetting::GetSetting`: the empty string of `DBConfigOptions`
+    if setting.name == "custom_user_agent" {
+        return Some(Value::varchar(""));
+    }
     let text = setting.default_value?;
     let ty = input_type(setting).ok()?;
     let value = cast_value(&Value::varchar(text), &ty).ok()?;
@@ -862,6 +866,7 @@ pub fn set_variable(
         ),
         _ => error,
     })?;
+    running_only(setting.name)?;
     let value = on_set(setting, value)?;
     let value = file_access_on_set(setting.name, value, global, session)?;
     if UNHONORED.contains(&setting.name) && Some(&value) != default_value(setting).as_ref() {
@@ -869,6 +874,17 @@ pub fn set_variable(
     }
     let target = if is_global { global } else { session };
     target.0.insert(index, value);
+    Ok(())
+}
+
+/// `CustomUserAgentSetting` and `DuckDBAPISetting`: set when the database starts, not after.
+fn running_only(name: &str) -> Result<()> {
+    if matches!(name, "custom_user_agent" | "duckdb_api") {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("Cannot change {name} setting while database is running"),
+        ));
+    }
     Ok(())
 }
 
@@ -883,6 +899,7 @@ pub fn reset_variable(
         return Err(crate::unported("RESET VARIABLE"));
     }
     let (index, setting) = find_setting(name).ok_or_else(|| unrecognized(name))?;
+    running_only(setting.name)?;
     if matches!(setting.name, "allowed_directories" | "allowed_paths") {
         check_external_access_enabled(setting.name, global, session)?;
     }

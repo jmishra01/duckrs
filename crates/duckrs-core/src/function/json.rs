@@ -360,7 +360,18 @@ fn single<'a>(value: &'a Json, path: &Path) -> Option<&'a Json> {
 /// The JSON of a `Value`, for `to_json` and casts to JSON (`JSONCreateFunctionData`).
 /// `VariantCasts::CastVariantToJSON`: a VARIANT NULL is a JSON null.
 fn variant_node_to_json(node: &duckrs_common::variant::VariantNode) -> Result<Json> {
+    variant_node_to_json_at(node, 0)
+}
+
+/// `VariantVisitor::CheckDepth`: a value nested this deep is refused.
+fn variant_node_to_json_at(node: &duckrs_common::variant::VariantNode, depth: usize) -> Result<Json> {
     use duckrs_common::variant::VariantNode;
+    const MAX_RECURSION_DEPTH: usize = 128;
+    if depth >= MAX_RECURSION_DEPTH {
+        return Err(invalid(format!(
+            "VARIANT exceeds maximum recursion depth of {MAX_RECURSION_DEPTH}"
+        )));
+    }
     Ok(match node {
         VariantNode::Null => Json::Null,
         // `VariantToJSON::VisitFloat` writes a FLOAT as a double, `VisitDecimal` writes
@@ -378,11 +389,16 @@ fn variant_node_to_json(node: &duckrs_common::variant::VariantNode) -> Result<Js
             }
             _ => value_to_json(value)?,
         },
-        VariantNode::Array(items) => Json::Array(items.iter().map(variant_node_to_json).collect::<Result<_>>()?),
+        VariantNode::Array(items) => Json::Array(
+            items
+                .iter()
+                .map(|item| variant_node_to_json_at(item, depth + 1))
+                .collect::<Result<_>>()?,
+        ),
         VariantNode::Object(children) => Json::Object(
             children
                 .iter()
-                .map(|(key, child)| Ok((key.clone(), variant_node_to_json(child)?)))
+                .map(|(key, child)| Ok((key.clone(), variant_node_to_json_at(child, depth + 1)?)))
                 .collect::<Result<_>>()?,
         ),
     })
@@ -449,11 +465,16 @@ pub fn value_to_json(value: &Value) -> Result<Json> {
             }
             Json::Object(items)
         }
+        // `CreateValuesTuple`: an array of the fields
+        (LogicalTypeId::Tuple, ValueData::Struct(fields)) => {
+            Json::Array(fields.iter().map(value_to_json).collect::<Result<_>>()?)
+        }
         (LogicalTypeId::Union, ValueData::Struct(fields)) => {
+            // `CreateValuesUnion`: an object of the member's name and value
             let tag = fields.first().and_then(Value::as_i128).unwrap_or(0) as usize;
-            match fields.get(tag + 1) {
-                Some(member) => value_to_json(member)?,
-                None => Json::Null,
+            match (fields.get(tag + 1), ty.struct_children().get(tag + 1)) {
+                (Some(member), Some((name, _))) => Json::Object(vec![(name.clone(), value_to_json(member)?)]),
+                _ => Json::Null,
             }
         }
         _ => Json::Str(value.try_to_string()?),
@@ -552,12 +573,62 @@ pub fn transform_with(json: &Json, ty: &LogicalType, strict: bool, formats: &For
             }
             return Err(invalid(format!("Failed to cast value to decimal: {text}")));
         }
+        // `GetValueNumerical`
+        if strict && (ty.is_numeric() || ty.id() == LogicalTypeId::Boolean) {
+            let mut text = json.text();
+            if text.len() > 50 {
+                let mut end = 50;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text = format!("{}...", &text[..end]);
+            }
+            return Err(invalid(format!("Failed to cast value to numerical: {text}")));
+        }
         if strict {
             Err(invalid(format!("Unable to cast '{}' to {ty}", json.text())))
         } else {
             Ok(Value::null(ty.clone()))
         }
     };
+    // `JSONTransform::Transform`: the types it has a reader for
+    {
+        use LogicalTypeId as T;
+        if !matches!(
+            ty.id(),
+            T::SqlNull
+                | T::Boolean
+                | T::TinyInt
+                | T::SmallInt
+                | T::Integer
+                | T::BigInt
+                | T::UTinyInt
+                | T::USmallInt
+                | T::UInteger
+                | T::UBigInt
+                | T::HugeInt
+                | T::UHugeInt
+                | T::Float
+                | T::Double
+                | T::Decimal
+                | T::Varchar
+                | T::Blob
+                | T::Struct
+                | T::Tuple
+                | T::List
+                | T::Map
+                | T::Union
+                | T::Array
+                | T::Geometry
+                | T::Variant
+        ) && !string_cast_type(ty)
+        {
+            return Err(Error::new(
+                ErrorKind::NotImplemented,
+                format!("Cannot read a value of type {ty} from a json file"),
+            ));
+        }
+    }
     if matches!(json, Json::Null) {
         return Ok(Value::null(ty.clone()));
     }
@@ -605,7 +676,22 @@ pub fn transform_with(json: &Json, ty: &LogicalType, strict: bool, formats: &For
             let child = ty.child_type().cloned().unwrap_or(LogicalType::VARCHAR);
             let size = ty.array_size().unwrap_or(0) as usize;
             if items.len() != size {
-                return fail(json);
+                // `TransformArrayToArray`
+                if strict {
+                    let mut text = json.text();
+                    if text.len() > 50 {
+                        let mut end = 50;
+                        while !text.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        text = format!("{}...", &text[..end]);
+                    }
+                    return Err(invalid(format!(
+                        "Expected array of size {size}, but got '{text}' with size {}",
+                        items.len()
+                    )));
+                }
+                return Ok(Value::null(ty.clone()));
             }
             let values = items
                 .iter()
@@ -681,7 +767,56 @@ pub fn transform_with(json: &Json, ty: &LogicalType, strict: bool, formats: &For
             }
             Value::new(ty.clone(), ValueData::Struct(fields))
         }
-        (LogicalTypeId::Struct | LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Map, _) => fail(json),
+        // `TransformObjectInternal`, `TransformArrayToList`, `TransformArrayToArray`, `TransformObjectToMap`
+        (LogicalTypeId::Struct | LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Map, _) if strict => {
+            let expected = match ty.id() {
+                LogicalTypeId::Struct | LogicalTypeId::Map => "OBJECT",
+                _ => "ARRAY",
+            };
+            let mut text = json.text();
+            if text.len() > 50 {
+                let mut end = 50;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text = format!("{}...", &text[..end]);
+            }
+            Err(invalid(format!("Expected {expected}, but got {}: {text}", json.type_name())))
+        }
+        // `TransformArrayToTuple`: the items by position, missing ones NULL, extra ones ignored
+        (LogicalTypeId::Tuple, Json::Array(items)) => {
+            let mut fields = Vec::new();
+            for (at, (_, child)) in ty.struct_children().iter().enumerate() {
+                fields.push(match items.get(at) {
+                    Some(item) => transform(item, child, strict)?,
+                    None => Value::null(child.clone()),
+                });
+            }
+            Value::new(ty.clone(), ValueData::Struct(fields))
+        }
+        (LogicalTypeId::Tuple, _) if strict => {
+            let mut text = json.text();
+            if text.len() > 50 {
+                let mut end = 50;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text = format!("{}...", &text[..end]);
+            }
+            Err(invalid(format!("Expected ARRAY, but got {}: {text}", json.type_name())))
+        }
+        (LogicalTypeId::Tuple, _) => Ok(Value::null(ty.clone())),
+        // `TransformObjectInternal`: what is no object is a struct of NULL fields
+        (LogicalTypeId::Struct, _) => Value::new(
+            ty.clone(),
+            ValueData::Struct(
+                ty.struct_children()
+                    .iter()
+                    .map(|(_, child)| Value::null(child.clone()))
+                    .collect(),
+            ),
+        ),
+        (LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Map, _) => fail(json),
         (_, Json::Array(_) | Json::Object(_)) => fail(json),
         (_, Json::Bool(flag)) => match cast_value(&Value::boolean(*flag), ty) {
             Some(value) => Ok(value),
@@ -865,7 +1000,12 @@ pub fn json_cast(source: &Vector, result: &mut Vector, count: usize, mode: CastM
         } else {
             let text = value.try_to_string()?;
             let strict = !matches!(mode, CastMode::Try);
-            with_stack_for(&text, || transform(&parsed(&text)?, &to, strict))?
+            // `JSONCommon::NumbersAsRaw`: a DECIMAL reads numbers from their text
+            let raw = contains_decimal(&to);
+            with_stack_for(&text, || {
+                let json = parse_with(&text, raw).map_err(|e| invalid(parse_error_text(&text, &e)))?;
+                transform(&json, &to, strict)
+            })?
         };
         result.set_value(row, &converted)?;
     }
@@ -1054,7 +1194,7 @@ fn structure_type(json: &Json, parse_type: &dyn Fn(&str) -> Result<LogicalType>)
         Json::Array(items) => match items.as_slice() {
             [item] => Ok(LogicalType::list(structure_type(item, parse_type)?)),
             _ => Err(binder_error(
-                "Too many items in JSON structure: arrays must have exactly one item",
+                "Too many values in array of JSON structure",
             )),
         },
         Json::Object(items) if !items.is_empty() => {
@@ -1965,7 +2105,12 @@ fn transform_rows(args: &DataChunk, result: &mut Vector, strict: bool) -> Result
         let Some(json) = json else {
             return Ok(nothing(&ty));
         };
-        transform(&json, &ty, strict)
+        // `JSONTransformOptions(strict, strict, strict, false)`: strictly, a key twice is an error
+        let formats = Formats {
+            error_duplicate_key: strict,
+            ..Formats::default()
+        };
+        transform_with(&json, &ty, strict, &formats)
     })
 }
 
@@ -2101,6 +2246,16 @@ pub fn bind_function(
         "to_json" | "json_quote" | "array_to_json" | "row_to_json" => {
             if children.len() != 1 {
                 return Err(binder_error(format!("{lower}() takes exactly one argument")));
+            }
+            // `ArrayToJSONBind` and `RowToJSONBind`
+            let id = children[0].return_type.id();
+            if lower == "array_to_json"
+                && !matches!(id, LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::SqlNull)
+            {
+                return Err(binder_error("array_to_json() argument type must be LIST or ARRAY"));
+            }
+            if lower == "row_to_json" && !matches!(id, LogicalTypeId::Struct | LogicalTypeId::SqlNull) {
+                return Err(binder_error("row_to_json() argument type must be STRUCT"));
             }
             Ok(bound_function(&lower, children, json_type(), to_json))
         }

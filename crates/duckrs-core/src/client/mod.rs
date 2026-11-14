@@ -1155,6 +1155,7 @@ impl ClientContext {
 
     fn bind_options(&self) -> BindOptions {
         BindOptions {
+            parser: self.parser_options(),
             transaction_id: self
                 .transaction
                 .as_ref()

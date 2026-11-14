@@ -2756,6 +2756,7 @@ test/sql/json/scalar/json_transform_case_insensitive_keys.test
 test/sql/json/scalar/test_json_array_length.test
 test/sql/json/scalar/test_json_arrow_expr.test
 test/sql/json/scalar/test_json_contains.test
+test/sql/json/scalar/test_json_create.test
 test/sql/json/scalar/test_json_deep_merge.test
 test/sql/json/scalar/test_json_exists.test
 test/sql/json/scalar/test_json_extract_input_types.test
@@ -2777,6 +2778,7 @@ test/sql/json/scalar/test_json_structure.test
 test/sql/json/scalar/test_json_structure_deep.test
 test/sql/json/scalar/test_json_structure_depth.test
 test/sql/json/scalar/test_json_structure_iterative.test
+test/sql/json/scalar/test_json_transform.test
 test/sql/json/scalar/test_json_type.test
 test/sql/json/scalar/test_json_valid.test
 test/sql/json/scalar/test_json_value.test
@@ -3028,6 +3030,7 @@ test/sql/parser/columns_issue9867.test
 test/sql/parser/columns_unpacked_empty.test
 test/sql/parser/create_macro_tostring.test
 test/sql/parser/cte_printing.test
+test/sql/parser/deeply_nested_types.test
 test/sql/parser/digit_separators.test
 test/sql/parser/division_operator_precedence.test
 test/sql/parser/dollar_quotes_internal_issue2224.test
@@ -3059,6 +3062,7 @@ test/sql/parser/switch_null_arguments.test
 test/sql/parser/test_columns.test
 test/sql/parser/test_columns_order.test
 test/sql/parser/test_columns_where.test
+test/sql/parser/test_deep_expression_chains.test
 test/sql/parser/test_deep_expression_nesting.test
 test/sql/parser/test_long_error.test
 test/sql/parser/test_many_or.test
@@ -3120,6 +3124,7 @@ test/sql/pivot/pivot_enum.test
 test/sql/pivot/pivot_errors.test
 test/sql/pivot/pivot_expressions.test
 test/sql/pivot/pivot_generated.test
+test/sql/pivot/pivot_identical_aggregates_names.test
 test/sql/pivot/pivot_in_boolean.test
 test/sql/pivot/pivot_operator_expression.test
 test/sql/pivot/pivot_prepare.test
@@ -3233,6 +3238,7 @@ test/sql/projection/test_scalar_projection.test
 test/sql/projection/test_simple_projection.test
 test/sql/projection/test_table_star.test
 test/sql/projection/test_value_list.test
+test/sql/returning/no_crash_when_no_returning_columns.test
 test/sql/returning/returning_delete_list.test
 test/sql/returning/returning_delete_same_transaction.test
 test/sql/returning/returning_insert.test
@@ -3302,6 +3308,7 @@ test/sql/settings/setting_threads.test
 test/sql/settings/test_nan_percentage_settings.test
 test/sql/settings/test_progress_bar_null.test
 test/sql/settings/test_progress_bar_time_negative.test
+test/sql/settings/user_agent.test
 test/sql/show_select/describe_case_alias.test
 test/sql/show_select/describe_rowid.test
 test/sql/show_select/describe_subquery.test
@@ -3315,7 +3322,9 @@ test/sql/show_select/test_summarize.test
 test/sql/show_select/test_summarize_quoted.test
 test/sql/sql_export/aggregate_literals.test
 test/sql/sql_export/aggregate_results.test
+test/sql/sql_export/alias.test
 test/sql/sql_export/basic_plan_shapes.test
+test/sql/sql_export/call_values.test
 test/sql/sql_export/catalog_invocations.test
 test/sql/sql_export/ci_reconstruction.test
 test/sql/sql_export/collation_results.test
@@ -3883,6 +3892,8 @@ test/sql/subquery/scalar/array_order_subquery.test
 test/sql/subquery/scalar/array_subquery.test
 test/sql/subquery/scalar/coalesce_subquery.test
 test/sql/subquery/scalar/correlated_cte_definition_subquery.test
+test/sql/subquery/scalar/correlated_pivot.test
+test/sql/subquery/scalar/correlated_pivot_error.test
 test/sql/subquery/scalar/correlated_subquery_in_list_null.test
 test/sql/subquery/scalar/correlated_unnest_join_null.test
 test/sql/subquery/scalar/in_multiple_columns.test
@@ -4451,6 +4462,7 @@ test/sql/types/struct/struct_tables.test
 test/sql/types/struct/struct_unnest_recursion.test
 test/sql/types/struct/struct_updates.test
 test/sql/types/struct/test_tuple.test
+test/sql/types/struct/tuple_old_storage_attach.test
 test/sql/types/struct/unnamed_struct_casts.test
 test/sql/types/struct/unnamed_struct_comparison.test
 test/sql/types/struct/unnamed_struct_mix.test

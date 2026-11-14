@@ -944,6 +944,14 @@ impl<'g> Transformer<'g> {
     }
 
     fn between_in_like(&mut self, node: &ParseNode) -> Result<Expr> {
+        // `TransformBetweenInLikeExpression`: each IN and each cast after it is a level
+        let predicates: usize = self
+            .subs(node, "InPredicate")
+            .iter()
+            .map(|predicate| 1 + self.subs(predicate, "CastOperator").len())
+            .sum::<usize>()
+            + usize::from(self.sub(node, "BetweenLikeOp").is_some());
+        self.stack_check(predicates)?;
         let mut expr = self.expr(self.req(node, "OtherOperatorExpression")?)?;
         for predicate in self.subs(node, "InPredicate") {
             let negated = self.has(predicate, "NOT");

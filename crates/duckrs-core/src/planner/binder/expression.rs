@@ -2216,16 +2216,35 @@ impl Binder<'_> {
                     && let [argument] = function.args.as_slice()
                     && argument.name.is_empty()
                 {
-                    self.bind_expression(&argument.expr)?;
+                    let bound = self.bind_expression(&argument.expr)?;
                     // `AliasFunction`: the call's own alias, if it has one
                     let name = if !expr.alias.is_empty() {
                         expr.alias.clone()
                     } else if argument.expr.alias.is_empty() {
-                        super::statements::expression_name(&argument.expr)
+                        // `Expression::GetName`: a bound column is named by its column, unqualified
+                        let mut unqualified = argument.expr.clone();
+                        visit_expr_mut(&mut unqualified, &mut |e: &mut Expr| {
+                            if let ExprKind::ColumnRef(names) = &mut e.kind
+                                && names.len() > 1
+                            {
+                                *names = vec![names.last().expect("a name").clone()];
+                            }
+                        });
+                        super::statements::expression_name(&unqualified)
                     } else {
                         argument.expr.alias.clone()
                     };
-                    return Ok(BoundExpr::constant(Value::varchar(name)));
+                    // the argument is evaluated all the same: its errors surface (a constant one folds)
+                    if bound.is_foldable() && crate::execution::expression_executor::evaluate_scalar(&bound).is_ok() {
+                        return Ok(BoundExpr::constant(Value::varchar(name)));
+                    }
+                    let name = BoundExpr::constant(Value::varchar(name));
+                    return Ok(crate::function::nested::bound_function(
+                        "alias",
+                        vec![bound, name],
+                        LogicalType::VARCHAR,
+                        alias_function,
+                    ));
                 }
                 // the macros of the system catalog (`DefaultFunctionGenerator`), where no function has
                 // the name
@@ -2299,6 +2318,7 @@ impl Binder<'_> {
                         "duckdb_optimizers",
                         "pragma_version",
                         "pragma_platform",
+                        "pragma_user_agent",
                         "pragma_database_size",
                     ];
                     // `ExpressionBinder::BindWindow` of a window function written without OVER
@@ -3762,4 +3782,13 @@ mod tests {
         assert_eq!(ty("1e3"), LogicalType::DOUBLE);
         assert_eq!(number_to_value("-0.25").unwrap().try_to_string().unwrap(), "-0.25");
     }
+}
+
+/// `AliasFunction`: the name it was bound with, for every row.
+fn alias_function(args: &duckrs_common::vector::DataChunk, result: &mut duckrs_common::vector::Vector) -> Result<()> {
+    let name = args.column(1).get_value(0);
+    for row in 0..args.len() {
+        result.set_value(row, &name)?;
+    }
+    Ok(())
 }

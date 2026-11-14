@@ -307,6 +307,8 @@ impl Binder<'_> {
         let mut type_binder = self.child_binder();
         type_binder.search_schema = Some(schema.to_string());
         let mut definition = ColumnDefinition::new(column.name.clone(), type_binder.bind_type(ty)?);
+        // `CheckTypeIsSupported`
+        self.catalog.check_column_type(&definition.ty)?;
         if let Some(default) = &column.default_value {
             definition.default_value = Some(self.bind_default(default, &definition.ty)?);
             definition.default_text = Some(default.to_string());
@@ -653,6 +655,8 @@ impl Binder<'_> {
                 (source.cast_to(&target, false), target)
             }
         };
+        // `CheckTypeIsSupported`
+        self.catalog.check_column_type(&target)?;
         for constraint in &table.constraints {
             match constraint {
                 TableConstraint::Check { expression, .. } if referenced_columns(expression).contains(&index) => {

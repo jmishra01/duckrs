@@ -631,6 +631,8 @@ impl std::fmt::Debug for SessionValues {
 /// The settings that change how statements bind.
 #[derive(Debug, Clone)]
 pub struct BindOptions {
+    /// how SQL that binding parses (`query()`) is parsed
+    pub parser: duckrs_parser::ParserOptions,
     /// `txid_current`
     pub transaction_id: u64,
     /// `default_order`
@@ -668,6 +670,7 @@ pub enum ShowBehavior {
 impl Default for BindOptions {
     fn default() -> Self {
         Self {
+            parser: duckrs_parser::ParserOptions::default(),
             transaction_id: 0,
             default_order: OrderType::Ascending,
             default_null_order: DefaultNullOrder::NullsLast,

@@ -2816,6 +2816,9 @@ impl Binder<'_> {
             return Err(excluded_in_returning());
         }
         let list = self.expand_star_expressions(returning)?;
+        if list.is_empty() {
+            return Err(binder_error("RETURNING list is empty!"));
+        }
         // `VerifyNotExcluded`
         for expr in &list {
             let mut excluded = false;
