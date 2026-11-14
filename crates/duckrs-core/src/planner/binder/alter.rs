@@ -136,14 +136,7 @@ fn not_implemented(message: &str) -> Error {
     Error::new(ErrorKind::NotImplemented, message)
 }
 
-fn nested_error(path: &[String]) -> Result<()> {
-    if path.len() > 1 {
-        return Err(crate::unported("ALTER of nested fields"));
-    }
-    Ok(())
-}
-
-fn column_index(table: &TableCatalogEntry, name: &str) -> Result<usize> {
+pub(super) fn column_index(table: &TableCatalogEntry, name: &str) -> Result<usize> {
     table.column_index(name).ok_or_else(|| {
         binder_error(format!(
             "Table {} does not have a column with name {}",
@@ -306,11 +299,14 @@ impl Binder<'_> {
         Ok(())
     }
 
-    fn bind_new_column(&self, column: &ParsedColumn) -> Result<ColumnDefinition> {
+    fn bind_new_column(&self, column: &ParsedColumn, schema: &str) -> Result<ColumnDefinition> {
         let Some(ty) = &column.column_type else {
             return Err(crate::unported("columns without a type"));
         };
-        let mut definition = ColumnDefinition::new(column.name.clone(), self.bind_type(ty)?);
+        // `AddColumn`: the types are looked up in the schema of the table first
+        let mut type_binder = self.child_binder();
+        type_binder.search_schema = Some(schema.to_string());
+        let mut definition = ColumnDefinition::new(column.name.clone(), type_binder.bind_type(ty)?);
         if let Some(default) = &column.default_value {
             definition.default_value = Some(self.bind_default(default, &definition.ty)?);
             definition.default_text = Some(default.to_string());
@@ -318,7 +314,7 @@ impl Binder<'_> {
         Ok(definition)
     }
 
-    fn bind_default(&self, default: &Expr, ty: &LogicalType) -> Result<BoundExpr> {
+    pub(super) fn bind_default(&self, default: &Expr, ty: &LogicalType) -> Result<BoundExpr> {
         let mut binder = Binder::with_options(self.catalog, self.options.clone());
         binder.aggregate_error = "DEFAULT value cannot contain aggregates!";
         binder.search_schema = self.search_schema.clone();
@@ -422,8 +418,10 @@ impl Binder<'_> {
                 });
                 alter.name.clone_from(new_name);
             }
+            AlterKind::RenameColumn { path, new_name } if path.len() > 1 => {
+                return self.rename_field(alter, path, new_name);
+            }
             AlterKind::RenameColumn { path, new_name } => {
-                nested_error(path)?;
                 if table.is_generated(new_name) {
                     return Err(catalog_error(format!(
                         "Column with name {} already exists!",
@@ -490,7 +488,7 @@ impl Binder<'_> {
                     );
                     return Ok(BoundAlter::Table(alter));
                 }
-                let mut definition = self.bind_new_column(column)?;
+                let mut definition = self.bind_new_column(column, &alter.schema.name)?;
                 definition.not_null = *not_null;
                 let mut projection = identity(&table)?;
                 projection.push(
@@ -509,12 +507,14 @@ impl Binder<'_> {
                 alter.projection = Some(projection);
                 alter.verify = *not_null || *unique;
             }
+            AlterKind::RemoveColumn { path, if_exists, .. } if path.len() > 1 => {
+                return self.remove_field(alter, path, *if_exists);
+            }
             AlterKind::RemoveColumn {
                 path,
                 if_exists,
                 cascade,
             } => {
-                nested_error(path)?;
                 let dependents = generated_dependents(&table, &path[0])?;
                 if !dependents.is_empty() && !cascade {
                     return Err(catalog_error(
@@ -618,14 +618,18 @@ impl Binder<'_> {
             AlterKind::ResetTableOptions(_) => {
                 return Err(not_implemented("RESET (<options>) is not supported for DuckDB tables"));
             }
-            AlterKind::AddField { .. } => return Err(crate::unported("ALTER of nested fields")),
+            AlterKind::AddField {
+                parent,
+                column,
+                if_not_exists,
+            } => return self.add_field(alter, parent, column, *if_not_exists),
             _ => return Err(crate::unported("this ALTER statement")),
         }
         Ok(BoundAlter::Table(alter))
     }
 
     /// `DuckTableEntry::ChangeColumnType`.
-    fn change_type(
+    pub(super) fn change_type(
         &self,
         alter: &mut BoundTableAlter,
         index: usize,

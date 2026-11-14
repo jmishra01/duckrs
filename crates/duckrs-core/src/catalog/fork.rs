@@ -221,6 +221,10 @@ impl TableCatalogEntry {
             constraints,
         );
         table.generated.clone_from(&self.generated);
+        table.from_query.store(
+            self.from_query.load(std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         *table.source.write() = self.source();
         {
             // what is known of the rows stays known, other than how often they changed

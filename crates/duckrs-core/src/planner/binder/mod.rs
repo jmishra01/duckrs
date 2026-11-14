@@ -4,6 +4,7 @@
 //! expressions and plans it as a tree of logical operators.
 
 mod alter;
+mod alter_fields;
 mod copy;
 mod create_index;
 mod expression;

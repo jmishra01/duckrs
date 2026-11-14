@@ -1150,11 +1150,9 @@ fn to_timestamp(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+/// `MetaTransaction::start_timestamp`: the time the transaction started (`CurrentTimestampFunction`).
 fn now_micros() -> i64 {
-    let elapsed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    elapsed.as_micros() as i64
+    crate::execution::temporary::current().transaction_start()
 }
 
 fn now(args: &DataChunk, result: &mut Vector) -> Result<()> {

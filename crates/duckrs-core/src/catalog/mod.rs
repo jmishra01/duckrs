@@ -355,6 +355,9 @@ pub struct TableCatalogEntry {
     /// Which row is which. Rows added at the end are in here once somebody asks.
     row_ids: Mutex<Arc<RowIds>>,
     versions: Arc<Mutex<RowVersions>>,
+    /// made by CREATE TABLE AS, whose columns depend on no type (`BindCreateTableInfo` registers
+    /// the types of the columns only when there is no query)
+    pub from_query: std::sync::atomic::AtomicBool,
 }
 
 /// The statistics of a table's columns, if they are up to date. Working them out takes a scan, and
@@ -634,6 +637,7 @@ impl TableCatalogEntry {
             row_ids: Mutex::default(),
             versions: Arc::default(),
             row_group_rows: std::sync::atomic::AtomicUsize::new(ROW_GROUP_ROWS),
+            from_query: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1876,7 +1880,10 @@ impl SchemaCatalogEntry {
             .read()
             .values()
             .filter_map(|entry| match entry {
-                TableOrView::Table(table) if table.columns.iter().any(|c| mentions(&c.ty, &target, name)) => {
+                TableOrView::Table(table)
+                    if !table.from_query.load(std::sync::atomic::Ordering::Relaxed)
+                        && table.columns.iter().any(|c| mentions(&c.ty, &target, name)) =>
+                {
                     Some(table.name.clone())
                 }
                 _ => None,

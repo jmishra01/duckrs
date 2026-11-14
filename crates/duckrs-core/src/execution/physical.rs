@@ -4008,6 +4008,7 @@ impl PhysicalOperator for PhysicalCreateTableAs {
             self.on_conflict,
         )?;
         if let Some(table) = table {
+            table.from_query.store(true, std::sync::atomic::Ordering::Relaxed);
             let data = self.data.lock();
             let mut storage = table.append_storage()?;
             for chunk in data.chunks() {

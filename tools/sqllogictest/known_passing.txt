@@ -752,6 +752,7 @@ test/sql/aggregate/aggregates/skewness_fallible.test
 test/sql/aggregate/aggregates/string_agg_fallible.test
 test/sql/aggregate/aggregates/string_agg_union.test
 test/sql/aggregate/aggregates/sum_avg_overflow_fallible.test
+test/sql/aggregate/aggregates/sum_no_overflow_fallible.test
 test/sql/aggregate/aggregates/test_aggr_string.test
 test/sql/aggregate/aggregates/test_aggregate_types.test
 test/sql/aggregate/aggregates/test_aggregate_types_scalar.test
@@ -897,6 +898,7 @@ test/sql/alter/add_col/test_add_col_local_storage.test
 test/sql/alter/add_col/test_add_col_not_null.test
 test/sql/alter/add_col/test_add_col_stats.test
 test/sql/alter/add_col/test_add_col_unique.test
+test/sql/alter/add_col/test_add_col_user_type.test
 test/sql/alter/add_pk/test_add_multi_column_pk.test
 test/sql/alter/add_pk/test_add_pk.test
 test/sql/alter/add_pk/test_add_pk_alter_in_tx.test
@@ -949,6 +951,7 @@ test/sql/alter/drop_col/test_drop_col.test
 test/sql/alter/drop_col/test_drop_col_check.test
 test/sql/alter/drop_col/test_drop_col_check_next.test
 test/sql/alter/drop_col/test_drop_col_concurrent_dml_conflict.test
+test/sql/alter/drop_col/test_drop_col_dotted_name.test
 test/sql/alter/drop_col/test_drop_col_failure.test
 test/sql/alter/drop_col/test_drop_col_index.test
 test/sql/alter/drop_col/test_drop_col_not_null.test
@@ -958,6 +961,12 @@ test/sql/alter/drop_col/test_drop_col_pk.test
 test/sql/alter/drop_col/test_drop_col_rollback.test
 test/sql/alter/drop_col/test_drop_col_with_generated_cols.test
 test/sql/alter/drop_constraint.test
+test/sql/alter/list/add_column_in_struct.test
+test/sql/alter/list/drop_column_in_struct.test
+test/sql/alter/list/rename_column_in_struct.test
+test/sql/alter/map/add_column_in_struct.test
+test/sql/alter/map/drop_column_in_struct.test
+test/sql/alter/map/rename_column_in_struct.test
 test/sql/alter/rename_col/test_rename_col.test
 test/sql/alter/rename_col/test_rename_col_check.test
 test/sql/alter/rename_col/test_rename_col_dependencies.test
@@ -985,7 +994,15 @@ test/sql/alter/rename_view/test_rename_view_incorrect.test
 test/sql/alter/rename_view/test_rename_view_many_transactions.test
 test/sql/alter/rename_view/test_rename_view_table.test
 test/sql/alter/rename_view/test_rename_view_transactions.test
+test/sql/alter/struct/add_col_nested_struct.test
+test/sql/alter/struct/add_col_struct.test
+test/sql/alter/struct/add_col_struct_column_default.test
 test/sql/alter/struct/alter_nested_struct_field_not_implemented.test
+test/sql/alter/struct/drop_col_nested_struct.test
+test/sql/alter/struct/drop_col_struct.test
+test/sql/alter/struct/rename_col_nested_struct.test
+test/sql/alter/struct/rename_col_struct.test
+test/sql/alter/struct/rename_col_struct_case_insensitive.test
 test/sql/alter/test_alter_if_exists.test
 test/sql/attach/attach_all_types.test
 test/sql/attach/attach_checkpoint_vacuum.test
@@ -2358,6 +2375,7 @@ test/sql/function/timestamp/test_date_diff_epoch.test
 test/sql/function/timestamp/test_date_part.test
 test/sql/function/timestamp/test_extract.test
 test/sql/function/timestamp/test_extract_ms.test
+test/sql/function/timestamp/test_now.test
 test/sql/function/timestamp/test_now_prepared.test
 test/sql/function/timestamp/test_strftime_timestamp.test
 test/sql/function/timestamp/test_strftime_timestamp_ns.test
@@ -3024,6 +3042,7 @@ test/sql/parser/indirection.test
 test/sql/parser/invisible_spaces.test
 test/sql/parser/is_not_null_cast.test
 test/sql/parser/join_alias.test
+test/sql/parser/literal_round_trip.test
 test/sql/parser/negative_integer_literal_types.test
 test/sql/parser/nested_join_backtracking.test
 test/sql/parser/not_comparison_precedence.test
@@ -3065,6 +3084,7 @@ test/sql/peg_parser/fuzzer/fuzzer_4434.test
 test/sql/peg_parser/fuzzer/internal_0001.test
 test/sql/peg_parser/fuzzer/internal_0206.test
 test/sql/peg_parser/fuzzer/internal_0208.test
+test/sql/peg_parser/fuzzer/internal_0227.test
 test/sql/peg_parser/fuzzer/new_parser_failure_0074.test
 test/sql/peg_parser/fuzzer/new_parser_failure_0076.test
 test/sql/peg_parser/identifier.test
@@ -4156,6 +4176,7 @@ test/sql/types/enum/test_enum_storage.test
 test/sql/types/enum/test_enum_structs.test
 test/sql/types/enum/test_enum_table.test
 test/sql/types/enum/test_enum_temp_tbl.test
+test/sql/types/enum/test_enum_to_numbers.test
 test/sql/types/enum/test_enums_and_built_in_types.test
 test/sql/types/float/ieee_floating_points.test
 test/sql/types/float/infinity_test.test

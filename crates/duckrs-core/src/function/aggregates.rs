@@ -23,6 +23,8 @@ pub enum AggregateKind {
     CountStar,
     Count,
     SumInteger,
+    /// `sum_no_overflow` of INTEGER or BIGINT: an `int64_t` accumulator (`IntegerSumOperation`)
+    SumNoOverflow,
     SumDouble,
     SumDecimal,
     SumBignum,
@@ -174,7 +176,15 @@ pub(super) fn aggregate_functions() -> Vec<AggregateFunctionSet> {
         AggregateFunctionSet::new("sum", sum()),
         AggregateFunctionSet::new("avg", avg()),
         AggregateFunctionSet::new("mean", avg()),
-        AggregateFunctionSet::new("sum_no_overflow", sum()),
+        // `SumNoOverflowFun`: INTEGER, BIGINT and DECIMAL
+        AggregateFunctionSet::new(
+            "sum_no_overflow",
+            vec![
+                (vec![LogicalType::INTEGER], LogicalType::HUGEINT, SumNoOverflow),
+                (vec![LogicalType::BIGINT], LogicalType::HUGEINT, SumNoOverflow),
+                (vec![decimal()], decimal(), SumDecimal),
+            ],
+        ),
         AggregateFunctionSet::new(
             "variant_group_object",
             vec![(
@@ -404,7 +414,17 @@ impl AggregateKind {
         use AggregateKind::*;
         matches!(
             self,
-            CountStar | Count | SumInteger | SumDouble | SumDecimal | AvgInteger | AvgDouble | AvgDecimal | Min | Max
+            CountStar
+                | Count
+                | SumInteger
+                | SumNoOverflow
+                | SumDouble
+                | SumDecimal
+                | AvgInteger
+                | AvgDouble
+                | AvgDecimal
+                | Min
+                | Max
         )
     }
 
@@ -414,7 +434,9 @@ impl AggregateKind {
         match self {
             Holistic(_) => AggregateState::Rows(Vec::new()),
             CountStar | Count => AggregateState::Count(0),
-            SumInteger | SumDecimal | AvgInteger | AvgDecimal => AggregateState::Integer { sum: 0, count: 0 },
+            SumInteger | SumNoOverflow | SumDecimal | AvgInteger | AvgDecimal => {
+                AggregateState::Integer { sum: 0, count: 0 }
+            }
             SumDouble | AvgDouble => AggregateState::Double { sum: 0.0, count: 0 },
             Min | Max => AggregateState::Extreme(None),
             First | Last | AnyValue | SumBignum => AggregateState::Value(None),
@@ -458,7 +480,7 @@ pub fn state_layout(kind: AggregateKind, arguments: &[LogicalType], result: &Log
         // `int64_t`
         CountStar | Count => LogicalType::BIGINT,
         // `OptionalStateType<T>`
-        SumInteger | SumDecimal => sum_type(),
+        SumInteger | SumNoOverflow | SumDecimal => sum_type(),
         SumDouble => LogicalType::DOUBLE,
         // `StructStateType<uint64_t, T>`
         AvgInteger | AvgDecimal => avg(sum_type()),
@@ -1599,6 +1621,23 @@ impl AggregateFunction {
                     }
                 }
             }
+            // the `int64_t` sum: an addition past it fails as the repeated combine of a constant does
+            SumNoOverflow => {
+                match input.physical_type() {
+                    PhysicalType::Int32 => add_integers::<i32>(input, count, rows, states)?,
+                    _ => add_integers::<i64>(input, count, rows, states)?,
+                }
+                for &(_, group) in rows {
+                    if let AggregateState::Integer { sum, .. } = &states[group]
+                        && i64::try_from(*sum).is_err()
+                    {
+                        return Err(Error::new(
+                            ErrorKind::OutOfRange,
+                            "Overflow in repeated aggregate state combine",
+                        ));
+                    }
+                }
+            }
             SumInteger | SumDecimal | AvgInteger | AvgDecimal => match input.physical_type() {
                 PhysicalType::Bool => add_integers::<bool>(input, count, rows, states)?,
                 PhysicalType::Int16 => add_integers::<i16>(input, count, rows, states)?,
@@ -1715,7 +1754,7 @@ impl AggregateFunction {
                 Value::new(return_type.clone(), ValueData::List(values.clone()))?
             }
             (_, AggregateState::Integer { count: 0, .. } | AggregateState::Double { count: 0, .. }) => null(),
-            (SumInteger, AggregateState::Integer { sum, .. }) => Value::hugeint(*sum),
+            (SumInteger | SumNoOverflow, AggregateState::Integer { sum, .. }) => Value::hugeint(*sum),
             (SumDecimal, AggregateState::Integer { sum, .. }) => {
                 let max_width = duckrs_common::types::decimal::MAX_WIDTH;
                 let (_, scale) = return_type.decimal_properties().expect("a DECIMAL result");

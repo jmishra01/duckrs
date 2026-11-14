@@ -894,6 +894,8 @@ struct ActiveTransaction {
     attached: Vec<Arc<DatabaseInstance>>,
     /// `MetaTransaction::modified_database`: the one database it wrote to
     modified: Option<Arc<DatabaseInstance>>,
+    /// `MetaTransaction::start_timestamp`, in microseconds since the epoch: what `now()` says
+    started: i64,
 }
 
 impl ActiveTransaction {
@@ -1442,6 +1444,7 @@ impl ClientContext {
                     forks: Vec::new(),
                     attached: Vec::new(),
                     modified: None,
+                    started: crate::execution::temporary::now_micros(),
                 });
                 if self
                     .setting_text("immediate_transaction_mode")
@@ -3321,6 +3324,12 @@ impl ClientContext {
         }
         let memory = self.query_memory()?;
         memory.set_threads(threads);
+        // an auto-commit statement is a transaction of its own, which starts now
+        memory.set_transaction_start(
+            self.transaction
+                .as_ref()
+                .map_or_else(crate::execution::temporary::now_micros, |t| t.started),
+        );
         crate::execution::profiler::with_profiler(operator_profiler.clone(), || {
             crate::execution::temporary::with_memory(memory, || execute_plan_with(&collector, threads))
         })?;
