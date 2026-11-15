@@ -633,9 +633,12 @@ pub(super) fn type_info(
     name: String,
     logical_type: LogicalType,
 ) -> g::CreateInfo {
+    let comment = schema.type_comment(&name);
     let path = entry_path(catalog, schema, &name);
     let kind = g::CreateInfoKind::CreateTypeInfo(g::CreateTypeInfo { name, logical_type });
-    to_stored::create_info(catalog_type::TYPE_ENTRY, path, kind)
+    let mut info = to_stored::create_info(catalog_type::TYPE_ENTRY, path, kind);
+    info.comment = comment.map(Value::varchar);
+    info
 }
 
 pub(super) fn sequence_info(
@@ -655,7 +658,9 @@ pub(super) fn sequence_info(
         last_value: data.last_value,
     });
     let path = entry_path(catalog, schema, &sequence.name);
-    to_stored::create_info(catalog_type::SEQUENCE_ENTRY, path, kind)
+    let mut info = to_stored::create_info(catalog_type::SEQUENCE_ENTRY, path, kind);
+    info.comment = sequence.comment.clone().map(Value::varchar);
+    info
 }
 
 pub(super) fn macro_info(
@@ -684,11 +689,9 @@ pub(super) fn macro_info(
         function: Some(Box::new(function)),
         extra_functions,
     });
-    Ok(to_stored::create_info(
-        entry_type,
-        entry_path(catalog, schema, &entry.name),
-        kind,
-    ))
+    let mut info = to_stored::create_info(entry_type, entry_path(catalog, schema, &entry.name), kind);
+    info.comment = entry.comment.clone().map(Value::varchar);
+    Ok(info)
 }
 
 /// `TriggerCatalogEntry::GetInfo`: the table as the CREATE TRIGGER named it.
@@ -731,14 +734,16 @@ pub(super) fn view_info(catalog: &str, schema: &SchemaCatalogEntry, view: &ViewC
         query: Some(Box::new(to_stored::select_statement(&view.query)?)),
         names: Vec::new(),
         column_comments: Vec::new(),
-        column_comments_map: Vec::new(),
+        column_comments_map: view
+            .column_comments
+            .iter()
+            .map(|(name, comment)| (name.clone(), Value::varchar(comment.clone())))
+            .collect(),
         security_type: None,
     });
-    Ok(to_stored::create_info(
-        catalog_type::VIEW_ENTRY,
-        entry_path(catalog, schema, &view.name),
-        kind,
-    ))
+    let mut info = to_stored::create_info(catalog_type::VIEW_ENTRY, entry_path(catalog, schema, &view.name), kind);
+    info.comment = view.comment.clone().map(Value::varchar);
+    Ok(info)
 }
 
 pub(super) fn table_info(
@@ -771,7 +776,7 @@ pub(super) fn table_info(
                 table_column_type::STANDARD
             },
             compression_type: COMPRESSION_AUTO,
-            comment: None,
+            comment: column.definition.and_then(|d| d.comment.clone()).map(Value::varchar),
             tags: Vec::new(),
         });
         if column.definition.is_some_and(|d| d.not_null) {
@@ -833,11 +838,9 @@ pub(super) fn table_info(
         sort_keys: Vec::new(),
         options: Vec::new(),
     });
-    Ok(to_stored::create_info(
-        catalog_type::TABLE_ENTRY,
-        entry_path(catalog, schema, &table.name),
-        kind,
-    ))
+    let mut info = to_stored::create_info(catalog_type::TABLE_ENTRY, entry_path(catalog, schema, &table.name), kind);
+    info.comment = table.comment.lock().clone().map(Value::varchar);
+    Ok(info)
 }
 
 /// `IndexCatalogEntry::GetInfo`. An index that backs a constraint isn't an entry in C++ either.

@@ -399,7 +399,7 @@ impl DatabaseInstance {
     fn has_foreign_indexes(&self) -> bool {
         self.catalog.schemas().iter().any(|schema| {
             schema.tables_and_views().iter().any(|entry| match entry {
-                TableOrView::Table(table) => table.indexes.read().iter().any(|index| index.index_type != "ART"),
+                TableOrView::Table(table) => table.indexes.read().iter().any(|index| !index.index_type.eq_ignore_ascii_case("ART")),
                 TableOrView::View(_) => false,
             })
         })
@@ -2460,6 +2460,122 @@ impl ClientContext {
         Ok(Self::success())
     }
 
+    /// Whether `info` is a COMMENT ON of an entry that is no table: a view (or a column of one),
+    /// a sequence, a type or a macro (`SetCommentInfo`, `SetColumnCommentInfo`).
+    fn comments_outside_tables(&self, info: &AlterInfo) -> Result<bool> {
+        Ok(match &info.kind {
+            AlterKind::SetComment { entry_type, .. } => {
+                matches!(*entry_type, "VIEW" | "SEQUENCE" | "TYPE" | "MACRO" | "MACRO TABLE")
+            }
+            AlterKind::SetColumnComment { .. } => {
+                let catalog = self.catalog();
+                let schema = schema_of(&info.name)?;
+                matches!(
+                    catalog.get_entry(schema.as_deref(), None, &info.name.name),
+                    Ok(TableOrView::View(_))
+                )
+            }
+            _ => false,
+        })
+    }
+
+    /// `AlterInfo` of a comment, on an entry that is no table: the entry with it takes its place.
+    fn comment_on_entry(&self, info: &AlterInfo) -> Result<MaterializedQueryResult> {
+        let catalog = self.catalog();
+        let schema_name = schema_of(&info.name)?;
+        let name = &info.name.name;
+        let text = |value: &duckrs_parser::ast::Literal| {
+            (!matches!(value.kind, LiteralKind::Null)).then(|| value.text.clone())
+        };
+        let system = || Error::new(ErrorKind::Binder, "Can not comment on System Catalog entries");
+        match &info.kind {
+            AlterKind::SetColumnComment { column, value } => {
+                let entry = catalog.get_entry(schema_name.as_deref(), None, name)?;
+                let TableOrView::View(view) = entry else {
+                    unreachable!("checked by the caller")
+                };
+                let schema = catalog.schema_for(Some(&view.schema))?;
+                // `ViewCatalogEntry::AlterEntry`: a column of the view by its name
+                let names = self.view_column_names(&view)?;
+                let Some(found) = names.iter().find(|n| n.eq_ignore_ascii_case(column)) else {
+                    return Err(Error::new(
+                        ErrorKind::Binder,
+                        format!("View \"{name}\" does not have a column with name \"{column}\""),
+                    ));
+                };
+                let mut comments: Vec<(String, String)> = view
+                    .column_comments
+                    .iter()
+                    .filter(|(n, _)| !n.eq_ignore_ascii_case(found))
+                    .cloned()
+                    .collect();
+                if let Some(comment) = text(value) {
+                    comments.push((found.clone(), comment));
+                }
+                schema.set_view_comments(&view.name, view.comment.clone(), comments);
+            }
+            AlterKind::SetComment { entry_type, value } => {
+                let comment = text(value);
+                match *entry_type {
+                    "VIEW" => {
+                        let view = match catalog.get_entry(schema_name.as_deref(), None, name) {
+                            Ok(TableOrView::View(view)) => view,
+                            _ if crate::catalog::defaults::default_view(schema_name.as_deref(), name).is_some() => {
+                                return Err(system());
+                            }
+                            _ => return Err(missing_entry("View", name)),
+                        };
+                        let schema = catalog.schema_for(Some(&view.schema))?;
+                        schema.set_view_comments(&view.name, comment, view.column_comments.clone());
+                    }
+                    "SEQUENCE" => {
+                        let schema = catalog.schema_for(schema_name.as_deref())?;
+                        if !schema.set_sequence_comment(name, comment) {
+                            return Err(missing_entry("Sequence", name));
+                        }
+                    }
+                    "TYPE" => {
+                        let schema = catalog.schema_for(schema_name.as_deref())?;
+                        if !schema.set_type_comment(name, comment) {
+                            return Err(missing_entry("Type", name));
+                        }
+                    }
+                    _ => {
+                        let table_macro = *entry_type == "MACRO TABLE";
+                        let schema = catalog.schema_for(schema_name.as_deref())?;
+                        if !schema.set_macro_comment(name, table_macro, comment) {
+                            let builtin = crate::function::BuiltinFunctions::get();
+                            if builtin.scalar(name).is_some()
+                                || builtin.aggregate(name).is_some()
+                                || crate::catalog::defaults::default_macro(schema_name.as_deref(), name, table_macro)
+                                    .is_some()
+                            {
+                                return Err(system());
+                            }
+                            let kind = if table_macro { "Table Macro Function" } else { "Macro Function" };
+                            return Err(missing_entry(kind, name));
+                        }
+                    }
+                }
+            }
+            _ => unreachable!("checked by the caller"),
+        }
+        Ok(Self::success())
+    }
+
+    /// The names of the columns of a view, as binding its query gives them.
+    fn view_column_names(&self, view: &crate::catalog::ViewCatalogEntry) -> Result<Vec<String>> {
+        let catalog = self.catalog();
+        let mut binder = Binder::with_options(&catalog, self.bind_options());
+        binder.session = Some(self.session_values());
+        let bound = binder.bind(&Statement::Select(view.query.clone()))?;
+        let mut names = bound.names;
+        for (name, alias) in names.iter_mut().zip(&view.aliases) {
+            name.clone_from(alias);
+        }
+        Ok(names)
+    }
+
     /// `EXPLAIN (SQL)` (`LogicalExplain::CreateSQLResult`).
     fn explain_sql(&mut self, statement: &Statement) -> Result<MaterializedQueryResult> {
         let supported = match statement {
@@ -3111,6 +3227,9 @@ impl ClientContext {
             Statement::Alter(info) if matches!(&info.kind, AlterKind::SetComment { entry_type, .. } if *entry_type == "INDEX") =>
             {
                 return self.comment_on_index(info);
+            }
+            Statement::Alter(info) if self.comments_outside_tables(info)? => {
+                return self.comment_on_entry(info);
             }
             // `ALTER SEQUENCE ... OWNED BY` (`ChangeOwnershipInfo`)
             Statement::Alter(info) if matches!(info.kind, AlterKind::ChangeOwnership { .. }) => {

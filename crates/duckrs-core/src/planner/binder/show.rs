@@ -1522,6 +1522,9 @@ impl Binder<'_> {
                     ));
                 }
                 // `MacroExtractor` and `TableMacroExtractor`
+                // what `COMMENT ON MACRO` said, by database, schema, name and kind
+                let mut macro_comments: std::collections::HashMap<(String, String, String, &'static str), String> =
+                    std::collections::HashMap::new();
                 let mut macro_rows = |database: &str,
                                       database_oid: i64,
                                       schema: &str,
@@ -1546,6 +1549,12 @@ impl Binder<'_> {
                             (Some(ty), "macro") => text(&self.bind_type(ty)?.to_string()),
                             _ => null_text(),
                         };
+                        if let Some(comment) = &entry.comment {
+                            macro_comments.insert(
+                                (database.to_string(), schema.to_string(), entry.name.clone(), kind),
+                                comment.clone(),
+                            );
+                        }
                         functions_ref.push((
                             catalog_type,
                             database.to_string(),
@@ -1601,6 +1610,7 @@ impl Binder<'_> {
                     ),
                 ) in functions.into_iter().enumerate()
                 {
+                    let comment = macro_comments.get(&(database.clone(), schema.clone(), name.clone(), kind));
                     rows.push(vec![
                         text(&database),
                         text(&database_oid.to_string()),
@@ -1609,7 +1619,7 @@ impl Binder<'_> {
                         null_text(),
                         text(kind),
                         null_text(),
-                        null_text(),
+                        comment.map_or_else(null_text, |c| text(c)),
                         no_tags.clone(),
                         ret,
                         parameters,
@@ -1668,6 +1678,7 @@ impl Binder<'_> {
                     LogicalType,
                     bool,
                     &'a [Constructor],
+                    Option<String>,
                 );
                 const USER: &[Constructor] = &[Constructor {
                     parameters: &[],
@@ -1692,6 +1703,7 @@ impl Binder<'_> {
                                 ty,
                                 true,
                                 *constructors,
+                                None,
                             )
                         })
                         .collect()
@@ -1709,8 +1721,9 @@ impl Binder<'_> {
                     }
                     for (name, ty) in schema.type_entries() {
                         oid += 1;
+                        let comment = schema.type_comment(&name);
                         let (database, schema) = (database.to_string(), schema_name.to_string());
-                        entries.push((database, database_oid, schema, schema_oid, oid, name, ty, false, USER));
+                        entries.push((database, database_oid, schema, schema_oid, oid, name, ty, false, USER, comment));
                     }
                 }
                 // `GetAllSchemas` orders by database, then schema; a schema's entries are by name
@@ -1718,7 +1731,7 @@ impl Binder<'_> {
                 let mut oids = std::collections::HashSet::new();
                 let mut rows = Vec::new();
                 let list = LogicalType::list(LogicalType::VARCHAR);
-                for (database, database_oid, schema, schema_oid, oid, name, ty, internal, constructors) in &entries {
+                for (database, database_oid, schema, schema_oid, oid, name, ty, internal, constructors, comment) in &entries {
                     for constructor in constructors.iter() {
                         let category = match ty.id() {
                             L::TinyInt
@@ -1780,7 +1793,7 @@ impl Binder<'_> {
                             },
                             text(ty.id().name()),
                             category.map_or_else(null_text, text),
-                            null_text(),
+                            comment.as_deref().map_or_else(null_text, text),
                             Value::new(tags.clone(), duckrs_common::value::ValueData::List(vec![]))?,
                             Value::boolean(*internal),
                             null_text(),
@@ -1896,7 +1909,7 @@ impl Binder<'_> {
                             Value::bigint(schema_oid as i64 + 1),
                             text(&sequence.name),
                             Value::bigint(oid),
-                            null_text(),
+                            sequence.comment.as_deref().map_or_else(null_text, text),
                             Value::null(tags.clone()),
                             Value::boolean(temporary),
                             Value::bigint(data.start_value),
@@ -2126,6 +2139,8 @@ impl Binder<'_> {
                         .iter()
                         .filter(|c| matches!(c, TableConstraint::Unique { .. } | TableConstraint::ForeignKey(_)))
                         .count();
+                    // (not locked while the row is made: its SQL reads the comment too)
+                    let comment = table.comment.lock().clone();
                     rows.push(vec![
                         text(&listed.database),
                         Value::bigint(listed.database_oid),
@@ -2133,7 +2148,7 @@ impl Binder<'_> {
                         Value::bigint(listed.schema_oid),
                         text(&table.name),
                         Value::bigint(listed.oid),
-                        null_text(),
+                        comment.as_deref().map_or_else(null_text, text),
                         Value::null(tags.clone()),
                         Value::boolean(false),
                         Value::boolean(temporary),
@@ -2233,7 +2248,7 @@ impl Binder<'_> {
                         Value::bigint(listed.schema_oid),
                         text(&view.name),
                         Value::bigint(listed.oid),
-                        null_text(),
+                        view.comment.as_deref().map_or_else(null_text, text),
                         Value::null(tags.clone()),
                         Value::boolean(false),
                         Value::boolean(temporary),
@@ -2328,6 +2343,20 @@ impl Binder<'_> {
                             LogicalTypeId::Double => binary(53),
                             _ => (None, None, None),
                         };
+                        // what `COMMENT ON COLUMN` said
+                        let name = column.try_to_string().unwrap_or_default();
+                        let comment = match &listed.entry {
+                            TableOrView::Table(table) => table
+                                .columns
+                                .iter()
+                                .find(|c| c.name.eq_ignore_ascii_case(&name))
+                                .and_then(|c| c.comment.clone()),
+                            TableOrView::View(view) => view
+                                .column_comments
+                                .iter()
+                                .find(|(n, _)| n.eq_ignore_ascii_case(&name))
+                                .map(|(_, c)| c.clone()),
+                        };
                         rows.push(vec![
                             text(&listed.database),
                             Value::bigint(listed.database_oid),
@@ -2337,7 +2366,7 @@ impl Binder<'_> {
                             Value::bigint(listed.oid),
                             column,
                             Value::integer(index as i32 + 1),
-                            null_text(),
+                            comment.as_deref().map_or_else(null_text, text),
                             Value::boolean(false),
                             default,
                             Value::boolean(!not_null),

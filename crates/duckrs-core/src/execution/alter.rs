@@ -45,6 +45,7 @@ fn execute_table_alter(alter: BoundTableAlter) -> Result<()> {
     drop(source);
     let mut table = TableCatalogEntry::new(old.schema.clone(), alter.name, alter.columns, rows, alter.constraints);
     table.generated = alter.generated;
+    *table.comment.lock() = alter.comment;
     table
         .row_group_rows
         .store(old.row_group_size(), std::sync::atomic::Ordering::Relaxed);

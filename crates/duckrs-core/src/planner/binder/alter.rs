@@ -19,7 +19,8 @@ use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast::{
-    AlterInfo, AlterKind, ColumnDefinition as ParsedColumn, Constraint, Expr, ExprKind, sql_quoted_identifier,
+    AlterInfo, AlterKind, ColumnDefinition as ParsedColumn, Constraint, Expr, ExprKind, LiteralKind,
+    sql_quoted_identifier,
 };
 use duckrs_parser::transformer::visit_expr_mut;
 use std::collections::BTreeSet;
@@ -50,6 +51,8 @@ pub struct BoundTableAlter {
     pub verify: bool,
     /// The error of an ADD constraint that the rows pass: C++ builds the index first.
     pub rejected: Option<Error>,
+    /// What `COMMENT ON TABLE` says of the new entry.
+    pub comment: Option<String>,
 }
 
 /// The columns of `table` and then `column`, as CREATE TABLE would list them.
@@ -198,6 +201,16 @@ impl Binder<'_> {
         {
             Ok(schema) => schema,
             Err(_) if info.if_exists => return Ok(BoundAlter::Nothing),
+            // `Catalog::LookupEntry`: a nested schema path that is missing is named
+            Err(error)
+                if info.name.qualification.len() >= 2 && error.message.starts_with("Schema with name") =>
+            {
+                let schema = info.name.qualification.join(".");
+                return Err(catalog_error(format!(
+                    "Table with name \"{schema}.{}\" does not exist because schema \"{schema}\" does not exist.",
+                    info.name.name
+                )));
+            }
             Err(error) => return Err(error),
         };
         // the names of a table of a nested schema are looked up in that schema
@@ -300,6 +313,8 @@ impl Binder<'_> {
                     | AlterKind::SetDefault { .. }
                     | AlterKind::SetTableOptions(_)
                     | AlterKind::ResetTableOptions(_)
+                    | AlterKind::SetComment { .. }
+                    | AlterKind::SetColumnComment { .. }
             )
         {
             return Err(Error::new(
@@ -432,6 +447,7 @@ impl Binder<'_> {
             projection: None,
             verify: false,
             rejected: None,
+            comment: table.comment.lock().clone(),
             schema,
             table: table.clone(),
         };
@@ -650,6 +666,14 @@ impl Binder<'_> {
                 column,
                 if_not_exists,
             } => return self.add_field(alter, parent, column, *if_not_exists),
+            // `SetCommentInfo` and `SetColumnCommentInfo` of a table: the rows stay
+            AlterKind::SetComment { value, .. } => {
+                alter.comment = (!matches!(value.kind, LiteralKind::Null)).then(|| value.text.clone());
+            }
+            AlterKind::SetColumnComment { column, value } => {
+                let index = column_index(&table, column)?;
+                alter.columns[index].comment = (!matches!(value.kind, LiteralKind::Null)).then(|| value.text.clone());
+            }
             _ => return Err(crate::unported("this ALTER statement")),
         }
         Ok(BoundAlter::Table(alter))

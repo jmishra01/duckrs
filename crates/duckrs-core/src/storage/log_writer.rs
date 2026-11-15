@@ -73,7 +73,8 @@ struct Durable {
     views: BTreeMap<Key, (Key, Arc<ViewCatalogEntry>)>,
     macros: [BTreeMap<Key, (Key, Arc<MacroCatalogEntry>)>; 2],
     sequences: BTreeMap<Key, (Key, Arc<SequenceCatalogEntry>, u64)>,
-    types: BTreeMap<Key, (Key, LogicalType)>,
+    /// with what `COMMENT ON TYPE` said, which a change of logs again
+    types: BTreeMap<Key, (Key, (LogicalType, Option<String>))>,
     /// By the table they are on and their name, which is unique per table.
     triggers: BTreeMap<Key, (Key, Arc<crate::catalog::TriggerCatalogEntry>)>,
 }
@@ -119,7 +120,8 @@ impl Durable {
                     .insert(key(&ident, &sequence.name), (name, sequence, usage));
             }
             for (name, ty) in schema.type_entries() {
-                result.types.insert(key(&ident, &name), (named(&name), ty));
+                let comment = schema.type_comment(&name);
+                result.types.insert(key(&ident, &name), (named(&name), (ty, comment)));
             }
             for trigger in schema.trigger_entries() {
                 let on = format!("{}{SCHEMA_PATH_SEPARATOR}{}", trigger.table, trigger.name);
@@ -780,7 +782,7 @@ impl WriteAheadLog {
         }
         for (k, (original, ty)) in &current.types {
             if self.durable.types.get(k).is_none_or(|(_, old)| old != ty) {
-                let info = type_info(name, &*schema_of(original)?, original.1.clone(), ty.clone());
+                let info = type_info(name, &*schema_of(original)?, original.1.clone(), ty.0.clone());
                 let entry = g::WALCreateType {
                     type_: Some(Box::new(info)),
                 };

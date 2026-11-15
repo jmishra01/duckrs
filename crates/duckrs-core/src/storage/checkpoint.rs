@@ -87,6 +87,9 @@ pub struct StoredTable {
     pub next_row_id: u64,
     /// Where the ART of each index is, for what reads one.
     pub indexes: Vec<g::IndexStorageInfo>,
+    /// What `COMMENT ON TABLE` and `COMMENT ON COLUMN` said, the columns by name.
+    pub comment: Option<String>,
+    pub column_comments: Vec<(String, String)>,
 }
 
 /// `CreateSequenceInfo`, which is what C++ checkpoints of a sequence.
@@ -113,22 +116,27 @@ pub enum StoredEntry {
         name: String,
         query: Box<ast::SelectStatement>,
         aliases: Vec<String>,
+        comment: Option<String>,
+        column_comments: Vec<(String, String)>,
     },
     Macro {
         schema: String,
         name: String,
         table_macro: bool,
         macros: Vec<ast::MacroFunction>,
+        comment: Option<String>,
     },
     Sequence {
         schema: String,
         name: String,
         data: StoredSequence,
+        comment: Option<String>,
     },
     Type {
         schema: String,
         name: String,
         ty: LogicalType,
+        comment: Option<String>,
     },
     /// With what `COMMENT ON INDEX` said.
     Index(Box<ast::CreateInfo>, Option<String>),
@@ -330,6 +338,11 @@ pub(super) enum Converted {
 pub(super) fn convert_entry(info: g::CreateInfo) -> Result<Converted> {
     let entry_type = info.type_;
     let comment = info.comment.clone();
+    // `CreateInfo::comment`, a VARCHAR or NULL
+    let text = |value: Option<duckrs_common::value::Value>| -> Result<Option<String>> {
+        value.filter(|v| !v.is_null()).map(|v| v.try_to_string()).transpose()
+    };
+    let entry_comment = text(comment.clone())?;
     // the path of a schema is its name and an empty name for the entry (`SchemaCatalogEntry::GetInfo`)
     if let g::CreateInfoKind::CreateSchemaInfo(stored) = &info.kind {
         if !stored.options.is_empty() {
@@ -348,6 +361,12 @@ pub(super) fn convert_entry(info: g::CreateInfo) -> Result<Converted> {
         g::CreateInfoKind::CreateSchemaInfo(_) => unreachable!("returned above"),
         g::CreateInfoKind::CreateTableInfo(stored) => {
             let name = stored.table.clone();
+            let mut column_comments = Vec::new();
+            for column in &stored.columns.columns {
+                if let Some(comment) = text(column.comment.clone())? {
+                    column_comments.push((column.name.clone(), comment));
+                }
+            }
             let (definition, columns) = table_definition(&schema, stored)?;
             return Ok(Converted::Table(Box::new(StoredTable {
                 schema,
@@ -359,6 +378,8 @@ pub(super) fn convert_entry(info: g::CreateInfo) -> Result<Converted> {
                 column_statistics: Vec::new(),
                 next_row_id: 0,
                 indexes: Vec::new(),
+                comment: entry_comment,
+                column_comments,
             })));
         }
         g::CreateInfoKind::CreateIndexInfo(stored) => {
@@ -366,12 +387,28 @@ pub(super) fn convert_entry(info: g::CreateInfo) -> Result<Converted> {
             let comment = comment.map(|value| value.try_to_string()).transpose()?;
             StoredEntry::Index(Box::new(convert::create_index(&schema, stored)?), comment)
         }
-        g::CreateInfoKind::CreateViewInfo(stored) => StoredEntry::View {
-            schema,
-            name: stored.view_name,
-            query: Box::new(convert::select_statement(stored.query)?),
-            aliases: stored.aliases,
-        },
+        g::CreateInfoKind::CreateViewInfo(stored) => {
+            // `CreateViewInfo`: by name, or (before v1.5.0) in the order of the names
+            let mut column_comments = Vec::new();
+            for (name, comment) in stored.column_comments_map {
+                if let Some(comment) = text(Some(comment))? {
+                    column_comments.push((name, comment));
+                }
+            }
+            for (name, comment) in stored.names.iter().zip(stored.column_comments) {
+                if let Some(comment) = text(Some(comment))? {
+                    column_comments.push((name.clone(), comment));
+                }
+            }
+            StoredEntry::View {
+                schema,
+                name: stored.view_name,
+                query: Box::new(convert::select_statement(stored.query)?),
+                aliases: stored.aliases,
+                comment: entry_comment,
+                column_comments,
+            }
+        }
         g::CreateInfoKind::CreateMacroInfo(stored) => {
             let mut macros = Vec::with_capacity(1 + stored.extra_functions.len());
             for function in std::iter::once(stored.function).chain(stored.extra_functions) {
@@ -383,6 +420,7 @@ pub(super) fn convert_entry(info: g::CreateInfo) -> Result<Converted> {
                 name: stored.name,
                 table_macro: entry_type == catalog_type::TABLE_MACRO_ENTRY,
                 macros,
+                comment: entry_comment,
             }
         }
         g::CreateInfoKind::CreateSequenceInfo(stored) => StoredEntry::Sequence {
@@ -397,6 +435,7 @@ pub(super) fn convert_entry(info: g::CreateInfo) -> Result<Converted> {
                 max_value: stored.max_value,
                 cycle: stored.cycle,
             },
+            comment: entry_comment,
         },
         g::CreateInfoKind::CreateTriggerInfo(stored) => {
             use crate::catalog::{TriggerEvent, TriggerForEach, TriggerTiming};
@@ -447,6 +486,7 @@ pub(super) fn convert_entry(info: g::CreateInfo) -> Result<Converted> {
             schema,
             name: stored.name,
             ty: stored.logical_type,
+            comment: entry_comment,
         },
     }))
 }

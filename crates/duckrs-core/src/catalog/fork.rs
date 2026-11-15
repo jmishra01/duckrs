@@ -221,6 +221,7 @@ impl TableCatalogEntry {
             constraints,
         );
         table.generated.clone_from(&self.generated);
+        *table.comment.lock() = self.comment.lock().clone();
         table.from_query.store(
             self.from_query.load(std::sync::atomic::Ordering::Relaxed),
             std::sync::atomic::Ordering::Relaxed,

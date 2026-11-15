@@ -98,6 +98,8 @@ pub struct ColumnDefinition {
     pub not_null: bool,
     /// The default as it was written.
     pub default_text: Option<String>,
+    /// What `COMMENT ON COLUMN` said.
+    pub comment: Option<String>,
 }
 
 /// A generated column: not stored, only an expression over the other columns.
@@ -129,6 +131,7 @@ impl ColumnDefinition {
             default_value: None,
             not_null: false,
             default_text: None,
+            comment: None,
         }
     }
 }
@@ -355,6 +358,8 @@ pub struct TableCatalogEntry {
     /// Which row is which. Rows added at the end are in here once somebody asks.
     row_ids: Mutex<Arc<RowIds>>,
     versions: Arc<Mutex<RowVersions>>,
+    /// What `COMMENT ON TABLE` said.
+    pub comment: Mutex<Option<String>>,
     /// made by CREATE TABLE AS, whose columns depend on no type (`BindCreateTableInfo` registers
     /// the types of the columns only when there is no query)
     pub from_query: std::sync::atomic::AtomicBool,
@@ -638,6 +643,7 @@ impl TableCatalogEntry {
             versions: Arc::default(),
             row_group_rows: std::sync::atomic::AtomicUsize::new(ROW_GROUP_ROWS),
             from_query: std::sync::atomic::AtomicBool::new(false),
+            comment: Mutex::new(None),
         }
     }
 
@@ -965,7 +971,7 @@ impl TableCatalogEntry {
 }
 
 /// A view (`ViewCatalogEntry`): a query, bound anew each time the view is read.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ViewCatalogEntry {
     pub schema: String,
     pub name: String,
@@ -974,6 +980,10 @@ pub struct ViewCatalogEntry {
     pub aliases: Vec<String>,
     /// with `enable_view_dependencies`, the tables and views (schema and name) it reads
     pub dependencies: Vec<(String, String)>,
+    /// What `COMMENT ON VIEW` said.
+    pub comment: Option<String>,
+    /// What `COMMENT ON COLUMN` said of its columns, by name.
+    pub column_comments: Vec<(String, String)>,
 }
 
 impl ViewCatalogEntry {
@@ -1001,11 +1011,13 @@ impl ViewCatalogEntry {
 }
 
 /// A macro with its overloads (`ScalarMacroCatalogEntry`, `TableMacroCatalogEntry`).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MacroCatalogEntry {
     pub name: String,
     pub table_macro: bool,
     pub macros: Vec<MacroFunction>,
+    /// What `COMMENT ON MACRO` said.
+    pub comment: Option<String>,
 }
 
 impl MacroCatalogEntry {
@@ -1044,10 +1056,13 @@ pub struct SequenceData {
 #[derive(Debug)]
 pub struct SequenceCatalogEntry {
     pub name: String,
-    data: Mutex<SequenceData>,
+    /// shared with the entry a `COMMENT ON SEQUENCE` replaces it by, whose counter it is
+    data: Arc<Mutex<SequenceData>>,
     /// `ALTER SEQUENCE ... OWNED BY`: the table or sequence of its schema that owns it, which
     /// takes it along when dropped (an ownership dependency, not transactional here)
     owner: Mutex<Option<(&'static str, String)>>,
+    /// What `COMMENT ON SEQUENCE` said.
+    pub comment: Option<String>,
 }
 
 impl SequenceCatalogEntry {
@@ -1201,13 +1216,16 @@ pub struct SchemaCatalogEntry {
     sequences: RwLock<BTreeMap<String, Arc<SequenceCatalogEntry>>>,
     /// the scalar macros and the table macros, which can share a name
     macros: [RwLock<BTreeMap<String, Arc<MacroCatalogEntry>>>; 2],
-    /// the types of CREATE TYPE, by name
-    types: RwLock<BTreeMap<String, LogicalType>>,
+    /// the types of CREATE TYPE, by name, with what `COMMENT ON TYPE` said
+    types: RwLock<BTreeMap<String, TypeEntry>>,
     /// the triggers of the tables of the schema, by name
     triggers: RwLock<BTreeMap<String, Arc<TriggerCatalogEntry>>>,
     /// the rows of a row group of the tables of its database (`ROW_GROUP_SIZE`), shared with the catalog
     row_group_rows: Arc<std::sync::atomic::AtomicUsize>,
 }
+
+/// A type of CREATE TYPE, and its comment.
+pub(crate) type TypeEntry = (LogicalType, Option<String>);
 
 /// What to do when an entry being created already exists (`OnCreateConflict`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1264,7 +1282,7 @@ impl SchemaCatalogEntry {
     }
 
     pub fn get_type(&self, name: &str) -> Option<LogicalType> {
-        self.types.read().get(&key(name)).cloned()
+        self.types.read().get(&key(name)).map(|(ty, _)| ty.clone())
     }
 
     /// How an entry names the schema it is in: a nested one by its path, which looks it up as
@@ -1303,13 +1321,29 @@ impl SchemaCatalogEntry {
                 OnCreateConflict::Replace => {}
             }
         }
-        types.insert(key(name), ty);
+        types.insert(key(name), (ty, None));
         Ok(())
+    }
+
+    /// What `COMMENT ON TYPE` said of a type.
+    pub fn type_comment(&self, name: &str) -> Option<String> {
+        self.types.read().get(&key(name)).and_then(|(_, comment)| comment.clone())
+    }
+
+    /// `COMMENT ON TYPE`: false if there is no such type.
+    pub fn set_type_comment(&self, name: &str, comment: Option<String>) -> bool {
+        match self.types.write().get_mut(&key(name)) {
+            Some(entry) => {
+                entry.1 = comment;
+                true
+            }
+            None => false,
+        }
     }
 
     /// The custom types, by name.
     pub fn type_entries(&self) -> Vec<(String, LogicalType)> {
-        self.types.read().iter().map(|(n, t)| (n.clone(), t.clone())).collect()
+        self.types.read().iter().map(|(n, (t, _))| (n.clone(), t.clone())).collect()
     }
 
     pub fn sequence_entries(&self) -> Vec<Arc<SequenceCatalogEntry>> {
@@ -1430,6 +1464,57 @@ impl SchemaCatalogEntry {
         }
     }
 
+    /// `COMMENT ON VIEW` and `COMMENT ON COLUMN` of a view: the view with these comments takes
+    /// its place. False if there is no such view.
+    pub fn set_view_comments(
+        &self,
+        name: &str,
+        comment: Option<String>,
+        column_comments: Vec<(String, String)>,
+    ) -> bool {
+        let mut tables = self.tables.write();
+        let Some(TableOrView::View(view)) = tables.get(&key(name)) else {
+            return false;
+        };
+        let view = ViewCatalogEntry {
+            comment,
+            column_comments,
+            ..(**view).clone()
+        };
+        tables.insert(key(name), TableOrView::View(Arc::new(view)));
+        true
+    }
+
+    /// `COMMENT ON MACRO`: the macro with the comment takes its place. False if there is none.
+    pub fn set_macro_comment(&self, name: &str, table_macro: bool, comment: Option<String>) -> bool {
+        let mut entries = self.macros[usize::from(table_macro)].write();
+        let Some(entry) = entries.get(&key(name)) else {
+            return false;
+        };
+        let entry = MacroCatalogEntry {
+            comment,
+            ..(**entry).clone()
+        };
+        entries.insert(key(name), Arc::new(entry));
+        true
+    }
+
+    /// `COMMENT ON SEQUENCE`: the sequence with the comment, and its state, takes its place.
+    pub fn set_sequence_comment(&self, name: &str, comment: Option<String>) -> bool {
+        let mut sequences = self.sequences.write();
+        let Some(sequence) = sequences.get(&key(name)) else {
+            return false;
+        };
+        let replacement = SequenceCatalogEntry {
+            name: sequence.name.clone(),
+            data: Arc::clone(&sequence.data),
+            owner: Mutex::new(sequence.owner.lock().clone()),
+            comment,
+        };
+        sequences.insert(key(name), Arc::new(replacement));
+        true
+    }
+
     pub fn rename_view(&self, view: &ViewCatalogEntry, new_name: &str) -> Result<()> {
         let old_name = view.name.clone();
         let mut tables = self.tables.write();
@@ -1440,6 +1525,8 @@ impl SchemaCatalogEntry {
             query: view.query.clone(),
             aliases: view.aliases.clone(),
             dependencies: view.dependencies.clone(),
+            comment: view.comment.clone(),
+            column_comments: view.column_comments.clone(),
         };
         tables.insert(key(new_name), TableOrView::View(Arc::new(view)));
         drop(tables);
@@ -1516,6 +1603,8 @@ impl SchemaCatalogEntry {
                 query,
                 aliases,
                 dependencies,
+                comment: None,
+                column_comments: Vec::new(),
             };
             tables.insert(key(name), TableOrView::View(Arc::new(view)));
         }
@@ -1634,8 +1723,9 @@ impl SchemaCatalogEntry {
         }
         let sequence = SequenceCatalogEntry {
             name: name.to_string(),
-            data: Mutex::new(data),
+            data: Arc::new(Mutex::new(data)),
             owner: Mutex::new(None),
+            comment: None,
         };
         sequences.insert(key(name), Arc::new(sequence));
         Ok(())
@@ -1776,6 +1866,7 @@ impl SchemaCatalogEntry {
             name: name.to_string(),
             table_macro,
             macros,
+            comment: None,
         };
         entries.insert(key(name), Arc::new(entry));
         Ok(())
@@ -2026,7 +2117,7 @@ struct SchemaEntries {
     tables: BTreeMap<String, TableOrView>,
     sequences: BTreeMap<String, Arc<SequenceCatalogEntry>>,
     macros: [BTreeMap<String, Arc<MacroCatalogEntry>>; 2],
-    types: BTreeMap<String, LogicalType>,
+    types: BTreeMap<String, TypeEntry>,
     triggers: BTreeMap<String, Arc<TriggerCatalogEntry>>,
 }
 

@@ -1152,6 +1152,13 @@ test/sql/catalog/case_insensitive_binder.test
 test/sql/catalog/case_insensitive_caps.test
 test/sql/catalog/case_insensitive_cte.test
 test/sql/catalog/case_insensitive_using.test
+test/sql/catalog/comment_on.test
+test/sql/catalog/comment_on_column.test
+test/sql/catalog/comment_on_dependencies.test
+test/sql/catalog/comment_on_extended.test
+test/sql/catalog/comment_on_pg_description.test
+test/sql/catalog/comment_on_sequence_counter.test
+test/sql/catalog/comment_on_wal.test
 test/sql/catalog/dependencies/add_column_to_table_referenced_by_fk.test
 test/sql/catalog/dependencies/add_column_to_table_referenced_by_macro.test
 test/sql/catalog/dependencies/add_column_to_table_referenced_by_view.test
@@ -1212,6 +1219,7 @@ test/sql/catalog/nested_schema/create_nested_schema.test
 test/sql/catalog/nested_schema/deeply_nested_entries.test
 test/sql/catalog/nested_schema/drop_nested_schema.test
 test/sql/catalog/nested_schema/drop_nested_schema_persist.test
+test/sql/catalog/nested_schema/nested_alter.test
 test/sql/catalog/nested_schema/nested_constraints.test
 test/sql/catalog/nested_schema/nested_export.test
 test/sql/catalog/nested_schema/nested_table.test
@@ -3061,6 +3069,7 @@ test/sql/parser/qualified_underscore_digit.test
 test/sql/parser/reject_accidental_expression_syntax.test
 test/sql/parser/reject_accidental_type_syntax.test
 test/sql/parser/reject_unknown_option_values.test
+test/sql/parser/single_quoted_names.test
 test/sql/parser/star_expression.test
 test/sql/parser/switch_case.test
 test/sql/parser/switch_null_arguments.test
@@ -3687,6 +3696,7 @@ test/sql/storage/read_duckdb/read_duckdb_union_by_name.test
 test/sql/storage/read_duckdb/read_duckdb_virtual_columns.test
 test/sql/storage/revert_append_after_checkpoint_new_row_group.test
 test/sql/storage/revert_append_nested_list.test
+test/sql/storage/revert_append_partial_vector.test
 test/sql/storage/row_group_fetch_bulk.test
 test/sql/storage/rowid_gaps/alter_preserves_rowid_gaps.test
 test/sql/storage/rowid_gaps/bulk_append_after_gap_checkpoint.test
@@ -3701,6 +3711,7 @@ test/sql/storage/rowid_gaps/indexed_remap_partial_chunk.test
 test/sql/storage/rowid_gaps/indexed_remap_same_key_rowid_collision.test
 test/sql/storage/rowid_gaps/leading_gap_lookup.test
 test/sql/storage/rowid_gaps/wal_replay_after_gap_checkpoint.test
+test/sql/storage/shutdown_create_index.test
 test/sql/storage/shutdown_running_transaction.test
 test/sql/storage/shutdown_running_transaction_updates.test
 test/sql/storage/shutdown_unique_index.test
@@ -3789,6 +3800,7 @@ test/sql/storage/vacuum/temp_table_vacuum_on_commit.test
 test/sql/storage/wal/test_wal_bc.test
 test/sql/storage/wal/wal_blob_storage.test
 test/sql/storage/wal/wal_check_constraint.test
+test/sql/storage/wal/wal_create_index.test
 test/sql/storage/wal/wal_create_insert_drop.test
 test/sql/storage/wal/wal_drop_table.test
 test/sql/storage/wal/wal_empty_table.test
