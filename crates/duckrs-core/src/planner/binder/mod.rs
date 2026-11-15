@@ -445,12 +445,48 @@ impl BindContext {
         (column_parts < names.len()).then_some(column_parts)
     }
 
-    /// `AmbiguityException`, for bindings with one alias.
-    fn ambiguous_table(table: &str) -> Error {
-        binder_error(format!(
-            "Ambiguous reference to table \"{table}\" (duplicate alias \"{table}\", explicitly alias one of the \
-             tables using \"AS my_alias\")"
-        ))
+    /// `AmbiguityException`: the bindings `table` names, each by the least that tells it apart
+    /// (`MinimumUniqueAlias`), or a duplicate alias if two can't be.
+    fn ambiguous_table(table: &str, bindings: &[&Binding]) -> Error {
+        let same_schema = |a: &Binding, b: &Binding| match (&a.schema, &b.schema) {
+            (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+            (None, None) => true,
+            _ => false,
+        };
+        let mut result = "(use: ".to_string();
+        for (i, binding) in bindings.iter().enumerate() {
+            if i > 0 {
+                result += if i + 1 == bindings.len() { " or " } else { ", " };
+            }
+            let mut duplicate = false;
+            let mut minimum = String::new();
+            for (k, other) in bindings.iter().enumerate() {
+                if k == i {
+                    continue;
+                }
+                let same_alias = binding.alias.eq_ignore_ascii_case(&other.alias);
+                if same_alias && same_schema(binding, other) {
+                    duplicate = true;
+                }
+                let alias = ast::sql_identifier(&binding.alias);
+                let candidate = match &binding.schema {
+                    Some(schema) if same_alias => format!("{}.{alias}", ast::sql_identifier(schema)),
+                    _ => alias,
+                };
+                if candidate.len() > minimum.len() {
+                    minimum = candidate;
+                }
+            }
+            if duplicate {
+                result = format!(
+                    "(duplicate alias \"{table}\", explicitly alias one of the tables using \"AS my_alias\""
+                );
+            } else {
+                result += &minimum;
+            }
+        }
+        result += ")";
+        binder_error(format!("Ambiguous reference to table \"{table}\" {result}"))
     }
 
     /// Binds `[schema.]table.column` (`BindContext::GetBinding(alias, column)`): of the bindings
@@ -474,7 +510,7 @@ impl BindContext {
             )));
         };
         if with_column.next().is_some() {
-            return Err(Self::ambiguous_table(table));
+            return Err(Self::ambiguous_table(table, &matching));
         }
         let (index, ty, name) = binding.column(name).expect("filtered above");
         Ok((ColumnBinding::new(binding.table_index, index), ty, name))

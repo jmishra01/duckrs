@@ -1396,9 +1396,17 @@ impl Binder<'_> {
         let args = binding
             .names
             .iter()
-            .map(|column| ast::FunctionArgument {
-                name: column.clone(),
-                expr: Expr::column(vec![binding.alias.clone(), column.clone()]),
+            .map(|column| {
+                // by the schema too, where the alias alone names more than one table
+                let mut path = match (schema, &binding.schema) {
+                    (Some(_), Some(own)) => vec![own.clone()],
+                    _ => Vec::new(),
+                };
+                path.extend([binding.alias.clone(), column.clone()]);
+                ast::FunctionArgument {
+                    name: column.clone(),
+                    expr: Expr::column(path),
+                }
             })
             .collect();
         let mut function = ast::FunctionExpr::new("struct_pack", Vec::new());
@@ -2350,13 +2358,46 @@ impl Binder<'_> {
                                 .chain(crate::function::extras::OTHER_FUNCTIONS.iter())
                                 .map(|name| name.to_string()),
                         );
+                    // the functions bound by name, and the macros of the system catalog
+                    const BOUND_BY_NAME: &[&str] = &["nullif", "if", "write_log", "current_setting", "getvariable"];
+                    let names = names
+                        .chain(BOUND_BY_NAME.iter().map(|name| name.to_string()))
+                        .chain(
+                            crate::catalog::defaults::default_macro_names()
+                                .filter(|(_, _, table_macro)| !table_macro)
+                                .map(|(_, name, _)| name.to_string()),
+                        );
                     for name in names {
                         let score = duckrs_common::string_util::similarity_rating(&name, &function.name.name);
                         if score > best.as_ref().map_or(0.0, |(b, _)| *b) {
                             best = Some((score, name));
                         }
                     }
-                    let hint = best.map_or_else(String::new, |(_, name)| format!("\nDid you mean \"{name}\"?"));
+                    // `SimilarEntriesInSchemas`: each schema's best, ties kept
+                    let mut found: Vec<(f64, String)> = best.into_iter().collect();
+                    for schema in self.catalog.schemas() {
+                        let mut schema_best: Option<(f64, String)> = None;
+                        for entry in schema.macro_entries(false) {
+                            let score = duckrs_common::string_util::similarity_rating(&entry.name, &function.name.name);
+                            if score > schema_best.as_ref().map_or(0.0, |(b, _)| *b) {
+                                schema_best = Some((score, entry.name.clone()));
+                            }
+                        }
+                        let Some((score, name)) = schema_best else { continue };
+                        match found.first().map(|(b, _)| *b) {
+                            Some(b) if score < b => {}
+                            Some(b) if score > b => found = vec![(score, name)],
+                            _ if found.iter().any(|(_, n)| n == &name) => {}
+                            _ => found.push((score, name)),
+                        }
+                    }
+                    let mut suggestions: Vec<String> = found.into_iter().map(|(_, name)| name).collect();
+                    suggestions.sort();
+                    let hint = if suggestions.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\nDid you mean \"{}\"?", suggestions.join(" or "))
+                    };
                     return Err(Error::new(
                         ErrorKind::Catalog,
                         format!("Scalar Function with name {} does not exist!{hint}", function.name.name),

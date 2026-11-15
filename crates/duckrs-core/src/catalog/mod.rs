@@ -2466,34 +2466,52 @@ impl Catalog {
         const UNSEEN_PENALTY: f64 = 0.2;
         let searched: Vec<String> = match schema {
             Some(schema) => vec![schema.to_string()],
+            // (the search path ends in the `main` and `pg_catalog` of the system catalog)
             None => [TEMP_SCHEMA]
                 .into_iter()
                 .map(str::to_string)
                 .chain(search_first.map(str::to_string))
                 .chain(search_schemas())
+                .chain(["main".to_string(), "pg_catalog".to_string()])
                 .collect(),
         };
         let schemas = self.schemas();
-        let mut seen: Option<(f64, String)> = None;
-        let mut unseen: Vec<(f64, String)> = Vec::new();
-        for entry in &schemas {
-            let Some((score, similar)) = entry.similar_entry(name) else {
-                continue;
-            };
-            if searched.iter().any(|s| s.eq_ignore_ascii_case(&entry.name)) {
-                if seen.as_ref().is_none_or(|(best, _)| score > *best) {
-                    seen = Some((score, similar));
-                }
-                continue;
-            }
-            let qualified = format!("{}.{similar}", entry.name);
-            match unseen.first().map(|(best, _)| *best) {
-                Some(best) if score < best => {}
-                Some(best) if score > best => unseen = vec![(score, qualified)],
-                _ => unseen.push((score, qualified)),
+        // each schema's most similar entry, and those of the views of the system catalog
+        // (`CatalogSet::SimilarEntry` scores default entries without creating them)
+        let mut candidates: Vec<(String, f64, String)> = schemas
+            .iter()
+            .filter_map(|entry| entry.similar_entry(name).map(|(score, similar)| (entry.name.clone(), score, similar)))
+            .collect();
+        let mut system: Vec<(&str, f64, &str)> = Vec::new();
+        for (view_schema, view, _) in defaults_table_views() {
+            let score = similarity_rating(view, name);
+            match system.iter_mut().find(|(s, ..)| s == view_schema) {
+                Some(best) if score > best.1 => *best = (view_schema, score, view),
+                Some(_) => {}
+                None => system.push((view_schema, score, view)),
             }
         }
-        let best_seen = seen.as_ref().map_or(0.0, |(score, _)| *score);
+        candidates.extend(system.into_iter().map(|(s, score, v)| (s.to_string(), score, v.to_string())));
+        // `SimilarEntriesInSchemas`: the best of all, ties kept
+        let mut seen: Vec<(f64, String)> = Vec::new();
+        let mut unseen: Vec<(f64, String)> = Vec::new();
+        for (schema_name, score, similar) in candidates {
+            if score <= 0.0 {
+                continue;
+            }
+            let (list, entry) = if searched.iter().any(|s| s.eq_ignore_ascii_case(&schema_name)) {
+                (&mut seen, similar)
+            } else {
+                (&mut unseen, format!("{schema_name}.{similar}"))
+            };
+            match list.first().map(|(best, _)| *best) {
+                Some(best) if score < best => {}
+                Some(best) if score > best => *list = vec![(score, entry)],
+                _ if list.iter().any(|(_, e)| e == &entry) => {}
+                _ => list.push((score, entry)),
+            }
+        }
+        let best_seen = seen.first().map_or(0.0, |(score, _)| *score);
         let mut suggestions: Vec<String> = match unseen.first() {
             Some((score, _)) if *score == 1.0 || score - UNSEEN_PENALTY > best_seen => {
                 unseen.into_iter().map(|(_, name)| name).collect()
@@ -2618,6 +2636,11 @@ fn dependency_check(schemas: &BTreeMap<String, Arc<SchemaCatalogEntry>>, schema:
     }
     message += "Use DROP...CASCADE to drop all dependents.";
     Err(Error::new(ErrorKind::Dependency, message))
+}
+
+/// The views of the system catalog: (schema, name, query).
+fn defaults_table_views() -> &'static [(&'static str, &'static str, &'static str)] {
+    defaults_table::VIEWS
 }
 
 /// `CatalogException::MissingEntry`.

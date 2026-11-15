@@ -696,6 +696,26 @@ fn for_each_table_name(statement: &mut Statement, f: &mut impl FnMut(&mut Qualif
     }
 }
 
+/// `Catalog::LookupEntry` of an entry whose schema is missing: a table, or anything in a nested
+/// schema, names the schema; another entry is just missing.
+fn missing_schema(error: Error, kind: &str, name: &QualifiedName) -> Error {
+    if error.kind != ErrorKind::Catalog || !error.message.starts_with("Schema with name") {
+        return error;
+    }
+    let schemas: Vec<&String> = name.qualification.iter().filter(|q| !q.is_empty()).collect();
+    if kind == "Table" || schemas.len() > 1 {
+        let schema = schemas.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(".");
+        return Error::new(
+            ErrorKind::Catalog,
+            format!(
+                "{kind} with name \"{schema}.{}\" does not exist because schema \"{schema}\" does not exist.",
+                name.name
+            ),
+        );
+    }
+    missing_entry(kind, &name.name)
+}
+
 /// The names of the `$name` parameters in the text of a statement, outside of string literals and
 /// quoted identifiers, lowercase.
 fn parameter_names(sql: &str) -> Vec<String> {
@@ -1672,6 +1692,29 @@ impl ClientContext {
     /// Runs one statement within the current transaction, or as a transaction of its own
     /// (`ClientContext::PendingStatementOrPreparedStatementInternal` + `CleanupInternal`).
     fn run_statement(&mut self, statement: &Statement) -> Result<MaterializedQueryResult> {
+        // `Binder::BindCreateSchema`: the system catalog (and its pg_catalog and information_schema)
+        // takes no entries
+        let created = match statement {
+            Statement::Create(info) if !info.temporary && !matches!(info.kind, CreateKind::Schema { .. }) => {
+                Some(&info.name)
+            }
+            Statement::CreateTable(info) if !info.temporary => Some(&info.name),
+            _ => None,
+        };
+        if let Some(name) = created {
+            let parts: Vec<&String> = name.qualification.iter().filter(|q| !q.is_empty()).collect();
+            let system = match parts.as_slice() {
+                [catalog, ..] if catalog.eq_ignore_ascii_case("system") => true,
+                [schema] => {
+                    (schema.eq_ignore_ascii_case("pg_catalog") || schema.eq_ignore_ascii_case("information_schema"))
+                        && self.catalog().get_schema(schema).is_none()
+                }
+                _ => false,
+            };
+            if system {
+                return Err(Error::new(ErrorKind::Binder, "Cannot create entry in system catalog"));
+            }
+        }
         if let Some((database, routed)) = self.route_to_database(statement)? {
             let previous = std::mem::replace(&mut self.db, database);
             let result = self.run_statement(&routed);
@@ -3005,16 +3048,28 @@ impl ClientContext {
                 }
                 // `EnableProfilingSetting::SetLocal`: a format the profiler knows, and profiling on
                 if name.eq_ignore_ascii_case("enable_profiling") {
-                    let format = value.try_to_string()?.to_lowercase();
-                    if !matches!(
-                        format.as_str(),
-                        "json" | "query_tree" | "query_tree_optimizer" | "no_output" | "html" | "graphviz"
-                    ) {
+                    // `LookupProfilerPrintFormat`
+                    const FORMATS: [&str; 11] = [
+                        "default",
+                        "text",
+                        "query_tree",
+                        "query_tree_optimizer",
+                        "no_output",
+                        "json",
+                        "html",
+                        "graphviz",
+                        "yaml",
+                        "mermaid",
+                        "compact",
+                    ];
+                    let given = value.try_to_string()?;
+                    let format = given.to_lowercase();
+                    if !FORMATS.contains(&format.as_str()) {
                         return Err(Error::new(
-                            ErrorKind::Parser,
+                            ErrorKind::InvalidInput,
                             format!(
-                                "Unrecognized print format {format}, supported formats: [json, query_tree, \
-                                 query_tree_optimizer, no_output, html, graphviz]"
+                                "\"{given}\" is not a valid FORMAT argument, valid options are: {}",
+                                FORMATS.join(", ")
                             ),
                         ));
                     }
@@ -3917,7 +3972,7 @@ impl ClientContext {
                         dropped
                     }
                     Err(_) if info.if_exists => false,
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(missing_schema(error, type_name, &info.name)),
                 };
                 // `Binder::Bind(DropStatement)`: the views of the system catalog are internal
                 if !dropped
@@ -3942,7 +3997,7 @@ impl ClientContext {
                             || (!table_macro && schema.drop_macro(&info.name.name, true))
                     }
                     Err(_) if info.if_exists => false,
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(missing_schema(error, macro_type_name(table_macro), &info.name)),
                 };
                 // a function of the system catalog is an internal entry
                 let functions = crate::function::BuiltinFunctions::get();
@@ -3962,7 +4017,7 @@ impl ClientContext {
                 let dropped = match catalog.schema_for(schema.as_deref()) {
                     Ok(schema) => schema.drop_index(&info.name.name),
                     Err(_) if info.if_exists => false,
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(missing_schema(error, "Index", &info.name)),
                 };
                 if !dropped && !info.if_exists {
                     return Err(missing_entry("Index", &info.name.name));
@@ -3974,7 +4029,7 @@ impl ClientContext {
                 let dropped = match catalog.schema_for(schema.as_deref()) {
                     Ok(schema) => schema.drop_sequence_checked(&info.name.name, info.cascade)?,
                     Err(_) if info.if_exists => false,
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(missing_schema(error, "Sequence", &info.name)),
                 };
                 if !dropped && !info.if_exists {
                     return Err(missing_entry("Sequence", &info.name.name));
@@ -3986,7 +4041,7 @@ impl ClientContext {
                 let dropped = match catalog.schema_for(schema.as_deref()) {
                     Ok(schema) => schema.drop_type_checked(&info.name.name, info.cascade)?,
                     Err(_) if info.if_exists => false,
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(missing_schema(error, "Type", &info.name)),
                 };
                 // the built-in types are internal entries of the system catalog
                 if !dropped && schema.is_none() && duckrs_parser::ast::is_builtin_type_name(&info.name.name) {

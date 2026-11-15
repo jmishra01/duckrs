@@ -1892,7 +1892,7 @@ impl Binder<'_> {
                 )));
             }
             if found.len() > 1 {
-                return Err(BindContext::ambiguous_table(&star.relation_name));
+                return Err(BindContext::ambiguous_table(&star.relation_name, &found));
             }
             found
         };
@@ -2632,6 +2632,26 @@ impl Binder<'_> {
                 .map(String::as_str);
             if let Some(entry) = crate::catalog::defaults::default_macro(schema, &call.name.name, true) {
                 return self.bind_table_macro(table_ref, call, entry);
+            }
+            // `Catalog::GetEntry`: a name that is no table function of C++ either
+            if !CPP_TABLE_FUNCTIONS.contains(&name.as_str()) {
+                let mut best: Option<(f64, String)> = None;
+                let candidates = CPP_TABLE_FUNCTIONS.iter().map(|n| n.to_string()).chain(
+                    crate::catalog::defaults::default_macro_names()
+                        .filter(|(_, _, table_macro)| *table_macro)
+                        .map(|(_, n, _)| n.to_string()),
+                );
+                for candidate in candidates {
+                    let score = duckrs_common::string_util::similarity_rating(&candidate, &call.name.name);
+                    if score > best.as_ref().map_or(0.0, |(b, _)| *b) {
+                        best = Some((score, candidate));
+                    }
+                }
+                let hint = best.map_or_else(String::new, |(_, n)| format!("\nDid you mean \"{n}\"?"));
+                return Err(Error::new(
+                    ErrorKind::Catalog,
+                    format!("Table Function with name {} does not exist!{hint}", call.name.name),
+                ));
             }
             return Err(not_implemented(&format!("the table function {name}")));
         }
@@ -3649,3 +3669,116 @@ pub(super) fn unnest_depths(ty: &LogicalType, max_depth: usize) -> (usize, usize
     };
     (lists, structs)
 }
+
+/// The table functions of C++ (the core and the json, parquet and icu extensions). A name outside
+/// this list is unknown to C++ as well, not merely unported.
+const CPP_TABLE_FUNCTIONS: &[&str] = &[
+    "add_grammar_extension",
+    "arrow_scan",
+    "arrow_scan_dumb",
+    "check_peg_parser",
+    "checkpoint",
+    "create_external_resource",
+    "destroy_external_resource",
+    "disable_logging",
+    "disable_peg_parser",
+    "disable_profiling",
+    "duckdb_approx_database_count",
+    "duckdb_available_metrics",
+    "duckdb_columns",
+    "duckdb_connection_count",
+    "duckdb_constraints",
+    "duckdb_coordinate_systems",
+    "duckdb_databases",
+    "duckdb_dependencies",
+    "duckdb_dialects",
+    "duckdb_eviction_queues",
+    "duckdb_extension_repositories",
+    "duckdb_extensions",
+    "duckdb_external_file_cache",
+    "duckdb_external_resource_types",
+    "duckdb_external_resources",
+    "duckdb_functions",
+    "duckdb_grammar_extensions",
+    "duckdb_indexes",
+    "duckdb_keywords",
+    "duckdb_live_query_metrics",
+    "duckdb_log_contexts",
+    "duckdb_logs",
+    "duckdb_memory",
+    "duckdb_optimizers",
+    "duckdb_prepared_statements",
+    "duckdb_schemas",
+    "duckdb_secret_type_parameters",
+    "duckdb_secret_types",
+    "duckdb_secrets",
+    "duckdb_sequences",
+    "duckdb_settings",
+    "duckdb_table_sample",
+    "duckdb_tables",
+    "duckdb_temporary_files",
+    "duckdb_triggers",
+    "duckdb_types",
+    "duckdb_variables",
+    "duckdb_views",
+    "enable_logging",
+    "enable_peg_parser",
+    "enable_profiling",
+    "force_checkpoint",
+    "generate_series",
+    "glob",
+    "icu_calendar_names",
+    "json_each",
+    "json_execute_serialized_sql",
+    "json_tree",
+    "parquet_bloom_probe",
+    "parquet_file_metadata",
+    "parquet_full_metadata",
+    "parquet_kv_metadata",
+    "parquet_metadata",
+    "parquet_page_index",
+    "parquet_scan",
+    "parquet_schema",
+    "pg_timezone_names",
+    "pragma_collations",
+    "pragma_database_size",
+    "pragma_metadata_info",
+    "pragma_platform",
+    "pragma_show",
+    "pragma_storage_info",
+    "pragma_table_info",
+    "pragma_user_agent",
+    "pragma_version",
+    "query",
+    "query_table",
+    "range",
+    "read_blob",
+    "read_csv",
+    "read_csv_auto",
+    "read_duckdb",
+    "read_json",
+    "read_json_auto",
+    "read_json_objects",
+    "read_json_objects_auto",
+    "read_ndjson",
+    "read_ndjson_auto",
+    "read_ndjson_objects",
+    "read_parquet",
+    "read_single_csv_file",
+    "read_single_json_file",
+    "read_single_parquet_file",
+    "read_text",
+    "register_external_resource",
+    "remove_grammar_extension",
+    "repeat",
+    "repeat_row",
+    "seq_scan",
+    "sniff_csv",
+    "sql_auto_complete",
+    "summary",
+    "test_all_types",
+    "test_vector_types",
+    "truncate_duckdb_logs",
+    "unnest",
+    "which_secret",
+];

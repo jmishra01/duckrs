@@ -29,6 +29,7 @@ test/fuzzer/duckfuzz/array_serialization_flattening.test
 test/fuzzer/duckfuzz/array_slice_nullness.test
 test/fuzzer/duckfuzz/array_slice_underflow.test
 test/fuzzer/duckfuzz/array_slice_vector_type.test
+test/fuzzer/duckfuzz/bitstring_agg_minmax.test
 test/fuzzer/duckfuzz/bitstring_agg_unfoldable.test
 test/fuzzer/duckfuzz/column_alias_exist.test
 test/fuzzer/duckfuzz/complex_join_cardinality_assert.test
@@ -207,6 +208,7 @@ test/fuzzer/public/insert_returning.test
 test/fuzzer/public/lateral_in_right_side_of_join.test
 test/fuzzer/public/lateral_join_subquery.test
 test/fuzzer/public/lateral_right_join.test
+test/fuzzer/public/pivot_empty_enum.test
 test/fuzzer/public/pivot_full_join_using.test
 test/fuzzer/public/pragma_named_parameters.test
 test/fuzzer/public/regex_range_filter_mismatch.test
@@ -1007,6 +1009,7 @@ test/sql/alter/struct/rename_col_struct.test
 test/sql/alter/struct/rename_col_struct_case_insensitive.test
 test/sql/alter/test_alter_if_exists.test
 test/sql/attach/attach_all_types.test
+test/sql/attach/attach_catalog_error_early_out.test
 test/sql/attach/attach_checkpoint_vacuum.test
 test/sql/attach/attach_conflicting_options.test
 test/sql/attach/attach_copy.test
@@ -1062,6 +1065,7 @@ test/sql/attach/attach_volatile_expression.test
 test/sql/attach/attach_wal_alter_sequence.test
 test/sql/attach/detach_keyword.test
 test/sql/attach/in_memory_attach.test
+test/sql/attach/system_catalog.test
 test/sql/binder/alias_error_10057.test
 test/sql/binder/alias_qualification_errors.test
 test/sql/binder/alias_qualification_group_by.test
@@ -1186,13 +1190,16 @@ test/sql/catalog/dependencies/test_set_default_sequence_dependency.test
 test/sql/catalog/dependencies/test_write_after_rename.test
 test/sql/catalog/dependency/drop_recreate_schema_dependency.test
 test/sql/catalog/did_you_mean.test
+test/sql/catalog/did_you_mean_default_entries.test
 test/sql/catalog/drop_create_rollback.test
+test/sql/catalog/function/information_schema_macro.test
 test/sql/catalog/function/macro_typed_parameter_rendering.test
 test/sql/catalog/function/python_style_macro_parameters.test
 test/sql/catalog/function/struct_extract_macro.test
 test/sql/catalog/function/test_complex_macro.test
 test/sql/catalog/function/test_cross_catalog_macros.test
 test/sql/catalog/function/test_cte_macro.test
+test/sql/catalog/function/test_drop_macro.test
 test/sql/catalog/function/test_macro_correlated_cte.test
 test/sql/catalog/function/test_macro_default_arg.test
 test/sql/catalog/function/test_macro_issue_13104.test
@@ -1214,6 +1221,7 @@ test/sql/catalog/function/test_table_macro_complex.test
 test/sql/catalog/function/test_table_macro_groups.test
 test/sql/catalog/function/test_window_macro.test
 test/sql/catalog/identifier_embedded_nul.test
+test/sql/catalog/information_schema_read_only.test
 test/sql/catalog/issue_9459.test
 test/sql/catalog/nested_schema/create_nested_schema.test
 test/sql/catalog/nested_schema/deeply_nested_entries.test
@@ -2884,6 +2892,7 @@ test/sql/merge/merge_into_constraint.test
 test/sql/merge/merge_into_default.test
 test/sql/merge/merge_into_error.test
 test/sql/merge/merge_into_index.test
+test/sql/merge/merge_into_insert_star.test
 test/sql/merge/merge_into_invalid_action.test
 test/sql/merge/merge_into_invalid_column.test
 test/sql/merge/merge_into_invalid_column_reference.test
@@ -2897,6 +2906,7 @@ test/sql/merge/merge_into_subquery_action.test
 test/sql/merge/merge_into_subquery_condition.test
 test/sql/merge/merge_into_subquery_condition_delete.test
 test/sql/merge/merge_into_too_few_columns.test
+test/sql/merge/merge_into_update_star.test
 test/sql/merge/merge_multi_match_error.test
 test/sql/merge/merge_not_matched_by_source_join_order.test
 test/sql/optimizer/anti_join_empty_rhs_projection_map.test
@@ -3109,6 +3119,7 @@ test/sql/peg_parser/identifier.test
 test/sql/peg_parser/peg_syntax_error.test
 test/sql/peg_parser/qualified_operator.test
 test/sql/peg_parser/transformer/between_asymmetric.test
+test/sql/peg_parser/transformer/drop_statement.test
 test/sql/peg_parser/transformer/is_predicate_operators.test
 test/sql/peg_parser/transformer/trim.test
 test/sql/peg_parser/transformer/use_statement.test
@@ -3186,6 +3197,7 @@ test/sql/pragma/profiling/test_operator_info_suppression.test
 test/sql/pragma/profiling/test_profiling_all.test
 test/sql/pragma/profiling/test_profiling_fs.test
 test/sql/pragma/test_disabled_compression.test
+test/sql/pragma/test_enable_profile.test
 test/sql/pragma/test_force_compression.test
 test/sql/pragma/test_memory_limit.test
 test/sql/pragma/test_pragma_database_size.test
@@ -3315,6 +3327,7 @@ test/sql/settings/set_schema_temp_main.test
 test/sql/settings/setting_alias.test
 test/sql/settings/setting_collation.test
 test/sql/settings/setting_disabled_optimizer.test
+test/sql/settings/setting_exhaustive.test
 test/sql/settings/setting_null_order.test
 test/sql/settings/setting_order.test
 test/sql/settings/setting_profiling_mode.test
@@ -3415,6 +3428,7 @@ test/sql/storage/catalog/test_store_rename_table.test
 test/sql/storage/catalog/test_store_rename_view.test
 test/sql/storage/catalog/test_store_sequences.test
 test/sql/storage/catalog/test_store_temporary.test
+test/sql/storage/catalog/test_table_macro_storage.test
 test/sql/storage/catalog/test_view_explicit_aliases.test
 test/sql/storage/catalog/test_view_storage.test
 test/sql/storage/catalog/test_view_storage_no_view_dependencies.test
@@ -3962,6 +3976,7 @@ test/sql/table_function/duckdb_schemas.test
 test/sql/table_function/duckdb_sequences.test
 test/sql/table_function/duckdb_settings.test
 test/sql/table_function/duckdb_settings_extension.test
+test/sql/table_function/duckdb_tables.test
 test/sql/table_function/duckdb_types.test
 test/sql/table_function/duckdb_views.test
 test/sql/table_function/glob_prepared.test

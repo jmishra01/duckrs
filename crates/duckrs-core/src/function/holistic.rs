@@ -850,6 +850,13 @@ fn bitstring(rows: &[Value], ty: &LogicalType) -> Result<Value> {
         return Ok(Value::null(ty.clone()));
     };
     let (low, high) = match given {
+        // `BitStringAggOperation::GetRange`
+        Some((low, high)) if low > high => {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("Invalid explicit bitstring range: Minimum ({low}) > maximum ({high})"),
+            ));
+        }
         Some(range) => *range,
         None => (
             numbers.iter().map(|n| n.0).min().unwrap_or(0),

@@ -290,6 +290,17 @@ impl Binder<'_> {
         if !column.pivot_enum.is_empty() {
             let search = self.search_schema.as_deref();
             let Some(ty) = self.catalog.get_type(None, search, &column.pivot_enum)? else {
+                // a built-in type: ENUM without values is incomplete, the others are no ENUM
+                if column.pivot_enum.eq_ignore_ascii_case("enum") {
+                    return Err(binder_error("ENUM type is incomplete"));
+                }
+                if duckrs_parser::ast::is_builtin_type_name(&column.pivot_enum) {
+                    return Err(binder_error(format!(
+                        "Pivot must reference an ENUM type: {} is of type \"{}\"",
+                        column.pivot_enum,
+                        column.pivot_enum.to_uppercase()
+                    )));
+                }
                 return Err(crate::catalog::missing_entry("Type", &column.pivot_enum));
             };
             if ty.id() != LogicalTypeId::Enum {

@@ -71,10 +71,13 @@ impl Binder<'_> {
                 return Err(binder_error("Cannot insert into a generated column"));
             }
             let Some(index) = table.column_index(name) else {
+                // `TableCatalogEntry::GetColumnIndex`
+                let names: Vec<String> = table.logical_columns().iter().map(|c| c.name.to_string()).collect();
                 return Err(binder_error(format!(
-                    "Table {} does not have a column with name {}",
+                    "Table {} does not have a column with name {}\n{}",
                     sql_quoted_identifier(&table.name),
-                    sql_quoted_identifier(name)
+                    sql_quoted_identifier(name),
+                    duckrs_common::string_util::candidates_error_message(&names, name, "Did you mean")
                 )));
             };
             result.push(index);
@@ -146,8 +149,11 @@ impl Binder<'_> {
                         )));
                     }
                     let Some(index) = table.column_index(name) else {
+                        // `BindUpdateSet`
+                        let names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
                         return Err(binder_error(format!(
-                            "Referenced update column {name} not found in table!"
+                            "Referenced update column {name} not found in table!\n{}",
+                            duckrs_common::string_util::candidates_error_message(&names, name, "Did you mean")
                         )));
                     };
                     if result.columns.contains(&index) {
