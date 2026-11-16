@@ -341,6 +341,50 @@ impl Group<'_> {
         };
         match (name, children) {
             ("coalesce", _) => self.union(children.iter()),
+            // `s || ''` and `replace(s, a, a)` are `s`
+            ("||", [input, other]) | ("||", [other, input])
+                if constant(other).and_then(|v| v.try_to_string().ok()).as_deref() == Some("") =>
+            {
+                self.range(input)
+            }
+            ("replace", [input, from, to])
+                if constant(from).is_some() && constant(from).map(|v| v.try_to_string().ok()) == constant(to).map(|v| v.try_to_string().ok()) =>
+            {
+                self.range(input)
+            }
+            // `x % c` of what is from 0 up to below `c` is itself, and otherwise from 0 up to below `c`
+            ("%", [input, divisor]) if constant(divisor).as_ref().and_then(Value::as_i128).is_some_and(|c| c > 0) => {
+                let c = constant(divisor).as_ref().and_then(Value::as_i128).expect("checked");
+                let Range::Bounds(min, max) = self.range(input) else {
+                    return self.range(input);
+                };
+                match (min.as_i128(), max.as_i128()) {
+                    (Some(low), Some(high)) if low >= 0 && high < c => Range::Bounds(min, max),
+                    (Some(low), Some(_)) if low >= 0 => {
+                        let bound = |n: i128| crate::execution::parquet::try_cast_value(&Value::hugeint(n), &expr.return_type);
+                        match (bound(0), bound(c - 1)) {
+                            (Some(zero), Some(top)) => Range::Bounds(zero, top),
+                            _ => Range::Unknown,
+                        }
+                    }
+                    _ => Range::Unknown,
+                }
+            }
+            // `isnan`: NaN sorts above every number, so the bounds tell
+            ("isnan", [input]) => match self.range(input) {
+                Range::Bounds(min, max) => {
+                    let nan = |v: &Value| match v.data() {
+                        duckrs_common::value::ValueData::Float(f) => Some(f.is_nan()),
+                        duckrs_common::value::ValueData::Double(d) => Some(d.is_nan()),
+                        _ => None,
+                    };
+                    match (nan(&min), nan(&max)) {
+                        (Some(low), Some(high)) => Range::Bounds(Value::boolean(low), Value::boolean(high)),
+                        _ => Range::Unknown,
+                    }
+                }
+                other => other,
+            },
             // `PowerStats`: a power above 0 of what is never negative grows with it
             ("power" | "pow", [base, exponent])
                 if constant(exponent).is_some_and(|e| sign(&e) == Some(Ordering::Greater))
@@ -431,6 +475,56 @@ impl Group<'_> {
                 }
                 other => other,
             },
+            // a deterministic function of what is one value in the group: that function of it
+            _ if !expr.is_volatile() && !children.is_empty() => {
+                // a column of the group with one value and no NULL, or a constant (a NULL in the group
+                // would give the function of NULL too)
+                let mut arguments = Vec::with_capacity(children.len());
+                for child in children {
+                    match &child.kind {
+                        BoundExprKind::Constant(_) => arguments.push(child.clone()),
+                        BoundExprKind::Reference(index) => match self.zone(*index) {
+                            Some(ColumnZone {
+                                min: Some(min),
+                                max: Some(max),
+                                has_null: false,
+                                ..
+                            }) if compare_values(ComparisonOp::Equal, &min, &max) == Some(true)
+                                // the sign of a floating point zero is not in the statistics
+                                && !matches!(min.data(), duckrs_common::value::ValueData::Float(f) if *f == 0.0)
+                                && !matches!(min.data(), duckrs_common::value::ValueData::Double(d) if *d == 0.0) =>
+                            {
+                                arguments.push(BoundExpr::constant(min))
+                            }
+                            // a group of only NULLs
+                            Some(ColumnZone {
+                                min: None,
+                                max: None,
+                                has_null: true,
+                                ..
+                            }) => arguments.push(BoundExpr::constant(Value::null(child.return_type.clone()))),
+                            _ => return Range::Unknown,
+                        },
+                        _ => return Range::Unknown,
+                    }
+                }
+                let BoundExprKind::Function { function, is_operator, .. } = &expr.kind else {
+                    return Range::Unknown;
+                };
+                let call = BoundExpr::new(
+                    BoundExprKind::Function {
+                        function: function.clone(),
+                        children: arguments,
+                        is_operator: *is_operator,
+                    },
+                    expr.return_type.clone(),
+                );
+                match crate::execution::expression_executor::try_evaluate_scalar(&call) {
+                    Some(value) if value.is_null() => Range::Null,
+                    Some(value) => Range::Bounds(value.clone(), value),
+                    None => Range::Unknown,
+                }
+            }
             _ => Range::Unknown,
         }
     }
@@ -601,6 +695,19 @@ impl Group<'_> {
                 // two expressions of the columns: their ranges (`PropagateComparison`)
                 _ => self.ranges_fail(*op, left, right),
             },
+            // a BOOLEAN function whose range in the group is only false or NULL
+            BoundExprKind::Function { function, .. }
+                if expr.return_type.id() == LogicalTypeId::Boolean
+                    && !matches!(function.name.as_str(), "prefix" | "starts_with" | "^@")
+                    && matches!(self.range(expr), Range::Null | Range::Bounds(_, _))
+                    && match self.range(expr) {
+                        Range::Null => true,
+                        Range::Bounds(_, max) => max.data() == &duckrs_common::value::ValueData::Bool(false),
+                        Range::Unknown => false,
+                    } =>
+            {
+                true
+            }
             // `prefix(s, 'ab')` / `starts_with`: s from 'ab' up to what follows all strings that start with it
             BoundExprKind::Function { function, children, .. }
                 if matches!(function.name.as_str(), "prefix" | "starts_with" | "^@") && children.len() == 2 =>

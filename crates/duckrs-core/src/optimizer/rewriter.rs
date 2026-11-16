@@ -102,6 +102,7 @@ fn apply_rules(expr: &mut BoundExpr, in_filter: bool) -> bool {
         || instr_prefix(expr)
         || string_prefix(expr)
         || glob_prefix(expr)
+        || identity_string_functions(expr)
         || (in_filter && null_distinct_comparison(expr))
         || empty_needle_removal(expr)
         || least_greatest_simplification(expr)
@@ -1451,6 +1452,28 @@ fn string_prefix(expr: &mut BoundExpr) -> bool {
     } else {
         crate::function::string_needle_call("prefix", input, BoundExpr::constant(constant_value.clone()))
     };
+    true
+}
+
+/// `replace(s, 'z', 'z')` is `s`, and so are `s || ''` and `'' || s`.
+fn identity_string_functions(expr: &mut BoundExpr) -> bool {
+    let BoundExprKind::Function { function, children, .. } = &expr.kind else {
+        return false;
+    };
+    let text = |e: &BoundExpr| match &e.kind {
+        BoundExprKind::Constant(v) if !v.is_null() && e.return_type.id() == LogicalTypeId::Varchar => v.try_to_string().ok(),
+        _ => None,
+    };
+    let input = match (function.name.as_str(), children.as_slice()) {
+        ("replace", [input, from, to]) if text(from).is_some() && text(from) == text(to) => input,
+        ("||", [input, other]) if text(other).as_deref() == Some("") => input,
+        ("||", [other, input]) if text(other).as_deref() == Some("") => input,
+        _ => return false,
+    };
+    if input.return_type != expr.return_type {
+        return false;
+    }
+    *expr = input.clone();
     true
 }
 
