@@ -316,6 +316,7 @@ test/issues/general/test_24049.test
 test/issues/general/test_2407.test
 test/issues/general/test_2416.test
 test/issues/general/test_24212.test
+test/issues/general/test_24245.test
 test/issues/general/test_24328.test
 test/issues/general/test_24442.test
 test/issues/general/test_24542.test
@@ -485,6 +486,7 @@ test/optimizer/column_lifetime_analyzer/no_unnecessary_projections.test
 test/optimizer/column_lifetime_analyzer/summary_column_lifetime.test
 test/optimizer/common_subplan_nested_cte.test
 test/optimizer/compare_blob.test
+test/optimizer/comparison_simplification.test
 test/optimizer/comparison_simplification_narrowing_casts.test
 test/optimizer/compressed_materialization_many_aggregates.test
 test/optimizer/conjunction_simplification.test
@@ -503,6 +505,7 @@ test/optimizer/filter_pushdown/filter_pushdown_into_subquery.test
 test/optimizer/filter_pushdown/like_prefix_boundary.test
 test/optimizer/grouping_expression_simplification.test
 test/optimizer/index_optimizer.test
+test/optimizer/instr_prefix_null_needle.test
 test/optimizer/issue_12181.test
 test/optimizer/issue_20928.test
 test/optimizer/issue_21011.test
@@ -547,6 +550,7 @@ test/optimizer/like_optimizer.test
 test/optimizer/limit_pushdown.test
 test/optimizer/materialized_cte_sibling_column_pruning.test
 test/optimizer/misc/test_count_and_sum.test
+test/optimizer/move_constants.test
 test/optimizer/needle_optimizer.test
 test/optimizer/not_in_null.test
 test/optimizer/optimize_unsigned_vs_signed_ints.test
@@ -579,6 +583,7 @@ test/optimizer/pushdown/test_pushdown_cte_group_by_all.test
 test/optimizer/pushdown/timestamp_to_date_infinity_pushdown.test
 test/optimizer/pushdown/type_pushdown_projection_index.test
 test/optimizer/pushdown/type_pushdown_virtual_column.test
+test/optimizer/regex_optimizer.test
 test/optimizer/regex_optimizer_anchors.test
 test/optimizer/regex_optimizer_coverage.test
 test/optimizer/regex_to_like_optimizer.test
@@ -2277,6 +2282,7 @@ test/sql/function/numeric/test_gamma.test
 test/sql/function/numeric/test_gcd_lcm.test
 test/sql/function/numeric/test_geomean.test
 test/sql/function/numeric/test_invalid_math.test
+test/sql/function/numeric/test_is_nan.test
 test/sql/function/numeric/test_mod.test
 test/sql/function/numeric/test_mod_min_negative_one.test
 test/sql/function/numeric/test_modulo_min_by_minus_one.test
@@ -2957,6 +2963,7 @@ test/sql/optimizer/expression/test_cse.test
 test/sql/optimizer/expression/test_date_subtract_filter.test
 test/sql/optimizer/expression/test_empty_needle_dead_branch.test
 test/sql/optimizer/expression/test_equal_or_null_optimization.test
+test/sql/optimizer/expression/test_float_identity.test
 test/sql/optimizer/expression/test_in_clause_simplification.test
 test/sql/optimizer/expression/test_indistinct_aggregates.test
 test/sql/optimizer/expression/test_move_constants.test
@@ -2966,11 +2973,14 @@ test/sql/optimizer/expression/test_time_ns_cast_comparison.test
 test/sql/optimizer/expression/test_timestamp_offset.test
 test/sql/optimizer/expression/uncommitted_appends_fold_guard.test
 test/sql/optimizer/false_or_null_segment_pruning.test
+test/sql/optimizer/instr_zonemap_pruning.test
 test/sql/optimizer/joins/join_order_deep_setop_chain.test
 test/sql/optimizer/late_materialization_pushdown_extract.test
 test/sql/optimizer/monotone_function_zonemap_pruning.test
 test/sql/optimizer/monotone_preimage_tinyint_boundaries.test
 test/sql/optimizer/multiple_column_stats_pruning.test
+test/sql/optimizer/narrowing_cast_not_invertible.test
+test/sql/optimizer/not_conjunction_simplification.test
 test/sql/optimizer/plan/test_anti_join_empty_child.test
 test/sql/optimizer/plan/test_anti_join_projection_map.test
 test/sql/optimizer/plan/test_disable_build_side_probe_side.test

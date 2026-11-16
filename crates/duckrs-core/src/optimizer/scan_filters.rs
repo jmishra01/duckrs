@@ -40,6 +40,19 @@ fn can_move_ignoring_errors(expr: &BoundExpr, scan: &[ColumnBinding]) -> bool {
     one_column && !outer && scan.contains(&columns[0]) && !expr.is_volatile()
 }
 
+/// A comparison with the constant on the left turned around, as `FilterCombiner` makes a table
+/// filter of the column: `5 < x` is `x > 5`.
+fn column_first(mut expr: BoundExpr) -> BoundExpr {
+    if let BoundExprKind::Comparison { op, left, right } = &mut expr.kind
+        && matches!(left.kind, BoundExprKind::Constant(_))
+        && !matches!(right.kind, BoundExprKind::Constant(_))
+    {
+        std::mem::swap(left, right);
+        *op = super::statistics::flip(*op);
+    }
+    expr
+}
+
 /// Moves the filters directly on scans into them.
 pub fn push_into_scans(op: &mut LogicalOperator) {
     for child in &mut op.children {
@@ -72,7 +85,7 @@ pub fn push_into_scans(op: &mut LogicalOperator) {
     let (barred, conjuncts): (Vec<BoundExpr>, Vec<BoundExpr>) = conjuncts.into_iter().partition(contains_barrier);
     for conjunct in conjuncts {
         if can_move_into_scan(&conjunct, &scan) {
-            filters.push(conjunct);
+            filters.push(column_first(conjunct));
         } else {
             expressions.push(conjunct);
         }
@@ -83,7 +96,7 @@ pub fn push_into_scans(op: &mut LogicalOperator) {
         && barred.is_empty()
         && can_move_ignoring_errors(only, &scan)
     {
-        filters.push(expressions.pop().expect("one filter"));
+        filters.push(column_first(expressions.pop().expect("one filter")));
     }
     // `PushdownBarrierFilters`: into the scan, after the filters there, only if no other filter stays on top
     for conjunct in barred {

@@ -1040,9 +1040,20 @@ impl StatisticsPropagator {
             return unknown();
         }
         let can_be_null = left_stats.can_be_null || right_stats.can_be_null;
-        if !left_stats.can_be_valid || !right_stats.can_be_valid {
+        // a side that is only NULL makes NULL; one without any value (a column of an empty table)
+        // prunes a filter (`FILTER_ALWAYS_FALSE`), but a projection keeps the comparison
+        let only_null = |stats: &Stats| stats.can_be_null && !stats.can_be_valid;
+        let empty = |stats: &Stats| !stats.can_be_null && !stats.can_be_valid;
+        if only_null(&left_stats) || only_null(&right_stats) {
             let alias = expr.alias.clone();
             *expr = BoundExpr::constant(Value::null(LogicalType::BOOLEAN)).with_alias(alias);
+            return unknown();
+        }
+        if empty(&left_stats) || empty(&right_stats) {
+            if in_filter {
+                let alias = expr.alias.clone();
+                *expr = BoundExpr::constant(Value::boolean(false)).with_alias(alias);
+            }
             return unknown();
         }
         if let Some(answer) = decide(op, &left_stats, &right_stats) {
@@ -1214,6 +1225,26 @@ impl StatisticsPropagator {
             unreachable!()
         };
         let mut stats: Vec<Stats> = children.iter_mut().map(|c| self.expression(c, false)).collect();
+        // `isnan` of a float whose largest value is a number: NaN sorts above every number
+        if function.name == "isnan"
+            && let [child] = stats.as_slice()
+            && !child.can_be_null
+            && child.max.as_ref().is_some_and(|max| match max.data() {
+                duckrs_common::value::ValueData::Float(f) => !f.is_nan(),
+                duckrs_common::value::ValueData::Double(d) => !d.is_nan(),
+                _ => false,
+            })
+            && !children[0].is_volatile()
+        {
+            let alias = expr.alias.clone();
+            *expr = BoundExpr::constant(Value::boolean(false)).with_alias(alias);
+            return Stats {
+                min: Some(Value::boolean(false)),
+                max: Some(Value::boolean(false)),
+                can_be_null: false,
+                ..unknown()
+            };
+        }
         // `PropagateLeastGreatestStats`: one of the inputs; only those that are never NULL anchor the far side
         if matches!(function.name.as_str(), "least" | "greatest")
             && !children.is_empty()

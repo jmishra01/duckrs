@@ -210,7 +210,7 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
         }
         K::Filter { expressions } => {
             let key = if physical { "Expression" } else { "Expressions" };
-            entry(key, lines(expressions.iter().map(|e| e.to_string())))
+            entry(key, lines(expressions.iter().map(filter_text)))
         }
         K::Projection { expressions, .. } => {
             let key = if physical { "Projections" } else { "Expressions" };

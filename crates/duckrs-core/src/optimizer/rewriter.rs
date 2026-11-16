@@ -97,7 +97,9 @@ fn apply_rules(expr: &mut BoundExpr, in_filter: bool) -> bool {
         || distributivity(expr)
         || arithmetic_simplification(expr)
         || constant_order_normalization(expr)
+        || regex_optimization(expr)
         || like_optimizations(expr)
+        || instr_prefix(expr)
         || empty_needle_removal(expr)
         || least_greatest_simplification(expr)
         || not_constant_or_null_simplification(expr)
@@ -105,6 +107,7 @@ fn apply_rules(expr: &mut BoundExpr, in_filter: bool) -> bool {
         || case_simplification(expr)
         || conjunction_simplification(expr, in_filter)
         || comparison_simplification(expr)
+        || cast_comparison_simplification(expr)
         || not_comparison_simplification(expr)
         || not_conjunction_simplification(expr)
         || join_dependent_filter(expr, in_filter)
@@ -472,6 +475,173 @@ fn comparison_simplification(expr: &mut BoundExpr) -> bool {
     true
 }
 
+/// The smallest and largest value of an integer type.
+fn integral_range(ty: &LogicalType) -> Option<(i128, i128)> {
+    use LogicalTypeId::*;
+    Some(match ty.id() {
+        TinyInt => (i128::from(i8::MIN), i128::from(i8::MAX)),
+        SmallInt => (i128::from(i16::MIN), i128::from(i16::MAX)),
+        Integer => (i128::from(i32::MIN), i128::from(i32::MAX)),
+        BigInt => (i128::from(i64::MIN), i128::from(i64::MAX)),
+        HugeInt => (i128::MIN, i128::MAX),
+        UTinyInt => (0, i128::from(u8::MAX)),
+        USmallInt => (0, i128::from(u16::MAX)),
+        UInteger => (0, i128::from(u32::MAX)),
+        UBigInt => (0, i128::from(u64::MAX)),
+        _ => return None,
+    })
+}
+
+/// The digits before the point that a numeric type holds all of, and its scale.
+fn decimal_digits(ty: &LogicalType) -> Option<(i32, i32)> {
+    use LogicalTypeId::*;
+    let (width, scale) = match ty.id() {
+        Decimal => {
+            let (width, scale) = ty.decimal_properties()?;
+            (i32::from(width), i32::from(scale))
+        }
+        TinyInt | UTinyInt => (3, 0),
+        SmallInt | USmallInt => (5, 0),
+        Integer | UInteger => (10, 0),
+        BigInt | UBigInt => (20, 0),
+        HugeInt | UHugeInt => (39, 0),
+        _ => return None,
+    };
+    Some((width - scale, scale))
+}
+
+/// `BoundCastExpression::CastIsInvertible`, for the types comparisons of casts meet.
+fn cast_is_invertible(source: &LogicalType, target: &LogicalType) -> bool {
+    use LogicalTypeId::*;
+    let ids = (source.id(), target.id());
+    if [ids.0, ids.1].iter().any(|id| matches!(id, Boolean | Float | Double | Variant | Enum)) {
+        return false;
+    }
+    if source.id() == Decimal || target.id() == Decimal {
+        let (Some((source_digits, source_scale)), Some((target_digits, target_scale))) =
+            (decimal_digits(source), decimal_digits(target))
+        else {
+            return false;
+        };
+        let unsigned = matches!(target.id(), UTinyInt | USmallInt | UInteger | UBigInt | UHugeInt);
+        if target_scale < source_scale || unsigned {
+            return false;
+        }
+        // an integer type does not hold all numbers of its width
+        let target_digits = if target.id() == Decimal { target_digits } else { target_digits - 1 };
+        let source_digits = if matches!(source.id(), HugeInt | UHugeInt) { source_digits + 1 } else { source_digits };
+        return source_digits <= target_digits;
+    }
+    match ids {
+        (Date, Timestamp | TimestampTz) => true,
+        (TimestampSec | TimestampMs | Timestamp, Timestamp | TimestampNs) => true,
+        _ => match (integral_range(source), integral_range(target)) {
+            (Some((source_min, source_max)), Some((target_min, target_max))) => {
+                target_min <= source_min && source_max <= target_max
+            }
+            _ => false,
+        },
+    }
+}
+
+/// `IsLosslessIntegralToFloatingCast`.
+fn lossless_integral_to_floating(source: &LogicalType, target: &LogicalType) -> bool {
+    use LogicalTypeId::*;
+    match target.id() {
+        Double => matches!(source.id(), TinyInt | SmallInt | Integer | UTinyInt | USmallInt | UInteger),
+        Float => matches!(source.id(), TinyInt | SmallInt | UTinyInt | USmallInt),
+        _ => false,
+    }
+}
+
+/// `ComparisonSimplificationRule` for a cast compared to a constant: `CAST(x AS BIGINT) = 1` is
+/// `x = 1`, with the constant cast to the type of `x` instead, when the cast loses nothing and the
+/// constant survives the way back. A DATE compared to a TIMESTAMP that is not midnight compares
+/// to one of the days around it.
+fn cast_comparison_simplification(expr: &mut BoundExpr) -> bool {
+    let BoundExprKind::Comparison { op, left, right } = &mut expr.kind else {
+        return false;
+    };
+    let cast_left = matches!(right.kind, BoundExprKind::Constant(_));
+    let (cast, constant) = if cast_left { (&mut *left, &mut *right) } else { (&mut *right, &mut *left) };
+    let (BoundExprKind::Cast { child, try_cast: false }, BoundExprKind::Constant(value)) = (&cast.kind, &constant.kind)
+    else {
+        return false;
+    };
+    if value.is_null() {
+        return false;
+    }
+    let (source, target) = (child.return_type.clone(), cast.return_type.clone());
+    if !cast_is_invertible(&source, &target) && !lossless_integral_to_floating(&source, &target) {
+        return false;
+    }
+    let Some(new_value) = try_evaluate_scalar(&BoundExpr::constant(value.clone()).cast_to(&source, false)) else {
+        return false;
+    };
+    let round_trip = || try_evaluate_scalar(&BoundExpr::constant(new_value.clone()).cast_to(&target, false));
+    let invertible = cast_is_invertible(&target, &source)
+        || (target.is_integral() && source.is_integral())
+        || ((lossless_integral_to_floating(&source, &target) || (target.id() == LogicalTypeId::Decimal
+            && source.id() == LogicalTypeId::Decimal))
+            && round_trip().as_ref() == Some(value));
+    let mut new_value = new_value.clone();
+    if !invertible {
+        if source.id() != LogicalTypeId::Date || target.id() != LogicalTypeId::Timestamp {
+            return false;
+        }
+        // `DateTimestampComparisonIsInvertible`
+        let ValueData::Int64(micros) = value.data() else {
+            return false;
+        };
+        // infinite timestamps have no date and time to split into
+        if *micros == i64::MAX || *micros <= -i64::MAX {
+            return false;
+        }
+        const DAY: i64 = 86_400_000_000;
+        if micros.rem_euclid(DAY) != 0 {
+            let column = (**child).clone();
+            let replacement = match op {
+                // a TIMESTAMP that is not midnight is no DATE
+                ComparisonOp::Equal | ComparisonOp::NotEqual => crate::function::constant_or_null(vec![
+                    BoundExpr::constant(Value::boolean(*op == ComparisonOp::NotEqual)),
+                    column,
+                ]),
+                ComparisonOp::DistinctFrom => BoundExpr::constant(Value::boolean(true)),
+                ComparisonOp::NotDistinctFrom => BoundExpr::constant(Value::boolean(false)),
+                _ => {
+                    // `d < T` and `d >= T` need the next day; the column on the right turns that around
+                    let next_day = match op {
+                        ComparisonOp::LessThan | ComparisonOp::GreaterThanOrEqual => cast_left,
+                        _ => !cast_left,
+                    };
+                    if next_day {
+                        let ValueData::Int32(days) = new_value.data() else {
+                            return false;
+                        };
+                        let Some(next) = days.checked_add(1) else {
+                            return false;
+                        };
+                        new_value = match Value::new(source.clone(), ValueData::Int32(next)) {
+                            Ok(value) => value,
+                            Err(_) => return false,
+                        };
+                    }
+                    let child = (**child).clone();
+                    **cast = child;
+                    **constant = BoundExpr::constant(new_value);
+                    return true;
+                }
+            };
+            *expr = replacement;
+            return true;
+        }
+    }
+    let child = (**child).clone();
+    **cast = child;
+    **constant = BoundExpr::constant(new_value);
+    true
+}
+
 /// `NotComparisonSimplificationRule`.
 fn not_comparison_simplification(expr: &mut BoundExpr) -> bool {
     let BoundExprKind::Operator {
@@ -499,11 +669,36 @@ fn not_conjunction_simplification(expr: &mut BoundExpr) -> bool {
     else {
         return false;
     };
-    if !matches!(children[0].kind, BoundExprKind::Conjunction { .. })
+    if !matches!(children[0].kind, BoundExprKind::Conjunction { .. } | BoundExprKind::Between { .. })
         || children[0].is_volatile()
         || can_throw(&children[0])
     {
         return false;
+    }
+    // C++ binds BETWEEN as `input >= lower AND input <= upper`
+    if let BoundExprKind::Between { input, lower, upper } = &children[0].kind {
+        let compare = |op, left: &BoundExpr, right: &BoundExpr| {
+            BoundExpr::new(
+                BoundExprKind::Comparison {
+                    op,
+                    left: Box::new(left.clone()),
+                    right: Box::new(right.clone()),
+                },
+                LogicalType::BOOLEAN,
+            )
+        };
+        let either = vec![
+            compare(ComparisonOp::LessThan, input, lower),
+            compare(ComparisonOp::GreaterThan, input, upper),
+        ];
+        *expr = BoundExpr::new(
+            BoundExprKind::Conjunction {
+                and: false,
+                children: either,
+            },
+            LogicalType::BOOLEAN,
+        );
+        return true;
     }
     let BoundExprKind::Conjunction { and, children: inner } = children.remove(0).kind else {
         return false;
@@ -765,11 +960,13 @@ fn move_constants(expr: &mut BoundExpr) -> bool {
     let BoundExprKind::Comparison { op, left, right } = &mut expr.kind else {
         return false;
     };
-    let (constant, arithmetic) = if matches!(left.kind, BoundExprKind::Constant(_)) {
-        (left, right)
-    } else {
-        (right, left)
-    };
+    let left_is_constant = matches!(left.kind, BoundExprKind::Constant(_));
+    let (constant, arithmetic) = if left_is_constant { (left, right) } else { (right, left) };
+    let negation_left = !left_is_constant;
+    if let Some(moved) = move_unary_minus(*op, constant, arithmetic, negation_left) {
+        *expr = moved;
+        return true;
+    }
     let Some(outer) = integer_constant(constant) else {
         return false;
     };
@@ -851,6 +1048,276 @@ fn move_constants(expr: &mut BoundExpr) -> bool {
     if flip {
         *op = super::statistics::flip(*op);
     }
+    true
+}
+
+/// `MoveUnaryMinusRule` for floating point and DECIMAL values: `-x = -2.5` is `x = 2.5`. NaN is
+/// larger than every number, also negated, so an ordered comparison of floats gets a guard:
+/// `-x < -2.5` is `x > 2.5 AND NOT isnan(x)`, and `-x > 2.5` is `x < -2.5 OR isnan(x)`. Integers
+/// are left to `move_constants`.
+fn move_unary_minus(
+    op: ComparisonOp,
+    constant: &BoundExpr,
+    negation: &BoundExpr,
+    negation_left: bool,
+) -> Option<BoundExpr> {
+    let BoundExprKind::Constant(value) = &constant.kind else {
+        return None;
+    };
+    let BoundExprKind::Function {
+        function,
+        children,
+        is_operator: true,
+    } = &negation.kind
+    else {
+        return None;
+    };
+    let [input] = children.as_slice() else {
+        return None;
+    };
+    let ty = &constant.return_type;
+    let floating = matches!(ty.id(), LogicalTypeId::Float | LogicalTypeId::Double);
+    if function.name != "-" || (!floating && ty.id() != LogicalTypeId::Decimal) || negation.return_type != *ty {
+        return None;
+    }
+    if value.is_null() {
+        return None;
+    }
+    let ordered = !matches!(
+        op,
+        ComparisonOp::Equal | ComparisonOp::NotEqual | ComparisonOp::DistinctFrom | ComparisonOp::NotDistinctFrom
+    );
+    if floating && ordered {
+        let number = match value.data() {
+            ValueData::Float(f) => f64::from(*f),
+            ValueData::Double(d) => *d,
+            _ => return None,
+        };
+        // `CanDuplicateForNaNGuard`: the guard reads the input again
+        if number.is_nan() || input.is_volatile() || can_throw(input) {
+            return None;
+        }
+    }
+    let negate = BoundExpr::new(
+        BoundExprKind::Function {
+            function: function.clone(),
+            children: vec![constant.clone()],
+            is_operator: true,
+        },
+        ty.clone(),
+    );
+    let negated = BoundExpr::constant(try_evaluate_scalar(&negate)?);
+    // both sides change sign, so the comparison turns around; each keeps its side
+    let (left, right) = if negation_left { (input.clone(), negated) } else { (negated, input.clone()) };
+    let comparison = BoundExpr::new(
+        BoundExprKind::Comparison {
+            op: super::statistics::flip(op),
+            left: Box::new(left),
+            right: Box::new(right),
+        },
+        LogicalType::BOOLEAN,
+    );
+    // the comparison as the negation sees it: `c > -x` is `-x < c`
+    let op = if negation_left { op } else { super::statistics::flip(op) };
+    if !(floating && ordered) {
+        return Some(comparison);
+    }
+    let isnan = crate::function::binder::bind_scalar_function(
+        crate::function::BuiltinFunctions::get().scalar("isnan")?,
+        vec![input.clone()],
+        false,
+        &try_evaluate_scalar,
+    )
+    .ok()?;
+    // `NaNGuardIsDisjunctive`: `-x > c` holds for NaN, `x < -c` does not
+    let disjunctive = matches!(op, ComparisonOp::GreaterThan | ComparisonOp::GreaterThanOrEqual);
+    let guard = if disjunctive {
+        isnan
+    } else {
+        BoundExpr::new(
+            BoundExprKind::Operator {
+                op: BoundOperator::Not,
+                children: vec![isnan],
+            },
+            LogicalType::BOOLEAN,
+        )
+    };
+    Some(BoundExpr::new(
+        BoundExprKind::Conjunction {
+            and: !disjunctive,
+            children: vec![comparison, guard],
+        },
+        LogicalType::BOOLEAN,
+    ))
+}
+
+/// A part of a regular expression that a LIKE pattern can say (RE2's `Regexp` ops).
+#[derive(PartialEq)]
+enum RegexPart {
+    Literal(String),
+    AnyChar,
+    AnyString,
+    BeginText,
+    EndText,
+}
+
+/// The parts of `pattern`, if it consists only of what LIKE can say. With `dot_nl` a `.` matches a
+/// newline too, which `_` does; otherwise a `.` cannot be said.
+fn regex_parts(pattern: &str, dot_nl: bool) -> Option<Vec<RegexPart>> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut parts: Vec<RegexPart> = Vec::new();
+    let mut literal = |parts: &mut Vec<RegexPart>, c: char| match parts.last_mut() {
+        Some(RegexPart::Literal(text)) => text.push(c),
+        _ => parts.push(RegexPart::Literal(c.to_string())),
+    };
+    let mut at = 0;
+    while at < chars.len() {
+        let c = chars[at];
+        let quantified = matches!(chars.get(at + 1), Some('*' | '+' | '?' | '{'));
+        match c {
+            '^' if at == 0 => parts.push(RegexPart::BeginText),
+            '$' if at + 1 == chars.len() => parts.push(RegexPart::EndText),
+            '.' if !dot_nl => return None,
+            '.' if chars.get(at + 1) == Some(&'*') => {
+                parts.push(RegexPart::AnyString);
+                at += 1;
+            }
+            '.' if quantified => return None,
+            '.' => parts.push(RegexPart::AnyChar),
+            '\\' => {
+                let next = *chars.get(at + 1)?;
+                if next.is_alphanumeric() || matches!(chars.get(at + 2), Some('*' | '+' | '?' | '{')) {
+                    return None;
+                }
+                literal(&mut parts, next);
+                at += 1;
+            }
+            '[' | ']' | '(' | ')' | '{' | '}' | '|' | '*' | '+' | '?' | '^' | '$' => return None,
+            _ if quantified || c.is_control() => return None,
+            _ => literal(&mut parts, c),
+        }
+        at += 1;
+    }
+    Some(parts)
+}
+
+/// `RegexOptimizationRule`: `regexp_matches(s, 'aa')` is `contains(s, 'aa')`, and a pattern of
+/// literals, `.`, `.*` and anchors is a LIKE pattern (which `like_optimizations` may simplify
+/// further): with the `s` option `regexp_matches(s, '^a.*b$', 's')` is `s LIKE 'a%b'`.
+fn regex_optimization(expr: &mut BoundExpr) -> bool {
+    let BoundExprKind::Function { function, children, .. } = &expr.kind else {
+        return false;
+    };
+    if function.name != "regexp_matches" || !(2..=3).contains(&children.len()) {
+        return false;
+    }
+    if children[..2].iter().any(|c| c.return_type.collation().is_some_and(|c| !c.is_empty())) {
+        return false;
+    }
+    let string = |e: &BoundExpr| match &e.kind {
+        BoundExprKind::Constant(value) if !value.is_null() => value.try_to_string().ok(),
+        _ => None,
+    };
+    let Some(pattern) = string(&children[1]) else {
+        return false;
+    };
+    // the options: `s` lets `.` match a newline, `m`, `n` and `p` keep it from that; case
+    // insensitivity cannot be said
+    let mut dot_nl = false;
+    if let Some(options) = children.get(2) {
+        let Some(options) = string(options) else {
+            return false;
+        };
+        for option in options.chars() {
+            match option {
+                's' => dot_nl = true,
+                'm' | 'n' | 'p' => dot_nl = false,
+                'c' | 'g' => {}
+                _ => return false,
+            }
+        }
+    }
+    let Some(parts) = regex_parts(&pattern, dot_nl) else {
+        return false;
+    };
+    let input = children[0].clone();
+    let bind = |name: &str, needle: String| {
+        let set = crate::function::BuiltinFunctions::get().scalar(name)?;
+        let arguments = vec![input.clone(), BoundExpr::constant(Value::varchar(needle))];
+        crate::function::binder::bind_scalar_function(set, arguments, false, &try_evaluate_scalar).ok()
+    };
+    // a single literal is a substring
+    if let [RegexPart::Literal(text)] = parts.as_slice() {
+        let needle = BoundExpr::constant(Value::varchar(text.clone()));
+        *expr = crate::function::string_needle_call("contains", input, needle);
+        return true;
+    }
+    if parts.is_empty() {
+        return false;
+    }
+    // `LikeMatchFromRegex`
+    let mut like = String::new();
+    let last = parts.len() - 1;
+    for (at, part) in parts.iter().enumerate() {
+        match part {
+            RegexPart::AnyChar => {
+                if at == 0 {
+                    like.push('%');
+                }
+                like.push('_');
+                if at == last {
+                    like.push('%');
+                }
+            }
+            RegexPart::AnyString => like.push('%'),
+            RegexPart::Literal(text) => {
+                // LIKE has no way to escape these here
+                if text.contains(['%', '_']) {
+                    return false;
+                }
+                if at == 0 {
+                    like.push('%');
+                }
+                like.push_str(text);
+                if at == last {
+                    like.push('%');
+                }
+            }
+            RegexPart::BeginText | RegexPart::EndText => {}
+        }
+    }
+    let Some(matcher) = bind("~~", like) else {
+        return false;
+    };
+    *expr = matcher;
+    true
+}
+
+/// `instr(s, 'ab') = 1` is `prefix(s, 'ab')`, for a needle that is not NULL.
+fn instr_prefix(expr: &mut BoundExpr) -> bool {
+    let BoundExprKind::Comparison {
+        op: ComparisonOp::Equal,
+        left,
+        right,
+    } = &expr.kind
+    else {
+        return false;
+    };
+    let (call, one) = if matches!(right.kind, BoundExprKind::Constant(_)) { (left, right) } else { (right, left) };
+    if integer_constant(one) != Some(1) {
+        return false;
+    }
+    let BoundExprKind::Function { function, children, .. } = &call.kind else {
+        return false;
+    };
+    let [haystack, needle] = children.as_slice() else {
+        return false;
+    };
+    let is_string = |e: &BoundExpr| matches!(&e.kind, BoundExprKind::Constant(v) if !v.is_null() && v.logical_type() == &LogicalType::VARCHAR);
+    if function.name != "instr" || !is_string(needle) {
+        return false;
+    }
+    *expr = crate::function::string_needle_call("prefix", haystack.clone(), needle.clone());
     true
 }
 

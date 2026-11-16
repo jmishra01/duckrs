@@ -476,7 +476,14 @@ impl fmt::Display for BoundExpr {
     /// `Expression::ToString`, as far as error messages need it.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
-            BoundExprKind::Constant(value) if value.is_null() => f.write_str("NULL"),
+            // `Value::ToSQLString`: a NULL with its type, unless it has none
+            BoundExprKind::Constant(value) if value.is_null() => {
+                if value.logical_type().id() == duckrs_common::types::LogicalTypeId::SqlNull {
+                    f.write_str("NULL")
+                } else {
+                    write!(f, "NULL::{}", value.logical_type())
+                }
+            }
             BoundExprKind::Constant(value) => {
                 use duckrs_common::types::LogicalTypeId as T;
                 let text = value.try_to_string().unwrap_or_default();
@@ -525,7 +532,14 @@ impl fmt::Display for BoundExpr {
                 [child] if *is_operator => write!(f, "{}{child}", function.name),
                 _ => {
                     let args: Vec<String> = children.iter().map(|c| c.to_string()).collect();
-                    write!(f, "{}({})", function.name, args.join(", "))
+                    // `KeywordHelper::WriteOptionallyQuoted`: a name that is no identifier is quoted
+                    let plain = function.name.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+                        && function.name.chars().all(|c| c.is_alphanumeric() || c == '_');
+                    if plain {
+                        write!(f, "{}({})", function.name, args.join(", "))
+                    } else {
+                        write!(f, "\"{}\"({})", function.name.replace('"', "\"\""), args.join(", "))
+                    }
                 }
             },
             BoundExprKind::Conjunction { and, children } => {
