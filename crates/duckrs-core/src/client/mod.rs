@@ -1175,6 +1175,10 @@ impl ClientContext {
 
     fn bind_options(&self) -> BindOptions {
         BindOptions {
+            local_file_system_disabled: self
+                .setting_text("disabled_filesystems")
+                .split(',')
+                .any(|f| f == "LocalFileSystem"),
             parser: self.parser_options(),
             transaction_id: self
                 .transaction

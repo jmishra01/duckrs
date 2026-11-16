@@ -2206,7 +2206,22 @@ impl Binder<'_> {
                             Value::null(tags.clone()),
                             Value::boolean(index.unique),
                             Value::boolean(false),
-                            text(&format!("[{}]", index.names.join(", "))),
+                            // `CreateIndexInfo::ExpressionsToList`: what is no bare column is in
+                            // parentheses; the list is written as a LIST of VARCHAR is
+                            {
+                                let items = index
+                                    .names
+                                    .iter()
+                                    .map(|name| {
+                                        if table.columns.iter().any(|c| c.name.eq_ignore_ascii_case(name)) {
+                                            Value::varchar(name.clone())
+                                        } else {
+                                            Value::varchar(format!("({name})"))
+                                        }
+                                    })
+                                    .collect();
+                                text(&Value::list(LogicalType::VARCHAR, items)?.try_to_string()?)
+                            },
                             text(&index.sql),
                         ]);
                     }

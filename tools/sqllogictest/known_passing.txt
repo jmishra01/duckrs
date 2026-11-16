@@ -3313,7 +3313,9 @@ test/sql/setops/union_shared_scan.test
 test/sql/setops/union_single_dedup.test
 test/sql/setops/value_union.test
 test/sql/settings/allowed_directories.test
+test/sql/settings/allowed_directories_atomic_update.test
 test/sql/settings/allowed_paths.test
+test/sql/settings/concurrent_set_disabled_optimizers.test
 test/sql/settings/connection_local_settings.test
 test/sql/settings/debug_deprecated_settings.test
 test/sql/settings/default_null_order_extended.test
@@ -3332,6 +3334,7 @@ test/sql/settings/setting_null_order.test
 test/sql/settings/setting_order.test
 test/sql/settings/setting_profiling_mode.test
 test/sql/settings/setting_threads.test
+test/sql/settings/test_disabled_file_systems_whitespace.test
 test/sql/settings/test_nan_percentage_settings.test
 test/sql/settings/test_progress_bar_null.test
 test/sql/settings/test_progress_bar_time_negative.test
@@ -3970,6 +3973,7 @@ test/sql/table_function/duckdb_constraints_issue11284.test
 test/sql/table_function/duckdb_constraints_issue12863.test
 test/sql/table_function/duckdb_dialects.test
 test/sql/table_function/duckdb_functions_window.test
+test/sql/table_function/duckdb_indexes.test
 test/sql/table_function/duckdb_keywords.test
 test/sql/table_function/duckdb_optimizers.test
 test/sql/table_function/duckdb_schemas.test

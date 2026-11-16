@@ -772,9 +772,25 @@ fn default_value(setting: &SettingDefinition) -> Option<Value> {
     if setting.name == "standard_vector_size" {
         return Some(Value::ubigint(duckrs_common::STANDARD_VECTOR_SIZE as u64));
     }
-    // `CustomUserAgentSetting::GetSetting`: the empty string of `DBConfigOptions`
-    if setting.name == "custom_user_agent" {
-        return Some(Value::varchar(""));
+    // the `GetSetting` of the settings with their own implementation: what `DBConfigOptions` and
+    // `ClientConfig` start with
+    match setting.name {
+        "custom_user_agent"
+        | "disabled_compression_methods"
+        | "disabled_filesystems"
+        | "disabled_optimizers"
+        | "http_proxy"
+        | "profiling_output" => return Some(Value::varchar("")),
+        "allowed_configs" | "allowed_directories" | "allowed_paths" | "extension_directories" => {
+            return Value::list(LogicalType::VARCHAR, Vec::new()).ok();
+        }
+        "enable_progress_bar" => return Some(Value::boolean(false)),
+        "enable_progress_bar_print" | "allow_persistent_secrets" => return Some(Value::boolean(true)),
+        "progress_bar_time" => return Some(Value::bigint(2000)),
+        "profiling_coverage" => return Some(Value::varchar("SELECT")),
+        "default_secret_storage" => return Some(Value::varchar("local_file")),
+        "checkpoint_threshold" => return Some(Value::varchar("16.0 MiB")),
+        _ => {}
     }
     let text = setting.default_value?;
     let ty = input_type(setting).ok()?;
@@ -906,6 +922,10 @@ pub fn reset_variable(
     if setting.name == "temp_directory" {
         check_temp_directory_change(global, session)?;
     }
+    // `DisabledFileSystemsSetting::ResetGlobal`: nothing disabled, which a disabled one refuses
+    if setting.name == "disabled_filesystems" {
+        disabled_file_systems("", global, session)?;
+    }
     if resolve_scope_of(setting, scope, true)? {
         global.0.remove(&index);
     } else {
@@ -989,6 +1009,35 @@ fn check_temp_directory_change(global: &SettingValues, session: &SettingValues) 
     ))
 }
 
+/// `FileSystemRegistry::SetDisabledFileSystems`: the file systems named, without blanks, sorted.
+/// One that is disabled stays so.
+fn disabled_file_systems(text: &str, global: &SettingValues, session: &SettingValues) -> Result<String> {
+    let mut names: Vec<String> = Vec::new();
+    for name in text.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+        if names.iter().any(|n| n == name) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("Duplicate disabled file system \"{name}\""),
+            ));
+        }
+        names.push(name.to_string());
+    }
+    let before = current_value("disabled_filesystems", global, session)
+        .filter(|v| !v.is_null())
+        .and_then(|v| v.try_to_string().ok())
+        .unwrap_or_default();
+    for disabled in before.split(',').filter(|n| !n.is_empty()) {
+        if !names.iter().any(|n| n == disabled) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("File system \"{disabled}\" has been disabled previously, it cannot be re-enabled"),
+            ));
+        }
+    }
+    names.sort();
+    Ok(names.join(","))
+}
+
 /// `EnableExternalAccessSetting::OnSet`, `AllowedDirectoriesSetting::SetGlobal` and
 /// `AllowedPathsSetting::SetGlobal`: the paths are kept as `SanitizeAllowedPath` makes them.
 fn file_access_on_set(name: &str, value: Value, global: &SettingValues, session: &SettingValues) -> Result<Value> {
@@ -1005,6 +1054,10 @@ fn file_access_on_set(name: &str, value: Value, global: &SettingValues, session:
         "temp_directory" => {
             check_temp_directory_change(global, session)?;
             Ok(value)
+        }
+        "disabled_filesystems" => {
+            let text = if value.is_null() { String::new() } else { value.try_to_string()? };
+            Ok(Value::varchar(disabled_file_systems(&text, global, session)?))
         }
         "allowed_directories" | "allowed_paths" => {
             check_external_access_enabled(name, global, session)?;

@@ -667,6 +667,8 @@ impl std::fmt::Debug for SessionValues {
 /// The settings that change how statements bind.
 #[derive(Debug, Clone)]
 pub struct BindOptions {
+    /// `disabled_filesystems` has `LocalFileSystem`
+    pub local_file_system_disabled: bool,
     /// how SQL that binding parses (`query()`) is parsed
     pub parser: duckrs_parser::ParserOptions,
     /// `txid_current`
@@ -706,6 +708,7 @@ pub enum ShowBehavior {
 impl Default for BindOptions {
     fn default() -> Self {
         Self {
+            local_file_system_disabled: false,
             parser: duckrs_parser::ParserOptions::default(),
             transaction_id: 0,
             default_order: OrderType::Ascending,
@@ -910,6 +913,13 @@ impl<'a> Binder<'a> {
     /// `OpenerFileSystem::VerifyCanAccessFile`: with `enable_external_access` off, only the
     /// allowed paths and directories can be read or written.
     pub(crate) fn check_file_access(&self, path: &str) -> Result<()> {
+        // `VirtualFileSystem::FindFileSystem`: a local path needs the LocalFileSystem
+        if self.options.local_file_system_disabled && !path.contains("://") {
+            return Err(Error::new(
+                ErrorKind::Permission,
+                "File system LocalFileSystem has been disabled by configuration",
+            ));
+        }
         match &self.options.file_access {
             Some(access) => access.check(path, false),
             None => Ok(()),
