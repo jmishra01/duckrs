@@ -120,11 +120,13 @@ fn visit(op: &mut LogicalOperator, by_position: bool, used: &mut HashSet<ColumnB
         | K::SecureView { .. } => by_position,
         _ => true,
     };
-    // these copy the rows of their children, in contrast to operators that pass vectors on
-    let copies = matches!(
-        op.kind,
-        K::Join { .. } | K::DelimJoin { .. } | K::MarkJoin { .. } | K::CrossProduct | K::Order { .. } | K::TopN { .. }
-    );
+    // `ColumnLifetimeAnalyzer`: the operators with projection maps, which copy the rows of their children:
+    // joins with an equality (hash joins) and ORDER BY
+    let copies = match &op.kind {
+        K::Join { conditions, .. } | K::MarkJoin { conditions, .. } => !conditions.is_empty(),
+        K::DelimJoin { .. } | K::Order { .. } => true,
+        _ => false,
+    };
     for child in &mut op.children {
         let read: Vec<ColumnBinding> = child
             .column_bindings()
@@ -138,14 +140,14 @@ fn visit(op: &mut LogicalOperator, by_position: bool, used: &mut HashSet<ColumnB
     }
 }
 
-fn drop_unread_columns(op: &mut LogicalOperator, mut keep: Vec<ColumnBinding>) {
+fn drop_unread_columns(op: &mut LogicalOperator, keep: Vec<ColumnBinding>) {
     let columns = op.column_bindings();
     if keep.len() == columns.len() || columns.is_empty() {
         return;
     }
-    // a chunk without columns would have no rows
+    // `GenerateProjectionMap`: with none of them read, the map is empty, which keeps them all
     if keep.is_empty() {
-        keep.push(columns[0]);
+        return;
     }
     let child = std::mem::replace(op, LogicalOperator::new(K::CrossProduct, Vec::new()));
     *op = LogicalOperator::new(K::ColumnSelect { keep }, vec![child]);

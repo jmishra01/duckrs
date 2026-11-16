@@ -525,6 +525,7 @@ test/optimizer/joins/delim_left_join_pushdown.test
 test/optimizer/joins/filter_on_subquery_with_aggregate.test
 test/optimizer/joins/filter_projection_map_reconstruction.test
 test/optimizer/joins/fkpk_composite_key_ce.test
+test/optimizer/joins/greedy_input_join_order.test
 test/optimizer/joins/issues/internal_6248.test
 test/optimizer/joins/join_bug.test
 test/optimizer/joins/join_filter_build_side.test
@@ -1961,6 +1962,7 @@ test/sql/cte/recursive_array_slice.test
 test/sql/cte/recursive_cte_batch_index.test
 test/sql/cte/recursive_cte_column_pruning.test
 test/sql/cte/recursive_cte_complex_pipelines.test
+test/sql/cte/recursive_cte_correlated_bindings.test
 test/sql/cte/recursive_cte_error.test
 test/sql/cte/recursive_cte_event_schedule_reset.test
 test/sql/cte/recursive_cte_invariant_build.test
@@ -2025,6 +2027,7 @@ test/sql/execution/physical_verify_vector.test
 test/sql/execution/positional_scan_nested.test
 test/sql/explain/explain_execute.test
 test/sql/explain/order_by_topn_explain_fqn.test
+test/sql/explain/test_explain_table_scan.test
 test/sql/export/empty_export.test
 test/sql/export/export_compression_level.test
 test/sql/export/export_csv_empty_strings.test

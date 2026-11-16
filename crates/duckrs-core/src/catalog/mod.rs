@@ -325,6 +325,8 @@ pub struct TableLog {
 #[derive(Debug)]
 pub struct TableCatalogEntry {
     pub schema: String,
+    /// the name of the catalog (database) of its schema
+    pub catalog: String,
     pub name: String,
     /// The columns that are stored.
     pub columns: Vec<ColumnDefinition>,
@@ -636,6 +638,15 @@ impl ReferencedTable {
 }
 
 impl TableCatalogEntry {
+    /// `GetQualifiedName(...).ToString()`: the catalog, the schema and the name; a temporary table
+    /// is in the schema `main` of the catalog `temp`.
+    pub fn qualified_name(&self) -> String {
+        if self.schema == TEMP_SCHEMA {
+            return format!("{TEMP_SCHEMA}.main.{}", self.name);
+        }
+        format!("{}.{}.{}", self.catalog, self.schema, self.name)
+    }
+
     pub fn new(
         schema: String,
         name: String,
@@ -645,6 +656,7 @@ impl TableCatalogEntry {
     ) -> Self {
         Self {
             schema,
+            catalog: DEFAULT_CATALOG.to_string(),
             name,
             columns,
             generated: Vec::new(),
@@ -1255,6 +1267,8 @@ impl TableOrView {
 #[derive(Debug)]
 pub struct SchemaCatalogEntry {
     pub name: String,
+    /// the name of the catalog (database) the schema is in
+    pub catalog: String,
     /// The schemas from the outermost down to this one (`GetSchemaPath`): only the name for a
     /// top-level schema
     pub path: Vec<String>,
@@ -1311,12 +1325,13 @@ impl SchemaCatalogEntry {
 
     /// The schema at `path`, nested in the one before it if there is one.
     fn at_path(path: Vec<String>) -> Self {
-        Self::at_path_in(path, Arc::new(std::sync::atomic::AtomicUsize::new(ROW_GROUP_ROWS)))
+        Self::at_path_in(path, Arc::new(std::sync::atomic::AtomicUsize::new(ROW_GROUP_ROWS)), TEMP_SCHEMA)
     }
 
-    fn at_path_in(path: Vec<String>, row_group_rows: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+    fn at_path_in(path: Vec<String>, row_group_rows: Arc<std::sync::atomic::AtomicUsize>, catalog: &str) -> Self {
         Self {
             row_group_rows,
+            catalog: catalog.to_string(),
             name: path.last().cloned().unwrap_or_default(),
             path,
             tables: RwLock::new(BTreeMap::new()),
@@ -1349,7 +1364,7 @@ impl SchemaCatalogEntry {
 
     /// An empty schema at the same place.
     pub(crate) fn empty_like(&self) -> Self {
-        Self::at_path_in(self.path.clone(), self.row_group_rows.clone())
+        Self::at_path_in(self.path.clone(), self.row_group_rows.clone(), &self.catalog)
     }
 
     /// `DuckSchemaEntry::CreateType`.
@@ -1630,6 +1645,7 @@ impl SchemaCatalogEntry {
             constraints,
         );
         table.generated = generated;
+        table.catalog = self.catalog.clone();
         table.row_group_rows.store(
             self.row_group_rows.load(std::sync::atomic::Ordering::Relaxed),
             std::sync::atomic::Ordering::Relaxed,
@@ -2363,7 +2379,8 @@ impl Catalog {
             row_group_rows: Arc::new(std::sync::atomic::AtomicUsize::new(ROW_GROUP_ROWS)),
         };
         for name in [DEFAULT_SCHEMA, TEMP_SCHEMA] {
-            let schema = SchemaCatalogEntry::at_path_in(vec![name.to_string()], catalog.row_group_rows.clone());
+            let schema =
+                SchemaCatalogEntry::at_path_in(vec![name.to_string()], catalog.row_group_rows.clone(), &catalog.name);
             catalog.schemas.write().insert(key(name), Arc::new(schema));
         }
         catalog
@@ -2415,6 +2432,7 @@ impl Catalog {
             Arc::new(SchemaCatalogEntry::at_path_in(
                 path.to_vec(),
                 self.row_group_rows.clone(),
+                &self.name,
             )),
         );
         Ok(())

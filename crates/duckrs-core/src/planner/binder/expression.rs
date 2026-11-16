@@ -723,6 +723,18 @@ impl Binder<'_> {
     }
 
     /// `Binder::BindCorrelatedColumns`: a column of a query around this one.
+    /// Where the fields of a struct start in `names`: after a column of this query, or else of a
+    /// query around it (`ExpressionBinder::BindQualifiedColumnName` on the outer binders).
+    fn struct_field_start(&self, names: &[String]) -> Option<usize> {
+        if let Some(start) = self.bind_context.struct_field_start(names) {
+            return Some(start);
+        }
+        if self.bind_context.bind_column_ref(names).is_ok() {
+            return None;
+        }
+        self.outer_contexts.iter().rev().find_map(|context| context.struct_field_start(names))
+    }
+
     fn bind_outer_column(&mut self, names: &[String]) -> Option<BoundExpr> {
         for context in self.outer_contexts.iter().rev() {
             let Ok((binding, ty, name)) = context.bind_column_ref(names) else {
@@ -1532,11 +1544,8 @@ impl Binder<'_> {
             ExprKind::ColumnRef(names) if self.table_function_argument => {
                 BoundExpr::constant(Value::varchar(names.join(".")))
             }
-            ExprKind::ColumnRef(names) if self.bind_context.struct_field_start(names).is_some() => {
-                let start = self
-                    .bind_context
-                    .struct_field_start(names)
-                    .expect("checked by the guard");
+            ExprKind::ColumnRef(names) if self.struct_field_start(names).is_some() => {
+                let start = self.struct_field_start(names).expect("checked by the guard");
                 let column = ast::Expr::from(ExprKind::ColumnRef(names[..start].to_vec()));
                 let mut bound = self.bind_expression(&column)?;
                 for field in &names[start..] {

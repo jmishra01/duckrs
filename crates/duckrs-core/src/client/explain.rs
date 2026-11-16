@@ -196,7 +196,7 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             projection,
             ..
         } => {
-            let mut info = entry("Table", table.name.clone());
+            let mut info = entry("Table", table.qualified_name());
             info.extend(entry("Type", "Sequential Scan".to_string()));
             let name = |&column: &usize| {
                 let name = table.columns.get(column).map(|c| c.name.as_str());
