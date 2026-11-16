@@ -22,7 +22,7 @@ use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, Column
 use crate::planner::logical::{COLUMN_IDENTIFIER_ROW_ID, JoinCondition, LogicalOperator, LogicalOperatorKind as K};
 use duckrs_common::value::Value;
 use duckrs_parser::ast::{ComparisonOp, JoinType};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// `approximate_join_order_threshold`: from here on the order is picked greedily.
@@ -44,6 +44,9 @@ const UNKNOWN_CARDINALITY: f64 = 1000.0;
 struct RelationStats {
     cardinality: f64,
     distinct: HashMap<ColumnBinding, f64>,
+    /// `total_domain`: the distinct values of the columns of the tables, which filters leave as
+    /// they are (the join order optimizer's domains)
+    total: HashMap<ColumnBinding, f64>,
 }
 
 impl RelationStats {
@@ -271,37 +274,126 @@ fn composite_denominator(domains: &[f64], left_rows: f64, right_rows: f64) -> Op
     (applies && cap > 0.0 && cap <= largest * MAX_CARDINALITY_TO_DISTINCT_RATIO).then_some(cap)
 }
 
-/// `CardinalityEstimator`, for one tree.
+/// A predicate of the tree as `CardinalityEstimator` sees it: an edge between the relations its
+/// sides read (`FilterInfoWithTotalDomains`).
+#[derive(Debug, Clone)]
+struct Edge {
+    /// the relations it reads
+    set: u64,
+    /// the relations of its two sides
+    left: u64,
+    right: u64,
+    /// the equivalence class of an equality of two columns
+    class: Option<usize>,
+    /// the comparison it makes, `None` for something else
+    op: Option<ComparisonOp>,
+    /// for an equality of a column of each of two relations: those two (`GetEqualityJoinPair`)
+    pair: Option<u64>,
+}
+
+impl Edge {
+    fn is_equality(&self) -> bool {
+        self.class.is_some()
+    }
+}
+
+/// `RelationsSetToStats`: a domain and the edges over it.
+#[derive(Debug)]
+struct DomainGroup {
+    /// `GetDistinctCount`
+    distinct: f64,
+    /// whether that count comes from statistics, not from row counts
+    reliable: bool,
+    edges: Vec<Edge>,
+}
+
+impl DomainGroup {
+    /// `IsSelectivityOnlyGroup`: only comparisons other than equalities.
+    fn selectivity_only(&self) -> bool {
+        !self.edges.is_empty() && self.edges.iter().all(|e| !e.is_equality() && e.op.is_some_and(|op| !matches!(op, ComparisonOp::Equal | ComparisonOp::NotDistinctFrom)))
+    }
+}
+
+/// `CompositeJoinPairStats`.
+#[derive(Debug, Default, Clone, Copy)]
+struct PairStats {
+    first_distinct: f64,
+    max_distinct: f64,
+    has_distinct: bool,
+}
+
+impl PairStats {
+    fn register(&mut self, distinct: f64) {
+        if !self.has_distinct {
+            self.first_distinct = distinct;
+            self.has_distinct = true;
+        }
+        self.max_distinct = self.max_distinct.max(distinct);
+    }
+
+    fn can_apply_cap(&self, cap: f64) -> bool {
+        self.has_distinct && self.max_distinct > 0.0 && cap <= self.max_distinct * MAX_CARDINALITY_TO_DISTINCT_RATIO
+    }
+}
+
+#[derive(PartialEq)]
+enum EdgeKind {
+    InnerEquivalence,
+    NonEquality,
+    RedundantTransitive,
+    Other,
+}
+
+/// `SelectivityState`.
+#[derive(Default)]
+struct SelectivityState {
+    subgraphs: Vec<(u64, f64)>,
+    applied_classes: HashSet<usize>,
+    pair_stats: Vec<(u64, PairStats)>,
+    capped: HashSet<u64>,
+    unused_domains: HashSet<u64>,
+}
+
+/// `CardinalityEstimator`, for one tree: the product of the relations' rows times the selectivity
+/// of the predicates among them.
 struct Estimator {
     cardinalities: Vec<f64>,
-    /// per equivalence class: the relations in it and its total domain
-    classes: Vec<(u64, f64)>,
-    /// per pair of relations joined on several keys: the two, and the classes of those keys
-    composites: Vec<(u64, Vec<usize>)>,
-    /// per predicate outside of the classes: its relations and what it divides the size by
-    denominators: Vec<(u64, f64)>,
+    /// sorted as `SortTdoms` sorts them
+    groups: Vec<DomainGroup>,
+    /// the relations of the predicates that are not comparisons of two sides
+    residuals: Vec<u64>,
+    /// pairs of relations with equalities in several classes (`HasDirectCompositeEquality`)
+    composites: HashSet<u64>,
     estimates: HashMap<u64, f64>,
 }
 
 impl Estimator {
     fn new(relations: &[RelationStats], predicates: &[Predicate], relation_of: &HashMap<ColumnBinding, usize>) -> Self {
-        let distinct_of = |binding: &ColumnBinding| {
+        // a column's distinct values, and whether statistics say so rather than the row count
+        let distinct_of = |binding: &ColumnBinding| -> Option<(f64, bool)> {
             relation_of.get(binding).map(|&relation| {
                 let stats = &relations[relation];
-                stats
-                    .distinct
-                    .get(binding)
-                    .copied()
-                    .unwrap_or(stats.cardinality)
-                    .max(1.0)
+                match stats.total.get(binding) {
+                    Some(&distinct) => (distinct.max(1.0), true),
+                    None => (stats.cardinality.max(1.0), false),
+                }
             })
         };
-        let domain_of = |expr: &BoundExpr| {
+        // `SelectTotalDomain`: the largest reliable count, else the smallest fallback
+        let select = |domains: &[(f64, bool)]| -> (f64, bool) {
+            let reliable = domains.iter().filter(|d| d.1).map(|d| d.0).reduce(f64::max);
+            match reliable {
+                Some(distinct) => (distinct, true),
+                None => (domains.iter().map(|d| d.0).reduce(f64::min).unwrap_or(f64::MAX), false),
+            }
+        };
+        let domain_of_expr = |expr: &BoundExpr| -> Vec<(f64, bool)> {
             let mut columns = Vec::new();
             expression_columns(expr, &mut columns);
-            columns.iter().filter_map(distinct_of).reduce(f64::max)
+            columns.iter().filter_map(distinct_of).collect()
         };
-        // the columns that equalities make equal, as a disjoint set
+        let relation_bit = |binding: &ColumnBinding| relation_of.get(binding).map(|&r| 1u64 << r);
+        // equivalence classes of columns
         let mut parents: HashMap<ColumnBinding, ColumnBinding> = HashMap::new();
         fn find(parents: &mut HashMap<ColumnBinding, ColumnBinding>, binding: ColumnBinding) -> ColumnBinding {
             let parent = *parents.entry(binding).or_insert(binding);
@@ -312,109 +404,330 @@ impl Estimator {
             parents.insert(binding, root);
             root
         }
-        let mut denominators = Vec::new();
-        for predicate in predicates {
-            if predicate.set.count_ones() < 2 {
-                continue;
-            }
+        let equality_columns = |predicate: &Predicate| -> Option<(ColumnBinding, ColumnBinding)> {
             if let BoundExprKind::Comparison { op, left, right } = &predicate.expr.kind
                 && matches!(op, ComparisonOp::Equal | ComparisonOp::NotDistinctFrom)
                 && let (Some(l), Some(r)) = (bare_column(left), bare_column(right))
                 && relation_of.contains_key(&l)
                 && relation_of.contains_key(&r)
+                && relation_of[&l] != relation_of[&r]
             {
+                return Some((l, r));
+            }
+            None
+        };
+        for predicate in predicates {
+            if let Some((l, r)) = equality_columns(predicate) {
                 let (l, r) = (find(&mut parents, l), find(&mut parents, r));
                 parents.insert(l, r);
+            }
+        }
+        let mut roots: Vec<ColumnBinding> = parents
+            .keys()
+            .copied()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|b| find(&mut parents, b))
+            .collect();
+        roots.sort_by_key(|b| (b.table_index, b.column_index));
+        roots.dedup();
+        let class_of_root: HashMap<ColumnBinding, usize> = roots.iter().enumerate().map(|(i, r)| (*r, i)).collect();
+        let mut class_groups: Vec<DomainGroup> = roots
+            .iter()
+            .map(|root| {
+                let columns: Vec<ColumnBinding> =
+                    parents.keys().copied().filter(|b| find(&mut parents.clone(), *b) == *root).collect();
+                let domains: Vec<(f64, bool)> = columns.iter().filter_map(distinct_of).collect();
+                let (distinct, reliable) = select(&domains);
+                DomainGroup {
+                    distinct,
+                    reliable,
+                    edges: Vec::new(),
+                }
+            })
+            .collect();
+        let mut other_groups = Vec::new();
+        let mut residuals = Vec::new();
+        let mut pair_classes: HashMap<u64, HashSet<usize>> = HashMap::new();
+        for predicate in predicates {
+            if predicate.set.count_ones() < 2 {
                 continue;
             }
-            denominators.push((predicate.set, predicate_denominator(&predicate.expr, &domain_of)));
-        }
-        let mut classes: HashMap<ColumnBinding, (u64, f64)> = HashMap::new();
-        for binding in parents.keys().copied().collect::<Vec<_>>() {
-            let root = find(&mut parents, binding);
-            let class = classes.entry(root).or_insert((0, 1.0));
-            class.0 |= 1 << relation_of[&binding];
-            class.1 = class.1.max(distinct_of(&binding).unwrap_or(1.0));
-        }
-        let mut classes: Vec<_> = classes.into_iter().collect();
-        classes.sort_by_key(|(root, _)| (root.table_index, root.column_index));
-        // `HasDirectCompositeEquality`: pairs of relations with equalities in several classes
-        let mut pairs: HashMap<u64, Vec<usize>> = HashMap::new();
-        for predicate in predicates {
-            if let BoundExprKind::Comparison {
-                op: ComparisonOp::Equal | ComparisonOp::NotDistinctFrom,
-                left,
-                ..
-            } = &predicate.expr.kind
-                && let Some(column) = bare_column(left)
-                && predicate.set.count_ones() == 2
-                && relation_of.contains_key(&column)
-                && parents.contains_key(&column)
-            {
-                let root = find(&mut parents, column);
-                let class = classes
-                    .iter()
-                    .position(|(r, _)| *r == root)
-                    .expect("every root has a class");
-                let keys = pairs.entry(predicate.set).or_default();
-                if !keys.contains(&class) {
-                    keys.push(class);
+            if let Some((l, r)) = equality_columns(predicate) {
+                let class = class_of_root[&find(&mut parents, l)];
+                let (left, right) = (relation_bit(&l).expect("known"), relation_bit(&r).expect("known"));
+                let op = match &predicate.expr.kind {
+                    BoundExprKind::Comparison { op, .. } => *op,
+                    _ => unreachable!("an equality"),
+                };
+                pair_classes.entry(left | right).or_default().insert(class);
+                class_groups[class].edges.push(Edge {
+                    set: predicate.set,
+                    left,
+                    right,
+                    class: Some(class),
+                    op: Some(op),
+                    pair: Some(left | right),
+                });
+                continue;
+            }
+            // a comparison of two sides is an edge over its own domain; anything else is residual
+            match (&predicate.expr.kind, predicate.sides) {
+                (BoundExprKind::Comparison { op, left, right }, Some((left_set, right_set))) => {
+                    let mut domains = domain_of_expr(left);
+                    domains.extend(domain_of_expr(right));
+                    let (distinct, reliable) = select(&domains);
+                    other_groups.push(DomainGroup {
+                        distinct,
+                        reliable,
+                        edges: vec![Edge {
+                            set: predicate.set,
+                            left: left_set,
+                            right: right_set,
+                            class: None,
+                            op: Some(*op),
+                            pair: None,
+                        }],
+                    });
                 }
+                _ => residuals.push(predicate.set),
             }
         }
-        let mut composites: Vec<_> = pairs.into_iter().filter(|(_, keys)| keys.len() >= 2).collect();
-        composites.sort_unstable();
+        let mut groups: Vec<DomainGroup> = class_groups.into_iter().filter(|g| !g.edges.is_empty()).collect();
+        groups.extend(other_groups);
+        // `SortTdoms`: comparisons last, then by their domains, largest first
+        groups.sort_by(|a, b| {
+            a.selectivity_only()
+                .cmp(&b.selectivity_only())
+                .then(b.distinct.partial_cmp(&a.distinct).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        let composites = pair_classes.into_iter().filter(|(_, c)| c.len() >= 2).map(|(pair, _)| pair).collect();
         Self {
             cardinalities: relations.iter().map(|r| r.cardinality).collect(),
-            classes: classes.into_iter().map(|(_, class)| class).collect(),
+            groups,
+            residuals,
             composites,
-            denominators,
             estimates: HashMap::new(),
         }
     }
 
-    /// `EstimateCardinalityWithSet`: the product of the relations over what the predicates remove.
+    /// `GetNumerator`: an empty relation counts as one row here.
+    fn numerator(&self, set: u64) -> f64 {
+        (0..self.cardinalities.len())
+            .filter(|r| set & (1 << r) != 0)
+            .map(|r| if self.cardinalities[r] == 0.0 { 1.0 } else { self.cardinalities[r] })
+            .product()
+    }
+
+    /// `EstimateCardinality` of a set of relations joined by inner joins.
     fn estimate(&mut self, set: u64) -> f64 {
         if let Some(&estimate) = self.estimates.get(&set) {
             return estimate;
         }
-        let mut numerator = 1.0;
-        for (relation, cardinality) in self.cardinalities.iter().enumerate() {
-            if set & (1 << relation) != 0 {
-                numerator *= cardinality;
-            }
-        }
-        let mut denominator = 1.0;
-        for &(relations, domain) in &self.classes {
-            let joined = (relations & set).count_ones();
-            if joined > 1 {
-                denominator *= domain.powi(joined as i32 - 1);
-            }
-        }
-        for &(relations, by) in &self.denominators {
-            if relations & !set == 0 {
-                denominator *= by;
-            }
-        }
-        // the key of a pair counts once, and its class only for one pair
-        let mut used = vec![false; self.classes.len()];
-        for (pair, keys) in &self.composites {
-            if pair & !set != 0 || keys.iter().any(|&key| used[key]) {
-                continue;
-            }
-            let rows: Vec<f64> = (0..self.cardinalities.len())
-                .filter(|relation| pair & (1 << relation) != 0)
-                .map(|relation| self.cardinalities[relation])
-                .collect();
-            let domains: Vec<f64> = keys.iter().map(|&key| self.classes[key].1).collect();
-            if let Some(cap) = composite_denominator(&domains, rows[0], rows[1]) {
-                denominator = denominator / domains.iter().product::<f64>() * cap;
-                keys.iter().for_each(|&key| used[key] = true);
-            }
-        }
-        let estimate = numerator / denominator;
+        let empty = (0..self.cardinalities.len()).any(|r| set & (1 << r) != 0 && self.cardinalities[r] == 0.0);
+        let estimate = if empty { 0.0 } else { self.numerator(set) * self.inner_selectivity(set) };
         self.estimates.insert(set, estimate);
         estimate
+    }
+
+    /// `GetInnerSelectivity`: that of the edges, and the default one of each residual predicate.
+    fn inner_selectivity(&self, set: u64) -> f64 {
+        let residuals = self.residuals.iter().filter(|r| *r & !set == 0).count();
+        self.selectivity(set) * DEFAULT_SELECTIVITY.powi(residuals as i32)
+    }
+
+    /// `GetSelectivity`.
+    fn selectivity(&self, set: u64) -> f64 {
+        let mut state = SelectivityState::default();
+        for group in &self.groups {
+            for edge in &group.edges {
+                if edge.set & !set != 0 || edge.left == edge.right {
+                    continue;
+                }
+                self.process_edge(edge, group, set, &mut state);
+            }
+        }
+        // `MergeDisconnectedSelectivitySubgraphs`
+        let selectivity = if state.subgraphs.is_empty() {
+            1.0
+        } else {
+            state.subgraphs.iter().map(|s| s.1).product()
+        };
+        selectivity / (1.0 + state.unused_domains.len() as f64)
+    }
+
+    fn classify(edge: &Edge, state: &SelectivityState) -> EdgeKind {
+        if edge.class.is_some_and(|c| state.applied_classes.contains(&c)) {
+            return EdgeKind::RedundantTransitive;
+        }
+        match edge.op {
+            Some(_) if edge.is_equality() => EdgeKind::InnerEquivalence,
+            Some(_) => EdgeKind::NonEquality,
+            None => EdgeKind::Other,
+        }
+    }
+
+    /// `ProcessSelectivityEdge`.
+    fn process_edge(&self, edge: &Edge, group: &DomainGroup, set: u64, state: &mut SelectivityState) {
+        let kind = Self::classify(edge, state);
+        if state.subgraphs.len() == 1 && state.subgraphs[0].0 == set {
+            let (relations, mut selectivity) = state.subgraphs[0];
+            self.apply_caps(&mut selectivity, relations, state);
+            state.subgraphs[0].1 = selectivity;
+            if kind == EdgeKind::RedundantTransitive {
+                return;
+            }
+            if kind == EdgeKind::InnerEquivalence && self.apply_increment(&mut selectivity, edge, relations, state) {
+                state.subgraphs[0].1 = selectivity;
+                return;
+            }
+            if group.reliable {
+                state.unused_domains.insert(group.distinct.to_bits());
+            }
+            return;
+        }
+        if let Some(class) = edge.class {
+            state.applied_classes.insert(class);
+        }
+        if let Some(pair) = edge.pair {
+            match state.pair_stats.iter_mut().find(|(p, _)| *p == pair) {
+                Some((_, stats)) => stats.register(group.distinct),
+                None => {
+                    let mut stats = PairStats::default();
+                    stats.register(group.distinct);
+                    state.pair_stats.push((pair, stats));
+                }
+            }
+        }
+        let connects = |subgraph: u64| subset(edge.left, subgraph) || subset(edge.right, subgraph);
+        let mut connections = Vec::new();
+        'outer: for outer in 0..state.subgraphs.len() {
+            for inner in outer + 1..state.subgraphs.len() {
+                if connects(state.subgraphs[outer].0) && connects(state.subgraphs[inner].0) {
+                    connections = vec![outer, inner];
+                    break 'outer;
+                }
+            }
+            if connects(state.subgraphs[outer].0) {
+                connections = vec![outer];
+                break;
+            }
+        }
+        match connections.as_slice() {
+            [] => {
+                let mut selectivity = Self::edge_selectivity(1.0, edge, group);
+                let relations = edge.left | edge.right;
+                self.apply_caps(&mut selectivity, relations, state);
+                state.subgraphs.push((relations, selectivity));
+            }
+            [index] => {
+                let (relations, mut selectivity) = state.subgraphs[*index];
+                if subset(edge.left, relations) && subset(edge.right, relations) {
+                    if kind == EdgeKind::InnerEquivalence {
+                        self.apply_increment(&mut selectivity, edge, relations, state);
+                    }
+                    self.apply_caps(&mut selectivity, relations, state);
+                    state.subgraphs[*index].1 = selectivity;
+                    return;
+                }
+                let other = if subset(edge.right, relations) { edge.left } else { edge.right };
+                let mut selectivity = Self::edge_selectivity(selectivity, edge, group);
+                let relations = relations | other;
+                self.apply_caps(&mut selectivity, relations, state);
+                state.subgraphs[*index] = (relations, selectivity);
+            }
+            [into, from] => {
+                let (into_relations, into_selectivity) = state.subgraphs[*into];
+                let (from_relations, from_selectivity) = state.subgraphs[*from];
+                let mut selectivity = Self::edge_selectivity(into_selectivity * from_selectivity, edge, group);
+                let relations = into_relations | from_relations;
+                self.apply_caps(&mut selectivity, relations, state);
+                state.subgraphs[*into] = (relations, selectivity);
+                state.subgraphs.remove(*from);
+            }
+            _ => unreachable!("at most two subgraphs"),
+        }
+    }
+
+    /// `CalculateInnerJoinSelectivity` / `ApplyComparisonRatio`.
+    fn edge_selectivity(base: f64, edge: &Edge, group: &DomainGroup) -> f64 {
+        let d = if group.distinct <= 0.0 { 1.0 } else { group.distinct };
+        match edge.op {
+            None | Some(ComparisonOp::Equal | ComparisonOp::NotDistinctFrom) => base / d,
+            Some(ComparisonOp::NotEqual | ComparisonOp::DistinctFrom) => {
+                if d > 1.0 {
+                    base * (d - 1.0) / d
+                } else {
+                    base
+                }
+            }
+            // strict comparisons keep half the cross product, also of small domains
+            Some(ComparisonOp::LessThan | ComparisonOp::GreaterThan) => base / 2.0,
+            Some(ComparisonOp::LessThanOrEqual | ComparisonOp::GreaterThanOrEqual) => base * (d + 1.0) / (2.0 * d),
+        }
+    }
+
+    /// `GetJoinPairCap`: the rows of the smaller of the two relations.
+    fn pair_cap(&self, pair: u64) -> f64 {
+        let mut cap = f64::MAX;
+        for relation in (0..self.cardinalities.len()).filter(|r| pair & (1 << r) != 0) {
+            let rows = if self.cardinalities[relation] == 0.0 { 1.0 } else { self.cardinalities[relation] };
+            if rows <= 0.0 {
+                return 0.0;
+            }
+            cap = cap.min(rows);
+        }
+        if cap == f64::MAX { 0.0 } else { cap }
+    }
+
+    /// `ApplyJoinPairCap`: a pair joined on several keys is an FK/PK join at most as large as its
+    /// larger side.
+    fn apply_pair_cap(&self, selectivity: &mut f64, pair: u64, state: &mut SelectivityState) -> bool {
+        if state.capped.contains(&pair) {
+            return false;
+        }
+        let cap = self.pair_cap(pair);
+        let Some((_, stats)) = state.pair_stats.iter_mut().find(|(p, _)| *p == pair) else {
+            return false;
+        };
+        if !stats.can_apply_cap(cap) {
+            return false;
+        }
+        let first = stats.first_distinct;
+        if cap <= 0.0 || first <= 0.0 || first > cap {
+            return false;
+        }
+        if first < cap {
+            *selectivity = *selectivity * first / cap;
+            stats.first_distinct = cap;
+        }
+        state.capped.insert(pair);
+        true
+    }
+
+    /// `ApplyCompositeJoinPairCaps`.
+    fn apply_caps(&self, selectivity: &mut f64, scope: u64, state: &mut SelectivityState) {
+        let pairs: Vec<u64> = state.pair_stats.iter().map(|(p, _)| *p).collect();
+        for pair in pairs {
+            if state.capped.contains(&pair) || !subset(pair, scope) || !self.composites.contains(&pair) {
+                continue;
+            }
+            self.apply_pair_cap(selectivity, pair, state);
+        }
+    }
+
+    /// `ApplyJoinIncrement`: a further equality of a pair already capped changes nothing.
+    fn apply_increment(&self, selectivity: &mut f64, edge: &Edge, scope: u64, state: &mut SelectivityState) -> bool {
+        let Some(pair) = edge.pair.filter(|_| edge.is_equality()) else {
+            return false;
+        };
+        if !subset(pair, scope) || !self.composites.contains(&pair) {
+            return false;
+        }
+        if state.capped.contains(&pair) {
+            return true;
+        }
+        self.apply_pair_cap(selectivity, pair, state)
     }
 }
 
@@ -731,9 +1044,10 @@ impl JoinOrderOptimizer {
                     return RelationStats {
                         cardinality: UNKNOWN_CARDINALITY,
                         distinct: HashMap::new(),
+                        total: HashMap::new(),
                     };
                 };
-                let distinct = column_ids
+                let distinct: HashMap<ColumnBinding, f64> = column_ids
                     .iter()
                     .enumerate()
                     .filter_map(|(at, &column)| {
@@ -747,6 +1061,7 @@ impl JoinOrderOptimizer {
                     .collect();
                 let stats = RelationStats {
                     cardinality: counts.rows as f64,
+                    total: distinct.clone(),
                     distinct,
                 };
                 let filters: Vec<BoundExpr> = filters
@@ -762,10 +1077,11 @@ impl JoinOrderOptimizer {
                     return RelationStats {
                         cardinality: UNKNOWN_CARDINALITY,
                         distinct: HashMap::new(),
+                        total: HashMap::new(),
                     };
                 };
                 // the range of an integral column's values bounds how many distinct ones it has
-                let distinct = crate::execution::parquet::scan_statistics(scan)
+                let distinct: HashMap<ColumnBinding, f64> = crate::execution::parquet::scan_statistics(scan)
                     .into_iter()
                     .enumerate()
                     .filter_map(|(column, stats)| {
@@ -783,6 +1099,7 @@ impl JoinOrderOptimizer {
                     .collect();
                 let stats = RelationStats {
                     cardinality: rows as f64,
+                    total: distinct.clone(),
                     distinct,
                 };
                 let cardinality = filter_cardinality(&scan.filters, &stats);
@@ -791,19 +1108,23 @@ impl JoinOrderOptimizer {
             K::Range { count, .. } => RelationStats {
                 cardinality: *count as f64,
                 distinct: HashMap::new(),
+                total: HashMap::new(),
             },
             K::EmptyResult { .. } => RelationStats::default(),
             K::DummyScan { .. } => RelationStats {
                 cardinality: 1.0,
                 distinct: HashMap::new(),
+                total: HashMap::new(),
             },
             K::ChunkGet { chunks, .. } => RelationStats {
                 cardinality: chunks.iter().map(|c| c.len()).sum::<usize>() as f64,
                 distinct: HashMap::new(),
+                total: HashMap::new(),
             },
             K::ExpressionGet { expressions, .. } => RelationStats {
                 cardinality: expressions.len() as f64,
                 distinct: HashMap::new(),
+                total: HashMap::new(),
             },
             K::DelimGet { delim, .. } => RelationStats {
                 cardinality: self
@@ -812,6 +1133,7 @@ impl JoinOrderOptimizer {
                     .copied()
                     .unwrap_or(UNKNOWN_CARDINALITY),
                 distinct: HashMap::new(),
+                total: HashMap::new(),
             },
             K::MaterializedCte { .. } => self.stats(&op.children[1]),
             // `ReadSingleCSVFileCardinality`: a file's bytes over 5 per column of a row, 42 rows where
@@ -826,20 +1148,24 @@ impl JoinOrderOptimizer {
                     })
                     .sum::<u64>() as f64,
                 distinct: HashMap::new(),
+                total: HashMap::new(),
             },
             K::CteRef { data, .. } => match self.ctes.get(&(Arc::as_ptr(data) as *const () as usize)) {
                 Some(stats) => RelationStats {
                     cardinality: stats.cardinality,
                     distinct: HashMap::new(),
+                    total: HashMap::new(),
                 },
                 None => RelationStats {
                     cardinality: UNKNOWN_CARDINALITY,
                     distinct: HashMap::new(),
+                    total: HashMap::new(),
                 },
             },
             K::WorkingTable { .. } | K::RecursiveCte { .. } => RelationStats {
                 cardinality: UNKNOWN_CARDINALITY,
                 distinct: HashMap::new(),
+                total: HashMap::new(),
             },
             K::Filter { expressions } => {
                 let child = self.stats(&op.children[0]);
@@ -851,17 +1177,20 @@ impl JoinOrderOptimizer {
                 expressions,
             } => {
                 let child = self.stats(&op.children[0]);
-                let distinct = expressions
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(at, expr)| {
-                        let source = child.distinct.get(&bare_column(expr)?)?;
-                        Some((ColumnBinding::new(*table_index, at), *source))
-                    })
-                    .collect();
+                let of = |map: &HashMap<ColumnBinding, f64>| -> HashMap<ColumnBinding, f64> {
+                    expressions
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(at, expr)| {
+                            let source = map.get(&bare_column(expr)?)?;
+                            Some((ColumnBinding::new(*table_index, at), *source))
+                        })
+                        .collect()
+                };
                 RelationStats {
                     cardinality: child.cardinality,
-                    distinct,
+                    distinct: of(&child.distinct),
+                    total: of(&child.total),
                 }
             }
             K::Aggregate {
@@ -872,9 +1201,11 @@ impl JoinOrderOptimizer {
                     return RelationStats {
                         cardinality: 1.0,
                         distinct: HashMap::new(),
+                        total: HashMap::new(),
                     };
                 }
                 let mut distinct = HashMap::new();
+                let mut total = HashMap::new();
                 let mut cardinality: f64 = 1.0;
                 for (at, group) in groups.iter().enumerate() {
                     let count = bare_column(group)
@@ -882,10 +1213,14 @@ impl JoinOrderOptimizer {
                         .unwrap_or(child.cardinality);
                     cardinality = cardinality.max(count);
                     distinct.insert(ColumnBinding::new(*group_index, at), count);
+                    if let Some(domain) = bare_column(group).and_then(|column| child.total.get(&column).copied()) {
+                        total.insert(ColumnBinding::new(*group_index, at), domain);
+                    }
                 }
                 RelationStats {
                     cardinality: cardinality.min(child.cardinality),
                     distinct,
+                    total,
                 }
             }
             K::TopN { limit, .. } => {
@@ -901,12 +1236,17 @@ impl JoinOrderOptimizer {
             K::Union { .. } => RelationStats {
                 cardinality: op.children.iter().map(|c| self.stats(c).cardinality).sum(),
                 distinct: HashMap::new(),
+                total: HashMap::new(),
             },
             K::CrossProduct => {
                 let (mut left, right) = (self.stats(&op.children[0]), self.stats(&op.children[1]));
                 left.cardinality *= right.cardinality;
                 left.distinct.extend(right.distinct);
-                left
+                left.total.extend(right.total);
+                match self.tree_cardinality(op) {
+                    Some(cardinality) => left.scaled(cardinality),
+                    None => left,
+                }
             }
             K::Join {
                 join_type,
@@ -924,6 +1264,7 @@ impl JoinOrderOptimizer {
                 }
                 let (left_rows, right_rows) = (left.cardinality, right.cardinality);
                 left.distinct.extend(right.distinct);
+                left.total.extend(right.total);
                 let domain_of = |expr: &BoundExpr| {
                     let mut columns = Vec::new();
                     expression_columns(expr, &mut columns);
@@ -949,7 +1290,8 @@ impl JoinOrderOptimizer {
                 }
                 let inner = left_rows * right_rows / denominator;
                 let cardinality = match join_type {
-                    JoinType::Inner => inner,
+                    // `EstimateCardinality` of all relations of the tree below
+                    JoinType::Inner => self.tree_cardinality(op).unwrap_or(inner),
                     JoinType::Left => inner.max(left_rows),
                     JoinType::Right => inner.max(right_rows),
                     _ => inner.max(left_rows).max(right_rows),
@@ -960,8 +1302,97 @@ impl JoinOrderOptimizer {
             _ => RelationStats {
                 cardinality: UNKNOWN_CARDINALITY,
                 distinct: HashMap::new(),
+                total: HashMap::new(),
             },
         }
+    }
+
+    /// The estimate of a tree of inner joins from all its relations and predicates, as the join
+    /// order optimizer has it for each set of relations (`EstimateCardinality`).
+    fn tree_cardinality(&self, op: &LogicalOperator) -> Option<f64> {
+        fn collect(op: &LogicalOperator, relations: &mut Vec<LogicalOperator>, conjuncts: &mut Vec<BoundExpr>) {
+            match &op.kind {
+                K::Join {
+                    conditions, predicate, ..
+                } if is_binary_tree(op) => {
+                    conjuncts.extend(conditions.iter().cloned().map(condition_expression));
+                    if let Some(predicate) = predicate {
+                        split_conjuncts(predicate.clone(), conjuncts);
+                    }
+                }
+                K::CrossProduct => {}
+                K::Filter { expressions } if is_tree(op) && is_binary_tree(&op.children[0]) => {
+                    for expr in expressions {
+                        split_conjuncts(expr.clone(), conjuncts);
+                    }
+                }
+                _ => {
+                    relations.push(op.clone());
+                    return;
+                }
+            }
+            for child in &op.children {
+                collect(child, relations, conjuncts);
+            }
+        }
+        if !is_binary_tree(op) {
+            return None;
+        }
+        let mut relations = Vec::new();
+        let mut conjuncts = Vec::new();
+        collect(op, &mut relations, &mut conjuncts);
+        if relations.len() < 2 || relations.len() > MAX_RELATIONS {
+            return None;
+        }
+        let mut relation_of = HashMap::new();
+        for (at, relation) in relations.iter().enumerate() {
+            for binding in relation.column_bindings() {
+                relation_of.insert(binding, at);
+            }
+        }
+        let set_of = |expr: &BoundExpr| -> Option<u64> {
+            let mut columns = Vec::new();
+            expression_columns(expr, &mut columns);
+            columns
+                .iter()
+                .try_fold(0u64, |set, c| Some(set | 1 << *relation_of.get(c)?))
+        };
+        let mut on_relation: Vec<Vec<BoundExpr>> = vec![Vec::new(); relations.len()];
+        let mut predicates = Vec::new();
+        for expr in conjuncts {
+            let set = set_of(&expr).unwrap_or(0);
+            if set == 0 {
+                continue;
+            } else if set.count_ones() == 1 {
+                on_relation[set.trailing_zeros() as usize].push(expr);
+            } else {
+                let sides = match &expr.kind {
+                    BoundExprKind::Comparison { left, right, .. } => set_of(left).zip(set_of(right)),
+                    _ => None,
+                };
+                let sides = sides.filter(|(l, r)| *l != 0 && *r != 0 && l & r == 0);
+                predicates.push(Predicate {
+                    expr,
+                    set,
+                    sides,
+                    class: None,
+                });
+            }
+        }
+        add_implied_equalities(&mut predicates, &relation_of);
+        let stats: Vec<RelationStats> = relations
+            .into_iter()
+            .zip(on_relation)
+            .map(|(relation, expressions)| {
+                if expressions.is_empty() {
+                    self.stats(&relation)
+                } else {
+                    self.stats(&LogicalOperator::new(K::Filter { expressions }, vec![relation]))
+                }
+            })
+            .collect();
+        let all = (1u64 << stats.len()) - 1;
+        Some(Estimator::new(&stats, &predicates, &relation_of).estimate(all))
     }
 
     /// Remembers the size of what `DelimGet`s of a `DelimJoin` read, once its left side is known.
@@ -1319,7 +1750,11 @@ fn estimate(op: &LogicalOperator, optimizer: &mut JoinOrderOptimizer) -> PlanEst
         }
     }
     PlanEstimate {
-        cardinality: optimizer.stats(op).cardinality.max(0.0).round() as u64,
+        // `CardinalityFromDouble`: truncated, and a row for what is not nothing
+        cardinality: {
+            let rows = optimizer.stats(op).cardinality.max(0.0);
+            if rows > 0.0 { rows.floor().max(1.0) as u64 } else { 0 }
+        },
         children,
     }
 }

@@ -199,10 +199,12 @@ pub fn table_column_distinct(table: &TableCatalogEntry, column: usize) -> Option
                     log.insert(hash_values[hash_data.sel.get(row)]);
                 }
             };
+            // `UpdateSample`: a chunk that is no full vector has its first rows of the sample's size
+            // counted, a full one the rows of the sample
             let wanted = sample_size(integral).min(count);
             if count != STANDARD_VECTOR_SIZE || wanted == count {
-                (0..count).for_each(&mut insert);
-                sample_count += count as u64;
+                (0..wanted).for_each(&mut insert);
+                sample_count += wanted as u64;
             } else {
                 samples(integral).iter().take(wanted).copied().for_each(&mut insert);
                 sample_count += wanted as u64;

@@ -524,6 +524,7 @@ test/optimizer/joins/delim_join_with_in_has_correct_results.test
 test/optimizer/joins/delim_left_join_pushdown.test
 test/optimizer/joins/filter_on_subquery_with_aggregate.test
 test/optimizer/joins/filter_projection_map_reconstruction.test
+test/optimizer/joins/fkpk_composite_key_ce.test
 test/optimizer/joins/issues/internal_6248.test
 test/optimizer/joins/join_bug.test
 test/optimizer/joins/join_filter_build_side.test
