@@ -1156,6 +1156,7 @@ test/sql/catalog/case_insensitive_alter.test
 test/sql/catalog/case_insensitive_binder.test
 test/sql/catalog/case_insensitive_caps.test
 test/sql/catalog/case_insensitive_cte.test
+test/sql/catalog/case_insensitive_operations.test
 test/sql/catalog/case_insensitive_using.test
 test/sql/catalog/comment_on.test
 test/sql/catalog/comment_on_column.test
@@ -1193,6 +1194,7 @@ test/sql/catalog/dependency/drop_recreate_schema_dependency.test
 test/sql/catalog/did_you_mean.test
 test/sql/catalog/did_you_mean_default_entries.test
 test/sql/catalog/drop_create_rollback.test
+test/sql/catalog/function/builtin_macro_parser_settings.test
 test/sql/catalog/function/information_schema_macro.test
 test/sql/catalog/function/macro_typed_parameter_rendering.test
 test/sql/catalog/function/python_style_macro_parameters.test
@@ -3067,6 +3069,7 @@ test/sql/parallelism/intraquery/test_transaction_local_parallelism.test
 test/sql/parallelism/intraquery/test_verify_parallelism.test
 test/sql/parallelism/modify_thread_settings.test
 test/sql/parser/adjacent_string_literal.test
+test/sql/parser/backtick_identifiers.test
 test/sql/parser/bare_column_alias.test
 test/sql/parser/bare_column_alias_keywords.test
 test/sql/parser/columns_aliases.test
@@ -3358,6 +3361,7 @@ test/sql/settings/setting_disabled_optimizer.test
 test/sql/settings/setting_exhaustive.test
 test/sql/settings/setting_null_order.test
 test/sql/settings/setting_order.test
+test/sql/settings/setting_preserve_identifier_case.test
 test/sql/settings/setting_profiling_mode.test
 test/sql/settings/setting_threads.test
 test/sql/settings/test_disabled_file_systems_whitespace.test

@@ -133,7 +133,18 @@ impl std::hash::Hasher for KeyHasher {
 
 type Memo = HashMap<(RuleId, usize), Option<(usize, Arc<ParseNode>)>, std::hash::BuildHasherDefault<KeyHasher>>;
 
+/// `IdentifierCaseMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IdentifierCase {
+    #[default]
+    Preserve,
+    Lower,
+    Upper,
+}
+
 pub struct Matcher<'a> {
+    /// `MatchState::FoldIdentifier`: what happens to an identifier that is not quoted
+    pub identifier_case: IdentifierCase,
     grammar: &'a Grammar,
     tokens: &'a [Token],
     memo: Memo,
@@ -165,6 +176,7 @@ impl<'a> Matcher<'a> {
     /// A matcher that uses at most `stack_budget` bytes of the current thread's stack.
     pub fn with_stack_budget(grammar: &'a Grammar, tokens: &'a [Token], stack_budget: usize) -> Self {
         Self {
+            identifier_case: IdentifierCase::Preserve,
             grammar,
             tokens,
             memo: Memo::default(),
@@ -295,11 +307,11 @@ impl<'a> Matcher<'a> {
                 if cats != 0 && cats & kind.mask() == 0 {
                     return None;
                 }
-                let text = identifier_text(&token.text, paths, true)?;
+                let text = self.fold(&token.text, identifier_text(&token.text, paths, true)?);
                 Some((self.advance(pos), leaf(TerminalValue::Identifier(text))))
             }
             Terminal::ReservedIdentifier { paths } => {
-                let text = identifier_text(&token.text, paths, false)?;
+                let text = self.fold(&token.text, identifier_text(&token.text, paths, false)?);
                 Some((self.advance(pos), leaf(TerminalValue::Identifier(text))))
             }
             Terminal::Number => {
@@ -338,6 +350,20 @@ impl<'a> Matcher<'a> {
                 }
                 Some((end, leaf(TerminalValue::String { value, prefix })))
             }
+        }
+    }
+}
+
+impl Matcher<'_> {
+    /// `FoldIdentifier` of an identifier written as `written`: quoted ones and paths stay as they are.
+    fn fold(&self, written: &str, text: String) -> String {
+        if written.starts_with(['"', '`', '\'']) {
+            return text;
+        }
+        match self.identifier_case {
+            IdentifierCase::Preserve => text,
+            IdentifierCase::Lower => text.to_lowercase(),
+            IdentifierCase::Upper => text.to_uppercase(),
         }
     }
 }

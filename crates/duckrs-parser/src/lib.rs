@@ -56,6 +56,8 @@ pub struct ParserOptions {
     pub integer_division: bool,
     /// `regex_match_operator_semantics = full`: `~` and friends match the whole string.
     pub regex_full_match: bool,
+    /// `preserve_identifier_case` (`IdentifierCaseMode`): how unquoted identifiers are folded.
+    pub identifier_case: matcher::IdentifierCase,
 }
 
 impl Default for ParserOptions {
@@ -64,6 +66,7 @@ impl Default for ParserOptions {
             max_expression_depth: transformer::DEFAULT_MAX_EXPRESSION_DEPTH,
             integer_division: false,
             regex_full_match: false,
+            identifier_case: matcher::IdentifierCase::Preserve,
         }
     }
 }
@@ -126,6 +129,7 @@ fn parse_statements(sql: &str, options: &ParserOptions) -> Result<ParsedStatemen
     let grammar = Grammar::duckdb();
     let statement = grammar.rule("Statement").expect("the grammar has a Statement rule");
     let mut matcher = Matcher::new(grammar, &tokens);
+    matcher.identifier_case = options.identifier_case;
     let mut statements = Vec::new();
     let mut starts = Vec::new();
     let mut pos = 0;

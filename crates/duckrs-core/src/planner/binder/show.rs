@@ -412,11 +412,32 @@ impl Binder<'_> {
                 .map(|(n, t)| plain_column_info(n, t))
                 .collect());
         }
-        let entry = self.catalog.get_entry(
+        let entry = match self.catalog.get_entry(
             super::schema_of(name)?.as_deref(),
             self.search_schema.as_deref(),
             &name.name,
-        )?;
+        ) {
+            Ok(entry) => entry,
+            // the views of the system catalog (`information_schema`, `pg_catalog`) bind as a reference does
+            Err(error) => {
+                let reference = TableRef::from(TableRefKind::BaseTable {
+                    name: name.clone(),
+                    at_clause: None,
+                });
+                let mut binder = self.child_binder();
+                if binder.bind_table_ref(&reference).is_err() {
+                    return Err(error);
+                }
+                self.next_table_index = binder.next_table_index;
+                let binding = &binder.bind_context.bindings[0];
+                return Ok(binding
+                    .names
+                    .iter()
+                    .zip(&binding.types)
+                    .map(|(n, t)| plain_column_info(n, t))
+                    .collect());
+            }
+        };
         Ok(match entry {
             TableOrView::Table(table) => table
                 .logical_columns()

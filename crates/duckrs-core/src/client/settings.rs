@@ -62,7 +62,6 @@ const UNHONORED: &[&str] = &[
     "errors_as_json",
     "legacy_disable_null_type",
     "binary_as_string",
-    "preserve_identifier_case",
     "schema",
     "search_path",
     "table_function_identifier_conversion",
@@ -551,6 +550,27 @@ fn on_set(setting: &SettingDefinition, value: Value) -> Result<Value> {
                         candidates_message(&top_n_strings(scores), "Candidates")
                     ),
                 ));
+            }
+        }
+        // `PreserveIdentifierCaseSetting::OnSet`: the 1.x boolean still works
+        "preserve_identifier_case" => {
+            if value.is_null() {
+                return invalid("preserve_identifier_case setting cannot be NULL".to_string());
+            }
+            let input = value.try_to_string()?;
+            if let Ok(boolean) = cast_value(&value, &LogicalType::BOOLEAN)
+                && let duckrs_common::value::ValueData::Bool(on) = boolean.data()
+            {
+                return Ok(Value::varchar(if *on { "preserve_case" } else { "lowercase" }));
+            }
+            match input.to_lowercase().as_str() {
+                "preserve_case" | "lowercase" | "uppercase" => return Ok(Value::varchar(input.to_lowercase())),
+                _ => {
+                    return invalid(format!(
+                        "Unrecognized parameter for option preserve_identifier_case \"{input}\", expected one of: \
+                         preserve_case, lowercase, uppercase"
+                    ));
+                }
             }
         }
         // `CurrentDialectSetting::OnLocalSet`: there are no dialect extensions
@@ -1331,9 +1351,9 @@ mod tests {
         );
         // a result-changing setting that is not implemented
         let err = set_variable(
-            "preserve_identifier_case",
+            "errors_as_json",
             SetScope::Automatic,
-            &Value::boolean(false),
+            &Value::boolean(true),
             &mut global,
             &mut session,
         )

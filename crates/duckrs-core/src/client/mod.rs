@@ -1230,6 +1230,11 @@ impl ClientContext {
         options.regex_full_match = self
             .setting_text("regex_match_operator_semantics")
             .eq_ignore_ascii_case("full");
+        options.identifier_case = match self.setting_text("preserve_identifier_case").to_lowercase().as_str() {
+            "lowercase" => duckrs_parser::matcher::IdentifierCase::Lower,
+            "uppercase" => duckrs_parser::matcher::IdentifierCase::Upper,
+            _ => duckrs_parser::matcher::IdentifierCase::Preserve,
+        };
         options
     }
 
