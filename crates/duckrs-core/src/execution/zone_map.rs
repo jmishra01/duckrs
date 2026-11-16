@@ -29,7 +29,7 @@ pub const STRING_STATISTICS_BYTES: usize = 12;
 /// Functions that do not give NULL for a NULL argument (`FunctionNullHandling::SPECIAL_HANDLING`): the one
 /// value of a group with NULLs says nothing of their result. Of the others, a NULL gives NULL, which
 /// a range leaves out.
-const SPECIAL_NULL_HANDLING: &[&str] = &[
+pub(crate) const SPECIAL_NULL_HANDLING: &[&str] = &[
     "hash",
     "coalesce",
     "concat",
@@ -52,6 +52,39 @@ const SPECIAL_NULL_HANDLING: &[&str] = &[
     "map_concat",
     "greatest",
     "least",
+    "list_position",
+    "list_indexof",
+    "array_position",
+    "array_indexof",
+    "list_contains",
+    "list_has",
+    "array_contains",
+    "array_has",
+    "list_filter",
+    "list_transform",
+    "list_zip",
+    "list_resize",
+    "list_intersect",
+    "array_slice",
+    "list_slice",
+    "map_entries",
+    "map_keys",
+    "map_values",
+    "map_contains",
+    "map_extract",
+    "struct_insert",
+    "struct_update",
+    "struct_contains",
+    "remap_struct",
+    "string_split",
+    "str_split",
+    "strftime",
+    "invoke",
+    "create_sort_key",
+    "stats",
+    "regexp_matches",
+    "regexp_replace",
+    "regexp_extract",
 ];
 
 /// The date part `part` of `value`, if it can be worked out.
@@ -134,6 +167,9 @@ const MONOTONE_ARGUMENTS: &[(&str, usize, bool)] = &[
 fn compute_zones(table: &TableCatalogEntry, column: usize, known: &[ColumnZone]) -> Vec<ColumnZone> {
     // intervals sort by their normalized form, as they compare
     let ty = &table.columns[column].ty;
+    if let Some(element) = nested_element_type(ty) {
+        return compute_nested_zones(table, column, &element);
+    }
     if !has_ordered_statistics(ty) && ty.id() != LogicalTypeId::Interval {
         return Vec::new();
     }
@@ -206,6 +242,104 @@ fn compute_zones(table: &TableCatalogEntry, column: usize, known: &[ColumnZone])
     // with what can't be read there is nothing to go by, which means reading every group
     if read.is_err() {
         return Vec::new();
+    }
+    zones
+}
+
+/// Whether `value` lies outside of the bounds of `elements` (no element at all counts as outside). Of
+/// strings and blobs only the 12 bytes C++ keeps of the bounds are compared.
+fn outside_elements(value: &Value, elements: &ColumnZone) -> bool {
+    let (Some(min), Some(max)) = (&elements.min, &elements.max) else {
+        return true;
+    };
+    let cut = |v: &Value| -> Value {
+        match v.data() {
+            duckrs_common::value::ValueData::Bytes(bytes) if bytes.len() > STRING_STATISTICS_BYTES => {
+                let mut cut = bytes[..STRING_STATISTICS_BYTES].to_vec();
+                // a truncated bound stands for all strings it is a prefix of
+                if std::ptr::eq(v, max) {
+                    cut.push(0xff);
+                }
+                Value::new(v.logical_type().clone(), duckrs_common::value::ValueData::Bytes(cut)).unwrap_or_else(|_| v.clone())
+            }
+            _ => v.clone(),
+        }
+    };
+    let (min, max) = (cut(min), cut(max));
+    compare_values(ComparisonOp::LessThan, value, &min) == Some(true)
+        || compare_values(ComparisonOp::GreaterThan, value, &max) == Some(true)
+}
+
+/// The type of what the zone of a nested column's `elements` describes: the elements of a LIST or
+/// ARRAY, the values of a MAP; `None` for other types, or elements without ordered statistics.
+fn nested_element_type(ty: &LogicalType) -> Option<LogicalType> {
+    let element = match ty.id() {
+        LogicalTypeId::List | LogicalTypeId::Array => ty.child_type()?.clone(),
+        LogicalTypeId::Map => ty.child_type()?.struct_children().get(1)?.1.clone(),
+        _ => return None,
+    };
+    (has_ordered_statistics(&element) || matches!(element.id(), LogicalTypeId::Blob | LogicalTypeId::Interval)).then_some(element)
+}
+
+/// The zones of a nested column: what is NULL, and the bounds of its elements.
+fn compute_nested_zones(table: &TableCatalogEntry, column: usize, element: &LogicalType) -> Vec<ColumnZone> {
+    let mut zones: Vec<ColumnZone> = Vec::new();
+    let map = table.columns[column].ty.id() == LogicalTypeId::Map;
+    let chunks_per_group = table.chunks_per_row_group();
+    let read = table.for_each_chunk(column, |index, vector, count| {
+        if index % chunks_per_group == 0 {
+            zones.push(ColumnZone {
+                // the elements of the group are known until one is not
+                elements: Some(Box::default()),
+                ..ColumnZone::default()
+            });
+        }
+        let zone = zones.last_mut().expect("just pushed one");
+        for row in 0..count {
+            let value = vector.get_value(row);
+            if value.is_null() {
+                zone.has_null = true;
+                continue;
+            }
+            let duckrs_common::value::ValueData::List(items) = value.data() else {
+                zone.elements = None;
+                continue;
+            };
+            let Some(elements) = zone.elements.as_mut() else {
+                continue;
+            };
+            for item in items {
+                let item = match (map, item.data()) {
+                    (true, duckrs_common::value::ValueData::Struct(fields)) if fields.len() == 2 => &fields[1],
+                    (true, _) => {
+                        zone.elements = None;
+                        break;
+                    }
+                    (false, _) => item,
+                };
+                if item.is_null() {
+                    elements.has_null = true;
+                    continue;
+                }
+                if item.logical_type() != element {
+                    zone.elements = None;
+                    break;
+                }
+                if elements.min.as_ref().is_none_or(|min| compare_values(ComparisonOp::LessThan, item, min) == Some(true)) {
+                    elements.min = Some(item.clone());
+                }
+                if elements.max.as_ref().is_none_or(|max| compare_values(ComparisonOp::GreaterThan, item, max) == Some(true)) {
+                    elements.max = Some(item.clone());
+                }
+            }
+        }
+    });
+    if read.is_err() {
+        return Vec::new();
+    }
+    // the bounds of the column itself are not known, only its elements' (where those could be told)
+    for zone in &mut zones {
+        zone.unknown = zone.elements.is_none();
     }
     zones
 }
@@ -298,6 +432,8 @@ impl Group<'_> {
     fn column_range(&self, index: usize) -> Range {
         match self.zone(index) {
             None => Range::Unknown,
+            // a nested column: only its elements have bounds
+            Some(ColumnZone { elements: Some(_), .. }) => Range::Unknown,
             Some(ColumnZone {
                 min: Some(min),
                 max: Some(max),
@@ -385,6 +521,38 @@ impl Group<'_> {
             };
             max >= min && max - min < values.len() as i128 && (min..=max).all(|v| values.contains(&v))
         })
+    }
+
+    /// The zone of the elements of a LIST or ARRAY column in the group, or of the values of a MAP
+    /// (also through `map_values`).
+    fn elements(&self, expr: &BoundExpr) -> Option<ColumnZone> {
+        match &expr.kind {
+            BoundExprKind::Reference(index) => self.zone(*index)?.elements.map(|zone| *zone),
+            BoundExprKind::Function { function, children, .. } if function.name == "map_values" && children.len() == 1 => {
+                self.elements(&children[0]).filter(|_| children[0].return_type.id() == LogicalTypeId::Map)
+            }
+            // `list_transform(l, x -> f(x))`: f of the elements' range, for a lambda that reads nothing else
+            BoundExprKind::ListLambda {
+                kind: crate::planner::expression::LambdaKind::Transform,
+                list,
+                captures,
+                body,
+                ..
+            } if captures.is_empty() => {
+                let inner = self.elements(list)?;
+                let zone = move |index: usize| (index == 0).then(|| inner.clone());
+                let range = Group { zone: &zone }.range(body);
+                match range {
+                    Range::Bounds(min, max) => Some(ColumnZone {
+                        min: Some(min),
+                        max: Some(max),
+                        ..ColumnZone::default()
+                    }),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     /// The fewest and most bytes of the strings of a column in the group, and whether any is unicode.
@@ -612,6 +780,40 @@ impl Group<'_> {
                 }
                 other => other,
             },
+            // an element of a LIST or ARRAY, or a value of a MAP, lies within what the group's elements are
+            ("array_extract" | "list_extract" | "list_element" | "map_extract_value", [input, _])
+                if self.elements(input).is_some()
+                    && (input.return_type.id() == LogicalTypeId::Map
+                        || expr.return_type == *input.return_type.child_type().expect("a nested type")) =>
+            {
+                let elements = self.elements(input).expect("checked");
+                match (elements.min, elements.max) {
+                    (Some(min), Some(max)) => Range::Bounds(min, max),
+                    _ => Range::Null,
+                }
+            }
+            // the position of a value outside of the bounds of the elements is NULL
+            ("list_position" | "list_indexof" | "array_position" | "array_indexof", [input, value])
+                if self.elements(input).is_some() && constant(value).is_some() =>
+            {
+                let elements = self.elements(input).expect("checked");
+                let value = constant(value).expect("checked");
+                let outside = outside_elements(&value, &elements);
+                if outside { Range::Null } else { Range::Unknown }
+            }
+            // a list holds no value outside of the bounds of its elements
+            ("list_contains" | "list_has" | "array_contains" | "array_has" | "contains", [input, value])
+                if self.elements(input).is_some() && constant(value).is_some() =>
+            {
+                let elements = self.elements(input).expect("checked");
+                let value = constant(value).expect("checked");
+                let outside = outside_elements(&value, &elements);
+                if outside {
+                    Range::Bounds(Value::boolean(false), Value::boolean(false))
+                } else {
+                    Range::Unknown
+                }
+            }
             // `isnan`: NaN sorts above every number, so the bounds tell
             ("isnan", [input]) => match self.range(input) {
                 Range::Bounds(min, max) => {
@@ -1007,7 +1209,11 @@ impl Group<'_> {
                 };
                 match (op, zone) {
                     (BoundOperator::IsNull, Some(zone)) => !zone.has_null,
-                    (BoundOperator::IsNotNull, Some(zone)) => zone.min.is_none(),
+                    (BoundOperator::IsNotNull, Some(zone)) => zone.min.is_none() && zone.elements.is_none(),
+                    // a function that is only NULL in the group
+                    (BoundOperator::IsNotNull, None) if children.len() == 1 => {
+                        matches!(children[0].kind, BoundExprKind::Function { .. }) && matches!(self.range(&children[0]), Range::Null)
+                    }
                     _ => false,
                 }
             }

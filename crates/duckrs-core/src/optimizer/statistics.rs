@@ -1125,6 +1125,19 @@ impl StatisticsPropagator {
                 };
             }
         }
+        // a function that gives NULL for NULL, of an argument that is only NULL, is only NULL
+        if matches!(
+            function.name.as_str(),
+            "array_extract" | "list_extract" | "list_element" | "map_extract_value"
+        ) && !expr_is_volatile_function(&function.name)
+            && stats.iter().any(|s| s.can_be_null && !s.can_be_valid)
+        {
+            return Stats {
+                can_be_null: true,
+                can_be_valid: false,
+                ..unknown()
+            };
+        }
         // `lower` and `upper` are NULL only for a NULL, and keep the bytes of ASCII strings
         if matches!(function.name.as_str(), "lower" | "upper" | "lcase" | "ucase")
             && let [child] = stats.as_slice()
@@ -2001,6 +2014,11 @@ impl StatisticsPropagator {
         }
         Some(total)
     }
+}
+
+/// Whether calls of the function `name` give something else each time.
+fn expr_is_volatile_function(name: &str) -> bool {
+    crate::planner::expression::VOLATILE_FUNCTIONS.contains(&name)
 }
 
 /// The smallest and largest value of an integer type that fits in an `i128`.

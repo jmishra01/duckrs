@@ -440,6 +440,9 @@ pub struct ColumnZone {
     /// of strings, whether a value has a character beyond ASCII (then its length in characters is
     /// less than in bytes)
     pub has_unicode: bool,
+    /// of a LIST or ARRAY, the zone of its elements, and of a MAP of its values (`ListStats` /
+    /// `ArrayStats` child statistics)
+    pub elements: Option<Box<ColumnZone>>,
 }
 
 /// How many rows a table has and how many distinct values each column holds, approximately.
