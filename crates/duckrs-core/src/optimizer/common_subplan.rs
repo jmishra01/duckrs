@@ -8,8 +8,7 @@
 //! text with the same renaming, and subplans are found again by their path of child positions,
 //! which the rewrites keep up to date.
 //!
-//! Not ported yet: `CommonJoinFilters` (joins that differ in the filters of one scan), and
-//! combining the states of ungrouped aggregates. Subqueries have plans of their own here, so
+//! Not ported yet: combining the states of ungrouped aggregates. Subqueries have plans of their own here, so
 //! identical subqueries are not shared.
 
 use super::join_order::{PlanEstimate, estimate_plan};
@@ -36,6 +35,7 @@ pub fn optimize(mut plan: LogicalOperator) -> LogicalOperator {
         return plan;
     }
     let mut next_index = max_table_index(&plan) + 1;
+    CommonJoinFilters::default().normalize(&mut plan);
     let mut finder = Finder::default();
     finder.find(&mut plan);
     finder.filter(&mut plan);
@@ -1271,4 +1271,289 @@ fn is_selective_multi_table_plan(estimate: &PlanEstimate, cardinality: u64) -> b
         return false;
     }
     cardinality <= CARDINALITY_THRESHOLD || cardinality < max_cardinality / CARDINALITY_RATIO
+}
+
+/// A tree of inner joins whose scans' filters could differ from those of another (`Candidate`).
+struct JoinCandidate {
+    path: Path,
+    /// the scans whose filters the signature leaves out, in the order it reaches them
+    scans: Vec<Path>,
+}
+
+/// `CandidateGroup`: candidates that differ in the filters of the scan at `differing_scan` only.
+struct CandidateGroup {
+    candidates: Vec<usize>,
+    differing_scan: Option<usize>,
+}
+
+/// `CommonJoinFilters`: inner joins that are the same but for the filters of one of their scans
+/// become the same join, of the scan with the disjunction of all their filters, each with its own
+/// filter on top again. The common subplans that follow share the join.
+#[derive(Default)]
+struct CommonJoinFilters {
+    /// the canonical forms of the joins without the filters of their scans
+    finder: Finder,
+    candidates: Vec<JoinCandidate>,
+    /// candidates by their signature, in the order found
+    by_signature: Vec<(usize, Vec<usize>)>,
+}
+
+fn is_inner_join(op: &LogicalOperator) -> bool {
+    matches!(
+        op.kind,
+        K::Join {
+            join_type: JoinType::Inner,
+            ..
+        }
+    )
+}
+
+/// The filters of a scan with its own table index made 0, to compare them with another's.
+fn filters_text(op: &LogicalOperator) -> String {
+    let K::Get { table_index, filters, .. } = &op.kind else {
+        return String::new();
+    };
+    let mut filters = filters.clone();
+    for filter in &mut filters {
+        filter.walk_mut(&mut |e| {
+            if let BoundExprKind::ColumnRef { binding, .. } = &mut e.kind
+                && binding.table_index == *table_index
+            {
+                binding.table_index = 0;
+            }
+        });
+    }
+    format!("{filters:?}")
+}
+
+impl CommonJoinFilters {
+    /// `Normalize`.
+    fn normalize(&mut self, plan: &mut LogicalOperator) {
+        self.find_candidates(plan, &mut Vec::new());
+        let mut changes = Vec::new();
+        for (_, members) in &self.by_signature {
+            let mut groups: Vec<CandidateGroup> = Vec::new();
+            for &candidate in members {
+                if !groups.iter_mut().any(|group| self.try_add(plan, group, candidate)) {
+                    groups.push(CandidateGroup {
+                        candidates: vec![candidate],
+                        differing_scan: None,
+                    });
+                }
+            }
+            changes.extend(groups);
+        }
+        // the candidates are apart, so each keeps its path while the others change
+        for group in changes {
+            self.normalize_group(plan, &group);
+        }
+    }
+
+    /// `FindCandidates`.
+    fn find_candidates(&mut self, plan: &LogicalOperator, path: &mut Path) {
+        let op = node(plan, path);
+        if is_inner_join(op) {
+            let mut stripped = op.clone();
+            let mut scans = Vec::new();
+            if Self::strip(&mut stripped, &mut Vec::new(), true, &mut scans) {
+                self.finder.signatures.clear();
+                self.finder.visit(&mut stripped, &mut Vec::new());
+                if let Some(&signature) = self.finder.signatures.get(&Vec::new()) {
+                    let at = self.candidates.len();
+                    self.candidates.push(JoinCandidate {
+                        path: path.clone(),
+                        scans: scans
+                            .into_iter()
+                            .map(|scan: Path| path.iter().copied().chain(scan).collect())
+                            .collect(),
+                    });
+                    match self.by_signature.iter_mut().find(|(s, _)| *s == signature) {
+                        Some((_, members)) => members.push(at),
+                        None => self.by_signature.push((signature, vec![at])),
+                    }
+                }
+            }
+            return;
+        }
+        for at in 0..op.children.len() {
+            path.push(at);
+            self.find_candidates(plan, path);
+            path.pop();
+        }
+    }
+
+    /// The `Signature` walk: takes the filters off the scans below inner joins and filters, noting
+    /// their paths; false where an expression there cannot be shared.
+    fn strip(op: &mut LogicalOperator, path: &mut Path, movable: bool, scans: &mut Vec<Path>) -> bool {
+        let traverse = movable && (is_inner_join(op) || matches!(op.kind, K::Filter { .. } | K::ColumnSelect { .. }));
+        if traverse && any_expression(&op.kind, &|e| !can_share_expression(e)) {
+            return false;
+        }
+        for at in 0..op.children.len() {
+            path.push(at);
+            let ok = Self::strip(&mut op.children[at], path, traverse, scans);
+            path.pop();
+            if !ok {
+                return false;
+            }
+        }
+        if !movable {
+            return true;
+        }
+        if let K::Get {
+            filters,
+            zone_filters,
+            index_rows,
+            ..
+        } = &mut op.kind
+            && op.children.is_empty()
+            && zone_filters.is_empty()
+            && index_rows.is_none()
+            && filters.iter().all(can_share_expression)
+        {
+            filters.clear();
+            scans.push(path.clone());
+        }
+        true
+    }
+
+    /// `CandidateGroup::TryAdd`.
+    fn try_add(&self, plan: &LogicalOperator, group: &mut CandidateGroup, candidate: usize) -> bool {
+        let primary = &self.candidates[group.candidates[0]];
+        let other = &self.candidates[candidate];
+        if primary.scans.len() != other.scans.len() {
+            return false;
+        }
+        let mut varying = group.differing_scan;
+        for (at, (left, right)) in primary.scans.iter().zip(&other.scans).enumerate() {
+            let (left, right) = (node(plan, left), node(plan, right));
+            let (K::Get { column_ids: a, .. }, K::Get { column_ids: b, .. }) = (&left.kind, &right.kind) else {
+                return false;
+            };
+            if a != b {
+                return false;
+            }
+            if filters_text(left) == filters_text(right) {
+                continue;
+            }
+            // one varying input avoids cross-combinations between independent filter disjunctions
+            if varying.is_some_and(|v| v != at) {
+                return false;
+            }
+            varying = Some(at);
+        }
+        group.differing_scan = varying;
+        group.candidates.push(candidate);
+        true
+    }
+
+    /// `NormalizeGroup`.
+    fn normalize_group(&self, plan: &mut LogicalOperator, group: &CandidateGroup) {
+        let Some(differing) = group.differing_scan else {
+            return;
+        };
+        if group.candidates.len() < 2 {
+            return;
+        }
+        let cardinality: u64 = group
+            .candidates
+            .iter()
+            .map(|&c| super::join_order::estimated_cardinality(node(plan, &self.candidates[c].path)))
+            .sum();
+        let primary = node(plan, &self.candidates[group.candidates[0]].path);
+        if !is_selective_multi_table_plan(&estimate_plan(primary), cardinality) {
+            return;
+        }
+        // `ScanPredicate` of each
+        let mut predicates = Vec::new();
+        let mut table_indexes = Vec::new();
+        for &c in &group.candidates {
+            let K::Get { table_index, filters, .. } = &node(plan, &self.candidates[c].scans[differing]).kind else {
+                unreachable!("a scan")
+            };
+            predicates.push(if filters.is_empty() {
+                BoundExpr::constant(duckrs_common::value::Value::boolean(true))
+            } else {
+                super::conjunction_of(filters.clone())
+            });
+            table_indexes.push(*table_index);
+        }
+        for (i, &c) in group.candidates.iter().enumerate() {
+            let candidate = &self.candidates[c];
+            let old_bindings = node(plan, &candidate.path).column_bindings();
+            let scan = node_mut(plan, &candidate.scans[differing]);
+            let K::Get {
+                table_index,
+                column_ids,
+                filters,
+                projection,
+                ..
+            } = &mut scan.kind
+            else {
+                unreachable!("a scan")
+            };
+            let own = *table_index;
+            let disjuncts: Vec<BoundExpr> = predicates
+                .iter()
+                .zip(&table_indexes)
+                .map(|(predicate, &from)| {
+                    let mut predicate = predicate.clone();
+                    predicate.walk_mut(&mut |e| {
+                        if let BoundExprKind::ColumnRef { binding, depth: 0 } = &mut e.kind
+                            && binding.table_index == from
+                        {
+                            binding.table_index = own;
+                        }
+                    });
+                    predicate
+                })
+                .collect();
+            filters.clear();
+            // all its columns go on, but the row ids the binder reads for nothing
+            *projection = column_ids
+                .contains(&COLUMN_IDENTIFIER_ROW_ID)
+                .then(|| (0..column_ids.len()).filter(|&p| column_ids[p] != COLUMN_IDENTIFIER_ROW_ID).collect());
+            let get = std::mem::replace(scan, LogicalOperator::new(K::CrossProduct, Vec::new()));
+            *scan = LogicalOperator::new(
+                K::Filter {
+                    expressions: vec![BoundExpr::new(
+                        BoundExprKind::Conjunction {
+                            and: false,
+                            children: disjuncts,
+                        },
+                        LogicalType::BOOLEAN,
+                    )],
+                },
+                vec![get],
+            );
+            // `ExposeFilterColumns`: the joins pass on all columns, for the filter on top
+            let op = node_mut(plan, &candidate.path);
+            Self::expose_filter_columns(op);
+            let new_bindings = op.column_bindings();
+            let join = std::mem::replace(op, LogicalOperator::new(K::CrossProduct, Vec::new()));
+            let mut residual = LogicalOperator::new(
+                K::Filter {
+                    expressions: vec![predicates[i].clone()],
+                },
+                vec![join],
+            );
+            if new_bindings != old_bindings {
+                residual = LogicalOperator::new(K::ColumnSelect { keep: old_bindings }, vec![residual]);
+            }
+            *op = residual;
+        }
+    }
+
+    fn expose_filter_columns(op: &mut LogicalOperator) {
+        if !(is_inner_join(op) || matches!(op.kind, K::Filter { .. } | K::ColumnSelect { .. })) {
+            return;
+        }
+        for child in &mut op.children {
+            while matches!(child.kind, K::ColumnSelect { .. }) {
+                let below = child.children.remove(0);
+                *child = below;
+            }
+            Self::expose_filter_columns(child);
+        }
+    }
 }
