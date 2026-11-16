@@ -69,6 +69,8 @@ pub struct ScalarFunction {
     pub null_on_zero: bool,
     /// `ieee_floating_point_ops = false` (`BindBinaryFloatingPoint`): a zero divisor is an error
     pub error_on_zero: bool,
+    /// `FunctionErrors::CANNOT_ERROR`, set where the arguments or their statistics show it
+    pub cannot_error: bool,
 }
 
 impl ScalarFunction {
@@ -86,6 +88,21 @@ impl ScalarFunction {
             resolve_types: None,
             null_on_zero: false,
             error_on_zero: false,
+            cannot_error: false,
+        }
+    }
+
+    /// This overload, known not to fail (`SetErrorMode(FunctionErrors::CANNOT_ERROR)`).
+    pub fn infallible(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            arguments: self.arguments.clone(),
+            return_type: self.return_type.clone(),
+            function: self.function,
+            resolve_types: self.resolve_types,
+            null_on_zero: self.null_on_zero,
+            error_on_zero: self.error_on_zero,
+            cannot_error: true,
         }
     }
 
@@ -99,6 +116,7 @@ impl ScalarFunction {
             resolve_types: self.resolve_types,
             null_on_zero: null,
             error_on_zero: !null,
+            cannot_error: self.cannot_error,
         }
     }
 

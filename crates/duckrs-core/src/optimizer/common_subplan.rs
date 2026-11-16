@@ -178,7 +178,7 @@ fn expression_any(expr: &BoundExpr, f: &impl Fn(&BoundExpr) -> bool) -> bool {
 }
 
 /// The highest table index of the plan, of its subqueries too.
-fn max_table_index(op: &LogicalOperator) -> usize {
+pub(super) fn max_table_index(op: &LogicalOperator) -> usize {
     let mut max = defined_indexes(&op.kind).into_iter().max().unwrap_or(0);
     let mut kind = op.kind.clone();
     visit_bindings(&mut kind, &mut |binding, _| max = max.max(binding.table_index));

@@ -1103,7 +1103,12 @@ impl Binder<'_> {
             let bound = self.bind_expression(expr);
             self.alias_fallback.clear();
             self.later_select_aliases = None;
-            expressions.push(bound?);
+            // `ExpressionBinder::Bind` keeps the alias of what it binds
+            let mut bound = bound?;
+            if !expr.alias.is_empty() {
+                bound.alias = expr.alias.clone();
+            }
+            expressions.push(bound);
             let aggregates = self.aggregates.as_mut().expect("set above");
             if node.force_aggregates && i < column_count {
                 // GROUP BY ALL: an entry with columns becomes a group

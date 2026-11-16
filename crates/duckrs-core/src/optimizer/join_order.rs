@@ -1781,6 +1781,12 @@ fn estimate(op: &LogicalOperator, optimizer: &mut JoinOrderOptimizer) -> PlanEst
     }
 }
 
+/// The estimated rows of one operator (`estimated_cardinality`), truncated as C++ keeps them.
+pub fn estimated_cardinality(op: &LogicalOperator) -> u64 {
+    let rows = JoinOrderOptimizer::default().stats(op).cardinality.max(0.0);
+    if rows > 0.0 { rows.floor().max(1.0) as u64 } else { 0 }
+}
+
 /// `LogicalOperator::EstimateCardinality` for all operators of a plan.
 pub fn estimate_plan(op: &LogicalOperator) -> PlanEstimate {
     estimate(op, &mut JoinOrderOptimizer::default())

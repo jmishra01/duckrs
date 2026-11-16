@@ -698,14 +698,35 @@ fn has_unique_tables(op: &LogicalOperator, seen: &mut HashSet<usize>) -> bool {
     own && op.children.iter().all(|child| has_unique_tables(child, seen))
 }
 
-/// Runs the pass over a plan.
-pub fn propagate_statistics(plan: &mut LogicalOperator, perfect_ht_threshold: u64) {
-    if has_unique_tables(plan, &mut HashSet::new()) {
-        StatisticsPropagator {
-            perfect_ht_threshold,
-            ..Default::default()
+/// Runs the pass over a plan, and gives what it found out of the columns of the plan
+/// (`GetStatisticsMap`), if it ran.
+pub fn propagate_statistics(plan: &mut LogicalOperator, perfect_ht_threshold: u64) -> Option<StatisticsMap> {
+    if !has_unique_tables(plan, &mut HashSet::new()) {
+        return None;
+    }
+    let mut propagator = StatisticsPropagator {
+        perfect_ht_threshold,
+        ..Default::default()
+    };
+    propagator.visit(plan);
+    Some(StatisticsMap(propagator))
+}
+
+/// The statistics of the columns of a plan after `propagate_statistics` (`statistics_map`).
+pub struct StatisticsMap(StatisticsPropagator);
+
+impl StatisticsMap {
+    /// What is known of the values of `binding`.
+    pub fn get(&mut self, binding: ColumnBinding) -> ColumnStatistics {
+        self.0.lookup(binding)
+    }
+
+    /// `CopyStatistics`: `target` has the values of `source`.
+    pub fn copy(&mut self, source: ColumnBinding, target: ColumnBinding) {
+        if source != target {
+            self.0.stats.remove(&target);
+            self.0.aliases.insert(target, source);
         }
-        .visit(plan);
     }
 }
 
@@ -1139,6 +1160,30 @@ impl StatisticsPropagator {
                 ..unknown()
             };
         }
+        // `SubstringPropagateStats`, `SubstringGraphemePropagateStats` and `RepeatStringStats`: the longest
+        // string of the result
+        if let Some(max_length) = string_function_max_length(&function.name, children, &stats) {
+            let child = &stats[0];
+            // `PropagateStrictFunctionValidity`
+            let mut result = Stats {
+                can_be_null: stats.iter().any(|s| s.can_be_null),
+                can_be_valid: stats.iter().all(|s| s.can_be_valid),
+                strings: Some(crate::catalog::StringStatistics {
+                    bounds: None,
+                    has_unicode: child.strings.as_ref().is_none_or(|s| s.has_unicode),
+                    min_length: None,
+                    max_length: Some(max_length),
+                    total_length: None,
+                }),
+                ..unknown()
+            };
+            if function.name == "repeat" {
+                // the result is known to fit in a string
+                *function = Arc::new(function.infallible());
+                result.can_be_valid = child.can_be_valid && stats[1].can_be_valid;
+            }
+            return result;
+        }
         // `left(s, 0)` is the empty string
         if function.name == "left"
             && let [child, _] = stats.as_slice()
@@ -1152,17 +1197,14 @@ impl StatisticsPropagator {
                 ..unknown()
             };
         }
-        // `lower` and `upper` are NULL only for a NULL, and keep the bytes of ASCII strings
+        // `CaseConvertPropagateStats`: `lower` and `upper` are NULL only for a NULL, and say nothing of the
+        // lengths of their strings
         if matches!(function.name.as_str(), "lower" | "upper" | "lcase" | "ucase")
             && let [child] = stats.as_slice()
         {
             return Stats {
                 can_be_null: child.can_be_null,
                 can_be_valid: child.can_be_valid,
-                strings: child.strings.as_ref().filter(|s| !s.has_unicode).map(|s| crate::catalog::StringStatistics {
-                    bounds: None,
-                    ..s.clone()
-                }),
                 ..unknown()
             };
         }
@@ -2032,6 +2074,60 @@ impl StatisticsPropagator {
 }
 
 /// Whether calls of the function `name` give something else each time.
+/// The longest string `substring`, `substring_grapheme` or `repeat` gives for arguments with `stats`
+/// (`StringStats::SetMaxStringLength` of their statistics functions).
+fn string_function_max_length(name: &str, children: &[BoundExpr], stats: &[Stats]) -> Option<u64> {
+    let constant = |expr: &BoundExpr| match &expr.kind {
+        BoundExprKind::Constant(value) if !value.is_null() => value.try_to_string().ok()?.parse::<i128>().ok(),
+        _ => None,
+    };
+    let input_max = stats.first()?.strings.as_ref().and_then(|s| s.max_length);
+    match name {
+        "substring" | "substr" if (2..=3).contains(&children.len()) => {
+            // `TryGetSubstringStatsParameters`: a constant offset from 1 on, and a constant positive length
+            let mut parameters = None;
+            if let Some(mut offset) = constant(&children[1]) {
+                let count = match children.get(2) {
+                    None => Some(None),
+                    Some(length) => constant(length).filter(|&l| l > 0 && l <= i128::from(u32::MAX)).map(Some),
+                };
+                if let Some(mut count) = count {
+                    let mut valid = true;
+                    if offset == 0 {
+                        match count {
+                            Some(n) if n > 1 => {
+                                count = Some(n - 1);
+                                offset = 1;
+                            }
+                            _ => valid = false,
+                        }
+                    }
+                    if valid && offset >= 1 {
+                        parameters = Some(count);
+                    }
+                }
+            }
+            let unicode = stats[0].strings.as_ref().is_none_or(|s| s.has_unicode);
+            let mut max = parameters.flatten().and_then(|count| {
+                let per_character = if unicode { 4 } else { 1 };
+                (count <= i128::from(u32::MAX) / per_character).then(|| (count * per_character) as u64)
+            });
+            if let Some(input_max) = input_max {
+                max = Some(max.map_or(input_max, |m| m.min(input_max)));
+            }
+            max
+        }
+        "substring_grapheme" if (2..=3).contains(&children.len()) => input_max,
+        "repeat" if children.len() == 2 => {
+            let count = constant(&children[1])?;
+            let input_max = input_max?;
+            let size = if count > 0 { input_max.checked_mul(u64::try_from(count).ok()?)? } else { 0 };
+            (size <= u64::from(u32::MAX)).then_some(size)
+        }
+        _ => None,
+    }
+}
+
 fn expr_is_volatile_function(name: &str) -> bool {
     crate::planner::expression::VOLATILE_FUNCTIONS.contains(&name)
 }

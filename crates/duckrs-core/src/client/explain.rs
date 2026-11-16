@@ -250,8 +250,13 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             entry(key, lines(expressions.iter().map(filter_text)))
         }
         K::Projection { expressions, .. } => {
-            let key = if physical { "Projections" } else { "Expressions" };
-            entry(key, lines(expressions.iter().map(|e| e.to_string())))
+            if physical {
+                entry("Projections", lines(expressions.iter().map(|e| e.to_string())))
+            } else {
+                // `LogicalOperator::ParamsToString`: `Expression::GetName`, the alias where there is one
+                let name = |e: &BoundExpr| if e.alias.is_empty() { e.to_string() } else { e.alias.clone() };
+                entry("Expressions", lines(expressions.iter().map(name)))
+            }
         }
         K::Aggregate { groups, aggregates, .. } => {
             let mut info = Vec::new();

@@ -11,6 +11,7 @@ pub mod build_side;
 mod common_subplan;
 mod join_elimination;
 mod projection_pullup;
+mod projection_placement;
 mod deliminator;
 pub mod distinct_statistics;
 pub mod empty_result_pullup;
@@ -41,6 +42,7 @@ pub struct OptimizerOptions {
     pub type_pushdown: bool,
     pub common_subplan: bool,
     pub projection_pullup: bool,
+    pub projection_placement: bool,
     pub join_elimination: bool,
     /// `index_scan_percentage`
     pub index_scan_percentage: f64,
@@ -65,6 +67,7 @@ impl Default for OptimizerOptions {
             type_pushdown: true,
             common_subplan: true,
             projection_pullup: true,
+            projection_placement: true,
             join_elimination: true,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
@@ -88,6 +91,7 @@ impl OptimizerOptions {
             type_pushdown: false,
             common_subplan: false,
             projection_pullup: false,
+            projection_placement: false,
             join_elimination: false,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
@@ -110,6 +114,7 @@ impl OptimizerOptions {
             type_pushdown: !off("type_pushdown"),
             common_subplan: !off("common_subplan"),
             projection_pullup: !off("projection_pullup"),
+            projection_placement: !off("projection_placement"),
             join_elimination: !off("join_elimination"),
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
@@ -166,9 +171,10 @@ pub fn optimize_timed(
     if options.join_elimination {
         plan = run("join_elimination", plan, &mut join_elimination::eliminate);
     }
+    let mut statistics_map = None;
     if options.statistics_propagation {
         plan = run("statistics_propagation", plan, &mut |mut plan| {
-            statistics::propagate_statistics(&mut plan, options.perfect_ht_threshold);
+            statistics_map = statistics::propagate_statistics(&mut plan, options.perfect_ht_threshold);
             plan
         });
     }
@@ -187,6 +193,15 @@ pub fn optimize_timed(
     if options.unused_columns {
         plan = run("unused_columns", plan, &mut |mut plan| {
             unused_columns::remove_unused_columns(&mut plan);
+            plan
+        });
+    }
+    // `PROJECTION_PLACEMENT` runs where the statistics have been propagated, once the unused columns are gone
+    if options.projection_placement
+        && let Some(statistics_map) = statistics_map.as_mut()
+    {
+        plan = run("projection_placement", plan, &mut |mut plan| {
+            projection_placement::place(&mut plan, statistics_map);
             plan
         });
     }

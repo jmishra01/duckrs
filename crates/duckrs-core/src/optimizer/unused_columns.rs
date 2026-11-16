@@ -90,6 +90,8 @@ fn visit(op: &mut LogicalOperator, by_position: bool, used: &mut HashSet<ColumnB
             if !used.contains(&ColumnBinding::new(*table_index, index)) && !expr.is_volatile() {
                 let ty = expr.return_type.clone();
                 expr.kind = BoundExprKind::Constant(Value::null(ty));
+                // the column is gone, as C++ removes it: so is its name
+                expr.alias.clear();
             }
         }
     }

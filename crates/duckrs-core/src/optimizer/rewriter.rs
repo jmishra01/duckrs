@@ -915,11 +915,41 @@ pub(crate) fn can_throw(expr: &BoundExpr) -> bool {
                 && matches!(&children[1].kind, BoundExprKind::Constant(value)
                     if !value.is_null()
                         && value.try_to_string().ok().and_then(|t| t.parse::<f64>().ok()).is_some_and(|v| v != 0.0 && v != -1.0));
-            !floating && !safe_division && !INFALLIBLE_FUNCTIONS.contains(&function.name.as_str())
+            !floating
+                && !safe_division
+                && !function.cannot_error
+                && !substring_in_range(&function.name, children)
+                && !INFALLIBLE_FUNCTIONS.contains(&function.name.as_str())
         }
         _ => false,
     };
     own || expr.children().into_iter().any(can_throw)
+}
+
+/// `SubstringBind`: a substring whose offset and length are constants in the supported range cannot fail.
+fn substring_in_range(name: &str, children: &[BoundExpr]) -> bool {
+    if !matches!(name, "substring" | "substr" | "substring_grapheme") || !(2..=3).contains(&children.len()) {
+        return false;
+    }
+    let constant = |expr: &BoundExpr| -> Option<i128> {
+        let folded = match &expr.kind {
+            BoundExprKind::Constant(_) => expr.clone(),
+            _ if expr.is_foldable() => BoundExpr::constant(try_evaluate_scalar(expr)?),
+            _ => return None,
+        };
+        match &folded.kind {
+            BoundExprKind::Constant(value) if !value.is_null() => integer_of(value),
+            _ => None,
+        }
+    };
+    const UPPER: i128 = u32::MAX as i128;
+    const LOWER: i128 = -UPPER - 1;
+    let offset = constant(&children[1]);
+    let length = match children.get(2) {
+        Some(length) => constant(length),
+        None => Some(UPPER),
+    };
+    matches!((offset, length), (Some(o), Some(l)) if (LOWER..=UPPER).contains(&o) && (LOWER..=UPPER).contains(&l))
 }
 
 fn cast_can_throw(source: &LogicalType, target: &LogicalType) -> bool {

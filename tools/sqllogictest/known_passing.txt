@@ -4576,6 +4576,7 @@ test/sql/types/struct/struct_operations.test
 test/sql/types/struct/struct_pack_list.test
 test/sql/types/struct/struct_position.test
 test/sql/types/struct/struct_projection_pushdown.test
+test/sql/types/struct/struct_projection_pushdown_in_storage.test
 test/sql/types/struct/struct_projection_pushdown_optimizer_bug.test
 test/sql/types/struct/struct_projection_pushdown_unnamed.test
 test/sql/types/struct/struct_search_physical_types.test
@@ -4584,6 +4585,7 @@ test/sql/types/struct/struct_subquery.test
 test/sql/types/struct/struct_tables.test
 test/sql/types/struct/struct_unnest_recursion.test
 test/sql/types/struct/struct_updates.test
+test/sql/types/struct/struct_variant_projection_pushdown.test
 test/sql/types/struct/test_tuple.test
 test/sql/types/struct/tuple_old_storage_attach.test
 test/sql/types/struct/unnamed_struct_casts.test
