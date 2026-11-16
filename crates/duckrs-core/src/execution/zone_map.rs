@@ -26,6 +26,34 @@ use std::sync::Arc;
 /// `StringStatsData::MAX_STRING_MINMAX_SIZE`: the bytes of the bounds of strings C++ keeps.
 pub const STRING_STATISTICS_BYTES: usize = 12;
 
+/// Functions that do not give NULL for a NULL argument (`FunctionNullHandling::SPECIAL_HANDLING`): the one
+/// value of a group with NULLs says nothing of their result. Of the others, a NULL gives NULL, which
+/// a range leaves out.
+const SPECIAL_NULL_HANDLING: &[&str] = &[
+    "hash",
+    "coalesce",
+    "concat",
+    "concat_ws",
+    "ifnull",
+    "nullif",
+    "list_value",
+    "array_value",
+    "struct_pack",
+    "row",
+    "map",
+    "constant_or_null",
+    "to_json",
+    "json_object",
+    "json_array",
+    "typeof",
+    "error",
+    "list_concat",
+    "array_concat",
+    "map_concat",
+    "greatest",
+    "least",
+];
+
 /// `DEFAULT_ROW_GROUP_SIZE`.
 pub const ROW_GROUP_SIZE: usize = 122_880;
 /// The chunks of a row group, which all but the last chunk of a table fill.
@@ -150,6 +178,18 @@ fn compute_zones(table: &TableCatalogEntry, column: usize, known: &[ColumnZone])
         };
         merge(&mut zone.min, smallest, Ordering::Less);
         merge(&mut zone.max, largest, Ordering::Greater);
+        // the lengths of strings (`StringStats` keeps the longest and whether there is unicode)
+        if vector.logical_type().id() == LogicalTypeId::Varchar {
+            for row in (0..count).filter(|&row| validity.is_valid(row)) {
+                let Ok(text) = vector.get_value(row).try_to_string() else {
+                    continue;
+                };
+                let length = text.len() as u64;
+                let (low, high) = zone.lengths.unwrap_or((length, length));
+                zone.lengths = Some((low.min(length), high.max(length)));
+                zone.has_unicode |= !text.is_ascii();
+            }
+        }
     });
     // with what can't be read there is nothing to go by, which means reading every group
     if read.is_err() {
@@ -296,6 +336,55 @@ impl Group<'_> {
         }
     }
 
+    /// Whether `x != a AND x != b ...` among `conjuncts` leaves no value of the range of an integer column in
+    /// the group (a NOT IN list that covers it).
+    fn excludes_every_value(&self, conjuncts: &[BoundExpr]) -> bool {
+        let mut excluded: std::collections::HashMap<usize, std::collections::HashSet<i128>> = Default::default();
+        for conjunct in conjuncts {
+            let BoundExprKind::Comparison {
+                op: ComparisonOp::NotEqual,
+                left,
+                right,
+            } = &conjunct.kind
+            else {
+                continue;
+            };
+            let (index, constant) = match (&left.kind, &right.kind) {
+                (BoundExprKind::Reference(index), BoundExprKind::Constant(c))
+                | (BoundExprKind::Constant(c), BoundExprKind::Reference(index)) => (*index, c),
+                _ => continue,
+            };
+            if let Some(value) = constant.as_i128() {
+                excluded.entry(index).or_default().insert(value);
+            }
+        }
+        excluded.into_iter().any(|(index, values)| {
+            let Some(zone) = self.zone(index) else {
+                return false;
+            };
+            let (Some(min), Some(max)) = (zone.min.as_ref(), zone.max.as_ref()) else {
+                return false;
+            };
+            if !min.logical_type().is_integral() {
+                return false;
+            }
+            let (Some(min), Some(max)) = (min.as_i128(), max.as_i128()) else {
+                return false;
+            };
+            max >= min && max - min < values.len() as i128 && (min..=max).all(|v| values.contains(&v))
+        })
+    }
+
+    /// The fewest and most bytes of the strings of a column in the group, and whether any is unicode.
+    fn lengths(&self, expr: &BoundExpr) -> Option<(u64, u64, bool)> {
+        let BoundExprKind::Reference(index) = &expr.kind else {
+            return None;
+        };
+        let zone = self.zone(*index)?;
+        let (low, high) = zone.lengths?;
+        Some((low, high, zone.has_unicode))
+    }
+
     /// The range of what is any of `exprs`.
     fn union<'e>(&self, exprs: impl Iterator<Item = &'e BoundExpr>) -> Range {
         let is = |op, a: &Value, b: &Value| compare_values(op, a, b) == Some(true);
@@ -369,6 +458,56 @@ impl Group<'_> {
                     }
                     _ => Range::Unknown,
                 }
+            }
+            // the lengths of strings (`StringStats`): in bytes, and in characters, which without unicode
+            // are bytes and with it at least a quarter of them
+            ("length" | "len" | "char_length" | "character_length" | "length_grapheme" | "strlen" | "octet_length", [input])
+                if self.lengths(input).is_some() =>
+            {
+                let (low, high, unicode) = self.lengths(input).expect("checked");
+                let bytes = matches!(name, "strlen" | "octet_length");
+                let low = if bytes || !unicode {
+                    low
+                } else if name == "length_grapheme" {
+                    0
+                } else {
+                    low.div_ceil(4)
+                };
+                let bound = |n: u64| crate::execution::parquet::try_cast_value(&Value::bigint(n as i64), &expr.return_type);
+                match (bound(low), bound(high)) {
+                    (Some(low), Some(high)) => Range::Bounds(low, high),
+                    _ => Range::Unknown,
+                }
+            }
+            // a needle in the prefix that all strings of the group share (of the bytes C++ keeps of the bounds)
+            // is in all of them
+            ("contains", [input, needle])
+                if constant(needle).and_then(|n| n.try_to_string().ok()).is_some_and(|needle| {
+                    let Range::Bounds(min, max) = self.range(input) else {
+                        return false;
+                    };
+                    let (Ok(min), Ok(max)) = (min.try_to_string(), max.try_to_string()) else {
+                        return false;
+                    };
+                    let shared = min
+                        .bytes()
+                        .zip(max.bytes())
+                        .take(STRING_STATISTICS_BYTES)
+                        .take_while(|(a, b)| a == b)
+                        .count();
+                    min.get(..shared).is_some_and(|prefix| prefix.contains(needle.as_str()))
+                }) =>
+            {
+                Range::Bounds(Value::boolean(true), Value::boolean(true))
+            }
+            // a needle longer than every string is in none of them
+            ("contains" | "suffix" | "ends_with", [input, needle])
+                if self.lengths(input).is_some()
+                    && constant(needle)
+                        .and_then(|n| n.try_to_string().ok())
+                        .is_some_and(|n| n.len() as u64 > self.lengths(input).expect("checked").1) =>
+            {
+                Range::Bounds(Value::boolean(false), Value::boolean(false))
             }
             // `isnan`: NaN sorts above every number, so the bounds tell
             ("isnan", [input]) => match self.range(input) {
@@ -487,9 +626,10 @@ impl Group<'_> {
                             Some(ColumnZone {
                                 min: Some(min),
                                 max: Some(max),
-                                has_null: false,
+                                has_null,
                                 ..
-                            }) if compare_values(ComparisonOp::Equal, &min, &max) == Some(true)
+                            }) if (!has_null || !SPECIAL_NULL_HANDLING.contains(&name))
+                                && compare_values(ComparisonOp::Equal, &min, &max) == Some(true)
                                 // the sign of a floating point zero is not in the statistics
                                 && !matches!(min.data(), duckrs_common::value::ValueData::Float(f) if *f == 0.0)
                                 && !matches!(min.data(), duckrs_common::value::ValueData::Double(d) if *d == 0.0) =>
@@ -608,13 +748,26 @@ impl Group<'_> {
                 // C++'s string statistics keep 12 bytes of the bounds, which prove no longer prefix
                 prefix.len() <= STRING_STATISTICS_BYTES && min.starts_with(&prefix) && max.starts_with(&prefix)
             }
+            // `NOT f(..)` of a BOOLEAN function that is true for every value of the group (NULL stays NULL)
+            BoundExprKind::Operator {
+                op: BoundOperator::Not,
+                children,
+            } if children.len() == 1
+                && matches!(children[0].kind, BoundExprKind::Function { .. })
+                && children[0].return_type.id() == LogicalTypeId::Boolean
+                && matches!(self.range(&children[0]), Range::Bounds(ref min, _) if min.data() == &duckrs_common::value::ValueData::Bool(true)) =>
+            {
+                true
+            }
             BoundExprKind::Operator {
                 op: BoundOperator::Not,
                 children,
             } if children.len() == 1 && negated(without_noop_casts(&children[0])).is_some() => {
                 self.never_true(&negated(without_noop_casts(&children[0])).expect("checked"))
             }
-            BoundExprKind::Conjunction { and: true, children } => children.iter().any(|c| self.never_true(c)),
+            BoundExprKind::Conjunction { and: true, children } => {
+                children.iter().any(|c| self.never_true(c)) || self.excludes_every_value(children)
+            }
             BoundExprKind::Conjunction { and: false, children } => children.iter().all(|c| self.never_true(c)),
             // `(x > 5) = true`: the comparison itself
             BoundExprKind::Comparison {

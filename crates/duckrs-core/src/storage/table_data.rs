@@ -991,7 +991,20 @@ impl TableSource for DiskTable {
                 continue;
             }
             let varchar = self.table.columns[column].ty.id() == LogicalTypeId::Varchar;
+            let mut lengths_known = varchar;
             for pointer in &stored.pointers {
+                // the lengths of the strings, while every segment has them
+                match pointer.statistics.strings.as_ref().and_then(|s| Some((s.min_length.unwrap_or(0), s.max_length?, s.has_unicode))) {
+                    Some((low, high, unicode)) if lengths_known => {
+                        let (old_low, old_high) = zone.lengths.unwrap_or((low, high));
+                        zone.lengths = Some((old_low.min(low), old_high.max(high)));
+                        zone.has_unicode |= unicode;
+                    }
+                    _ => {
+                        lengths_known = false;
+                        zone.lengths = None;
+                    }
+                }
                 let (min, max) = if varchar {
                     string_bounds(pointer.statistics.strings.as_ref())
                 } else {

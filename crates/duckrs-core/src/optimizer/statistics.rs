@@ -1125,6 +1125,37 @@ impl StatisticsPropagator {
                 };
             }
         }
+        // `lower` and `upper` are NULL only for a NULL, and keep the bytes of ASCII strings
+        if matches!(function.name.as_str(), "lower" | "upper" | "lcase" | "ucase")
+            && let [child] = stats.as_slice()
+        {
+            return Stats {
+                can_be_null: child.can_be_null,
+                can_be_valid: child.can_be_valid,
+                strings: child.strings.as_ref().filter(|s| !s.has_unicode).map(|s| crate::catalog::StringStatistics {
+                    bounds: None,
+                    ..s.clone()
+                }),
+                ..unknown()
+            };
+        }
+        // `StringStats` of `length`: the longest string bounds it, and so does the shortest without unicode
+        if matches!(function.name.as_str(), "length" | "len" | "char_length" | "character_length" | "strlen" | "octet_length")
+            && let [child] = stats.as_slice()
+            && let Some(strings) = &child.strings
+            && let Some(max) = strings.max_length
+        {
+            let bytes = matches!(function.name.as_str(), "strlen" | "octet_length");
+            let shortest = strings.min_length.unwrap_or(0);
+            // a character takes at most 4 bytes
+            let min = if bytes || !strings.has_unicode { shortest } else { shortest.div_ceil(4) };
+            return Stats {
+                min: Some(Value::bigint(min as i64)),
+                max: Some(Value::bigint(max as i64)),
+                can_be_null: child.can_be_null,
+                ..unknown()
+            };
+        }
         // `isnan` of a float whose largest value is a number: NaN sorts above every number
         if function.name == "isnan"
             && let [child] = stats.as_slice()
@@ -1669,6 +1700,42 @@ impl StatisticsPropagator {
                     self.update_from_filter(&expr);
                     kept.push(expr);
                 }
+            }
+        }
+        // `x != a AND x != b ...` that leaves no value of an integer column's range (a NOT IN list
+        // covering it) is never true
+        let mut excluded: HashMap<ColumnBinding, HashSet<i128>> = HashMap::new();
+        for expr in &kept {
+            if let BoundExprKind::Comparison {
+                op: ComparisonOp::NotEqual,
+                left,
+                right,
+            } = &expr.kind
+            {
+                let (column, constant) = match (&left.kind, &right.kind) {
+                    (BoundExprKind::ColumnRef { binding, depth: 0 }, BoundExprKind::Constant(c))
+                    | (BoundExprKind::Constant(c), BoundExprKind::ColumnRef { binding, depth: 0 }) => (*binding, c),
+                    _ => continue,
+                };
+                if let Some(value) = constant.as_i128() {
+                    excluded.entry(column).or_default().insert(value);
+                }
+            }
+        }
+        for (column, values) in excluded {
+            let stats = self.lookup(column);
+            let (Some(min), Some(max)) = (
+                stats.min.as_ref().and_then(Value::as_i128),
+                stats.max.as_ref().and_then(Value::as_i128),
+            ) else {
+                continue;
+            };
+            if stats.min.as_ref().is_some_and(|v| !v.logical_type().is_integral()) {
+                continue;
+            }
+            if max >= min && max - min < values.len() as i128 + 1 && (min..=max).all(|v| values.contains(&v)) {
+                *op = empty_result(op);
+                return;
             }
         }
         if kept.is_empty() {

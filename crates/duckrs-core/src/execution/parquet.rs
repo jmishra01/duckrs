@@ -1085,6 +1085,7 @@ fn row_groups_to_scan(
                     min: (!value.is_null()).then(|| value.clone()),
                     max: (!value.is_null()).then_some(value),
                     unknown: false,
+                    ..Default::default()
                 })
             };
             !crate::execution::zone_map::never_true(&zone, filter)

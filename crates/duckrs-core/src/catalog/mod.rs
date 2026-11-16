@@ -435,6 +435,11 @@ pub struct ColumnZone {
     pub has_null: bool,
     /// the bounds could not be worked out
     pub unknown: bool,
+    /// of strings, the fewest and most bytes of the values that are not NULL, if known
+    pub lengths: Option<(u64, u64)>,
+    /// of strings, whether a value has a character beyond ASCII (then its length in characters is
+    /// less than in bytes)
+    pub has_unicode: bool,
 }
 
 /// How many rows a table has and how many distinct values each column holds, approximately.
