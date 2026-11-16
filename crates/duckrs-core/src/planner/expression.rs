@@ -500,7 +500,16 @@ impl fmt::Display for BoundExpr {
                     _ => f.write_str(&text),
                 }
             }
-            BoundExprKind::ColumnRef { .. } | BoundExprKind::Reference(_) => f.write_str(&self.alias),
+            _ if !self.alias.is_empty()
+                && matches!(self.kind, BoundExprKind::ColumnRef { .. } | BoundExprKind::Reference(_)) =>
+            {
+                f.write_str(&self.alias)
+            }
+            // `ColumnBinding::ToString` and `BoundReferenceExpression::ToString` without an alias
+            BoundExprKind::ColumnRef { binding, .. } => {
+                write!(f, "#[{}.{}]", binding.table_index, binding.column_index)
+            }
+            BoundExprKind::Reference(index) => write!(f, "#{index}"),
             BoundExprKind::JoinFilter { child, .. } => write!(f, "optional: Dynamic Filter ({child})"),
             BoundExprKind::Cast { child, try_cast } => {
                 let name = if *try_cast { "TRY_CAST" } else { "CAST" };

@@ -706,6 +706,8 @@ impl Tree {
 struct JoinOrderOptimizer {
     /// the size of what a `DelimGet` reads, by the rows it shares with its `DelimJoin`
     delim: HashMap<usize, f64>,
+    /// what the rows of a materialized CTE are, by its table
+    ctes: HashMap<usize, RelationStats>,
 }
 
 impl JoinOrderOptimizer {
@@ -804,6 +806,17 @@ impl JoinOrderOptimizer {
                     .copied()
                     .unwrap_or(UNKNOWN_CARDINALITY),
                 distinct: HashMap::new(),
+            },
+            K::MaterializedCte { .. } => self.stats(&op.children[1]),
+            K::CteRef { data, .. } => match self.ctes.get(&(Arc::as_ptr(data) as *const () as usize)) {
+                Some(stats) => RelationStats {
+                    cardinality: stats.cardinality,
+                    distinct: HashMap::new(),
+                },
+                None => RelationStats {
+                    cardinality: UNKNOWN_CARDINALITY,
+                    distinct: HashMap::new(),
+                },
             },
             K::WorkingTable { .. } | K::RecursiveCte { .. } => RelationStats {
                 cardinality: UNKNOWN_CARDINALITY,
@@ -934,6 +947,11 @@ impl JoinOrderOptimizer {
 
     /// Remembers the size of what `DelimGet`s of a `DelimJoin` read, once its left side is known.
     fn note_delim(&mut self, op: &LogicalOperator) {
+        if let K::MaterializedCte { data, .. } = &op.kind {
+            let stats = self.stats(&op.children[0]);
+            self.ctes.insert(Arc::as_ptr(data) as *const () as usize, stats);
+            return;
+        }
         let K::DelimJoin { delim, conditions, .. } = &op.kind else {
             return;
         };

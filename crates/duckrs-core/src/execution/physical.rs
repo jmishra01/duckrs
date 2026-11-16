@@ -1643,6 +1643,93 @@ impl PhysicalOperator for PhysicalRecursiveCte {
     }
 }
 
+/// `PhysicalCTE`: the rows of its first child go into the CTE's table before its second child
+/// runs, whose CTE scans read them; its own rows are those of the second child.
+#[derive(Debug)]
+pub struct PhysicalMaterializedCte {
+    pub types: Vec<LogicalType>,
+    pub children: Vec<Box<dyn PhysicalOperator>>,
+    pub name: String,
+    pub table_index: usize,
+    /// what the CTE scans read
+    pub data: Arc<Mutex<ColumnDataCollection>>,
+    /// the rows of the first child until it is done
+    definition: Mutex<ColumnDataCollection>,
+    /// the rows of the second child
+    output: Mutex<ColumnDataCollection>,
+}
+
+impl PhysicalMaterializedCte {
+    pub fn new(
+        types: Vec<LogicalType>,
+        children: Vec<Box<dyn PhysicalOperator>>,
+        name: String,
+        table_index: usize,
+        data: Arc<Mutex<ColumnDataCollection>>,
+    ) -> Self {
+        let definition = Mutex::new(ColumnDataCollection::new(children[0].types().to_vec()));
+        let output = Mutex::new(ColumnDataCollection::new(types.clone()));
+        Self {
+            types,
+            children,
+            name,
+            table_index,
+            data,
+            definition,
+            output,
+        }
+    }
+}
+
+impl PhysicalOperator for PhysicalMaterializedCte {
+    fn name(&self) -> &'static str {
+        "CTE"
+    }
+    fn explain_details(&self) -> Vec<String> {
+        vec![
+            format!("CTE Name: {}", self.name),
+            format!("Table Index: {}", self.table_index),
+        ]
+    }
+    fn types(&self) -> &[LogicalType] {
+        &self.types
+    }
+    fn children(&self) -> &[Box<dyn PhysicalOperator>] {
+        &self.children
+    }
+    fn is_sink(&self) -> bool {
+        true
+    }
+    fn sink_children(&self) -> Vec<usize> {
+        vec![0, 1]
+    }
+    fn sink_input(&self, input: usize, chunk: &DataChunk) -> Result<()> {
+        let target = if input == 0 { &self.definition } else { &self.output };
+        let mut data = target.lock();
+        data.append(chunk);
+        check_buffered(&data)
+    }
+    fn sink(&self, chunk: &DataChunk) -> Result<()> {
+        self.sink_input(1, chunk)
+    }
+    fn finish_input(&self, input: usize) -> Result<()> {
+        if input == 0 {
+            let types = self.children[0].types().to_vec();
+            *self.data.lock() = std::mem::replace(&mut *self.definition.lock(), ColumnDataCollection::new(types));
+        }
+        Ok(())
+    }
+    fn is_source(&self) -> bool {
+        true
+    }
+    fn source_state(&self) -> SourceState {
+        Box::new(0usize)
+    }
+    fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
+        Ok(scan_collection(&self.output, state))
+    }
+}
+
 /// The rows of the last round of a recursive CTE.
 #[derive(Debug)]
 pub struct PhysicalWorkingTable {
@@ -1719,7 +1806,8 @@ impl PhysicalLateralJoin {
                 joined.extend(chunk.columns().iter().cloned());
                 let mut joined = DataChunk::from_columns(joined, chunk.len());
                 if let Some(predicate) = &self.predicate {
-                    let (selection, selected) = super::expression_executor::as_join_condition(|| select(predicate, &joined))?;
+                    let (selection, selected) =
+                        super::expression_executor::as_join_condition(|| select(predicate, &joined))?;
                     if selected != joined.len() {
                         joined.slice(&selection, selected);
                     }

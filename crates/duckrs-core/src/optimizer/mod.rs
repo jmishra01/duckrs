@@ -8,6 +8,7 @@
 //! which the binder resolves, so it runs the optimizer on that plan itself.
 
 pub mod build_side;
+mod common_subplan;
 mod deliminator;
 pub mod empty_result_pullup;
 pub mod filter_pushdown;
@@ -35,6 +36,7 @@ pub struct OptimizerOptions {
     pub empty_result_pullup: bool,
     pub unused_columns: bool,
     pub type_pushdown: bool,
+    pub common_subplan: bool,
     /// `index_scan_percentage`
     pub index_scan_percentage: f64,
     /// `index_scan_max_count`
@@ -54,6 +56,7 @@ impl Default for OptimizerOptions {
             empty_result_pullup: true,
             unused_columns: true,
             type_pushdown: true,
+            common_subplan: true,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -73,6 +76,7 @@ impl OptimizerOptions {
             empty_result_pullup: false,
             unused_columns: false,
             type_pushdown: false,
+            common_subplan: false,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -91,6 +95,7 @@ impl OptimizerOptions {
             empty_result_pullup: !off("empty_result_pullup"),
             unused_columns: !off("unused_columns"),
             type_pushdown: !off("type_pushdown"),
+            common_subplan: !off("common_subplan"),
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -165,6 +170,10 @@ pub fn optimize_timed(
     }
     if options.join_order && options.unused_columns {
         build_side::choose_by_width(&mut plan);
+    }
+    // shared subplans run once, as materialized CTEs
+    if options.common_subplan {
+        plan = run("common_subplan", plan, &mut common_subplan::optimize);
     }
     index_scan::plan_index_scans(&mut plan, &options);
     // casts in SELECT pushed into file readers, e.g. `SELECT num::UHUGEINT FROM read_csv(...)`

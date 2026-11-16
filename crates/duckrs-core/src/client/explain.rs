@@ -58,7 +58,8 @@ fn logical_name(op: &LogicalOperator) -> &'static str {
         K::ExceptIntersect { except: true, .. } => "EXCEPT",
         K::ExceptIntersect { .. } => "INTERSECT",
         K::RecursiveCte { .. } => "REC_CTE",
-        K::WorkingTable { .. } => "CTE_SCAN",
+        K::WorkingTable { .. } | K::CteRef { .. } => "CTE_SCAN",
+        K::MaterializedCte { .. } => "CTE",
         K::DelimGet { .. } => "DELIM_GET",
         K::DelimJoin { .. } => "DELIM_JOIN",
         K::LateralJoin { .. } => "DEPENDENT_JOIN",
@@ -144,6 +145,12 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
         info
     };
     match &op.kind {
+        K::MaterializedCte { name, table_index, .. } => {
+            let mut info = entry("CTE Name", name.clone());
+            info.extend(entry("Table Index", table_index.to_string()));
+            info
+        }
+        K::CteRef { cte_index, .. } => entry("CTE Index", cte_index.to_string()),
         K::Get {
             table,
             column_ids,

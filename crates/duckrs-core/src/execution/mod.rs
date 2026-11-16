@@ -147,10 +147,33 @@ pub fn create_plan(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
     create_physical(op)
 }
 
+/// Points the scans of the CTE whose table was `old` at `fresh`.
+fn renew_cte_scans(
+    op: &mut LogicalOperator,
+    old: *const Mutex<ColumnDataCollection>,
+    fresh: &Arc<Mutex<ColumnDataCollection>>,
+) {
+    if let LogicalOperatorKind::CteRef { data, .. } = &mut op.kind
+        && Arc::as_ptr(data) == old
+    {
+        *data = fresh.clone();
+    }
+    for child in &mut op.children {
+        renew_cte_scans(child, old, fresh);
+    }
+}
+
 /// [`create_plan`] once the join filters are in place.
-fn create_physical(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
+fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
     if matches!(op.kind, LogicalOperatorKind::ColumnSelect { .. }) {
         return create_column_select(op);
+    }
+    if let LogicalOperatorKind::MaterializedCte { data, .. } = &mut op.kind {
+        // each run of a plan has a table of its own, as copies of a plan can run at once
+        let old = Arc::as_ptr(data);
+        let fresh = Arc::new(Mutex::new(ColumnDataCollection::new(data.lock().types().to_vec())));
+        *data = fresh.clone();
+        renew_cte_scans(&mut op.children[1], old, &fresh);
     }
     let types = op.types();
     let mut children: Vec<Box<dyn PhysicalOperator>> = op.children.into_iter().map(create_physical).collect();
@@ -373,6 +396,19 @@ fn create_physical(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             types, children, union_all, working, recurring, key, *recursive,
         )),
         LogicalOperatorKind::WorkingTable { working, .. } => Box::new(PhysicalWorkingTable { types, working }),
+        LogicalOperatorKind::CteRef { data, .. } => Box::new(PhysicalWorkingTable { types, working: data }),
+        LogicalOperatorKind::MaterializedCte {
+            name,
+            table_index,
+            data,
+            ..
+        } => Box::new(physical::PhysicalMaterializedCte::new(
+            types,
+            children,
+            name,
+            table_index,
+            data,
+        )),
         LogicalOperatorKind::DelimGet { delim, .. } => Box::new(PhysicalWorkingTable { types, working: delim }),
         LogicalOperatorKind::DelimJoin {
             join_type,

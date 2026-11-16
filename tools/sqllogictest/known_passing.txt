@@ -2880,6 +2880,7 @@ test/sql/optimizer/joins/join_order_deep_setop_chain.test
 test/sql/optimizer/late_materialization_pushdown_extract.test
 test/sql/optimizer/monotone_function_zonemap_pruning.test
 test/sql/optimizer/monotone_preimage_tinyint_boundaries.test
+test/sql/optimizer/multiple_column_stats_pruning.test
 test/sql/optimizer/plan/test_anti_join_empty_child.test
 test/sql/optimizer/plan/test_anti_join_projection_map.test
 test/sql/optimizer/plan/test_disable_build_side_probe_side.test
@@ -2900,6 +2901,7 @@ test/sql/optimizer/struct_segment_pruning.test
 test/sql/optimizer/sum_aggregate_stats_propagation.test
 test/sql/optimizer/test_common_subplan_aggregate_columns.test
 test/sql/optimizer/test_common_subplan_cte_binding_order.test
+test/sql/optimizer/test_common_subplan_filtered_join.test
 test/sql/optimizer/test_common_subplan_nested_bindings.test
 test/sql/optimizer/test_common_subplan_overlapping_columns.test
 test/sql/optimizer/test_common_subplan_projection_columns.test
@@ -2907,6 +2909,7 @@ test/sql/optimizer/test_common_subplan_projection_maps.test
 test/sql/optimizer/test_common_subplan_repeatability_readers.test
 test/sql/optimizer/test_common_subplan_scan_filters.test
 test/sql/optimizer/test_common_subplan_self_join.test
+test/sql/optimizer/test_common_subplan_table_filters.test
 test/sql/optimizer/test_duplicate_groups_optimizer.test
 test/sql/optimizer/test_in_rewrite_rule.test
 test/sql/optimizer/test_not_comparison_simplification.test

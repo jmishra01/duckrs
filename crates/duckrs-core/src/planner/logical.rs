@@ -185,6 +185,21 @@ pub enum LogicalOperatorKind {
         types: Vec<LogicalType>,
         working: Arc<Mutex<ColumnDataCollection>>,
     },
+    /// `LogicalMaterializedCTE`: runs `children[0]` once, into `data`, and is then `children[1]`,
+    /// whose `CteRef`s of `table_index` read those rows.
+    MaterializedCte {
+        name: String,
+        table_index: usize,
+        data: Arc<Mutex<ColumnDataCollection>>,
+    },
+    /// `LogicalCTERef` of a materialized CTE: the rows of the CTE `cte_index`, from its `data`.
+    CteRef {
+        table_index: usize,
+        cte_index: usize,
+        types: Vec<LogicalType>,
+        names: Vec<String>,
+        data: Arc<Mutex<ColumnDataCollection>>,
+    },
     /// `LogicalDelimGet`: the distinct values of the correlated columns of a `DelimJoin` around it.
     DelimGet {
         table_index: usize,
@@ -540,7 +555,9 @@ impl LogicalOperator {
             | LogicalOperatorKind::ExceptIntersect { types, .. }
             | LogicalOperatorKind::RecursiveCte { types, .. }
             | LogicalOperatorKind::WorkingTable { types, .. }
+            | LogicalOperatorKind::CteRef { types, .. }
             | LogicalOperatorKind::DelimGet { types, .. } => types.clone(),
+            LogicalOperatorKind::MaterializedCte { .. } => self.children[1].types(),
             LogicalOperatorKind::DelimJoin { mark_index, .. } => {
                 let mut types = self.children[0].types();
                 match mark_index {
@@ -686,7 +703,9 @@ impl LogicalOperator {
             | LogicalOperatorKind::ExceptIntersect { table_index, types, .. }
             | LogicalOperatorKind::RecursiveCte { table_index, types, .. }
             | LogicalOperatorKind::WorkingTable { table_index, types, .. }
+            | LogicalOperatorKind::CteRef { table_index, types, .. }
             | LogicalOperatorKind::DelimGet { table_index, types, .. } => numbered(*table_index, types.len()),
+            LogicalOperatorKind::MaterializedCte { .. } => self.children[1].column_bindings(),
             LogicalOperatorKind::DelimJoin { mark_index, .. } => {
                 let mut bindings = self.children[0].column_bindings();
                 match mark_index {

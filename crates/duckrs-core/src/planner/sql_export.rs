@@ -1261,6 +1261,9 @@ impl Exporter<'_> {
             Op::CsvScan { .. } | Op::JsonScan { .. } => {
                 return Err("The file scan has no SQL export".into());
             }
+            Op::MaterializedCte { .. } | Op::CteRef { .. } => {
+                return Err("A materialized CTE has no SQL export".into());
+            }
             Op::Insert { .. }
             | Op::Delete { .. }
             | Op::Update { .. }
