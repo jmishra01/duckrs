@@ -2962,6 +2962,7 @@ test/sql/optimizer/case_zonemap_pruning.test
 test/sql/optimizer/coalesce_zonemap_pruning.test
 test/sql/optimizer/contains_row_group_pruning.test
 test/sql/optimizer/cse_error_capture.test
+test/sql/optimizer/date_part_row_group_pruning.test
 test/sql/optimizer/distinct_sibling_column_pruning.test
 test/sql/optimizer/distinctness_statistics.test
 test/sql/optimizer/distinctness_statistics_nested.test
@@ -3018,6 +3019,7 @@ test/sql/optimizer/string_row_group_pruning.test
 test/sql/optimizer/string_stats_merge_truncated_prefix.test
 test/sql/optimizer/struct_extract_struct_pack_collation.test
 test/sql/optimizer/struct_segment_pruning.test
+test/sql/optimizer/substring_zonemap_pruning.test
 test/sql/optimizer/sum_aggregate_stats_propagation.test
 test/sql/optimizer/test_common_subplan_aggregate_columns.test
 test/sql/optimizer/test_common_subplan_cte_binding_order.test
@@ -3043,6 +3045,7 @@ test/sql/optimizer/topn_window_elimination_computed_filter.test
 test/sql/optimizer/topn_window_elimination_nullable_order.test
 test/sql/optimizer/topn_window_set_elimination.test
 test/sql/optimizer/try_struct_extract_cast.test
+test/sql/optimizer/upper_lower_zonemap_pruning.test
 test/sql/optimizer/window_self_join_optimizer_csv.test
 test/sql/optimizer/yearweek_negative_iso_year.test
 test/sql/order/hugeint_order_by_extremes.test

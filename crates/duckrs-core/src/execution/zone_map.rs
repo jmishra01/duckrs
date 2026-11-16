@@ -54,6 +54,16 @@ const SPECIAL_NULL_HANDLING: &[&str] = &[
     "least",
 ];
 
+/// The date part `part` of `value`, if it can be worked out.
+pub(crate) fn evaluate_part(part: &str, value: &Value) -> Option<Value> {
+    let call = crate::function::dates::bind_date_function(
+        "date_part",
+        vec![BoundExpr::constant(Value::varchar(part)), BoundExpr::constant(value.clone())],
+    )
+    .ok()?;
+    try_evaluate_scalar(&call).filter(|value| !value.is_null())
+}
+
 /// `DEFAULT_ROW_GROUP_SIZE`.
 pub const ROW_GROUP_SIZE: usize = 122_880;
 /// The chunks of a row group, which all but the last chunk of a table fill.
@@ -122,7 +132,9 @@ const MONOTONE_ARGUMENTS: &[(&str, usize, bool)] = &[
 
 /// The zones of a column, by the keys in which its values sort as they do in a comparison.
 fn compute_zones(table: &TableCatalogEntry, column: usize, known: &[ColumnZone]) -> Vec<ColumnZone> {
-    if !has_ordered_statistics(&table.columns[column].ty) {
+    // intervals sort by their normalized form, as they compare
+    let ty = &table.columns[column].ty;
+    if !has_ordered_statistics(ty) && ty.id() != LogicalTypeId::Interval {
         return Vec::new();
     }
     if let Some(source) = table
@@ -509,6 +521,97 @@ impl Group<'_> {
             {
                 Range::Bounds(Value::boolean(false), Value::boolean(false))
             }
+            // `upper` and `lower` work on each character: strings that share a prefix (of the 12 bytes C++
+            // keeps of the bounds) give strings that share its converted prefix
+            ("upper" | "lower" | "ucase" | "lcase", [input]) => {
+                let Range::Bounds(min, max) = self.range(input) else {
+                    return self.range(input);
+                };
+                let (Ok(min), Ok(max)) = (min.try_to_string(), max.try_to_string()) else {
+                    return Range::Unknown;
+                };
+                let shared: String = min
+                    .chars()
+                    .zip(max.chars())
+                    .take_while(|(a, b)| a == b)
+                    .map(|(a, _)| a)
+                    .scan(0, |bytes, c| {
+                        *bytes += c.len_utf8();
+                        (*bytes <= STRING_STATISTICS_BYTES).then_some(c)
+                    })
+                    .collect();
+                if shared.is_empty() || !shared.is_ascii() {
+                    return Range::Unknown;
+                }
+                let prefix = if matches!(name, "upper" | "ucase") {
+                    shared.to_ascii_uppercase()
+                } else {
+                    shared.to_ascii_lowercase()
+                };
+                let mut above = prefix.clone();
+                above.push(char::MAX);
+                Range::Bounds(Value::varchar(prefix), Value::varchar(above))
+            }
+            // comparisons of intervals go by their normalized form already
+            ("normalized_interval", [_]) => self.monotone(expr, 0, true),
+            // `substring(s, k)` of strings that share their first k - 1 characters sorts as the strings do
+            // `s[:]` is `s`, and `s[:n]` a prefix of it, which sorts as it does
+            ("array_slice" | "list_slice", [input, start, end])
+                if expr.return_type.id() == LogicalTypeId::Varchar
+                    && start.return_type.id() == LogicalTypeId::List
+                    && matches!(end.kind, BoundExprKind::Constant(_)) =>
+            {
+                if end.return_type.id() == LogicalTypeId::List {
+                    self.range(input)
+                } else {
+                    self.monotone(expr, 0, true)
+                }
+            }
+            ("substring" | "substr" | "array_slice" | "list_slice", [input, start, rest @ ..])
+                if expr.return_type.id() == LogicalTypeId::Varchar
+                    && rest.iter().all(|r| matches!(r.kind, BoundExprKind::Constant(_)))
+                    && constant(start).and_then(|v| v.as_i128()).is_some_and(|k| k >= 0)
+                    && matches!(self.range(input), Range::Bounds(ref min, ref max) if {
+                        let k = (constant(start).and_then(|v| v.as_i128()).expect("checked") as usize).max(1);
+                        match (min.try_to_string(), max.try_to_string()) {
+                            (Ok(min), Ok(max)) => {
+                                let shared = min.chars().zip(max.chars()).take_while(|(a, b)| a == b).count();
+                                // C++ knows the shared prefix only within the 12 bytes it keeps
+                                shared >= k - 1 && min.chars().count() >= k - 1 && k - 1 <= STRING_STATISTICS_BYTES
+                            }
+                            _ => false,
+                        }
+                    }) =>
+            {
+                self.monotone(expr, 0, true)
+            }
+            // a time part of values that share the larger units follows them: `hour` within a day,
+            // `minute` within an hour, `second` and the smaller ones within a minute
+            ("hour" | "minute" | "second" | "millisecond" | "microsecond" | "nanosecond", [input]) => match self.range(input) {
+                Range::Bounds(min, max) => {
+                    let larger: &[&str] = match name {
+                        "hour" => &["year", "doy"],
+                        "minute" => &["year", "doy", "hour"],
+                        _ => &["year", "doy", "hour", "minute"],
+                    };
+                    let same = larger
+                        .iter()
+                        .all(|part| super::zone_map::evaluate_part(part, &min) == super::zone_map::evaluate_part(part, &max));
+                    if same { self.monotone(expr, 0, true) } else { Range::Unknown }
+                }
+                other => other,
+            },
+            // `week` of dates in one ISO year follows them
+            ("week" | "weekofyear", [input]) => match self.range(input) {
+                Range::Bounds(min, max) => {
+                    let iso_year = |value: &Value| super::zone_map::evaluate_part("isoyear", value);
+                    match (iso_year(&min), iso_year(&max)) {
+                        (Some(a), Some(b)) if a == b => self.monotone(expr, 0, true),
+                        _ => Range::Unknown,
+                    }
+                }
+                other => other,
+            },
             // `isnan`: NaN sorts above every number, so the bounds tell
             ("isnan", [input]) => match self.range(input) {
                 Range::Bounds(min, max) => {
@@ -630,6 +733,10 @@ impl Group<'_> {
                                 ..
                             }) if (!has_null || !SPECIAL_NULL_HANDLING.contains(&name))
                                 && compare_values(ComparisonOp::Equal, &min, &max) == Some(true)
+                                // C++ keeps 12 bytes of a string bound, which do not tell a longer one
+                                && min.try_to_string().map_or(true, |text| {
+                                    min.logical_type().id() != LogicalTypeId::Varchar || text.len() <= STRING_STATISTICS_BYTES
+                                })
                                 // the sign of a floating point zero is not in the statistics
                                 && !matches!(min.data(), duckrs_common::value::ValueData::Float(f) if *f == 0.0)
                                 && !matches!(min.data(), duckrs_common::value::ValueData::Double(d) if *d == 0.0) =>
