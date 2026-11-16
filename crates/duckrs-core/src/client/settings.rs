@@ -60,10 +60,7 @@ const UNHONORED: &[&str] = &[
     "dialect_compatibility_mode",
     "disable_timestamptz_casts",
     "errors_as_json",
-    "file_search_path",
-    "home_directory",
     "legacy_disable_null_type",
-    "lock_configuration",
     "binary_as_string",
     "preserve_identifier_case",
     "schema",
@@ -858,6 +855,7 @@ pub fn set_variable(
     if scope == SetScope::Variable {
         return Err(crate::unported("SET VARIABLE"));
     }
+    check_lock(name, global, session)?;
     let (index, setting) = find_setting(name).ok_or_else(|| unrecognized(name))?;
     let is_global = resolve_scope(setting, scope)?;
     if value.is_null() {
@@ -893,6 +891,31 @@ pub fn set_variable(
     Ok(())
 }
 
+/// `DBConfig::CheckLock`: with `lock_configuration`, only `schema`, `search_path` and what
+/// `allowed_configs` names (by canonical name) can change.
+pub fn check_lock(name: &str, global: &SettingValues, session: &SettingValues) -> Result<()> {
+    let locked = current_value("lock_configuration", global, session)
+        .is_some_and(|value| matches!(value.data(), duckrs_common::value::ValueData::Bool(true)));
+    if !locked || name.eq_ignore_ascii_case("schema") || name.eq_ignore_ascii_case("search_path") {
+        return Ok(());
+    }
+    let canonical = |name: &str| find_setting(name).map_or_else(|| name.to_string(), |(_, s)| s.name.to_string());
+    let wanted = canonical(name);
+    if let Some(allowed) = current_value("allowed_configs", global, session)
+        && let duckrs_common::value::ValueData::List(names) = allowed.data()
+    {
+        for allowed in names {
+            if allowed.try_to_string().is_ok_and(|a| canonical(&a).eq_ignore_ascii_case(&wanted)) {
+                return Ok(());
+            }
+        }
+    }
+    Err(Error::new(
+        ErrorKind::InvalidInput,
+        format!("Cannot change configuration option {name} - the configuration has been locked"),
+    ))
+}
+
 /// `CustomUserAgentSetting` and `DuckDBAPISetting`: set when the database starts, not after.
 fn running_only(name: &str) -> Result<()> {
     if matches!(name, "custom_user_agent" | "duckdb_api") {
@@ -914,6 +937,7 @@ pub fn reset_variable(
     if scope == SetScope::Variable {
         return Err(crate::unported("RESET VARIABLE"));
     }
+    check_lock(name, global, session)?;
     let (index, setting) = find_setting(name).ok_or_else(|| unrecognized(name))?;
     running_only(setting.name)?;
     if matches!(setting.name, "allowed_directories" | "allowed_paths") {

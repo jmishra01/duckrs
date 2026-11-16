@@ -1031,6 +1031,7 @@ test/sql/attach/attach_expr.test
 test/sql/attach/attach_external_access.test
 test/sql/attach/attach_foreign_key.test
 test/sql/attach/attach_foreign_key_external_catalog.test
+test/sql/attach/attach_home_directory.test
 test/sql/attach/attach_huggingface_index.test
 test/sql/attach/attach_if_not_exists.test
 test/sql/attach/attach_index.test
@@ -1472,6 +1473,7 @@ test/sql/copy/csv/csv_external_access.test
 test/sql/copy/csv/csv_glob_fallback.test
 test/sql/copy/csv/csv_hive.test
 test/sql/copy/csv/csv_hive_filename_union.test
+test/sql/copy/csv/csv_home_directory.test
 test/sql/copy/csv/csv_limit_copy.test
 test/sql/copy/csv/csv_multibyte_delimiter_escapes.test
 test/sql/copy/csv/csv_null_byte.test
@@ -1485,6 +1487,7 @@ test/sql/copy/csv/empty_first_line.test
 test/sql/copy/csv/empty_string_quote.test
 test/sql/copy/csv/except.test
 test/sql/copy/csv/glob/copy_csv_glob.test
+test/sql/copy/csv/glob/read_csv_glob.test
 test/sql/copy/csv/glob/test_unmatch_globs.test
 test/sql/copy/csv/inconsistent_cells_error.test
 test/sql/copy/csv/integer_exponent.test
@@ -1813,6 +1816,7 @@ test/sql/copy/parquet/writer/parquet_write_date.test
 test/sql/copy/parquet/writer/parquet_write_decimals.test
 test/sql/copy/parquet/writer/parquet_write_enums.test
 test/sql/copy/parquet/writer/parquet_write_field_id.test
+test/sql/copy/parquet/writer/parquet_write_home_directory.test
 test/sql/copy/parquet/writer/parquet_write_hugeint.test
 test/sql/copy/parquet/writer/parquet_write_interval.test
 test/sql/copy/parquet/writer/parquet_write_issue_5779.test
@@ -3133,6 +3137,7 @@ test/sql/peg_parser/fuzzer/internal_0227.test
 test/sql/peg_parser/fuzzer/new_parser_failure_0074.test
 test/sql/peg_parser/fuzzer/new_parser_failure_0076.test
 test/sql/peg_parser/identifier.test
+test/sql/peg_parser/parser/copy_file_name.test
 test/sql/peg_parser/peg_syntax_error.test
 test/sql/peg_parser/qualified_operator.test
 test/sql/peg_parser/transformer/between_asymmetric.test
@@ -3330,8 +3335,10 @@ test/sql/setops/union_pipeline.test
 test/sql/setops/union_shared_scan.test
 test/sql/setops/union_single_dedup.test
 test/sql/setops/value_union.test
+test/sql/settings/allowed_configs.test
 test/sql/settings/allowed_directories.test
 test/sql/settings/allowed_directories_atomic_update.test
+test/sql/settings/allowed_directories_home_directory.test
 test/sql/settings/allowed_paths.test
 test/sql/settings/concurrent_set_disabled_optimizers.test
 test/sql/settings/connection_local_settings.test
@@ -3340,6 +3347,7 @@ test/sql/settings/default_null_order_extended.test
 test/sql/settings/drop_set_schema.test
 test/sql/settings/enable_block_allocator.test
 test/sql/settings/integer_division_setting.test
+test/sql/settings/lock_configuration_schema.test
 test/sql/settings/max_memory_percentage.test
 test/sql/settings/reset/reset_threads.test
 test/sql/settings/set_null_settings.test
@@ -3353,6 +3361,7 @@ test/sql/settings/setting_order.test
 test/sql/settings/setting_profiling_mode.test
 test/sql/settings/setting_threads.test
 test/sql/settings/test_disabled_file_systems_whitespace.test
+test/sql/settings/test_lock_configuration.test
 test/sql/settings/test_nan_percentage_settings.test
 test/sql/settings/test_progress_bar_null.test
 test/sql/settings/test_progress_bar_time_negative.test

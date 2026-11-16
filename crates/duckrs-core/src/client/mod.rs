@@ -1702,6 +1702,9 @@ impl ClientContext {
     /// Runs one statement within the current transaction, or as a transaction of its own
     /// (`ClientContext::PendingStatementOrPreparedStatementInternal` + `CleanupInternal`).
     fn run_statement(&mut self, statement: &Statement) -> Result<MaterializedQueryResult> {
+        // `FileSystem::GetHomeDirectory` of this connection
+        crate::execution::file_system::set_home_directory(Some(self.setting_text("home_directory")));
+        crate::execution::file_system::set_file_search_path(&self.setting_text("file_search_path"));
         // `Binder::BindCreateSchema`: the system catalog (and its pg_catalog and information_schema)
         // takes no entries
         let created = match statement {
@@ -2190,6 +2193,7 @@ impl ClientContext {
             return Err(crate::unported("ATTACH TO EXTERNAL RESOURCE"));
         }
         let path = evaluate_scalar(&bind_constant_expression(&self.catalog(), &info.path)?)?.try_to_string()?;
+        let path = crate::execution::file_system::expand_path(&path);
         let mut options = AttachOptions::default();
         let mut mode_given = false;
         // the options given as expressions, such as `TYPE getvariable('t')`, by their values
@@ -3776,6 +3780,19 @@ impl ClientContext {
         };
         let with_dependencies = self.setting_text("enable_view_dependencies") == "true";
         let catalog = self.catalog();
+        // an older file has no place for it: it would come back as a regular view
+        if *secure
+            && !info.temporary
+            && catalog
+                .storage_version()
+                .is_some_and(|version| version < duckrs_common::serializer::StorageVersion::V2_0_0)
+        {
+            return Err(Error::new(
+                ErrorKind::Binder,
+                "CREATE SECURE VIEW is only supported for storage versions v2.0.0 and higher.\nUse an in-memory \
+                 database, or ATTACH with (STORAGE_VERSION v2.0.0)",
+            ));
+        }
         let schema = catalog.schema_for(create_schema_of(info)?.as_deref())?;
         let on_conflict = on_create_conflict(info.on_conflict);
         // IF NOT EXISTS for a view that exists does not look at the query
