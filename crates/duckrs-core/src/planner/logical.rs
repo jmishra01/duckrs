@@ -142,6 +142,9 @@ pub enum LogicalOperatorKind {
     Sample { options: SampleOptions },
     /// `LogicalDistinct` (`DISTINCT`, not `DISTINCT ON`): one row per distinct `targets`.
     Distinct { targets: Vec<BoundExpr> },
+    /// `LogicalSecureView`: the plan of a SECURE VIEW, which it passes on. The optimizer pushes
+    /// nothing into it, so that no expression of the query sees the rows the view hides.
+    SecureView { view_name: String },
     /// `LogicalUnnest`: a row per element of the lists of `expressions`, next to the child's
     /// columns. A list that runs out gives NULL.
     Unnest {
@@ -528,14 +531,20 @@ impl LogicalOperator {
             | LogicalOperatorKind::Limit { .. }
             | LogicalOperatorKind::Sample { .. }
             | LogicalOperatorKind::LimitPercent { .. }
+            | LogicalOperatorKind::SecureView { .. }
             | LogicalOperatorKind::Distinct { .. } => self.children[0].types(),
             LogicalOperatorKind::Projection { expressions, .. } => {
                 expressions.iter().map(|e| e.return_type.clone()).collect()
             }
+            // and the `rowid` of each row
             LogicalOperatorKind::Delete {
                 table, returning: true, ..
+            } => {
+                let mut types = table.types();
+                types.push(LogicalType::BIGINT);
+                types
             }
-            | LogicalOperatorKind::Insert {
+            LogicalOperatorKind::Insert {
                 table, returning: true, ..
             }
             | LogicalOperatorKind::Update {
@@ -671,6 +680,7 @@ impl LogicalOperator {
             | LogicalOperatorKind::Limit { .. }
             | LogicalOperatorKind::Sample { .. }
             | LogicalOperatorKind::LimitPercent { .. }
+            | LogicalOperatorKind::SecureView { .. }
             | LogicalOperatorKind::Distinct { .. } => self.children[0].column_bindings(),
             LogicalOperatorKind::Projection {
                 table_index,
@@ -680,8 +690,8 @@ impl LogicalOperator {
                 table,
                 table_index,
                 returning,
-            }
-            | LogicalOperatorKind::Insert {
+            } => numbered(*table_index, if *returning { table.columns.len() + 1 } else { 1 }),
+            LogicalOperatorKind::Insert {
                 table,
                 table_index,
                 returning,

@@ -129,13 +129,21 @@ pub fn is_pipe(path: &str) -> bool {
 }
 
 pub fn glob(pattern: &str) -> Vec<String> {
+    let expanded = expand_path(pattern);
+    let pattern = expanded.as_str();
+    let absolute = pattern.starts_with('/');
+    let search_path = if absolute { Vec::new() } else { file_search_path() };
     if !has_glob(pattern) {
         // `LocalFileSystem::Glob`: a file that exists, or a pipe (`IsPipe`, e.g. `/dev/stdin`)
-        return if Path::new(pattern).is_file() || is_pipe(pattern) {
-            vec![pattern.to_string()]
-        } else {
-            Vec::new()
-        };
+        if Path::new(pattern).is_file() || is_pipe(pattern) {
+            return vec![pattern.to_string()];
+        }
+        // `FetchFileWithoutGlob`: a relative path in each directory of `file_search_path`
+        return search_path
+            .iter()
+            .map(|directory| join(directory, pattern))
+            .filter(|path| Path::new(path).is_file() || is_pipe(path))
+            .collect();
     }
     let (root, relative) = match pattern.strip_prefix('/') {
         Some(relative) => ("/", relative),
@@ -144,7 +152,14 @@ pub fn glob(pattern: &str) -> Vec<String> {
     // `Path`: a backslash separates as a slash does, and empty segments are dropped
     let segments: Vec<&str> = relative.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
     let mut result = Vec::new();
-    walk(root, &segments, &mut result);
+    // a relative pattern starts in the directories of `file_search_path`, if it names any
+    if search_path.is_empty() {
+        walk(root, &segments, &mut result);
+    } else {
+        for directory in &search_path {
+            walk(directory, &segments, &mut result);
+        }
+    }
     result.sort();
     result.dedup();
     // a file whose name has glob characters in it (#4699)
@@ -236,7 +251,8 @@ pub fn check_compression(path: &str, compression: Compression) -> Result<()> {
 /// All of a file, decompressed.
 pub fn read_file(path: &str, compression: Compression) -> Result<Vec<u8>> {
     check_compression(path, compression)?;
-    let data = std::fs::read(path).map_err(|e| io_error(format!("Cannot open file \"{path}\": {e}")))?;
+    let expanded = expand_path(path);
+    let data = std::fs::read(&expanded).map_err(|e| io_error(format!("Cannot open file \"{path}\": {e}")))?;
     // the file is read at once: one READ of all of it
     crate::logging::log_file_system(path, "OPEN", None);
     crate::logging::log_file_system(path, "READ", Some((data.len() as i64, 0)));
@@ -272,12 +288,64 @@ mod tests {
     }
 }
 
-/// `FileSystem::ExpandPath`: a leading `~` is the home directory.
+thread_local! {
+    /// The `home_directory` setting of the connection whose statement this thread runs.
+    static HOME_DIRECTORY: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+thread_local! {
+    /// The `file_search_path` setting, as its directories.
+    static FILE_SEARCH_PATH: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Sets the directories of `file_search_path` on this thread, for the statement that starts.
+pub fn set_file_search_path(setting: &str) {
+    let paths = setting.split(',').filter(|p| !p.is_empty()).map(str::to_string).collect();
+    FILE_SEARCH_PATH.with(|current| *current.borrow_mut() = paths);
+}
+
+fn file_search_path() -> Vec<String> {
+    FILE_SEARCH_PATH.with(|current| current.borrow().clone())
+}
+
+/// Sets what [`home_directory`] gives on this thread, for the statement that starts.
+pub fn set_home_directory(home: Option<String>) {
+    HOME_DIRECTORY.with(|current| *current.borrow_mut() = home.filter(|home| !home.is_empty()));
+}
+
+/// `FileSystem::GetHomeDirectory`: the `home_directory` setting, else `HOME`.
+pub fn home_directory() -> String {
+    HOME_DIRECTORY
+        .with(|current| current.borrow().clone())
+        .unwrap_or_else(|| std::env::var("HOME").unwrap_or_default())
+}
+
+/// `GetFileUrlOffset`: where the path of a `file:` URL starts, or 0.
+fn file_url_offset(path: &str) -> usize {
+    let bytes = path.as_bytes();
+    if !path.starts_with("file:/") {
+        return 0;
+    }
+    if bytes.get(6) != Some(&b'/') {
+        return 5;
+    }
+    if bytes.get(7) == Some(&b'/') {
+        return 7;
+    }
+    if path.get(7..17) == Some("localhost/") {
+        return 16;
+    }
+    0
+}
+
+/// `FileSystem::ExpandPath`: a leading `~` is the home directory, and a `file:` URL its path.
 pub fn expand_path(path: &str) -> String {
-    if (path == "~" || path.starts_with("~/"))
-        && let Ok(home) = std::env::var("HOME")
-    {
-        return format!("{home}{}", &path[1..]);
+    if let Some(rest) = path.strip_prefix('~') {
+        return format!("{}{rest}", home_directory());
+    }
+    let offset = file_url_offset(path);
+    if offset > 0 {
+        return path[offset..].to_string();
     }
     path.to_string()
 }

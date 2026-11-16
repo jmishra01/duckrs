@@ -71,10 +71,13 @@ impl Binder<'_> {
                 return Err(binder_error("Cannot insert into a generated column"));
             }
             let Some(index) = table.column_index(name) else {
+                // `TableCatalogEntry::GetColumnIndex`
+                let names: Vec<String> = table.logical_columns().iter().map(|c| c.name.to_string()).collect();
                 return Err(binder_error(format!(
-                    "Table {} does not have a column with name {}",
+                    "Table {} does not have a column with name {}\n{}",
                     sql_quoted_identifier(&table.name),
-                    sql_quoted_identifier(name)
+                    sql_quoted_identifier(name),
+                    duckrs_common::string_util::candidates_error_message(&names, name, "Did you mean")
                 )));
             };
             result.push(index);
@@ -92,8 +95,14 @@ impl Binder<'_> {
     ) -> Result<BoundMergeAction> {
         let bound_condition = match &action.condition {
             Some(condition) => {
-                let bound = self.bind_expression(condition)?;
-                Some(bound.cast_to(&LogicalType::BOOLEAN, false))
+                // `ProjectionBinder` for the "WHERE clause" of the action
+                let errors = (
+                    std::mem::replace(&mut self.window_error, "WHERE clause cannot contain window functions!"),
+                    std::mem::replace(&mut self.aggregate_error, "WHERE clause cannot contain aggregate functions"),
+                );
+                let bound = self.bind_expression(condition);
+                (self.window_error, self.aggregate_error) = errors;
+                Some(bound?.cast_to(&LogicalType::BOOLEAN, false))
             }
             None => None,
         };
@@ -140,8 +149,11 @@ impl Binder<'_> {
                         )));
                     }
                     let Some(index) = table.column_index(name) else {
+                        // `BindUpdateSet`
+                        let names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
                         return Err(binder_error(format!(
-                            "Referenced update column {name} not found in table!"
+                            "Referenced update column {name} not found in table!\n{}",
+                            duckrs_common::string_util::candidates_error_message(&names, name, "Did you mean")
                         )));
                     };
                     if result.columns.contains(&index) {

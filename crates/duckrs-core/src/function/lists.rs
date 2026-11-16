@@ -379,6 +379,13 @@ fn list_grade_up(args: &DataChunk, result: &mut Vector) -> Result<()> {
 /// `ListAggregatesFunction`: the aggregate over the items of each list.
 fn list_aggr(args: &DataChunk, result: &mut Vector) -> Result<()> {
     let ty = result.logical_type().clone();
+    // `default_collation` comes with the aggregate's name, an explicit one with the items
+    let declared = args.column(0).logical_type().child_type().map(|element| {
+        match args.columns().get(1).and_then(|which| which.logical_type().collation()) {
+            Some(collation) if element.collation().is_none() => element.with_collation(Some(collation)),
+            _ => element.clone(),
+        }
+    });
     row_wise(args, result, |row| {
         if row[0].is_null() {
             return Ok(Value::null(ty.clone()));
@@ -386,10 +393,19 @@ fn list_aggr(args: &DataChunk, result: &mut Vector) -> Result<()> {
         let name = row[1].try_to_string()?;
         let set = BuiltinFunctions::get().aggregate(&name).expect("checked when binding");
         let element = row[0].logical_type().child_type().expect("a list").clone();
-        let mut children: Vec<BoundExpr> = vec![BoundExpr::constant(Value::null(element))];
+        let mut children: Vec<BoundExpr> = vec![BoundExpr::constant(Value::null(element.clone()))];
         children.extend(row[2..].iter().map(|extra| BoundExpr::constant(extra.clone())));
         let bound = bind_aggregate_function(set, children, None, false)?;
         let values = items(&row[0]);
+        // `BindMinMax`: a collated string compares by its collated key (`arg_min`/`arg_max`)
+        if matches!(set.name.as_str(), "min" | "max")
+            && row.len() == 2
+            && let Some(declared) = declared.as_ref().filter(|d| {
+                d.id() == LogicalTypeId::Varchar && d.collation().is_some()
+            })
+        {
+            return collated_extreme(values, declared, set.name == "max", &ty);
+        }
         let input_type = bound.children[0].return_type.clone();
         // the parameters the aggregate was bound with (its own defaults too), packed with each item
         let packed = match &bound.children[0].kind {
@@ -422,6 +438,34 @@ fn list_aggr(args: &DataChunk, result: &mut Vector) -> Result<()> {
         let input = Some(&input_type);
         bound.function.finalize(&states[0], &bound.return_type, input)
     })
+}
+
+/// The smallest or largest of `values` by the collation of `element`, the first of equals.
+fn collated_extreme(values: &[Value], element: &LogicalType, largest: bool, ty: &LogicalType) -> Result<Value> {
+    let mut best: Option<(Value, &Value)> = None;
+    for value in values.iter().filter(|v| !v.is_null()) {
+        let (key, _) = crate::planner::collation::push_collation(
+            BoundExpr::constant(value.clone()),
+            element,
+            "",
+            crate::planner::collation::CollationType::AllCollations,
+        )?;
+        let key = evaluate_scalar(&key)?;
+        let better = best.as_ref().is_none_or(|(current, _)| {
+            let order = match (key.data(), current.data()) {
+                (ValueData::Bytes(a), ValueData::Bytes(b)) => a.cmp(b),
+                _ => std::cmp::Ordering::Equal,
+            };
+            if largest { order.is_gt() } else { order.is_lt() }
+        });
+        if better {
+            best = Some((key, value));
+        }
+    }
+    match best {
+        Some((_, value)) => cast_value(value, ty),
+        None => Ok(Value::null(ty.clone())),
+    }
 }
 
 fn cast_value(value: &Value, ty: &LogicalType) -> Result<Value> {

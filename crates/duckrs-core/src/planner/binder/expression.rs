@@ -412,6 +412,25 @@ impl Binder<'_> {
                             if let Some(ty) = found {
                                 return Ok(ty);
                             }
+                            // `catalog.type`: a name that is no schema can be a database
+                            if let [catalog] = name.qualification.as_slice() {
+                                // without a session (a stored definition) the database is this one
+                                let attached = if catalog.eq_ignore_ascii_case(&self.catalog.name)
+                                    || self.session.as_ref().is_none_or(|s| s.database.eq_ignore_ascii_case(catalog))
+                                {
+                                    self.catalog.get_type(Some("main"), None, &name.name)?
+                                } else {
+                                    self.session
+                                        .as_ref()
+                                        .and_then(|session| (session.attached_catalog)(catalog))
+                                        .map(|attached| attached.get_type(Some("main"), None, &name.name))
+                                        .transpose()?
+                                        .flatten()
+                                };
+                                if let Some(ty) = attached {
+                                    return Ok(ty);
+                                }
+                            }
                             // the built-in types are found in `main` too
                             let in_main = name
                                 .qualification
@@ -449,7 +468,20 @@ impl Binder<'_> {
                 .map(|candidate| (similarity_rating(candidate, &name), *candidate))
                 .max_by(|a, b| a.0.total_cmp(&b.0))
                 .filter(|(score, _)| *score > 0.7);
-            let hint = closest.map_or_else(String::new, |(_, type_name)| format!("\nDid you mean \"{type_name}\"?"));
+            // `CreateMissingEntryException`: a type of that name in a schema off the search path
+            let mut elsewhere: Vec<String> = self
+                .catalog
+                .schemas()
+                .iter()
+                .filter(|schema| schema.get_type(&name).is_some())
+                .map(|schema| format!("{}.{original}", schema.name))
+                .collect();
+            elsewhere.sort();
+            let hint = if elsewhere.is_empty() {
+                closest.map_or_else(String::new, |(_, type_name)| format!("\nDid you mean \"{type_name}\"?"))
+            } else {
+                format!("\nDid you mean \"{}\"?", elsewhere.join(" or "))
+            };
             return Err(Error::new(
                 ErrorKind::Catalog,
                 format!("Type with name {original} does not exist!{hint}"),
@@ -589,7 +621,6 @@ impl Binder<'_> {
                 }
             }
             _ if !children.is_empty() => Err(crate::unported(format!("type parameters for {}", name.to_uppercase()))),
-            LogicalTypeId::Type => Err(crate::unported(format!("the {} type", name.to_uppercase()))),
             id => Ok(LogicalType::new(id)),
         }
     }
@@ -662,6 +693,23 @@ impl Binder<'_> {
         let (mut own, mut outer) = (false, false);
         for argument in &function.args {
             visit_expr_mut(&mut argument.expr.clone(), &mut |e| {
+                // the parameters of a lambda in the arguments are none of the query's columns
+                if let ExprKind::Lambda { lhs, expr, .. } = &mut e.kind {
+                    let mut parameters = Vec::new();
+                    visit_expr_mut(lhs, &mut |p| {
+                        if let ExprKind::ColumnRef(names) = &p.kind {
+                            parameters.push(names[0].clone());
+                        }
+                    });
+                    visit_expr_mut(expr, &mut |inner| {
+                        if let ExprKind::ColumnRef(names) = &inner.kind
+                            && parameters.iter().any(|p| p.eq_ignore_ascii_case(&names[0]))
+                        {
+                            inner.kind = ExprKind::Default;
+                        }
+                    });
+                    **lhs = Expr::from(ExprKind::Default);
+                }
                 if let ExprKind::ColumnRef(names) = &e.kind {
                     if self.bind_context.bind_column_ref(names).is_ok() {
                         own = true;
@@ -1071,7 +1119,37 @@ impl Binder<'_> {
                 return self.bind_expression(&rewritten);
             }
         }
-        let bound = self.bind_expression_inner(expr)?;
+        // `ExpressionBinder::TryBindLambdaOrJson`: a function that takes no lambda and is given an
+        // arrow binds the arrow as JSON's `->`; when that fails too, both failures are told
+        let arrow_argument = |e: &Expr| {
+            matches!(
+                e.kind,
+                ExprKind::Lambda {
+                    syntax: ast::LambdaSyntax::Arrow,
+                    ..
+                }
+            )
+        };
+        let not_lambda_call = match &expr.kind {
+            ExprKind::Function(function) => {
+                !super::lambda::is_lambda_function(&function.name.name)
+                    && function.args.iter().any(|a| arrow_argument(&a.expr))
+            }
+            ExprKind::Operator {
+                op: ast::OperatorType::ArrayConstructor,
+                children,
+            } => children.iter().any(arrow_argument),
+            _ => false,
+        };
+        let bound = match self.bind_expression_inner(expr) {
+            Err(error) if not_lambda_call && error.kind == ErrorKind::Binder => {
+                return Err(binder_error(format!(
+                    "failed to bind function, either: This scalar function does not support lambdas!\n or: {}",
+                    error.message
+                )));
+            }
+            bound => bound?,
+        };
         // `BindMapContainsExpression`: with a collation on the key or the map's keys, the key is
         // looked for among the keys as a list: list_contains(map_keys(m), key)
         if let (ExprKind::Function(call), BoundExprKind::Function { function, children, .. }) = (&expr.kind, &bound.kind)
@@ -1318,9 +1396,17 @@ impl Binder<'_> {
         let args = binding
             .names
             .iter()
-            .map(|column| ast::FunctionArgument {
-                name: column.clone(),
-                expr: Expr::column(vec![binding.alias.clone(), column.clone()]),
+            .map(|column| {
+                // by the schema too, where the alias alone names more than one table
+                let mut path = match (schema, &binding.schema) {
+                    (Some(_), Some(own)) => vec![own.clone()],
+                    _ => Vec::new(),
+                };
+                path.extend([binding.alias.clone(), column.clone()]);
+                ast::FunctionArgument {
+                    name: column.clone(),
+                    expr: Expr::column(path),
+                }
             })
             .collect();
         let mut function = ast::FunctionExpr::new("struct_pack", Vec::new());
@@ -1439,11 +1525,12 @@ impl Binder<'_> {
                 let types = std::cell::RefCell::new(self.child_binder());
                 return crate::function::json::bind_function("->", children, &|name| types.borrow_mut().csv_type(name));
             }
-            ExprKind::ColumnRef(names) if self.table_function_argument => {
-                BoundExpr::constant(Value::varchar(names.join(".")))
-            }
+            // a lambda's parameter is one before a name of a table function's argument is its text
             ExprKind::ColumnRef(names) if !self.lambda_scopes.is_empty() && self.is_lambda_parameter(names) => {
                 return Ok(self.bind_lambda_parameter(names)?.expect("just checked"));
+            }
+            ExprKind::ColumnRef(names) if self.table_function_argument => {
+                BoundExpr::constant(Value::varchar(names.join(".")))
             }
             ExprKind::ColumnRef(names) if self.bind_context.struct_field_start(names).is_some() => {
                 let start = self
@@ -1613,6 +1700,10 @@ impl Binder<'_> {
                     child
                 };
                 if child.return_type.id() != LogicalTypeId::Varchar || child.return_type.alias().is_some() {
+                    // `BindSelectNode`: of a position, the select list entry is no VARCHAR
+                    if expr.alias == super::statements::ORDER_POSITION_COLLATE {
+                        return Err(binder_error("COLLATE can only be applied to varchar columns"));
+                    }
                     return Err(binder_error("collations are only supported for type varchar"));
                 }
                 crate::planner::collation::test_collation(collation)?;
@@ -1861,6 +1952,40 @@ impl Binder<'_> {
                         .iter()
                         .map(|a| self.bind_expression(&a.expr))
                         .collect::<Result<Vec<_>>>()?;
+                    // `BindMinMax` under `default_collation`: the strings compare collated
+                    let lower = function.name.name.to_ascii_lowercase();
+                    let default = self.default_collation();
+                    let aggregate_name = |at: usize| match children.get(at).map(|c| &c.kind) {
+                        Some(BoundExprKind::Constant(value)) => value.try_to_string().ok(),
+                        _ => None,
+                    };
+                    let min_max = matches!(lower.as_str(), "list_max" | "list_min" | "array_max" | "array_min")
+                        || matches!(
+                            lower.as_str(),
+                            "list_aggr" | "list_aggregate" | "array_aggr" | "array_aggregate" | "aggregate"
+                        ) && children.len() == 2
+                            && aggregate_name(1)
+                                .is_some_and(|n| n.eq_ignore_ascii_case("min") || n.eq_ignore_ascii_case("max"));
+                    if min_max
+                        && !default.is_empty()
+                        && let Some(list) = children.first()
+                        && list.return_type.id() == LogicalTypeId::List
+                        && list
+                            .return_type
+                            .child_type()
+                            .is_some_and(|c| c.id() == LogicalTypeId::Varchar && c.collation().is_none())
+                    {
+                        // the aggregate's name carries the collation to `list_aggr`
+                        let collated = LogicalType::VARCHAR.with_collation(Some(&default));
+                        let name = aggregate_name(1).unwrap_or_else(|| lower[lower.len() - 3..].to_string());
+                        let list = list.clone();
+                        drop(children);
+                        let which = BoundExpr::constant(Value::varchar(name).reinterpret(&collated)?);
+                        // `arg_max` returns the item, which has no collation
+                        let mut bound = bind_generic_function("list_aggr", vec![list, which])?;
+                        bound.return_type = bound.return_type.with_collation(None);
+                        return Ok(bound);
+                    }
                     return bind_generic_function(&function.name.name, children);
                 }
                 if ["st_crs", "st_setcrs"]
@@ -2099,16 +2224,35 @@ impl Binder<'_> {
                     && let [argument] = function.args.as_slice()
                     && argument.name.is_empty()
                 {
-                    self.bind_expression(&argument.expr)?;
+                    let bound = self.bind_expression(&argument.expr)?;
                     // `AliasFunction`: the call's own alias, if it has one
                     let name = if !expr.alias.is_empty() {
                         expr.alias.clone()
                     } else if argument.expr.alias.is_empty() {
-                        super::statements::expression_name(&argument.expr)
+                        // `Expression::GetName`: a bound column is named by its column, unqualified
+                        let mut unqualified = argument.expr.clone();
+                        visit_expr_mut(&mut unqualified, &mut |e: &mut Expr| {
+                            if let ExprKind::ColumnRef(names) = &mut e.kind
+                                && names.len() > 1
+                            {
+                                *names = vec![names.last().expect("a name").clone()];
+                            }
+                        });
+                        super::statements::expression_name(&unqualified)
                     } else {
                         argument.expr.alias.clone()
                     };
-                    return Ok(BoundExpr::constant(Value::varchar(name)));
+                    // the argument is evaluated all the same: its errors surface (a constant one folds)
+                    if bound.is_foldable() && crate::execution::expression_executor::evaluate_scalar(&bound).is_ok() {
+                        return Ok(BoundExpr::constant(Value::varchar(name)));
+                    }
+                    let name = BoundExpr::constant(Value::varchar(name));
+                    return Ok(crate::function::nested::bound_function(
+                        "alias",
+                        vec![bound, name],
+                        LogicalType::VARCHAR,
+                        alias_function,
+                    ));
                 }
                 // the macros of the system catalog (`DefaultFunctionGenerator`), where no function has
                 // the name
@@ -2182,6 +2326,7 @@ impl Binder<'_> {
                         "duckdb_optimizers",
                         "pragma_version",
                         "pragma_platform",
+                        "pragma_user_agent",
                         "pragma_database_size",
                     ];
                     // `ExpressionBinder::BindWindow` of a window function written without OVER
@@ -2213,13 +2358,46 @@ impl Binder<'_> {
                                 .chain(crate::function::extras::OTHER_FUNCTIONS.iter())
                                 .map(|name| name.to_string()),
                         );
+                    // the functions bound by name, and the macros of the system catalog
+                    const BOUND_BY_NAME: &[&str] = &["nullif", "if", "write_log", "current_setting", "getvariable"];
+                    let names = names
+                        .chain(BOUND_BY_NAME.iter().map(|name| name.to_string()))
+                        .chain(
+                            crate::catalog::defaults::default_macro_names()
+                                .filter(|(_, _, table_macro)| !table_macro)
+                                .map(|(_, name, _)| name.to_string()),
+                        );
                     for name in names {
                         let score = duckrs_common::string_util::similarity_rating(&name, &function.name.name);
                         if score > best.as_ref().map_or(0.0, |(b, _)| *b) {
                             best = Some((score, name));
                         }
                     }
-                    let hint = best.map_or_else(String::new, |(_, name)| format!("\nDid you mean \"{name}\"?"));
+                    // `SimilarEntriesInSchemas`: each schema's best, ties kept
+                    let mut found: Vec<(f64, String)> = best.into_iter().collect();
+                    for schema in self.catalog.schemas() {
+                        let mut schema_best: Option<(f64, String)> = None;
+                        for entry in schema.macro_entries(false) {
+                            let score = duckrs_common::string_util::similarity_rating(&entry.name, &function.name.name);
+                            if score > schema_best.as_ref().map_or(0.0, |(b, _)| *b) {
+                                schema_best = Some((score, entry.name.clone()));
+                            }
+                        }
+                        let Some((score, name)) = schema_best else { continue };
+                        match found.first().map(|(b, _)| *b) {
+                            Some(b) if score < b => {}
+                            Some(b) if score > b => found = vec![(score, name)],
+                            _ if found.iter().any(|(_, n)| n == &name) => {}
+                            _ => found.push((score, name)),
+                        }
+                    }
+                    let mut suggestions: Vec<String> = found.into_iter().map(|(_, name)| name).collect();
+                    suggestions.sort();
+                    let hint = if suggestions.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\nDid you mean \"{}\"?", suggestions.join(" or "))
+                    };
                     return Err(Error::new(
                         ErrorKind::Catalog,
                         format!("Scalar Function with name {} does not exist!{hint}", function.name.name),
@@ -2345,8 +2523,9 @@ impl Binder<'_> {
                             {
                                 *function = Arc::new(function.with_zero_check(!self.options.error_on_division_by_zero));
                             } else if checked && let BoundExprKind::Function { function, .. } = &mut bound.kind {
-                                let floating =
-                                    matches!(function.return_type.id(), LogicalTypeId::Float | LogicalTypeId::Double);
+                                // (`//` of floats is `BindDivisionByZero`, as for integers)
+                                let floating = set.name != "//"
+                                    && matches!(function.return_type.id(), LogicalTypeId::Float | LogicalTypeId::Double);
                                 let null = !self.options.error_on_division_by_zero;
                                 if !floating && null {
                                     *function = Arc::new(function.with_zero_check(true));
@@ -2726,6 +2905,10 @@ impl Binder<'_> {
                 .unwrap_or_else(crate::catalog::default_schema);
             return Ok(Some(BoundExpr::constant(Value::varchar(schema))));
         }
+        // `IndexKeyFun`
+        if name == "index_key" && function.name.qualification.iter().all(String::is_empty) {
+            return self.bind_index_key(function).map(Some);
+        }
         // `VersionFun`: the version of the library
         if name == "version" && function.args.is_empty() && function.name.qualification.iter().all(String::is_empty) {
             return Ok(Some(BoundExpr::constant(Value::varchar(format!(
@@ -2826,6 +3009,15 @@ impl Binder<'_> {
 
     /// `BaseSelectBinder::BindAggregate`.
     fn bind_aggregate(&mut self, function: &FunctionExpr) -> Result<BoundExpr> {
+        // `InaccessibleLambdaBindings`: the parameters of the lambdas around the aggregate are not
+        // values of the rows it aggregates
+        let before = std::mem::replace(&mut self.inaccessible_lambdas, self.lambda_scopes.len());
+        let result = self.bind_aggregate_call(function);
+        self.inaccessible_lambdas = before;
+        result
+    }
+
+    fn bind_aggregate_call(&mut self, function: &FunctionExpr) -> Result<BoundExpr> {
         if self.aggregate_of_outer_query(function) {
             self.pending_outer_aggregate = Some(function.clone());
             return Err(crate::unported("aggregates of the columns of an outer query"));
@@ -3631,4 +3823,13 @@ mod tests {
         assert_eq!(ty("1e3"), LogicalType::DOUBLE);
         assert_eq!(number_to_value("-0.25").unwrap().try_to_string().unwrap(), "-0.25");
     }
+}
+
+/// `AliasFunction`: the name it was bound with, for every row.
+fn alias_function(args: &duckrs_common::vector::DataChunk, result: &mut duckrs_common::vector::Vector) -> Result<()> {
+    let name = args.column(1).get_value(0);
+    for row in 0..args.len() {
+        result.set_value(row, &name)?;
+    }
+    Ok(())
 }

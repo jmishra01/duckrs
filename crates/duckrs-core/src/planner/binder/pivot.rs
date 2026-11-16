@@ -290,6 +290,17 @@ impl Binder<'_> {
         if !column.pivot_enum.is_empty() {
             let search = self.search_schema.as_deref();
             let Some(ty) = self.catalog.get_type(None, search, &column.pivot_enum)? else {
+                // a built-in type: ENUM without values is incomplete, the others are no ENUM
+                if column.pivot_enum.eq_ignore_ascii_case("enum") {
+                    return Err(binder_error("ENUM type is incomplete"));
+                }
+                if duckrs_parser::ast::is_builtin_type_name(&column.pivot_enum) {
+                    return Err(binder_error(format!(
+                        "Pivot must reference an ENUM type: {} is of type \"{}\"",
+                        column.pivot_enum,
+                        column.pivot_enum.to_uppercase()
+                    )));
+                }
                 return Err(crate::catalog::missing_entry("Type", &column.pivot_enum));
             };
             if ty.id() != LogicalTypeId::Enum {
@@ -348,6 +359,37 @@ impl Binder<'_> {
             }
             handle_columns(&found[0], &mut handled)?;
             templates.push((template, found.into_iter().next().expect("one aggregate")));
+        }
+        // `BindBoundPivot`: identical aggregates are computed once, so they need one name
+        let mut distinct: Vec<Expr> = Vec::new();
+        for aggregate in &pivot.aggregates {
+            let mut unnamed = aggregate.clone();
+            unnamed.alias.clear();
+            if !distinct.contains(&unnamed) {
+                distinct.push(unnamed);
+            }
+        }
+        // an aggregate without an alias is named by its expression
+        let mut names: Vec<String> = Vec::new();
+        for (aggregate, unnamed) in pivot.aggregates.iter().map(|a| {
+            let mut unnamed = a.clone();
+            unnamed.alias.clear();
+            (a, unnamed)
+        }) {
+            let name = if aggregate.alias.is_empty() {
+                unnamed.to_string()
+            } else {
+                aggregate.alias.clone()
+            };
+            if !names.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                names.push(name);
+            }
+        }
+        if distinct.len() < pivot.aggregates.len() && names.len() != distinct.len() {
+            return Err(binder_error(
+                "PIVOT: identical aggregates must have the same name - use a single aggregate, or make the \
+                 aggregates differ",
+            ));
         }
         let mut columns = Vec::with_capacity(pivot.pivots.len());
         let mut total: u128 = 1;
@@ -662,7 +704,12 @@ impl Binder<'_> {
             source.alias = format!("__internal_pivot_alias_{}", self.generate_table_index());
         }
         let mut star_binder = self.child_binder();
+        let correlated = self.correlated.lock().len();
         star_binder.bind_table_ref(&source)?;
+        // `BindBoundPivot`: the source of a PIVOT reads no columns of an enclosing query
+        if !pivot.aggregates.is_empty() && self.correlated.lock().len() > correlated {
+            return Err(binder_error("PIVOT is not supported in correlated subqueries yet"));
+        }
         let mut all_columns = Vec::new();
         star_binder.expand_star_expression(&Expr::star(), &mut all_columns)?;
         let node = if pivot.aggregates.is_empty() {

@@ -39,6 +39,7 @@ fn unknown() -> Stats {
         geometry: None,
         strings: None,
         distinct: None,
+        children: Vec::new(),
     }
 }
 
@@ -62,8 +63,50 @@ fn compute_statistics(table: &Arc<TableCatalogEntry>, positions: Option<Vec<usiz
         return Some(statistics);
     }
     let mut statistics = compute_ordered_statistics(table, positions.clone())?;
-    add_geometry_statistics(table, positions, &mut statistics)?;
+    add_geometry_statistics(table, positions.clone(), &mut statistics)?;
+    add_nested_statistics(table, positions, &mut statistics)?;
     Some(statistics)
+}
+
+/// The statistics of the LIST, ARRAY and STRUCT columns, with their children's, from their values.
+fn add_nested_statistics(
+    table: &Arc<TableCatalogEntry>,
+    positions: Option<Vec<usize>>,
+    statistics: &mut [Stats],
+) -> Option<()> {
+    let nested = |ty: &LogicalType| matches!(ty.id(), LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Struct);
+    let columns: Vec<usize> = (0..table.columns.len())
+        .filter(|&c| nested(&table.columns[c].ty) && statistics[c].children.is_empty())
+        .collect();
+    if columns.is_empty() {
+        return Some(());
+    }
+    let scan = LogicalOperator::new(
+        K::Get {
+            table: table.clone(),
+            table_index: 0,
+            column_ids: columns.clone(),
+            filters: Vec::new(),
+            zone_filters: Vec::new(),
+            projection: None,
+            index_rows: positions.map(Arc::new),
+        },
+        Vec::new(),
+    );
+    let mut plan = scan;
+    resolve_column_bindings(&mut plan).ok()?;
+    let result = run_plan(plan).ok()?;
+    for (index, &column) in columns.iter().enumerate() {
+        let ty = &table.columns[column].ty;
+        let merged = (0..result.len())
+            .map(|row| value_stats(&result.get_value(index, row), ty))
+            .reduce(union);
+        if let Some(merged) = merged {
+            let distinct = statistics[column].distinct;
+            statistics[column] = Stats { distinct, ..merged };
+        }
+    }
+    Some(())
 }
 
 /// `VertexExtractStats`: the bounds of a coordinate of the points, and whether it is always NULL.
@@ -284,6 +327,7 @@ fn compute_ordered_statistics(table: &Arc<TableCatalogEntry>, positions: Option<
             geometry: None,
             strings,
             distinct: None,
+            children: Vec::new(),
         });
     }
     Some(statistics)
@@ -633,6 +677,90 @@ fn union(a: Stats, b: Stats) -> Stats {
             _ => None,
         },
         distinct: None,
+        children: if a.children.len() == b.children.len() {
+            a.children.into_iter().zip(b.children).map(|(a, b)| union(a, b)).collect()
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+/// `BaseStatistics::FromConstant`: the statistics of one value, its children's too.
+fn value_stats(value: &Value, ty: &LogicalType) -> Stats {
+    use duckrs_common::value::ValueData;
+    // no value at all: what is merged into nothing changes nothing
+    let empty = |ty: &LogicalType| Stats {
+        can_be_null: false,
+        can_be_valid: false,
+        children: empty_children(ty),
+        ..unknown()
+    };
+    fn empty_children(ty: &LogicalType) -> Vec<Stats> {
+        let none = |child: &LogicalType| Stats {
+            can_be_null: false,
+            can_be_valid: false,
+            children: empty_children(child),
+            ..unknown()
+        };
+        match ty.id() {
+            LogicalTypeId::List | LogicalTypeId::Array => ty.child_type().map(none).into_iter().collect(),
+            LogicalTypeId::Struct => ty.struct_children().iter().map(|(_, child)| none(child)).collect(),
+            _ => Vec::new(),
+        }
+    }
+    if value.is_null() {
+        return Stats {
+            can_be_null: true,
+            can_be_valid: false,
+            children: empty_children(ty),
+            ..unknown()
+        };
+    }
+    match (ty.id(), value.data()) {
+        (LogicalTypeId::List | LogicalTypeId::Array, ValueData::List(items)) => {
+            let child = ty.child_type().cloned().unwrap_or(LogicalType::SQLNULL);
+            let merged = items
+                .iter()
+                .map(|item| value_stats(item, &child))
+                .reduce(union)
+                .unwrap_or_else(|| empty(&child));
+            Stats {
+                can_be_null: false,
+                can_be_valid: true,
+                children: vec![merged],
+                ..unknown()
+            }
+        }
+        (LogicalTypeId::Struct, ValueData::Struct(fields)) => Stats {
+            can_be_null: false,
+            can_be_valid: true,
+            children: ty
+                .struct_children()
+                .iter()
+                .zip(fields)
+                .map(|((_, child), field)| value_stats(field, child))
+                .collect(),
+            ..unknown()
+        },
+        _ => {
+            let strings = match (ty.id(), value.data()) {
+                (id @ (LogicalTypeId::Varchar | LogicalTypeId::Blob), ValueData::Bytes(bytes)) => Some(
+                    crate::catalog::StringStatistics::of_constant(bytes, id == LogicalTypeId::Varchar),
+                ),
+                _ => None,
+            };
+            let bound = has_ordered_statistics(ty).then(|| value.clone());
+            Stats {
+                min: bound.clone(),
+                max: bound,
+                can_be_null: false,
+                can_be_valid: true,
+                geometry: geometry_stats_of(value),
+                strings,
+                distinct: None,
+                children: Vec::new(),
+            }
+        }
     }
 }
 
@@ -790,7 +918,16 @@ impl StatisticsPropagator {
                     .filter(|_| expr.return_type.id() == LogicalTypeId::Geometry),
                 strings: None,
                 distinct: None,
+                children: Vec::new(),
             },
+            BoundExprKind::Constant(value)
+                if matches!(
+                    expr.return_type.id(),
+                    LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Struct
+                ) =>
+            {
+                value_stats(value, &expr.return_type)
+            }
             BoundExprKind::Constant(value) => {
                 let geometry = geometry_stats_of(value);
                 let strings = match (expr.return_type.id(), value.data()) {
@@ -812,6 +949,7 @@ impl StatisticsPropagator {
                     geometry,
                     strings,
                     distinct: None,
+                    children: Vec::new(),
                 }
             }
             BoundExprKind::ColumnRef { binding, depth: 0 } => {
@@ -1118,7 +1256,67 @@ impl StatisticsPropagator {
                 geometry: None,
                 strings: None,
                 distinct: None,
+                children: Vec::new(),
             };
+        }
+        // `StructPackStats`, `ListValueStats`, `StructExtractStats`, `ListExtractStats`
+        match function.name.as_str() {
+            "struct_pack" | "row" if return_type.id() == LogicalTypeId::Struct => {
+                return Stats {
+                    can_be_null: false,
+                    can_be_valid: true,
+                    children: stats,
+                    ..unknown()
+                };
+            }
+            "list_value" | "list_pack" if matches!(return_type.id(), LogicalTypeId::List) => {
+                let child = stats.into_iter().reduce(union).unwrap_or_else(|| Stats {
+                    can_be_null: false,
+                    can_be_valid: false,
+                    ..unknown()
+                });
+                return Stats {
+                    can_be_null: false,
+                    can_be_valid: true,
+                    children: vec![child],
+                    ..unknown()
+                };
+            }
+            "struct_extract" if children.len() == 2 && children[0].return_type.id() == LogicalTypeId::Struct => {
+                let position = match &children[1].kind {
+                    BoundExprKind::Constant(key) => match key.data() {
+                        duckrs_common::value::ValueData::Bytes(name) => {
+                            let name = String::from_utf8_lossy(name);
+                            children[0]
+                                .return_type
+                                .struct_children()
+                                .iter()
+                                .position(|(field, _)| field.eq_ignore_ascii_case(&name))
+                        }
+                        _ => key.as_i128().and_then(|i| usize::try_from(i).ok()),
+                    },
+                    _ => None,
+                };
+                if let Some(child) = position.and_then(|at| stats[0].children.get(at)) {
+                    let mut child = child.clone();
+                    child.can_be_null |= stats[0].can_be_null;
+                    return child;
+                }
+                return unknown();
+            }
+            "array_extract" | "list_extract" | "list_element"
+                if children.len() == 2
+                    && matches!(children[0].return_type.id(), LogicalTypeId::List | LogicalTypeId::Array) =>
+            {
+                // an index past the end is NULL
+                if let Some(child) = stats[0].children.first() {
+                    let mut child = child.clone();
+                    child.can_be_null = true;
+                    return child;
+                }
+                return unknown();
+            }
+            _ => {}
         }
         // `StatsPropagateStats`: `stats()` gets the statistics of its argument as a constant
         if function.name == "stats" && children.len() == 1 {
@@ -1202,6 +1400,7 @@ impl StatisticsPropagator {
                 geometry: None,
                 strings: None,
                 distinct: None,
+                children: Vec::new(),
             };
         }
         let part = match (function.name.as_str(), children.len()) {
@@ -1287,6 +1486,7 @@ impl StatisticsPropagator {
                 geometry: None,
                 strings: None,
                 distinct: None,
+                children: Vec::new(),
             };
         }
         if children.len() == 2 && return_type.is_integral() && matches!(function.name.as_str(), "%" | "//") {
@@ -1346,6 +1546,7 @@ impl StatisticsPropagator {
                 geometry: None,
                 strings: None,
                 distinct: None,
+                children: Vec::new(),
             };
         }
         if !*is_operator || children.len() != 2 || !return_type.is_integral() {
@@ -1815,6 +2016,7 @@ impl StatisticsPropagator {
             geometry: None,
             strings: None,
             distinct: None,
+            children: Vec::new(),
         })
     }
 }
@@ -1823,7 +2025,35 @@ impl StatisticsPropagator {
 /// `BaseStatistics::ToStruct` of numeric statistics (`NumericStats::ToStruct`), as a VARIANT
 /// (`StatsPropagateStats`). duckrs keeps no distinct counts, so there is no `approx_unique`.
 fn stats_struct(stats: &Stats, ty: &LogicalType) -> Option<Value> {
+    let fields = stats_fields(stats, ty)?;
+    let variant = LogicalType::new(LogicalTypeId::Variant);
+    let source = duckrs_common::vector::Vector::constant(&fields);
+    let mut result = duckrs_common::vector::Vector::new(variant, 1);
+    crate::function::cast::cast_vector(&source, &mut result, 1, crate::function::cast::CastMode::Strict).ok()?;
+    Some(result.get_value(0))
+}
+
+/// `BaseStatistics::ToStruct`, as a STRUCT value.
+fn stats_fields(stats: &Stats, ty: &LogicalType) -> Option<Value> {
     let mut fields = Vec::new();
+    // `ListStats::ToStruct` / `ArrayStats::ToStruct` / `StructStats::ToStruct`: the children's
+    let child = |at: usize, child_type: &LogicalType| -> Option<Value> {
+        let unknown_child = unknown();
+        stats_fields(stats.children.get(at).unwrap_or(&unknown_child), child_type)
+    };
+    match ty.id() {
+        LogicalTypeId::List | LogicalTypeId::Array => {
+            fields.push(("child_stats".to_string(), child(0, ty.child_type()?)?));
+        }
+        LogicalTypeId::Struct => {
+            let mut children = Vec::new();
+            for (at, (name, child_type)) in ty.struct_children().iter().enumerate() {
+                children.push((name.clone(), child(at, child_type)?));
+            }
+            fields.push(("child_stats".to_string(), Value::struct_value(children)));
+        }
+        _ => {}
+    }
     // `StringStats::ToStruct`
     if matches!(ty.id(), LogicalTypeId::Varchar | LogicalTypeId::Blob) {
         let strings = stats.strings.as_ref()?;
@@ -1885,11 +2115,7 @@ fn stats_struct(stats: &Stats, ty: &LogicalType) -> Option<Value> {
     if let Some(distinct) = stats.distinct {
         fields.push(("approx_unique".to_string(), Value::ubigint(distinct)));
     }
-    let variant = LogicalType::new(LogicalTypeId::Variant);
-    let source = duckrs_common::vector::Vector::constant(&Value::struct_value(fields));
-    let mut result = duckrs_common::vector::Vector::new(variant, 1);
-    crate::function::cast::cast_vector(&source, &mut result, 1, crate::function::cast::CastMode::Strict).ok()?;
-    Some(result.get_value(0))
+    Some(Value::struct_value(fields))
 }
 
 fn expr_with_constants(
@@ -2024,5 +2250,6 @@ fn date_part_stats(name: &str, child: &Stats, child_type: &LogicalType, return_t
         geometry: None,
         strings: None,
         distinct: None,
+        children: Vec::new(),
     })
 }

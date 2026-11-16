@@ -128,7 +128,7 @@ fn implicit_cast_to_union_member(from: &LogicalType, to: &LogicalType) -> i64 {
     // the first child is the tag
     to.struct_children()[1..]
         .iter()
-        .map(|(_, member)| implicit_cast(from, member))
+        .map(|(_, member)| implicit_cast_rules(from, member))
         .filter(|&cost| cost != -1)
         .min()
         .unwrap_or(-1)
@@ -138,8 +138,33 @@ fn is_struct(id: LogicalTypeId) -> bool {
     matches!(id, LogicalTypeId::Struct | LogicalTypeId::Tuple)
 }
 
-/// `CastRules::ImplicitCast`: the cost of implicitly casting `from` to `to`, or -1.
+thread_local! {
+    // `old_implicit_casting` of the statement being bound on this thread
+    static OLD_IMPLICIT_CASTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets `old_implicit_casting` for what binds on this thread, returning what it was.
+pub fn set_old_implicit_casting(on: bool) -> bool {
+    OLD_IMPLICIT_CASTING.with(|flag| flag.replace(on))
+}
+
+/// Whether `old_implicit_casting` is on for this thread.
+pub fn old_implicit_casting() -> bool {
+    OLD_IMPLICIT_CASTING.with(std::cell::Cell::get)
+}
+
+/// `CastFunctionSet::ImplicitCastCost`: the rules, and with `old_implicit_casting` anything
+/// but a BLOB casts to VARCHAR, at a cost that keeps it the last resort.
 pub fn implicit_cast(from: &LogicalType, to: &LogicalType) -> i64 {
+    let score = implicit_cast_rules(from, to);
+    if score < 0 && from.id() != LogicalTypeId::Blob && to.id() == LogicalTypeId::Varchar && old_implicit_casting() {
+        return 10_000_000_000;
+    }
+    score
+}
+
+/// `CastRules::ImplicitCast`: the cost of implicitly casting `from` to `to`, or -1.
+pub fn implicit_cast_rules(from: &LogicalType, to: &LogicalType) -> i64 {
     use LogicalTypeId::*;
     if from.id() == SqlNull && to.id() == Template {
         // prefer the TEMPLATE type for NULL casts, as it is the most generic
@@ -180,7 +205,7 @@ pub fn implicit_cast(from: &LogicalType, to: &LogicalType) -> i64 {
             return target_cost - 90;
         }
         // in any other case we use the casting rules of the preferred type of the literal
-        return implicit_cast(&literal_type, to);
+        return implicit_cast_rules(&literal_type, to);
     }
     if from.alias() == Some("JSON") && to.id() == Varchar && to.alias().is_none() {
         return 1;
@@ -188,8 +213,8 @@ pub fn implicit_cast(from: &LogicalType, to: &LogicalType) -> i64 {
     if to.alias() == Some("JSON") && to.id() == Varchar && from.alias().is_none() {
         // `RegisterJSONCastFunctions`: a parse, so one more than a cast to STRUCT
         return match from.id() {
-            Varchar => implicit_cast(&LogicalType::SQLNULL, &LogicalType::new(Struct)) + 1,
-            SqlNull => implicit_cast(&LogicalType::SQLNULL, &LogicalType::VARCHAR) + 1,
+            Varchar => implicit_cast_rules(&LogicalType::SQLNULL, &LogicalType::new(Struct)) + 1,
+            SqlNull => implicit_cast_rules(&LogicalType::SQLNULL, &LogicalType::VARCHAR) + 1,
             _ => -1,
         };
     }
@@ -203,7 +228,7 @@ pub fn implicit_cast(from: &LogicalType, to: &LogicalType) -> i64 {
     match (from.id(), to.id()) {
         (List, List) => {
             // lists can be cast if their child types can be cast
-            let mut child_cost = implicit_cast(from.child_type().unwrap(), to.child_type().unwrap());
+            let mut child_cost = implicit_cast_rules(from.child_type().unwrap(), to.child_type().unwrap());
             if child_cost >= 1 {
                 // we prefer LIST[X] -> LIST[VARCHAR] over LIST[X] -> VARCHAR
                 child_cost -= 1;
@@ -213,7 +238,7 @@ pub fn implicit_cast(from: &LogicalType, to: &LogicalType) -> i64 {
         (Array, Array) => {
             let to_any_size = to.array_size() == Some(0);
             if from.array_size() == to.array_size() || to_any_size {
-                let mut child_cost = implicit_cast(from.child_type().unwrap(), to.child_type().unwrap());
+                let mut child_cost = implicit_cast_rules(from.child_type().unwrap(), to.child_type().unwrap());
                 if child_cost >= 100 {
                     // we prefer ARRAY[X] -> ARRAY[VARCHAR] over ARRAY[X] -> VARCHAR
                     child_cost -= 1;
@@ -223,7 +248,7 @@ pub fn implicit_cast(from: &LogicalType, to: &LogicalType) -> i64 {
             return -1;
         }
         (Array, List) => {
-            let child_cost = implicit_cast(from.child_type().unwrap(), to.child_type().unwrap());
+            let child_cost = implicit_cast_rules(from.child_type().unwrap(), to.child_type().unwrap());
             if child_cost < 0 {
                 return -1;
             }
@@ -231,7 +256,7 @@ pub fn implicit_cast(from: &LogicalType, to: &LogicalType) -> i64 {
             return child_cost + 1;
         }
         (List, Array) if to.array_size() != Some(0) => {
-            return implicit_cast(from.child_type().unwrap(), to.child_type().unwrap());
+            return implicit_cast_rules(from.child_type().unwrap(), to.child_type().unwrap());
         }
         (Union, Union) => {
             if !to.has_params() {
@@ -243,7 +268,7 @@ pub fn implicit_cast(from: &LogicalType, to: &LogicalType) -> i64 {
                 let Some((_, to_member)) = to.struct_children()[1..].iter().find(|(n, _)| n == name) else {
                     return -1;
                 };
-                cost = cost.max(implicit_cast(from_member, to_member));
+                cost = cost.max(implicit_cast_rules(from_member, to_member));
             }
             if cost != -1 {
                 return cost;
@@ -277,7 +302,7 @@ pub fn implicit_cast(from: &LogicalType, to: &LogicalType) -> i64 {
                     return -1;
                 };
                 let (_, target_type) = remaining.remove(pos);
-                let child_cost = implicit_cast(source_type, target_type);
+                let child_cost = implicit_cast_rules(source_type, target_type);
                 if child_cost == -1 {
                     return -1;
                 }
@@ -285,7 +310,7 @@ pub fn implicit_cast(from: &LogicalType, to: &LogicalType) -> i64 {
             }
         } else {
             for ((_, source_type), (_, target_type)) in source.iter().zip(target) {
-                let child_cost = implicit_cast(source_type, target_type);
+                let child_cost = implicit_cast_rules(source_type, target_type);
                 if child_cost == -1 {
                     return -1;
                 }
@@ -320,24 +345,24 @@ mod tests {
 
     #[test]
     fn numeric_widening() {
-        assert_eq!(implicit_cast(&LogicalType::INTEGER, &LogicalType::INTEGER), 0);
-        assert_eq!(implicit_cast(&LogicalType::INTEGER, &LogicalType::BIGINT), 101);
-        assert_eq!(implicit_cast(&LogicalType::INTEGER, &LogicalType::DOUBLE), 104);
-        assert_eq!(implicit_cast(&LogicalType::BIGINT, &LogicalType::INTEGER), -1);
-        assert_eq!(implicit_cast(&LogicalType::DOUBLE, &LogicalType::FLOAT), -1);
-        assert_eq!(implicit_cast(&LogicalType::INTEGER, &LogicalType::VARCHAR), -1);
+        assert_eq!(implicit_cast_rules(&LogicalType::INTEGER, &LogicalType::INTEGER), 0);
+        assert_eq!(implicit_cast_rules(&LogicalType::INTEGER, &LogicalType::BIGINT), 101);
+        assert_eq!(implicit_cast_rules(&LogicalType::INTEGER, &LogicalType::DOUBLE), 104);
+        assert_eq!(implicit_cast_rules(&LogicalType::BIGINT, &LogicalType::INTEGER), -1);
+        assert_eq!(implicit_cast_rules(&LogicalType::DOUBLE, &LogicalType::FLOAT), -1);
+        assert_eq!(implicit_cast_rules(&LogicalType::INTEGER, &LogicalType::VARCHAR), -1);
     }
 
     #[test]
     fn literals() {
         // the literal's own type is free; other integer types it fits are cheap
-        assert_eq!(implicit_cast(&literal(2), &LogicalType::INTEGER), 0);
-        assert_eq!(implicit_cast(&literal(2), &LogicalType::TINYINT), 20);
-        assert_eq!(implicit_cast(&literal(2), &LogicalType::BIGINT), 11);
-        assert_eq!(implicit_cast(&literal(1000), &LogicalType::TINYINT), -1);
+        assert_eq!(implicit_cast_rules(&literal(2), &LogicalType::INTEGER), 0);
+        assert_eq!(implicit_cast_rules(&literal(2), &LogicalType::TINYINT), 20);
+        assert_eq!(implicit_cast_rules(&literal(2), &LogicalType::BIGINT), 11);
+        assert_eq!(implicit_cast_rules(&literal(1000), &LogicalType::TINYINT), -1);
         let string = LogicalType::new(LogicalTypeId::StringLiteral);
-        assert_eq!(implicit_cast(&string, &LogicalType::VARCHAR), 1);
-        assert_eq!(implicit_cast(&string, &LogicalType::INTEGER), 20);
-        assert_eq!(implicit_cast(&LogicalType::SQLNULL, &LogicalType::INTEGER), 102);
+        assert_eq!(implicit_cast_rules(&string, &LogicalType::VARCHAR), 1);
+        assert_eq!(implicit_cast_rules(&string, &LogicalType::INTEGER), 20);
+        assert_eq!(implicit_cast_rules(&LogicalType::SQLNULL, &LogicalType::INTEGER), 102);
     }
 }

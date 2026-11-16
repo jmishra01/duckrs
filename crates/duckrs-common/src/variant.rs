@@ -186,6 +186,18 @@ impl VariantNode {
 
     /// `CAST(variant AS VARCHAR)`.
     pub fn render(&self) -> Result<String> {
+        self.render_at(0)
+    }
+
+    /// `VariantVisitor::CheckDepth`: a value this deep is refused.
+    fn render_at(&self, depth: usize) -> Result<String> {
+        const MAX_RECURSION_DEPTH: usize = 128;
+        if depth >= MAX_RECURSION_DEPTH {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("VARIANT exceeds maximum recursion depth of {MAX_RECURSION_DEPTH}"),
+            ));
+        }
         match self {
             Self::Null => Ok("NULL".to_string()),
             Self::Scalar(value) => value.try_to_string(),
@@ -195,13 +207,16 @@ impl VariantNode {
                     entries.push(format!(
                         "{}: {}",
                         escape_nested_string(key, true),
-                        child.render_child()?
+                        child.render_child_at(depth + 1)?
                     ));
                 }
                 Ok(format!("{{{}}}", entries.join(", ")))
             }
             Self::Array(items) => {
-                let items = items.iter().map(Self::render_child).collect::<Result<Vec<_>>>()?;
+                let items = items
+                    .iter()
+                    .map(|item| item.render_child_at(depth + 1))
+                    .collect::<Result<Vec<_>>>()?;
                 Ok(format!("[{}]", items.join(", ")))
             }
         }
@@ -209,9 +224,13 @@ impl VariantNode {
 
     /// `render` inside of a nested value: strings are escaped where they need it.
     pub fn render_child(&self) -> Result<String> {
+        self.render_child_at(0)
+    }
+
+    fn render_child_at(&self, depth: usize) -> Result<String> {
         match self {
-            Self::Scalar(value) => Ok(escape_nested_string(&value.try_to_string()?, false)),
-            other => other.render(),
+            Self::Scalar(value) if depth < 128 => Ok(escape_nested_string(&value.try_to_string()?, false)),
+            other => other.render_at(depth),
         }
     }
 

@@ -287,7 +287,11 @@ impl Binder<'_> {
                 if query.is_null() {
                     return Err(binder_error("Cannot use NULL as function argument"));
                 }
-                let select = parse_select(&query.try_to_string()?, "Expected a single SELECT statement")?;
+                let mut statements = duckrs_parser::parse_ast_with(&query.try_to_string()?, &self.options.parser)?;
+                let select = match (statements.pop(), statements.is_empty()) {
+                    (Some(Statement::Select(select)), true) => select,
+                    _ => return Err(Error::new(ErrorKind::Parser, "Expected a single SELECT statement")),
+                };
                 return self.bind_rewritten(&select, table_ref, &name).map(Some);
             }
             "query_table" => {
@@ -313,6 +317,10 @@ impl Binder<'_> {
                     return Err(binder_error("glob requires a pattern"));
                 };
                 let value = self.constant_argument(&pattern.expr)?;
+                // `MultiFileReader::ParseFileList`
+                if value.is_null() {
+                    return Err(Error::new(ErrorKind::Parser, "glob cannot take NULL list as parameter"));
+                }
                 // a list of patterns: the files of each, in turn
                 let patterns = match value.data() {
                     ValueData::List(items) => items.iter().map(Value::try_to_string).collect::<Result<Vec<_>>>()?,

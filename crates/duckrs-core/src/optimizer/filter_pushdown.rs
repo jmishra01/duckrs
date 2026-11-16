@@ -137,6 +137,7 @@ impl FilterPushdown {
                 | LogicalOperatorKind::Projection { .. }
                 | LogicalOperatorKind::Order { .. }
                 | LogicalOperatorKind::Get { .. }
+                | LogicalOperatorKind::SecureView { .. }
         );
         if !passes && self.filters.iter().any(|f| contains_barrier(&f.filter)) {
             let (barred, rest): (Vec<Filter>, Vec<Filter>) = std::mem::take(&mut self.filters)
@@ -181,8 +182,28 @@ impl FilterPushdown {
             }
             LogicalOperatorKind::Limit { limit: Some(0), .. } => empty_result(&op),
             LogicalOperatorKind::Unnest { .. } => self.pushdown_unnest(op),
+            LogicalOperatorKind::SecureView { .. } => self.pushdown_secure_view(op),
             _ => self.finish_pushdown(op),
         }
+    }
+
+    /// `FilterPushdown::PushdownSecureView`: the filters go into the view, but one that could be
+    /// observed from outside (it can throw, or is volatile) goes in a barrier, which no operator
+    /// inside that removes rows lets past. The boundary stays.
+    fn pushdown_secure_view(self, mut op: LogicalOperator) -> LogicalOperator {
+        let mut inside = FilterPushdown::default();
+        for f in self.filters {
+            let mut expr = f.filter;
+            if (can_throw(&expr) || expr.is_volatile()) && !contains_barrier(&expr) {
+                expr = crate::function::wrap_in_barrier(expr);
+            }
+            if !inside.add_filter(expr) {
+                return empty_result(&op);
+            }
+        }
+        let child = op.children.remove(0);
+        op.children.push(inside.rewrite(child));
+        op
     }
 
     /// `PushdownMarkJoin` and `PushdownSingleJoin`: each left row stays, once, so what reads only
@@ -449,11 +470,11 @@ impl FilterPushdown {
                     columns.push(binding);
                 }
             });
+            // a projection removes no rows, so what it computes may throw below the barrier too
             let stays = !remaining.is_empty()
                 || columns.iter().any(|b| {
                     let entry = projected.get(b.column_index);
-                    b.table_index != table_index
-                        || entry.is_none_or(|e| e.is_volatile() || contains_subquery(e) || can_throw(e))
+                    b.table_index != table_index || entry.is_none_or(|e| e.is_volatile() || contains_subquery(e))
                 });
             if stays {
                 remaining.push(f.filter);

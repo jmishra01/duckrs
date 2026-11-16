@@ -725,6 +725,10 @@ impl Binder<'_> {
             }
             result.files.extend(found);
         }
+        // `MultiFileReader::CreateFileList`: an empty list names no file
+        if result.files.is_empty() && !result.allow_empty {
+            return Err(Error::new(ErrorKind::Io, format!("{name} needs at least one file to read")));
+        }
         result.options.auto_detect = result.auto_detect.unwrap_or(true);
         Ok(result)
     }
@@ -1299,6 +1303,8 @@ impl Binder<'_> {
             }
             None => info.file_path.clone(),
         };
+        // `FileSystem::ExpandPath`: `~` and `file:` URLs
+        let path = crate::execution::file_system::expand_path(&path);
         if !info.is_from && !path.is_empty() && self.is_attached_database_file(&path) {
             return Err(binder_error(format!(
                 "Cannot COPY to \"{path}\": the file belongs to an attached database"

@@ -52,6 +52,7 @@ fn logical_name(op: &LogicalOperator) -> &'static str {
         K::TopN { .. } => "TOP_N",
         K::Limit { .. } | K::LimitPercent { .. } => "LIMIT",
         K::Sample { .. } => "SAMPLE",
+        K::SecureView { .. } => "SECURE_VIEW",
         K::Distinct { .. } => "DISTINCT",
         K::Unnest { .. } => "UNNEST",
         K::Union { .. } => "UNION",

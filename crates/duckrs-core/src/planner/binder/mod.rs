@@ -4,13 +4,16 @@
 //! expressions and plans it as a tree of logical operators.
 
 mod alter;
+mod alter_fields;
 mod copy;
 mod create_index;
 mod expression;
 mod generated;
+mod index_key;
 mod join;
 mod json;
 mod lambda;
+pub(crate) use lambda::is_lambda_function;
 mod macros;
 mod match_recognize;
 mod merge;
@@ -442,12 +445,48 @@ impl BindContext {
         (column_parts < names.len()).then_some(column_parts)
     }
 
-    /// `AmbiguityException`, for bindings with one alias.
-    fn ambiguous_table(table: &str) -> Error {
-        binder_error(format!(
-            "Ambiguous reference to table \"{table}\" (duplicate alias \"{table}\", explicitly alias one of the \
-             tables using \"AS my_alias\")"
-        ))
+    /// `AmbiguityException`: the bindings `table` names, each by the least that tells it apart
+    /// (`MinimumUniqueAlias`), or a duplicate alias if two can't be.
+    fn ambiguous_table(table: &str, bindings: &[&Binding]) -> Error {
+        let same_schema = |a: &Binding, b: &Binding| match (&a.schema, &b.schema) {
+            (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+            (None, None) => true,
+            _ => false,
+        };
+        let mut result = "(use: ".to_string();
+        for (i, binding) in bindings.iter().enumerate() {
+            if i > 0 {
+                result += if i + 1 == bindings.len() { " or " } else { ", " };
+            }
+            let mut duplicate = false;
+            let mut minimum = String::new();
+            for (k, other) in bindings.iter().enumerate() {
+                if k == i {
+                    continue;
+                }
+                let same_alias = binding.alias.eq_ignore_ascii_case(&other.alias);
+                if same_alias && same_schema(binding, other) {
+                    duplicate = true;
+                }
+                let alias = ast::sql_identifier(&binding.alias);
+                let candidate = match &binding.schema {
+                    Some(schema) if same_alias => format!("{}.{alias}", ast::sql_identifier(schema)),
+                    _ => alias,
+                };
+                if candidate.len() > minimum.len() {
+                    minimum = candidate;
+                }
+            }
+            if duplicate {
+                result = format!(
+                    "(duplicate alias \"{table}\", explicitly alias one of the tables using \"AS my_alias\""
+                );
+            } else {
+                result += &minimum;
+            }
+        }
+        result += ")";
+        binder_error(format!("Ambiguous reference to table \"{table}\" {result}"))
     }
 
     /// Binds `[schema.]table.column` (`BindContext::GetBinding(alias, column)`): of the bindings
@@ -471,7 +510,7 @@ impl BindContext {
             )));
         };
         if with_column.next().is_some() {
-            return Err(Self::ambiguous_table(table));
+            return Err(Self::ambiguous_table(table, &matching));
         }
         let (index, ty, name) = binding.column(name).expect("filtered above");
         Ok((ColumnBinding::new(binding.table_index, index), ty, name))
@@ -580,7 +619,12 @@ pub struct SessionValues {
     pub replacement_scans: Vec<ReplacementScan>,
     /// `DatabaseManager::IsAttachedDatabaseFile`: the files of the attached databases
     pub database_files: Box<dyn Fn() -> Vec<std::path::PathBuf> + Send + Sync>,
+    /// the catalog of an attached database by name (`Catalog::GetCatalogEntry`), committed state
+    pub attached_catalog: AttachedCatalogLookup,
 }
+
+/// [`SessionValues::attached_catalog`].
+pub type AttachedCatalogLookup = Box<dyn Fn(&str) -> Option<Arc<crate::catalog::Catalog>> + Send + Sync>;
 
 /// The rows of an `Appender`, for `__internal_appender_chunks`.
 pub type AppendedRows = (
@@ -623,6 +667,10 @@ impl std::fmt::Debug for SessionValues {
 /// The settings that change how statements bind.
 #[derive(Debug, Clone)]
 pub struct BindOptions {
+    /// `disabled_filesystems` has `LocalFileSystem`
+    pub local_file_system_disabled: bool,
+    /// how SQL that binding parses (`query()`) is parsed
+    pub parser: duckrs_parser::ParserOptions,
     /// `txid_current`
     pub transaction_id: u64,
     /// `default_order`
@@ -660,6 +708,8 @@ pub enum ShowBehavior {
 impl Default for BindOptions {
     fn default() -> Self {
         Self {
+            local_file_system_disabled: false,
+            parser: duckrs_parser::ParserOptions::default(),
             transaction_id: 0,
             default_order: OrderType::Ascending,
             default_null_order: DefaultNullOrder::NullsLast,
@@ -772,6 +822,8 @@ pub struct Binder<'a> {
     aggregate_error: &'static str,
     pub session: Option<Arc<SessionValues>>,
     lambda_scopes: Vec<lambda::LambdaScope>,
+    /// the lambda scopes an aggregate being bound cannot read (`inaccessible_lambda_binding_count`)
+    inaccessible_lambdas: usize,
     /// The windows of the SELECT clause being bound, when it may have any here.
     windows: Option<window::WindowBindState>,
     window_error: &'static str,
@@ -830,6 +882,8 @@ pub struct Binder<'a> {
     working_tables: Vec<WorkingTable>,
     /// RETURNING of a MERGE can read `merge_action`
     merge_action_column: bool,
+    /// DELETE ... RETURNING: the statement gives the `rowid` of each row after its columns
+    returning_row_id: bool,
     /// the aggregate of an outer query's columns that stopped this binder
     pending_outer_aggregate: Option<ast::FunctionExpr>,
 }
@@ -861,6 +915,13 @@ impl<'a> Binder<'a> {
     /// `OpenerFileSystem::VerifyCanAccessFile`: with `enable_external_access` off, only the
     /// allowed paths and directories can be read or written.
     pub(crate) fn check_file_access(&self, path: &str) -> Result<()> {
+        // `VirtualFileSystem::FindFileSystem`: a local path needs the LocalFileSystem
+        if self.options.local_file_system_disabled && !path.contains("://") {
+            return Err(Error::new(
+                ErrorKind::Permission,
+                "File system LocalFileSystem has been disabled by configuration",
+            ));
+        }
         match &self.options.file_access {
             Some(access) => access.check(path, false),
             None => Ok(()),
@@ -884,6 +945,7 @@ impl<'a> Binder<'a> {
             aggregate_error: "Aggregate functions are not supported here",
             session: None,
             lambda_scopes: Vec::new(),
+            inaccessible_lambdas: 0,
             windows: None,
             window_error: "Window functions are not supported here",
             inside_window: false,
@@ -911,6 +973,7 @@ impl<'a> Binder<'a> {
             correlated: Arc::default(),
             working_tables: Vec::new(),
             merge_action_column: false,
+            returning_row_id: false,
             pending_outer_aggregate: None,
         };
         // the transition tables of the trigger whose body this binds

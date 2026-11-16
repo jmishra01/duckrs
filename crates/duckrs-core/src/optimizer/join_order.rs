@@ -115,7 +115,13 @@ fn is_movable_semi(op: &LogicalOperator) -> bool {
 /// Whether `op` is an operator of a tree of joins, or filters on such a tree.
 fn is_tree(op: &LogicalOperator) -> bool {
     match &op.kind {
-        K::Filter { expressions } => !expressions.iter().any(BoundExpr::is_volatile) && is_tree(&op.children[0]),
+        // a barrier must not end up below one of the joins (`must_remain_at_root`)
+        K::Filter { expressions } => {
+            !expressions
+                .iter()
+                .any(|e| e.is_volatile() || super::rewriter::contains_barrier(e))
+                && is_tree(&op.children[0])
+        }
         _ => is_binary_tree(op) || is_movable_semi(op),
     }
 }

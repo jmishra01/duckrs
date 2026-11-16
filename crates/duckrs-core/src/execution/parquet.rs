@@ -2518,6 +2518,7 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
                 geometry: None,
                 strings: None,
                 distinct: None,
+                children: Vec::new(),
             };
             let mut bounds_known = true;
             let mut usable = true;

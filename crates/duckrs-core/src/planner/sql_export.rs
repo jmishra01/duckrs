@@ -936,6 +936,8 @@ impl Exporter<'_> {
                 select.limit = Some((Some(limit), offset, true));
                 Body::Select(select)
             }
+            // `LogicalSecureView::ToSQL` names the view, which needs the mapping of its outputs
+            Op::SecureView { .. } => return Err("secure view boundaries are not exported yet".into()),
             Op::Sample { options } => {
                 let child = self.export_child(op, 0)?;
                 let child_fields = child.fields.clone();

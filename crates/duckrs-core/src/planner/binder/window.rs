@@ -92,6 +92,10 @@ impl Binder<'_> {
         };
         let mut body = (**body).clone();
         super::macros::replace_in_expr(&mut body, &super::macros::parameter_names(function), &arguments);
+        // `RETURNS`: the result of the macro is cast to its type
+        if let Some(ty) = &function.return_type {
+            body = duckrs_parser::ast::Expr::cast(body, ty.clone());
+        }
         Ok(Some(body))
     }
 

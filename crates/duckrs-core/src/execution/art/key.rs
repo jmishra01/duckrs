@@ -152,6 +152,11 @@ impl ArtKey {
         self.data.is_empty()
     }
 
+    /// The bytes of the key.
+    pub fn bytes(&self) -> &[u8] {
+        &self.data
+    }
+
     /// `ARTKey::GetMismatchPos`: where they first differ, from `start`.
     pub fn mismatch_position(&self, other: &ArtKey, start: usize) -> usize {
         let (left, right) = (&self.data[start..], &other.data[start..]);

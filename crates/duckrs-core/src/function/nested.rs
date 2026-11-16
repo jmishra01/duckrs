@@ -205,7 +205,7 @@ fn map_extract(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
-pub(super) fn bound_function(
+pub(crate) fn bound_function(
     name: &str,
     children: Vec<BoundExpr>,
     return_type: LogicalType,
@@ -296,7 +296,16 @@ pub fn bind_struct_pack(names: Vec<String>, children: Vec<BoundExpr>) -> Result<
     for (name, child) in names.into_iter().zip(&children) {
         let name = if name.is_empty() { child.alias.clone() } else { name };
         if name.is_empty() {
-            return Err(binder_error("Need named argument for struct pack, e.g., a := b"));
+            // the overload takes only named arguments (`kwargs`)
+            let types: Vec<String> = children
+                .iter()
+                .map(|c| super::binder::expression_return_type(c).to_string())
+                .collect();
+            return Err(binder_error(format!(
+                "No function matches the given name and argument types 'struct_pack({})'. You might need to add \
+                 explicit type casts.",
+                types.join(", ")
+            )));
         }
         if fields.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
             return Err(binder_error(format!("Duplicate struct entry name \"{name}\"")));
@@ -688,6 +697,10 @@ fn bind_extract(name: &str, child: BoundExpr, key: BoundExpr) -> Result<BoundExp
                 LogicalType::VARCHAR,
                 string_extract,
             ))
+        }
+        // with `old_implicit_casting`, anything casts to the string overload
+        _ if super::cast_rules::implicit_cast(&ty, &LogicalType::VARCHAR) >= 0 && ty.id() != LogicalTypeId::Blob => {
+            bind_extract(name, child.cast_to(&LogicalType::VARCHAR, false), key)
         }
         _ => Err(binder_error(format!(
             "No function matches the given name and argument types '{name}({ty}, {})'. You might need to add \

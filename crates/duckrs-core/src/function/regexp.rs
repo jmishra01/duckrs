@@ -88,10 +88,73 @@ fn parse_options(options: &str) -> Result<Options> {
     Ok(parsed)
 }
 
+/// RE2's Perl mode refuses a repetition operator right after another: `a**`, `a++` (a possessive
+/// quantifier elsewhere), `a{2}*`; only `?` may follow, once, for a non-greedy repetition.
+fn check_stacked_repetition(pattern: &str) -> Result<()> {
+    let bytes = pattern.as_bytes();
+    let mut last_repeat: Option<usize> = None;
+    let mut at = 0;
+    let counted = |at: usize| -> Option<usize> {
+        // `{n}`, `{n,}`, `{n,m}`: the end of it
+        let rest = &pattern[at..];
+        let close = rest.find('}')?;
+        let inner = &rest[1..close];
+        let (low, high) = inner.split_once(',').unwrap_or((inner, "0"));
+        (!low.is_empty() && low.bytes().all(|b| b.is_ascii_digit()) && high.bytes().all(|b| b.is_ascii_digit()))
+            .then_some(at + close + 1)
+    };
+    while at < bytes.len() {
+        let byte = bytes[at];
+        let repeat_end = match byte {
+            b'*' | b'+' | b'?' => Some(at + 1),
+            b'{' => counted(at),
+            _ => None,
+        };
+        if let Some(mut end) = repeat_end {
+            if bytes.get(end) == Some(&b'?') {
+                end += 1;
+            }
+            if let Some(start) = last_repeat {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("bad repetition operator: {}", &pattern[start..end]),
+                ));
+            }
+            last_repeat = Some(at);
+            at = end;
+            continue;
+        }
+        last_repeat = None;
+        match byte {
+            b'\\' => at += 2,
+            b'[' => {
+                // a class up to its `]`, which may come first
+                at += 1;
+                if bytes.get(at) == Some(&b'^') {
+                    at += 1;
+                }
+                if bytes.get(at) == Some(&b']') {
+                    at += 1;
+                }
+                while at < bytes.len() && bytes[at] != b']' {
+                    at += if bytes[at] == b'\\' { 2 } else { 1 };
+                }
+                at += 1;
+            }
+            b'(' if bytes.get(at + 1) == Some(&b'?') => at += 2,
+            _ => at += 1,
+        }
+    }
+    Ok(())
+}
+
 fn compile(pattern: &str, options: Options, anchored: bool) -> Result<Regex> {
     let key = format!("{options:?}{anchored}{pattern}");
     if let Some(regex) = CACHE.with(|cache| cache.borrow().get(&key).cloned()) {
         return Ok(regex);
+    }
+    if !options.literal {
+        check_stacked_repetition(pattern)?;
     }
     let source = if options.literal {
         regex::escape(pattern)

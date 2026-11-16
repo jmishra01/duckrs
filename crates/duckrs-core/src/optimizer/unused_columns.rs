@@ -98,7 +98,8 @@ fn visit(op: &mut LogicalOperator, by_position: bool, used: &mut HashSet<ColumnB
         | K::DelimJoin { .. }
         | K::MarkJoin { .. }
         | K::Window { .. }
-        | K::Unnest { .. } => by_position,
+        | K::Unnest { .. }
+        | K::SecureView { .. } => by_position,
         _ => true,
     };
     // these copy the rows of their children, in contrast to operators that pass vectors on

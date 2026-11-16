@@ -877,6 +877,7 @@ impl TableSource for DiskTable {
                     geometry: None,
                     strings: None,
                     distinct: None,
+                    children: Vec::new(),
                 };
                 let Some(stored) = stored else {
                     return Some(unknown);
@@ -895,6 +896,7 @@ impl TableSource for DiskTable {
                         total_length: strings.total_length,
                     }),
                     distinct: None,
+                    children: Vec::new(),
                 })
             })
             .collect()

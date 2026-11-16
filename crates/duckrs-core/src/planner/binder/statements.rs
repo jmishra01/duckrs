@@ -187,7 +187,8 @@ enum PreparedModifier {
         percent: f64,
         offset: u64,
     },
-    Order(Vec<(OrderModifiers, usize)>),
+    /// with the collation a position of a set operation is sorted by
+    Order(Vec<(OrderModifiers, usize, Option<String>)>),
     OrderAll(OrderModifiers),
     Limit {
         limit: Option<u64>,
@@ -261,6 +262,9 @@ pub fn schema_of(name: &QualifiedName) -> Result<Option<String>> {
         path => Ok(Some(crate::catalog::schema_key(path))),
     }
 }
+
+/// The alias of a COLLATE that an ORDER BY position applies to its select list entry.
+pub(super) const ORDER_POSITION_COLLATE: &str = "\u{1}order position";
 
 impl Binder<'_> {
     /// `schema_of` in this binder's catalog, which a qualification can name by its own name, as
@@ -665,7 +669,7 @@ impl Binder<'_> {
                     )));
                 }
                 for index in matched {
-                    orders.push((self.options.resolve_order(node.order, node.nulls), index));
+                    orders.push((self.options.resolve_order(node.order, node.nulls), index, None));
                 }
                 continue;
             }
@@ -681,7 +685,17 @@ impl Binder<'_> {
                      this behavior.",
                 ));
             }
-            let index = match &node.expr.kind {
+            // `BindSelectNode`: a position with a collation
+            let (order_expr, collation) = match &node.expr.kind {
+                ExprKind::Collate { child, collation }
+                    if matches!(&child.kind, ExprKind::Constant(l) if l.kind == LiteralKind::Integer)
+                        || matches!(&child.kind, ExprKind::Positional(_)) =>
+                {
+                    (&**child, Some(collation.clone()))
+                }
+                _ => (&node.expr, None),
+            };
+            let index = match &order_expr.kind {
                 ExprKind::Constant(literal) if literal.kind == LiteralKind::Integer => {
                     let value: i64 = literal.text.replace('_', "").parse().unwrap_or(i64::MAX);
                     if value <= 0 || value as usize > types.len() {
@@ -729,7 +743,10 @@ impl Binder<'_> {
                     index
                 }
             };
-            orders.push((self.options.resolve_order(node.order, node.nulls), index));
+            if collation.is_some() && types.get(index).is_some_and(|t| t.id() != LogicalTypeId::Varchar) {
+                return Err(binder_error("COLLATE can only be applied to varchar columns"));
+            }
+            orders.push((self.options.resolve_order(node.order, node.nulls), index, collation));
         }
         Ok(PreparedModifier::Order(orders))
     }
@@ -793,11 +810,18 @@ impl Binder<'_> {
                 PreparedModifier::Order(orders) => LogicalOperatorKind::Order {
                     orders: orders
                         .into_iter()
-                        .map(|(modifiers, index)| {
-                            Ok(BoundOrderByNode {
-                                modifiers,
-                                expr: collated_column(index)?,
-                            })
+                        .map(|(modifiers, index, collation)| {
+                            let expr = match collation {
+                                Some(collation) => {
+                                    let mut expr = column(index)?;
+                                    expr.return_type = LogicalType::varchar_collation(&collation);
+                                    let ty = expr.return_type.clone();
+                                    let kind = crate::planner::collation::CollationType::AllCollations;
+                                    crate::planner::collation::push_collation(expr, &ty, &default_collation, kind)?.0
+                                }
+                                None => collated_column(index)?,
+                            };
+                            Ok(BoundOrderByNode { modifiers, expr })
                         })
                         .collect::<Result<_>>()?,
                 },
@@ -908,7 +932,18 @@ impl Binder<'_> {
         let mut state = SelectBindState::default();
         for (i, expr) in select_list.iter_mut().enumerate() {
             names.push(expression_name(expr));
+            let written = match (&expr.kind, expr.alias.is_empty()) {
+                (ExprKind::ColumnRef(parts), true) => parts.last().cloned(),
+                _ => None,
+            };
             self.qualify_column_names(expr);
+            // `ColumnQualifier::QualifyColumnName`: a column is named as the table spells it
+            if let (Some(written), ExprKind::ColumnRef(parts)) = (written, &expr.kind)
+                && let Some(column) = parts.last()
+                && column.eq_ignore_ascii_case(&written)
+            {
+                *names.last_mut().expect("just pushed") = column.clone();
+            }
             if !expr.alias.is_empty() && !unnested_fields.contains(&i) {
                 state.alias_map.push((expr.alias.clone(), i));
             }
@@ -1406,7 +1441,7 @@ impl Binder<'_> {
                     };
                     for target in &targets {
                         let index = self.bind_order_expression(target, select_list, state, "ORDER BY")?;
-                        orders.push((self.options.resolve_order(node.order, node.nulls), index));
+                        orders.push((self.options.resolve_order(node.order, node.nulls), index, None));
                     }
                 }
                 PreparedModifier::Order(orders)
@@ -1556,6 +1591,11 @@ impl Binder<'_> {
                         rewritten = Expr::from(ExprKind::Collate {
                             child: Box::new(target),
                             collation: collation.clone(),
+                        })
+                        .with_alias(if matches!(&child.kind, ExprKind::Constant(_) | ExprKind::Positional(_)) {
+                            ORDER_POSITION_COLLATE
+                        } else {
+                            ""
                         });
                         &rewritten
                     }
@@ -1852,7 +1892,7 @@ impl Binder<'_> {
                 )));
             }
             if found.len() > 1 {
-                return Err(BindContext::ambiguous_table(&star.relation_name));
+                return Err(BindContext::ambiguous_table(&star.relation_name, &found));
             }
             found
         };
@@ -2553,8 +2593,18 @@ impl Binder<'_> {
         binder.outer_contexts.clear();
         binder.bound_views.push(view.clone());
         binder.search_schema = Some(view.schema.clone());
-        let bound = binder.bind_select_statement(&view.query)?;
+        let mut bound = binder.bind_select_statement(&view.query)?;
         self.next_table_index = binder.next_table_index;
+        if view.secure {
+            // the boundary that keeps the optimizer out of the view
+            let plan = std::mem::replace(&mut bound.plan, LogicalOperator::new(LogicalOperatorKind::CrossProduct, vec![]));
+            bound.plan = LogicalOperator::new(
+                LogicalOperatorKind::SecureView {
+                    view_name: view.name.clone(),
+                },
+                vec![plan],
+            );
+        }
         let alias = if table_ref.alias.is_empty() {
             view.name.clone()
         } else {
@@ -2592,6 +2642,26 @@ impl Binder<'_> {
                 .map(String::as_str);
             if let Some(entry) = crate::catalog::defaults::default_macro(schema, &call.name.name, true) {
                 return self.bind_table_macro(table_ref, call, entry);
+            }
+            // `Catalog::GetEntry`: a name that is no table function of C++ either
+            if !CPP_TABLE_FUNCTIONS.contains(&name.as_str()) {
+                let mut best: Option<(f64, String)> = None;
+                let candidates = CPP_TABLE_FUNCTIONS.iter().map(|n| n.to_string()).chain(
+                    crate::catalog::defaults::default_macro_names()
+                        .filter(|(_, _, table_macro)| *table_macro)
+                        .map(|(_, n, _)| n.to_string()),
+                );
+                for candidate in candidates {
+                    let score = duckrs_common::string_util::similarity_rating(&candidate, &call.name.name);
+                    if score > best.as_ref().map_or(0.0, |(b, _)| *b) {
+                        best = Some((score, candidate));
+                    }
+                }
+                let hint = best.map_or_else(String::new, |(_, n)| format!("\nDid you mean \"{n}\"?"));
+                return Err(Error::new(
+                    ErrorKind::Catalog,
+                    format!("Table Function with name {} does not exist!{hint}", call.name.name),
+                ));
             }
             return Err(not_implemented(&format!("the table function {name}")));
         }
@@ -2761,12 +2831,13 @@ impl Binder<'_> {
         self.bind_context = BindContext::default();
         // the generated columns too, computed from the stored ones the statement returns (not with
         // MERGE, whose `merge_action` comes after the stored columns)
-        let logical = !table.generated.is_empty() && !self.merge_action_column;
+        let logical = !table.generated.is_empty();
         if logical {
             let names = table.logical_columns().iter().map(|c| c.name.to_string()).collect();
             let mut binding = super::generated::table_binding(table, alias, table_index, names);
             binding.schema = Some(table.schema.clone());
-            binding.row_id = None;
+            // past the logical columns, and moved after the stored ones below
+            binding.row_id = (self.returning_row_id && !self.merge_action_column).then(|| table.logical_columns().len());
             self.bind_context.add_binding(binding);
         } else {
             self.bind_context.add_binding(Binding {
@@ -2776,7 +2847,7 @@ impl Binder<'_> {
                 table_index,
                 names: table.columns.iter().map(|c| c.name.clone()).collect(),
                 types: table.types(),
-                row_id: None,
+                row_id: self.returning_row_id.then_some(table.columns.len()),
                 virtual_columns: Vec::new(),
                 generated: Vec::new(),
             });
@@ -2787,6 +2858,9 @@ impl Binder<'_> {
             return Err(excluded_in_returning());
         }
         let list = self.expand_star_expressions(returning)?;
+        if list.is_empty() {
+            return Err(binder_error("RETURNING list is empty!"));
+        }
         // `VerifyNotExcluded`
         for expr in &list {
             let mut excluded = false;
@@ -2810,8 +2884,12 @@ impl Binder<'_> {
         }
         let names: Vec<String> = list.iter().map(expression_name).collect();
         if self.merge_action_column {
-            // a virtual column: `*` left it out
-            let columns = table.columns.len();
+            // a virtual column: `*` left it out. Past the logical columns, if the binding has those.
+            let columns = if logical {
+                table.logical_columns().len()
+            } else {
+                table.columns.len()
+            };
             let mut hidden: Vec<String> = (0..columns).map(|i| format!("\u{1}{i}")).collect();
             hidden.push("merge_action".to_string());
             let mut types = vec![LogicalType::SQLNULL; columns];
@@ -2843,13 +2921,17 @@ impl Binder<'_> {
                     }))
                 })
                 .collect();
+            let row_id = columns.len();
             for e in &mut expressions {
                 e.walk_mut(&mut |e| {
                     if let BoundExprKind::ColumnRef { binding, depth: 0 } = &mut e.kind
                         && binding.table_index == table_index
-                        && let Some(Some(position)) = stored.get(binding.column_index)
                     {
-                        binding.column_index = *position;
+                        if binding.column_index == row_id {
+                            binding.column_index = table.columns.len();
+                        } else if let Some(Some(position)) = stored.get(binding.column_index) {
+                            binding.column_index = *position;
+                        }
                     }
                 });
             }
@@ -2931,7 +3013,11 @@ impl Binder<'_> {
             );
             if returning {
                 let alias = Self::write_alias(&delete.table, &table);
-                return binder.bind_returning(plan, &delete.returning, &table, table_index, alias);
+                // `rowid` is a virtual column a DELETE can return
+                binder.returning_row_id = true;
+                let result = binder.bind_returning(plan, &delete.returning, &table, table_index, alias);
+                binder.returning_row_id = false;
+                return result;
             }
             Ok(Self::changed_rows(plan))
         })
@@ -2996,7 +3082,14 @@ impl Binder<'_> {
                         None => BoundExpr::constant(Value::null(column.ty.clone())),
                     }
                 } else {
-                    binder.bind_expression(value)?
+                    // `UpdateBinder`
+                    let errors = (
+                        std::mem::replace(&mut binder.window_error, "window functions are not allowed in UPDATE"),
+                        std::mem::replace(&mut binder.aggregate_error, "aggregate functions are not allowed in UPDATE"),
+                    );
+                    let bound = binder.bind_expression(value);
+                    (binder.window_error, binder.aggregate_error) = errors;
+                    bound?
                 };
                 expressions.push(checked_cast(bound, &column.ty)?);
             }
@@ -3144,7 +3237,14 @@ impl Binder<'_> {
                             })
                             .collect()
                     };
-                    let (types, expressions) = self.bind_values(rows, Some(&expected_types), &defaults)?;
+                    // `InsertBinder`
+                    let errors = (
+                        std::mem::replace(&mut self.window_error, "INSERT statement cannot contain window functions!"),
+                        std::mem::replace(&mut self.aggregate_error, "INSERT statement cannot contain aggregates!"),
+                    );
+                    let bound = self.bind_values(rows, Some(&expected_types), &defaults);
+                    (self.window_error, self.aggregate_error) = errors;
+                    let (types, expressions) = bound?;
                     let table_index = self.generate_table_index();
                     LogicalOperator::new(
                         LogicalOperatorKind::ExpressionGet {
@@ -3592,3 +3692,118 @@ pub(super) fn unnest_depths(ty: &LogicalType, max_depth: usize) -> (usize, usize
     };
     (lists, structs)
 }
+
+/// The table functions of C++ (the core and the json, parquet and icu extensions). A name outside
+/// this list is unknown to C++ as well, not merely unported.
+const CPP_TABLE_FUNCTIONS: &[&str] = &[
+    "add_grammar_extension",
+    "arrow_scan",
+    "arrow_scan_dumb",
+    "check_peg_parser",
+    "checkpoint",
+    "create_external_resource",
+    "deregister_external_resource",
+    "destroy_external_resource",
+    "disable_logging",
+    "disable_peg_parser",
+    "disable_profiling",
+    "duckdb_approx_database_count",
+    "duckdb_available_metrics",
+    "duckdb_columns",
+    "duckdb_connection_count",
+    "duckdb_constraints",
+    "duckdb_coordinate_systems",
+    "duckdb_databases",
+    "duckdb_dependencies",
+    "duckdb_dialects",
+    "duckdb_eviction_queues",
+    "duckdb_extension_repositories",
+    "duckdb_extensions",
+    "duckdb_external_file_cache",
+    "duckdb_external_resource_types",
+    "duckdb_external_resources",
+    "duckdb_functions",
+    "duckdb_grammar_extensions",
+    "duckdb_indexes",
+    "duckdb_keywords",
+    "duckdb_live_query_metrics",
+    "duckdb_log_contexts",
+    "duckdb_logs",
+    "duckdb_memory",
+    "duckdb_optimizers",
+    "duckdb_prepared_statements",
+    "duckdb_schemas",
+    "duckdb_secret_type_parameters",
+    "duckdb_secret_types",
+    "duckdb_secrets",
+    "duckdb_sequences",
+    "duckdb_settings",
+    "duckdb_table_sample",
+    "duckdb_tables",
+    "duckdb_temporary_files",
+    "duckdb_triggers",
+    "duckdb_types",
+    "duckdb_variables",
+    "duckdb_views",
+    "enable_logging",
+    "enable_peg_parser",
+    "enable_profiling",
+    "force_checkpoint",
+    "generate_series",
+    "glob",
+    "icu_calendar_names",
+    "json_each",
+    "json_execute_serialized_sql",
+    "json_tree",
+    "parquet_bloom_probe",
+    "parquet_file_metadata",
+    "parquet_full_metadata",
+    "parquet_kv_metadata",
+    "parquet_metadata",
+    "parquet_page_index",
+    "parquet_scan",
+    "parquet_schema",
+    "pg_timezone_names",
+    "pragma_collations",
+    "pragma_database_size",
+    "pragma_metadata_info",
+    "pragma_platform",
+    "pragma_show",
+    "pragma_storage_info",
+    "pragma_table_info",
+    "pragma_user_agent",
+    "pragma_version",
+    "query",
+    "query_table",
+    "range",
+    "read_blob",
+    "read_csv",
+    "read_csv_auto",
+    "read_duckdb",
+    "read_json",
+    "read_json_auto",
+    "read_json_objects",
+    "read_json_objects_auto",
+    "read_ndjson",
+    "read_ndjson_auto",
+    "read_ndjson_objects",
+    "read_parquet",
+    "read_single_csv_file",
+    "read_single_json_file",
+    "read_single_parquet_file",
+    "read_text",
+    "register_external_resource",
+    "register_external_resource_type",
+    "remove_grammar_extension",
+    "repeat",
+    "repeat_row",
+    "seq_scan",
+    "sniff_csv",
+    "sql_auto_complete",
+    "summary",
+    "test_all_types",
+    "test_vector_types",
+    "truncate_duckdb_logs",
+    "unnest",
+    "which_secret",
+];

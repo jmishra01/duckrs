@@ -220,7 +220,7 @@ impl DatabaseInstance {
             views.push(name);
         }
         for view in views {
-            schema.create_view(&view, query.clone(), Vec::new(), OnCreateConflict::Error, Vec::new())?;
+            schema.create_view(&view, query.clone(), Vec::new(), OnCreateConflict::Error, Vec::new(), false)?;
         }
         Ok(Arc::new(db))
     }
@@ -399,7 +399,11 @@ impl DatabaseInstance {
     fn has_foreign_indexes(&self) -> bool {
         self.catalog.schemas().iter().any(|schema| {
             schema.tables_and_views().iter().any(|entry| match entry {
-                TableOrView::Table(table) => table.indexes.read().iter().any(|index| index.index_type != "ART"),
+                TableOrView::Table(table) => table
+                    .indexes
+                    .read()
+                    .iter()
+                    .any(|index| !index.index_type.eq_ignore_ascii_case("ART")),
                 TableOrView::View(_) => false,
             })
         })
@@ -696,6 +700,26 @@ fn for_each_table_name(statement: &mut Statement, f: &mut impl FnMut(&mut Qualif
     }
 }
 
+/// `Catalog::LookupEntry` of an entry whose schema is missing: a table, or anything in a nested
+/// schema, names the schema; another entry is just missing.
+fn missing_schema(error: Error, kind: &str, name: &QualifiedName) -> Error {
+    if error.kind != ErrorKind::Catalog || !error.message.starts_with("Schema with name") {
+        return error;
+    }
+    let schemas: Vec<&String> = name.qualification.iter().filter(|q| !q.is_empty()).collect();
+    if kind == "Table" || schemas.len() > 1 {
+        let schema = schemas.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(".");
+        return Error::new(
+            ErrorKind::Catalog,
+            format!(
+                "{kind} with name \"{schema}.{}\" does not exist because schema \"{schema}\" does not exist.",
+                name.name
+            ),
+        );
+    }
+    missing_entry(kind, &name.name)
+}
+
 /// The names of the `$name` parameters in the text of a statement, outside of string literals and
 /// quoted identifiers, lowercase.
 fn parameter_names(sql: &str) -> Vec<String> {
@@ -894,6 +918,8 @@ struct ActiveTransaction {
     attached: Vec<Arc<DatabaseInstance>>,
     /// `MetaTransaction::modified_database`: the one database it wrote to
     modified: Option<Arc<DatabaseInstance>>,
+    /// `MetaTransaction::start_timestamp`, in microseconds since the epoch: what `now()` says
+    started: i64,
 }
 
 impl ActiveTransaction {
@@ -1054,6 +1080,7 @@ impl ClientContext {
         let (db, session) = (self.home.clone(), self.settings.clone());
         let (list_db, list_session) = (self.home.clone(), self.settings.clone());
         let files_db = self.home.clone();
+        let attached_db = self.home.clone();
         Arc::new(SessionValues {
             database: self.db.name.clone(),
             log_manager: self.home.log_manager.clone(),
@@ -1117,6 +1144,16 @@ impl ClientContext {
                     .map(|file| std::fs::canonicalize(&file.path).unwrap_or_else(|_| file.path.clone()))
                     .collect()
             }),
+            attached_catalog: Box::new(move |name: &str| {
+                if name.eq_ignore_ascii_case(&attached_db.name) {
+                    return Some(attached_db.catalog.clone());
+                }
+                attached_db
+                    .attached
+                    .read()
+                    .get(&name.to_lowercase())
+                    .map(|database| database.catalog.clone())
+            }),
         })
     }
 
@@ -1142,6 +1179,11 @@ impl ClientContext {
 
     fn bind_options(&self) -> BindOptions {
         BindOptions {
+            local_file_system_disabled: self
+                .setting_text("disabled_filesystems")
+                .split(',')
+                .any(|f| f == "LocalFileSystem"),
+            parser: self.parser_options(),
             transaction_id: self
                 .transaction
                 .as_ref()
@@ -1184,6 +1226,15 @@ impl ClientContext {
         if let Some(depth) = self.setting("max_expression_depth").and_then(|v| v.as_i128()) {
             options.max_expression_depth = depth as usize;
         }
+        options.integer_division = self.setting_text("integer_division") == "true";
+        options.regex_full_match = self
+            .setting_text("regex_match_operator_semantics")
+            .eq_ignore_ascii_case("full");
+        options.identifier_case = match self.setting_text("preserve_identifier_case").to_lowercase().as_str() {
+            "lowercase" => duckrs_parser::matcher::IdentifierCase::Lower,
+            "uppercase" => duckrs_parser::matcher::IdentifierCase::Upper,
+            _ => duckrs_parser::matcher::IdentifierCase::Preserve,
+        };
         options
     }
 
@@ -1265,10 +1316,17 @@ impl ClientContext {
             self.pending_profile = None;
             let profiler = profiled.map(|_| Arc::new(crate::execution::profiler::OperatorProfiler::default()));
             let outcome = crate::execution::profiler::with_profiler(profiler.clone(), || {
-                crate::logging::with_file_logging(&target, || match self.verification_statement(statement) {
-                    Ok(Some(replacement)) => self.run_statement(&replacement),
-                    Ok(None) => self.run_statement(statement),
-                    Err(error) => Err(error),
+                crate::logging::with_file_logging(&target, || {
+                    let old_casting = crate::function::cast_rules::set_old_implicit_casting(
+                        self.setting_text("old_implicit_casting") == "true",
+                    );
+                    let result = match self.verification_statement(statement) {
+                        Ok(Some(replacement)) => self.run_statement(&replacement),
+                        Ok(None) => self.run_statement(statement),
+                        Err(error) => Err(error),
+                    };
+                    crate::function::cast_rules::set_old_implicit_casting(old_casting);
+                    result
                 })
             });
             self.end_statement_logging();
@@ -1422,6 +1480,7 @@ impl ClientContext {
                     forks: Vec::new(),
                     attached: Vec::new(),
                     modified: None,
+                    started: crate::execution::temporary::now_micros(),
                 });
                 if self
                     .setting_text("immediate_transaction_mode")
@@ -1648,6 +1707,32 @@ impl ClientContext {
     /// Runs one statement within the current transaction, or as a transaction of its own
     /// (`ClientContext::PendingStatementOrPreparedStatementInternal` + `CleanupInternal`).
     fn run_statement(&mut self, statement: &Statement) -> Result<MaterializedQueryResult> {
+        // `FileSystem::GetHomeDirectory` of this connection
+        crate::execution::file_system::set_home_directory(Some(self.setting_text("home_directory")));
+        crate::execution::file_system::set_file_search_path(&self.setting_text("file_search_path"));
+        // `Binder::BindCreateSchema`: the system catalog (and its pg_catalog and information_schema)
+        // takes no entries
+        let created = match statement {
+            Statement::Create(info) if !info.temporary && !matches!(info.kind, CreateKind::Schema { .. }) => {
+                Some(&info.name)
+            }
+            Statement::CreateTable(info) if !info.temporary => Some(&info.name),
+            _ => None,
+        };
+        if let Some(name) = created {
+            let parts: Vec<&String> = name.qualification.iter().filter(|q| !q.is_empty()).collect();
+            let system = match parts.as_slice() {
+                [catalog, ..] if catalog.eq_ignore_ascii_case("system") => true,
+                [schema] => {
+                    (schema.eq_ignore_ascii_case("pg_catalog") || schema.eq_ignore_ascii_case("information_schema"))
+                        && self.catalog().get_schema(schema).is_none()
+                }
+                _ => false,
+            };
+            if system {
+                return Err(Error::new(ErrorKind::Binder, "Cannot create entry in system catalog"));
+            }
+        }
         if let Some((database, routed)) = self.route_to_database(statement)? {
             let previous = std::mem::replace(&mut self.db, database);
             let result = self.run_statement(&routed);
@@ -1805,7 +1890,10 @@ impl ClientContext {
             }
         }
         // outside of a transaction only a commit that is made to fail needs one of these
-        let undo = (write && self.transaction.is_none() && self.commit_may_fail()).then(|| self.catalog().snapshot());
+        // as does one that writes to a table with a DEFERRED key, which its commit checks
+        let deferred = write && self.transaction.is_none() && !self.catalog().deferred_tables().is_empty();
+        let undo = (write && self.transaction.is_none() && (deferred || self.commit_may_fail()))
+            .then(|| self.catalog().snapshot());
         // what isn't a change to rows can conflict with what transactions did to the catalog
         let changes_entries = write
             && !matches!(
@@ -1867,11 +1955,23 @@ impl ClientContext {
                 transaction.apply_invalidation_policy(error.kind);
             }
         } else if self.transaction.is_none() {
-            if let Some(snapshot) = undo
-                && let Some(error) = self.forced_commit_failure()
-            {
-                self.catalog().restore(snapshot);
-                return Err(error);
+            if let Some(snapshot) = undo {
+                let failure = if deferred {
+                    self.catalog()
+                        .deferred_tables()
+                        .iter()
+                        .try_for_each(|table| {
+                            crate::execution::constraints::check_deferred_keys(table, &*table.rows()?, |_| true)
+                        })
+                        .err()
+                        .map(crate::catalog::failed_commit)
+                } else {
+                    None
+                };
+                if let Some(error) = failure.or_else(|| self.forced_commit_failure()) {
+                    self.catalog().restore(snapshot);
+                    return Err(error);
+                }
             }
             // also for a SELECT, as `nextval` is one
             self.log_commit()?;
@@ -2098,6 +2198,7 @@ impl ClientContext {
             return Err(crate::unported("ATTACH TO EXTERNAL RESOURCE"));
         }
         let path = evaluate_scalar(&bind_constant_expression(&self.catalog(), &info.path)?)?.try_to_string()?;
+        let path = crate::execution::file_system::expand_path(&path);
         let mut options = AttachOptions::default();
         let mut mode_given = false;
         // the options given as expressions, such as `TYPE getvariable('t')`, by their values
@@ -2434,6 +2535,126 @@ impl ClientContext {
             *entry = changed.clone();
         }
         Ok(Self::success())
+    }
+
+    /// Whether `info` is a COMMENT ON of an entry that is no table: a view (or a column of one),
+    /// a sequence, a type or a macro (`SetCommentInfo`, `SetColumnCommentInfo`).
+    fn comments_outside_tables(&self, info: &AlterInfo) -> Result<bool> {
+        Ok(match &info.kind {
+            AlterKind::SetComment { entry_type, .. } => {
+                matches!(*entry_type, "VIEW" | "SEQUENCE" | "TYPE" | "MACRO" | "MACRO TABLE")
+            }
+            AlterKind::SetColumnComment { .. } => {
+                let catalog = self.catalog();
+                let schema = schema_of(&info.name)?;
+                matches!(
+                    catalog.get_entry(schema.as_deref(), None, &info.name.name),
+                    Ok(TableOrView::View(_))
+                )
+            }
+            _ => false,
+        })
+    }
+
+    /// `AlterInfo` of a comment, on an entry that is no table: the entry with it takes its place.
+    fn comment_on_entry(&self, info: &AlterInfo) -> Result<MaterializedQueryResult> {
+        let catalog = self.catalog();
+        let schema_name = schema_of(&info.name)?;
+        let name = &info.name.name;
+        let text = |value: &duckrs_parser::ast::Literal| {
+            (!matches!(value.kind, LiteralKind::Null)).then(|| value.text.clone())
+        };
+        let system = || Error::new(ErrorKind::Binder, "Can not comment on System Catalog entries");
+        match &info.kind {
+            AlterKind::SetColumnComment { column, value } => {
+                let entry = catalog.get_entry(schema_name.as_deref(), None, name)?;
+                let TableOrView::View(view) = entry else {
+                    unreachable!("checked by the caller")
+                };
+                let schema = catalog.schema_for(Some(&view.schema))?;
+                // `ViewCatalogEntry::AlterEntry`: a column of the view by its name
+                let names = self.view_column_names(&view)?;
+                let Some(found) = names.iter().find(|n| n.eq_ignore_ascii_case(column)) else {
+                    return Err(Error::new(
+                        ErrorKind::Binder,
+                        format!("View \"{name}\" does not have a column with name \"{column}\""),
+                    ));
+                };
+                let mut comments: Vec<(String, String)> = view
+                    .column_comments
+                    .iter()
+                    .filter(|(n, _)| !n.eq_ignore_ascii_case(found))
+                    .cloned()
+                    .collect();
+                if let Some(comment) = text(value) {
+                    comments.push((found.clone(), comment));
+                }
+                schema.set_view_comments(&view.name, view.comment.clone(), comments);
+            }
+            AlterKind::SetComment { entry_type, value } => {
+                let comment = text(value);
+                match *entry_type {
+                    "VIEW" => {
+                        let view = match catalog.get_entry(schema_name.as_deref(), None, name) {
+                            Ok(TableOrView::View(view)) => view,
+                            _ if crate::catalog::defaults::default_view(schema_name.as_deref(), name).is_some() => {
+                                return Err(system());
+                            }
+                            _ => return Err(missing_entry("View", name)),
+                        };
+                        let schema = catalog.schema_for(Some(&view.schema))?;
+                        schema.set_view_comments(&view.name, comment, view.column_comments.clone());
+                    }
+                    "SEQUENCE" => {
+                        let schema = catalog.schema_for(schema_name.as_deref())?;
+                        if !schema.set_sequence_comment(name, comment) {
+                            return Err(missing_entry("Sequence", name));
+                        }
+                    }
+                    "TYPE" => {
+                        let schema = catalog.schema_for(schema_name.as_deref())?;
+                        if !schema.set_type_comment(name, comment) {
+                            return Err(missing_entry("Type", name));
+                        }
+                    }
+                    _ => {
+                        let table_macro = *entry_type == "MACRO TABLE";
+                        let schema = catalog.schema_for(schema_name.as_deref())?;
+                        if !schema.set_macro_comment(name, table_macro, comment) {
+                            let builtin = crate::function::BuiltinFunctions::get();
+                            if builtin.scalar(name).is_some()
+                                || builtin.aggregate(name).is_some()
+                                || crate::catalog::defaults::default_macro(schema_name.as_deref(), name, table_macro)
+                                    .is_some()
+                            {
+                                return Err(system());
+                            }
+                            let kind = if table_macro {
+                                "Table Macro Function"
+                            } else {
+                                "Macro Function"
+                            };
+                            return Err(missing_entry(kind, name));
+                        }
+                    }
+                }
+            }
+            _ => unreachable!("checked by the caller"),
+        }
+        Ok(Self::success())
+    }
+
+    /// The names of the columns of a view, as binding its query gives them.
+    fn view_column_names(&self, view: &crate::catalog::ViewCatalogEntry) -> Result<Vec<String>> {
+        let catalog = self.catalog();
+        let mut binder = Binder::with_options(&catalog, self.bind_options());
+        binder.session = Some(self.session_values());
+        let bound = binder.bind(&Statement::Select(view.query.clone()))?;
+        let mut names = bound.names;
+        for (name, alias) in names.iter_mut().zip(&view.aliases) {
+            name.clone_from(alias);
+        }
+        Ok(names)
     }
 
     /// `EXPLAIN (SQL)` (`LogicalExplain::CreateSQLResult`).
@@ -2841,7 +3062,10 @@ impl ClientContext {
                     return Err(Error::new(ErrorKind::Binder, "SET value cannot contain subqueries"));
                 }
                 let bound = bind_constant_expression(&self.catalog(), value).map_err(|error| {
-                    if error.message.contains("was not found because the FROM clause is missing") {
+                    if error
+                        .message
+                        .contains("was not found because the FROM clause is missing")
+                    {
                         Error::new(ErrorKind::Binder, "SET value cannot contain column names")
                     } else {
                         error
@@ -2865,16 +3089,28 @@ impl ClientContext {
                 }
                 // `EnableProfilingSetting::SetLocal`: a format the profiler knows, and profiling on
                 if name.eq_ignore_ascii_case("enable_profiling") {
-                    let format = value.try_to_string()?.to_lowercase();
-                    if !matches!(
-                        format.as_str(),
-                        "json" | "query_tree" | "query_tree_optimizer" | "no_output" | "html" | "graphviz"
-                    ) {
+                    // `LookupProfilerPrintFormat`
+                    const FORMATS: [&str; 11] = [
+                        "default",
+                        "text",
+                        "query_tree",
+                        "query_tree_optimizer",
+                        "no_output",
+                        "json",
+                        "html",
+                        "graphviz",
+                        "yaml",
+                        "mermaid",
+                        "compact",
+                    ];
+                    let given = value.try_to_string()?;
+                    let format = given.to_lowercase();
+                    if !FORMATS.contains(&format.as_str()) {
                         return Err(Error::new(
-                            ErrorKind::Parser,
+                            ErrorKind::InvalidInput,
                             format!(
-                                "Unrecognized print format {format}, supported formats: [json, query_tree, \
-                                 query_tree_optimizer, no_output, html, graphviz]"
+                                "\"{given}\" is not a valid FORMAT argument, valid options are: {}",
+                                FORMATS.join(", ")
                             ),
                         ));
                     }
@@ -3088,6 +3324,9 @@ impl ClientContext {
             {
                 return self.comment_on_index(info);
             }
+            Statement::Alter(info) if self.comments_outside_tables(info)? => {
+                return self.comment_on_entry(info);
+            }
             // `ALTER SEQUENCE ... OWNED BY` (`ChangeOwnershipInfo`)
             Statement::Alter(info) if matches!(info.kind, AlterKind::ChangeOwnership { .. }) => {
                 let AlterKind::ChangeOwnership { owner_name, .. } = &info.kind else {
@@ -3121,7 +3360,7 @@ impl ClientContext {
                 {
                     check_alter_dependents(&catalog, &schema.ident(), &info.name.name)?;
                 }
-                let mut binder = Binder::new(&catalog);
+                let mut binder = Binder::with_options(&catalog, self.bind_options());
                 let alter = binder.bind_alter(info)?;
                 execute_alter(alter)?;
                 self.alter_triggers(info);
@@ -3301,6 +3540,12 @@ impl ClientContext {
         }
         let memory = self.query_memory()?;
         memory.set_threads(threads);
+        // an auto-commit statement is a transaction of its own, which starts now
+        memory.set_transaction_start(
+            self.transaction
+                .as_ref()
+                .map_or_else(crate::execution::temporary::now_micros, |t| t.started),
+        );
         crate::execution::profiler::with_profiler(operator_profiler.clone(), || {
             crate::execution::temporary::with_memory(memory, || execute_plan_with(&collector, threads))
         })?;
@@ -3538,11 +3783,21 @@ impl ClientContext {
         else {
             unreachable!("checked by the caller");
         };
-        if *secure {
-            return Err(crate::unported("CREATE SECURE VIEW"));
-        }
         let with_dependencies = self.setting_text("enable_view_dependencies") == "true";
         let catalog = self.catalog();
+        // an older file has no place for it: it would come back as a regular view
+        if *secure
+            && !info.temporary
+            && catalog
+                .storage_version()
+                .is_some_and(|version| version < duckrs_common::serializer::StorageVersion::V2_0_0)
+        {
+            return Err(Error::new(
+                ErrorKind::Binder,
+                "CREATE SECURE VIEW is only supported for storage versions v2.0.0 and higher.\nUse an in-memory \
+                 database, or ATTACH with (STORAGE_VERSION v2.0.0)",
+            ));
+        }
         let schema = catalog.schema_for(create_schema_of(info)?.as_deref())?;
         let on_conflict = on_create_conflict(info.on_conflict);
         // IF NOT EXISTS for a view that exists does not look at the query
@@ -3574,6 +3829,7 @@ impl ClientContext {
             aliases.clone(),
             on_conflict,
             dependencies,
+            *secure,
         )
     }
 
@@ -3590,13 +3846,60 @@ impl ClientContext {
         let mut binder = Binder::with_options(&catalog, self.bind_options());
         binder.session = Some(self.session_values());
         binder.bind_create_macro(&info.name.name, macros, *table_macro, &schema.ident())?;
+        // `CheckMacroStorageVersion` and `BindCreateFunctionInfo`: what an older file can't hold
+        if let Some(version) = catalog.storage_version().filter(|_| !info.temporary) {
+            use duckrs_common::serializer::StorageVersion;
+            if version < StorageVersion::V2_1_0 && macros.iter().any(|m| m.return_type.is_some()) {
+                return Err(Error::new(
+                    ErrorKind::Binder,
+                    "Macros with a declared RETURNS type are only supported for storage versions v2.1.0 and \
+                     higher.\nUse an in-memory database, ATTACH with (STORAGE_VERSION v2.1.0), or create a TEMP macro",
+                ));
+            }
+            if version < StorageVersion::V1_4_0
+                && macros
+                    .iter()
+                    .any(|m| m.parameters.iter().any(|p| p.parameter_type.is_some()))
+            {
+                return Err(Error::new(
+                    ErrorKind::Binder,
+                    "Typed macro parameters are only supported for storage versions v1.4.0 and higher.\nUse an \
+                     in-memory database, ATTACH with (STORAGE_VERSION v1.4.0), or create a TEMP macro",
+                ));
+            }
+        }
         if on_create_conflict(info.on_conflict) == OnCreateConflict::Replace {
             macro_is_free(&schema, &info.name.name)?;
+        }
+        // what is stored is the parsed body, whose lambdas `LambdaExpression::ToString` writes with the
+        // keyword: the arrow it was created with (under `lambda_syntax`) is not checked again
+        let mut macros = macros.clone();
+        let mut to_keyword = |e: &mut Expr| {
+            duckrs_parser::transformer::visit_expr_mut(e, &mut |e: &mut Expr| {
+                // only the lambda of a function that takes one: another arrow is JSON's `->`
+                if let ExprKind::Function(function) = &mut e.kind
+                    && crate::planner::binder::is_lambda_function(&function.name.name)
+                {
+                    for argument in &mut function.args {
+                        if let ExprKind::Lambda { syntax, .. } = &mut argument.expr.kind {
+                            *syntax = duckrs_parser::ast::LambdaSyntax::Keyword;
+                        }
+                    }
+                }
+            })
+        };
+        for function in &mut macros {
+            match &mut function.body {
+                duckrs_parser::ast::MacroBody::Scalar(body) => to_keyword(body),
+                duckrs_parser::ast::MacroBody::Table(body) => {
+                    duckrs_parser::transformer::visit_query_node_exprs_mut(body, &mut to_keyword)
+                }
+            }
         }
         schema.create_macro(
             &info.name.name,
             *table_macro,
-            macros.clone(),
+            macros,
             on_create_conflict(info.on_conflict),
         )
     }
@@ -3672,16 +3975,15 @@ impl ClientContext {
 
     /// `DROP TABLE`, `VIEW`, `SEQUENCE`, `MACRO` and `SCHEMA` (`Catalog::DropEntry`).
     fn drop_entry(&mut self, info: &DropInfo) -> Result<()> {
-        let internal_entry =
-            |name: &str| {
-                Error::new(
-                    ErrorKind::Catalog,
-                    format!(
-                        "Cannot drop internal catalog entry {}!",
-                        duckrs_parser::ast::sql_quoted_identifier(name)
-                    ),
-                )
-            };
+        let internal_entry = |name: &str| {
+            Error::new(
+                ErrorKind::Catalog,
+                format!(
+                    "Cannot drop internal catalog entry {}!",
+                    duckrs_parser::ast::sql_quoted_identifier(name)
+                ),
+            )
+        };
         let catalog = self.catalog();
         let temporary = catalog.schema_for(Some(TEMP_SCHEMA))?;
         let in_temp = info.name.qualification.is_empty()
@@ -3726,7 +4028,7 @@ impl ClientContext {
                         dropped
                     }
                     Err(_) if info.if_exists => false,
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(missing_schema(error, type_name, &info.name)),
                 };
                 // `Binder::Bind(DropStatement)`: the views of the system catalog are internal
                 if !dropped
@@ -3751,7 +4053,7 @@ impl ClientContext {
                             || (!table_macro && schema.drop_macro(&info.name.name, true))
                     }
                     Err(_) if info.if_exists => false,
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(missing_schema(error, macro_type_name(table_macro), &info.name)),
                 };
                 // a function of the system catalog is an internal entry
                 let functions = crate::function::BuiltinFunctions::get();
@@ -3771,7 +4073,7 @@ impl ClientContext {
                 let dropped = match catalog.schema_for(schema.as_deref()) {
                     Ok(schema) => schema.drop_index(&info.name.name),
                     Err(_) if info.if_exists => false,
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(missing_schema(error, "Index", &info.name)),
                 };
                 if !dropped && !info.if_exists {
                     return Err(missing_entry("Index", &info.name.name));
@@ -3783,7 +4085,7 @@ impl ClientContext {
                 let dropped = match catalog.schema_for(schema.as_deref()) {
                     Ok(schema) => schema.drop_sequence_checked(&info.name.name, info.cascade)?,
                     Err(_) if info.if_exists => false,
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(missing_schema(error, "Sequence", &info.name)),
                 };
                 if !dropped && !info.if_exists {
                     return Err(missing_entry("Sequence", &info.name.name));
@@ -3795,7 +4097,7 @@ impl ClientContext {
                 let dropped = match catalog.schema_for(schema.as_deref()) {
                     Ok(schema) => schema.drop_type_checked(&info.name.name, info.cascade)?,
                     Err(_) if info.if_exists => false,
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(missing_schema(error, "Type", &info.name)),
                 };
                 // the built-in types are internal entries of the system catalog
                 if !dropped && schema.is_none() && duckrs_parser::ast::is_builtin_type_name(&info.name.name) {
@@ -7151,7 +7453,7 @@ mod tests {
         );
         assert_eq!(
             err(&mut context, "SELECT * FROM t"),
-            "Catalog Error: Table with name t does not exist!"
+            "Catalog Error: Table with name t does not exist!\nDid you mean \"pg_tables\"?"
         );
         run(&mut context, "CREATE TABLE t (abc INTEGER)");
         assert_eq!(

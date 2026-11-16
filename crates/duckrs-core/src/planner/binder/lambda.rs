@@ -13,7 +13,6 @@ use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::Value;
 use duckrs_common::{ErrorKind, Result};
 use duckrs_parser::ast::{Expr, ExprKind, FunctionExpr, LambdaSyntax};
-use duckrs_parser::transformer::visit_expr_mut;
 
 const DEPRECATED_ARROW: &str = "Deprecated lambda arrow (->) detected. Please transition to the new lambda syntax, \
                                 i.e.., lambda x, i: x + i, before DuckDB's next release.\nUse SET \
@@ -29,7 +28,7 @@ pub(super) struct LambdaScope {
 }
 
 /// Whether `name` is a function that takes a lambda.
-pub(super) fn is_lambda_function(name: &str) -> bool {
+pub(crate) fn is_lambda_function(name: &str) -> bool {
     lambda_kind(name).is_some()
 }
 
@@ -46,14 +45,20 @@ fn lambda_kind(name: &str) -> Option<LambdaKind> {
 fn parameter_names(lhs: &Expr) -> Result<Vec<String>> {
     let mut names = Vec::new();
     let mut qualified = false;
-    visit_expr_mut(&mut lhs.clone(), &mut |e: &mut Expr| {
-        if let ExprKind::ColumnRef(parts) = &e.kind {
-            match parts.as_slice() {
-                [name] => names.push(name.clone()),
-                _ => qualified = true,
-            }
+    // a column, or a `row` of columns: nothing else names parameters
+    let parameters: Vec<&Expr> = match &lhs.kind {
+        ExprKind::ColumnRef(_) => vec![lhs],
+        ExprKind::Function(function) if function.name.name.eq_ignore_ascii_case("row") => {
+            function.args.iter().map(|a| &a.expr).collect()
         }
-    });
+        _ => Vec::new(),
+    };
+    for parameter in parameters {
+        match &parameter.kind {
+            ExprKind::ColumnRef(parts) if parts.len() == 1 => names.push(parts[0].clone()),
+            _ => qualified = true,
+        }
+    }
     if qualified || names.is_empty() {
         return Err(binder_error(
             "Invalid lambda parameters! Parameters must be unqualified comma-separated names like x or (x, y).",
@@ -71,13 +76,16 @@ impl Binder<'_> {
 
     /// A column that is a parameter of a lambda in scope, with the fields of a STRUCT after it.
     pub(super) fn bind_lambda_parameter(&mut self, names: &[String]) -> Result<Option<BoundExpr>> {
-        let found = self.lambda_scopes.iter().rev().find_map(|scope| {
+        let found = self.lambda_scopes.iter().enumerate().rev().find_map(|(at, scope)| {
             let index = scope.names.iter().position(|n| n.eq_ignore_ascii_case(&names[0]))?;
-            Some((scope.table_index, index, scope.types[index].clone()))
+            Some((at, scope.table_index, index, scope.types[index].clone()))
         });
-        let Some((table_index, index, ty)) = found else {
+        let Some((at, table_index, index, ty)) = found else {
             return Ok(None);
         };
+        if at < self.inaccessible_lambdas {
+            return Err(binder_error("aggregate functions cannot reference lambda parameters"));
+        }
         let mut bound = BoundExpr::column_ref(ColumnBinding::new(table_index, index), ty, names[0].clone());
         for field in &names[1..] {
             let name = BoundExpr::constant(Value::varchar(field.clone()));

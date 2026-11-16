@@ -1126,6 +1126,15 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             if children.is_empty() {
                 return Err(no_match(&lower, &children));
             }
+            // `PUSH_COMBINABLE_COLLATIONS`: the arguments hash as they compare
+            let children = children
+                .into_iter()
+                .map(|child| {
+                    let ty = child.return_type.clone();
+                    let kind = crate::planner::collation::CollationType::CombinableCollations;
+                    Ok(crate::planner::collation::push_collation(child, &ty, "", kind)?.0)
+                })
+                .collect::<Result<Vec<_>>>()?;
             Ok(bound_function("hash", children, LogicalType::UBIGINT, hash_function))
         }
         "repeat" => {
@@ -1212,6 +1221,13 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             let [text, length, fill] = children.as_slice() else {
                 return Err(no_match(&lower, &children));
             };
+            // default NULL handling: a NULL constant argument makes the call a NULL constant
+            if children.iter().any(|c| {
+                c.is_foldable()
+                    && crate::execution::expression_executor::evaluate_scalar(c).is_ok_and(|v| v.is_null())
+            }) {
+                return Ok(BoundExpr::constant(Value::null(LogicalType::VARCHAR)));
+            }
             let args = vec![
                 text.clone().cast_to(&LogicalType::VARCHAR, false),
                 length.clone().cast_to(&LogicalType::INTEGER, false),
