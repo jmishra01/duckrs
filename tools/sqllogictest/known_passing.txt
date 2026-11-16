@@ -526,6 +526,7 @@ test/optimizer/joins/filter_on_subquery_with_aggregate.test
 test/optimizer/joins/filter_projection_map_reconstruction.test
 test/optimizer/joins/fkpk_composite_key_ce.test
 test/optimizer/joins/greedy_input_join_order.test
+test/optimizer/joins/integer_range_selectivity_floor.test
 test/optimizer/joins/issues/internal_6248.test
 test/optimizer/joins/join_bug.test
 test/optimizer/joins/join_filter_build_side.test
@@ -540,6 +541,7 @@ test/optimizer/joins/no_cross_product_reordering.test
 test/optimizer/joins/no_duplicate_elimination_join.test
 test/optimizer/joins/not_equal_join_cardinality_estimation.test
 test/optimizer/joins/order_optimizer_bindings.test
+test/optimizer/joins/parquet_minmax_cardinality_estimation.test
 test/optimizer/joins/pushdown_semi_anti.test
 test/optimizer/joins/range_join_cardinality_estimation.test
 test/optimizer/joins/relation_statistics_bindings.test
@@ -548,6 +550,7 @@ test/optimizer/joins/test_delim_join_with_cross_product_in_rhs.test
 test/optimizer/joins/test_logical_get_with_unnest.test
 test/optimizer/joins/test_must_apply_residual_predicate.test
 test/optimizer/joins/test_tpcds_pushdown.test
+test/optimizer/joins/unsupported_conjunct_selectivity.test
 test/optimizer/joins/wide_build_skinny_probe.test
 test/optimizer/joins/zero_column_filter_reconstruction.test
 test/optimizer/like_optimizer.test

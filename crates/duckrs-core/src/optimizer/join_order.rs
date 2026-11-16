@@ -17,7 +17,8 @@ use super::conjunction_of;
 use super::filter_pushdown::condition_expression;
 use super::rewriter::split_conjuncts;
 use super::statistics::{table_distinct_counts, table_statistics};
-use crate::catalog::TableCatalogEntry;
+use crate::catalog::{ColumnStatistics, TableCatalogEntry};
+use duckrs_common::types::LogicalType;
 use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, ColumnBinding};
 use crate::planner::logical::{COLUMN_IDENTIFIER_ROW_ID, JoinCondition, LogicalOperator, LogicalOperatorKind as K};
 use duckrs_common::value::Value;
@@ -1069,7 +1070,7 @@ impl JoinOrderOptimizer {
                     .filter(|filter| !is_proven_not_null(filter, table, *table_index, column_ids))
                     .cloned()
                     .collect();
-                let cardinality = filter_cardinality(&filters, &stats);
+                let cardinality = scan_filter_cardinality(table, *table_index, column_ids, &filters, &stats);
                 stats.scaled(cardinality)
             }
             // a scan whose filters left out all of its files has no estimate (`LogicalGet` takes 1)
@@ -1092,15 +1093,22 @@ impl JoinOrderOptimizer {
                     .enumerate()
                     .filter_map(|(column, stats)| {
                         let stats = stats?;
-                        if scan.types[column].id() == duckrs_common::types::LogicalTypeId::Decimal {
+                        // `GetMinMaxDistinctCount`: integers of up to 64 bits whose span and its
+                        // successor fit 64 bits
+                        use duckrs_common::types::PhysicalType as P;
+                        if scan.types[column].id() == duckrs_common::types::LogicalTypeId::Decimal
+                            || !matches!(
+                                scan.types[column].physical_type(),
+                                P::Int8 | P::Int16 | P::Int32 | P::Int64 | P::UInt8 | P::UInt16 | P::UInt32 | P::UInt64
+                            )
+                        {
                             return None;
                         }
                         let (min, max) = (stats.min?.as_i128()?, stats.max?.as_i128()?);
-                        let range = max.checked_sub(min)?.checked_add(1)?;
-                        Some((
-                            ColumnBinding::new(*table_index, column),
-                            (range as f64).min(rows as f64),
-                        ))
+                        let span = u64::try_from(max.checked_sub(min)?).ok()?;
+                        let distinct = span.checked_add(1)?.min(rows);
+                        (rows > 0 && distinct != u64::MAX).then_some(())?;
+                        Some((ColumnBinding::new(*table_index, column), distinct as f64))
                     })
                     .collect();
                 let stats = RelationStats {
@@ -1736,6 +1744,233 @@ fn conjunct_rows(cardinality: f64, conjunct: &BoundExpr, child: &RelationStats) 
     }
 }
 
+/// `IntegerRangeEstimate`: the values of an integer column of at most 64 bits the range comparisons
+/// with constants of one filter leave of those between its minimum and its maximum.
+#[derive(Default)]
+struct IntegerRange {
+    bounds: Option<(i128, i128, i128)>,
+}
+
+impl IntegerRange {
+    /// `AddBound`: false where the comparison says nothing of the range.
+    fn add_bound(&mut self, op: ComparisonOp, constant: &Value, ty: &LogicalType, column: &ColumnStatistics) -> bool {
+        use duckrs_common::types::LogicalTypeId as T;
+        if constant.is_null()
+            || constant.logical_type() != ty
+            || !matches!(
+                ty.id(),
+                T::TinyInt | T::SmallInt | T::Integer | T::BigInt | T::UTinyInt | T::USmallInt | T::UInteger | T::UBigInt
+            )
+        {
+            return false;
+        }
+        let (Some(min), Some(max)) = (column.min.as_ref().and_then(Value::as_i128), column.max.as_ref().and_then(Value::as_i128))
+        else {
+            return false;
+        };
+        let Some(value) = constant.as_i128() else {
+            return false;
+        };
+        if self.bounds.is_none() {
+            if min > max {
+                return false;
+            }
+            // a complete 64-bit interval has 2^64 values
+            self.bounds = Some((min, max, max - min + 1));
+        }
+        let (lower, upper, _) = self.bounds.as_mut().expect("just set");
+        match op {
+            ComparisonOp::LessThan => *upper = (*upper).min(value - 1),
+            ComparisonOp::LessThanOrEqual => *upper = (*upper).min(value),
+            ComparisonOp::GreaterThan => *lower = (*lower).max(value + 1),
+            ComparisonOp::GreaterThanOrEqual => *lower = (*lower).max(value),
+            _ => return false,
+        }
+        true
+    }
+
+    /// `Fraction`.
+    fn fraction(&self) -> Option<f64> {
+        let (lower, upper, count) = self.bounds?;
+        Some((upper - lower + 1).max(0) as f64 / count as f64)
+    }
+}
+
+/// `ExpressionFilter::CheckExpressionStatistics` of a filter on a column with `column` statistics.
+#[derive(PartialEq)]
+enum FilterPropagate {
+    NoPruning,
+    AlwaysTrue,
+    TrueOrNull,
+    AlwaysFalse,
+}
+
+fn check_filter_statistics(filter: &BoundExpr, column: &ColumnStatistics) -> FilterPropagate {
+    match &filter.kind {
+        BoundExprKind::Operator { op, children } if children.len() == 1 && strict_column(&children[0]).is_some() => {
+            let (null, valid) = (column.can_be_null, column.can_be_valid);
+            match (op, null, valid) {
+                (BoundOperator::IsNull, false, _) | (BoundOperator::IsNotNull, _, false) => FilterPropagate::AlwaysFalse,
+                (BoundOperator::IsNull, true, false) | (BoundOperator::IsNotNull, false, true) => FilterPropagate::AlwaysTrue,
+                _ => FilterPropagate::NoPruning,
+            }
+        }
+        BoundExprKind::Comparison { op, left, right } => {
+            let (op, constant) = match (strict_column(left), &right.kind, strict_column(right), &left.kind) {
+                (Some(_), BoundExprKind::Constant(value), _, _) => (*op, (value, &right.return_type)),
+                (_, _, Some(_), BoundExprKind::Constant(value)) => (flip(*op), (value, &left.return_type)),
+                _ => return FilterPropagate::NoPruning,
+            };
+            if constant.0.is_null() || matches!(op, ComparisonOp::DistinctFrom | ComparisonOp::NotDistinctFrom) {
+                return FilterPropagate::NoPruning;
+            }
+            if !column.can_be_valid {
+                return FilterPropagate::AlwaysFalse;
+            }
+            // `CheckComparisonStatistics`: with NULLs only an answer of false stands
+            match super::statistics::decide_with_constant(op, column, constant.0, constant.1) {
+                Some(false) => FilterPropagate::AlwaysFalse,
+                Some(true) if !column.can_be_null => FilterPropagate::AlwaysTrue,
+                _ => FilterPropagate::NoPruning,
+            }
+        }
+        _ => FilterPropagate::NoPruning,
+    }
+}
+
+/// `FilterColumn`: the column `expr` is, itself.
+fn strict_column(expr: &BoundExpr) -> Option<ColumnBinding> {
+    match &expr.kind {
+        BoundExprKind::ColumnRef { binding, depth: 0 } => Some(*binding),
+        _ => None,
+    }
+}
+
+fn flip(op: ComparisonOp) -> ComparisonOp {
+    match op {
+        ComparisonOp::LessThan => ComparisonOp::GreaterThan,
+        ComparisonOp::LessThanOrEqual => ComparisonOp::GreaterThanOrEqual,
+        ComparisonOp::GreaterThan => ComparisonOp::LessThan,
+        ComparisonOp::GreaterThanOrEqual => ComparisonOp::LessThanOrEqual,
+        other => other,
+    }
+}
+
+/// `EstimateFilterRows` with the statistics of the scanned column and its integer range.
+fn scan_conjunct_rows(
+    cardinality: f64,
+    conjunct: &BoundExpr,
+    child: &RelationStats,
+    column: Option<(&ColumnStatistics, &LogicalType)>,
+    range: &mut IntegerRange,
+) -> (f64, bool) {
+    if let BoundExprKind::Conjunction { and: true, children } = &conjunct.kind {
+        let mut result = (cardinality, true);
+        for child_expr in children {
+            let (rows, modeled) = scan_conjunct_rows(cardinality, child_expr, child, column, range);
+            result = (result.0.min(rows), result.1 && modeled);
+        }
+        return result;
+    }
+    let mut pruning = FilterPropagate::NoPruning;
+    if let Some((statistics, _)) = column {
+        pruning = check_filter_statistics(conjunct, statistics);
+        match pruning {
+            FilterPropagate::AlwaysTrue => return (cardinality, true),
+            FilterPropagate::AlwaysFalse => return (0.0, true),
+            _ => {}
+        }
+    }
+    let BoundExprKind::Comparison { op, left, right } = &conjunct.kind else {
+        return conjunct_rows(cardinality, conjunct, child);
+    };
+    // `EstimateComparisonRows`
+    let (op, value) = match (strict_column(left), strict_column(right)) {
+        (Some(_), _) => (*op, right),
+        (None, Some(_)) => (flip(*op), left),
+        _ => return (cardinality, false),
+    };
+    let BoundExprKind::Constant(constant) = &value.kind else {
+        return (cardinality, false);
+    };
+    if constant.is_null() {
+        return match op {
+            ComparisonOp::NotDistinctFrom => (filter_fraction(cardinality, DEFAULT_SELECTIVITY), true),
+            ComparisonOp::DistinctFrom => (filter_fraction(cardinality, 1.0 - DEFAULT_SELECTIVITY), true),
+            _ => (0.0, true),
+        };
+    }
+    if pruning == FilterPropagate::TrueOrNull && !matches!(op, ComparisonOp::DistinctFrom | ComparisonOp::NotDistinctFrom) {
+        return (filter_fraction(cardinality, 1.0 - DEFAULT_SELECTIVITY), true);
+    }
+    match op {
+        ComparisonOp::LessThan | ComparisonOp::LessThanOrEqual | ComparisonOp::GreaterThan | ComparisonOp::GreaterThanOrEqual => {
+            if let Some((statistics, ty)) = column
+                && range.add_bound(op, constant, ty, statistics)
+            {
+                return (cardinality, true);
+            }
+            (filter_fraction(cardinality, DEFAULT_SELECTIVITY), true)
+        }
+        _ => conjunct_rows(cardinality, conjunct, child),
+    }
+}
+
+/// `ExtractGetStats`: the rows the filters of a scan leave, each estimated with the statistics of
+/// its column, and the range comparisons on one column together.
+fn scan_filter_cardinality(
+    table: &Arc<TableCatalogEntry>,
+    table_index: usize,
+    column_ids: &[usize],
+    filters: &[BoundExpr],
+    stats: &RelationStats,
+) -> f64 {
+    let base = stats.cardinality;
+    let statistics = super::statistics::table_statistics(table);
+    // the filters of each column, in the order of their first
+    let mut groups: Vec<(Option<usize>, Vec<&BoundExpr>)> = Vec::new();
+    for filter in filters {
+        fn first_column(expr: &BoundExpr, table_index: usize) -> Option<usize> {
+            match &expr.kind {
+                BoundExprKind::ColumnRef { binding, depth: 0 } if binding.table_index == table_index => {
+                    Some(binding.column_index)
+                }
+                _ => expr.children().into_iter().find_map(|child| first_column(child, table_index)),
+            }
+        }
+        let position = first_column(filter, table_index);
+        match groups.iter_mut().find(|(at, _)| *at == position) {
+            Some((_, members)) => members.push(filter),
+            None => groups.push((position, vec![filter])),
+        }
+    }
+    let mut cardinality = base;
+    let mut supported = true;
+    for (position, members) in groups {
+        let column = position.and_then(|at| column_ids.get(at)).copied().filter(|&c| c != COLUMN_IDENTIFIER_ROW_ID);
+        let column_stats = column.and_then(|c| Some((statistics.as_ref()?.get(c)?, &table.columns.get(c)?.ty)));
+        let mut range = IntegerRange::default();
+        for filter in members {
+            let (rows, modeled) = scan_conjunct_rows(base, filter, stats, column_stats, &mut range);
+            cardinality = cardinality.min(rows);
+            supported &= modeled;
+        }
+        // intersect the bounds on one column before the floor of the default selectivity
+        if let Some(fraction) = range.fraction() {
+            let rows = if fraction == 0.0 {
+                0.0
+            } else {
+                filter_fraction(base, fraction.max(DEFAULT_SELECTIVITY))
+            };
+            cardinality = cardinality.min(rows);
+        }
+    }
+    if !supported {
+        cardinality = cardinality.min(filter_fraction(base, DEFAULT_SELECTIVITY));
+    }
+    cardinality
+}
+
 /// How many rows filters leave of `child` (`EstimateFilterRows` and `ApplyFilterEstimate`): the
 /// smallest estimate of a conjunct, and the default selectivity when one is not modeled.
 fn filter_cardinality(expressions: &[BoundExpr], child: &RelationStats) -> f64 {
@@ -1746,7 +1981,7 @@ fn filter_cardinality(expressions: &[BoundExpr], child: &RelationStats) -> f64 {
     let mut cardinality = child.cardinality;
     let mut supported = true;
     for conjunct in &conjuncts {
-        let (rows, modeled) = conjunct_rows(child.cardinality, conjunct, child);
+        let (rows, modeled) = scan_conjunct_rows(child.cardinality, conjunct, child, None, &mut IntegerRange::default());
         cardinality = cardinality.min(rows);
         supported &= modeled;
     }

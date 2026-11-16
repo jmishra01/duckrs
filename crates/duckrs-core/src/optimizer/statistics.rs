@@ -503,6 +503,12 @@ fn decide(op: ComparisonOp, left: &Stats, right: &Stats) -> Option<bool> {
     }
 }
 
+/// Whether `column op constant` holds for all the values of a column with `column` statistics that are
+/// not NULL (`Some(true)`), for none (`Some(false)`), or is not known.
+pub(super) fn decide_with_constant(op: ComparisonOp, column: &Stats, constant: &Value, ty: &LogicalType) -> Option<bool> {
+    decide(op, column, &value_stats(constant, ty))
+}
+
 fn smaller(a: Option<Value>, b: Option<Value>) -> Option<Value> {
     let (a, b) = (a?, b?);
     compare_values(ComparisonOp::LessThan, &b, &a).map(|less| if less { b } else { a })
