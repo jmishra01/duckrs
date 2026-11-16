@@ -9,6 +9,7 @@
 
 pub mod build_side;
 mod common_subplan;
+mod join_elimination;
 mod projection_pullup;
 mod deliminator;
 pub mod empty_result_pullup;
@@ -39,6 +40,7 @@ pub struct OptimizerOptions {
     pub type_pushdown: bool,
     pub common_subplan: bool,
     pub projection_pullup: bool,
+    pub join_elimination: bool,
     /// `index_scan_percentage`
     pub index_scan_percentage: f64,
     /// `index_scan_max_count`
@@ -60,6 +62,7 @@ impl Default for OptimizerOptions {
             type_pushdown: true,
             common_subplan: true,
             projection_pullup: true,
+            join_elimination: true,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -81,6 +84,7 @@ impl OptimizerOptions {
             type_pushdown: false,
             common_subplan: false,
             projection_pullup: false,
+            join_elimination: false,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -101,6 +105,7 @@ impl OptimizerOptions {
             type_pushdown: !off("type_pushdown"),
             common_subplan: !off("common_subplan"),
             projection_pullup: !off("projection_pullup"),
+            join_elimination: !off("join_elimination"),
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -151,6 +156,9 @@ pub fn optimize_timed(
     if options.join_order {
         build_side::choose_build_sides(&mut plan);
         plan = run("join_order", plan, &mut join_order::reorder_joins);
+    }
+    if options.join_elimination {
+        plan = run("join_elimination", plan, &mut join_elimination::eliminate);
     }
     if options.statistics_propagation {
         plan = run("statistics_propagation", plan, &mut |mut plan| {

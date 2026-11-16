@@ -90,7 +90,7 @@ fn has_join_below(op: &LogicalOperator) -> bool {
 /// Whether the columns of child `at` of `op` may change their order and number: whether what
 /// reads them goes by binding, up to an operator that makes columns of its own. A plan's root,
 /// a set operation and the like read their input by position (C++ keeps projections under those).
-fn child_layout_free(op: &LogicalOperator, at: usize, free: bool) -> bool {
+pub(super) fn child_layout_free(op: &LogicalOperator, at: usize, free: bool) -> bool {
     match &op.kind {
         K::Projection { .. } | K::Aggregate { .. } => true,
         K::Filter { .. }

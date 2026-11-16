@@ -509,6 +509,7 @@ test/optimizer/issue_21011.test
 test/optimizer/issue_23294.test
 test/optimizer/issue_25819.test
 test/optimizer/issue_topn_window_elimination_cte_mixed_partition_types.test
+test/optimizer/join_elimination.test
 test/optimizer/join_reorder_optimizer.test
 test/optimizer/joins/always_true_scan_filter_estimate.test
 test/optimizer/joins/asof_join_adds_rows.test
