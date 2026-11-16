@@ -118,6 +118,9 @@ pub enum LogicalOperatorKind {
         aggregates: Vec<BoundAggregate>,
         grouping_sets: Vec<BTreeSet<usize>>,
         grouping_functions: Vec<Vec<usize>>,
+        /// `CanUsePerfectHashAggregate`, which the statistics tell: the groups are integers of so
+        /// small a range that a value's offset from the minimum can index the groups' table
+        perfect_hash: bool,
     },
     /// `LogicalOrder`: sorts by the expressions, in order.
     Order { orders: Vec<BoundOrderByNode> },

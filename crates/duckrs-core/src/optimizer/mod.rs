@@ -47,6 +47,8 @@ pub struct OptimizerOptions {
     pub index_scan_max_count: u64,
     /// `dynamic_or_filter_threshold`
     pub dynamic_or_filter_threshold: usize,
+    /// `perfect_ht_threshold`
+    pub perfect_ht_threshold: u64,
 }
 
 impl Default for OptimizerOptions {
@@ -66,6 +68,7 @@ impl Default for OptimizerOptions {
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
+            perfect_ht_threshold: 12,
         }
     }
 }
@@ -88,6 +91,7 @@ impl OptimizerOptions {
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
+            perfect_ht_threshold: 12,
         }
     }
 
@@ -109,6 +113,7 @@ impl OptimizerOptions {
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
+            perfect_ht_threshold: 12,
         }
     }
 }
@@ -162,7 +167,7 @@ pub fn optimize_timed(
     }
     if options.statistics_propagation {
         plan = run("statistics_propagation", plan, &mut |mut plan| {
-            statistics::propagate_statistics(&mut plan);
+            statistics::propagate_statistics(&mut plan, options.perfect_ht_threshold);
             plan
         });
     }

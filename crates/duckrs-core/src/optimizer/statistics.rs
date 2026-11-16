@@ -288,6 +288,7 @@ fn compute_ordered_statistics(table: &Arc<TableCatalogEntry>, positions: Option<
             aggregates,
             grouping_sets: Vec::new(),
             grouping_functions: Vec::new(),
+            perfect_hash: false,
         },
         vec![scan],
     );
@@ -530,6 +531,7 @@ fn compute_distinct_counts(table: &Arc<TableCatalogEntry>) -> Option<TableDistin
             aggregates,
             grouping_sets: Vec::new(),
             grouping_functions: Vec::new(),
+            perfect_hash: false,
         },
         vec![scan],
     );
@@ -837,14 +839,20 @@ fn has_unique_tables(op: &LogicalOperator, seen: &mut HashSet<usize>) -> bool {
 }
 
 /// Runs the pass over a plan.
-pub fn propagate_statistics(plan: &mut LogicalOperator) {
+pub fn propagate_statistics(plan: &mut LogicalOperator, perfect_ht_threshold: u64) {
     if has_unique_tables(plan, &mut HashSet::new()) {
-        StatisticsPropagator::default().visit(plan);
+        StatisticsPropagator {
+            perfect_ht_threshold,
+            ..Default::default()
+        }
+        .visit(plan);
     }
 }
 
 #[derive(Default)]
 struct StatisticsPropagator {
+    /// `perfect_ht_threshold`: the most bits the groups of a perfect hash aggregate take
+    perfect_ht_threshold: u64,
     /// what is known by now
     stats: HashMap<ColumnBinding, Stats>,
     /// the table columns a binding reads, whose statistics nobody asked for yet
@@ -1913,8 +1921,14 @@ impl StatisticsPropagator {
                 groups,
                 grouping_sets,
                 aggregates,
+                grouping_functions,
+                perfect_hash,
                 ..
             } if grouping_sets.len() <= 1 && grouping_sets.iter().all(|set| set.len() == groups.len()) => {
+                *perfect_hash = grouping_functions.is_empty()
+                    && !groups.is_empty()
+                    && !aggregates.iter().any(|a| a.distinct)
+                    && self.perfect_hash_bits(groups).is_some_and(|bits| bits <= self.perfect_ht_threshold);
                 for (index, group) in groups.iter().enumerate() {
                     if let BoundExprKind::ColumnRef { binding, depth: 0 } = &group.kind {
                         self.aliases.insert(ColumnBinding::new(*group_index, index), *binding);
@@ -1946,6 +1960,40 @@ impl StatisticsPropagator {
             }
             _ => {}
         }
+    }
+}
+
+impl StatisticsPropagator {
+    /// The bits the groups take in a perfect hash table (`CanUsePerfectHashAggregate`): each needs
+    /// its range of values, plus one for NULL and one to count from one. Groups must be integers,
+    /// with statistics unless their type is small enough to take its whole range.
+    fn perfect_hash_bits(&mut self, groups: &[BoundExpr]) -> Option<u64> {
+        use duckrs_common::types::PhysicalType::*;
+        let mut total = 0;
+        for group in groups {
+            let ty = &group.return_type;
+            let physical = ty.physical_type();
+            if !matches!(physical, Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64) {
+                return None;
+            }
+            let stats = self.expression(&mut group.clone(), false);
+            let known = stats.min.as_ref().and_then(Value::as_i128).zip(stats.max.as_ref().and_then(Value::as_i128));
+            let (min, max) = match known {
+                Some(range) => range,
+                None if matches!(physical, Int8 | Int16 | UInt8 | UInt16) => integer_range(ty)?,
+                None => return None,
+            };
+            if max < min {
+                return None;
+            }
+            let range = u64::try_from(max - min).ok()?;
+            if range >= i32::MAX as u64 {
+                return None;
+            }
+            // `RequiredBitsForValue`
+            total += u64::from(64 - (range + 2).leading_zeros());
+        }
+        Some(total)
     }
 }
 

@@ -2578,6 +2578,9 @@ pub struct PhysicalAggregate {
     output: Mutex<Vec<DataChunk>>,
     /// where rows go past the memory limit, for an aggregate that can spill
     spill: Option<AggregateSpill>,
+    /// `PhysicalPerfectHashAggregate`, which C++ plans for groups of small integer ranges; here
+    /// only its name, as the hash table does the same work
+    pub perfect_hash: bool,
 }
 
 /// From how many groups the states of threads are put together by partition, on threads.
@@ -2770,6 +2773,7 @@ impl PhysicalAggregate {
             aggregates,
             children,
             spill: None,
+            perfect_hash: false,
             grouping_sets: sets,
             state: Mutex::new(state),
             locals: Mutex::default(),
@@ -3244,6 +3248,8 @@ impl PhysicalOperator for PhysicalAggregate {
     fn name(&self) -> &'static str {
         if self.groups.is_empty() && self.grouping_sets.len() == 1 {
             "UNGROUPED_AGGREGATE"
+        } else if self.perfect_hash {
+            "PERFECT_HASH_GROUP_BY"
         } else {
             "HASH_GROUP_BY"
         }

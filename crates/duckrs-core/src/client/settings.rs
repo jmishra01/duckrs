@@ -892,6 +892,16 @@ pub fn set_variable(
             _ => {}
         }
     }
+    // `PerfectHtThresholdSetting::OnSet` sees the value before it is cast
+    if setting.name == "perfect_ht_threshold"
+        && let Some(bits) = value.as_i128()
+        && !(0..=32).contains(&bits)
+    {
+        return Err(Error::new(
+            ErrorKind::Parser,
+            "Perfect HT threshold out of range: should be within range 0 - 32",
+        ));
+    }
     // `Value::CastAs`: a value that does not cast is not one of the setting's
     let value = cast_value(value, &input_type(setting)?).map_err(|error| match error.kind {
         ErrorKind::Conversion => Error::new(

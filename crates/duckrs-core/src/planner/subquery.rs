@@ -651,6 +651,7 @@ impl Flatten<'_> {
                 aggregates: aggregates.to_vec(),
                 grouping_sets: Vec::new(),
                 grouping_functions: Vec::new(),
+                perfect_hash: false,
             },
             vec![input],
         );

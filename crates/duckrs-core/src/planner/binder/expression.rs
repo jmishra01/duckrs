@@ -2746,12 +2746,14 @@ impl Binder<'_> {
     pub(super) fn try_bind_group(&self, expr: &Expr) -> Option<BoundExpr> {
         let group = self.find_group(expr)?;
         let state = self.aggregates.as_ref()?;
+        // `BindGroup` names the reference after the expression (`GetName`)
+        let name = super::statements::expression_name(expr);
         if let Some((_, aggregate)) = state.collated_groups.iter().find(|(g, _)| *g == group) {
             let return_type = state.aggregates[*aggregate].return_type.clone();
             let first = BoundExpr::column_ref(
                 ColumnBinding::new(state.aggregate_index, *aggregate),
                 return_type.clone(),
-                expr.alias.clone(),
+                name.clone(),
             );
             if state.grouping_set_count <= 1 {
                 return Some(first);
@@ -2760,7 +2762,7 @@ impl Binder<'_> {
             let collated = BoundExpr::column_ref(
                 ColumnBinding::new(state.group_index, group),
                 state.groups[group].return_type.clone(),
-                expr.alias.clone(),
+                name.clone(),
             );
             let is_null = BoundExpr::new(
                 BoundExprKind::Operator {
@@ -2778,13 +2780,13 @@ impl Binder<'_> {
                     },
                     return_type,
                 )
-                .with_alias(expr.alias.clone()),
+                .with_alias(name.clone()),
             );
         }
         Some(BoundExpr::column_ref(
             ColumnBinding::new(state.group_index, group),
             state.groups[group].return_type.clone(),
-            expr.alias.clone(),
+            name.clone(),
         ))
     }
 

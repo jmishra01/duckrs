@@ -1244,6 +1244,7 @@ impl Binder<'_> {
                     aggregates: aggregates.aggregates,
                     grouping_sets: node.groups.grouping_sets.clone(),
                     grouping_functions: aggregates.grouping_functions,
+                    perfect_hash: false,
                 },
                 vec![plan],
             );

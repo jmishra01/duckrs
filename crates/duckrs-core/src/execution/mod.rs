@@ -278,6 +278,7 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             aggregates,
             grouping_sets,
             grouping_functions,
+            perfect_hash,
             ..
         } => match distinct_in_two_steps(&groups, &aggregates, &grouping_sets, &grouping_functions) {
             Some(argument) => {
@@ -315,14 +316,12 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
                     vec![Box::new(inner)],
                 ))
             }
-            None => Box::new(PhysicalAggregate::new(
-                types,
-                groups,
-                aggregates,
-                &grouping_sets,
-                &grouping_functions,
-                children,
-            )),
+            None => {
+                let mut aggregate =
+                    PhysicalAggregate::new(types, groups, aggregates, &grouping_sets, &grouping_functions, children);
+                aggregate.perfect_hash = perfect_hash;
+                Box::new(aggregate)
+            }
         },
         LogicalOperatorKind::Window { windows, .. } => window::plan(types, windows, children),
         LogicalOperatorKind::MatchRecognize { data, .. } => {

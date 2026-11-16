@@ -1174,6 +1174,9 @@ impl ClientContext {
         if let Ok(threshold) = self.setting_text("dynamic_or_filter_threshold").parse() {
             options.dynamic_or_filter_threshold = threshold;
         }
+        if let Ok(threshold) = self.setting_text("perfect_ht_threshold").parse() {
+            options.perfect_ht_threshold = threshold;
+        }
         options
     }
 
