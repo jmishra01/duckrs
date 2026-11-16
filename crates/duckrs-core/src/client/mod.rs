@@ -220,7 +220,7 @@ impl DatabaseInstance {
             views.push(name);
         }
         for view in views {
-            schema.create_view(&view, query.clone(), Vec::new(), OnCreateConflict::Error, Vec::new())?;
+            schema.create_view(&view, query.clone(), Vec::new(), OnCreateConflict::Error, Vec::new(), false)?;
         }
         Ok(Arc::new(db))
     }
@@ -3774,9 +3774,6 @@ impl ClientContext {
         else {
             unreachable!("checked by the caller");
         };
-        if *secure {
-            return Err(crate::unported("CREATE SECURE VIEW"));
-        }
         let with_dependencies = self.setting_text("enable_view_dependencies") == "true";
         let catalog = self.catalog();
         let schema = catalog.schema_for(create_schema_of(info)?.as_deref())?;
@@ -3810,6 +3807,7 @@ impl ClientContext {
             aliases.clone(),
             on_conflict,
             dependencies,
+            *secure,
         )
     }
 

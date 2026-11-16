@@ -603,6 +603,24 @@ fn ilike_escape(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+fn not_like_escape(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| {
+        let input: Vec<char> = text(&row[0]).chars().collect();
+        let pattern: Vec<char> = text(&row[1]).chars().collect();
+        let escape = escape_of(&row[2])?;
+        Ok(Value::boolean(!like_match(&input, &pattern, escape)?))
+    })
+}
+
+fn not_ilike_escape(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| {
+        let input: Vec<char> = text(&row[0]).to_lowercase().chars().collect();
+        let pattern: Vec<char> = text(&row[1]).to_lowercase().chars().collect();
+        let escape = escape_of(&row[2])?.map(|c| c.to_ascii_lowercase());
+        Ok(Value::boolean(!like_match(&input, &pattern, escape)?))
+    })
+}
+
 /// Whether a `[...]` at the start of `pattern` takes `c`, and the size of the class.
 fn glob_class(pattern: &[char], c: char) -> Option<(bool, usize)> {
     let close = pattern.iter().skip(2).position(|p| *p == ']')? + 2;
@@ -967,6 +985,18 @@ pub fn string_functions() -> Vec<ScalarFunctionSet> {
             vec![v.clone(), v.clone(), v.clone()],
             b.clone(),
             ilike_escape,
+        ),
+        (
+            "not_like_escape",
+            vec![v.clone(), v.clone(), v.clone()],
+            b.clone(),
+            not_like_escape,
+        ),
+        (
+            "not_ilike_escape",
+            vec![v.clone(), v.clone(), v.clone()],
+            b.clone(),
+            not_ilike_escape,
         ),
         ("md5", vec![v.clone()], v.clone(), md5),
         ("md5", vec![blob.clone()], v.clone(), md5),

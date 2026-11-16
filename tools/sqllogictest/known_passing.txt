@@ -1279,6 +1279,7 @@ test/sql/catalog/view/deferred_binding.test
 test/sql/catalog/view/nested_view_search_path.test
 test/sql/catalog/view/recursive_view.test
 test/sql/catalog/view/recursive_view_with_dependencies.test
+test/sql/catalog/view/secure_view.test
 test/sql/catalog/view/test_loosely_qualified_view_sql.test
 test/sql/catalog/view/test_stacked_view.test
 test/sql/catalog/view/test_view.test
@@ -2970,6 +2971,8 @@ test/sql/optimizer/predicate_factoring.test
 test/sql/optimizer/pushdown_extract_multiple_filters.test
 test/sql/optimizer/remove_unused_columns_nested_struct_cast.test
 test/sql/optimizer/rewrite_nan_null.test
+test/sql/optimizer/secure_view_fallible_functions.test
+test/sql/optimizer/secure_view_pushdown_compression.test
 test/sql/optimizer/sign_row_group_pruning.test
 test/sql/optimizer/string_row_group_pruning.test
 test/sql/optimizer/string_stats_merge_truncated_prefix.test

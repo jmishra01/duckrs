@@ -118,6 +118,7 @@ pub enum StoredEntry {
         aliases: Vec<String>,
         comment: Option<String>,
         column_comments: Vec<(String, String)>,
+        secure: bool,
     },
     Macro {
         schema: String,
@@ -407,6 +408,7 @@ pub(super) fn convert_entry(info: g::CreateInfo) -> Result<Converted> {
                 aliases: stored.aliases,
                 comment: entry_comment,
                 column_comments,
+                secure: stored.security_type == Some(g::enums::view_security_type::SECURE_VIEW),
             }
         }
         g::CreateInfoKind::CreateMacroInfo(stored) => {

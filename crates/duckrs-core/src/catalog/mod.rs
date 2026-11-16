@@ -1020,6 +1020,8 @@ pub struct ViewCatalogEntry {
     pub comment: Option<String>,
     /// What `COMMENT ON COLUMN` said of its columns, by name.
     pub column_comments: Vec<(String, String)>,
+    /// `ViewSecurityType::SECURE_VIEW`: the optimizer pushes nothing into it
+    pub secure: bool,
 }
 
 impl ViewCatalogEntry {
@@ -1032,7 +1034,7 @@ impl ViewCatalogEntry {
 
     /// `ViewCatalogEntry::ToSQL`.
     pub fn to_sql(&self) -> String {
-        let mut sql = String::from("CREATE VIEW ");
+        let mut sql = String::from(if self.secure { "CREATE SECURE VIEW " } else { "CREATE VIEW " });
         if !self.schema.eq_ignore_ascii_case(DEFAULT_SCHEMA) {
             sql += &sql_identifier(&self.schema);
             sql.push('.');
@@ -1570,6 +1572,7 @@ impl SchemaCatalogEntry {
             dependencies: view.dependencies.clone(),
             comment: view.comment.clone(),
             column_comments: view.column_comments.clone(),
+            secure: view.secure,
         };
         tables.insert(key(new_name), TableOrView::View(Arc::new(view)));
         drop(tables);
@@ -1637,6 +1640,7 @@ impl SchemaCatalogEntry {
         aliases: Vec<String>,
         on_conflict: OnCreateConflict,
         dependencies: Vec<(String, String)>,
+        secure: bool,
     ) -> Result<()> {
         let mut tables = self.tables.write();
         if Self::check_conflict(&tables, name, "View", on_conflict)? {
@@ -1648,6 +1652,7 @@ impl SchemaCatalogEntry {
                 dependencies,
                 comment: None,
                 column_comments: Vec::new(),
+                secure,
             };
             tables.insert(key(name), TableOrView::View(Arc::new(view)));
         }

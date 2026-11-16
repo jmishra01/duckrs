@@ -739,7 +739,7 @@ pub(super) fn view_info(catalog: &str, schema: &SchemaCatalogEntry, view: &ViewC
             .iter()
             .map(|(name, comment)| (name.clone(), Value::varchar(comment.clone())))
             .collect(),
-        security_type: None,
+        security_type: view.secure.then_some(g::enums::view_security_type::SECURE_VIEW),
     });
     let mut info = to_stored::create_info(catalog_type::VIEW_ENTRY, entry_path(catalog, schema, &view.name), kind);
     info.comment = view.comment.clone().map(Value::varchar);

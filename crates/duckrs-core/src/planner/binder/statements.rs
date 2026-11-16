@@ -2593,8 +2593,18 @@ impl Binder<'_> {
         binder.outer_contexts.clear();
         binder.bound_views.push(view.clone());
         binder.search_schema = Some(view.schema.clone());
-        let bound = binder.bind_select_statement(&view.query)?;
+        let mut bound = binder.bind_select_statement(&view.query)?;
         self.next_table_index = binder.next_table_index;
+        if view.secure {
+            // the boundary that keeps the optimizer out of the view
+            let plan = std::mem::replace(&mut bound.plan, LogicalOperator::new(LogicalOperatorKind::CrossProduct, vec![]));
+            bound.plan = LogicalOperator::new(
+                LogicalOperatorKind::SecureView {
+                    view_name: view.name.clone(),
+                },
+                vec![plan],
+            );
+        }
         let alias = if table_ref.alias.is_empty() {
             view.name.clone()
         } else {

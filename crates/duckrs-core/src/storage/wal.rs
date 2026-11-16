@@ -861,9 +861,10 @@ impl<'a> Replay<'a> {
                 aliases,
                 comment,
                 column_comments,
+                secure,
             } => {
                 let schema = self.catalog.schema_for(Some(&schema))?;
-                schema.create_view(&name, *query, aliases, OnCreateConflict::Error, Vec::new())?;
+                schema.create_view(&name, *query, aliases, OnCreateConflict::Error, Vec::new(), secure)?;
                 if comment.is_some() || !column_comments.is_empty() {
                     schema.set_view_comments(&name, comment, column_comments);
                 }

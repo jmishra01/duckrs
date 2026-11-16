@@ -142,6 +142,9 @@ pub enum LogicalOperatorKind {
     Sample { options: SampleOptions },
     /// `LogicalDistinct` (`DISTINCT`, not `DISTINCT ON`): one row per distinct `targets`.
     Distinct { targets: Vec<BoundExpr> },
+    /// `LogicalSecureView`: the plan of a SECURE VIEW, which it passes on. The optimizer pushes
+    /// nothing into it, so that no expression of the query sees the rows the view hides.
+    SecureView { view_name: String },
     /// `LogicalUnnest`: a row per element of the lists of `expressions`, next to the child's
     /// columns. A list that runs out gives NULL.
     Unnest {
@@ -513,6 +516,7 @@ impl LogicalOperator {
             | LogicalOperatorKind::Limit { .. }
             | LogicalOperatorKind::Sample { .. }
             | LogicalOperatorKind::LimitPercent { .. }
+            | LogicalOperatorKind::SecureView { .. }
             | LogicalOperatorKind::Distinct { .. } => self.children[0].types(),
             LogicalOperatorKind::Projection { expressions, .. } => {
                 expressions.iter().map(|e| e.return_type.clone()).collect()
@@ -654,6 +658,7 @@ impl LogicalOperator {
             | LogicalOperatorKind::Limit { .. }
             | LogicalOperatorKind::Sample { .. }
             | LogicalOperatorKind::LimitPercent { .. }
+            | LogicalOperatorKind::SecureView { .. }
             | LogicalOperatorKind::Distinct { .. } => self.children[0].column_bindings(),
             LogicalOperatorKind::Projection {
                 table_index,

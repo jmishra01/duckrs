@@ -326,6 +326,8 @@ fn create_physical(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             })
         }
         LogicalOperatorKind::Sample { options } => Box::new(PhysicalSample::new(options, children.remove(0))),
+        // only the optimizer sees the boundary
+        LogicalOperatorKind::SecureView { .. } => children.remove(0),
         LogicalOperatorKind::Distinct { targets } => {
             let (child, keys, columns) = computed_targets(children.remove(0), targets);
             drop_computed(Box::new(PhysicalDistinct::new(&keys, child)), columns)
