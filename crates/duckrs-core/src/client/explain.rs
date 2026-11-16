@@ -152,6 +152,20 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             info
         }
         K::CteRef { cte_index, .. } => entry("CTE Index", cte_index.to_string()),
+        // `PhysicalTableScan::ParamsToString` of `read_csv`
+        K::CsvScan { scan, .. } => {
+            let mut info = entry("Function", "READ_CSV".to_string());
+            if let Some(columns) = &scan.projection {
+                let mut names = scan.names.clone();
+                if scan.filename {
+                    names.push("filename".to_string());
+                }
+                names.extend(scan.hive.iter().map(|(name, _)| name.clone()));
+                let projected = columns.iter().map(|&c| names.get(c).cloned().unwrap_or_default());
+                info.extend(entry("Projections", lines(projected)));
+            }
+            info
+        }
         K::Get {
             table,
             column_ids,
@@ -301,6 +315,17 @@ pub(super) fn physical_tree(
     analyze: bool,
 ) -> ExplainNode {
     let children = op.children();
+    // a projection that only passes its child's columns on has no physical operator
+    if let Some(LogicalOperator {
+        kind: K::Projection { .. },
+        children: logical_children,
+    }) = logical
+        && op.name() != "PROJECTION"
+        && logical_children.len() == 1
+    {
+        let estimate = estimate.filter(|e| e.children.len() == 1).map(|e| &e.children[0]);
+        return physical_tree(op, Some(&logical_children[0]), estimate, analyze);
+    }
     // `CreatePlan(LogicalWindow)` puts a projection over the window operators it makes, one per
     // group of windows, all of which come from the one logical window
     if let Some(

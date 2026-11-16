@@ -452,6 +452,17 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             children,
         }),
         LogicalOperatorKind::ColumnSelect { .. } => unreachable!("create_column_select"),
+        // `CreatePlan(LogicalProjection)`: a projection of the child's columns in their order is omitted
+        LogicalOperatorKind::Projection { expressions, .. }
+            if children[0].types().len() == expressions.len()
+                && expressions.iter().enumerate().all(|(at, e)| {
+                    matches!(e.kind, BoundExprKind::Reference(index) if index == at)
+                        && e.return_type == children[0].types()[at]
+                        && e.return_type.collation() == children[0].types()[at].collation()
+                }) =>
+        {
+            children.remove(0)
+        }
         LogicalOperatorKind::Projection { expressions, .. } => Box::new(PhysicalProjection {
             types,
             expressions,

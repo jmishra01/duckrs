@@ -973,6 +973,7 @@ impl Binder<'_> {
             types,
             filename: arguments.filename.is_some(),
             first_data: std::sync::Mutex::new(Some(first_data)),
+            projection: None,
             virtual_columns,
         };
         Ok(LogicalOperator::new(
@@ -1022,6 +1023,7 @@ impl Binder<'_> {
             filename: false,
             rejects: None,
             first_data: std::sync::Mutex::new(None),
+            projection: None,
             virtual_columns: Vec::new(),
         };
         Ok(LogicalOperator::new(

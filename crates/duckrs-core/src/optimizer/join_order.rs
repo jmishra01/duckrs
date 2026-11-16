@@ -814,6 +814,19 @@ impl JoinOrderOptimizer {
                 distinct: HashMap::new(),
             },
             K::MaterializedCte { .. } => self.stats(&op.children[1]),
+            // `ReadSingleCSVFileCardinality`: a file's bytes over 5 per column of a row, 42 rows where
+            // its size is not known
+            K::CsvScan { scan, .. } => RelationStats {
+                cardinality: scan
+                    .files
+                    .iter()
+                    .map(|file| match std::fs::metadata(&file.path) {
+                        Ok(metadata) if !scan.types.is_empty() => metadata.len() / (scan.types.len() as u64 * 5),
+                        _ => 42,
+                    })
+                    .sum::<u64>() as f64,
+                distinct: HashMap::new(),
+            },
             K::CteRef { data, .. } => match self.ctes.get(&(Arc::as_ptr(data) as *const () as usize)) {
                 Some(stats) => RelationStats {
                     cardinality: stats.cardinality,

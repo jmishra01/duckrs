@@ -64,6 +64,27 @@ fn visit(op: &mut LogicalOperator, by_position: bool, used: &mut HashSet<ColumnB
         scan.read = Some(read);
         scan.projected = Some(projected);
     }
+    // `RemoveUnusedColumns` for a table function with projection pushdown: the CSV scan outputs what is
+    // read of it
+    if let K::CsvScan { table_index, scan } = &mut op.kind
+        && !by_position
+    {
+        let columns = scan.projected_columns();
+        let mut read: Vec<usize> = columns
+            .iter()
+            .copied()
+            .filter(|&column| used.contains(&ColumnBinding::new(*table_index, column)))
+            .collect();
+        // a chunk without columns would have no rows to count
+        if read.is_empty() {
+            read.push(columns[0]);
+        }
+        if read.len() != columns.len() {
+            let mut narrowed = super::type_pushdown::clone_scan(scan);
+            narrowed.projection = Some(read);
+            *scan = std::sync::Arc::new(narrowed);
+        }
+    }
     if let K::Projection {
         table_index,
         expressions,

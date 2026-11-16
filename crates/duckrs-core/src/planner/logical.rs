@@ -504,7 +504,7 @@ impl LogicalOperator {
             LogicalOperatorKind::Range { .. } => vec![LogicalType::BIGINT],
             LogicalOperatorKind::JsonScan { scan, .. } => scan.output_types(),
             LogicalOperatorKind::ParquetScan { scan, .. } => scan.output_types(),
-            LogicalOperatorKind::CsvScan { scan, .. } => scan.output_types(),
+            LogicalOperatorKind::CsvScan { scan, .. } => scan.projected_types(),
             LogicalOperatorKind::EmptyResult { types, .. } => types.clone(),
             // the dummy scan's single column is never read
             LogicalOperatorKind::DummyScan { .. } => vec![LogicalType::INTEGER],
@@ -654,7 +654,11 @@ impl LogicalOperator {
             | LogicalOperatorKind::ChunkGet { table_index, types, .. } => numbered(*table_index, types.len()),
             LogicalOperatorKind::JsonScan { table_index, scan } => numbered(*table_index, scan.output_types().len()),
             LogicalOperatorKind::ParquetScan { table_index, scan } => numbered(*table_index, scan.output_types().len()),
-            LogicalOperatorKind::CsvScan { table_index, scan } => numbered(*table_index, scan.output_types().len()),
+            LogicalOperatorKind::CsvScan { table_index, scan } => scan
+                .projected_columns()
+                .into_iter()
+                .map(|column| ColumnBinding::new(*table_index, column))
+                .collect(),
             LogicalOperatorKind::MatchRecognize { table_index, data } => {
                 numbered(*table_index, data.output_types.len())
             }
