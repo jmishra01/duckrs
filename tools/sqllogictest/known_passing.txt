@@ -555,6 +555,7 @@ test/optimizer/partition_stats_prepared.test
 test/optimizer/prefer_final_projected_columns_on_probe_side.test
 test/optimizer/projection_placement_results.test
 test/optimizer/projection_pullup_nested.test
+test/optimizer/projection_pullup_nested_plan.test
 test/optimizer/projection_pullup_projection_map.test
 test/optimizer/pullup_join_expression.test
 test/optimizer/pullup_join_expression_errors.test

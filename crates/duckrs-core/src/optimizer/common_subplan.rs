@@ -51,11 +51,11 @@ fn contains_dml(op: &LogicalOperator) -> bool {
     ) || op.children.iter().any(contains_dml)
 }
 
-fn node<'a>(root: &'a LogicalOperator, path: &[usize]) -> &'a LogicalOperator {
+pub(super) fn node<'a>(root: &'a LogicalOperator, path: &[usize]) -> &'a LogicalOperator {
     path.iter().fold(root, |op, &i| &op.children[i])
 }
 
-fn node_mut<'a>(root: &'a mut LogicalOperator, path: &[usize]) -> &'a mut LogicalOperator {
+pub(super) fn node_mut<'a>(root: &'a mut LogicalOperator, path: &[usize]) -> &'a mut LogicalOperator {
     path.iter().fold(root, |op, &i| &mut op.children[i])
 }
 
@@ -107,7 +107,7 @@ fn with_operator<R>(kind: &mut K, f: impl FnOnce(&mut LogicalOperator) -> R) -> 
 }
 
 /// Calls `f` on each column reference of the operator's expressions (and of a `ColumnSelect`).
-fn visit_bindings(kind: &mut K, f: &mut impl FnMut(&mut ColumnBinding, usize)) {
+pub(super) fn visit_bindings(kind: &mut K, f: &mut impl FnMut(&mut ColumnBinding, usize)) {
     if let K::ColumnSelect { keep } = kind {
         for binding in keep {
             f(binding, 0);

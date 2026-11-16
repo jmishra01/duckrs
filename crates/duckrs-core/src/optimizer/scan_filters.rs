@@ -139,7 +139,11 @@ fn prune_files(
                 .position(|b| b == binding)
                 .is_some_and(|at| known.contains(&at))
         };
-        if columns.is_empty() || outer || conjunct.is_volatile() || !columns.iter().all(on_known) {
+        // a subquery runs with the query (in a recursive CTE, once per round): not before it
+        fn has_subquery(expr: &BoundExpr) -> bool {
+            matches!(expr.kind, BoundExprKind::Subquery { .. }) || expr.children().into_iter().any(has_subquery)
+        }
+        if columns.is_empty() || outer || conjunct.is_volatile() || has_subquery(conjunct) || !columns.iter().all(on_known) {
             return true;
         }
         let mut preserved = false;

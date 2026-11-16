@@ -9,6 +9,7 @@
 
 pub mod build_side;
 mod common_subplan;
+mod projection_pullup;
 mod deliminator;
 pub mod empty_result_pullup;
 pub mod filter_pushdown;
@@ -37,6 +38,7 @@ pub struct OptimizerOptions {
     pub unused_columns: bool,
     pub type_pushdown: bool,
     pub common_subplan: bool,
+    pub projection_pullup: bool,
     /// `index_scan_percentage`
     pub index_scan_percentage: f64,
     /// `index_scan_max_count`
@@ -57,6 +59,7 @@ impl Default for OptimizerOptions {
             unused_columns: true,
             type_pushdown: true,
             common_subplan: true,
+            projection_pullup: true,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -77,6 +80,7 @@ impl OptimizerOptions {
             unused_columns: false,
             type_pushdown: false,
             common_subplan: false,
+            projection_pullup: false,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -96,6 +100,7 @@ impl OptimizerOptions {
             unused_columns: !off("unused_columns"),
             type_pushdown: !off("type_pushdown"),
             common_subplan: !off("common_subplan"),
+            projection_pullup: !off("projection_pullup"),
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -139,6 +144,9 @@ pub fn optimize_timed(
     }
     if options.filter_pushdown {
         filter_pushdown::convert_mark_joins(&mut plan);
+    }
+    if options.projection_pullup {
+        plan = run("projection_pullup", plan, &mut projection_pullup::pull_up);
     }
     if options.join_order {
         build_side::choose_build_sides(&mut plan);

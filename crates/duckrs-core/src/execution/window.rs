@@ -96,9 +96,6 @@ pub fn plan(
         remaining = unprocessed;
         groups.push(matching);
     }
-    if groups.len() == 1 {
-        return Box::new(PhysicalWindow::new(types, windows, children));
-    }
     let mut slots: Vec<Option<BoundWindow>> = windows.into_iter().map(Some).collect();
     let mut layer_types = types[..input_width].to_vec();
     let mut position = vec![0; slots.len()];

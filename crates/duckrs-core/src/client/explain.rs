@@ -301,6 +301,29 @@ pub(super) fn physical_tree(
     analyze: bool,
 ) -> ExplainNode {
     let children = op.children();
+    // `CreatePlan(LogicalWindow)` puts a projection over the window operators it makes, one per
+    // group of windows, all of which come from the one logical window
+    if let Some(
+        window @ LogicalOperator {
+            kind: K::Window { .. }, ..
+        },
+    ) = logical
+        && children.len() == 1
+        && (op.name() == "PROJECTION" || children[0].name() == "WINDOW")
+    {
+        let info = if op.name() == "PROJECTION" {
+            let references = (0..op.types().len()).map(|i| format!("#{i}"));
+            vec![("Projections".to_string(), lines(references))]
+        } else {
+            operator_info(window, true)
+        };
+        return ExplainNode {
+            name: op.name().to_string(),
+            info,
+            estimate: estimate.map(|e| e.cardinality),
+            children: vec![physical_tree(children[0].as_ref(), Some(window), estimate, analyze)],
+        };
+    }
     let logical = logical.filter(|l| l.children.len() == children.len());
     let estimate = estimate.filter(|e| e.children.len() == children.len());
     if op.name() == "COLUMN_SELECT" {
