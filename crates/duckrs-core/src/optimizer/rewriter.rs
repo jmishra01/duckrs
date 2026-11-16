@@ -1166,7 +1166,7 @@ enum RegexPart {
 fn regex_parts(pattern: &str, dot_nl: bool) -> Option<Vec<RegexPart>> {
     let chars: Vec<char> = pattern.chars().collect();
     let mut parts: Vec<RegexPart> = Vec::new();
-    let mut literal = |parts: &mut Vec<RegexPart>, c: char| match parts.last_mut() {
+    let literal = |parts: &mut Vec<RegexPart>, c: char| match parts.last_mut() {
         Some(RegexPart::Literal(text)) => text.push(c),
         _ => parts.push(RegexPart::Literal(c.to_string())),
     };

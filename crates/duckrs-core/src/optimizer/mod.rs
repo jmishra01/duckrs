@@ -12,6 +12,7 @@ mod common_subplan;
 mod join_elimination;
 mod projection_pullup;
 mod deliminator;
+pub mod distinct_statistics;
 pub mod empty_result_pullup;
 pub mod filter_pushdown;
 mod index_scan;

@@ -614,6 +614,7 @@ test/optimizer/statistics/statistics_struct.test
 test/optimizer/statistics/statistics_unsigned_arithmetic_pruning.test
 test/optimizer/statistics/statistics_unsigned_cast.test
 test/optimizer/statistics/statistics_varchar.test
+test/optimizer/statistics/union_selected_cardinality.test
 test/optimizer/stats_non_numeric_cast.test
 test/optimizer/table_in_out_unique_keys.test
 test/optimizer/temporal_cardinality_bounds.test
