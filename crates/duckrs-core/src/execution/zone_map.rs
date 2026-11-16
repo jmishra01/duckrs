@@ -840,7 +840,8 @@ impl Group<'_> {
             // a prefix of a string sorts as the string does
             ("left" | "substring" | "substr", [_, ..])
                 if children[1..].iter().all(|c| constant(c).is_some())
-                    && (name == "left"
+                    // a negative count of `left` drops characters from the end: no prefix
+                    && ((name == "left" && constant(&children[1]).and_then(|v| v.as_i128()).is_some_and(|n| n >= 0))
                         || constant(&children[1]).and_then(|v| v.try_to_string().ok()).as_deref() == Some("1")) =>
             {
                 self.monotone(expr, 0, true)
@@ -883,13 +884,13 @@ impl Group<'_> {
                         ("-", _) => (1, false),
                         ("*", Some(Ordering::Greater)) => (1, true),
                         ("*", Some(Ordering::Less)) => (1, false),
-                        // a constant that isn't negative over divisors that are all positive: the larger the divisor,
-                        // the smaller the quotient
+                        // a constant that isn't negative over divisors that are all positive, or all negative: the
+                        // larger the divisor, the smaller the quotient
                         ("/" | "//", Some(Ordering::Greater | Ordering::Equal)) => {
-                            let Range::Bounds(min, _) = self.range(right) else {
+                            let Range::Bounds(min, max) = self.range(right) else {
                                 return Range::Unknown;
                             };
-                            if sign(&min) != Some(Ordering::Greater) {
+                            if sign(&min) != Some(Ordering::Greater) && sign(&max) != Some(Ordering::Less) {
                                 return Range::Unknown;
                             }
                             (1, false)
@@ -1157,6 +1158,13 @@ impl Group<'_> {
                 // two expressions of the columns: their ranges (`PropagateComparison`)
                 _ => self.ranges_fail(*op, left, right),
             },
+            // `constant_or_null(false, ..)` is false or NULL
+            BoundExprKind::Function { function, children, .. }
+                if function.name == "constant_or_null"
+                    && matches!(&children[0].kind, BoundExprKind::Constant(v) if v.data() == &duckrs_common::value::ValueData::Bool(false)) =>
+            {
+                true
+            }
             // a BOOLEAN function whose range in the group is only false or NULL
             BoundExprKind::Function { function, .. }
                 if expr.return_type.id() == LogicalTypeId::Boolean

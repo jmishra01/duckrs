@@ -1128,13 +1128,27 @@ impl StatisticsPropagator {
         // a function that gives NULL for NULL, of an argument that is only NULL, is only NULL
         if matches!(
             function.name.as_str(),
-            "array_extract" | "list_extract" | "list_element" | "map_extract_value"
+            "array_extract" | "list_extract" | "list_element" | "map_extract_value" | "split_part" | "lower" | "upper"
+                | "length" | "substring" | "substr" | "replace" | "trim" | "ltrim" | "rtrim" | "left" | "right"
         ) && !expr_is_volatile_function(&function.name)
             && stats.iter().any(|s| s.can_be_null && !s.can_be_valid)
         {
             return Stats {
                 can_be_null: true,
                 can_be_valid: false,
+                ..unknown()
+            };
+        }
+        // `left(s, 0)` is the empty string
+        if function.name == "left"
+            && let [child, _] = stats.as_slice()
+            && matches!(&children[1].kind, BoundExprKind::Constant(v) if v.as_i128() == Some(0))
+        {
+            return Stats {
+                min: Some(Value::varchar("")),
+                max: Some(Value::varchar("")),
+                can_be_null: child.can_be_null,
+                can_be_valid: child.can_be_valid,
                 ..unknown()
             };
         }
@@ -1532,7 +1546,8 @@ impl StatisticsPropagator {
                 children: Vec::new(),
             };
         }
-        if !*is_operator || children.len() != 2 || !return_type.is_integral() {
+        let floating = matches!(return_type.id(), LogicalTypeId::Float | LogicalTypeId::Double);
+        if !*is_operator || children.len() != 2 || !(return_type.is_integral() || floating) {
             return unknown();
         }
         let right = stats.pop().expect("two children");
