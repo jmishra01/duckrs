@@ -1072,6 +1072,12 @@ impl JoinOrderOptimizer {
                 let cardinality = filter_cardinality(&filters, &stats);
                 stats.scaled(cardinality)
             }
+            // a scan whose filters left out all of its files has no estimate (`LogicalGet` takes 1)
+            K::ParquetScan { scan, .. } if scan.files.is_empty() && scan.total_files.is_some() => RelationStats {
+                cardinality: 1.0,
+                distinct: HashMap::new(),
+                total: HashMap::new(),
+            },
             K::ParquetScan { table_index, scan } => {
                 let Some(rows) = crate::execution::parquet::scan_cardinality(scan) else {
                     return RelationStats {
@@ -1138,6 +1144,12 @@ impl JoinOrderOptimizer {
             K::MaterializedCte { .. } => self.stats(&op.children[1]),
             // `ReadSingleCSVFileCardinality`: a file's bytes over 5 per column of a row, 42 rows where
             // its size is not known
+            // a scan whose filters left out all of its files has no estimate (`LogicalGet` takes 1)
+            K::CsvScan { scan, .. } if scan.files.is_empty() => RelationStats {
+                cardinality: 1.0,
+                distinct: HashMap::new(),
+                total: HashMap::new(),
+            },
             K::CsvScan { scan, .. } => RelationStats {
                 cardinality: scan
                     .files
@@ -1147,6 +1159,16 @@ impl JoinOrderOptimizer {
                         _ => 42,
                     })
                     .sum::<u64>() as f64,
+                distinct: HashMap::new(),
+                total: HashMap::new(),
+            },
+            // `ReadSingleJSONFileCardinality` for each file: the estimate of the first, 42 without one
+            K::JsonScan { scan, .. } => RelationStats {
+                cardinality: if scan.files.is_empty() {
+                    1.0
+                } else {
+                    (scan.cardinality_per_file.unwrap_or(42) * scan.files.len() as u64) as f64
+                },
                 distinct: HashMap::new(),
                 total: HashMap::new(),
             },

@@ -68,22 +68,17 @@ fn visit(op: &mut LogicalOperator, by_position: bool, used: &mut HashSet<ColumnB
     // read of it
     if let K::CsvScan { table_index, scan } = &mut op.kind
         && !by_position
+        && let Some(read) = pushed_projection(*table_index, &scan.projected_columns(), &scan.column_order, used)
     {
-        let columns = scan.projected_columns();
-        let mut read: Vec<usize> = columns
-            .iter()
-            .copied()
-            .filter(|&column| used.contains(&ColumnBinding::new(*table_index, column)))
-            .collect();
-        // a chunk without columns would have no rows to count
-        if read.is_empty() {
-            read.push(columns[0]);
-        }
-        if read.len() != columns.len() {
-            let mut narrowed = super::type_pushdown::clone_scan(scan);
-            narrowed.projection = Some(read);
-            *scan = std::sync::Arc::new(narrowed);
-        }
+        let mut narrowed = super::type_pushdown::clone_scan(scan);
+        narrowed.projection = Some(read);
+        *scan = std::sync::Arc::new(narrowed);
+    }
+    if let K::JsonScan { table_index, scan } = &mut op.kind
+        && !by_position
+        && let Some(read) = pushed_projection(*table_index, &scan.projected_columns(), &scan.column_order, used)
+    {
+        std::sync::Arc::make_mut(scan).projection = Some(read);
     }
     if let K::Projection {
         table_index,
@@ -152,4 +147,25 @@ fn drop_unread_columns(op: &mut LogicalOperator, mut keep: Vec<ColumnBinding>) {
     }
     let child = std::mem::replace(op, LogicalOperator::new(K::CrossProduct, Vec::new()));
     *op = LogicalOperator::new(K::ColumnSelect { keep }, vec![child]);
+}
+
+/// The columns a scan with projection pushdown outputs once those nothing reads are gone, in the
+/// order the binder read them (`column_ids`); `None` when that is what it outputs already.
+fn pushed_projection(
+    table_index: usize,
+    columns: &[usize],
+    order: &crate::execution::multi_file::ColumnOrder,
+    used: &HashSet<ColumnBinding>,
+) -> Option<Vec<usize>> {
+    let read: Vec<usize> = columns
+        .iter()
+        .copied()
+        .filter(|&column| used.contains(&ColumnBinding::new(table_index, column)))
+        .collect();
+    let mut read = order.arrange(&read);
+    // a chunk without columns would have no rows to count
+    if read.is_empty() {
+        read.push(columns[0]);
+    }
+    (read != columns).then_some(read)
 }

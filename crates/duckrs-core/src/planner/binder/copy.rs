@@ -974,6 +974,9 @@ impl Binder<'_> {
             filename: arguments.filename.is_some(),
             first_data: std::sync::Mutex::new(Some(first_data)),
             projection: None,
+            column_order: self.column_order(table_index),
+            file_filters: String::new(),
+            total_files: None,
             virtual_columns,
         };
         Ok(LogicalOperator::new(
@@ -1024,6 +1027,9 @@ impl Binder<'_> {
             rejects: None,
             first_data: std::sync::Mutex::new(None),
             projection: None,
+            column_order: Default::default(),
+            file_filters: String::new(),
+            total_files: None,
             virtual_columns: Vec::new(),
         };
         Ok(LogicalOperator::new(

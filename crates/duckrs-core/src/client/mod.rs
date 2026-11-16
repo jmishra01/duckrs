@@ -5,7 +5,7 @@
 //! parser, binder, planner and executor.
 
 mod dml_cte;
-mod explain;
+pub(crate) mod explain;
 mod triggers;
 pub(crate) use triggers::body_dependencies as trigger_body_dependencies;
 mod export;

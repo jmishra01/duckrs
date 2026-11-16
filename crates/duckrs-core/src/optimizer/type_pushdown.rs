@@ -87,6 +87,9 @@ pub(super) fn clone_scan(scan: &CsvScanData) -> CsvScanData {
         rejects: scan.rejects.clone(),
         first_data: std::sync::Mutex::new(scan.first_data.lock().map(|data| data.clone()).unwrap_or(None)),
         projection: scan.projection.clone(),
+        column_order: scan.column_order.clone(),
+        file_filters: scan.file_filters.clone(),
+        total_files: scan.total_files,
     }
 }
 

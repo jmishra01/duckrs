@@ -1671,6 +1671,9 @@ impl Binder<'_> {
                 if mode == Some(ColumnMode::SelectList) {
                     self.aggregates.as_mut().unwrap().bound_columns.push(name.clone());
                 }
+                if let Some(order) = self.column_orders.get(&binding.table_index) {
+                    order.note(binding.column_index);
+                }
                 BoundExpr::column_ref(binding, ty, name)
             }
             ExprKind::Positional(position) => {

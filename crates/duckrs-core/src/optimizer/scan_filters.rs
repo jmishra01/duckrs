@@ -10,6 +10,7 @@
 use super::rewriter::{can_throw, contains_barrier, split_conjuncts};
 use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind as K};
+use duckrs_common::value::Value;
 
 /// The columns of the expression, in the query around the plan too, with `outer` for those.
 fn columns_of(expr: &BoundExpr, columns: &mut Vec<ColumnBinding>, outer: &mut bool) {
@@ -109,6 +110,32 @@ pub fn push_into_scans(op: &mut LogicalOperator) {
     let K::Filter { expressions } = &mut op.kind else {
         return;
     };
+    // `MultiFileFunction` has no `filter_pushdown` for CSV and JSON, only `pushdown_complex_filter`, which
+    // leaves out files
+    if matches!(op.children[0].kind, K::CsvScan { .. } | K::JsonScan { .. }) {
+        let bindings = op.children[0].column_bindings();
+        let mut conjuncts = Vec::new();
+        for expr in std::mem::take(expressions) {
+            split_conjuncts(expr, &mut conjuncts);
+        }
+        match &mut op.children[0].kind {
+            K::CsvScan { scan: data, .. } => match std::sync::Arc::get_mut(data) {
+                Some(data) => prune_files(data, &bindings, &mut conjuncts),
+                None => {
+                    let mut copy = super::type_pushdown::clone_scan(data);
+                    prune_files(&mut copy, &bindings, &mut conjuncts);
+                    *data = std::sync::Arc::new(copy);
+                }
+            },
+            K::JsonScan { scan: data, .. } => prune_files(std::sync::Arc::make_mut(data), &bindings, &mut conjuncts),
+            _ => unreachable!("checked above"),
+        }
+        *expressions = conjuncts;
+        if expressions.is_empty() {
+            *op = op.children.remove(0);
+        }
+        return;
+    }
     if !matches!(op.children[0].kind, K::Get { .. } | K::ParquetScan { .. }) {
         return;
     }
@@ -181,49 +208,106 @@ pub fn push_into_scans(op: &mut LogicalOperator) {
     }
 }
 
+/// The files of a multi-file scan, with the columns that have one value for each of them.
+pub(crate) trait FileList {
+    fn paths(&self) -> Vec<String>;
+    /// The value of output column `at` in the file at `path`, if it is the same for all its rows.
+    fn known_value(&self, at: usize, path: &str) -> Option<Value>;
+    /// Keeps the files `keep` says, as filters `file_filters` left them of `total`.
+    fn keep_files(&mut self, keep: &[bool], file_filters: &str, total: usize);
+}
+
+impl FileList for crate::execution::parquet::ParquetScanData {
+    fn paths(&self) -> Vec<String> {
+        self.files.clone()
+    }
+    fn known_value(&self, at: usize, path: &str) -> Option<Value> {
+        crate::execution::parquet::ParquetScanData::known_value(self, at, path)
+    }
+    fn keep_files(&mut self, keep: &[bool], file_filters: &str, total: usize) {
+        let mut keep = keep.iter();
+        self.files.retain(|_| keep.next().copied().unwrap_or(true));
+        self.file_filters.push_str(file_filters);
+        self.total_files = Some(total);
+    }
+}
+
+impl FileList for crate::execution::csv::CsvScanData {
+    fn paths(&self) -> Vec<String> {
+        self.files.iter().map(|file| file.path.clone()).collect()
+    }
+    fn known_value(&self, at: usize, path: &str) -> Option<Value> {
+        crate::execution::json_scan::known_value(&self.names, self.filename, &self.hive, &self.virtual_columns, at, path)
+    }
+    fn keep_files(&mut self, keep: &[bool], file_filters: &str, total: usize) {
+        // the bytes sniffing read are of the first file
+        if keep.first() == Some(&false) {
+            *self.first_data.lock().expect("not poisoned") = None;
+        }
+        let mut keep = keep.iter();
+        self.files.retain(|_| keep.next().copied().unwrap_or(true));
+        self.file_filters.push_str(file_filters);
+        self.total_files = Some(total);
+    }
+}
+
+impl FileList for crate::execution::json_scan::JsonScanData {
+    fn paths(&self) -> Vec<String> {
+        self.files.clone()
+    }
+    fn known_value(&self, at: usize, path: &str) -> Option<Value> {
+        crate::execution::json_scan::JsonScanData::known_value(self, at, path)
+    }
+    fn keep_files(&mut self, keep: &[bool], file_filters: &str, total: usize) {
+        let mut keep = keep.iter();
+        self.files.retain(|_| keep.next().copied().unwrap_or(true));
+        self.file_filters.push_str(file_filters);
+        self.total_files = Some(total);
+    }
+}
+
 /// `HivePartitioning::ApplyFiltersToFileList`: the filters that only read the hive partitions and the file name
 /// are worked out for each file, those of the files they are false for are left out, and the filters that could
 /// be worked out for every file are no longer needed.
-fn prune_files(
-    scan: &mut crate::execution::parquet::ParquetScanData,
-    bindings: &[ColumnBinding],
-    conjuncts: &mut Vec<BoundExpr>,
-) {
-    let known: Vec<usize> = (0..bindings.len()).filter(|&at| scan.is_known_per_file(at)).collect();
+fn prune_files(scan: &mut impl FileList, bindings: &[ColumnBinding], conjuncts: &mut Vec<BoundExpr>) {
+    let paths = scan.paths();
+    let Some(first) = paths.first() else {
+        return;
+    };
+    let known: Vec<ColumnBinding> = bindings
+        .iter()
+        .copied()
+        .filter(|b| scan.known_value(b.column_index, first).is_some())
+        .collect();
     if known.is_empty() || conjuncts.is_empty() {
         return;
     }
-    let mut keep = vec![true; scan.files.len()];
+    let mut keep = vec![true; paths.len()];
     let mut file_filters = String::new();
     conjuncts.retain(|conjunct| {
         let mut columns = Vec::new();
         let mut outer = false;
         columns_of(conjunct, &mut columns, &mut outer);
-        let on_known = |binding: &ColumnBinding| {
-            bindings
-                .iter()
-                .position(|b| b == binding)
-                .is_some_and(|at| known.contains(&at))
-        };
         // a subquery runs with the query (in a recursive CTE, once per round): not before it
         fn has_subquery(expr: &BoundExpr) -> bool {
             matches!(expr.kind, BoundExprKind::Subquery { .. }) || expr.children().into_iter().any(has_subquery)
         }
-        if columns.is_empty() || outer || conjunct.is_volatile() || has_subquery(conjunct) || !columns.iter().all(on_known) {
+        if columns.is_empty()
+            || outer
+            || conjunct.is_volatile()
+            || has_subquery(conjunct)
+            || !columns.iter().all(|c| known.contains(c))
+        {
             return true;
         }
         let mut preserved = false;
         let mut applied = false;
-        for (file, keep) in scan.files.iter().zip(keep.iter_mut()) {
+        for (path, keep) in paths.iter().zip(keep.iter_mut()) {
             let mut copy = conjunct.clone();
             let mut known_values = true;
             copy.walk_mut(&mut |e| {
                 if let BoundExprKind::ColumnRef { binding, depth: 0 } = &e.kind {
-                    let at = bindings
-                        .iter()
-                        .position(|b| b == binding)
-                        .expect("a column of the scan");
-                    match scan.known_value(at, file) {
+                    match scan.known_value(binding.column_index, path) {
                         Some(value) => *e = BoundExpr::constant(value),
                         None => known_values = false,
                     }
@@ -241,14 +325,11 @@ fn prune_files(
                 Some(_) => {}
             }
         }
+        // `ExtraOperatorInfo::file_filters`: the filters' texts, one after the other
         if applied {
-            file_filters.push_str(&conjunct.to_string());
+            file_filters.push_str(&crate::client::explain::filter_text(conjunct));
         }
         preserved
     });
-    let total = scan.files.len();
-    let mut keep = keep.into_iter();
-    scan.files.retain(|_| keep.next().unwrap_or(true));
-    scan.file_filters.push_str(&file_filters);
-    scan.total_files = Some(total);
+    scan.keep_files(&keep, &file_filters, paths.len());
 }

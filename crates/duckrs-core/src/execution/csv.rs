@@ -252,6 +252,12 @@ pub struct CsvScanData {
     /// the columns of `output_types` the scan outputs, in order (`column_ids`); `None` for all.
     /// The others are not converted, so their values cannot fail.
     pub projection: Option<Vec<usize>>,
+    /// the order the binder read the columns in, which projection pushdown keeps
+    pub column_order: crate::execution::multi_file::ColumnOrder,
+    /// `ExtraOperatorInfo::file_filters`: the filters that left files out, as text
+    pub file_filters: String,
+    /// how many files there were before filters left some out
+    pub total_files: Option<usize>,
 }
 
 /// The tables that `store_rejects` fills (`CSVRejectsTable`).

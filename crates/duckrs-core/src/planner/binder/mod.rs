@@ -810,6 +810,8 @@ pub struct Binder<'a> {
     pub options: BindOptions,
     bind_context: BindContext,
     next_table_index: usize,
+    /// The order the columns of the scans with projection pushdown are read in, by table index.
+    column_orders: std::collections::HashMap<usize, crate::execution::multi_file::ColumnOrder>,
     /// The COPY being bound is about JSON.
     copy_json: bool,
     /// Binding what a table function was given: `TableFunctionBinder` reads a name as its text.
@@ -938,6 +940,7 @@ impl<'a> Binder<'a> {
             options,
             bind_context: BindContext::default(),
             next_table_index: 0,
+            column_orders: std::collections::HashMap::new(),
             copy_json: false,
             table_function_argument: false,
             unnamed_subquery_index: 1,
@@ -1076,6 +1079,11 @@ impl<'a> Binder<'a> {
     }
 
     /// `Binder::GenerateTableIndex`.
+    /// The order of the columns of the scan at `table_index`, kept as the binder reads them.
+    fn column_order(&mut self, table_index: usize) -> crate::execution::multi_file::ColumnOrder {
+        self.column_orders.entry(table_index).or_default().clone()
+    }
+
     fn generate_table_index(&mut self) -> usize {
         let index = self.next_table_index;
         self.next_table_index += 1;

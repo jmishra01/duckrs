@@ -208,16 +208,32 @@ impl Binder<'_> {
                 "When auto_detect=false, read_json requires columns to be specified through the \"columns\" parameter.",
             ));
         }
+        let mut cardinality_per_file = None;
         let (names, types, use_records) = if objects {
             (vec!["json".to_string()], vec![json_type()], false)
         } else if let Some(columns) = columns {
+            // `JSONScan::AutoDetect` still samples the first file when the format or `records` is left to it
+            if (format == JsonFormat::Auto || records.is_none())
+                && let Some(path) = files.first()
+            {
+                let data = read_file(path, compression)?;
+                let (found, detected) = read_records(&data, format);
+                let size = std::fs::metadata(path).map_or(data.len() as u64, |m| m.len());
+                cardinality_per_file =
+                    crate::execution::json_scan::estimate_per_file(&data, &found, detected, size, sample_size);
+            }
             let (names, types): (Vec<_>, Vec<_>) = columns.into_iter().unzip();
             (names, types, records.unwrap_or(true))
         } else {
             let mut sampled: Vec<Json> = Vec::new();
-            for path in &files {
+            for (at, path) in files.iter().enumerate() {
                 let data = read_file(path, compression)?;
-                let (found, _) = read_records(&data, format);
+                let (found, detected) = read_records(&data, format);
+                if at == 0 {
+                    let size = std::fs::metadata(path).map_or(data.len() as u64, |m| m.len());
+                    cardinality_per_file =
+                        crate::execution::json_scan::estimate_per_file(&data, &found, detected, size, sample_size);
+                }
                 for record in found {
                     match record {
                         Ok((record, _)) => sampled.push(record),
@@ -278,6 +294,7 @@ impl Binder<'_> {
             output_names.push(key.clone());
             output_types.push(ty.clone());
         }
+        let name_for_explain = name.clone();
         let alias = if table_ref.alias.is_empty() {
             name
         } else {
@@ -312,6 +329,12 @@ impl Binder<'_> {
             filename: filename.is_some(),
             hive,
             virtual_columns,
+            function_name: name_for_explain,
+            projection: None,
+            column_order: self.column_order(table_index),
+            file_filters: String::new(),
+            total_files: None,
+            cardinality_per_file,
         };
         Ok(LogicalOperator::new(
             LogicalOperatorKind::JsonScan {

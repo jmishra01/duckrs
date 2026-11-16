@@ -81,6 +81,18 @@ fn logical_name(op: &LogicalOperator) -> &'static str {
     }
 }
 
+/// The `File Filters` and `Scanning Files` of a multi-file scan whose filters left out files.
+fn file_filter_info(file_filters: &str, files: usize, total: Option<usize>) -> Vec<(String, String)> {
+    let mut info = Vec::new();
+    if !file_filters.is_empty() {
+        info.push(("File Filters".to_string(), file_filters.to_string()));
+        if let Some(total) = total {
+            info.push(("Scanning Files".to_string(), format!("{files}/{total}")));
+        }
+    }
+    info
+}
+
 fn lines(values: impl IntoIterator<Item = String>) -> String {
     values.into_iter().collect::<Vec<_>>().join("\n")
 }
@@ -105,7 +117,7 @@ fn aggregate_text(aggregate: &BoundAggregate) -> String {
 }
 
 /// `ExpressionFilter::ToString`: without the parentheses around all of it, if there are any.
-fn filter_text(filter: &BoundExpr) -> String {
+pub(crate) fn filter_text(filter: &BoundExpr) -> String {
     let text = filter.to_string();
     let Some(inner) = text.strip_prefix('(').and_then(|t| t.strip_suffix(')')) else {
         return text;
@@ -164,6 +176,17 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
                 let projected = columns.iter().map(|&c| names.get(c).cloned().unwrap_or_default());
                 info.extend(entry("Projections", lines(projected)));
             }
+            info.extend(file_filter_info(&scan.file_filters, scan.files.len(), scan.total_files));
+            info
+        }
+        K::JsonScan { scan, .. } => {
+            let mut info = entry("Function", scan.function_name.to_uppercase());
+            if let Some(columns) = &scan.projection {
+                let names = scan.output_names();
+                let projected = columns.iter().map(|&c| names.get(c).cloned().unwrap_or_default());
+                info.extend(entry("Projections", lines(projected)));
+            }
+            info.extend(file_filter_info(&scan.file_filters, scan.files.len(), scan.total_files));
             info
         }
         K::Get {
@@ -363,6 +386,7 @@ pub(super) fn physical_tree(
         Some(K::Get { .. }) => "SEQ_SCAN".to_string(),
         // `PhysicalTableScan::GetName`
         Some(K::ParquetScan { scan, .. }) => scan.function_name.to_uppercase(),
+        Some(K::JsonScan { scan, .. }) => scan.function_name.to_uppercase(),
         _ => op.name().to_string(),
     };
     let mut info: Vec<(String, String)> = match logical {
