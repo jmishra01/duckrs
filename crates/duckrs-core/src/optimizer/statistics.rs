@@ -23,7 +23,7 @@ use crate::planner::column_binding_resolver::resolve_column_bindings;
 use crate::planner::expression::{BoundAggregate, BoundExpr, BoundExprKind, BoundOperator, ColumnBinding};
 use crate::planner::logical::{COLUMN_IDENTIFIER_ROW_ID, LogicalOperator, LogicalOperatorKind as K};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
-use duckrs_common::value::Value;
+use duckrs_common::value::{Value, ValueData};
 use duckrs_parser::ast::{ComparisonOp, JoinType};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -1085,6 +1085,46 @@ impl StatisticsPropagator {
             unreachable!()
         };
         let mut stats: Vec<Stats> = children.iter_mut().map(|c| self.expression(c, false)).collect();
+        // `prefix` of strings that all start with it, or that all sort outside of the strings that do
+        if matches!(function.name.as_str(), "prefix" | "starts_with" | "^@")
+            && let [child, needle] = stats.as_slice()
+            && let BoundExprKind::Constant(needle_value) = &children[1].kind
+            && !needle_value.is_null()
+            && needle.can_be_valid
+            && let (Some(min), Some(max)) = (&child.min, &child.max)
+            && let (Ok(min), Ok(max), Ok(prefix)) = (min.try_to_string(), max.try_to_string(), needle_value.try_to_string())
+            && !children[0].is_volatile()
+        {
+            // C++'s string statistics keep 12 bytes of the bounds
+            let provable = prefix.len() <= crate::execution::zone_map::STRING_STATISTICS_BYTES;
+            let answer = if !provable {
+                None
+            } else if min.starts_with(&prefix) && max.starts_with(&prefix) {
+                Some(true)
+            } else if max.as_str() < prefix.as_str() || (min.as_str() > prefix.as_str() && !min.starts_with(&prefix)) {
+                Some(false)
+            } else {
+                None
+            };
+            if let Some(answer) = answer {
+                let alias = expr.alias.clone();
+                let can_be_null = child.can_be_null;
+                let constant = BoundExpr::constant(Value::boolean(answer));
+                // NULL where the string is
+                *expr = if can_be_null {
+                    crate::function::constant_or_null(vec![constant, children[0].clone()])
+                } else {
+                    constant
+                }
+                .with_alias(alias);
+                return Stats {
+                    min: Some(Value::boolean(answer)),
+                    max: Some(Value::boolean(answer)),
+                    can_be_null,
+                    ..unknown()
+                };
+            }
+        }
         // `isnan` of a float whose largest value is a number: NaN sorts above every number
         if function.name == "isnan"
             && let [child] = stats.as_slice()
@@ -1611,6 +1651,14 @@ impl StatisticsPropagator {
         for mut expr in std::mem::take(expressions) {
             self.expression(&mut expr, true);
             rewrite_expression(&mut expr, true);
+            // `constant_or_null(false, x)` is false or NULL, which a filter does not let through
+            let never = matches!(&expr.kind, BoundExprKind::Function { function, children, .. }
+                if function.name == "constant_or_null"
+                    && matches!(&children[0].kind, BoundExprKind::Constant(v) if v.data() == &ValueData::Bool(false)));
+            if never {
+                *op = empty_result(op);
+                return;
+            }
             match fold_boolean(&expr) {
                 Some(Some(true)) => {}
                 Some(_) => {

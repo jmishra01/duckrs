@@ -100,6 +100,9 @@ fn apply_rules(expr: &mut BoundExpr, in_filter: bool) -> bool {
         || regex_optimization(expr)
         || like_optimizations(expr)
         || instr_prefix(expr)
+        || string_prefix(expr)
+        || glob_prefix(expr)
+        || (in_filter && null_distinct_comparison(expr))
         || empty_needle_removal(expr)
         || least_greatest_simplification(expr)
         || not_constant_or_null_simplification(expr)
@@ -1318,6 +1321,209 @@ fn instr_prefix(expr: &mut BoundExpr) -> bool {
         return false;
     }
     *expr = crate::function::string_needle_call("prefix", haystack.clone(), needle.clone());
+    true
+}
+
+/// `StringPrefixRule`: `left(s, 3) = 'abc'` is `prefix(s, 'abc')`, `substring(s, 1) = c` is `s = c`,
+/// and a constant of another length than the prefix makes it an equality, or false.
+fn string_prefix(expr: &mut BoundExpr) -> bool {
+    let BoundExprKind::Comparison {
+        op: ComparisonOp::Equal,
+        left,
+        right,
+    } = &expr.kind
+    else {
+        return false;
+    };
+    let (call, constant) = if matches!(right.kind, BoundExprKind::Constant(_)) { (left, right) } else { (right, left) };
+    let BoundExprKind::Constant(constant_value) = &constant.kind else {
+        return false;
+    };
+    let BoundExprKind::Function { function, children, .. } = &call.kind else {
+        return false;
+    };
+    if call.return_type.id() != LogicalTypeId::Varchar || constant.return_type.id() != LogicalTypeId::Varchar {
+        return false;
+    }
+    let number = |e: &BoundExpr| match &e.kind {
+        BoundExprKind::Constant(v) => Some(if v.is_null() { None } else { v.as_i128() }),
+        _ => None,
+    };
+    let null = BoundExpr::constant(Value::null(LogicalType::BOOLEAN));
+    if constant_value.is_null() {
+        *expr = null;
+        return true;
+    }
+    let characters = match (function.name.as_str(), children.as_slice()) {
+        ("left", [_, count]) => match number(count) {
+            Some(None) => {
+                *expr = null;
+                return true;
+            }
+            Some(Some(n)) if (0..=i128::from(u32::MAX)).contains(&n) => n,
+            _ => return false,
+        },
+        ("substring" | "substr", [input, start, rest @ ..]) => {
+            match number(start) {
+                Some(None) => {
+                    *expr = null;
+                    return true;
+                }
+                Some(Some(1)) => {}
+                _ => return false,
+            }
+            match rest {
+                [] => {
+                    // the whole string
+                    let (input, constant) = (input.clone(), (**constant).clone());
+                    expr.kind = BoundExprKind::Comparison {
+                        op: ComparisonOp::Equal,
+                        left: Box::new(input),
+                        right: Box::new(constant),
+                    };
+                    return true;
+                }
+                [length] => match number(length) {
+                    Some(None) => {
+                        *expr = null;
+                        return true;
+                    }
+                    Some(Some(n)) if (0..=i128::from(u32::MAX)).contains(&n) => n,
+                    _ => return false,
+                },
+                _ => return false,
+            }
+        }
+        // `s[x:y]` is `array_slice(s, x, y)`; `s[0:]` is `s[1:]`, and a bound left out is an empty list
+        ("array_slice" | "list_slice", [input, begin, end]) => {
+            let is_list = |e: &BoundExpr| {
+                matches!(&e.kind, BoundExprKind::Constant(v) if !v.is_null())
+                    && e.return_type.id() == LogicalTypeId::List
+            };
+            if !is_list(begin) {
+                match number(begin) {
+                    Some(None) => {
+                        *expr = null;
+                        return true;
+                    }
+                    Some(Some(0 | 1)) => {}
+                    _ => return false,
+                }
+            }
+            if is_list(end) {
+                let (input, constant) = (input.clone(), (**constant).clone());
+                expr.kind = BoundExprKind::Comparison {
+                    op: ComparisonOp::Equal,
+                    left: Box::new(input),
+                    right: Box::new(constant),
+                };
+                return true;
+            }
+            match number(end) {
+                Some(None) => {
+                    *expr = null;
+                    return true;
+                }
+                Some(Some(n)) if n >= 0 => n,
+                _ => return false,
+            }
+        }
+        _ => return false,
+    };
+    let Ok(text) = constant_value.try_to_string() else {
+        return false;
+    };
+    let input = children[0].clone();
+    let length = text.chars().count() as i128;
+    *expr = if length > characters {
+        // a constant longer than the prefix is never it
+        crate::function::constant_or_null(vec![BoundExpr::constant(Value::boolean(false)), input])
+    } else if length < characters {
+        // a prefix shorter than asked for is the whole string
+        BoundExpr::new(
+            BoundExprKind::Comparison {
+                op: ComparisonOp::Equal,
+                left: Box::new(input),
+                right: Box::new(BoundExpr::constant(constant_value.clone())),
+            },
+            LogicalType::BOOLEAN,
+        )
+    } else {
+        crate::function::string_needle_call("prefix", input, BoundExpr::constant(constant_value.clone()))
+    };
+    true
+}
+
+/// `s GLOB 'abc*'` is `prefix(s, 'abc')`, and `s GLOB 'abc'` is `s = 'abc'`.
+fn glob_prefix(expr: &mut BoundExpr) -> bool {
+    let BoundExprKind::Function { function, children, .. } = &expr.kind else {
+        return false;
+    };
+    let [input, pattern] = children.as_slice() else {
+        return false;
+    };
+    let BoundExprKind::Constant(value) = &pattern.kind else {
+        return false;
+    };
+    if !matches!(function.name.as_str(), "glob" | "~~~") || value.is_null() || input.return_type.collation().is_some() {
+        return false;
+    }
+    let Ok(pattern) = value.try_to_string() else {
+        return false;
+    };
+    let special = |c: char| matches!(c, '*' | '?' | '[' | ']' | '\\');
+    let (literal, prefix) = match pattern.strip_suffix('*') {
+        Some(head) => (head, true),
+        None => (pattern.as_str(), false),
+    };
+    if literal.is_empty() || literal.chars().any(special) {
+        return false;
+    }
+    let needle = BoundExpr::constant(Value::varchar(literal));
+    *expr = if prefix {
+        crate::function::string_needle_call("prefix", input.clone(), needle)
+    } else {
+        BoundExpr::new(
+            BoundExprKind::Comparison {
+                op: ComparisonOp::Equal,
+                left: Box::new(input.clone()),
+                right: Box::new(needle),
+            },
+            LogicalType::BOOLEAN,
+        )
+    };
+    true
+}
+
+/// `x IS NOT DISTINCT FROM NULL` is `x IS NULL`, and `x IS DISTINCT FROM NULL` is `x IS NOT NULL`
+/// (`CreateNullCheckExpression`), for a column.
+fn null_distinct_comparison(expr: &mut BoundExpr) -> bool {
+    let BoundExprKind::Comparison { op, left, right } = &expr.kind else {
+        return false;
+    };
+    let null_check = match op {
+        ComparisonOp::NotDistinctFrom => BoundOperator::IsNull,
+        ComparisonOp::DistinctFrom => BoundOperator::IsNotNull,
+        _ => return false,
+    };
+    let is_null = |e: &BoundExpr| matches!(&e.kind, BoundExprKind::Constant(v) if v.is_null());
+    let column = if is_null(right) {
+        left
+    } else if is_null(left) {
+        right
+    } else {
+        return false;
+    };
+    if !matches!(column.kind, BoundExprKind::ColumnRef { .. }) {
+        return false;
+    }
+    *expr = BoundExpr::new(
+        BoundExprKind::Operator {
+            op: null_check,
+            children: vec![(**column).clone()],
+        },
+        LogicalType::BOOLEAN,
+    );
     true
 }
 

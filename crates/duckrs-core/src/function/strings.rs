@@ -207,10 +207,23 @@ fn right_grapheme(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+/// `AssertInSupportedRange` of `left`'s substring: a count beyond what a string can hold is refused.
+/// A negative count, like any count of `right`, is bounded by the string's length first.
+fn substring_length_in_range(length: i64) -> Result<()> {
+    if length > SUBSTRING_UPPER_BOUND {
+        return Err(duckrs_common::Error::new(
+            duckrs_common::ErrorKind::OutOfRange,
+            "Substring length outside of supported range",
+        ));
+    }
+    Ok(())
+}
+
 fn left(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
         let chars: Vec<char> = text(&row[0]).chars().collect();
         let count = integer(&row[1]);
+        substring_length_in_range(count)?;
         let size = chars.len() as i64;
         let take = if count >= 0 {
             count.min(size)

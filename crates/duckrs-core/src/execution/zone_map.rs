@@ -23,6 +23,9 @@ use duckrs_parser::ast::ComparisonOp;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+/// `StringStatsData::MAX_STRING_MINMAX_SIZE`: the bytes of the bounds of strings C++ keeps.
+pub const STRING_STATISTICS_BYTES: usize = 12;
+
 /// `DEFAULT_ROW_GROUP_SIZE`.
 pub const ROW_GROUP_SIZE: usize = 122_880;
 /// The chunks of a row group, which all but the last chunk of a table fill.
@@ -488,6 +491,29 @@ impl Group<'_> {
                     Some(max) => max.data() == &duckrs_common::value::ValueData::Bool(false),
                 })
             }
+            // `NOT prefix(s, 'ab')`: every string of the group starts with it (a NULL gives NULL)
+            BoundExprKind::Operator {
+                op: BoundOperator::Not,
+                children,
+            } if children.len() == 1
+                && matches!(&children[0].kind, BoundExprKind::Function { function, children, .. }
+                    if matches!(function.name.as_str(), "prefix" | "starts_with" | "^@") && children.len() == 2) =>
+            {
+                let BoundExprKind::Function { children, .. } = &children[0].kind else {
+                    unreachable!("checked")
+                };
+                let BoundExprKind::Constant(prefix) = &children[1].kind else {
+                    return false;
+                };
+                let (Ok(prefix), Range::Bounds(min, max)) = (prefix.try_to_string(), self.range(&children[0])) else {
+                    return false;
+                };
+                let (Ok(min), Ok(max)) = (min.try_to_string(), max.try_to_string()) else {
+                    return false;
+                };
+                // C++'s string statistics keep 12 bytes of the bounds, which prove no longer prefix
+                prefix.len() <= STRING_STATISTICS_BYTES && min.starts_with(&prefix) && max.starts_with(&prefix)
+            }
             BoundExprKind::Operator {
                 op: BoundOperator::Not,
                 children,
@@ -577,7 +603,7 @@ impl Group<'_> {
             },
             // `prefix(s, 'ab')` / `starts_with`: s from 'ab' up to what follows all strings that start with it
             BoundExprKind::Function { function, children, .. }
-                if matches!(function.name.as_str(), "prefix" | "starts_with") && children.len() == 2 =>
+                if matches!(function.name.as_str(), "prefix" | "starts_with" | "^@") && children.len() == 2 =>
             {
                 let BoundExprKind::Constant(prefix) = &children[1].kind else {
                     return false;

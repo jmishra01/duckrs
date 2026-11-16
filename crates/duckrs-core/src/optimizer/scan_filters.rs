@@ -53,6 +53,51 @@ fn column_first(mut expr: BoundExpr) -> BoundExpr {
     expr
 }
 
+/// `TryPushdownPrefixFilter`: `prefix(s, 'abc')` on a column is `s >= 'abc' AND s < 'abd'`, which
+/// a scan's zone maps can use.
+fn prefix_bounds(expr: &BoundExpr) -> Option<[BoundExpr; 2]> {
+    let BoundExprKind::Function { function, children, .. } = &expr.kind else {
+        return None;
+    };
+    if !matches!(function.name.as_str(), "prefix" | "starts_with" | "^@") {
+        return None;
+    }
+    let [column, BoundExpr {
+        kind: BoundExprKind::Constant(value),
+        ..
+    }] = children.as_slice()
+    else {
+        return None;
+    };
+    if !matches!(column.kind, BoundExprKind::ColumnRef { .. }) || value.is_null() {
+        return None;
+    }
+    let prefix = value.try_to_string().ok()?;
+    if prefix.is_empty() || column.return_type.collation().is_some() {
+        return None;
+    }
+    // `Utf8Proc::FindNextLegalUTF8`: the next string of the same length, by its last character
+    let mut chars: Vec<char> = prefix.chars().collect();
+    let last = chars.pop()?;
+    let next = (u32::from(last) + 1..=u32::from(char::MAX)).find_map(char::from_u32)?;
+    chars.push(next);
+    let upper: String = chars.into_iter().collect();
+    let compare = |op, bound: String| {
+        BoundExpr::new(
+            BoundExprKind::Comparison {
+                op,
+                left: Box::new(column.clone()),
+                right: Box::new(BoundExpr::constant(duckrs_common::value::Value::varchar(bound))),
+            },
+            duckrs_common::types::LogicalType::BOOLEAN,
+        )
+    };
+    Some([
+        compare(duckrs_parser::ast::ComparisonOp::GreaterThanOrEqual, prefix),
+        compare(duckrs_parser::ast::ComparisonOp::LessThan, upper),
+    ])
+}
+
 /// Moves the filters directly on scans into them.
 pub fn push_into_scans(op: &mut LogicalOperator) {
     for child in &mut op.children {
@@ -85,6 +130,10 @@ pub fn push_into_scans(op: &mut LogicalOperator) {
     let (barred, conjuncts): (Vec<BoundExpr>, Vec<BoundExpr>) = conjuncts.into_iter().partition(contains_barrier);
     for conjunct in conjuncts {
         if can_move_into_scan(&conjunct, &scan) {
+            if let Some(bounds) = prefix_bounds(&conjunct) {
+                filters.extend(bounds);
+                continue;
+            }
             filters.push(column_first(conjunct));
         } else {
             expressions.push(conjunct);
@@ -96,7 +145,11 @@ pub fn push_into_scans(op: &mut LogicalOperator) {
         && barred.is_empty()
         && can_move_ignoring_errors(only, &scan)
     {
-        filters.push(column_first(expressions.pop().expect("one filter")));
+        let only = expressions.pop().expect("one filter");
+        match prefix_bounds(&only) {
+            Some(bounds) => filters.extend(bounds),
+            None => filters.push(column_first(only)),
+        }
     }
     // `PushdownBarrierFilters`: into the scan, after the filters there, only if no other filter stays on top
     for conjunct in barred {
