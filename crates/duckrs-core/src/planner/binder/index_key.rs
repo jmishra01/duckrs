@@ -192,11 +192,11 @@ impl Binder<'_> {
                 let mut found: Vec<Vec<usize>> = Vec::new();
                 for constraint in &table.constraints {
                     let (constraint_kind, keys) = match constraint {
-                        TableConstraint::Unique { columns, primary_key } => {
+                        TableConstraint::Unique { columns, primary_key, .. } => {
                             (if *primary_key { "PRIMARY" } else { "UNIQUE" }, columns.clone())
                         }
                         TableConstraint::ForeignKey(key) => ("FOREIGN", key.columns.clone()),
-                        TableConstraint::Check { .. } => continue,
+                        TableConstraint::Check { .. } | TableConstraint::NotNull(_) => continue,
                     };
                     let names: Vec<&str> = keys.iter().map(|&k| table.columns[k].name.as_str()).collect();
                     let matches = columns.is_empty()

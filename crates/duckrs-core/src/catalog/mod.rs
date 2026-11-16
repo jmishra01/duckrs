@@ -583,8 +583,13 @@ pub enum TableConstraint {
     Unique {
         columns: Vec<usize>,
         primary_key: bool,
+        /// written on the column (`UniqueConstraint::HasIndex`), which is how its SQL shows it
+        column_level: bool,
     },
     ForeignKey(ForeignKey),
+    /// `NotNullConstraint` of the column at this index, at its place among the others: the
+    /// column's `not_null` says the same
+    NotNull(usize),
 }
 
 /// A foreign key, on the table that has it. `columns` match `referenced_columns` one by one,
@@ -757,7 +762,7 @@ impl TableCatalogEntry {
                 let columns = match constraint {
                     TableConstraint::Unique { columns, .. } => columns,
                     TableConstraint::ForeignKey(foreign) => &foreign.columns,
-                    TableConstraint::Check { .. } => return None,
+                    TableConstraint::Check { .. } | TableConstraint::NotNull(_) => return None,
                 };
                 Some(TableKey {
                     columns: columns.clone(),
@@ -824,7 +829,7 @@ impl TableCatalogEntry {
             }
         }
         let keyed = self.constraints.iter().any(|constraint| match constraint {
-            TableConstraint::Check { .. } => false,
+            TableConstraint::Check { .. } | TableConstraint::NotNull(_) => false,
             TableConstraint::Unique { columns: keys, .. } => keys.iter().any(|c| columns.contains(c)),
             TableConstraint::ForeignKey(key) => key.columns.iter().any(|c| columns.contains(c)),
         });
@@ -916,7 +921,7 @@ impl TableCatalogEntry {
             .constraints
             .iter()
             .filter_map(|constraint| match constraint {
-                TableConstraint::Unique { columns, primary_key } => Some(TableKey {
+                TableConstraint::Unique { columns, primary_key, .. } => Some(TableKey {
                     columns: columns.clone(),
                     expressions: None,
                     names: columns.iter().map(|c| self.columns[*c].name.clone()).collect(),

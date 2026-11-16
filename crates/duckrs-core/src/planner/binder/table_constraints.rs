@@ -209,12 +209,17 @@ impl Binder<'_> {
         schema: &Arc<SchemaCatalogEntry>,
     ) -> Result<Vec<TableConstraint>> {
         let table = &info.name.name;
-        let mut bound = Vec::new();
-        // the keys go first, for the foreign keys of a table that references itself
+        // each at the place it was written; the keys are bound first, for the foreign keys of a
+        // table that references itself
+        let mut slots: Vec<Option<TableConstraint>> = vec![None; info.constraints.len()];
+        let mut primary_columns: Vec<usize> = Vec::new();
         let mut has_primary_key = false;
-        for constraint in &info.constraints {
+        for (slot, constraint) in info.constraints.iter().enumerate() {
             match constraint {
-                Constraint::NotNull(index) => columns[*index].not_null = true,
+                Constraint::NotNull(index) => {
+                    columns[*index].not_null = true;
+                    slots[slot] = Some(TableConstraint::NotNull(*index));
+                }
                 Constraint::Unique {
                     index,
                     columns: names,
@@ -233,13 +238,12 @@ impl Binder<'_> {
                     let key = bind_unique(table, columns, *index, names)?;
                     check_key_types(columns, &key)?;
                     if *primary_key {
-                        for column in &key {
-                            columns[*column].not_null = true;
-                        }
+                        primary_columns.clone_from(&key);
                     }
-                    bound.push(TableConstraint::Unique {
+                    slots[slot] = Some(TableConstraint::Unique {
                         columns: key,
                         primary_key: *primary_key,
+                        column_level: index.is_some(),
                     });
                 }
                 // `BindForeignKey`, in the order of the constraints: a key named twice
@@ -266,13 +270,16 @@ impl Binder<'_> {
                 Constraint::Check(_) => {}
             }
         }
-        for constraint in &info.constraints {
+        let keys: Vec<TableConstraint> = slots.iter().flatten().cloned().collect();
+        for (slot, constraint) in info.constraints.iter().enumerate() {
             match constraint {
-                Constraint::Check(check) => bound.push(TableConstraint::Check {
-                    expression: self.bind_check(table, columns, check)?,
-                    parsed: (**check).clone(),
-                    text: constraint.to_string(),
-                }),
+                Constraint::Check(check) => {
+                    slots[slot] = Some(TableConstraint::Check {
+                        expression: self.bind_check(table, columns, check)?,
+                        parsed: (**check).clone(),
+                        text: constraint.to_string(),
+                    });
+                }
                 Constraint::ForeignKey {
                     fk_columns,
                     pk_columns,
@@ -282,17 +289,25 @@ impl Binder<'_> {
                     let foreign_key = self.bind_foreign_key(
                         info,
                         columns,
-                        &bound,
+                        &keys,
                         schema,
                         fk_columns,
                         pk_columns,
                         referenced_schema,
                         referenced_table,
                     )?;
-                    bound.push(TableConstraint::ForeignKey(foreign_key));
+                    slots[slot] = Some(TableConstraint::ForeignKey(foreign_key));
                 }
                 Constraint::NotNull(_) | Constraint::Unique { .. } => {}
             }
+        }
+        let mut bound: Vec<TableConstraint> = slots.into_iter().flatten().collect();
+        // `BindNewConstraints`: a NOT NULL for each column of the primary key without one, last
+        for column in primary_columns {
+            if !columns[column].not_null {
+                bound.push(TableConstraint::NotNull(column));
+            }
+            columns[column].not_null = true;
         }
         Ok(bound)
     }
@@ -326,7 +341,7 @@ impl Binder<'_> {
             constraints
                 .iter()
                 .filter_map(|c| match c {
-                    TableConstraint::Unique { columns, primary_key } => Some((columns.clone(), *primary_key)),
+                    TableConstraint::Unique { columns, primary_key, .. } => Some((columns.clone(), *primary_key)),
                     _ => None,
                 })
                 .collect()

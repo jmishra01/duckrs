@@ -754,7 +754,7 @@ pub(super) fn table_info(
     let mut columns = Vec::with_capacity(table.columns.len());
     let mut constraints = Vec::new();
     let boxed = |constraint: g::Constraint| Some(Box::new(constraint));
-    for (index, column) in table.logical_columns().iter().enumerate() {
+    for column in table.logical_columns().iter() {
         let expression = match (
             column.generated,
             column.definition.and_then(|d| d.default_text.as_deref()),
@@ -779,27 +779,41 @@ pub(super) fn table_info(
             comment: column.definition.and_then(|d| d.comment.clone()).map(Value::varchar),
             tags: Vec::new(),
         });
-        if column.definition.is_some_and(|d| d.not_null) {
-            constraints.push(boxed(g::Constraint {
-                type_: constraint_type::NOT_NULL,
-                kind: g::ConstraintKind::NotNullConstraint(g::NotNullConstraint { index: index as u64 }),
-            }));
-        }
     }
+    // a column by its place among all the columns, generated ones too (`LogicalIndex`)
+    let logical = table.logical_columns();
+    let logical_index = |column: usize| -> u64 {
+        let name = &table.columns[column].name;
+        logical
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(name))
+            .unwrap_or(column) as u64
+    };
+    // in the order the table has them, as C++ keeps its `constraints`
     for constraint in &table.constraints {
         match constraint {
+            TableConstraint::NotNull(column) => constraints.push(boxed(g::Constraint {
+                type_: constraint_type::NOT_NULL,
+                kind: g::ConstraintKind::NotNullConstraint(g::NotNullConstraint {
+                    index: logical_index(*column),
+                }),
+            })),
             TableConstraint::Check { parsed, .. } => constraints.push(boxed(g::Constraint {
                 type_: constraint_type::CHECK,
                 kind: g::ConstraintKind::CheckConstraint(g::CheckConstraint {
                     expression: Some(Box::new(to_stored::expression(parsed)?)),
                 }),
             })),
-            TableConstraint::Unique { columns, primary_key } => constraints.push(boxed(g::Constraint {
+            TableConstraint::Unique { columns, primary_key, column_level } => constraints.push(boxed(g::Constraint {
                 type_: constraint_type::UNIQUE,
                 kind: g::ConstraintKind::UniqueConstraint(g::UniqueConstraint {
                     is_primary_key: *primary_key,
-                    // `DConstants::INVALID_INDEX`: the columns are by name
-                    index: u64::MAX,
+                    // a column constraint is by index, a table constraint by name
+                    // (`DConstants::INVALID_INDEX`)
+                    index: match (column_level, columns.as_slice()) {
+                        (true, [column]) => logical_index(*column),
+                        _ => u64::MAX,
+                    },
                     columns: columns.iter().map(|c| table.columns[*c].name.clone()).collect(),
                     check_mode: None,
                 }),

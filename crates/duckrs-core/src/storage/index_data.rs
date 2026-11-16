@@ -81,18 +81,11 @@ impl TableIndex {
     /// `AddIndex` of a table: its keys in the order of its constraints, then its indexes. C++ reads
     /// back the first ones by position and the last ones by name.
     pub fn all_of(table: &TableCatalogEntry, block_size: usize, version: StorageVersion) -> Vec<Self> {
-        // the NOT NULL go first in what a table says of its constraints
-        let not_null = table
-            .logical_columns()
-            .iter()
-            .filter(|column| column.definition.is_some_and(|d| d.not_null))
-            .count();
         let mut indexes = Vec::new();
         for (position, constraint) in table.constraints.iter().enumerate() {
-            let position = not_null + position;
             let (kind, columns, unique) = match constraint {
-                TableConstraint::Check { .. } => continue,
-                TableConstraint::Unique { columns, primary_key } => {
+                TableConstraint::Check { .. } | TableConstraint::NotNull(_) => continue,
+                TableConstraint::Unique { columns, primary_key, .. } => {
                     (if *primary_key { "PRIMARY" } else { "UNIQUE" }, columns, true)
                 }
                 TableConstraint::ForeignKey(key) => ("FOREIGN", &key.columns, false),

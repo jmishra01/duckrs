@@ -1331,6 +1331,7 @@ test/sql/constraints/foreignkey/fk_4365.test
 test/sql/constraints/foreignkey/fk_alter_preserves_parent_dependency.test
 test/sql/constraints/foreignkey/fk_case_insensitivity.test
 test/sql/constraints/foreignkey/fk_implicit_primary_key.test
+test/sql/constraints/foreignkey/fk_self_reference_tostring.test
 test/sql/constraints/foreignkey/foreign_key_matching_columns.test
 test/sql/constraints/foreignkey/test_action.test
 test/sql/constraints/foreignkey/test_fk_alter.test
@@ -1366,6 +1367,7 @@ test/sql/constraints/primarykey/test_pk_updel_local.test
 test/sql/constraints/primarykey/test_pk_updel_multi_column.test
 test/sql/constraints/primarykey/test_primary_key.test
 test/sql/constraints/test_constraint_with_updates.test
+test/sql/constraints/test_named_column_constraints.test
 test/sql/constraints/test_not_null.test
 test/sql/constraints/unique/test_unique.test
 test/sql/constraints/unique/test_unique_error.test
@@ -3125,6 +3127,7 @@ test/sql/peg_parser/transformer/trim.test
 test/sql/peg_parser/transformer/use_statement.test
 test/sql/peg_parser/unterminated_literals.test
 test/sql/pg_catalog/pg_attribute.test
+test/sql/pg_catalog/pg_constraint.test
 test/sql/pg_catalog/pg_database.test
 test/sql/pg_catalog/pg_enum.test
 test/sql/pg_catalog/pg_index.test
@@ -3969,8 +3972,11 @@ test/sql/subquery/table/test_table_subquery.test
 test/sql/subquery/table/test_unnamed_subquery.test
 test/sql/subquery/test_neumann.test
 test/sql/table_function/database_oid.test
+test/sql/table_function/duckdb_constraints.test
+test/sql/table_function/duckdb_constraints_fk.test
 test/sql/table_function/duckdb_constraints_issue11284.test
 test/sql/table_function/duckdb_constraints_issue12863.test
+test/sql/table_function/duckdb_constraints_struct_check.test
 test/sql/table_function/duckdb_dialects.test
 test/sql/table_function/duckdb_functions_window.test
 test/sql/table_function/duckdb_indexes.test
@@ -3984,6 +3990,7 @@ test/sql/table_function/duckdb_tables.test
 test/sql/table_function/duckdb_types.test
 test/sql/table_function/duckdb_views.test
 test/sql/table_function/glob_prepared.test
+test/sql/table_function/information_schema.test
 test/sql/table_function/information_schema_fkey_constraint_names.test
 test/sql/table_function/information_schema_issue12867.test
 test/sql/table_function/information_schema_types.test
@@ -3992,6 +3999,7 @@ test/sql/table_function/range_cardinality_extremes.test
 test/sql/table_function/range_function_different_iterators.test
 test/sql/table_function/range_timestamp.test
 test/sql/table_function/range_timestamp_lateral_empty.test
+test/sql/table_function/sqlite_master.test
 test/sql/table_function/sqlite_master_connections.test
 test/sql/table_function/sqlite_master_quotes.test
 test/sql/table_function/test_information_schema_columns.test

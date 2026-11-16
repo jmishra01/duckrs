@@ -21,7 +21,6 @@ use duckrs_parser::ast::{
     sql_identifier,
 };
 use duckrs_parser::transformer::visit_expr_mut;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 fn text(value: &str) -> Value {
@@ -40,7 +39,7 @@ fn sql_string(value: &str) -> String {
 fn column_keys(table: &TableCatalogEntry, column: usize) -> (bool, bool) {
     let (mut primary, mut unique) = (false, false);
     for constraint in &table.constraints {
-        if let TableConstraint::Unique { columns, primary_key } = constraint
+        if let TableConstraint::Unique { columns, primary_key, .. } = constraint
             && columns.contains(&column)
         {
             if *primary_key {
@@ -802,14 +801,12 @@ impl Binder<'_> {
         let list = LogicalType::list(LogicalType::VARCHAR);
         let indexes = LogicalType::list(LogicalType::BIGINT);
         let mut rows = Vec::new();
-        let mut used = HashSet::new();
         for listed in self.listed_entries() {
             let TableOrView::Table(table) = &listed.entry else {
                 continue;
             };
             let names_of =
                 |columns: &[usize]| -> Vec<String> { columns.iter().map(|c| table.columns[*c].name.clone()).collect() };
-            let not_nulls = (0..table.columns.len()).filter(|c| table.columns[*c].not_null);
             // type, text, expression, columns, referenced table and columns, the end of the name
             type Row = (
                 &'static str,
@@ -820,20 +817,8 @@ impl Binder<'_> {
                 Vec<String>,
                 &'static str,
             );
-            let mut constraints: Vec<Row> = not_nulls
-                .map(|c| {
-                    let name = sql_identifier(&table.columns[c].name);
-                    (
-                        "NOT NULL",
-                        format!("{name} NOT NULL"),
-                        None,
-                        vec![c],
-                        None,
-                        Vec::new(),
-                        "not_null",
-                    )
-                })
-                .collect();
+            // in the order the table has them (`NotNullConstraint::ToString` is "NOT NULL")
+            let mut constraints: Vec<Row> = Vec::new();
             for constraint in &table.constraints {
                 let quoted = |columns: &[usize]| {
                     columns
@@ -843,9 +828,41 @@ impl Binder<'_> {
                         .join(", ")
                 };
                 constraints.push(match constraint {
+                    TableConstraint::NotNull(column) => (
+                        "NOT NULL",
+                        "NOT NULL".to_string(),
+                        None,
+                        vec![*column],
+                        None,
+                        Vec::new(),
+                        "not_null",
+                    ),
                     TableConstraint::Check { parsed, .. } => {
                         let mut columns = Vec::new();
                         visit_expr_mut(&mut parsed.clone(), &mut |e: &mut Expr| {
+                            // a lambda's parameters are no columns (an arrow is the JSON operator here,
+                            // as a CHECK refuses the arrow lambdas that read columns)
+                            if let ExprKind::Lambda {
+                                lhs,
+                                expr: body,
+                                syntax: duckrs_parser::ast::LambdaSyntax::Keyword,
+                            } = &mut e.kind
+                            {
+                                let mut parameters = Vec::new();
+                                visit_expr_mut(lhs, &mut |p: &mut Expr| {
+                                    if let ExprKind::ColumnRef(names) = &p.kind {
+                                        parameters.push(names[0].clone());
+                                    }
+                                });
+                                visit_expr_mut(body, &mut |inner: &mut Expr| {
+                                    if let ExprKind::ColumnRef(names) = &inner.kind
+                                        && parameters.iter().any(|p| p.eq_ignore_ascii_case(&names[0]))
+                                    {
+                                        inner.kind = ExprKind::Default;
+                                    }
+                                });
+                                **lhs = Expr::from(ExprKind::Default);
+                            }
                             if let ExprKind::ColumnRef(parts) = &e.kind {
                                 let at = usize::from(parts.len() > 1 && parts[0].eq_ignore_ascii_case(&table.name));
                                 columns.extend(parts.get(at).and_then(|name| table.column_index(name)));
@@ -862,7 +879,7 @@ impl Binder<'_> {
                             "check",
                         )
                     }
-                    TableConstraint::Unique { columns, primary_key } => {
+                    TableConstraint::Unique { columns, primary_key, .. } => {
                         let (kind, end) = if *primary_key {
                             ("PRIMARY KEY", "pkey")
                         } else {
@@ -916,13 +933,8 @@ impl Binder<'_> {
                 for column in names.iter().chain(&referenced) {
                     name += &format!("{}_", column.to_lowercase());
                 }
+                // `GetConstraintName`: names can repeat
                 name += end;
-                let base = name.clone();
-                let mut number = 2;
-                while !used.insert(name.clone()) {
-                    name = format!("{base}_{number}");
-                    number += 1;
-                }
                 let index = rows.len() as i64;
                 let temporary = listed.schema.name.eq_ignore_ascii_case(TEMP_SCHEMA);
                 let varchars = |names: Vec<String>| {

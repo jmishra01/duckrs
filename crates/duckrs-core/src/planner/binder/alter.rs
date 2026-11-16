@@ -540,10 +540,15 @@ impl Binder<'_> {
                         .clone()
                         .unwrap_or_else(|| BoundExpr::constant(Value::null(definition.ty.clone()))),
                 );
+                // the constraints of the column, as written on it
+                if *not_null {
+                    alter.constraints.push(TableConstraint::NotNull(alter.columns.len()));
+                }
                 if *unique {
                     alter.constraints.push(TableConstraint::Unique {
                         columns: vec![alter.columns.len()],
                         primary_key: false,
+                        column_level: true,
                     });
                 }
                 alter.columns.push(definition);
@@ -627,6 +632,10 @@ impl Binder<'_> {
                     return Err(binder_error("Unsupported constraint for generated column!"));
                 }
                 let index = column_index(&table, &path[0])?;
+                // `DuckTableEntry::SetNotNull`: the constraint goes last, once
+                if !alter.constraints.iter().any(|c| matches!(c, TableConstraint::NotNull(i) if *i == index)) {
+                    alter.constraints.push(TableConstraint::NotNull(index));
+                }
                 alter.columns[index].not_null = true;
                 alter.verify = true;
             }
@@ -638,7 +647,7 @@ impl Binder<'_> {
                 }
                 let index = column_index(&table, &path[0])?;
                 let in_primary_key = table.constraints.iter().any(
-                    |c| matches!(c, TableConstraint::Unique { columns, primary_key: true } if columns.contains(&index)),
+                    |c| matches!(c, TableConstraint::Unique { columns, primary_key: true, .. } if columns.contains(&index)),
                 );
                 if in_primary_key {
                     return Err(catalog_error(format!(
@@ -647,6 +656,7 @@ impl Binder<'_> {
                     )));
                 }
                 alter.columns[index].not_null = false;
+                alter.constraints.retain(|c| !matches!(c, TableConstraint::NotNull(i) if *i == index));
             }
             AlterKind::AddConstraint(constraint) => add_constraint(&mut alter, constraint)?,
             AlterKind::SetPartitionedBy(_) => {
@@ -753,6 +763,13 @@ fn remove_column(alter: &mut BoundTableAlter, index: usize) -> Result<()> {
     for constraint in &table.constraints {
         let mut constraint = constraint.clone();
         match &mut constraint {
+            // `UpdateConstraintsOnColumnDrop`: the column's goes with it
+            TableConstraint::NotNull(column) => {
+                if *column == index {
+                    continue;
+                }
+                *column = shifted(*column);
+            }
             TableConstraint::Check { expression, .. } => {
                 let columns = referenced_columns(expression);
                 if columns.contains(&index) {
@@ -769,7 +786,7 @@ fn remove_column(alter: &mut BoundTableAlter, index: usize) -> Result<()> {
                     }
                 });
             }
-            TableConstraint::Unique { columns, primary_key } => {
+            TableConstraint::Unique { columns, primary_key, .. } => {
                 if columns.contains(&index) {
                     if columns.len() == 1 {
                         let kind = if *primary_key { "PRIMARY KEY" } else { "UNIQUE" };
@@ -848,6 +865,7 @@ fn add_constraint(alter: &mut BoundTableAlter, constraint: &Constraint) -> Resul
         let TableConstraint::Unique {
             columns: existing,
             primary_key: existing_primary,
+            ..
         } = existing
         else {
             continue;
@@ -869,15 +887,22 @@ fn add_constraint(alter: &mut BoundTableAlter, constraint: &Constraint) -> Resul
             });
         }
     }
+    // `BindNewConstraints`: a primary key brings a NOT NULL for each of its columns without one
+    let mut implied = Vec::new();
     if *primary_key {
         for column in &key {
+            if !alter.columns[*column].not_null {
+                implied.push(TableConstraint::NotNull(*column));
+            }
             alter.columns[*column].not_null = true;
         }
     }
     alter.constraints.push(TableConstraint::Unique {
         columns: key,
         primary_key: *primary_key,
+        column_level: false,
     });
+    alter.constraints.extend(implied);
     alter.verify = true;
     Ok(())
 }
