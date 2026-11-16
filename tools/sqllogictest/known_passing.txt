@@ -173,6 +173,7 @@ test/fuzzer/pedro/rename_table_index_storage.test
 test/fuzzer/pedro/restart_current_time.test
 test/fuzzer/pedro/restart_random.test
 test/fuzzer/pedro/returning_clause_sizes_not_match.test
+test/fuzzer/pedro/returning_clause_with_rowid.test
 test/fuzzer/pedro/rollup_wrong_result.test
 test/fuzzer/pedro/sample_limit_overflow.test
 test/fuzzer/pedro/segment_tree_index_issue.test
@@ -314,6 +315,7 @@ test/issues/general/test_23940.test
 test/issues/general/test_24049.test
 test/issues/general/test_2407.test
 test/issues/general/test_2416.test
+test/issues/general/test_24212.test
 test/issues/general/test_24328.test
 test/issues/general/test_24442.test
 test/issues/general/test_24542.test
@@ -3291,6 +3293,7 @@ test/sql/projection/test_simple_projection.test
 test/sql/projection/test_table_star.test
 test/sql/projection/test_value_list.test
 test/sql/returning/no_crash_when_no_returning_columns.test
+test/sql/returning/returning_delete.test
 test/sql/returning/returning_delete_list.test
 test/sql/returning/returning_delete_same_transaction.test
 test/sql/returning/returning_insert.test

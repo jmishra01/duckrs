@@ -521,10 +521,15 @@ impl LogicalOperator {
             LogicalOperatorKind::Projection { expressions, .. } => {
                 expressions.iter().map(|e| e.return_type.clone()).collect()
             }
+            // and the `rowid` of each row
             LogicalOperatorKind::Delete {
                 table, returning: true, ..
+            } => {
+                let mut types = table.types();
+                types.push(LogicalType::BIGINT);
+                types
             }
-            | LogicalOperatorKind::Insert {
+            LogicalOperatorKind::Insert {
                 table, returning: true, ..
             }
             | LogicalOperatorKind::Update {
@@ -668,8 +673,8 @@ impl LogicalOperator {
                 table,
                 table_index,
                 returning,
-            }
-            | LogicalOperatorKind::Insert {
+            } => numbered(*table_index, if *returning { table.columns.len() + 1 } else { 1 }),
+            LogicalOperatorKind::Insert {
                 table,
                 table_index,
                 returning,

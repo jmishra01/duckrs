@@ -882,6 +882,8 @@ pub struct Binder<'a> {
     working_tables: Vec<WorkingTable>,
     /// RETURNING of a MERGE can read `merge_action`
     merge_action_column: bool,
+    /// DELETE ... RETURNING: the statement gives the `rowid` of each row after its columns
+    returning_row_id: bool,
     /// the aggregate of an outer query's columns that stopped this binder
     pending_outer_aggregate: Option<ast::FunctionExpr>,
 }
@@ -971,6 +973,7 @@ impl<'a> Binder<'a> {
             correlated: Arc::default(),
             working_tables: Vec::new(),
             merge_action_column: false,
+            returning_row_id: false,
             pending_outer_aggregate: None,
         };
         // the transition tables of the trigger whose body this binds

@@ -3640,6 +3640,9 @@ impl PhysicalOperator for PhysicalDelete {
         let mut storage = self.table.write_storage()?;
         let mut kept = ColumnDataCollection::new(storage.types().to_vec());
         let mut deleted = ColumnDataCollection::new(storage.types().to_vec());
+        // with RETURNING, the `rowid` of each deleted row comes after its columns
+        let ids = self.table.row_ids(count);
+        let mut deleted_ids = Vec::new();
         for (index, chunk) in storage.chunks().enumerate() {
             let first_row = index * STANDARD_VECTOR_SIZE;
             let (gone, stay): (Vec<u32>, Vec<u32>) =
@@ -3647,6 +3650,9 @@ impl PhysicalOperator for PhysicalDelete {
             if gone.is_empty() {
                 kept.append(chunk);
                 continue;
+            }
+            if self.returning {
+                deleted_ids.extend(gone.iter().map(|row| ids.id(first_row + *row as usize) as i64));
             }
             for (rows, target) in [(stay, &mut kept), (gone, &mut deleted)] {
                 let count = rows.len();
@@ -3663,6 +3669,21 @@ impl PhysicalOperator for PhysicalDelete {
         let mut removed: Vec<usize> = positions.iter().copied().collect();
         removed.sort_unstable();
         self.table.rows_moved(&removed, count);
+        let deleted = if self.returning {
+            let mut with_ids = ColumnDataCollection::new(self.types.clone());
+            let mut at = 0;
+            for chunk in deleted.chunks() {
+                let mut column = Vector::new(LogicalType::BIGINT, chunk.len());
+                column.data_mut::<i64>()[..chunk.len()].copy_from_slice(&deleted_ids[at..at + chunk.len()]);
+                at += chunk.len();
+                let mut columns = chunk.columns().to_vec();
+                columns.push(column);
+                with_ids.append(&DataChunk::from_columns(columns, chunk.len()));
+            }
+            with_ids
+        } else {
+            deleted
+        };
         *self.output.lock() = changed_rows_output(&self.types, deleted, removed.len() as u64, self.returning);
         Ok(())
     }

@@ -2831,12 +2831,13 @@ impl Binder<'_> {
         self.bind_context = BindContext::default();
         // the generated columns too, computed from the stored ones the statement returns (not with
         // MERGE, whose `merge_action` comes after the stored columns)
-        let logical = !table.generated.is_empty() && !self.merge_action_column;
+        let logical = !table.generated.is_empty();
         if logical {
             let names = table.logical_columns().iter().map(|c| c.name.to_string()).collect();
             let mut binding = super::generated::table_binding(table, alias, table_index, names);
             binding.schema = Some(table.schema.clone());
-            binding.row_id = None;
+            // past the logical columns, and moved after the stored ones below
+            binding.row_id = (self.returning_row_id && !self.merge_action_column).then(|| table.logical_columns().len());
             self.bind_context.add_binding(binding);
         } else {
             self.bind_context.add_binding(Binding {
@@ -2846,7 +2847,7 @@ impl Binder<'_> {
                 table_index,
                 names: table.columns.iter().map(|c| c.name.clone()).collect(),
                 types: table.types(),
-                row_id: None,
+                row_id: self.returning_row_id.then_some(table.columns.len()),
                 virtual_columns: Vec::new(),
                 generated: Vec::new(),
             });
@@ -2883,8 +2884,12 @@ impl Binder<'_> {
         }
         let names: Vec<String> = list.iter().map(expression_name).collect();
         if self.merge_action_column {
-            // a virtual column: `*` left it out
-            let columns = table.columns.len();
+            // a virtual column: `*` left it out. Past the logical columns, if the binding has those.
+            let columns = if logical {
+                table.logical_columns().len()
+            } else {
+                table.columns.len()
+            };
             let mut hidden: Vec<String> = (0..columns).map(|i| format!("\u{1}{i}")).collect();
             hidden.push("merge_action".to_string());
             let mut types = vec![LogicalType::SQLNULL; columns];
@@ -2916,13 +2921,17 @@ impl Binder<'_> {
                     }))
                 })
                 .collect();
+            let row_id = columns.len();
             for e in &mut expressions {
                 e.walk_mut(&mut |e| {
                     if let BoundExprKind::ColumnRef { binding, depth: 0 } = &mut e.kind
                         && binding.table_index == table_index
-                        && let Some(Some(position)) = stored.get(binding.column_index)
                     {
-                        binding.column_index = *position;
+                        if binding.column_index == row_id {
+                            binding.column_index = table.columns.len();
+                        } else if let Some(Some(position)) = stored.get(binding.column_index) {
+                            binding.column_index = *position;
+                        }
                     }
                 });
             }
@@ -3004,7 +3013,11 @@ impl Binder<'_> {
             );
             if returning {
                 let alias = Self::write_alias(&delete.table, &table);
-                return binder.bind_returning(plan, &delete.returning, &table, table_index, alias);
+                // `rowid` is a virtual column a DELETE can return
+                binder.returning_row_id = true;
+                let result = binder.bind_returning(plan, &delete.returning, &table, table_index, alias);
+                binder.returning_row_id = false;
+                return result;
             }
             Ok(Self::changed_rows(plan))
         })
