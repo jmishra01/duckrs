@@ -804,7 +804,12 @@ pub(super) fn table_info(
                     expression: Some(Box::new(to_stored::expression(parsed)?)),
                 }),
             })),
-            TableConstraint::Unique { columns, primary_key, column_level } => constraints.push(boxed(g::Constraint {
+            TableConstraint::Unique {
+                columns,
+                primary_key,
+                column_level,
+                check_mode,
+            } => constraints.push(boxed(g::Constraint {
                 type_: constraint_type::UNIQUE,
                 kind: g::ConstraintKind::UniqueConstraint(g::UniqueConstraint {
                     is_primary_key: *primary_key,
@@ -815,7 +820,11 @@ pub(super) fn table_info(
                         _ => u64::MAX,
                     },
                     columns: columns.iter().map(|c| table.columns[*c].name.clone()).collect(),
-                    check_mode: None,
+                    check_mode: match check_mode {
+                        duckrs_parser::ast::ConstraintCheckMode::Default => None,
+                        duckrs_parser::ast::ConstraintCheckMode::Immediate => Some(1),
+                        duckrs_parser::ast::ConstraintCheckMode::Deferred => Some(2),
+                    },
                 }),
             })),
             TableConstraint::ForeignKey(key) => {
@@ -852,7 +861,11 @@ pub(super) fn table_info(
         sort_keys: Vec::new(),
         options: Vec::new(),
     });
-    let mut info = to_stored::create_info(catalog_type::TABLE_ENTRY, entry_path(catalog, schema, &table.name), kind);
+    let mut info = to_stored::create_info(
+        catalog_type::TABLE_ENTRY,
+        entry_path(catalog, schema, &table.name),
+        kind,
+    );
     info.comment = table.comment.lock().clone().map(Value::varchar);
     Ok(info)
 }

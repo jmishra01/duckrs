@@ -399,7 +399,11 @@ impl DatabaseInstance {
     fn has_foreign_indexes(&self) -> bool {
         self.catalog.schemas().iter().any(|schema| {
             schema.tables_and_views().iter().any(|entry| match entry {
-                TableOrView::Table(table) => table.indexes.read().iter().any(|index| !index.index_type.eq_ignore_ascii_case("ART")),
+                TableOrView::Table(table) => table
+                    .indexes
+                    .read()
+                    .iter()
+                    .any(|index| !index.index_type.eq_ignore_ascii_case("ART")),
                 TableOrView::View(_) => false,
             })
         })
@@ -1223,7 +1227,9 @@ impl ClientContext {
             options.max_expression_depth = depth as usize;
         }
         options.integer_division = self.setting_text("integer_division") == "true";
-        options.regex_full_match = self.setting_text("regex_match_operator_semantics").eq_ignore_ascii_case("full");
+        options.regex_full_match = self
+            .setting_text("regex_match_operator_semantics")
+            .eq_ignore_ascii_case("full");
         options
     }
 
@@ -1876,7 +1882,10 @@ impl ClientContext {
             }
         }
         // outside of a transaction only a commit that is made to fail needs one of these
-        let undo = (write && self.transaction.is_none() && self.commit_may_fail()).then(|| self.catalog().snapshot());
+        // as does one that writes to a table with a DEFERRED key, which its commit checks
+        let deferred = write && self.transaction.is_none() && !self.catalog().deferred_tables().is_empty();
+        let undo = (write && self.transaction.is_none() && (deferred || self.commit_may_fail()))
+            .then(|| self.catalog().snapshot());
         // what isn't a change to rows can conflict with what transactions did to the catalog
         let changes_entries = write
             && !matches!(
@@ -1938,11 +1947,23 @@ impl ClientContext {
                 transaction.apply_invalidation_policy(error.kind);
             }
         } else if self.transaction.is_none() {
-            if let Some(snapshot) = undo
-                && let Some(error) = self.forced_commit_failure()
-            {
-                self.catalog().restore(snapshot);
-                return Err(error);
+            if let Some(snapshot) = undo {
+                let failure = if deferred {
+                    self.catalog()
+                        .deferred_tables()
+                        .iter()
+                        .try_for_each(|table| {
+                            crate::execution::constraints::check_deferred_keys(table, &*table.rows()?, |_| true)
+                        })
+                        .err()
+                        .map(crate::catalog::failed_commit)
+                } else {
+                    None
+                };
+                if let Some(error) = failure.or_else(|| self.forced_commit_failure()) {
+                    self.catalog().restore(snapshot);
+                    return Err(error);
+                }
             }
             // also for a SELECT, as `nextval` is one
             self.log_commit()?;
@@ -2599,7 +2620,11 @@ impl ClientContext {
                             {
                                 return Err(system());
                             }
-                            let kind = if table_macro { "Table Macro Function" } else { "Macro Function" };
+                            let kind = if table_macro {
+                                "Table Macro Function"
+                            } else {
+                                "Macro Function"
+                            };
                             return Err(missing_entry(kind, name));
                         }
                     }
@@ -3028,7 +3053,10 @@ impl ClientContext {
                     return Err(Error::new(ErrorKind::Binder, "SET value cannot contain subqueries"));
                 }
                 let bound = bind_constant_expression(&self.catalog(), value).map_err(|error| {
-                    if error.message.contains("was not found because the FROM clause is missing") {
+                    if error
+                        .message
+                        .contains("was not found because the FROM clause is missing")
+                    {
                         Error::new(ErrorKind::Binder, "SET value cannot contain column names")
                     } else {
                         error
@@ -3848,7 +3876,12 @@ impl ClientContext {
                 }
             }
         }
-        schema.create_macro(&info.name.name, *table_macro, macros, on_create_conflict(info.on_conflict))
+        schema.create_macro(
+            &info.name.name,
+            *table_macro,
+            macros,
+            on_create_conflict(info.on_conflict),
+        )
     }
 
     /// `CREATE TYPE` (`Binder::Bind(CreateStatement)` + `PhysicalCreateType`).
@@ -3922,16 +3955,15 @@ impl ClientContext {
 
     /// `DROP TABLE`, `VIEW`, `SEQUENCE`, `MACRO` and `SCHEMA` (`Catalog::DropEntry`).
     fn drop_entry(&mut self, info: &DropInfo) -> Result<()> {
-        let internal_entry =
-            |name: &str| {
-                Error::new(
-                    ErrorKind::Catalog,
-                    format!(
-                        "Cannot drop internal catalog entry {}!",
-                        duckrs_parser::ast::sql_quoted_identifier(name)
-                    ),
-                )
-            };
+        let internal_entry = |name: &str| {
+            Error::new(
+                ErrorKind::Catalog,
+                format!(
+                    "Cannot drop internal catalog entry {}!",
+                    duckrs_parser::ast::sql_quoted_identifier(name)
+                ),
+            )
+        };
         let catalog = self.catalog();
         let temporary = catalog.schema_for(Some(TEMP_SCHEMA))?;
         let in_temp = info.name.qualification.is_empty()
@@ -7401,7 +7433,7 @@ mod tests {
         );
         assert_eq!(
             err(&mut context, "SELECT * FROM t"),
-            "Catalog Error: Table with name t does not exist!"
+            "Catalog Error: Table with name t does not exist!\nDid you mean \"pg_tables\"?"
         );
         run(&mut context, "CREATE TABLE t (abc INTEGER)");
         assert_eq!(

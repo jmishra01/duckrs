@@ -22,6 +22,7 @@ pub mod default_types;
 pub mod defaults;
 mod defaults_table;
 mod fork;
+pub(crate) use fork::failed_commit;
 mod row_ids;
 pub mod trigger;
 pub use fork::{CatalogVersions, Fork, RowVersions, TableOrigin, tick};
@@ -355,6 +356,9 @@ pub struct TableCatalogEntry {
     rewrites: std::sync::atomic::AtomicU64,
     /// What this is a copy of, for a transaction.
     origin: Option<TableOrigin>,
+    /// The committed rows that a transaction deleted before it added a DEFERRED key, whose keys its
+    /// commit still sees: C++ has them in no delete index of that key (a FIXME of its tests)
+    pub deleted_before_key: Mutex<Option<ColumnDataCollection>>,
     /// Which row is which. Rows added at the end are in here once somebody asks.
     row_ids: Mutex<Arc<RowIds>>,
     versions: Arc<Mutex<RowVersions>>,
@@ -567,6 +571,8 @@ pub struct TableKey {
     pub expressions: Option<Vec<BoundExpr>>,
     pub names: Vec<String>,
     pub primary_key: bool,
+    /// checked when committing (`ConstraintCheckMode::DEFERRED`)
+    pub deferred: bool,
 }
 
 pub use crate::execution::art::tree::UniqueKeys;
@@ -585,6 +591,8 @@ pub enum TableConstraint {
         primary_key: bool,
         /// written on the column (`UniqueConstraint::HasIndex`), which is how its SQL shows it
         column_level: bool,
+        /// a DEFERRED key holds at commit, not after each statement
+        check_mode: duckrs_parser::ast::ConstraintCheckMode,
     },
     ForeignKey(ForeignKey),
     /// `NotNullConstraint` of the column at this index, at its place among the others: the
@@ -644,6 +652,7 @@ impl TableCatalogEntry {
             index_trees: Mutex::default(),
             rewrites: Default::default(),
             origin: None,
+            deleted_before_key: Mutex::default(),
             row_ids: Mutex::default(),
             versions: Arc::default(),
             row_group_rows: std::sync::atomic::AtomicUsize::new(ROW_GROUP_ROWS),
@@ -752,6 +761,19 @@ impl TableCatalogEntry {
         self.rewrites.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Whether a PRIMARY KEY or UNIQUE of the table is DEFERRED, which a commit checks.
+    pub fn has_deferred_keys(&self) -> bool {
+        self.constraints.iter().any(|constraint| {
+            matches!(
+                constraint,
+                TableConstraint::Unique {
+                    check_mode: duckrs_parser::ast::ConstraintCheckMode::Deferred,
+                    ..
+                }
+            )
+        })
+    }
+
     /// All that can have a tree, in the order that a scan tries them: the keys of constraints and
     /// then the indexes, as `TableIndexList` has them.
     pub fn scan_keys(&self) -> Vec<TableKey> {
@@ -769,6 +791,7 @@ impl TableCatalogEntry {
                     expressions: None,
                     names: columns.iter().map(|c| self.columns[*c].name.clone()).collect(),
                     primary_key: false,
+                    deferred: false,
                 })
             })
             .collect();
@@ -777,6 +800,7 @@ impl TableCatalogEntry {
             expressions: Some(index.expressions.clone()),
             names: index.names.clone(),
             primary_key: false,
+            deferred: false,
         }));
         keys
     }
@@ -921,11 +945,17 @@ impl TableCatalogEntry {
             .constraints
             .iter()
             .filter_map(|constraint| match constraint {
-                TableConstraint::Unique { columns, primary_key, .. } => Some(TableKey {
+                TableConstraint::Unique {
+                    columns,
+                    primary_key,
+                    check_mode,
+                    ..
+                } => Some(TableKey {
                     columns: columns.clone(),
                     expressions: None,
                     names: columns.iter().map(|c| self.columns[*c].name.clone()).collect(),
                     primary_key: *primary_key,
+                    deferred: *check_mode == duckrs_parser::ast::ConstraintCheckMode::Deferred,
                 }),
                 _ => None,
             })
@@ -940,6 +970,7 @@ impl TableCatalogEntry {
                     expressions: Some(index.expressions.clone()),
                     names: index.names.clone(),
                     primary_key: false,
+                    deferred: false,
                 }),
         );
         keys
@@ -1332,7 +1363,10 @@ impl SchemaCatalogEntry {
 
     /// What `COMMENT ON TYPE` said of a type.
     pub fn type_comment(&self, name: &str) -> Option<String> {
-        self.types.read().get(&key(name)).and_then(|(_, comment)| comment.clone())
+        self.types
+            .read()
+            .get(&key(name))
+            .and_then(|(_, comment)| comment.clone())
     }
 
     /// `COMMENT ON TYPE`: false if there is no such type.
@@ -1348,7 +1382,11 @@ impl SchemaCatalogEntry {
 
     /// The custom types, by name.
     pub fn type_entries(&self) -> Vec<(String, LogicalType)> {
-        self.types.read().iter().map(|(n, (t, _))| (n.clone(), t.clone())).collect()
+        self.types
+            .read()
+            .iter()
+            .map(|(n, (t, _))| (n.clone(), t.clone()))
+            .collect()
     }
 
     pub fn sequence_entries(&self) -> Vec<Arc<SequenceCatalogEntry>> {
@@ -1992,11 +2030,16 @@ impl SchemaCatalogEntry {
         if self.get_sequence(name).is_none() {
             return Ok(false);
         }
-        let mut users: Vec<(&'static str, String)> =
-            self.tables_using_sequence(name).into_iter().map(|t| ("table", t)).collect();
+        let mut users: Vec<(&'static str, String)> = self
+            .tables_using_sequence(name)
+            .into_iter()
+            .map(|t| ("table", t))
+            .collect();
         // the entry that owns it depends on it too
         if let Some(owner) = self.owner_of(name)
-            && !users.iter().any(|(k, u)| *k == owner.0 && u.eq_ignore_ascii_case(&owner.1))
+            && !users
+                .iter()
+                .any(|(k, u)| *k == owner.0 && u.eq_ignore_ascii_case(&owner.1))
         {
             users.push(owner);
         }
@@ -2134,6 +2177,22 @@ impl Catalog {
 
     pub fn set_storage_version(&self, version: duckrs_common::serializer::StorageVersion) {
         *self.storage_version.write() = Some(version);
+    }
+
+    /// `VerifyConstraintCheckModeStorageVersion`: a file before v2.0.0 has no place for IMMEDIATE or
+    /// DEFERRED. The caller leaves out temporary tables.
+    pub fn check_constraint_check_mode(&self, check_mode: duckrs_parser::ast::ConstraintCheckMode) -> Result<()> {
+        if check_mode == duckrs_parser::ast::ConstraintCheckMode::Default {
+            return Ok(());
+        }
+        match self.storage_version() {
+            Some(version) if version < duckrs_common::serializer::StorageVersion::V2_0_0 => Err(Error::new(
+                ErrorKind::Binder,
+                "Explicit constraint check mode is only supported for storage versions v2.0.0 and higher.\nUse an \
+                 in-memory database, or ATTACH with (STORAGE_VERSION 'v2.0.0')",
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// `CheckTypeIsSupported`: what files before a storage version can't hold.
@@ -2415,6 +2474,21 @@ impl Catalog {
         SESSION_TEMP.with_borrow(Clone::clone)
     }
 
+    /// The tables with a DEFERRED key, which a commit checks.
+    pub(crate) fn deferred_tables(&self) -> Vec<Arc<TableCatalogEntry>> {
+        let mut found = Vec::new();
+        for schema in self.schema_map().values() {
+            for entry in schema.tables.read().values() {
+                if let TableOrView::Table(table) = entry
+                    && table.has_deferred_keys()
+                {
+                    found.push(table.clone());
+                }
+            }
+        }
+        found
+    }
+
     /// The schemas as the connection on this thread sees them.
     fn schema_map(&self) -> BTreeMap<String, Arc<SchemaCatalogEntry>> {
         let mut schemas = self.schemas.read().clone();
@@ -2485,7 +2559,11 @@ impl Catalog {
         // (`CatalogSet::SimilarEntry` scores default entries without creating them)
         let mut candidates: Vec<(String, f64, String)> = schemas
             .iter()
-            .filter_map(|entry| entry.similar_entry(name).map(|(score, similar)| (entry.name.clone(), score, similar)))
+            .filter_map(|entry| {
+                entry
+                    .similar_entry(name)
+                    .map(|(score, similar)| (entry.name.clone(), score, similar))
+            })
             .collect();
         let mut system: Vec<(&str, f64, &str)> = Vec::new();
         for (view_schema, view, _) in defaults_table_views() {
@@ -2496,7 +2574,11 @@ impl Catalog {
                 None => system.push((view_schema, score, view)),
             }
         }
-        candidates.extend(system.into_iter().map(|(s, score, v)| (s.to_string(), score, v.to_string())));
+        candidates.extend(
+            system
+                .into_iter()
+                .map(|(s, score, v)| (s.to_string(), score, v.to_string())),
+        );
         // `SimilarEntriesInSchemas`: the best of all, ties kept
         let mut seen: Vec<(f64, String)> = Vec::new();
         let mut unseen: Vec<(f64, String)> = Vec::new();
@@ -2680,6 +2762,9 @@ mod tests {
                 .is_none()
         );
         let err = catalog.get_table(None, "nope").unwrap_err();
-        assert_eq!(err.to_string(), "Catalog Error: Table with name nope does not exist!");
+        assert_eq!(
+            err.to_string(),
+            "Catalog Error: Table with name nope does not exist!\nDid you mean \"pg_enum\"?"
+        );
     }
 }

@@ -1325,6 +1325,18 @@ test/sql/constraints/check/check_qualified_names.test
 test/sql/constraints/check/check_struct.test
 test/sql/constraints/check/test_check.test
 test/sql/constraints/check/test_update_check_non_updated_columns.test
+test/sql/constraints/deferred/test_alter_constraint_check_mode.test
+test/sql/constraints/deferred/test_constraint_check_mode_persistence.test
+test/sql/constraints/deferred/test_constraint_check_mode_storage_version.test
+test/sql/constraints/deferred/test_deferred_alter.test
+test/sql/constraints/deferred/test_deferred_compatibility.test
+test/sql/constraints/deferred/test_deferred_delete_reinsert.test
+test/sql/constraints/deferred/test_deferred_metadata.test
+test/sql/constraints/deferred/test_deferred_persistence.test
+test/sql/constraints/deferred/test_deferred_statements.test
+test/sql/constraints/deferred/test_deferred_syntax.test
+test/sql/constraints/deferred/test_deferred_trigger.test
+test/sql/constraints/deferred/test_deferred_unique_pk.test
 test/sql/constraints/foreignkey/fk_19469.test
 test/sql/constraints/foreignkey/fk_4309.test
 test/sql/constraints/foreignkey/fk_4365.test
@@ -4780,6 +4792,7 @@ test/sql/window/test_window_clause_scope.test
 test/sql/window/test_window_constant_aggregate.test
 test/sql/window/test_window_constant_allocator.test
 test/sql/window/test_window_dbplyr.test
+test/sql/window/test_window_degenerate_frames.test
 test/sql/window/test_window_distinct.test
 test/sql/window/test_window_filter.test
 test/sql/window/test_window_finalize_race.test

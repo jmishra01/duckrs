@@ -72,7 +72,7 @@ pub(super) fn check_key_types(columns: &[ColumnDefinition], key: &[usize]) -> Re
 fn find_referenced_key(
     table: &str,
     columns: &[ColumnDefinition],
-    uniques: &[(Vec<usize>, bool)],
+    uniques: &[(Vec<usize>, bool, bool)],
     foreign: &[String],
     referenced: &[String],
 ) -> Result<Vec<usize>> {
@@ -85,7 +85,12 @@ fn find_referenced_key(
         )));
     }
     let mut found_constraint = false;
-    for (key, primary_key) in uniques {
+    let mut found_deferred = false;
+    // `ThrowDeferredReferencedKey`
+    let deferred_key = || {
+        binder_error("Failed to create foreign key: the referenced PRIMARY KEY or UNIQUE constraint cannot be DEFERRED")
+    };
+    for (key, primary_key, deferred) in uniques {
         if find_primary_key && !primary_key {
             continue;
         }
@@ -99,12 +104,23 @@ fn find_referenced_key(
                     names.join(",")
                 )));
             }
+            if *deferred {
+                return Err(deferred_key());
+            }
             return Ok(key.clone());
         }
         let wanted: Vec<Option<usize>> = referenced.iter().map(|name| column_index(columns, name)).collect();
         if key.len() == wanted.len() && key.iter().all(|c| wanted.contains(&Some(*c))) {
+            if *deferred {
+                // keep looking for one that is not deferred
+                found_deferred = true;
+                continue;
+            }
             return Ok(wanted.into_iter().flatten().collect());
         }
+    }
+    if found_deferred {
+        return Err(deferred_key());
     }
     if !found_constraint {
         let term = if find_primary_key {
@@ -226,14 +242,14 @@ impl Binder<'_> {
                     primary_key,
                     check_mode,
                 } => {
-                    if *check_mode == ConstraintCheckMode::Deferred {
-                        return Err(crate::unported("DEFERRED constraints"));
-                    }
                     if *primary_key && std::mem::replace(&mut has_primary_key, true) {
                         return Err(Error::new(
                             ErrorKind::Parser,
                             format!("table {} has more than one primary key", sql_quoted_identifier(table)),
                         ));
+                    }
+                    if !info.temporary && !schema.name.eq_ignore_ascii_case(crate::catalog::TEMP_SCHEMA) {
+                        self.catalog.check_constraint_check_mode(*check_mode)?;
                     }
                     let key = bind_unique(table, columns, *index, names)?;
                     check_key_types(columns, &key)?;
@@ -244,10 +260,13 @@ impl Binder<'_> {
                         columns: key,
                         primary_key: *primary_key,
                         column_level: index.is_some(),
+                        check_mode: *check_mode,
                     });
                 }
                 // `BindForeignKey`, in the order of the constraints: a key named twice
-                Constraint::ForeignKey { fk_columns, pk_columns, .. } => {
+                Constraint::ForeignKey {
+                    fk_columns, pk_columns, ..
+                } => {
                     let twice = |names: &[String]| {
                         names
                             .iter()
@@ -337,11 +356,20 @@ impl Binder<'_> {
             }
             foreign.push(index);
         }
-        let uniques_of = |constraints: &[TableConstraint]| -> Vec<(Vec<usize>, bool)> {
+        let uniques_of = |constraints: &[TableConstraint]| -> Vec<(Vec<usize>, bool, bool)> {
             constraints
                 .iter()
                 .filter_map(|c| match c {
-                    TableConstraint::Unique { columns, primary_key, .. } => Some((columns.clone(), *primary_key)),
+                    TableConstraint::Unique {
+                        columns,
+                        primary_key,
+                        check_mode,
+                        ..
+                    } => Some((
+                        columns.clone(),
+                        *primary_key,
+                        *check_mode == ConstraintCheckMode::Deferred,
+                    )),
                     _ => None,
                 })
                 .collect()
@@ -392,7 +420,8 @@ impl Binder<'_> {
         // keys compare in the order of the UNIQUE that they use
         let key = uniques
             .iter()
-            .map(|(key, _)| key)
+            .filter(|(_, _, deferred)| !deferred)
+            .map(|(key, ..)| key)
             .find(|key| key.len() == wanted.len() && key.iter().all(|c| wanted.contains(c)))
             .expect("find_referenced_key found it");
         let columns = key

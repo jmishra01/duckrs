@@ -85,9 +85,9 @@ impl TableIndex {
         for (position, constraint) in table.constraints.iter().enumerate() {
             let (kind, columns, unique) = match constraint {
                 TableConstraint::Check { .. } | TableConstraint::NotNull(_) => continue,
-                TableConstraint::Unique { columns, primary_key, .. } => {
-                    (if *primary_key { "PRIMARY" } else { "UNIQUE" }, columns, true)
-                }
+                TableConstraint::Unique {
+                    columns, primary_key, ..
+                } => (if *primary_key { "PRIMARY" } else { "UNIQUE" }, columns, true),
                 TableConstraint::ForeignKey(key) => ("FOREIGN", &key.columns, false),
             };
             let key = TableKey {
@@ -95,6 +95,7 @@ impl TableIndex {
                 expressions: None,
                 names: Vec::new(),
                 primary_key: false,
+                deferred: false,
             };
             let name = format!("{kind}_{}_{position}", table.name);
             indexes.push(Self::new(table, name, key, unique, block_size, version));
@@ -116,6 +117,7 @@ impl TableIndex {
             expressions: Some(index.expressions.clone()),
             names: index.names.clone(),
             primary_key: false,
+            deferred: false,
         };
         Self::new(table, index.name.clone(), key, index.unique, block_size, version)
     }

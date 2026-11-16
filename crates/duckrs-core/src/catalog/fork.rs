@@ -175,6 +175,37 @@ impl TableCatalogEntry {
         first_new_row.min(self.row_ids(count).first_from(MAX_ROW_ID))
     }
 
+    /// The rows of the table of the database that this transaction deleted.
+    pub(crate) fn deleted_committed_rows(&self) -> Result<Option<ColumnDataCollection>> {
+        let Some(origin) = &self.origin else {
+            return Ok(None);
+        };
+        let claimed = origin.claimed.lock();
+        if claimed.is_empty() {
+            return Ok(None);
+        }
+        let own = self.row_ids(self.row_count());
+        let present: HashSet<u64> = (0..self.row_count()).map(|position| own.id(position)).collect();
+        let rows = origin.table.rows()?;
+        let ids = origin.table.row_ids(rows.len());
+        let types = origin.table.types();
+        let mut deleted = ColumnDataCollection::new(types.clone());
+        for (index, chunk) in rows.chunks().enumerate() {
+            let mut output = DataChunk::new(&types);
+            for row in 0..chunk.len() {
+                let id = ids.id(index * STANDARD_VECTOR_SIZE + row);
+                if claimed.contains(&id) && !present.contains(&id) {
+                    let values: Vec<Value> = (0..types.len()).map(|c| chunk.column(c).get_value(row)).collect();
+                    output.append_row(&values)?;
+                }
+            }
+            if !output.is_empty() {
+                deleted.append(&output);
+            }
+        }
+        Ok((!deleted.is_empty()).then_some(deleted))
+    }
+
     /// The table of the database, as long as this copy has the same rows in the same places.
     pub(crate) fn same_as_origin(&self, rows: usize) -> Option<&Arc<Self>> {
         let origin = self.origin.as_ref()?;
@@ -652,6 +683,11 @@ impl Fork {
         let entries = changed_entries(&self.base, &self.catalog);
         let changed: HashSet<&str> = entries.iter().map(|entry| entry.key.as_str()).collect();
         self.check_drops(&entries)?;
+        // the DEFERRED keys among the rows as the transaction leaves them, also of the tables it
+        // created or altered; `prepare_table` checks the rows of others with them
+        for table in self.catalog.deferred_tables() {
+            constraints::check_deferred_keys(&table, &*table.rows()?, |_| true).map_err(failed_commit)?;
+        }
         // first what can fail, for a commit to do all or nothing
         let mut prepared = Vec::new();
         for table in &self.tables {
@@ -835,7 +871,7 @@ fn gone_table(table: &str, how: &str) -> Error {
     )
 }
 
-fn failed_commit(error: Error) -> Error {
+pub(crate) fn failed_commit(error: Error) -> Error {
     if error.kind == ErrorKind::Constraint {
         Error::new(ErrorKind::Transaction, format!("Failed to commit: {}", error.message))
     } else {

@@ -17,8 +17,13 @@ use duckrs_parser::ast::{Expr, ExprKind, InsertStatement, OnConflictAction, OnCo
 use duckrs_parser::transformer::visit_expr_mut;
 use std::collections::BTreeSet;
 
-fn unique_keys(table: &TableCatalogEntry) -> Vec<Vec<usize>> {
-    table.keys().into_iter().map(|key| key.columns).collect()
+/// The keys that can be conflict targets, and whether a DEFERRED one was left out.
+fn unique_keys(table: &TableCatalogEntry) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
+    let (deferred, keys): (Vec<_>, Vec<_>) = table.keys().into_iter().partition(|key| key.deferred);
+    (
+        keys.into_iter().map(|key| key.columns).collect(),
+        deferred.into_iter().map(|key| key.columns).collect(),
+    )
 }
 
 /// `DoUpdateSetQualify`: unqualified columns are the table's, not `excluded`'s.
@@ -54,8 +59,15 @@ impl Binder<'_> {
         info: &OnConflictInfo,
         table: &TableCatalogEntry,
     ) -> Result<OnConflict> {
-        let keys = unique_keys(table);
+        let (keys, deferred) = unique_keys(table);
         let targets: Vec<Vec<usize>> = if info.indexed_columns.is_empty() {
+            if !deferred.is_empty() {
+                // without a conflict target, every constraint is one
+                return Err(binder_error(
+                    "DEFERRED PRIMARY KEY or UNIQUE constraints cannot be ON CONFLICT targets, specify the ON \
+                     CONFLICT columns of a constraint that is not DEFERRED",
+                ));
+            }
             if keys.is_empty() {
                 return Err(binder_error(
                     "There are no UNIQUE/PRIMARY KEY constraints that refer to this table, specify ON CONFLICT \
@@ -74,10 +86,14 @@ impl Binder<'_> {
             for name in &info.indexed_columns {
                 named.insert(self.conflict_column(table, name)?);
             }
-            let key = keys
-                .iter()
-                .find(|key| key.iter().copied().collect::<BTreeSet<usize>>() == named);
+            let matches = |key: &&Vec<usize>| key.iter().copied().collect::<BTreeSet<usize>>() == named;
+            let key = keys.iter().find(matches);
             let Some(key) = key else {
+                if deferred.iter().any(|key| matches(&key)) {
+                    return Err(binder_error(
+                        "DEFERRED PRIMARY KEY or UNIQUE constraints cannot be ON CONFLICT targets",
+                    ));
+                }
                 return Err(binder_error(
                     "The specified columns as conflict target are not referenced by a UNIQUE/PRIMARY KEY CONSTRAINT \
                      or INDEX",

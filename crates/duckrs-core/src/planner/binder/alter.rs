@@ -192,8 +192,14 @@ impl Binder<'_> {
                 }
                 return Err(error);
             }
-            let verb = if matches!(info.kind, AlterKind::SetSchemaOptions(_)) { "SET" } else { "RESET" };
-            return Err(not_implemented(&format!("{verb} (<options>) is not supported for DuckDB schemas")));
+            let verb = if matches!(info.kind, AlterKind::SetSchemaOptions(_)) {
+                "SET"
+            } else {
+                "RESET"
+            };
+            return Err(not_implemented(&format!(
+                "{verb} (<options>) is not supported for DuckDB schemas"
+            )));
         }
         let schema = match self
             .catalog
@@ -202,9 +208,7 @@ impl Binder<'_> {
             Ok(schema) => schema,
             Err(_) if info.if_exists => return Ok(BoundAlter::Nothing),
             // `Catalog::LookupEntry`: a nested schema path that is missing is named
-            Err(error)
-                if info.name.qualification.len() >= 2 && error.message.starts_with("Schema with name") =>
-            {
+            Err(error) if info.name.qualification.len() >= 2 && error.message.starts_with("Schema with name") => {
                 let schema = info.name.qualification.join(".");
                 return Err(catalog_error(format!(
                     "Table with name \"{schema}.{}\" does not exist because schema \"{schema}\" does not exist.",
@@ -223,10 +227,15 @@ impl Binder<'_> {
             let system_function = matches!(
                 &info.kind,
                 AlterKind::SetComment { entry_type, .. } if matches!(*entry_type, "FUNCTION" | "MACRO" | "MACRO TABLE")
-            ) && (crate::function::BuiltinFunctions::get().scalar(&info.name.name).is_some()
-                || crate::function::BuiltinFunctions::get().aggregate(&info.name.name).is_some()
+            ) && (crate::function::BuiltinFunctions::get()
+                .scalar(&info.name.name)
+                .is_some()
+                || crate::function::BuiltinFunctions::get()
+                    .aggregate(&info.name.name)
+                    .is_some()
                 || crate::catalog::defaults::default_macro(schema_name.as_deref(), &info.name.name, false).is_some());
-            if system_function || crate::catalog::defaults::default_view(schema_name.as_deref(), &info.name.name).is_some()
+            if system_function
+                || crate::catalog::defaults::default_view(schema_name.as_deref(), &info.name.name).is_some()
             {
                 return Err(binder_error("Can not comment on System Catalog entries"));
             }
@@ -295,9 +304,7 @@ impl Binder<'_> {
                 .constraints
                 .iter()
                 .any(|c| matches!(c, TableConstraint::Unique { columns, .. } if columns.contains(&index)));
-            if matches!(info.kind, AlterKind::RemoveColumn { .. })
-                && !constrained
-                && indexed.iter().any(|c| *c > index)
+            if matches!(info.kind, AlterKind::RemoveColumn { .. }) && !constrained && indexed.iter().any(|c| *c > index)
             {
                 return Err(catalog_error(
                     "Cannot drop this column: an index depends on a column after it!".to_string(),
@@ -380,8 +387,7 @@ impl Binder<'_> {
         });
         let mut error = None;
         visit_expr_mut(&mut expression.clone(), &mut |e: &mut Expr| match &e.kind {
-            ExprKind::ColumnRef(names)
-                if names.len() == 1 && lambda_parameters.contains(&names[0].to_lowercase()) => {}
+            ExprKind::ColumnRef(names) if names.len() == 1 && lambda_parameters.contains(&names[0].to_lowercase()) => {}
             ExprKind::Subquery { .. } => {
                 error.get_or_insert_with(|| "cannot use subquery in alter statement".to_string());
             }
@@ -549,6 +555,7 @@ impl Binder<'_> {
                         columns: vec![alter.columns.len()],
                         primary_key: false,
                         column_level: true,
+                        check_mode: duckrs_parser::ast::ConstraintCheckMode::Default,
                     });
                 }
                 alter.columns.push(definition);
@@ -633,7 +640,11 @@ impl Binder<'_> {
                 }
                 let index = column_index(&table, &path[0])?;
                 // `DuckTableEntry::SetNotNull`: the constraint goes last, once
-                if !alter.constraints.iter().any(|c| matches!(c, TableConstraint::NotNull(i) if *i == index)) {
+                if !alter
+                    .constraints
+                    .iter()
+                    .any(|c| matches!(c, TableConstraint::NotNull(i) if *i == index))
+                {
                     alter.constraints.push(TableConstraint::NotNull(index));
                 }
                 alter.columns[index].not_null = true;
@@ -656,9 +667,18 @@ impl Binder<'_> {
                     )));
                 }
                 alter.columns[index].not_null = false;
-                alter.constraints.retain(|c| !matches!(c, TableConstraint::NotNull(i) if *i == index));
+                alter
+                    .constraints
+                    .retain(|c| !matches!(c, TableConstraint::NotNull(i) if *i == index));
             }
-            AlterKind::AddConstraint(constraint) => add_constraint(&mut alter, constraint)?,
+            AlterKind::AddConstraint(constraint) => {
+                if let Constraint::Unique { check_mode, .. } = constraint
+                    && !table.schema.eq_ignore_ascii_case(crate::catalog::TEMP_SCHEMA)
+                {
+                    self.catalog.check_constraint_check_mode(*check_mode)?;
+                }
+                add_constraint(&mut alter, constraint)?;
+            }
             AlterKind::SetPartitionedBy(_) => {
                 return Err(not_implemented("SET PARTITIONED BY is not supported for DuckDB tables"));
             }
@@ -786,7 +806,9 @@ fn remove_column(alter: &mut BoundTableAlter, index: usize) -> Result<()> {
                     }
                 });
             }
-            TableConstraint::Unique { columns, primary_key, .. } => {
+            TableConstraint::Unique {
+                columns, primary_key, ..
+            } => {
                 if columns.contains(&index) {
                     if columns.len() == 1 {
                         let kind = if *primary_key { "PRIMARY KEY" } else { "UNIQUE" };
@@ -838,7 +860,7 @@ fn add_constraint(alter: &mut BoundTableAlter, constraint: &Constraint) -> Resul
         index,
         columns,
         primary_key,
-        ..
+        check_mode,
     } = constraint
     else {
         let kind = if matches!(constraint, Constraint::Check(_)) {
@@ -852,7 +874,11 @@ fn add_constraint(alter: &mut BoundTableAlter, constraint: &Constraint) -> Resul
     };
     // `BindUniqueConstraint`: a generated column has no values to key on
     if let Some(generated) = columns.iter().find(|name| table.is_generated(name)) {
-        let kind = if *primary_key { "PRIMARY KEY" } else { "UNIQUE constraint" };
+        let kind = if *primary_key {
+            "PRIMARY KEY"
+        } else {
+            "UNIQUE constraint"
+        };
         return Err(binder_error(format!(
             "cannot create a {kind} on a generated column: {}",
             duckrs_parser::ast::sql_identifier(generated)
@@ -901,6 +927,7 @@ fn add_constraint(alter: &mut BoundTableAlter, constraint: &Constraint) -> Resul
         columns: key,
         primary_key: *primary_key,
         column_level: false,
+        check_mode: *check_mode,
     });
     alter.constraints.extend(implied);
     alter.verify = true;

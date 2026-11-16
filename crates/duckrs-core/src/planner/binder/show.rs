@@ -17,8 +17,8 @@ use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::Value;
 use duckrs_common::{ErrorKind, Result};
 use duckrs_parser::ast::{
-    Expr, ExprKind, QualifiedName, QueryNode, SelectNode, SelectStatement, ShowRef, ShowType, TableRef, TableRefKind,
-    sql_identifier,
+    ConstraintCheckMode, Expr, ExprKind, QualifiedName, QueryNode, SelectNode, SelectStatement, ShowRef, ShowType,
+    TableRef, TableRefKind, sql_identifier,
 };
 use duckrs_parser::transformer::visit_expr_mut;
 use std::sync::Arc;
@@ -39,7 +39,9 @@ fn sql_string(value: &str) -> String {
 fn column_keys(table: &TableCatalogEntry, column: usize) -> (bool, bool) {
     let (mut primary, mut unique) = (false, false);
     for constraint in &table.constraints {
-        if let TableConstraint::Unique { columns, primary_key, .. } = constraint
+        if let TableConstraint::Unique {
+            columns, primary_key, ..
+        } = constraint
             && columns.contains(&column)
         {
             if *primary_key {
@@ -187,7 +189,11 @@ pub(crate) fn platform() -> String {
         "x86" => "i686",
         _ => "amd64",
     };
-    let postfix = if os == "windows" && cfg!(target_env = "gnu") { "_mingw" } else { "" };
+    let postfix = if os == "windows" && cfg!(target_env = "gnu") {
+        "_mingw"
+    } else {
+        ""
+    };
     format!("{os}_{arch}{postfix}")
 }
 
@@ -807,7 +813,8 @@ impl Binder<'_> {
             };
             let names_of =
                 |columns: &[usize]| -> Vec<String> { columns.iter().map(|c| table.columns[*c].name.clone()).collect() };
-            // type, text, expression, columns, referenced table and columns, the end of the name
+            // type, text, expression, columns, referenced table and columns, the end of the name, the
+            // check mode
             type Row = (
                 &'static str,
                 String,
@@ -815,6 +822,7 @@ impl Binder<'_> {
                 Vec<usize>,
                 Option<String>,
                 Vec<String>,
+                &'static str,
                 &'static str,
             );
             // in the order the table has them (`NotNullConstraint::ToString` is "NOT NULL")
@@ -836,6 +844,7 @@ impl Binder<'_> {
                         None,
                         Vec::new(),
                         "not_null",
+                        "DEFAULT",
                     ),
                     TableConstraint::Check { parsed, .. } => {
                         let mut columns = Vec::new();
@@ -877,23 +886,31 @@ impl Binder<'_> {
                             None,
                             Vec::new(),
                             "check",
+                            "DEFAULT",
                         )
                     }
-                    TableConstraint::Unique { columns, primary_key, .. } => {
+                    TableConstraint::Unique {
+                        columns,
+                        primary_key,
+                        check_mode,
+                        ..
+                    } => {
                         let (kind, end) = if *primary_key {
                             ("PRIMARY KEY", "pkey")
                         } else {
                             ("UNIQUE", "key")
                         };
-                        (
-                            kind,
-                            format!("{kind}({})", quoted(columns)),
-                            None,
-                            columns.clone(),
-                            None,
-                            Vec::new(),
-                            end,
-                        )
+                        // `UniqueConstraint::ToString` and `EnumUtil::ToString(check_mode)`
+                        let mode = match check_mode {
+                            ConstraintCheckMode::Default => "DEFAULT",
+                            ConstraintCheckMode::Immediate => "IMMEDIATE",
+                            ConstraintCheckMode::Deferred => "DEFERRED",
+                        };
+                        let mut text = format!("{kind}({})", quoted(columns));
+                        if *check_mode != ConstraintCheckMode::Default {
+                            text = format!("{text} {mode}");
+                        }
+                        (kind, text, None, columns.clone(), None, Vec::new(), end, mode)
                     }
                     TableConstraint::ForeignKey(key) => {
                         let (parent, referenced) = match &key.referenced {
@@ -923,11 +940,12 @@ impl Binder<'_> {
                             Some(parent),
                             referenced,
                             "fkey",
+                            "DEFAULT",
                         )
                     }
                 });
             }
-            for (kind, text, expression, columns, parent, referenced, end) in constraints {
+            for (kind, text, expression, columns, parent, referenced, end, mode) in constraints {
                 let names = names_of(&columns);
                 let mut name = format!("{}_", table.name);
                 for column in names.iter().chain(&referenced) {
@@ -959,7 +977,7 @@ impl Binder<'_> {
                     Value::varchar(name),
                     parent.map_or_else(|| Value::null(LogicalType::VARCHAR), Value::varchar),
                     varchars(referenced)?,
-                    Value::varchar("DEFAULT"),
+                    Value::varchar(mode),
                 ]);
             }
         }
@@ -1735,7 +1753,18 @@ impl Binder<'_> {
                         oid += 1;
                         let comment = schema.type_comment(&name);
                         let (database, schema) = (database.to_string(), schema_name.to_string());
-                        entries.push((database, database_oid, schema, schema_oid, oid, name, ty, false, USER, comment));
+                        entries.push((
+                            database,
+                            database_oid,
+                            schema,
+                            schema_oid,
+                            oid,
+                            name,
+                            ty,
+                            false,
+                            USER,
+                            comment,
+                        ));
                     }
                 }
                 // `GetAllSchemas` orders by database, then schema; a schema's entries are by name
@@ -1743,7 +1772,9 @@ impl Binder<'_> {
                 let mut oids = std::collections::HashSet::new();
                 let mut rows = Vec::new();
                 let list = LogicalType::list(LogicalType::VARCHAR);
-                for (database, database_oid, schema, schema_oid, oid, name, ty, internal, constructors, comment) in &entries {
+                for (database, database_oid, schema, schema_oid, oid, name, ty, internal, constructors, comment) in
+                    &entries
+                {
                     for constructor in constructors.iter() {
                         let category = match ty.id() {
                             L::TinyInt
