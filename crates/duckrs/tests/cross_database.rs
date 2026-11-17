@@ -137,6 +137,42 @@ fn temporary_tables_of_a_transaction() {
     assert!(c.query("SELECT * FROM t2").is_err());
 }
 
+/// `nextval` writes the database of its sequence (`NextValModifiedDatabases`): a sequence of another
+/// database than the one a statement or its transaction writes is refused, and unqualified sequences
+/// that the statement's database lacks are those of the default one.
+#[test]
+fn sequences_of_other_databases() {
+    let mut c = connection();
+    run(&mut c, "CREATE SEQUENCE seq");
+    run(&mut c, "CREATE SEQUENCE db2.s2");
+    let refused = "a single transaction can only write to a single attached database";
+    for sql in [
+        "CREATE TABLE db2.bad (i INTEGER DEFAULT nextval('seq'))",
+        "CREATE TABLE bad (i INTEGER DEFAULT nextval('db2.s2'))",
+        "INSERT INTO db2.u SELECT nextval('seq')",
+    ] {
+        let error = c.query(sql).unwrap_err().to_string();
+        assert!(error.contains(refused), "{sql}: {error}");
+    }
+    run(&mut c, "CREATE TABLE db2.ok (i INTEGER DEFAULT nextval('db2.s2'))");
+    run(&mut c, "INSERT INTO db2.ok DEFAULT VALUES");
+    run(&mut c, "INSERT INTO db2.ok DEFAULT VALUES");
+    assert_eq!(rows(&mut c, "SELECT i FROM db2.ok ORDER BY i"), [["1"], ["2"]]);
+    assert_eq!(one(&mut c, "SELECT nextval('seq')"), "1");
+
+    // a SELECT that advances a sequence writes its database too
+    run(&mut c, "BEGIN");
+    assert_eq!(one(&mut c, "SELECT nextval('db2.s2')"), "3");
+    let error = c.query("SELECT nextval('seq')").unwrap_err().to_string();
+    assert!(error.contains(refused), "{error}");
+    run(&mut c, "ROLLBACK");
+
+    // a temporary sequence is the connection's, in any database
+    run(&mut c, "CREATE TEMP SEQUENCE ts");
+    run(&mut c, "CREATE TABLE db2.tv AS SELECT nextval('ts') i");
+    assert_eq!(one(&mut c, "SELECT i FROM db2.tv"), "1");
+}
+
 #[test]
 fn a_transaction_writes_one_database() {
     let mut c = connection();

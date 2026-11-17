@@ -3769,6 +3769,8 @@ impl Binder<'_> {
                 let mut binder = Binder::new(self.catalog);
                 binder.aggregate_error = "DEFAULT value cannot contain aggregates!";
                 binder.search_schema = self.search_schema.clone();
+                // the sequences of `nextval` are those of the statement's databases
+                binder.session = self.session.clone();
                 definition.default_value = Some(checked_cast(binder.bind_expression(default)?, &definition.ty)?);
                 definition.default_text = Some(default.to_string());
             }

@@ -679,6 +679,12 @@ pub struct SessionValues {
     /// the connection's default database, which a statement routed to `database` came from: unqualified
     /// names that `database` does not have are looked up there, as along C++'s search path
     pub default_database: String,
+    /// the database the transaction (or else the statement) writes, if any: a sequence of another
+    /// that `nextval` or `setval` would write is refused (`MetaTransaction::ModifyDatabase`)
+    pub written_database: Option<String>,
+    /// the database the sequences that `nextval` and `setval` bound so far write, which the connection
+    /// counts as written by the statement's transaction
+    pub sequence_writes: Arc<std::sync::Mutex<Option<String>>>,
     pub variables: HashMap<String, Value>,
     pub setting: SettingLookup,
     /// `duckdb_logs()`, and the connection's logger for `write_log`

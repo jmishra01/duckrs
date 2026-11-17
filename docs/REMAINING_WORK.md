@@ -195,7 +195,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
     pack `db1.s1.t`, and `MinimumUniqueAlias` in the errors of ambiguous tables and columns
   - [x] temp tables created in the transaction in a statement routed to another database: the forks of a
     transaction share the temporary schema of its first one, which alone commits it
-  - [ ] sequences of the default database in a statement routed to another, DETACH of the default database
+  - [x] sequences of other databases: `nextval('db.seq')`, unqualified ones of the default database in a statement
+    routed to another, and `nextval`/`setval` writing the database of the sequence (`NextValModifiedDatabases`), so
+    that a DEFAULT or a statement that advances a sequence of another database than it writes is refused
+  - [ ] DETACH of the default database
   - [x] `RECOVERY_MODE` (`NO_WAL_WRITES` keeps commits out of the log until a checkpoint)
   - [ ] `ENCRYPTION_KEY`, `COMPRESS`, `IO_MODE` and the other ATTACH options
 - [x] 11. Files that C++ DuckDB v69 can read and write (`sql/storage_version`: all pass)

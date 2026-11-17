@@ -6,7 +6,7 @@
 //! Binding parsed expressions into [`BoundExpr`]s.
 
 use super::{Binder, ColumnMode, CorrelatedColumn, binder_error};
-use crate::catalog::DEFAULT_CATALOG;
+use crate::catalog::{DEFAULT_CATALOG, SequenceCatalogEntry};
 use crate::execution::expression_executor::{evaluate_scalar, try_evaluate_scalar};
 use crate::function::binder::{bind_aggregate_function, bind_scalar_function, expression_return_type};
 use crate::function::combine_types::{force_max_logical_type, normalize_type, try_max_logical_type};
@@ -2718,6 +2718,17 @@ pub(super) fn parse_qualified_name(input: &str) -> Result<Vec<String>> {
     Ok(parts)
 }
 
+/// `MetaTransaction::ModifyDatabase` of the database of a sequence that `nextval` or `setval` writes.
+fn sequence_write_conflict(database: &str, written: &str) -> Error {
+    Error::new(
+        ErrorKind::Transaction,
+        format!(
+            "Attempting to write to database {database} in a transaction that has already modified database \
+             {written} - a single transaction can only write to a single attached database."
+        ),
+    )
+}
+
 impl Binder<'_> {
     /// `NextValBind`: the name of a sequence function is a constant, looked up once.
     fn bind_sequence_function(&self, bound: BoundExpr) -> Result<BoundExpr> {
@@ -2745,13 +2756,25 @@ impl Binder<'_> {
         let Some((name, qualification)) = parts.split_last() else {
             return Err(crate::unported("this sequence name"));
         };
-        let schema = self.schema_of(&ast::QualifiedName {
+        let qualified = ast::QualifiedName {
             qualification: qualification.to_vec(),
             name: name.clone(),
-        })?;
-        let sequence = self
-            .catalog
-            .get_sequence(schema.as_deref(), self.search_schema.as_deref(), name)?;
+        };
+        let (sequence, database) = self.lookup_sequence(&qualified)?;
+        // `NextValModifiedDatabases`: nextval and setval write the database of the sequence
+        if op != SequenceOp::Current
+            && let Some(database) = database
+            && let Some(session) = &self.session
+        {
+            let mut recorded = session.sequence_writes.lock().expect("not poisoned");
+            match session.written_database.clone().or_else(|| recorded.clone()) {
+                Some(written) if !written.eq_ignore_ascii_case(&database) => {
+                    return Err(sequence_write_conflict(&database, &written));
+                }
+                Some(_) => {}
+                None => *recorded = Some(database),
+            }
+        }
         Ok(BoundExpr::new(
             BoundExprKind::Sequence {
                 op,
@@ -2760,6 +2783,56 @@ impl Binder<'_> {
             },
             LogicalType::BIGINT,
         ))
+    }
+
+    /// `BindSequence`: the sequence `name` names along the search path, and the database it is in (`None`
+    /// for a temporary one): this binder's, another attached one that qualifies it, or the default one.
+    fn lookup_sequence(&self, name: &ast::QualifiedName) -> Result<(Arc<SequenceCatalogEntry>, Option<String>)> {
+        let session = self.session.as_ref();
+        if let Some((catalog, schema)) = self.other_database_of(name) {
+            let sequence = catalog.get_sequence(schema.as_deref(), None, &name.name)?;
+            return Ok((sequence, name.qualification.first().cloned()));
+        }
+        let mut schema = self.schema_of(name)?;
+        // a stored DEFAULT bound as the file loads, before it has the name it is attached by: what
+        // qualifies the sequence beyond a schema of the file is its database (C++ binds it later, by name)
+        if session.is_none()
+            && let Some(first) = schema.as_deref().filter(|s| self.catalog.get_schema(s).is_none())
+        {
+            schema = match name.qualification.as_slice() {
+                [_] => None,
+                [_, inner] if self.catalog.get_schema(inner).is_some() => Some(inner.clone()),
+                _ => Some(first.to_string()),
+            };
+        }
+        let temporary = |sequence: &Arc<SequenceCatalogEntry>| {
+            self.catalog
+                .get_schema(crate::catalog::TEMP_SCHEMA)
+                .and_then(|temp| temp.get_sequence(&sequence.name))
+                .is_some_and(|temp| Arc::ptr_eq(&temp, sequence))
+        };
+        match self
+            .catalog
+            .get_sequence(schema.as_deref(), self.search_schema.as_deref(), &name.name)
+        {
+            Ok(sequence) => {
+                let database = (!temporary(&sequence))
+                    .then(|| session.map(|s| s.database.clone()))
+                    .flatten();
+                Ok((sequence, database))
+            }
+            Err(error) => {
+                // past the search path of this database comes that of the connection's default one
+                let fallback = session
+                    .filter(|_| name.qualification.is_empty())
+                    .filter(|s| !s.default_database.eq_ignore_ascii_case(&s.database))
+                    .and_then(|s| Some(((s.attached_catalog)(&s.default_database)?, s.default_database.clone())))
+                    .and_then(|(catalog, database)| {
+                        Some((catalog.get_sequence(None, None, &name.name).ok()?, Some(database)))
+                    });
+                fallback.ok_or(error)
+            }
+        }
     }
 
     /// `BaseSelectBinder::TryBindGroup` + `BindGroup`: a reference to the group `expr` matches.

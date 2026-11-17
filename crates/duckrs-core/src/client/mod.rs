@@ -883,6 +883,10 @@ pub struct ClientContext {
     /// the default database of a statement running now that was routed to `db`: the names of other
     /// databases left in it are bound there by name, not routed again
     routed_from: Option<String>,
+    /// the database the statement being run writes, if it writes one that is not temporary
+    statement_writes: Option<String>,
+    /// the database the sequences of the statement being run write (`SessionValues::sequence_writes`)
+    sequence_writes: Arc<std::sync::Mutex<Option<String>>>,
     /// identifies the connection among the database's connections
     id: u64,
     /// the statement ran side-effecting CTEs before what is planned now, which its statistics don't see
@@ -1110,6 +1114,8 @@ impl ClientContext {
         let context = Self {
             home: db.clone(),
             routed_from: None,
+            statement_writes: None,
+            sequence_writes: Arc::default(),
             db,
             id,
             after_dml_ctes: false,
@@ -1192,6 +1198,13 @@ impl ClientContext {
         Arc::new(SessionValues {
             database: self.db.name.clone(),
             default_database: self.routed_from.clone().unwrap_or_else(|| self.db.name.clone()),
+            written_database: self
+                .transaction
+                .as_ref()
+                .and_then(|transaction| transaction.modified.as_ref())
+                .map(|database| database.name.clone())
+                .or_else(|| self.statement_writes.clone()),
+            sequence_writes: self.sequence_writes.clone(),
             log_manager: self.home.log_manager.clone(),
             log_target: self.log_target_id,
             connection_id: self.id,
@@ -2042,6 +2055,12 @@ impl ClientContext {
                 statement,
                 Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) | Statement::Merge(_)
             );
+        // what a sequence of another database it uses is refused for (`NextValModifiedDatabases`)
+        let previous_writes = std::mem::replace(
+            &mut self.statement_writes,
+            (write && !writes_temporary_table).then(|| self.db.name.clone()),
+        );
+        let previous_sequence_writes = self.sequence_writes.lock().expect("not poisoned").take();
         let db = self.db.clone();
         let result = if self.transaction.is_some() {
             // on a fork of its own, which nobody else writes to
@@ -2092,6 +2111,20 @@ impl ClientContext {
                 (result, _) => result,
             }
         };
+        self.statement_writes = previous_writes;
+        // `MetaTransaction::ModifyDatabase` of the database whose sequence the statement advanced
+        let sequence_writes = std::mem::replace(
+            &mut *self.sequence_writes.lock().expect("not poisoned"),
+            previous_sequence_writes,
+        );
+        if result.is_ok()
+            && let Some(name) = sequence_writes
+            && let Some(database) = self.find_database(&name)
+            && let Some(transaction) = &mut self.transaction
+            && transaction.modified.is_none()
+        {
+            transaction.modified = Some(database);
+        }
         if let Err(error) = &result {
             if let Some(transaction) = &mut self.transaction {
                 transaction.apply_invalidation_policy(error.kind);
