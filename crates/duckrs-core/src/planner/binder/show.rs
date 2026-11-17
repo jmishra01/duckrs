@@ -639,15 +639,11 @@ impl Binder<'_> {
             return self.show_all_tables(table_ref);
         };
         match name.name.as_str() {
+            // `PragmaShowDatabases`
             "\"databases\"" => {
-                let name = self.catalog.name.clone();
-                self.bind_rows(
-                    table_ref,
-                    "__show_select",
-                    vec!["database_name".to_string()],
-                    vec![LogicalType::VARCHAR],
-                    vec![vec![Value::varchar(name)]],
-                )
+                let select = "SELECT database_name FROM duckdb_databases() WHERE NOT internal ORDER BY database_name";
+                let select = parse_select(select, "Expected a single SELECT statement")?;
+                self.bind_rewritten(&select, table_ref, "__show_select")
             }
             "\"schemas\"" => {
                 let select = "SELECT schema.database_name, schema.schema_name, ((SELECT current_schema() = \

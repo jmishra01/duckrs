@@ -78,9 +78,11 @@ pub struct DatabaseInstance {
     log_sync_failed: AtomicBool,
     /// How `USE` and qualified names call this database.
     name: String,
-    /// What `ATTACH` added to this database, which connections go to with `USE` or by name. A
-    /// query runs in one database, so one that reads two isn't ported.
+    /// What `ATTACH` added to this database, which connections go to with `USE` or by name.
     attached: RwLock<BTreeMap<String, Arc<DatabaseInstance>>>,
+    /// `DETACH` of the database the connections were made to (`DatabaseManager::DetachDatabase` of the
+    /// default one): it is gone by name, and only keeps what is attached
+    detached: AtomicBool,
     /// `DatabaseInstance::GetLogManager`
     log_manager: crate::logging::SharedLogManager,
     /// `DatabaseManager::GetNewQueryNumber`: the queries so far
@@ -149,6 +151,7 @@ impl DatabaseInstance {
             log_sync_failed: AtomicBool::new(false),
             name: DEFAULT_CATALOG.to_string(),
             attached: RwLock::default(),
+            detached: AtomicBool::new(false),
             log_manager: Arc::default(),
             query_number: AtomicU64::new(0),
             transaction_number: AtomicU64::new(0),
@@ -1267,7 +1270,7 @@ impl ClientContext {
                     .collect()
             }),
             attached_catalog: Box::new(move |name: &str| {
-                if name.eq_ignore_ascii_case(&attached_db.name) {
+                if name.eq_ignore_ascii_case(&attached_db.name) && !attached_db.is_detached() {
                     return Some(attached_db.catalog.clone());
                 }
                 attached_db
@@ -1896,7 +1899,7 @@ impl ClientContext {
         }
         let _search_path = crate::catalog::SearchPathGuard::set(self.search_path_for(&self.db.name.clone()));
         // the default database can be gone, as when its ATTACH was rolled back
-        if !Arc::ptr_eq(&self.db, &self.home)
+        if (!Arc::ptr_eq(&self.db, &self.home) || self.home.is_detached())
             && !self
                 .home
                 .attached
@@ -2156,7 +2159,7 @@ impl ClientContext {
 
     /// The database of this name, among those this connection can reach.
     fn find_database(&self, name: &str) -> Option<Arc<DatabaseInstance>> {
-        if name.eq_ignore_ascii_case(&self.home.name) {
+        if name.eq_ignore_ascii_case(&self.home.name) && !self.home.is_detached() {
             return Some(self.home.clone());
         }
         if name.eq_ignore_ascii_case(&self.db.name) {
@@ -2647,6 +2650,13 @@ impl ClientContext {
                     "Cannot detach database \"{name}\" because it is the default database. Select a different database using `USE` to allow detaching."
                 ),
             ));
+        }
+        // the database the connection was made to keeps what is attached: it is only gone by name
+        if name.eq_ignore_ascii_case(&self.home.name)
+            && !self.home.attached.read().contains_key(&name.to_lowercase())
+            && !self.home.detached.swap(true, AtomicOrdering::SeqCst)
+        {
+            return Ok(());
         }
         if self.home.attached.write().remove(&name.to_lowercase()).is_none() && !if_exists {
             return Err(Error::new(
@@ -3252,7 +3262,12 @@ impl ClientContext {
             {
                 // `CatalogSearchPath::Reset`
                 self.search_path.clear();
-                self.db = self.home.clone();
+                // the default database, or with it detached one that remains
+                let remaining = self.home.attached.read().values().next().cloned();
+                self.db = match remaining {
+                    Some(remaining) if self.home.is_detached() => remaining,
+                    _ => self.home.clone(),
+                };
                 return Ok(Self::success());
             }
             Statement::Attach(info) => {
@@ -3934,9 +3949,16 @@ fn on_create_conflict(conflict: AstConflict) -> OnCreateConflict {
     }
 }
 
+impl DatabaseInstance {
+    /// Whether `DETACH` took this database away by name (only the one connections were made to).
+    fn is_detached(&self) -> bool {
+        self.detached.load(AtomicOrdering::SeqCst)
+    }
+}
+
 impl DatabaseList for DatabaseInstance {
     fn with_catalog(&self, name: &str, use_it: &mut dyn FnMut(&crate::catalog::Catalog)) {
-        if name.eq_ignore_ascii_case(&self.name) {
+        if name.eq_ignore_ascii_case(&self.name) && !self.is_detached() {
             use_it(&self.catalog);
         } else if let Some(database) = self.attached.read().get(&name.to_lowercase()) {
             use_it(&database.catalog);
@@ -3946,6 +3968,7 @@ impl DatabaseList for DatabaseInstance {
     fn databases(&self) -> Vec<DatabaseListing> {
         let attached = self.attached.read();
         std::iter::once(self)
+            .filter(|home| !home.is_detached())
             .chain(attached.values().map(Arc::as_ref))
             .map(DatabaseInstance::listing)
             .collect()

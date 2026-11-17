@@ -1188,7 +1188,10 @@ test/sql/attach/attach_views.test
 test/sql/attach/attach_volatile_expression.test
 test/sql/attach/attach_wal_alter_sequence.test
 test/sql/attach/detach_keyword.test
+test/sql/attach/detach_manager_default_database.test
 test/sql/attach/in_memory_attach.test
+test/sql/attach/show_databases.test
+test/sql/attach/show_schemas.test
 test/sql/attach/system_catalog.test
 test/sql/binder/alias_error_10057.test
 test/sql/binder/alias_qualification_errors.test
@@ -4264,6 +4267,7 @@ test/sql/table_function/duckdb_constraints_fk.test
 test/sql/table_function/duckdb_constraints_issue11284.test
 test/sql/table_function/duckdb_constraints_issue12863.test
 test/sql/table_function/duckdb_constraints_struct_check.test
+test/sql/table_function/duckdb_databases.test
 test/sql/table_function/duckdb_dialects.test
 test/sql/table_function/duckdb_functions_window.test
 test/sql/table_function/duckdb_indexes.test

@@ -198,7 +198,8 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] sequences of other databases: `nextval('db.seq')`, unqualified ones of the default database in a statement
     routed to another, and `nextval`/`setval` writing the database of the sequence (`NextValModifiedDatabases`), so
     that a DEFAULT or a statement that advances a sequence of another database than it writes is refused
-  - [ ] DETACH of the default database
+  - [x] DETACH of the default database: it is gone by name and keeps what is attached; RESET of the search path
+    then goes to a database that remains; SHOW DATABASES lists them all (`PragmaShowDatabases`)
   - [x] `RECOVERY_MODE` (`NO_WAL_WRITES` keeps commits out of the log until a checkpoint)
   - [ ] `ENCRYPTION_KEY`, `COMPRESS`, `IO_MODE` and the other ATTACH options
 - [x] 11. Files that C++ DuckDB v69 can read and write (`sql/storage_version`: all pass)

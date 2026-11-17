@@ -173,6 +173,27 @@ fn sequences_of_other_databases() {
     assert_eq!(one(&mut c, "SELECT i FROM db2.tv"), "1");
 }
 
+/// The database a connection was made to can be detached once another is the default: it is gone
+/// by name, what was attached stays, and its name can be attached again.
+#[test]
+fn detach_the_default_database() {
+    let mut c = connection();
+    let error = c.query("DETACH memory").unwrap_err().to_string();
+    assert!(error.contains("because it is the default database"), "{error}");
+    run(&mut c, "USE db1");
+    run(&mut c, "DETACH memory");
+    let names = |c: &mut Connection| rows(c, "SHOW DATABASES").into_iter().flatten().collect::<Vec<_>>();
+    assert_eq!(names(&mut c), ["db1", "db2"]);
+    assert!(c.query("SELECT * FROM memory.local").is_err());
+    assert!(c.query("DETACH memory").is_err());
+    run(&mut c, "DETACH IF EXISTS memory");
+    // an unset search path goes to a database that remains
+    run(&mut c, "RESET search_path");
+    assert_eq!(one(&mut c, "SELECT count(*) FROM t"), "5");
+    run(&mut c, "ATTACH ':memory:' AS memory");
+    assert_eq!(names(&mut c), ["db1", "db2", "memory"]);
+}
+
 #[test]
 fn a_transaction_writes_one_database() {
     let mut c = connection();
