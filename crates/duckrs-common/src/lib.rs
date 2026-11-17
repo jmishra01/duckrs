@@ -12,6 +12,7 @@ pub mod geometry_crs;
 pub mod hash;
 pub mod json;
 pub mod path;
+pub mod render_width;
 pub mod row;
 pub mod serializer;
 pub mod sort_key;

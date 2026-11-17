@@ -6,6 +6,7 @@
 
 mod dml_cte;
 pub(crate) mod explain;
+mod text_tree_renderer;
 mod triggers;
 pub(crate) use triggers::body_dependencies as trigger_body_dependencies;
 mod export;
@@ -4152,6 +4153,32 @@ impl ClientContext {
 mod tests {
     use super::*;
 
+    /// The text of each box of an EXPLAIN, a line per line of a box and the name of the operator
+    /// on a line of its own, as the boxes do not matter to what the tests look for.
+    fn flat_plan(plan: &str) -> String {
+        let mut out = String::new();
+        for line in plan.lines() {
+            // boxes side by side share lines, with borders between them
+            for cell in line.split(['│', '╮', '╯']) {
+                let cell = cell.trim();
+                if let Some(title) = cell.strip_prefix("╭─ ") {
+                    let name = title
+                        .split(|c: char| !c.is_ascii() || c == '\n')
+                        .next()
+                        .unwrap_or(title)
+                        .trim_end();
+                    out.push_str(name);
+                    out.push('\n');
+                } else if !cell.is_empty() && !cell.chars().all(|c| "─╭╮╰╯┬┴├┼┤ ┰┸┒┎┚┖┟┧╁┃┠".contains(c))
+                {
+                    out.push_str(cell);
+                    out.push('\n');
+                }
+            }
+        }
+        out
+    }
+
     fn run(context: &mut ClientContext, sql: &str) -> Vec<Vec<String>> {
         let result = context.query(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
         (0..result.row_count())
@@ -6201,7 +6228,8 @@ mod tests {
         let mut context = ClientContext::new(DatabaseInstance::new());
         run(&mut context, "CREATE TABLE a AS SELECT i AS x FROM range(1000) t(i)");
         run(&mut context, "CREATE TABLE b AS SELECT i AS y FROM range(1000) t(i)");
-        let explain = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let explain =
+            |context: &mut ClientContext, sql: &str| flat_plan(&run(context, &format!("EXPLAIN {sql}"))[0][1]);
         let query = "SELECT x FROM a, b WHERE x = y ORDER BY x LIMIT 10";
         // operators are in title case, with their details and estimates
         let plan = explain(&mut context, query);
@@ -6264,16 +6292,14 @@ mod tests {
             &mut context,
             "INSERT INTO t SELECT r, r % 10, r::VARCHAR FROM range(5000) x(r)",
         );
-        let explain = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let explain =
+            |context: &mut ClientContext, sql: &str| flat_plan(&run(context, &format!("EXPLAIN {sql}"))[0][1]);
         // one column goes into the scan, and no operator is left
         let plan = explain(&mut context, "SELECT i FROM t WHERE j = 5");
         assert!(plan.contains("Filters: j = 5") && !plan.contains("Filter\n"), "{plan}");
         // several columns stay above it, and each conjunct goes its own way
         let plan = explain(&mut context, "SELECT i FROM t WHERE j = 5 AND i > j AND s <> '55'");
-        assert!(
-            plan.contains("Filters: j = 5\n") && plan.contains("s != '55'"),
-            "{plan}"
-        );
+        assert!(plan.contains("Filters: j = 5,\ns != '55'"), "{plan}");
         assert!(plan.contains("Filter\n") && plan.contains("i > j"), "{plan}");
         // and an OR on one column is one filter, without parentheses around all of it
         let plan = explain(&mut context, "SELECT i FROM t WHERE j = 5 OR j = 6");
@@ -6323,7 +6349,8 @@ mod tests {
         run(&mut context, "SET explain_output = 'OPTIMIZED_ONLY'");
         run(&mut context, "CREATE TABLE d (t TIMESTAMP)");
         run(&mut context, "INSERT INTO d VALUES ('2024-03-05 06:07:08.5'), (NULL)");
-        let explain = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let explain =
+            |context: &mut ClientContext, sql: &str| flat_plan(&run(context, &format!("EXPLAIN {sql}"))[0][1]);
         // the plan is that of the function, and the value that of date_part
         let plan = explain(&mut context, "SELECT EXTRACT(year FROM t) FROM d");
         assert!(plan.contains("year(t)") && !plan.contains("date_part"), "{plan}");
@@ -6411,7 +6438,7 @@ mod tests {
         );
         let scanned = |context: &mut ClientContext, filter: &str| {
             let sql = format!("EXPLAIN ANALYZE SELECT sum(x) FROM t WHERE {filter}");
-            let plan = run(context, &sql)[0][1].clone();
+            let plan = flat_plan(&run(context, &sql)[0][1]);
             let line = plan.lines().find(|line| line.contains("Row Groups Scanned"));
             let line = line.unwrap_or_else(|| panic!("{sql}: {plan}"));
             let count = |c: &mut ClientContext| run(c, &format!("SELECT count(*) FROM t WHERE {filter}"))[0][0].clone();
@@ -6526,7 +6553,7 @@ mod tests {
             &mut context,
             "CREATE TABLE t AS SELECT i, i % 7 AS g, CASE WHEN i % 5 = 0 THEN NULL ELSE i END AS n FROM range(200000) t(i)",
         );
-        let plan = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let plan = |context: &mut ClientContext, sql: &str| flat_plan(&run(context, &format!("EXPLAIN {sql}"))[0][1]);
         let sorted = |context: &mut ClientContext, order: &str, limit: usize, offset: usize| {
             let rows = run(context, &format!("SELECT i FROM t ORDER BY {order}"));
             rows[offset.min(rows.len())..(offset + limit).min(rows.len())].to_vec()
@@ -6619,7 +6646,7 @@ mod tests {
             &mut context,
             "INSERT INTO b VALUES (1, 5, 's'), (1, 6, 't'), (2, 7, 'r')",
         );
-        let plan = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let plan = |context: &mut ClientContext, sql: &str| flat_plan(&run(context, &format!("EXPLAIN {sql}"))[0][1]);
 
         let sql = "SELECT a.x, b.y FROM a JOIN b ON a.k = b.k ORDER BY a.x, b.y";
         let joined = plan(&mut context, sql);
@@ -6694,13 +6721,15 @@ mod tests {
         assert_eq!(run(&mut context, sql), [["3"]]);
         // the operator that does this stays out of plans, and it shows in the result only
         let sql = "EXPLAIN ANALYZE SELECT a.x FROM a JOIN b ON a.k = b.k JOIN d ON b.y = d.y";
-        let analyzed = run(&mut context, sql)[0][1].clone();
+        let analyzed = flat_plan(&run(&mut context, sql)[0][1]);
         assert!(
             !analyzed.contains("COLUMN_SELECT") && !analyzed.contains("Column Select"),
             "{analyzed}"
         );
         // off, a scan outputs everything
         run(&mut context, "SET disabled_optimizers = 'unused_columns'");
+        // the logical plan does not list what a scan reads
+        run(&mut context, "SET explain_output = 'PHYSICAL_ONLY'");
         let sql = "SELECT a.x FROM a JOIN b ON a.k = b.k";
         assert!(plan(&mut context, sql).contains("unused"));
     }
@@ -6716,7 +6745,7 @@ mod tests {
             &mut context,
             "INSERT INTO b VALUES (1, 'keep'), (1, 'drop'), (2, 'drop'), (NULL, 'keep'), (9, NULL)",
         );
-        let plan = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let plan = |context: &mut ClientContext, sql: &str| flat_plan(&run(context, &format!("EXPLAIN {sql}"))[0][1]);
         // the left rows stay, with NULLs where the condition left no partner
         let sql = "SELECT a.k, b.s FROM a LEFT JOIN b ON a.k = b.k AND b.s LIKE 'k%' ORDER BY 1 NULLS LAST, 2";
         let below = plan(&mut context, sql);
@@ -6762,7 +6791,7 @@ mod tests {
             &mut context,
             "INSERT INTO b VALUES (1, 1), (1, 2), (2, 3), (9, 4), (NULL, 5)",
         );
-        let plan = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let plan = |context: &mut ClientContext, sql: &str| flat_plan(&run(context, &format!("EXPLAIN {sql}"))[0][1]);
         let delim_gets = |plan: &str| plan.lines().filter(|line| line.contains("Delim Get")).count();
 
         // nothing filters the outer rows, so nothing of the delim join is left, and a key that the
@@ -6837,7 +6866,8 @@ mod tests {
             &mut context,
             "CREATE TABLE b AS SELECT i AS x, i::VARCHAR AS s FROM range(10) t(i)",
         );
-        let explain = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let explain =
+            |context: &mut ClientContext, sql: &str| flat_plan(&run(context, &format!("EXPLAIN {sql}"))[0][1]);
         let filters = |plan: &str| plan.lines().filter(|line| line.contains("Filters: ")).count();
         // both tables get what they alone can tell, and the OR stays for the pairs
         let sql = "SELECT count(*) FROM a, b WHERE (a.x = 2 AND b.x = 4) OR (a.x = 0 AND b.x = 2)";
@@ -6877,7 +6907,8 @@ mod tests {
         run(&mut context, "CREATE TABLE n (j INTEGER)");
         run(&mut context, "INSERT INTO n VALUES (1), (NULL)");
         run(&mut context, "CREATE TABLE e (j INTEGER)");
-        let explain = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let explain =
+            |context: &mut ClientContext, sql: &str| flat_plan(&run(context, &format!("EXPLAIN {sql}"))[0][1]);
         // three-valued: every combination of a NULL on the left, a NULL on the right and no rows
         let marks = |context: &mut ClientContext, right: &str| {
             let sql = format!("SELECT i IN (SELECT j FROM {right}), i NOT IN (SELECT j FROM {right}) FROM l");
@@ -6945,7 +6976,8 @@ mod tests {
         );
         run(&mut context, "CREATE TABLE mid AS SELECT i AS id FROM range(500) t(i)");
         run(&mut context, "CREATE TABLE small AS SELECT i AS id FROM range(20) t(i)");
-        let explain = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let explain =
+            |context: &mut ClientContext, sql: &str| flat_plan(&run(context, &format!("EXPLAIN {sql}"))[0][1]);
         let at = |plan: &str, table: &str| {
             let line = format!("Table: {table}");
             let line = plan.lines().position(|text| text.trim() == line);
@@ -7053,7 +7085,8 @@ mod tests {
         run(&mut context, "SET explain_output = 'OPTIMIZED_ONLY'");
         run(&mut context, "CREATE TABLE s (i INTEGER)");
         run(&mut context, "INSERT INTO s VALUES (1), (2), (3)");
-        let explain = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let explain =
+            |context: &mut ClientContext, sql: &str| flat_plan(&run(context, &format!("EXPLAIN {sql}"))[0][1]);
         let plan = explain(&mut context, "SELECT * FROM s WHERE i > 10");
         assert!(plan.contains("EMPTY_RESULT"), "{plan}");
         assert_eq!(run(&mut context, "SELECT count(*) FROM s WHERE i > 10"), [["0"]]);

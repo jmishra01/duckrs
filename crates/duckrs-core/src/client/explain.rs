@@ -2,9 +2,8 @@
 // {text_tree_renderer,json_tree_renderer}.cpp and the ParamsToString methods of the operators
 // @ rust-port-baseline
 //
-//! What EXPLAIN shows. A plan becomes a tree of [`ExplainNode`]s, which render as text or JSON. The
-//! text form has one line per fact, not the boxes of `TextTreeRenderer`, as what reads it looks for
-//! names and values. A physical plan takes its details from the logical plan it came from, whose
+//! What EXPLAIN shows. A plan becomes a tree of [`ExplainNode`]s, which render as the boxes of
+//! `TextTreeRenderer` (in [`text_tree_renderer`]) or as JSON. A physical plan takes its details from the logical plan it came from, whose
 //! expressions still have their names.
 
 use crate::execution::physical::PhysicalOperator;
@@ -12,6 +11,8 @@ use crate::optimizer::join_order::PlanEstimate;
 use crate::planner::expression::{BoundAggregate, BoundExpr};
 use crate::planner::logical::{BoundOrderByNode, JoinCondition, LogicalOperator, LogicalOperatorKind as K};
 use duckrs_common::sort_key::OrderType;
+
+use super::text_tree_renderer::{self, TextTreeConfig, TreeNode, split_lines, strip_outer_parens};
 
 /// `RenderTreeNode`.
 pub(super) struct ExplainNode {
@@ -196,6 +197,16 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             projection,
             ..
         } => {
+            // `LogicalGet::ParamsToString` has the filters, then what `TableScanToString` adds
+            if !physical {
+                let mut info = Vec::new();
+                if !filters.is_empty() {
+                    info.extend(entry("Filters", lines(filters.iter().map(filter_text))));
+                }
+                info.extend(entry("Table", table.qualified_name()));
+                info.extend(entry("Type", "Sequential Scan".to_string()));
+                return info;
+            }
             let mut info = entry("Table", table.qualified_name());
             info.extend(entry("Type", "Sequential Scan".to_string()));
             let name = |&column: &usize| {
@@ -429,60 +440,28 @@ pub(super) fn physical_tree(
     }
 }
 
-/// `DisplayName`: HASH_JOIN is Hash Join, unless `operator_casing` asks for the name as it is.
-fn display_name(name: &str, upper: bool) -> String {
-    if upper {
-        return name.to_string();
-    }
-    let title: Vec<String> = name
-        .split('_')
-        .map(|word| {
-            let mut letters = word.chars();
-            match letters.next() {
-                Some(first) => first.to_string() + &letters.as_str().to_lowercase(),
-                None => String::new(),
-            }
+/// `BuildExplainTree`: what the text renderer shows of a node. A detail without a key is `Text`.
+fn text_tree(node: &ExplainNode) -> TreeNode {
+    let details = node
+        .info
+        .iter()
+        .filter(|(_, value)| !value.is_empty())
+        .map(|(key, value)| {
+            let values = split_lines(value).into_iter().map(strip_outer_parens).collect();
+            let key = if key.is_empty() {
+                "Text".to_string()
+            } else {
+                key.clone()
+            };
+            (key, values)
         })
         .collect();
-    title.join(" ").replace("Cte", "CTE").replace("Ie Join", "IE Join")
-}
-
-/// `FormatCount`, with the default thousand separator.
-fn format_count(count: u64) -> String {
-    let digits = count.to_string();
-    let mut result = String::new();
-    for (at, digit) in digits.chars().enumerate() {
-        if at > 0 && (digits.len() - at).is_multiple_of(3) {
-            result.push(',');
-        }
-        result.push(digit);
-    }
-    result
-}
-
-fn render_text_node(node: &ExplainNode, depth: usize, upper: bool, out: &mut String) {
-    let indent = "  ".repeat(depth);
-    out.push_str(&indent);
-    out.push_str(&display_name(&node.name, upper));
-    out.push('\n');
-    for (key, value) in &node.info {
-        for (at, line) in value.lines().enumerate() {
-            out.push_str(&indent);
-            out.push_str("  ");
-            if at == 0 && !key.is_empty() {
-                out.push_str(key);
-                out.push_str(": ");
-            }
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    if let Some(estimate) = node.estimate {
-        let unit = if estimate == 1 { "row" } else { "rows" };
-        out.push_str(&format!("{indent}  ~{} {unit}\n", format_count(estimate)));
-    }
-    for child in &node.children {
-        render_text_node(child, depth + 1, upper, out);
+    TreeNode {
+        name: node.name.clone(),
+        details,
+        rows: None,
+        estimated_rows: node.estimate,
+        children: node.children.iter().map(text_tree).collect(),
     }
 }
 
@@ -569,8 +548,11 @@ pub(super) fn render(node: &ExplainNode, format: &str, upper: bool) -> String {
         render_json_node(node, 1, &mut out);
         out.push_str("\n]");
     } else {
-        render_text_node(node, 0, upper, &mut out);
+        let config = TextTreeConfig {
+            upper_case: upper,
+            ..TextTreeConfig::default()
+        };
+        out = text_tree_renderer::render(&text_tree(node), &config);
     }
     out
 }
-

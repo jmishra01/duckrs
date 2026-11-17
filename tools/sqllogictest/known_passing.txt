@@ -526,6 +526,7 @@ test/optimizer/joins/filter_on_subquery_with_aggregate.test
 test/optimizer/joins/filter_projection_map_reconstruction.test
 test/optimizer/joins/fkpk_composite_key_ce.test
 test/optimizer/joins/greedy_input_join_order.test
+test/optimizer/joins/inequality_only_join_order.test
 test/optimizer/joins/integer_range_selectivity_floor.test
 test/optimizer/joins/issues/internal_6248.test
 test/optimizer/joins/join_bug.test
@@ -604,6 +605,7 @@ test/optimizer/statistics/constant_or_null_conjunction.test
 test/optimizer/statistics/constant_or_null_conjunction_effects.test
 test/optimizer/statistics/large_join_cardinality.test
 test/optimizer/statistics/positive_join_cardinality.test
+test/optimizer/statistics/right_semi_join_filter.test
 test/optimizer/statistics/statistics_additive_duplication.test
 test/optimizer/statistics/statistics_aggregate.test
 test/optimizer/statistics/statistics_all_null_comparison.test
@@ -3020,6 +3022,7 @@ test/sql/optimizer/multiple_column_stats_pruning.test
 test/sql/optimizer/narrowing_cast_not_invertible.test
 test/sql/optimizer/not_conjunction_simplification.test
 test/sql/optimizer/nullable_row_group_pruning.test
+test/sql/optimizer/or_null_simplification.test
 test/sql/optimizer/plan/test_anti_join_empty_child.test
 test/sql/optimizer/plan/test_anti_join_projection_map.test
 test/sql/optimizer/plan/test_disable_build_side_probe_side.test
