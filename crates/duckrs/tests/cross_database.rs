@@ -110,6 +110,33 @@ fn columns_qualified_by_the_database() {
     assert!(error.contains("'db1.s1.x.c' or 'db2.s1.x.c'"), "{error}");
 }
 
+/// The temporary tables a transaction creates are the connection's: a statement routed to another
+/// database sees them, and they commit (or roll back) once.
+#[test]
+fn temporary_tables_of_a_transaction() {
+    let mut c = connection();
+    run(&mut c, "CREATE TEMP TABLE before_tx AS SELECT 10 i");
+    run(&mut c, "BEGIN");
+    run(&mut c, "CREATE TEMP TABLE tmp AS SELECT 1 i");
+    run(&mut c, "INSERT INTO db2.u SELECT * FROM tmp");
+    run(&mut c, "INSERT INTO tmp VALUES (2)");
+    run(&mut c, "INSERT INTO before_tx VALUES (11)");
+    run(&mut c, "INSERT INTO db2.u SELECT * FROM tmp WHERE i = 2");
+    run(&mut c, "COMMIT");
+    assert_eq!(rows(&mut c, "SELECT i FROM db2.u ORDER BY i"), [["1"], ["2"]]);
+    assert_eq!(rows(&mut c, "SELECT i FROM tmp ORDER BY i"), [["1"], ["2"]]);
+    assert_eq!(rows(&mut c, "SELECT i FROM before_tx ORDER BY i"), [["10"], ["11"]]);
+
+    // the first database the transaction uses can be the attached one
+    run(&mut c, "BEGIN");
+    run(&mut c, "INSERT INTO db2.u VALUES (3)");
+    run(&mut c, "CREATE TEMP TABLE t2 AS SELECT 5 i");
+    run(&mut c, "INSERT INTO db2.u SELECT * FROM t2");
+    run(&mut c, "ROLLBACK");
+    assert_eq!(one(&mut c, "SELECT count(*) FROM db2.u"), "2");
+    assert!(c.query("SELECT * FROM t2").is_err());
+}
+
 #[test]
 fn a_transaction_writes_one_database() {
     let mut c = connection();

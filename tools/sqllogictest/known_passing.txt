@@ -1157,6 +1157,7 @@ test/sql/attach/attach_issue_21491.test
 test/sql/attach/attach_issue_7660.test
 test/sql/attach/attach_lambda_view.test
 test/sql/attach/attach_macros.test
+test/sql/attach/attach_modify_multiple_databases.test
 test/sql/attach/attach_multi_identifiers.test
 test/sql/attach/attach_nested_types.test
 test/sql/attach/attach_no_wal_writes_mode.test

@@ -570,6 +570,7 @@ impl Catalog {
             dirty: false,
             stops_checkpoints: false,
             held: Mutex::default(),
+            shares_temp: false,
         }
     }
 }
@@ -620,6 +621,10 @@ pub struct Fork {
     stops_checkpoints: bool,
     /// The entries it changed.
     held: Mutex<HashSet<String>>,
+    /// Its temporary schema is that of another fork of the transaction, which commits it
+    /// (`MetaTransaction`: the temporary objects are the connection's, whatever database a
+    /// statement runs in).
+    shares_temp: bool,
 }
 
 impl Fork {
@@ -636,9 +641,33 @@ impl Fork {
         Arc::ptr_eq(&self.database, database)
     }
 
+    /// The temporary schema of this fork, which another fork of the transaction can share.
+    pub fn temp_schema(&self) -> Option<Arc<SchemaCatalogEntry>> {
+        self.catalog.schemas.read().get(TEMP_SCHEMA).cloned()
+    }
+
+    /// Takes the temporary schema of `owner`, another fork of the transaction: what a statement
+    /// created there is seen here, and only `owner` commits it.
+    pub fn share_temp(&mut self, owner: &Fork) {
+        let Some(temp) = owner.temp_schema() else { return };
+        self.catalog.schemas.write().insert(TEMP_SCHEMA.to_string(), temp);
+        self.base.retain(|saved| saved.schema.key() != TEMP_SCHEMA);
+        self.tables.retain(|table| key(&table.schema) != TEMP_SCHEMA);
+        self.shares_temp = true;
+    }
+
+    /// `changed_entries` of this fork, without the temporary ones of a shared schema.
+    fn changed_entries(&self) -> Vec<ChangedEntry> {
+        let mut entries = changed_entries(&self.base, &self.catalog);
+        if self.shares_temp {
+            entries.retain(|entry| entry.schema != TEMP_SCHEMA);
+        }
+        entries
+    }
+
     /// After a statement that can change the catalog: fails if another transaction got there first.
     pub fn claim_changes(&self) -> Result<()> {
-        let entries = changed_entries(&self.base, &self.catalog);
+        let entries = self.changed_entries();
         self.database
             .versions
             .lock()
@@ -694,7 +723,7 @@ impl Fork {
 
     /// `DuckTransactionManager::CommitTransaction`. Whoever calls this keeps everyone else out.
     pub fn commit(&self) -> Result<()> {
-        let entries = changed_entries(&self.base, &self.catalog);
+        let entries = self.changed_entries();
         let changed: HashSet<&str> = entries.iter().map(|entry| entry.key.as_str()).collect();
         self.check_drops(&entries)?;
         // the DEFERRED keys among the rows as the transaction leaves them, also of the tables it
@@ -791,6 +820,9 @@ impl Fork {
             }
         }
         for (name, schema) in own.iter() {
+            if self.shares_temp && name == TEMP_SCHEMA {
+                continue;
+            }
             let saved = self.base.iter().find(|saved| saved.schema.key() == *name);
             // one that another transaction dropped has nothing of this one: `check_drops`
             if saved.is_some() && !schemas.contains_key(name) {

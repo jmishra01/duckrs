@@ -193,9 +193,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
     lacks are looked up in the default one, as are those of the views of an attached database
   - [x] the catalog in table bindings (`BindingAlias`): `db1.t.c`, `db1.s1.t.c`, `EXCLUDE (db1.s1.t.c)`, the struct
     pack `db1.s1.t`, and `MinimumUniqueAlias` in the errors of ambiguous tables and columns
-  - [ ] temp tables created in the transaction in a statement routed to another database (each database's fork
-    copies the temporary schema of the last commit), sequences of the default database in a statement routed to
-    another, DETACH of the default database
+  - [x] temp tables created in the transaction in a statement routed to another database: the forks of a
+    transaction share the temporary schema of its first one, which alone commits it
+  - [ ] sequences of the default database in a statement routed to another, DETACH of the default database
   - [x] `RECOVERY_MODE` (`NO_WAL_WRITES` keeps commits out of the log until a checkpoint)
   - [ ] `ENCRYPTION_KEY`, `COMPRESS`, `IO_MODE` and the other ATTACH options
 - [x] 11. Files that C++ DuckDB v69 can read and write (`sql/storage_version`: all pass)

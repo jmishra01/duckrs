@@ -1831,10 +1831,14 @@ impl ClientContext {
         }
         let db = self.db.clone();
         if let Some(transaction) = &mut self.transaction {
-            let fork = {
+            let mut fork = {
                 let _reading = db.statements.read();
                 db.catalog.fork()
             };
+            // the temporary objects the transaction made so far are those of its first database's fork
+            if let Some((_, first)) = transaction.forks.first() {
+                fork.share_temp(first);
+            }
             db.transactions.lock().open.insert(self.id);
             transaction.forks.push((db, fork));
         }
