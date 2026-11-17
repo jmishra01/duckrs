@@ -106,9 +106,86 @@ struct FilterPushdown {
     filters: Vec<Filter>,
 }
 
+thread_local! {
+    /// The next table index of the plan being rewritten (`Binder::GenerateTableIndex`).
+    static NEXT_TABLE_INDEX: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn generate_table_index() -> usize {
+    NEXT_TABLE_INDEX.with(|next| {
+        let index = next.get();
+        next.set(index + 1);
+        index
+    })
+}
+
 /// Runs the pass over a plan.
 pub fn push_down(plan: LogicalOperator) -> LogicalOperator {
-    FilterPushdown::default().rewrite(plan)
+    // the pass also runs on parts of the plan it rewrites: the outermost run numbers the new tables
+    let outermost = NEXT_TABLE_INDEX.with(|next| next.get()) == 0;
+    if outermost {
+        let first_free = super::common_subplan::max_table_index(&plan) + 1;
+        NEXT_TABLE_INDEX.with(|next| next.set(first_free));
+    }
+    let result = FilterPushdown::default().rewrite(plan);
+    if outermost {
+        NEXT_TABLE_INDEX.with(|next| next.set(0));
+    }
+    result
+}
+
+/// `CreateDummyRHS`: one row of NULLs with the columns of `op`, a projection on a dummy scan for
+/// each of its tables, side by side.
+fn dummy_rhs(op: &LogicalOperator) -> LogicalOperator {
+    let mut groups: Vec<(usize, Vec<(usize, duckrs_common::types::LogicalType)>)> = Vec::new();
+    for (binding, ty) in op.column_bindings().into_iter().zip(op.types()) {
+        match groups.iter_mut().find(|(table, _)| *table == binding.table_index) {
+            Some((_, columns)) => columns.push((binding.column_index, ty)),
+            None => groups.push((binding.table_index, vec![(binding.column_index, ty)])),
+        }
+    }
+    let mut result: Option<LogicalOperator> = None;
+    for (table_index, columns) in groups {
+        // the columns keep their bindings: a projection with each at its column index
+        let width = columns.iter().map(|(c, _)| c + 1).max().unwrap_or(0);
+        let expressions = (0..width)
+            .map(|at| {
+                let ty = columns
+                    .iter()
+                    .find(|(c, _)| *c == at)
+                    .map_or(duckrs_common::types::LogicalType::INTEGER, |(_, ty)| ty.clone());
+                BoundExpr::constant(Value::null(ty.clone())).cast_to(&ty, false)
+            })
+            .collect();
+        let projection = LogicalOperator::new(
+            LogicalOperatorKind::Projection {
+                table_index,
+                expressions,
+            },
+            vec![LogicalOperator::new(
+                LogicalOperatorKind::DummyScan {
+                    table_index: generate_table_index(),
+                },
+                Vec::new(),
+            )],
+        );
+        result = Some(match result {
+            None => projection,
+            Some(left) => LogicalOperator::new(LogicalOperatorKind::CrossProduct, vec![left, projection]),
+        });
+    }
+    result.unwrap_or_else(|| LogicalOperator::new(LogicalOperatorKind::DummyScan { table_index: generate_table_index() }, Vec::new()))
+}
+
+/// Whether a condition can hold for no row: it folds to false or NULL (`FilterResult::UNSATISFIABLE`).
+fn unsatisfiable(expr: &BoundExpr) -> bool {
+    let mut conjuncts = Vec::new();
+    split_conjuncts(expr.clone(), &mut conjuncts);
+    conjuncts.iter().any(|conjunct| {
+        conjunct.is_foldable()
+            && crate::execution::expression_executor::try_evaluate_scalar(conjunct)
+                .is_some_and(|value| value.is_null() || value == Value::boolean(false))
+    })
 }
 
 impl FilterPushdown {
@@ -402,6 +479,15 @@ impl FilterPushdown {
         }
         let right_child = op.children.remove(1);
         let left_child = op.children.remove(0);
+        // a LEFT join on a condition that holds for no row: each left row with NULLs on the right
+        let LogicalOperatorKind::Join { predicate, .. } = &op.kind else {
+            unreachable!()
+        };
+        if predicate.as_ref().is_some_and(unsatisfiable) {
+            let dummy = dummy_rhs(&right_child);
+            let product = LogicalOperator::new(LogicalOperatorKind::CrossProduct, vec![left.rewrite(left_child), dummy]);
+            return add_filter_operator(product, remaining.into_iter().map(|f| f.filter).collect());
+        }
         op.children = vec![left.rewrite(left_child), right.rewrite(right_child)];
         add_filter_operator(op, remaining.into_iter().map(|f| f.filter).collect())
     }

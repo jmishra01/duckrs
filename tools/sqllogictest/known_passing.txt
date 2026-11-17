@@ -600,6 +600,7 @@ test/optimizer/remove_duplicate_groups_with_stats.test
 test/optimizer/remove_unused_filter_column.test
 test/optimizer/reported_bugs/in_vs_where.test
 test/optimizer/row_number_virtual_column_local.test
+test/optimizer/statistics/constant_or_null_conjunction.test
 test/optimizer/statistics/constant_or_null_conjunction_effects.test
 test/optimizer/statistics/large_join_cardinality.test
 test/optimizer/statistics/positive_join_cardinality.test
@@ -615,13 +616,16 @@ test/optimizer/statistics/statistics_count_not_null_join_pruning.test
 test/optimizer/statistics/statistics_count_not_null_pruning.test
 test/optimizer/statistics/statistics_exp_libm.test
 test/optimizer/statistics/statistics_filter_multicolumn.test
+test/optimizer/statistics/statistics_is_null.test
 test/optimizer/statistics/statistics_join_always_matches_layout.test
 test/optimizer/statistics/statistics_join_arbitrary_condition.test
 test/optimizer/statistics/statistics_join_multicolumn.test
 test/optimizer/statistics/statistics_join_null.test
 test/optimizer/statistics/statistics_join_ungrouped_aggregate_limit.test
 test/optimizer/statistics/statistics_least_greatest.test
+test/optimizer/statistics/statistics_null_comparison.test
 test/optimizer/statistics/statistics_root_replaced.test
+test/optimizer/statistics/statistics_setop.test
 test/optimizer/statistics/statistics_string_length.test
 test/optimizer/statistics/statistics_struct.test
 test/optimizer/statistics/statistics_suffix.test
@@ -2720,6 +2724,7 @@ test/sql/join/inner/test_using_chain.test
 test/sql/join/inner/test_using_join.test
 test/sql/join/inner/test_varchar_join.test
 test/sql/join/left_outer/left_join_issue_1172.test
+test/sql/join/left_outer/left_join_issue_15316.test
 test/sql/join/left_outer/left_join_issue_23805.test
 test/sql/join/left_outer/left_join_issue_24540.test
 test/sql/join/left_outer/left_join_issue_6341.test

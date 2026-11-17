@@ -853,9 +853,16 @@ impl StatisticsPropagator {
             }
             BoundExprKind::Comparison { .. } => self.comparison(expr, in_filter),
             BoundExprKind::Between { .. } => self.between(expr, in_filter),
-            BoundExprKind::Conjunction { children, .. } => {
-                for child in children {
+            BoundExprKind::Conjunction { children, and } => {
+                for child in children.iter_mut() {
                     self.expression(child, in_filter);
+                }
+                if *and {
+                    simplify_constant_or_null(children);
+                    if children.len() == 1 {
+                        let only = children.remove(0);
+                        *expr = only;
+                    }
                 }
                 unknown()
             }
@@ -1778,6 +1785,11 @@ impl StatisticsPropagator {
                 }
             }
         }
+        simplify_constant_or_null(&mut kept);
+        // as a table filter (which a filter that can fail keeps it from becoming)
+        if !kept.iter().any(crate::optimizer::rewriter::can_throw) {
+            kept = kept.into_iter().map(|expr| true_or_null_as_not_null(expr, &op.children[0])).collect();
+        }
         // `x != a AND x != b ...` that leaves no value of an integer column's range (a NOT IN list
         // covering it) is never true
         let mut excluded: HashMap<ColumnBinding, HashSet<i128>> = HashMap::new();
@@ -1835,6 +1847,8 @@ impl StatisticsPropagator {
         let matches_only = matches!(join_type, JoinType::Inner | JoinType::Semi);
         let mut no_rows = false;
         let mut right_is_empty = false;
+        // the filters the ranges of the keys after the join make for each side (`CreateFilterFromJoinStats`)
+        let mut range_filters: [Vec<BoundExpr>; 2] = [Vec::new(), Vec::new()];
         for condition in conditions.iter_mut().filter(|c| !c.null_safe) {
             let left = self.expression(&mut condition.left, false);
             let right = self.expression(&mut condition.right, false);
@@ -1848,12 +1862,40 @@ impl StatisticsPropagator {
                 BoundExprKind::ColumnRef { binding: b, depth: 0 },
             ) = (matches_only, &condition.left.kind, &condition.right.kind)
             {
-                self.update_columns(ComparisonOp::Equal, *a, *b);
+                let (a, b) = (*a, *b);
+                self.update_columns(ComparisonOp::Equal, a, b);
+                for (side, (expr, before)) in [(&condition.left, &left), (&condition.right, &right)].into_iter().enumerate() {
+                    let binding = if side == 0 { a } else { b };
+                    let after = self.lookup(binding);
+                    range_filters[side].extend(join_range_filters(expr, before, &after));
+                }
             }
         }
+        for (side, filters) in range_filters.into_iter().enumerate() {
+            // C++ evaluates the filters already on a scan before those it adds: one that can fail fails
+            // on the rows the range would have left out, as here it would not
+            if filters.is_empty() || no_rows || has_failing_filter(&op.children[side]) {
+                continue;
+            }
+            let child = std::mem::replace(&mut op.children[side], LogicalOperator::new(K::CrossProduct, Vec::new()));
+            let filtered = LogicalOperator::new(K::Filter { expressions: filters }, vec![child]);
+            op.children[side] = super::filter_pushdown::push_down(filtered);
+        }
+        let K::Join {
+            conditions,
+            predicate,
+            ..
+        } = &mut op.kind
+        else {
+            unreachable!()
+        };
+        // `PropagateStatistics(LogicalAnyJoin)`: the condition of an outer join is an expression, not a
+        // filter: an OR keeps a branch that is false or NULL. What duckrs keeps as the condition of an
+        // inner join, C++ has as a filter above it
+        let in_filter = join_type == JoinType::Inner;
         if let Some(condition) = predicate {
-            self.expression(condition, true);
-            rewrite_expression(condition, true);
+            self.expression(condition, in_filter);
+            rewrite_expression(condition, in_filter);
             match fold_boolean(condition) {
                 Some(Some(true)) => *predicate = None,
                 Some(_) => {
@@ -2028,6 +2070,15 @@ impl StatisticsPropagator {
                 let (table_index, columns) = (*table_index, types.len());
                 self.union_of_children(op, table_index, columns);
             }
+            // `PropagateStatistics(LogicalSetOperation)`: EXCEPT and INTERSECT have values of the left side
+            K::ExceptIntersect { table_index, types, .. } => {
+                let (table_index, columns) = (*table_index, types.len());
+                let left = op.children[0].column_bindings();
+                for (column, binding) in left.into_iter().enumerate().take(columns) {
+                    let stats = self.lookup(binding);
+                    self.stats.insert(ColumnBinding::new(table_index, column), stats);
+                }
+            }
             K::DelimJoin {
                 join_type: JoinType::Single,
                 ..
@@ -2132,6 +2183,150 @@ fn string_function_max_length(name: &str, children: &[BoundExpr], stats: &[Stats
         }
         _ => None,
     }
+}
+
+/// Whether the filters down from `op` to its scan include one that can fail.
+fn has_failing_filter(op: &LogicalOperator) -> bool {
+    match &op.kind {
+        K::Filter { expressions } => {
+            expressions.iter().any(crate::optimizer::rewriter::can_throw) || op.children.iter().any(has_failing_filter)
+        }
+        K::Get { filters, .. } => filters.iter().any(crate::optimizer::rewriter::can_throw),
+        K::Projection { .. } | K::ColumnSelect { .. } => op.children.iter().any(has_failing_filter),
+        _ => false,
+    }
+}
+
+/// `CreateFilterFromJoinStats`: the bounds a join left of an integer key column, as filters for its side.
+fn join_range_filters(expr: &BoundExpr, before: &Stats, after: &Stats) -> Vec<BoundExpr> {
+    if !matches!(expr.kind, BoundExprKind::ColumnRef { depth: 0, .. }) || !expr.return_type.is_integral() {
+        return Vec::new();
+    }
+    let (Some(min_before), Some(max_before), Some(min_after), Some(max_after)) =
+        (&before.min, &before.max, &after.min, &after.max)
+    else {
+        return Vec::new();
+    };
+    let compare = |op, value: &Value| {
+        BoundExpr::new(
+            BoundExprKind::Comparison {
+                op,
+                left: Box::new(expr.clone()),
+                right: Box::new(BoundExpr::constant(value.clone()).cast_to(&expr.return_type, false)),
+            },
+            LogicalType::BOOLEAN,
+        )
+    };
+    let mut filters = Vec::new();
+    if compare_values(ComparisonOp::GreaterThan, min_after, min_before) == Some(true) {
+        filters.push(compare(ComparisonOp::GreaterThanOrEqual, min_after));
+    }
+    if compare_values(ComparisonOp::LessThan, max_after, max_before) == Some(true) {
+        filters.push(compare(ComparisonOp::LessThanOrEqual, max_after));
+    }
+    filters
+}
+
+/// `FilterRejectsNull`: whether `filter` is never true where `expr` is NULL.
+fn filter_rejects_null(filter: &BoundExpr, expr: &BoundExpr) -> bool {
+    let same = |e: &BoundExpr| format!("{:?}", e.kind) == format!("{:?}", expr.kind);
+    match &filter.kind {
+        BoundExprKind::Conjunction { and: true, children } => children.iter().any(|c| filter_rejects_null(c, expr)),
+        BoundExprKind::Conjunction { and: false, children } => {
+            !children.is_empty() && children.iter().all(|c| filter_rejects_null(c, expr))
+        }
+        BoundExprKind::Operator {
+            op: BoundOperator::IsNotNull,
+            children,
+        } => children.first().is_some_and(same),
+        BoundExprKind::Comparison { op, left, right }
+            if !matches!(op, ComparisonOp::DistinctFrom | ComparisonOp::NotDistinctFrom) =>
+        {
+            same(left) || same(right)
+        }
+        _ => false,
+    }
+}
+
+/// `SimplifyConstantOrNull`: `constant_or_null(true, x, ...)` among conjuncts that are each NULL where one of
+/// `x, ...` is adds nothing, as long as removing it lets no conjunct see more rows that can fail.
+fn simplify_constant_or_null(expressions: &mut Vec<BoundExpr>) {
+    let is_candidate = |e: &BoundExpr| {
+        matches!(&e.kind, BoundExprKind::Function { function, children, .. }
+            if function.name == "constant_or_null"
+                && children.len() >= 2
+                && matches!(&children[0].kind, BoundExprKind::Constant(v) if v.data() == &ValueData::Bool(true)))
+    };
+    if expressions.len() < 2 || !expressions.iter().any(is_candidate) {
+        return;
+    }
+    if expressions
+        .iter()
+        .any(|e| crate::optimizer::rewriter::can_throw(e) || e.is_volatile() || crate::optimizer::rewriter::contains_barrier(e))
+    {
+        return;
+    }
+    let mut at = 0;
+    while at < expressions.len() {
+        let redundant = is_candidate(&expressions[at]) && {
+            let BoundExprKind::Function { children, .. } = &expressions[at].kind else {
+                unreachable!("a candidate")
+            };
+            children[1..].iter().all(|child| match &child.kind {
+                BoundExprKind::Constant(value) => !value.is_null(),
+                _ => expressions
+                    .iter()
+                    .enumerate()
+                    .any(|(other, filter)| other != at && filter_rejects_null(filter, child)),
+            })
+        };
+        if redundant {
+            expressions.remove(at);
+        } else {
+            at += 1;
+        }
+    }
+}
+
+/// `PropagateStatistics(LogicalGet)` of a `FILTER_TRUE_OR_NULL` table filter: `constant_or_null(true, ...)`
+/// of one column of a scan, and constants that are not NULL, is NULL just when the column is, and
+/// filters as `column IS NOT NULL` (`IsNullOnlyForNullColumn`).
+fn true_or_null_as_not_null(expr: BoundExpr, child: &LogicalOperator) -> BoundExpr {
+    let BoundExprKind::Function { function, children, .. } = &expr.kind else {
+        return expr;
+    };
+    if function.name != "constant_or_null"
+        || children.len() < 2
+        || !matches!(&children[0].kind, BoundExprKind::Constant(v) if v.data() == &ValueData::Bool(true))
+        || !matches!(child.kind, K::Get { .. })
+    {
+        return expr;
+    }
+    let scan = child.column_bindings();
+    let mut column: Option<&BoundExpr> = None;
+    for argument in &children[1..] {
+        match &argument.kind {
+            BoundExprKind::ColumnRef { binding, depth: 0 } if scan.contains(binding) => {
+                let same = |c: &BoundExpr| matches!(&c.kind, BoundExprKind::ColumnRef { binding: b, .. } if b == binding);
+                if column.is_some_and(|c| !same(c)) {
+                    return expr;
+                }
+                column = Some(argument);
+            }
+            BoundExprKind::Constant(value) if !value.is_null() => {}
+            _ => return expr,
+        }
+    }
+    let Some(column) = column else {
+        return expr;
+    };
+    BoundExpr::new(
+        BoundExprKind::Operator {
+            op: BoundOperator::IsNotNull,
+            children: vec![column.clone()],
+        },
+        LogicalType::BOOLEAN,
+    )
 }
 
 fn expr_is_volatile_function(name: &str) -> bool {
