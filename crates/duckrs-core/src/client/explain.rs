@@ -573,3 +573,4 @@ pub(super) fn render(node: &ExplainNode, format: &str, upper: bool) -> String {
     }
     out
 }
+

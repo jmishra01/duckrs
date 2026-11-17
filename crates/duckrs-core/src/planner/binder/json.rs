@@ -56,6 +56,8 @@ impl Binder<'_> {
         let mut filename = None;
         let mut hive_options = super::copy::HiveOptions::default();
         let mut union_by_name = false;
+        // `maximum_sample_files`: the files `DetectStructure` samples
+        let mut maximum_sample_files = 32usize;
         for argument in &args {
             let value = self.constant_argument(&argument.expr)?;
             if argument.name.is_empty() {
@@ -162,10 +164,11 @@ impl Binder<'_> {
                 "compression" => compression = Compression::parse(&value.try_to_string()?)?,
                 // -1 (`DConstants::INVALID_INDEX`): no objects become MAPs
                 "map_inference_threshold" => map_inference = number()? != -1,
-                "maximum_object_size"
-                | "field_appearance_threshold"
-                | "maximum_sample_files"
-                | "convert_strings_to_integers" => {}
+                "maximum_sample_files" => {
+                    let files = number()?;
+                    maximum_sample_files = if files < 0 { usize::MAX } else { files as usize };
+                }
+                "maximum_object_size" | "field_appearance_threshold" | "convert_strings_to_integers" => {}
                 "union_by_name" => union_by_name = is_true(&value, &option)?,
                 "case_insensitive_keys" => formats.case_insensitive = is_true(&value, &option)?,
                 "hive_partitioning" | "hive_types" | "hive_type" | "hive_types_autocast" | "hive_type_autocast" => {
@@ -226,7 +229,9 @@ impl Binder<'_> {
             (names, types, records.unwrap_or(true))
         } else {
             let mut sampled: Vec<Json> = Vec::new();
-            for (at, path) in files.iter().enumerate() {
+            // `DetectStructure`: up to `sample_size` records of each of the first files
+            for (at, path) in files.iter().enumerate().take(maximum_sample_files.max(1)) {
+                let mut taken = 0;
                 let data = read_file(path, compression)?;
                 let (found, detected) = read_records(&data, format);
                 if at == 0 {
@@ -240,14 +245,14 @@ impl Binder<'_> {
                         Err(_) if ignore_errors => {}
                         Err(error) => return Err(record_error(path, &data, &error)),
                     }
-                    if sampled.len() >= sample_size {
+                    taken += 1;
+                    if taken >= sample_size {
                         break;
                     }
                 }
-                if sampled.len() >= sample_size || !(union_by_name || sampled.is_empty()) {
-                    break;
-                }
             }
+            // the schema of the sampled files is combined either way; union_by_name changes how files are read
+            let _ = union_by_name;
             let references: Vec<&Json> = sampled.iter().collect();
             let structure = infer_with(&references, formats.case_insensitive);
             let ty = structure.logical_type_with(maximum_depth, map_inference);

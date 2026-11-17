@@ -1836,15 +1836,13 @@ impl StatisticsPropagator {
     /// `PropagateStatistics(LogicalJoin)`.
     fn join(&mut self, op: &mut LogicalOperator) {
         let K::Join {
-            join_type,
-            conditions,
-            predicate,
+            join_type, conditions, ..
         } = &mut op.kind
         else {
             unreachable!()
         };
         let join_type = *join_type;
-        let matches_only = matches!(join_type, JoinType::Inner | JoinType::Semi);
+        let matches_only = matches!(join_type, JoinType::Inner | JoinType::Semi | JoinType::RightSemi);
         let mut no_rows = false;
         let mut right_is_empty = false;
         // the filters the ranges of the keys after the join make for each side (`CreateFilterFromJoinStats`)
