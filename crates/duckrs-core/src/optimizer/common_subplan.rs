@@ -65,7 +65,7 @@ fn defined_indexes(kind: &K) -> Vec<usize> {
     defined_indexes_mut(&mut kind).into_iter().map(|i| *i).collect()
 }
 
-fn defined_indexes_mut(kind: &mut K) -> Vec<&mut usize> {
+pub(super) fn defined_indexes_mut(kind: &mut K) -> Vec<&mut usize> {
     match kind {
         K::Get { table_index, .. }
         | K::Range { table_index, .. }
@@ -221,7 +221,7 @@ fn can_share_expression(expr: &BoundExpr) -> bool {
 }
 
 /// `CTEInlining::EndsInAggregateOrDistinct`.
-fn ends_in_aggregate_or_distinct(op: &LogicalOperator) -> bool {
+pub(super) fn ends_in_aggregate_or_distinct(op: &LogicalOperator) -> bool {
     match op.kind {
         K::Aggregate { .. } | K::Distinct { .. } | K::Window { .. } => true,
         _ => op.children.len() == 1 && ends_in_aggregate_or_distinct(&op.children[0]),
@@ -1134,6 +1134,7 @@ impl Finder {
                     name: cte_name,
                     table_index: cte_index,
                     data,
+                    always: false,
                 },
                 vec![definition, rest],
             );

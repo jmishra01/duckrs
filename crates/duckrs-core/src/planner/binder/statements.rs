@@ -3554,14 +3554,26 @@ impl Binder<'_> {
             return Err(binder_error("Target table has more column names than query result."));
         }
         let mut columns: Vec<ColumnDefinition> = Vec::with_capacity(bound.names.len());
+        // `ColumnList::SetAllowDuplicates`: without target names, a name taken becomes `name_1`, ...
+        let allow_duplicates = info.columns.is_empty();
+        let taken =
+            |columns: &[ColumnDefinition], name: &str| columns.iter().any(|c| c.name.eq_ignore_ascii_case(name));
         for (i, (name, ty)) in bound.names.iter().zip(&bound.types).enumerate() {
-            let name = info.columns.get(i).map_or(name, |c| &c.name);
-            if columns.iter().any(|c| c.name.eq_ignore_ascii_case(name)) {
+            let mut name = info.columns.get(i).map_or(name, |c| &c.name).clone();
+            if allow_duplicates {
+                let base = name.clone();
+                let mut index = 1;
+                while taken(&columns, &name) {
+                    name = format!("{base}_{index}");
+                    index += 1;
+                }
+            } else if taken(&columns, &name) {
                 return Err(Error::new(
                     ErrorKind::Catalog,
-                    format!("Column with name {} already exists!", sql_quoted_identifier(name)),
+                    format!("Column with name {} already exists!", sql_quoted_identifier(&name)),
                 ));
             }
+            let name = &name;
             // a column of untyped NULLs becomes an INTEGER column
             let ty = if ty.id() == LogicalTypeId::SqlNull {
                 LogicalType::INTEGER

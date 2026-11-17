@@ -9,10 +9,12 @@
 
 pub mod build_side;
 mod common_subplan;
+mod cte_inlining;
 mod join_elimination;
 mod projection_pullup;
 mod projection_placement;
 mod deliminator;
+mod disjunctive_join;
 pub mod distinct_statistics;
 pub mod empty_result_pullup;
 pub mod filter_pushdown;
@@ -48,6 +50,8 @@ pub struct OptimizerOptions {
     pub projection_placement: bool,
     pub join_elimination: bool,
     pub in_clause: bool,
+    pub disjunctive_join_rewriter: bool,
+    pub cte_inlining: bool,
     /// `index_scan_percentage`
     pub index_scan_percentage: f64,
     /// `index_scan_max_count`
@@ -76,6 +80,8 @@ impl Default for OptimizerOptions {
             projection_placement: true,
             join_elimination: true,
             in_clause: true,
+            disjunctive_join_rewriter: true,
+            cte_inlining: true,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -102,6 +108,8 @@ impl OptimizerOptions {
             projection_placement: false,
             join_elimination: false,
             in_clause: false,
+            disjunctive_join_rewriter: false,
+            cte_inlining: false,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -127,6 +135,8 @@ impl OptimizerOptions {
             projection_placement: !off("projection_placement"),
             join_elimination: !off("join_elimination"),
             in_clause: !off("in_clause"),
+            disjunctive_join_rewriter: !off("disjunctive_join_rewriter"),
+            cte_inlining: !off("cte_inlining"),
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -189,6 +199,12 @@ pub fn optimize_timed(
     // C++ runs this before the DELIMINATOR, after `CheckMarkToSemi`: its MARK joins stay
     if options.in_clause {
         plan = run("in_clause", plan, &mut in_clause_rewriter::rewrite);
+    }
+    if options.disjunctive_join_rewriter {
+        plan = run("disjunctive_join_rewriter", plan, &mut disjunctive_join::rewrite);
+    }
+    if options.cte_inlining {
+        plan = run("cte_inlining", plan, &mut cte_inlining::inline);
     }
     if options.projection_pullup {
         plan = run("projection_pullup", plan, &mut projection_pullup::pull_up);

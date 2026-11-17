@@ -498,7 +498,10 @@ test/optimizer/constant_folding.test
 test/optimizer/constant_order_normalization.test
 test/optimizer/csv_pushdown.test
 test/optimizer/cte_statistics_propagation.test
+test/optimizer/disjunctive_join_rewriter_exclusions.test
+test/optimizer/disjunctive_join_rewriter_expansion.test
 test/optimizer/disjunctive_join_rewriter_nested.test
+test/optimizer/disjunctive_join_rewriter_occurrences.test
 test/optimizer/distributivity_rule.test
 test/optimizer/estimated_cardinalities_are_in_logical_plan.test
 test/optimizer/expression_rewriter/functions_that_error_are_not_reordered.test
@@ -1935,6 +1938,7 @@ test/sql/create/create_index_on_issue_13643.test
 test/sql/create/create_objects_readonly.test
 test/sql/create/create_or_replace.test
 test/sql/create/create_schema_options.test
+test/sql/create/create_table_as_duplicate_names.test
 test/sql/create/create_table_as_error.test
 test/sql/create/create_table_as_no_data_limit.test
 test/sql/create/create_table_empty_name.test

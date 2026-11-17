@@ -769,6 +769,8 @@ struct StatisticsPropagator {
     filter_simplification: bool,
     /// `filter_bindings_changed`
     filter_bindings_changed: bool,
+    /// `cte_stats_map`: the statistics of the columns of each materialized CTE's definition
+    ctes: HashMap<usize, Vec<Stats>>,
 }
 
 impl StatisticsPropagator {
@@ -2024,8 +2026,26 @@ impl StatisticsPropagator {
     }
 
     fn visit(&mut self, op: &mut LogicalOperator) {
-        for child in &mut op.children {
+        for (at, child) in op.children.iter_mut().enumerate() {
             self.visit(child);
+            // `PropagateStatistics(LogicalMaterializedCTE)`: the definition runs once, so what holds
+            // for its columns holds for each scan of it
+            if at == 0
+                && let K::MaterializedCte { table_index, .. } = &op.kind
+            {
+                let columns = child.column_bindings().into_iter().map(|b| self.lookup(b)).collect();
+                self.ctes.insert(*table_index, columns);
+            }
+        }
+        // `PropagateStatistics(LogicalCTERef)`
+        if let K::CteRef {
+            table_index, cte_index, ..
+        } = &op.kind
+            && let Some(columns) = self.ctes.get(cte_index)
+        {
+            for (i, stats) in columns.clone().into_iter().enumerate() {
+                self.stats.insert(ColumnBinding::new(*table_index, i), stats);
+            }
         }
         self.count_valid_as_count_star(op);
         // `ParquetCopyToPropagateStatistics`: columns that can't be NULL are written REQUIRED
