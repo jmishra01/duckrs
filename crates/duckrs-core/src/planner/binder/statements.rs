@@ -542,45 +542,154 @@ impl Binder<'_> {
                 types: types.clone(),
             },
             operation => {
-                // the rows match as the collations of their columns say
-                let mut keys = Vec::with_capacity(types.len());
-                let mut collated = false;
-                for (i, ty) in types.iter().enumerate() {
-                    let column = BoundExpr::new(BoundExprKind::Reference(i), ty.clone());
-                    let (key, pushed) = crate::planner::collation::push_collation(
-                        column,
-                        ty,
-                        &self.default_collation(),
-                        crate::planner::collation::CollationType::AllCollations,
-                    )?;
-                    collated |= pushed;
-                    keys.push(key);
-                }
-                LogicalOperatorKind::ExceptIntersect {
-                    table_index,
-                    types: types.clone(),
-                    except: operation == SetOpType::Except,
-                    all: node.setop_all,
-                    keys: if collated { keys } else { Vec::new() },
-                }
+                // `CreateSetOperationJoin`: EXCEPT is an ANTI join and INTERSECT a SEMI join on all
+                // columns, by their collations, with NULLs equal
+                let mut plans = plans.into_iter();
+                let (left, right) = (plans.next().expect("two children"), plans.next().expect("two children"));
+                let plan = self.set_operation_join(operation == SetOpType::Except, node.setop_all, &types, left, right, table_index)?;
+                return self.finish_set_operation(plan, node, modifiers, &aliases, &types, table_index, names);
             }
         };
         let plan = LogicalOperator::new(kind, plans);
+        self.finish_set_operation(plan, node, modifiers, &aliases, &types, table_index, names)
+    }
+
+    /// `VisitQueryNode` of a set operation: DISTINCT unless ALL, and the modifiers.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_set_operation(
+        &mut self,
+        plan: LogicalOperator,
+        node: &SetOperationNode,
+        modifiers: &[ResultModifier],
+        aliases: &[(String, usize)],
+        types: &[LogicalType],
+        table_index: usize,
+        names: Vec<String>,
+    ) -> Result<BoundStatement> {
         let mut prepared = Vec::with_capacity(modifiers.len() + 1);
         if !node.setop_all {
             prepared.push(PreparedModifier::Distinct);
         }
         for modifier in modifiers {
-            prepared.push(self.prepare_set_operation_modifier(modifier, &aliases, &types, node)?);
+            prepared.push(self.prepare_set_operation_modifier(modifier, aliases, types, node)?);
         }
-        let plan = self.apply_modifiers(plan, prepared, table_index, &names, &types, types.len())?;
+        let plan = self.apply_modifiers(plan, prepared, table_index, &names, types, types.len())?;
         Ok(BoundStatement {
             plan,
-            column_aliases: aliases,
+            column_aliases: aliases.to_vec(),
             names,
-            types,
+            types: types.to_vec(),
             return_type: StatementReturnType::QueryResult,
         })
+    }
+
+    /// `CreateSetOperationJoin`: the left rows with (EXCEPT: without) an equal right row, as a
+    /// projection `table_index` of the left columns; with ALL the n-th copies of a row match.
+    fn set_operation_join(
+        &mut self,
+        except: bool,
+        all: bool,
+        types: &[LogicalType],
+        mut left: LogicalOperator,
+        mut right: LogicalOperator,
+        table_index: usize,
+    ) -> Result<LogicalOperator> {
+        let mut compared = types.to_vec();
+        if all {
+            left = self.add_row_number(types, left)?;
+            right = self.add_row_number(types, right)?;
+            compared.push(LogicalType::BIGINT);
+        }
+        let (left_bindings, right_bindings) = (left.column_bindings(), right.column_bindings());
+        let collation = self.default_collation();
+        let collate = |expr: BoundExpr, ty: &LogicalType| -> Result<BoundExpr> {
+            Ok(crate::planner::collation::push_collation(
+                expr,
+                ty,
+                &collation,
+                crate::planner::collation::CollationType::AllCollations,
+            )?
+            .0)
+        };
+        let mut conditions = Vec::with_capacity(compared.len());
+        for (i, ty) in compared.iter().enumerate() {
+            conditions.push(crate::planner::logical::JoinCondition {
+                left: collate(BoundExpr::column_ref(left_bindings[i], ty.clone(), ""), ty)?,
+                right: collate(BoundExpr::column_ref(right_bindings[i], ty.clone(), ""), ty)?,
+                comparison: duckrs_parser::ast::ComparisonOp::NotDistinctFrom,
+                filter: None,
+            });
+        }
+        let join = LogicalOperator::new(
+            LogicalOperatorKind::Join {
+                join_type: if except {
+                    duckrs_parser::ast::JoinType::Anti
+                } else {
+                    duckrs_parser::ast::JoinType::Semi
+                },
+                conditions,
+                predicate: None,
+                algorithm: Default::default(),
+            },
+            vec![left, right],
+        );
+        let expressions = types
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| BoundExpr::column_ref(left_bindings[i], ty.clone(), ""))
+            .collect();
+        Ok(LogicalOperator::new(
+            LogicalOperatorKind::Projection {
+                table_index,
+                expressions,
+            },
+            vec![join],
+        ))
+    }
+
+    /// `AddRowNumber`: the rows numbered within the groups of rows equal in all columns.
+    fn add_row_number(&mut self, types: &[LogicalType], child: LogicalOperator) -> Result<LogicalOperator> {
+        use crate::planner::expression::{BoundWindow, WindowFunction};
+        use duckrs_parser::ast::{WindowBoundary, WindowExclude};
+        let bindings = child.column_bindings();
+        let collation = self.default_collation();
+        let mut partitions = Vec::with_capacity(types.len());
+        for (i, ty) in types.iter().enumerate() {
+            let column = BoundExpr::column_ref(bindings[i], ty.clone(), "");
+            partitions.push(
+                crate::planner::collation::push_collation(
+                    column,
+                    ty,
+                    &collation,
+                    crate::planner::collation::CollationType::AllCollations,
+                )?
+                .0,
+            );
+        }
+        let window = BoundWindow {
+            function: WindowFunction::RowNumber,
+            aggregate: None,
+            return_type: LogicalType::BIGINT,
+            children: Vec::new(),
+            filter: None,
+            distinct: false,
+            ignore_nulls: false,
+            partitions,
+            orders: Vec::new(),
+            arg_orders: Vec::new(),
+            start: WindowBoundary::UnboundedPreceding,
+            end: WindowBoundary::UnboundedFollowing,
+            start_expr: None,
+            end_expr: None,
+            exclude: WindowExclude::NoOther,
+        };
+        Ok(LogicalOperator::new(
+            LogicalOperatorKind::Window {
+                table_index: self.generate_table_index(),
+                windows: vec![window],
+            },
+            vec![child],
+        ))
     }
 
     /// `CastLogicalOperatorToTypes`: a projection of a child of a set operation. `columns[i]` is
