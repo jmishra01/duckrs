@@ -46,7 +46,7 @@ fn groups_for_child(op: &LogicalOperator, above: &[Group]) -> Vec<Group> {
     match &op.kind {
         // these pick rows by count, or compute values that depend on how often rows occur
         K::Limit { .. } | K::LimitPercent { .. } | K::TopN { .. } | K::Sample { .. } | K::Window { .. } => Vec::new(),
-        K::Distinct { targets } => {
+        K::Distinct { targets, .. } => {
             let mut groups = above.to_vec();
             if let Some(group) = targets.iter().map(column_ref).collect::<Option<Group>>()
                 && !group.is_empty()
@@ -86,7 +86,7 @@ fn groups_for_child(op: &LogicalOperator, above: &[Group]) -> Vec<Group> {
 /// The sets of columns of `op` whose values no two of its rows share.
 fn unique_keys(op: &LogicalOperator) -> Vec<Group> {
     match &op.kind {
-        K::Distinct { targets } => {
+        K::Distinct { targets, .. } => {
             let mut keys = unique_keys(&op.children[0]);
             if let Some(key) = targets.iter().map(column_ref).collect::<Option<Group>>()
                 && !key.is_empty()

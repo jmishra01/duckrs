@@ -610,7 +610,7 @@ impl FilterPushdown {
     /// `FilterPushdown::PushdownDistinct`. DISTINCT ON picks a row of each group, so what it picks
     /// changes with a filter below it.
     fn pushdown_distinct(mut self, mut op: LogicalOperator) -> LogicalOperator {
-        let LogicalOperatorKind::Distinct { targets } = &op.kind else {
+        let LogicalOperatorKind::Distinct { targets, .. } = &op.kind else {
             unreachable!()
         };
         if targets.len() != op.children[0].column_bindings().len() {

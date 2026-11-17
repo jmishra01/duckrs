@@ -8,7 +8,7 @@
 
 use crate::execution::physical::PhysicalOperator;
 use crate::optimizer::join_order::PlanEstimate;
-use crate::planner::expression::{BoundAggregate, BoundExpr};
+use crate::planner::expression::{BoundAggregate, BoundExpr, BoundWindow};
 use crate::optimizer::range_joins::{range_order, reorder_conditions};
 use crate::planner::logical::{
     BoundOrderByNode, JoinAlgorithm, JoinCondition, LogicalOperator, LogicalOperatorKind as K,
@@ -138,6 +138,150 @@ pub(crate) fn filter_text(filter: &BoundExpr) -> String {
         }
     }
     inner.to_string()
+}
+
+/// `BoundOrderByNode::ToString`.
+fn order_node_text(expr: &BoundExpr, modifiers: duckrs_common::sort_key::OrderModifiers) -> String {
+    let order = match modifiers.order {
+        OrderType::Descending => "DESC",
+        _ => "ASC",
+    };
+    let nulls = match modifiers.nulls {
+        duckrs_common::sort_key::NullOrder::NullsFirst => "NULLS FIRST",
+        duckrs_common::sort_key::NullOrder::NullsLast => "NULLS LAST",
+    };
+    format!("{expr} {order} {nulls}")
+}
+
+/// `BoundWindowExpression::ToString` (`WindowExpression::ToString`).
+fn window_text(window: &BoundWindow) -> String {
+    use crate::planner::expression::WindowFunction as F;
+    use duckrs_parser::ast::{WindowBoundary as B, WindowExclude};
+    let name = match window.function {
+        F::Aggregate => window.aggregate.as_ref().map_or("", |a| a.name.as_str()),
+        F::RowNumber => "row_number",
+        F::Rank => "rank",
+        F::DenseRank => "dense_rank",
+        F::PercentRank => "percent_rank",
+        F::CumeDist => "cume_dist",
+        F::Ntile => "ntile",
+        F::Lag => "lag",
+        F::Lead => "lead",
+        F::FirstValue => "first_value",
+        F::LastValue => "last_value",
+        F::NthValue => "nth_value",
+        F::Fill => "fill",
+    };
+    let mut result = format!("{name}(");
+    let arguments: Vec<String> = window
+        .children
+        .iter()
+        .enumerate()
+        .map(|(at, child)| {
+            if at == 0 && window.distinct { format!("DISTINCT {child}") } else { child.to_string() }
+        })
+        .collect();
+    result += &arguments.join(", ");
+    if !window.arg_orders.is_empty() {
+        let orders: Vec<String> = window.arg_orders.iter().map(|(e, m)| order_node_text(e, *m)).collect();
+        result += &format!(" ORDER BY {}", orders.join(", "));
+    }
+    if window.ignore_nulls {
+        result += " IGNORE NULLS";
+    }
+    if let Some(filter) = &window.filter {
+        result += &format!(") FILTER (WHERE {filter}");
+    }
+    result += ") OVER (";
+    let mut separator = "";
+    if !window.partitions.is_empty() {
+        let partitions: Vec<String> = window.partitions.iter().map(|p| p.to_string()).collect();
+        result += &format!("PARTITION BY {}", partitions.join(", "));
+        separator = " ";
+    }
+    if !window.orders.is_empty() {
+        let orders: Vec<String> = window.orders.iter().map(|(e, m)| order_node_text(e, *m)).collect();
+        result += &format!("{separator}ORDER BY {}", orders.join(", "));
+        separator = " ";
+    }
+    let units_of = |boundary: B| match boundary {
+        B::CurrentRowRange | B::ExprPrecedingRange | B::ExprFollowingRange => "RANGE",
+        B::CurrentRowGroups | B::ExprPrecedingGroups | B::ExprFollowingGroups => "GROUPS",
+        _ => "ROWS",
+    };
+    let expr_text = |expr: &Option<BoundExpr>| expr.as_ref().map(|e| e.to_string()).unwrap_or_default();
+    let mut units = "ROWS";
+    let mut from = String::new();
+    match window.start {
+        B::CurrentRowRange | B::CurrentRowRows | B::CurrentRowGroups => {
+            from = "CURRENT ROW".to_string();
+            units = units_of(window.start);
+        }
+        B::UnboundedPreceding => {
+            if window.end != B::CurrentRowRange {
+                from = "UNBOUNDED PRECEDING".to_string();
+            }
+        }
+        B::ExprPrecedingRows | B::ExprPrecedingRange | B::ExprPrecedingGroups => {
+            from = format!("{} PRECEDING", expr_text(&window.start_expr));
+            units = units_of(window.start);
+        }
+        B::ExprFollowingRows | B::ExprFollowingRange | B::ExprFollowingGroups => {
+            from = format!("{} FOLLOWING", expr_text(&window.start_expr));
+            units = units_of(window.start);
+        }
+        _ => {}
+    }
+    let mut to = String::new();
+    match window.end {
+        B::CurrentRowRange => {
+            if window.start != B::UnboundedPreceding {
+                to = "CURRENT ROW".to_string();
+                units = "RANGE";
+            }
+        }
+        B::CurrentRowRows | B::CurrentRowGroups => {
+            to = "CURRENT ROW".to_string();
+            units = units_of(window.end);
+        }
+        B::UnboundedPreceding => to = "UNBOUNDED PRECEDING".to_string(),
+        B::UnboundedFollowing => to = "UNBOUNDED FOLLOWING".to_string(),
+        B::ExprPrecedingRows | B::ExprPrecedingRange | B::ExprPrecedingGroups => {
+            to = format!("{} PRECEDING", expr_text(&window.end_expr));
+            units = units_of(window.end);
+        }
+        B::ExprFollowingRows | B::ExprFollowingRange | B::ExprFollowingGroups => {
+            to = format!("{} FOLLOWING", expr_text(&window.end_expr));
+            units = units_of(window.end);
+        }
+        B::Invalid => {}
+    }
+    if window.exclude != WindowExclude::NoOther {
+        if from.is_empty() {
+            from = "UNBOUNDED PRECEDING".to_string();
+        }
+        if to.is_empty() {
+            to = "CURRENT ROW".to_string();
+            units = "RANGE";
+        }
+    }
+    if !from.is_empty() || !to.is_empty() {
+        result += &format!("{separator}{units}");
+    }
+    match (from.is_empty(), to.is_empty()) {
+        (false, false) => result += &format!(" BETWEEN {from} AND {to}"),
+        (false, true) => result += &format!(" {from}"),
+        (true, false) => result += &format!(" {to}"),
+        (true, true) => {}
+    }
+    result += match window.exclude {
+        WindowExclude::CurrentRow => " EXCLUDE CURRENT ROW",
+        WindowExclude::Group => " EXCLUDE GROUP",
+        WindowExclude::Ties => " EXCLUDE TIES",
+        WindowExclude::NoOther => "",
+    };
+    result += ")";
+    result
 }
 
 fn order_text(orders: &[BoundOrderByNode]) -> String {
@@ -344,6 +488,8 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             predicate.as_ref().map(|p| p.to_string()),
         ),
         K::AsOfJoin { join_type, .. } => entry("Join Type", join_type.name().to_string()),
+        // `PhysicalWindow::ParamsToString`
+        K::Window { windows, .. } => entry("Projections", lines(windows.iter().map(window_text))),
         _ => Vec::new(),
     }
 }
@@ -376,6 +522,17 @@ pub(super) fn physical_tree(
     analyze: bool,
 ) -> ExplainNode {
     let children = op.children();
+    // a column select that went into the projection below it has no physical operator
+    if let Some(LogicalOperator {
+        kind: K::ColumnSelect { .. },
+        children: logical_children,
+    }) = logical
+        && op.name() != "COLUMN_SELECT"
+        && logical_children.len() == 1
+    {
+        let estimate = estimate.filter(|e| e.children.len() == 1).map(|e| &e.children[0]);
+        return physical_tree(op, Some(&logical_children[0]), estimate, analyze);
+    }
     // a projection that only passes its child's columns on has no physical operator
     if let Some(LogicalOperator {
         kind: K::Projection { .. },

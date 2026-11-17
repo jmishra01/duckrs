@@ -603,6 +603,8 @@ test/optimizer/regex_optimizer_anchors.test
 test/optimizer/regex_optimizer_coverage.test
 test/optimizer/regex_to_like_optimizer.test
 test/optimizer/remove_duplicate_groups_with_stats.test
+test/optimizer/remove_redundant_order_keys_deferred.test
+test/optimizer/remove_redundant_order_keys_side_effects.test
 test/optimizer/remove_unused_filter_column.test
 test/optimizer/reported_bugs/in_vs_where.test
 test/optimizer/row_number_virtual_column_local.test

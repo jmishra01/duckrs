@@ -951,7 +951,7 @@ impl Exporter<'_> {
                 select.sample = Some(options.clone());
                 Body::Select(select)
             }
-            Op::Distinct { targets } => {
+            Op::Distinct { targets, .. } => {
                 let child = self.export_child(op, 0)?;
                 let child_fields = child.fields.clone();
                 let all_columns = targets.len() == child_fields.len()

@@ -146,8 +146,8 @@ pub enum LogicalOperatorKind {
     LimitPercent { percent: f64, offset: u64 },
     /// `LogicalSample`: a random part of the child's rows.
     Sample { options: SampleOptions },
-    /// `LogicalDistinct` (`DISTINCT`, not `DISTINCT ON`): one row per distinct `targets`.
-    Distinct { targets: Vec<BoundExpr> },
+    /// `LogicalDistinct`: one row per distinct `targets`, the first one with DISTINCT ON (`on`).
+    Distinct { targets: Vec<BoundExpr>, on: bool },
     /// `LogicalSecureView`: the plan of a SECURE VIEW, which it passes on. The optimizer pushes
     /// nothing into it, so that no expression of the query sees the rows the view hides.
     SecureView { view_name: String },
@@ -836,7 +836,7 @@ impl LogicalOperator {
             LogicalOperatorKind::Filter { expressions }
             | LogicalOperatorKind::Projection { expressions, .. }
             | LogicalOperatorKind::Unnest { expressions, .. }
-            | LogicalOperatorKind::Distinct { targets: expressions } => expressions.iter_mut().collect(),
+            | LogicalOperatorKind::Distinct { targets: expressions, .. } => expressions.iter_mut().collect(),
             LogicalOperatorKind::LateralJoin {
                 correlated, predicate, ..
             } => correlated.iter_mut().chain(predicate.iter_mut()).collect(),

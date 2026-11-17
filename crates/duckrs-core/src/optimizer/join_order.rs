@@ -1351,7 +1351,7 @@ impl JoinOrderOptimizer {
                 }
                 stats
             }
-            K::Distinct { targets } => {
+            K::Distinct { targets, .. } => {
                 // `ExtractDistinctStats`
                 let child = self.stats(&op.children[0]);
                 let mut stats = child.project(&op.column_bindings());

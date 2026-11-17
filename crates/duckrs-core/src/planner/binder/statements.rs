@@ -803,9 +803,11 @@ impl Binder<'_> {
             let kind = match modifier {
                 PreparedModifier::Distinct => LogicalOperatorKind::Distinct {
                     targets: (0..column_count).map(collated_column).collect::<Result<_>>()?,
+                    on: false,
                 },
                 PreparedModifier::DistinctOn(indexes) => LogicalOperatorKind::Distinct {
                     targets: indexes.into_iter().map(collated_column).collect::<Result<_>>()?,
+                    on: true,
                 },
                 PreparedModifier::LimitPercent { percent, offset } => {
                     LogicalOperatorKind::LimitPercent { percent, offset }
@@ -1293,6 +1295,11 @@ impl Binder<'_> {
         }
         let plan = self.plan_unnests(&mut expressions, plan);
         let types: Vec<LogicalType> = expressions.iter().map(|e| e.return_type.clone()).collect();
+        // the hidden entries that ORDER BY and DISTINCT ON add are called what they compute
+        let mut modifier_names = names.clone();
+        modifier_names.extend(expressions.iter().skip(names.len()).map(|e| {
+            if e.alias.is_empty() { e.to_string() } else { e.alias.clone() }
+        }));
         let projection_index = self.generate_table_index();
         let plan = LogicalOperator::new(
             LogicalOperatorKind::Projection {
@@ -1301,7 +1308,7 @@ impl Binder<'_> {
             },
             vec![plan],
         );
-        let plan = self.apply_modifiers(plan, prepared, projection_index, &names, &types, column_count)?;
+        let plan = self.apply_modifiers(plan, prepared, projection_index, &modifier_names, &types, column_count)?;
         let mut column_aliases: Vec<(String, usize)> = names.iter().cloned().zip(0..).collect();
         column_aliases.truncate(column_count);
         Ok(BoundStatement {

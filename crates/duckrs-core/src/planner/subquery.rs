@@ -521,7 +521,7 @@ impl Flatten<'_> {
             K::Distinct { .. } => {
                 let state = self.push_through(plan)?;
                 let refs = self.state_refs(&state);
-                let K::Distinct { targets } = &mut plan.kind else {
+                let K::Distinct { targets, .. } = &mut plan.kind else {
                     unreachable!()
                 };
                 targets.extend(refs);
