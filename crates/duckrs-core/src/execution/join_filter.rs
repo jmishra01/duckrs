@@ -214,13 +214,15 @@ pub fn push_join_filters(op: &mut LogicalOperator) {
         let BoundExprKind::Reference(column) = condition.left.kind else {
             continue;
         };
+        // the range joins of C++ push min and max filters of their keys, which duckrs does not
         if condition.filter.is_some()
+            || !condition.is_equality()
             || !supported(&condition.left.return_type)
             || condition.left.return_type != condition.right.return_type
         {
             continue;
         }
-        let filter = std::sync::Arc::new(JoinFilter::new(condition.null_safe));
+        let filter = std::sync::Arc::new(JoinFilter::new(condition.null_safe()));
         if push_into(&mut op.children[0], column, &condition.left, &filter) {
             condition.filter = Some(filter);
         }

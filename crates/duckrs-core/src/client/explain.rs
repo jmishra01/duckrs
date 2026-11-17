@@ -10,7 +10,10 @@
 use crate::execution::physical::PhysicalOperator;
 use crate::optimizer::join_order::PlanEstimate;
 use crate::planner::expression::{BoundAggregate, BoundExpr};
-use crate::planner::logical::{BoundOrderByNode, JoinCondition, LogicalOperator, LogicalOperatorKind as K};
+use crate::optimizer::range_joins::{range_order, reorder_conditions};
+use crate::planner::logical::{
+    BoundOrderByNode, JoinAlgorithm, JoinCondition, LogicalOperator, LogicalOperatorKind as K,
+};
 use duckrs_common::sort_key::OrderType;
 
 /// `RenderTreeNode`.
@@ -98,10 +101,9 @@ fn lines(values: impl IntoIterator<Item = String>) -> String {
 }
 
 fn conditions_text(conditions: &[JoinCondition], predicate: Option<String>) -> String {
-    let conditions = conditions.iter().map(|c| {
-        let op = if c.null_safe { "IS NOT DISTINCT FROM" } else { "=" };
-        format!("{} {op} {}", c.left, c.right)
-    });
+    let conditions = conditions
+        .iter()
+        .map(|c| format!("{} {} {}", c.left, c.comparison.operator(), c.right));
     lines(conditions.chain(predicate))
 }
 
@@ -288,10 +290,30 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             }
             info
         }
+        // `PhysicalComparisonJoin` orders its conditions: equalities first, and for range joins the
+        // ranges first (`ReorderConditions`, `PhysicalRangeJoin`)
         K::Join {
             join_type,
             conditions,
             predicate,
+            algorithm,
+        } if physical && !conditions.is_empty() => {
+            let mut conditions = conditions.clone();
+            match algorithm {
+                JoinAlgorithm::Hash | JoinAlgorithm::NestedLoop => reorder_conditions(&mut conditions),
+                JoinAlgorithm::PiecewiseMerge | JoinAlgorithm::IeJoin => range_order(&mut conditions),
+            }
+            join(
+                join_type.name().to_string(),
+                &conditions,
+                predicate.as_ref().map(|p| p.to_string()),
+            )
+        }
+        K::Join {
+            join_type,
+            conditions,
+            predicate,
+            ..
         }
         | K::DelimJoin {
             join_type,

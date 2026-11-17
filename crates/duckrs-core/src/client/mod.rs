@@ -1177,6 +1177,13 @@ impl ClientContext {
         if let Ok(threshold) = self.setting_text("perfect_ht_threshold").parse() {
             options.perfect_ht_threshold = threshold;
         }
+        if let Ok(threshold) = self.setting_text("nested_loop_join_threshold").parse() {
+            options.range_joins.nested_loop_join_threshold = threshold;
+        }
+        if let Ok(threshold) = self.setting_text("merge_join_threshold").parse() {
+            options.range_joins.merge_join_threshold = threshold;
+        }
+        options.range_joins.prefer_range_joins = self.setting_text("prefer_range_joins") == "true";
         options
     }
 

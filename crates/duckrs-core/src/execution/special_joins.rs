@@ -71,7 +71,7 @@ impl PhysicalAsOfJoin {
             .conditions
             .iter()
             .zip(&vectors)
-            .filter(|(c, _)| !c.null_safe)
+            .filter(|(c, _)| !c.null_safe())
             .map(|(_, v)| v.to_unified(chunk.len()))
             .collect();
         Ok(keys

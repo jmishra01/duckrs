@@ -17,9 +17,11 @@ use crate::planner::logical::{LogicalOperator, LogicalOperatorKind as K};
 use duckrs_common::types::{LogicalType, PhysicalType};
 use duckrs_parser::ast::JoinType;
 
-pub fn choose_build_sides(plan: &mut LogicalOperator) {
+/// With `prefer_range_joins`, a SEMI or ANTI join stays as it is: no range join runs RIGHT SEMI or
+/// RIGHT ANTI.
+pub fn choose_build_sides(plan: &mut LogicalOperator, prefer_range_joins: bool) {
     // an estimate reads the statistics of the tables, which a plan without such a join has no use for
-    if !has_semi_join(plan) {
+    if prefer_range_joins || !has_semi_join(plan) {
         return;
     }
     let estimate = estimate_plan(plan);

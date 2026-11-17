@@ -185,6 +185,7 @@ fn find(
         join_type,
         conditions,
         predicate,
+        ..
     } = &op.kind
     else {
         return None;
@@ -214,7 +215,7 @@ fn find(
                     .iter()
                     .map(|c| {
                         let (left, right) = (column_ref(&c.left)?, column_ref(&c.right)?);
-                        (!c.null_safe).then_some(if inner == 0 { left } else { right })
+                        (!c.null_safe()).then_some(if inner == 0 { left } else { right })
                     })
                     .collect::<Option<Group>>()
             })

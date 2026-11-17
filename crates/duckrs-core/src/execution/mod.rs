@@ -473,8 +473,9 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             join_type,
             conditions,
             predicate,
-        } => Box::new(join::PhysicalJoin::new(
-            types, join_type, conditions, predicate, children,
+            algorithm,
+        } => Box::new(join::PhysicalJoin::for_algorithm(
+            types, join_type, conditions, predicate, algorithm, children,
         )),
         LogicalOperatorKind::AsOfJoin {
             join_type,

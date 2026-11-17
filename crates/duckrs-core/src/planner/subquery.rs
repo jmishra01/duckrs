@@ -188,7 +188,7 @@ fn flatten_in(expr: &BoundExpr, left: &mut LogicalOperator, next_table_index: &m
             vec![JoinCondition {
                 left: (**child).clone(),
                 right,
-                null_safe: false,
+                comparison: ComparisonOp::Equal,
                 filter: None,
             }],
             None,
@@ -326,7 +326,7 @@ fn flatten_subquery(expr: &BoundExpr, left: &mut LogicalOperator, next_table_ind
         .map(|(value, binding)| JoinCondition {
             left: value.clone(),
             right: BoundExpr::column_ref(*binding, value.return_type.clone(), ""),
-            null_safe: true,
+            comparison: ComparisonOp::NotDistinctFrom,
             filter: None,
         })
         .collect();
@@ -628,6 +628,7 @@ impl Flatten<'_> {
                 },
                 conditions,
                 predicate: None,
+                algorithm: Default::default(),
             },
             vec![get, aggregate],
         );
@@ -766,7 +767,7 @@ impl Flatten<'_> {
             .map(|(left, right)| JoinCondition {
                 left,
                 right,
-                null_safe: true,
+                comparison: ComparisonOp::NotDistinctFrom,
                 filter: None,
             })
             .collect()
@@ -788,6 +789,7 @@ impl Flatten<'_> {
             join_type: JoinType::Inner,
             conditions: self.state_conditions(&left_state, &right_state),
             predicate: None,
+            algorithm: Default::default(),
         };
         Ok(left_state)
     }
@@ -799,6 +801,7 @@ impl Flatten<'_> {
             join_type,
             conditions,
             predicate,
+            ..
         } = &mut plan.kind
         else {
             unreachable!()
@@ -811,7 +814,7 @@ impl Flatten<'_> {
         if !moved.is_empty() {
             let mut conjuncts: Vec<BoundExpr> = predicate.take().into_iter().collect();
             conjuncts.extend(moved.into_iter().map(|condition| {
-                let op = if condition.null_safe {
+                let op = if condition.null_safe() {
                     ComparisonOp::NotDistinctFrom
                 } else {
                     ComparisonOp::Equal
