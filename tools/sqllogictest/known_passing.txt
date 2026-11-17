@@ -584,6 +584,7 @@ test/optimizer/pushdown/join_filter_pushdown_sample.test
 test/optimizer/pushdown/lateral_projection_evaluation.test
 test/optimizer/pushdown/no_mark_to_semi_if_mark_index_is_projected.test
 test/optimizer/pushdown/prefix_pushdown_null_constant.test
+test/optimizer/pushdown/pushdown_after_statistics.test
 test/optimizer/pushdown/pushdown_in_to_parquet.test
 test/optimizer/pushdown/pushdown_unnest_into_cte.test
 test/optimizer/pushdown/pushdown_window_decreasing_partition.test
@@ -615,6 +616,7 @@ test/optimizer/statistics/statistics_contains.test
 test/optimizer/statistics/statistics_count_not_null_join_pruning.test
 test/optimizer/statistics/statistics_count_not_null_pruning.test
 test/optimizer/statistics/statistics_exp_libm.test
+test/optimizer/statistics/statistics_filter_context.test
 test/optimizer/statistics/statistics_filter_multicolumn.test
 test/optimizer/statistics/statistics_filter_pruning.test
 test/optimizer/statistics/statistics_is_null.test
@@ -2026,6 +2028,7 @@ test/sql/error/table_function_as_scalar_function.test
 test/sql/error/test_has_error_expression.test
 test/sql/error/test_try_common_subexpression.test
 test/sql/error/test_try_constant_regex.test
+test/sql/error/test_try_in_clause.test
 test/sql/error/test_try_nested_conditional.test
 test/sql/error/unknown_window_function.test
 test/sql/execution/column_binding_resolver.test
@@ -3020,6 +3023,7 @@ test/sql/optimizer/multiple_column_stats_pruning.test
 test/sql/optimizer/narrowing_cast_not_invertible.test
 test/sql/optimizer/not_conjunction_simplification.test
 test/sql/optimizer/nullable_row_group_pruning.test
+test/sql/optimizer/or_null_simplification.test
 test/sql/optimizer/plan/test_anti_join_empty_child.test
 test/sql/optimizer/plan/test_anti_join_projection_map.test
 test/sql/optimizer/plan/test_disable_build_side_probe_side.test
