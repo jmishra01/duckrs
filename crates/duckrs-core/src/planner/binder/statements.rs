@@ -1250,6 +1250,7 @@ impl Binder<'_> {
                     grouping_sets: node.groups.grouping_sets.clone(),
                     grouping_functions: aggregates.grouping_functions,
                     perfect_hash: false,
+                    domain_cap: None,
                 },
                 vec![plan],
             );

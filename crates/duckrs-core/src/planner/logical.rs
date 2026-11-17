@@ -121,6 +121,9 @@ pub enum LogicalOperatorKind {
         /// `CanUsePerfectHashAggregate`, which the statistics tell: the groups are integers of so
         /// small a range that a value's offset from the minimum can index the groups' table
         perfect_hash: bool,
+        /// `CapGroupedAggregateCardinalityByKeyDomain`, which the statistics tell: at most how many
+        /// combinations of groups there are, from the ranges and types of the groups
+        domain_cap: Option<u64>,
     },
     /// `LogicalOrder`: sorts by the expressions, in order.
     Order { orders: Vec<BoundOrderByNode> },

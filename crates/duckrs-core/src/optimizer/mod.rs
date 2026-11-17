@@ -19,6 +19,7 @@ pub mod filter_pushdown;
 pub mod in_clause_rewriter;
 mod index_scan;
 pub mod join_order;
+mod relation_statistics;
 pub mod rewriter;
 pub mod scan_filters;
 pub mod statistics;

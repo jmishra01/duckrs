@@ -515,7 +515,7 @@ fn decimal_digits(ty: &LogicalType) -> Option<(i32, i32)> {
 }
 
 /// `BoundCastExpression::CastIsInvertible`, for the types comparisons of casts meet.
-fn cast_is_invertible(source: &LogicalType, target: &LogicalType) -> bool {
+pub(super) fn cast_is_invertible(source: &LogicalType, target: &LogicalType) -> bool {
     use LogicalTypeId::*;
     let ids = (source.id(), target.id());
     if [ids.0, ids.1].iter().any(|id| matches!(id, Boolean | Float | Double | Variant | Enum)) {
