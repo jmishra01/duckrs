@@ -660,6 +660,7 @@ test/optimizer/topn/topn_optimizer.test
 test/optimizer/topn_window_elimination_filter_above_null.test
 test/optimizer/topn_window_elimination_group_stats.test
 test/optimizer/topn_window_elimination_nearest_setop.test
+test/optimizer/transitive_filters.test
 test/optimizer/union_exclude.test
 test/optimizer/unused_columns/cte_unused_columns.test
 test/optimizer/unused_columns/distinct_on_projection_pushdown.test
@@ -1779,6 +1780,7 @@ test/sql/copy/parquet/parquet_filter_dictionary_materialize.test
 test/sql/copy/parquet/parquet_filter_narrowing_cast.test
 test/sql/copy/parquet/parquet_fixed_length_blob_dict.test
 test/sql/copy/parquet/parquet_go.test
+test/sql/copy/parquet/parquet_hive.test
 test/sql/copy/parquet/parquet_hive2.test
 test/sql/copy/parquet/parquet_hive_column_alias.test
 test/sql/copy/parquet/parquet_hive_empty.test

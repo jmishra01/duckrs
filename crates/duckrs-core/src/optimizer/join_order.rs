@@ -2262,6 +2262,27 @@ fn scan_conjunct_rows(
     column: Option<(&ColumnStatistics, &LogicalType)>,
     range: &mut IntegerRange,
 ) -> (f64, bool) {
+    // a BETWEEN is its two bounds, as `GenerateTableScanFilters` pushes them
+    if let BoundExprKind::Between { input, lower, upper } = &conjunct.kind {
+        let bound = |op: ComparisonOp, value: &BoundExpr| {
+            BoundExpr::new(
+                BoundExprKind::Comparison {
+                    op,
+                    left: input.clone(),
+                    right: Box::new(value.clone()),
+                },
+                LogicalType::BOOLEAN,
+            )
+        };
+        let both = BoundExpr::new(
+            BoundExprKind::Conjunction {
+                and: true,
+                children: vec![bound(ComparisonOp::GreaterThanOrEqual, lower), bound(ComparisonOp::LessThanOrEqual, upper)],
+            },
+            LogicalType::BOOLEAN,
+        );
+        return scan_conjunct_rows(cardinality, &both, child, column, range);
+    }
     if let BoundExprKind::Conjunction { and: true, children } = &conjunct.kind {
         let mut result = (cardinality, true);
         for child_expr in children {

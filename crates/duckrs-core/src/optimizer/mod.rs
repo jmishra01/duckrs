@@ -19,6 +19,7 @@ mod deliminator;
 mod disjunctive_join;
 pub mod distinct_statistics;
 pub mod empty_result_pullup;
+mod filter_combiner;
 pub mod filter_pushdown;
 pub mod in_clause_rewriter;
 mod index_scan;

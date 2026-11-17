@@ -6,8 +6,8 @@
 //! `FilterPushdown`: moves filters as far down the plan as they go, and turns cross products with
 //! a filter on both sides into joins. Operators it has no rule for keep the filters on top of them.
 //!
-//! `FilterCombiner` is reduced to splitting conjuncts, dropping duplicates and deciding constant
-//! filters; its transitive filters and ranges are not ported.
+//! The filters go through a `FilterCombiner` (`optimizer::filter_combiner`) where C++ pushes and
+//! generates them: after a filter operator and before each operator they reach.
 
 use super::conjunction_of;
 use super::rewriter::{
@@ -206,7 +206,26 @@ impl FilterPushdown {
         true
     }
 
+    /// `PushFilters` and `GenerateFilters`: the filters through a `FilterCombiner`; false if
+    /// together they hold for no row.
+    fn combine(&mut self) -> bool {
+        if self.filters.is_empty() {
+            return true;
+        }
+        let mut combiner = super::filter_combiner::FilterCombiner::default();
+        for filter in std::mem::take(&mut self.filters) {
+            if combiner.add(filter.filter) == super::filter_combiner::FilterResult::Unsatisfiable {
+                return false;
+            }
+        }
+        self.filters = combiner.generate().into_iter().map(Filter::new).collect();
+        true
+    }
+
     fn rewrite(mut self, mut op: LogicalOperator) -> LogicalOperator {
+        if !matches!(op.kind, LogicalOperatorKind::Filter { .. }) && !self.combine() {
+            return empty_result(&op);
+        }
         // `BarrierCanPassThrough`: an operator that can remove rows keeps the barred filters on top of it
         let passes = matches!(
             op.kind,
@@ -234,6 +253,10 @@ impl FilterPushdown {
                     if !self.add_filter(expr) {
                         return empty_result(&op);
                     }
+                }
+                // `PushdownFilter`: `GenerateFilters`
+                if !self.combine() {
+                    return empty_result(&op);
                 }
                 self.rewrite(op.children.remove(0))
             }
@@ -542,8 +565,12 @@ impl FilterPushdown {
             let mut filter = f.filter;
             replace_columns(&mut filter, &mut |e| {
                 if let BoundExprKind::ColumnRef { binding, .. } = e.kind {
-                    // the filter reads what the projection reads, by its own name
-                    *e = projected[binding.column_index].clone();
+                    // `ReplaceProjectionBindings`: what the projection reads, by the column's name if it has one
+                    let mut copy = projected[binding.column_index].clone();
+                    if !e.alias.is_empty() {
+                        copy.alias = e.alias.clone();
+                    }
+                    *e = copy;
                 }
             });
             if !below.add_filter(filter) {
