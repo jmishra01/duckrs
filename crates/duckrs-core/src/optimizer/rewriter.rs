@@ -1183,8 +1183,6 @@ const INFALLIBLE_FUNCTIONS: &[&str] = &[
     "decade",
     "century",
     "millennium",
-    "/",
-    "%",
     "lower",
     "upper",
     "lcase",
@@ -1234,18 +1232,11 @@ pub(crate) fn can_throw(expr: &BoundExpr) -> bool {
                 && children
                     .iter()
                     .all(|c| matches!(c.return_type.id(), LogicalTypeId::Float | LogicalTypeId::Double));
-            // a division by a constant that is neither 0 nor -1 can't divide by zero or overflow
-            let safe_division = matches!(function.name.as_str(), "/" | "//" | "%")
-                && children.len() == 2
-                && matches!(&children[1].kind, BoundExprKind::Constant(value)
-                    if !value.is_null()
-                        && value.try_to_string().ok().and_then(|t| t.parse::<f64>().ok()).is_some_and(|v| v != 0.0 && v != -1.0));
             // `ListExtractFunction`: an index past the end is NULL
             let list_extract = matches!(function.name.as_str(), "list_extract" | "array_extract" | "list_element")
                 && children.first().is_some_and(|c| c.return_type.id() == LogicalTypeId::List);
             !floating
                 && !list_extract
-                && !safe_division
                 && !function.cannot_error
                 && !substring_in_range(&function.name, children)
                 && !INFALLIBLE_FUNCTIONS.contains(&function.name.as_str())
