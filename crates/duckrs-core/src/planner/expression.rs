@@ -54,6 +54,17 @@ pub enum BoundOperator {
     Try,
     /// `OPERATOR_HAS_ERROR`: whether evaluating the argument fails, per row
     HasError,
+    /// `COMPARE_IN`: whether the first argument equals one of the others. The binder only keeps a
+    /// list that `InClauseRewriter` can turn into a MARK join; it spells out the others as `=` ORs
+    In,
+    /// `COMPARE_NOT_IN`
+    NotIn,
+}
+
+impl BoundOperator {
+    pub fn is_in(self) -> bool {
+        matches!(self, BoundOperator::In | BoundOperator::NotIn)
+    }
 }
 
 /// What a subquery asks of its rows (`SubqueryType`).
@@ -556,6 +567,11 @@ impl fmt::Display for BoundExpr {
                     BoundOperator::Coalesce => write!(f, "COALESCE({all})"),
                     BoundOperator::Try => write!(f, "TRY({all})"),
                     BoundOperator::HasError => write!(f, "has_error({all})"),
+                    BoundOperator::In | BoundOperator::NotIn => {
+                        let list: Vec<&str> = parts[1..].iter().map(String::as_str).collect();
+                        let keyword = if *op == BoundOperator::In { "IN" } else { "NOT IN" };
+                        write!(f, "({} {keyword} ({}))", parts[0], list.join(", "))
+                    }
                 }
             }
             BoundExprKind::Between { input, lower, upper } => write!(f, "({input} BETWEEN {lower} AND {upper})"),
@@ -569,5 +585,42 @@ impl fmt::Display for BoundExpr {
             BoundExprKind::Subquery { .. } => f.write_str("SUBQUERY"),
             _ => write!(f, "{:?}", self.kind),
         }
+    }
+}
+
+/// `x IN (a, b, ...)` as `x = a OR x = b ...`, and `x NOT IN (...)` as the NOT of that, of the
+/// `children` of an IN: the input, then the values.
+pub fn in_as_comparisons(negated: bool, children: &[BoundExpr]) -> BoundExpr {
+    let input = &children[0];
+    let comparisons = children[1..]
+        .iter()
+        .map(|value| {
+            BoundExpr::new(
+                BoundExprKind::Comparison {
+                    op: ComparisonOp::Equal,
+                    left: Box::new(input.clone()),
+                    right: Box::new(value.clone()),
+                },
+                LogicalType::BOOLEAN,
+            )
+        })
+        .collect();
+    let result = BoundExpr::new(
+        BoundExprKind::Conjunction {
+            and: false,
+            children: comparisons,
+        },
+        LogicalType::BOOLEAN,
+    );
+    if negated {
+        BoundExpr::new(
+            BoundExprKind::Operator {
+                op: BoundOperator::Not,
+                children: vec![result],
+            },
+            LogicalType::BOOLEAN,
+        )
+    } else {
+        result
     }
 }

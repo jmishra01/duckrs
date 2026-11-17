@@ -1004,6 +1004,13 @@ pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
             op: BoundOperator::HasError,
             children,
         } => execute_has_error(&children[0], input),
+        BoundExprKind::Operator {
+            op: op @ (BoundOperator::In | BoundOperator::NotIn),
+            children,
+        } => execute(
+            &crate::planner::expression::in_as_comparisons(*op == BoundOperator::NotIn, children),
+            input,
+        ),
         BoundExprKind::Operator { op, children } => {
             let child = execute(&children[0], input)?;
             Ok(match op {
@@ -1014,7 +1021,11 @@ pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
                 }
                 BoundOperator::IsNull => null_check(&child, count, true),
                 BoundOperator::IsNotNull => null_check(&child, count, false),
-                BoundOperator::Coalesce | BoundOperator::Try | BoundOperator::HasError => {
+                BoundOperator::Coalesce
+                | BoundOperator::Try
+                | BoundOperator::HasError
+                | BoundOperator::In
+                | BoundOperator::NotIn => {
                     unreachable!("handled above")
                 }
             })

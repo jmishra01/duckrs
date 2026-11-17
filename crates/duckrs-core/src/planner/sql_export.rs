@@ -2367,6 +2367,8 @@ impl Exporter<'_> {
                     BoundOperator::Coalesce => OperatorType::Coalesce,
                     BoundOperator::Try => OperatorType::Try,
                     BoundOperator::HasError => unreachable!("exported as a function"),
+                    BoundOperator::In => OperatorType::In,
+                    BoundOperator::NotIn => OperatorType::NotIn,
                 };
                 Expr::operator(op, children)
             }

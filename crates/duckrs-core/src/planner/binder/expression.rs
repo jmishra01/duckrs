@@ -3544,42 +3544,26 @@ impl Binder<'_> {
         let name = if negated { "NOT IN" } else { "IN" };
         let (bound, max_type) = self.resolve_coalesce_type(children, Some(name))?;
         // `BindExpression(OperatorExpression)`: the children compare with the collation of their type
-        let mut bound = bound
+        let bound = bound
             .into_iter()
             .map(|child| self.collate(child, &max_type))
             .collect::<Result<Vec<_>>>()?;
-        let input = bound.remove(0);
-        let comparisons = bound
-            .into_iter()
-            .map(|value| {
-                BoundExpr::new(
-                    BoundExprKind::Comparison {
-                        op: ComparisonOp::Equal,
-                        left: Box::new(input.clone()),
-                        right: Box::new(value),
-                    },
-                    LogicalType::BOOLEAN,
-                )
-            })
-            .collect();
-        let result = BoundExpr::new(
-            BoundExprKind::Conjunction {
-                and: false,
-                children: comparisons,
-            },
-            LogicalType::BOOLEAN,
-        );
-        Ok(if negated {
-            BoundExpr::new(
-                BoundExprKind::Operator {
-                    op: BoundOperator::Not,
-                    children: vec![result],
-                },
+        // `InClauseRewriter::HasRewritableInClause`: a list it turns into a MARK join stays an IN,
+        // which it spells out otherwise
+        let rewritable = bound.len() >= crate::optimizer::in_clause_rewriter::IN_CLAUSE_REWRITE_THRESHOLD
+            && bound[1..].iter().all(BoundExpr::is_foldable);
+        if rewritable {
+            let op = if negated {
+                BoundOperator::NotIn
+            } else {
+                BoundOperator::In
+            };
+            return Ok(BoundExpr::new(
+                BoundExprKind::Operator { op, children: bound },
                 LogicalType::BOOLEAN,
-            )
-        } else {
-            result
-        })
+            ));
+        }
+        Ok(crate::planner::expression::in_as_comparisons(negated, &bound))
     }
 }
 

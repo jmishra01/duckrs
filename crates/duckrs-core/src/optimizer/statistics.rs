@@ -718,6 +718,22 @@ pub fn propagate_statistics(plan: &mut LogicalOperator, perfect_ht_threshold: u6
     Some(StatisticsMap(propagator))
 }
 
+/// `StatisticsPropagator` with `StatisticsPropagationMode::FILTER_SIMPLIFICATION`, before the joins
+/// are ordered: it also takes the branches out of filters that statistics tell cannot be true, and
+/// leaves the joins' range filters and the choice of aggregates for the full pass. Gives whether a
+/// filter now reads other tables than before (`FilterBindingsChanged`).
+pub fn simplify_filters(plan: &mut LogicalOperator) -> bool {
+    if !has_unique_tables(plan, &mut HashSet::new()) {
+        return false;
+    }
+    let mut propagator = StatisticsPropagator {
+        filter_simplification: true,
+        ..Default::default()
+    };
+    propagator.visit(plan);
+    propagator.filter_bindings_changed
+}
+
 /// The statistics of the columns of a plan after `propagate_statistics` (`statistics_map`).
 pub struct StatisticsMap(StatisticsPropagator);
 
@@ -748,6 +764,10 @@ struct StatisticsPropagator {
     aliases: HashMap<ColumnBinding, ColumnBinding>,
     /// bindings an outer join puts NULLs in
     nullable: HashSet<ColumnBinding>,
+    /// `StatisticsPropagationMode::FILTER_SIMPLIFICATION`
+    filter_simplification: bool,
+    /// `filter_bindings_changed`
+    filter_bindings_changed: bool,
 }
 
 impl StatisticsPropagator {
@@ -1771,8 +1791,7 @@ impl StatisticsPropagator {
         };
         let mut kept = Vec::with_capacity(expressions.len());
         for mut expr in std::mem::take(expressions) {
-            self.expression(&mut expr, true);
-            rewrite_expression(&mut expr, true);
+            self.handle_filter(&mut expr);
             // `constant_or_null(false, x)` is false or NULL, which a filter does not let through
             let never = matches!(&expr.kind, BoundExprKind::Function { function, children, .. }
                 if function.name == "constant_or_null"
@@ -1841,6 +1860,17 @@ impl StatisticsPropagator {
         }
     }
 
+    /// `HandleFilter`, up to classifying the result.
+    fn handle_filter(&mut self, expr: &mut BoundExpr) {
+        let before = self.filter_simplification.then(|| filter_bindings(expr));
+        self.expression(expr, true);
+        rewrite_expression(expr, true);
+        if let Some(before) = before {
+            simplify_filter(expr);
+            self.filter_bindings_changed |= before != filter_bindings(expr);
+        }
+    }
+
     /// `PropagateStatistics(LogicalJoin)`.
     fn join(&mut self, op: &mut LogicalOperator) {
         let K::Join {
@@ -1880,7 +1910,8 @@ impl StatisticsPropagator {
         for (side, filters) in range_filters.into_iter().enumerate() {
             // C++ evaluates the filters already on a scan before those it adds: one that can fail fails
             // on the rows the range would have left out, as here it would not
-            if filters.is_empty() || no_rows || has_failing_filter(&op.children[side]) {
+            // `CreateFilterFromJoinStats` waits for the joins to be ordered
+            if filters.is_empty() || no_rows || self.filter_simplification || has_failing_filter(&op.children[side]) {
                 continue;
             }
             let child = std::mem::replace(&mut op.children[side], LogicalOperator::new(K::CrossProduct, Vec::new()));
@@ -1900,8 +1931,12 @@ impl StatisticsPropagator {
         // inner join, C++ has as a filter above it
         let in_filter = join_type == JoinType::Inner;
         if let Some(condition) = predicate {
-            self.expression(condition, in_filter);
-            rewrite_expression(condition, in_filter);
+            if in_filter {
+                self.handle_filter(condition);
+            } else {
+                self.expression(condition, in_filter);
+                rewrite_expression(condition, in_filter);
+            }
             match fold_boolean(condition) {
                 Some(Some(true)) => *predicate = None,
                 Some(_) => {
@@ -2055,7 +2090,8 @@ impl StatisticsPropagator {
                 perfect_hash,
                 ..
             } if grouping_sets.len() <= 1 && grouping_sets.iter().all(|set| set.len() == groups.len()) => {
-                *perfect_hash = grouping_functions.is_empty()
+                *perfect_hash = !self.filter_simplification
+                    && grouping_functions.is_empty()
                     && !groups.is_empty()
                     && !aggregates.iter().any(|a| a.distinct)
                     && self.perfect_hash_bits(groups).is_some_and(|bits| bits <= self.perfect_ht_threshold);
@@ -2192,6 +2228,75 @@ fn string_function_max_length(name: &str, children: &[BoundExpr], stats: &[Stats
 }
 
 /// Whether the filters down from `op` to its scan include one that can fail.
+/// `GetFilterBindings`: the tables a filter reads.
+fn filter_bindings(expr: &BoundExpr) -> HashSet<usize> {
+    let mut tables = HashSet::new();
+    let mut expr = expr.clone();
+    expr.walk_mut(&mut |e| {
+        if let BoundExprKind::ColumnRef { binding, depth: 0 } = &e.kind {
+            tables.insert(binding.table_index);
+        }
+    });
+    tables
+}
+
+/// `ExpressionIsConstantOrNull(expr, false)` and `ExpressionIsConstant(expr, value)`.
+fn constant_answer(expr: &BoundExpr) -> Option<(bool, bool)> {
+    match &expr.kind {
+        BoundExprKind::Constant(value) => match value.data() {
+            ValueData::Bool(b) => Some((*b, false)),
+            _ => None,
+        },
+        BoundExprKind::Function { function, children, .. } if function.name == "constant_or_null" => {
+            match &children.first()?.kind {
+                BoundExprKind::Constant(value) => match value.data() {
+                    ValueData::Bool(b) => Some((*b, true)),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `StatisticsPropagator::SimplifyFilter`: in a filter, a branch that is false or NULL decides an
+/// AND and drops out of an OR.
+fn simplify_filter(condition: &mut BoundExpr) -> bool {
+    let BoundExprKind::Conjunction { and, children } = &mut condition.kind else {
+        return false;
+    };
+    let is_and = *and;
+    let mut changed = false;
+    let mut index = 0;
+    while index < children.len() {
+        changed |= simplify_filter(&mut children[index]);
+        let answer = constant_answer(&children[index]);
+        let is_true = answer == Some((true, false));
+        let false_or_null = matches!(answer, Some((false, _)));
+        if (is_and && false_or_null) || (!is_and && is_true) {
+            *condition = BoundExpr::constant(Value::boolean(!is_and));
+            return true;
+        }
+        if (is_and && is_true) || (!is_and && false_or_null) {
+            children.remove(index);
+            changed = true;
+            continue;
+        }
+        index += 1;
+    }
+    if children.is_empty() {
+        *condition = BoundExpr::constant(Value::boolean(is_and));
+        return true;
+    }
+    if children.len() == 1 {
+        let only = children.remove(0);
+        *condition = only;
+        return true;
+    }
+    changed
+}
+
 fn has_failing_filter(op: &LogicalOperator) -> bool {
     match &op.kind {
         K::Filter { expressions } => {

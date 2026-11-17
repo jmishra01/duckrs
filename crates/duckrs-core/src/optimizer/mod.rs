@@ -16,6 +16,7 @@ mod deliminator;
 pub mod distinct_statistics;
 pub mod empty_result_pullup;
 pub mod filter_pushdown;
+pub mod in_clause_rewriter;
 mod index_scan;
 pub mod join_order;
 pub mod rewriter;
@@ -44,6 +45,7 @@ pub struct OptimizerOptions {
     pub projection_pullup: bool,
     pub projection_placement: bool,
     pub join_elimination: bool,
+    pub in_clause: bool,
     /// `index_scan_percentage`
     pub index_scan_percentage: f64,
     /// `index_scan_max_count`
@@ -69,6 +71,7 @@ impl Default for OptimizerOptions {
             projection_pullup: true,
             projection_placement: true,
             join_elimination: true,
+            in_clause: true,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -93,6 +96,7 @@ impl OptimizerOptions {
             projection_pullup: false,
             projection_placement: false,
             join_elimination: false,
+            in_clause: false,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -116,6 +120,7 @@ impl OptimizerOptions {
             projection_pullup: !off("projection_pullup"),
             projection_placement: !off("projection_placement"),
             join_elimination: !off("join_elimination"),
+            in_clause: !off("in_clause"),
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -152,6 +157,17 @@ pub fn optimize_timed(
     if options.filter_pushdown {
         plan = run("filter_pushdown", plan, &mut filter_pushdown::push_down);
     }
+    // `FilterStatisticsOptimizer`
+    if options.filter_pushdown && options.statistics_propagation && filter_statistics_applies(&plan) {
+        let mut changed = false;
+        plan = run("statistics_propagation", plan, &mut |mut plan| {
+            changed = statistics::simplify_filters(&mut plan);
+            plan
+        });
+        if changed {
+            plan = run("filter_pushdown", plan, &mut filter_pushdown::push_down);
+        }
+    }
     if options.deliminator {
         plan = run("deliminator", plan, &mut |mut plan| {
             deliminator::deliminate(&mut plan);
@@ -160,6 +176,10 @@ pub fn optimize_timed(
     }
     if options.filter_pushdown {
         filter_pushdown::convert_mark_joins(&mut plan);
+    }
+    // C++ runs this before the DELIMINATOR, after `CheckMarkToSemi`: its MARK joins stay
+    if options.in_clause {
+        plan = run("in_clause", plan, &mut in_clause_rewriter::rewrite);
     }
     if options.projection_pullup {
         plan = run("projection_pullup", plan, &mut projection_pullup::pull_up);
@@ -221,6 +241,47 @@ pub fn optimize_timed(
         });
     }
     plan
+}
+
+/// `FilterStatisticsOptimizer::Optimize`: a plan without DELIM joins with a filter that reads more
+/// than one table (here also the condition of an inner join, which C++ has as a filter).
+fn filter_statistics_applies(plan: &LogicalOperator) -> bool {
+    use crate::planner::logical::LogicalOperatorKind as K;
+    fn tables(expr: &BoundExpr, found: &mut std::collections::HashSet<usize>) {
+        if let BoundExprKind::ColumnRef { binding, depth: 0 } = &expr.kind {
+            found.insert(binding.table_index);
+        }
+        for child in expr.children() {
+            tables(child, found);
+        }
+    }
+    fn multi(expr: &BoundExpr) -> bool {
+        let mut found = std::collections::HashSet::new();
+        tables(expr, &mut found);
+        found.len() > 1
+    }
+    fn has_delim(op: &LogicalOperator) -> bool {
+        matches!(op.kind, K::DelimJoin { .. }) || op.children.iter().any(has_delim)
+    }
+    fn has_multi(op: &LogicalOperator) -> bool {
+        let own = match &op.kind {
+            K::Filter { expressions } => expressions.iter().any(multi),
+            K::Join {
+                join_type: duckrs_parser::ast::JoinType::Inner,
+                predicate: Some(predicate),
+                ..
+            } => multi(predicate),
+            _ => false,
+        };
+        own || op.children.iter().any(has_multi)
+    }
+    // `CTEContainsDML`
+    fn has_dml_below(op: &LogicalOperator) -> bool {
+        op.children.iter().any(|child| {
+            matches!(child.kind, K::Insert { .. } | K::Update { .. } | K::Delete { .. }) || has_dml_below(child)
+        })
+    }
+    !has_delim(plan) && has_multi(plan) && !has_dml_below(plan)
 }
 
 /// The conjunction of `expressions`, of which there is at least one.
