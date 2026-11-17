@@ -287,12 +287,13 @@ fn list_sort(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
         let option = |index: usize, default: &str| row.get(index).map_or(default.to_string(), text_of).to_uppercase();
         let modifiers = OrderModifiers {
-            order: if option(1, "ASC") == "DESC" {
+            // `EnumUtil::FromString`: both spellings of each
+            order: if matches!(option(1, "ASC").as_str(), "DESC" | "DESCENDING") {
                 OrderType::Descending
             } else {
                 OrderType::Ascending
             },
-            nulls: if option(2, "NULLS FIRST") == "NULLS LAST" {
+            nulls: if matches!(option(2, "NULLS FIRST").as_str(), "NULLS LAST" | "NULLS_LAST") {
                 NullOrder::NullsLast
             } else {
                 NullOrder::NullsFirst

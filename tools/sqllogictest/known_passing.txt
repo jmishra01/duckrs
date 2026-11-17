@@ -480,6 +480,7 @@ test/issues/rigger/test_value_binop.test
 test/issues/rigger/timestamp_overflow.test
 test/issues/rigger/zonemap_column_out_of_range.test
 test/ldbc/ldbc-empty.test
+test/optimizer/avg_rewrite_profitability.test
 test/optimizer/case_simplification.test
 test/optimizer/case_simplification_errors.test
 test/optimizer/column_lifetime_analyzer/must_visit_operator_expressions_first.test
@@ -603,6 +604,7 @@ test/optimizer/regex_optimizer_anchors.test
 test/optimizer/regex_optimizer_coverage.test
 test/optimizer/regex_to_like_optimizer.test
 test/optimizer/remove_duplicate_groups_with_stats.test
+test/optimizer/remove_redundant_order.test
 test/optimizer/remove_redundant_order_keys_deferred.test
 test/optimizer/remove_redundant_order_keys_side_effects.test
 test/optimizer/remove_unused_filter_column.test
@@ -652,6 +654,7 @@ test/optimizer/stats_non_numeric_cast.test
 test/optimizer/string_prefix.test
 test/optimizer/table_in_out_unique_keys.test
 test/optimizer/temporal_cardinality_bounds.test
+test/optimizer/test_aggregate_function_rewrite.test
 test/optimizer/test_try_cast_decimal.test
 test/optimizer/topn/topn_optimizer.test
 test/optimizer/topn_window_elimination_filter_above_null.test

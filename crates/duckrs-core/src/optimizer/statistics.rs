@@ -2130,9 +2130,30 @@ impl StatisticsPropagator {
                 }
                 let (aggregate_index, aggregates) = (*aggregate_index, aggregates.clone());
                 let rows = max_cardinality(&op.children[0]);
+                let mut no_overflow = Vec::new();
                 for (index, aggregate) in aggregates.iter().enumerate() {
                     if let Some(stats) = self.aggregate_stats(aggregate, rows) {
                         self.stats.insert(ColumnBinding::new(aggregate_index, index), stats);
+                    }
+                    if !self.filter_simplification && self.sum_fits_in_int64(aggregate, rows) {
+                        no_overflow.push(index);
+                    }
+                }
+                // `SumPropagateStats`: a sum of INTEGER or BIGINT that fits in an int64 needs no wider state
+                if let K::Aggregate { aggregates, .. } = &mut op.kind {
+                    for index in no_overflow {
+                        let aggregate = &mut aggregates[index];
+                        if let Some(set) = BuiltinFunctions::get().aggregate("sum_no_overflow")
+                            && let Ok(bound) = bind_aggregate_function(
+                                set,
+                                aggregate.children.clone(),
+                                aggregate.filter.clone(),
+                                false,
+                            )
+                            && bound.return_type == aggregate.return_type
+                        {
+                            aggregate.function = bound.function;
+                        }
                     }
                 }
             }
@@ -2557,6 +2578,32 @@ fn max_cardinality(op: &LogicalOperator) -> Option<u64> {
 
 impl StatisticsPropagator {
     /// `SumPropagateStats`: a sum of integers lies between the smallest and largest value times the rows.
+    /// `SumPropagateStats`: whether a sum of INTEGER or BIGINT values provably fits in an int64.
+    fn sum_fits_in_int64(&mut self, aggregate: &BoundAggregate, rows: Option<u64>) -> bool {
+        let [child] = aggregate.children.as_slice() else {
+            return false;
+        };
+        if aggregate.function.name != "sum"
+            || aggregate.distinct
+            || !matches!(child.return_type.id(), LogicalTypeId::Integer | LogicalTypeId::BigInt)
+        {
+            return false;
+        }
+        let Some(rows) = rows else {
+            return false;
+        };
+        let stats = self.expression(&mut child.clone(), false);
+        let as_int = |value: &Option<Value>| value.as_ref()?.try_to_string().ok()?.parse::<i128>().ok();
+        let (Some(low), Some(high)) = (as_int(&stats.min), as_int(&stats.max)) else {
+            return false;
+        };
+        let rows = i128::from(rows);
+        match (low.checked_mul(rows), high.checked_mul(rows)) {
+            (Some(low), Some(high)) => low > i128::from(i64::MIN) && high < i128::from(i64::MAX),
+            _ => false,
+        }
+    }
+
     fn aggregate_stats(&mut self, aggregate: &BoundAggregate, rows: Option<u64>) -> Option<Stats> {
         if aggregate.children.len() != 1 {
             return None;

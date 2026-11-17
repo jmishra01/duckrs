@@ -8,6 +8,7 @@
 //! which the binder resolves, so it runs the optimizer on that plan itself.
 
 pub mod build_side;
+mod aggregate_rewriter;
 mod common_subplan;
 mod cte_inlining;
 mod join_elimination;
@@ -56,6 +57,8 @@ pub struct OptimizerOptions {
     pub cte_inlining: bool,
     pub redundant_order: bool,
     pub redundant_order_keys: bool,
+    pub aggregate_function_rewriter: bool,
+    pub common_aggregate: bool,
     /// `index_scan_percentage`
     pub index_scan_percentage: f64,
     /// `index_scan_max_count`
@@ -88,6 +91,8 @@ impl Default for OptimizerOptions {
             cte_inlining: true,
             redundant_order: true,
             redundant_order_keys: true,
+            aggregate_function_rewriter: true,
+            common_aggregate: true,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -118,6 +123,8 @@ impl OptimizerOptions {
             cte_inlining: false,
             redundant_order: false,
             redundant_order_keys: false,
+            aggregate_function_rewriter: false,
+            common_aggregate: false,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -147,6 +154,8 @@ impl OptimizerOptions {
             cte_inlining: !off("cte_inlining"),
             redundant_order: !off("redundant_order"),
             redundant_order_keys: !off("redundant_order_keys"),
+            aggregate_function_rewriter: !off("aggregate_function_rewriter"),
+            common_aggregate: !off("common_aggregate"),
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -181,6 +190,12 @@ pub fn optimize_timed(
         plan = run("expression_rewriter", plan, &mut |mut plan| {
             rewriter::rewrite_plan(&mut plan);
             plan
+        });
+    }
+    if options.aggregate_function_rewriter {
+        let (common, statistics) = (options.common_aggregate, options.statistics_propagation);
+        plan = run("aggregate_function_rewriter", plan, &mut |plan| {
+            aggregate_rewriter::rewrite(plan, common, statistics)
         });
     }
     if options.redundant_order {
