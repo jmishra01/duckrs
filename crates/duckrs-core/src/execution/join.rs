@@ -1,6 +1,7 @@
 // Ported from duckdb/src/execution/operator/join/{physical_cross_product,physical_hash_join,
-// physical_blockwise_nl_join}.cpp and duckdb/src/execution/physical_plan/plan_comparison_join.cpp
-// @ rust-port-baseline
+// physical_blockwise_nl_join,physical_nested_loop_join,physical_piecewise_merge_join,
+// physical_iejoin,physical_range_join,physical_comparison_join}.cpp and
+// duckdb/src/execution/physical_plan/plan_comparison_join.cpp @ rust-port-baseline
 //
 //! Joins. The right child is the build side: it is gathered first (sink), and then the left
 //! child's chunks stream through the join (operator). RIGHT and FULL joins emit the build rows
@@ -21,6 +22,16 @@
 //! partitions come after the others, and a spilled partition is joined in memory whatever its size.
 //! The build side is looked up by the sort key of its join keys, like grouping; `JoinHashTable`
 //! over the row format replaces that when performance gets its turn (Phase 13).
+//!
+//! The joins on comparisons that are not equalities run the same way, with what finds the build
+//! rows of a probe row in place of the hash table. `PhysicalPiecewiseMergeJoin` sorts the build
+//! side by its first comparison, so the rows a probe row matches are a run of them that a binary
+//! search finds. `PhysicalIEJoin` does that for two comparisons: the runs of the first one are
+//! cut into nodes of a merge sort tree whose nodes are sorted by the second one, where binary
+//! searches find the rows that match both. `PhysicalNestedLoopJoin` checks every pair, as
+//! `PhysicalBlockwiseNLJoin` does. The comparisons the lookups do not cover are checked on the
+//! pairs, with the rest of the predicate. C++ merges sorted runs of both sides instead of looking
+//! up each probe row, so rows come out in another order.
 
 use super::expression_executor::{MULTIPLE_ROWS, execute, select};
 use super::physical::{
@@ -29,7 +40,9 @@ use super::physical::{
 };
 use super::temporary::{PartitionedSpill, SpillFile, current, estimated_bytes};
 use crate::planner::expression::{BoundExpr, BoundExprKind};
-use crate::planner::logical::JoinCondition;
+use crate::optimizer::range_joins::{range_order, reorder_conditions};
+use crate::planner::logical::{JoinAlgorithm, JoinCondition};
+use duckrs_parser::ast::ComparisonOp;
 use crate::storage::log_writer::can_serialize;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::{KeyHasher, RowKey, create_row_keys};
@@ -158,6 +171,132 @@ pub struct PhysicalJoin {
     pub error_on_multiple_rows: bool,
     /// where the partitions of a hash join past the memory limit go
     spill: Option<JoinSpill>,
+    /// the comparisons a range join looks the build rows up by: one for a piecewise merge join,
+    /// two for an IE join
+    range: Vec<JoinCondition>,
+    /// the name of the operator, if it is not a hash join or a blockwise nested loop join
+    operator_name: Option<&'static str>,
+}
+
+/// How many positions of the sorted build side a leaf of [`SecondIndex`] has.
+const RANGE_BLOCK: usize = 64;
+
+/// What a range join looks the build rows up by: the build rows without a NULL key, sorted by
+/// the key of the first comparison (`PhysicalRangeJoin::GlobalSortedTable`).
+#[derive(Debug)]
+struct RangeIndex {
+    /// the build row at each position
+    rows: Vec<u32>,
+    /// the key of the first comparison at each position, ascending
+    first: Vec<RowKey>,
+    /// IE join: the second comparison
+    second: Option<SecondIndex>,
+}
+
+/// The keys of the second comparison of an IE join, at each position, in a merge sort tree: in
+/// level `k`, the positions of each node of `RANGE_BLOCK << k` of them, sorted by their key.
+#[derive(Debug)]
+struct SecondIndex {
+    keys: Vec<RowKey>,
+    levels: Vec<Vec<u32>>,
+}
+
+/// Whether `left op right`, for sort keys.
+fn compare_keys(op: ComparisonOp, left: &[u8], right: &[u8]) -> bool {
+    match op {
+        ComparisonOp::LessThan => left < right,
+        ComparisonOp::LessThanOrEqual => left <= right,
+        ComparisonOp::GreaterThan => left > right,
+        ComparisonOp::GreaterThanOrEqual => left >= right,
+        _ => unreachable!("range joins look up ranges"),
+    }
+}
+
+/// The positions `0..len`, whose keys `key(i)` ascend, with `left op key(i)`: a suffix for `<`
+/// and `<=`, a prefix for `>` and `>=`.
+fn matching_run<'a>(len: usize, key: impl Fn(usize) -> &'a [u8], op: ComparisonOp, left: &[u8]) -> std::ops::Range<usize> {
+    let point = |pred: &dyn Fn(&[u8]) -> bool| {
+        let (mut low, mut high) = (0, len);
+        while low < high {
+            let mid = (low + high) / 2;
+            if pred(key(mid)) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        low
+    };
+    match op {
+        ComparisonOp::LessThan => point(&|k| k <= left)..len,
+        ComparisonOp::LessThanOrEqual => point(&|k| k < left)..len,
+        ComparisonOp::GreaterThan => 0..point(&|k| k < left),
+        ComparisonOp::GreaterThanOrEqual => 0..point(&|k| k <= left),
+        _ => unreachable!("range joins look up ranges"),
+    }
+}
+
+impl SecondIndex {
+    fn new(keys: Vec<RowKey>) -> Self {
+        let count = keys.len();
+        let mut level: Vec<u32> = (0..count as u32).collect();
+        for block in level.chunks_mut(RANGE_BLOCK) {
+            block.sort_by(|a, b| keys[*a as usize].as_bytes().cmp(keys[*b as usize].as_bytes()));
+        }
+        let mut levels = vec![level];
+        let mut size = RANGE_BLOCK;
+        while size < count {
+            let below = levels.last().expect("a level");
+            let mut merged = Vec::with_capacity(count);
+            for pair in below.chunks(size * 2) {
+                let (a, b) = pair.split_at(pair.len().min(size));
+                let (mut i, mut j) = (0, 0);
+                while i < a.len() && j < b.len() {
+                    if keys[b[j] as usize].as_bytes() < keys[a[i] as usize].as_bytes() {
+                        merged.push(b[j]);
+                        j += 1;
+                    } else {
+                        merged.push(a[i]);
+                        i += 1;
+                    }
+                }
+                merged.extend_from_slice(&a[i..]);
+                merged.extend_from_slice(&b[j..]);
+            }
+            levels.push(merged);
+            size *= 2;
+        }
+        Self { keys, levels }
+    }
+
+    /// Adds the positions in `range` whose keys `k` have `left op k` to `out`.
+    fn find(&self, range: std::ops::Range<usize>, op: ComparisonOp, left: &[u8], out: &mut Vec<u32>) {
+        let (mut position, end) = (range.start, range.end);
+        while position < end {
+            if position % RANGE_BLOCK != 0 || position + RANGE_BLOCK > end {
+                let stop = end.min((position / RANGE_BLOCK + 1) * RANGE_BLOCK);
+                for p in position..stop {
+                    if compare_keys(op, left, self.keys[p].as_bytes()) {
+                        out.push(p as u32);
+                    }
+                }
+                position = stop;
+                continue;
+            }
+            let mut level = 0;
+            while level + 1 < self.levels.len()
+                && position % (RANGE_BLOCK << (level + 1)) == 0
+                && position + (RANGE_BLOCK << (level + 1)) <= end
+            {
+                level += 1;
+            }
+            let size = RANGE_BLOCK << level;
+            let node = &self.levels[level][position..position + size];
+            let run = matching_run(node.len(), |i| self.keys[node[i] as usize].as_bytes(), op, left);
+            out.extend_from_slice(&node[run]);
+            position += size;
+        }
+    }
 }
 
 /// The temporary files of a hash join past the memory limit.
@@ -344,6 +483,8 @@ struct FinishedBuild {
     spilled: Vec<bool>,
     /// the build rows, those in files included
     total_count: usize,
+    /// a range join: what finds the build rows of a probe row
+    range: Option<RangeIndex>,
 }
 
 impl FinishedBuild {
@@ -412,6 +553,13 @@ struct Probe {
     nulls: Vec<bool>,
     /// SINGLE: the build row of each input row
     single: Vec<Option<u32>>,
+    /// a range join: the keys of each input row
+    range_keys: Vec<Option<Vec<RowKey>>>,
+    /// a range join: the build rows `row` matches, once looked up: positions of the sorted
+    /// build side for a piecewise merge join, build rows for an IE join
+    current: Vec<u32>,
+    current_run: std::ops::Range<usize>,
+    current_row: Option<usize>,
 }
 
 impl PhysicalJoin {
@@ -446,6 +594,144 @@ impl PhysicalJoin {
             builders: AtomicUsize::new(0),
             error_on_multiple_rows: false,
             spill,
+            range: Vec::new(),
+            operator_name: None,
+        }
+    }
+
+    /// `PlanComparisonJoin` for the operator the optimizer picked: the comparisons each operator
+    /// does not run itself are checked on the pairs, with the predicate.
+    pub fn for_algorithm(
+        types: Vec<LogicalType>,
+        join_type: JoinType,
+        mut conditions: Vec<JoinCondition>,
+        predicate: Option<BoundExpr>,
+        algorithm: JoinAlgorithm,
+        children: Vec<Box<dyn PhysicalOperator>>,
+    ) -> Self {
+        let left_width = children[0].types().len();
+        // `RewriteJoinCondition`: the right side of a pair comes after its left side
+        let pair_predicate = |conditions: Vec<JoinCondition>, predicate: Option<BoundExpr>| {
+            let mut expressions: Vec<BoundExpr> = conditions
+                .into_iter()
+                .map(|c| {
+                    let mut right = c.right;
+                    right.walk_mut(&mut |e| {
+                        if let BoundExprKind::Reference(index) = &mut e.kind {
+                            *index += left_width;
+                        }
+                    });
+                    BoundExpr::new(
+                        BoundExprKind::Comparison {
+                            op: c.comparison,
+                            left: Box::new(c.left),
+                            right: Box::new(right),
+                        },
+                        LogicalType::BOOLEAN,
+                    )
+                })
+                .collect();
+            expressions.extend(predicate);
+            (!expressions.is_empty()).then(|| crate::optimizer::conjunction_of(expressions))
+        };
+        match algorithm {
+            JoinAlgorithm::Hash => {
+                reorder_conditions(&mut conditions);
+                let (keys, others): (Vec<_>, Vec<_>) = conditions.into_iter().partition(JoinCondition::is_equality);
+                let predicate = pair_predicate(others, predicate);
+                Self::new(types, join_type, keys, predicate, children)
+            }
+            JoinAlgorithm::NestedLoop => {
+                reorder_conditions(&mut conditions);
+                let predicate = pair_predicate(conditions, predicate);
+                let mut join = Self::new(types, join_type, Vec::new(), predicate, children);
+                join.operator_name = Some("NESTED_LOOP_JOIN");
+                join
+            }
+            JoinAlgorithm::PiecewiseMerge | JoinAlgorithm::IeJoin => {
+                range_order(&mut conditions);
+                let looked_up = if algorithm == JoinAlgorithm::IeJoin { 2 } else { 1 };
+                let rest = conditions.split_off(looked_up);
+                let predicate = pair_predicate(rest, predicate);
+                let mut join = Self::new(types, join_type, Vec::new(), predicate, children);
+                join.range = conditions;
+                join.operator_name = Some(if algorithm == JoinAlgorithm::IeJoin {
+                    "IE_JOIN"
+                } else {
+                    "PIECEWISE_MERGE_JOIN"
+                });
+                join
+            }
+        }
+    }
+
+    /// The keys of the comparisons of a range join for `side` of the rows of `chunk`, or `None`
+    /// for a row with a NULL key, which matches nothing.
+    fn range_keys(&self, chunk: &DataChunk, right: bool) -> Result<Vec<Option<Vec<RowKey>>>> {
+        let mut keys: Vec<Option<Vec<RowKey>>> = vec![Some(Vec::with_capacity(self.range.len())); chunk.len()];
+        for condition in &self.range {
+            let vector = execute(if right { &condition.right } else { &condition.left }, chunk)?;
+            let unified = vector.to_unified(chunk.len());
+            let row_keys = create_row_keys(&[&vector], chunk.len())?;
+            for (row, key) in row_keys.into_iter().enumerate() {
+                if !unified.is_valid(row) {
+                    keys[row] = None;
+                } else if let Some(keys) = &mut keys[row] {
+                    keys.push(key);
+                }
+            }
+        }
+        Ok(keys)
+    }
+
+    /// The range index of the build rows of `data`.
+    fn range_index(&self, data: &DataChunk, count: usize) -> Result<RangeIndex> {
+        let mut entries: Vec<(u32, Vec<RowKey>)> = Vec::new();
+        let mut start = 0;
+        while start < count {
+            let end = (start + STANDARD_VECTOR_SIZE).min(count);
+            let chunk = Self::rows_of(data, (start as u32..end as u32).collect());
+            for (row, keys) in self.range_keys(&chunk, true)?.into_iter().enumerate() {
+                if let Some(keys) = keys {
+                    entries.push(((start + row) as u32, keys));
+                }
+            }
+            start = end;
+        }
+        entries.sort_by(|a, b| a.1[0].as_bytes().cmp(b.1[0].as_bytes()));
+        let mut rows = Vec::with_capacity(entries.len());
+        let mut first = Vec::with_capacity(entries.len());
+        let mut second = Vec::new();
+        for (row, mut keys) in entries {
+            rows.push(row);
+            if keys.len() > 1 {
+                second.push(keys.pop().expect("two keys"));
+            }
+            first.push(keys.pop().expect("a key"));
+        }
+        let second = (self.range.len() > 1).then(|| SecondIndex::new(second));
+        Ok(RangeIndex { rows, first, second })
+    }
+
+    /// The build rows that `keys`, the keys of a probe row, match: the positions of the sorted
+    /// build side it gives for one comparison, and in `out` for two.
+    fn range_candidates(&self, index: &RangeIndex, keys: &[RowKey], out: &mut Vec<u32>) -> std::ops::Range<usize> {
+        out.clear();
+        let run = matching_run(
+            index.first.len(),
+            |i| index.first[i].as_bytes(),
+            self.range[0].comparison,
+            keys[0].as_bytes(),
+        );
+        match &index.second {
+            None => run,
+            Some(second) => {
+                second.find(run, self.range[1].comparison, keys[1].as_bytes(), out);
+                for position in out.iter_mut() {
+                    *position = index.rows[*position as usize];
+                }
+                0..0
+            }
         }
     }
 
@@ -617,6 +903,7 @@ impl PhysicalJoin {
             matched: (0..count).map(|_| AtomicBool::new(false)).collect(),
             spilled: std::mem::take(&mut build.spilled),
             total_count,
+            range: None,
         }
     }
 
@@ -740,7 +1027,7 @@ impl PhysicalJoin {
             .conditions
             .iter()
             .zip(&vectors)
-            .filter(|(c, _)| !c.null_safe)
+            .filter(|(c, _)| !c.null_safe())
             .map(|(_, v)| v.to_unified(chunk.len()))
             .collect();
         Ok(keys
@@ -785,6 +1072,11 @@ impl PhysicalJoin {
                         .collect()
                 };
                 let count = kept.as_ref().map_or(input.len(), DataChunk::len);
+                let range_keys = if self.range.is_empty() {
+                    Vec::new()
+                } else {
+                    self.range_keys(input, false)?
+                };
                 slot.insert(Probe {
                     groups,
                     row: 0,
@@ -792,6 +1084,10 @@ impl PhysicalJoin {
                     found: vec![false; count],
                     nulls,
                     single: vec![None; count],
+                    range_keys,
+                    current: Vec::new(),
+                    current_run: 0..0,
+                    current_row: None,
                 })
             }
         };
@@ -802,7 +1098,9 @@ impl PhysicalJoin {
             JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Outer
         );
         loop {
-            let (left, right) = if self.conditions.is_empty() {
+            let (left, right) = if let Some(index) = &build.range {
+                self.next_range_pairs(index, probe)
+            } else if self.conditions.is_empty() {
                 self.next_pairs(build, probe)
             } else {
                 self.next_key_pairs(build, probe)
@@ -940,6 +1238,53 @@ impl PhysicalJoin {
             }
         });
         partitions.into_iter().map(Mutex::into_inner).collect()
+    }
+
+    /// The next pairs of a left row and a build row its range keys match, at most a vector of them.
+    fn next_range_pairs(&self, index: &RangeIndex, probe: &mut Probe) -> (Vec<u32>, Vec<u32>) {
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        while left.len() < STANDARD_VECTOR_SIZE && probe.row < probe.found.len() {
+            let row = probe.row;
+            if probe.current_row != Some(row) {
+                probe.current.clear();
+                probe.current_run = 0..0;
+                if !(self.first_match_only() && probe.found[row])
+                    && let Some(keys) = &probe.range_keys[row]
+                {
+                    probe.current_run = self.range_candidates(index, keys, &mut probe.current);
+                }
+                probe.current_row = Some(row);
+            }
+            let candidates = match index.second {
+                None => &index.rows[probe.current_run.clone()],
+                Some(_) => &probe.current[..],
+            };
+            // a SEMI or ANTI row is done at its first match, which the pairs so far may have; without
+            // a predicate every build row the lookup finds is a match (`ResolveSimpleJoin`)
+            let done = self.first_match_only() && probe.found[row];
+            let chain = if done {
+                &[][..]
+            } else if self.first_match_only() && self.predicate.is_none() {
+                &candidates[..candidates.len().min(1)]
+            } else {
+                candidates
+            };
+            let take = chain
+                .len()
+                .saturating_sub(probe.candidate)
+                .min(STANDARD_VECTOR_SIZE - left.len());
+            left.extend(std::iter::repeat_n(row as u32, take));
+            if take > 0 {
+                right.extend_from_slice(&chain[probe.candidate..probe.candidate + take]);
+            }
+            probe.candidate += take;
+            if probe.candidate >= chain.len() {
+                probe.row += 1;
+                probe.candidate = 0;
+            }
+        }
+        (left, right)
     }
 
     /// The next pairs of a left and a build row with equal keys, at most a vector of them.
@@ -1086,7 +1431,9 @@ impl PhysicalOperator for PhysicalJoin {
         vec![format!("Join Type: {}", self.join_type.name())]
     }
     fn name(&self) -> &'static str {
-        if self.conditions.is_empty() {
+        if let Some(name) = self.operator_name {
+            name
+        } else if self.conditions.is_empty() {
             "BLOCKWISE_NL_JOIN"
         } else {
             "HASH_JOIN"
@@ -1109,7 +1456,7 @@ impl PhysicalOperator for PhysicalJoin {
         self.append(&mut self.build.lock(), chunk, keys, false)
     }
     fn parallel_sink(&self) -> bool {
-        self.conditions.iter().all(|c| parallel_expression(&c.right))
+        self.conditions.iter().chain(&self.range).all(|c| parallel_expression(&c.right))
     }
     fn local_sink_state(&self) -> LocalSinkState {
         self.builders.fetch_add(1, Ordering::Relaxed);
@@ -1151,7 +1498,10 @@ impl PhysicalOperator for PhysicalJoin {
             *spill.build_files.lock() = spill.build.take()?;
         }
         let complete = build.spilled_rows == 0;
-        let finished = Self::finish_build(&mut build, threads, total_count, has_null_key);
+        let mut finished = Self::finish_build(&mut build, threads, total_count, has_null_key);
+        if !self.range.is_empty() {
+            finished.range = Some(self.range_index(&finished.data, finished.count)?);
+        }
         for condition in &self.conditions {
             if let Some(filter) = &condition.filter {
                 match condition.right.kind {
@@ -1167,7 +1517,7 @@ impl PhysicalOperator for PhysicalJoin {
             .map_err(|_| Error::new(ErrorKind::Internal, "a join build side was finished twice"))
     }
     fn parallel_operator(&self) -> bool {
-        self.conditions.iter().all(|c| parallel_expression(&c.left))
+        self.conditions.iter().chain(&self.range).all(|c| parallel_expression(&c.left))
             && self.predicate.as_ref().is_none_or(parallel_expression)
     }
     fn operator_state(&self) -> OperatorState {

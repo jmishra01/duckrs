@@ -406,6 +406,7 @@ impl FilterPushdown {
                 join_type: JoinType::Inner,
                 conditions,
                 predicate: (!predicates.is_empty()).then(|| conjunction_of(predicates)),
+                algorithm: Default::default(),
             };
             LogicalOperator::new(kind, children)
         };
@@ -706,11 +707,7 @@ fn add_filter_operator(op: LogicalOperator, mut expressions: Vec<BoundExpr>) -> 
 pub(super) fn condition_expression(condition: JoinCondition) -> BoundExpr {
     BoundExpr::new(
         BoundExprKind::Comparison {
-            op: if condition.null_safe {
-                ComparisonOp::NotDistinctFrom
-            } else {
-                ComparisonOp::Equal
-            },
+            op: condition.comparison,
             left: Box::new(condition.left),
             right: Box::new(condition.right),
         },
@@ -753,7 +750,7 @@ fn extract_join_conditions(
                 conditions.push(JoinCondition {
                     left: (**l).clone(),
                     right: (**r).clone(),
-                    null_safe,
+                    comparison: JoinCondition::equality(null_safe),
                     filter: None,
                 });
                 continue;
@@ -825,7 +822,7 @@ fn mark_to_semi(op: &mut LogicalOperator, reads: &HashMap<ColumnBinding, usize>)
     let join_type = if expressions.iter().any(is_marker) {
         JoinType::Semi
     } else if expressions.iter().any(is_not_marker)
-        && conditions.iter().all(|condition| condition.null_safe)
+        && conditions.iter().all(|condition| condition.null_safe())
         && predicate.as_ref().is_none_or(never_null)
     {
         JoinType::Anti
@@ -838,6 +835,7 @@ fn mark_to_semi(op: &mut LogicalOperator, reads: &HashMap<ColumnBinding, usize>)
         join_type,
         conditions,
         predicate,
+        algorithm: Default::default(),
     };
     if expressions.is_empty() {
         *op = op.children.remove(0);

@@ -265,7 +265,7 @@ impl Rewriter<'_> {
                 conditions: vec![JoinCondition {
                     left: input,
                     right: BoundExpr::column_ref(ColumnBinding::new(chunk_index, 0), in_type, ""),
-                    null_safe: false,
+                    comparison: duckrs_parser::ast::ComparisonOp::Equal,
                     filter: None,
                 }],
                 predicate: None,

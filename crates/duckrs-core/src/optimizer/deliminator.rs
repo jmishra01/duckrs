@@ -229,6 +229,7 @@ fn remove_join_with_delim_get(
         join_type,
         conditions,
         predicate,
+        ..
     } = &op.kind
     else {
         return None;
@@ -275,7 +276,7 @@ fn remove_join_with_delim_get(
         }
         replacements.push((from_column, to_column));
         // the join dropped NULLs
-        if !condition.null_safe {
+        if !condition.null_safe() {
             filters.push(is_not_null(to));
         }
     }
@@ -484,6 +485,7 @@ fn to_ordinary_join(op: &mut LogicalOperator) {
             join_type,
             conditions,
             predicate,
+            algorithm: Default::default(),
         },
     };
 }

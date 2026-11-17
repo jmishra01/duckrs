@@ -257,6 +257,8 @@ pub enum LogicalOperatorKind {
         join_type: JoinType,
         conditions: Vec<JoinCondition>,
         predicate: Option<BoundExpr>,
+        /// the operator its comparisons make, which the end of the optimizer picks
+        algorithm: JoinAlgorithm,
     },
     /// `LogicalAsOfJoin`: for each left row, the closest right row with `left op right` among those
     /// with equal `conditions` that `predicate` lets through.
@@ -330,6 +332,21 @@ pub enum LogicalOperatorKind {
     },
 }
 
+/// The physical operator of a join (`PlanComparisonJoin`): a hash join with equalities among its
+/// conditions, a blockwise nested loop join without conditions, and for comparisons the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum JoinAlgorithm {
+    /// `PhysicalHashJoin`, or `PhysicalBlockwiseNLJoin` without conditions it can use
+    #[default]
+    Hash,
+    /// `PhysicalNestedLoopJoin`
+    NestedLoop,
+    /// `PhysicalPiecewiseMergeJoin`
+    PiecewiseMerge,
+    /// `PhysicalIEJoin`
+    IeJoin,
+}
+
 /// What a column of a recursive CTE is to its USING KEY.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CteKeyColumn {
@@ -368,17 +385,34 @@ pub struct OnConflict {
     pub condition: Option<BoundExpr>,
 }
 
-/// An equality between the two sides of a join (`JoinCondition`).
+/// A comparison between the two sides of a join (`JoinCondition`): `left comparison right`.
+/// The optimizer only sees equalities; the comparisons of `predicate` that are conditions in C++
+/// join them at the end of it ([`crate::optimizer::range_joins`]).
 #[derive(Debug, Clone)]
 pub struct JoinCondition {
     /// reads the left child
     pub left: BoundExpr,
     /// reads the right child
     pub right: BoundExpr,
-    /// `IS NOT DISTINCT FROM`: NULLs are equal
-    pub null_safe: bool,
+    /// `=`, or `IS NOT DISTINCT FROM`, where NULLs are equal; past the optimizer also the others
+    pub comparison: ComparisonOp,
     /// what the join tells a scan below its left side of its keys on the right
     pub filter: Option<std::sync::Arc<crate::execution::join_filter::JoinFilter>>,
+}
+
+impl JoinCondition {
+    /// `IS NOT DISTINCT FROM`: NULLs are equal.
+    pub fn null_safe(&self) -> bool {
+        self.comparison == ComparisonOp::NotDistinctFrom
+    }
+    /// `=` or `IS NOT DISTINCT FROM`: a key of a hash join.
+    pub fn is_equality(&self) -> bool {
+        matches!(self.comparison, ComparisonOp::Equal | ComparisonOp::NotDistinctFrom)
+    }
+    /// The comparison of the condition for its sides, `IS NOT DISTINCT FROM` if `null_safe`.
+    pub fn equality(null_safe: bool) -> ComparisonOp {
+        if null_safe { ComparisonOp::NotDistinctFrom } else { ComparisonOp::Equal }
+    }
 }
 
 /// An ORDER BY term with its resolved order and NULL order (`BoundOrderByNode`).

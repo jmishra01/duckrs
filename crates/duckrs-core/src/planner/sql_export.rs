@@ -1163,6 +1163,7 @@ impl Exporter<'_> {
                 join_type,
                 conditions,
                 predicate,
+                ..
             } => {
                 let left = self.export_child(op, 0)?;
                 let right = self.export_child(op, 1)?;
@@ -1897,11 +1898,7 @@ impl Exporter<'_> {
         scope.add(&right_select, &right_fields);
         let mut on = Vec::new();
         for c in conditions {
-            let op = if c.null_safe {
-                ComparisonOp::NotDistinctFrom
-            } else {
-                ComparisonOp::Equal
-            };
+            let op = c.comparison;
             on.push(Expr::comparison(
                 op,
                 self.expr(&scope, &c.left)?,
@@ -1995,11 +1992,7 @@ impl Exporter<'_> {
         scope.add(&Select::new(TableRef::empty(), right_columns), &right_fields);
         let mut on = Vec::new();
         for c in conditions {
-            let op = if c.null_safe {
-                ComparisonOp::NotDistinctFrom
-            } else {
-                ComparisonOp::Equal
-            };
+            let op = c.comparison;
             on.push(Expr::comparison(
                 op,
                 self.expr(&scope, &c.left)?,
@@ -2078,7 +2071,7 @@ impl Exporter<'_> {
         predicate: Option<&BoundExpr>,
     ) -> Res<Expr> {
         if let ([condition], None) = (conditions, predicate)
-            && !condition.null_safe
+            && condition.comparison == ComparisonOp::Equal
         {
             // IN is exactly that
             let key = self.expr(scope, &condition.right)?;
@@ -2100,15 +2093,11 @@ impl Exporter<'_> {
         for c in conditions {
             let l = self.expr(scope, &c.left)?;
             let r = self.expr(scope, &c.right)?;
-            if !c.null_safe {
+            if !c.null_safe() {
                 left_nulls.push(Expr::operator(OperatorType::IsNull, vec![l.clone()]));
                 right_nulls.push(Expr::operator(OperatorType::IsNull, vec![r.clone()]));
             }
-            let op = if c.null_safe {
-                ComparisonOp::NotDistinctFrom
-            } else {
-                ComparisonOp::Equal
-            };
+            let op = c.comparison;
             keys.push(Expr::comparison(op, l, r));
         }
         let predicate = predicate.map(|p| self.expr(scope, p)).transpose()?;
@@ -2186,11 +2175,7 @@ impl Exporter<'_> {
             JoinType::Single => {
                 let mut keys = Vec::new();
                 for c in conditions {
-                    let op = if c.null_safe {
-                        ComparisonOp::NotDistinctFrom
-                    } else {
-                        ComparisonOp::Equal
-                    };
+                    let op = c.comparison;
                     keys.push(Expr::comparison(
                         op,
                         self.expr(&scope, &c.left)?,

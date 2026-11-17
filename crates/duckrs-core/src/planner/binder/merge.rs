@@ -346,6 +346,7 @@ impl Binder<'_> {
                 join_type,
                 conditions: join_conditions,
                 predicate: conjunction_of(predicate),
+                algorithm: Default::default(),
             },
             vec![source_plan, target_plan],
         );

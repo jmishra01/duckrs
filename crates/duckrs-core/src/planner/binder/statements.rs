@@ -395,7 +395,10 @@ impl Binder<'_> {
         let columns = (0..types.len()).map(Some).collect();
         let recursive = self.cast_plan(recursive, &types, columns);
         let plan = if used.load(Ordering::Relaxed) || !key.is_empty() {
-            let mut recursive = optimize(recursive, self.options.optimizer);
+            // `recursive_cte_tables` has the CTE while its recursive part is planned
+            let mut options = self.options.optimizer;
+            options.range_joins.in_recursive_cte = true;
+            let mut recursive = optimize(recursive, options);
             let unresolved = Box::new(recursive.clone());
             resolve_column_bindings(&mut recursive)?;
             LogicalOperator::new(

@@ -19,6 +19,7 @@ pub mod filter_pushdown;
 pub mod in_clause_rewriter;
 mod index_scan;
 pub mod join_order;
+pub mod range_joins;
 mod relation_statistics;
 pub mod rewriter;
 pub mod scan_filters;
@@ -55,6 +56,8 @@ pub struct OptimizerOptions {
     pub dynamic_or_filter_threshold: usize,
     /// `perfect_ht_threshold`
     pub perfect_ht_threshold: u64,
+    /// what picks the operators of joins on comparisons
+    pub range_joins: range_joins::RangeJoinOptions,
 }
 
 impl Default for OptimizerOptions {
@@ -77,6 +80,7 @@ impl Default for OptimizerOptions {
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
             perfect_ht_threshold: 12,
+            range_joins: range_joins::RangeJoinOptions::default(),
         }
     }
 }
@@ -102,6 +106,7 @@ impl OptimizerOptions {
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
             perfect_ht_threshold: 12,
+            range_joins: range_joins::RangeJoinOptions::default(),
         }
     }
 
@@ -126,6 +131,7 @@ impl OptimizerOptions {
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
             perfect_ht_threshold: 12,
+            range_joins: range_joins::RangeJoinOptions::default(),
         }
     }
 }
@@ -149,6 +155,8 @@ pub fn optimize_timed(
             timings.push((name, start.elapsed()));
             plan
         };
+    // a plan that has been through here before has its comparisons back in the predicates
+    range_joins::restore_predicates(&mut plan);
     if options.expression_rewriter {
         plan = run("expression_rewriter", plan, &mut |mut plan| {
             rewriter::rewrite_plan(&mut plan);
@@ -186,7 +194,7 @@ pub fn optimize_timed(
         plan = run("projection_pullup", plan, &mut projection_pullup::pull_up);
     }
     if options.join_order {
-        build_side::choose_build_sides(&mut plan);
+        build_side::choose_build_sides(&mut plan, options.range_joins.prefer_range_joins);
         plan = run("join_order", plan, &mut join_order::reorder_joins);
     }
     if options.join_elimination {
@@ -241,6 +249,8 @@ pub fn optimize_timed(
             plan
         });
     }
+    // what the binder does in C++, which has them as conditions all the way, and the planner
+    range_joins::plan_range_joins(&mut plan, &options.range_joins);
     plan
 }
 

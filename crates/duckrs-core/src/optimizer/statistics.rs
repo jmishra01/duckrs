@@ -1886,7 +1886,7 @@ impl StatisticsPropagator {
         let mut right_is_empty = false;
         // the filters the ranges of the keys after the join make for each side (`CreateFilterFromJoinStats`)
         let mut range_filters: [Vec<BoundExpr>; 2] = [Vec::new(), Vec::new()];
-        for condition in conditions.iter_mut().filter(|c| !c.null_safe) {
+        for condition in conditions.iter_mut().filter(|c| !c.null_safe()) {
             let left = self.expression(&mut condition.left, false);
             let right = self.expression(&mut condition.right, false);
             // `PropagateComparison`: without minimum and maximum nothing is decided, not even for a

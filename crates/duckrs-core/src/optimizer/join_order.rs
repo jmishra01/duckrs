@@ -1002,7 +1002,7 @@ impl Tree {
                     conditions.push(JoinCondition {
                         left: *a,
                         right: *b,
-                        null_safe: op == ComparisonOp::NotDistinctFrom,
+                        comparison: op,
                         filter: None,
                     });
                 }
@@ -1017,6 +1017,7 @@ impl Tree {
                 join_type: JoinType::Inner,
                 conditions,
                 predicate: (!residual.is_empty()).then(|| conjunction_of(residual)),
+                algorithm: Default::default(),
             },
             vec![left, right],
         )
@@ -1422,6 +1423,7 @@ impl JoinOrderOptimizer {
                 join_type,
                 conditions,
                 predicate,
+                ..
             } => {
                 let (left, right) = (self.stats(&op.children[0]), self.stats(&op.children[1]));
                 if matches!(
@@ -1434,11 +1436,7 @@ impl JoinOrderOptimizer {
                         .map(|c| SemiAntiCondition {
                             left: &c.left,
                             right: &c.right,
-                            op: if c.null_safe {
-                                ComparisonOp::NotDistinctFrom
-                            } else {
-                                ComparisonOp::Equal
-                            },
+                            op: c.comparison,
                         })
                         .collect();
                     if let Some((l, r)) = residual {
@@ -1461,8 +1459,10 @@ impl JoinOrderOptimizer {
                     let distinct = found.iter().filter_map(|c| columns.get(c).map(|s| s.current.count));
                     distinct.reduce(f64::max)
                 };
+                // past the optimizer, the comparisons of the predicate are conditions too
                 let domains: Vec<f64> = conditions
                     .iter()
+                    .filter(|condition| condition.is_equality())
                     .map(|condition| {
                         let sides = [domain_of(&condition.left), domain_of(&condition.right)];
                         let domain = sides.into_iter().flatten().reduce(f64::max);
@@ -1471,9 +1471,12 @@ impl JoinOrderOptimizer {
                     .collect();
                 let mut denominator =
                     composite_denominator(&domains, left_rows, right_rows).unwrap_or_else(|| domains.iter().product());
+                let comparisons = conditions.iter().filter(|c| !c.is_equality()).cloned().map(condition_expression);
+                let mut conjuncts: Vec<BoundExpr> = comparisons.collect();
                 if let Some(predicate) = predicate {
-                    let mut conjuncts = Vec::new();
                     split_conjuncts(predicate.clone(), &mut conjuncts);
+                }
+                {
                     for conjunct in &conjuncts {
                         denominator *= predicate_denominator(conjunct, &domain_of);
                     }

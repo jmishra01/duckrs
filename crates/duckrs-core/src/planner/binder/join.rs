@@ -235,14 +235,14 @@ pub(super) fn extract_join_conditions(
             conditions.push(JoinCondition {
                 left: *first,
                 right: *second,
-                null_safe,
+                comparison: JoinCondition::equality(null_safe),
                 filter: None,
             });
         } else if only(&first, &right_tables, &left_tables) && only(&second, &left_tables, &right_tables) {
             conditions.push(JoinCondition {
                 left: *second,
                 right: *first,
-                null_safe,
+                comparison: JoinCondition::equality(null_safe),
                 filter: None,
             });
         } else {
@@ -501,6 +501,7 @@ impl Binder<'_> {
                 join_type: join.join_type,
                 conditions,
                 predicate,
+                algorithm: Default::default(),
             },
             vec![left, right],
         ))
@@ -614,6 +615,7 @@ impl Binder<'_> {
                     join_type,
                     conditions,
                     predicate: residual,
+                    algorithm: Default::default(),
                 },
                 vec![left, right],
             ));
