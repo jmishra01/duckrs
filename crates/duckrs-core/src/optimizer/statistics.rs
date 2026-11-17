@@ -289,6 +289,7 @@ fn compute_ordered_statistics(table: &Arc<TableCatalogEntry>, positions: Option<
             grouping_sets: Vec::new(),
             grouping_functions: Vec::new(),
             perfect_hash: false,
+            domain_cap: None,
         },
         vec![scan],
     );
@@ -1888,8 +1889,9 @@ impl StatisticsPropagator {
         for condition in conditions.iter_mut().filter(|c| !c.null_safe) {
             let left = self.expression(&mut condition.left, false);
             let right = self.expression(&mut condition.right, false);
-            let never =
-                decide(ComparisonOp::Equal, &left, &right) == Some(false) || !left.can_be_valid || !right.can_be_valid;
+            // `PropagateComparison`: without minimum and maximum nothing is decided, not even for a
+            // side without values
+            let never = decide(ComparisonOp::Equal, &left, &right) == Some(false);
             no_rows |= matches_only && never;
             right_is_empty |= join_type == JoinType::Left && never;
             if let (
@@ -2088,6 +2090,7 @@ impl StatisticsPropagator {
                 aggregates,
                 grouping_functions,
                 perfect_hash,
+                domain_cap,
                 ..
             } if grouping_sets.len() <= 1 && grouping_sets.iter().all(|set| set.len() == groups.len()) => {
                 *perfect_hash = !self.filter_simplification
@@ -2095,6 +2098,11 @@ impl StatisticsPropagator {
                     && !groups.is_empty()
                     && !aggregates.iter().any(|a| a.distinct)
                     && self.perfect_hash_bits(groups).is_some_and(|bits| bits <= self.perfect_ht_threshold);
+                // the result has no more rows than the input (its maximum, not its estimate)
+                *domain_cap = (!self.filter_simplification)
+                    .then(|| self.group_domain_bound(groups))
+                    .flatten()
+                    .map(|bound| max_cardinality(&op.children[0]).map_or(bound, |rows| bound.min(rows)));
                 for (index, group) in groups.iter().enumerate() {
                     if let BoundExprKind::ColumnRef { binding, depth: 0 } = &group.kind {
                         self.aliases.insert(ColumnBinding::new(*group_index, index), *binding);
@@ -2139,6 +2147,58 @@ impl StatisticsPropagator {
 }
 
 impl StatisticsPropagator {
+    /// `CapGroupedAggregateCardinalityByKeyDomain`: the product of what `TryGetGroupKeyDistinctUpperBound`
+    /// says of each group, a range of values from the statistics of an integer, else the values of a
+    /// narrow type, and one more for NULL. The caller clamps it with the rows of the input. Not for
+    /// groups that are all columns of tables: C++'s expectations (`current_domain_cardinality.test`)
+    /// keep the join order estimate for those, which its comment says already uses their range.
+    fn group_domain_bound(&mut self, groups: &[BoundExpr]) -> Option<u64> {
+        use duckrs_common::types::PhysicalType::*;
+        if groups.is_empty() {
+            return None;
+        }
+        let base_column = |group: &BoundExpr, this: &Self| match &group.kind {
+            BoundExprKind::ColumnRef { binding, depth: 0 } => this.sources.contains_key(&this.base_of(*binding)),
+            _ => false,
+        };
+        if groups.iter().all(|g| base_column(g, self)) {
+            return None;
+        }
+        let mut bound: u128 = 1;
+        for group in groups {
+            let ty = &group.return_type;
+            let stats = self.expression(&mut group.clone(), false);
+            let ranged = matches!(ty.physical_type(), Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64)
+                && (ty.is_integral()
+                    || matches!(
+                        ty.id(),
+                        LogicalTypeId::Date
+                            | LogicalTypeId::Time
+                            | LogicalTypeId::Timestamp
+                            | LogicalTypeId::TimestampSec
+                            | LogicalTypeId::TimestampMs
+                            | LogicalTypeId::TimestampNs
+                            | LogicalTypeId::TimestampTz
+                    ));
+            let known = stats.min.as_ref().and_then(Value::as_i128).zip(stats.max.as_ref().and_then(Value::as_i128));
+            let key = match known.filter(|_| ranged) {
+                Some((min, max)) => {
+                    let range = u128::try_from(max - min).ok()?;
+                    range + 1 + u128::from(stats.can_be_null)
+                }
+                None => match ty.id() {
+                    LogicalTypeId::Boolean => 3,
+                    LogicalTypeId::TinyInt | LogicalTypeId::UTinyInt => 257,
+                    LogicalTypeId::SmallInt | LogicalTypeId::USmallInt => 65537,
+                    LogicalTypeId::Enum => ty.enum_values().len() as u128 + 1,
+                    _ => return None,
+                },
+            };
+            bound = bound.saturating_mul(key).min(u64::MAX as u128);
+        }
+        Some(bound as u64)
+    }
+
     /// The bits the groups take in a perfect hash table (`CanUsePerfectHashAggregate`): each needs
     /// its range of values, plus one for NULL and one to count from one. Groups must be integers,
     /// with statistics unless their type is small enough to take its whole range.
@@ -2308,6 +2368,11 @@ fn has_failing_filter(op: &LogicalOperator) -> bool {
     }
 }
 
+/// The name of a filter `CreateFilterFromJoinStats` makes. C++ makes them once the joins are
+/// ordered, and the estimates of the operators they go into are taken by then: the cardinality
+/// estimates leave them out.
+pub(crate) const JOIN_STATS_FILTER: &str = "\u{0}join_stats_filter";
+
 /// `CreateFilterFromJoinStats`: the bounds a join left of an integer key column, as filters for its side.
 fn join_range_filters(expr: &BoundExpr, before: &Stats, after: &Stats) -> Vec<BoundExpr> {
     if !matches!(expr.kind, BoundExprKind::ColumnRef { depth: 0, .. }) || !expr.return_type.is_integral() {
@@ -2327,6 +2392,7 @@ fn join_range_filters(expr: &BoundExpr, before: &Stats, after: &Stats) -> Vec<Bo
             },
             LogicalType::BOOLEAN,
         )
+        .with_alias(JOIN_STATS_FILTER)
     };
     let mut filters = Vec::new();
     if compare_values(ComparisonOp::GreaterThan, min_after, min_before) == Some(true) {
