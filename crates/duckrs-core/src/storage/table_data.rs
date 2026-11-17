@@ -265,6 +265,8 @@ fn scan_fixed(
         COMPRESSION_BITPACKING => scan_bitpacking(data, count, width, out),
         COMPRESSION_ALP if float => scan_alp(data, count, width, out),
         COMPRESSION_ALPRD if float => scan_alprd(data, count, width, out),
+        COMPRESSION_CHIMP if float => super::float_codecs::scan_chimp(data, count, width, out),
+        COMPRESSION_PATAS if float => super::float_codecs::scan_patas(data, count, width, out),
         COMPRESSION_ROARING if ty == PhysicalType::Bool => {
             // booleans go through the validity format, where a set bit is true
             let mut bits = Vec::with_capacity(count);

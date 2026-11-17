@@ -483,8 +483,7 @@ passes `checkpoint_threshold` and when the database goes away.
 These fail with an error that says they are not ported, because going on would give wrong answers
 or lose data:
 
-- ZSTD, Chimp and Patas;
-- VARIANT and GEOMETRY columns;
+- shredded VARIANT columns, and GEOMETRY columns;
 - triggers;
 - `CREATE TABLE ... AS` queries, partition and sort keys, table options, and schemas with options;
 - in a stored query: INSERT, UPDATE, DELETE, MERGE, COPY, SHOW and MATCH_RECOGNIZE;
@@ -497,8 +496,7 @@ These stop writes, or fail when they are made, as a file can't hold them yet:
 - VARIANT and GEOMETRY columns, and in a stored query what can't be read from one either. These fail
   at the commit, which leaves the database in memory as it is, until what can't be stored is dropped.
 
-Next: VARIANT and writing older `STORAGE_VERSION`s are the largest of the rest. ZSTD takes a new dependency, and Chimp and
-Patas are only in old files.
+Next: shredded VARIANT and writing older `STORAGE_VERSION`s are the largest of the rest.
 
 **Indexes**: the ART of each index in a file is parsed past and not read, whichever way the file
 points to it (`index_storage_infos`, or `index_pointers` and `root_block_pointer` in old files). C++
@@ -748,9 +746,9 @@ bytes of a block and fixes its checksum, to get past that to the decoders. Layou
 exactly and not just bounds: an FSST symbol table in the wrong place is corruption even if it is in
 bounds, as otherwise strings decode to garbage without an error.
 
-Of the 25 database files under DuckDB's `data` and `test`, 12 open. The rest fail on Patas and Chimp
-(3) and encryption (2), and 8 are refused as DuckDB refuses them: damaged, of another vector size, or
-too old.
+Of the 25 database files under DuckDB's `data` and `test`, 15 open, the Patas and Chimp ones (`float_codecs`)
+among them. The rest fail on encryption (2), and 8 are refused as DuckDB refuses them: damaged, of another
+vector size, or too old.
 
 `stored_queries.txt` is one query per line, stored as a view in files for v1.0.0, v1.5.0 and v2.0.0.
 Every view gives the rows that DuckDB gives, and on the v1.5.0 file `duckdb_views()` renders each

@@ -16,6 +16,8 @@ pub const COMPRESSION_RLE: u8 = 3;
 pub const COMPRESSION_DICTIONARY: u8 = 4;
 pub const COMPRESSION_BITPACKING: u8 = 6;
 pub const COMPRESSION_FSST: u8 = 7;
+pub const COMPRESSION_CHIMP: u8 = 8;
+pub const COMPRESSION_PATAS: u8 = 9;
 pub const COMPRESSION_ALP: u8 = 10;
 pub const COMPRESSION_ALPRD: u8 = 11;
 pub const COMPRESSION_ROARING: u8 = 13;
@@ -30,8 +32,8 @@ const METADATA_GROUP_SIZE: usize = 2048;
 
 pub fn compression_name(compression: u8) -> &'static str {
     match compression {
-        8 => "Chimp",
-        9 => "Patas",
+        COMPRESSION_CHIMP => "Chimp",
+        COMPRESSION_PATAS => "Patas",
         12 => "ZSTD",
         _ => "this",
     }
@@ -46,8 +48,8 @@ pub fn storage_name(compression: u8) -> &'static str {
         COMPRESSION_DICTIONARY => "Dictionary",
         COMPRESSION_BITPACKING => "BitPacking",
         COMPRESSION_FSST => "FSST",
-        8 => "Chimp",
-        9 => "Patas",
+        COMPRESSION_CHIMP => "Chimp",
+        COMPRESSION_PATAS => "Patas",
         COMPRESSION_ALP => "ALP",
         COMPRESSION_ALPRD => "ALPRD",
         12 => "ZSTD",

@@ -174,7 +174,8 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] the statistics of the unshredded part, a row group the checkpoint does not shred as `UNINITIALIZED`
     (which merges into what the others are), and the row groups a delete emptied dropped in files before
     v2.0.0, the rows after them taking new ids where no index keeps them
-  - [ ] shredded GEOMETRY columns, Patas and Chimp segments (8), `read_duckdb` (8)
+  - [x] Patas and Chimp segments of the files before v0.9, with C++'s checks of damaged ones
+  - [ ] shredded GEOMETRY columns, `read_duckdb` (8)
   - [x] list-length statistics: the shortest, longest and total length of a table's lists, kept through appends,
     checkpoints (v2.1.0, with the lists' `ListPersistentColumnData`) and WAL replay; checkpoints write v2.1.0 when
     asked; a table's statistics keep those of what is in its nested columns

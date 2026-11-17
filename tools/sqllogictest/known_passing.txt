@@ -3781,6 +3781,10 @@ test/sql/storage/compression/bitpacking/bitpacking_storage_info.test
 test/sql/storage/compression/bitpacking/bitpacking_uhugeint.test
 test/sql/storage/compression/bitpacking/force_bitpacking.test
 test/sql/storage/compression/bitpacking/struct_bitpacking.test
+test/sql/storage/compression/chimp/chimp_corrupt_group_count.test
+test/sql/storage/compression/chimp/chimp_corrupt_leading_zero_block_count.test
+test/sql/storage/compression/chimp/chimp_corrupt_metadata_offset.test
+test/sql/storage/compression/chimp/chimp_fetch_row.test
 test/sql/storage/compression/compression_count_sentinel.test
 test/sql/storage/compression/compression_null_block.test
 test/sql/storage/compression/compression_selection.test
@@ -3830,6 +3834,10 @@ test/sql/storage/compression/fsst/invalid_fsst_bitpacking_width.test
 test/sql/storage/compression/fsst/issue_5675.test
 test/sql/storage/compression/fsst/issue_5675_followup.test
 test/sql/storage/compression/fsst/issue_5759.test
+test/sql/storage/compression/patas/patas_corrupt_data_offset_high.test
+test/sql/storage/compression/patas/patas_corrupt_group_count.test
+test/sql/storage/compression/patas/patas_corrupt_metadata_offset_low.test
+test/sql/storage/compression/patas/patas_corrupted_file.test
 test/sql/storage/compression/rle/force_rle.test
 test/sql/storage/compression/rle/rle_bool.test
 test/sql/storage/compression/rle/rle_corrupt_run_undercount.test

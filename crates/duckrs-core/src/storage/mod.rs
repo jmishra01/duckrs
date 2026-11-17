@@ -8,6 +8,7 @@ pub mod checkpoint;
 pub mod checksum;
 pub mod compression;
 mod dict_fsst_analyze;
+mod float_codecs;
 pub mod encode;
 mod fsst;
 mod index_data;
