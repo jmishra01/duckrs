@@ -1067,6 +1067,19 @@ pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
             }
             let arguments = DataChunk::from_columns(arguments, count);
             let mut result = Vector::new(expr.return_type.clone(), count.max(1));
+            // `RandomFunction`: the engine of this call, seeded from the client's when first run
+            if let Some(state) = &function.random {
+                let mut state = state.lock();
+                let engine = state.get_or_insert_with(|| {
+                    let mut engine = super::random_engine::RandomEngine::new(0);
+                    engine.set_seed(super::random_engine::client_next_seed());
+                    engine
+                });
+                for row in 0..count {
+                    result.set_value(row, &Value::double(engine.next_random()))?;
+                }
+                return Ok(result);
+            }
             (function.function)(&arguments, &mut result).map_err(|error| {
                 if error.message == DIVISION_BY_ZERO {
                     let message = format!(

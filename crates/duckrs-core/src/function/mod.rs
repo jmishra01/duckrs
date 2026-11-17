@@ -71,6 +71,8 @@ pub struct ScalarFunction {
     pub error_on_zero: bool,
     /// `FunctionErrors::CANNOT_ERROR`, set where the arguments or their statistics show it
     pub cannot_error: bool,
+    /// `RandomLocalState` of `random()`: its engine, seeded from the client's when first run
+    pub random: Option<Arc<parking_lot::Mutex<Option<crate::execution::random_engine::RandomEngine>>>>,
 }
 
 impl ScalarFunction {
@@ -89,6 +91,7 @@ impl ScalarFunction {
             null_on_zero: false,
             error_on_zero: false,
             cannot_error: false,
+            random: None,
         }
     }
 
@@ -103,6 +106,7 @@ impl ScalarFunction {
             null_on_zero: self.null_on_zero,
             error_on_zero: self.error_on_zero,
             cannot_error: true,
+            random: self.random.clone(),
         }
     }
 
@@ -117,6 +121,7 @@ impl ScalarFunction {
             null_on_zero: null,
             error_on_zero: !null,
             cannot_error: self.cannot_error,
+            random: self.random.clone(),
         }
     }
 

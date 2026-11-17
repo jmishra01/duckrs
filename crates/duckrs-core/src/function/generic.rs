@@ -642,6 +642,9 @@ fn setseed(args: &DataChunk, result: &mut Vector) -> Result<()> {
         }
         // xorshift never leaves zero
         *RANDOM_STATE.lock() = seed.to_bits() | 1;
+        // `SetSeedFunction`: the seed in [-1, 1] spread over the 32 bit integers
+        let half_max = f64::from(u32::MAX / 2);
+        crate::execution::random_engine::client_set_seed(((seed + 1.0) * half_max) as u32 as u64);
     }
     *result = Vector::constant_null(LogicalType::SQLNULL);
     Ok(())
@@ -1266,7 +1269,16 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             if !children.is_empty() {
                 return Err(no_match("random", &children));
             }
-            Ok(bound_function("random", children, LogicalType::DOUBLE, random))
+            let mut function = super::ScalarFunction::new("random", Vec::new(), LogicalType::DOUBLE, random);
+            function.random = Some(std::sync::Arc::new(parking_lot::Mutex::new(None)));
+            Ok(BoundExpr::new(
+                BoundExprKind::Function {
+                    function: std::sync::Arc::new(function),
+                    children,
+                    is_operator: false,
+                },
+                LogicalType::DOUBLE,
+            ))
         }
         "sleep_ms" => {
             let child = single(&children)?.cast_to(&LogicalType::BIGINT, false);

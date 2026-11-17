@@ -56,3 +56,28 @@ impl RandomEngine {
         self.next_random_integer64() as f64 * (-64f64).exp2()
     }
 }
+
+/// `RandomEngine::Get(context)`: the client's engine, and whether `setseed` seeded it. C++ has one
+/// per connection; duckrs shares one.
+static CLIENT: parking_lot::Mutex<Option<(RandomEngine, bool)>> = parking_lot::Mutex::new(None);
+
+fn entropy() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
+}
+
+/// `SetseedFunction`: the client's engine starts over from `seed`.
+pub fn client_set_seed(seed: u64) {
+    let mut engine = RandomEngine { state: 0 };
+    engine.set_seed(seed);
+    *CLIENT.lock() = Some((engine, true));
+}
+
+/// `RandomEngine::NextSeed` of the client's engine: the seed of a `random()` call.
+pub fn client_next_seed() -> u64 {
+    let mut client = CLIENT.lock();
+    let (engine, seeded) = client.get_or_insert_with(|| (RandomEngine::new(-1), false));
+    let seed = engine.next_random_integer64();
+    if *seeded { seed } else { seed ^ entropy() }
+}

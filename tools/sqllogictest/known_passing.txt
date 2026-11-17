@@ -661,6 +661,7 @@ test/optimizer/table_in_out_unique_keys.test
 test/optimizer/temporal_cardinality_bounds.test
 test/optimizer/test_aggregate_function_rewrite.test
 test/optimizer/test_try_cast_decimal.test
+test/optimizer/topn/complex_top_n.test
 test/optimizer/topn/topn_optimizer.test
 test/optimizer/topn_window_elimination_filter_above_null.test
 test/optimizer/topn_window_elimination_group_stats.test
@@ -696,6 +697,7 @@ test/parquet/parquet_version.test
 test/parquet/prefetching.test
 test/parquet/schema_nested_evolution.test
 test/parquet/schema_nested_extract.test
+test/parquet/test_18470.test
 test/parquet/test_filename_column.test
 test/parquet/test_internal_5021.test
 test/parquet/test_parquet_invalid_decimal.test
@@ -1726,6 +1728,7 @@ test/sql/copy/parquet/enum_converted_type.test
 test/sql/copy/parquet/fixed.test
 test/sql/copy/parquet/float16.test
 test/sql/copy/parquet/hive_partitioning_struct.test
+test/sql/copy/parquet/hive_timestamps.test
 test/sql/copy/parquet/incorrect_converted_type.test
 test/sql/copy/parquet/infer_copy_format.test
 test/sql/copy/parquet/int96_invalid_stats.test
@@ -2734,6 +2737,7 @@ test/sql/join/iejoin/test_countzeros.test
 test/sql/join/iejoin/test_ieantijoin.test
 test/sql/join/iejoin/test_iejoin.test
 test/sql/join/iejoin/test_iejoin_east_west.test
+test/sql/join/iejoin/test_iejoin_events.test
 test/sql/join/iejoin/test_iejoin_null_keys.test
 test/sql/join/iejoin/test_iejoin_overlaps.test
 test/sql/join/iejoin/test_iejoin_predicate.test
@@ -4908,6 +4912,7 @@ test/sql/window/test_tpcc_results.test
 test/sql/window/test_tpcds_q49.test
 test/sql/window/test_value_exclude.test
 test/sql/window/test_value_orderby.test
+test/sql/window/test_volatile_independence.test
 test/sql/window/test_wide_orderby.test
 test/sql/window/test_window_agg_stats_propagation.test
 test/sql/window/test_window_aggregate_macro.test
