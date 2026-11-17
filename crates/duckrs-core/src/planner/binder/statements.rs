@@ -2189,11 +2189,10 @@ impl Binder<'_> {
         let in_scope = |qualification: &[String], binding: &Binding| match qualification.split_last() {
             Some((table, schema)) => {
                 table.eq_ignore_ascii_case(&binding.alias)
-                    && (schema.is_empty()
-                        || binding.schema.as_ref().is_some_and(|s| {
-                            let path = schema.join(&crate::catalog::SCHEMA_PATH_SEPARATOR.to_string());
-                            super::BindContext::schema_matches(s, &path)
-                        }))
+                    && (schema.is_empty() || {
+                        let path = schema.join(&crate::catalog::SCHEMA_PATH_SEPARATOR.to_string());
+                        super::BindContext::schema_matches(binding, &path)
+                    })
             }
             None => true,
         };
@@ -2506,6 +2505,7 @@ impl Binder<'_> {
                     self.bind_context.add_binding(Binding {
                         alias,
                         schema: None,
+                        catalog: None,
                         table_index,
                         names,
                         types: working.types.clone(),
@@ -2653,6 +2653,12 @@ impl Binder<'_> {
                 let table_index = self.generate_table_index();
                 let mut binding = table_binding(&table, alias, table_index, names);
                 binding.schema = table_ref.alias.is_empty().then(|| table.schema.clone());
+                if table_ref.alias.is_empty() && foreign.is_none() {
+                    binding.catalog = match &other {
+                        Some(_) => name.qualification.first().cloned(),
+                        None => self.session.as_ref().map(|session| session.database.clone()),
+                    };
+                }
                 self.bind_context.add_binding(binding);
                 // the scan also outputs the rowid, past the columns
                 let column_ids = (0..table.columns.len()).chain([COLUMN_IDENTIFIER_ROW_ID]).collect();
@@ -2685,6 +2691,7 @@ impl Binder<'_> {
                 self.bind_context.add_binding(Binding {
                     alias,
                     schema: None,
+                    catalog: None,
                     table_index,
                     names,
                     types: types.clone(),
@@ -2870,6 +2877,7 @@ impl Binder<'_> {
         self.bind_context.add_binding(Binding {
             alias,
             schema: None,
+            catalog: None,
             table_index,
             names,
             types: bound.types,
@@ -3022,6 +3030,7 @@ impl Binder<'_> {
         self.bind_context.add_binding(Binding {
             alias,
             schema: None,
+            catalog: None,
             table_index,
             names,
             types: vec![LogicalType::BIGINT],
@@ -3155,6 +3164,7 @@ impl Binder<'_> {
                 alias,
                 // `schema.table.column` reads it too
                 schema: Some(table.schema.clone()),
+                catalog: None,
                 table_index,
                 names: table.columns.iter().map(|c| c.name.clone()).collect(),
                 types: table.types(),
@@ -3208,6 +3218,7 @@ impl Binder<'_> {
             self.bind_context.add_binding(Binding {
                 alias: "\u{1}merge".to_string(),
                 schema: None,
+                catalog: None,
                 table_index,
                 names: hidden,
                 types,

@@ -922,6 +922,7 @@ impl Binder<'_> {
         self.bind_context.add_binding(Binding {
             alias,
             schema: None,
+            catalog: None,
             table_index,
             names: output_names,
             types: output_types,
@@ -1009,6 +1010,7 @@ impl Binder<'_> {
         self.bind_context.add_binding(Binding {
             alias,
             schema: None,
+            catalog: None,
             table_index,
             names: output_names,
             types: types.clone(),
@@ -1726,6 +1728,7 @@ impl Binder<'_> {
         binder.bind_context.add_binding(Binding {
             alias: "__copy_input".to_string(),
             schema: None,
+            catalog: None,
             table_index,
             names: names.to_vec(),
             types: types.to_vec(),
@@ -2285,6 +2288,7 @@ impl Binder<'_> {
         binder.bind_context.add_binding(Binding {
             alias: String::new(),
             schema: None,
+            catalog: None,
             table_index,
             names: columns.iter().map(|&c| names[c].clone()).collect(),
             types: columns.iter().map(|&c| types[c].clone()).collect(),

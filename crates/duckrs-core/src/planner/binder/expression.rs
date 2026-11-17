@@ -830,6 +830,7 @@ impl Binder<'_> {
                 context.add_binding(super::Binding {
                     alias: "__outer_aggregates".to_string(),
                     schema: None,
+                    catalog: None,
                     table_index,
                     names: outer_aggregates.iter().map(|(n, ..)| n.clone()).collect(),
                     types: outer_aggregates.iter().map(|(.., t)| t.clone()).collect(),
@@ -1396,12 +1397,12 @@ impl Binder<'_> {
     /// `ColumnQualifier::CreateStructPack`: a name that is a table of the FROM clause, as
     /// `[schema.]table`, is a STRUCT of its columns.
     fn implicit_struct_pack(&self, names: &[String]) -> Option<Expr> {
-        let (schema, table) = match names {
-            [table] => (None, table),
-            [schema, table] => (Some(schema.as_str()), table),
-            _ => return None,
-        };
-        let bindings = self.bind_context.bindings_of(schema, table).ok()?;
+        // `[catalog.][schema path.]table` (`GetTableQualifications`): the binding's catalog and
+        // schema path end in what qualifies the table
+        let (table, qualification) = names.split_last()?;
+        let schema =
+            (!qualification.is_empty()).then(|| qualification.join(&crate::catalog::SCHEMA_PATH_SEPARATOR.to_string()));
+        let bindings = self.bind_context.bindings_of(schema.as_deref(), table).ok()?;
         let [binding] = bindings.as_slice() else {
             return None;
         };
@@ -1409,12 +1410,12 @@ impl Binder<'_> {
             .names
             .iter()
             .map(|column| {
-                // by the schema too, where the alias alone names more than one table
-                let mut path = match (schema, &binding.schema) {
-                    (Some(_), Some(own)) => vec![own.clone()],
-                    _ => Vec::new(),
+                // by the schema (and catalog) too, where the alias alone names more than one table
+                let path = if schema.is_some() {
+                    self.bind_context.qualified_names(binding, column)
+                } else {
+                    vec![binding.alias.clone(), column.clone()]
                 };
-                path.extend([binding.alias.clone(), column.clone()]);
                 ast::FunctionArgument {
                     name: column.clone(),
                     expr: Expr::column(path),
@@ -1623,7 +1624,7 @@ impl Binder<'_> {
                 return Err(self.lateral_error(names, error));
             }
             ExprKind::ColumnRef(names)
-                if names.len() <= 2
+                if !names.is_empty()
                     && self.bind_context.bind_column_ref(names).is_err()
                     && let Some(pack) = self.implicit_struct_pack(names) =>
             {

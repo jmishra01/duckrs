@@ -1157,6 +1157,8 @@ test/sql/attach/attach_issue_21491.test
 test/sql/attach/attach_issue_7660.test
 test/sql/attach/attach_lambda_view.test
 test/sql/attach/attach_macros.test
+test/sql/attach/attach_multi_identifiers.test
+test/sql/attach/attach_nested_types.test
 test/sql/attach/attach_no_wal_writes_mode.test
 test/sql/attach/attach_null.test
 test/sql/attach/attach_or_replace.test
@@ -1354,6 +1356,7 @@ test/sql/catalog/nested_schema/nested_alter.test
 test/sql/catalog/nested_schema/nested_constraints.test
 test/sql/catalog/nested_schema/nested_export.test
 test/sql/catalog/nested_schema/nested_table.test
+test/sql/catalog/nested_schema/nested_table_columnref.test
 test/sql/catalog/nested_schema/nested_table_dml.test
 test/sql/catalog/nested_schema/nested_table_dml_persist.test
 test/sql/catalog/nested_schema/nested_table_persist.test

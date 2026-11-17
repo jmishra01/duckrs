@@ -348,6 +348,7 @@ impl Binder<'_> {
         self.bind_context.add_binding(super::Binding {
             alias,
             schema: None,
+            catalog: None,
             table_index,
             names,
             types: types.clone(),

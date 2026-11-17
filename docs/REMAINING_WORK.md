@@ -191,8 +191,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] statements that read one database and write another (`CREATE TABLE db2.t AS SELECT ... FROM db1.t`): they
     run in the database they write, and bind the tables of the others by name; unqualified names that database
     lacks are looked up in the default one, as are those of the views of an attached database
-  - [ ] the catalog in table bindings (`db1.t.c`, `db1.s1.t.c`, `EXCLUDE (db1.s1.t.c)`: `attach_multi_identifiers`),
-    temp tables created in the transaction in a statement routed to another database (each database's fork
+  - [x] the catalog in table bindings (`BindingAlias`): `db1.t.c`, `db1.s1.t.c`, `EXCLUDE (db1.s1.t.c)`, the struct
+    pack `db1.s1.t`, and `MinimumUniqueAlias` in the errors of ambiguous tables and columns
+  - [ ] temp tables created in the transaction in a statement routed to another database (each database's fork
     copies the temporary schema of the last commit), sequences of the default database in a statement routed to
     another, DETACH of the default database
   - [x] `RECOVERY_MODE` (`NO_WAL_WRITES` keeps commits out of the log until a checkpoint)

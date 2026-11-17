@@ -815,9 +815,7 @@ fn strip_database(statement: &mut Statement, database: &str) {
                 ty.name.qualification.remove(0);
             }
         }
-        ExprKind::ColumnRef(parts) if parts.len() > 2 && parts[0].eq_ignore_ascii_case(database) => {
-            parts.remove(0);
-        }
+        // (a column qualified by the database finds its table by the catalog of the binding)
         // `db.f()` calls `f` of the database
         ExprKind::Function(function)
             if function

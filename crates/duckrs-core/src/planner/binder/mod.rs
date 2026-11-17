@@ -93,6 +93,8 @@ pub struct Binding {
     pub alias: String,
     /// the schema of a base table that kept its name, which can tell it from another's
     pub schema: Option<String>,
+    /// the database of a base table that kept its name (`BindingAlias::catalog`)
+    pub catalog: Option<String>,
     pub table_index: usize,
     pub names: Vec<String>,
     pub types: Vec<LogicalType>,
@@ -105,6 +107,55 @@ pub struct Binding {
 }
 
 impl Binding {
+    /// The schema path of the binding's `BindingAlias`: empty for an alias.
+    fn schema_path(&self) -> Vec<&str> {
+        self.schema
+            .as_deref()
+            .map(|schema| schema.split(crate::catalog::SCHEMA_PATH_SEPARATOR).collect())
+            .unwrap_or_default()
+    }
+
+    /// `BindingAlias::operator==`.
+    fn same_alias(&self, other: &Binding) -> bool {
+        let same_catalog = match (&self.catalog, &other.catalog) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            (None, None) => true,
+            _ => false,
+        };
+        let (path, other_path) = (self.schema_path(), other.schema_path());
+        same_catalog
+            && self.alias.eq_ignore_ascii_case(&other.alias)
+            && path.len() == other_path.len()
+            && path.iter().zip(&other_path).all(|(a, b)| a.eq_ignore_ascii_case(b))
+    }
+
+    /// `BindingAlias::ToString`: the catalog, the schema path and the alias.
+    fn alias_text(&self) -> String {
+        let mut parts: Vec<String> = self.catalog.iter().map(|c| ast::sql_identifier(c)).collect();
+        parts.extend(self.schema_path().iter().map(|s| ast::sql_identifier(s)));
+        parts.push(ast::sql_identifier(&self.alias));
+        parts.join(".")
+    }
+
+    /// `MinimumUniqueAlias`: the alias, qualified by as much of the schema path (innermost first) as
+    /// tells it apart from `other`, or by everything if their paths are the same.
+    fn minimum_unique_alias(&self, other: &Binding) -> String {
+        let mut qualification = ast::sql_identifier(&self.alias);
+        if !self.alias.eq_ignore_ascii_case(&other.alias) {
+            return qualification;
+        }
+        let (path, other_path) = (self.schema_path(), other.schema_path());
+        for (i, schema) in path.iter().rev().enumerate() {
+            qualification = format!("{}.{qualification}", ast::sql_identifier(schema));
+            let other_matches =
+                i < other_path.len() && other_path[other_path.len() - 1 - i].eq_ignore_ascii_case(schema);
+            if !other_matches {
+                return qualification;
+            }
+        }
+        self.alias_text()
+    }
+
     fn column_index(&self, name: &str) -> Option<usize> {
         if let Some(position) = name.strip_prefix(generated::POSITIONAL_COLUMN) {
             return position.parse().ok();
@@ -248,18 +299,22 @@ impl BindContext {
 
     /// The expression of the generated column `names` refers to, if it does.
     fn generated_expression(&self, names: &[String]) -> Option<ast::Expr> {
-        let (table, column) = match names {
-            [column] => (None, column),
-            [table, column] => (Some(table), column),
-            _ => return None,
-        };
+        let (bound, ..) = self.bind_column_ref(names).ok()?;
         let binding = self
             .bindings
             .iter()
-            .filter(|b| !b.generated.is_empty())
-            .filter(|b| table.is_none_or(|t| b.alias.eq_ignore_ascii_case(t)))
-            .find(|b| b.column_index(column).is_some())?;
-        binding.generated[binding.column_index(column)?].clone()
+            .find(|b| b.table_index == bound.table_index && !b.generated.is_empty())?;
+        let mut generated = binding.generated[binding.column_index(names.last()?)?].clone()?;
+        // its columns are `alias.column`: as qualified as this binding needs among the others
+        duckrs_parser::transformer::visit_expr_mut(&mut generated, &mut |e| {
+            if let ast::ExprKind::ColumnRef(parts) = &mut e.kind
+                && let [alias, column] = parts.as_slice()
+                && alias.eq_ignore_ascii_case(&binding.alias)
+            {
+                *parts = self.qualified_names(binding, column);
+            }
+        });
+        Some(generated)
     }
 
     /// `BindContext::GetUsingBinding(column)`: the USING set of a column, which has to be unique.
@@ -339,8 +394,8 @@ impl BindContext {
                     return Err(binder_error(format!(
                         "Ambiguous reference to column name {} (use: '{}.{quoted}' or '{}.{quoted}')",
                         ast::sql_quoted_identifier(name),
-                        previous.alias,
-                        binding.alias
+                        previous.minimum_unique_alias(binding),
+                        binding.minimum_unique_alias(previous)
                     )));
                 }
                 found = Some((binding, index));
@@ -389,7 +444,7 @@ impl BindContext {
             .iter()
             .filter(|b| b.alias.eq_ignore_ascii_case(table))
             .filter(|b| match schema {
-                Some(schema) => b.schema.as_ref().is_some_and(|s| Self::schema_matches(s, schema)),
+                Some(schema) => Self::schema_matches(b, schema),
                 None => true,
             })
             .collect();
@@ -412,11 +467,19 @@ impl BindContext {
     }
 
     /// `BindingAlias::Matches`: whether a qualification names the schema a binding is of. It is the
-    /// end of its path: the innermost schema, the path, or the catalog and the path.
-    pub(super) fn schema_matches(binding: &str, qualification: &str) -> bool {
+    /// end of its path: the innermost schema, the path, or the catalog and the path; or the catalog
+    /// alone, as in `db.t.c`.
+    pub(super) fn schema_matches(binding: &Binding, qualification: &str) -> bool {
+        let Some(schema) = &binding.schema else {
+            return false;
+        };
         let sep = crate::catalog::SCHEMA_PATH_SEPARATOR;
-        let mut full = vec![crate::catalog::DEFAULT_CATALOG];
-        full.extend(binding.split(sep));
+        let catalog = binding.catalog.as_deref().unwrap_or(crate::catalog::DEFAULT_CATALOG);
+        if binding.catalog.is_some() && catalog.eq_ignore_ascii_case(qualification) {
+            return true;
+        }
+        let mut full = vec![catalog];
+        full.extend(schema.split(sep));
         let given: Vec<&str> = qualification.split(sep).collect();
         given.len() <= full.len()
             && full[full.len() - given.len()..]
@@ -435,9 +498,7 @@ impl BindContext {
         };
         let schema_table_column = |schema: &str, table: &str, column: &str| {
             self.bindings.iter().any(|b| {
-                b.alias.eq_ignore_ascii_case(table)
-                    && b.schema.as_ref().is_some_and(|s| Self::schema_matches(s, schema))
-                    && b.matches_column(column)
+                b.alias.eq_ignore_ascii_case(table) && Self::schema_matches(b, schema) && b.matches_column(column)
             })
         };
         let has_column = |column: &str| self.bindings.iter().any(|b| b.column_index(column).is_some());
@@ -461,11 +522,6 @@ impl BindContext {
     /// `AmbiguityException`: the bindings `table` names, each by the least that tells it apart
     /// (`MinimumUniqueAlias`), or a duplicate alias if two can't be.
     fn ambiguous_table(table: &str, bindings: &[&Binding]) -> Error {
-        let same_schema = |a: &Binding, b: &Binding| match (&a.schema, &b.schema) {
-            (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
-            (None, None) => true,
-            _ => false,
-        };
         let mut result = "(use: ".to_string();
         for (i, binding) in bindings.iter().enumerate() {
             if i > 0 {
@@ -477,15 +533,10 @@ impl BindContext {
                 if k == i {
                     continue;
                 }
-                let same_alias = binding.alias.eq_ignore_ascii_case(&other.alias);
-                if same_alias && same_schema(binding, other) {
+                if binding.same_alias(other) {
                     duplicate = true;
                 }
-                let alias = ast::sql_identifier(&binding.alias);
-                let candidate = match &binding.schema {
-                    Some(schema) if same_alias => format!("{}.{alias}", ast::sql_identifier(schema)),
-                    _ => alias,
-                };
+                let candidate = binding.minimum_unique_alias(other);
                 if candidate.len() > minimum.len() {
                     minimum = candidate;
                 }
@@ -580,15 +631,32 @@ impl BindContext {
 
     /// The names that refer to a column of `binding`: with its schema if other bindings share
     /// its alias (`BindContext::CreateColumnReference`).
-    fn qualified_names(&self, binding: &Binding, column: &str) -> Vec<String> {
+    pub(super) fn qualified_names(&self, binding: &Binding, column: &str) -> Vec<String> {
         let shared = self
             .bindings
             .iter()
             .filter(|b| b.alias.eq_ignore_ascii_case(&binding.alias))
             .count()
             > 1;
-        match &binding.schema {
-            Some(schema) if shared => vec![schema.clone(), binding.alias.clone(), column.to_string()],
+        // and with its catalog if one shares its schema too (`db1.s1.t` and `db2.s1.t`)
+        let same_schema = |b: &&Binding| {
+            b.alias.eq_ignore_ascii_case(&binding.alias)
+                && b.schema.is_some()
+                && b.schema_path().len() == binding.schema_path().len()
+                && b.schema_path()
+                    .iter()
+                    .zip(binding.schema_path())
+                    .all(|(x, y)| x.eq_ignore_ascii_case(y))
+        };
+        let catalog_shared = self.bindings.iter().filter(same_schema).count() > 1;
+        match (&binding.schema, &binding.catalog) {
+            (Some(_), Some(catalog)) if catalog_shared => {
+                let mut names = vec![catalog.clone()];
+                names.extend(binding.schema_path().iter().map(|s| s.to_string()));
+                names.extend([binding.alias.clone(), column.to_string()]);
+                names
+            }
+            (Some(schema), _) if shared => vec![schema.clone(), binding.alias.clone(), column.to_string()],
             _ => vec![binding.alias.clone(), column.to_string()],
         }
     }
