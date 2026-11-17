@@ -20,6 +20,7 @@ mod disjunctive_join;
 pub mod distinct_statistics;
 pub mod empty_result_pullup;
 mod filter_combiner;
+mod filter_pullup;
 pub mod filter_pushdown;
 pub mod in_clause_rewriter;
 mod index_scan;
@@ -62,6 +63,7 @@ pub struct OptimizerOptions {
     pub aggregate_function_rewriter: bool,
     pub common_aggregate: bool,
     pub outer_join_simplification: bool,
+    pub filter_pullup: bool,
     /// `index_scan_percentage`
     pub index_scan_percentage: f64,
     /// `index_scan_max_count`
@@ -97,6 +99,7 @@ impl Default for OptimizerOptions {
             aggregate_function_rewriter: true,
             common_aggregate: true,
             outer_join_simplification: true,
+            filter_pullup: true,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -130,6 +133,7 @@ impl OptimizerOptions {
             aggregate_function_rewriter: false,
             common_aggregate: false,
             outer_join_simplification: false,
+            filter_pullup: false,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -162,6 +166,7 @@ impl OptimizerOptions {
             aggregate_function_rewriter: !off("aggregate_function_rewriter"),
             common_aggregate: !off("common_aggregate"),
             outer_join_simplification: !off("outer_join_simplification"),
+            filter_pullup: !off("filter_pullup"),
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -206,6 +211,9 @@ pub fn optimize_timed(
     }
     if options.redundant_order {
         plan = run("redundant_order", plan, &mut remove_redundant_order::remove);
+    }
+    if options.filter_pullup {
+        plan = run("filter_pullup", plan, &mut filter_pullup::pull_up);
     }
     if options.filter_pushdown {
         plan = run("filter_pushdown", plan, &mut filter_pushdown::push_down);

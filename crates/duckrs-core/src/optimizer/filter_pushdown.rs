@@ -483,6 +483,43 @@ impl FilterPushdown {
             }
         }
         let mut right = FilterPushdown::default();
+        // the join's conditions and the left side's filters tell filters of the right side: with
+        // `i = a` and `i = 500`, `a = 500`
+        let LogicalOperatorKind::Join {
+            conditions, predicate, ..
+        } = &op.kind
+        else {
+            unreachable!()
+        };
+        let mut combiner = super::filter_combiner::FilterCombiner::default();
+        for condition in conditions {
+            combiner.add(BoundExpr::new(
+                BoundExprKind::Comparison {
+                    op: condition.comparison,
+                    left: Box::new(condition.left.clone()),
+                    right: Box::new(condition.right.clone()),
+                },
+                duckrs_common::types::LogicalType::BOOLEAN,
+            ));
+        }
+        if let Some(predicate) = predicate {
+            let mut conjuncts = Vec::new();
+            split_conjuncts(predicate.clone(), &mut conjuncts);
+            for conjunct in conjuncts {
+                combiner.add(conjunct);
+            }
+        }
+        for f in &left.filters {
+            combiner.add(f.filter.clone());
+        }
+        // only a comparison join (with conditions here) does this, not `LogicalAnyJoin`
+        let generated = if conditions.is_empty() { Vec::new() } else { combiner.generate() };
+        for generated in generated {
+            let generated = Filter::new(generated);
+            if join_side(&generated.tables, &left_tables, &right_tables) == JoinSide::Right {
+                right.filters.push(generated);
+            }
+        }
         let LogicalOperatorKind::Join { predicate, .. } = &mut op.kind else {
             unreachable!()
         };
@@ -518,9 +555,20 @@ impl FilterPushdown {
 
     /// `FilterPushdown::PushdownSemiAntiJoin`: the output is the left side's, filters and all.
     fn pushdown_semi_anti_join(self, mut op: LogicalOperator) -> LogicalOperator {
+        // a right row that matches a left row passes what the filters tell of the right side
+        let mut right = FilterPushdown::default();
+        if let LogicalOperatorKind::Join { conditions, .. } = &op.kind
+            && !conditions.is_empty()
+            && !self.filters.is_empty()
+        {
+            let filters: Vec<BoundExpr> = self.filters.iter().map(|f| f.filter.clone()).collect();
+            for generated in super::filter_pullup::join_filters(conditions, &filters, false) {
+                right.filters.push(Filter::new(generated));
+            }
+        }
         let right_child = op.children.remove(1);
         let left_child = op.children.remove(0);
-        op.children = vec![self.rewrite(left_child), push_down(right_child)];
+        op.children = vec![self.rewrite(left_child), right.rewrite(right_child)];
         op
     }
 

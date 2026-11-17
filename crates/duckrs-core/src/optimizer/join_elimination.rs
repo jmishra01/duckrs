@@ -132,7 +132,9 @@ fn has_filter(op: &LogicalOperator) -> bool {
         // duckrs moves most filters into the scans only after this pass
         match &current.kind {
             K::Get { filters, .. } if !filters.is_empty() => return true,
-            K::Filter { .. } => return true,
+            // those that become table filters: of one column (C++ keeps one of several columns, such as
+            // `a = b`, in a `LogicalFilter`)
+            K::Filter { expressions } if expressions.iter().any(reads_one_column) => return true,
             _ => {}
         }
         if current.children.len() != 1 {
@@ -140,6 +142,21 @@ fn has_filter(op: &LogicalOperator) -> bool {
         }
         current = &current.children[0];
     }
+}
+
+/// Whether the expression reads exactly one column.
+fn reads_one_column(expr: &crate::planner::expression::BoundExpr) -> bool {
+    fn collect(expr: &crate::planner::expression::BoundExpr, found: &mut HashSet<ColumnBinding>) {
+        if let Some(binding) = column_ref(expr) {
+            found.insert(binding);
+        }
+        for child in expr.children() {
+            collect(child, found);
+        }
+    }
+    let mut found = HashSet::new();
+    collect(expr, &mut found);
+    found.len() == 1
 }
 
 /// The tables whose columns the plan reads outside of the operator at `skip`.

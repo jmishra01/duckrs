@@ -65,6 +65,7 @@ test/fuzzer/duckfuzz/regex_syntax_2889.test
 test/fuzzer/duckfuzz/regexp_replace_constant.test
 test/fuzzer/duckfuzz/repeat_row_null.test
 test/fuzzer/duckfuzz/repeat_wrong_number.test
+test/fuzzer/duckfuzz/semi_join_has_correct_left_right_relations.test
 test/fuzzer/duckfuzz/string_to_nested_cast_sample.test
 test/fuzzer/duckfuzz/strptime_const_arg.test
 test/fuzzer/duckfuzz/temporal_avg.test
