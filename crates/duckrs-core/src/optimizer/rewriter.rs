@@ -94,6 +94,7 @@ fn apply_rules(expr: &mut BoundExpr, in_filter: bool) -> bool {
     constant_folding(expr)
         || equal_or_null_simplification(expr, in_filter)
         || date_part_simplification(expr)
+        || date_trunc_simplification(expr)
         || distributivity(expr)
         || arithmetic_simplification(expr)
         || constant_order_normalization(expr)
@@ -319,6 +320,257 @@ fn equal_or_is_null(equal: &BoundExpr, nulls: &BoundExpr) -> Option<BoundExprKin
         left: left.clone(),
         right: right.clone(),
     })
+}
+
+/// A call of `name`, bound as the binder binds it.
+fn bind_call(name: &str, children: Vec<BoundExpr>) -> Option<BoundExpr> {
+    if crate::function::dates::is_date_function(name) {
+        return crate::function::dates::bind_date_function(name, children).ok();
+    }
+    if crate::function::generic::is_generic_function(name) {
+        return crate::function::generic::bind_generic_function(name, children).ok();
+    }
+    let set = crate::function::BuiltinFunctions::get().scalar(name)?;
+    let operator = matches!(name, "+" | "-" | "*" | "/");
+    crate::function::binder::bind_scalar_function(set, children, operator, &try_evaluate_scalar).ok()
+}
+
+/// The expression as `ty`, folded if it is constant (`AddDefaultCastToType` and `TryEvaluateScalar`).
+fn cast_and_fold(expr: BoundExpr, ty: &LogicalType) -> BoundExpr {
+    let expr = if expr.return_type.id() == ty.id() { expr } else { expr.cast_to(ty, true) };
+    if expr.is_foldable()
+        && let Some(value) = try_evaluate_scalar(&expr)
+    {
+        return BoundExpr::constant(value);
+    }
+    expr
+}
+
+/// `DateTruncSimplificationRule::CreateTrunc`.
+fn create_trunc(part: &BoundExpr, constant: &BoundExpr, ty: &LogicalType) -> Option<BoundExpr> {
+    Some(cast_and_fold(bind_call("date_trunc", vec![part.clone(), constant.clone()])?, ty))
+}
+
+/// `DateTruncSimplificationRule::CreateTruncAdd`: `date_trunc(part, constant + INTERVAL 1 part)`.
+fn create_trunc_add(part: &BoundExpr, constant: &BoundExpr, ty: &LogicalType) -> Option<BoundExpr> {
+    use duckrs_common::types::DatePart as P;
+    let name = try_evaluate_scalar(part)?.try_to_string().ok()?;
+    // `DatePartToFunc`: the parts that are intervals
+    let interval = match P::parse(&name)? {
+        P::Year => "to_years",
+        P::Month => "to_months",
+        P::Day => "to_days",
+        P::Decade => "to_decades",
+        P::Century => "to_centuries",
+        P::Millennium => "to_millennia",
+        P::Microseconds => "to_microseconds",
+        P::Milliseconds => "to_milliseconds",
+        P::Second => "to_seconds",
+        P::Minute => "to_minutes",
+        P::Hour => "to_hours",
+        P::Week => "to_weeks",
+        P::Quarter => "to_quarters",
+        _ => return None,
+    };
+    let interval = bind_call(interval, vec![BoundExpr::constant(Value::integer(1))])?;
+    let add = bind_call("+", vec![constant.clone(), interval])?;
+    Some(cast_and_fold(bind_call("date_trunc", vec![part.clone(), add])?, ty))
+}
+
+/// `DateTruncSimplificationRule`: a comparison of `date_trunc(part, column)` with a constant as
+/// one of the column, with the constant truncated: `date_trunc('day', d) < c` is `d < c` when `c`
+/// is a day, `d < date_trunc('day', c + INTERVAL 1 DAY)` otherwise.
+fn date_trunc_simplification(expr: &mut BoundExpr) -> bool {
+    use duckrs_common::types::DatePart as P;
+    let BoundExprKind::Comparison { op, left, right } = &expr.kind else {
+        return false;
+    };
+    let is_trunc = |e: &BoundExpr| {
+        matches!(&e.kind, BoundExprKind::Function { function, children, .. }
+            if matches!(function.name.as_str(), "date_trunc" | "datetrunc")
+                && children.len() == 2
+                && matches!(children[0].kind, BoundExprKind::Constant(_)))
+    };
+    let column_is_left = is_trunc(left) && matches!(right.kind, BoundExprKind::Constant(_));
+    if !column_is_left && !(is_trunc(right) && matches!(left.kind, BoundExprKind::Constant(_))) {
+        return false;
+    }
+    let (trunc, constant) = if column_is_left { (&**left, &**right) } else { (&**right, &**left) };
+    let BoundExprKind::Function { children, .. } = &trunc.kind else {
+        return false;
+    };
+    let (part, column) = (children[0].clone(), children[1].clone());
+    if !matches!(column.kind, BoundExprKind::ColumnRef { .. }) {
+        return false;
+    }
+    let BoundExprKind::Constant(value) = &constant.kind else {
+        return false;
+    };
+    let value = value.clone();
+    let constant = constant.clone();
+    // as if the constant were on the right
+    let comparison = if column_is_left { *op } else { super::statistics::flip(*op) };
+    let column_type = column.return_type.clone();
+    let rebuild = |op: ComparisonOp, constant: BoundExpr| {
+        let (left, right) = if column_is_left { (column.clone(), constant) } else { (constant, column.clone()) };
+        BoundExpr::new(
+            BoundExprKind::Comparison {
+                op: if column_is_left { op } else { super::statistics::flip(op) },
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            LogicalType::BOOLEAN,
+        )
+    };
+    let comparison_of = |op: ComparisonOp, constant: BoundExpr| {
+        BoundExpr::new(
+            BoundExprKind::Comparison {
+                op,
+                left: Box::new(column.clone()),
+                right: Box::new(constant),
+            },
+            LogicalType::BOOLEAN,
+        )
+    };
+    let operator = |op: BoundOperator| {
+        BoundExpr::new(
+            BoundExprKind::Operator {
+                op,
+                children: vec![column.clone()],
+            },
+            LogicalType::BOOLEAN,
+        )
+    };
+    let conjunction = |and: bool, children: Vec<BoundExpr>| {
+        BoundExpr::new(BoundExprKind::Conjunction { and, children }, LogicalType::BOOLEAN)
+    };
+    // date_trunc keeps temporal infinities: only the call goes
+    let infinite = !value.is_null()
+        && matches!(
+            value.logical_type().id(),
+            LogicalTypeId::Timestamp
+                | LogicalTypeId::TimestampSec
+                | LogicalTypeId::TimestampMs
+                | LogicalTypeId::TimestampNs
+                | LogicalTypeId::TimestampTz
+        )
+        && value.try_to_string().is_ok_and(|t| t == "infinity" || t == "-infinity");
+    if infinite {
+        *expr = rebuild(comparison, cast_and_fold(constant, &column_type));
+        return true;
+    }
+    // decades, centuries and millennia round the years before the common era towards zero
+    let part_name = try_evaluate_scalar(&part).and_then(|v| v.try_to_string().ok()).unwrap_or_default();
+    let towards_zero = !matches!(P::parse(&part_name), Some(p) if !matches!(p, P::Decade | P::Century | P::Millennium));
+    if towards_zero {
+        let after_first_year = value.is_null()
+            || try_evaluate_scalar(&constant.clone().cast_to(&LogicalType::DATE, true))
+                .filter(|d| !d.is_null())
+                .and_then(|d| d.try_to_string().ok())
+                .and_then(|text| text.split('-').next().and_then(|y| y.parse::<i64>().ok()))
+                .is_some_and(|year| year > 1 && !text_is_bc(&constant));
+        if !after_first_year {
+            return false;
+        }
+    }
+    // `DateIsTruncated`
+    let truncated = value.is_null()
+        || create_trunc(&part, &constant, &constant.return_type)
+            .and_then(|t| try_evaluate_scalar(&t))
+            .is_some_and(|t| t == value);
+    let result = match comparison {
+        ComparisonOp::Equal | ComparisonOp::NotDistinctFrom => {
+            if comparison == ComparisonOp::NotDistinctFrom && value.is_null() {
+                operator(BoundOperator::IsNull)
+            } else if !truncated {
+                if comparison == ComparisonOp::NotDistinctFrom {
+                    BoundExpr::constant(Value::boolean(false))
+                } else {
+                    crate::function::constant_or_null(vec![BoundExpr::constant(Value::boolean(false)), column.clone()])
+                }
+            } else {
+                let (Some(trunc), Some(next)) = (
+                    create_trunc(&part, &constant, &column_type),
+                    create_trunc_add(&part, &constant, &column_type),
+                ) else {
+                    return false;
+                };
+                let range = conjunction(
+                    true,
+                    vec![
+                        comparison_of(ComparisonOp::GreaterThanOrEqual, trunc),
+                        comparison_of(ComparisonOp::LessThan, next),
+                    ],
+                );
+                if comparison == ComparisonOp::NotDistinctFrom {
+                    conjunction(true, vec![range, operator(BoundOperator::IsNotNull)])
+                } else {
+                    range
+                }
+            }
+        }
+        ComparisonOp::NotEqual | ComparisonOp::DistinctFrom => {
+            if comparison == ComparisonOp::DistinctFrom && value.is_null() {
+                operator(BoundOperator::IsNotNull)
+            } else if !truncated {
+                if comparison == ComparisonOp::DistinctFrom {
+                    BoundExpr::constant(Value::boolean(true))
+                } else {
+                    crate::function::constant_or_null(vec![BoundExpr::constant(Value::boolean(true)), column.clone()])
+                }
+            } else {
+                let (Some(trunc), Some(next)) = (
+                    create_trunc(&part, &constant, &column_type),
+                    create_trunc_add(&part, &constant, &column_type),
+                ) else {
+                    return false;
+                };
+                let outside = conjunction(
+                    false,
+                    vec![
+                        comparison_of(ComparisonOp::GreaterThanOrEqual, next),
+                        comparison_of(ComparisonOp::LessThan, trunc),
+                    ],
+                );
+                if comparison == ComparisonOp::DistinctFrom {
+                    conjunction(false, vec![outside, operator(BoundOperator::IsNull)])
+                } else {
+                    outside
+                }
+            }
+        }
+        ComparisonOp::LessThan | ComparisonOp::GreaterThanOrEqual => {
+            if truncated {
+                rebuild(comparison, cast_and_fold(constant, &column_type))
+            } else {
+                let Some(next) = create_trunc_add(&part, &constant, &column_type) else {
+                    return false;
+                };
+                rebuild(comparison, next)
+            }
+        }
+        ComparisonOp::LessThanOrEqual | ComparisonOp::GreaterThan => {
+            let Some(next) = create_trunc_add(&part, &constant, &column_type) else {
+                return false;
+            };
+            // <= becomes <, > becomes >=
+            let op = if comparison == ComparisonOp::GreaterThan {
+                ComparisonOp::GreaterThanOrEqual
+            } else {
+                ComparisonOp::LessThan
+            };
+            rebuild(op, next)
+        }
+    };
+    *expr = result;
+    true
+}
+
+/// Whether the constant is a date of the years before the common era.
+fn text_is_bc(constant: &BoundExpr) -> bool {
+    try_evaluate_scalar(&constant.clone().cast_to(&LogicalType::DATE, true))
+        .and_then(|d| d.try_to_string().ok())
+        .is_some_and(|text| text.ends_with("(BC)") || text.starts_with('-'))
 }
 
 /// `DatePartSimplificationRule`: `date_part('year', x)` is `year(x)`.
