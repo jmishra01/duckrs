@@ -341,6 +341,7 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             column_ids,
             filters,
             projection,
+            sample,
             ..
         } => {
             // `LogicalGet::ParamsToString` has the filters, then what `TableScanToString` adds
@@ -366,6 +367,17 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             info.extend(entry("Projections", lines(projected)));
             if !filters.is_empty() {
                 info.extend(entry("Filters", lines(filters.iter().map(filter_text))));
+            }
+            // `PhysicalTableScan::ParamsToString`
+            if let Some(sample) = sample {
+                let text = if sample.options.is_percentage {
+                    let value = sample.options.sample_size.parse::<f64>().unwrap_or(0.0);
+                    let value = if value.fract() == 0.0 { format!("{value:.1}") } else { value.to_string() };
+                    format!("System: {value}%")
+                } else {
+                    format!("System: {} rows", sample.options.sample_size)
+                };
+                info.extend(entry("Sample Method", text));
             }
             info
         }
@@ -488,6 +500,30 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             predicate.as_ref().map(|p| p.to_string()),
         ),
         K::AsOfJoin { join_type, .. } => entry("Join Type", join_type.name().to_string()),
+        // `PhysicalStreamingSample::ParamsToString` and `PhysicalReservoirSample::ParamsToString`
+        K::Sample { options } => {
+            use duckrs_parser::ast::SampleMethod;
+            let size = options.sample_size.parse::<f64>().unwrap_or(0.0);
+            match options.method {
+                SampleMethod::Reservoir => {
+                    let value = if size.fract() == 0.0 && options.is_percentage {
+                        format!("{size:.1}")
+                    } else {
+                        options.sample_size.clone()
+                    };
+                    let unit = if options.is_percentage { "%" } else { " rows" };
+                    entry("Sample Size", format!("{value}{unit}"))
+                }
+                method => {
+                    let name = if method == SampleMethod::System { "System" } else { "Bernoulli" };
+                    if options.is_percentage {
+                        entry("Sample Method", format!("{name}: {size:.6}%"))
+                    } else {
+                        entry("Sample Method", format!("{name}: {} rows", options.sample_size))
+                    }
+                }
+            }
+        }
         // `PhysicalWindow::ParamsToString`
         K::Window { windows, .. } => entry("Projections", lines(windows.iter().map(window_text))),
         _ => Vec::new(),
@@ -543,6 +579,21 @@ pub(super) fn physical_tree(
     {
         let estimate = estimate.filter(|e| e.children.len() == 1).map(|e| &e.children[0]);
         return physical_tree(op, Some(&logical_children[0]), estimate, analyze);
+    }
+    // `CreatePlan(LogicalSample)` puts a LIMIT over a SYSTEM sample of rows
+    if let Some(LogicalOperator {
+        kind: K::Sample { options },
+        ..
+    }) = logical
+        && op.name() == "LIMIT"
+        && children.len() == 1
+    {
+        return ExplainNode {
+            name: op.name().to_string(),
+            info: vec![("Limit".to_string(), options.sample_size.clone())],
+            estimate: estimate.map(|e| e.cardinality),
+            children: vec![physical_tree(children[0].as_ref(), logical, estimate, analyze)],
+        };
     }
     // `CreatePlan(LogicalWindow)` puts a projection over the window operators it makes, one per
     // group of windows, all of which come from the one logical window

@@ -614,6 +614,7 @@ test/optimizer/remove_redundant_order_keys_side_effects.test
 test/optimizer/remove_unused_filter_column.test
 test/optimizer/reported_bugs/in_vs_where.test
 test/optimizer/row_number_virtual_column_local.test
+test/optimizer/sampling_pushdown.test
 test/optimizer/statistics/constant_or_null_conjunction.test
 test/optimizer/statistics/constant_or_null_conjunction_effects.test
 test/optimizer/statistics/current_domain_join.test
@@ -3102,6 +3103,7 @@ test/sql/optimizer/test_rollup_column_pruning.test
 test/sql/optimizer/test_rowid_pruning.test
 test/sql/optimizer/test_rowid_pushdown_deletes.test
 test/sql/optimizer/test_rowid_vector_pruning_results.test
+test/sql/optimizer/tests_no_pushdown_under_samples.test
 test/sql/optimizer/topn_window_elimination_argument_order.test
 test/sql/optimizer/topn_window_elimination_computed_filter.test
 test/sql/optimizer/topn_window_elimination_nullable_order.test
@@ -3402,12 +3404,15 @@ test/sql/returning/returning_update.test
 test/sql/sample/helper_operator_coverage.test
 test/sql/sample/repeatable_seed_range.test
 test/sql/sample/reservoir_sample.test
+test/sql/sample/same_seed_same_sample.test
 test/sql/sample/system_sample_index_scan.test
 test/sql/sample/table_samples/basic_sample_tests.test
 test/sql/sample/table_samples/table_sample_converts_to_block_sample.test
 test/sql/sample/table_samples/test_sample_is_destroyed_on_updates.test
 test/sql/sample/table_samples/test_sample_types.test
 test/sql/sample/test_sample_too_big.test
+test/sql/sample/test_system_rows.test
+test/sql/sample/test_system_rows_pushdown.test
 test/sql/select/test_multi_column_reference.test
 test/sql/select/test_positional_reference.test
 test/sql/select/test_projection_names.test

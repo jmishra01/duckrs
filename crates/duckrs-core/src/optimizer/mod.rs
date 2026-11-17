@@ -29,6 +29,7 @@ pub mod join_order;
 pub mod range_joins;
 mod redundant_order_keys;
 mod relation_statistics;
+mod sampling_pushdown;
 mod remove_redundant_order;
 pub mod rewriter;
 pub mod scan_filters;
@@ -66,6 +67,7 @@ pub struct OptimizerOptions {
     pub outer_join_simplification: bool,
     pub filter_pullup: bool,
     pub grouping_sets: bool,
+    pub sampling_pushdown: bool,
     /// `index_scan_percentage`
     pub index_scan_percentage: f64,
     /// `index_scan_max_count`
@@ -103,6 +105,7 @@ impl Default for OptimizerOptions {
             outer_join_simplification: true,
             filter_pullup: true,
             grouping_sets: true,
+            sampling_pushdown: true,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -138,6 +141,7 @@ impl OptimizerOptions {
             outer_join_simplification: false,
             filter_pullup: false,
             grouping_sets: false,
+            sampling_pushdown: false,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -172,6 +176,7 @@ impl OptimizerOptions {
             outer_join_simplification: !off("outer_join_simplification"),
             filter_pullup: !off("filter_pullup"),
             grouping_sets: !off("grouping_sets"),
+            sampling_pushdown: !off("sampling_pushdown"),
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -281,6 +286,9 @@ pub fn optimize_timed(
     }
     if options.empty_result_pullup {
         plan = run("empty_result_pullup", plan, &mut empty_result_pullup::pull_up);
+    }
+    if options.sampling_pushdown {
+        plan = run("sampling_pushdown", plan, &mut sampling_pushdown::push_down);
     }
     plan = run("top_n", plan, &mut |mut plan| {
         top_n::push_limits(&mut plan);

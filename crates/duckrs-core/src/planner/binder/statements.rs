@@ -1127,6 +1127,10 @@ impl Binder<'_> {
             .as_deref()
             .map(|condition| self.bind_where_star_expression(condition))
             .transpose()?;
+        // `BindSelectNode`: the sample is of the FROM clause, before the WHERE clause
+        if let Some(options) = &node.sample {
+            plan = bind_sample(options, plan)?;
+        }
         if let Some(condition) = &where_clause {
             // the WHERE clause may refer to aliases of the select list (`ColumnAliasBinder`)
             self.alias_fallback = state
@@ -1145,9 +1149,6 @@ impl Binder<'_> {
                 },
                 vec![plan],
             );
-        }
-        if let Some(options) = &node.sample {
-            plan = bind_sample(options, plan)?;
         }
         self.aggregate_error = "GROUP BY clause cannot contain aggregates!";
         self.window_error = "GROUP BY clause cannot contain window functions!";
@@ -2483,6 +2484,7 @@ impl Binder<'_> {
                         projection: None,
                         zone_filters: Vec::new(),
                         index_rows: None,
+                        sample: None,
                     },
                     vec![],
                 ))

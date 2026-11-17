@@ -222,6 +222,8 @@ struct TableScanState {
     /// A filtered scan of a table in its file, a row group at a time: the next group, and the chunks
     /// of the last one that are still to come.
     filtered: Option<(usize, Vec<usize>, std::collections::VecDeque<DataChunk>)>,
+    /// `ScanSamplingInfo`: the scan's random engine, and the phase of a sample of rows
+    sampling: Option<(super::random_engine::RandomEngine, f64)>,
 }
 
 /// What a scan reads of a file. `column_ids` lists all columns for the filter and the projection to
@@ -246,6 +248,8 @@ pub struct PhysicalTableScan {
     pub prune: Option<BoundExpr>,
     /// the rows to read, in order, instead of all of them
     pub index_rows: Option<Arc<Vec<usize>>>,
+    /// a SYSTEM sample of the vectors or rows the scan reads
+    pub sample: Option<crate::planner::logical::TableSample>,
 }
 
 impl PhysicalTableScan {
@@ -572,7 +576,7 @@ impl PhysicalOperator for PhysicalTableScan {
         "TABLE_SCAN"
     }
     fn parallel_source(&self) -> Option<(SharedSourceState, usize)> {
-        if self.index_rows.is_some() || !self.filter.as_ref().is_none_or(parallel_expression) {
+        if self.index_rows.is_some() || self.sample.is_some() || !self.filter.as_ref().is_none_or(parallel_expression) {
             return None;
         }
         if let Some(source) = self.table.source() {
@@ -666,6 +670,18 @@ impl PhysicalOperator for PhysicalTableScan {
         let filtered = source
             .filter(|_| self.filter.is_some() && self.index_rows.is_none())
             .map(|source| (0, group_starts(&*source), std::collections::VecDeque::new()));
+        // `TableScanState::Initialize`: a seeded sample seeds the scan's engine, and a sample of rows
+        // starts at a random phase of its own engine
+        let sampling = self.sample.as_ref().map(|sample| {
+            let seed = sample.options.seed.map_or(-1, |seed| seed as i64);
+            let engine = super::random_engine::RandomEngine::new(seed);
+            let phase = if sample.options.is_percentage {
+                0.0
+            } else {
+                super::random_engine::RandomEngine::new(seed).next_random()
+            };
+            (engine, phase)
+        });
         Box::new(TableScanState {
             ids,
             next: 0,
@@ -674,6 +690,7 @@ impl PhysicalOperator for PhysicalTableScan {
             cursor,
             next_index_row: 0,
             filtered,
+            sampling,
         })
     }
     fn row_groups_scanned(&self) -> Option<(usize, usize)> {
@@ -693,6 +710,7 @@ impl PhysicalOperator for PhysicalTableScan {
             cursor,
             next_index_row,
             filtered,
+            sampling,
         } = state.downcast_mut().expect("table scan state");
         if let Some(rows) = &self.index_rows {
             return self.next_index_chunk(rows, next_index_row);
@@ -729,6 +747,35 @@ impl PhysicalOperator for PhysicalTableScan {
             let first_row = index * STANDARD_VECTOR_SIZE;
             let wanted = groups.get(index / self.table.chunks_per_row_group()).is_none_or(|g| *g);
             *next += 1;
+            // `RowGroup::Scan`: a SYSTEM sample skips whole vectors, or keeps rows of one at its rate
+            let mut sample_selection = None;
+            if let (Some(sample), Some((engine, phase))) = (&self.sample, sampling.as_mut()) {
+                let count = STANDARD_VECTOR_SIZE.min(*remaining);
+                if sample.options.is_percentage {
+                    let rate = sample.options.sample_size.parse::<f64>().unwrap_or(0.0) / 100.0;
+                    if engine.next_random() > rate {
+                        *remaining -= count;
+                        continue;
+                    }
+                } else if sample.rate <= 0.0 {
+                    *remaining -= count;
+                    continue;
+                } else if sample.rate < 1.0 {
+                    // `SystemRowsSelection`: a row is kept where the running count of the rate steps
+                    let selected: Vec<u32> = (0..count)
+                        .filter(|i| {
+                            let row = (first_row + i) as f64;
+                            (((row + 1.0) * sample.rate + *phase).floor()) > ((row * sample.rate + *phase).floor())
+                        })
+                        .map(|i| i as u32)
+                        .collect();
+                    if selected.is_empty() {
+                        *remaining -= count;
+                        continue;
+                    }
+                    sample_selection = Some(selected);
+                }
+            }
             if !wanted {
                 *remaining -= STANDARD_VECTOR_SIZE.min(*remaining);
                 continue;
@@ -745,7 +792,10 @@ impl PhysicalOperator for PhysicalTableScan {
             *remaining -= count;
             let columns = self.scan_columns(&chunk, ids, first_row, cursor.as_ref())?;
             let mut result = DataChunk::from_columns(columns, chunk.len());
-            if count < chunk.len() {
+            if let Some(selected) = sample_selection {
+                let kept = selected.len();
+                result.slice(&SelectionVector::from_vec(selected), kept);
+            } else if count < chunk.len() {
                 result.slice(&SelectionVector::from_vec((0..count as u32).collect()), count);
             }
             match self.finish_chunk(result)? {
@@ -2346,6 +2396,8 @@ impl PhysicalOperator for PhysicalLimitPercent {
 pub struct PhysicalSample {
     pub types: Vec<LogicalType>,
     pub options: SampleOptions,
+    /// of a SYSTEM sample of rows, the fraction of rows it keeps
+    pub rate: f64,
     pub children: Vec<Box<dyn PhysicalOperator>>,
     pub data: Mutex<ColumnDataCollection>,
 }
@@ -2355,6 +2407,7 @@ impl PhysicalSample {
         let types = child.types().to_vec();
         Self {
             options,
+            rate: 1.0,
             data: Mutex::new(ColumnDataCollection::new(types.clone())),
             types,
             children: vec![child],
@@ -2402,9 +2455,34 @@ impl PhysicalOperator for PhysicalSample {
         });
         let size: f64 = self.options.sample_size.parse().unwrap_or(0.0);
         let mut keep = vec![false; total];
-        if self.options.is_percentage && self.options.method != SampleMethod::Reservoir {
-            for row in &mut keep {
-                *row = (next_random(&mut random) as f64 / u64::MAX as f64) * 100.0 < size;
+        if self.options.method != SampleMethod::Reservoir {
+            // `PhysicalStreamingSample`: with the engine of the seed, a die per chunk (SYSTEM) or row
+            // (BERNOULLI), or the rows where the running count of the rate steps (SYSTEM of rows)
+            let seed = self.options.seed.map_or(-1, |seed| seed as i64);
+            let mut engine = super::random_engine::RandomEngine::new(seed);
+            let percentage = size / 100.0;
+            let mut offset = 0;
+            if self.options.method == SampleMethod::System && !self.options.is_percentage {
+                let rate = self.rate.clamp(0.0, 1.0);
+                let phase = super::random_engine::RandomEngine::new(seed).next_random();
+                for (seen, row) in keep.iter_mut().enumerate() {
+                    *row = rate >= 1.0
+                        || (rate > 0.0
+                            && ((seen + 1) as f64 * rate + phase).floor() > (seen as f64 * rate + phase).floor());
+                }
+            } else {
+                for chunk in data.chunks() {
+                    let rows = offset..offset + chunk.len();
+                    offset += chunk.len();
+                    if self.options.method == SampleMethod::System {
+                        let kept = engine.next_random() <= percentage;
+                        keep[rows].iter_mut().for_each(|row| *row = kept);
+                    } else {
+                        for row in &mut keep[rows] {
+                            *row = engine.next_random() <= percentage;
+                        }
+                    }
+                }
             }
         } else {
             let wanted = if self.options.is_percentage {

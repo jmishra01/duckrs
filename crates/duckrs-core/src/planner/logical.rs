@@ -38,6 +38,8 @@ pub enum LogicalOperatorKind {
         /// `is_index_scan`: the rows that an ART found, by position, which is all that gets read.
         /// The filters still run on them.
         index_rows: Option<Arc<Vec<usize>>>,
+        /// `extra_info.sample_options`: a SYSTEM sample the scan takes (`SamplingPushdown`)
+        sample: Option<TableSample>,
     },
     /// The `range` and `generate_series` table functions: `count` integers from `start`.
     Range {
@@ -415,6 +417,14 @@ impl JoinCondition {
     pub fn equality(null_safe: bool) -> ComparisonOp {
         if null_safe { ComparisonOp::NotDistinctFrom } else { ComparisonOp::Equal }
     }
+}
+
+/// A SYSTEM sample of a table scan: whole vectors at `sample_size` percent, or about as many rows
+/// as asked for, at `rate` of them (`SampleOptions` with its `sample_rate`).
+#[derive(Debug, Clone)]
+pub struct TableSample {
+    pub options: SampleOptions,
+    pub rate: f64,
 }
 
 /// An ORDER BY term with its resolved order and NULL order (`BoundOrderByNode`).

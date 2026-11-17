@@ -41,6 +41,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 pub mod alter;
 pub mod constraints;
 mod merge;
+pub mod random_engine;
 mod special_joins;
 mod upsert;
 mod window;
@@ -163,6 +164,32 @@ fn renew_cte_scans(
     }
 }
 
+/// `LogicalOperator::EstimateCardinality`: the rows of the tables below, as the operators above
+/// them do not reduce them.
+fn base_cardinality(op: &LogicalOperator) -> u64 {
+    match &op.kind {
+        LogicalOperatorKind::Get { table, .. } => table.row_count() as u64,
+        LogicalOperatorKind::ExpressionGet { expressions, .. } => expressions.len() as u64,
+        LogicalOperatorKind::DummyScan { .. } => 1,
+        LogicalOperatorKind::EmptyResult { .. } => 0,
+        LogicalOperatorKind::Range { count, .. } => (*count).max(0) as u64,
+        LogicalOperatorKind::TopN { limit, .. } => (*limit).min(op.children.first().map_or(0, base_cardinality)),
+        LogicalOperatorKind::Limit { limit: Some(limit), .. } => {
+            (*limit).min(op.children.first().map_or(0, base_cardinality))
+        }
+        LogicalOperatorKind::Sample { options } => {
+            let child = op.children.first().map_or(0, base_cardinality);
+            let size = options.sample_size.parse::<f64>().unwrap_or(0.0);
+            if options.is_percentage {
+                ((child as f64) * size / 100.0).min(child as f64) as u64
+            } else {
+                (size as u64).min(child)
+            }
+        }
+        _ => op.children.iter().map(base_cardinality).max().unwrap_or(1),
+    }
+}
+
 /// [`create_plan`] once the join filters are in place.
 fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
     if matches!(op.kind, LogicalOperatorKind::ColumnSelect { .. }) {
@@ -176,6 +203,12 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
         renew_cte_scans(&mut op.children[1], old, &fresh);
     }
     let types = op.types();
+    // `CreatePlan(LogicalSample)`: a SYSTEM sample of rows keeps them at the rate of their number
+    // to the child's estimated rows
+    let child_cardinality = match &op.kind {
+        LogicalOperatorKind::Sample { .. } => op.children.first().map_or(0, base_cardinality),
+        _ => 0,
+    };
     let mut children: Vec<Box<dyn PhysicalOperator>> = op.children.into_iter().map(create_physical).collect();
     match op.kind {
         LogicalOperatorKind::Get {
@@ -185,6 +218,7 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             zone_filters,
             projection,
             index_rows,
+            sample,
             ..
         } => {
             let all: Vec<_> = filters.iter().chain(&zone_filters).cloned().collect();
@@ -196,6 +230,7 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
                 filter: (!filters.is_empty()).then(|| crate::optimizer::conjunction_of(filters)),
                 prune: (!all.is_empty()).then(|| crate::optimizer::conjunction_of(all)),
                 index_rows,
+                sample,
             })
         }
         LogicalOperatorKind::CsvScan { scan, .. } => Box::new(PhysicalCsvScan { types, scan }),
@@ -347,7 +382,23 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
                 data,
             })
         }
-        LogicalOperatorKind::Sample { options } => Box::new(PhysicalSample::new(options, children.remove(0))),
+        LogicalOperatorKind::Sample { options } => {
+            let rows = (options.method == duckrs_parser::ast::SampleMethod::System && !options.is_percentage)
+                .then(|| options.sample_size.parse::<f64>().unwrap_or(0.0) as u64);
+            let mut sample = PhysicalSample::new(options, children.remove(0));
+            if let Some(rows) = rows {
+                sample.rate = if child_cardinality > 0 { rows as f64 / child_cardinality as f64 } else { 1.0 };
+                // the sample can keep more rows than asked for: a LIMIT stops at them
+                let types = sample.types.clone();
+                return Box::new(PhysicalLimit {
+                    types,
+                    children: vec![Box::new(sample)],
+                    remaining: Mutex::new((0, Some(rows))),
+                    failure: None,
+                });
+            }
+            Box::new(sample)
+        }
         // only the optimizer sees the boundary
         LogicalOperatorKind::SecureView { .. } => children.remove(0),
         LogicalOperatorKind::Distinct { targets, .. } => {

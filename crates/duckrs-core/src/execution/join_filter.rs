@@ -240,6 +240,7 @@ fn push_into(op: &mut LogicalOperator, column: usize, key: &BoundExpr, filter: &
             filters,
             projection,
             index_rows: None,
+                        sample: None,
             ..
         } => {
             let position = match projection {

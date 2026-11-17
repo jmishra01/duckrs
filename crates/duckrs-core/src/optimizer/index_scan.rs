@@ -237,6 +237,7 @@ pub fn plan_index_scans(op: &mut LogicalOperator, options: &OptimizerOptions) {
         column_ids,
         filters,
         index_rows: rows,
+        sample: None,
         ..
     } = &mut op.kind
         && !filters.is_empty()
@@ -302,9 +303,11 @@ fn scan_join_keys(
         table_index,
         column_ids,
         index_rows: rows,
+        sample: None,
         ..
     } = &mut scan.kind
     else {
+        // the index scan does not apply a sample
         return;
     };
     let BoundExprKind::ColumnRef { binding, .. } = &column.kind else {

@@ -90,6 +90,7 @@ fn add_nested_statistics(
             zone_filters: Vec::new(),
             projection: None,
             index_rows: positions.map(Arc::new),
+            sample: None,
         },
         Vec::new(),
     );
@@ -211,6 +212,7 @@ fn add_geometry_statistics(
             zone_filters: Vec::new(),
             projection: None,
             index_rows: positions.map(Arc::new),
+            sample: None,
         },
         Vec::new(),
     );
@@ -275,6 +277,7 @@ fn compute_ordered_statistics(table: &Arc<TableCatalogEntry>, positions: Option<
             zone_filters: Vec::new(),
             projection: None,
             index_rows: positions.map(Arc::new),
+            sample: None,
         },
         Vec::new(),
     );
