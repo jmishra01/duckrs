@@ -1321,6 +1321,14 @@ impl StatisticsPropagator {
                     ..unknown()
                 };
             }
+            // `StructConcatStats`, `StructInsertStats`, `StructUpdateStats`: a struct, also of NULL inputs
+            "struct_concat" | "struct_insert" | "struct_update" if return_type.id() == LogicalTypeId::Struct => {
+                return Stats {
+                    can_be_null: false,
+                    can_be_valid: true,
+                    ..unknown()
+                };
+            }
             "list_value" | "list_pack" if matches!(return_type.id(), LogicalTypeId::List) => {
                 let child = stats.into_iter().reduce(union).unwrap_or_else(|| Stats {
                     can_be_null: false,

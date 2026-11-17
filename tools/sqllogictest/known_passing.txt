@@ -616,6 +616,7 @@ test/optimizer/statistics/statistics_count_not_null_join_pruning.test
 test/optimizer/statistics/statistics_count_not_null_pruning.test
 test/optimizer/statistics/statistics_exp_libm.test
 test/optimizer/statistics/statistics_filter_multicolumn.test
+test/optimizer/statistics/statistics_filter_pruning.test
 test/optimizer/statistics/statistics_is_null.test
 test/optimizer/statistics/statistics_join_always_matches_layout.test
 test/optimizer/statistics/statistics_join_arbitrary_condition.test
