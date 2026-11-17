@@ -68,6 +68,8 @@ pub struct ParquetScanData {
     pub projected: Option<Vec<bool>>,
     /// `ExtraOperatorInfo::file_filters`: the filters that left files out, as text
     pub file_filters: String,
+    /// the order the binder read the columns in (`column_ids`), which EXPLAIN lists them in
+    pub column_order: crate::execution::multi_file::ColumnOrder,
     /// `ExtraOperatorInfo::total_files`: how many files there were before that
     pub total_files: Option<usize>,
 }

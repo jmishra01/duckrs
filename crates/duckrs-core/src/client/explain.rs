@@ -224,15 +224,15 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             }
             names.extend(scan.hive.iter().map(|(name, _)| name.clone()));
             names.extend(scan.virtual_columns.iter().map(|c| c.name().to_string()));
-            let projected = names
-                .into_iter()
-                .enumerate()
-                .filter(|(at, _)| {
+            let positions: Vec<usize> = (0..names.len())
+                .filter(|at| {
                     scan.projected
                         .as_ref()
                         .is_none_or(|p| p.get(*at).copied().unwrap_or(true))
                 })
-                .map(|(_, name)| name);
+                .collect();
+            // `column_ids` are in the order the binder read the columns
+            let projected = scan.column_order.arrange(&positions).into_iter().map(|at| names[at].clone());
             info.extend(entry("Projections", lines(projected)));
             if !scan.filters.is_empty() {
                 info.extend(entry("Filters", lines(scan.filters.iter().map(filter_text))));

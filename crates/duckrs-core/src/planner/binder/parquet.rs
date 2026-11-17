@@ -367,6 +367,7 @@ impl Binder<'_> {
             filters: Vec::new(),
             projected: None,
             file_filters: String::new(),
+            column_order: self.column_order(table_index),
             total_files: None,
         };
         Ok(LogicalOperator::new(
