@@ -511,6 +511,7 @@ test/optimizer/expression_rewriter/ordered_aggregate_incorrectly_remove_order.te
 test/optimizer/filter_pushdown/filter_pushdown_into_subquery.test
 test/optimizer/filter_pushdown/like_prefix_boundary.test
 test/optimizer/grouping_expression_simplification.test
+test/optimizer/grouping_sets_optimizer.test
 test/optimizer/index_optimizer.test
 test/optimizer/instr_prefix_null_needle.test
 test/optimizer/issue_12181.test

@@ -375,7 +375,7 @@ fn expandable_outputs(kind: &K) -> Option<(usize, Vec<Expandable>)> {
 
 /// `CanCombineAggregateState`: aggregates whose states are of a fixed size, which one aggregate
 /// can compute side by side without using more memory than computing them apart.
-fn can_combine_aggregate(aggregate: &BoundAggregate) -> bool {
+pub(super) fn can_combine_aggregate(aggregate: &BoundAggregate) -> bool {
     if aggregate.distinct || !aggregate.order_by.is_empty() {
         return false;
     }

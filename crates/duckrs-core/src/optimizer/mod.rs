@@ -21,6 +21,7 @@ pub mod distinct_statistics;
 pub mod empty_result_pullup;
 mod filter_combiner;
 mod filter_pullup;
+mod grouping_sets;
 pub mod filter_pushdown;
 pub mod in_clause_rewriter;
 mod index_scan;
@@ -64,6 +65,7 @@ pub struct OptimizerOptions {
     pub common_aggregate: bool,
     pub outer_join_simplification: bool,
     pub filter_pullup: bool,
+    pub grouping_sets: bool,
     /// `index_scan_percentage`
     pub index_scan_percentage: f64,
     /// `index_scan_max_count`
@@ -100,6 +102,7 @@ impl Default for OptimizerOptions {
             common_aggregate: true,
             outer_join_simplification: true,
             filter_pullup: true,
+            grouping_sets: true,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -134,6 +137,7 @@ impl OptimizerOptions {
             common_aggregate: false,
             outer_join_simplification: false,
             filter_pullup: false,
+            grouping_sets: false,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -167,6 +171,7 @@ impl OptimizerOptions {
             common_aggregate: !off("common_aggregate"),
             outer_join_simplification: !off("outer_join_simplification"),
             filter_pullup: !off("filter_pullup"),
+            grouping_sets: !off("grouping_sets"),
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -241,6 +246,9 @@ pub fn optimize_timed(
     // C++ runs this before the DELIMINATOR, after `CheckMarkToSemi`: its MARK joins stay
     if options.in_clause {
         plan = run("in_clause", plan, &mut in_clause_rewriter::rewrite);
+    }
+    if options.grouping_sets {
+        plan = run("grouping_sets", plan, &mut grouping_sets::optimize);
     }
     if options.disjunctive_join_rewriter {
         plan = run("disjunctive_join_rewriter", plan, &mut disjunctive_join::rewrite);
