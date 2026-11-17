@@ -1134,6 +1134,7 @@ test/sql/attach/attach_dbname_quotes.test
 test/sql/attach/attach_default_database_case.test
 test/sql/attach/attach_defaults.test
 test/sql/attach/attach_dependencies.test
+test/sql/attach/attach_detach_in_transaction.test
 test/sql/attach/attach_detach_reattach_transaction.test
 test/sql/attach/attach_detach_same_name_transaction.test
 test/sql/attach/attach_different_alias.test
@@ -1149,10 +1150,12 @@ test/sql/attach/attach_home_directory.test
 test/sql/attach/attach_huggingface_index.test
 test/sql/attach/attach_if_not_exists.test
 test/sql/attach/attach_index.test
+test/sql/attach/attach_issue16122.test
 test/sql/attach/attach_issue7567.test
 test/sql/attach/attach_issue7711.test
 test/sql/attach/attach_issue_21491.test
 test/sql/attach/attach_issue_7660.test
+test/sql/attach/attach_lambda_view.test
 test/sql/attach/attach_macros.test
 test/sql/attach/attach_no_wal_writes_mode.test
 test/sql/attach/attach_null.test
@@ -1160,6 +1163,7 @@ test/sql/attach/attach_or_replace.test
 test/sql/attach/attach_persistent.test
 test/sql/attach/attach_pragma_storage_info.test
 test/sql/attach/attach_prefetch_header.test
+test/sql/attach/attach_read_only.test
 test/sql/attach/attach_read_only_transaction.test
 test/sql/attach/attach_reserved.test
 test/sql/attach/attach_row_group_size.test
@@ -1176,6 +1180,7 @@ test/sql/attach/attach_transactionality.test
 test/sql/attach/attach_use_rollback.test
 test/sql/attach/attach_use_string_literal.test
 test/sql/attach/attach_view_search_path.test
+test/sql/attach/attach_views.test
 test/sql/attach/attach_volatile_expression.test
 test/sql/attach/attach_wal_alter_sequence.test
 test/sql/attach/detach_keyword.test
@@ -2802,6 +2807,7 @@ test/sql/join/hash_join/hash_join_dict_surviving_computed_build.test
 test/sql/join/hash_join/hash_join_dict_surviving_cte.test
 test/sql/join/hash_join/hash_join_dict_surviving_outer_build.test
 test/sql/join/hash_join/hash_join_dict_surviving_reinterpret.test
+test/sql/join/hash_join/hash_join_dictionary_probe.test
 test/sql/join/hash_join/hash_join_local_build.test
 test/sql/join/hash_join/hash_join_nested_key_after_constant_key.test
 test/sql/join/iejoin/iejoin_issue_6861.test
@@ -3332,6 +3338,7 @@ test/sql/parser/test_many_or.test
 test/sql/parser/test_nested_subquery_depth.test
 test/sql/parser/test_operator_precedence.test
 test/sql/parser/trailing_commas.test
+test/sql/parser/unquoted_underscore_digit_identifiers.test
 test/sql/parser/unreserved_keyword_casing.test
 test/sql/parser/values_list_without_brackets.test
 test/sql/parser/wide_type_definitions.test
@@ -3652,6 +3659,7 @@ test/sql/sql_export/union_value.test
 test/sql/sql_export/values_consumers.test
 test/sql/sql_export/variant_key_order.test
 test/sql/sql_export/window_unnest_results.test
+test/sql/storage/adaptive_segment_lifecycle.test
 test/sql/storage/alter/alter_add_col_defaultexpr_sequence.test
 test/sql/storage/alter/alter_based_on_unfinished_insert_fails.test
 test/sql/storage/alter/alter_column_constraint.test

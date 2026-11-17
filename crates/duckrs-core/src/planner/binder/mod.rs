@@ -608,6 +608,9 @@ pub enum DefaultNullOrder {
 pub struct SessionValues {
     /// the name of the database statements run in, which its catalog does not know
     pub database: String,
+    /// the connection's default database, which a statement routed to `database` came from: unqualified
+    /// names that `database` does not have are looked up there, as along C++'s search path
+    pub default_database: String,
     pub variables: HashMap<String, Value>,
     pub setting: SettingLookup,
     /// `duckdb_logs()`, and the connection's logger for `write_log`

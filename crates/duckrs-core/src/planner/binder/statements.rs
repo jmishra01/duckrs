@@ -282,7 +282,55 @@ impl Binder<'_> {
             rest.qualification[0] = DEFAULT_CATALOG.to_string();
             return schema_of(&rest);
         }
+        // `db.t`: the database's default schema, unless it has a schema of that name
+        if let [first] = name.qualification.as_slice()
+            && first.eq_ignore_ascii_case(database)
+            && self.session.is_some()
+            && self.catalog.get_schema(first).is_none()
+        {
+            return Ok(None);
+        }
         schema_of(name)
+    }
+
+    /// A table or view of the connection's default database, when this binder binds in another one.
+    fn default_database_entry(&self, name: &str) -> Option<crate::catalog::TableOrView> {
+        let session = self.session.as_ref()?;
+        if session.default_database.eq_ignore_ascii_case(&session.database) {
+            return None;
+        }
+        let catalog = (session.attached_catalog)(&session.default_database)?;
+        if std::ptr::eq(Arc::as_ptr(&catalog), self.catalog) {
+            return None;
+        }
+        catalog.get_entry(None, None, name).ok()
+    }
+
+    /// The catalog of an attached database other than this binder's that `name` is qualified by, and
+    /// the schema in it (`None` for its default one). The first part of `a.b` is a schema if this
+    /// catalog has one, as in C++.
+    pub(super) fn other_database_of(&self, name: &QualifiedName) -> Option<(Arc<crate::catalog::Catalog>, Option<String>)> {
+        let first = name.qualification.first()?;
+        let session = self.session.as_ref()?;
+        if first.eq_ignore_ascii_case(&session.database)
+            || first.eq_ignore_ascii_case(TEMP_SCHEMA)
+            || first.eq_ignore_ascii_case("system")
+        {
+            return None;
+        }
+        if name.qualification.len() == 1 && self.catalog.get_schema(first).is_some() {
+            return None;
+        }
+        let catalog = (session.attached_catalog)(first)?;
+        if std::ptr::eq(Arc::as_ptr(&catalog), self.catalog) {
+            return None;
+        }
+        let schema = match &name.qualification[1..] {
+            [] => None,
+            [schema] => Some(schema.clone()),
+            path => Some(crate::catalog::schema_key(path)),
+        };
+        Some((catalog, schema))
     }
 
     /// `Binder::Bind(SelectStatement)`.
@@ -2486,17 +2534,35 @@ impl Binder<'_> {
                         .find(|f| f.name.eq_ignore_ascii_case(first))
                         .cloned()
                 });
-                let entry = match &foreign {
-                    Some(foreign) => {
+                // `Catalog::GetEntry` of another attached database: a statement that writes one database
+                // reads the others by their names
+                let other = match &foreign {
+                    Some(_) => None,
+                    None => self.other_database_of(name),
+                };
+                let entry = match (&foreign, &other) {
+                    (Some(foreign), _) => {
                         foreign
                             .catalog
                             .get_entry(name.qualification.get(1).map(String::as_str), None, &name.name)
                     }
-                    None => self.catalog.get_entry(
+                    (None, Some((catalog, schema))) => catalog.get_entry(schema.as_deref(), None, &name.name),
+                    (None, None) => self.catalog.get_entry(
                         self.schema_of(name)?.as_deref(),
                         self.search_schema.as_deref(),
                         &name.name,
                     ),
+                };
+                // `CatalogEntryRetriever::GetEntry`: past the search path of the statement's (or view's)
+                // database comes that of the connection, in its default database
+                let entry = match entry {
+                    Err(error) if foreign.is_none() && other.is_none() && name.qualification.is_empty() => {
+                        match self.default_database_entry(&name.name) {
+                            Some(found) => Ok(found),
+                            None => Err(error),
+                        }
+                    }
+                    entry => entry,
                 };
                 if entry.is_err()
                     && name.qualification.is_empty()

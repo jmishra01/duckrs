@@ -188,10 +188,13 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] COPY, casts to a database's types and `PRAGMA table_info('db.t')` run in the database they name
   - [x] ATTACH options as expressions, unknown options and TYPEs refused, `OR REPLACE`, access-mode conflicts,
     a rollback detaches what the transaction attached; one database written per transaction
-  - [ ] statements that read one database and write another (`CREATE TABLE db2.t AS SELECT ... FROM db1.t`; refused
-    for now, as running them in one of the databases wrote to the wrong one),
-    temp tables and sequences of the default database in a statement routed to another, views binding across
-    databases, DETACH of the default database
+  - [x] statements that read one database and write another (`CREATE TABLE db2.t AS SELECT ... FROM db1.t`): they
+    run in the database they write, and bind the tables of the others by name; unqualified names that database
+    lacks are looked up in the default one, as are those of the views of an attached database
+  - [ ] the catalog in table bindings (`db1.t.c`, `db1.s1.t.c`, `EXCLUDE (db1.s1.t.c)`: `attach_multi_identifiers`),
+    temp tables created in the transaction in a statement routed to another database (each database's fork
+    copies the temporary schema of the last commit), sequences of the default database in a statement routed to
+    another, DETACH of the default database
   - [x] `RECOVERY_MODE` (`NO_WAL_WRITES` keeps commits out of the log until a checkpoint)
   - [ ] `ENCRYPTION_KEY`, `COMPRESS`, `IO_MODE` and the other ATTACH options
 - [x] 11. Files that C++ DuckDB v69 can read and write (`sql/storage_version`: all pass)

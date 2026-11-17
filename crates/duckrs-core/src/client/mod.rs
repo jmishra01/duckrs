@@ -882,6 +882,9 @@ pub struct ClientContext {
     db: Arc<DatabaseInstance>,
     /// What the connection was made to, which holds what is attached.
     home: Arc<DatabaseInstance>,
+    /// the default database of a statement running now that was routed to `db`: the names of other
+    /// databases left in it are bound there by name, not routed again
+    routed_from: Option<String>,
     /// identifies the connection among the database's connections
     id: u64,
     /// the statement ran side-effecting CTEs before what is planned now, which its statistics don't see
@@ -1002,6 +1005,79 @@ fn is_write(statement: &Statement) -> bool {
     }
 }
 
+/// The name of the table (or other entry) a statement that `is_write` writes, as written.
+fn written_name(statement: &Statement) -> Option<&QualifiedName> {
+    fn in_table(table: &duckrs_parser::ast::TableRef) -> Option<&QualifiedName> {
+        match &table.kind {
+            duckrs_parser::ast::TableRefKind::BaseTable { name, .. } => Some(name),
+            _ => None,
+        }
+    }
+    match statement {
+        Statement::Insert(insert) => Some(&insert.table),
+        Statement::Update(update) => in_table(&update.table),
+        Statement::Delete(delete) => in_table(&delete.table),
+        Statement::CreateTable(info) if !info.temporary => Some(&info.name),
+        Statement::Copy(info) if info.is_from => Some(&info.table),
+        _ => None,
+    }
+}
+
+/// The names of the CTEs anywhere in a statement, which unqualified table names may refer to.
+fn cte_names(statement: &Statement) -> Vec<String> {
+    use duckrs_parser::ast::{QueryNode, QueryNodeKind, TableRef, TableRefKind};
+    fn in_table(table: &mut TableRef, names: &mut Vec<String>) {
+        match &mut table.kind {
+            TableRefKind::Join(join) => {
+                in_table(&mut join.left, names);
+                in_table(&mut join.right, names);
+            }
+            TableRefKind::Subquery(query) => in_query(&mut query.node, names),
+            _ => {}
+        }
+    }
+    fn in_query(node: &mut QueryNode, names: &mut Vec<String>) {
+        for (name, cte) in &mut node.cte_map.0 {
+            names.push(name.clone());
+            in_query(&mut cte.query, names);
+        }
+        match &mut node.kind {
+            QueryNodeKind::Select(select) => in_table(&mut select.from_table, names),
+            QueryNodeKind::SetOperation(set) => set.children.iter_mut().for_each(|child| in_query(child, names)),
+            _ => {}
+        }
+        duckrs_parser::transformer::visit_query_node_exprs_mut(node, &mut |e: &mut Expr| {
+            if let ExprKind::Subquery { subquery, .. } = &mut e.kind {
+                in_query(&mut subquery.node, names);
+            }
+        });
+    }
+    let mut names = Vec::new();
+    let mut statement = statement.clone();
+    match &mut statement {
+        Statement::Select(select) => in_query(&mut select.node, &mut names),
+        Statement::Insert(insert) => {
+            if let duckrs_parser::ast::InsertValues::Select(query) = &mut insert.values {
+                in_query(&mut query.node, &mut names);
+            }
+        }
+        Statement::CreateTable(info) => {
+            if let Some(query) = &mut info.query {
+                in_query(&mut query.node, &mut names);
+            }
+        }
+        Statement::Update(update) => in_table(&mut update.table, &mut names),
+        Statement::Delete(delete) => in_table(&mut delete.table, &mut names),
+        Statement::Copy(info) => {
+            if let Some(query) = &mut info.select {
+                in_query(query, &mut names);
+            }
+        }
+        _ => {}
+    }
+    names
+}
+
 /// `StatementTypeToString`, of a statement that `is_write`.
 fn statement_type_name(statement: &Statement) -> &'static str {
     match statement {
@@ -1035,6 +1111,7 @@ impl ClientContext {
         let log_target_id = crate::logging::register_target(&log_target);
         let context = Self {
             home: db.clone(),
+            routed_from: None,
             db,
             id,
             after_dml_ctes: false,
@@ -1116,6 +1193,7 @@ impl ClientContext {
         let attached_db = self.home.clone();
         Arc::new(SessionValues {
             database: self.db.name.clone(),
+            default_database: self.routed_from.clone().unwrap_or_else(|| self.db.name.clone()),
             log_manager: self.home.log_manager.clone(),
             log_target: self.log_target_id,
             connection_id: self.id,
@@ -1795,7 +1873,9 @@ impl ClientContext {
         }
         if let Some((database, routed)) = self.route_to_database(statement)? {
             let previous = std::mem::replace(&mut self.db, database);
+            let was_routed = self.routed_from.replace(previous.name.clone());
             let result = self.run_statement(&routed);
+            self.routed_from = was_routed;
             self.db = previous;
             return result;
         }
@@ -2053,6 +2133,9 @@ impl ClientContext {
     /// A statement that names another database runs there, without that name. The first part of
     /// `a.b` is a schema if this database has one, as in C++.
     fn route_to_database(&self, statement: &Statement) -> Result<Option<(Arc<DatabaseInstance>, Statement)>> {
+        if self.routed_from.is_some() {
+            return Ok(None);
+        }
         let mut names = Vec::new();
         let mut routed = statement.clone();
         for_each_table_name(&mut routed, &mut |name| names.push(name.clone()));
@@ -2074,33 +2157,48 @@ impl ClientContext {
                 })
             });
         }
-        let named: Vec<Arc<DatabaseInstance>> = names
-            .iter()
-            .filter_map(|name| {
-                let first = name.qualification.first()?;
-                let is_schema = name.qualification.len() == 1
-                    && (self.catalog().get_schema(first).is_some() || first.eq_ignore_ascii_case(TEMP_SCHEMA));
-                if is_schema {
-                    return None;
-                }
-                self.find_database(first)
-            })
-            .collect();
-        let Some(database) = named.first().cloned() else {
+        let database_of = |name: &QualifiedName| {
+            let first = name.qualification.first()?;
+            let is_schema = name.qualification.len() == 1
+                && (self.catalog().get_schema(first).is_some() || first.eq_ignore_ascii_case(TEMP_SCHEMA));
+            if is_schema {
+                return None;
+            }
+            self.find_database(first)
+        };
+        let named: Vec<Arc<DatabaseInstance>> = names.iter().filter_map(database_of).collect();
+        let Some(first) = named.first().cloned() else {
             return Ok(None);
         };
-        // a statement runs in one database here: reading another works, but a write to another would quietly go to
-        // the first in its place
-        let reads_only = matches!(
-            statement,
-            Statement::Select(_) | Statement::Explain { .. } | Statement::Pragma { .. }
-        );
-        if !reads_only && named.iter().any(|other| !Arc::ptr_eq(other, &database)) {
-            return Err(crate::unported(
-                "statements that write to one database and read another",
-            ));
-        }
+        // a statement that writes runs in the database it writes, and binds the tables of the others it reads
+        // by their names (`Binder::other_database_of`)
+        let database = match written_name(statement) {
+            Some(written) => match database_of(written) {
+                Some(database) => database,
+                None => return Ok(None),
+            },
+            None => first,
+        };
         let prefix = database.name.clone();
+        // a name the default database resolves stays there: it is qualified by that database
+        if !Arc::ptr_eq(&database, &self.db) {
+            let ctes = cte_names(statement);
+            let here = self.db.name.clone();
+            for_each_table_name(&mut routed, &mut |name| {
+                // (the temporary tables are the connection's: any catalog finds them)
+                let temporary = self
+                    .catalog()
+                    .get_schema(TEMP_SCHEMA)
+                    .is_some_and(|temp| temp.get_entry(&name.name).is_some());
+                if name.qualification.is_empty()
+                    && !temporary
+                    && !ctes.iter().any(|cte| cte.eq_ignore_ascii_case(&name.name))
+                    && self.catalog().get_entry(None, None, &name.name).is_ok()
+                {
+                    name.qualification.push(here.clone());
+                }
+            });
+        }
         for_each_table_name(&mut routed, &mut |name| {
             if name
                 .qualification
