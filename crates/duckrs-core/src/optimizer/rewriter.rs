@@ -115,6 +115,79 @@ fn apply_rules(expr: &mut BoundExpr, in_filter: bool) -> bool {
         || not_comparison_simplification(expr)
         || not_conjunction_simplification(expr)
         || join_dependent_filter(expr, in_filter)
+        || contains_to_in_clause(expr)
+}
+
+/// `ContainsToInClauseRule`: `list_contains` of a constant list is an IN of its elements that are
+/// not NULL; of a NULL list it is NULL, of an empty one false.
+fn contains_to_in_clause(expr: &mut BoundExpr) -> bool {
+    let BoundExprKind::Function { function, children, .. } = &expr.kind else {
+        return false;
+    };
+    if !matches!(
+        function.name.as_str(),
+        "contains" | "list_contains" | "list_has" | "array_contains" | "array_has"
+    ) || children.len() != 2
+        || !children[0].is_foldable()
+    {
+        return false;
+    }
+    let Some(list) = try_evaluate_scalar(&children[0]) else {
+        return false;
+    };
+    let probe = children[1].clone();
+    if list.is_null() {
+        *expr = BoundExpr::constant(Value::null(LogicalType::BOOLEAN));
+        return true;
+    }
+    if list.logical_type().id() != LogicalTypeId::List {
+        return false;
+    }
+    let ValueData::List(items) = list.data() else {
+        return false;
+    };
+    let Some(child_type) = list.logical_type().child_type().cloned() else {
+        return false;
+    };
+    let elements: Vec<Value> = items.iter().filter(|item| !item.is_null()).cloned().collect();
+    if elements.is_empty() {
+        if items.is_empty() {
+            // an empty list contains nothing, not even NULL, but the probe still runs if it can fail
+            if probe.is_volatile() || can_throw(&probe) {
+                return false;
+            }
+            *expr = BoundExpr::constant(Value::boolean(false));
+            return true;
+        }
+        *expr = crate::function::constant_or_null(vec![BoundExpr::constant(Value::boolean(false)), probe]);
+        return true;
+    }
+    // a constant probe is constant folding's
+    if probe.is_foldable() || probe.return_type != child_type {
+        return false;
+    }
+    let mut operands = vec![probe];
+    for element in elements {
+        let element = BoundExpr::constant(element);
+        operands.push(if element.return_type == child_type {
+            element
+        } else {
+            element.cast_to(&child_type, false)
+        });
+    }
+    // as the binder has IN: an operator for lists `InClauseRewriter` takes, comparisons otherwise
+    *expr = if operands.len() >= super::in_clause_rewriter::IN_CLAUSE_REWRITE_THRESHOLD {
+        BoundExpr::new(
+            BoundExprKind::Operator {
+                op: BoundOperator::In,
+                children: operands,
+            },
+            LogicalType::BOOLEAN,
+        )
+    } else {
+        crate::planner::expression::in_as_comparisons(false, &operands)
+    };
+    true
 }
 
 /// The tables an expression reads, if all it reads is in the query itself.

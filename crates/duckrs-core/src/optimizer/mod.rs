@@ -12,6 +12,7 @@ mod aggregate_rewriter;
 mod common_subplan;
 mod cte_inlining;
 mod join_elimination;
+mod outer_join_simplification;
 mod projection_pullup;
 mod projection_placement;
 mod deliminator;
@@ -59,6 +60,7 @@ pub struct OptimizerOptions {
     pub redundant_order_keys: bool,
     pub aggregate_function_rewriter: bool,
     pub common_aggregate: bool,
+    pub outer_join_simplification: bool,
     /// `index_scan_percentage`
     pub index_scan_percentage: f64,
     /// `index_scan_max_count`
@@ -93,6 +95,7 @@ impl Default for OptimizerOptions {
             redundant_order_keys: true,
             aggregate_function_rewriter: true,
             common_aggregate: true,
+            outer_join_simplification: true,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -125,6 +128,7 @@ impl OptimizerOptions {
             redundant_order_keys: false,
             aggregate_function_rewriter: false,
             common_aggregate: false,
+            outer_join_simplification: false,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -156,6 +160,7 @@ impl OptimizerOptions {
             redundant_order_keys: !off("redundant_order_keys"),
             aggregate_function_rewriter: !off("aggregate_function_rewriter"),
             common_aggregate: !off("common_aggregate"),
+            outer_join_simplification: !off("outer_join_simplification"),
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -236,6 +241,9 @@ pub fn optimize_timed(
     }
     if options.projection_pullup {
         plan = run("projection_pullup", plan, &mut projection_pullup::pull_up);
+    }
+    if options.outer_join_simplification {
+        plan = run("outer_join_simplification", plan, &mut outer_join_simplification::simplify);
     }
     if options.join_order {
         build_side::choose_build_sides(&mut plan, options.range_joins.prefer_range_joins);
