@@ -867,6 +867,16 @@ impl TableCatalogEntry {
         *self.checkpointed_columns.write() = (!identity).then_some(columns);
     }
 
+    /// Of a table an UPDATE or an ALTER made of one in a file: its rows are still there, but for the columns that
+    /// `source` has in memory. What the last checkpoint wrote stays what it was.
+    pub fn keep_in_file(&self, source: Arc<dyn TableSource>) {
+        self.set_row_ids(source.row_ids());
+        *self.write_loaded_storage() = ColumnDataCollection::new(self.types());
+        *self.read_from.write() = None;
+        *self.source.write() = Some(source);
+        self.statistics.lock().forget();
+    }
+
     /// [`Self::checkpointed`]: what the last checkpoint left of the table in its file.
     pub fn checkpointed(&self) -> Option<Arc<dyn TableSource>> {
         self.checkpointed.read().clone()

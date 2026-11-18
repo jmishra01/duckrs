@@ -12,6 +12,7 @@ mod float_codecs;
 pub mod encode;
 mod fsst;
 mod index_data;
+pub mod layered;
 pub mod log_writer;
 pub mod metadata;
 pub mod roaring;

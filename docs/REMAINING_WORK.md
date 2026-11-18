@@ -214,9 +214,11 @@ Each item gives the number of failing files in `test/` that it should fix, where
     TYPE, SET and DROP DEFAULT and NOT NULL, RENAME TO are read, and an ALTER of a column is logged as such unless
     the transaction changed the rows first, the table has indexes, or an ALTER TYPE gives the rows new ids; a replay
     keeps the ids the log has the rows under. SET DEFAULT keeps the text of the default too.
-  - [ ] columns that stay in the file through UPDATE and ALTER: those read all of a table into memory (and so load
-    all its columns), as do the commits of transactions, so `partial_column_metadata_reuse*` still fail on what
-    `loaded_segments_only` lists
+  - [x] columns that stay in the file through UPDATE and ALTER (`LayeredTable`): an UPDATE in place of a table in a
+    file reads and changes only its columns in the row groups it updates, and ADD, DROP and ALTER TYPE COLUMN only
+    compute the column they make; a commit takes the table's columns as they are, the log reads only the updated
+    columns, and a checkpoint writes the columns in memory and keeps the others unread. An UPDATE with RETURNING,
+    of a table with a CHECK or that a foreign key references, and an ALTER that checks the rows read the table.
     columns, `read_duckdb` (8)
   - [ ] string and list-length statistics for `stats()` (~10 files), per-column `USING COMPRESSION`
   - [x] `read_duckdb` and the replacement scan of `.db` files; `enable_view_dependencies` (DROP ... CASCADE,

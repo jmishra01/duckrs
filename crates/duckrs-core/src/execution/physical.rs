@@ -4160,6 +4160,62 @@ impl PhysicalUpdate {
     }
 }
 
+impl PhysicalUpdate {
+    /// `ColumnData::Update` of a table in a file: the columns it sets change in the row groups it updates, read
+    /// from the file for that, and nothing else is read. `false` where the rows have to be in memory: what a key,
+    /// a foreign key, a CHECK or RETURNING needs of them.
+    fn update_in_file(&self, updates: &HashMap<usize, &Vec<Value>>) -> Result<bool> {
+        use crate::storage::layered::{Layer, LayeredTable};
+        let table = &self.table;
+        let Some(source) = table.source() else {
+            return Ok(false);
+        };
+        let checks = table
+            .constraints
+            .iter()
+            .any(|c| matches!(c, TableConstraint::Check { .. }));
+        if self.returning || checks || !table.referenced_by.lock().is_empty() {
+            return Ok(false);
+        }
+        let types = table.types();
+        let (base, mut layers) = LayeredTable::parts(&source, types.len());
+        // where each group starts among the rows
+        let mut starts = Vec::with_capacity(source.group_count() + 1);
+        let mut start = 0;
+        for group in 0..source.group_count() {
+            starts.push(start);
+            start += source.group_rows(group);
+        }
+        starts.push(start);
+        let mut by_group: Vec<Vec<(usize, &Vec<Value>)>> = vec![Vec::new(); source.group_count()];
+        for (&position, values) in updates {
+            let group = starts.partition_point(|start| *start <= position) - 1;
+            by_group[group].push((position - starts[group], values));
+        }
+        for (at, &column) in self.columns.iter().enumerate() {
+            let (mut groups, from) = match &layers[column] {
+                Layer::Base(from) => (vec![None; source.group_count()], Some(*from)),
+                Layer::Memory { groups, from } => ((**groups).clone(), *from),
+            };
+            for (group, rows) in by_group.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
+                let mut vector = LayeredTable::column_of(&*base, &layers[column], group)?;
+                let count = source.group_rows(group);
+                vector.flatten(count);
+                for (row, values) in rows {
+                    vector.set_value(*row, &values[at])?;
+                }
+                groups[group] = Some(vector);
+            }
+            layers[column] = Layer::Memory {
+                groups: Arc::new(groups),
+                from,
+            };
+        }
+        table.keep_in_file(Arc::new(LayeredTable::new(base, layers, types)));
+        Ok(true)
+    }
+}
+
 impl PhysicalOperator for PhysicalUpdate {
     fn name(&self) -> &'static str {
         "UPDATE"
@@ -4211,6 +4267,13 @@ impl PhysicalOperator for PhysicalUpdate {
             crate::optimizer::statistics::warm_statistics(&self.table);
         }
         self.table.claim_rows(updates.keys().copied(), count, !moves_rows)?;
+        if !moves_rows && self.update_in_file(&updates)? {
+            self.table.rows_updated_in_place(updates.keys().copied());
+            self.table.rows_updated(updates.keys().copied(), &self.columns, count);
+            let changed = ColumnDataCollection::new(self.table.types());
+            *self.output.lock() = changed_rows_output(&self.types, changed, updates.len() as u64, false);
+            return Ok(());
+        }
         let mut storage = self.table.write_storage()?;
         let mut rewritten = ColumnDataCollection::new(storage.types().to_vec());
         let mut changed = ColumnDataCollection::new(storage.types().to_vec());

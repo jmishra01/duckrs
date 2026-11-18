@@ -390,16 +390,15 @@ fn log_deletes(records: &mut Records, ids: &[u64]) -> Result<()> {
 /// replay are `ids`.
 fn log_update(
     records: &mut Records,
-    rows: &ColumnDataCollection,
+    chunk_column: &mut dyn FnMut(usize) -> Result<Vector>,
     column: usize,
     positions: &[usize],
     ids: &[u64],
 ) -> Result<()> {
     let mut done = 0;
     for part in positions.chunk_by(|a, b| a / STANDARD_VECTOR_SIZE == b / STANDARD_VECTOR_SIZE) {
-        let chunk = rows.chunk(part[0] / STANDARD_VECTOR_SIZE);
         let selection = part.iter().map(|at| (at % STANDARD_VECTOR_SIZE) as u32).collect();
-        let mut values = chunk.column(column).clone();
+        let mut values = chunk_column(part[0] / STANDARD_VECTOR_SIZE)?;
         values.slice(&SelectionVector::from_vec(selection), part.len());
         let mut row_ids = Vector::new(LogicalType::BIGINT, part.len());
         for (target, id) in row_ids.data_mut::<i64>().iter_mut().zip(&ids[done..]) {
@@ -434,13 +433,18 @@ fn log_rows(records: &mut Records, name: &Key, table: &TableCatalogEntry) -> Res
         }
     }
     records.use_table(name);
-    let storage = table.rows()?;
     let mut replayed = (*log.replayed).clone();
     let columns: Vec<usize> = log.updated_columns.iter().copied().collect();
     // a nested column takes more than a column in an update, and a replay sees it as a new row
     let nested = columns
         .iter()
         .any(|c| table.columns[*c].ty.physical_type() == PhysicalType::Struct);
+    // rows still in a file, of which nothing is new, need only the columns that were updated
+    let in_file = table.source().filter(|_| !nested && first_new >= count);
+    let storage = match &in_file {
+        Some(_) => None,
+        None => Some(table.rows()?),
+    };
     let first_written = if nested {
         let all: Vec<u64> = replayed
             .ranges()
@@ -458,7 +462,21 @@ fn log_rows(records: &mut Records, name: &Key, table: &TableCatalogEntry) -> Res
             .unzip();
         if !positions.is_empty() {
             for column in &columns {
-                log_update(records, &storage, *column, &positions, &updated)?;
+                let mut chunk_column: Box<dyn FnMut(usize) -> Result<Vector>> = match (&in_file, &storage) {
+                    (Some(source), _) => {
+                        let ty = table.columns[*column].ty.clone();
+                        let mut cursor = crate::catalog::TableCursor::new(
+                            source.clone(),
+                            vec![*column],
+                            vec![ty],
+                            table.row_group_size(),
+                        );
+                        Box::new(move |chunk| Ok(cursor.chunk(chunk)?.column(0).clone()))
+                    }
+                    (None, Some(rows)) => Box::new(|chunk| Ok(rows.chunk(chunk).column(*column).clone())),
+                    (None, None) => unreachable!("the rows are read where they aren't in a file"),
+                };
+                log_update(records, &mut *chunk_column, *column, &positions, &updated)?;
             }
         }
         let gone = log.logged.missing_from(&ids);
@@ -468,7 +486,10 @@ fn log_rows(records: &mut Records, name: &Key, table: &TableCatalogEntry) -> Res
         first_new
     };
     let mut row = first_written / STANDARD_VECTOR_SIZE * STANDARD_VECTOR_SIZE;
-    for chunk in storage.chunks().skip(first_written / STANDARD_VECTOR_SIZE) {
+    let chunks = storage
+        .as_ref()
+        .map(|rows| rows.chunks().skip(first_written / STANDARD_VECTOR_SIZE));
+    for chunk in chunks.into_iter().flatten() {
         let skip = first_written.saturating_sub(row);
         let mut chunk = chunk.clone();
         let count = chunk.len();

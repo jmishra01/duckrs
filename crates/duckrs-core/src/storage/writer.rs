@@ -1212,7 +1212,7 @@ struct Writer<'a> {
     /// Of the table being written: whether its rows are those of its last checkpoint as they were, so that its
     /// row groups are kept without reading them (`RowGroup::HasChanges`), and which columns of each of those
     /// were loaded (`RowGroup::is_loaded`).
-    untouched: bool,
+    in_file: Option<(Arc<dyn crate::catalog::TableSource>, Vec<super::layered::Layer>)>,
     stored_loaded: Vec<Vec<bool>>,
     /// Which columns of each row group written of the table are loaded: all of one that was written, and of
     /// one that was kept, those that were.
@@ -1444,6 +1444,24 @@ fn matching_columns(
     Ok((same_deletes, same))
 }
 
+/// The values of the rows of a row group that are left, `live`, with NULLs where `kept` says a row was deleted.
+fn with_deleted(live: Vector, kept: &[bool], ty: &LogicalType) -> Result<Vector> {
+    if kept.iter().all(|kept| *kept) {
+        return Ok(live);
+    }
+    let mut result = Vector::new(ty.clone(), kept.len());
+    let mut at = 0;
+    for (row, kept) in kept.iter().enumerate() {
+        if *kept {
+            result.set_value(row, &live.get_value(at))?;
+            at += 1;
+        } else {
+            result.set_value(row, &Value::null(ty.clone()))?;
+        }
+    }
+    Ok(result)
+}
+
 /// Whether two values are the same, floating point ones bit for bit (-0.0 is not 0.0).
 fn identical(a: &Value, b: &Value) -> bool {
     use duckrs_common::value::ValueData as V;
@@ -1608,7 +1626,7 @@ impl<'a> Writer<'a> {
             next_block: blocks.header().block_count,
             used: BTreeSet::new(),
             kept_pages: std::collections::BTreeMap::new(),
-            untouched: false,
+            in_file: None,
             stored_loaded: Vec::new(),
             group_loaded: Vec::new(),
             loaded: HashMap::new(),
@@ -2764,27 +2782,58 @@ impl<'a> Writer<'a> {
                 .and_then(|disk| Some((disk, disk.group_at(group.row_start, group.rows)?))),
             _ => None,
         };
-        // the rows are those the file has: what the file has of them stays, unread
-        if let (true, true, Some((disk, stored_group))) = (self.untouched, indexes.is_empty(), stored) {
-            let mut kept = vec![disk.alive_rows(stored_group).is_none(); group.rows];
-            for &row in disk.alive_rows(stored_group).unwrap_or_default() {
-                kept[row as usize] = true;
-            }
-            let deletes = (kept.iter().any(|kept| !kept)).then(|| deletes_of(&kept));
+        // the rows are those the file has: of the columns, those still there stay, unread, and those an UPDATE or
+        // an ALTER changed are written from memory
+        if let (Some((source, layers)), true, Some((disk, stored_group))) =
+            (self.in_file.clone(), indexes.is_empty(), stored)
+        {
+            use super::layered::Layer;
+            let same: Vec<Option<usize>> = layers
+                .iter()
+                .map(|layer| match layer {
+                    Layer::Base(column) => Some(*column),
+                    Layer::Memory { groups, from } => groups[stored_group].is_none().then_some(*from).flatten(),
+                })
+                .collect();
             let kept_group = disk.stored_group(stored_group)?;
-            let all: Vec<Option<usize>> = (0..types.len()).map(Some).collect();
-            let reused = self.keep_columns(stored_group, &kept_group, &all, &types, statistics);
-            let parts = types.iter().map(|_| Vec::new()).collect();
-            let written = self.write_row_group(
-                table,
-                parts,
-                group.file_start,
-                group.rows,
-                deletes.as_deref(),
-                statistics,
-                reused,
-            )?;
-            return Ok((written, group.file_start as usize + group.rows));
+            let identity = disk.column_count() == types.len() && same.iter().enumerate().all(|(at, c)| *c == Some(at));
+            let unchanged = identity && (self.per_column_writes || !kept_group.per_column);
+            let partly = !unchanged && self.per_column_writes && kept_group.per_column;
+            if unchanged || partly {
+                let mut kept = vec![disk.alive_rows(stored_group).is_none(); group.rows];
+                for &row in disk.alive_rows(stored_group).unwrap_or_default() {
+                    kept[row as usize] = true;
+                }
+                let deletes = (kept.iter().any(|kept| !kept)).then(|| deletes_of(&kept));
+                let mut parts: Vec<Vec<Part>> = types.iter().map(|_| Vec::new()).collect();
+                for (column, keep) in same.iter().enumerate() {
+                    if keep.is_some() {
+                        continue;
+                    }
+                    let live = source.read_group(stored_group, &[column])?.column(0).clone();
+                    let values = with_deleted(live, &kept, &types[column])?;
+                    for first in (0..group.rows).step_by(STANDARD_VECTOR_SIZE) {
+                        let count = STANDARD_VECTOR_SIZE.min(group.rows - first);
+                        let mut part = values.clone();
+                        part.slice(
+                            &SelectionVector::from_vec((first as u32..(first + count) as u32).collect()),
+                            count,
+                        );
+                        parts[column].push(Part::new(&part, count));
+                    }
+                }
+                let reused = self.keep_columns(stored_group, &kept_group, &same, &types, statistics);
+                let written = self.write_row_group(
+                    table,
+                    parts,
+                    group.file_start,
+                    group.rows,
+                    deletes.as_deref(),
+                    statistics,
+                    reused,
+                )?;
+                return Ok((written, group.file_start as usize + group.rows));
+            }
         }
         let mut live_chunks = Vec::new();
         let row_id = |offset: usize| group.row_start + offset as u64;
@@ -2909,20 +2958,17 @@ impl<'a> Writer<'a> {
             .map(super::table_data::DiskTable::loaded_columns)
             .unwrap_or_default();
         self.group_loaded.clear();
-        let identity = table
-            .checkpointed_columns()
-            .iter()
-            .enumerate()
-            .all(|(at, column)| *column == Some(at));
-        self.untouched = match (table.source(), disk) {
-            (Some(source), Some(disk)) if self.metadata_reuse && identity => {
+        // the rows are still those of the file, as a layer over its table or that table itself
+        self.in_file = match (table.source(), disk) {
+            (Some(source), Some(disk)) if self.metadata_reuse => {
+                let (base, layers) = super::layered::LayeredTable::parts(&source, types.len());
                 let stored = crate::catalog::TableSource::row_ids(disk);
-                std::ptr::addr_eq(Arc::as_ptr(&source), disk as *const _)
-                    && disk.column_count() == types.len()
+                let same = std::ptr::addr_eq(Arc::as_ptr(&base), disk as *const _)
                     && stored.next() == ids.next()
-                    && stored.ranges().eq(ids.ranges())
+                    && stored.ranges().eq(ids.ranges());
+                same.then_some((source, layers))
             }
-            _ => false,
+            _ => None,
         };
         let mut rows = PositionedRows {
             cursor,
@@ -2953,7 +2999,7 @@ impl<'a> Writer<'a> {
             next_row_id = next_row_id.max(end as u64);
         }
         crate::execution::profiler::add_timing("storage.total_vacuum_time", vacuum_time);
-        self.untouched = false;
+        self.in_file = None;
         let loaded = std::mem::take(&mut self.group_loaded);
         self.loaded.insert((table.schema.clone(), table.name.clone()), loaded);
         let mut s = serializer(self.version);

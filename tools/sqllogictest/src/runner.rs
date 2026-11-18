@@ -621,7 +621,8 @@ impl<'a> FileRunner<'a> {
     /// `RestartCommand`: the database opened again, with the settings and the search path of the connection
     /// before.
     fn restart(&mut self) -> Result<(), String> {
-        const SETTINGS: &str = "SELECT name, value FROM duckdb_settings()";
+        // all of them, as C++ copies `DBConfig::options`: the deprecated and debug ones too
+        const SETTINGS: &str = "SELECT name, value FROM duckdb_settings(include_all := true)";
         let read = |con: &mut Box<dyn Connection>| -> Vec<(String, Option<String>)> {
             con.query(SETTINGS)
                 .map(|output| {

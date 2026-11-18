@@ -1088,3 +1088,40 @@ fn alters_in_the_log_come_back() {
     let mut c = db.connect().unwrap();
     assert_eq!((rows(&mut c, answer), rows(&mut c, shape)), expected);
 }
+
+#[test]
+fn update_and_alter_read_only_their_columns() {
+    let file = path("lazy_changes.db");
+    {
+        let db = Database::open_in_memory().unwrap();
+        let mut c = db.connect().unwrap();
+        run(
+            &mut c,
+            &format!("ATTACH '{}' AS db (STORAGE_VERSION 'v2.0.0')", file.display()),
+        );
+        run(
+            &mut c,
+            "CREATE TABLE db.t AS SELECT i c0, i * 2 c1, i::VARCHAR c2, i % 7 c3 FROM range(300000) r(i)",
+        );
+    }
+    let loaded = "SELECT DISTINCT column_name FROM pragma_storage_info('t', loaded_segments_only = true) ORDER BY 1";
+    let sums = "SELECT count(*), sum(c0), sum(c1), max(c2), sum(c4) FROM t";
+    let db = Database::open(&file, false).unwrap();
+    let mut c = db.connect().unwrap();
+    run(&mut c, "UPDATE t SET c1 = -c1 WHERE c0 % 3 = 0");
+    assert_eq!(rows(&mut c, loaded), ["c0", "c1"]);
+    run(&mut c, "ALTER TABLE t ADD COLUMN c4 INTEGER DEFAULT 4");
+    run(&mut c, "ALTER TABLE t DROP COLUMN c3");
+    assert_eq!(rows(&mut c, loaded), ["c0", "c1", "c4"]);
+    // a checkpoint writes the columns in memory and keeps the others as they were
+    run(&mut c, "CHECKPOINT");
+    assert_eq!(rows(&mut c, loaded), ["c0", "c1", "c4"]);
+    let expected = rows(&mut c, sums);
+    assert_eq!(expected, ["300000|44999850000|30000300000|99999|1200000"]);
+    drop(c);
+    drop(db);
+    let db = Database::open(&file, true).unwrap();
+    let mut c = db.connect().unwrap();
+    assert!(rows(&mut c, loaded).is_empty());
+    assert_eq!(rows(&mut c, sums), expected);
+}

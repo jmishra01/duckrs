@@ -618,6 +618,8 @@ enum TableChange {
     /// Rows at the end, by themselves or ahead of keys that are known.
     Append(Vec<DataChunk>),
     Replace(ColumnDataCollection, Arc<RowIds>),
+    /// The rows are still in a file, but for the columns in memory that the source has.
+    ReplaceSource(Arc<dyn super::TableSource>, Arc<RowIds>),
 }
 
 struct PreparedTable {
@@ -730,6 +732,10 @@ impl Fork {
                 check_appended(table, origin, &added)?;
             }
             return Ok(Some(TableChange::Append(added)));
+        }
+        if let (false, Some(source)) = (theirs_changed, table.source()) {
+            let ids = table.row_ids(table.row_count());
+            return Ok(Some(TableChange::ReplaceSource(source, ids)));
         }
         let rows = table.rows()?.clone();
         let ids = table.row_ids(rows.len());
@@ -1037,6 +1043,12 @@ impl TableOrigin {
                 // who reads the rows mustn't get ids of others
                 let mut storage = table.write_storage()?;
                 *storage = rows;
+                table.set_row_ids(ids.committed(next));
+            }
+            TableChange::ReplaceSource(source, ids) => {
+                table.rows_rewritten();
+                let next = table.row_ids(table.row_count()).next();
+                table.keep_in_file(source);
                 table.set_row_ids(ids.committed(next));
             }
         }

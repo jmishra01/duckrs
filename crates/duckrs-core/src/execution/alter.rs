@@ -6,7 +6,7 @@
 
 use super::constraints;
 use super::expression_executor::execute;
-use crate::catalog::{IndexCatalogEntry, RowIds, TableCatalogEntry};
+use crate::catalog::{IndexCatalogEntry, RowIds, TableCatalogEntry, TableSource};
 use crate::planner::binder::{BoundAlter, BoundTableAlter};
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::vector::DataChunk;
@@ -22,12 +22,26 @@ pub fn execute_alter(alter: BoundAlter) -> Result<()> {
 }
 
 fn execute_table_alter(alter: BoundTableAlter) -> Result<()> {
-    let old = alter.table;
+    let old = alter.table.clone();
     let adding_key = alter.constraints.len() > old.constraints.len();
-    let source = old.rows()?;
-    let row_ids = old.row_ids(source.len());
     let before: Vec<_> = old.types();
+    // rows still in a file stay there: only the columns that the ALTER makes are read and written
+    let layered = layered_alter(&old, &alter, &before)?;
+    let empty;
+    let loaded;
+    let source = match layered {
+        Some(_) => {
+            empty = ColumnDataCollection::new(before.clone());
+            &empty
+        }
+        None => {
+            loaded = old.rows()?;
+            &*loaded
+        }
+    };
+    let row_ids = old.row_ids(old.row_count());
     let rows = match &alter.projection {
+        _ if layered.is_some() => ColumnDataCollection::new(alter.columns.iter().map(|c| c.ty.clone()).collect()),
         Some(projection) => {
             let types: Vec<_> = alter.columns.iter().map(|c| c.ty.clone()).collect();
             let mut rows = ColumnDataCollection::new(types);
@@ -42,8 +56,10 @@ fn execute_table_alter(alter: BoundTableAlter) -> Result<()> {
         }
         None => source.clone(),
     };
-    drop(source);
     let mut table = TableCatalogEntry::new(old.schema.clone(), alter.name, alter.columns, rows, alter.constraints);
+    if let Some(layered) = layered {
+        table.keep_in_file(layered);
+    }
     table.generated = alter.generated;
     table.catalog = old.catalog.clone();
     *table.comment.lock() = alter.comment;
@@ -176,4 +192,72 @@ fn log_as_alter(
         replayed: log.replayed.clone(),
         ..crate::catalog::TableLog::default()
     };
+}
+
+/// `RowGroup::AddColumn`, `RemoveColumn` and `AlterType` of a table whose rows are in a file: the rows stay, and of
+/// each column either that of the table, which stays unread, or one the ALTER computes from the columns it reads.
+/// `None` where the rows have to be read: they are in memory, the ALTER checks them, or a new type gives them new
+/// ids.
+fn layered_alter(
+    old: &TableCatalogEntry,
+    alter: &BoundTableAlter,
+    before: &[duckrs_common::types::LogicalType],
+) -> Result<Option<Arc<dyn TableSource>>> {
+    use crate::planner::expression::BoundExprKind;
+    use crate::storage::layered::{Layer, LayeredTable};
+    let Some(source) = old.source() else {
+        return Ok(None);
+    };
+    if alter.verify {
+        return Ok(None);
+    }
+    let types: Vec<_> = alter.columns.iter().map(|c| c.ty.clone()).collect();
+    let Some(projection) = &alter.projection else {
+        return Ok(Some(source));
+    };
+    let ids = old.row_ids(old.row_count());
+    let dense = ids.ranges().count() <= 1 && ids.ranges().next().is_none_or(|(first, _)| first == 0);
+    if alter.retyped.is_some() && !dense {
+        return Ok(None);
+    }
+    let (base, old_layers) = LayeredTable::parts(&source, before.len());
+    let mut layers = Vec::with_capacity(projection.len());
+    for (index, (expression, ty)) in projection.iter().zip(&types).enumerate() {
+        if let BoundExprKind::Reference(at) = expression.kind
+            && before[at] == *ty
+            && alter.retyped != Some(index)
+        {
+            layers.push(old_layers[at].clone());
+            continue;
+        }
+        // the columns it reads, in the order it reads them
+        let mut read = Vec::new();
+        let mut expression = expression.clone();
+        expression.walk_mut(&mut |e| {
+            if let BoundExprKind::Reference(at) = e.kind {
+                let position = read.iter().position(|c| *c == at).unwrap_or_else(|| {
+                    read.push(at);
+                    read.len() - 1
+                });
+                e.kind = BoundExprKind::Reference(position);
+            }
+        });
+        let mut groups = Vec::with_capacity(source.group_count());
+        for group in 0..source.group_count() {
+            let rows = source.group_rows(group);
+            let chunk = if read.is_empty() {
+                DataChunk::from_columns(Vec::new(), rows)
+            } else {
+                source.read_group(group, &read)?
+            };
+            let mut vector = execute(&expression, &chunk)?;
+            vector.flatten(rows);
+            groups.push(Some(vector));
+        }
+        layers.push(Layer::Memory {
+            groups: Arc::new(groups),
+            from: None,
+        });
+    }
+    Ok(Some(Arc::new(LayeredTable::new(base, layers, types))))
 }
