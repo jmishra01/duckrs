@@ -99,6 +99,48 @@ fn is_movable_semi(op: &LogicalOperator) -> bool {
         })
 }
 
+/// How many SEMI and ANTI joins, RIGHT ones too, with equalities and without volatile predicates,
+/// are stacked at `op` on what they keep the rows of.
+fn semi_chain_length(op: &LogicalOperator) -> usize {
+    let K::Join {
+        join_type,
+        conditions,
+        predicate,
+        ..
+    } = &op.kind
+    else {
+        return 0;
+    };
+    let kept = match join_type {
+        JoinType::Semi | JoinType::Anti => 0,
+        JoinType::RightSemi | JoinType::RightAnti => 1,
+        _ => return 0,
+    };
+    if conditions.is_empty() || predicate.as_ref().is_some_and(BoundExpr::is_volatile) {
+        return 0;
+    }
+    1 + semi_chain_length(&op.children[kept])
+}
+
+/// A RIGHT SEMI or RIGHT ANTI join as the SEMI or ANTI join it was.
+fn unflip_semi(op: &mut LogicalOperator) {
+    let K::Join {
+        join_type, conditions, ..
+    } = &mut op.kind
+    else {
+        return;
+    };
+    *join_type = match join_type {
+        JoinType::RightSemi => JoinType::Semi,
+        JoinType::RightAnti => JoinType::Anti,
+        _ => return,
+    };
+    for condition in conditions {
+        std::mem::swap(&mut condition.left, &mut condition.right);
+    }
+    op.children.swap(0, 1);
+}
+
 /// Whether `op` is an operator of a tree of joins, or filters on such a tree.
 fn is_tree(op: &LogicalOperator) -> bool {
     match &op.kind {
@@ -417,7 +459,22 @@ impl Estimator {
                 let columns: Vec<ColumnBinding> =
                     parents.keys().copied().filter(|b| find(&mut parents.clone(), *b) == *root).collect();
                 let domains: Vec<DistinctCount> = columns.iter().filter_map(distinct_of).collect();
-                let (distinct, reliable) = select(&domains);
+                let (mut distinct, reliable) = select(&domains);
+                // `RestrictFilterDomains`: with every column of the class filtered to a finite set of
+                // values, and its domain known from statistics, the class has at most the most of those
+                let mut retained: Option<f64> = Some(0.0);
+                for column in &columns {
+                    let stats = relations[relation_of[column]].column(column);
+                    retained = match (retained, stats.evidence.filter_bound()) {
+                        (Some(r), Some(bound)) if stats.total.source != CountSource::Cardinality => Some(r.max(bound)),
+                        _ => None,
+                    };
+                }
+                if let Some(retained) = retained
+                    && !columns.is_empty()
+                {
+                    distinct = distinct.min(retained.max(1.0));
+                }
                 DomainGroup {
                     distinct,
                     reliable,
@@ -1855,6 +1912,9 @@ impl JoinOrderOptimizer {
                 return self.reorder(op);
             }
         }
+        if !by_position && semi_chain_length(&op) >= 2 {
+            return self.reorder_semi_chain(op);
+        }
         let inherited = by_position
             && matches!(
                 op.kind,
@@ -1942,6 +2002,79 @@ impl JoinOrderOptimizer {
         }
     }
 
+    /// Two or more SEMI and ANTI joins on one relation that is not a tree of joins: they filter
+    /// it each by its own columns, so any order gives the same rows, and the plan enumerator, for
+    /// which their right sides are relations, picks the cheapest. Build sides were chosen already;
+    /// they are chosen again for the new order.
+    fn reorder_semi_chain(&mut self, mut op: LogicalOperator) -> LogicalOperator {
+        let mut semis = Vec::new();
+        while semi_chain_length(&op) >= 1 {
+            unflip_semi(&mut op);
+            let right = op.children.pop().expect("a join has two sides");
+            let left = op.children.pop().expect("a join has two sides");
+            op.children.push(self.optimize(right, false));
+            semis.push(op);
+            op = left;
+        }
+        let relation = self.optimize(op, false);
+        semis.reverse();
+        let mut plan = self.stack_semis(relation, semis);
+        super::build_side::choose_build_sides(&mut plan, false);
+        plan
+    }
+
+    /// Puts the SEMI and ANTI joins of one relation on it, in the order the plan enumerator would
+    /// join them in: the least rows in all, and of orders as good, the one with the most rows on
+    /// the right side of the last join (`EmitPair`'s tiebreaker).
+    fn stack_semis(&self, relation: LogicalOperator, semis: Vec<LogicalOperator>) -> LogicalOperator {
+        let build = |relation: LogicalOperator, order: &[usize], semis: &[LogicalOperator]| {
+            let mut op = relation;
+            for &at in order {
+                let mut semi = semis[at].clone();
+                semi.children.insert(0, op);
+                op = semi;
+            }
+            op
+        };
+        if semis.len() < 2 || semis.len() > 4 {
+            let order: Vec<usize> = (0..semis.len()).collect();
+            return build(relation, &order, &semis);
+        }
+        fn permutations(items: Vec<usize>) -> Vec<Vec<usize>> {
+            if items.len() <= 1 {
+                return vec![items];
+            }
+            let mut result = Vec::new();
+            for at in 0..items.len() {
+                let mut rest = items.clone();
+                let first = rest.remove(at);
+                for mut tail in permutations(rest) {
+                    tail.insert(0, first);
+                    result.push(tail);
+                }
+            }
+            result
+        }
+        let right_rows: Vec<f64> = semis.iter().map(|semi| self.stats(&semi.children[0]).cardinality).collect();
+        let mut best: Option<(f64, f64, Vec<usize>)> = None;
+        for order in permutations((0..semis.len()).collect()) {
+            let mut cost = 0.0;
+            for depth in 1..=order.len() {
+                cost += self.stats(&build(relation.clone(), &order[..depth], &semis)).cardinality;
+            }
+            let right = right_rows[*order.last().expect("two or more")];
+            let better = match &best {
+                None => true,
+                Some((best_cost, best_right, _)) => cost < *best_cost || (cost == *best_cost && right > *best_right),
+            };
+            if better {
+                best = Some((cost, right, order));
+            }
+        }
+        let (_, _, order) = best.expect("two or more");
+        build(relation, &order, &semis)
+    }
+
     fn reorder(&mut self, op: LogicalOperator) -> LogicalOperator {
         let mut relations = Vec::new();
         let mut conjuncts = Vec::new();
@@ -1997,11 +2130,13 @@ impl JoinOrderOptimizer {
             })
             .collect();
         // innermost first, as they were
-        for (columns, mut semi) in semis.into_iter().rev() {
-            let at = relation_of[&columns[0]];
+        let mut stacks: Vec<Vec<LogicalOperator>> = (0..relations.len()).map(|_| Vec::new()).collect();
+        for (columns, semi) in semis.into_iter().rev() {
+            stacks[relation_of[&columns[0]]].push(semi);
+        }
+        for (at, stack) in stacks.into_iter().enumerate() {
             let relation = std::mem::replace(&mut relations[at], LogicalOperator::new(K::CrossProduct, Vec::new()));
-            semi.children.insert(0, relation);
-            relations[at] = semi;
+            relations[at] = self.stack_semis(relation, stack);
         }
         let stats: Vec<RelationStats> = relations.iter().map(|r| self.stats(r)).collect();
         let mut estimator = Estimator::new(&stats, &predicates, &relation_of);

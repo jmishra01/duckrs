@@ -631,6 +631,7 @@ test/optimizer/statistics/large_join_cardinality.test
 test/optimizer/statistics/positive_join_cardinality.test
 test/optimizer/statistics/right_semi_join_filter.test
 test/optimizer/statistics/selected_join_statistics.test
+test/optimizer/statistics/shared_join_filter_domain.test
 test/optimizer/statistics/statistics_additive_duplication.test
 test/optimizer/statistics/statistics_aggregate.test
 test/optimizer/statistics/statistics_all_null_comparison.test

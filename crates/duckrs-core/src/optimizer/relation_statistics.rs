@@ -68,6 +68,11 @@ impl DomainEvidence {
         self.unique = true;
     }
 
+    /// `GetFilterDomainBound`
+    pub fn filter_bound(&self) -> Option<f64> {
+        self.filter_bound
+    }
+
     /// `GetSupportedDomainSize`
     pub fn supported(&self, current: f64) -> Option<f64> {
         let unique = self.unique.then_some(current);
