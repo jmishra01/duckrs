@@ -109,7 +109,29 @@ fn conditions_text(conditions: &[JoinCondition], predicate: Option<String>) -> S
 }
 
 fn aggregate_text(aggregate: &BoundAggregate) -> String {
-    let arguments: Vec<String> = aggregate.children.iter().map(|c| c.to_string()).collect();
+    // the arguments of an aggregate duckrs computes from its rows are packed into one (`a0`, `a1`, ...)
+    let children = match aggregate.children.as_slice() {
+        [only] if matches!(aggregate.function.kind, crate::function::aggregates::AggregateKind::Holistic(_)) => {
+            match &only.kind {
+                crate::planner::expression::BoundExprKind::Function { function, children, .. }
+                    if function.name == "struct_pack"
+                        && children.len() > 1
+                        && only.return_type.id() == duckrs_common::types::LogicalTypeId::Struct
+                        && only
+                            .return_type
+                            .struct_children()
+                            .iter()
+                            .enumerate()
+                            .all(|(i, (name, _))| *name == format!("a{i}")) =>
+                {
+                    children.as_slice()
+                }
+                _ => aggregate.children.as_slice(),
+            }
+        }
+        _ => aggregate.children.as_slice(),
+    };
+    let arguments: Vec<String> = children.iter().map(|c| c.to_string()).collect();
     let name = &aggregate.function.name;
     let distinct = if aggregate.distinct { "DISTINCT " } else { "" };
     let text = format!("{name}({distinct}{})", arguments.join(", "));
@@ -294,8 +316,34 @@ fn order_text(orders: &[BoundOrderByNode]) -> String {
     }))
 }
 
+/// A physical aggregate reads its child by position: a column without a name shows as one
+/// (`BoundReferenceExpression::ToString`).
+fn resolve_unnamed(op: &LogicalOperator) -> Option<LogicalOperator> {
+    let K::Aggregate { .. } = &op.kind else {
+        return None;
+    };
+    let bindings = op.children.first()?.column_bindings();
+    let mut resolved = LogicalOperator::new(op.kind.clone(), Vec::new());
+    let mut changed = false;
+    for expr in resolved.expressions_mut() {
+        expr.walk_mut(&mut |e| {
+            if let crate::planner::expression::BoundExprKind::ColumnRef { binding, depth: 0 } = &e.kind
+                && e.alias.is_empty()
+                && let Some(at) = bindings.iter().position(|b| b == binding)
+            {
+                e.kind = crate::planner::expression::BoundExprKind::Reference(at);
+                changed = true;
+            }
+        });
+    }
+    changed.then_some(resolved)
+}
+
 /// `ParamsToString`, where physical operators differ from logical ones in some keys.
 fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> {
+    if physical && let Some(resolved) = resolve_unnamed(op) {
+        return operator_info(&resolved, physical);
+    }
     let entry = |key: &str, value: String| vec![(key.to_string(), value)];
     let join = |join_type: String, conditions: &[JoinCondition], predicate: Option<String>| {
         let mut info = entry("Join Type", join_type);

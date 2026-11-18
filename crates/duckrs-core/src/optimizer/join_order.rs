@@ -2441,6 +2441,11 @@ pub fn estimated_cardinality(op: &LogicalOperator) -> u64 {
     if rows > 0.0 { rows.floor().max(1.0) as u64 } else { 0 }
 }
 
+/// `RelationStatsExtractor::Extract`: the statistics of the rows of `op`.
+pub(super) fn relation_stats(op: &LogicalOperator) -> RelationStats {
+    JoinOrderOptimizer::default().stats(op)
+}
+
 /// `LogicalOperator::EstimateCardinality` for all operators of a plan.
 pub fn estimate_plan(op: &LogicalOperator) -> PlanEstimate {
     estimate(op, &mut JoinOrderOptimizer::default())

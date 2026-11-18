@@ -573,6 +573,7 @@ test/optimizer/not_in_null.test
 test/optimizer/optimize_unsigned_vs_signed_ints.test
 test/optimizer/ordered_aggregate.test
 test/optimizer/outer_join_simplification_anti_on_filter.test
+test/optimizer/partial_aggregate_pushdown.test
 test/optimizer/partition_stats_prepared.test
 test/optimizer/perfect_ht.test
 test/optimizer/prefer_final_projected_columns_on_probe_side.test

@@ -22,6 +22,7 @@ pub mod empty_result_pullup;
 mod filter_combiner;
 mod filter_pullup;
 mod grouping_sets;
+mod partial_aggregate_pushdown;
 pub mod filter_pushdown;
 pub mod in_clause_rewriter;
 mod index_scan;
@@ -68,6 +69,7 @@ pub struct OptimizerOptions {
     pub filter_pullup: bool,
     pub grouping_sets: bool,
     pub sampling_pushdown: bool,
+    pub partial_aggregate_pushdown: bool,
     /// `index_scan_percentage`
     pub index_scan_percentage: f64,
     /// `index_scan_max_count`
@@ -106,6 +108,7 @@ impl Default for OptimizerOptions {
             filter_pullup: true,
             grouping_sets: true,
             sampling_pushdown: true,
+            partial_aggregate_pushdown: true,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -142,6 +145,7 @@ impl OptimizerOptions {
             filter_pullup: false,
             grouping_sets: false,
             sampling_pushdown: false,
+            partial_aggregate_pushdown: false,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -177,6 +181,7 @@ impl OptimizerOptions {
             filter_pullup: !off("filter_pullup"),
             grouping_sets: !off("grouping_sets"),
             sampling_pushdown: !off("sampling_pushdown"),
+            partial_aggregate_pushdown: !off("partial_aggregate_pushdown"),
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -270,6 +275,9 @@ pub fn optimize_timed(
     if options.join_order {
         build_side::choose_build_sides(&mut plan, options.range_joins.prefer_range_joins);
         plan = run("join_order", plan, &mut join_order::reorder_joins);
+    }
+    if options.partial_aggregate_pushdown {
+        plan = run("partial_aggregate_pushdown", plan, &mut partial_aggregate_pushdown::push_down);
     }
     if options.join_elimination {
         plan = run("join_elimination", plan, &mut join_elimination::eliminate);
