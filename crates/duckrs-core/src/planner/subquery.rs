@@ -302,8 +302,10 @@ fn flatten_subquery(expr: &BoundExpr, left: &mut LogicalOperator, next_table_ind
         .collect();
     let types = domain.iter().map(|(_, ty)| ty.clone()).collect::<Vec<_>>();
     let delim = Arc::new(Mutex::new(ColumnDataCollection::new(types)));
+    let names = correlated.iter().map(|value| value.alias.clone()).collect();
     let mut flatten = Flatten {
         domain,
+        names,
         delim: delim.clone(),
         next_table_index,
         empty_values: Vec::new(),
@@ -325,7 +327,7 @@ fn flatten_subquery(expr: &BoundExpr, left: &mut LogicalOperator, next_table_ind
         .zip(&state)
         .map(|(value, binding)| JoinCondition {
             left: value.clone(),
-            right: BoundExpr::column_ref(*binding, value.return_type.clone(), ""),
+            right: BoundExpr::column_ref(*binding, value.return_type.clone(), value.alias.clone()),
             comparison: ComparisonOp::NotDistinctFrom,
             filter: None,
         })
@@ -382,6 +384,8 @@ struct EmptyValue {
 /// `FlattenDependentJoins`.
 struct Flatten<'a> {
     domain: Vec<(ColumnBinding, LogicalType)>,
+    /// The names of the correlated columns, which the columns standing in for them take.
+    names: Vec<String>,
     delim: Arc<Mutex<ColumnDataCollection>>,
     next_table_index: &'a mut usize,
     empty_values: Vec<EmptyValue>,
@@ -435,8 +439,8 @@ impl Flatten<'_> {
     fn state_refs(&self, state: &[ColumnBinding]) -> Vec<BoundExpr> {
         state
             .iter()
-            .zip(&self.domain)
-            .map(|(binding, (_, ty))| BoundExpr::column_ref(*binding, ty.clone(), ""))
+            .zip(self.domain.iter().zip(&self.names))
+            .map(|(binding, ((_, ty), name))| BoundExpr::column_ref(*binding, ty.clone(), name.clone()))
             .collect()
     }
 

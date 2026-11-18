@@ -447,7 +447,7 @@ fn column_binding(expr: &BoundExpr) -> Option<ColumnBinding> {
 }
 
 /// `NotNullExpressionAnalyzer::IsNotNull`: whether `expr` over the rows of `op` is never NULL.
-fn is_not_null(op: &LogicalOperator, expr: &BoundExpr, root: &LogicalOperator) -> bool {
+pub(super) fn is_not_null(op: &LogicalOperator, expr: &BoundExpr, root: &LogicalOperator) -> bool {
     match &op.kind {
         K::Projection {
             table_index,

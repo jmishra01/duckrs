@@ -359,6 +359,7 @@ test/issues/general/test_4704.test
 test/issues/general/test_4753.test
 test/issues/general/test_4766.test
 test/issues/general/test_4935.test
+test/issues/general/test_4950.test
 test/issues/general/test_5072.test
 test/issues/general/test_5200.test
 test/issues/general/test_5390.test
@@ -500,6 +501,7 @@ test/optimizer/constant_folding.test
 test/optimizer/constant_order_normalization.test
 test/optimizer/csv_pushdown.test
 test/optimizer/cte_statistics_propagation.test
+test/optimizer/deliminator_nullability.test
 test/optimizer/disjunctive_join_rewriter_exclusions.test
 test/optimizer/disjunctive_join_rewriter_expansion.test
 test/optimizer/disjunctive_join_rewriter_nested.test
