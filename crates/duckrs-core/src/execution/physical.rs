@@ -1682,7 +1682,7 @@ impl PhysicalRecursiveCte {
 
 impl PhysicalOperator for PhysicalRecursiveCte {
     fn name(&self) -> &'static str {
-        "RECURSIVE_CTE"
+        "REC_CTE"
     }
     fn types(&self) -> &[LogicalType] {
         &self.types

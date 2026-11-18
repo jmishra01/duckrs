@@ -359,6 +359,16 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             info
         }
         K::CteRef { cte_index, .. } => entry("CTE Index", cte_index.to_string()),
+        // `PhysicalRecursiveCTE::ParamsToString`
+        K::RecursiveCte { name, table_index, .. } => {
+            let mut info = entry("CTE Name", name.clone());
+            info.extend(entry("Table Index", table_index.to_string()));
+            info
+        }
+        K::WorkingTable { working, .. } => match recursive_scan(working) {
+            Some((_, cte_index)) => entry("CTE Index", cte_index.to_string()),
+            None => Vec::new(),
+        },
         // `PhysicalTableScan::ParamsToString` of `read_csv`
         K::CsvScan { scan, .. } => {
             let mut info = entry("Function", "READ_CSV".to_string());
@@ -621,6 +631,29 @@ pub(super) fn logical_tree(op: &LogicalOperator, estimate: Option<&PlanEstimate>
 }
 
 /// The tree of a physical plan, and the logical plan it came from if they have the same shape.
+thread_local! {
+    /// The working and recurring tables of the recursive CTEs being rendered, and their table
+    /// indexes.
+    static RECURSIVE_TABLES: std::cell::RefCell<Vec<(usize, usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// What a scan of `table` is: `REC_CTE_SCAN` of a working table or `REC_REC_CTE_SCAN` of a
+/// recurring one, with the index of its CTE.
+fn recursive_scan(table: &std::sync::Arc<parking_lot::Mutex<duckrs_common::column_data::ColumnDataCollection>>) -> Option<(&'static str, usize)> {
+    let pointer = std::sync::Arc::as_ptr(table) as *const () as usize;
+    RECURSIVE_TABLES.with(|tables| {
+        tables.borrow().iter().rev().find_map(|&(working, recurring, index)| {
+            if pointer == working {
+                Some(("REC_CTE_SCAN", index))
+            } else if pointer == recurring {
+                Some(("REC_REC_CTE_SCAN", index))
+            } else {
+                None
+            }
+        })
+    })
+}
+
 pub(super) fn physical_tree(
     op: &dyn PhysicalOperator,
     logical: Option<&LogicalOperator>,
@@ -628,6 +661,40 @@ pub(super) fn physical_tree(
     analyze: bool,
 ) -> ExplainNode {
     let children = op.children();
+    // `PhysicalRecursiveCTE`: its recursive part is planned for each round, so it is planned here
+    // once more to show
+    if let Some(
+        cte @ LogicalOperator {
+            kind:
+                K::RecursiveCte {
+                    working,
+                    recurring,
+                    table_index,
+                    recursive,
+                    unresolved,
+                    ..
+                },
+            children: logical_children,
+        },
+    ) = logical
+        && op.name() == "REC_CTE"
+        && children.len() == 1
+        && logical_children.len() == 1
+    {
+        let child_estimate = |at: usize| estimate.and_then(|e| e.children.get(at));
+        let anchor = physical_tree(children[0].as_ref(), Some(&logical_children[0]), child_estimate(0), analyze);
+        let pointer = |table: &std::sync::Arc<_>| std::sync::Arc::as_ptr(table) as *const () as usize;
+        RECURSIVE_TABLES.with(|t| t.borrow_mut().push((pointer(working), pointer(recurring), *table_index)));
+        let plan = crate::execution::create_plan((**recursive).clone());
+        let rounds = physical_tree(plan.as_ref(), Some(unresolved), child_estimate(1), analyze);
+        RECURSIVE_TABLES.with(|t| t.borrow_mut().pop());
+        return ExplainNode {
+            name: op.name().to_string(),
+            info: operator_info(cte, true),
+            estimate: estimate.map(|e| e.cardinality),
+            children: vec![anchor, rounds],
+        };
+    }
     // a column select that went into the projection below it has no physical operator
     if let Some(LogicalOperator {
         kind: K::ColumnSelect { .. },
@@ -738,6 +805,10 @@ pub(super) fn physical_tree(
         // `PhysicalTableScan::GetName`
         Some(K::ParquetScan { scan, .. }) => scan.function_name.to_uppercase(),
         Some(K::JsonScan { scan, .. }) => scan.function_name.to_uppercase(),
+        Some(K::WorkingTable { working, .. }) => match recursive_scan(working) {
+            Some((name, _)) => name.to_string(),
+            None => op.name().to_string(),
+        },
         _ => op.name().to_string(),
     };
     let mut info: Vec<(String, String)> = match logical {

@@ -181,6 +181,8 @@ pub enum LogicalOperatorKind {
     /// `LogicalRecursiveCTE`: the rows of its child, then those of `recursive`, run over and over
     /// on the rows of the last round in `working`, until a round adds nothing.
     RecursiveCte {
+        /// the name of the CTE, for `EXPLAIN`
+        name: String,
         table_index: usize,
         types: Vec<LogicalType>,
         union_all: bool,

@@ -512,6 +512,7 @@ impl Binder<'_> {
             resolve_column_bindings(&mut recursive)?;
             LogicalOperator::new(
                 LogicalOperatorKind::RecursiveCte {
+                    name: name.to_string(),
                     table_index: self.generate_table_index(),
                     types: types.clone(),
                     union_all: node.union_all,

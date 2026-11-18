@@ -2560,6 +2560,19 @@ fn estimate(op: &LogicalOperator, optimizer: &mut JoinOrderOptimizer) -> PlanEst
             optimizer.note_delim(op);
         }
     }
+    // the recursive part, a round of it over the rows of the anchor, as a second child
+    if let K::RecursiveCte {
+        working, unresolved, ..
+    } = &op.kind
+    {
+        let anchor = optimizer.stats(&op.children[0]);
+        let mut inner = optimizer.clone();
+        inner.ctes.insert(
+            Arc::as_ptr(working) as *const () as usize,
+            (op.children[0].column_bindings(), anchor),
+        );
+        children.push(estimate(unresolved, &mut inner));
+    }
     PlanEstimate {
         // `CardinalityFromDouble`: truncated, and a row for what is not nothing
         cardinality: {

@@ -220,7 +220,7 @@ pub fn select_operator(op_type: &str) -> bool {
             | "UNION"
             | "CTE"
             | "CTE_SCAN"
-            | "RECURSIVE_CTE"
+            | "REC_CTE"
             | "RECURSIVE_KEY_CTE"
             | "RECURSIVE_KEY_JOIN"
             | "EMPTY_RESULT"
