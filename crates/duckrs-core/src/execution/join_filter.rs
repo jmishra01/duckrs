@@ -57,6 +57,46 @@ pub struct JoinFilter {
     bloom_off: AtomicBool,
     /// whether a scan it went to is large enough for the Bloom filter
     bloom: AtomicBool,
+    /// what decides on a Bloom or prefix-range filter (`CanUseBloomFilter`)
+    shape: JoinShape,
+    /// the largest estimated rows of a scan it went to (`estimated_scan_cardinality`)
+    scan_estimate: AtomicU64,
+    /// the filter of the build keys published next to `published`
+    runtime: OnceLock<Option<RuntimeFilter>>,
+}
+
+/// What of its join decides which filters of the build keys a join filter publishes.
+#[derive(Debug, Clone, Default)]
+pub struct JoinShape {
+    /// the equalities among its conditions
+    pub equalities: usize,
+    /// the estimated rows of the probe side
+    pub probe_estimate: u64,
+    /// `build_side_has_filter`
+    pub build_filtered: bool,
+    /// the build key, as the filter names it
+    pub key_name: String,
+}
+
+/// `DeferredRuntimeFilterType`: what a scan checks its values against besides `Published`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RuntimeFilter {
+    /// `k IN BF(key)`
+    Bloom,
+    /// `k IN PRF(key)`
+    PrefixRange,
+}
+
+const BUILD_TO_PROBE_RATIO_THRESHOLD: f64 = 1.0;
+const NON_FILTERING_RATIO_THRESHOLD: f64 = 0.1;
+const NON_FILTERING_BUILD_SIDE_THRESHOLD: usize = 4_194_304;
+/// `SMALL_EXACT_PRF_BITS`
+const SMALL_EXACT_PRF_BITS: u128 = 1 << 26;
+
+/// `BloomFilterBitBudget`: `GetNumberOfSectors` of the rows, in bits.
+fn bloom_filter_bits(rows: usize) -> u128 {
+    let bits = 512usize.max(rows.saturating_mul(12)).next_power_of_two();
+    ((bits >> 6).min(1 << 26) * 64) as u128
 }
 
 /// The filter of the build keys that a scan applies and shows (`Dynamic Filters`).
@@ -195,8 +235,11 @@ fn for_each_value(vector: &Vector, count: usize, mut f: impl FnMut(usize, Option
 }
 
 impl JoinFilter {
-    pub fn new(null_safe: bool, ty: LogicalType) -> Self {
+    pub fn new(null_safe: bool, ty: LogicalType, shape: JoinShape) -> Self {
         Self {
+            shape,
+            scan_estimate: AtomicU64::new(0),
+            runtime: OnceLock::new(),
             null_safe,
             ty,
             in_threshold: IN_FILTER_THRESHOLD.load(Ordering::Relaxed),
@@ -237,7 +280,13 @@ impl JoinFilter {
             result
         });
         let published = complete.then(|| self.finalize_filters(keys, count)).flatten();
-        if self.keys.set(value).is_err() || self.published.set(published).is_err() {
+        let runtime = match &published {
+            Some(Published::In(values)) => self.runtime_filter(values.first(), values.last(), count),
+            Some(Published::Range(min, max)) => self.runtime_filter(Some(min), Some(max), count),
+            _ => None,
+        };
+        if self.keys.set(value).is_err() || self.published.set(published).is_err() || self.runtime.set(runtime).is_err()
+        {
             // a join that runs twice would give a scan the keys of the time before
             self.off.store(true, Ordering::Relaxed);
         }
@@ -269,6 +318,75 @@ impl JoinFilter {
         Some(Published::Range(min, max))
     }
 
+    /// `CanUseBloomFilter`: the join has one equality, and its build side is not larger than its
+    /// probe side, nor large and unfiltered next to it.
+    fn can_use_bloom_filter(&self, build_rows: usize) -> bool {
+        let mut probe = self.shape.probe_estimate;
+        if self.shape.build_filtered {
+            probe = probe.max(self.scan_estimate.load(Ordering::Relaxed));
+        }
+        let ratio = build_rows as f64 / probe as f64;
+        self.shape.equalities == 1
+            && ratio <= BUILD_TO_PROBE_RATIO_THRESHOLD
+            && !(!self.shape.build_filtered
+                && ratio > NON_FILTERING_RATIO_THRESHOLD
+                && build_rows > NON_FILTERING_BUILD_SIDE_THRESHOLD)
+    }
+
+    /// `TryComputeSpan`: how far apart the smallest and largest key are, where the type has that.
+    fn span(&self, min: &Key, max: &Key) -> Option<u128> {
+        if let (Some(low), Some(high)) = (min.int, max.int) {
+            let (lowest, highest): (i128, i128) = match self.ty.id() {
+                LogicalTypeId::TinyInt => (i8::MIN.into(), i8::MAX.into()),
+                LogicalTypeId::SmallInt => (i16::MIN.into(), i16::MAX.into()),
+                LogicalTypeId::Integer | LogicalTypeId::Date => (i32::MIN.into(), i32::MAX.into()),
+                _ => (i64::MIN.into(), i64::MAX.into()),
+            };
+            let span = high as i128 - low as i128;
+            return (span >= lowest && span <= highest).then_some(span as u128);
+        }
+        if self.ty.id() == LogicalTypeId::Varchar {
+            // `GetPrefixIntegerComparable`: the first four bytes
+            let prefix = |key: &Key| {
+                let text = key.value.try_to_string().unwrap_or_default();
+                let mut bytes = [0u8; 4];
+                for (at, byte) in text.bytes().take(4).enumerate() {
+                    bytes[at] = byte;
+                }
+                u32::from_be_bytes(bytes)
+            };
+            return prefix(max).checked_sub(prefix(min)).map(u128::from);
+        }
+        None
+    }
+
+    /// The prefix-range filter where the keys are close enough together, else the Bloom filter,
+    /// for keys that are not all one (`FinalizeFilters`).
+    fn runtime_filter(&self, min: Option<&Key>, max: Option<&Key>, build_rows: usize) -> Option<RuntimeFilter> {
+        if !self.can_use_bloom_filter(build_rows) {
+            return None;
+        }
+        let prefix_type = supported(&self.ty)
+            || matches!(
+                self.ty.id(),
+                LogicalTypeId::TinyInt
+                    | LogicalTypeId::SmallInt
+                    | LogicalTypeId::UTinyInt
+                    | LogicalTypeId::USmallInt
+                    | LogicalTypeId::UInteger
+                    | LogicalTypeId::UBigInt
+                    | LogicalTypeId::Varchar
+            );
+        if prefix_type
+            && let (Some(min), Some(max)) = (min, max)
+            && let Some(span) = self.span(min, max)
+            && (span < SMALL_EXACT_PRF_BITS || span <= bloom_filter_bits(build_rows))
+        {
+            return Some(RuntimeFilter::PrefixRange);
+        }
+        Some(RuntimeFilter::Bloom)
+    }
+
     /// Whether the filter has the keys of its join and still drops rows with them.
     pub fn is_active(&self) -> bool {
         if self.off.load(Ordering::Relaxed) {
@@ -291,7 +409,14 @@ impl JoinFilter {
                 filter
             }
         };
-        Some(match self.published.get()?.as_ref()? {
+        let runtime = self.runtime.get().copied().flatten().map(|runtime| {
+            let kind = match runtime {
+                RuntimeFilter::Bloom => "BF",
+                RuntimeFilter::PrefixRange => "PRF",
+            };
+            format!("optional: {name} IN {kind}({})", self.shape.key_name)
+        });
+        let published = match self.published.get()?.as_ref()? {
             Published::Single(v) => {
                 let op = if self.null_safe { "IS NOT DISTINCT FROM" } else { "=" };
                 retain(format!("{name} {op} {}", literal(v)))
@@ -300,11 +425,20 @@ impl JoinFilter {
                 let list: Vec<String> = values.iter().map(literal).collect();
                 format!("optional: {}", retain(format!("{name} IN ({})", list.join(", "))))
             }
+            // a prefix-range filter takes the place of the range
+            Published::Range(..) if runtime.is_some() && self.runtime.get().copied().flatten() == Some(RuntimeFilter::PrefixRange) => {
+                return runtime;
+            }
             Published::Range(min, max) => format!(
                 "(optional: {} AND optional: {})",
                 retain(format!("{name} >= {}", literal(min))),
                 retain(format!("{name} <= {}", literal(max)))
             ),
+        };
+        // `TableFilterSet::PushFilter`: the runtime filter comes after, ANDed
+        Some(match runtime {
+            Some(runtime) => format!("({published} AND {runtime})"),
+            None => published,
         })
     }
 
@@ -432,6 +566,9 @@ pub fn push_join_filters(op: &mut LogicalOperator) {
     if conditions.iter().any(|c| c.left.is_volatile()) {
         return;
     }
+    let equalities = conditions.iter().filter(|c| c.is_equality()).count();
+    let probe_estimate = crate::optimizer::join_order::estimated_cardinality(&op.children[0]);
+    let build_filtered = is_filtering(&op.children[1]);
     for condition in conditions.iter_mut() {
         let BoundExprKind::Reference(column) = condition.left.kind else {
             continue;
@@ -443,10 +580,29 @@ pub fn push_join_filters(op: &mut LogicalOperator) {
         {
             continue;
         }
-        let filter = std::sync::Arc::new(JoinFilter::new(condition.null_safe(), condition.left.return_type.clone()));
+        let filter = std::sync::Arc::new(JoinFilter::new(
+            condition.null_safe(),
+            condition.left.return_type.clone(),
+            JoinShape {
+                equalities,
+                probe_estimate,
+                build_filtered,
+                key_name: condition.right.to_string(),
+            },
+        ));
         if push_into(&mut op.children[0], column, &filter) {
             condition.filter = Some(filter);
         }
+    }
+}
+
+/// `JoinFilterPushdownOptimizer::IsFiltering`.
+fn is_filtering(op: &LogicalOperator) -> bool {
+    use LogicalOperatorKind as K;
+    match &op.kind {
+        K::Get { filters, .. } => !filters.is_empty(),
+        K::Filter { .. } | K::TopN { .. } => true,
+        _ => op.children.iter().any(is_filtering),
     }
 }
 
@@ -518,6 +674,7 @@ fn push_into(op: &mut LogicalOperator, column: usize, filter: &std::sync::Arc<Jo
             if table.row_count() >= MIN_BLOOM_TABLE_ROWS {
                 filter.bloom.store(true, Ordering::Relaxed);
             }
+            filter.scan_estimate.fetch_max(table.row_count() as u64, Ordering::Relaxed);
             if !already {
                 let child = BoundExpr::new(BoundExprKind::Reference(position), definition.ty.clone())
                     .with_alias(definition.name.clone());

@@ -2758,6 +2758,7 @@ test/sql/join/inner/list_join.test
 test/sql/join/inner/not_between_is_null.test
 test/sql/join/inner/null_safe_runtime_filter.test
 test/sql/join/inner/null_safe_runtime_filter_boundaries.test
+test/sql/join/inner/null_safe_runtime_filter_plan.test
 test/sql/join/inner/right_semi_dict_emission_dead_end.test
 test/sql/join/inner/test_eq_ineq_join.test
 test/sql/join/inner/test_inner_join_filter_pushdown.test
