@@ -19,6 +19,9 @@ use std::sync::Arc;
 
 /// The `column_ids` entry of a scan for the `rowid` pseudo-column (`COLUMN_IDENTIFIER_ROW_ID`).
 pub const COLUMN_IDENTIFIER_ROW_ID: usize = usize::MAX;
+/// The `column_ids` entry of a scan for the `row_number` virtual column
+/// (`COLUMN_IDENTIFIER_ROW_NUMBER`): the place of a row among the rows of the table, from 1.
+pub const COLUMN_IDENTIFIER_ROW_NUMBER: usize = usize::MAX - 1;
 
 #[derive(Debug, Clone)]
 pub enum LogicalOperatorKind {
@@ -528,7 +531,7 @@ impl LogicalOperator {
                 ..
             } => {
                 let type_of = |&i: &usize| {
-                    if i == COLUMN_IDENTIFIER_ROW_ID {
+                    if i == COLUMN_IDENTIFIER_ROW_ID || i == COLUMN_IDENTIFIER_ROW_NUMBER {
                         LogicalType::BIGINT
                     } else {
                         table.columns[i].ty.clone()

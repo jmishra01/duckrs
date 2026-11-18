@@ -623,6 +623,7 @@ test/optimizer/remove_redundant_order_keys_deferred.test
 test/optimizer/remove_redundant_order_keys_side_effects.test
 test/optimizer/remove_unused_filter_column.test
 test/optimizer/reported_bugs/in_vs_where.test
+test/optimizer/row_number_virtual_column.test
 test/optimizer/row_number_virtual_column_local.test
 test/optimizer/sampling_pushdown.test
 test/optimizer/statistics/constant_or_null_conjunction.test
@@ -4932,6 +4933,7 @@ test/sql/window/test_single_following_frame.test
 test/sql/window/test_split_partition_heap.test
 test/sql/window/test_streaming_lead_lag.test
 test/sql/window/test_streaming_nthvalue.test
+test/sql/window/test_streaming_window.test
 test/sql/window/test_streaming_window_distinct.test
 test/sql/window/test_thread_count.test
 test/sql/window/test_tpcc_results.test

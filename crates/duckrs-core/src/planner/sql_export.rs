@@ -1392,6 +1392,24 @@ impl Exporter<'_> {
         .into();
         from.alias = alias.clone();
         let column_of = |id: usize| {
+            // `TableFunctionColumn`: the `row_number` column is the window it stands for
+            if id == super::logical::COLUMN_IDENTIFIER_ROW_NUMBER {
+                let window = WindowExpr {
+                    name: QualifiedName {
+                        qualification: vec!["system".into(), "main".into()],
+                        name: "row_number".into(),
+                    },
+                    start: ast::WindowBoundary::UnboundedPreceding,
+                    end: ast::WindowBoundary::CurrentRowRange,
+                    ..Default::default()
+                };
+                // a window: a WHERE on the scan goes in a SELECT around it
+                return Column {
+                    expr: ExprKind::Window(Box::new(window)).into(),
+                    kind: Kind::Window,
+                    volatile: false,
+                };
+            }
             let name = if id == COLUMN_IDENTIFIER_ROW_ID {
                 "rowid".to_string()
             } else {
@@ -1400,7 +1418,7 @@ impl Exporter<'_> {
             Column::plain(Expr::column(vec![alias.clone(), name]))
         };
         let type_of = |id: usize| {
-            if id == COLUMN_IDENTIFIER_ROW_ID {
+            if id == COLUMN_IDENTIFIER_ROW_ID || id == super::logical::COLUMN_IDENTIFIER_ROW_NUMBER {
                 LogicalType::BIGINT
             } else {
                 table.columns[id].ty.clone()

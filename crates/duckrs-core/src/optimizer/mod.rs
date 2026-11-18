@@ -39,6 +39,7 @@ pub mod rewriter;
 pub mod scan_filters;
 pub mod statistics;
 pub mod top_n;
+pub mod row_number_rewriter;
 pub mod type_pushdown;
 pub mod unused_columns;
 
@@ -56,6 +57,7 @@ pub struct OptimizerOptions {
     pub statistics_propagation: bool,
     pub empty_result_pullup: bool,
     pub unused_columns: bool,
+    pub row_number_rewriter: bool,
     pub type_pushdown: bool,
     pub common_subplan: bool,
     pub projection_pullup: bool,
@@ -98,6 +100,7 @@ impl Default for OptimizerOptions {
             statistics_propagation: true,
             empty_result_pullup: true,
             unused_columns: true,
+            row_number_rewriter: true,
             type_pushdown: true,
             common_subplan: true,
             projection_pullup: true,
@@ -138,6 +141,7 @@ impl OptimizerOptions {
             statistics_propagation: false,
             empty_result_pullup: false,
             unused_columns: false,
+            row_number_rewriter: false,
             type_pushdown: false,
             common_subplan: false,
             projection_pullup: false,
@@ -177,6 +181,7 @@ impl OptimizerOptions {
             statistics_propagation: !off("statistics_propagation"),
             empty_result_pullup: !off("empty_result_pullup"),
             unused_columns: !off("unused_columns"),
+            row_number_rewriter: !off("window_rewriter"),
             type_pushdown: !off("type_pushdown"),
             common_subplan: !off("common_subplan"),
             projection_pullup: !off("projection_pullup"),
@@ -356,6 +361,10 @@ pub fn optimize_timed(
         plan = run("common_subplan", plan, &mut common_subplan::optimize);
     }
     index_scan::plan_index_scans(&mut plan, &options);
+    // `ROW_NUMBER() OVER ()` over a table becomes its `row_number` column
+    if options.row_number_rewriter {
+        plan = run("row_number_rewriter", plan, &mut row_number_rewriter::rewrite);
+    }
     // casts in SELECT pushed into file readers, e.g. `SELECT num::UHUGEINT FROM read_csv(...)`
     if options.type_pushdown {
         plan = run("type_pushdown", plan, &mut |mut plan| {

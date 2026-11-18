@@ -424,6 +424,9 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             let mut info = entry("Table", table.qualified_name());
             info.extend(entry("Type", "Sequential Scan".to_string()));
             let name = |&column: &usize| {
+                if column == crate::planner::logical::COLUMN_IDENTIFIER_ROW_NUMBER {
+                    return "row_number".to_string();
+                }
                 let name = table.columns.get(column).map(|c| c.name.as_str());
                 name.unwrap_or("rowid").to_string()
             };

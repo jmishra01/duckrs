@@ -22,7 +22,7 @@ use crate::execution::run_plan;
 use crate::execution::temporary::{self, PartitionedSpill, SpillFile};
 use crate::function::aggregates::{AggregateState, combine_states, value_keys};
 use crate::planner::expression::{BoundAggregate, BoundExpr, BoundExprKind, ColumnBinding};
-use crate::planner::logical::{BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, CteKeyColumn, LogicalOperator, OnConflict};
+use crate::planner::logical::{BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, COLUMN_IDENTIFIER_ROW_NUMBER, CteKeyColumn, LogicalOperator, OnConflict};
 use crate::storage::log_writer::can_serialize;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::{
@@ -278,6 +278,9 @@ impl PhysicalTableScan {
                 if i == COLUMN_IDENTIFIER_ROW_ID {
                     return ids.vector(first_row, chunk.len());
                 }
+                if i == COLUMN_IDENTIFIER_ROW_NUMBER {
+                    return Vector::sequence(LogicalType::BIGINT, first_row as i64 + 1, 1);
+                }
                 Ok(match cursor.map(|scan| &scan.columns[position]) {
                     None => chunk.column(i).clone(),
                     Some(Ok(at)) => chunk.column(*at).clone(),
@@ -360,7 +363,7 @@ impl PhysicalTableScan {
         let mut read = Vec::new();
         let mut columns = Vec::with_capacity(self.column_ids.len());
         for (position, &column) in self.column_ids.iter().enumerate() {
-            if column == COLUMN_IDENTIFIER_ROW_ID {
+            if column == COLUMN_IDENTIFIER_ROW_ID || column == COLUMN_IDENTIFIER_ROW_NUMBER {
                 // stands for the sequence that `get_data` makes
                 columns.push(Ok(usize::MAX));
             } else if used[position] {
@@ -461,7 +464,7 @@ impl PhysicalTableScan {
                 }
             }
             _ if positions.iter().all(|&position| {
-                self.column_ids[position] == COLUMN_IDENTIFIER_ROW_ID
+                matches!(self.column_ids[position], COLUMN_IDENTIFIER_ROW_ID | COLUMN_IDENTIFIER_ROW_NUMBER)
                     || self.table.columns[self.column_ids[position]].ty.id()
                         != duckrs_common::types::LogicalTypeId::Varchar
             }) =>
@@ -473,7 +476,7 @@ impl PhysicalTableScan {
         conjuncts.sort_by_key(|(conjunct, positions)| (positions.len(), cost(conjunct, positions)));
         let type_of = |position: usize| -> LogicalType {
             match self.column_ids[position] {
-                COLUMN_IDENTIFIER_ROW_ID => LogicalType::BIGINT,
+                COLUMN_IDENTIFIER_ROW_ID | COLUMN_IDENTIFIER_ROW_NUMBER => LogicalType::BIGINT,
                 column => self.table.columns[column].ty.clone(),
             }
         };
@@ -483,6 +486,11 @@ impl PhysicalTableScan {
                     let mut ids = ids.vector(first_row, group_rows)?;
                     ids.slice(&SelectionVector::from_vec(selection.to_vec()), selection.len());
                     Ok(ids)
+                }
+                COLUMN_IDENTIFIER_ROW_NUMBER => {
+                    let mut numbers = Vector::sequence(LogicalType::BIGINT, first_row as i64 + 1, 1)?;
+                    numbers.slice(&SelectionVector::from_vec(selection.to_vec()), selection.len());
+                    Ok(numbers)
                 }
                 column => source.fetch_rows(group, column, selection),
             }
