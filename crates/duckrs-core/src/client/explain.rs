@@ -753,6 +753,23 @@ pub(super) fn physical_tree(
     }
 }
 
+/// `Dynamic Filters` of the table scans, from a run of the statement, in the order of the scans.
+pub(super) fn add_dynamic_filters(node: &mut ExplainNode, recorded: &mut impl Iterator<Item = Option<String>>) {
+    if matches!(node.name.as_str(), "SEQ_SCAN" | "TABLE_SCAN")
+        && let Some(Some(filters)) = recorded.next()
+    {
+        let at = node
+            .info
+            .iter()
+            .position(|(key, _)| key == "Row Groups Scanned")
+            .unwrap_or(node.info.len());
+        node.info.insert(at, ("Dynamic Filters".to_string(), filters));
+    }
+    for child in &mut node.children {
+        add_dynamic_filters(child, recorded);
+    }
+}
+
 /// `BuildExplainTree`: what the text renderer shows of a node. A detail without a key is `Text`.
 fn text_tree(node: &ExplainNode) -> TreeNode {
     let details = node

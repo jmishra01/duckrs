@@ -1175,6 +1175,7 @@ impl ClientContext {
         if let Ok(threshold) = self.setting_text("dynamic_or_filter_threshold").parse() {
             options.dynamic_or_filter_threshold = threshold;
         }
+        crate::execution::join_filter::set_in_filter_threshold(options.dynamic_or_filter_threshold);
         if let Ok(threshold) = self.setting_text("perfect_ht_threshold").parse() {
             options.perfect_ht_threshold = threshold;
         }
@@ -2866,10 +2867,18 @@ impl ClientContext {
         let ([logical, logical_optimized, physical], _, _) = self.explain_trees(statement, analyze)?;
         let logical = explain::render(&logical, format, upper);
         let logical_optimized = explain::render(&logical_optimized, format, upper);
-        let physical = explain::render(&physical, format, upper);
-        if explain_type == ExplainType::Analyze {
-            self.execute_statement(statement)?;
-        }
+        let physical = if explain_type == ExplainType::Analyze {
+            // what the joins gave the scans is known once the statement ran
+            crate::execution::join_filter::start_recording();
+            let ran = self.execute_statement(statement);
+            let recorded = crate::execution::join_filter::take_recorded();
+            ran?;
+            let mut physical = physical;
+            explain::add_dynamic_filters(&mut physical, &mut recorded.into_iter());
+            explain::render(&physical, format, upper)
+        } else {
+            explain::render(&physical, format, upper)
+        };
         let rows: Vec<(&str, String)> = if explain_type == ExplainType::Analyze {
             vec![("analyzed_plan", physical)]
         } else {
@@ -3560,6 +3569,7 @@ impl ClientContext {
         crate::execution::profiler::with_profiler(operator_profiler.clone(), || {
             crate::execution::temporary::with_memory(memory, || execute_plan_with(&collector, threads))
         })?;
+        crate::execution::join_filter::record(&collector);
         if let (Some(start), Some(planned), Some(optimized), Some(physical), Some(operators)) =
             (profiling, planned, optimized, physical, &operator_profiler)
         {

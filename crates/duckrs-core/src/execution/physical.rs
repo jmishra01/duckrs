@@ -201,6 +201,11 @@ pub trait PhysicalOperator: fmt::Debug + Send + Sync {
         None
     }
 
+    /// `Dynamic Filters`: what the joins above gave a table scan, once they did.
+    fn dynamic_filters(&self) -> Option<String> {
+        None
+    }
+
     /// Whether a join has rows to emit through `get_data` after its input is done
     /// (`IsSource` of RIGHT and FULL joins).
     fn has_unmatched_source(&self) -> bool {
@@ -692,6 +697,33 @@ impl PhysicalOperator for PhysicalTableScan {
             filtered,
             sampling,
         })
+    }
+    fn dynamic_filters(&self) -> Option<String> {
+        let mut found: Vec<(String, Vec<String>)> = Vec::new();
+        let mut visit = |expr: &BoundExpr| {
+            if let BoundExprKind::JoinFilter { child, filter } = &expr.kind
+                && let Some(text) = filter.describe(&child.alias)
+            {
+                match found.iter_mut().find(|(name, _)| *name == child.alias) {
+                    Some((_, texts)) => texts.push(text),
+                    None => found.push((child.alias.clone(), vec![text])),
+                }
+            }
+        };
+        match self.filter.as_ref().map(|f| &f.kind) {
+            Some(BoundExprKind::Conjunction { and: true, children }) => children.iter().for_each(&mut visit),
+            Some(_) => visit(self.filter.as_ref().expect("matched")),
+            None => {}
+        }
+        // `TableFilterSet::PushFilter`: the filters of one column are one AND
+        let lines: Vec<String> = found
+            .into_iter()
+            .map(|(_, texts)| match texts.as_slice() {
+                [one] => one.clone(),
+                _ => format!("({})", texts.join(" AND ")),
+            })
+            .collect();
+        (!lines.is_empty()).then(|| lines.join("\n"))
     }
     fn row_groups_scanned(&self) -> Option<(usize, usize)> {
         if self.index_rows.is_some() {
