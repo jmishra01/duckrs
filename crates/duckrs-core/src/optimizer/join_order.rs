@@ -30,8 +30,28 @@ use duckrs_parser::ast::{ComparisonOp, JoinType};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-/// `approximate_join_order_threshold`: from here on the order is picked greedily.
-const APPROXIMATE_THRESHOLD: usize = 12;
+thread_local! {
+    /// `approximate_join_order_threshold`: from here on the order is picked greedily.
+    static APPROXIMATE_THRESHOLD: std::cell::Cell<usize> = const { std::cell::Cell::new(12) };
+    /// `debug_force_no_cross_product`
+    static FORCE_NO_CROSS_PRODUCT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// what the join order refused, for the client to raise
+    static ERROR: std::cell::RefCell<Option<duckrs_common::Error>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The settings of the join order for the plans optimized from here on.
+pub fn configure(approximate_threshold: usize, force_no_cross_product: bool) {
+    APPROXIMATE_THRESHOLD.with(|t| t.set(approximate_threshold));
+    FORCE_NO_CROSS_PRODUCT.with(|f| f.set(force_no_cross_product));
+}
+
+/// The error the last join order ran into (`PlanEnumerator::SolveJoinOrder` throws).
+pub fn take_error() -> duckrs_common::Result<()> {
+    match ERROR.with(|e| e.borrow_mut().take()) {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
 /// Past this many pairs DPhyp gives up.
 const MAX_PAIRS: usize = 10_000;
 /// A set of relations is a mask, so there can be this many.
@@ -286,6 +306,18 @@ fn bare_column(expr: &BoundExpr) -> Option<ColumnBinding> {
     match &expr.kind {
         BoundExprKind::ColumnRef { binding, depth: 0 } => Some(*binding),
         BoundExprKind::Cast { child, .. } => bare_column(child),
+        _ => None,
+    }
+}
+
+/// An ON-clause equality between two columns (`JoinEqualityGroups::AddEquality`).
+fn residual_equality(conjunct: &BoundExpr) -> Option<(ColumnBinding, ColumnBinding)> {
+    match &conjunct.kind {
+        BoundExprKind::Comparison {
+            op: ComparisonOp::Equal | ComparisonOp::NotDistinctFrom,
+            left,
+            right,
+        } => bare_column(left).zip(bare_column(right)),
         _ => None,
     }
 }
@@ -997,9 +1029,33 @@ impl Enumerator<'_> {
 
     fn solve(&mut self) {
         let all = (1 << self.relations) - 1;
-        if self.relations >= APPROXIMATE_THRESHOLD || !self.solve_exactly() || !self.plans.contains_key(&all) {
+        if self.relations >= APPROXIMATE_THRESHOLD.with(std::cell::Cell::get)
+            || !self.solve_exactly()
+            || !self.plans.contains_key(&all)
+        {
             self.solve_approximately();
         }
+        if FORCE_NO_CROSS_PRODUCT.with(std::cell::Cell::get) && self.uses_cross_product(all) {
+            ERROR.with(|e| {
+                *e.borrow_mut() = Some(duckrs_common::Error::new(
+                    duckrs_common::ErrorKind::InvalidInput,
+                    "Query requires a cross-product, but 'force_no_cross_product' PRAGMA is enabled",
+                ));
+            });
+        }
+    }
+
+    /// `PlanUsesCrossProduct`: a join of the plan between sets no edge connects.
+    fn uses_cross_product(&self, set: u64) -> bool {
+        let Some(node) = self.plans.get(&set) else {
+            return set.count_ones() > 1;
+        };
+        if node.left == 0 || node.right == 0 {
+            return false;
+        }
+        !(self.connected(node.left, node.right) || self.connected(node.right, node.left))
+            || self.uses_cross_product(node.left)
+            || self.uses_cross_product(node.right)
     }
 }
 
@@ -1516,10 +1572,61 @@ impl JoinOrderOptimizer {
                     let distinct = found.iter().filter_map(|c| columns.get(c).map(|s| s.current.count));
                     distinct.reduce(f64::max)
                 };
+                // `GetLeftJoinSelectivity`: equalities that connect the same columns
+                // (`JoinEqualityGroups`) count once, so `a = x AND a = y` is no composite key
+                let mut parents: HashMap<ColumnBinding, ColumnBinding> = HashMap::new();
+                fn root(parents: &mut HashMap<ColumnBinding, ColumnBinding>, binding: ColumnBinding) -> ColumnBinding {
+                    let mut current = binding;
+                    while let Some(&parent) = parents.get(&current) {
+                        if parent == current {
+                            break;
+                        }
+                        current = parent;
+                    }
+                    current
+                }
+                let comparisons = conditions.iter().filter(|c| !c.is_equality()).cloned().map(condition_expression);
+                let mut conjuncts: Vec<BoundExpr> = comparisons.collect();
+                if let Some(predicate) = predicate {
+                    split_conjuncts(predicate.clone(), &mut conjuncts);
+                }
+                let mut grouped: Vec<Option<(ColumnBinding, ColumnBinding)>> = Vec::new();
+                for condition in conditions.iter().filter(|condition| condition.is_equality()) {
+                    let pair = bare_column(&condition.left).zip(bare_column(&condition.right));
+                    if let Some((l, r)) = pair {
+                        let (a, b) = (root(&mut parents, l), root(&mut parents, r));
+                        parents.entry(a).or_insert(a);
+                        parents.insert(b, a);
+                    }
+                    grouped.push(pair);
+                }
+                for (l, r) in conjuncts.iter().filter_map(residual_equality) {
+                    let (a, b) = (root(&mut parents, l), root(&mut parents, r));
+                    parents.entry(a).or_insert(a);
+                    parents.insert(b, a);
+                }
+                let mut group_roots: Vec<ColumnBinding> = Vec::new();
+                let keep: Vec<bool> = grouped
+                    .iter()
+                    .map(|pair| match pair {
+                        Some((l, _)) => {
+                            let group = root(&mut parents, *l);
+                            if group_roots.contains(&group) {
+                                false
+                            } else {
+                                group_roots.push(group);
+                                true
+                            }
+                        }
+                        None => true,
+                    })
+                    .collect();
                 // past the optimizer, the comparisons of the predicate are conditions too
                 let domains: Vec<f64> = conditions
                     .iter()
                     .filter(|condition| condition.is_equality())
+                    .zip(keep)
+                    .filter_map(|(condition, keep)| keep.then_some(condition))
                     .map(|condition| {
                         let sides = [domain_of(&condition.left), domain_of(&condition.right)];
                         let domain = sides.into_iter().flatten().reduce(f64::max);
@@ -1528,15 +1635,18 @@ impl JoinOrderOptimizer {
                     .collect();
                 let mut denominator =
                     composite_denominator(&domains, left_rows, right_rows).unwrap_or_else(|| domains.iter().product());
-                let comparisons = conditions.iter().filter(|c| !c.is_equality()).cloned().map(condition_expression);
-                let mut conjuncts: Vec<BoundExpr> = comparisons.collect();
-                if let Some(predicate) = predicate {
-                    split_conjuncts(predicate.clone(), &mut conjuncts);
-                }
-                {
-                    for conjunct in &conjuncts {
-                        denominator *= predicate_denominator(conjunct, &domain_of);
+                for conjunct in &conjuncts {
+                    // a same-side equality joins the group of an equality between the sides, and
+                    // a group of its own is a residual (`GetResidualOnSelectivity`) once
+                    if let Some(pair) = residual_equality(conjunct) {
+                        let group = root(&mut parents, pair.0);
+                        if !group_roots.contains(&group) {
+                            group_roots.push(group);
+                            denominator /= DEFAULT_SELECTIVITY;
+                        }
+                        continue;
                     }
+                    denominator *= predicate_denominator(conjunct, &domain_of);
                 }
                 let inner = left_rows * right_rows / denominator;
                 let cardinality = match join_type {

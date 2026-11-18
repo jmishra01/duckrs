@@ -1178,6 +1178,10 @@ impl ClientContext {
         crate::execution::join_filter::set_in_filter_threshold(options.dynamic_or_filter_threshold);
         crate::execution::join_filter::set_enabled(options.join_filter_pushdown);
         crate::execution::set_streaming_windows(self.setting_text("enable_optimizer") != "false");
+        if let Ok(threshold) = self.setting_text("approximate_join_order_threshold").parse() {
+            options.approximate_join_order_threshold = threshold;
+        }
+        options.force_no_cross_product = self.setting_text("debug_force_no_cross_product") == "true";
         if let Ok(threshold) = self.setting_text("perfect_ht_threshold").parse() {
             options.perfect_ht_threshold = threshold;
         }
@@ -2721,6 +2725,7 @@ impl ClientContext {
         let bound = binder.bind(statement)?;
         let modifies = !matches!(statement, Statement::Select(_));
         let plan = optimize(bound.plan, self.optimizer_options());
+        crate::optimizer::join_order::take_error()?;
         let databases: Vec<(String, Arc<crate::catalog::Catalog>)> = std::iter::once(self.db.clone())
             .chain(std::iter::once(self.home.clone()))
             .chain(self.home.attached.read().values().cloned())
@@ -2842,6 +2847,7 @@ impl ClientContext {
         let (names, types) = (bound.names.clone(), bound.types.clone());
         let logical = explain::logical_tree(&bound.plan, None);
         let mut plan = optimize(bound.plan, self.optimizer_options());
+        crate::optimizer::join_order::take_error()?;
         let optimized = plan.clone();
         let estimate = estimate_plan(&plan);
         let logical_optimized = explain::logical_tree(&plan, Some(&estimate));
@@ -3551,6 +3557,7 @@ impl ClientContext {
         let planned = profiling.map(|_| std::time::Instant::now());
         let mut optimizers = Vec::new();
         let mut plan = crate::optimizer::optimize_timed(bound.plan, self.optimizer_options(), &mut optimizers);
+        crate::optimizer::join_order::take_error()?;
         let optimized = profiling.map(|_| std::time::Instant::now());
         crate::execution::join_filter::note_probe_estimates(&plan);
         resolve_column_bindings(&mut plan)?;

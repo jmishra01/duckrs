@@ -3999,6 +3999,11 @@ impl PhysicalOperator for PhysicalUpdate {
             .filter_map(|(id, values)| Some((ids.position(*id as u64)?, values)))
             .collect();
         let moves_rows = self.table.update_moves_rows(&self.columns);
+        // C++ keeps statistics as rows are written, and an update only widens them: what is known
+        // of the rows before has to be there for the updated values to add to
+        if !moves_rows {
+            crate::optimizer::statistics::warm_statistics(&self.table);
+        }
         self.table.claim_rows(updates.keys().copied(), count, !moves_rows)?;
         let mut storage = self.table.write_storage()?;
         let mut rewritten = ColumnDataCollection::new(storage.types().to_vec());

@@ -142,6 +142,18 @@ fn aggregate_text(aggregate: &BoundAggregate) -> String {
 }
 
 /// `ExpressionFilter::ToString`: without the parentheses around all of it, if there are any.
+/// The filters of a scan as `GetFilterInfo` shows them: a BETWEEN of a column is its two
+/// comparisons (`FilterCombiner::GenerateTableScanFilters`), in one conjunction.
+fn scan_filter_lines(filters: &[BoundExpr]) -> String {
+    use crate::planner::expression::BoundExprKind as E;
+    lines(filters.iter().map(|filter| match &filter.kind {
+        E::Between { input, lower, upper } if matches!(input.kind, E::ColumnRef { .. }) => {
+            format!("({input} >= {lower}) AND ({input} <= {upper})")
+        }
+        _ => filter_text(filter),
+    }))
+}
+
 pub(crate) fn filter_text(filter: &BoundExpr) -> String {
     let text = filter.to_string();
     let Some(inner) = text.strip_prefix('(').and_then(|t| t.strip_suffix(')')) else {
@@ -425,7 +437,7 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             if !physical {
                 let mut info = Vec::new();
                 if !filters.is_empty() {
-                    info.extend(entry("Filters", lines(filters.iter().map(filter_text))));
+                    info.extend(entry("Filters", scan_filter_lines(filters)));
                 }
                 info.extend(entry("Table", table.qualified_name()));
                 info.extend(entry("Type", "Sequential Scan".to_string()));
@@ -446,7 +458,7 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             };
             info.extend(entry("Projections", lines(projected)));
             if !filters.is_empty() {
-                info.extend(entry("Filters", lines(filters.iter().map(filter_text))));
+                info.extend(entry("Filters", scan_filter_lines(filters)));
             }
             // `PhysicalTableScan::ParamsToString`
             if let Some(sample) = sample {

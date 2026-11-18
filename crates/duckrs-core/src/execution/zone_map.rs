@@ -170,7 +170,8 @@ fn compute_zones(table: &TableCatalogEntry, column: usize, known: &[ColumnZone])
     if let Some(element) = nested_element_type(ty) {
         return compute_nested_zones(table, column, &element);
     }
-    if !has_ordered_statistics(ty) && ty.id() != LogicalTypeId::Interval {
+    // UUIDs and ENUMs keep the statistics of the integers they are stored as
+    if !has_ordered_statistics(ty) && !matches!(ty.id(), LogicalTypeId::Interval | LogicalTypeId::Uuid | LogicalTypeId::Enum) {
         return Vec::new();
     }
     if let Some(source) = table
@@ -367,6 +368,18 @@ fn zones_of(table: &TableCatalogEntry, column: usize) -> Arc<Vec<ColumnZone>> {
 }
 
 /// The argument of a call of `name` that its result follows, in order or reversed, while the others are constant.
+/// Whether a function of one argument follows the order of it (`true`) or reverses it (`false`),
+/// where its `ArgProperties` say it does either.
+pub(crate) fn unary_monotonicity(name: &str) -> Option<bool> {
+    if MONOTONE_FUNCTIONS.contains(&name) {
+        return Some(true);
+    }
+    MONOTONE_ARGUMENTS
+        .iter()
+        .find(|(function, at, _)| *function == name && *at == 0)
+        .map(|&(_, _, increasing)| increasing)
+}
+
 fn monotone_argument(name: &str, children: &[BoundExpr]) -> Option<(usize, bool)> {
     MONOTONE_ARGUMENTS
         .iter()
@@ -468,6 +481,8 @@ impl Group<'_> {
                 let (varying, increasing) = monotone_argument(&function.name, children).expect("checked");
                 self.monotone(expr, varying, increasing)
             }
+            // a cast of NULL is NULL, whether it could convert the values or not
+            BoundExprKind::Cast { child, .. } if matches!(self.range(child), Range::Null) => Range::Null,
             BoundExprKind::Constant(value) if value.is_null() => Range::Null,
             BoundExprKind::Constant(value) => Range::Bounds(value.clone(), value.clone()),
             // `PropagateCaseExpression`: what any branch gives
@@ -1231,7 +1246,39 @@ impl Group<'_> {
 
     /// Whether `left op right` can not hold for any two values of their ranges.
     fn ranges_fail(&self, op: ComparisonOp, left: &BoundExpr, right: &BoundExpr) -> bool {
-        let is = |op, a: &Value, b: &Value| compare_values(op, a, b) == Some(true);
+        // `StringStats`: of the bounds of strings C++ keeps a prefix, and prefixes that are the same
+        // where one was cut decide nothing
+        let cut = |value: &Value| match value.data() {
+            duckrs_common::value::ValueData::Bytes(bytes) if bytes.len() > STRING_STATISTICS_BYTES => {
+                Some(bytes[..STRING_STATISTICS_BYTES].to_vec())
+            }
+            _ => None,
+        };
+        let is = |op, a: &Value, b: &Value| {
+            let (cut_a, cut_b) = (cut(a), cut(b));
+            if cut_a.is_some() || cut_b.is_some() {
+                let bytes = |v: &Value| match v.data() {
+                    duckrs_common::value::ValueData::Bytes(bytes) => Some(bytes.clone()),
+                    _ => None,
+                };
+                let (Some(x), Some(y)) = (bytes(a), bytes(b)) else {
+                    return false;
+                };
+                let (x, y) = (x.as_slice(), y.as_slice());
+                let x = cut_a.as_deref().unwrap_or(x);
+                let y = cut_b.as_deref().unwrap_or(y);
+                if x == y {
+                    return false;
+                }
+                let order = x.cmp(y);
+                return match op {
+                    ComparisonOp::LessThan | ComparisonOp::LessThanOrEqual => order.is_lt(),
+                    ComparisonOp::GreaterThan | ComparisonOp::GreaterThanOrEqual => order.is_gt(),
+                    _ => false,
+                };
+            }
+            compare_values(op, a, b) == Some(true)
+        };
         let (Range::Bounds(l_min, l_max), Range::Bounds(r_min, r_max)) = (self.range(left), self.range(right)) else {
             return false;
         };

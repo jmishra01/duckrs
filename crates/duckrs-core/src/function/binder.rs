@@ -146,7 +146,12 @@ pub fn bind_scalar_function(
     // `IntegerNegateBind`: the negation of a type's minimum is of the next wider type
     if set.name == "-"
         && let [child] = children.as_mut_slice()
-        && let BoundExprKind::Constant(value) = &child.kind
+        && let Some(value) = match &child.kind {
+            BoundExprKind::Constant(value) => Some(value.clone()),
+            // `TryGetConstant`: a foldable argument counts as the constant it folds to
+            _ if child.is_foldable() => fold(child),
+            _ => None,
+        }
         && !value.is_null()
     {
         let (minimum, wider) = match child.return_type.id() {

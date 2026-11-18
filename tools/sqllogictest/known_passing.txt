@@ -122,6 +122,7 @@ test/fuzzer/pedro/first_value_window_crash.test
 test/fuzzer/pedro/floating_point_conversion_overflow.test
 test/fuzzer/pedro/floating_point_inequality.test
 test/fuzzer/pedro/force_external_blob.test
+test/fuzzer/pedro/force_no_cross_product.test
 test/fuzzer/pedro/forced_parallelism_empty_select.test
 test/fuzzer/pedro/foreign_key_binding_issue.test
 test/fuzzer/pedro/foreign_key_type_mismatch.test
@@ -548,6 +549,7 @@ test/optimizer/joins/join_on_floats.test
 test/optimizer/joins/joins_with_correlated_subqueries.test
 test/optimizer/joins/lateral_cross_join.test
 test/optimizer/joins/left_join_reordering/complex_left_joins.test
+test/optimizer/joins/left_join_reordering/left_join_composite_domain.test
 test/optimizer/joins/left_join_reordering/non_inner_join_edge_constraints.test
 test/optimizer/joins/left_join_reordering/test_reordering_left_joins.test
 test/optimizer/joins/no_cross_product_reordering.test
@@ -558,6 +560,7 @@ test/optimizer/joins/parquet_minmax_cardinality_estimation.test
 test/optimizer/joins/pushdown_semi_anti.test
 test/optimizer/joins/range_join_cardinality_estimation.test
 test/optimizer/joins/relation_statistics_bindings.test
+test/optimizer/joins/required_cross_product_activation.test
 test/optimizer/joins/single_sided_predicate_reconstruction.test
 test/optimizer/joins/test_delim_join_with_cross_product_in_rhs.test
 test/optimizer/joins/test_logical_get_with_unnest.test
@@ -658,11 +661,13 @@ test/optimizer/statistics/statistics_join_ungrouped_aggregate_limit.test
 test/optimizer/statistics/statistics_least_greatest.test
 test/optimizer/statistics/statistics_null_comparison.test
 test/optimizer/statistics/statistics_numeric.test
+test/optimizer/statistics/statistics_numeric_comparison_pruning.test
 test/optimizer/statistics/statistics_root_replaced.test
 test/optimizer/statistics/statistics_setop.test
 test/optimizer/statistics/statistics_string_length.test
 test/optimizer/statistics/statistics_struct.test
 test/optimizer/statistics/statistics_suffix.test
+test/optimizer/statistics/statistics_try_cast.test
 test/optimizer/statistics/statistics_unsigned_arithmetic_pruning.test
 test/optimizer/statistics/statistics_unsigned_cast.test
 test/optimizer/statistics/statistics_varchar.test
@@ -3068,6 +3073,7 @@ test/sql/optimizer/expression/test_in_clause_simplification.test
 test/sql/optimizer/expression/test_indistinct_aggregates.test
 test/sql/optimizer/expression/test_move_constants.test
 test/sql/optimizer/expression/test_move_constants_overflow.test
+test/sql/optimizer/expression/test_negation_limits.test
 test/sql/optimizer/expression/test_nop_arithmetic.test
 test/sql/optimizer/expression/test_time_ns_cast_comparison.test
 test/sql/optimizer/expression/test_timestamp_offset.test
@@ -3082,6 +3088,7 @@ test/sql/optimizer/list_contains_row_group_pruning.test
 test/sql/optimizer/list_transform_row_group_pruning.test
 test/sql/optimizer/map_extract_row_group_pruning.test
 test/sql/optimizer/monotone_function_zonemap_pruning.test
+test/sql/optimizer/monotone_preimage.test
 test/sql/optimizer/monotone_preimage_tinyint_boundaries.test
 test/sql/optimizer/multiple_column_stats_pruning.test
 test/sql/optimizer/narrowing_cast_not_invertible.test

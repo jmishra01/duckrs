@@ -338,6 +338,12 @@ fn compute_ordered_statistics(table: &Arc<TableCatalogEntry>, positions: Option<
     Some(statistics)
 }
 
+/// Makes sure what is known of the columns of `table` is there, for rows written from here on to
+/// add to.
+pub fn warm_statistics(table: &Arc<TableCatalogEntry>) {
+    let _ = table_statistics(table);
+}
+
 /// What is known of the columns of `table`. Reading all rows takes long, and a table that is written
 /// to would pay for that with each statement, so this goes on from what was known: new values add to
 /// it, and rows that went don't take anything away, as in C++.
@@ -1113,8 +1119,12 @@ impl StatisticsPropagator {
         let BoundExprKind::Cast { child, try_cast } = &mut expr.kind else {
             unreachable!()
         };
-        let _ = *try_cast;
-        let stats = self.expression(child, false);
+        // `FunctionNullHandling::SPECIAL_HANDLING`: a TRY_CAST gives NULL of what doesn't convert
+        let try_cast = *try_cast;
+        let mut stats = self.expression(child, false);
+        if try_cast {
+            stats.can_be_null = true;
+        }
         // `CastStatistics::CanPropagate`: of numbers to numbers, by their physical types, DECIMAL
         // too; a DATE or a TIMESTAMP, whose -infinity sorts above its smallest values, is left out
         let numeric = |ty: &LogicalType| {

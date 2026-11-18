@@ -41,6 +41,9 @@ pub mod statistics;
 pub mod top_n;
 pub mod row_number_rewriter;
 pub mod type_pushdown;
+pub mod monotone_preimage;
+pub mod or_range_merge;
+pub mod reorder_filter;
 pub mod unnest_rewriter;
 pub mod unused_columns;
 
@@ -61,6 +64,8 @@ pub struct OptimizerOptions {
     pub row_number_rewriter: bool,
     pub type_pushdown: bool,
     pub unnest_rewriter: bool,
+    /// `REORDER_FILTER`
+    pub reorder_filter: bool,
     pub common_subplan: bool,
     pub projection_pullup: bool,
     pub projection_placement: bool,
@@ -88,6 +93,10 @@ pub struct OptimizerOptions {
     pub dynamic_or_filter_threshold: usize,
     /// `perfect_ht_threshold`
     pub perfect_ht_threshold: u64,
+    /// `approximate_join_order_threshold`
+    pub approximate_join_order_threshold: usize,
+    /// `debug_force_no_cross_product`
+    pub force_no_cross_product: bool,
     /// what picks the operators of joins on comparisons
     pub range_joins: range_joins::RangeJoinOptions,
 }
@@ -105,6 +114,7 @@ impl Default for OptimizerOptions {
             row_number_rewriter: true,
             type_pushdown: true,
             unnest_rewriter: true,
+            reorder_filter: true,
             common_subplan: true,
             projection_pullup: true,
             projection_placement: true,
@@ -128,6 +138,8 @@ impl Default for OptimizerOptions {
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
             perfect_ht_threshold: 12,
+            approximate_join_order_threshold: 12,
+            force_no_cross_product: false,
             range_joins: range_joins::RangeJoinOptions::default(),
         }
     }
@@ -147,6 +159,7 @@ impl OptimizerOptions {
             row_number_rewriter: false,
             type_pushdown: false,
             unnest_rewriter: false,
+            reorder_filter: false,
             common_subplan: false,
             projection_pullup: false,
             projection_placement: false,
@@ -170,6 +183,8 @@ impl OptimizerOptions {
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
             perfect_ht_threshold: 12,
+            approximate_join_order_threshold: 12,
+            force_no_cross_product: false,
             range_joins: range_joins::RangeJoinOptions::default(),
         }
     }
@@ -188,6 +203,7 @@ impl OptimizerOptions {
             row_number_rewriter: !off("window_rewriter"),
             type_pushdown: !off("type_pushdown"),
             unnest_rewriter: !off("unnest_rewriter"),
+            reorder_filter: !off("reorder_filter"),
             common_subplan: !off("common_subplan"),
             projection_pullup: !off("projection_pullup"),
             projection_placement: !off("projection_placement"),
@@ -211,6 +227,8 @@ impl OptimizerOptions {
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
             perfect_ht_threshold: 12,
+            approximate_join_order_threshold: 12,
+            force_no_cross_product: false,
             range_joins: range_joins::RangeJoinOptions::default(),
         }
     }
@@ -311,6 +329,7 @@ pub fn optimize_timed(
     }
     if options.join_order {
         build_side::choose_build_sides(&mut plan, options.range_joins.prefer_range_joins);
+        join_order::configure(options.approximate_join_order_threshold, options.force_no_cross_product);
         plan = run("join_order", plan, &mut join_order::reorder_joins);
     }
     if options.aggregate_reuse {
@@ -364,6 +383,10 @@ pub fn optimize_timed(
     }
     if options.join_order && options.unused_columns {
         build_side::choose_by_width(&mut plan);
+    }
+    // cheapest filters first
+    if options.reorder_filter {
+        plan = run("reorder_filter", plan, &mut reorder_filter::reorder_filters);
     }
     // shared subplans run once, as materialized CTEs
     if options.common_subplan {

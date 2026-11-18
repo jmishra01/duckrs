@@ -3494,6 +3494,30 @@ impl Binder<'_> {
             .collate_compared(&originals, sides)?
             .try_into()
             .expect("three sides");
+        // a column can be copied cheaply: two comparisons, which the optimizers handle more easily, and
+        // which the filter combiner folds into a BETWEEN again where both remain
+        if matches!(input.kind, BoundExprKind::ColumnRef { .. }) {
+            let compare = |op, left: BoundExpr, right: BoundExpr| {
+                BoundExpr::new(
+                    BoundExprKind::Comparison {
+                        op,
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    },
+                    LogicalType::BOOLEAN,
+                )
+            };
+            return Ok(BoundExpr::new(
+                BoundExprKind::Conjunction {
+                    and: true,
+                    children: vec![
+                        compare(ComparisonOp::GreaterThanOrEqual, input.clone(), lower),
+                        compare(ComparisonOp::LessThanOrEqual, input, upper),
+                    ],
+                },
+                LogicalType::BOOLEAN,
+            ));
+        }
         Ok(BoundExpr::new(
             BoundExprKind::Between {
                 input: Box::new(input),

@@ -1376,10 +1376,14 @@ fn days_shifted(value: &Value, days: i128) -> Result<Value> {
     if !Date(raw).is_finite() {
         return Ok(value.clone());
     }
+    // `TryAddOperator`: dates below -infinity are out of range, as input and as result
+    if raw < Date::NINFINITY.0 {
+        return Err(out_of_range("Date out of range"));
+    }
     let moved = i128::from(raw) + days;
     i32::try_from(moved)
         .ok()
-        .filter(|d| Date(*d).is_finite())
+        .filter(|d| *d > Date::NINFINITY.0 && *d < Date::INFINITY.0)
         .map(date_value)
         .ok_or_else(|| out_of_range("Date out of range"))
 }
