@@ -140,6 +140,8 @@ impl ColumnDefinition {
 /// The rows of a table that stay in a database file: row groups that can be read one at a time,
 /// and only the columns that are needed.
 pub trait TableSource: std::fmt::Debug + Send + Sync {
+    /// The source as what it is, for the checkpoint that wrote it.
+    fn as_any(&self) -> &dyn std::any::Any;
     /// Its rows that aren't deleted.
     fn row_count(&self) -> usize;
     /// Their ids.
@@ -359,6 +361,9 @@ pub struct TableCatalogEntry {
     /// How the last checkpoint shredded the VARIANT columns of the row groups it wrote, by the row group's first
     /// row id, its rows and the column: the type of the typed part, or `None` when not shredded.
     pub variant_shredding: Mutex<HashMap<(u64, usize, usize), Option<LogicalType>>>,
+    /// What the file has of the table as of its last checkpoint, whatever happened to the rows since: a
+    /// checkpoint keeps the row groups of it whose rows are still the same (`REUSE_EXISTING_ROW_GROUP_METADATA`).
+    checkpointed: RwLock<Option<Arc<dyn TableSource>>>,
     /// Beyond the NOT NULLs, which are in `columns`.
     pub constraints: Vec<TableConstraint>,
     /// What the write-ahead log knows of the rows.
@@ -777,6 +782,7 @@ impl TableCatalogEntry {
             source: RwLock::default(),
             read_from: RwLock::default(),
             variant_shredding: Mutex::default(),
+            checkpointed: RwLock::default(),
             log: Mutex::default(),
             constraints,
             referenced_by: Mutex::default(),
@@ -825,7 +831,18 @@ impl TableCatalogEntry {
         if !variants.is_empty() {
             *self.variant_shredding.lock() = source.all_variant_shredding(&variants);
         }
+        *self.checkpointed.write() = Some(source.clone());
         *self.source.write() = Some(source);
+    }
+
+    /// [`Self::checkpointed`]: what the last checkpoint left of the table in its file.
+    pub fn checkpointed(&self) -> Option<Arc<dyn TableSource>> {
+        self.checkpointed.read().clone()
+    }
+
+    /// For a copy of the table: what the file had of it.
+    pub fn set_checkpointed(&self, source: Option<Arc<dyn TableSource>>) {
+        *self.checkpointed.write() = source;
     }
 
     /// One column of each chunk in turn, of rows in memory or in a file, which stay there.
@@ -857,6 +874,7 @@ impl TableCatalogEntry {
         }
         self.set_row_ids(ids);
         *self.write_loaded_storage() = ColumnDataCollection::new(types);
+        *self.checkpointed.write() = Some(source.clone());
         *self.source.write() = Some(source);
         self.statistics.lock().forget();
     }

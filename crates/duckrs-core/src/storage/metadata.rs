@@ -89,6 +89,24 @@ impl MetadataChains {
         Ok(&self.data[self.starts[&pointer.block_pointer] + offset..])
     }
 
+    /// The sub-blocks (as disk pointers) that `length` bytes of the chain from `pointer` on are in.
+    pub fn sub_blocks(&self, buffer: &BufferManager, pointer: MetaBlockPointer, length: usize) -> Vec<u64> {
+        let payload = metadata_block_size(buffer.block_manager().block_size()) - NEXT_POINTER_SIZE;
+        let Some(&first) = self.starts.get(&pointer.block_pointer) else {
+            return Vec::new();
+        };
+        let start = first + (pointer.offset as usize).max(NEXT_POINTER_SIZE) - NEXT_POINTER_SIZE;
+        let end = start + length.max(1);
+        let mut result: Vec<(usize, u64)> = self
+            .starts
+            .iter()
+            .filter(|(_, at)| **at < end && **at + payload > start)
+            .map(|(block, at)| (*at, *block))
+            .collect();
+        result.sort_unstable();
+        result.into_iter().map(|(_, block)| block).collect()
+    }
+
     fn read_chain(&mut self, buffer: &BufferManager, first: u64) -> Result<()> {
         let size = metadata_block_size(buffer.block_manager().block_size());
         let mut next = first;

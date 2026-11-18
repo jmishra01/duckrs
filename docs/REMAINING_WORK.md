@@ -188,6 +188,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
     checkpoints (v2.1.0, with the lists' `ListPersistentColumnData`) and WAL replay; checkpoints write v2.1.0 when
     asked; a table's statistics keep those of what is in its nested columns
   - [ ] string statistics for `stats()` from database files, per-column `USING COMPRESSION`
+  - [x] a checkpoint keeps the row groups whose rows are as the last one left them
+    (`REUSE_EXISTING_ROW_GROUP_METADATA`): their column metadata, blocks and statistics stay, and only the row group
+    and its deletes are written again. Whether rows changed is found by comparing them with the file's.
   - [x] `read_duckdb` and the replacement scan of `.db` files; `enable_view_dependencies` (DROP ... CASCADE,
     refused DROP and ALTER, CREATE OR REPLACE of a view that reads itself)
   - [ ] `vector_type` (~20 files) and `duckdb_memory` (~17) report engine internals duckrs does not model

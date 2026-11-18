@@ -1197,6 +1197,9 @@ struct Writer<'a> {
     free: BTreeSet<u64>,
     next_block: u64,
     used: BTreeSet<u64>,
+    /// metadata pages of the last checkpoint with sub-blocks that row groups kept as they were still take, and
+    /// which of them (`MetadataManager::ClearModifiedBlocks`)
+    kept_pages: std::collections::BTreeMap<u64, u64>,
     /// How many segments each block holds, which DuckDB has to know to free them one by one.
     segments_in_block: HashMap<u64, u32>,
     /// The block that segments go into now, with how much of it they fill.
@@ -1367,6 +1370,150 @@ fn plan_groups(ids: &RowIds, size: usize, vacuum_tasks: usize, dense: bool, keep
     groups
 }
 
+/// Whether the rows a row group has now, `live` of which `kept` are, are those `group` of `disk` has.
+fn unchanged_rows(
+    disk: &super::table_data::DiskTable,
+    group: usize,
+    kept: &[bool],
+    live: &[DataChunk],
+) -> Result<bool> {
+    let same_deletes = match disk.alive_rows(group) {
+        None => kept.iter().all(|kept| *kept),
+        Some(alive) => {
+            let mut alive = alive.iter().peekable();
+            kept.iter().enumerate().all(|(row, kept)| {
+                let stored = alive.peek().is_some_and(|at| **at as usize == row);
+                if stored {
+                    alive.next();
+                }
+                stored == *kept
+            })
+        }
+    };
+    if !same_deletes {
+        return Ok(false);
+    }
+    let columns: Vec<usize> = (0..live.first().map_or(0, DataChunk::column_count)).collect();
+    let stored = crate::catalog::TableSource::read_group(disk, group, &columns)?;
+    let mut at = 0;
+    for chunk in live {
+        for row in 0..chunk.len() {
+            if at >= stored.len() {
+                return Ok(false);
+            }
+            for &column in &columns {
+                if !identical(
+                    &chunk.column(column).get_value(row),
+                    &stored.column(column).get_value(at),
+                ) {
+                    return Ok(false);
+                }
+            }
+            at += 1;
+        }
+    }
+    Ok(at == stored.len())
+}
+
+/// Whether two values are the same, floating point ones bit for bit (-0.0 is not 0.0).
+fn identical(a: &Value, b: &Value) -> bool {
+    use duckrs_common::value::ValueData as V;
+    if a.logical_type() != b.logical_type() {
+        return false;
+    }
+    match (a.data(), b.data()) {
+        (V::Float(x), V::Float(y)) => x.to_bits() == y.to_bits(),
+        (V::Double(x), V::Double(y)) => x.to_bits() == y.to_bits(),
+        (V::List(xs), V::List(ys)) | (V::Struct(xs), V::Struct(ys)) => {
+            xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| identical(x, y))
+        }
+        _ => a == b,
+    }
+}
+
+/// `StringStatsData` as the file has it: a bound that was cut off is made one that sorts past it (above for
+/// the maximum, as a byte below the rest does for the minimum), so that it is not taken to be exact.
+fn stored_strings(strings: &super::statistics::StringBounds) -> StringStatsOut {
+    let bound = |bytes: &[u8], exact: bool, pad: u8| {
+        let mut bound = bytes.to_vec();
+        if !exact {
+            bound.push(pad);
+        }
+        bound
+    };
+    StringStatsOut {
+        bounds: strings.has_bounds.then(|| {
+            (
+                bound(&strings.min, strings.min_exact, 0x00),
+                bound(&strings.max, strings.max_exact, 0xFF),
+            )
+        }),
+        has_unicode: strings.has_unicode,
+        max_length: strings
+            .max_length
+            .map_or(u32::MAX, |length| length.min(u64::from(u32::MAX)) as u32),
+        min_length: strings
+            .min_length
+            .map_or(0, |length| length.min(u64::from(u32::MAX)) as u32),
+        total_length: strings.total_length,
+    }
+}
+
+/// [`Stats`] of what the file says of a segment.
+fn segment_stats(stored: &super::statistics::BaseStatistics) -> Stats {
+    let mut stats = Stats::unknown();
+    stats.has_null = stored.has_null;
+    stats.has_no_null = stored.has_no_null;
+    stats.bounds = stored.min.zip(stored.max);
+    stats.geometry = stored.geometry;
+    stats.strings = stored.strings.as_ref().map(stored_strings);
+    stats
+}
+
+/// `ColumnData::MergeIntoStatistics` of a column a row group keeps: the statistics of its segments, its
+/// validity's, its children's and of a VARIANT's shredded part.
+fn stored_stats(column: &super::table_data::PersistentColumn, ty: &LogicalType) -> Stats {
+    let mut stats = Stats::of_validity(&[]);
+    if let Some(validity) = &column.validity {
+        for pointer in &validity.pointers {
+            stats.has_null |= pointer.statistics.has_null;
+            stats.has_no_null |= pointer.statistics.has_no_null;
+        }
+    }
+    let data_type = if column.spatial { LogicalType::BLOB } else { ty.clone() };
+    let mut segments = column.pointers.iter().map(|pointer| segment_stats(&pointer.statistics));
+    if let Some(mut merged) = segments.next() {
+        for segment in segments {
+            merged.merge(&segment, &data_type);
+        }
+        let (has_null, has_no_null) = (stats.has_null, stats.has_no_null);
+        stats = merged;
+        if column.validity.is_some() {
+            stats.has_null = has_null;
+            stats.has_no_null = has_no_null;
+        }
+    }
+    if column.spatial {
+        stats.strings = None;
+    }
+    if ty.id() == LogicalTypeId::Variant {
+        if let (Some(shredded_type), Some(shredded)) = (&column.shredded_type, column.children.get(1)) {
+            stats.variant_shredded = Some(Box::new((shredded_type.clone(), stored_stats(shredded, shredded_type))));
+        }
+        return stats;
+    }
+    let types = child_types(ty);
+    if column.children.len() == types.len() {
+        stats.children = column
+            .children
+            .iter()
+            .zip(&types)
+            .map(|(child, ty)| stored_stats(child, ty))
+            .collect();
+    }
+    stats
+}
+
 /// `RowVersionManager::Checkpoint`: which rows of a row group are deleted. `kept` has its rows.
 fn deletes_of(kept: &[bool]) -> Vec<u8> {
     let vectors: Vec<(usize, &[bool])> = kept
@@ -1431,6 +1578,7 @@ impl<'a> Writer<'a> {
             },
             next_block: blocks.header().block_count,
             used: BTreeSet::new(),
+            kept_pages: std::collections::BTreeMap::new(),
             segments_in_block: HashMap::new(),
             open: None,
             pages: Vec::new(),
@@ -2416,10 +2564,11 @@ impl<'a> Writer<'a> {
         rows: usize,
         deletes: Option<&[u8]>,
         statistics: &mut [Option<Stats>],
+        reused: Option<Vec<MetaBlockPointer>>,
     ) -> Result<Vec<u8>> {
         let mut tables = std::mem::take(&mut self.tables);
-        let mut pointers = Vec::with_capacity(parts.len());
-        for (column, parts) in parts.iter().enumerate() {
+        let mut pointers = reused.clone().unwrap_or_else(|| Vec::with_capacity(parts.len()));
+        for (column, parts) in parts.iter().enumerate().filter(|_| reused.is_none()) {
             let ty = &table.columns[column].ty;
             self.log_column = (format!("{}.{}", table.schema, table.name), column);
             let out = self.write_column_data(ty, parts)?;
@@ -2456,6 +2605,29 @@ impl<'a> Writer<'a> {
         Ok(s.into_bytes())
     }
 
+    /// The blocks the segments of a column that a row group keeps are in, which stay taken.
+    fn keep_blocks(&mut self, column: &super::table_data::PersistentColumn) {
+        for pointer in &column.pointers {
+            if pointer.block_id >= 0 {
+                self.used.insert(pointer.block_id as u64);
+                *self.segments_in_block.entry(pointer.block_id as u64).or_default() += 1;
+            }
+            self.used.extend(
+                pointer
+                    .overflow_blocks
+                    .iter()
+                    .filter(|block| **block >= 0)
+                    .map(|block| *block as u64),
+            );
+        }
+        if let Some(validity) = &column.validity {
+            self.keep_blocks(validity);
+        }
+        for child in &column.children {
+            self.keep_blocks(child);
+        }
+    }
+
     /// The vectors of a row group, with what indexes have to know. Rows that are deleted are NULL.
     fn write_group(
         &mut self,
@@ -2469,6 +2641,17 @@ impl<'a> Writer<'a> {
         let types = table.types();
         let mut parts: Vec<Vec<Part>> = types.iter().map(|_| Vec::new()).collect();
         let mut kept = Vec::with_capacity(group.rows);
+        // `RowGroup::CanReuseMetadata`: a row group of the last checkpoint, whose rows may still be the same
+        let checkpointed = table.checkpointed();
+        let stored = match (&checkpointed, group.merged || group.file_start != group.row_start) {
+            (Some(source), false) => source
+                .as_any()
+                .downcast_ref::<super::table_data::DiskTable>()
+                .filter(|disk| disk.is_in(self.buffer))
+                .and_then(|disk| Some((disk, disk.group_at(group.row_start, group.rows)?))),
+            _ => None,
+        };
+        let mut live_chunks = Vec::new();
         let row_id = |offset: usize| group.row_start + offset as u64;
         let file_id = |offset: usize| group.file_start + offset as u64;
         let position_of = |offset: usize| {
@@ -2519,8 +2702,32 @@ impl<'a> Writer<'a> {
             for (column, parts) in parts.iter_mut().enumerate() {
                 parts.push(Part::new(chunk.column(column), count));
             }
+            if stored.is_some() {
+                live_chunks.push(live);
+            }
         }
         let deletes = (kept.iter().any(|kept| !kept)).then(|| deletes_of(&kept));
+        // `RowGroup::HasChanges`: the same rows deleted, and the others with the same values
+        let mut reused = None;
+        if let Some((disk, stored_group)) = stored
+            && unchanged_rows(disk, stored_group, &kept, &live_chunks)?
+        {
+            let kept_group = disk.stored_group(stored_group)?;
+            for (column, stored_column) in kept_group.columns.iter().enumerate() {
+                let ty = &types[column];
+                let stats = stored_stats(stored_column, ty);
+                match &mut statistics[column] {
+                    Some(merged) => merged.merge(&stats, ty),
+                    empty => *empty = Some(stats),
+                }
+                self.keep_blocks(stored_column);
+            }
+            for sub_block in &kept_group.sub_blocks {
+                let pointer = MetaBlockPointer::new(*sub_block, 0);
+                *self.kept_pages.entry(pointer.block_id()).or_default() |= 1 << pointer.block_index();
+            }
+            reused = Some(kept_group.data_pointers);
+        }
         let written = self.write_row_group(
             table,
             parts,
@@ -2528,6 +2735,7 @@ impl<'a> Writer<'a> {
             group.rows,
             deletes.as_deref(),
             statistics,
+            reused,
         )?;
         Ok((written, group.file_start as usize + group.rows))
     }
@@ -2693,10 +2901,12 @@ impl<'a> Writer<'a> {
         // the blocks that takes are no longer free. So this takes enough for any outcome, and the
         // sub-blocks it doesn't need stay free, which the list of metadata blocks says.
         let payload = metadata_block_size(self.block_size) - SUB_BLOCK_HEADER_SIZE;
+        let kept_pages = std::mem::take(&mut self.kept_pages);
+        self.used.extend(kept_pages.keys());
         let mut pages = self.pages.len();
         loop {
             let entries = self.next_block as usize + self.free.len() + pages;
-            let bytes = 24 + 8 * entries + 12 * multi_use.len() + 16 * pages;
+            let bytes = 24 + 8 * entries + 12 * multi_use.len() + 16 * (pages + kept_pages.len());
             let needed = bytes.div_ceil(payload).div_ceil(METADATA_BLOCK_COUNT) + 1;
             if self.pages.len() + needed <= pages {
                 break;
@@ -2711,7 +2921,7 @@ impl<'a> Writer<'a> {
         let free: Vec<u64> = (0..self.next_block)
             .filter(|block| !self.used.contains(block))
             .collect();
-        let size = 24 + free.len() * 8 + multi_use.len() * 12 + self.pages.len() * 16;
+        let size = 24 + free.len() * 8 + multi_use.len() * 12 + (self.pages.len() + kept_pages.len()) * 16;
         sub_blocks.truncate(size.div_ceil(payload));
         for &(page, index) in &sub_blocks {
             self.taken[page] |= 1 << index;
@@ -2735,8 +2945,13 @@ impl<'a> Writer<'a> {
             list.extend_from_slice(&block.to_le_bytes());
             list.extend_from_slice(&segments.to_le_bytes());
         }
-        list.extend_from_slice(&(self.pages.len() as u64).to_le_bytes());
+        list.extend_from_slice(&((self.pages.len() + kept_pages.len()) as u64).to_le_bytes());
         for ((block, _), taken) in self.pages.iter().zip(&self.taken) {
+            list.extend_from_slice(&block.to_le_bytes());
+            list.extend_from_slice(&(!taken).to_le_bytes());
+        }
+        // the pages of the last checkpoint that kept row groups still have metadata in
+        for (block, taken) in &kept_pages {
             list.extend_from_slice(&block.to_le_bytes());
             list.extend_from_slice(&(!taken).to_le_bytes());
         }

@@ -27,14 +27,14 @@ const STANDARD_VECTOR_SIZE: usize = 2048;
 const MAX_ROW_GROUP_SIZE: u64 = 1 << 30;
 
 /// `DataPointer`.
-struct DataPointer {
-    tuple_count: usize,
-    block_id: i64,
-    offset: usize,
-    compression: u8,
-    statistics: BaseStatistics,
+pub(super) struct DataPointer {
+    pub(super) tuple_count: usize,
+    pub(super) block_id: i64,
+    pub(super) offset: usize,
+    pub(super) compression: u8,
+    pub(super) statistics: BaseStatistics,
     /// `UncompressedStringSegmentState`: the blocks of its own that a segment reads from
-    overflow_blocks: Vec<i64>,
+    pub(super) overflow_blocks: Vec<i64>,
 }
 
 fn read_data_pointer(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>) -> Result<DataPointer> {
@@ -71,18 +71,26 @@ fn read_data_pointer(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>) -
     })
 }
 
+/// [`DiskTable::stored_group`].
+pub(super) struct StoredGroup {
+    pub(super) data_pointers: Vec<MetaBlockPointer>,
+    pub(super) columns: Vec<PersistentColumn>,
+    /// the disk pointers of the metadata sub-blocks the columns are in
+    pub(super) sub_blocks: Vec<u64>,
+}
+
 /// `PersistentColumnData`.
 pub(super) struct PersistentColumn {
-    pointers: Vec<DataPointer>,
-    validity: Option<Box<PersistentColumn>>,
+    pub(super) pointers: Vec<DataPointer>,
+    pub(super) validity: Option<Box<PersistentColumn>>,
     /// Of a LIST or ARRAY, one; of a STRUCT, its fields; of a VARIANT, the unshredded column and, if
     /// it is shredded, the shredded one.
-    children: Vec<PersistentColumn>,
+    pub(super) children: Vec<PersistentColumn>,
     /// `VariantPersistentColumnData::logical_type`: the type of a shredded VARIANT's shredded column
-    shredded_type: Option<LogicalType>,
+    pub(super) shredded_type: Option<LogicalType>,
     /// of a GEOMETRY without extra data, that it is the BLOB of the spatial extension's format
     /// (`GeometryStorageType::SPATIAL`)
-    spatial: bool,
+    pub(super) spatial: bool,
 }
 
 fn not_ported_column(ty: &LogicalType) -> Error {
@@ -745,6 +753,47 @@ impl DiskTable {
         self.table.next_row_id
     }
 
+    /// Whether the rows are in the file of `buffer`.
+    pub(super) fn is_in(&self, buffer: &BufferManager) -> bool {
+        std::ptr::eq(&*self.buffer, buffer)
+    }
+
+    /// The row group of the file with rows from `row_start` on, of `rows` rows, deleted ones included.
+    pub(super) fn group_at(&self, row_start: u64, rows: usize) -> Option<usize> {
+        let group = self
+            .table
+            .row_groups
+            .partition_point(|group| group.row_start < row_start);
+        let found = self.table.row_groups.get(group)?;
+        (found.row_start == row_start && found.tuple_count as usize == rows).then_some(group)
+    }
+
+    /// Which rows of a row group are not deleted, `None` for all of them.
+    pub(super) fn alive_rows(&self, group: usize) -> Option<&[u32]> {
+        self.alive[group].as_deref()
+    }
+
+    /// What a checkpoint keeps of a row group it doesn't write again: where each column's metadata is, the
+    /// columns themselves, and the metadata sub-blocks the columns take (`ComputePerColumnMetadataBlocks`).
+    pub(super) fn stored_group(&self, group: usize) -> Result<StoredGroup> {
+        let row_group = &self.table.row_groups[group];
+        let mut columns = Vec::with_capacity(row_group.data_pointers.len());
+        let mut sub_blocks = std::collections::BTreeSet::new();
+        let mut chains = self.chains.lock();
+        for (column, &pointer) in row_group.data_pointers.iter().enumerate() {
+            let data = chains.at(&self.buffer, pointer)?;
+            let mut d = BinaryDeserializer::new(data);
+            columns.push(read_persistent_column(&mut d, Some(&self.table.columns[column].ty))?);
+            let length = d.position();
+            sub_blocks.extend(chains.sub_blocks(&self.buffer, pointer, length));
+        }
+        Ok(StoredGroup {
+            data_pointers: row_group.data_pointers.clone(),
+            columns,
+            sub_blocks: sub_blocks.into_iter().collect(),
+        })
+    }
+
     fn persistent_column(&self, group: usize, column: usize) -> Result<PersistentColumn> {
         let pointer = self.table.row_groups[group].data_pointers[column];
         let mut chains = self.chains.lock();
@@ -905,6 +954,9 @@ impl DiskTable {
 }
 
 impl TableSource for DiskTable {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
     fn fetch_rows(&self, group: usize, column: usize, rows: &[u32]) -> Result<Vector> {
         // rows one by one only pay off when few are wanted; otherwise the column is decoded whole
         let group_rows = self.table.row_groups[group].tuple_count as usize;
