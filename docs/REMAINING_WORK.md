@@ -178,8 +178,11 @@ Each item gives the number of failing files in `test/` that it should fix, where
 
 ## Phase 7: Optimizer
 
-- [ ] 14. Filter pushdown and pullup (`optimizer/pushdown`: 29 failing, 32.6%)
-- [ ] 15. Statistics propagation (`optimizer/statistics`: 32 failing, 37.3%)
+- [ ] 14. Filter pushdown and pullup (`optimizer/pushdown`: 19 failing, 55.8% pass)
+  - [x] OR range merge, monotone preimage, filter reordering (`ExpressionHeuristics`), BETWEEN of a column as two comparisons
+  - [ ] scalar functions pushed into Parquet scans, a filter on the right of a SEMI join through a subquery's
+    projection, CTE inlining after filter pushdown as in C++ (`test_no_pushdown_cast_into_cte`)
+- [ ] 15. Statistics propagation (`optimizer/statistics`: 4 failing, 91.8% pass)
   - [x] row groups of the database's `ROW_GROUP_SIZE`; zone maps through CASE, COALESCE, greatest/least,
     arithmetic with constants, month/quarter, prefix, left, sign, two-column comparisons
   - [x] statistics of least/greatest, of sum (rows times the bounds), min and max; `constant_or_null` keeps both
@@ -206,11 +209,21 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] string statistics in `stats()`: bounds, unicode, lengths and totals of tables and constants; `approx_unique`
   - [ ] string statistics through functions (contains, suffix, upper/lower, length), struct/list/map extracts,
     EXPLAIN ANALYZE metrics of other operators (~190 EXPLAIN-shape files under `test/optimizer`, `sql/optimizer`)
-- [ ] 16. Join order and cardinality estimation (`optimizer/joins`: 14 failing)
+- [ ] 16. Join order and cardinality estimation (`optimizer/joins`: 1 failing)
+  - [x] LEFT join equality groups, `debug_force_no_cross_product`, `approximate_join_order_threshold`
+  - [ ] LEFT joins reordered inside the join graph (C++'s CD-C conflict detector, `left_join_cardinality_estimation`)
 - [ ] 17. Column lifetime, unused columns, TopN, expression rewriter (small dirs under `test/optimizer`)
-- [ ] 18. Optimizer-dependent SQL tests (`sql/optimizer`: 114 failing, 32.7%)
-- [ ] 19. TPC-H 22/22 and TPC-DS 99/99 correct. Today the tests are skipped and the generators in `tools/tpch` and `tools/tpcds` are stubs.
-- [ ] 20. Verification mode: run each query with the optimizer on and off and compare the results
+- [ ] 18. Optimizer-dependent SQL tests (`sql/optimizer`: 62 failing, 63.7% pass)
+  - [ ] passes not ported: TopN window elimination, window self-join, window join pushdown, self-join
+    aggregate, scalar aggregate merge, compressed materialization, late materialization, partitioned
+    execution, list comprehension rewrite, enum IN simplification (C++ keeps IN lists as IN)
+- [ ] 19. TPC-H 22/22 and TPC-DS 99/99 correct
+  - [x] with `tools/tpch` and `tools/tpcds` building dbgen and dsdgen from the C++ checkout, the examples get
+    TPC-H 22/22 at SF 0.01 and 0.1, TPC-DS 99/99 at SF 0.01
+  - [ ] `dbgen` / `dsdgen` as table functions in duckrs, so the corpus's tpch and tpcds tests run
+- [x] 20. Verification mode: run each query with the optimizer on and off and compare the results
+  (`sqllogictest --diff-against unoptimized --diff-out <file>`); over `optimizer`, `join`, `subquery` and
+  `aggregate` it finds `complex_top_n` (105 rows against 102) and `test_no_pushdown_cast_into_cte`
 
 ## Phase 6: SQL surface
 
