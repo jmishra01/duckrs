@@ -1355,8 +1355,9 @@ const MAX_MERGE_COUNT: usize = 3;
 
 /// `ScheduleVacuumTasks`: `groups` as they are written, some of them together where that makes for
 /// fewer row groups.
-/// `only_full`: only row groups none of whose rows went come together, which keeps the ids of their rows.
-fn vacuum_groups(groups: Vec<PlannedGroup>, size: usize, tasks: usize, only_full: bool) -> Vec<PlannedGroup> {
+/// `keep_ids`: the ids can't change (`can_change_row_ids` is false), so a merge takes only row groups without
+/// deletes whose ids follow each other.
+fn vacuum_groups(groups: Vec<PlannedGroup>, size: usize, tasks: usize, keep_ids: bool) -> Vec<PlannedGroup> {
     let mut result = Vec::with_capacity(groups.len());
     let mut at = 0;
     let mut merges = 0;
@@ -1365,9 +1366,14 @@ fn vacuum_groups(groups: Vec<PlannedGroup>, size: usize, tasks: usize, only_full
         for target in (1..=MAX_MERGE_COUNT).filter(|_| merges < tasks) {
             let mut next = at;
             let mut rows = 0;
-            let full = |group: &PlannedGroup| !only_full || group.live == group.rows;
-            while next < groups.len() && full(&groups[next]) && rows + groups[next].live <= target * size {
-                rows += groups[next].live;
+            while next < groups.len() && rows + groups[next].live <= target * size {
+                let group = &groups[next];
+                let follows =
+                    next == at || group.row_start == groups[next - 1].row_start + groups[next - 1].rows as u64;
+                if keep_ids && (group.live != group.rows || !follows) {
+                    break;
+                }
+                rows += group.live;
                 next += 1;
             }
             // what is appended would otherwise rewrite the last row group each time
@@ -1424,7 +1430,6 @@ fn vacuum_groups(groups: Vec<PlannedGroup>, size: usize, tasks: usize, only_full
 /// rewritten to follow each other. `keep_ids`: indexes don't let the ids change (`KEEP_ROW_IDS`), so none come
 /// together, and in a `dense` file row groups without rows stay where later rows follow them.
 fn plan_groups(ids: &RowIds, size: usize, vacuum_tasks: usize, dense: bool, keep_ids: bool) -> Vec<PlannedGroup> {
-    let vacuum_tasks = if keep_ids { 0 } else { vacuum_tasks };
     let mut groups: Vec<PlannedGroup> = Vec::new();
     let mut add = |row_start: u64, rows: usize| {
         let first_position = ids.first_from(row_start);
@@ -1456,7 +1461,7 @@ fn plan_groups(ids: &RowIds, size: usize, vacuum_tasks: usize, dense: bool, keep
         while groups.last().is_some_and(|group| group.live == 0) {
             groups.pop();
         }
-        return groups;
+        return vacuum_groups(groups, size, vacuum_tasks, true);
     }
     let mut groups = vacuum_groups(groups, size, vacuum_tasks, false);
     if dense {
@@ -2690,12 +2695,19 @@ impl<'a> Writer<'a> {
         let rebuild = self.vacuum_rebuild_indexes > 0 && ids.next() <= self.vacuum_rebuild_indexes;
         let keep_ids =
             !rebuild && ((dense && !indexes.is_empty()) || indexes.iter().any(|index| index.legacy_geometry));
+        // `storage.total_vacuum_time`: what writing the row groups that came together took
+        let mut vacuum_time = std::time::Duration::ZERO;
         for group in plan_groups(&ids, size, self.vacuum_tasks, dense, keep_ids) {
+            let start = std::time::Instant::now();
             let (written, end) = self.write_group(table, &group, &ids, &mut rows, indexes, &mut statistics)?;
+            if group.merged {
+                vacuum_time += start.elapsed();
+            }
             row_groups.push(written);
             stored_rows += group.rows as u64;
             next_row_id = next_row_id.max(end as u64);
         }
+        crate::execution::profiler::add_timing("storage.total_vacuum_time", vacuum_time);
         let mut s = serializer(self.version);
         s.write_object_value(|s| {
             s.write_list(100, "column_stats", types.len(), |s, column| {

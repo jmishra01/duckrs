@@ -164,7 +164,8 @@ Each item gives the number of failing files in `test/` that it should fix, where
     index with such keys (`KEEP_ROW_IDS`)
   - [x] ATTACH's and the setting `vacuum_rebuild_indexes`: indexes of tables up to that many rows are built
     again after a vacuum that moves their rows (`VacuumIndexStrategy::REBUILD`)
-  - [ ] `rowid_gaps`: the `total_vacuum_time` of the checkpoint profiling
+  - [x] `storage.total_vacuum_time` of the checkpoint profiling; under `KEEP_ROW_IDS` row groups without deletes
+    whose ids follow each other still come together
   - [x] unshredded VARIANT columns, in the file and the WAL
   - [x] shredded VARIANT columns: read from files C++ writes, and written at a checkpoint by
     `variant_minimum_shredding_size` and `force_variant_shredding`, with the type inferred as C++ does (object fields
