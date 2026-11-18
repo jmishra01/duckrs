@@ -6,8 +6,7 @@
 //! the aggregate of the SEMI join instead of reading the table again. The SEMI join becomes an
 //! INNER join that brings the state along, and the aggregate above combines the states.
 //!
-//! `TryReuseMaterializedAggregate` (a payload of a materialized CTE) is not ported: duckrs does
-//! not plan dependent joins as CTEs.
+//! `TryReuseMaterializedAggregate` is in `materialized_aggregate_reuse`.
 //!
 //! duckrs turns `sum` into `sum_no_overflow` before this pass, where C++ does it later: the two
 //! are the same aggregate here, and the reused one is a `sum` again.
@@ -30,6 +29,7 @@ pub fn reuse(mut plan: LogicalOperator) -> LogicalOperator {
     let mut pass = Pass {
         next: max_table_index(&plan) + 1,
         replacements: Replacements::new(),
+        ctes: HashMap::new(),
     };
     pass.visit(&mut plan);
     plan
@@ -38,13 +38,15 @@ pub fn reuse(mut plan: LogicalOperator) -> LogicalOperator {
 struct Pass {
     next: usize,
     replacements: Replacements,
+    /// `cte_definitions`: what each materialized CTE runs, with its table
+    ctes: HashMap<usize, (LogicalOperator, Arc<parking_lot::Mutex<duckrs_common::column_data::ColumnDataCollection>>)>,
 }
 
-/// `TableColumnOrigin`: a column of a table, read without filters.
-#[derive(PartialEq)]
-struct Origin {
-    table: usize,
-    column: usize,
+/// `TableColumnOrigin`: a column of a table.
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub(super) struct Origin {
+    pub table: usize,
+    pub column: usize,
 }
 
 impl Pass {
@@ -55,8 +57,14 @@ impl Pass {
     }
 
     fn visit(&mut self, op: &mut LogicalOperator) {
-        for child in &mut op.children {
+        for (at, child) in op.children.iter_mut().enumerate() {
             self.visit(child);
+            // `CollectCTEs`: the definition as the query after it sees it
+            if at == 0
+                && let K::MaterializedCte { table_index, data, .. } = &op.kind
+            {
+                self.ctes.insert(*table_index, (child.clone(), data.clone()));
+            }
         }
         if !self.replacements.is_empty() {
             let replacements = &self.replacements;
@@ -68,7 +76,10 @@ impl Pass {
                 }
             });
         }
-        self.try_reuse_semi_aggregate(op);
+        let reused = super::materialized_aggregate_reuse::try_reuse(op, &self.ctes, &mut self.next);
+        if !reused {
+            self.try_reuse_semi_aggregate(op);
+        }
     }
 
     /// `TryReuseSemiAggregate`.
@@ -259,7 +270,7 @@ fn candidate(op: &LogicalOperator) -> Option<Candidate> {
 }
 
 /// `HasCompleteGrouping`: groups, all of them in the one grouping set.
-fn has_complete_grouping(op: &LogicalOperator) -> bool {
+pub(super) fn has_complete_grouping(op: &LogicalOperator) -> bool {
     let K::Aggregate {
         groups,
         grouping_sets,
@@ -278,7 +289,7 @@ fn has_complete_grouping(op: &LogicalOperator) -> bool {
 }
 
 /// `GetDirectReferenceIndex`: the output of `input` that `expr` is.
-fn reference_index(expr: &BoundExpr, input: &LogicalOperator) -> Option<usize> {
+pub(super) fn reference_index(expr: &BoundExpr, input: &LogicalOperator) -> Option<usize> {
     let BoundExprKind::ColumnRef { binding, depth: 0 } = &expr.kind else {
         return None;
     };
@@ -338,7 +349,7 @@ fn traced_output(op: &LogicalOperator, target: ColumnBinding) -> Option<usize> {
 }
 
 /// `FindUnaryAggregate`: the aggregate below projections and filters.
-fn unary_aggregate_path(op: &LogicalOperator) -> Option<usize> {
+pub(super) fn unary_aggregate_path(op: &LogicalOperator) -> Option<usize> {
     let mut depth = 0;
     let mut current = op;
     while !matches!(current.kind, K::Aggregate { .. }) {

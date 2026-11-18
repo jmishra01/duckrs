@@ -24,6 +24,7 @@ mod filter_pullup;
 mod grouping_sets;
 mod partial_aggregate_pushdown;
 mod aggregate_reuse;
+mod materialized_aggregate_reuse;
 pub mod filter_pushdown;
 pub mod in_clause_rewriter;
 mod index_scan;

@@ -370,7 +370,8 @@ impl Binder<'_> {
             if !bound_already {
                 let before = self.correlated.lock().len();
                 let bound = self.bind_cte_definition(&name, &cte, index, outer_depth)?;
-                let correlated = self.correlated.lock().len() != before || !self.outer_contexts.is_empty();
+                // a CTE defined in a subquery can read the queries around it
+                let correlated = self.correlated.lock().len() != before || outer_depth > 0;
                 let mut state = state.lock();
                 if correlated {
                     state.inline = true;

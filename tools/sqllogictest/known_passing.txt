@@ -482,6 +482,7 @@ test/issues/rigger/test_value_binop.test
 test/issues/rigger/timestamp_overflow.test
 test/issues/rigger/zonemap_column_out_of_range.test
 test/ldbc/ldbc-empty.test
+test/optimizer/aggregate_reuse.test
 test/optimizer/avg_rewrite_profitability.test
 test/optimizer/case_simplification.test
 test/optimizer/case_simplification_errors.test

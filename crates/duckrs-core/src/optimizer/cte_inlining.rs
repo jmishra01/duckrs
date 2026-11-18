@@ -33,6 +33,26 @@ fn count_cte_references(op: &LogicalOperator, cte: usize) -> usize {
     usize::from(own) + op.children.iter().map(|c| count_cte_references(c, cte)).sum::<usize>()
 }
 
+/// Whether a scan of the CTE is in a plan of its own: a subquery that stays an expression, a
+/// recursive CTE or a lateral join, which C++ has flattened. Those the inlining does not reach.
+fn has_nested_reference(op: &LogicalOperator, cte: usize) -> bool {
+    let nested = match &op.kind {
+        K::RecursiveCte { recursive, .. } => count_cte_references(recursive, cte) > 0 || has_nested_reference(recursive, cte),
+        K::LateralJoin { right, .. } => count_cte_references(right, cte) > 0 || has_nested_reference(right, cte),
+        _ => false,
+    };
+    let mut in_subquery = false;
+    let mut shallow = LogicalOperator::new(op.kind.clone(), Vec::new());
+    shallow.visit_expressions(&mut |e| {
+        if let BoundExprKind::Subquery { subquery, .. } = &e.kind {
+            for plan in std::iter::once(&subquery.plan).chain(subquery.raw.as_ref()) {
+                in_subquery |= count_cte_references(plan, cte) > 0 || has_nested_reference(plan, cte);
+            }
+        }
+    });
+    nested || in_subquery || op.children.iter().any(|c| has_nested_reference(c, cte))
+}
+
 /// `ContainsLimit`: along the operators with one child.
 fn contains_limit(op: &LogicalOperator) -> bool {
     if matches!(op.kind, K::Limit { .. } | K::TopN { .. }) {
@@ -107,6 +127,9 @@ fn try_inlining(op: &mut LogicalOperator, next: &mut usize) {
     else {
         return;
     };
+    if has_nested_reference(&op.children[1], table_index) {
+        return;
+    }
     let ref_count = count_cte_references(op, table_index);
     if ref_count == 0 {
         if !has_side_effects(&op.children[0]) {
