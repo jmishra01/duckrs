@@ -1264,8 +1264,41 @@ impl Exporter<'_> {
             Op::CsvScan { .. } | Op::JsonScan { .. } => {
                 return Err("The file scan has no SQL export".into());
             }
-            Op::MaterializedCte { .. } | Op::CteRef { .. } => {
-                return Err("A materialized CTE has no SQL export".into());
+            // `ExportMaterializedCTE`: the definition is a WITH entry that runs once
+            Op::MaterializedCte { data, .. } => {
+                let name = self.alias();
+                let types = op.children[0].types();
+                let producer = self.export_child(op, 0)?;
+                let query = self.set_child(producer, &types)?;
+                let aliases: Vec<String> = (0..types.len()).map(field_name).collect();
+                let at = self.ctes.len();
+                self.ctes.push((
+                    name.clone(),
+                    CteInfo {
+                        aliases,
+                        query: Box::new(query),
+                        key_targets: Vec::new(),
+                        materialized: CteMaterialize::Always,
+                    },
+                ));
+                self.working.push((std::sync::Arc::as_ptr(data) as usize, name, 0));
+                let consumer = self.export_child(op, 1);
+                let (.., reads) = self.working.pop().expect("pushed above");
+                let consumer = consumer?;
+                if reads == 0 {
+                    self.ctes.remove(at);
+                    return Err("SQL would discard the unreferenced CTE producer".into());
+                }
+                consumer.body
+            }
+            Op::CteRef { data, types, .. } => {
+                let key = std::sync::Arc::as_ptr(data) as usize;
+                let Some(entry) = self.working.iter_mut().find(|(k, ..)| *k == key) else {
+                    return Err("A materialized CTE has no SQL export".into());
+                };
+                entry.2 += 1;
+                let name = entry.1.clone();
+                Body::Select(self.named_source(&name, types.len()))
             }
             Op::Insert { .. }
             | Op::Delete { .. }

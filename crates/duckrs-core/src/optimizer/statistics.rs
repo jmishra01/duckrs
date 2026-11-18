@@ -774,6 +774,8 @@ struct StatisticsPropagator {
     filter_bindings_changed: bool,
     /// `cte_stats_map`: the statistics of the columns of each materialized CTE's definition
     ctes: HashMap<usize, Vec<Stats>>,
+    /// the most rows each materialized CTE's definition has
+    cte_rows: HashMap<usize, Option<u64>>,
 }
 
 impl StatisticsPropagator {
@@ -2038,6 +2040,8 @@ impl StatisticsPropagator {
             {
                 let columns = child.column_bindings().into_iter().map(|b| self.lookup(b)).collect();
                 self.ctes.insert(*table_index, columns);
+                let rows = self.max_rows(child);
+                self.cte_rows.insert(*table_index, rows);
             }
         }
         // `PropagateStatistics(LogicalCTERef)`
@@ -2125,14 +2129,14 @@ impl StatisticsPropagator {
                 *domain_cap = (!self.filter_simplification)
                     .then(|| self.group_domain_bound(groups))
                     .flatten()
-                    .map(|bound| max_cardinality(&op.children[0]).map_or(bound, |rows| bound.min(rows)));
+                    .map(|bound| self.max_rows(&op.children[0]).map_or(bound, |rows| bound.min(rows)));
                 for (index, group) in groups.iter().enumerate() {
                     if let BoundExprKind::ColumnRef { binding, depth: 0 } = &group.kind {
                         self.aliases.insert(ColumnBinding::new(*group_index, index), *binding);
                     }
                 }
                 let (aggregate_index, aggregates) = (*aggregate_index, aggregates.clone());
-                let rows = max_cardinality(&op.children[0]);
+                let rows = self.max_rows(&op.children[0]);
                 let mut no_overflow = Vec::new();
                 for (index, aggregate) in aggregates.iter().enumerate() {
                     if let Some(stats) = self.aggregate_stats(aggregate, rows) {
@@ -2580,6 +2584,15 @@ fn max_cardinality(op: &LogicalOperator) -> Option<u64> {
 }
 
 impl StatisticsPropagator {
+    /// `NodeStatistics::max_cardinality`, which a scan of a CTE has from its definition.
+    fn max_rows(&self, op: &LogicalOperator) -> Option<u64> {
+        match &op.kind {
+            K::CteRef { cte_index, .. } => self.cte_rows.get(cte_index).copied().flatten(),
+            K::Filter { .. } | K::Projection { .. } => op.children.first().and_then(|c| self.max_rows(c)),
+            _ => max_cardinality(op),
+        }
+    }
+
     /// `SumPropagateStats`: a sum of integers lies between the smallest and largest value times the rows.
     /// `SumPropagateStats`: whether a sum of INTEGER or BIGINT values provably fits in an int64.
     fn sum_fits_in_int64(&mut self, aggregate: &BoundAggregate, rows: Option<u64>) -> bool {

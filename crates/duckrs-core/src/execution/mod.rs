@@ -148,16 +148,46 @@ pub fn create_plan(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
     create_physical(op)
 }
 
-/// Points the scans of the CTE whose table was `old` at `fresh`.
+/// Points the scans of the CTE whose table was `old` at `fresh`, in the plans of subqueries and
+/// recursive CTEs too.
 fn renew_cte_scans(
     op: &mut LogicalOperator,
     old: *const Mutex<ColumnDataCollection>,
     fresh: &Arc<Mutex<ColumnDataCollection>>,
 ) {
-    if let LogicalOperatorKind::CteRef { data, .. } = &mut op.kind
-        && Arc::as_ptr(data) == old
-    {
-        *data = fresh.clone();
+    match &mut op.kind {
+        LogicalOperatorKind::CteRef { data, .. } if Arc::as_ptr(data) == old => *data = fresh.clone(),
+        LogicalOperatorKind::RecursiveCte {
+            recursive, unresolved, ..
+        } => {
+            renew_cte_scans(recursive, old, fresh);
+            renew_cte_scans(unresolved, old, fresh);
+        }
+        LogicalOperatorKind::LateralJoin { right, .. } => renew_cte_scans(right, old, fresh),
+        _ => {}
+    }
+    for expr in op.expressions_mut() {
+        expr.walk_mut(&mut |e| {
+            if let BoundExprKind::Subquery { subquery, .. } = &mut e.kind {
+                // the subquery runs again for this table: it has no results yet
+                let mut plan = subquery.plan.clone();
+                renew_cte_scans(&mut plan, old, fresh);
+                let raw = subquery.raw.clone().map(|mut raw| {
+                    renew_cte_scans(&mut raw, old, fresh);
+                    raw
+                });
+                *subquery = Arc::new(crate::planner::expression::BoundSubquery {
+                    kind: subquery.kind,
+                    plan,
+                    raw,
+                    correlated: subquery.correlated.clone(),
+                    volatile: subquery.volatile,
+                    error_on_multiple_rows: subquery.error_on_multiple_rows,
+                    row: subquery.row,
+                    results: Mutex::default(),
+                });
+            }
+        });
     }
     for child in &mut op.children {
         renew_cte_scans(child, old, fresh);

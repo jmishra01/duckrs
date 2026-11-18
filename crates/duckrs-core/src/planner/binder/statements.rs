@@ -310,24 +310,111 @@ impl Binder<'_> {
                     ));
                 }
             }
+            let materialized = (cte.materialized == ast::CteMaterialize::Always
+                && matches!(cte.query.kind, QueryNodeKind::Select(_) | QueryNodeKind::SetOperation(_)))
+            .then(|| {
+                Arc::new(Mutex::new(super::MaterializedCteState {
+                    cte_index: self.generate_table_index(),
+                    data: Arc::new(Mutex::new(ColumnDataCollection::new(Vec::new()))),
+                    bound: None,
+                    inline: false,
+                }))
+            });
             self.ctes
-                .push((name.clone(), Arc::new(cte.clone()), self.outer_contexts.len()));
+                .push((name.clone(), Arc::new(cte.clone()), self.outer_contexts.len(), materialized));
         }
         let result = match &node.kind {
             QueryNodeKind::Select(select) => self.bind_select_node(select, &node.modifiers),
             QueryNodeKind::SetOperation(operation) => self.bind_set_operation(operation, &node.modifiers),
             _ => Err(not_implemented("this kind of query")),
         };
-        self.ctes.truncate(scope);
-        result
+        let pushed = self.ctes.split_off(scope);
+        let mut result = result?;
+        // `FinishCTE`: a materialized CTE that was referenced runs before the query, the first one
+        // outermost
+        for (name, _, _, state) in pushed.into_iter().rev() {
+            let Some(state) = state else {
+                continue;
+            };
+            let mut state = state.lock();
+            if state.inline {
+                continue;
+            }
+            let Some((plan, ..)) = state.bound.take() else {
+                continue;
+            };
+            let query = std::mem::replace(&mut result.plan, LogicalOperator::new(LogicalOperatorKind::CrossProduct, Vec::new()));
+            result.plan = LogicalOperator::new(
+                LogicalOperatorKind::MaterializedCte {
+                    name,
+                    table_index: state.cte_index,
+                    data: state.data.clone(),
+                    always: true,
+                },
+                vec![plan, query],
+            );
+        }
+        Ok(result)
     }
 
     /// A reference to the CTE at `index` of the visible ones (`Binder::Bind(BaseTableRef)`).
     fn bind_cte_reference(&mut self, table_ref: &TableRef, index: usize) -> Result<LogicalOperator> {
-        let (name, cte, outer_depth) = self.ctes[index].clone();
+        let (name, cte, outer_depth, materialized) = self.ctes[index].clone();
         if cte.aliases.iter().any(String::is_empty) {
             return Err(binder_error("column alias cannot be empty"));
         }
+        if let Some(state) = &materialized
+            && !state.lock().inline
+        {
+            let bound_already = state.lock().bound.is_some();
+            if !bound_already {
+                let before = self.correlated.lock().len();
+                let bound = self.bind_cte_definition(&name, &cte, index, outer_depth)?;
+                let correlated = self.correlated.lock().len() != before || !self.outer_contexts.is_empty();
+                let mut state = state.lock();
+                if correlated {
+                    state.inline = true;
+                    drop(state);
+                    return self.finish_cte_reference(table_ref, name, &cte, bound);
+                }
+                state.data = Arc::new(Mutex::new(ColumnDataCollection::new(bound.types.clone())));
+                state.bound = Some((bound.plan, bound.names, bound.types, bound.column_aliases, bound.return_type));
+            }
+            let state = state.lock();
+            let (_, names, types, column_aliases, return_type) = state.bound.as_ref().expect("bound above");
+            let reference = LogicalOperator::new(
+                LogicalOperatorKind::CteRef {
+                    table_index: self.generate_table_index(),
+                    cte_index: state.cte_index,
+                    types: types.clone(),
+                    names: names.clone(),
+                    data: state.data.clone(),
+                },
+                Vec::new(),
+            );
+            let bound = BoundStatement {
+                plan: reference,
+                names: names.clone(),
+                types: types.clone(),
+                column_aliases: column_aliases.clone(),
+                return_type: *return_type,
+            };
+            drop(state);
+            return self.finish_cte_reference(table_ref, name, &cte, bound);
+        }
+        let bound = self.bind_cte_definition(&name, &cte, index, outer_depth)?;
+        self.finish_cte_reference(table_ref, name, &cte, bound)
+    }
+
+    /// The query of the CTE at `index`, bound as at its definition.
+    fn bind_cte_definition(
+        &mut self,
+        name: &str,
+        cte: &ast::CteInfo,
+        index: usize,
+        outer_depth: usize,
+    ) -> Result<BoundStatement> {
+        let name = name.to_string();
         let mut binder = self.child_binder();
         // a CTE sees the ones before it, and not itself
         binder.ctes.truncate(index);
@@ -339,6 +426,16 @@ impl Binder<'_> {
             _ => binder.bind_query_node(&cte.query)?,
         };
         self.next_table_index = binder.next_table_index;
+        Ok(bound)
+    }
+
+    fn finish_cte_reference(
+        &mut self,
+        table_ref: &TableRef,
+        name: String,
+        cte: &ast::CteInfo,
+        bound: BoundStatement,
+    ) -> Result<LogicalOperator> {
         // the aliases of the reference override the ones of the CTE
         let mut column_aliases = cte.aliases.clone();
         for (i, alias) in table_ref.column_name_alias.iter().enumerate() {
@@ -2922,7 +3019,7 @@ impl Binder<'_> {
         let scope = self.ctes.len();
         for (name, cte) in &cte_map.0 {
             self.ctes
-                .push((name.clone(), Arc::new(cte.clone()), self.outer_contexts.len()));
+                .push((name.clone(), Arc::new(cte.clone()), self.outer_contexts.len(), None));
         }
         let result = bind(self);
         self.ctes.truncate(scope);

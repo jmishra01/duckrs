@@ -29,6 +29,28 @@ fn collect_columns(expr: &BoundExpr, used: &mut HashSet<ColumnBinding>) {
 /// `used` holds the columns that the operators above read. `by_position` says something above reads
 /// this operator's output by position and not through bindings.
 fn visit(op: &mut LogicalOperator, by_position: bool, used: &mut HashSet<ColumnBinding>) {
+    // a scan of a CTE read by position has all of its columns read
+    if let K::CteRef { .. } = &op.kind
+        && by_position
+    {
+        used.extend(op.column_bindings());
+    }
+    if let K::MaterializedCte { table_index, .. } = &op.kind {
+        let cte_index = *table_index;
+        // the output is what the query after the CTE gives
+        visit(&mut op.children[1], true, used);
+        // `CTERefPruner`: the columns of the definition that a scan of it reads
+        let mut read = HashSet::new();
+        let mut seen = true;
+        collect_cte_reads(&mut op.children[1], cte_index, used, &mut read, &mut seen);
+        let bindings = op.children[0].column_bindings();
+        let narrow = seen && read.len() < bindings.len() && matches!(op.children[0].kind, K::Projection { .. });
+        if narrow {
+            used.extend(read.iter().map(|&column| bindings[column]));
+        }
+        visit(&mut op.children[0], !narrow, used);
+        return;
+    }
     if let K::Get {
         table_index,
         column_ids,
@@ -137,6 +159,40 @@ fn visit(op: &mut LogicalOperator, by_position: bool, used: &mut HashSet<ColumnB
         if !by_position && (copies || matches!(child.kind, K::Projection { .. })) {
             drop_unread_columns(child, read);
         }
+    }
+}
+
+/// The columns of the CTE `cte_index` that its scans below `op` read. `seen` turns false where a
+/// subquery could read it without the scan's columns being among `used`.
+fn collect_cte_reads(
+    op: &mut LogicalOperator,
+    cte_index: usize,
+    used: &HashSet<ColumnBinding>,
+    read: &mut HashSet<usize>,
+    seen: &mut bool,
+) {
+    if let K::CteRef {
+        table_index,
+        cte_index: index,
+        types,
+        ..
+    } = &op.kind
+        && *index == cte_index
+    {
+        read.extend((0..types.len()).filter(|&column| used.contains(&ColumnBinding::new(*table_index, column))));
+    }
+    if matches!(op.kind, K::RecursiveCte { .. } | K::LateralJoin { .. }) {
+        *seen = false;
+    }
+    for expr in op.expressions_mut() {
+        expr.walk_mut(&mut |e| {
+            if matches!(e.kind, BoundExprKind::Subquery { .. }) {
+                *seen = false;
+            }
+        });
+    }
+    for child in &mut op.children {
+        collect_cte_reads(child, cte_index, used, read, seen);
     }
 }
 

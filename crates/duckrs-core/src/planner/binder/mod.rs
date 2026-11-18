@@ -74,6 +74,18 @@ pub struct BoundStatement {
     pub return_type: StatementReturnType,
 }
 
+/// A CTE that runs once (`CTE_MATERIALIZE_ALWAYS`), whose references are `CteRef`s
+/// (`CTEBindState`).
+#[derive(Debug)]
+pub(super) struct MaterializedCteState {
+    pub cte_index: usize,
+    pub data: Arc<Mutex<ColumnDataCollection>>,
+    /// what the first reference bound: the plan, its names, types and column aliases
+    pub bound: Option<(LogicalOperator, Vec<String>, Vec<LogicalType>, Vec<(String, usize)>, StatementReturnType)>,
+    /// the CTE reads the queries around it: each reference binds it on its own
+    pub inline: bool,
+}
+
 /// The columns a FROM clause entry makes visible (`TableBinding`).
 #[derive(Debug, Clone)]
 pub struct Binding {
@@ -871,8 +883,9 @@ pub struct Binder<'a> {
     unnest_level: usize,
     /// The parameters of the prepared statement being bound, if it is one.
     pub parameters: Option<Arc<ParameterValues>>,
-    /// The CTEs in scope, innermost last, with how many outer contexts they can see.
-    ctes: Vec<(String, Arc<ast::CteInfo>, usize)>,
+    /// The CTEs in scope, innermost last, with how many outer contexts they can see, and for one
+    /// that is materialized, what its references read.
+    ctes: Vec<(String, Arc<ast::CteInfo>, usize, Option<Arc<Mutex<MaterializedCteState>>>)>,
     /// The CTEs whose definition is being bound, which cannot refer to themselves.
     ctes_being_bound: Vec<String>,
     /// What the queries around a subquery can see, innermost last.

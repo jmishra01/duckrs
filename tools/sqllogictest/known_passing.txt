@@ -500,6 +500,7 @@ test/optimizer/constant_argument_errors_like_regex.test
 test/optimizer/constant_folding.test
 test/optimizer/constant_order_normalization.test
 test/optimizer/csv_pushdown.test
+test/optimizer/cte_inlining.test
 test/optimizer/cte_statistics_propagation.test
 test/optimizer/deliminator_nullability.test
 test/optimizer/disjunctive_join_rewriter_exclusions.test
@@ -1975,6 +1976,7 @@ test/sql/cte/insert_cte_bug_3417.test
 test/sql/cte/lazy_cte_bind.test
 test/sql/cte/lazy_cte_bind_correlated.test
 test/sql/cte/materialized/annotated_and_auto_materialized.test
+test/sql/cte/materialized/cte_runtime_filter_effects.test
 test/sql/cte/materialized/cte_runtime_filters.test
 test/sql/cte/materialized/dml_materialized_cte.test
 test/sql/cte/materialized/incorrect_recursive_cte_materialized.test
@@ -3542,6 +3544,7 @@ test/sql/sql_export/structural_expressions.test
 test/sql/sql_export/table_row_number_sql_export.test
 test/sql/sql_export/tuple_type_constants.test
 test/sql/sql_export/union_value.test
+test/sql/sql_export/values_consumers.test
 test/sql/sql_export/variant_key_order.test
 test/sql/sql_export/window_unnest_results.test
 test/sql/storage/alter/alter_add_col_defaultexpr_sequence.test
