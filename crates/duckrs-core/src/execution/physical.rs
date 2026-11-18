@@ -701,12 +701,17 @@ impl PhysicalOperator for PhysicalTableScan {
     fn dynamic_filters(&self) -> Option<String> {
         let mut found: Vec<(String, Vec<String>)> = Vec::new();
         let mut visit = |expr: &BoundExpr| {
-            if let BoundExprKind::JoinFilter { child, filter } = &expr.kind
-                && let Some(text) = filter.describe(&child.alias)
+            if let BoundExprKind::JoinFilter {
+                child,
+                filter,
+                keep_null,
+            } = &expr.kind
+                && let Some(text) = filter.describe(child, *keep_null)
             {
-                match found.iter_mut().find(|(name, _)| *name == child.alias) {
+                let name = child.to_string();
+                match found.iter_mut().find(|(n, _)| *n == name) {
                     Some((_, texts)) => texts.push(text),
-                    None => found.push((child.alias.clone(), vec![text])),
+                    None => found.push((name, vec![text])),
                 }
             }
         };

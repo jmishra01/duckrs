@@ -903,9 +903,13 @@ pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
     let count = input.len();
     match &expr.kind {
         BoundExprKind::Constant(value) => Ok(Vector::constant(value)),
-        BoundExprKind::JoinFilter { child, filter } => {
+        BoundExprKind::JoinFilter {
+            child,
+            filter,
+            keep_null,
+        } => {
             let values = execute(child, input)?;
-            let Some(kept) = filter.select(&values, count) else {
+            let Some(kept) = filter.select(&values, count, *keep_null) else {
                 return Ok(Vector::constant(&Value::boolean(true)));
             };
             let mut result = Vector::new(LogicalType::BOOLEAN, count);
@@ -1196,9 +1200,14 @@ pub fn select(expr: &BoundExpr, input: &DataChunk) -> Result<(SelectionVector, u
         let count = chosen.len();
         return Ok((SelectionVector::from_vec(chosen), count));
     }
-    if let BoundExprKind::JoinFilter { child, filter } = &expr.kind {
+    if let BoundExprKind::JoinFilter {
+        child,
+        filter,
+        keep_null,
+    } = &expr.kind
+    {
         let values = execute(child, input)?;
-        return Ok(match filter.select(&values, input.len()) {
+        return Ok(match filter.select(&values, input.len(), *keep_null) {
             Some(kept) => {
                 let count = kept.len();
                 (SelectionVector::from_vec(kept), count)

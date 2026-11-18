@@ -595,7 +595,10 @@ test/optimizer/pushdown/issue_16104.test
 test/optimizer/pushdown/issue_16863.test
 test/optimizer/pushdown/issue_18202.test
 test/optimizer/pushdown/join_filter_pushdown.test
+test/optimizer/pushdown/join_filter_pushdown_bloom_cast.test
+test/optimizer/pushdown/join_filter_pushdown_cast.test
 test/optimizer/pushdown/join_filter_pushdown_sample.test
+test/optimizer/pushdown/join_filter_target_cardinality.test
 test/optimizer/pushdown/lateral_projection_evaluation.test
 test/optimizer/pushdown/no_mark_to_semi_if_mark_index_is_projected.test
 test/optimizer/pushdown/prefix_pushdown_null_constant.test

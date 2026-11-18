@@ -1176,6 +1176,7 @@ impl ClientContext {
             options.dynamic_or_filter_threshold = threshold;
         }
         crate::execution::join_filter::set_in_filter_threshold(options.dynamic_or_filter_threshold);
+        crate::execution::join_filter::set_enabled(options.join_filter_pushdown);
         if let Ok(threshold) = self.setting_text("perfect_ht_threshold").parse() {
             options.perfect_ht_threshold = threshold;
         }
@@ -2843,6 +2844,7 @@ impl ClientContext {
         let optimized = plan.clone();
         let estimate = estimate_plan(&plan);
         let logical_optimized = explain::logical_tree(&plan, Some(&estimate));
+        crate::execution::join_filter::note_probe_estimates(&plan);
         resolve_column_bindings(&mut plan)?;
         let physical_plan = create_plan(plan);
         let physical = explain::physical_tree(physical_plan.as_ref(), Some(&optimized), Some(&estimate), analyze);
@@ -3549,6 +3551,7 @@ impl ClientContext {
         let mut optimizers = Vec::new();
         let mut plan = crate::optimizer::optimize_timed(bound.plan, self.optimizer_options(), &mut optimizers);
         let optimized = profiling.map(|_| std::time::Instant::now());
+        crate::execution::join_filter::note_probe_estimates(&plan);
         resolve_column_bindings(&mut plan)?;
         let plan = create_plan(plan);
         let physical = profiling.map(|_| std::time::Instant::now());

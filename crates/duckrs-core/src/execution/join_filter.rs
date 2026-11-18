@@ -37,6 +37,13 @@ pub fn set_in_filter_threshold(threshold: usize) {
     IN_FILTER_THRESHOLD.store(threshold, Ordering::Relaxed);
 }
 
+/// `disabled_optimizers` without `join_filter_pushdown`, as the client last planned with it.
+static ENABLED: AtomicBool = AtomicBool::new(true);
+
+pub fn set_enabled(enabled: bool) {
+    ENABLED.store(enabled, Ordering::Relaxed);
+}
+
 /// What a join filter knows of the build keys of its join.
 pub struct JoinFilter {
     /// `IS NOT DISTINCT FROM`: a NULL can match
@@ -63,6 +70,8 @@ pub struct JoinFilter {
     scan_estimate: AtomicU64,
     /// the filter of the build keys published next to `published`
     runtime: OnceLock<Option<RuntimeFilter>>,
+    /// `published` with its keys cast to the type of a scan's column, by that type
+    converted: parking_lot::Mutex<Vec<(LogicalType, Option<Published>)>>,
 }
 
 /// What of its join decides which filters of the build keys a join filter publishes.
@@ -143,6 +152,63 @@ fn keys_of(vector: &Vector, count: usize) -> Vec<Option<Key>> {
             })
         })
         .collect()
+}
+
+/// The name of the column an expression of a scan's column reads.
+fn column_name(expr: &BoundExpr) -> String {
+    match &expr.kind {
+        BoundExprKind::Cast { child, .. } => column_name(child),
+        _ => expr.alias.clone(),
+    }
+}
+
+/// The size and signedness of the integer types a join filter goes through casts of.
+fn integral(ty: &LogicalType) -> Option<(u8, bool)> {
+    Some(match ty.id() {
+        LogicalTypeId::TinyInt => (1, true),
+        LogicalTypeId::SmallInt => (2, true),
+        LogicalTypeId::Integer => (4, true),
+        LogicalTypeId::BigInt => (8, true),
+        LogicalTypeId::UTinyInt => (1, false),
+        LogicalTypeId::USmallInt => (2, false),
+        LogicalTypeId::UInteger => (4, false),
+        LogicalTypeId::UBigInt => (8, false),
+        _ => return None,
+    })
+}
+
+/// `RuntimeFilterCastCanFail`.
+fn cast_can_fail(source: &LogicalType, target: &LogicalType) -> bool {
+    if source == target {
+        return false;
+    }
+    let (Some((source_size, source_signed)), Some((target_size, target_signed))) = (integral(source), integral(target))
+    else {
+        return true;
+    };
+    if source_size > target_size {
+        return true;
+    }
+    if source_signed == target_signed {
+        return false;
+    }
+    source_signed || source_size >= target_size
+}
+
+/// `PushdownJoinFilterExpressionInternal`: the output column under integer casts, with the casts
+/// from the column outward and whether each was a TRY_CAST.
+fn peel_casts(expr: &BoundExpr) -> Option<(usize, Vec<(LogicalType, bool)>)> {
+    match &expr.kind {
+        BoundExprKind::Reference(column) => Some((*column, Vec::new())),
+        BoundExprKind::Cast { child, try_cast }
+            if integral(&child.return_type).is_some() && integral(&expr.return_type).is_some() =>
+        {
+            let (column, mut casts) = peel_casts(child)?;
+            casts.push((expr.return_type.clone(), *try_cast));
+            Some((column, casts))
+        }
+        _ => None,
+    }
 }
 
 /// `PushdownJoinFilterExpressionInternal`: no nested types, and no INTERVAL.
@@ -240,6 +306,7 @@ impl JoinFilter {
             shape,
             scan_estimate: AtomicU64::new(0),
             runtime: OnceLock::new(),
+            converted: parking_lot::Mutex::new(Vec::new()),
             null_safe,
             ty,
             in_threshold: IN_FILTER_THRESHOLD.load(Ordering::Relaxed),
@@ -395,15 +462,54 @@ impl JoinFilter {
         self.published.get().is_some_and(Option::is_some) || self.keys.get().is_some_and(Option::is_some)
     }
 
-    /// `PhysicalTableScan::GetFilterInfo` of what the filter gives the scan, for the column `name`.
-    pub fn describe(&self, name: &str) -> Option<String> {
+    /// `published` for values of `ty`: a scan whose column the join's key is a cast of that cannot
+    /// fail compares the column with the keys cast to its type (`FinalizeFilters`). A key that
+    /// does not fit leaves no filter, or the range for an IN list.
+    fn published_for(&self, ty: &LogicalType) -> Option<Published> {
+        let published = self.published.get()?.as_ref()?;
+        if *ty == self.ty {
+            return Some(published.clone());
+        }
+        let mut converted = self.converted.lock();
+        if let Some((_, result)) = converted.iter().find(|(t, _)| t == ty) {
+            return result.clone();
+        }
+        let cast = |key: &Key| -> Option<Key> {
+            let value = BoundExpr::constant(key.value.clone()).cast_to(ty, true);
+            let value = crate::execution::expression_executor::evaluate_scalar(&value).ok()?;
+            if value.is_null() {
+                return None;
+            }
+            keys_of(&Vector::constant(&value), 1).pop().flatten()
+        };
+        let result = match published {
+            Published::Single(key) => cast(key).map(Published::Single),
+            Published::Range(min, max) => cast(min).zip(cast(max)).map(|(min, max)| Published::Range(min, max)),
+            Published::In(keys) => match keys.iter().map(cast).collect::<Option<Vec<_>>>() {
+                Some(keys) => Some(Published::In(keys)),
+                None => keys
+                    .first()
+                    .and_then(cast)
+                    .zip(keys.last().and_then(cast))
+                    .map(|(min, max)| Published::Range(min, max)),
+            },
+        };
+        converted.push((ty.clone(), result.clone()));
+        result
+    }
+
+    /// `PhysicalTableScan::GetFilterInfo` of what the filter gives the scan through `input`, an
+    /// expression of its column. `keep_null`: a NULL of `input` is a value its cast failed on.
+    pub fn describe(&self, input: &BoundExpr, keep_null: bool) -> Option<String> {
         if self.off.load(Ordering::Relaxed) {
             return None;
         }
+        let column = column_name(input);
+        let name = &input.to_string();
         let literal = |key: &Key| BoundExpr::constant(key.value.clone()).to_string();
         // `RetainRuntimeFilterNulls`
         let retain = |filter: String| {
-            if self.null_safe {
+            if self.null_safe || keep_null {
                 format!("({name} IS NULL OR {filter})")
             } else {
                 filter
@@ -414,9 +520,9 @@ impl JoinFilter {
                 RuntimeFilter::Bloom => "BF",
                 RuntimeFilter::PrefixRange => "PRF",
             };
-            format!("optional: {name} IN {kind}({})", self.shape.key_name)
+            format!("optional: {column} IN {kind}({})", self.shape.key_name)
         });
-        let published = match self.published.get()?.as_ref()? {
+        let published = match &self.published_for(&input.return_type)? {
             Published::Single(v) => {
                 let op = if self.null_safe { "IS NOT DISTINCT FROM" } else { "=" };
                 retain(format!("{name} {op} {}", literal(v)))
@@ -443,11 +549,12 @@ impl JoinFilter {
     }
 
     /// The rows of `count` of `values` that can match a build key, or `None` if all of them can.
-    pub fn select(&self, values: &Vector, count: usize) -> Option<Vec<u32>> {
+    pub fn select(&self, values: &Vector, count: usize, keep_null: bool) -> Option<Vec<u32>> {
         if self.off.load(Ordering::Relaxed) {
             return None;
         }
-        let published = self.published.get().and_then(Option::as_ref);
+        let converted = self.published_for(values.logical_type());
+        let published = converted.as_ref();
         // the Bloom filter only where it is complete, and while it drops enough rows
         let keys = self
             .keys
@@ -460,7 +567,7 @@ impl JoinFilter {
         if published.is_none() && keys.is_none() {
             return None;
         }
-        let null_passes = self.null_safe;
+        let null_passes = self.null_safe || keep_null;
         let mut kept = Vec::with_capacity(count);
         if supported(values.logical_type()) {
             let int = |key: &Key| key.int.unwrap_or_default();
@@ -545,14 +652,50 @@ pub fn record(op: &dyn crate::execution::physical::PhysicalOperator) {
     });
 }
 
+thread_local! {
+    /// The estimated rows of the probe side of each join, in pre-order, of the plan about to be
+    /// planned: the estimates of the plan before its column bindings were resolved.
+    static PROBE_ESTIMATES: std::cell::RefCell<Option<Vec<u64>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Keeps the estimates of the probe sides of the joins of `plan`, which has its column bindings
+/// still, for the next [`push_join_filters`].
+pub fn note_probe_estimates(plan: &LogicalOperator) {
+    fn collect(op: &LogicalOperator, out: &mut Vec<u64>) {
+        if matches!(op.kind, LogicalOperatorKind::Join { .. }) {
+            out.push(crate::optimizer::join_order::estimated_cardinality(&op.children[0]));
+        }
+        for child in &op.children {
+            collect(child, out);
+        }
+    }
+    let mut estimates = Vec::new();
+    collect(plan, &mut estimates);
+    PROBE_ESTIMATES.with(|e| *e.borrow_mut() = Some(estimates));
+}
+
 /// `JoinFilterPushdownOptimizer`: gives each hash join that drops the probe rows without a match a
 /// filter for each equality on a column of a scan below its probe side, in that scan
 /// (`JoinTypeIsSupported`). The range joins of C++ push min and max filters of their keys, which
 /// duckrs does not.
 pub fn push_join_filters(op: &mut LogicalOperator) {
+    let estimates = PROBE_ESTIMATES.with(|e| e.borrow_mut().take());
+    if !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    push_join_filters_with(op, estimates.as_deref(), &mut 0);
+}
+
+fn push_join_filters_with(op: &mut LogicalOperator, estimates: Option<&[u64]>, next: &mut usize) {
+    let noted = if matches!(op.kind, LogicalOperatorKind::Join { .. }) {
+        *next += 1;
+        estimates.and_then(|e| e.get(*next - 1).copied())
+    } else {
+        None
+    };
     // the recursive part runs again for each round: only the anchor (`VisitOperator`)
     for child in &mut op.children {
-        push_join_filters(child);
+        push_join_filters_with(child, estimates, next);
     }
     let LogicalOperatorKind::Join {
         join_type: JoinType::Inner | JoinType::Semi | JoinType::RightSemi | JoinType::Right,
@@ -567,10 +710,11 @@ pub fn push_join_filters(op: &mut LogicalOperator) {
         return;
     }
     let equalities = conditions.iter().filter(|c| c.is_equality()).count();
-    let probe_estimate = crate::optimizer::join_order::estimated_cardinality(&op.children[0]);
+    let probe_estimate =
+        noted.unwrap_or_else(|| crate::optimizer::join_order::estimated_cardinality(&op.children[0]));
     let build_filtered = is_filtering(&op.children[1]);
     for condition in conditions.iter_mut() {
-        let BoundExprKind::Reference(column) = condition.left.kind else {
+        let Some((column, casts)) = peel_casts(&condition.left) else {
             continue;
         };
         if condition.filter.is_some()
@@ -590,7 +734,7 @@ pub fn push_join_filters(op: &mut LogicalOperator) {
                 key_name: condition.right.to_string(),
             },
         ));
-        if push_into(&mut op.children[0], column, &filter) {
+        if push_into(&mut op.children[0], column, &casts, &filter) {
             condition.filter = Some(filter);
         }
     }
@@ -633,7 +777,12 @@ fn can_skip(op: &mut LogicalOperator) -> bool {
 /// `FindFilterTargets`: puts `filter` on output column `column` of `op` into the scans its values
 /// come from, where the way there keeps them as they are and drops no row that a row of the scan
 /// would make. Gives whether it went anywhere.
-fn push_into(op: &mut LogicalOperator, column: usize, filter: &std::sync::Arc<JoinFilter>) -> bool {
+fn push_into(
+    op: &mut LogicalOperator,
+    column: usize,
+    casts: &[(LogicalType, bool)],
+    filter: &std::sync::Arc<JoinFilter>,
+) -> bool {
     use LogicalOperatorKind as K;
     if has_volatile_expressions(op) {
         return false;
@@ -663,25 +812,42 @@ fn push_into(op: &mut LogicalOperator, column: usize, filter: &std::sync::Arc<Jo
             let Some(definition) = table.columns.get(*column_id) else {
                 return false;
             };
-            if definition.ty != filter.ty {
+            if casts.last().map_or(&definition.ty, |(ty, _)| ty) != &filter.ty {
                 return false;
             }
+            // `CreateRuntimeFilterInputExpression`: a cast that can fail is a TRY_CAST, and where
+            // the query's own cast would have failed the row stays for it (`preserves_cast_errors`)
+            let column_ref = BoundExpr::new(BoundExprKind::Reference(position), definition.ty.clone())
+                .with_alias(definition.name.clone());
+            let mut input = column_ref.clone();
+            let (mut reconstruct, mut keep_null) = (false, false);
+            let mut source = definition.ty.clone();
+            for (target, try_cast) in casts {
+                let can_fail = cast_can_fail(&source, target);
+                if source != *target {
+                    input = input.cast_to(target, *try_cast || can_fail);
+                }
+                reconstruct |= can_fail;
+                keep_null |= !try_cast && can_fail;
+                source = target.clone();
+            }
+            // `RequiresRuntimeFilterExpressionReconstruction`: without a cast that can fail the
+            // column itself is compared, with the keys cast to its type
+            let input = if reconstruct || filter.null_safe { input } else { column_ref };
             let already = filters.iter().any(|f| {
-                matches!(&f.kind, BoundExprKind::JoinFilter { child, filter: other }
-                    if std::sync::Arc::ptr_eq(other, filter)
-                        && matches!(child.kind, BoundExprKind::Reference(p) if p == position))
+                matches!(&f.kind, BoundExprKind::JoinFilter { child, filter: other, .. }
+                    if std::sync::Arc::ptr_eq(other, filter) && format!("{child:?}") == format!("{input:?}"))
             });
             if table.row_count() >= MIN_BLOOM_TABLE_ROWS {
                 filter.bloom.store(true, Ordering::Relaxed);
             }
             filter.scan_estimate.fetch_max(table.row_count() as u64, Ordering::Relaxed);
             if !already {
-                let child = BoundExpr::new(BoundExprKind::Reference(position), definition.ty.clone())
-                    .with_alias(definition.name.clone());
                 filters.push(BoundExpr::new(
                     BoundExprKind::JoinFilter {
-                        child: Box::new(child),
+                        child: Box::new(input),
                         filter: filter.clone(),
+                        keep_null,
                     },
                     LogicalType::BOOLEAN,
                 ));
@@ -690,24 +856,24 @@ fn push_into(op: &mut LogicalOperator, column: usize, filter: &std::sync::Arc<Jo
         }
         // a SECURE VIEW takes a join filter as it takes a pushed WHERE filter: it cannot fail
         K::Filter { .. } | K::Order { .. } | K::Distinct { on: false, .. } | K::SecureView { .. } => {
-            push_into(&mut op.children[0], column, filter)
+            push_into(&mut op.children[0], column, casts, filter)
         }
         K::ColumnSelect { keep } => {
             let Some(kept) = keep.get(column).copied() else {
                 return false;
             };
             match op.children[0].column_bindings().iter().position(|binding| *binding == kept) {
-                Some(child_column) => push_into(&mut op.children[0], child_column, filter),
+                Some(child_column) => push_into(&mut op.children[0], child_column, casts, filter),
                 None => false,
             }
         }
-        // `PushdownProjectionColumns`
-        K::Projection { expressions, .. } => match expressions.get(column).map(|e| &e.kind) {
-            Some(BoundExprKind::Reference(child_column)) => {
-                let child_column = *child_column;
-                push_into(&mut op.children[0], child_column, filter)
+        // `PushdownProjectionColumns`: through integer casts too
+        K::Projection { expressions, .. } => match expressions.get(column).and_then(peel_casts) {
+            Some((child_column, mut inner)) => {
+                inner.extend_from_slice(casts);
+                push_into(&mut op.children[0], child_column, &inner, filter)
             }
-            _ => false,
+            None => false,
         },
         // `PushdownAggregateColumns`: a group of every grouping set
         K::Aggregate {
@@ -716,12 +882,12 @@ fn push_into(op: &mut LogicalOperator, column: usize, filter: &std::sync::Arc<Jo
             if !grouping_sets.iter().all(|set| set.contains(&column)) {
                 return false;
             }
-            match groups.get(column).map(|g| &g.kind) {
-                Some(BoundExprKind::Reference(child_column)) => {
-                    let child_column = *child_column;
-                    push_into(&mut op.children[0], child_column, filter)
+            match groups.get(column).and_then(peel_casts) {
+                Some((child_column, mut inner)) => {
+                    inner.extend_from_slice(casts);
+                    push_into(&mut op.children[0], child_column, &inner, filter)
                 }
-                _ => false,
+                None => false,
             }
         }
         // `FindWindowFilterTargets`: a column all windows partition by
@@ -733,20 +899,20 @@ fn push_into(op: &mut LogicalOperator, column: usize, filter: &std::sync::Arc<Jo
                         .iter()
                         .any(|p| matches!(p.kind, BoundExprKind::Reference(c) if c == column))
                 });
-            shared && push_into(&mut op.children[0], column, filter)
+            shared && push_into(&mut op.children[0], column, casts, filter)
         }
         // `FindSetOperationFilterTargets`: EXCEPT keeps the rows of its first child
         K::Union { .. } | K::ExceptIntersect { except: false, .. } => {
             let mut any = false;
             for child in &mut op.children {
-                any |= push_into(child, column, filter);
+                any |= push_into(child, column, casts, filter);
             }
             any
         }
-        K::ExceptIntersect { except: true, .. } => push_into(&mut op.children[0], column, filter),
+        K::ExceptIntersect { except: true, .. } => push_into(&mut op.children[0], column, casts, filter),
         // the columns of its input, not those it unnests
-        K::Unnest { .. } => column < left_columns && push_into(&mut op.children[0], column, filter),
-        K::MaterializedCte { .. } => can_skip(&mut op.children[0]) && push_into(&mut op.children[1], column, filter),
+        K::Unnest { .. } => column < left_columns && push_into(&mut op.children[0], column, casts, filter),
+        K::MaterializedCte { .. } => can_skip(&mut op.children[0]) && push_into(&mut op.children[1], column, casts, filter),
         // `FindJoinFilterTargets`: an INNER join takes the filter on either side, and to the columns
         // its equalities make equal; a filtered build side makes the probe side's rows go
         K::CrossProduct
@@ -786,7 +952,7 @@ fn push_into(op: &mut LogicalOperator, column: usize, filter: &std::sync::Arc<Jo
                 if side == 1 && !left_skippable {
                     continue;
                 }
-                any |= push_into(&mut op.children[side], at, filter);
+                any |= push_into(&mut op.children[side], at, casts, filter);
             }
             any
         }
@@ -795,7 +961,7 @@ fn push_into(op: &mut LogicalOperator, column: usize, filter: &std::sync::Arc<Jo
             join_type: JoinType::Left | JoinType::Semi | JoinType::Anti | JoinType::Single,
             ..
         }
-        | K::MarkJoin { .. } => column < left_columns && push_into(&mut op.children[0], column, filter),
+        | K::MarkJoin { .. } => column < left_columns && push_into(&mut op.children[0], column, casts, filter),
         _ => false,
     }
 }

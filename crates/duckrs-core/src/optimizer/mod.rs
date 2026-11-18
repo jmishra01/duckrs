@@ -73,6 +73,7 @@ pub struct OptimizerOptions {
     pub sampling_pushdown: bool,
     pub partial_aggregate_pushdown: bool,
     pub aggregate_reuse: bool,
+    pub join_filter_pushdown: bool,
     /// `index_scan_percentage`
     pub index_scan_percentage: f64,
     /// `index_scan_max_count`
@@ -113,6 +114,7 @@ impl Default for OptimizerOptions {
             sampling_pushdown: true,
             partial_aggregate_pushdown: true,
             aggregate_reuse: true,
+            join_filter_pushdown: true,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -151,6 +153,7 @@ impl OptimizerOptions {
             sampling_pushdown: false,
             partial_aggregate_pushdown: false,
             aggregate_reuse: false,
+            join_filter_pushdown: false,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -188,6 +191,7 @@ impl OptimizerOptions {
             sampling_pushdown: !off("sampling_pushdown"),
             partial_aggregate_pushdown: !off("partial_aggregate_pushdown"),
             aggregate_reuse: !off("aggregate_reuse"),
+            join_filter_pushdown: !off("join_filter_pushdown"),
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,

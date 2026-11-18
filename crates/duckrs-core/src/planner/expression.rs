@@ -148,6 +148,8 @@ pub enum BoundExprKind {
     JoinFilter {
         child: Box<BoundExpr>,
         filter: Arc<crate::execution::join_filter::JoinFilter>,
+        /// a NULL of `child` passes: it is a value a cast failed on, for the query to fail on
+        keep_null: bool,
     },
     /// `BoundCastExpression` to the expression's return type.
     Cast { child: Box<BoundExpr>, try_cast: bool },
