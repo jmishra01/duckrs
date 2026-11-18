@@ -94,6 +94,8 @@ pub(super) struct PersistentColumn {
     /// of a GEOMETRY without extra data, that it is the BLOB of the spatial extension's format
     /// (`GeometryStorageType::SPATIAL`)
     pub(super) spatial: bool,
+    /// of a LIST, the lengths of its lists in the row group (`ListPersistentColumnData`, from v2.1.0)
+    pub(super) list_lengths: Option<crate::catalog::ListLengths>,
 }
 
 fn not_ported_column(ty: &LogicalType) -> Error {
@@ -145,7 +147,27 @@ fn read_persistent_column(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalTyp
                 return Err(corrupt("a VARIANT column has extra data of another column"));
             }
             shredded_type = storage_type;
-        } else if d.has_property(99)? {
+        }
+        // `ListPersistentColumnData`: the lengths of the lists
+        let mut list_lengths = None;
+        if ty.map(LogicalType::physical_type) == Some(PhysicalType::List) && d.has_property(99)? {
+            const LIST_EXTRA_DATA: u8 = 3;
+            list_lengths = d.read_object_field(99, "extra_data", |d| {
+                if !d.begin_nullable()? {
+                    return Ok(None);
+                }
+                d.read_object_value(|d| {
+                    if d.read_optional_property::<u8>(100, "type")? != Some(LIST_EXTRA_DATA) {
+                        return Err(corrupt("a LIST column has extra data of another column"));
+                    }
+                    Ok(Some(crate::catalog::ListLengths {
+                        min: d.read_optional_property::<u64>(101, "min_list_length")?,
+                        max: d.read_optional_property::<u64>(102, "max_list_length")?,
+                        total: d.read_optional_property::<u64>(103, "total_list_length")?,
+                    }))
+                })
+            })?;
+        } else if ty.map(LogicalType::id) != Some(LogicalTypeId::Variant) && d.has_property(99)? {
             return Err(Error::not_implemented(
                 "reading extra column data from a database file is not yet ported to duckrs",
             ));
@@ -162,6 +184,7 @@ fn read_persistent_column(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalTyp
                 children: Vec::new(),
                 shredded_type: None,
                 spatial: false,
+                list_lengths: None,
             });
         };
         let validity = d.read_object_field(101, "validity", |d| read_persistent_column(d, None))?;
@@ -178,6 +201,7 @@ fn read_persistent_column(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalTyp
                 children,
                 shredded_type,
                 spatial: false,
+                list_lengths: None,
             });
         }
         let children = match ty.physical_type() {
@@ -200,6 +224,7 @@ fn read_persistent_column(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalTyp
             children,
             shredded_type: None,
             spatial,
+            list_lengths,
         })
     })
 }
@@ -932,7 +957,6 @@ fn column_statistics(stored: &super::statistics::BaseStatistics, ty: &LogicalTyp
         can_be_valid: stored.has_no_null,
         geometry: stored.geometry,
         variant,
-        lists: None,
         strings: stored.strings.as_ref().map(|strings| crate::catalog::StringStatistics {
             bounds: strings.has_bounds.then(|| (strings.min.clone(), strings.max.clone())),
             has_unicode: strings.has_unicode,
@@ -940,6 +964,7 @@ fn column_statistics(stored: &super::statistics::BaseStatistics, ty: &LogicalTyp
             max_length: strings.max_length,
             total_length: strings.total_length,
         }),
+        lists: stored.lists,
         distinct: None,
         children,
     })

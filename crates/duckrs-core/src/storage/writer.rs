@@ -131,6 +131,8 @@ struct Stats {
     variant_inconsistent: bool,
     /// of a LIST or ARRAY its element's, of a STRUCT each field's; empty when not known
     children: Vec<Stats>,
+    /// of a LIST, the lengths of its lists (`ListStatsData`), if known
+    lists: Option<crate::catalog::ListLengths>,
 }
 
 /// `StringStatsData` as `StatsWriter<string_t>` works it out: the bounds in full (a serialization keeps a
@@ -197,6 +199,7 @@ impl Stats {
             variant_shredded: None,
             variant_inconsistent: false,
             children: Vec::new(),
+            lists: None,
         }
     }
 
@@ -210,12 +213,18 @@ impl Stats {
             variant_shredded: None,
             variant_inconsistent: false,
             children: Vec::new(),
+            lists: None,
         }
     }
 
     /// `BaseStatistics::Merge`, of the statistics of a column of type `ty`.
     fn merge(&mut self, other: &Self, ty: &LogicalType) {
         let physical = ty.physical_type();
+        // `ListStats::Merge`: of row groups that are not the same, the totals add up
+        self.lists = match (self.lists, other.lists) {
+            (Some(a), Some(b)) => Some(a.merge(&b, true)),
+            _ => None,
+        };
         if self.children.len() == other.children.len() {
             let types = child_types(ty);
             for (at, (child, other)) in self.children.iter_mut().zip(&other.children).enumerate() {
@@ -719,6 +728,12 @@ fn write_stats(s: &mut BinarySerializer, ty: Option<&LogicalType>, stats: &Stats
             }
             PhysicalType::List | PhysicalType::Array => {
                 s.write_object(200, "child_stats", |s| write_stats(s, ty.child_type(), child_stats(0)));
+                // `ListStats::Serialize`: from v2.1.0, the lengths that are known
+                if let (PhysicalType::List, Some(lists)) = (ty.physical_type(), &stats.lists)
+                    && s.should_serialize(StorageVersion::V2_1_0)
+                {
+                    write_list_lengths(s, lists, 201);
+                }
             }
             PhysicalType::Bit | PhysicalType::Invalid | PhysicalType::Unknown => {}
             physical => {
@@ -775,6 +790,21 @@ fn write_segment(s: &mut BinarySerializer, segment: &SegmentOut, ty: Option<&Log
     });
 }
 
+/// `min_list_length`, `max_list_length` and `total_list_length` from field `first` on, those that are known
+/// (`WritePropertyWithDefault` of an `optional_idx`).
+fn write_list_lengths(s: &mut BinarySerializer, lists: &crate::catalog::ListLengths, first: u16) {
+    let fields = [
+        ("min_list_length", lists.min_length()),
+        ("max_list_length", lists.max),
+        ("total_list_length", lists.total),
+    ];
+    for (at, (tag, value)) in fields.into_iter().enumerate() {
+        if let Some(value) = value {
+            s.write_property(first + at as u16, tag, &value);
+        }
+    }
+}
+
 /// `PersistentColumnData::Serialize`, without the object around it.
 fn write_column(s: &mut BinarySerializer, column: &ColumnOut, ty: Option<&LogicalType>, row_start: u64) {
     // before v1.5.0 a GEOMETRY is the BLOB of the spatial extension's format, with nothing to say so
@@ -791,6 +821,17 @@ fn write_column(s: &mut BinarySerializer, column: &ColumnOut, ty: Option<&Logica
         s.write_nullable_object(99, "extra_data", |s| {
             s.write_property(100, "type", &VARIANT_EXTRA_DATA);
             s.write_property(101, "storage_type", shredded_type);
+        });
+    }
+    // `ListPersistentColumnData`, from v2.1.0: the lengths of the lists of the row group
+    if let (Some(ty), Some(lists)) = (ty, &column.stats.lists)
+        && ty.physical_type() == PhysicalType::List
+        && s.should_serialize(StorageVersion::V2_1_0)
+    {
+        const LIST_EXTRA_DATA: u8 = 3;
+        s.write_nullable_object(99, "extra_data", |s| {
+            s.write_property(100, "type", &LIST_EXTRA_DATA);
+            write_list_lengths(s, lists, 101);
         });
     }
     if ty.is_some_and(|ty| ty.id() == LogicalTypeId::Geometry) {
@@ -1561,6 +1602,7 @@ fn stored_stats(column: &super::table_data::PersistentColumn, ty: &LogicalType) 
             .map(|(child, ty)| stored_stats(child, ty))
             .collect();
     }
+    stats.lists = column.list_lengths;
     stats
 }
 
@@ -2432,12 +2474,15 @@ impl<'a> Writer<'a> {
             self.write_validity(&valid)?
         });
         let mut stats = Stats::of_validity(&valid);
+        let mut list_lengths = None;
         let (segments, children) = match physical {
             PhysicalType::Varchar => (string_segments.take().expect("written above"), Vec::new()),
             PhysicalType::List => {
                 let mut offsets = Vec::with_capacity(rows * 8);
                 let mut child_parts = Vec::with_capacity(parts.len());
                 let mut total = 0u64;
+                // `ListColumnData::Append`: the lengths of the lists that aren't NULL
+                let mut lengths = crate::catalog::ListLengths::empty();
                 for part in parts {
                     let entries = part.vector.data::<ListEntry>();
                     let mut selection = Vec::new();
@@ -2445,6 +2490,7 @@ impl<'a> Writer<'a> {
                         if part.vector.is_valid(row) {
                             selection.extend((entry.offset..entry.offset + entry.length).map(|i| i as u32));
                             total += entry.length;
+                            lengths = lengths.merge(&crate::catalog::ListLengths::of(entry.length), true);
                         }
                         offsets.extend_from_slice(&total.to_le_bytes());
                     }
@@ -2468,6 +2514,7 @@ impl<'a> Writer<'a> {
                         overflow_blocks: Vec::new(),
                     });
                 }
+                list_lengths = Some(lengths);
                 (segments, vec![child])
             }
             PhysicalType::Array => {
@@ -2538,6 +2585,8 @@ impl<'a> Writer<'a> {
             stats.merge(&segment.stats, ty);
         }
         stats.children = children.iter().map(|child| child.stats.clone()).collect();
+        // they are of the column, not of its segments
+        stats.lists = list_lengths;
         Ok(ColumnOut {
             segments,
             validity: Some(validity),

@@ -223,7 +223,12 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] string statistics for `stats()`: a minimum length too long to keep is left out, a checkpoint leaves a table the
     statistics it computed until the file is opened again (a file before v2.0.0 keeps 8 bytes of a string bound),
     and Parquet strings have the bounds of the file
-  - [ ] list-length statistics for `stats()` (`list_length_stats*`), per-column `USING COMPRESSION`
+  - [x] list-length statistics (`ListStatsData`): the shortest, longest and total of a column's lists, in a row
+    group's column (`ListPersistentColumnData`) and the table's statistics from v2.1.0, which checkpoints now write;
+    `length` of lists all as long is a `constant_or_null`, `list_concat`, `flatten`, list constants and ARRAY to
+    LIST casts give their lengths, and joins, cross products and UNNEST drop the totals of strings and lists
+    (`ResetAdditiveStatistics`)
+  - [ ] per-column `USING COMPRESSION`
   - [x] `read_duckdb` and the replacement scan of `.db` files; `enable_view_dependencies` (DROP ... CASCADE,
     refused DROP and ALTER, CREATE OR REPLACE of a view that reads itself)
   - [ ] `vector_type` (~20 files) and `duckdb_memory` (~17) report engine internals duckrs does not model

@@ -36,6 +36,8 @@ pub struct BaseStatistics {
     pub variant_shredded: Option<Box<(LogicalType, BaseStatistics)>>,
     /// of a LIST or ARRAY its element's, of a STRUCT each field's
     pub children: Vec<BaseStatistics>,
+    /// of a LIST, the lengths of its lists, as files from v2.1.0 have them
+    pub lists: Option<crate::catalog::ListLengths>,
 }
 
 fn numeric_value(d: &mut BinaryDeserializer<'_>, physical: PhysicalType) -> Result<Option<[u8; 16]>> {
@@ -213,6 +215,7 @@ pub fn read_statistics(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>)
             variant_state: nested.variant_state,
             variant_shredded: nested.variant_shredded,
             children: nested.children,
+            lists: nested.lists,
         })
     })
 }
@@ -223,6 +226,7 @@ struct Nested {
     variant_state: Option<u8>,
     variant_shredded: Option<Box<(LogicalType, BaseStatistics)>>,
     children: Vec<BaseStatistics>,
+    lists: Option<crate::catalog::ListLengths>,
 }
 
 /// The bounds of the values, of the types that have numeric statistics.
@@ -303,6 +307,15 @@ fn read_type_stats(
         PhysicalType::List | PhysicalType::Array => {
             let child = d.read_object_field(200, "child_stats", |d| read_statistics(d, ty.child_type()))?;
             nested.children = vec![child];
+            // `ListStats::Deserialize`: what is not there is not known
+            if ty.physical_type() == PhysicalType::List {
+                nested.lists = Some(crate::catalog::ListLengths {
+                    min: d.read_optional_property::<u64>(201, "min_list_length")?,
+                    max: d.read_optional_property::<u64>(202, "max_list_length")?,
+                    total: d.read_optional_property::<u64>(203, "total_list_length")?,
+                })
+                .filter(|lists| lists.min.is_some() || lists.max.is_some() || lists.total.is_some());
+            }
             Ok(None)
         }
         PhysicalType::Bit | PhysicalType::Invalid | PhysicalType::Unknown => Ok(None),

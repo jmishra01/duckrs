@@ -511,6 +511,8 @@ pub struct ColumnStatistics {
     pub geometry: Option<duckrs_common::geometry::GeometryStats>,
     /// of a VARCHAR or BLOB, its `StringStats`, if known
     pub strings: Option<StringStatistics>,
+    /// of a LIST, the lengths of its lists (`ListStatsData`), if known
+    pub lists: Option<ListLengths>,
     /// `distinct_count`: the approximate number of distinct values of a table's column, if known
     pub distinct: Option<u64>,
     /// of a LIST or ARRAY its element's (`ListStats` / `ArrayStats`), of a STRUCT each field's
@@ -518,8 +520,6 @@ pub struct ColumnStatistics {
     pub children: Vec<ColumnStatistics>,
     /// of a VARIANT, how it is shredded (`VariantStats`); `None` when not known (`INCONSISTENT`)
     pub variant: Option<Box<VariantStatistics>>,
-    /// of a LIST (or MAP), the lengths of its lists (`ListStatsData`); `None` when none is known
-    pub lists: Option<ListLengths>,
 }
 
 /// `ListStatsData`: the shortest, longest and total length of the lists that are not NULL, each `None` when not
@@ -601,6 +601,29 @@ impl ColumnStatistics {
             variant: None,
             lists: None,
         }
+    }
+}
+
+impl ListLengths {
+
+    /// Of one list of `length` elements.
+    pub fn of(length: u64) -> Self {
+        Self {
+            min: Some(length),
+            max: Some(length),
+            total: Some(length),
+        }
+    }
+
+
+    /// `StatsMergeType::EXPAND_BOUNDS` and `ResetTotalListLength`: lists that may be counted twice have no total.
+    pub fn without_total(self) -> Self {
+        Self { total: None, ..self }
+    }
+
+    /// `ListStats::MinListLength`: the shortest, if there is one.
+    pub fn min_length(&self) -> Option<u64> {
+        self.min.filter(|min| *min != u64::MAX)
     }
 }
 
