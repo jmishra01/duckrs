@@ -310,7 +310,9 @@ impl Binder<'_> {
                     ));
                 }
             }
-            let materialized = (cte.materialized == ast::CteMaterialize::Always
+            // `PrepareCTE`: a CTE runs once, and `CTEInlining` puts its query back where that is
+            // better, unless it says MATERIALIZED
+            let materialized = (cte.materialized != ast::CteMaterialize::Never
                 && matches!(cte.query.kind, QueryNodeKind::Select(_) | QueryNodeKind::SetOperation(_)))
             .then(|| {
                 Arc::new(Mutex::new(super::MaterializedCteState {
@@ -318,6 +320,7 @@ impl Binder<'_> {
                     data: Arc::new(Mutex::new(ColumnDataCollection::new(Vec::new()))),
                     bound: None,
                     inline: false,
+                    always: cte.materialized == ast::CteMaterialize::Always,
                 }))
             });
             self.ctes
@@ -349,7 +352,7 @@ impl Binder<'_> {
                     name,
                     table_index: state.cte_index,
                     data: state.data.clone(),
-                    always: true,
+                    always: state.always,
                 },
                 vec![plan, query],
             );
@@ -451,6 +454,14 @@ impl Binder<'_> {
             table_ref.alias.clone()
         };
         self.add_query_binding(alias, bound, &column_aliases)
+    }
+
+    /// What this binder evaluates while binding runs before any CTE has: its references bind the
+    /// CTE's query in place.
+    fn inline_ctes(&mut self) {
+        for cte in &mut self.ctes {
+            cte.3 = None;
+        }
     }
 
     /// `Binder::BindNode(RecursiveCTENode)`: the recursive part sees the CTE as the rows of the
@@ -1710,6 +1721,7 @@ impl Binder<'_> {
     /// `Binder::BindLimitValue` for a percentage.
     fn bind_limit_percent(&mut self, expr: &Expr, offset: u64) -> Result<PreparedModifier> {
         let mut binder = self.child_binder();
+        binder.inline_ctes();
         let bound = binder.bind_expression(expr)?;
         // a subquery's value is read by the operator (`Value::GetValue`), whose cast fails as invalid input
         let mut has_subquery = false;
@@ -1741,6 +1753,7 @@ impl Binder<'_> {
     /// `Binder::BindLimitValue` for constant values: NULL means no limit (or no offset).
     fn bind_limit_value(&mut self, expr: &Expr, is_offset: bool) -> Result<Option<u64>> {
         let mut binder = self.child_binder();
+        binder.inline_ctes();
         binder.correlated = Arc::default();
         let bound = binder.bind_expression(expr)?;
         if !binder.correlated.lock().is_empty() {

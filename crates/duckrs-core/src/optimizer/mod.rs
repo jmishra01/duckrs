@@ -224,6 +224,10 @@ pub fn optimize_timed(
             plan
         });
     }
+    // `CTE_INLINING` runs here too, so that what is inlined goes through the filter pushdown
+    if options.cte_inlining {
+        plan = run("cte_inlining", plan, &mut cte_inlining::inline);
+    }
     if options.aggregate_function_rewriter {
         let (common, statistics) = (options.common_aggregate, options.statistics_propagation);
         plan = run("aggregate_function_rewriter", plan, &mut |plan| {

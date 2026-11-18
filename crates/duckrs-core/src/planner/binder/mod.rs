@@ -83,7 +83,8 @@ pub(super) struct MaterializedCteState {
     /// what the first reference bound: the plan, its names, types and column aliases
     pub bound: Option<(LogicalOperator, Vec<String>, Vec<LogicalType>, Vec<(String, usize)>, StatementReturnType)>,
     /// the CTE reads the queries around it: each reference binds it on its own
-    pub inline: bool,
+    pub inline: bool,    /// `CTE_MATERIALIZE_ALWAYS`
+    pub always: bool,
 }
 
 /// The columns a FROM clause entry makes visible (`TableBinding`).
