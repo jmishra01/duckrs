@@ -618,6 +618,11 @@ struct Scan {
     checkpoint: Option<(MetaBlockPointer, usize)>,
     /// Where the last entry started, or would have.
     last_position: usize,
+    /// Where what was committed ends, before a checkpoint marker: where the log goes on
+    /// (`WriteAheadLog::Initialize` with the size that replay left)
+    committed_end: usize,
+    /// the version of its entries
+    version: u64,
     expected_iteration: Option<u64>,
 }
 
@@ -633,6 +638,8 @@ fn scan(data: &[u8], file: &FileState, kind: LogKind) -> Result<Scan> {
     let mut position = 0;
     let mut last_position;
     let mut checkpoint = None;
+    let mut committed_end = 0;
+    let mut marker_start = None;
     loop {
         last_position = position;
         match reader.next(data, position) {
@@ -640,13 +647,17 @@ fn scan(data: &[u8], file: &FileState, kind: LogKind) -> Result<Scan> {
                 position = next;
                 match entry {
                     Entry::Record(record) => records.push(record),
-                    Entry::Version => {}
+                    Entry::Version => committed_end = next,
                     Entry::Checkpoint(_) if checkpoint.is_some() => {
                         return Err(corrupt("a log has more than one checkpoint marker"));
                     }
-                    Entry::Checkpoint(pointer) => checkpoint = Some((pointer, next)),
+                    Entry::Checkpoint(pointer) => {
+                        marker_start = Some(last_position);
+                        checkpoint = Some((pointer, next));
+                    }
                     Entry::Flush => {
                         committed = records.len();
+                        committed_end = next;
                         if next == data.len() {
                             break;
                         }
@@ -663,6 +674,8 @@ fn scan(data: &[u8], file: &FileState, kind: LogKind) -> Result<Scan> {
         records,
         checkpoint,
         last_position,
+        committed_end: marker_start.map_or(committed_end, |start| start.min(committed_end)),
+        version: reader.version,
         expected_iteration: reader.expected_iteration,
     })
 }
@@ -730,6 +743,40 @@ pub(super) fn read_records(path: &Path, buffer: &BufferManager) -> Result<Vec<Re
         before_v2: checkpoint::is_before_v2(&header),
     };
     replay_log(&data, path, buffer, &file, LogKind::Main)
+}
+
+/// What became of the log of a file that was replayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayedLog {
+    /// none, or one that doesn't belong to the file
+    None,
+    /// `IsCheckpointClean`: all of it is in the file already, as its marker says
+    Checkpointed,
+    /// it goes on at the end of what it committed, before a checkpoint marker, with entries of this version
+    Ends(u64, u64),
+}
+
+/// [`ReplayedLog`] of the log of the file at `path`.
+pub(super) fn replayed_end(path: &Path, buffer: &BufferManager) -> Result<ReplayedLog> {
+    let Some(data) = read_log(&with_suffix(path, ".wal"))? else {
+        return Ok(ReplayedLog::None);
+    };
+    let header = buffer.block_manager().header();
+    let file = FileState {
+        db_identifier: buffer.block_manager().main_header().db_identifier,
+        iteration: header.iteration,
+        before_v2: checkpoint::is_before_v2(&header),
+    };
+    let Ok(scanned) = scan(&data, &file, LogKind::Main) else {
+        return Ok(ReplayedLog::None);
+    };
+    let clean = scanned
+        .checkpoint
+        .is_some_and(|(marker, _)| marker.block_pointer == header.meta_block);
+    if clean && read_log(&with_suffix(path, ".wal.checkpoint"))?.is_none() {
+        return Ok(ReplayedLog::Checkpointed);
+    }
+    Ok(ReplayedLog::Ends(scanned.committed_end as u64, scanned.version))
 }
 
 /// A table while a log is replayed. Row ids are what records name rows by, and deleting rows in

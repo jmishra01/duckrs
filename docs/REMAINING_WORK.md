@@ -188,6 +188,19 @@ Each item gives the number of failing files in `test/` that it should fix, where
     checkpoints (v2.1.0, with the lists' `ListPersistentColumnData`) and WAL replay; checkpoints write v2.1.0 when
     asked; a table's statistics keep those of what is in its nested columns
   - [ ] string statistics for `stats()` from database files, per-column `USING COMPRESSION`
+  - [x] shredded VARIANT columns in the file: read and written as C++ does (`variant_minimum_shredding_size`,
+    `force_variant_shredding`, the type the values suggest), with their statistics
+  - [x] GEOMETRY in a VARIANT; `vector_type` of a shredded scan (SHREDDED_VECTOR); `stats()` of a VARIANT column:
+    its validity and `shredding_state`
+  - [x] the statistics of the shredded part in `stats()` (`fully_shredded`, `partially_shredded`), merged across
+    row groups as `MergeShredding` does, also of casts to VARIANT, of casts of a VARIANT, and through extracts;
+    nested (STRUCT, LIST, ARRAY) child statistics in the file; the empty bounds of an all-NULL numeric segment,
+    which C++ scans a constant segment with
+  - [ ] of shredded VARIANTs: pushdown of extracts into the shredded part; C++'s order of the fields of a shredded
+    object (that of an `unordered_map`); shredded GEOMETRY
+  - [x] a crash between the end of a checkpoint and the removal of its log: a log that its marker says is in the
+    file goes on open (`IsCheckpointClean`), and the checkpoint of a replayed log marks it where what it committed
+    ends, before the new header goes in
   - [x] a checkpoint keeps the row groups whose rows are as the last one left them
     (`REUSE_EXISTING_ROW_GROUP_METADATA`): their column metadata, blocks and statistics stay, and only the row group
     and its deletes are written again. Whether rows changed is found by comparing them with the file's.

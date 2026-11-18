@@ -331,6 +331,25 @@ impl DatabaseInstance {
             no_wal_writes: options.no_wal_writes,
             vacuum_rebuild_indexes: options.vacuum_rebuild_indexes,
         });
+        // `WriteAheadLog::ReplayInternal` of a log that is in the file already: done with it. Another one is marked
+        // where what it committed ends by the checkpoint below.
+        if db.file_access.is_none()
+            && let Some(file) = &db.file
+        {
+            match storage::replayed_log_end(path, &file.buffer)? {
+                storage::wal::ReplayedLog::Checkpointed => {
+                    let mut log = path.as_os_str().to_owned();
+                    log.push(".wal");
+                    std::fs::remove_file(&log)
+                        .map_err(|error| Error::new(ErrorKind::Io, format!("{}: {error}", Path::new(&log).display())))?;
+                }
+                storage::wal::ReplayedLog::Ends(end, version) => {
+                    let mut log = file.log.lock();
+                    *log = std::mem::take(&mut *log).with_replayed(Some((end, version)));
+                }
+                storage::wal::ReplayedLog::None => {}
+            }
+        }
         // a log that was replayed can end in anything a crash leaves, so it isn't added to: its
         // records go to the file, and the next commit starts a new one
         if db.file_access.is_none() && storage::has_log(path) {

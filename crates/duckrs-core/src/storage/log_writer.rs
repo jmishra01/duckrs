@@ -32,7 +32,7 @@ use duckrs_common::vector::{DataChunk, SelectionVector, Vector};
 use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -535,6 +535,8 @@ pub struct WriteAheadLog {
     version: StorageVersion,
     /// `wal_entries_count`: the records since the last checkpoint.
     entries: u64,
+    /// Of a log that was replayed and isn't written to: where what it committed ends
+    replayed: Option<u64>,
 }
 
 impl std::fmt::Debug for WriteAheadLog {
@@ -575,6 +577,16 @@ impl WriteAheadLog {
 
     pub fn size(&self) -> u64 {
         self.size
+    }
+
+    /// A log that was replayed ends with what it committed at `end`, of entries of `version`: a checkpoint marks
+    /// it there (`WriteAheadLog::Initialize` of the size replay left), so that a crash between the end of the
+    /// checkpoint and the removal of the log leaves a log that says it is in the file.
+    pub fn with_replayed(mut self, replayed: Option<(u64, u64)>) -> Self {
+        self.replayed = replayed
+            .filter(|(_, version)| *version == WAL_VERSION)
+            .map(|(end, _)| end);
+        self
     }
 
     /// `GetWALEntriesCount`.
@@ -931,6 +943,21 @@ impl WriteAheadLog {
     /// `WriteCheckpoint`: before a checkpoint, for a crash during it to be told from one after it.
     /// Returns what the log held, to go back to if the checkpoint fails.
     pub fn mark_checkpoint(&mut self, path: &Path, root: MetaBlockPointer) -> Result<u64> {
+        if self.file.is_none()
+            && let Some(end) = self.replayed.take()
+        {
+            // what follows `end` was never committed, or is a marker of a checkpoint that didn't finish
+            let wal = log_path(path);
+            let mut file = OpenOptions::new()
+                .write(true)
+                .open(&wal)
+                .map_err(|error| io_error(&wal, error))?;
+            file.set_len(end).map_err(|error| io_error(&wal, error))?;
+            file.seek(std::io::SeekFrom::End(0))
+                .map_err(|error| io_error(&wal, error))?;
+            self.file = Some(file);
+            self.size = end;
+        }
         let size = self.size;
         if self.file.is_some() {
             let mut records = Records(Vec::new(), self.version, 0);

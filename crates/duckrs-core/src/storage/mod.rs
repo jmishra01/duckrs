@@ -84,6 +84,11 @@ pub fn load_database(path: &Path, catalog: &Catalog, read_only: bool) -> Result<
     Ok(buffer)
 }
 
+/// [`wal::replayed_end`]: where the replayed log of the file at `path` goes on, and its entries' version.
+pub fn replayed_log_end(path: &Path, buffer: &BufferManager) -> Result<wal::ReplayedLog> {
+    wal::replayed_end(path, buffer)
+}
+
 /// Whether a write-ahead log is next to the file at `path`.
 pub fn has_log(path: &Path) -> bool {
     let mut log = path.as_os_str().to_owned();

@@ -722,7 +722,17 @@ fn commits_survive_kill_9() {
             assert_eq!(acknowledged, 0, "round {round}");
             continue;
         }
-        let state: u64 = rows(&mut connection, "SELECT n FROM state")[0].parse().unwrap();
+        let Some(state) = rows(&mut connection, "SELECT n FROM state")
+            .first()
+            .map(|n| n.parse::<u64>().unwrap())
+        else {
+            // killed between the tables and the first row of `state`
+            assert_eq!(
+                acknowledged, 0,
+                "round {round}: {acknowledged} were acknowledged, and `state` is empty"
+            );
+            continue;
+        };
         assert!(
             state >= acknowledged,
             "round {round} after {elapsed:?}: {acknowledged} were acknowledged, {state} are there"
@@ -889,4 +899,30 @@ fn geometries_of_old_storage_come_back() {
         rows(&mut c, "SELECT i FROM db.t WHERE g = 'POINT (151 151)'::GEOMETRY"),
         ["151"]
     );
+}
+
+/// A crash between the end of a checkpoint and the removal of its log leaves a log that its marker says is in
+/// the file: opening the file again is done with it (`IsCheckpointClean`), and a checkpoint of a log that was
+/// replayed marks it before the new header goes in, so that the same crash again leaves a log that says so too.
+#[test]
+fn a_log_that_is_in_the_file_goes() {
+    let file = path("checkpointed_log.db");
+    let mut log = file.clone().into_os_string();
+    log.push(".wal");
+    {
+        let db = Database::open(&file, false).unwrap();
+        let mut c = db.connect().unwrap();
+        run(&mut c, "PRAGMA disable_checkpoint_on_shutdown");
+        run(&mut c, "CREATE TABLE t AS SELECT range i FROM range(100)");
+        run(&mut c, "SET debug_checkpoint_abort = 'before_truncate'");
+        assert!(c.query("CHECKPOINT").is_err());
+    }
+    assert!(std::fs::metadata(&log).is_ok(), "the log stays behind the checkpoint");
+    for _ in 0..2 {
+        let db = Database::open(&file, false).unwrap();
+        let mut c = db.connect().unwrap();
+        assert_eq!(rows(&mut c, "SELECT count(*), sum(i) FROM t"), ["100|4950"]);
+        run(&mut c, "PRAGMA disable_checkpoint_on_shutdown");
+    }
+    assert!(std::fs::metadata(&log).is_err(), "the log is in the file, so it went");
 }
