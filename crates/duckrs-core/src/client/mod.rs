@@ -1177,6 +1177,7 @@ impl ClientContext {
         }
         crate::execution::join_filter::set_in_filter_threshold(options.dynamic_or_filter_threshold);
         crate::execution::join_filter::set_enabled(options.join_filter_pushdown);
+        crate::execution::set_streaming_windows(self.setting_text("enable_optimizer") != "false");
         if let Ok(threshold) = self.setting_text("perfect_ht_threshold").parse() {
             options.perfect_ht_threshold = threshold;
         }

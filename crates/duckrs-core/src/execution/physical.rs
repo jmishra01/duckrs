@@ -127,6 +127,11 @@ pub trait PhysicalOperator: fmt::Debug + Send + Sync {
         Ok((self.execute(input.clone())?, OperatorResult::NeedMoreInput))
     }
 
+    /// `FinalExecute`: what the operator still has once its input is done, a chunk at a time.
+    fn final_execute(&self, _state: &mut OperatorState) -> Result<Option<DataChunk>> {
+        Ok(None)
+    }
+
     /// Whether the operator needs no more input, so that its pipeline can stop early.
     fn is_finished(&self) -> bool {
         false

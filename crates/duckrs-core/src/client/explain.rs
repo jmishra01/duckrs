@@ -705,7 +705,7 @@ pub(super) fn physical_tree(
         },
     ) = logical
         && children.len() == 1
-        && (op.name() == "PROJECTION" || children[0].name() == "WINDOW")
+        && (op.name() == "PROJECTION" || matches!(children[0].name(), "WINDOW" | "STREAMING_WINDOW"))
     {
         let info = if op.name() == "PROJECTION" {
             let references = (0..op.types().len()).map(|i| format!("#{i}"));

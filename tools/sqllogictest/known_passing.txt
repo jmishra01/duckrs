@@ -331,6 +331,7 @@ test/issues/general/test_24936.test
 test/issues/general/test_2496.test
 test/issues/general/test_25167.test
 test/issues/general/test_25373.test
+test/issues/general/test_25700.test
 test/issues/general/test_26175.test
 test/issues/general/test_26175_bind_once.test
 test/issues/general/test_26177.test
@@ -4929,6 +4930,9 @@ test/sql/window/test_rownumber_orderby.test
 test/sql/window/test_scalar_window.test
 test/sql/window/test_single_following_frame.test
 test/sql/window/test_split_partition_heap.test
+test/sql/window/test_streaming_lead_lag.test
+test/sql/window/test_streaming_nthvalue.test
+test/sql/window/test_streaming_window_distinct.test
 test/sql/window/test_thread_count.test
 test/sql/window/test_tpcc_results.test
 test/sql/window/test_tpcds_q49.test

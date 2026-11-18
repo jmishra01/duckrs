@@ -44,7 +44,9 @@ mod merge;
 pub mod random_engine;
 mod special_joins;
 mod upsert;
+mod streaming_window;
 mod window;
+pub use window::set_streaming as set_streaming_windows;
 
 /// A projection does not compute what is dropped right after it.
 fn create_column_select(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
@@ -772,6 +774,14 @@ impl Pipeline<'_> {
                 self.push(chunk, 0, &mut operator_states)?;
                 if self.is_finished() {
                     break;
+                }
+            }
+            // `PipelineExecutor::FinishProcessing`: what the operators hold back goes on up
+            for index in 0..self.operators.len() {
+                while !self.is_finished()
+                    && let Some(chunk) = self.operators[index].final_execute(&mut operator_states[index])?
+                {
+                    self.push(chunk, index + 1, &mut operator_states)?;
                 }
             }
         }

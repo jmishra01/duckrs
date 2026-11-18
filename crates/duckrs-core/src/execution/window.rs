@@ -43,16 +43,46 @@ impl PhysicalWindow {
     }
 }
 
+thread_local! {
+    /// `enable_optimizer`: without it, no window streams
+    static STREAMING: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Whether windows can stream, from `enable_optimizer`.
+pub fn set_streaming(enabled: bool) {
+    STREAMING.with(|s| s.set(enabled));
+}
+
+/// `GetSources`: how many sources feed the pipeline of `op`.
+fn sources(op: &dyn PhysicalOperator) -> usize {
+    if op.name() == "UNION" {
+        return op.children().iter().map(|child| sources(child.as_ref())).sum();
+    }
+    if op.is_source() || op.children().is_empty() {
+        return 1;
+    }
+    sources(op.children()[0].as_ref())
+}
+
 /// `PhysicalPlanGenerator::CreatePlan(LogicalWindow &)`: the windows that share their partitions
 /// and whose orders are prefixes of one another are computed together; each such group is a
 /// window operator on top of the one before, and a projection puts the results back in place.
-/// The rows leave in the order of the last group, ties in the order the group below left them.
+/// Streaming windows go in one operator below the others. The rows leave in the order of the last group, ties in the order the group below left them.
 pub fn plan(
     types: Vec<LogicalType>,
     windows: Vec<BoundWindow>,
     mut children: Vec<Box<dyn PhysicalOperator>>,
 ) -> Box<dyn PhysicalOperator> {
     let input_width = types.len() - windows.len();
+    // the streaming windows come first, in one operator, and the others go on top of them
+    let can_stream = STREAMING.with(std::cell::Cell::get) && children.len() == 1 && sources(children[0].as_ref()) == 1;
+    let streaming: Vec<usize> = if can_stream {
+        (0..windows.len())
+            .filter(|&at| super::streaming_window::is_streaming(&windows[at]))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let text = |expr: &BoundExpr| format!("{expr:?}");
     let partitions_equivalent = |a: &BoundWindow, b: &BoundWindow| {
         a.partitions.len() == b.partitions.len() && {
@@ -68,7 +98,7 @@ pub fn plan(
             .count()
     };
     let mut groups: Vec<Vec<usize>> = Vec::new();
-    let mut remaining: Vec<usize> = (0..windows.len()).collect();
+    let mut remaining: Vec<usize> = (0..windows.len()).filter(|at| !streaming.contains(at)).collect();
     while !remaining.is_empty() {
         let mut over = remaining[0];
         let mut matching = Vec::new();
@@ -100,6 +130,19 @@ pub fn plan(
     let mut layer_types = types[..input_width].to_vec();
     let mut position = vec![0; slots.len()];
     let mut plan: Option<Box<dyn PhysicalOperator>> = None;
+    if !streaming.is_empty() {
+        let mut group_windows = Vec::with_capacity(streaming.len());
+        for &at in &streaming {
+            position[at] = layer_types.len();
+            layer_types.push(types[input_width + at].clone());
+            group_windows.push(slots[at].take().expect("each window is in one group"));
+        }
+        plan = Some(Box::new(super::streaming_window::PhysicalStreamingWindow::new(
+            layer_types.clone(),
+            group_windows,
+            std::mem::take(&mut children),
+        )));
+    }
     for group in groups {
         let mut group_windows = Vec::with_capacity(group.len());
         for at in group {
