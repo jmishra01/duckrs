@@ -109,6 +109,9 @@ struct FilterPushdown {
 thread_local! {
     /// The next table index of the plan being rewritten (`Binder::GenerateTableIndex`).
     static NEXT_TABLE_INDEX: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// `ProjectionMode::PRESERVE_COMPUTED_EXPRESSIONS`: a filter of a column a projection computes
+    /// stays above it
+    static PRESERVE_COMPUTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn generate_table_index() -> usize {
@@ -117,6 +120,15 @@ fn generate_table_index() -> usize {
         next.set(index + 1);
         index
     })
+}
+
+/// [`push_down`] that leaves above a projection the filters of what it computes
+/// (`ProjectionMode::PRESERVE_COMPUTED_EXPRESSIONS`).
+pub fn push_down_preserving_computed(plan: LogicalOperator) -> LogicalOperator {
+    let before = PRESERVE_COMPUTED.with(|p| p.replace(true));
+    let result = push_down(plan);
+    PRESERVE_COMPUTED.with(|p| p.set(before));
+    result
 }
 
 /// Runs the pass over a plan.
@@ -585,6 +597,7 @@ impl FilterPushdown {
         let projected = expressions.clone();
         let mut below = FilterPushdown::default();
         let mut remaining = Vec::new();
+        let mut split = Vec::new();
         let mut barred = Vec::new();
         for mut f in self.filters {
             // a barrier goes below only if all the others do, so that it is evaluated after them
@@ -600,13 +613,27 @@ impl FilterPushdown {
             });
             // copying a subquery would run it twice, and below the projection an entry that can
             // fail would run ahead of the filters there
-            let stays = can_throw(&f.filter)
+            // `stays_on_top`: volatile, or a filter that can throw
+            let on_top = can_throw(&f.filter)
                 || columns.iter().any(|b| {
                     let entry = projected.get(b.column_index);
-                    b.table_index != table_index
-                        || entry.is_none_or(|e| e.is_volatile() || contains_subquery(e) || can_throw(e))
+                    b.table_index != table_index || entry.is_none_or(|e| e.is_volatile() || contains_subquery(e))
                 });
-            if stays {
+            // `splits_off`: what reads a computed column is evaluated once, below the filter, where
+            // the projection computes it as it did
+            let preserve = PRESERVE_COMPUTED.with(std::cell::Cell::get);
+            if !on_top
+                && preserve
+                && columns.iter().any(|b| {
+                    projected
+                        .get(b.column_index)
+                        .is_some_and(|e| !matches!(e.kind, BoundExprKind::ColumnRef { .. }))
+                })
+            {
+                split.push(f.filter);
+                continue;
+            }
+            if on_top {
                 remaining.push(f.filter);
                 continue;
             }
@@ -634,6 +661,7 @@ impl FilterPushdown {
             });
             // a projection removes no rows, so what it computes may throw below the barrier too
             let stays = !remaining.is_empty()
+                || !split.is_empty()
                 || columns.iter().any(|b| {
                     let entry = projected.get(b.column_index);
                     b.table_index != table_index || entry.is_none_or(|e| e.is_volatile() || contains_subquery(e))
@@ -650,6 +678,9 @@ impl FilterPushdown {
                 }
             });
             below.filters.push(Filter::new(filter));
+        }
+        if !split.is_empty() {
+            return split_projection(op, below, split, remaining);
         }
         let child = op.children.remove(0);
         op.children.push(below.rewrite(child));
@@ -769,6 +800,101 @@ fn replace_set_operation_bindings(filter: &mut BoundExpr, table_index: usize, bi
 }
 
 /// `FilterPushdown::AddLogicalFilter`.
+/// `FilterPushdown::SplitProjection`: the columns the `split` filters read are computed by a
+/// projection of their own below them, which passes on what the others read.
+fn split_projection(
+    mut op: LogicalOperator,
+    below: FilterPushdown,
+    mut split: Vec<BoundExpr>,
+    remaining: Vec<BoundExpr>,
+) -> LogicalOperator {
+    let LogicalOperatorKind::Projection {
+        table_index,
+        expressions,
+    } = &mut op.kind
+    else {
+        unreachable!()
+    };
+    let table_index = *table_index;
+    let mut referenced = vec![false; expressions.len()];
+    for filter in &mut split {
+        visit_columns(filter, &mut |e| {
+            if let BoundExprKind::ColumnRef { binding, depth: 0 } = e.kind
+                && binding.table_index == table_index
+                && let Some(r) = referenced.get_mut(binding.column_index)
+            {
+                *r = true;
+            }
+        });
+    }
+    if referenced.iter().all(|r| *r) {
+        let child = op.children.remove(0);
+        op.children.push(below.rewrite(child));
+        let mut all = remaining;
+        all.extend(split);
+        return add_filter_operator(op, all);
+    }
+    let lower_index = generate_table_index();
+    let mut lower_expressions: Vec<BoundExpr> = Vec::new();
+    let mut lower_positions = vec![None; expressions.len()];
+    for (at, expr) in expressions.iter_mut().enumerate() {
+        if !referenced[at] {
+            continue;
+        }
+        lower_positions[at] = Some(lower_expressions.len());
+        let column = BoundExpr::column_ref(
+            ColumnBinding::new(lower_index, lower_expressions.len()),
+            expr.return_type.clone(),
+            expr.alias.clone(),
+        );
+        lower_expressions.push(std::mem::replace(expr, column));
+    }
+    // `AddPassThroughColumns`
+    let mut pass_through: Vec<(ColumnBinding, usize)> = Vec::new();
+    for (at, expr) in expressions.iter_mut().enumerate() {
+        if referenced[at] {
+            continue;
+        }
+        expr.walk_mut(&mut |e| {
+            if let BoundExprKind::ColumnRef { binding, depth: 0 } = &mut e.kind {
+                let position = match pass_through.iter().find(|(b, _)| b == binding) {
+                    Some((_, position)) => *position,
+                    None => {
+                        let position = lower_expressions.len();
+                        pass_through.push((*binding, position));
+                        let mut copy = BoundExpr::column_ref(*binding, e.return_type.clone(), e.alias.clone());
+                        copy.alias.clone_from(&e.alias);
+                        lower_expressions.push(copy);
+                        position
+                    }
+                };
+                *binding = ColumnBinding::new(lower_index, position);
+            }
+        });
+    }
+    // `ReplaceFilterBindings`
+    for filter in &mut split {
+        replace_columns(filter, &mut |e| {
+            if let BoundExprKind::ColumnRef { binding, depth: 0 } = &mut e.kind
+                && binding.table_index == table_index
+                && let Some(Some(position)) = lower_positions.get(binding.column_index)
+            {
+                *binding = ColumnBinding::new(lower_index, *position);
+            }
+        });
+    }
+    let child = op.children.remove(0);
+    let lower = LogicalOperator::new(
+        LogicalOperatorKind::Projection {
+            table_index: lower_index,
+            expressions: lower_expressions,
+        },
+        vec![below.rewrite(child)],
+    );
+    op.children.push(add_filter_operator(lower, split));
+    add_filter_operator(op, remaining)
+}
+
 fn add_filter_operator(op: LogicalOperator, mut expressions: Vec<BoundExpr>) -> LogicalOperator {
     // the barred filters run after the others
     expressions.sort_by_key(contains_barrier);

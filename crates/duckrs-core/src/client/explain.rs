@@ -386,12 +386,31 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
         }
         K::Get {
             table,
+            table_index,
             column_ids,
             filters,
             projection,
             sample,
             ..
         } => {
+            // `PhysicalTableScan::GetFilterInfo`: a filter of a column by the column's name
+            let renamed: Vec<BoundExpr> = filters
+                .iter()
+                .map(|filter| {
+                    let mut filter = filter.clone();
+                    filter.walk_mut(&mut |e| {
+                        if let crate::planner::expression::BoundExprKind::ColumnRef { binding, depth: 0 } = &e.kind
+                            && binding.table_index == *table_index
+                            && let Some(column) = column_ids.get(binding.column_index)
+                            && let Some(definition) = table.columns.get(*column)
+                        {
+                            e.alias = definition.name.clone();
+                        }
+                    });
+                    filter
+                })
+                .collect();
+            let filters = &renamed;
             // `LogicalGet::ParamsToString` has the filters, then what `TableScanToString` adds
             if !physical {
                 let mut info = Vec::new();

@@ -1971,6 +1971,7 @@ test/sql/create/create_using_index.test
 test/sql/cte/cte_bc.test
 test/sql/cte/cte_colname_issue_10074.test
 test/sql/cte/cte_describe.test
+test/sql/cte/cte_filter_pushdown_predicates.test
 test/sql/cte/cte_issue_17311.test
 test/sql/cte/cte_null_values.test
 test/sql/cte/cte_on_conflict_issue.test
@@ -3029,6 +3030,7 @@ test/sql/merge/merge_not_matched_by_source_join_order.test
 test/sql/optimizer/anti_join_empty_rhs_projection_map.test
 test/sql/optimizer/any_extremum_rewrite.test
 test/sql/optimizer/array_extract_row_group_pruning.test
+test/sql/optimizer/barrier_projection_siblings.test
 test/sql/optimizer/barrier_row_group_pruning.test
 test/sql/optimizer/bool_ref_row_group_pruning.test
 test/sql/optimizer/boolean_row_group_pruning.test

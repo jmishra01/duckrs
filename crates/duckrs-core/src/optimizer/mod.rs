@@ -24,6 +24,7 @@ mod filter_pullup;
 mod grouping_sets;
 mod partial_aggregate_pushdown;
 mod aggregate_reuse;
+mod cte_filter_pusher;
 mod materialized_aggregate_reuse;
 pub mod filter_pushdown;
 pub mod in_clause_rewriter;
@@ -74,6 +75,7 @@ pub struct OptimizerOptions {
     pub partial_aggregate_pushdown: bool,
     pub aggregate_reuse: bool,
     pub join_filter_pushdown: bool,
+    pub cte_filter_pusher: bool,
     /// `index_scan_percentage`
     pub index_scan_percentage: f64,
     /// `index_scan_max_count`
@@ -115,6 +117,7 @@ impl Default for OptimizerOptions {
             partial_aggregate_pushdown: true,
             aggregate_reuse: true,
             join_filter_pushdown: true,
+            cte_filter_pusher: true,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -154,6 +157,7 @@ impl OptimizerOptions {
             partial_aggregate_pushdown: false,
             aggregate_reuse: false,
             join_filter_pushdown: false,
+            cte_filter_pusher: false,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -192,6 +196,7 @@ impl OptimizerOptions {
             partial_aggregate_pushdown: !off("partial_aggregate_pushdown"),
             aggregate_reuse: !off("aggregate_reuse"),
             join_filter_pushdown: !off("join_filter_pushdown"),
+            cte_filter_pusher: !off("cte_filter_pusher"),
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -257,6 +262,10 @@ pub fn optimize_timed(
         if changed {
             plan = run("filter_pushdown", plan, &mut filter_pushdown::push_down);
         }
+    }
+    // `CTE_FILTER_PUSHER`: the filters of the scans of a materialized CTE go into its definition
+    if options.cte_filter_pusher {
+        plan = run("cte_filter_pusher", plan, &mut cte_filter_pusher::push);
     }
     if options.deliminator {
         plan = run("deliminator", plan, &mut |mut plan| {
