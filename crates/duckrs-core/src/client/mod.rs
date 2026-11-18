@@ -101,6 +101,8 @@ pub struct AttachOptions {
     pub storage_version: Option<(String, duckrs_common::serializer::StorageVersion)>,
     /// `RecoveryMode::NO_WAL_WRITES`: commits don't go into the log, so only checkpoints keep them.
     pub no_wal_writes: bool,
+    /// `vacuum_rebuild_indexes`: what this database has rather than the setting
+    pub vacuum_rebuild_indexes: Option<u64>,
     /// Those of the database that it is attached to, as a log is replayed with them.
     settings: Option<Arc<RwLock<SettingValues>>>,
 }
@@ -118,6 +120,8 @@ struct DatabaseFile {
     storage_version: duckrs_common::serializer::StorageVersion,
     /// `RecoveryMode::NO_WAL_WRITES`
     no_wal_writes: bool,
+    /// `AttachedDatabase::vacuum_rebuild_threshold`
+    vacuum_rebuild_indexes: Option<u64>,
 }
 
 /// Why a database that came from a file takes no writes.
@@ -172,6 +176,7 @@ impl DatabaseInstance {
             row_group_size: None,
             storage_version: None,
             no_wal_writes: false,
+            vacuum_rebuild_indexes: None,
             settings: None,
         };
         Self::open_with(path, &options)
@@ -195,6 +200,7 @@ impl DatabaseInstance {
             row_group_size: None,
             storage_version: Some((version.to_string(), known)),
             no_wal_writes: false,
+            vacuum_rebuild_indexes: None,
             settings: None,
         };
         Self::open_with(path, &options)
@@ -323,6 +329,7 @@ impl DatabaseInstance {
                 .unwrap_or(crate::execution::zone_map::ROW_GROUP_SIZE as u64),
             storage_version,
             no_wal_writes: options.no_wal_writes,
+            vacuum_rebuild_indexes: options.vacuum_rebuild_indexes,
         });
         // a log that was replayed can end in anything a crash leaves, so it isn't added to: its
         // records go to the file, and the next commit starts a new one
@@ -489,7 +496,14 @@ impl DatabaseInstance {
             }
             None => None,
         };
+        // `AttachedDatabase::GetVacuumRebuildIndexThreshold`
+        let vacuum_rebuild_indexes = file.vacuum_rebuild_indexes.unwrap_or_else(|| {
+            settings::current_value("vacuum_rebuild_indexes", &self.settings.read(), &SettingValues::default())
+                .and_then(|value| value.as_i128())
+                .map_or(0, |rows| rows as u64)
+        });
         let options = storage::writer::CheckpointOptions {
+            vacuum_rebuild_indexes,
             variant_minimum_shredding_size,
             force_variant_shredding: force_variant_shredding.as_ref(),
             zstd_min_string_length,
@@ -2475,6 +2489,16 @@ impl ClientContext {
                     }
                     options.row_group_size = Some(size);
                 }
+                // `AttachOptions::AttachOptions`: a UBIGINT
+                "vacuum_rebuild_indexes" => {
+                    let threshold: u64 = value.text.trim().parse().map_err(|_| {
+                        Error::new(
+                            ErrorKind::Conversion,
+                            format!("Could not convert string '{}' to UINT64", value.text),
+                        )
+                    })?;
+                    options.vacuum_rebuild_indexes = Some(threshold);
+                }
                 "recovery_mode" => {
                     // `RecoveryMode`
                     let modes = [(false, "DEFAULT"), (true, "NO_WAL_WRITES")];
@@ -2483,7 +2507,6 @@ impl ClientContext {
                 // `AttachOptions` and `StorageOptions::Initialize` have these
                 other @ ("default_table"
                 | "hidden"
-                | "vacuum_rebuild_indexes"
                 | "access_mode"
                 | "encryption_key"
                 | "encryption_cipher"

@@ -162,7 +162,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] GEOMETRY in files and logs before v1.5.0: the spatial extension's BLOB format and type, the keys of
     an index of one (`ART::ConvertKeyInput`), the `storage_version` each index keeps, and no vacuum remap of an
     index with such keys (`KEEP_ROW_IDS`)
-  - [ ] `rowid_gaps`: ATTACH's `vacuum_rebuild_indexes`, the `total_vacuum_time` of the checkpoint profiling
+  - [x] ATTACH's and the setting `vacuum_rebuild_indexes`: indexes of tables up to that many rows are built
+    again after a vacuum that moves their rows (`VacuumIndexStrategy::REBUILD`)
+  - [ ] `rowid_gaps`: the `total_vacuum_time` of the checkpoint profiling
   - [x] unshredded VARIANT columns, in the file and the WAL
   - [x] shredded VARIANT columns: read from files C++ writes, and written at a checkpoint by
     `variant_minimum_shredding_size` and `force_variant_shredding`, with the type inferred as C++ does (object fields

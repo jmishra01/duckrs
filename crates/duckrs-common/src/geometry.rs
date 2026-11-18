@@ -1293,7 +1293,7 @@ pub fn to_spatial(wkb: &[u8]) -> Result<Vec<u8>> {
             }
         }
         let dims = 2 + usize::from(has_z) + usize::from(has_m);
-        let mut vertex = |reader: &mut Cursor<'_>, extent: &mut Extent, point: bool| -> Result<()> {
+        let vertex = |reader: &mut Cursor<'_>, extent: &mut Extent, point: bool| -> Result<()> {
             let bytes = reader.take(dims * 8)?;
             let value = |i: usize| f64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().expect("8 bytes"));
             if point && (0..dims).all(|i| value(i).is_nan()) {

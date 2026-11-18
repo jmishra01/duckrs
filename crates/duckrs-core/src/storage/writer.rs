@@ -63,6 +63,9 @@ pub struct CheckpointOptions<'a> {
     /// How many times row groups can come together, which gives their rows new ids. There is no
     /// such thing while a transaction goes by the ids it knows (`InitializeVacuumState`).
     pub vacuum_tasks: usize,
+    /// `vacuum_rebuild_indexes`: of tables with up to this many rows, indexes are built again after a vacuum
+    /// that gives rows new ids, where they couldn't be remapped (`VacuumIndexStrategy::REBUILD`); 0 for never
+    pub vacuum_rebuild_indexes: u64,
     /// `debug_checkpoint_abort`, in lower case: where to stop as a crash would.
     pub abort: &'a str,
     /// Transactions are reading tables from the blocks they are in: those stay as they are.
@@ -1318,6 +1321,7 @@ struct Writer<'a> {
     log_column: (String, usize),
     chunks_per_row_group: usize,
     vacuum_tasks: usize,
+    vacuum_rebuild_indexes: u64,
     abort: String,
     /// what the file is written in
     version: StorageVersion,
@@ -1546,6 +1550,7 @@ impl<'a> Writer<'a> {
             log_column: (String::new(), 0),
             chunks_per_row_group: options.row_group_size as usize / STANDARD_VECTOR_SIZE,
             vacuum_tasks: options.vacuum_tasks,
+            vacuum_rebuild_indexes: options.vacuum_rebuild_indexes,
             abort: options.abort.to_string(),
             version: options.storage_version,
             variant_minimum_shredding_size: options.variant_minimum_shredding_size,
@@ -2681,7 +2686,10 @@ impl<'a> Writer<'a> {
         let dense = self.version < StorageVersion::V2_0_0;
         // `GetVacuumIndexStrategy`: KEEP_ROW_IDS where indexes can't be remapped (`CanVacuumRemap`), which needs
         // gaps a file can say and no keys of GEOMETRYs as before v1.5.0
-        let keep_ids = (dense && !indexes.is_empty()) || indexes.iter().any(|index| index.legacy_geometry);
+        // `CanRebuildExistingIndexesAfterVacuum`: REBUILD before KEEP_ROW_IDS, for tables small enough
+        let rebuild = self.vacuum_rebuild_indexes > 0 && ids.next() <= self.vacuum_rebuild_indexes;
+        let keep_ids =
+            !rebuild && ((dense && !indexes.is_empty()) || indexes.iter().any(|index| index.legacy_geometry));
         for group in plan_groups(&ids, size, self.vacuum_tasks, dense, keep_ids) {
             let (written, end) = self.write_group(table, &group, &ids, &mut rows, indexes, &mut statistics)?;
             row_groups.push(written);
