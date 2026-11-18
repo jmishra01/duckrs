@@ -1219,6 +1219,9 @@ struct Writer<'a> {
     group_loaded: Vec<Vec<bool>>,
     /// That of each table, by schema and name, for the table read back from the file.
     pub(super) loaded: HashMap<(String, String), Vec<Vec<bool>>>,
+    /// Of each table whose statistics the file has less of than they are (before v2.0.0, strings to 8 bytes), the
+    /// statistics of each column as v2.0.0 writes them: until the database opens again, they are what a table has.
+    pub(super) memory_statistics: HashMap<(String, String), Vec<Vec<u8>>>,
     /// How many segments each block holds, which DuckDB has to know to free them one by one.
     segments_in_block: HashMap<u64, u32>,
     /// The block that segments go into now, with how much of it they fill.
@@ -1630,6 +1633,7 @@ impl<'a> Writer<'a> {
             stored_loaded: Vec::new(),
             group_loaded: Vec::new(),
             loaded: HashMap::new(),
+            memory_statistics: HashMap::new(),
             segments_in_block: HashMap::new(),
             open: None,
             pages: Vec::new(),
@@ -3002,6 +3006,21 @@ impl<'a> Writer<'a> {
         self.in_file = None;
         let loaded = std::mem::take(&mut self.group_loaded);
         self.loaded.insert((table.schema.clone(), table.name.clone()), loaded);
+        if self.version < StorageVersion::V2_0_0 {
+            let columns = (0..types.len())
+                .map(|column| {
+                    let stats = statistics[column].clone().unwrap_or_else(Stats::unknown);
+                    let mut s = serializer(StorageVersion::V2_0_0);
+                    true.write_value(&mut s);
+                    s.write_object_value(|s| {
+                        s.write_object(100, "statistics", |s| write_stats(s, Some(&types[column]), &stats));
+                    });
+                    s.into_bytes()
+                })
+                .collect();
+            self.memory_statistics
+                .insert((table.schema.clone(), table.name.clone()), columns);
+        }
         let mut s = serializer(self.version);
         s.write_object_value(|s| {
             s.write_list(100, "column_stats", types.len(), |s, column| {
@@ -3266,6 +3285,7 @@ pub fn write_checkpoint(
     });
     writer.write_metadata(&mut root, &s.into_bytes());
     let loaded = std::mem::take(&mut writer.loaded);
+    let memory_statistics = std::mem::take(&mut writer.memory_statistics);
     writer.finish(pointer)?;
     // what the log held is in the file now
     let mut log = path.as_os_str().to_owned();
@@ -3278,9 +3298,21 @@ pub fn write_checkpoint(
     // the blocks of the last checkpoint are free now, so what reads a table has to read the new ones
     buffer.clear();
     for entry in checkpoint::read_catalog(buffer)?.entries {
-        if let StoredEntry::Table(table) = entry {
+        if let StoredEntry::Table(mut table) = entry {
             let schema = table.schema.clone();
             let name = table.name.clone();
+            // `RowGroupCollection::Checkpoint` keeps the statistics it had: those of the file are read on opening it
+            if let Some(columns) = memory_statistics.get(&(schema.clone(), name.clone())) {
+                let statistics = columns
+                    .iter()
+                    .zip(&table.columns)
+                    .map(|(bytes, column)| {
+                        let mut d = checkpoint::catalog_deserializer(bytes, false);
+                        super::statistics::read_column_statistics(&mut d, &column.ty)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                table.column_statistics = statistics;
+            }
             let disk = Arc::new(DiskTable::new(buffer.clone(), *table)?);
             if let Some(loaded) = loaded.get(&(schema.clone(), name.clone())) {
                 disk.set_loaded(loaded);

@@ -2725,9 +2725,51 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
                 stats.min = None;
                 stats.max = None;
             }
-            if string_column {
-                stats.strings = Some(strings.unwrap_or_else(unknown_strings));
-                string_bounds_only(&mut stats);
+            // `TransformParquetStatistics` of strings: the bounds as the file has them, nothing of their lengths or
+            // characters
+            let ty = scan.types.get(column).map(LogicalType::id);
+            if matches!(ty, Some(LogicalTypeId::Varchar | LogicalTypeId::Blob)) {
+                let varchar = ty == Some(LogicalTypeId::Varchar);
+                let mut bounds: Option<(Vec<u8>, Vec<u8>)> = None;
+                let mut known = true;
+                for group in metadata.row_groups() {
+                    let Some(statistics) = group.column(leaf).statistics() else {
+                        known = false;
+                        break;
+                    };
+                    if statistics
+                        .null_count_opt()
+                        .is_some_and(|nulls| nulls >= group.num_rows() as u64)
+                    {
+                        continue;
+                    }
+                    // `StringStatsAreValid`: exact bounds of a VARCHAR that are not UTF-8 are bogus; cut ones may be
+                    let valid = |bytes: &[u8], exact: bool| !(varchar && exact && std::str::from_utf8(bytes).is_err());
+                    match (statistics.min_bytes_opt(), statistics.max_bytes_opt()) {
+                        (Some(min), Some(max))
+                            if valid(min, statistics.min_is_exact()) && valid(max, statistics.max_is_exact()) =>
+                        {
+                            let (low, high) = bounds.get_or_insert_with(|| (min.to_vec(), max.to_vec()));
+                            if min < low.as_slice() {
+                                *low = min.to_vec();
+                            }
+                            if max > high.as_slice() {
+                                *high = max.to_vec();
+                            }
+                        }
+                        _ => {
+                            known = false;
+                            break;
+                        }
+                    }
+                }
+                stats.strings = Some(crate::catalog::StringStatistics {
+                    bounds: bounds.filter(|_| known),
+                    has_unicode: true,
+                    min_length: None,
+                    max_length: None,
+                    total_length: None,
+                });
             }
             file_stats.push(usable.then_some(stats));
         }
@@ -2758,10 +2800,22 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
                         (None, y) if !a.can_be_valid => y,
                         _ => None,
                     };
-                    if let (Some(x), Some(y)) = (&a.strings, &b.strings) {
-                        a.strings = Some(x.merge(y, false));
-                        string_bounds_only(&mut a);
-                    }
+                    // `StringStats::Merge`: the bounds of both, of files that have any values
+                    a.strings = match (a.strings.take(), b.strings) {
+                        (Some(mut x), Some(y)) => {
+                            x.bounds = match (x.bounds, y.bounds) {
+                                (Some((low, high)), Some((other_low, other_high))) => {
+                                    Some((low.min(other_low), high.max(other_high)))
+                                }
+                                (bounds, None) if !b.can_be_valid => bounds,
+                                (None, bounds) if !a.can_be_valid => bounds,
+                                _ => None,
+                            };
+                            x.has_unicode |= y.has_unicode;
+                            Some(x)
+                        }
+                        _ => None,
+                    };
                     Some(a)
                 }
                 _ => None,

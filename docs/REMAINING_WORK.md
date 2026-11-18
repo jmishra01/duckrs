@@ -220,7 +220,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
     columns, and a checkpoint writes the columns in memory and keeps the others unread. An UPDATE with RETURNING,
     of a table with a CHECK or that a foreign key references, and an ALTER that checks the rows read the table.
     columns, `read_duckdb` (8)
-  - [ ] string and list-length statistics for `stats()` (~10 files), per-column `USING COMPRESSION`
+  - [x] string statistics for `stats()`: a minimum length too long to keep is left out, a checkpoint leaves a table the
+    statistics it computed until the file is opened again (a file before v2.0.0 keeps 8 bytes of a string bound),
+    and Parquet strings have the bounds of the file
+  - [ ] list-length statistics for `stats()` (`list_length_stats*`), per-column `USING COMPRESSION`
   - [x] `read_duckdb` and the replacement scan of `.db` files; `enable_view_dependencies` (DROP ... CASCADE,
     refused DROP and ALTER, CREATE OR REPLACE of a view that reads itself)
   - [ ] `vector_type` (~20 files) and `duckdb_memory` (~17) report engine internals duckrs does not model

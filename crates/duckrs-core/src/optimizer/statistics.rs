@@ -3495,7 +3495,11 @@ pub(super) fn stats_fields(stats: &Stats, ty: &LogicalType) -> Option<Value> {
         }
         fields.push(("has_unicode".to_string(), Value::boolean(strings.has_unicode)));
         for (name, value) in [
-            ("min_string_length", strings.min_length),
+            // `StringStatsData::HasMinStringLength`: the most it holds says only that it is at least that
+            (
+                "min_string_length",
+                strings.min_length.filter(|length| *length != u64::from(u32::MAX)),
+            ),
             ("max_string_length", strings.max_length),
             ("total_string_length", strings.total_length),
         ] {
