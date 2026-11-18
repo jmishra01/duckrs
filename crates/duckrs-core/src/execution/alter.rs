@@ -78,6 +78,7 @@ fn execute_table_alter(alter: BoundTableAlter) -> Result<()> {
     } else {
         (*row_ids).clone()
     });
+    log_as_alter(&old, &table, alter.logged.as_ref());
     if alter.verify {
         let rows = table.rows()?;
         for chunk in rows.chunks() {
@@ -135,4 +136,44 @@ pub fn execute_create_index(table: &Arc<TableCatalogEntry>, index: IndexCatalogE
             error
         }
     })
+}
+
+/// `WriteAlter`: the log says an ALTER of a column as such, if it knows the table as it was and nothing of its rows
+/// is waiting to be logged. The new entry goes on from the log state of that table, its rows in the same places.
+/// Otherwise the log makes the table again with its rows. Tables with indexes are made again, which logs those.
+fn log_as_alter(
+    old: &Arc<TableCatalogEntry>,
+    table: &Arc<TableCatalogEntry>,
+    kind: Option<&duckrs_parser::ast::AlterKind>,
+) {
+    let (Some(kind), Some(base)) = (kind, old.durable_base()) else {
+        return;
+    };
+    if !base.indexes.read().is_empty() {
+        return;
+    }
+    let ids = base.row_ids(base.row_count());
+    let log = base.log.lock();
+    let same_ids =
+        |a: &crate::catalog::RowIds, b: &crate::catalog::RowIds| a.next() == b.next() && a.ranges().eq(b.ranges());
+    let settled = log.updated.is_empty() && (Arc::ptr_eq(&log.logged, &ids) || same_ids(&log.logged, &ids));
+    // an ALTER TYPE gives the rows of a table with gaps other ids, which the log's ALTER doesn't
+    let renumbered = !same_ids(&table.row_ids(table.row_count()), &old.row_ids(old.row_count()));
+    if !settled || renumbered {
+        return;
+    }
+    let Ok(info) = crate::storage::log_writer::alter_record(old, table, kind) else {
+        return;
+    };
+    let mut alters = base.alters.lock().clone();
+    alters.push(crate::catalog::LoggedAlter {
+        from: Arc::downgrade(&base),
+        info,
+    });
+    *table.alters.lock() = alters;
+    *table.log.lock() = crate::catalog::TableLog {
+        logged: log.logged.clone(),
+        replayed: log.replayed.clone(),
+        ..crate::catalog::TableLog::default()
+    };
 }

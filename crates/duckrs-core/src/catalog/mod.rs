@@ -342,6 +342,13 @@ pub struct TableLog {
     pub updated_columns: BTreeSet<usize>,
 }
 
+/// An ALTER of a table, as the log says it, and the entry it was made of.
+#[derive(Debug, Clone)]
+pub struct LoggedAlter {
+    pub from: std::sync::Weak<TableCatalogEntry>,
+    pub info: crate::storage::serialization::generated::AlterInfo,
+}
+
 /// A table (`TableCatalogEntry`) and its rows.
 #[derive(Debug)]
 pub struct TableCatalogEntry {
@@ -396,6 +403,9 @@ pub struct TableCatalogEntry {
     versions: Arc<Mutex<RowVersions>>,
     /// What `COMMENT ON TABLE` said.
     pub comment: Mutex<Option<String>>,
+    /// The ALTERs that made this entry of one the log knows, oldest first, which the log says as such
+    /// (`WriteAlter`): empty when it has to make the table again.
+    pub alters: Mutex<Vec<LoggedAlter>>,
     /// made by CREATE TABLE AS, whose columns depend on no type (`BindCreateTableInfo` registers
     /// the types of the columns only when there is no query)
     pub from_query: std::sync::atomic::AtomicBool,
@@ -804,6 +814,7 @@ impl TableCatalogEntry {
             from_query: std::sync::atomic::AtomicBool::new(false),
             unloaded_deletes: std::sync::atomic::AtomicBool::new(false),
             comment: Mutex::new(None),
+            alters: Mutex::default(),
         }
     }
 

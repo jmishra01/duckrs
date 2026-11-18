@@ -987,6 +987,34 @@ pub(super) fn view_info(catalog: &str, schema: &SchemaCatalogEntry, view: &ViewC
     Ok(info)
 }
 
+/// `ColumnDefinition` of a column of a table, as CREATE TABLE and ALTER TABLE ... ADD COLUMN say it.
+pub(super) fn stored_column(column: &crate::catalog::LogicalColumn<'_>) -> Result<g::ColumnDefinition> {
+    let expression = match (
+        column.generated,
+        column.definition.and_then(|d| d.default_text.as_deref()),
+    ) {
+        (Some(expr), _) => Some(expr.clone()),
+        (None, Some(text)) => Some(parse_expression(text)?),
+        (None, None) => None,
+    };
+    Ok(g::ColumnDefinition {
+        name: column.name.to_string(),
+        type_: column.ty.clone(),
+        expression: expression
+            .as_ref()
+            .map(|expr| to_stored::expression(expr).map(Box::new))
+            .transpose()?,
+        category: if column.generated.is_some() {
+            table_column_type::GENERATED
+        } else {
+            table_column_type::STANDARD
+        },
+        compression_type: COMPRESSION_AUTO,
+        comment: column.definition.and_then(|d| d.comment.clone()).map(Value::varchar),
+        tags: Vec::new(),
+    })
+}
+
 pub(super) fn table_info(
     catalog: &str,
     schema: &SchemaCatalogEntry,
@@ -996,30 +1024,7 @@ pub(super) fn table_info(
     let mut constraints = Vec::new();
     let boxed = |constraint: g::Constraint| Some(Box::new(constraint));
     for column in table.logical_columns().iter() {
-        let expression = match (
-            column.generated,
-            column.definition.and_then(|d| d.default_text.as_deref()),
-        ) {
-            (Some(expr), _) => Some(expr.clone()),
-            (None, Some(text)) => Some(parse_expression(text)?),
-            (None, None) => None,
-        };
-        columns.push(g::ColumnDefinition {
-            name: column.name.to_string(),
-            type_: column.ty.clone(),
-            expression: expression
-                .as_ref()
-                .map(|expr| to_stored::expression(expr).map(Box::new))
-                .transpose()?,
-            category: if column.generated.is_some() {
-                table_column_type::GENERATED
-            } else {
-                table_column_type::STANDARD
-            },
-            compression_type: COMPRESSION_AUTO,
-            comment: column.definition.and_then(|d| d.comment.clone()).map(Value::varchar),
-            tags: Vec::new(),
-        });
+        columns.push(stored_column(column)?);
     }
     // a column by its place among all the columns, generated ones too (`LogicalIndex`)
     let logical = table.logical_columns();

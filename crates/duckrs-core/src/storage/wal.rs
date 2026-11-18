@@ -18,7 +18,7 @@ use super::serialization::generated::enums::{vector_type, wal_type};
 use super::serialization::generated::{self as g};
 use super::serialization::not_ported;
 use super::table_data::{self, DiskTable, PersistentRowGroup, fill_vector, fixed_width};
-use crate::catalog::{Catalog, OnCreateConflict, RowIds, SequenceData};
+use crate::catalog::{Catalog, OnCreateConflict, RowIds, SequenceData, TableCatalogEntry};
 use crate::planner::binder::Binder;
 use crate::planner::logical::LogicalOperatorKind;
 use duckrs_common::column_data::ColumnDataCollection;
@@ -77,6 +77,8 @@ pub(super) enum Record {
         validity: bool,
         chunk: DataChunk,
     },
+    /// `ReplayAlter`: an ALTER TABLE, run again
+    Alter(duckrs_parser::ast::AlterInfo),
 }
 
 /// What reading an entry leaves besides a `Record`.
@@ -561,7 +563,21 @@ impl Reader<'_> {
                     chunk,
                 }
             }
-            ALTER_INFO => return Err(not_ported("ALTER in a write-ahead log")),
+            ALTER_INFO => {
+                let info = d.read_property::<Option<Box<g::ParseInfo>>>(101, "info")?;
+                let Some(g::ParseInfoKind::AlterInfo(alter)) = info.map(|info| info.kind) else {
+                    return Err(corrupt("an ALTER of a log is not an ALTER"));
+                };
+                // ADD of a UNIQUE constraint comes with the index it makes (`index_storage_info`)
+                if let g::AlterInfoKind::AlterTableInfo(g::AlterTableInfo {
+                    kind: g::AlterTableInfoKind::AddConstraintInfo(_),
+                    ..
+                }) = &alter.kind
+                {
+                    return Err(not_ported("ADD CONSTRAINT in a write-ahead log"));
+                }
+                Record::Alter(super::serialization::convert::alter_info(alter)?)
+            }
             other => return Err(corrupt(format!("unknown write-ahead log entry {other}"))),
         };
         Ok(Entry::Record(record))
@@ -1134,6 +1150,7 @@ impl<'a> Replay<'a> {
                 }
                 Ok(())
             }
+            Record::Alter(info) => self.alter(&info),
             Record::Update {
                 column,
                 validity,
@@ -1159,43 +1176,59 @@ impl<'a> Replay<'a> {
     fn finish(self) -> Result<()> {
         for ((schema, name), live) in self.tables {
             let table = self.catalog.get_table(Some(&schema), &name)?;
-            let ids: Vec<u64> = (0..live.row_ids.len())
+            settle(&table, &live)?;
+        }
+        Ok(())
+    }
+
+    /// `ReplayAlter`: the ALTER as the statement did it, on the rows as the log has them so far, whose columns it
+    /// may move. A table renamed is the same table under its new name.
+    fn alter(&mut self, info: &duckrs_parser::ast::AlterInfo) -> Result<()> {
+        let name = &info.name;
+        let schema = match name.qualification.last() {
+            Some(schema) => schema.clone(),
+            None => self.catalog.schema_for(None)?.name.clone(),
+        };
+        let entry_name = (schema.clone(), name.name.clone());
+        let table_key = key(&entry_name);
+        if self.disk.contains_key(&table_key) || self.tables.contains_key(&table_key) {
+            self.live_table(&entry_name)?;
+            let table = self.catalog.get_table(Some(&schema), &name.name)?;
+            let live = self.tables.get_mut(&table_key).expect("just made live");
+            settle(&table, live)?;
+            let kept: Vec<u64> = (0..live.row_ids.len())
                 .filter(|position| !live.deleted.contains(position))
                 .map(|position| live.row_ids[position])
                 .collect();
-            table.set_row_ids(RowIds::of_list(&ids, live.next_row_id));
-            if live.deleted.is_empty() && live.updates.is_empty() {
-                table.reset_log();
-                continue;
+            live.row_ids = kept;
+            live.deleted.clear();
+            live.updates.clear();
+        }
+        // the database is this one, whatever it was called
+        let mut info = info.clone();
+        info.name.qualification = vec![schema.clone()];
+        let bound = Binder::new(self.catalog).bind_alter(&info)?;
+        crate::execution::alter::execute_alter(bound)?;
+        // the rows keep the ids the log has them under, which C++ doesn't change (`RowGroup::AlterType`)
+        if !self.tables.contains_key(&table_key) {
+            return Ok(());
+        }
+        let new_name = match &info.kind {
+            duckrs_parser::ast::AlterKind::RenameTable(new_name) => new_name.clone(),
+            _ => name.name.clone(),
+        };
+        let table = self.catalog.get_table(Some(&schema), &new_name)?;
+        if new_name != name.name {
+            let new_key = key(&(schema.clone(), new_name));
+            if let Some(live) = self.tables.remove(&table_key) {
+                self.tables.insert(new_key.clone(), live);
             }
-            let mut storage = table.write_storage()?;
-            let types = storage.types().to_vec();
-            let mut result = ColumnDataCollection::new(types.clone());
-            let mut chunk = DataChunk::new(&types);
-            for position in (0..storage.len()).filter(|position| !live.deleted.contains(position)) {
-                let mut row = storage.row(position);
-                for (&column, cell) in live.updates.get(&position).into_iter().flatten() {
-                    let target = row
-                        .get_mut(column)
-                        .ok_or_else(|| corrupt("a log updates a column that does not exist"))?;
-                    if cell.null == Some(true) {
-                        *target = Value::null(types[column].clone());
-                    } else if let Some(value) = &cell.value {
-                        *target = value.clone();
-                    }
-                }
-                chunk.append_row(&row)?;
-                if chunk.len() == STANDARD_VECTOR_SIZE {
-                    result.append(&chunk);
-                    chunk.reset();
-                }
+            if let Some(disk) = self.disk.remove(&table_key) {
+                self.disk.insert(new_key, disk);
             }
-            if !chunk.is_empty() {
-                result.append(&chunk);
+            if self.current.as_ref().is_some_and(|current| key(current) == table_key) {
+                self.current = Some((schema, table.name.clone()));
             }
-            *storage = result;
-            drop(storage);
-            table.reset_log();
         }
         Ok(())
     }
@@ -1210,4 +1243,46 @@ impl<'a> Replay<'a> {
         }
         self.finish()
     }
+}
+
+/// What a log deleted and updated of a table, put into its rows, which it numbers as the log does.
+fn settle(table: &TableCatalogEntry, live: &LiveTable) -> Result<()> {
+    let ids: Vec<u64> = (0..live.row_ids.len())
+        .filter(|position| !live.deleted.contains(position))
+        .map(|position| live.row_ids[position])
+        .collect();
+    table.set_row_ids(RowIds::of_list(&ids, live.next_row_id));
+    if live.deleted.is_empty() && live.updates.is_empty() {
+        table.reset_log();
+        return Ok(());
+    }
+    let mut storage = table.write_storage()?;
+    let types = storage.types().to_vec();
+    let mut result = ColumnDataCollection::new(types.clone());
+    let mut chunk = DataChunk::new(&types);
+    for position in (0..storage.len()).filter(|position| !live.deleted.contains(position)) {
+        let mut row = storage.row(position);
+        for (&column, cell) in live.updates.get(&position).into_iter().flatten() {
+            let target = row
+                .get_mut(column)
+                .ok_or_else(|| corrupt("a log updates a column that does not exist"))?;
+            if cell.null == Some(true) {
+                *target = Value::null(types[column].clone());
+            } else if let Some(value) = &cell.value {
+                *target = value.clone();
+            }
+        }
+        chunk.append_row(&row)?;
+        if chunk.len() == STANDARD_VECTOR_SIZE {
+            result.append(&chunk);
+            chunk.reset();
+        }
+    }
+    if !chunk.is_empty() {
+        result.append(&chunk);
+    }
+    *storage = result;
+    drop(storage);
+    table.reset_log();
+    Ok(())
 }

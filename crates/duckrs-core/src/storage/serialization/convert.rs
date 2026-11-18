@@ -948,3 +948,52 @@ pub fn column(stored: g::ColumnDefinition) -> Result<(ast::ColumnDefinition, Opt
         physical,
     ))
 }
+
+/// `AlterInfo` of a write-ahead log (`ReplayAlter`): an ALTER TABLE as the statement says it. The other kinds of
+/// ALTER aren't logged by duckrs, nor read.
+pub fn alter_info(stored: g::AlterInfo) -> Result<ast::AlterInfo> {
+    let g::AlterInfoKind::AlterTableInfo(table) = stored.kind else {
+        return Err(not_ported("an ALTER of other than a table in a write-ahead log"));
+    };
+    // a column, or a field of one when the path says so
+    let path = |name: String, path: Vec<String>| if path.is_empty() { vec![name] } else { path };
+    let kind = match table.kind {
+        g::AlterTableInfoKind::RenameColumnInfo(info) => ast::AlterKind::RenameColumn {
+            path: vec![info.old_name],
+            new_name: info.new_name,
+        },
+        g::AlterTableInfoKind::RenameTableInfo(info) => ast::AlterKind::RenameTable(info.new_table_name),
+        g::AlterTableInfoKind::AddColumnInfo(info) => ast::AlterKind::AddColumn {
+            column: column(info.new_column)?.0,
+            if_not_exists: info.if_column_not_exists,
+            not_null: info.add_not_null,
+            unique: info.add_unique,
+        },
+        g::AlterTableInfoKind::RemoveColumnInfo(info) => ast::AlterKind::RemoveColumn {
+            path: vec![info.removed_column],
+            if_exists: info.if_column_exists,
+            cascade: info.cascade,
+        },
+        g::AlterTableInfoKind::ChangeColumnTypeInfo(info) => ast::AlterKind::ChangeColumnType {
+            path: path(info.column_name, info.column_path),
+            target: Some(CastType::Resolved(info.target_type)),
+            using: optional(info.expression)?,
+        },
+        g::AlterTableInfoKind::SetDefaultInfo(info) => ast::AlterKind::SetDefault {
+            path: path(info.column_name, info.column_path),
+            expression: optional(info.expression)?,
+        },
+        g::AlterTableInfoKind::SetNotNullInfo(info) => {
+            ast::AlterKind::SetNotNull(path(info.column_name, info.column_path))
+        }
+        g::AlterTableInfoKind::DropNotNullInfo(info) => {
+            ast::AlterKind::DropNotNull(path(info.column_name, info.column_path))
+        }
+        _ => return Err(not_ported("this kind of ALTER TABLE in a write-ahead log")),
+    };
+    Ok(ast::AlterInfo {
+        name: qualified_name(String::new(), stored.schema, stored.name, stored.qualified_name),
+        if_exists: stored.if_not_found == enums::on_entry_not_found::RETURN_NULL,
+        kind,
+    })
+}

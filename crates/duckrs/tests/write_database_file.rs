@@ -1047,3 +1047,44 @@ fn columns_that_stay_keep_their_blocks() {
     run(&mut c, &format!("ATTACH '{}' AS db", file.display()));
     assert_eq!(rows(&mut c, &sums.replace("FROM t", "FROM db.t")), expected);
 }
+
+#[test]
+fn alters_in_the_log_come_back() {
+    let file = path("logged_alters.db");
+    let steps = [
+        "UPDATE t SET b = -b WHERE a % 3 = 0",
+        "ALTER TABLE t ADD COLUMN d INTEGER DEFAULT 42",
+        "UPDATE t SET d = a WHERE a < 100",
+        "ALTER TABLE t DROP COLUMN b",
+        // with gaps in the row ids this would be the table made again
+        "ALTER TABLE t ALTER a TYPE VARCHAR",
+        "DELETE FROM t WHERE a::INT % 7 = 0",
+        "ALTER TABLE t RENAME COLUMN c TO cc",
+        "ALTER TABLE t ALTER d SET DEFAULT 7",
+        "INSERT INTO t (a, cc) VALUES ('new', 'y')",
+        "ALTER TABLE t ALTER cc SET NOT NULL",
+    ];
+    let answer = "SELECT count(*), md5(string_agg(t::VARCHAR, ',' ORDER BY t::VARCHAR)) FROM t";
+    let shape = "SELECT string_agg(column_name || ':' || data_type || ':' || coalesce(column_default, '-') || ':' || \
+                 is_nullable, ' ') FROM information_schema.columns WHERE table_name = 't'";
+    let expected = {
+        let db = Database::open(&file, false).unwrap();
+        let mut c = db.connect().unwrap();
+        run(
+            &mut c,
+            "CREATE TABLE t AS SELECT i a, i * 2 b, i::VARCHAR c FROM range(5000) r(i)",
+        );
+        run(&mut c, "CHECKPOINT");
+        run(&mut c, "PRAGMA disable_checkpoint_on_shutdown");
+        for step in steps {
+            run(&mut c, step);
+        }
+        (rows(&mut c, answer), rows(&mut c, shape))
+    };
+    // the log says the ALTERs as such, not the table made again
+    let log = std::fs::metadata(format!("{}.wal", file.display())).unwrap().len();
+    assert!(log < 100_000, "a log of {log} bytes");
+    let db = Database::open(&file, true).unwrap();
+    let mut c = db.connect().unwrap();
+    assert_eq!((rows(&mut c, answer), rows(&mut c, shape)), expected);
+}

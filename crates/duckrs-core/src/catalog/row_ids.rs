@@ -254,7 +254,7 @@ impl RowIds {
 }
 
 /// A set of ids, for what tends to come in long runs.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct IdSet {
     /// The last id of each run by its first.
     runs: BTreeMap<u64, u64>,

@@ -210,6 +210,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
     says which metadata blocks each column takes (`PerColumnMetadataBlocks`), and a checkpoint writes again only
     the columns whose values changed; an ALTER keeps the columns it leaves as they were (ADD, DROP, ALTER TYPE).
     Before v2.0.0 a row group lists the blocks of all its columns together (`extra_metadata_blocks`).
+  - [x] ALTER TABLE in the WAL (`ALTER_INFO`, `WriteAlter` and `ReplayAlter`): ADD, DROP and RENAME COLUMN, ALTER
+    TYPE, SET and DROP DEFAULT and NOT NULL, RENAME TO are read, and an ALTER of a column is logged as such unless
+    the transaction changed the rows first, the table has indexes, or an ALTER TYPE gives the rows new ids; a replay
+    keeps the ids the log has the rows under. SET DEFAULT keeps the text of the default too.
   - [ ] columns that stay in the file through UPDATE and ALTER: those read all of a table into memory (and so load
     all its columns), as do the commits of transactions, so `partial_column_metadata_reuse*` still fail on what
     `loaded_segments_only` lists

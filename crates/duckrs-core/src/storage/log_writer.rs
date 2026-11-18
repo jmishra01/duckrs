@@ -681,8 +681,12 @@ impl WriteAheadLog {
     /// The tables that go and come back: each that changed its entry, as there are no records for
     /// ALTER, and what references one of those, as that keeps it from being dropped.
     fn written_again(&self, current: &Durable) -> BTreeSet<Key> {
+        // a table that ALTERs made of this one is the same table to the log
         let changed = |k: &Key, table: &Arc<TableCatalogEntry>| {
-            current.tables.get(k).is_some_and(|(_, new)| !Arc::ptr_eq(new, table))
+            current
+                .tables
+                .get(k)
+                .is_some_and(|(_, new)| !Arc::ptr_eq(new, table) && alters_since(new, table).is_none())
         };
         let mut again: BTreeSet<Key> = self
             .durable
@@ -759,6 +763,16 @@ impl WriteAheadLog {
             let tables: &BTreeMap<Key, (Key, Arc<TableCatalogEntry>)> = tables;
             !again.contains(k) && tables.get(k).is_some_and(|(_, other)| Arc::ptr_eq(other, table))
         };
+        // `WriteAlter`: the tables that ALTERs made of those the log knows, with the ALTERs since
+        let mut altered: BTreeMap<Key, Vec<g::AlterInfo>> = BTreeMap::new();
+        for (k, (_, table)) in &current.tables {
+            let Some((_, durable)) = self.durable.tables.get(k).filter(|_| !again.contains(k)) else {
+                continue;
+            };
+            if let Some(alters) = alters_since(table, durable) {
+                altered.insert(k.clone(), alters);
+            }
+        }
         for (k, (original, table, index)) in &self.durable.indexes {
             let same = current
                 .indexes
@@ -776,7 +790,7 @@ impl WriteAheadLog {
             .rev()
         {
             let (k, (original, table)) = tables[position];
-            if !same_table(k, table, &current.tables) {
+            if !same_table(k, table, &current.tables) && !altered.contains_key(k) {
                 records.drop_entry(wal_type::DROP_TABLE, original);
             }
         }
@@ -860,7 +874,17 @@ impl WriteAheadLog {
         let tables: Vec<_> = current.tables.iter().collect();
         for position in parents_first(tables.iter().map(|(_, (_, table))| table)) {
             let (k, (original, table)) = tables[position];
-            if !same_table(k, table, &self.durable.tables) {
+            if let Some(alters) = altered.remove(k) {
+                for info in alters {
+                    let info = g::ParseInfo {
+                        info_type: super::serialization::generated::enums::parse_info_type::ALTER_INFO,
+                        kind: g::ParseInfoKind::AlterInfo(info),
+                    };
+                    records.entry(wal_type::ALTER_INFO, |s| {
+                        s.write_property(101, "info", &Some(Box::new(info)))
+                    });
+                }
+            } else if !same_table(k, table, &self.durable.tables) {
                 if again.contains(k) {
                     // its rows go in again, under the ids of a new table
                     *table.log.lock() = TableLog::default();
@@ -872,6 +896,7 @@ impl WriteAheadLog {
                 records.entry(wal_type::CREATE_TABLE, |s| entry.write_members(s));
             }
             log_rows(&mut records, original, table)?;
+            table.alters.lock().clear();
         }
         for (k, (original, table, index)) in &current.indexes {
             let same = self
@@ -981,4 +1006,138 @@ impl WriteAheadLog {
     pub fn checkpointed(&mut self, catalog: &Catalog) {
         *self = Self::new(catalog);
     }
+}
+
+/// `AlterInfo` of an ALTER of a column of `table`, now `altered`, as `WriteAlter` logs it: what the statement said,
+/// with the column it added as the table has it, and a cast to the new type for a type changed without USING.
+pub(crate) fn alter_record(
+    table: &TableCatalogEntry,
+    altered: &TableCatalogEntry,
+    kind: &duckrs_parser::ast::AlterKind,
+) -> Result<g::AlterInfo> {
+    use super::serialization::generated::enums::{alter_table_type, alter_type, on_entry_not_found};
+    use duckrs_parser::ast::AlterKind;
+    let column = |path: &[String]| path.first().cloned().unwrap_or_default();
+    let expression = |expr: &duckrs_parser::ast::Expr| -> Result<Option<Box<g::ParsedExpression>>> {
+        Ok(Some(Box::new(super::serialization::to_stored::expression(expr)?)))
+    };
+    let (alter_table_type, kind) = match kind {
+        AlterKind::RenameColumn { path, new_name } => (
+            alter_table_type::RENAME_COLUMN,
+            g::AlterTableInfoKind::RenameColumnInfo(g::RenameColumnInfo {
+                old_name: column(path),
+                new_name: new_name.clone(),
+            }),
+        ),
+        AlterKind::AddColumn {
+            column: added,
+            if_not_exists,
+            not_null,
+            unique,
+        } => {
+            let columns = altered.logical_columns();
+            let stored = columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(&added.name))
+                .ok_or_else(|| write_not_ported("an ADD COLUMN of a column the table doesn't have"))?;
+            (
+                alter_table_type::ADD_COLUMN,
+                g::AlterTableInfoKind::AddColumnInfo(g::AddColumnInfo {
+                    new_column: super::writer::stored_column(stored)?,
+                    if_column_not_exists: *if_not_exists,
+                    add_not_null: *not_null,
+                    add_unique: *unique,
+                }),
+            )
+        }
+        AlterKind::RemoveColumn {
+            path,
+            if_exists,
+            cascade,
+        } => (
+            alter_table_type::REMOVE_COLUMN,
+            g::AlterTableInfoKind::RemoveColumnInfo(g::RemoveColumnInfo {
+                removed_column: column(path),
+                if_column_exists: *if_exists,
+                cascade: *cascade,
+            }),
+        ),
+        AlterKind::ChangeColumnType { path, using, .. } => {
+            let name = column(path);
+            let target = altered
+                .columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(&name))
+                .map(|c| c.ty.clone())
+                .ok_or_else(|| write_not_ported("an ALTER TYPE of a column the table doesn't have"))?;
+            // `BindAlterTypes`: without USING, the column cast to the type
+            let using = match using {
+                Some(using) => (**using).clone(),
+                None => super::writer::parse_expression(&format!(
+                    "CAST({} AS {target})",
+                    duckrs_parser::ast::sql_identifier(&name)
+                ))?,
+            };
+            (
+                alter_table_type::ALTER_COLUMN_TYPE,
+                g::AlterTableInfoKind::ChangeColumnTypeInfo(g::ChangeColumnTypeInfo {
+                    column_name: name,
+                    target_type: target,
+                    expression: expression(&using)?,
+                    column_path: Vec::new(),
+                }),
+            )
+        }
+        AlterKind::SetDefault { path, expression: set } => (
+            alter_table_type::SET_DEFAULT,
+            g::AlterTableInfoKind::SetDefaultInfo(g::SetDefaultInfo {
+                column_name: column(path),
+                expression: match set {
+                    Some(set) => expression(set)?,
+                    None => None,
+                },
+                column_path: Vec::new(),
+            }),
+        ),
+        AlterKind::SetNotNull(path) => (
+            alter_table_type::SET_NOT_NULL,
+            g::AlterTableInfoKind::SetNotNullInfo(g::SetNotNullInfo {
+                column_name: column(path),
+                column_path: Vec::new(),
+            }),
+        ),
+        AlterKind::DropNotNull(path) => (
+            alter_table_type::DROP_NOT_NULL,
+            g::AlterTableInfoKind::DropNotNullInfo(g::DropNotNullInfo {
+                column_name: column(path),
+                column_path: Vec::new(),
+            }),
+        ),
+        _ => return Err(write_not_ported("this ALTER in a write-ahead log")),
+    };
+    let mut path = vec![table.catalog.clone()];
+    path.extend(schema_path(&table.schema));
+    path.push(table.name.clone());
+    Ok(g::AlterInfo {
+        type_: alter_type::ALTER_TABLE,
+        catalog: table.catalog.clone(),
+        schema: table.schema.clone(),
+        name: table.name.clone(),
+        if_not_found: on_entry_not_found::THROW_EXCEPTION,
+        allow_internal: false,
+        qualified_name: Some(QualifiedName { path }),
+        kind: g::AlterInfoKind::AlterTableInfo(g::AlterTableInfo { alter_table_type, kind }),
+    })
+}
+
+/// The ALTERs that made `table` of `durable`, oldest first, if it was made of it that way.
+fn alters_since(table: &Arc<TableCatalogEntry>, durable: &Arc<TableCatalogEntry>) -> Option<Vec<g::AlterInfo>> {
+    if Arc::ptr_eq(table, durable) {
+        return None;
+    }
+    let alters = table.alters.lock();
+    let from = alters
+        .iter()
+        .position(|alter| std::ptr::eq(alter.from.as_ptr(), Arc::as_ptr(durable)))?;
+    Some(alters[from..].iter().map(|alter| alter.info.clone()).collect())
 }

@@ -30,12 +30,13 @@ SPECS = [
     "nodes",
     "dependency",
     "storage",
+    "parse_info",
     "wal",
 ]
 
 # Where the generated readers start.
 # The records of the WAL other than `WALCheckpoint`, which `wal.rs` reads, come from `wal.json`.
-ROOTS = ["CreateInfo", "FunctionArgument", "IndexStorageInfo", "BlockPointer"]
+ROOTS = ["CreateInfo", "FunctionArgument", "IndexStorageInfo", "BlockPointer", "ParseInfo"]
 
 # C++ deserializes these by hand. They are written by hand in `custom.rs` too.
 CUSTOM = {"CastExpression", "FunctionExpression", "LambdaExpression", "WindowExpression", "QualifiedName"}

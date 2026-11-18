@@ -220,6 +220,15 @@ impl TableCatalogEntry {
         Ok((!deleted.is_empty()).then_some(deleted))
     }
 
+    /// The entry whose rows and log state this one has: the table of the database for a copy of it whose rows are
+    /// still those, this one if it isn't a copy, `None` for a copy whose rows changed.
+    pub(crate) fn durable_base(self: &Arc<Self>) -> Option<Arc<Self>> {
+        match &self.origin {
+            Some(_) => self.same_as_origin(self.row_count()).cloned(),
+            None => Some(self.clone()),
+        }
+    }
+
     /// The table of the database, as long as this copy has the same rows in the same places.
     pub(crate) fn same_as_origin(&self, rows: usize) -> Option<&Arc<Self>> {
         let origin = self.origin.as_ref()?;
@@ -292,6 +301,16 @@ impl TableCatalogEntry {
         *table.indexes.write() = self.indexes.read().clone();
         if origin.is_some() {
             table.versions = self.versions.clone();
+        } else {
+            // the entry a commit puts in the database: what the log knows of it, and the ALTERs it says since
+            let theirs = self.log.lock();
+            *table.log.lock() = super::TableLog {
+                logged: theirs.logged.clone(),
+                replayed: theirs.replayed.clone(),
+                updated: theirs.updated.clone(),
+                updated_columns: theirs.updated_columns.clone(),
+            };
+            table.alters.lock().clone_from(&self.alters.lock());
         }
         table.origin = origin;
         Arc::new(table)
