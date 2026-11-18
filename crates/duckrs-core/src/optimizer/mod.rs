@@ -41,6 +41,7 @@ pub mod statistics;
 pub mod top_n;
 pub mod row_number_rewriter;
 pub mod type_pushdown;
+pub mod unnest_rewriter;
 pub mod unused_columns;
 
 use crate::planner::expression::{BoundExpr, BoundExprKind};
@@ -59,6 +60,7 @@ pub struct OptimizerOptions {
     pub unused_columns: bool,
     pub row_number_rewriter: bool,
     pub type_pushdown: bool,
+    pub unnest_rewriter: bool,
     pub common_subplan: bool,
     pub projection_pullup: bool,
     pub projection_placement: bool,
@@ -102,6 +104,7 @@ impl Default for OptimizerOptions {
             unused_columns: true,
             row_number_rewriter: true,
             type_pushdown: true,
+            unnest_rewriter: true,
             common_subplan: true,
             projection_pullup: true,
             projection_placement: true,
@@ -143,6 +146,7 @@ impl OptimizerOptions {
             unused_columns: false,
             row_number_rewriter: false,
             type_pushdown: false,
+            unnest_rewriter: false,
             common_subplan: false,
             projection_pullup: false,
             projection_placement: false,
@@ -183,6 +187,7 @@ impl OptimizerOptions {
             unused_columns: !off("unused_columns"),
             row_number_rewriter: !off("window_rewriter"),
             type_pushdown: !off("type_pushdown"),
+            unnest_rewriter: !off("unnest_rewriter"),
             common_subplan: !off("common_subplan"),
             projection_pullup: !off("projection_pullup"),
             projection_placement: !off("projection_placement"),
@@ -271,6 +276,10 @@ pub fn optimize_timed(
     // `CTE_FILTER_PUSHER`: the filters of the scans of a materialized CTE go into its definition
     if options.cte_filter_pusher {
         plan = run("cte_filter_pusher", plan, &mut cte_filter_pusher::push);
+    }
+    // `UNNEST_REWRITER`, before the DELIMINATOR
+    if options.unnest_rewriter {
+        plan = run("unnest_rewriter", plan, &mut unnest_rewriter::rewrite);
     }
     if options.deliminator {
         plan = run("deliminator", plan, &mut |mut plan| {

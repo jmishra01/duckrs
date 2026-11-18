@@ -630,7 +630,6 @@ pub(super) fn logical_tree(op: &LogicalOperator, estimate: Option<&PlanEstimate>
     }
 }
 
-/// The tree of a physical plan, and the logical plan it came from if they have the same shape.
 thread_local! {
     /// The working and recurring tables of the recursive CTEs being rendered, and their table
     /// indexes.
@@ -654,6 +653,7 @@ fn recursive_scan(table: &std::sync::Arc<parking_lot::Mutex<duckrs_common::colum
     })
 }
 
+/// The tree of a physical plan, and the logical plan it came from if they have the same shape.
 pub(super) fn physical_tree(
     op: &dyn PhysicalOperator,
     logical: Option<&LogicalOperator>,
