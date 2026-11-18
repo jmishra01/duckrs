@@ -1326,6 +1326,8 @@ struct Writer<'a> {
 #[derive(Debug, PartialEq, Eq)]
 struct PlannedGroup {
     row_start: u64,
+    /// the id of its first row in the file: `row_start` unless the ids are rewritten densely
+    file_start: u64,
     rows: usize,
     first_position: usize,
     live: usize,
@@ -1368,6 +1370,7 @@ fn vacuum_groups(groups: Vec<PlannedGroup>, size: usize, tasks: usize, only_full
         let Some((target, next, rows)) = planned else {
             result.push(PlannedGroup {
                 row_start: groups[at].row_start,
+                file_start: groups[at].file_start,
                 rows: groups[at].rows,
                 first_position: groups[at].first_position,
                 live: groups[at].live,
@@ -1384,6 +1387,7 @@ fn vacuum_groups(groups: Vec<PlannedGroup>, size: usize, tasks: usize, only_full
             if count > 0 {
                 result.push(PlannedGroup {
                     row_start,
+                    file_start: row_start,
                     rows: count,
                     first_position,
                     live: count,
@@ -1401,17 +1405,20 @@ fn vacuum_groups(groups: Vec<PlannedGroup>, size: usize, tasks: usize, only_full
 
 /// The row groups of rows with these ids: those that a file has, without the ones whose rows all
 /// went, and new ones of `size` for what came after them.
-/// `dense`: the file can't say that row ids have gaps (`CanPersistRowIdGaps`, before v2.0.0), so row groups
-/// without rows stay, and only those that keep all their rows come together.
-/// `stable_ids`: indexes need the rows to keep their ids.
-fn plan_groups(ids: &RowIds, size: usize, vacuum_tasks: usize, dense: bool, stable_ids: bool) -> Vec<PlannedGroup> {
+/// `dense`: the file can't say that row ids have gaps (`CanPersistRowIdGaps`, before v2.0.0), so the ids are
+/// rewritten to follow each other. `keep_ids`: indexes don't let the ids change (`KEEP_ROW_IDS`), so row groups
+/// without rows stay where later rows follow them, and none come together.
+fn plan_groups(ids: &RowIds, size: usize, vacuum_tasks: usize, dense: bool, keep_ids: bool) -> Vec<PlannedGroup> {
+    let keep_ids = dense && keep_ids;
+    let vacuum_tasks = if keep_ids { 0 } else { vacuum_tasks };
     let mut groups: Vec<PlannedGroup> = Vec::new();
     let mut add = |row_start: u64, rows: usize| {
         let first_position = ids.first_from(row_start);
         let live = ids.first_from(row_start + rows as u64) - first_position;
-        if live > 0 || dense {
+        if live > 0 || keep_ids {
             groups.push(PlannedGroup {
                 row_start,
+                file_start: row_start,
                 rows,
                 first_position,
                 live,
@@ -1430,38 +1437,26 @@ fn plan_groups(ids: &RowIds, size: usize, vacuum_tasks: usize, dense: bool, stab
         add(end, rows as usize);
         end += rows;
     }
-    // `InitializeVacuumState` of a file that can't say that row ids have gaps: a row group whose rows all went is
-    // dropped where the rows after it can take new ids (`SetRowIdsChanged`), or else only at the end
-    if dense && (stable_ids || vacuum_tasks == 0) {
+    if keep_ids {
+        // a suffix of row groups without rows shifts no row that stays
         while groups.last().is_some_and(|group| group.live == 0) {
             groups.pop();
         }
-    } else if dense && groups.iter().any(|group| group.live == 0) {
-        let mut next = groups.first().map_or(0, |group| group.row_start);
-        let mut shifted = false;
-        let mut kept = Vec::with_capacity(groups.len());
-        for group in groups {
-            if group.live == 0 {
-                shifted = true;
-                continue;
-            }
-            if shifted || group.row_start != next {
-                kept.push(PlannedGroup {
-                    row_start: next,
-                    rows: group.live,
-                    first_position: group.first_position,
-                    live: group.live,
-                    merged: true,
-                });
-                next += group.live as u64;
-            } else {
-                next = group.row_start + group.rows as u64;
-                kept.push(group);
-            }
-        }
-        groups = kept;
+        return groups;
     }
-    vacuum_groups(groups, size, vacuum_tasks, dense)
+    let mut groups = vacuum_groups(groups, size, vacuum_tasks, false);
+    if dense {
+        // `RowGroupCollection::Checkpoint`: without `next_row_id`, the row groups are numbered without gaps
+        let mut next = 0u64;
+        for group in &mut groups {
+            if group.merged {
+                group.row_start = next;
+            }
+            group.file_start = next;
+            next += group.rows as u64;
+        }
+    }
+    groups
 }
 
 /// `RowVersionManager::Checkpoint`: which rows of a row group are deleted. `kept` has its rows.
@@ -2570,6 +2565,7 @@ impl<'a> Writer<'a> {
         let mut parts: Vec<Vec<Part>> = types.iter().map(|_| Vec::new()).collect();
         let mut kept = Vec::with_capacity(group.rows);
         let row_id = |offset: usize| group.row_start + offset as u64;
+        let file_id = |offset: usize| group.file_start + offset as u64;
         let position_of = |offset: usize| {
             if group.merged {
                 Some(group.first_position + offset)
@@ -2589,7 +2585,7 @@ impl<'a> Writer<'a> {
                 if count < chunk.len() {
                     chunk.slice(&SelectionVector::from_vec((0..count as u32).collect()), count);
                 }
-                live_ids.extend((0..count).map(|row| row_id(first + row) as i64));
+                live_ids.extend((0..count).map(|row| file_id(first + row) as i64));
                 kept.resize(kept.len() + count, true);
                 (chunk.clone(), chunk)
             } else {
@@ -2607,7 +2603,7 @@ impl<'a> Writer<'a> {
                     let values: Vec<Value> = (0..types.len()).map(|c| source.column(c).get_value(row)).collect();
                     chunk.append_row(&values)?;
                     live.append_row(&values)?;
-                    live_ids.push(row_id(offset) as i64);
+                    live_ids.push(file_id(offset) as i64);
                     kept.push(true);
                 }
                 (chunk, live)
@@ -2625,12 +2621,12 @@ impl<'a> Writer<'a> {
         let written = self.write_row_group(
             table,
             parts,
-            group.row_start,
+            group.file_start,
             group.rows,
             deletes.as_deref(),
             statistics,
         )?;
-        Ok((written, group.row_start as usize + group.rows))
+        Ok((written, group.file_start as usize + group.rows))
     }
 
     /// `SingleFileTableDataWriter::FinalizeTable`: where the rows of a table are, how many rows its

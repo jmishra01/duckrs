@@ -157,7 +157,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] the ART layouts of files before v2.0.0, in checkpoints and the WAL: from v1.2.0 the current nodes with
     the 264-byte `Node256Leaf` (`GetNode256LeafSegmentSize`), before it `ART::TransformToDeprecated` (chains of
     `Leaf` of 4 row ids, 15-byte prefixes, 6 allocators); the `storage_version` option is the file's
-  - [ ] dense row id rewriting of files before v2.0.0 (`rowid_gaps/old_storage_*`): row groups stay as they are
+  - [x] dense row id rewriting of files before v2.0.0: row groups without rows go and the ids after them move
+    up, unless indexes keep the ids (`KEEP_ROW_IDS`: then only the trailing ones go)
+  - [ ] `rowid_gaps`: GEOMETRY columns of files before v1.5.0, ATTACH's `vacuum_rebuild_indexes`, the
+    `total_vacuum_time` of the checkpoint profiling
   - [x] unshredded VARIANT columns, in the file and the WAL
   - [x] shredded VARIANT columns: read from files C++ writes, and written at a checkpoint by
     `variant_minimum_shredding_size` and `force_variant_shredding`, with the type inferred as C++ does (object fields
