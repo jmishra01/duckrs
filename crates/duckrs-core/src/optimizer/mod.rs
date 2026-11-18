@@ -23,6 +23,7 @@ mod filter_combiner;
 mod filter_pullup;
 mod grouping_sets;
 mod partial_aggregate_pushdown;
+mod aggregate_reuse;
 pub mod filter_pushdown;
 pub mod in_clause_rewriter;
 mod index_scan;
@@ -70,6 +71,7 @@ pub struct OptimizerOptions {
     pub grouping_sets: bool,
     pub sampling_pushdown: bool,
     pub partial_aggregate_pushdown: bool,
+    pub aggregate_reuse: bool,
     /// `index_scan_percentage`
     pub index_scan_percentage: f64,
     /// `index_scan_max_count`
@@ -109,6 +111,7 @@ impl Default for OptimizerOptions {
             grouping_sets: true,
             sampling_pushdown: true,
             partial_aggregate_pushdown: true,
+            aggregate_reuse: true,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -146,6 +149,7 @@ impl OptimizerOptions {
             grouping_sets: false,
             sampling_pushdown: false,
             partial_aggregate_pushdown: false,
+            aggregate_reuse: false,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -182,6 +186,7 @@ impl OptimizerOptions {
             grouping_sets: !off("grouping_sets"),
             sampling_pushdown: !off("sampling_pushdown"),
             partial_aggregate_pushdown: !off("partial_aggregate_pushdown"),
+            aggregate_reuse: !off("aggregate_reuse"),
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -275,6 +280,9 @@ pub fn optimize_timed(
     if options.join_order {
         build_side::choose_build_sides(&mut plan, options.range_joins.prefer_range_joins);
         plan = run("join_order", plan, &mut join_order::reorder_joins);
+    }
+    if options.aggregate_reuse {
+        plan = run("aggregate_reuse", plan, &mut aggregate_reuse::reuse);
     }
     if options.partial_aggregate_pushdown {
         plan = run("partial_aggregate_pushdown", plan, &mut partial_aggregate_pushdown::push_down);

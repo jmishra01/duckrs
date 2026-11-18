@@ -628,6 +628,41 @@ pub(super) fn physical_tree(
         let estimate = estimate.filter(|e| e.children.len() == 1).map(|e| &e.children[0]);
         return physical_tree(op, Some(&logical_children[0]), estimate, analyze);
     }
+    // duckrs runs DISTINCT aggregates as a grouping by the argument below the aggregate, which C++
+    // does inside the one operator
+    if !analyze
+        && let Some(
+            aggregate @ LogicalOperator {
+                kind:
+                    K::Aggregate {
+                        groups,
+                        aggregates,
+                        grouping_sets,
+                        grouping_functions,
+                        ..
+                    },
+                children: logical_children,
+            },
+        ) = logical
+        && logical_children.len() == 1
+        && children.len() == 1
+        && children[0].name() == op.name()
+        && children[0].children().len() == 1
+        && crate::execution::distinct_in_two_steps(groups, aggregates, grouping_sets, grouping_functions).is_some()
+    {
+        let estimate = estimate.filter(|e| e.children.len() == 1);
+        return ExplainNode {
+            name: op.name().to_string(),
+            info: operator_info(aggregate, true),
+            estimate: estimate.map(|e| e.cardinality),
+            children: vec![physical_tree(
+                children[0].children()[0].as_ref(),
+                Some(&logical_children[0]),
+                estimate.map(|e| &e.children[0]),
+                analyze,
+            )],
+        };
+    }
     // `CreatePlan(LogicalSample)` puts a LIMIT over a SYSTEM sample of rows
     if let Some(LogicalOperator {
         kind: K::Sample { options },

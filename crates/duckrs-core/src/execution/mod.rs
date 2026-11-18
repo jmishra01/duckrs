@@ -807,7 +807,7 @@ fn build_pipelines<'a>(sink: &'a dyn PhysicalOperator, pipelines: &mut Vec<Pipel
 /// The argument of aggregates that are all DISTINCT on the same one, with nothing else that keeps
 /// rows apart, which can then run as a grouping by the groups and the argument and then the
 /// aggregates without DISTINCT over that: what DISTINCT keeps apart keeps no thread from the work.
-fn distinct_in_two_steps(
+pub(crate) fn distinct_in_two_steps(
     groups: &[BoundExpr],
     aggregates: &[BoundAggregate],
     grouping_sets: &[BTreeSet<usize>],
