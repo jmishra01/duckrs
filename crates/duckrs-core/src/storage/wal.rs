@@ -282,8 +282,32 @@ fn read_flat_vector(d: &mut BinaryDeserializer<'_>, ty: &LogicalType, count: usi
     // `Vector::Deserialize` of a GEOMETRY: WKB, or the spatial extension's format before v1.5.0
     if ty.id() == duckrs_common::types::LogicalTypeId::Geometry {
         const WKB: u8 = 1;
-        if d.read_optional_property::<u8>(99, "geometry_format")? != Some(WKB) {
-            return Err(not_ported("GEOMETRY of the spatial extension in a write-ahead log"));
+        const SPATIAL: u8 = 0;
+        match d
+            .read_optional_property::<u8>(99, "geometry_format")?
+            .unwrap_or(SPATIAL)
+        {
+            WKB => {}
+            SPATIAL => {
+                // `Geometry::FromSpatialGeometry` of each blob
+                let blobs = read_flat_vector(d, &LogicalType::BLOB, count)?;
+                let mut result = Vector::new(ty.clone(), count.max(1));
+                for row in 0..count {
+                    let value = blobs.get_value(row);
+                    match value.data() {
+                        duckrs_common::value::ValueData::Bytes(blob) if !value.is_null() => {
+                            let wkb = duckrs_common::geometry::from_spatial(blob)?;
+                            result.set_value(
+                                row,
+                                &Value::new(ty.clone(), duckrs_common::value::ValueData::Bytes(wkb))?,
+                            )?;
+                        }
+                        _ => result.set_null(row, true),
+                    }
+                }
+                return Ok(result);
+            }
+            _ => return Err(not_ported("a shredded GEOMETRY in a write-ahead log")),
         }
     } else if d.has_property(99)? {
         return Err(not_ported("extra vector data in a write-ahead log"));
@@ -755,6 +779,8 @@ pub(super) struct Replay<'a> {
     tables: HashMap<EntryName, LiveTable>,
     sequence_usage: HashMap<EntryName, u64>,
     current: Option<EntryName>,
+    /// The `storage_version` of each index whose ART the file has, by schema and name.
+    index_versions: HashMap<EntryName, Option<u64>>,
 }
 
 impl<'a> Replay<'a> {
@@ -768,12 +794,24 @@ impl<'a> Replay<'a> {
             tables: HashMap::new(),
             sequence_usage: HashMap::new(),
             current: None,
+            index_versions: HashMap::new(),
         }
     }
 
     /// Binds the definition of a table as `CREATE TABLE` does, for its defaults, generated columns
     /// and constraints. Its rows stay in the file.
     fn load_table(&mut self, table: StoredTable) -> Result<()> {
+        // `ART::ART` of an index with storage: the version it has, if it says
+        for index in &table.indexes {
+            let version = index
+                .options
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("storage_version"))
+                .and_then(|(_, value)| value.as_i128())
+                .map(|version| version as u64);
+            self.index_versions
+                .insert(key(&(table.schema.clone(), index.name.clone())), version);
+        }
         let plan = Binder::new(self.catalog).bind_stored_table(&table.definition, &table.schema)?;
         let LogicalOperatorKind::CreateTable {
             schema,
@@ -925,6 +963,8 @@ impl<'a> Replay<'a> {
                 };
                 // the file has these rows under the index already, so they aren't checked again
                 if let Some((table, mut index)) = Binder::new(self.catalog).bind_create_index(&info)? {
+                    let name = key(&(table.schema.clone(), index.name.clone()));
+                    index.storage_version = self.index_versions.get(&name).copied();
                     index.index_type = index_type;
                     index.comment = comment;
                     table.indexes.write().push(Arc::new(index));

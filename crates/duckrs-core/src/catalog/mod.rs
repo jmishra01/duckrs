@@ -636,6 +636,9 @@ pub struct IndexCatalogEntry {
     pub sql: String,
     /// `COMMENT ON INDEX`, which makes a new entry, for a transaction that rolls back to lose it.
     pub comment: Option<String>,
+    /// `ART::storage_version` of an index a file had: `Some(None)` where the file says none
+    /// (`StorageVersion::INVALID`, of before v1.5.0). `None` for a new index, which has the version of its file.
+    pub storage_version: Option<Option<u64>>,
 }
 
 /// The tree of a key, for scans.

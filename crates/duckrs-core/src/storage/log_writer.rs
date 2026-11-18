@@ -210,17 +210,30 @@ fn write_validity(s: &mut BinarySerializer, vector: &Vector, count: usize) -> bo
 fn write_vector(s: &mut BinarySerializer, vector: &Vector, ty: &LogicalType, count: usize) -> Result<()> {
     // `Vector::Serialize` of a GEOMETRY: its format, then the WKB as a list of blobs
     if ty.id() == LogicalTypeId::Geometry {
-        const WKB: u8 = 1;
-        s.write_property(99, "geometry_format", &WKB);
+        // before v1.5.0 (`Geometry::VERSION_ADDED`) without a format: the spatial extension's
+        let spatial = !s.should_serialize(StorageVersion::V1_5_0);
+        if !spatial {
+            const WKB: u8 = 1;
+            s.write_property(99, "geometry_format", &WKB);
+        }
         write_validity(s, vector, count);
-        s.write_list(102, "data", count, |s, row| {
+        let mut blobs = Vec::with_capacity(count);
+        for row in 0..count {
             let value = vector.get_value(row);
-            let wkb: &[u8] = match value.data() {
-                duckrs_common::value::ValueData::Bytes(bytes) if vector.is_valid(row) => bytes,
-                _ => &[],
-            };
-            s.write_varint_unsigned(wkb.len() as u64);
-            s.write_raw(wkb);
+            blobs.push(match value.data() {
+                duckrs_common::value::ValueData::Bytes(bytes) if vector.is_valid(row) => {
+                    if spatial {
+                        duckrs_common::geometry::to_spatial(bytes)?
+                    } else {
+                        bytes.to_vec()
+                    }
+                }
+                _ => Vec::new(),
+            });
+        }
+        s.write_list(102, "data", count, |s, row| {
+            s.write_varint_unsigned(blobs[row].len() as u64);
+            s.write_raw(&blobs[row]);
         });
         return Ok(());
     }

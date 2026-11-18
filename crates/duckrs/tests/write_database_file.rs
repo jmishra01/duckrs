@@ -771,3 +771,122 @@ fn a_referenced_table_can_change_in_the_log() {
     assert_eq!(rows(&mut connection, "SELECT count(*) FROM c"), ["1"]);
     run(&mut connection, "DROP INDEX c_i");
 }
+
+/// A checkpoint shreds VARIANT columns whose values have a common shape (`variant_minimum_shredding_size`
+/// rows or more): the shredded part is in the file next to the unshredded one, and the values come
+/// back as they were, those of another shape too.
+#[test]
+fn shredded_variants_come_back() {
+    let file = path("shredded_variants.db");
+    let tables = [
+        ("ints", "SELECT (i % 7)::INTEGER::VARIANT v FROM range(50) t(i)"),
+        (
+            "mixed",
+            "SELECT CASE WHEN i % 5 = 0 THEN ('s' || i)::VARIANT WHEN i % 7 = 0 THEN NULL ELSE i::VARIANT END v \
+             FROM range(50) t(i)",
+        ),
+        (
+            "objects",
+            "SELECT CASE WHEN i % 9 = 0 THEN {'a': 'text', 'z': [1, 2]}::VARIANT \
+             WHEN i % 11 = 0 THEN [i]::VARIANT ELSE {'a': i, 'b': 'x' || i}::VARIANT END v FROM range(50) t(i)",
+        ),
+        ("lists", "SELECT [i, NULL, i + 1]::VARIANT v FROM range(50) t(i)"),
+    ];
+    let read = |c: &mut Connection, table: &str| rows(c, &format!("SELECT v::VARCHAR FROM {table} ORDER BY rowid"));
+    let mut expected = Vec::new();
+    {
+        let db = Database::open(&file, false).unwrap();
+        let mut c = db.connect().unwrap();
+        run(&mut c, "SET variant_minimum_shredding_size = 0");
+        for (table, query) in tables {
+            run(&mut c, &format!("CREATE TABLE {table} AS {query}"));
+            expected.push(read(&mut c, table));
+        }
+        run(&mut c, "CHECKPOINT");
+        for (table, _) in tables {
+            let shredded = rows(
+                &mut c,
+                &format!("SELECT count(*) FROM pragma_storage_info('{table}') WHERE column_path LIKE '[0, 2%'"),
+            );
+            assert_ne!(shredded, ["0"], "{table} is shredded");
+        }
+    }
+    let db = Database::open(&file, true).unwrap();
+    let mut c = db.connect().unwrap();
+    for ((table, _), expected) in tables.iter().zip(&expected) {
+        assert_eq!(&read(&mut c, table), expected, "{table}");
+    }
+}
+
+/// `VariantStats::ToStruct` of a shredded column read back from its file: the typed parts that every value
+/// is in (`fully_shredded`), by field and element, with their statistics, and an all-NULL INTEGER column
+/// next to it, whose empty statistics hold no bounds.
+#[test]
+fn shredded_variant_statistics_come_back() {
+    let file = path("shredded_variant_statistics.db");
+    {
+        let db = Database::open(&file, false).unwrap();
+        let mut c = db.connect().unwrap();
+        run(&mut c, "SET variant_minimum_shredding_size = 0");
+        run(
+            &mut c,
+            "CREATE TABLE t AS SELECT {'a': i::INTEGER, 'l': [i::INTEGER]}::VARIANT v, NULL::INTEGER n FROM range(100) r(i)",
+        );
+        run(&mut c, "CHECKPOINT");
+    }
+    let db = Database::open(&file, true).unwrap();
+    let mut c = db.connect().unwrap();
+    let stats = |c: &mut Connection, query: &str| rows(c, &format!("SELECT {query} FROM t LIMIT 1"));
+    assert_eq!(stats(&mut c, "stats(v).shredding_state"), ["SHREDDED"]);
+    assert_eq!(
+        stats(
+            &mut c,
+            "stats(v).fully_shredded.a.type || ' ' || stats(v).fully_shredded.a.stats.max"
+        ),
+        ["INTEGER 99"]
+    );
+    assert_eq!(stats(&mut c, "stats(v).fully_shredded.l.child_stats.stats.min"), ["0"]);
+    assert_eq!(stats(&mut c, "stats(v.a).fully_shredded.stats.min"), ["0"]);
+    assert_eq!(
+        stats(&mut c, "stats(n)::VARCHAR"),
+        ["{'has_no_null': false, 'has_null': true}"]
+    );
+    assert_eq!(rows(&mut c, "SELECT count(n), sum((v.a)::INTEGER) FROM t"), ["0|4950"]);
+}
+
+/// Before v1.5.0 a GEOMETRY is the spatial extension's BLOB, in the file and in the log, and the keys of an
+/// index of one are too (`ART::ConvertKeyInput`): they come back as they went in, and the index finds them.
+#[test]
+fn geometries_of_old_storage_come_back() {
+    let dir = path("geometry_v140");
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("g.db");
+    let _ = std::fs::remove_file(&file);
+    let _ = std::fs::remove_file(dir.join("g.db.wal"));
+    let shapes = "SELECT i, CASE WHEN i % 7 = 0 THEN NULL WHEN i % 5 = 0 THEN 'POLYGON ((0 0, 1 0, 1 1, 0 0))'::GEOMETRY \
+                  WHEN i % 3 = 0 THEN ('LINESTRING Z (0 0 1, ' || i || ' 1 2)')::GEOMETRY \
+                  ELSE ('POINT (' || i || ' ' || i || ')')::GEOMETRY END g FROM range(300) r(i)";
+    let read = |c: &mut Connection| {
+        rows(
+            c,
+            "SELECT md5(string_agg(g::VARCHAR, ',' ORDER BY i)), count(g) FROM db.t",
+        )
+    };
+    let db = Database::open_in_memory().unwrap();
+    let mut c = db.connect().unwrap();
+    let attach = format!("ATTACH '{}' AS db (STORAGE_VERSION 'v1.4.0')", file.display());
+    run(&mut c, &attach);
+    run(&mut c, &format!("CREATE TABLE db.t AS {shapes}"));
+    run(&mut c, "CREATE INDEX gi ON db.t(g)");
+    run(&mut c, "CHECKPOINT db");
+    run(&mut c, "INSERT INTO db.t VALUES (1000, 'POINT (7 8)'::GEOMETRY)");
+    let expected = read(&mut c);
+    run(&mut c, "PRAGMA disable_checkpoint_on_shutdown");
+    run(&mut c, "DETACH db");
+    run(&mut c, &format!("ATTACH '{}' AS db", file.display()));
+    assert_eq!(read(&mut c), expected);
+    assert_eq!(
+        rows(&mut c, "SELECT i FROM db.t WHERE g = 'POINT (151 151)'::GEOMETRY"),
+        ["151"]
+    );
+}

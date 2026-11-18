@@ -145,6 +145,7 @@ impl Binder<'_> {
                 index_type: index_type.clone(),
                 sql: info.to_string(),
                 comment: None,
+                storage_version: None,
             },
         )))
     }

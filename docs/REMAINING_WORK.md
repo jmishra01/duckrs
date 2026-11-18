@@ -159,8 +159,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
     `Leaf` of 4 row ids, 15-byte prefixes, 6 allocators); the `storage_version` option is the file's
   - [x] dense row id rewriting of files before v2.0.0: row groups without rows go and the ids after them move
     up, unless indexes keep the ids (`KEEP_ROW_IDS`: then only the trailing ones go)
-  - [ ] `rowid_gaps`: GEOMETRY columns of files before v1.5.0, ATTACH's `vacuum_rebuild_indexes`, the
-    `total_vacuum_time` of the checkpoint profiling
+  - [x] GEOMETRY in files and logs before v1.5.0: the spatial extension's BLOB format and type, the keys of
+    an index of one (`ART::ConvertKeyInput`), the `storage_version` each index keeps, and no vacuum remap of an
+    index with such keys (`KEEP_ROW_IDS`)
+  - [ ] `rowid_gaps`: ATTACH's `vacuum_rebuild_indexes`, the `total_vacuum_time` of the checkpoint profiling
   - [x] unshredded VARIANT columns, in the file and the WAL
   - [x] shredded VARIANT columns: read from files C++ writes, and written at a checkpoint by
     `variant_minimum_shredding_size` and `force_variant_shredding`, with the type inferred as C++ does (object fields
@@ -497,7 +499,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] CRS type parameters (AUTH:CODE, PROJJSON, WKT2:2019, the OGC:CRS84/CRS83 defaults), `ST_CRS`, `ST_SetCRS`
   - [ ] `CREATE COORDINATE SYSTEM`, `duckdb_coordinate_systems()`, `ignore_unknown_crs`
   - [x] GEOMETRY columns in database files (v1.5.0 and later, as WKB) and the WAL
-  - [ ] shredded GEOMETRY columns, and the spatial extension's format of files before v1.5.0
+  - [ ] shredded GEOMETRY columns
   - [x] `GeometryStats`: in `stats()`, in database files (extent, types, flags), and `vertex_extract`'s bounds
   - [ ] `ST_GeomFromWKB`'s types from BLOB min/max (duckrs keeps no string statistics), GeoParquet, the spatial extension's blob format
 - [ ] 34. Remaining type and cast failures (`sql/types`: 39 failing, 92.6%; `sql/cast`: 2 failing)

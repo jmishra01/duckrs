@@ -752,6 +752,10 @@ fn write_stats(s: &mut BinarySerializer, ty: Option<&LogicalType>, stats: &Stats
             }
             return;
         }
+        // `GeometryStats::Serialize` before v1.5.0: unknown string statistics
+        if ty.id() == LogicalTypeId::Geometry && !s.should_serialize(StorageVersion::V1_5_0) {
+            return write_string_stats(s, None);
+        }
         // `GeometryStats::Serialize` of `CreateUnknown`: any extent, type and flag, which prunes nothing
         if ty.id() == LogicalTypeId::Geometry {
             let geometry = stats
@@ -842,6 +846,13 @@ fn write_segment(s: &mut BinarySerializer, segment: &SegmentOut, ty: Option<&Log
 
 /// `PersistentColumnData::Serialize`, without the object around it.
 fn write_column(s: &mut BinarySerializer, column: &ColumnOut, ty: Option<&LogicalType>, row_start: u64) {
+    // before v1.5.0 a GEOMETRY is the BLOB of the spatial extension's format, with nothing to say so
+    // (`GeoColumnData::Serialize` of `GeometryStorageType::SPATIAL`)
+    let blob = LogicalType::BLOB;
+    let ty = match ty {
+        Some(ty) if ty.id() == LogicalTypeId::Geometry && !s.should_serialize(StorageVersion::V1_5_0) => Some(&blob),
+        ty => ty,
+    };
     // `GeometryPersistentColumnData`: stored as WKB, the default storage type
     if ty.is_some_and(|ty| ty.id() == LogicalTypeId::Geometry) {
         const GEOMETRY_EXTRA_DATA: u8 = 2;
@@ -1406,16 +1417,15 @@ fn vacuum_groups(groups: Vec<PlannedGroup>, size: usize, tasks: usize, only_full
 /// The row groups of rows with these ids: those that a file has, without the ones whose rows all
 /// went, and new ones of `size` for what came after them.
 /// `dense`: the file can't say that row ids have gaps (`CanPersistRowIdGaps`, before v2.0.0), so the ids are
-/// rewritten to follow each other. `keep_ids`: indexes don't let the ids change (`KEEP_ROW_IDS`), so row groups
-/// without rows stay where later rows follow them, and none come together.
+/// rewritten to follow each other. `keep_ids`: indexes don't let the ids change (`KEEP_ROW_IDS`), so none come
+/// together, and in a `dense` file row groups without rows stay where later rows follow them.
 fn plan_groups(ids: &RowIds, size: usize, vacuum_tasks: usize, dense: bool, keep_ids: bool) -> Vec<PlannedGroup> {
-    let keep_ids = dense && keep_ids;
     let vacuum_tasks = if keep_ids { 0 } else { vacuum_tasks };
     let mut groups: Vec<PlannedGroup> = Vec::new();
     let mut add = |row_start: u64, rows: usize| {
         let first_position = ids.first_from(row_start);
         let live = ids.first_from(row_start + rows as u64) - first_position;
-        if live > 0 || keep_ids {
+        if live > 0 || (keep_ids && dense) {
             groups.push(PlannedGroup {
                 row_start,
                 file_start: row_start,
@@ -2273,10 +2283,24 @@ impl<'a> Writer<'a> {
         }
         // before v1.5.0, a GEOMETRY is stored as the spatial extension's blob (`GetSpatialGeometryType`)
         if ty.id() == LogicalTypeId::Geometry && self.version < StorageVersion::V1_5_0 {
-            return Err(Error::not_implemented(format!(
-                "writing a GEOMETRY column to a database file of storage version {} is not yet ported to duckrs",
-                self.version.display_name(false)
-            )));
+            let mut spatial_parts = Vec::with_capacity(parts.len());
+            for part in parts {
+                let mut blobs = Vector::new(LogicalType::BLOB, part.count.max(1));
+                for row in 0..part.count {
+                    let value = part.vector.get_value(row);
+                    match value.data() {
+                        ValueData::Bytes(wkb) if !value.is_null() => {
+                            blobs.set_value(row, &Value::blob(duckrs_common::geometry::to_spatial(wkb)?))?
+                        }
+                        _ => blobs.set_null(row, true),
+                    }
+                }
+                spatial_parts.push(Part::new(&blobs, part.count));
+            }
+            let mut out = self.write_column_data(&LogicalType::BLOB, &spatial_parts)?;
+            // `GeometryStats::CreateUnknown`, of which only the validity is kept
+            out.stats.strings = None;
+            return Ok(out);
         }
         let rows = parts.iter().map(|part| part.count).sum();
         let mut valid = Vec::with_capacity(rows);
@@ -2655,7 +2679,10 @@ impl<'a> Writer<'a> {
         let size = self.chunks_per_row_group * STANDARD_VECTOR_SIZE;
         let (mut stored_rows, mut next_row_id) = (0u64, 0u64);
         let dense = self.version < StorageVersion::V2_0_0;
-        for group in plan_groups(&ids, size, self.vacuum_tasks, dense, !indexes.is_empty()) {
+        // `GetVacuumIndexStrategy`: KEEP_ROW_IDS where indexes can't be remapped (`CanVacuumRemap`), which needs
+        // gaps a file can say and no keys of GEOMETRYs as before v1.5.0
+        let keep_ids = (dense && !indexes.is_empty()) || indexes.iter().any(|index| index.legacy_geometry);
+        for group in plan_groups(&ids, size, self.vacuum_tasks, dense, keep_ids) {
             let (written, end) = self.write_group(table, &group, &ids, &mut rows, indexes, &mut statistics)?;
             row_groups.push(written);
             stored_rows += group.rows as u64;

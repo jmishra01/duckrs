@@ -80,6 +80,9 @@ pub(super) struct PersistentColumn {
     children: Vec<PersistentColumn>,
     /// Of a shredded VARIANT, the type of its typed part (`VariantPersistentColumnData`).
     shredded: Option<LogicalType>,
+    /// of a GEOMETRY without extra data, that it is the BLOB of the spatial extension's format
+    /// (`GeometryStorageType::SPATIAL`)
+    spatial: bool,
 }
 
 fn not_ported_column(ty: &LogicalType) -> Error {
@@ -92,6 +95,8 @@ fn not_ported_column(ty: &LogicalType) -> Error {
 /// `PersistentColumnData::Deserialize`, of a column or (with no `ty`) of its validity.
 fn read_persistent_column(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>) -> Result<PersistentColumn> {
     d.read_object_value(|d| {
+        // a GEOMETRY without `GeometryPersistentColumnData` is of the spatial extension's format
+        let spatial = ty.map(LogicalType::id) == Some(LogicalTypeId::Geometry) && !d.has_property(99)?;
         // `GeometryPersistentColumnData`: a GEOMETRY stored as WKB reads as the strings it is
         if ty.map(LogicalType::id) == Some(LogicalTypeId::Geometry) && d.has_property(99)? {
             // a `unique_ptr`: whether there is one, then it
@@ -110,10 +115,6 @@ fn read_persistent_column(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalTyp
                     "reading a shredded GEOMETRY column from a database file is not yet ported to duckrs",
                 ));
             }
-        } else if ty.map(LogicalType::id) == Some(LogicalTypeId::Geometry) {
-            return Err(Error::not_implemented(
-                "reading a GEOMETRY column of the spatial extension from a database file is not yet ported to duckrs",
-            ));
         }
         // `VariantPersistentColumnData`: the type the typed part of a shredded VARIANT is stored as
         let mut shredded = None;
@@ -163,6 +164,7 @@ fn read_persistent_column(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalTyp
                 validity: None,
                 children: Vec::new(),
                 shredded: None,
+                spatial: false,
             });
         };
         let validity = d.read_object_field(101, "validity", |d| read_persistent_column(d, None))?;
@@ -178,6 +180,7 @@ fn read_persistent_column(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalTyp
                 validity: Some(Box::new(validity)),
                 children,
                 shredded,
+                spatial: false,
             });
         }
         let children = match ty.physical_type() {
@@ -199,6 +202,7 @@ fn read_persistent_column(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalTyp
             validity: Some(Box::new(validity)),
             children,
             shredded: None,
+            spatial,
         })
     })
 }
@@ -521,6 +525,22 @@ fn scan_column_as(
     rows: usize,
     top_level: bool,
 ) -> Result<Vector> {
+    // `GeoColumnData::Scan` of `GeometryStorageType::SPATIAL`: the BLOBs, as WKB (`FromSpatialGeometry`)
+    if column.spatial && ty.id() == LogicalTypeId::Geometry {
+        let blobs = scan_column_as(buffer, column, &LogicalType::BLOB, rows, false)?;
+        let mut result = Vector::new(ty.clone(), rows.max(1));
+        for row in 0..rows {
+            let value = blobs.get_value(row);
+            match value.data() {
+                ValueData::Bytes(blob) if !value.is_null() => {
+                    let wkb = duckrs_common::geometry::from_spatial(blob)?;
+                    result.set_value(row, &Value::new(ty.clone(), ValueData::Bytes(wkb))?)?;
+                }
+                _ => result.set_null(row, true),
+            }
+        }
+        return Ok(result);
+    }
     let validity = column
         .validity
         .as_ref()
