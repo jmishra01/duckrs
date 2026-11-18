@@ -204,6 +204,12 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] a checkpoint keeps the row groups whose rows are as the last one left them
     (`REUSE_EXISTING_ROW_GROUP_METADATA`): their column metadata, blocks and statistics stay, and only the row group
     and its deletes are written again. Whether rows changed is found by comparing them with the file's.
+  - [x] columns load when something reads them (`RowGroup::is_loaded`, `LoadColumn`), and `pragma_storage_info`'s
+    `loaded_segments_only` lists only those; a checkpoint leaves loaded what it wrote and what a kept row group had
+  - [ ] `PARTIALLY_REUSE_COLUMN_METADATA` (per-column reuse, v2.0.0): UPDATE, ADD and DROP COLUMN read all of a
+    table into memory, so its columns are all loaded and all written again (`partial_column_metadata_reuse*`)
+    columns, `read_duckdb` (8)
+  - [ ] string and list-length statistics for `stats()` (~10 files), per-column `USING COMPRESSION`
   - [x] `read_duckdb` and the replacement scan of `.db` files; `enable_view_dependencies` (DROP ... CASCADE,
     refused DROP and ALTER, CREATE OR REPLACE of a view that reads itself)
   - [ ] `vector_type` (~20 files) and `duckdb_memory` (~17) report engine internals duckrs does not model

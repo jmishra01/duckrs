@@ -926,3 +926,68 @@ fn a_log_that_is_in_the_file_goes() {
     }
     assert!(std::fs::metadata(&log).is_err(), "the log is in the file, so it went");
 }
+
+/// A path of a shredded VARIANT that a scan gives is read from the shredded part where all its values are there,
+/// and from the whole column where they aren't: either way it is what extracting from the whole column gives.
+#[test]
+fn shredded_paths_read_alone_are_the_same() {
+    let file = path("shredded_paths.db");
+    {
+        let db = Database::open(&file, false).unwrap();
+        let mut c = db.connect().unwrap();
+        run(&mut c, "SET variant_minimum_shredding_size = 0");
+        run(
+            &mut c,
+            "CREATE TABLE typed AS SELECT i, CASE WHEN i % 5 = 0 THEN NULL WHEN i % 3 = 0 THEN {'b': 'x'}::VARIANT \
+             ELSE {'a': i, 'n': {'m': i * 2}}::VARIANT END v FROM range(3000) r(i)",
+        );
+        run(
+            &mut c,
+            "CREATE TABLE untyped AS SELECT i, CASE WHEN i % 4 = 0 THEN {'a': 'text'}::VARIANT \
+             ELSE {'a': i}::VARIANT END v FROM range(3000) r(i)",
+        );
+        run(&mut c, "CHECKPOINT");
+    }
+    let db = Database::open(&file, true).unwrap();
+    let mut c = db.connect().unwrap();
+    for query in [
+        "SELECT md5(string_agg(coalesce(v.a::VARCHAR, '-'), ',' ORDER BY i)), sum(v.n.m::BIGINT) FROM typed",
+        "SELECT md5(string_agg(coalesce(v.a::VARCHAR, '-'), ',' ORDER BY i)), count(v.a) FROM untyped",
+    ] {
+        let pushed = rows(&mut c, query);
+        run(&mut c, "SET disabled_optimizers = 'unused_columns'");
+        let whole = rows(&mut c, query);
+        run(&mut c, "SET disabled_optimizers = ''");
+        assert_eq!(pushed, whole, "{query}");
+    }
+}
+
+#[test]
+fn columns_load_when_they_are_read() {
+    let file = path("lazy_columns.db");
+    {
+        let db = Database::open(&file, false).unwrap();
+        let mut c = db.connect().unwrap();
+        run(
+            &mut c,
+            "CREATE TABLE t AS SELECT i a, i * 2 b, i::VARCHAR c FROM range(300000) r(i)",
+        );
+        run(&mut c, "DELETE FROM t WHERE a % 7 = 0");
+    }
+    let loaded = "SELECT DISTINCT column_name FROM pragma_storage_info('t', loaded_segments_only = true) ORDER BY 1";
+    let db = Database::open(&file, false).unwrap();
+    let mut c = db.connect().unwrap();
+    assert!(rows(&mut c, loaded).is_empty());
+    let sum = rows(&mut c, "SELECT sum(b) FROM t");
+    assert_eq!(rows(&mut c, loaded), ["b"]);
+    // a checkpoint keeps the row groups as they were, unread, and what of them was loaded
+    run(&mut c, "CHECKPOINT");
+    assert_eq!(rows(&mut c, loaded), ["b"]);
+    assert_eq!(rows(&mut c, "SELECT sum(b) FROM t"), sum);
+    drop(c);
+    drop(db);
+    let db = Database::open(&file, true).unwrap();
+    let mut c = db.connect().unwrap();
+    assert!(rows(&mut c, loaded).is_empty());
+    assert_eq!(rows(&mut c, "SELECT count(*), sum(b) FROM t"), ["257142|77142342858"]);
+}

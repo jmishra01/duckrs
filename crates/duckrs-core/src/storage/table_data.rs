@@ -21,6 +21,7 @@ use duckrs_common::{Error, Result};
 use duckrs_parser::ast::ComparisonOp;
 use parking_lot::Mutex;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const STANDARD_VECTOR_SIZE: usize = 2048;
 /// `Storage::MAX_ROW_GROUP_SIZE`.
@@ -710,6 +711,9 @@ pub struct DiskTable {
     /// rows of a table is known without reading any.
     alive: Vec<Option<Vec<u32>>>,
     rows: usize,
+    /// Per group, which columns were read (`RowGroup::is_loaded`): the metadata of a column is only
+    /// read once something needs the column.
+    loaded: Vec<Box<[AtomicBool]>>,
 }
 
 impl DiskTable {
@@ -740,13 +744,40 @@ impl DiskTable {
             count += left.as_ref().map_or(rows, Vec::len);
             alive.push(left);
         }
+        let columns = table.columns.len();
+        let loaded = (0..table.row_groups.len())
+            .map(|_| (0..columns).map(|_| AtomicBool::new(false)).collect())
+            .collect();
         Ok(Self {
             buffer,
             table,
             chains: Mutex::new(chains),
             alive,
             rows: count,
+            loaded,
         })
+    }
+
+    /// Which columns of each group were read (`RowGroup::ColumnIsLoaded`).
+    pub(super) fn loaded_columns(&self) -> Vec<Vec<bool>> {
+        let flags = self.loaded.iter();
+        flags
+            .map(|group| group.iter().map(|flag| flag.load(Ordering::Relaxed)).collect())
+            .collect()
+    }
+
+    /// Of a table a checkpoint just wrote: which columns of each group are loaded already, those it wrote
+    /// and those of a group it kept that were before.
+    pub(super) fn set_loaded(&self, loaded: &[Vec<bool>]) {
+        for (flags, loaded) in self.loaded.iter().zip(loaded) {
+            for (flag, &loaded) in flags.iter().zip(loaded) {
+                flag.store(loaded, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub(super) fn column_count(&self) -> usize {
+        self.table.columns.len()
     }
 
     pub fn next_row_id(&self) -> u64 {
@@ -794,7 +825,9 @@ impl DiskTable {
         })
     }
 
+    /// `RowGroup::LoadColumn`: what the file has of a column of a group, which loads it.
     fn persistent_column(&self, group: usize, column: usize) -> Result<PersistentColumn> {
+        self.loaded[group][column].store(true, Ordering::Relaxed);
         let pointer = self.table.row_groups[group].data_pointers[column];
         let mut chains = self.chains.lock();
         let mut d = BinaryDeserializer::new(chains.at(&self.buffer, pointer)?);
@@ -1131,12 +1164,10 @@ impl TableSource for DiskTable {
         }
         Ok(Some(result))
     }
-
     fn variant_group_shredded(&self, group: usize, column: usize) -> bool {
         self.table.columns[column].ty.id() == LogicalTypeId::Variant
             && self.persistent_column(group, column).is_ok_and(|stored| stored.shredded_type.is_some())
     }
-
     fn all_variant_shredding(&self, columns: &[usize]) -> HashMap<(u64, usize, usize), Option<LogicalType>> {
         let mut result = HashMap::new();
         for (index, group) in self.table.row_groups.iter().enumerate() {
@@ -1148,7 +1179,6 @@ impl TableSource for DiskTable {
         }
         result
     }
-
     fn variant_shredding(&self, row_start: u64, rows: usize, column: usize) -> Option<Option<LogicalType>> {
         let group = self
             .table
@@ -1157,8 +1187,7 @@ impl TableSource for DiskTable {
             .position(|group| group.row_start == row_start && group.tuple_count as usize == rows)?;
         Some(self.persistent_column(group, column).ok()?.shredded_type)
     }
-
-    fn segments(&self, include_info: bool) -> Result<Vec<SegmentInfo>> {
+    fn segments(&self, include_info: bool, loaded_only: bool) -> Result<Vec<SegmentInfo>> {
         fn add(
             buffer: Option<&BufferManager>,
             result: &mut Vec<SegmentInfo>,
@@ -1223,6 +1252,10 @@ impl TableSource for DiskTable {
         let buffer = include_info.then_some(&*self.buffer);
         for group in 0..self.table.row_groups.len() {
             for column in 0..self.table.columns.len() {
+                // `loaded_segments_only`: what is not loaded stays so
+                if loaded_only && !self.loaded[group][column].load(Ordering::Relaxed) {
+                    continue;
+                }
                 let stored = self.persistent_column(group, column)?;
                 let ty = &self.table.columns[column].ty;
                 add(buffer, &mut result, &stored, group as u64, column, &[column], Some(ty))?;

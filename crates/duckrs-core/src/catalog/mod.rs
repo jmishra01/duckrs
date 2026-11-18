@@ -170,9 +170,6 @@ pub trait TableSource: std::fmt::Debug + Send + Sync {
     fn column_statistics(&self) -> Option<Vec<ColumnStatistics>>;
     /// What the file says about a column per group, without reading its values.
     fn zones(&self, column: usize) -> Result<Vec<ColumnZone>>;
-    /// `pragma_storage_info`: the segments, in the order that C++ lists them. Reading what fills
-    /// `segment_info` takes their blocks, so that is only done on request.
-    fn segments(&self, include_info: bool) -> Result<Vec<SegmentInfo>>;
     /// Of the row group from `row_start` with `rows` rows as it is stored, how a VARIANT column of it is shredded:
     /// the type of its typed part, or `None` when it is not; `None` when there is no such row group.
     fn variant_shredding(&self, _row_start: u64, _rows: usize, _column: usize) -> Option<Option<LogicalType>> {
@@ -191,6 +188,10 @@ pub trait TableSource: std::fmt::Debug + Send + Sync {
     fn all_variant_shredding(&self, _columns: &[usize]) -> HashMap<(u64, usize, usize), Option<LogicalType>> {
         HashMap::new()
     }
+    /// `pragma_storage_info`: the segments, in the order that C++ lists them. Reading what fills
+    /// `segment_info` takes their blocks, so that is only done on request. Listing a column loads it, unless
+    /// `loaded_only` leaves out the columns that aren't (`loaded_segments_only`).
+    fn segments(&self, include_info: bool, loaded_only: bool) -> Result<Vec<SegmentInfo>>;
 }
 
 /// A row of `pragma_storage_info`.

@@ -1319,23 +1319,28 @@ impl Binder<'_> {
         call: &duckrs_parser::ast::FunctionExpr,
         table_ref: &TableRef,
     ) -> Result<LogicalOperator> {
-        let mut include_info = false;
+        let (mut include_info, mut loaded_only) = (false, false);
         let arguments: Vec<_> = call.args.iter().map(super::table_functions::named_argument).collect();
         for argument in arguments.iter().filter(|argument| !argument.name.is_empty()) {
-            if !argument.name.eq_ignore_ascii_case("include_segment_info") {
-                return Err(binder_error(format!(
-                    "Invalid named parameter \"{}\" for function pragma_storage_info",
-                    argument.name
-                )));
-            }
+            let name = argument.name.to_lowercase();
+            let target = match name.as_str() {
+                "include_segment_info" => &mut include_info,
+                "loaded_segments_only" => &mut loaded_only,
+                _ => {
+                    return Err(binder_error(format!(
+                        "Invalid named parameter \"{}\" for function pragma_storage_info",
+                        argument.name
+                    )));
+                }
+            };
             let value = evaluate_scalar(&self.bind_expression(&argument.expr)?)?;
             if value.is_null() {
                 return Err(duckrs_common::Error::new(
                     duckrs_common::ErrorKind::InvalidInput,
-                    "Cannot use NULL as argument for include_segment_info",
+                    format!("Cannot use NULL as argument for {name}"),
                 ));
             }
-            include_info = value.try_to_string()?.eq_ignore_ascii_case("true");
+            *target = value.try_to_string()?.eq_ignore_ascii_case("true");
         }
         let mut positional = arguments.iter().filter(|argument| argument.name.is_empty());
         let (Some(argument), None) = (positional.next(), positional.next()) else {
@@ -1361,7 +1366,7 @@ impl Binder<'_> {
         let stored = table.stored();
         let persistent = stored.is_some();
         let segments = match stored {
-            Some(source) => source.segments(include_info)?,
+            Some(source) => source.segments(include_info, loaded_only)?,
             None => memory_segments(&table),
         };
         let (bigint, varchar, boolean) = (LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::BOOLEAN);

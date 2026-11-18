@@ -1200,6 +1200,16 @@ struct Writer<'a> {
     /// metadata pages of the last checkpoint with sub-blocks that row groups kept as they were still take, and
     /// which of them (`MetadataManager::ClearModifiedBlocks`)
     kept_pages: std::collections::BTreeMap<u64, u64>,
+    /// Of the table being written: whether its rows are those of its last checkpoint as they were, so that its
+    /// row groups are kept without reading them (`RowGroup::HasChanges`), and which columns of each of those
+    /// were loaded (`RowGroup::is_loaded`).
+    untouched: bool,
+    stored_loaded: Vec<Vec<bool>>,
+    /// Which columns of each row group written of the table are loaded: all of one that was written, and of
+    /// one that was kept, those that were.
+    group_loaded: Vec<Vec<bool>>,
+    /// That of each table, by schema and name, for the table read back from the file.
+    pub(super) loaded: HashMap<(String, String), Vec<Vec<bool>>>,
     /// How many segments each block holds, which DuckDB has to know to free them one by one.
     segments_in_block: HashMap<u64, u32>,
     /// The block that segments go into now, with how much of it they fill.
@@ -1579,6 +1589,10 @@ impl<'a> Writer<'a> {
             next_block: blocks.header().block_count,
             used: BTreeSet::new(),
             kept_pages: std::collections::BTreeMap::new(),
+            untouched: false,
+            stored_loaded: Vec::new(),
+            group_loaded: Vec::new(),
+            loaded: HashMap::new(),
             segments_in_block: HashMap::new(),
             open: None,
             pages: Vec::new(),
@@ -2628,6 +2642,35 @@ impl<'a> Writer<'a> {
         }
     }
 
+    /// What a row group of the last checkpoint that stays as it was keeps: the metadata of its columns, their
+    /// blocks and statistics, and which columns are loaded.
+    fn keep_group(
+        &mut self,
+        disk: &super::table_data::DiskTable,
+        stored_group: usize,
+        types: &[LogicalType],
+        statistics: &mut [Option<Stats>],
+    ) -> Result<Vec<MetaBlockPointer>> {
+        let kept_group = disk.stored_group(stored_group)?;
+        for (column, stored_column) in kept_group.columns.iter().enumerate() {
+            let ty = &types[column];
+            let stats = stored_stats(stored_column, ty);
+            match &mut statistics[column] {
+                Some(merged) => merged.merge(&stats, ty),
+                empty => *empty = Some(stats),
+            }
+            self.keep_blocks(stored_column);
+        }
+        for sub_block in &kept_group.sub_blocks {
+            let pointer = MetaBlockPointer::new(*sub_block, 0);
+            *self.kept_pages.entry(pointer.block_id()).or_default() |= 1 << pointer.block_index();
+        }
+        let loaded = self.stored_loaded.get(stored_group).cloned();
+        self.group_loaded
+            .push(loaded.unwrap_or_else(|| vec![true; types.len()]));
+        Ok(kept_group.data_pointers)
+    }
+
     /// The vectors of a row group, with what indexes have to know. Rows that are deleted are NULL.
     fn write_group(
         &mut self,
@@ -2651,6 +2694,26 @@ impl<'a> Writer<'a> {
                 .and_then(|disk| Some((disk, disk.group_at(group.row_start, group.rows)?))),
             _ => None,
         };
+        // the rows are those the file has: what the file has of them stays, unread
+        if let (true, true, Some((disk, stored_group))) = (self.untouched, indexes.is_empty(), stored) {
+            let mut kept = vec![disk.alive_rows(stored_group).is_none(); group.rows];
+            for &row in disk.alive_rows(stored_group).unwrap_or_default() {
+                kept[row as usize] = true;
+            }
+            let deletes = (kept.iter().any(|kept| !kept)).then(|| deletes_of(&kept));
+            let pointers = self.keep_group(disk, stored_group, &types, statistics)?;
+            let parts = types.iter().map(|_| Vec::new()).collect();
+            let written = self.write_row_group(
+                table,
+                parts,
+                group.file_start,
+                group.rows,
+                deletes.as_deref(),
+                statistics,
+                Some(pointers),
+            )?;
+            return Ok((written, group.file_start as usize + group.rows));
+        }
         let mut live_chunks = Vec::new();
         let row_id = |offset: usize| group.row_start + offset as u64;
         let file_id = |offset: usize| group.file_start + offset as u64;
@@ -2712,21 +2775,9 @@ impl<'a> Writer<'a> {
         if let Some((disk, stored_group)) = stored
             && unchanged_rows(disk, stored_group, &kept, &live_chunks)?
         {
-            let kept_group = disk.stored_group(stored_group)?;
-            for (column, stored_column) in kept_group.columns.iter().enumerate() {
-                let ty = &types[column];
-                let stats = stored_stats(stored_column, ty);
-                match &mut statistics[column] {
-                    Some(merged) => merged.merge(&stats, ty),
-                    empty => *empty = Some(stats),
-                }
-                self.keep_blocks(stored_column);
-            }
-            for sub_block in &kept_group.sub_blocks {
-                let pointer = MetaBlockPointer::new(*sub_block, 0);
-                *self.kept_pages.entry(pointer.block_id()).or_default() |= 1 << pointer.block_index();
-            }
-            reused = Some(kept_group.data_pointers);
+            reused = Some(self.keep_group(disk, stored_group, &types, statistics)?);
+        } else {
+            self.group_loaded.push(vec![true; types.len()]);
         }
         let written = self.write_row_group(
             table,
@@ -2755,6 +2806,26 @@ impl<'a> Writer<'a> {
             .source()
             .map(|source| TableCursor::new(source, columns.clone(), types.clone(), table.row_group_size()));
         let memory = if cursor.is_none() { Some(table.rows()?) } else { None };
+        // what was loaded of the file before the rows are read for this
+        let checkpointed = table.checkpointed();
+        let disk = checkpointed
+            .as_ref()
+            .and_then(|source| source.as_any().downcast_ref::<super::table_data::DiskTable>())
+            .filter(|disk| disk.is_in(self.buffer));
+        self.stored_loaded = disk
+            .map(super::table_data::DiskTable::loaded_columns)
+            .unwrap_or_default();
+        self.group_loaded.clear();
+        self.untouched = match (table.source(), disk) {
+            (Some(source), Some(disk)) => {
+                let stored = crate::catalog::TableSource::row_ids(disk);
+                std::ptr::addr_eq(Arc::as_ptr(&source), disk as *const _)
+                    && disk.column_count() == types.len()
+                    && stored.next() == ids.next()
+                    && stored.ranges().eq(ids.ranges())
+            }
+            _ => false,
+        };
         let mut rows = PositionedRows {
             cursor,
             memory,
@@ -2784,6 +2855,9 @@ impl<'a> Writer<'a> {
             next_row_id = next_row_id.max(end as u64);
         }
         crate::execution::profiler::add_timing("storage.total_vacuum_time", vacuum_time);
+        self.untouched = false;
+        let loaded = std::mem::take(&mut self.group_loaded);
+        self.loaded.insert((table.schema.clone(), table.name.clone()), loaded);
         let mut s = serializer(self.version);
         s.write_object_value(|s| {
             s.write_list(100, "column_stats", types.len(), |s, column| {
@@ -3047,6 +3121,7 @@ pub fn write_checkpoint(
         s.write_list(100, "catalog_entries", entries.len(), |s, i| s.write_raw(&entries[i]));
     });
     writer.write_metadata(&mut root, &s.into_bytes());
+    let loaded = std::mem::take(&mut writer.loaded);
     writer.finish(pointer)?;
     // what the log held is in the file now
     let mut log = path.as_os_str().to_owned();
@@ -3063,6 +3138,9 @@ pub fn write_checkpoint(
             let schema = table.schema.clone();
             let name = table.name.clone();
             let disk = Arc::new(DiskTable::new(buffer.clone(), *table)?);
+            if let Some(loaded) = loaded.get(&(schema.clone(), name.clone())) {
+                disk.set_loaded(loaded);
+            }
             let table = catalog.get_table(Some(&schema), &name)?;
             table.leave_in_file(disk);
             table.reset_log();
