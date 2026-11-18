@@ -49,22 +49,36 @@ pub struct RowGroupPointer {
     pub tuple_count: u64,
     pub data_pointers: Vec<MetaBlockPointer>,
     pub deletes_pointers: Vec<MetaBlockPointer>,
+    /// `has_per_column_metadata_blocks`: it says which metadata blocks each column takes, which a checkpoint
+    /// needs to keep the columns of it that stay the same
+    pub per_column: bool,
+    /// `per_column_metadata_blocks`, by column: what a debug build checks against the columns
+    pub column_blocks: Vec<(u64, Vec<u64>)>,
 }
 
 impl Deserialize for RowGroupPointer {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(|d| {
-            let result = Self {
+            let mut result = Self {
                 row_start: d.read_property(100, "row_start")?,
                 tuple_count: d.read_property(101, "tuple_count")?,
                 data_pointers: d.read_property(102, "data_pointers")?,
                 deletes_pointers: d.read_property(103, "delete_pointers")?,
+                per_column: false,
+                column_blocks: Vec::new(),
             };
             d.read_optional_property::<bool>(104, "has_metadata_blocks")?;
             d.read_property_with_default::<Vec<u64>>(105, "extra_metadata_blocks")?;
-            d.read_optional_property::<bool>(106, "has_per_column_metadata_blocks")?;
-            // which metadata blocks a row group owns, packed: only a rewrite needs to know
-            d.read_property_with_default::<Vec<u64>>(107, "per_column_metadata_blocks")?;
+            result.per_column = d.read_optional_property::<bool>(106, "has_per_column_metadata_blocks")? == Some(true);
+            // which metadata blocks each column takes, packed (`PerColumnMetadataBlock`): the top bit marks a column
+            for packed in d.read_property_with_default::<Vec<u64>>(107, "per_column_metadata_blocks")? {
+                let index = packed & !(1 << 63);
+                match result.column_blocks.last_mut() {
+                    _ if packed >> 63 == 1 => result.column_blocks.push((index, Vec::new())),
+                    Some((_, blocks)) => blocks.push(index),
+                    None => return Err(corrupt("per_column_metadata_blocks starts without a column")),
+                }
+            }
             Ok(result)
         })
     }

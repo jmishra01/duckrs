@@ -272,7 +272,7 @@ impl TableCatalogEntry {
             std::sync::atomic::Ordering::Relaxed,
         );
         *table.source.write() = self.source();
-        table.set_checkpointed(self.checkpointed());
+        table.set_checkpointed_columns(self.checkpointed(), self.checkpointed_columns());
         {
             // what is known of the rows stays known, other than how often they changed
             let theirs = self.statistics.lock();

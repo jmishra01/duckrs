@@ -50,6 +50,24 @@ fn execute_table_alter(alter: BoundTableAlter) -> Result<()> {
     table
         .row_group_rows
         .store(old.row_group_size(), std::sync::atomic::Ordering::Relaxed);
+    // the columns it leaves as they were keep what the last checkpoint wrote of them
+    if let Some(checkpointed) = old.checkpointed() {
+        let stored = old.checkpointed_columns();
+        let columns = match &alter.projection {
+            Some(projection) => projection
+                .iter()
+                .zip(&table.columns)
+                .enumerate()
+                .map(|(index, (expression, column))| match expression.kind {
+                    _ if alter.retyped == Some(index) => None,
+                    crate::planner::expression::BoundExprKind::Reference(at) if before[at] == column.ty => stored[at],
+                    _ => None,
+                })
+                .collect(),
+            None => stored,
+        };
+        table.set_checkpointed_columns(Some(checkpointed), columns);
+    }
     let table = Arc::new(table);
     // C++ writes a column of a new type to new row groups, without the gaps
     let retyped =

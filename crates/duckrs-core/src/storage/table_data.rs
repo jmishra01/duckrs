@@ -76,8 +76,10 @@ fn read_data_pointer(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>) -
 pub(super) struct StoredGroup {
     pub(super) data_pointers: Vec<MetaBlockPointer>,
     pub(super) columns: Vec<PersistentColumn>,
-    /// the disk pointers of the metadata sub-blocks the columns are in
-    pub(super) sub_blocks: Vec<u64>,
+    /// per column, those it takes other than the one it starts in (`ComputePerColumnMetadataBlocks`)
+    pub(super) column_blocks: Vec<Vec<u64>>,
+    /// that the file says which they are (`has_per_column_metadata_blocks`)
+    pub(super) per_column: bool,
 }
 
 /// `PersistentColumnData`.
@@ -780,6 +782,17 @@ impl DiskTable {
         self.table.columns.len()
     }
 
+    pub(super) fn column_type(&self, column: usize) -> Option<&LogicalType> {
+        self.table.columns.get(column).map(|column| &column.ty)
+    }
+
+    /// All the values of a column of a group, those of deleted rows too.
+    pub(super) fn read_column_unfiltered(&self, group: usize, column: usize) -> Result<Vector> {
+        let rows = self.table.row_groups[group].tuple_count as usize;
+        let stored = self.persistent_column(group, column)?;
+        scan_table_column(&self.buffer, &stored, &self.table.columns[column].ty, rows)
+    }
+
     pub fn next_row_id(&self) -> u64 {
         self.table.next_row_id
     }
@@ -805,23 +818,43 @@ impl DiskTable {
     }
 
     /// What a checkpoint keeps of a row group it doesn't write again: where each column's metadata is, the
-    /// columns themselves, and the metadata sub-blocks the columns take (`ComputePerColumnMetadataBlocks`).
+    /// columns themselves, and the metadata sub-blocks each takes (`ComputePerColumnMetadataBlocks`).
     pub(super) fn stored_group(&self, group: usize) -> Result<StoredGroup> {
         let row_group = &self.table.row_groups[group];
         let mut columns = Vec::with_capacity(row_group.data_pointers.len());
-        let mut sub_blocks = std::collections::BTreeSet::new();
+        let mut column_blocks: Vec<Vec<u64>> = Vec::with_capacity(row_group.data_pointers.len());
         let mut chains = self.chains.lock();
         for (column, &pointer) in row_group.data_pointers.iter().enumerate() {
             let data = chains.at(&self.buffer, pointer)?;
             let mut d = BinaryDeserializer::new(data);
             columns.push(read_persistent_column(&mut d, Some(&self.table.columns[column].ty))?);
             let length = d.position();
-            sub_blocks.extend(chains.sub_blocks(&self.buffer, pointer, length));
+            let blocks = chains.sub_blocks(&self.buffer, pointer, length);
+            column_blocks.push(
+                blocks
+                    .into_iter()
+                    .filter(|block| *block != pointer.block_pointer)
+                    .collect(),
+            );
+        }
+        // `RowGroupCollection::Checkpoint` verifies that what the file says of them is so
+        #[cfg(debug_assertions)]
+        if row_group.per_column {
+            let listed: Vec<(u64, Vec<u64>)> = column_blocks
+                .iter()
+                .enumerate()
+                .filter(|(_, blocks)| !blocks.is_empty())
+                .map(|(column, blocks)| (column as u64, blocks.clone()))
+                .collect();
+            if listed != row_group.column_blocks {
+                return Err(corrupt("per_column_metadata_blocks mismatch"));
+            }
         }
         Ok(StoredGroup {
             data_pointers: row_group.data_pointers.clone(),
             columns,
-            sub_blocks: sub_blocks.into_iter().collect(),
+            column_blocks,
+            per_column: row_group.per_column,
         })
     }
 

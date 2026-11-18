@@ -66,6 +66,10 @@ pub struct CheckpointOptions<'a> {
     /// `vacuum_rebuild_indexes`: of tables with up to this many rows, indexes are built again after a vacuum
     /// that gives rows new ids, where they couldn't be remapped (`VacuumIndexStrategy::REBUILD`); 0 for never
     pub vacuum_rebuild_indexes: u64,
+    /// `experimental_metadata_reuse`: row groups and columns that stay the same keep their metadata
+    pub metadata_reuse: bool,
+    /// `force_column_metadata_reuse`: columns keep theirs on their own from v1.4.0 on, not only from v2.0.0
+    pub force_column_metadata_reuse: bool,
     /// `debug_checkpoint_abort`, in lower case: where to stop as a crash would.
     pub abort: &'a str,
     /// Transactions are reading tables from the blocks they are in: those stay as they are.
@@ -1233,6 +1237,12 @@ struct Writer<'a> {
     chunks_per_row_group: usize,
     vacuum_tasks: usize,
     vacuum_rebuild_indexes: u64,
+    metadata_reuse: bool,
+    /// `RowGroupCollection::SupportsPerColumnWrites`: a row group says which metadata blocks each of its columns
+    /// takes, and a checkpoint writes again only the columns of it that changed
+    per_column_writes: bool,
+    /// While a column's metadata is written: the metadata sub-blocks that it goes on to (`StartWritingColumns`).
+    written_pages: Option<Vec<u64>>,
     abort: String,
     /// what the file is written in
     version: StorageVersion,
@@ -1380,13 +1390,17 @@ fn plan_groups(ids: &RowIds, size: usize, vacuum_tasks: usize, dense: bool, keep
     groups
 }
 
-/// Whether the rows a row group has now, `live` of which `kept` are, are those `group` of `disk` has.
-fn unchanged_rows(
+/// Of a row group that has now the rows `live` (those of its offsets that `kept` says), against `group` of `disk`:
+/// whether the same rows are deleted, and of each column, the column of `disk` it has the values of, if it is
+/// `stored` of it and has them all (`ColumnData::HasAnyChanges`). The values of deleted rows don't count.
+fn matching_columns(
     disk: &super::table_data::DiskTable,
     group: usize,
     kept: &[bool],
     live: &[DataChunk],
-) -> Result<bool> {
+    stored: &[Option<usize>],
+    types: &[LogicalType],
+) -> Result<(bool, Vec<Option<usize>>)> {
     let same_deletes = match disk.alive_rows(group) {
         None => kept.iter().all(|kept| *kept),
         Some(alive) => {
@@ -1400,29 +1414,29 @@ fn unchanged_rows(
             })
         }
     };
-    if !same_deletes {
-        return Ok(false);
+    let mut same = Vec::with_capacity(types.len());
+    for (column, ty) in types.iter().enumerate() {
+        let candidate = stored
+            .get(column)
+            .copied()
+            .flatten()
+            .filter(|&at| disk.column_type(at) == Some(ty));
+        let Some(at) = candidate else {
+            same.push(None);
+            continue;
+        };
+        // as many as `kept`: the group is that of `disk` with as many rows
+        let values = disk.read_column_unfiltered(group, at)?;
+        let mut rows = live
+            .iter()
+            .flat_map(|chunk| (0..chunk.len()).map(move |row| (chunk, row)));
+        let equal = kept.iter().enumerate().filter(|(_, kept)| **kept).all(|(offset, _)| {
+            rows.next()
+                .is_some_and(|(chunk, row)| identical(&chunk.column(column).get_value(row), &values.get_value(offset)))
+        });
+        same.push(equal.then_some(at));
     }
-    let columns: Vec<usize> = (0..live.first().map_or(0, DataChunk::column_count)).collect();
-    let stored = crate::catalog::TableSource::read_group(disk, group, &columns)?;
-    let mut at = 0;
-    for chunk in live {
-        for row in 0..chunk.len() {
-            if at >= stored.len() {
-                return Ok(false);
-            }
-            for &column in &columns {
-                if !identical(
-                    &chunk.column(column).get_value(row),
-                    &stored.column(column).get_value(at),
-                ) {
-                    return Ok(false);
-                }
-            }
-            at += 1;
-        }
-    }
-    Ok(at == stored.len())
+    Ok((same_deletes, same))
 }
 
 /// Whether two values are the same, floating point ones bit for bit (-0.0 is not 0.0).
@@ -1609,6 +1623,10 @@ impl<'a> Writer<'a> {
             chunks_per_row_group: options.row_group_size as usize / STANDARD_VECTOR_SIZE,
             vacuum_tasks: options.vacuum_tasks,
             vacuum_rebuild_indexes: options.vacuum_rebuild_indexes,
+            metadata_reuse: options.metadata_reuse,
+            per_column_writes: options.storage_version >= StorageVersion::V2_0_0
+                || (options.storage_version >= StorageVersion::V1_4_0 && options.force_column_metadata_reuse),
+            written_pages: None,
             abort: options.abort.to_string(),
             version: options.storage_version,
         }
@@ -1690,6 +1708,10 @@ impl<'a> Writer<'a> {
         }
         stream.current = Some(next);
         stream.offset = SUB_BLOCK_HEADER_SIZE;
+        if self.written_pages.is_some() {
+            let pointer = self.disk_pointer(next);
+            self.written_pages.as_mut().expect("just checked").push(pointer);
+        }
     }
 
     /// `MetadataWriter::WriteData`.
@@ -2578,11 +2600,18 @@ impl<'a> Writer<'a> {
         rows: usize,
         deletes: Option<&[u8]>,
         statistics: &mut [Option<Stats>],
-        reused: Option<Vec<MetaBlockPointer>>,
+        reused: Vec<Option<(MetaBlockPointer, Vec<u64>)>>,
     ) -> Result<Vec<u8>> {
         let mut tables = std::mem::take(&mut self.tables);
-        let mut pointers = reused.clone().unwrap_or_else(|| Vec::with_capacity(parts.len()));
-        for (column, parts) in parts.iter().enumerate().filter(|_| reused.is_none()) {
+        let mut pointers = Vec::with_capacity(parts.len());
+        // of each column, the metadata blocks it takes other than the one it starts in
+        let mut column_blocks: Vec<Vec<u64>> = Vec::with_capacity(parts.len());
+        for (column, (parts, reused)) in parts.iter().zip(reused).enumerate() {
+            if let Some((pointer, extras)) = reused {
+                pointers.push(pointer);
+                column_blocks.push(extras);
+                continue;
+            }
             let ty = &table.columns[column].ty;
             self.log_column = (format!("{}.{}", table.schema, table.name), column);
             let out = self.write_column_data(ty, parts)?;
@@ -2592,8 +2621,18 @@ impl<'a> Writer<'a> {
             }
             let mut s = serializer(self.version);
             s.write_object_value(|s| write_column(s, &out, Some(ty), row_start));
-            pointers.push(self.pointer(&mut tables));
+            // `StartWritingColumns`: the blocks the column's metadata goes on to
+            self.written_pages = Some(Vec::new());
+            let pointer = self.pointer(&mut tables);
             self.write_metadata(&mut tables, &s.into_bytes());
+            let pages = self.written_pages.take().unwrap_or_default();
+            pointers.push(pointer);
+            column_blocks.push(
+                pages
+                    .into_iter()
+                    .filter(|page| *page != pointer.block_pointer)
+                    .collect(),
+            );
         }
         // one pointer per block that they take
         let size = metadata_block_size(self.block_size);
@@ -2612,8 +2651,21 @@ impl<'a> Writer<'a> {
             s.write_property(101, "tuple_count", &(rows as u64));
             s.write_property(102, "data_pointers", &pointers);
             s.write_property(103, "delete_pointers", &delete_pointers);
+            // `RowGroup::Serialize`: the metadata blocks of the columns, all together and, where a checkpoint can
+            // keep columns on their own, per column (`PerColumnMetadataBlocks`, a column's index marked by the top bit)
             if s.should_serialize(StorageVersion::V1_4_0) {
-                s.write_property(104, "has_metadata_blocks", &false);
+                let all: Vec<u64> = column_blocks.iter().flatten().copied().collect();
+                s.write_property(104, "has_metadata_blocks", &true);
+                s.write_property_with_default(105, "extra_metadata_blocks", &all);
+                if self.per_column_writes {
+                    let mut packed = Vec::new();
+                    for (column, blocks) in column_blocks.iter().enumerate().filter(|(_, b)| !b.is_empty()) {
+                        packed.push(column as u64 | 1 << 63);
+                        packed.extend(blocks);
+                    }
+                    s.write_property(106, "has_per_column_metadata_blocks", &true);
+                    s.write_property_with_default(107, "per_column_metadata_blocks", &packed);
+                }
             }
         });
         Ok(s.into_bytes())
@@ -2642,33 +2694,46 @@ impl<'a> Writer<'a> {
         }
     }
 
-    /// What a row group of the last checkpoint that stays as it was keeps: the metadata of its columns, their
-    /// blocks and statistics, and which columns are loaded.
-    fn keep_group(
+    /// What the columns of a row group of the last checkpoint that stay as they were keep: their metadata,
+    /// blocks and statistics, and whether they are loaded. `columns` says, of each column now, the stored one it
+    /// is if it stays; the others are written again. Of those that stay, where their metadata starts and the
+    /// metadata blocks it goes on to.
+    fn keep_columns(
         &mut self,
-        disk: &super::table_data::DiskTable,
         stored_group: usize,
+        kept_group: &super::table_data::StoredGroup,
+        columns: &[Option<usize>],
         types: &[LogicalType],
         statistics: &mut [Option<Stats>],
-    ) -> Result<Vec<MetaBlockPointer>> {
-        let kept_group = disk.stored_group(stored_group)?;
-        for (column, stored_column) in kept_group.columns.iter().enumerate() {
+    ) -> Vec<Option<(MetaBlockPointer, Vec<u64>)>> {
+        let mut reused = Vec::with_capacity(columns.len());
+        let mut loaded = Vec::with_capacity(columns.len());
+        for (column, stored) in columns.iter().enumerate() {
+            let Some(stored) = *stored else {
+                reused.push(None);
+                loaded.push(true);
+                continue;
+            };
             let ty = &types[column];
+            let stored_column = &kept_group.columns[stored];
             let stats = stored_stats(stored_column, ty);
             match &mut statistics[column] {
                 Some(merged) => merged.merge(&stats, ty),
                 empty => *empty = Some(stats),
             }
             self.keep_blocks(stored_column);
+            let pointer = kept_group.data_pointers[stored];
+            let extras = kept_group.column_blocks[stored].clone();
+            for sub_block in std::iter::once(pointer.block_pointer).chain(extras.iter().copied()) {
+                let page = MetaBlockPointer::new(sub_block, 0);
+                *self.kept_pages.entry(page.block_id()).or_default() |= 1 << page.block_index();
+            }
+            reused.push(Some((pointer, extras)));
+            let was = self.stored_loaded.get(stored_group).and_then(|group| group.get(stored));
+            loaded.push(was.copied().unwrap_or(true));
         }
-        for sub_block in &kept_group.sub_blocks {
-            let pointer = MetaBlockPointer::new(*sub_block, 0);
-            *self.kept_pages.entry(pointer.block_id()).or_default() |= 1 << pointer.block_index();
-        }
-        let loaded = self.stored_loaded.get(stored_group).cloned();
-        self.group_loaded
-            .push(loaded.unwrap_or_else(|| vec![true; types.len()]));
-        Ok(kept_group.data_pointers)
+        self.group_loaded.push(loaded);
+        reused
     }
 
     /// The vectors of a row group, with what indexes have to know. Rows that are deleted are NULL.
@@ -2701,7 +2766,9 @@ impl<'a> Writer<'a> {
                 kept[row as usize] = true;
             }
             let deletes = (kept.iter().any(|kept| !kept)).then(|| deletes_of(&kept));
-            let pointers = self.keep_group(disk, stored_group, &types, statistics)?;
+            let kept_group = disk.stored_group(stored_group)?;
+            let all: Vec<Option<usize>> = (0..types.len()).map(Some).collect();
+            let reused = self.keep_columns(stored_group, &kept_group, &all, &types, statistics);
             let parts = types.iter().map(|_| Vec::new()).collect();
             let written = self.write_row_group(
                 table,
@@ -2710,7 +2777,7 @@ impl<'a> Writer<'a> {
                 group.rows,
                 deletes.as_deref(),
                 statistics,
-                Some(pointers),
+                reused,
             )?;
             return Ok((written, group.file_start as usize + group.rows));
         }
@@ -2770,13 +2837,34 @@ impl<'a> Writer<'a> {
             }
         }
         let deletes = (kept.iter().any(|kept| !kept)).then(|| deletes_of(&kept));
-        // `RowGroup::HasChanges`: the same rows deleted, and the others with the same values
-        let mut reused = None;
-        if let Some((disk, stored_group)) = stored
-            && unchanged_rows(disk, stored_group, &kept, &live_chunks)?
-        {
-            reused = Some(self.keep_group(disk, stored_group, &types, statistics)?);
-        } else {
+        // `RowGroup::WriteToDisk`: what stays of the row group as the last checkpoint wrote it
+        let mut reused = vec![None; types.len()];
+        let mut kept_any = false;
+        if let Some((disk, stored_group)) = stored.filter(|_| self.metadata_reuse) {
+            let stored_columns = table.checkpointed_columns();
+            let (same_deletes, same) =
+                matching_columns(disk, stored_group, &kept, &live_chunks, &stored_columns, &types)?;
+            let kept_group = disk.stored_group(stored_group)?;
+            let identity = disk.column_count() == types.len()
+                && stored_columns
+                    .iter()
+                    .enumerate()
+                    .all(|(at, column)| *column == Some(at));
+            // `HasChanges`: the same rows deleted, and the others with the same values (REUSE_EXISTING_ROW_GROUP_METADATA),
+            // unless the file says which blocks each column takes and this can't
+            let unchanged = identity
+                && same_deletes
+                && same.iter().all(Option::is_some)
+                && (self.per_column_writes || !kept_group.per_column);
+            // PARTIALLY_REUSE_COLUMN_METADATA: the columns with the same values keep their metadata
+            let partly =
+                !unchanged && self.per_column_writes && kept_group.per_column && same.iter().any(Option::is_some);
+            if unchanged || partly {
+                reused = self.keep_columns(stored_group, &kept_group, &same, &types, statistics);
+                kept_any = true;
+            }
+        }
+        if !kept_any {
             self.group_loaded.push(vec![true; types.len()]);
         }
         let written = self.write_row_group(
@@ -2816,8 +2904,13 @@ impl<'a> Writer<'a> {
             .map(super::table_data::DiskTable::loaded_columns)
             .unwrap_or_default();
         self.group_loaded.clear();
+        let identity = table
+            .checkpointed_columns()
+            .iter()
+            .enumerate()
+            .all(|(at, column)| *column == Some(at));
         self.untouched = match (table.source(), disk) {
-            (Some(source), Some(disk)) => {
+            (Some(source), Some(disk)) if self.metadata_reuse && identity => {
                 let stored = crate::catalog::TableSource::row_ids(disk);
                 std::ptr::addr_eq(Arc::as_ptr(&source), disk as *const _)
                     && disk.column_count() == types.len()

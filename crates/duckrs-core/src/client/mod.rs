@@ -522,8 +522,17 @@ impl DatabaseInstance {
                 .and_then(|value| value.as_i128())
                 .map_or(0, |rows| rows as u64)
         });
+        let setting = |name: &str| {
+            settings::current_value(name, &self.settings.read(), &SettingValues::default()).is_some_and(|value| {
+                value
+                    .try_to_string()
+                    .is_ok_and(|text| text.eq_ignore_ascii_case("true"))
+            })
+        };
         let options = storage::writer::CheckpointOptions {
             vacuum_rebuild_indexes,
+            metadata_reuse: setting("experimental_metadata_reuse"),
+            force_column_metadata_reuse: setting("force_column_metadata_reuse"),
             variant_minimum_shredding_size,
             force_variant_shredding: force_variant_shredding.as_ref(),
             zstd_min_string_length,

@@ -365,6 +365,9 @@ pub struct TableCatalogEntry {
     /// What the file has of the table as of its last checkpoint, whatever happened to the rows since: a
     /// checkpoint keeps the row groups of it whose rows are still the same (`REUSE_EXISTING_ROW_GROUP_METADATA`).
     checkpointed: RwLock<Option<Arc<dyn TableSource>>>,
+    /// Of each column, which of `checkpointed` it is the same as, if any: an ALTER keeps the columns it doesn't
+    /// change (`RowGroup::AddColumn`, `RemoveColumn`, `AlterType`). `None` while they are those of the file.
+    checkpointed_columns: RwLock<Option<Vec<Option<usize>>>>,
     /// Beyond the NOT NULLs, which are in `columns`.
     pub constraints: Vec<TableConstraint>,
     /// What the write-ahead log knows of the rows.
@@ -784,6 +787,7 @@ impl TableCatalogEntry {
             read_from: RwLock::default(),
             variant_shredding: Mutex::default(),
             checkpointed: RwLock::default(),
+            checkpointed_columns: RwLock::default(),
             log: Mutex::default(),
             constraints,
             referenced_by: Mutex::default(),
@@ -833,7 +837,23 @@ impl TableCatalogEntry {
             *self.variant_shredding.lock() = source.all_variant_shredding(&variants);
         }
         *self.checkpointed.write() = Some(source.clone());
+        *self.checkpointed_columns.write() = None;
         *self.source.write() = Some(source);
+    }
+
+    /// Of each column, the column of [`Self::checkpointed`] it has the values of, if it is one.
+    pub fn checkpointed_columns(&self) -> Vec<Option<usize>> {
+        match &*self.checkpointed_columns.read() {
+            Some(columns) => columns.clone(),
+            None => (0..self.columns.len()).map(Some).collect(),
+        }
+    }
+
+    /// For a table an ALTER made of one with the rows of `source`: which of its columns each of this one's is.
+    pub fn set_checkpointed_columns(&self, source: Option<Arc<dyn TableSource>>, columns: Vec<Option<usize>>) {
+        let identity = columns.iter().enumerate().all(|(at, column)| *column == Some(at));
+        *self.checkpointed.write() = source;
+        *self.checkpointed_columns.write() = (!identity).then_some(columns);
     }
 
     /// [`Self::checkpointed`]: what the last checkpoint left of the table in its file.
@@ -876,6 +896,7 @@ impl TableCatalogEntry {
         self.set_row_ids(ids);
         *self.write_loaded_storage() = ColumnDataCollection::new(types);
         *self.checkpointed.write() = Some(source.clone());
+        *self.checkpointed_columns.write() = None;
         *self.source.write() = Some(source);
         self.statistics.lock().forget();
     }

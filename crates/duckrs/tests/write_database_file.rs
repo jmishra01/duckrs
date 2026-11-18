@@ -892,6 +892,7 @@ fn geometries_of_old_storage_come_back() {
     run(&mut c, "INSERT INTO db.t VALUES (1000, 'POINT (7 8)'::GEOMETRY)");
     let expected = read(&mut c);
     run(&mut c, "PRAGMA disable_checkpoint_on_shutdown");
+    run(&mut c, "USE memory");
     run(&mut c, "DETACH db");
     run(&mut c, &format!("ATTACH '{}' AS db", file.display()));
     assert_eq!(read(&mut c), expected);
@@ -990,4 +991,59 @@ fn columns_load_when_they_are_read() {
     let mut c = db.connect().unwrap();
     assert!(rows(&mut c, loaded).is_empty());
     assert_eq!(rows(&mut c, "SELECT count(*), sum(b) FROM t"), ["257142|77142342858"]);
+}
+
+#[test]
+fn columns_that_stay_keep_their_blocks() {
+    let file = path("per_column_reuse.db");
+    let db = Database::open_in_memory().unwrap();
+    let mut c = db.connect().unwrap();
+    run(
+        &mut c,
+        &format!("ATTACH '{}' AS db (STORAGE_VERSION 'v2.0.0')", file.display()),
+    );
+    run(&mut c, "USE db");
+    run(
+        &mut c,
+        "CREATE TABLE t AS SELECT i c0, i * 2 c1, i::VARCHAR c2, i % 10 c3 FROM range(300000) r(i)",
+    );
+    run(&mut c, "CHECKPOINT");
+    // where each column's segments are, by column
+    let blocks = |c: &mut Connection| -> std::collections::BTreeMap<String, Vec<String>> {
+        let mut by_column = std::collections::BTreeMap::new();
+        let query = "SELECT column_name, row_group_id, column_path, segment_id, block_id, block_offset \
+                     FROM pragma_storage_info('t') ORDER BY ALL";
+        for row in rows(c, query) {
+            let name = row.split('|').next().unwrap().to_string();
+            by_column.entry(name).or_insert_with(Vec::new).push(row);
+        }
+        by_column
+    };
+    let sums = "SELECT sum(c0), sum(c1), max(c2), sum(c3), count(*) FROM t";
+    let before = blocks(&mut c);
+    run(&mut c, "UPDATE t SET c1 = c1 + 1 WHERE c0 < 100");
+    let expected = rows(&mut c, sums);
+    run(&mut c, "CHECKPOINT");
+    let after = blocks(&mut c);
+    for column in ["c0", "c2", "c3"] {
+        assert_eq!(before[column], after[column], "{column} stays where it was");
+    }
+    assert_ne!(before["c1"], after["c1"]);
+    assert_eq!(rows(&mut c, sums), expected);
+    // ALTER keeps the columns it doesn't change
+    run(&mut c, "ALTER TABLE t ADD COLUMN c4 INTEGER DEFAULT 42");
+    run(&mut c, "ALTER TABLE t DROP COLUMN c3");
+    run(&mut c, "ALTER TABLE t ALTER c0 TYPE BIGINT");
+    run(&mut c, "CHECKPOINT");
+    let altered = blocks(&mut c);
+    for column in ["c1", "c2"] {
+        assert_eq!(after[column], altered[column], "{column} stays where it was");
+    }
+    assert_ne!(after["c0"], altered["c0"]);
+    let sums = "SELECT sum(c0), sum(c1), max(c2), sum(c4), count(*) FROM t";
+    let expected = rows(&mut c, sums);
+    run(&mut c, "USE memory");
+    run(&mut c, "DETACH db");
+    run(&mut c, &format!("ATTACH '{}' AS db", file.display()));
+    assert_eq!(rows(&mut c, &sums.replace("FROM t", "FROM db.t")), expected);
 }

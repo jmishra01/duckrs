@@ -206,8 +206,13 @@ Each item gives the number of failing files in `test/` that it should fix, where
     and its deletes are written again. Whether rows changed is found by comparing them with the file's.
   - [x] columns load when something reads them (`RowGroup::is_loaded`, `LoadColumn`), and `pragma_storage_info`'s
     `loaded_segments_only` lists only those; a checkpoint leaves loaded what it wrote and what a kept row group had
-  - [ ] `PARTIALLY_REUSE_COLUMN_METADATA` (per-column reuse, v2.0.0): UPDATE, ADD and DROP COLUMN read all of a
-    table into memory, so its columns are all loaded and all written again (`partial_column_metadata_reuse*`)
+  - [x] `PARTIALLY_REUSE_COLUMN_METADATA` (from v2.0.0, or v1.4.0 with `force_column_metadata_reuse`): a row group
+    says which metadata blocks each column takes (`PerColumnMetadataBlocks`), and a checkpoint writes again only
+    the columns whose values changed; an ALTER keeps the columns it leaves as they were (ADD, DROP, ALTER TYPE).
+    Before v2.0.0 a row group lists the blocks of all its columns together (`extra_metadata_blocks`).
+  - [ ] columns that stay in the file through UPDATE and ALTER: those read all of a table into memory (and so load
+    all its columns), as do the commits of transactions, so `partial_column_metadata_reuse*` still fail on what
+    `loaded_segments_only` lists
     columns, `read_duckdb` (8)
   - [ ] string and list-length statistics for `stats()` (~10 files), per-column `USING COMPRESSION`
   - [x] `read_duckdb` and the replacement scan of `.db` files; `enable_view_dependencies` (DROP ... CASCADE,

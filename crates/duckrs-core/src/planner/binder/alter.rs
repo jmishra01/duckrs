@@ -53,6 +53,8 @@ pub struct BoundTableAlter {
     pub rejected: Option<Error>,
     /// What `COMMENT ON TABLE` says of the new entry.
     pub comment: Option<String>,
+    /// The column whose type changes, which is written again even to the type it had (`RowGroup::AlterType`).
+    pub retyped: Option<usize>,
 }
 
 /// The columns of `table` and then `column`, as CREATE TABLE would list them.
@@ -455,6 +457,7 @@ impl Binder<'_> {
             verify: false,
             rejected: None,
             comment: table.comment.lock().clone(),
+            retyped: None,
             schema,
             table: table.clone(),
         };
@@ -610,6 +613,7 @@ impl Binder<'_> {
                 }
                 let index = column_index(&table, &path[0])?;
                 self.change_type(&mut alter, index, target.as_ref(), using.as_deref())?;
+                alter.retyped = Some(index);
             }
             AlterKind::SetDefault { path, expression } => {
                 if path.len() > 1 {
