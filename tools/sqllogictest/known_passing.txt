@@ -653,6 +653,7 @@ test/optimizer/statistics/statistics_join_null.test
 test/optimizer/statistics/statistics_join_ungrouped_aggregate_limit.test
 test/optimizer/statistics/statistics_least_greatest.test
 test/optimizer/statistics/statistics_null_comparison.test
+test/optimizer/statistics/statistics_numeric.test
 test/optimizer/statistics/statistics_root_replaced.test
 test/optimizer/statistics/statistics_setop.test
 test/optimizer/statistics/statistics_string_length.test
@@ -1186,6 +1187,7 @@ test/sql/cast/double_to_varchar_shortest.test
 test/sql/cast/float_decimal_cast.test
 test/sql/cast/float_integer_cast.test
 test/sql/cast/nested_union_variant_to_varchar_quoting.test
+test/sql/cast/signed_cast_repro.test
 test/sql/cast/string_to_integer_decimal_cast.test
 test/sql/cast/string_to_integer_exponent_cast.test
 test/sql/cast/string_to_integer_many_decimals.test

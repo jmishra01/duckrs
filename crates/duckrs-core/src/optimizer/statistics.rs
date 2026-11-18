@@ -22,7 +22,7 @@ use crate::function::{BuiltinFunctions, constant_or_null};
 use crate::planner::column_binding_resolver::resolve_column_bindings;
 use crate::planner::expression::{BoundAggregate, BoundExpr, BoundExprKind, BoundOperator, ColumnBinding};
 use crate::planner::logical::{COLUMN_IDENTIFIER_ROW_ID, LogicalOperator, LogicalOperatorKind as K};
-use duckrs_common::types::{LogicalType, LogicalTypeId};
+use duckrs_common::types::{LogicalType, LogicalTypeId, PhysicalType};
 use duckrs_common::value::{Value, ValueData};
 use duckrs_parser::ast::{ComparisonOp, JoinType};
 use std::collections::{HashMap, HashSet};
@@ -1113,12 +1113,48 @@ impl StatisticsPropagator {
         let BoundExprKind::Cast { child, try_cast } = &mut expr.kind else {
             unreachable!()
         };
-        let try_cast = *try_cast;
+        let _ = *try_cast;
         let stats = self.expression(child, false);
-        // a value that does not fit fails, or is NULL with TRY_CAST
-        if try_cast || !child.return_type.is_integral() || !target.is_integral() {
+        // `CastStatistics::CanPropagate`: of numbers to numbers, by their physical types, DECIMAL
+        // too; a DATE or a TIMESTAMP, whose -infinity sorts above its smallest values, is left out
+        let numeric = |ty: &LogicalType| {
+            ty.id() != LogicalTypeId::Enum
+                && matches!(
+                    ty.physical_type(),
+                    PhysicalType::Int8
+                        | PhysicalType::Int16
+                        | PhysicalType::Int32
+                        | PhysicalType::Int64
+                        | PhysicalType::Int128
+                        | PhysicalType::UInt8
+                        | PhysicalType::UInt16
+                        | PhysicalType::UInt32
+                        | PhysicalType::UInt64
+                        | PhysicalType::UInt128
+                        | PhysicalType::Float
+                        | PhysicalType::Double
+                )
+        };
+        let temporal = |ty: &LogicalType| {
+            matches!(
+                ty.id(),
+                LogicalTypeId::Date
+                    | LogicalTypeId::Time
+                    | LogicalTypeId::TimeTz
+                    | LogicalTypeId::Timestamp
+                    | LogicalTypeId::TimestampTz
+                    | LogicalTypeId::TimestampSec
+                    | LogicalTypeId::TimestampMs
+                    | LogicalTypeId::TimestampNs
+                    | LogicalTypeId::TimestampTzNs
+                    | LogicalTypeId::Interval
+            )
+        };
+        let source = &child.return_type;
+        if !numeric(source) || !numeric(&target) || temporal(source) || temporal(&target) {
             return unknown();
         }
+        // a value that does not fit fails, or is NULL with TRY_CAST: with both bounds fitting, all do
         let convert = |value: Option<Value>| {
             let cast = BoundExpr::constant(value?).cast_to(&target, false);
             let converted = crate::execution::expression_executor::try_evaluate_scalar(&cast)?;
@@ -1638,8 +1674,13 @@ impl StatisticsPropagator {
             };
         }
         let floating = matches!(return_type.id(), LogicalTypeId::Float | LogicalTypeId::Double);
-        if !*is_operator || children.len() != 2 || !(return_type.is_integral() || floating) {
-            return unknown();
+        let decimal = return_type.id() == LogicalTypeId::Decimal;
+        let arithmetic = *is_operator
+            && children.len() == 2
+            && (return_type.is_integral() || floating || decimal)
+            && matches!(function.name.as_str(), "+" | "-" | "*");
+        if !arithmetic {
+            return monotone_bounds(function, *is_operator, children, &stats, &return_type).unwrap_or_else(unknown);
         }
         let right = stats.pop().expect("two children");
         let left = stats.pop().expect("two children");
@@ -1654,7 +1695,12 @@ impl StatisticsPropagator {
         let apply = |x: &Value, y: &Value| {
             let call = expr_with_constants(function, x, y, &return_type);
             let value = crate::execution::expression_executor::try_evaluate_scalar(&call)?;
-            (value.logical_type() == &return_type).then_some(value)
+            if value.logical_type() == &return_type {
+                return Some(value);
+            }
+            // a DECIMAL of another width, as the bound function gives it
+            let cast = BoundExpr::constant(value).cast_to(&return_type, true);
+            crate::execution::expression_executor::try_evaluate_scalar(&cast).filter(|v| v.logical_type() == &return_type)
         };
         let corners: Option<Vec<Value>> = match function.name.as_str() {
             "+" => [apply(&a, &c), apply(&b, &d)].into_iter().collect(),
@@ -2760,6 +2806,154 @@ fn stats_fields(stats: &Stats, ty: &LogicalType) -> Option<Value> {
         fields.push(("approx_unique".to_string(), Value::ubigint(distinct)));
     }
     Some(Value::struct_value(fields))
+}
+
+/// The `ArgProperties` monotonicity of argument `at` of a call of `name` with arguments of
+/// `types`: 1 when the result does not decrease with it, -1 when it does not increase.
+fn arg_monotonicity(name: &str, at: usize, types: &[LogicalType]) -> Option<i8> {
+    use LogicalTypeId as T;
+    let numeric = |t: &LogicalType| t.is_numeric();
+    let id = |i: usize| types.get(i).map(LogicalType::id);
+    match (name, types.len()) {
+        ("+", 1) => Some(1),
+        ("-", 1) => Some(-1),
+        ("+", 2) => match (id(0)?, id(1)?) {
+            _ if numeric(&types[0]) && numeric(&types[1]) => Some(1),
+            (T::Date, T::Integer) | (T::Integer, T::Date) | (T::Interval, T::Interval) => Some(1),
+            // calendar months make it monotone in the DATE only
+            (T::Date, T::Interval) => (at == 0).then_some(1),
+            (T::Interval, T::Date) => (at == 1).then_some(1),
+            _ => None,
+        },
+        ("-", 2) => match (id(0)?, id(1)?) {
+            _ if numeric(&types[0]) && numeric(&types[1]) => Some(if at == 0 { 1 } else { -1 }),
+            (T::Date, T::Date) | (T::Date, T::Integer) | (T::Timestamp, T::Timestamp) => {
+                Some(if at == 0 { 1 } else { -1 })
+            }
+            (T::Date, T::Interval) => (at == 0).then_some(1),
+            _ => None,
+        },
+        // the base of a two-argument log can be below 1
+        ("log", 2) => None,
+        (
+            "ceil" | "ceiling" | "floor" | "trunc" | "round" | "round_even" | "roundbankers" | "sqrt" | "cbrt" | "ln"
+            | "log10" | "log" | "log2" | "degrees" | "radians" | "atan" | "sinh" | "asinh" | "tanh" | "isoyear"
+            | "era" | "last_day" | "to_timestamp" | "normalized_interval" | "epoch_ms" | "epoch_us" | "epoch_ns",
+            _,
+        ) => (at == 0).then_some(1),
+        // `SetNonDecreasingExceptInterval`
+        ("year" | "decade" | "century" | "millennium" | "epoch", _) => {
+            (at == 0 && id(0)? != T::Interval).then_some(1)
+        }
+        ("make_date" | "make_timestamp" | "make_timestamp_ns" | "make_timestamp_ms", 1) => (at == 0).then_some(1),
+        ("date_diff" | "datediff" | "date_sub" | "datesub", 3) => match at {
+            1 => Some(-1),
+            2 => Some(1),
+            _ => None,
+        },
+        ("date_trunc" | "datetrunc" | "time_bucket", _) => (at == 1).then_some(1),
+        _ => None,
+    }
+}
+
+/// `PropagateMonotoneBounds`: the function at the smallest and the largest values of its
+/// arguments that it is monotone in, and at the constants it is called with.
+fn monotone_bounds(
+    function: &Arc<crate::function::ScalarFunction>,
+    is_operator: bool,
+    children: &[BoundExpr],
+    stats: &[Stats],
+    return_type: &LogicalType,
+) -> Option<Stats> {
+    if children.is_empty() || function.random.is_some() || expr_is_volatile_function(&function.name) {
+        return None;
+    }
+    let numeric_stats = return_type.is_numeric()
+        || matches!(
+            return_type.id(),
+            LogicalTypeId::Date
+                | LogicalTypeId::Time
+                | LogicalTypeId::Timestamp
+                | LogicalTypeId::TimestampTz
+                | LogicalTypeId::TimestampSec
+                | LogicalTypeId::TimestampMs
+                | LogicalTypeId::TimestampNs
+        );
+    if !numeric_stats {
+        return None;
+    }
+    let types: Vec<LogicalType> = children.iter().map(|c| c.return_type.clone()).collect();
+    let mut low = Vec::with_capacity(children.len());
+    let mut high = Vec::with_capacity(children.len());
+    let mut can_be_null = false;
+    for (at, (child, stats)) in children.iter().zip(stats).enumerate() {
+        if child.is_foldable() {
+            let value = crate::execution::expression_executor::try_evaluate_scalar(child)?;
+            if value.is_null() {
+                return None;
+            }
+            low.push(value.clone());
+            high.push(value);
+            continue;
+        }
+        can_be_null |= stats.can_be_null;
+        let (Some(min), Some(max)) = (stats.min.clone(), stats.max.clone()) else {
+            return None;
+        };
+        match arg_monotonicity(&function.name, at, &types)? {
+            1 => {
+                low.push(min);
+                high.push(max);
+            }
+            _ => {
+                low.push(max);
+                high.push(min);
+            }
+        }
+    }
+    let at = |values: Vec<Value>| {
+        let call = BoundExpr::new(
+            BoundExprKind::Function {
+                function: function.clone(),
+                children: values.into_iter().map(BoundExpr::constant).collect(),
+                is_operator,
+            },
+            return_type.clone(),
+        );
+        let value = crate::execution::expression_executor::try_evaluate_scalar(&call)?;
+        if value.logical_type() == return_type {
+            return Some(value);
+        }
+        // a DECIMAL of another width, as the bound function gives it
+        let cast = BoundExpr::constant(value).cast_to(return_type, true);
+        crate::execution::expression_executor::try_evaluate_scalar(&cast).filter(|v| v.logical_type() == return_type)
+    };
+    let (out_low, out_high) = (at(low)?, at(high)?);
+    // NaN or NULL at a corner: the input was NaN, or e.g. year(infinity)
+    let unusable = |v: &Value| {
+        v.is_null()
+            || match v.data() {
+                duckrs_common::value::ValueData::Double(d) => d.is_nan(),
+                duckrs_common::value::ValueData::Float(f) => f.is_nan(),
+                _ => false,
+            }
+    };
+    if unusable(&out_low) || unusable(&out_high) {
+        return None;
+    }
+    if compare_values(ComparisonOp::GreaterThan, &out_low, &out_high) != Some(false) {
+        return None;
+    }
+    Some(Stats {
+        min: Some(out_low),
+        max: Some(out_high),
+        can_be_null,
+        can_be_valid: true,
+        geometry: None,
+        strings: None,
+        distinct: None,
+        children: Vec::new(),
+    })
 }
 
 fn expr_with_constants(

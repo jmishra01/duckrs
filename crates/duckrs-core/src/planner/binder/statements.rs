@@ -1078,7 +1078,10 @@ impl Binder<'_> {
         // prune the entries ORDER BY added to the select list
         if types.len() > column_count {
             let prune_index = self.generate_table_index();
-            let expressions = (0..column_count).map(column).collect::<Result<_>>()?;
+            // `BoundColumnRefExpression` without an alias: the names are the statement's
+            let expressions = (0..column_count)
+                .map(|i| column(i).map(|c| c.with_alias(String::new())))
+                .collect::<Result<_>>()?;
             plan = LogicalOperator::new(
                 LogicalOperatorKind::Projection {
                     table_index: prune_index,
