@@ -80,6 +80,8 @@ pub(super) struct StoredGroup {
     pub(super) column_blocks: Vec<Vec<u64>>,
     /// that the file says which they are (`has_per_column_metadata_blocks`)
     pub(super) per_column: bool,
+    /// where its deletes are (`RowVersionManager::storage_pointers`)
+    pub(super) deletes_pointers: Vec<MetaBlockPointer>,
 }
 
 /// `PersistentColumnData`.
@@ -659,8 +661,8 @@ pub(super) const VECTOR_INFO: u8 = 1;
 const EMPTY_INFO: u8 = 2;
 /// `ValiditySerialization`.
 pub(super) const BITMASK: u8 = 0;
-const VALID_VALUES: u8 = 1;
-const INVALID_VALUES: u8 = 2;
+pub(super) const VALID_VALUES: u8 = 1;
+pub(super) const INVALID_VALUES: u8 = 2;
 
 /// `ValidityMask::Read` of a vector's mask, where a valid row is one that was deleted.
 fn read_deleted_mask(data: &mut &[u8]) -> Result<[bool; STANDARD_VECTOR_SIZE]> {
@@ -828,6 +830,11 @@ impl DiskTable {
     }
 
     /// The row group of the file with rows from `row_start` on, of `rows` rows, deleted ones included.
+    /// Where the table's statistics and row groups are in the file, and the metadata sub-blocks they take.
+    pub(super) fn table_data(&self) -> (MetaBlockPointer, &[u64]) {
+        (self.table.table_pointer, &self.table.table_blocks)
+    }
+
     pub(super) fn group_at(&self, row_start: u64, rows: usize) -> Option<usize> {
         let group = self
             .table
@@ -880,6 +887,7 @@ impl DiskTable {
             columns,
             column_blocks,
             per_column: row_group.per_column,
+            deletes_pointers: row_group.deletes_pointers.clone(),
         })
     }
 

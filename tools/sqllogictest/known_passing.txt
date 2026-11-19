@@ -2733,6 +2733,8 @@ test/sql/index/art/storage/test_art_buffered_replays_chunk_edges.test
 test/sql/index/art/storage/test_art_buffered_replays_interleaved.test
 test/sql/index/art/storage/test_art_buffered_replays_interval_merging.test
 test/sql/index/art/storage/test_art_buffered_replays_multi_col.test
+test/sql/index/art/storage/test_art_checkpoint.test
+test/sql/index/art/storage/test_art_duckdb_versions.test
 test/sql/index/art/storage/test_art_if_not_exists_constraint_name.test
 test/sql/index/art/storage/test_art_import.test
 test/sql/index/art/storage/test_art_import_export.test
@@ -3979,6 +3981,7 @@ test/sql/storage/nested/struct_of_lists_unaligned.test
 test/sql/storage/null_byte_storage.test
 test/sql/storage/optimistic_write/optimistic_write_alter_then_append.test
 test/sql/storage/optimistic_write/optimistic_write_batch_insert_sub_rowgroup.test
+test/sql/storage/optimistic_write/optimistic_write_commit_failure.test
 test/sql/storage/optimistic_write/optimistic_write_cyclic_scan_single_thread.test
 test/sql/storage/optimistic_write/optimistic_write_delete.test
 test/sql/storage/optimistic_write/optimistic_write_large_strings.test
@@ -4004,6 +4007,7 @@ test/sql/storage/read_duckdb/read_duckdb_top_n.test
 test/sql/storage/read_duckdb/read_duckdb_transaction.test
 test/sql/storage/read_duckdb/read_duckdb_union_by_name.test
 test/sql/storage/read_duckdb/read_duckdb_virtual_columns.test
+test/sql/storage/reclaim_space/reclaim_space_drop_table_optimistic.test
 test/sql/storage/revert_append_after_checkpoint_new_row_group.test
 test/sql/storage/revert_append_nested_list.test
 test/sql/storage/revert_append_partial_vector.test

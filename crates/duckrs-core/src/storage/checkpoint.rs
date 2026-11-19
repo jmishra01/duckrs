@@ -5,7 +5,7 @@
 //! A serialized object can't be skipped, so what is not ported (indexes and so on) stops the whole
 //! load with an error instead of going missing silently.
 
-use super::block_manager::{DatabaseHeader, corrupt};
+use super::block_manager::{DatabaseHeader, INVALID_BLOCK, corrupt};
 use super::buffer_manager::BufferManager;
 use super::metadata::{MetaBlockPointer, MetadataChains};
 use super::serialization::convert;
@@ -99,6 +99,10 @@ pub struct StoredTable {
     pub column_statistics: Vec<Option<BaseStatistics>>,
     /// The id of the next row, past the gaps that a vacuum leaves.
     pub next_row_id: u64,
+    /// Where its statistics and row groups are (`base_table_pointer`), and the metadata sub-blocks they take
+    /// (`read_metadata_pointers`).
+    pub table_pointer: MetaBlockPointer,
+    pub table_blocks: Vec<u64>,
     /// Where the ART of each index is, for what reads one.
     pub indexes: Vec<g::IndexStorageInfo>,
     /// What `COMMENT ON TABLE` and `COMMENT ON COLUMN` said, the columns by name.
@@ -230,7 +234,7 @@ fn read_row_groups(
     chains: &mut MetadataChains,
     pointer: MetaBlockPointer,
     columns: &[StoredColumn],
-) -> Result<(Vec<RowGroupPointer>, Vec<Option<BaseStatistics>>)> {
+) -> Result<(Vec<RowGroupPointer>, Vec<Option<BaseStatistics>>, Vec<u64>)> {
     let mut d = BinaryDeserializer::new(chains.at(buffer, pointer)?);
     let statistics = d.read_object_value(|d| {
         let mut column = columns.iter();
@@ -249,7 +253,8 @@ fn read_row_groups(
     let row_groups = (0..count)
         .map(|_| RowGroupPointer::read_value(&mut d))
         .collect::<Result<_>>()?;
-    Ok((row_groups, statistics))
+    let read = d.position();
+    Ok((row_groups, statistics, chains.sub_blocks(buffer, pointer, read)))
 }
 
 /// `CheckpointReader::LoadCheckpoint`.
@@ -272,8 +277,9 @@ pub fn read_catalog(buffer: &BufferManager) -> Result<StoredCatalog> {
         catalog.entries.push(match entry {
             Pending::Done(entry) => entry,
             Pending::Table(mut table, pointer) => {
-                (table.row_groups, table.column_statistics) =
+                (table.row_groups, table.column_statistics, table.table_blocks) =
                     read_row_groups(buffer, &mut chains, pointer, &table.columns)?;
+                table.table_pointer = pointer;
                 StoredEntry::Table(table)
             }
         });
@@ -392,6 +398,8 @@ pub(super) fn convert_entry(info: g::CreateInfo) -> Result<Converted> {
                 row_groups: Vec::new(),
                 column_statistics: Vec::new(),
                 next_row_id: 0,
+                table_pointer: MetaBlockPointer::new(INVALID_BLOCK, 0),
+                table_blocks: Vec::new(),
                 indexes: Vec::new(),
                 comment: entry_comment,
                 column_comments,

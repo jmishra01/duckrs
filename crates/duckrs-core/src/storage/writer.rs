@@ -29,7 +29,7 @@ use super::serialization::generated::enums::{
 };
 use super::serialization::generated::{self as g};
 use super::serialization::to_stored::{self, write_not_ported};
-use super::table_data::{BITMASK, CONSTANT_INFO, DiskTable, VECTOR_INFO, fixed_width};
+use super::table_data::{BITMASK, CONSTANT_INFO, DiskTable, INVALID_VALUES, VALID_VALUES, VECTOR_INFO, fixed_width};
 use crate::catalog::{
     Catalog, IndexCatalogEntry, MacroCatalogEntry, RowIds, SchemaCatalogEntry, SequenceCatalogEntry, TEMP_SCHEMA,
     TableCatalogEntry, TableConstraint, TableCursor, ViewCatalogEntry,
@@ -110,8 +110,8 @@ fn internal(message: &str) -> Error {
 /// A position in one of the chains of metadata that a checkpoint writes.
 #[derive(Default)]
 struct MetaStream {
-    /// the sub-block, as a page and an index in it
-    current: Option<(usize, usize)>,
+    /// the sub-block, as its metadata block and its index there
+    current: Option<(u64, usize)>,
     offset: usize,
 }
 
@@ -1241,6 +1241,15 @@ impl Part {
     }
 }
 
+/// `MetadataBlock`: which sub-blocks are free, and the bytes once the checkpoint writes some of it.
+struct MetaBlock {
+    free: u64,
+    data: Option<Vec<u8>>,
+    dirty: bool,
+    /// whether this checkpoint can take its free sub-blocks
+    available: bool,
+}
+
 /// One checkpoint in the making.
 struct Writer<'a> {
     buffer: &'a BufferManager,
@@ -1250,9 +1259,11 @@ struct Writer<'a> {
     free: BTreeSet<u64>,
     next_block: u64,
     used: BTreeSet<u64>,
-    /// metadata pages of the last checkpoint with sub-blocks that row groups kept as they were still take, and
-    /// which of them (`MetadataManager::ClearModifiedBlocks`)
-    kept_pages: std::collections::BTreeMap<u64, u64>,
+    /// `MetadataManager::blocks`: the metadata blocks, of the file and new ones
+    meta: std::collections::BTreeMap<u64, MetaBlock>,
+    /// `MetadataManager::modified_blocks`: of each metadata block of the file, the sub-blocks it had taken, which
+    /// are free once this checkpoint is written unless it keeps them (`ClearModifiedBlocks`)
+    modified: std::collections::BTreeMap<u64, u64>,
     /// Of the table being written: whether its rows are those of its last checkpoint as they were, so that its
     /// row groups are kept without reading them (`RowGroup::HasChanges`), and which columns of each of those
     /// were loaded (`RowGroup::is_loaded`).
@@ -1269,14 +1280,12 @@ struct Writer<'a> {
     /// How many segments each block holds, which DuckDB has to know to free them one by one.
     segments_in_block: HashMap<u64, u32>,
     /// The block that segments go into now, with how much of it they fill.
-    open: Option<(u64, Vec<u8>, usize)>,
-    /// Metadata blocks, which go out at the end.
-    pages: Vec<(u64, Vec<u8>)>,
-    /// Per page, which of its sub-blocks are taken.
-    taken: Vec<u64>,
-    next_sub_block: Option<(usize, usize)>,
-    /// Sub-blocks that were put aside for what comes next.
-    reserved: VecDeque<(usize, usize)>,
+    /// `PartialBlockManager::partially_filled_blocks`: blocks segments still go into, by the room they have left
+    /// (and then in the order they came, as a multimap has them), with their bytes and how much they fill.
+    partial: std::collections::BTreeMap<(usize, u64), (u64, Vec<u8>, usize)>,
+    partial_count: u64,
+    /// Sub-blocks that were put aside for the free list (`GetFreeListBlocks`).
+    reserved: VecDeque<(u64, usize)>,
     tables: MetaStream,
     /// The setting, in lower case.
     force_compression: String,
@@ -1453,19 +1462,7 @@ fn matching_columns(
     stored: &[Option<usize>],
     types: &[LogicalType],
 ) -> Result<(bool, Vec<Option<usize>>)> {
-    let same_deletes = match disk.alive_rows(group) {
-        None => kept.iter().all(|kept| *kept),
-        Some(alive) => {
-            let mut alive = alive.iter().peekable();
-            kept.iter().enumerate().all(|(row, kept)| {
-                let stored = alive.peek().is_some_and(|at| **at as usize == row);
-                if stored {
-                    alive.next();
-                }
-                stored == *kept
-            })
-        }
-    };
+    let same_deletes = same_deletes(disk, group, kept);
     let mut same = Vec::with_capacity(types.len());
     for (column, ty) in types.iter().enumerate() {
         let candidate = stored
@@ -1489,6 +1486,29 @@ fn matching_columns(
         same.push(equal.then_some(at));
     }
     Ok((same_deletes, same))
+}
+
+/// Whether the rows of `group` of `disk` that are left are those `kept` says.
+fn same_deletes(disk: &super::table_data::DiskTable, group: usize, kept: &[bool]) -> bool {
+    match disk.alive_rows(group) {
+        None => kept.iter().all(|kept| *kept),
+        Some(alive) => {
+            let mut alive = alive.iter().peekable();
+            kept.iter().enumerate().all(|(row, kept)| {
+                let stored = alive.peek().is_some_and(|at| **at as usize == row);
+                if stored {
+                    alive.next();
+                }
+                stored == *kept
+            })
+        }
+    }
+}
+
+/// What a row group's deletes are: as the file has them, or to be written (if there are any).
+enum Deletes {
+    Keep(Vec<MetaBlockPointer>),
+    Write(Option<Vec<u8>>),
 }
 
 /// The values of the rows of a row group that are left, `live`, with NULLs where `kept` says a row was deleted.
@@ -1627,14 +1647,37 @@ fn deletes_of(kept: &[bool]) -> Vec<u8> {
         }
         out.push(VECTOR_INFO);
         out.extend_from_slice(&start.to_le_bytes());
-        out.push(BITMASK);
-        let mut words = [0u64; STANDARD_VECTOR_SIZE / 64];
-        for (row, kept) in rows.iter().enumerate() {
-            words[row / 64] |= u64::from(!kept) << (row % 64);
-        }
-        words.iter().for_each(|word| out.extend_from_slice(&word.to_le_bytes()));
+        // `ChunkVectorInfo::Write`: a mask whose valid rows are the deleted ones, rows past the vector's not
+        let deleted = |row: usize| rows.get(row).is_some_and(|kept| !kept);
+        write_validity(&mut out, deleted);
     }
     out
+}
+
+/// `ValidityMask::Write` of a vector's mask: the indexes of its valid or its invalid rows, whichever are fewer, where
+/// that is less than the bitmask.
+fn write_validity(out: &mut Vec<u8>, valid: impl Fn(usize) -> bool) {
+    const COUNT: usize = STANDARD_VECTOR_SIZE;
+    let valid_values = (0..COUNT).filter(|row| valid(*row)).count();
+    let invalid_values = COUNT - valid_values;
+    let bitmask_bytes = COUNT / 8;
+    let valid_size = 2 * valid_values + 4;
+    let invalid_size = 2 * invalid_values + 4;
+    if valid_size < bitmask_bytes || invalid_size < bitmask_bytes {
+        let serialize_valid = valid_size < invalid_size;
+        out.push(if serialize_valid { VALID_VALUES } else { INVALID_VALUES });
+        out.extend_from_slice(&(valid_values.min(invalid_values) as u32).to_le_bytes());
+        for row in (0..COUNT).filter(|row| valid(*row) == serialize_valid) {
+            out.extend_from_slice(&(row as u16).to_le_bytes());
+        }
+        return;
+    }
+    out.push(BITMASK);
+    let mut words = [0u64; COUNT / 64];
+    for row in (0..COUNT).filter(|row| valid(*row)) {
+        words[row / 64] |= 1 << (row % 64);
+    }
+    words.iter().for_each(|word| out.extend_from_slice(&word.to_le_bytes()));
 }
 
 /// The rows of a table in order of position, as they come from its file or from memory.
@@ -1673,17 +1716,33 @@ impl<'a> Writer<'a> {
             },
             next_block: blocks.header().block_count,
             used: BTreeSet::new(),
-            kept_pages: std::collections::BTreeMap::new(),
+            meta: blocks
+                .metadata_blocks()
+                .into_iter()
+                .map(|(block, free)| {
+                    let state = MetaBlock {
+                        free,
+                        data: None,
+                        dirty: false,
+                        // while other transactions may still read what it frees, what the file has stays
+                        available: !options.keep_free_blocks,
+                    };
+                    (block, state)
+                })
+                .collect(),
+            modified: blocks
+                .metadata_blocks()
+                .into_iter()
+                .map(|(block, free)| (block, !free))
+                .collect(),
             in_file: None,
             stored_loaded: Vec::new(),
             group_loaded: Vec::new(),
             loaded: HashMap::new(),
             memory_statistics: HashMap::new(),
             segments_in_block: HashMap::new(),
-            open: None,
-            pages: Vec::new(),
-            taken: Vec::new(),
-            next_sub_block: None,
+            partial: std::collections::BTreeMap::new(),
+            partial_count: 0,
             reserved: VecDeque::new(),
             tables: MetaStream::default(),
             force_compression: options.force_compression.to_lowercase(),
@@ -1714,51 +1773,136 @@ impl<'a> Writer<'a> {
         block
     }
 
+    /// `FlushPartialBlocks`.
     fn flush_open_block(&mut self) -> Result<()> {
-        if let Some((block, data, _)) = self.open.take() {
+        for (_, (block, data, _)) in std::mem::take(&mut self.partial) {
             self.buffer.block_manager().write_block(block, &data)?;
         }
         Ok(())
     }
 
-    /// Puts a segment in the open block, or a new one if it doesn't fit.
+    /// `PartialBlockManager::Write` of a segment: into the fullest block that has room for it, unless it is too
+    /// large to share one, or else a new block; a block keeps taking segments while a fifth of it is free.
     fn place(&mut self, data: &[u8]) -> Result<(i64, u32)> {
-        let at = self.open.as_ref().map(|(_, _, used)| used.next_multiple_of(8));
-        if at.is_none_or(|at| at + data.len() > self.block_size) {
-            self.flush_open_block()?;
-            self.open = Some((self.allocate_block(), vec![0; self.block_size], 0));
-        }
-        let (block, buffer, used) = self.open.as_mut().expect("just ensured");
-        let at = used.next_multiple_of(8);
+        let max_partial_size = self.block_size / 5 * 4;
+        let min_reusable_space = self.block_size - max_partial_size;
+        let taken = if data.len() <= max_partial_size {
+            let key = self.partial.range((data.len(), 0)..).next().map(|(key, _)| *key);
+            key.and_then(|key| self.partial.remove(&key))
+        } else {
+            None
+        };
+        let (block, mut buffer, used) = match taken {
+            Some(partial) => partial,
+            None => (self.allocate_block(), vec![0; self.block_size], 0),
+        };
+        let at = used;
         buffer[at..at + data.len()].copy_from_slice(data);
-        *used = at + data.len();
-        *self.segments_in_block.entry(*block).or_default() += 1;
-        Ok((*block as i64, at as u32))
+        let used = (at + data.len()).next_multiple_of(8);
+        *self.segments_in_block.entry(block).or_default() += 1;
+        // `RetainOrFlush`
+        let available = self.block_size - used;
+        if available < min_reusable_space {
+            self.buffer.block_manager().write_block(block, &buffer)?;
+        } else {
+            self.partial_count += 1;
+            self.partial
+                .insert((available, self.partial_count), (block, buffer, used));
+        }
+        Ok((block as i64, at as u32))
     }
 
-    /// The disk pointer of a new sub-block, which starts out as the last of its chain.
-    fn next_sub_block(&mut self) -> (usize, usize) {
+    /// `MetadataManager::AllocateHandle`: the lowest free sub-block of the first metadata block that has one,
+    /// unless a new block would have a lower id; it starts out as the last of its chain.
+    fn next_sub_block(&mut self) -> (u64, usize) {
         if let Some(reserved) = self.reserved.pop_front() {
             return reserved;
         }
-        let (page, index) = match self.next_sub_block {
-            Some(next) => next,
-            None => {
+        let candidate = self
+            .meta
+            .iter()
+            .find(|(_, block)| block.available && block.free != 0)
+            .map(|(id, _)| *id);
+        let peek = self.free.first().copied().unwrap_or(self.next_block);
+        let block = match candidate {
+            Some(block) if block <= peek => block,
+            _ => {
                 let block = self.allocate_block();
-                self.pages.push((block, vec![0; self.block_size]));
-                self.taken.push(0);
-                (self.pages.len() - 1, 0)
+                let state = MetaBlock {
+                    free: u64::MAX,
+                    data: Some(vec![0; self.block_size]),
+                    dirty: true,
+                    available: true,
+                };
+                self.meta.insert(block, state);
+                block
             }
         };
-        self.next_sub_block = (index + 1 < METADATA_BLOCK_COUNT).then_some((page, index + 1));
-        self.taken[page] |= 1 << index;
         let size = metadata_block_size(self.block_size);
-        self.pages[page].1[index * size..index * size + 8].copy_from_slice(&INVALID_BLOCK.to_le_bytes());
-        (page, index)
+        let state = self.meta.get_mut(&block).expect("just found");
+        let index = state.free.trailing_zeros() as usize;
+        state.free &= !(1 << index);
+        state.dirty = true;
+        let data = state.data.as_mut().expect("loaded in `load_metadata_blocks`");
+        // `NextBlock` and `Flush`: the chain ends here, and nothing of what was there before stays
+        data[index * size..(index + 1) * size].fill(0);
+        data[index * size..index * size + 8].copy_from_slice(&INVALID_BLOCK.to_le_bytes());
+        (block, index)
     }
 
-    fn disk_pointer(&self, (page, index): (usize, usize)) -> u64 {
-        self.pages[page].0 | (index as u64) << 56
+    /// `ConvertToTransient` ahead of time: the metadata blocks of the file that sub-blocks can be taken from.
+    fn load_metadata_blocks(&mut self) -> Result<()> {
+        let blocks = self.buffer.block_manager();
+        for (id, block) in self.meta.iter_mut() {
+            if block.available && block.free != 0 && block.data.is_none() {
+                block.data = Some(blocks.read_block(*id)?);
+            }
+        }
+        Ok(())
+    }
+
+    /// `ClearModifiedBlocks`: what the last checkpoint wrote at these sub-blocks stays; before v1.5.0, so does the
+    /// sub-block each of them goes on to.
+    fn keep_sub_blocks(&mut self, pointers: &[u64]) -> Result<()> {
+        let mut next = Vec::new();
+        if self.version < StorageVersion::V1_5_0 {
+            let size = metadata_block_size(self.block_size);
+            let mut seen = std::collections::HashSet::new();
+            for &pointer in pointers {
+                if !seen.insert(pointer) {
+                    continue;
+                }
+                let at = MetaBlockPointer::new(pointer, 0);
+                let block = self.buffer.pin(at.block_id())?;
+                let start = at.block_index() as usize * size;
+                let following = u64::from_le_bytes(block[start..start + 8].try_into().expect("8 bytes"));
+                if following != INVALID_BLOCK {
+                    next.push(following);
+                }
+            }
+        }
+        for pointer in pointers.iter().chain(&next) {
+            let at = MetaBlockPointer::new(*pointer, 0);
+            if let Some(taken) = self.modified.get_mut(&at.block_id()) {
+                *taken &= !(1 << at.block_index());
+            }
+        }
+        Ok(())
+    }
+
+    fn disk_pointer(&self, (block, index): (u64, usize)) -> u64 {
+        block | (index as u64) << 56
+    }
+
+    /// The bytes of a sub-block that is being written.
+    fn sub_block(&mut self, (block, index): (u64, usize)) -> &mut [u8] {
+        let size = metadata_block_size(self.block_size);
+        let data = self
+            .meta
+            .get_mut(&block)
+            .and_then(|block| block.data.as_mut())
+            .expect("a sub-block that was taken");
+        &mut data[index * size..(index + 1) * size]
     }
 
     /// `MetadataWriter::GetMetaBlockPointer`.
@@ -1773,10 +1917,9 @@ impl<'a> Writer<'a> {
 
     fn advance(&mut self, stream: &mut MetaStream) {
         let next = self.next_sub_block();
-        if let Some((page, index)) = stream.current {
-            let size = metadata_block_size(self.block_size);
+        if let Some(current) = stream.current {
             let pointer = self.disk_pointer(next);
-            self.pages[page].1[index * size..index * size + 8].copy_from_slice(&pointer.to_le_bytes());
+            self.sub_block(current)[..8].copy_from_slice(&pointer.to_le_bytes());
         }
         stream.current = Some(next);
         stream.offset = SUB_BLOCK_HEADER_SIZE;
@@ -1793,10 +1936,10 @@ impl<'a> Writer<'a> {
             if stream.current.is_none() || stream.offset >= size {
                 self.advance(stream);
             }
-            let (page, index) = stream.current.expect("just ensured");
+            let current = stream.current.expect("just ensured");
             let take = data.len().min(size - stream.offset);
-            let at = index * size + stream.offset;
-            self.pages[page].1[at..at + take].copy_from_slice(&data[..take]);
+            let at = stream.offset;
+            self.sub_block(current)[at..at + take].copy_from_slice(&data[..take]);
             stream.offset += take;
             data = &data[take..];
         }
@@ -2678,7 +2821,7 @@ impl<'a> Writer<'a> {
         parts: Vec<Vec<Part>>,
         row_start: u64,
         rows: usize,
-        deletes: Option<&[u8]>,
+        deletes: Deletes,
         statistics: &mut [Option<Stats>],
         reused: Vec<Option<(MetaBlockPointer, Vec<u64>)>>,
     ) -> Result<Vec<u8>> {
@@ -2724,16 +2867,23 @@ impl<'a> Writer<'a> {
                     .collect(),
             );
         }
-        // one pointer per block that they take
-        let size = metadata_block_size(self.block_size);
-        let mut delete_pointers = Vec::new();
-        let mut left = deletes.unwrap_or_default();
-        while !left.is_empty() {
-            delete_pointers.push(self.pointer(&mut tables));
-            let (now, rest) = left.split_at(left.len().min(size - tables.offset));
-            self.write_metadata(&mut tables, now);
-            left = rest;
-        }
+        // `RowGroup::CheckpointDeletes`: as they were, or in a writer of their own, at the sub-blocks it takes
+        let delete_pointers = match deletes {
+            Deletes::Keep(pointers) => {
+                let sub_blocks: Vec<u64> = pointers.iter().map(|pointer| pointer.block_pointer).collect();
+                self.keep_sub_blocks(&sub_blocks)?;
+                pointers
+            }
+            Deletes::Write(None) => Vec::new(),
+            Deletes::Write(Some(bytes)) => {
+                let mut stream = MetaStream::default();
+                let columns = self.written_pages.replace(Vec::new());
+                self.pointer(&mut stream);
+                self.write_metadata(&mut stream, &bytes);
+                let written = std::mem::replace(&mut self.written_pages, columns).unwrap_or_default();
+                written.into_iter().map(|page| MetaBlockPointer::new(page, 0)).collect()
+            }
+        };
         self.tables = tables;
         let mut s = serializer(self.version);
         s.write_object_value(|s| {
@@ -2795,9 +2945,11 @@ impl<'a> Writer<'a> {
         columns: &[Option<usize>],
         types: &[LogicalType],
         statistics: &mut [Option<Stats>],
-    ) -> Vec<Option<(MetaBlockPointer, Vec<u64>)>> {
+    ) -> Result<Vec<Option<(MetaBlockPointer, Vec<u64>)>>> {
         let mut reused = Vec::with_capacity(columns.len());
         let mut loaded = Vec::with_capacity(columns.len());
+        // `RowGroup::Checkpoint`: the metadata of the columns that stay is kept (`ClearModifiedBlocks`)
+        let mut kept = Vec::new();
         for (column, stored) in columns.iter().enumerate() {
             let Some(stored) = *stored else {
                 reused.push(None);
@@ -2814,16 +2966,15 @@ impl<'a> Writer<'a> {
             self.keep_blocks(stored_column);
             let pointer = kept_group.data_pointers[stored];
             let extras = kept_group.column_blocks[stored].clone();
-            for sub_block in std::iter::once(pointer.block_pointer).chain(extras.iter().copied()) {
-                let page = MetaBlockPointer::new(sub_block, 0);
-                *self.kept_pages.entry(page.block_id()).or_default() |= 1 << page.block_index();
-            }
+            kept.push(pointer.block_pointer);
+            kept.extend(extras.iter().copied());
             reused.push(Some((pointer, extras)));
             let was = self.stored_loaded.get(stored_group).and_then(|group| group.get(stored));
             loaded.push(was.copied().unwrap_or(true));
         }
         self.group_loaded.push(loaded);
-        reused
+        self.keep_sub_blocks(&kept)?;
+        Ok(reused)
     }
 
     /// The vectors of a row group, with what indexes have to know. Rows that are deleted are NULL.
@@ -2835,7 +2986,7 @@ impl<'a> Writer<'a> {
         rows: &mut PositionedRows<'_>,
         indexes: &mut [TableIndex],
         statistics: &mut [Option<Stats>],
-    ) -> Result<(Vec<u8>, usize)> {
+    ) -> Result<(Vec<u8>, usize, bool)> {
         let types = table.types();
         let mut parts: Vec<Vec<Part>> = types.iter().map(|_| Vec::new()).collect();
         let mut kept = Vec::with_capacity(group.rows);
@@ -2878,7 +3029,11 @@ impl<'a> Writer<'a> {
                         .for_each(|row| kept[stored_rows[*row as usize] as usize] = true),
                     None => stored_rows.iter().for_each(|row| kept[*row as usize] = true),
                 }
-                let deletes = (kept.iter().any(|kept| !kept)).then(|| deletes_of(&kept));
+                // no DELETE since: the deletes are those of the file
+                let deletes = match source.alive_rows(stored_group) {
+                    None => Deletes::Keep(kept_group.deletes_pointers.clone()),
+                    Some(_) => Deletes::Write((kept.iter().any(|kept| !kept)).then(|| deletes_of(&kept))),
+                };
                 let mut parts: Vec<Vec<Part>> = types.iter().map(|_| Vec::new()).collect();
                 for (column, keep) in same.iter().enumerate() {
                     if keep.is_some() {
@@ -2898,17 +3053,12 @@ impl<'a> Writer<'a> {
                         parts[column].push(Part::new(&part, count));
                     }
                 }
-                let reused = self.keep_columns(stored_group, &kept_group, &same, &types, statistics);
-                let written = self.write_row_group(
-                    table,
-                    parts,
-                    group.file_start,
-                    group.rows,
-                    deletes.as_deref(),
-                    statistics,
-                    reused,
-                )?;
-                return Ok((written, group.file_start as usize + group.rows));
+                let reused = self.keep_columns(stored_group, &kept_group, &same, &types, statistics)?;
+                // `RowGroupWriteAction::REUSE_EXISTING_ROW_GROUP_METADATA`, deletes and all
+                let whole = unchanged && matches!(deletes, Deletes::Keep(_));
+                let written =
+                    self.write_row_group(table, parts, group.file_start, group.rows, deletes, statistics, reused)?;
+                return Ok((written, group.file_start as usize + group.rows, whole));
             }
         }
         let mut live_chunks = Vec::new();
@@ -2966,10 +3116,17 @@ impl<'a> Writer<'a> {
                 live_chunks.push(live);
             }
         }
-        let deletes = (kept.iter().any(|kept| !kept)).then(|| deletes_of(&kept));
+        // `RowVersionManager::Checkpoint`: deletes the row group of the file had, the same, stay where they are
+        let deletes = match stored {
+            Some((disk, stored_group)) if same_deletes(disk, stored_group, &kept) => {
+                Deletes::Keep(disk.stored_group(stored_group)?.deletes_pointers)
+            }
+            _ => Deletes::Write((kept.iter().any(|kept| !kept)).then(|| deletes_of(&kept))),
+        };
         // `RowGroup::WriteToDisk`: what stays of the row group as the last checkpoint wrote it
         let mut reused = vec![None; types.len()];
         let mut kept_any = false;
+        let mut whole = false;
         if let Some((disk, stored_group)) = stored.filter(|_| self.metadata_reuse) {
             let stored_columns = table.checkpointed_columns();
             let (same_deletes, same) =
@@ -2990,23 +3147,16 @@ impl<'a> Writer<'a> {
             let partly =
                 !unchanged && self.per_column_writes && kept_group.per_column && same.iter().any(Option::is_some);
             if unchanged || partly {
-                reused = self.keep_columns(stored_group, &kept_group, &same, &types, statistics);
+                reused = self.keep_columns(stored_group, &kept_group, &same, &types, statistics)?;
                 kept_any = true;
             }
+            whole = unchanged && matches!(deletes, Deletes::Keep(_));
         }
         if !kept_any {
             self.group_loaded.push(vec![true; types.len()]);
         }
-        let written = self.write_row_group(
-            table,
-            parts,
-            group.file_start,
-            group.rows,
-            deletes.as_deref(),
-            statistics,
-            reused,
-        )?;
-        Ok((written, group.file_start as usize + group.rows))
+        let written = self.write_row_group(table, parts, group.file_start, group.rows, deletes, statistics, reused)?;
+        Ok((written, group.file_start as usize + group.rows, whole))
     }
 
     /// `SingleFileTableDataWriter::FinalizeTable`: where the rows of a table are, how many rows its
@@ -3065,9 +3215,20 @@ impl<'a> Writer<'a> {
             !rebuild && ((dense && !indexes.is_empty()) || indexes.iter().any(|index| index.legacy_geometry));
         // `storage.total_vacuum_time`: what writing the row groups that came together took
         let mut vacuum_time = std::time::Duration::ZERO;
+        // `WriteUnchangedTable`: of a table whose row groups all stay as they were, the statistics and the list of
+        // row groups stay too
+        let existing = disk
+            .filter(|_| self.metadata_reuse)
+            .map(|disk| {
+                let (pointer, blocks) = disk.table_data();
+                (pointer, blocks.to_vec(), crate::catalog::TableSource::group_count(disk))
+            })
+            .filter(|(pointer, _, _)| pointer.is_valid());
+        let mut all_whole = existing.is_some();
         for group in plan_groups(&ids, size, self.vacuum_tasks, dense, keep_ids) {
             let start = std::time::Instant::now();
-            let (written, end) = self.write_group(table, &group, &ids, &mut rows, indexes, &mut statistics)?;
+            let (written, end, whole) = self.write_group(table, &group, &ids, &mut rows, indexes, &mut statistics)?;
+            all_whole &= whole;
             if group.merged {
                 vacuum_time += start.elapsed();
             }
@@ -3104,6 +3265,13 @@ impl<'a> Writer<'a> {
                 });
             });
         });
+        if let Some((pointer, blocks, groups)) = existing
+            && all_whole
+            && groups == row_groups.len()
+        {
+            self.keep_sub_blocks(&blocks)?;
+            return Ok((pointer, stored_rows, next_row_id));
+        }
         let mut tables = std::mem::take(&mut self.tables);
         let pointer = self.pointer(&mut tables);
         self.write_metadata(&mut tables, &s.into_bytes());
@@ -3201,51 +3369,48 @@ impl<'a> Writer<'a> {
     /// `WriteHeader`: the free list, the metadata, and then the header that makes it all count.
     fn finish(mut self, root: MetaBlockPointer) -> Result<()> {
         self.flush_open_block()?;
-        let multi_use: Vec<(u64, u32)> = self
+        // in the order of `multi_use_blocks`, a map
+        let mut multi_use: Vec<(u64, u32)> = self
             .segments_in_block
             .iter()
             .filter(|(_, segments)| **segments > 1)
             .map(|(&block, &segments)| (block, segments))
             .collect();
-        // `GetFreeListBlocks`: the room for the free list has to be taken before it is known, and
-        // the blocks that takes are no longer free. So this takes enough for any outcome, and the
-        // sub-blocks it doesn't need stay free, which the list of metadata blocks says.
+        multi_use.sort_unstable();
+        // `GetFreeListBlocks`: the room for the free list is taken before it is known, as sub-blocks taken then
+        // are no longer free, until what it would take is less
         let payload = metadata_block_size(self.block_size) - SUB_BLOCK_HEADER_SIZE;
-        let kept_pages = std::mem::take(&mut self.kept_pages);
-        self.used.extend(kept_pages.keys());
-        let mut pages = self.pages.len();
+        let free_count = |writer: &Self| {
+            (0..writer.next_block)
+                .filter(|block| !writer.used.contains(block) && !writer.meta.contains_key(block))
+                .count()
+        };
+        let mut sub_blocks = Vec::new();
+        let mut allocated = 0;
         loop {
-            let entries = self.next_block as usize + self.free.len() + pages;
-            let bytes = 24 + 8 * entries + 12 * multi_use.len() + 16 * (pages + kept_pages.len());
-            let needed = bytes.div_ceil(payload).div_ceil(METADATA_BLOCK_COUNT) + 1;
-            if self.pages.len() + needed <= pages {
+            let total = 8 + 8 * free_count(&self) + 8 + 12 * multi_use.len() + 8 + 16 * self.meta.len();
+            if total < allocated {
                 break;
             }
-            pages = self.pages.len() + needed;
-        }
-        let needed = pages - self.pages.len();
-        let mut sub_blocks = Vec::with_capacity(needed * METADATA_BLOCK_COUNT);
-        for _ in 0..needed * METADATA_BLOCK_COUNT {
             sub_blocks.push(self.next_sub_block());
+            allocated += payload;
         }
-        let free: Vec<u64> = (0..self.next_block)
-            .filter(|block| !self.used.contains(block))
-            .collect();
-        let size = 24 + free.len() * 8 + multi_use.len() * 12 + (self.pages.len() + kept_pages.len()) * 16;
-        sub_blocks.truncate(size.div_ceil(payload));
-        for &(page, index) in &sub_blocks {
-            self.taken[page] |= 1 << index;
-        }
-        // those beyond what the list takes are free after all
-        for page in 0..self.pages.len() {
-            if page >= pages - needed {
-                self.taken[page] = 0;
+        // `MarkBlocksAsModified`: what the last checkpoint took and this one doesn't keep is free; a metadata block
+        // all free is a free block
+        for (block, taken) in std::mem::take(&mut self.modified) {
+            if let Some(state) = self.meta.get_mut(&block) {
+                let free = state.free | taken;
+                if free == u64::MAX {
+                    self.meta.remove(&block);
+                } else {
+                    state.free = free;
+                }
             }
         }
-        for &(page, index) in &sub_blocks {
-            self.taken[page] |= 1 << index;
-        }
-        let mut list = Vec::with_capacity(size);
+        let free: Vec<u64> = (0..self.next_block)
+            .filter(|block| !self.used.contains(block) && !self.meta.contains_key(block))
+            .collect();
+        let mut list = Vec::new();
         list.extend_from_slice(&(free.len() as u64).to_le_bytes());
         for block in &free {
             list.extend_from_slice(&block.to_le_bytes());
@@ -3255,24 +3420,24 @@ impl<'a> Writer<'a> {
             list.extend_from_slice(&block.to_le_bytes());
             list.extend_from_slice(&segments.to_le_bytes());
         }
-        list.extend_from_slice(&((self.pages.len() + kept_pages.len()) as u64).to_le_bytes());
-        for ((block, _), taken) in self.pages.iter().zip(&self.taken) {
+        list.extend_from_slice(&(self.meta.len() as u64).to_le_bytes());
+        for (block, state) in &self.meta {
             list.extend_from_slice(&block.to_le_bytes());
-            list.extend_from_slice(&(!taken).to_le_bytes());
-        }
-        // the pages of the last checkpoint that kept row groups still have metadata in
-        for (block, taken) in &kept_pages {
-            list.extend_from_slice(&block.to_le_bytes());
-            list.extend_from_slice(&(!taken).to_le_bytes());
+            list.extend_from_slice(&state.free.to_le_bytes());
         }
         self.reserved = sub_blocks.into();
         let mut stream = MetaStream::default();
         let free_list = self.pointer(&mut stream).block_pointer;
         self.write_metadata(&mut stream, &list);
+        // `MetadataManager::Flush`: the blocks written to, past their sub-blocks zeros
         let blocks = self.buffer.block_manager();
-        for (block, data) in &self.pages {
+        let end = metadata_block_size(self.block_size) * METADATA_BLOCK_COUNT;
+        for (block, state) in self.meta.iter_mut().filter(|(_, state)| state.dirty) {
+            let data = state.data.as_mut().expect("written");
+            data[end..].fill(0);
             blocks.write_block(*block, data)?;
         }
+        blocks.set_metadata_blocks(self.meta.iter().map(|(block, state)| (*block, state.free)).collect());
         const FLAG: &str = "because of PRAGMA checkpoint_abort flag";
         check_abort(
             &self.abort,
@@ -3339,6 +3504,7 @@ pub fn write_checkpoint(
     mark: &mut dyn FnMut(MetaBlockPointer) -> Result<()>,
 ) -> Result<()> {
     let mut writer = Writer::new(buffer, catalog, name.to_string(), options);
+    writer.load_metadata_blocks()?;
     // `RewriteMainHeader`: a file of v0.10.2 that goes to v1.2.0 or newer says so in its main header
     if writer.version >= StorageVersion::V1_2_0 && buffer.block_manager().main_header().version_number == 64 {
         buffer.block_manager().rewrite_main_header(StorageVersion::V1_2_0)?;

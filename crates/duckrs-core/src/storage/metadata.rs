@@ -141,7 +141,8 @@ pub(super) fn take<const N: usize>(data: &mut &[u8]) -> Result<[u8; N]> {
     Ok(*head)
 }
 
-/// `LoadFreeList`, without the free sub-blocks at its end, which only writing needs.
+/// `LoadFreeList`: the free blocks, those that several segments share, and the metadata blocks with their free
+/// sub-blocks (`MetadataManager::Read`).
 pub fn load_free_list(buffer: &BufferManager) -> Result<()> {
     let blocks = buffer.block_manager();
     let pointer = MetaBlockPointer::new(blocks.header().free_list, 0);
@@ -161,6 +162,15 @@ pub fn load_free_list(buffer: &BufferManager) -> Result<()> {
         let block = u64::from_le_bytes(take(&mut data)?);
         multi_use_blocks.insert(block, u32::from_le_bytes(take(&mut data)?));
     }
+    // a file of DuckDB before v0.9 has no list of metadata blocks
+    let mut metadata_blocks = std::collections::BTreeMap::new();
+    if let Ok(count) = take::<8>(&mut data) {
+        for _ in 0..u64::from_le_bytes(count) {
+            let block = u64::from_le_bytes(take(&mut data)?);
+            metadata_blocks.insert(block, u64::from_le_bytes(take(&mut data)?));
+        }
+    }
     blocks.set_free_list(free_list, multi_use_blocks);
+    blocks.set_metadata_blocks(metadata_blocks);
     Ok(())
 }

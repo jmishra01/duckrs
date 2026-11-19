@@ -214,6 +214,8 @@ struct State {
     free_list: BTreeSet<u64>,
     /// `multi_use_blocks`: blocks that several segments or tables share.
     multi_use_blocks: HashMap<u64, u32>,
+    /// `MetadataManager::blocks`: the metadata blocks, with which of their sub-blocks are free.
+    metadata_blocks: std::collections::BTreeMap<u64, u64>,
 }
 
 impl SingleFileBlockManager {
@@ -257,6 +259,7 @@ impl SingleFileBlockManager {
                 header,
                 free_list: BTreeSet::new(),
                 multi_use_blocks: HashMap::new(),
+                metadata_blocks: std::collections::BTreeMap::new(),
             }),
         })
     }
@@ -337,6 +340,15 @@ impl SingleFileBlockManager {
         let mut state = self.state.lock();
         state.free_list = free_list;
         state.multi_use_blocks = multi_use_blocks;
+    }
+
+    /// The metadata blocks and the free sub-blocks of each, as a mask.
+    pub fn metadata_blocks(&self) -> std::collections::BTreeMap<u64, u64> {
+        self.state.lock().metadata_blocks.clone()
+    }
+
+    pub fn set_metadata_blocks(&self, blocks: std::collections::BTreeMap<u64, u64>) {
+        self.state.lock().metadata_blocks = blocks;
     }
 
     /// Large inserts write their blocks ahead of the commit, past the blocks that the last checkpoint
