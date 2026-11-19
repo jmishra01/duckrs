@@ -11,7 +11,7 @@
 use super::conjunction_of;
 use crate::execution::expression_executor::try_evaluate_scalar;
 use crate::function::date_part_call_of;
-use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator};
+use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, ColumnBinding};
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::{Value, ValueData};
@@ -118,7 +118,121 @@ fn apply_rules(expr: &mut BoundExpr, in_filter: bool) -> bool {
         || not_comparison_simplification(expr)
         || not_conjunction_simplification(expr)
         || join_dependent_filter(expr, in_filter)
+        || (in_filter && predicate_factoring(expr))
         || contains_to_in_clause(expr)
+}
+
+/// `GetSingleColumnBinding`: the one column a non-volatile expression reads.
+fn single_column_binding(expr: &BoundExpr) -> Option<ColumnBinding> {
+    if expr.is_volatile() {
+        return None;
+    }
+    let mut found: Option<ColumnBinding> = None;
+    let mut multiple = false;
+    expr.clone().walk_mut(&mut |e| {
+        if let BoundExprKind::ColumnRef { binding, .. } = &e.kind {
+            match found {
+                None => found = Some(*binding),
+                Some(b) if b != *binding => multiple = true,
+                _ => {}
+            }
+        }
+    });
+    found.filter(|_| !multiple)
+}
+
+fn extract_disjuncts<'a>(expr: &'a BoundExpr, out: &mut Vec<&'a BoundExpr>) {
+    match &expr.kind {
+        BoundExprKind::Conjunction { and: false, children } => {
+            for child in children {
+                extract_disjuncts(child, out);
+            }
+        }
+        _ => out.push(expr),
+    }
+}
+
+/// `ExtractDisjunctedPredicates` into a map: the conjuncts of `expr` that read one column, by it.
+fn extract_column_predicates<'a>(expr: &'a BoundExpr, map: &mut Vec<(ColumnBinding, Vec<&'a BoundExpr>)>) {
+    if let BoundExprKind::Conjunction { and: true, children } = &expr.kind {
+        for child in children {
+            extract_column_predicates(child, map);
+        }
+        return;
+    }
+    if let Some(binding) = single_column_binding(expr) {
+        match map.iter_mut().find(|(b, _)| *b == binding) {
+            Some((_, predicates)) => predicates.push(expr),
+            None => map.push((binding, vec![expr])),
+        }
+    }
+}
+
+/// `PredicateFactoringRule`: an OR at the root of a filter whose every alternative restricts a
+/// column gets, ANDed to it, the OR of those restrictions of each such column, which can go into
+/// a scan: `(a = 1 AND b = 2) OR (a = 3 AND b = 4)` also gives `(a = 1 OR a = 3) AND (b = 2 OR b = 4)`.
+fn predicate_factoring(expr: &mut BoundExpr) -> bool {
+    if !matches!(expr.kind, BoundExprKind::Conjunction { and: false, .. }) || single_column_binding(expr).is_some() {
+        return false;
+    }
+    let mut disjuncts = Vec::new();
+    extract_disjuncts(expr, &mut disjuncts);
+    let mut remaining = Vec::new();
+    extract_column_predicates(disjuncts[0], &mut remaining);
+    for child in &disjuncts[1..] {
+        let mut child_map = Vec::new();
+        extract_column_predicates(child, &mut child_map);
+        remaining.retain_mut(|(binding, predicates)| {
+            let Some((_, new)) = child_map.iter().find(|(b, _)| b == binding) else {
+                return false;
+            };
+            for predicate in new {
+                if !predicates.iter().any(|existing| expressions_equal(existing, predicate)) {
+                    predicates.push(predicate);
+                }
+            }
+            true
+        });
+    }
+    if remaining.is_empty() {
+        return false;
+    }
+    let mut derived: Option<BoundExpr> = None;
+    for (_, predicates) in remaining {
+        let mut column_filter: Option<BoundExpr> = None;
+        for predicate in predicates {
+            column_filter = Some(match column_filter {
+                None => predicate.clone(),
+                Some(filter) => BoundExpr::new(
+                    BoundExprKind::Conjunction {
+                        and: false,
+                        children: vec![filter, predicate.clone()],
+                    },
+                    LogicalType::BOOLEAN,
+                ),
+            });
+        }
+        let column_filter = column_filter.expect("a column has predicates");
+        derived = Some(match derived {
+            None => column_filter,
+            Some(derived) => BoundExpr::new(
+                BoundExprKind::Conjunction {
+                    and: true,
+                    children: vec![column_filter, derived],
+                },
+                LogicalType::BOOLEAN,
+            ),
+        });
+    }
+    let original = expr.clone();
+    *expr = BoundExpr::new(
+        BoundExprKind::Conjunction {
+            and: true,
+            children: vec![original, derived.expect("a column qualified")],
+        },
+        LogicalType::BOOLEAN,
+    );
+    true
 }
 
 /// `ContainsToInClauseRule`: `list_contains` of a constant list is an IN of its elements that are

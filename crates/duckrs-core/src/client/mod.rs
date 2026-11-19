@@ -1182,6 +1182,9 @@ impl ClientContext {
             options.approximate_join_order_threshold = threshold;
         }
         options.force_no_cross_product = self.setting_text("debug_force_no_cross_product") == "true";
+        if let Ok(threshold) = self.setting_text("scalar_aggregate_merge_threshold").parse() {
+            options.scalar_aggregate_merge_threshold = threshold;
+        }
         if let Ok(threshold) = self.setting_text("perfect_ht_threshold").parse() {
             options.perfect_ht_threshold = threshold;
         }

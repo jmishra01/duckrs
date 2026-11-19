@@ -364,6 +364,7 @@ impl Binder<'_> {
             read: None,
             hive_overrides,
             function_name: call.name.name.to_lowercase(),
+            arguments: format!("{:?}", call.args),
             filters: Vec::new(),
             projected: None,
             file_filters: String::new(),

@@ -2119,6 +2119,18 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         is_deprecated: true,
     },
     SettingDefinition {
+        name: "scalar_aggregate_merge_threshold",
+        aliases: &[],
+        input_type: "UBIGINT",
+        scope: SettingScope::LocalDefault,
+        default_value: Some("0"),
+        enum_name: None,
+        enum_values: &[],
+        description: "The number of rows a table needs for sibling scalar aggregates over it to be computed in one pass. 0 computes them in one pass only over table functions such as read_parquet.",
+        is_debug: false,
+        is_deprecated: false,
+    },
+    SettingDefinition {
         name: "scalar_subquery_error_on_multiple_rows",
         aliases: &[],
         input_type: "BOOLEAN",

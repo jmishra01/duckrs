@@ -13,7 +13,7 @@ pub fn remove(mut plan: LogicalOperator) -> LogicalOperator {
 }
 
 /// The aggregates C++ marks `AggregateOrderDependent::NOT_ORDER_DEPENDENT`.
-fn order_independent(name: &str, input: Option<LogicalTypeId>) -> bool {
+pub(super) fn order_independent(name: &str, input: Option<LogicalTypeId>) -> bool {
     match name {
         "count" | "count_star" | "min" | "max" | "bool_and" | "bool_or" | "histogram" | "mode" | "entropy" | "mad" => {
             true

@@ -44,6 +44,9 @@ pub mod type_pushdown;
 pub mod monotone_preimage;
 pub mod or_range_merge;
 pub mod reorder_filter;
+mod scalar_aggregate_merger;
+mod window_join_pushdown;
+mod window_self_join;
 pub mod unnest_rewriter;
 pub mod unused_columns;
 
@@ -85,6 +88,14 @@ pub struct OptimizerOptions {
     pub aggregate_reuse: bool,
     pub join_filter_pushdown: bool,
     pub cte_filter_pusher: bool,
+    /// `SCALAR_AGGREGATE_MERGE`
+    pub scalar_aggregate_merge: bool,
+    /// `WINDOW_SELF_JOIN`
+    pub window_self_join: bool,
+    /// `WINDOW_JOIN_PUSHDOWN`
+    pub window_join_pushdown: bool,
+    /// `scalar_aggregate_merge_threshold`
+    pub scalar_aggregate_merge_threshold: u64,
     /// `index_scan_percentage`
     pub index_scan_percentage: f64,
     /// `index_scan_max_count`
@@ -134,6 +145,10 @@ impl Default for OptimizerOptions {
             aggregate_reuse: true,
             join_filter_pushdown: true,
             cte_filter_pusher: true,
+            scalar_aggregate_merge: true,
+            window_self_join: true,
+            window_join_pushdown: true,
+            scalar_aggregate_merge_threshold: 0,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -179,6 +194,10 @@ impl OptimizerOptions {
             aggregate_reuse: false,
             join_filter_pushdown: false,
             cte_filter_pusher: false,
+            scalar_aggregate_merge: false,
+            window_self_join: false,
+            window_join_pushdown: false,
+            scalar_aggregate_merge_threshold: 0,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -223,6 +242,10 @@ impl OptimizerOptions {
             aggregate_reuse: !off("aggregate_reuse"),
             join_filter_pushdown: !off("join_filter_pushdown"),
             cte_filter_pusher: !off("cte_filter_pusher"),
+            scalar_aggregate_merge: !off("scalar_aggregate_merge"),
+            window_self_join: !off("window_self_join"),
+            window_join_pushdown: !off("window_join_pushdown"),
+            scalar_aggregate_merge_threshold: 0,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
             dynamic_or_filter_threshold: 50,
@@ -264,6 +287,10 @@ pub fn optimize_timed(
     // `CTE_INLINING` runs here too, so that what is inlined goes through the filter pushdown
     if options.cte_inlining {
         plan = run("cte_inlining", plan, &mut cte_inlining::inline);
+    }
+    if options.scalar_aggregate_merge {
+        let threshold = options.scalar_aggregate_merge_threshold;
+        plan = run("scalar_aggregate_merge", plan, &mut |plan| scalar_aggregate_merger::merge(plan, threshold));
     }
     if options.aggregate_function_rewriter {
         let (common, statistics) = (options.common_aggregate, options.statistics_propagation);
@@ -321,8 +348,17 @@ pub fn optimize_timed(
     if options.cte_inlining {
         plan = run("cte_inlining", plan, &mut cte_inlining::inline);
     }
+    if options.empty_result_pullup {
+        plan = run("empty_result_pullup", plan, &mut empty_result_pullup::pull_up);
+    }
+    if options.window_self_join {
+        plan = run("window_self_join", plan, &mut window_self_join::optimize);
+    }
     if options.projection_pullup {
         plan = run("projection_pullup", plan, &mut projection_pullup::pull_up);
+    }
+    if options.window_join_pushdown {
+        plan = run("window_join_pushdown", plan, &mut window_join_pushdown::optimize);
     }
     if options.outer_join_simplification {
         plan = run("outer_join_simplification", plan, &mut outer_join_simplification::simplify);
@@ -350,9 +386,6 @@ pub fn optimize_timed(
             statistics_map = statistics::propagate_statistics(&mut plan, options.perfect_ht_threshold);
             plan
         });
-    }
-    if options.empty_result_pullup {
-        plan = run("empty_result_pullup", plan, &mut empty_result_pullup::pull_up);
     }
     if options.sampling_pushdown {
         plan = run("sampling_pushdown", plan, &mut sampling_pushdown::push_down);

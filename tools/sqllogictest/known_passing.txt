@@ -492,6 +492,7 @@ test/optimizer/column_lifetime_analyzer/must_visit_operator_expressions_first.te
 test/optimizer/column_lifetime_analyzer/no_unnecessary_projections.test
 test/optimizer/column_lifetime_analyzer/summary_column_lifetime.test
 test/optimizer/common_subplan_nested_cte.test
+test/optimizer/common_subplan_projection_map.test
 test/optimizer/compare_blob.test
 test/optimizer/comparison_simplification.test
 test/optimizer/comparison_simplification_narrowing_casts.test
@@ -615,6 +616,7 @@ test/optimizer/pushdown/test_pushdown_cte_group_by_all.test
 test/optimizer/pushdown/timestamp_to_date_infinity_pushdown.test
 test/optimizer/pushdown/type_pushdown_projection_index.test
 test/optimizer/pushdown/type_pushdown_virtual_column.test
+test/optimizer/pushdown_semi_anti_join.test
 test/optimizer/pushdown_set_op.test
 test/optimizer/regex_optimizer.test
 test/optimizer/regex_optimizer_anchors.test
@@ -3109,7 +3111,10 @@ test/sql/optimizer/prefix_zonemap_pruning.test
 test/sql/optimizer/pushdown_extract_multiple_filters.test
 test/sql/optimizer/remove_unused_columns_nested_struct_cast.test
 test/sql/optimizer/rewrite_nan_null.test
+test/sql/optimizer/scalar_aggregate_merge.test
 test/sql/optimizer/scalar_aggregate_merge_files.test
+test/sql/optimizer/scalar_aggregate_merge_files_plan.test
+test/sql/optimizer/scalar_aggregate_merge_plan.test
 test/sql/optimizer/secure_view_fallible_functions.test
 test/sql/optimizer/secure_view_pushdown_compression.test
 test/sql/optimizer/sign_row_group_pruning.test
@@ -3139,6 +3144,8 @@ test/sql/optimizer/test_rollup_column_pruning.test
 test/sql/optimizer/test_rowid_pruning.test
 test/sql/optimizer/test_rowid_pushdown_deletes.test
 test/sql/optimizer/test_rowid_vector_pruning_results.test
+test/sql/optimizer/test_window_join_pushdown.test
+test/sql/optimizer/test_window_self_join.test
 test/sql/optimizer/tests_no_pushdown_under_samples.test
 test/sql/optimizer/topn_window_elimination_argument_order.test
 test/sql/optimizer/topn_window_elimination_computed_filter.test
@@ -4056,6 +4063,7 @@ test/sql/storage/wal/wal_view_storage_no_view_dependencies.test
 test/sql/storage_version/storage_hyperloglog.test
 test/sql/storage_version/storage_version_bump.test
 test/sql/subquery/any_all/issue_2999.test
+test/sql/subquery/any_all/subquery_in.test
 test/sql/subquery/any_all/test_any_all.test
 test/sql/subquery/any_all/test_any_left_join_in_on_clause.test
 test/sql/subquery/any_all/test_correlated_any_all.test
@@ -4130,6 +4138,7 @@ test/sql/subquery/scalar/test_issue_6184.test
 test/sql/subquery/scalar/test_issue_7079.test
 test/sql/subquery/scalar/test_join_in_subquery.test
 test/sql/subquery/scalar/test_many_correlated_columns.test
+test/sql/subquery/scalar/test_scalar_subquery.test
 test/sql/subquery/scalar/test_scalar_subquery_cte.test
 test/sql/subquery/scalar/test_subquery_any_join.test
 test/sql/subquery/scalar/test_tpcds_correlated_subquery.test

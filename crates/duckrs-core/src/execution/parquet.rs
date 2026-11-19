@@ -62,6 +62,8 @@ pub struct ParquetScanData {
     pub hive_overrides: Vec<(usize, String)>,
     /// the name the function was called by, which EXPLAIN shows (`read_parquet`, `parquet_scan`)
     pub function_name: String,
+    /// the arguments of the call, which tell two calls apart (`LogicalGet::parameters`)
+    pub arguments: String,
     /// `table_filters`: conditions on one column each, over the columns of [`Self::output_types`]
     pub filters: Vec<crate::planner::expression::BoundExpr>,
     /// by output column, those the operators above read (`projection_ids`), once unused columns are known

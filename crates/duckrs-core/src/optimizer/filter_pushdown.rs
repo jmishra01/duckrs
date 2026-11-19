@@ -13,7 +13,7 @@ use super::conjunction_of;
 use super::rewriter::{
     can_throw, contains_barrier, expressions_equal, fold_boolean, rewrite_expression, split_conjuncts,
 };
-use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, ColumnBinding};
+use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, ColumnBinding, WindowFunction};
 use crate::planner::logical::{JoinCondition, LogicalOperator, LogicalOperatorKind};
 use duckrs_common::value::Value;
 use duckrs_parser::ast::{ComparisonOp, JoinType};
@@ -287,6 +287,7 @@ impl FilterPushdown {
                 self.pushdown_set_operation(op)
             }
             LogicalOperatorKind::Distinct { .. } => self.pushdown_distinct(op),
+            LogicalOperatorKind::Window { .. } => self.pushdown_window(op),
             LogicalOperatorKind::Order { .. } => {
                 let child = op.children.remove(0);
                 op.children.push(self.rewrite(child));
@@ -348,6 +349,91 @@ impl FilterPushdown {
             );
             **right = push_down(plan);
         }
+        self.push_final_filters(op)
+    }
+
+    /// `FilterPushdown::PushdownWindow`: a filter on columns that partition every window holds
+    /// for all rows of a partition or none, and so does one that compares a partition of every
+    /// window with constants when the windows are rankings without arguments.
+    ///
+    /// Not ported: the auxiliary filters `e(b) op e(c)` that a filter `b op c` gives for an
+    /// order-preserving partition `e(b)`.
+    fn pushdown_window(mut self, mut op: LogicalOperator) -> LogicalOperator {
+        let LogicalOperatorKind::Window { windows, .. } = &op.kind else {
+            unreachable!()
+        };
+        let mut partition_bindings: Vec<BTreeSet<ColumnBinding>> = Vec::new();
+        for window in windows {
+            // all windows need partitions
+            if window.partitions.is_empty() {
+                return self.finish_pushdown(op);
+            }
+            partition_bindings.push(
+                window
+                    .partitions
+                    .iter()
+                    .filter_map(|p| match p.kind {
+                        BoundExprKind::ColumnRef { binding, depth: 0 } => Some(binding),
+                        _ => None,
+                    })
+                    .collect(),
+            );
+        }
+        if partition_bindings.is_empty() {
+            return self.finish_pushdown(op);
+        }
+        // `OnlyRanksWithoutArguments`
+        let only_ranks = windows.iter().all(|w| {
+            matches!(
+                w.function,
+                WindowFunction::RowNumber
+                    | WindowFunction::Rank
+                    | WindowFunction::DenseRank
+                    | WindowFunction::PercentRank
+                    | WindowFunction::CumeDist
+                    | WindowFunction::Ntile
+            ) && w.children.is_empty()
+                && w.filter.is_none()
+                && w.start_expr.is_none()
+                && w.end_expr.is_none()
+        });
+        // `ComparesWindowPartitions`
+        let compares_partitions = |filter: &BoundExpr| {
+            let Some(compared) = compared_expression(filter) else {
+                return false;
+            };
+            windows.iter().all(|w| {
+                w.partitions.iter().any(|p| match (&p.kind, &compared.kind) {
+                    (
+                        BoundExprKind::ColumnRef { binding: a, .. },
+                        BoundExprKind::ColumnRef { binding: b, .. },
+                    ) => a == b,
+                    _ => expressions_equal(p, compared),
+                })
+            })
+        };
+        let mut below = FilterPushdown::default();
+        let mut remaining = Vec::new();
+        for f in std::mem::take(&mut self.filters) {
+            let mut columns = Vec::new();
+            let mut probe = f.filter.clone();
+            visit_columns(&mut probe, &mut |e| {
+                if let BoundExprKind::ColumnRef { binding, .. } = e.kind {
+                    columns.push(binding);
+                }
+            });
+            let on_partitions = partition_bindings
+                .iter()
+                .all(|set| columns.iter().all(|b| set.contains(b)));
+            if (on_partitions || (only_ranks && compares_partitions(&f.filter))) && !f.filter.is_volatile() {
+                below.filters.push(f);
+            } else {
+                remaining.push(f);
+            }
+        }
+        let child = op.children.remove(0);
+        op.children.push(below.rewrite(child));
+        self.filters = remaining;
         self.push_final_filters(op)
     }
 
@@ -783,6 +869,45 @@ fn side_of_disjunction(expr: &BoundExpr, side: &BTreeSet<usize>) -> Option<Bound
         },
         duckrs_common::types::LogicalType::BOOLEAN,
     ))
+}
+
+/// `FilterCombiner::GetComparedExpression`: the one side that is not constant of a comparison,
+/// or the first child of BETWEEN and IN.
+fn compared_expression(filter: &BoundExpr) -> Option<&BoundExpr> {
+    if filter.is_volatile() {
+        return None;
+    }
+    let (children, first_only): (Vec<&BoundExpr>, bool) = match &filter.kind {
+        BoundExprKind::Comparison { op, left, right }
+            if matches!(
+                op,
+                ComparisonOp::Equal
+                    | ComparisonOp::NotEqual
+                    | ComparisonOp::LessThan
+                    | ComparisonOp::LessThanOrEqual
+                    | ComparisonOp::GreaterThan
+                    | ComparisonOp::GreaterThanOrEqual
+            ) =>
+        {
+            (vec![&**left, &**right], false)
+        }
+        BoundExprKind::Between { input, lower, upper } => (vec![&**input, &**lower, &**upper], true),
+        BoundExprKind::Operator {
+            op: BoundOperator::In,
+            children,
+        } => (children.iter().collect(), true),
+        _ => return None,
+    };
+    let mut compared = None;
+    for (i, child) in children.into_iter().enumerate() {
+        if !child.is_foldable() {
+            if compared.is_some() || (first_only && i != 0) {
+                return None;
+            }
+            compared = Some(child);
+        }
+    }
+    compared
 }
 
 fn contains_subquery(expr: &BoundExpr) -> bool {
