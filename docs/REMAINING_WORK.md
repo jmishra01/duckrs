@@ -204,8 +204,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] string comparisons that C++'s prefixes can't decide but exact bounds do (`a = b` prunes more here), an
     OR of columns proven false is an empty result here where C++ scans no row groups, INTERVAL and TIMESTAMPTZ_NS
     bounds, week, division by a column
-  - [ ] secure views (7 files), the scalar aggregate merger (`scalar_aggregate_merge_threshold`, 3),
-    `json_serialize_plan`, gamma's errors without IEEE
+  - [x] the scalar aggregate merger (`scalar_aggregate_merge_threshold`), over tables, `read_parquet`, `read_csv`
+    and `read_json`; predicate factoring of ORs in filters
+  - [ ] secure views (7 files), `json_serialize_plan`, gamma's errors without IEEE
   - [x] string statistics in `stats()`: bounds, unicode, lengths and totals of tables and constants; `approx_unique`
   - [ ] string statistics through functions (contains, suffix, upper/lower, length), struct/list/map extracts,
     EXPLAIN ANALYZE metrics of other operators (~190 EXPLAIN-shape files under `test/optimizer`, `sql/optimizer`)
@@ -214,9 +215,13 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] LEFT joins reordered inside the join graph (C++'s CD-C conflict detector, `left_join_cardinality_estimation`)
 - [ ] 17. Column lifetime, unused columns, TopN, expression rewriter (small dirs under `test/optimizer`)
 - [ ] 18. Optimizer-dependent SQL tests (`sql/optimizer`: 62 failing, 63.7% pass)
-  - [ ] passes not ported: TopN window elimination, window self-join, window join pushdown, self-join
-    aggregate, scalar aggregate merge, compressed materialization, late materialization, partitioned
-    execution, list comprehension rewrite, enum IN simplification (C++ keeps IN lists as IN)
+  - [x] uncorrelated scalar subqueries planned as cross products (`PlanUncorrelatedSubquery`), with first() and
+    the multiple-rows check where they may not return one row
+  - [x] window self-join, window join pushdown (with `GetUniqueColumnCombinations`), filter pushdown through
+    windows on their partitions; `EMPTY_RESULT_PULLUP` runs where C++ runs it
+  - [ ] passes not ported: TopN window elimination, self-join aggregate, compressed materialization, late
+    materialization, partitioned execution, list comprehension rewrite, enum IN simplification (C++ keeps IN
+    lists as IN), the auxiliary `e(b) op e(c)` filters of window pushdown, uncorrelated EXISTS as a cross product
 - [ ] 19. TPC-H 22/22 and TPC-DS 99/99 correct
   - [x] with `tools/tpch` and `tools/tpcds` building dbgen and dsdgen from the C++ checkout, the examples get
     TPC-H 22/22 at SF 0.01 and 0.1, TPC-DS 99/99 at SF 0.01
