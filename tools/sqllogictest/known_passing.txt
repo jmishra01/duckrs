@@ -3150,6 +3150,7 @@ test/sql/optimizer/test_window_self_join.test
 test/sql/optimizer/tests_no_pushdown_under_samples.test
 test/sql/optimizer/topn_window_elimination_argument_order.test
 test/sql/optimizer/topn_window_elimination_computed_filter.test
+test/sql/optimizer/topn_window_elimination_max_n.test
 test/sql/optimizer/topn_window_elimination_nullable_order.test
 test/sql/optimizer/topn_window_set_elimination.test
 test/sql/optimizer/try_struct_extract_cast.test

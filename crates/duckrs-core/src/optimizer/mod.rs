@@ -46,6 +46,7 @@ pub mod or_range_merge;
 pub mod reorder_filter;
 mod late_materialization;
 mod scalar_aggregate_merger;
+mod topn_window_elimination;
 mod window_join_pushdown;
 mod window_self_join;
 pub mod unnest_rewriter;
@@ -97,6 +98,8 @@ pub struct OptimizerOptions {
     pub window_join_pushdown: bool,
     /// `LATE_MATERIALIZATION`
     pub late_materialization: bool,
+    /// `TOP_N_WINDOW_ELIMINATION`
+    pub topn_window_elimination: bool,
     /// `late_materialization_max_rows` and `preserve_insertion_order`
     pub late_materialization_options: late_materialization::LateMaterializationOptions,
     /// `scalar_aggregate_merge_threshold`
@@ -154,6 +157,7 @@ impl Default for OptimizerOptions {
             window_self_join: true,
             window_join_pushdown: true,
             late_materialization: true,
+            topn_window_elimination: true,
             late_materialization_options: late_materialization::LateMaterializationOptions {
                 max_rows: 50,
                 preserve_insertion_order: true,
@@ -208,6 +212,7 @@ impl OptimizerOptions {
             window_self_join: false,
             window_join_pushdown: false,
             late_materialization: false,
+            topn_window_elimination: false,
             late_materialization_options: late_materialization::LateMaterializationOptions {
                 max_rows: 50,
                 preserve_insertion_order: true,
@@ -261,6 +266,7 @@ impl OptimizerOptions {
             window_self_join: !off("window_self_join"),
             window_join_pushdown: !off("window_join_pushdown"),
             late_materialization: !off("late_materialization"),
+            topn_window_elimination: !off("top_n_window_elimination"),
             late_materialization_options: late_materialization::LateMaterializationOptions {
                 max_rows: 50,
                 preserve_insertion_order: true,
@@ -441,6 +447,16 @@ pub fn optimize_timed(
     {
         plan = run("projection_placement", plan, &mut |mut plan| {
             projection_placement::place(&mut plan, statistics_map);
+            plan
+        });
+    }
+    // `TOP_N_WINDOW_ELIMINATION`, and the unused columns removed again after it
+    if options.topn_window_elimination {
+        let unused = options.unused_columns;
+        plan = run("topn_window_elimination", plan, &mut |mut plan| {
+            if topn_window_elimination::optimize(&mut plan) && unused {
+                unused_columns::remove_unused_columns(&mut plan);
+            }
             plan
         });
     }

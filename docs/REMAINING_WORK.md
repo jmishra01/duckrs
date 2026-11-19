@@ -222,8 +222,11 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] late materialization of Top-N, LIMIT and SAMPLE over tables (a SEMI join on the rowid; the second
     scan's filters are `optional:`)
   - [ ] late materialization over `read_parquet` (its file row number)
-  - [ ] passes not ported: TopN window elimination, self-join aggregate, compressed materialization,
-    partitioned execution, list comprehension rewrite, enum IN simplification (C++ keeps IN
+  - [x] TopN window elimination: `row_number() <= k` per partition as a grouped `arg_min`/`arg_max` of `k`,
+    unnested back into rows
+  - [ ] its late-materialization variant (a payload of several columns fetched by rowid), and projections
+    between the filter and the window that compute something
+  - [ ] passes not ported: self-join aggregate, compressed materialization, partitioned execution, list comprehension rewrite, enum IN simplification (C++ keeps IN
     lists as IN), the auxiliary `e(b) op e(c)` filters of window pushdown, uncorrelated EXISTS as a cross product
 - [ ] 19. TPC-H 22/22 and TPC-DS 99/99 correct
   - [x] with `tools/tpch` and `tools/tpcds` building dbgen and dsdgen from the C++ checkout, the examples get
