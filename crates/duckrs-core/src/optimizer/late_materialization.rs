@@ -112,7 +112,7 @@ fn scan_outputs(get: &LogicalOperator) -> Vec<(ColumnBinding, LogicalType)> {
 }
 
 /// `GetOrInsertRowIds`: the position of the `rowid` among the columns of `get`, which outputs it.
-fn get_or_insert_row_id(get: &mut LogicalOperator) -> usize {
+pub(super) fn get_or_insert_row_id(get: &mut LogicalOperator) -> usize {
     let K::Get {
         column_ids, projection, ..
     } = &mut get.kind
