@@ -1263,7 +1263,12 @@ impl JoinOrderOptimizer {
                         Some(count) => DistinctCount::new(count as f64, CountSource::Hll),
                         None => DistinctCount::cardinality(base),
                     };
-                    stats.columns.insert(ColumnBinding::new(*table_index, at), ColumnStats::new(total));
+                    let mut column_stats = ColumnStats::new(total);
+                    // no two rows share a row id, which a SEMI join on them (late materialization) counts on
+                    if column == COLUMN_IDENTIFIER_ROW_ID {
+                        column_stats.evidence.mark_unique();
+                    }
+                    stats.columns.insert(ColumnBinding::new(*table_index, at), column_stats);
                 }
                 let filters: Vec<BoundExpr> = filters
                     .iter()

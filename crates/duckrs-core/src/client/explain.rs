@@ -411,33 +411,45 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             table_index,
             column_ids,
             filters,
+            optional_filters,
             projection,
             sample,
             ..
         } => {
             // `PhysicalTableScan::GetFilterInfo`: a filter of a column by the column's name
-            let renamed: Vec<BoundExpr> = filters
-                .iter()
-                .map(|filter| {
-                    let mut filter = filter.clone();
-                    filter.walk_mut(&mut |e| {
-                        if let crate::planner::expression::BoundExprKind::ColumnRef { binding, depth: 0 } = &e.kind
-                            && binding.table_index == *table_index
-                            && let Some(column) = column_ids.get(binding.column_index)
-                            && let Some(definition) = table.columns.get(*column)
-                        {
-                            e.alias = definition.name.clone();
-                        }
-                    });
-                    filter
-                })
-                .collect();
+            let rename = |filter: &BoundExpr| {
+                let mut filter = filter.clone();
+                filter.walk_mut(&mut |e| {
+                    if let crate::planner::expression::BoundExprKind::ColumnRef { binding, depth: 0 } = &e.kind
+                        && binding.table_index == *table_index
+                        && let Some(column) = column_ids.get(binding.column_index)
+                        && let Some(definition) = table.columns.get(*column)
+                    {
+                        e.alias = definition.name.clone();
+                    }
+                });
+                filter
+            };
+            let renamed: Vec<BoundExpr> = filters.iter().map(rename).collect();
             let filters = &renamed;
+            // `FormatOptionalFilterString`
+            let filter_text = {
+                let mut text: Vec<String> = Vec::new();
+                if !filters.is_empty() {
+                    text.push(scan_filter_lines(filters));
+                }
+                text.extend(
+                    optional_filters
+                        .iter()
+                        .map(|f| format!("optional: {}", scan_filter_lines(&[rename(f)]))),
+                );
+                lines(text)
+            };
             // `LogicalGet::ParamsToString` has the filters, then what `TableScanToString` adds
             if !physical {
                 let mut info = Vec::new();
-                if !filters.is_empty() {
-                    info.extend(entry("Filters", scan_filter_lines(filters)));
+                if !filter_text.is_empty() {
+                    info.extend(entry("Filters", filter_text));
                 }
                 info.extend(entry("Table", table.qualified_name()));
                 info.extend(entry("Type", "Sequential Scan".to_string()));
@@ -457,8 +469,8 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
                 None => column_ids.iter().map(name).collect(),
             };
             info.extend(entry("Projections", lines(projected)));
-            if !filters.is_empty() {
-                info.extend(entry("Filters", scan_filter_lines(filters)));
+            if !filter_text.is_empty() {
+                info.extend(entry("Filters", filter_text));
             }
             // `PhysicalTableScan::ParamsToString`
             if let Some(sample) = sample {

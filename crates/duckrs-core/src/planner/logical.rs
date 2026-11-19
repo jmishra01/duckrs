@@ -35,6 +35,9 @@ pub enum LogicalOperatorKind {
         /// `multi_column_filters`: conditions on several of `column_ids`, copies of filters that stay above the
         /// scan, which only tell it which row groups it need not read
         zone_filters: Vec<BoundExpr>,
+        /// `OptionalFilter`s: conditions on one column each that, like `zone_filters`, only skip row
+        /// groups, as the rows are filtered elsewhere (the scan late materialization adds)
+        optional_filters: Vec<BoundExpr>,
         /// `projection_ids`: the positions in `column_ids` that it outputs, without one all of them.
         /// A column keeps its binding either way.
         projection: Option<Vec<usize>>,

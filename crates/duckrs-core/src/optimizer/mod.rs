@@ -44,6 +44,7 @@ pub mod type_pushdown;
 pub mod monotone_preimage;
 pub mod or_range_merge;
 pub mod reorder_filter;
+mod late_materialization;
 mod scalar_aggregate_merger;
 mod window_join_pushdown;
 mod window_self_join;
@@ -94,6 +95,10 @@ pub struct OptimizerOptions {
     pub window_self_join: bool,
     /// `WINDOW_JOIN_PUSHDOWN`
     pub window_join_pushdown: bool,
+    /// `LATE_MATERIALIZATION`
+    pub late_materialization: bool,
+    /// `late_materialization_max_rows` and `preserve_insertion_order`
+    pub late_materialization_options: late_materialization::LateMaterializationOptions,
     /// `scalar_aggregate_merge_threshold`
     pub scalar_aggregate_merge_threshold: u64,
     /// `index_scan_percentage`
@@ -148,6 +153,11 @@ impl Default for OptimizerOptions {
             scalar_aggregate_merge: true,
             window_self_join: true,
             window_join_pushdown: true,
+            late_materialization: true,
+            late_materialization_options: late_materialization::LateMaterializationOptions {
+                max_rows: 50,
+                preserve_insertion_order: true,
+            },
             scalar_aggregate_merge_threshold: 0,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
@@ -197,6 +207,11 @@ impl OptimizerOptions {
             scalar_aggregate_merge: false,
             window_self_join: false,
             window_join_pushdown: false,
+            late_materialization: false,
+            late_materialization_options: late_materialization::LateMaterializationOptions {
+                max_rows: 50,
+                preserve_insertion_order: true,
+            },
             scalar_aggregate_merge_threshold: 0,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
@@ -245,6 +260,11 @@ impl OptimizerOptions {
             scalar_aggregate_merge: !off("scalar_aggregate_merge"),
             window_self_join: !off("window_self_join"),
             window_join_pushdown: !off("window_join_pushdown"),
+            late_materialization: !off("late_materialization"),
+            late_materialization_options: late_materialization::LateMaterializationOptions {
+                max_rows: 50,
+                preserve_insertion_order: true,
+            },
             scalar_aggregate_merge_threshold: 0,
             index_scan_percentage: 0.001,
             index_scan_max_count: 2048,
@@ -404,6 +424,16 @@ pub fn optimize_timed(
             unused_columns::remove_unused_columns(&mut plan);
             plan
         });
+        // C++ runs it after `TOP_N`, with the unused columns gone, and removes those again after
+        if options.late_materialization {
+            let late = options.late_materialization_options;
+            plan = run("late_materialization", plan, &mut |mut plan| {
+                if late_materialization::optimize(&mut plan, late) {
+                    unused_columns::remove_unused_columns(&mut plan);
+                }
+                plan
+            });
+        }
     }
     // `PROJECTION_PLACEMENT` runs where the statistics have been propagated, once the unused columns are gone
     if options.projection_placement

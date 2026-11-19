@@ -3085,6 +3085,7 @@ test/sql/optimizer/in_list_row_group_pruning.test
 test/sql/optimizer/instr_zonemap_pruning.test
 test/sql/optimizer/joins/join_order_deep_setop_chain.test
 test/sql/optimizer/late_materialization_pushdown_extract.test
+test/sql/optimizer/late_materialization_table_filters.test
 test/sql/optimizer/left_zonemap_pruning.test
 test/sql/optimizer/list_contains_row_group_pruning.test
 test/sql/optimizer/list_transform_row_group_pruning.test
@@ -4201,6 +4202,7 @@ test/sql/topn/test_top_n_nulls_small.test
 test/sql/topn/test_top_n_offset_no_limit_pruner.test
 test/sql/topn/test_top_n_structs.test
 test/sql/topn/test_top_n_window_row_group_pruner.test
+test/sql/topn/top_n_materialization.test
 test/sql/topn/tpcds_q14_topn.test
 test/sql/topn/tpcds_q59_topn.test
 test/sql/transactions/aborted_transaction_commit.test

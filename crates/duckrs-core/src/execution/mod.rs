@@ -248,12 +248,18 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             column_ids,
             filters,
             zone_filters,
+            optional_filters,
             projection,
             index_rows,
             sample,
             ..
         } => {
-            let all: Vec<_> = filters.iter().chain(&zone_filters).cloned().collect();
+            let all: Vec<_> = filters
+                .iter()
+                .chain(&zone_filters)
+                .chain(&optional_filters)
+                .cloned()
+                .collect();
             Box::new(PhysicalTableScan {
                 table,
                 column_ids,

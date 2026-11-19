@@ -2598,6 +2598,7 @@ impl Binder<'_> {
                         filters: Vec::new(),
                         projection: None,
                         zone_filters: Vec::new(),
+                        optional_filters: Vec::new(),
                         index_rows: None,
                         sample: None,
                     },

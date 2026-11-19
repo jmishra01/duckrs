@@ -218,6 +218,7 @@ fn plain_scan(op: &LogicalOperator) -> Option<Scan> {
         column_ids,
         filters,
         zone_filters,
+        optional_filters,
         projection,
         index_rows,
         sample,
@@ -228,6 +229,7 @@ fn plain_scan(op: &LogicalOperator) -> Option<Scan> {
     if !op.children.is_empty()
         || !filters.is_empty()
         || !zone_filters.is_empty()
+        || !optional_filters.is_empty()
         || projection.is_some()
         || index_rows.is_some()
         || sample.is_some()

@@ -1182,6 +1182,11 @@ impl ClientContext {
             options.approximate_join_order_threshold = threshold;
         }
         options.force_no_cross_product = self.setting_text("debug_force_no_cross_product") == "true";
+        if let Ok(rows) = self.setting_text("late_materialization_max_rows").parse() {
+            options.late_materialization_options.max_rows = rows;
+        }
+        options.late_materialization_options.preserve_insertion_order =
+            self.setting_text("preserve_insertion_order") != "false";
         if let Ok(threshold) = self.setting_text("scalar_aggregate_merge_threshold").parse() {
             options.scalar_aggregate_merge_threshold = threshold;
         }
