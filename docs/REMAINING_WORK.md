@@ -149,11 +149,18 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] compression chosen as `DetectBestCompressionMethod` does, by the `final_analyze` score of each method in
     C++'s order (UNCOMPRESSED, RLE, BITPACKING, ROARING for validity and booleans), logged as C++ logs it;
     bitpacking with all of C++'s modes (CONSTANT_DELTA, DELTA_FOR) and types (BOOL, HUGEINT, UHUGEINT)
-  - [x] strings from v1.3.0 on: UNCOMPRESSED, ZSTD and DICT_FSST by their scores (a port of DictFSSTAnalyzeState,
-    with the FSST of `fsst.rs`), and EMPTY validity where DICT_FSST covers the NULLs
-  - [ ] before v1.3.0, DICTIONARY and FSST by score (their analyze samples at random; the smaller encoding is
-    taken), the analyze of ALP and ALPRD (scored by their encoded size), DICT_FSST and FSST segment layouts
-    as C++ writes them (`dict_fsst_count_bound`, `dict_fsst_boolean_selection`, `string/blob`)
+  - [x] strings from v1.3.0 on: UNCOMPRESSED, ZSTD and DICT_FSST by their scores (a port of DictFSSTAnalyzeState),
+    and EMPTY validity where DICT_FSST covers the NULLs
+  - [x] DICT_FSST segments as C++ fills them (`DictFSSTCompressionState`: a plain dictionary until the block is
+    full, then FSST encoded if that saves enough, without indices where all strings are unique), with libfsst
+    ported exactly (the sample, `buildSymbolTable` with its counters, `finalize`, `compressBulk`): segments are
+    those of C++ byte for byte, but for a padding byte C++ leaves as it was
+  - [ ] before v1.3.0, DICTIONARY and FSST by score (their analyze samples at random, so C++ itself differs from
+    run to run; the smaller encoding is taken), the analyze of ALP and ALPRD (scored by their encoded size)
+  - [ ] metadata blocks as `MetadataManager` hands them out: C++ fills the free sub-blocks of the file's metadata
+    blocks first (`AllocateHandle`, `MarkBlocksAsModified`); duckrs takes new blocks for what a checkpoint writes
+    and room for the free list, so a checkpoint that changes anything has a few more blocks than C++ and the data
+    after them other block ids
   - [x] the ART layouts of files before v2.0.0, in checkpoints and the WAL: from v1.2.0 the current nodes with
     the 264-byte `Node256Leaf` (`GetNode256LeafSegmentSize`), before it `ART::TransformToDeprecated` (chains of
     `Leaf` of 4 row ids, 15-byte prefixes, 6 allocators); the `storage_version` option is the file's

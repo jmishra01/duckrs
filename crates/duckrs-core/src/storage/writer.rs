@@ -18,8 +18,8 @@ use super::compression::{
     COMPRESSION_UNCOMPRESSED, COMPRESSION_ZSTD,
 };
 use super::encode::{
-    Encoded, encode_alp, encode_alprd, encode_dictionary, encode_old_dictionary, encode_old_fsst, encode_rle,
-    encode_roaring, fill_nulls, is_signed, supports_bitpacking, supports_rle,
+    Encoded, encode_alp, encode_alprd, encode_old_dictionary, encode_old_fsst, encode_rle, encode_roaring, fill_nulls,
+    is_signed, supports_bitpacking, supports_rle,
 };
 use super::fsst::SymbolTable;
 use super::index_data::TableIndex;
@@ -2238,16 +2238,17 @@ impl<'a> Writer<'a> {
         method
     }
 
-    /// DICT_FSST segments, the dictionaries FSST encoded where that is smaller; `None` where the strings
-    /// don't fit its segments.
+    /// DICT_FSST segments, as `DictFSSTCompressionState` fills them; `None` where a string is too long for them.
     fn write_dict_fsst(&mut self, strings: &[&[u8]], valid: &[bool], limit: usize) -> Result<Option<Vec<SegmentOut>>> {
-        let total = |segments: &Vec<Encoded>| segments.iter().map(|(bytes, _)| bytes.len()).sum::<usize>();
-        let plain = encode_dictionary(strings, valid, self.block_size, limit, None);
-        let table = valid.iter().any(|v| *v).then(|| SymbolTable::train(strings)).flatten();
-        let compressed = table.and_then(|t| encode_dictionary(strings, valid, self.block_size, limit, Some(&t)));
-        let Some(encoded) = [plain, compressed].into_iter().flatten().min_by_key(total) else {
+        if strings
+            .iter()
+            .zip(valid)
+            .any(|(string, valid)| *valid && string.len() >= limit)
+        {
             return Ok(None);
-        };
+        }
+        let fsst_limit = super::dict_fsst_analyze::fsst_string_limit(self.block_size);
+        let encoded = super::dict_fsst_compress::compress(strings, valid, self.block_size, fsst_limit);
         let mut segments = Vec::with_capacity(encoded.len());
         let mut row = 0;
         for (bytes, rows) in encoded {

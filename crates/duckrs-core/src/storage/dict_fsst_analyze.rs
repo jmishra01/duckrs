@@ -409,6 +409,11 @@ impl State {
     }
 }
 
+/// The length from which a string leaves FSST out of the column's DICT_FSST (`disable_fsst`).
+pub fn fsst_string_limit(block_size: usize) -> usize {
+    string_size_limit(block_size, true)
+}
+
 /// `DictFSSTCompressionStorage::StringFinalAnalyze` of the strings of a column (`strings[i]` is empty
 /// where `valid[i]` is not set); `None` where DICT_FSST can't store them. `block_size` is what a block
 /// holds.

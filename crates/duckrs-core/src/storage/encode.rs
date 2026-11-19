@@ -75,7 +75,7 @@ pub fn encode_rle(data: &[u8], width: usize, block_size: usize) -> Vec<Encoded> 
     segments
 }
 
-fn pack(values: &[u128], bits: usize) -> Vec<u8> {
+pub(super) fn pack(values: &[u128], bits: usize) -> Vec<u8> {
     let rows = values.len().next_multiple_of(PACKING_ROWS);
     let mut packed = vec![0u8; (rows * bits).div_ceil(8)];
     for (row, value) in values.iter().enumerate() {
@@ -162,108 +162,6 @@ pub fn encode_roaring(bits: &[bool], block_size: usize) -> Vec<Encoded> {
 
 fn bit_width(value: u64) -> usize {
     (64 - value.leading_zeros()) as usize
-}
-
-/// DICT_FSST: the distinct strings, how long each is, and per row which one it is, where 0 is NULL.
-/// With a table the strings go through FSST, and a segment where no string repeats and nothing is
-/// NULL needs no indices, which is `FSST_ONLY`.
-/// `None` for strings that are too long, which go to overflow blocks instead.
-pub fn encode_dictionary(
-    strings: &[&[u8]],
-    valid: &[bool],
-    block_size: usize,
-    limit: usize,
-    table: Option<&SymbolTable>,
-) -> Option<Vec<Encoded>> {
-    const HEADER: usize = 16;
-    const DICTIONARY: u8 = 0;
-    const DICT_FSST: u8 = 1;
-    const FSST_ONLY: u8 = 2;
-    let symbols = table.map_or_else(Vec::new, SymbolTable::export);
-    // C++ only takes `FSST_ONLY` for a row group without NULLs
-    let may_be_unique = table.is_some() && valid.iter().all(|valid| *valid);
-    let packed = |rows: usize, bits: usize| (rows.next_multiple_of(PACKING_ROWS) * bits).div_ceil(8);
-    let size = |dictionary: usize, count: usize, longest: usize, rows: usize| {
-        (HEADER + dictionary).next_multiple_of(8)
-            + symbols.len().next_multiple_of(8)
-            + packed(count, bit_width(longest as u64)).next_multiple_of(8)
-            + packed(rows, bit_width(count as u64 - 1))
-    };
-    let mut segments = Vec::new();
-    let mut start = 0;
-    let mut entry = Vec::new();
-    while start < strings.len() {
-        let mut positions: HashMap<&[u8], u32> = HashMap::new();
-        let mut lengths: Vec<u128> = vec![0];
-        let mut dictionary: Vec<u8> = Vec::new();
-        let mut indices: Vec<u128> = Vec::new();
-        let mut longest = 0;
-        let mut row = start;
-        while row < strings.len() {
-            let string = strings[row];
-            if string.len() >= limit {
-                return None;
-            }
-            let known = !valid[row] || positions.contains_key(string);
-            if !known {
-                match table {
-                    Some(table) => table.compress(string, &mut entry),
-                    None => {
-                        entry.clear();
-                        entry.extend_from_slice(string);
-                    }
-                }
-            }
-            let new_size = dictionary.len() + if known { 0 } else { entry.len() };
-            let new_count = lengths.len() + usize::from(!known);
-            let new_longest = if known { longest } else { longest.max(entry.len()) };
-            if row > start && size(new_size, new_count, new_longest, row + 1 - start) + 8 > block_size {
-                break;
-            }
-            let index = if !valid[row] {
-                0
-            } else if let Some(&index) = positions.get(string) {
-                index
-            } else {
-                let index = lengths.len() as u32;
-                positions.insert(string, index);
-                lengths.push(entry.len() as u128);
-                dictionary.extend_from_slice(&entry);
-                longest = new_longest;
-                index
-            };
-            indices.push(u128::from(index));
-            row += 1;
-        }
-        let lengths_width = bit_width(longest as u64);
-        // only plain strings can do without lengths, and only one of them
-        if lengths_width == 0 && (table.is_some() || lengths.len() > 2) {
-            return None;
-        }
-        let unique = may_be_unique && lengths.len() == row - start + 1;
-        let (mode, indices_width) = match (table, unique) {
-            (None, _) => (DICTIONARY, bit_width(lengths.len() as u64 - 1)),
-            (Some(_), false) => (DICT_FSST, bit_width(lengths.len() as u64 - 1)),
-            (Some(_), true) => (FSST_ONLY, 0),
-        };
-        let mut segment = Vec::new();
-        segment.extend_from_slice(&(dictionary.len() as u32).to_le_bytes());
-        segment.extend_from_slice(&(lengths.len() as u32).to_le_bytes());
-        segment.extend_from_slice(&[mode, lengths_width as u8, indices_width as u8, 0]);
-        segment.extend_from_slice(&(symbols.len() as u32).to_le_bytes());
-        segment.extend_from_slice(&dictionary);
-        segment.resize(segment.len().next_multiple_of(8), 0);
-        segment.extend_from_slice(&symbols);
-        segment.resize(segment.len().next_multiple_of(8), 0);
-        segment.extend_from_slice(&pack(&lengths, lengths_width));
-        if indices_width > 0 {
-            segment.resize(segment.len().next_multiple_of(8), 0);
-            segment.extend_from_slice(&pack(&indices, indices_width));
-        }
-        segments.push((segment, row - start));
-        start = row;
-    }
-    Some(segments)
 }
 
 /// `GetCompactionFlushLimit`: a segment that fills less of a block than this is moved to its start.

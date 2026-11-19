@@ -3794,6 +3794,7 @@ test/sql/storage/compression/compression_selection_dict_fsst.test
 test/sql/storage/compression/constant/constant_negative_zero.test
 test/sql/storage/compression/constant/constant_numeric_types.test
 test/sql/storage/compression/default_storage_dict_fsst.test
+test/sql/storage/compression/dict_fsst/dict_fsst_boolean_selection.test
 test/sql/storage/compression/dict_fsst/dict_fsst_column_data_collection.test
 test/sql/storage/compression/dict_fsst/dict_fsst_corrupt_dict_count.test
 test/sql/storage/compression/dict_fsst/dict_fsst_corrupt_dict_count_boundary.test
@@ -3804,6 +3805,7 @@ test/sql/storage/compression/dict_fsst/dict_fsst_corrupt_fsst_only_dict_count.te
 test/sql/storage/compression/dict_fsst/dict_fsst_corrupt_indices_width.test
 test/sql/storage/compression/dict_fsst/dict_fsst_corrupt_mode.test
 test/sql/storage/compression/dict_fsst/dict_fsst_corrupt_string_length.test
+test/sql/storage/compression/dict_fsst/dict_fsst_count_bound.test
 test/sql/storage/compression/dict_fsst/dict_fsst_test.test
 test/sql/storage/compression/dict_fsst/dictionary_covers_validity.test
 test/sql/storage/compression/dict_fsst/dictionary_storage_info.test
