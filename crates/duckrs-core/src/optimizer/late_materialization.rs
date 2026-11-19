@@ -9,6 +9,9 @@
 //! C++ runs this before the unused columns are removed and removes them again after. Here the
 //! unused columns are gone already, so a scan's columns are the ones it outputs, and the removal
 //! runs again once the plan changed.
+//!
+//! A `read_parquet` scan has two row id columns, the file and the row in it (`file_index`,
+//! `file_row_number`), on which the SEMI join is.
 
 use super::common_subplan::{max_table_index, visit_bindings};
 use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
@@ -83,6 +86,7 @@ fn optimize_large_limit(op: &LogicalOperator, limit: u64, has_offset: bool, opti
     loop {
         match &current.kind {
             K::Get { filters, .. } => return filters.is_empty(),
+            K::ParquetScan { scan, .. } => return scan.filters.is_empty(),
             K::Projection { .. } => current = &current.children[0],
             _ => return false,
         }
@@ -199,7 +203,7 @@ fn try_late_materialization(op: &mut LogicalOperator, next: &mut usize, root: bo
                 }
                 current = &current.children[0];
             }
-            K::Get { .. } => break,
+            K::Get { .. } | K::ParquetScan { .. } => break,
             _ => return false,
         }
     }
@@ -208,26 +212,35 @@ fn try_late_materialization(op: &mut LogicalOperator, next: &mut usize, root: bo
         return false;
     }
     let get = current;
-    let K::Get {
-        table_index: get_index,
-        filters,
-        index_rows,
-        sample,
-        ..
-    } = &get.kind
-    else {
-        unreachable!("the loop ends at a scan")
+    let (get_index, filters, read_count, cheap) = match &get.kind {
+        K::Get {
+            table_index,
+            filters,
+            index_rows,
+            sample,
+            ..
+        } => (
+            *table_index,
+            filters.clone(),
+            scan_outputs(get).len(),
+            // index scans and row samples are as cheap already
+            index_rows.is_some() || sample.as_ref().is_some_and(|s| !s.options.is_percentage),
+        ),
+        K::ParquetScan { table_index, scan } => {
+            let outputs = scan.output_types().len();
+            let read = scan.projected.as_ref().map_or(outputs, |p| p.iter().filter(|&&b| b).count());
+            // `ParquetGetRowIdColumns`: the file and the row in it
+            (*table_index, scan.filters.clone(), read, parquet_row_ids(scan).is_none())
+        }
+        _ => unreachable!("the loop ends at a scan"),
     };
-    let get_index = *get_index;
     // the scan's filters read columns too
-    for filter in filters {
+    for filter in &filters {
         collect_columns(filter, &mut referenced);
     }
     let required = referenced.iter().filter(|b| b.table_index == get_index).count();
-    let outputs = scan_outputs(get);
-    // a scan that has to read every column it outputs gains nothing; index scans and row samples are
-    // as cheap already
-    if required >= outputs.len() || index_rows.is_some() || sample.as_ref().is_some_and(|s| !s.options.is_percentage) {
+    // a scan that has to read every column it outputs gains nothing
+    if required >= read_count || cheap {
         return false;
     }
     let is_top_n = matches!(op.kind, K::TopN { .. });
@@ -235,30 +248,43 @@ fn try_late_materialization(op: &mut LogicalOperator, next: &mut usize, root: bo
     // the LHS: a copy of the scan whose filters only skip row groups, as the RHS applies them
     let lhs_index = take(next);
     let mut lhs = get.clone();
-    if let K::Get {
-        table_index,
-        filters,
-        optional_filters,
-        projection,
-        ..
-    } = &mut lhs.kind
-    {
-        *table_index = lhs_index;
-        optional_filters.extend(std::mem::take(filters));
-        // all its columns, of which the removal of unused columns keeps what is read
-        *projection = None;
+    match &mut lhs.kind {
+        K::Get {
+            table_index,
+            filters,
+            optional_filters,
+            projection,
+            ..
+        } => {
+            *table_index = lhs_index;
+            optional_filters.extend(std::mem::take(filters));
+            // all its columns, of which the removal of unused columns keeps what is read
+            *projection = None;
+        }
+        // its filters stay: the scan has no filters that only skip row groups
+        K::ParquetScan { table_index, scan } => {
+            *table_index = lhs_index;
+            let scan = std::sync::Arc::make_mut(scan);
+            scan.projected = None;
+            scan.read = None;
+        }
+        _ => unreachable!(),
     }
     rename_table(&mut lhs.kind, get_index, lhs_index);
-    let lhs_row_id = get_or_insert_row_id(&mut lhs);
-    let lhs_row_id_binding = ColumnBinding::new(lhs_index, lhs_row_id);
+    let original_columns = match &get.kind {
+        K::Get { column_ids, .. } => column_ids.len(),
+        K::ParquetScan { scan, .. } => scan.output_types().len(),
+        _ => unreachable!(),
+    };
+    let lhs_row_ids: Vec<(BoundExpr, usize)> = scan_row_ids(&mut lhs)
+        .into_iter()
+        .map(|(at, ty, name)| (BoundExpr::column_ref(ColumnBinding::new(lhs_index, at), ty, name), at))
+        .collect();
     let lhs_types = lhs.types();
 
     // the final columns: the root projection with the chain inlined into it, or the scan's columns
     let final_columns: Vec<BoundExpr> = if projections.is_empty() {
-        let K::Get { column_ids, .. } = &get.kind else {
-            unreachable!()
-        };
-        (0..column_ids.len())
+        (0..original_columns)
             .map(|i| BoundExpr::column_ref(ColumnBinding::new(lhs_index, i), lhs_types[i].clone(), ""))
             .collect()
     } else {
@@ -284,23 +310,27 @@ fn try_late_materialization(op: &mut LogicalOperator, next: &mut usize, root: bo
     };
     let final_index = projections.first().map_or(get_index, |(index, _)| *index);
 
-    // the RHS: the old chain, which outputs the rowid too
-    let rhs_row_id = construct_rhs(op);
+    // the RHS: the old chain, which outputs the row ids too
+    let rhs_row_ids = construct_rhs(op);
     // the RHS's top level gets a new index: the final projection takes over the old one
     let rhs_index = take(next);
     rename_top_level(op, final_index, rhs_index);
-    let rhs_row_id = ColumnBinding::new(rhs_index, rhs_row_id.column_index);
 
     let rhs = std::mem::replace(op, LogicalOperator::new(K::CrossProduct, Vec::new()));
+    let conditions = lhs_row_ids
+        .iter()
+        .zip(&rhs_row_ids)
+        .map(|((left, _), (right, ty, name))| JoinCondition {
+            left: left.clone(),
+            right: BoundExpr::column_ref(ColumnBinding::new(rhs_index, right.column_index), ty.clone(), name.clone()),
+            comparison: ComparisonOp::Equal,
+            filter: None,
+        })
+        .collect();
     let join = LogicalOperator::new(
         K::Join {
             join_type: JoinType::Semi,
-            conditions: vec![JoinCondition {
-                left: BoundExpr::column_ref(lhs_row_id_binding, LogicalType::BIGINT, "rowid"),
-                right: BoundExpr::column_ref(rhs_row_id, LogicalType::BIGINT, "rowid"),
-                comparison: ComparisonOp::Equal,
-                filter: None,
-            }],
+            conditions,
             predicate: None,
             algorithm: Default::default(),
         },
@@ -331,11 +361,14 @@ fn try_late_materialization(op: &mut LogicalOperator, next: &mut usize, root: bo
         LogicalOperator::new(K::Order { orders }, vec![projection(join)])
     } else {
         // a limit or sample keeps the order of the row ids, before the projection drops them
-        let order = BoundOrderByNode {
-            modifiers: OrderModifiers::new(OrderType::Ascending, NullOrder::NullsLast),
-            expr: BoundExpr::column_ref(lhs_row_id_binding, LogicalType::BIGINT, "rowid"),
-        };
-        projection(LogicalOperator::new(K::Order { orders: vec![order] }, vec![join]))
+        let orders = lhs_row_ids
+            .iter()
+            .map(|(expr, _)| BoundOrderByNode {
+                modifiers: OrderModifiers::new(OrderType::Ascending, NullOrder::NullsLast),
+                expr: expr.clone(),
+            })
+            .collect();
+        projection(LogicalOperator::new(K::Order { orders }, vec![join]))
     };
     true
 }
@@ -356,23 +389,58 @@ fn take(next: &mut usize) -> usize {
     index
 }
 
-/// `ConstructRHS`: the scan below `op` outputs its rowid, which each projection up to `op` passes
-/// on. The binding it has at the top.
-fn construct_rhs(op: &mut LogicalOperator) -> ColumnBinding {
-    fn walk(op: &mut LogicalOperator) -> ColumnBinding {
-        if let K::Get { table_index, .. } = &op.kind {
+/// The positions, types and names of the row id columns of a parquet scan: the file and the row in
+/// it (`ParquetGetRowIdColumns`), if the scan has them.
+fn parquet_row_ids(scan: &crate::execution::parquet::ParquetScanData) -> Option<Vec<(usize, LogicalType, String)>> {
+    use crate::execution::multi_file::VirtualColumn;
+    let base = scan.output_types().len() - scan.virtual_columns.len();
+    [VirtualColumn::FileIndex, VirtualColumn::FileRowNumber]
+        .into_iter()
+        .map(|column| {
+            let at = scan.virtual_columns.iter().position(|c| *c == column)?;
+            Some((base + at, column.logical_type(), column.name().to_string()))
+        })
+        .collect()
+}
+
+/// `GetOrInsertRowIds`: the row id columns of a scan, which it outputs.
+fn scan_row_ids(scan: &mut LogicalOperator) -> Vec<(usize, LogicalType, String)> {
+    if let K::ParquetScan { scan, .. } = &mut scan.kind {
+        let row_ids = parquet_row_ids(scan).expect("checked");
+        let scan = std::sync::Arc::make_mut(scan);
+        if let Some(projected) = &mut scan.projected {
+            for (at, ..) in &row_ids {
+                projected[*at] = true;
+            }
+        }
+        return row_ids;
+    }
+    vec![(get_or_insert_row_id(scan), LogicalType::BIGINT, "rowid".to_string())]
+}
+
+/// `ConstructRHS`: the scan below `op` outputs its row ids, which each projection up to `op` passes
+/// on. The bindings they have at the top.
+fn construct_rhs(op: &mut LogicalOperator) -> Vec<(ColumnBinding, LogicalType, String)> {
+    fn walk(op: &mut LogicalOperator) -> Vec<(ColumnBinding, LogicalType, String)> {
+        if let K::Get { table_index, .. } | K::ParquetScan { table_index, .. } = &op.kind {
             let table_index = *table_index;
-            return ColumnBinding::new(table_index, get_or_insert_row_id(op));
+            return scan_row_ids(op)
+                .into_iter()
+                .map(|(at, ty, name)| (ColumnBinding::new(table_index, at), ty, name))
+                .collect();
         }
         let below = walk(&mut op.children[0]);
         match &mut op.kind {
             K::Projection {
                 table_index,
                 expressions,
-            } => {
-                expressions.push(BoundExpr::column_ref(below, LogicalType::BIGINT, "rowid"));
-                ColumnBinding::new(*table_index, expressions.len() - 1)
-            }
+            } => below
+                .into_iter()
+                .map(|(binding, ty, name)| {
+                    expressions.push(BoundExpr::column_ref(binding, ty.clone(), name.clone()));
+                    (ColumnBinding::new(*table_index, expressions.len() - 1), ty, name)
+                })
+                .collect(),
             _ => below,
         }
     }
@@ -386,7 +454,9 @@ fn rename_top_level(op: &mut LogicalOperator, from: usize, to: usize) {
     loop {
         rename_table(&mut current.kind, from, to);
         match &mut current.kind {
-            K::Projection { table_index, .. } | K::Get { table_index, .. } if *table_index == from => {
+            K::Projection { table_index, .. } | K::Get { table_index, .. } | K::ParquetScan { table_index, .. }
+                if *table_index == from =>
+            {
                 *table_index = to;
                 return;
             }
