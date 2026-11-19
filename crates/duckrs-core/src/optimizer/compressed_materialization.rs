@@ -17,8 +17,11 @@
 //! down and its length in the least significant one: `__internal_compress_string_uinteger(s)`,
 //! and `__internal_decompress_string(c)` above.
 //!
-//! Ported: integral and VARCHAR columns of ORDER BY, DISTINCT, the groups of an aggregate and the
-//! build side and keys of a comparison join. Not yet: geometry and variant columns.
+//! A GEOMETRY of POINT-XY values only is their two coordinates as a `UHUGEINT`.
+//!
+//! Ported: integral, VARCHAR and POINT-XY GEOMETRY columns of ORDER BY, DISTINCT, the groups of an
+//! aggregate and the build side and keys of a comparison join. Not yet: VARIANT columns, whose
+//! shredded statistics duckrs does not read from a database file.
 
 use super::common_subplan::{max_table_index, visit_bindings};
 use super::statistics::StatisticsMap;
@@ -56,6 +59,8 @@ enum Compression {
     Offset(Value),
     /// `__internal_compress_string_*`
     String,
+    /// `__internal_compress_geometry_point`
+    GeometryPoint,
 }
 
 /// `CompressExpression`.
@@ -218,7 +223,9 @@ impl Pass<'_> {
                 let stats = child_can[i]
                     .then(|| overrides.get(&binding).cloned().unwrap_or_else(|| self.statistics.get(binding)));
                 let compress = |s: &ColumnStatistics| {
-                    integral_compress(input.clone(), s).or_else(|| string_compress(input.clone(), s))
+                    integral_compress(input.clone(), s)
+                        .or_else(|| string_compress(input.clone(), s))
+                        .or_else(|| geometry_compress(input.clone(), s))
                 };
                 match stats.as_ref().and_then(compress) {
                     Some(compressed) => {
@@ -641,9 +648,75 @@ fn decompress_string<C: Packed>(args: &DataChunk, result: &mut Vector) -> Result
     Ok(())
 }
 
+/// `GetGeometryCompress`: only POINT-XY geometries (`GeometryIsAllPointXY`), whose WKB is the
+/// 5-byte header and two doubles.
+fn geometry_compress(input: BoundExpr, stats: &ColumnStatistics) -> Option<Compressed> {
+    if input.return_type.id() != LogicalTypeId::Geometry {
+        return None;
+    }
+    // `HasOnly(POINT, XY)`: the POINT bit of the XY vertices, and nothing else
+    let geometry = stats.geometry.as_ref()?;
+    const POINT: u8 = 1 << 1;
+    if geometry.types[0] & !1 != POINT || geometry.types[1..].iter().any(|t| t & !1 != 0) {
+        return None;
+    }
+    Some(Compressed {
+        expression: crate::function::nested::bound_function(
+            "__internal_compress_geometry_point",
+            vec![input],
+            LogicalType::UHUGEINT,
+            compress_geometry_point,
+        ),
+        how: Compression::GeometryPoint,
+    })
+}
+
+/// The size of a POINT-XY in WKB: byte order, type, X and Y.
+const POINT_XY_BLOB_SIZE: usize = 21;
+
+/// `GeometryPointCompress`: the 16 coordinate bytes reversed, so that comparing the integers
+/// compares the bytes.
+fn compress_geometry_point(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let mut bad = false;
+    executor::unary_str::<u128>(args.column(0), result, args.len(), |wkb| {
+        if wkb.len() != POINT_XY_BLOB_SIZE || wkb[0] != 1 || wkb[1..5] != [1, 0, 0, 0] {
+            bad = true;
+            return 0;
+        }
+        let mut value: u128 = 0;
+        for &byte in &wkb[5..] {
+            value = (value << 8) | u128::from(byte);
+        }
+        value
+    });
+    if bad {
+        return Err(duckrs_common::Error::new(
+            duckrs_common::ErrorKind::InvalidInput,
+            "Expected only 2D POINT geometries based on the column statistics, but encountered a different geometry \
+             - the statistics might be corrupt",
+        ));
+    }
+    Ok(())
+}
+
+/// `GeometryPointDecompress`: the WKB header and the coordinate bytes back.
+fn decompress_geometry_point(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    executor::unary_to_str::<u128>(args.column(0), result, args.len(), |value, out| {
+        out.extend_from_slice(&[1, 1, 0, 0, 0]);
+        out.extend_from_slice(&value.to_be_bytes());
+    });
+    Ok(())
+}
+
 /// `CreateRestoreExpression`.
 fn restore(input: BoundExpr, how: &Compression, original: &LogicalType) -> BoundExpr {
     match how {
+        Compression::GeometryPoint => crate::function::nested::bound_function(
+            "__internal_decompress_geometry_point",
+            vec![input],
+            original.clone(),
+            decompress_geometry_point,
+        ),
         Compression::String => {
             let callback: Callback = match input.return_type.id() {
                 LogicalTypeId::UTinyInt => decompress_string::<u8>,

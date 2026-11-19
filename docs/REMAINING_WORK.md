@@ -233,7 +233,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] compressed materialization, stages 1-3: integral and VARCHAR columns of ORDER BY, DISTINCT, aggregate
     groups and the build side and single key pair of comparison joins (casts, `__internal_compress_integral_*`,
     `__internal_compress_string_*`); calling them is the binder error C++ gives
-  - [ ] compressed materialization of geometry and variant columns
+  - [x] compressed materialization of POINT-XY GEOMETRY columns (`__internal_compress_geometry_point`)
+  - [ ] compressed materialization of VARIANT columns: needs shredded VARIANT columns read from a database file
+    (not yet ported in storage) and their shredded statistics
   - [ ] `stats()` of a VARCHAR read from several parquet files with `union_by_name` (NULL here)
   - [ ] passes not ported: partitioned execution, list comprehension rewrite, enum IN simplification (C++ keeps IN
     lists as IN), the auxiliary `e(b) op e(c)` filters of window pushdown, uncorrelated EXISTS as a cross product

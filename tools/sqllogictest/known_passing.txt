@@ -496,6 +496,7 @@ test/optimizer/common_subplan_projection_map.test
 test/optimizer/compare_blob.test
 test/optimizer/comparison_simplification.test
 test/optimizer/comparison_simplification_narrowing_casts.test
+test/optimizer/compressed_materialization_geometry.test
 test/optimizer/compressed_materialization_grouping_sets.test
 test/optimizer/compressed_materialization_join_nulls.test
 test/optimizer/compressed_materialization_many_aggregates.test
