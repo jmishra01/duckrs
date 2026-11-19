@@ -3750,12 +3750,19 @@ impl Binder<'_> {
                 ));
             }
             if column.generated.is_some() {
+                if column.compression.is_some() {
+                    return Err(binder_error(format!(
+                        "Can't set a compression type on generated column {}, generated columns are not stored",
+                        sql_quoted_identifier(&column.name)
+                    )));
+                }
                 continue;
             }
             let Some(ty) = &column.column_type else {
                 return Err(not_implemented("columns without a type"));
             };
             let mut definition = ColumnDefinition::new(column.name.clone(), self.bind_type(ty)?);
+            definition.compression = self.column_compression(column, &definition.ty)?;
             if let Some(default) = &column.default_value {
                 // `Binder::BindCreateTableInfo`: a stored DEFAULT can't refer to parameters
                 // (unnamed `?` parameters are found missing before binding, as in C++)
@@ -4143,3 +4150,34 @@ const CPP_TABLE_FUNCTIONS: &[&str] = &[
     "unnest",
     "which_secret",
 ];
+
+impl Binder<'_> {
+    /// `VerifyCompressionType`: the method `USING COMPRESSION` names for a column of a new table, if one, which the
+    /// database's storage version has and which can store the column's type.
+    pub(super) fn column_compression(&self, column: &ast::ColumnDefinition, ty: &LogicalType) -> Result<Option<u8>> {
+        use crate::storage::compression::{compression_availability, compression_of_name, compression_supports};
+        let Some(name) = column.compression else {
+            return Ok(None);
+        };
+        let compression = compression_of_name(name).expect("the parser names a compression type");
+        if let Err(deprecated) = compression_availability(compression, self.catalog.storage_version()) {
+            return Err(binder_error(if deprecated {
+                format!(
+                    "Can't compress using user-provided compression type '{name}', that type is deprecated and only \
+                     has decompress support"
+                )
+            } else {
+                format!("Can't compress using user-provided compression type '{name}', that type is not available yet")
+            }));
+        }
+        let physical = ty.physical_type();
+        if !compression_supports(compression, physical) {
+            return Err(binder_error(format!(
+                "Can't compress column {} with type '{ty}' (physical: {}) using compression type '{name}'",
+                sql_quoted_identifier(&column.name),
+                physical.name()
+            )));
+        }
+        Ok(Some(compression))
+    }
+}

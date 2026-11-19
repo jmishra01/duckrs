@@ -1002,6 +1002,7 @@ test/sql/aggregate/variant/variant_group_object_fallible.test
 test/sql/aggregate/variant/variant_group_object_shredded.test
 test/sql/alter/add_col/test_add_col.test
 test/sql/alter/add_col/test_add_col_chain.test
+test/sql/alter/add_col/test_add_col_compression.test
 test/sql/alter/add_col/test_add_col_constraints.test
 test/sql/alter/add_col/test_add_col_default.test
 test/sql/alter/add_col/test_add_col_default_seq.test
@@ -2033,6 +2034,7 @@ test/sql/create/create_schema_options.test
 test/sql/create/create_table_as_duplicate_names.test
 test/sql/create/create_table_as_error.test
 test/sql/create/create_table_as_no_data_limit.test
+test/sql/create/create_table_compression.test
 test/sql/create/create_table_empty_name.test
 test/sql/create/create_using_index.test
 test/sql/cte/cte_bc.test
@@ -3851,6 +3853,7 @@ test/sql/storage/compression/rle/rle_nulls_edge_case.test
 test/sql/storage/compression/rle/rle_select.test
 test/sql/storage/compression/rle/rle_select_force_fetch_row.test
 test/sql/storage/compression/rle/rle_select_list.test
+test/sql/storage/compression/rle/rle_select_run_boundaries.test
 test/sql/storage/compression/rle/rle_signed_zero.test
 test/sql/storage/compression/rle/rle_storage_info.test
 test/sql/storage/compression/rle/struct_rle.test
@@ -3890,6 +3893,7 @@ test/sql/storage/compression/roaring/roaring_run_boundaries.test
 test/sql/storage/compression/roaring/roaring_run_simple.test
 test/sql/storage/compression/roaring/roaring_smaller_than_vector.test
 test/sql/storage/compression/simple_compression.test
+test/sql/storage/compression/skip_explicit_compression_analyze.test
 test/sql/storage/compression/string/big_strings.test
 test/sql/storage/compression/string/blob.test
 test/sql/storage/compression/string/empty.test
@@ -3907,6 +3911,7 @@ test/sql/storage/compression/string/string_corrupt_overflow_transient_block.test
 test/sql/storage/compression/string/string_scan_batch_boundaries.test
 test/sql/storage/compression/string/struct.test
 test/sql/storage/compression/string/vector_flatten.test
+test/sql/storage/compression/test_using_compression.test
 test/sql/storage/compression/uncompressed/uncompressed_count.test
 test/sql/storage/compression/uncompressed/uncompressed_count_boundary.test
 test/sql/storage/compression/uncompressed/uncompressed_offset.test
@@ -3925,6 +3930,7 @@ test/sql/storage/compression/zstd/zstd_corrupt_page_offset_boundary.test
 test/sql/storage/compression/zstd/zstd_corrupt_page_offset_directory.test
 test/sql/storage/compression/zstd/zstd_corrupt_string_length.test
 test/sql/storage/compression/zstd/zstd_force_compression.test
+test/sql/storage/compression/zstd/zstd_packed_segment.test
 test/sql/storage/concurrent_attach_if_not_exists_create.test
 test/sql/storage/constraints/foreignkey/foreign_key_persistent.test
 test/sql/storage/constraints/foreignkey/foreign_key_persistent_memory_limit.test

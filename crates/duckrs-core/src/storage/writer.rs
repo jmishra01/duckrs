@@ -1050,7 +1050,10 @@ pub(super) fn stored_column(column: &crate::catalog::LogicalColumn<'_>) -> Resul
         } else {
             table_column_type::STANDARD
         },
-        compression_type: COMPRESSION_AUTO,
+        compression_type: column
+            .definition
+            .and_then(|d| d.compression)
+            .map_or(COMPRESSION_AUTO, u64::from),
         comment: column.definition.and_then(|d| d.comment.clone()).map(Value::varchar),
         tags: Vec::new(),
     })
@@ -2690,7 +2693,17 @@ impl<'a> Writer<'a> {
             }
             let ty = &table.columns[column].ty;
             self.log_column = (format!("{}.{}", table.schema, table.name), column);
-            let out = self.write_column_data(ty, parts)?;
+            // `ColumnCheckpointInfo::GetCompressionType`: the method of the column, its validity and children
+            // too, in place of `force_compression`; one that none of them has leaves them all to choose
+            let forced = table.columns[column]
+                .compression
+                .map(|compression| compression_setting_name(compression).to_string());
+            let setting = forced.map(|forced| std::mem::replace(&mut self.force_compression, forced));
+            let out = self.write_column_data(ty, parts);
+            if let Some(setting) = setting {
+                self.force_compression = setting;
+            }
+            let out = out?;
             match &mut statistics[column] {
                 Some(stats) => stats.merge(&out.stats, ty),
                 empty => *empty = Some(out.stats.clone()),

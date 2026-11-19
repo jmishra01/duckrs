@@ -7,6 +7,8 @@
 
 use super::block_manager::{corrupt, corrupted};
 use super::statistics::BaseStatistics;
+use duckrs_common::serializer::StorageVersion;
+use duckrs_common::types::PhysicalType;
 use duckrs_common::{Error, ErrorKind, Result};
 
 /// `CompressionType`.
@@ -14,6 +16,7 @@ pub const COMPRESSION_UNCOMPRESSED: u8 = 1;
 pub const COMPRESSION_CONSTANT: u8 = 2;
 pub const COMPRESSION_RLE: u8 = 3;
 pub const COMPRESSION_DICTIONARY: u8 = 4;
+pub const COMPRESSION_PFOR_DELTA: u8 = 5;
 pub const COMPRESSION_BITPACKING: u8 = 6;
 pub const COMPRESSION_FSST: u8 = 7;
 pub const COMPRESSION_CHIMP: u8 = 8;
@@ -46,6 +49,7 @@ pub fn storage_name(compression: u8) -> &'static str {
         COMPRESSION_CONSTANT => "Constant",
         COMPRESSION_RLE => "RLE",
         COMPRESSION_DICTIONARY => "Dictionary",
+        COMPRESSION_PFOR_DELTA => "PFOR",
         COMPRESSION_BITPACKING => "BitPacking",
         COMPRESSION_FSST => "FSST",
         COMPRESSION_CHIMP => "Chimp",
@@ -57,6 +61,55 @@ pub fn storage_name(compression: u8) -> &'static str {
         COMPRESSION_EMPTY => "Empty Validity",
         COMPRESSION_DICT_FSST => "DICT_FSST",
         _ => "Unknown",
+    }
+}
+
+/// The `CompressionType` that `CompressionTypeToString` names `name`.
+pub fn compression_of_name(name: &str) -> Option<u8> {
+    (COMPRESSION_UNCOMPRESSED..=COMPRESSION_DICT_FSST).find(|compression| storage_name(*compression) == name)
+}
+
+/// `CompressionTypeIsAvailable` in a file of `version` (any, of none): `Err` with whether the method is
+/// deprecated, else not available yet.
+pub fn compression_availability(compression: u8, version: Option<StorageVersion>) -> std::result::Result<(), bool> {
+    let (minimum, maximum) = match compression {
+        COMPRESSION_PATAS | COMPRESSION_CHIMP => return Err(true),
+        COMPRESSION_DICTIONARY | COMPRESSION_FSST => (StorageVersion::V0_10_2, Some(StorageVersion::V1_2_0)),
+        COMPRESSION_ROARING | COMPRESSION_ZSTD => (StorageVersion::V1_2_0, None),
+        COMPRESSION_DICT_FSST => (StorageVersion::V1_3_0, None),
+        // not implemented: after every version
+        COMPRESSION_PFOR_DELTA => return if version.is_some() { Err(false) } else { Ok(()) },
+        _ => return Ok(()),
+    };
+    let Some(version) = version else { return Ok(()) };
+    if minimum > version {
+        return Err(false);
+    }
+    if maximum.is_some_and(|maximum| maximum < version) {
+        return Err(true);
+    }
+    Ok(())
+}
+
+/// `DBConfig::TryGetCompressionFunction`: whether a method can store a physical type (`TypeIsSupported` of
+/// each in `internal_compression_methods`).
+pub fn compression_supports(compression: u8, physical: PhysicalType) -> bool {
+    use PhysicalType::*;
+    let integer = matches!(
+        physical,
+        Bool | Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 | Int128 | UInt128
+    );
+    let float = matches!(physical, Float | Double);
+    match compression {
+        COMPRESSION_CONSTANT => integer || float || physical == Bit,
+        COMPRESSION_UNCOMPRESSED => integer || float || matches!(physical, List | Interval | Bit | Varchar),
+        COMPRESSION_RLE => integer || float || physical == List,
+        COMPRESSION_BITPACKING => integer || physical == List,
+        COMPRESSION_DICTIONARY | COMPRESSION_FSST | COMPRESSION_ZSTD | COMPRESSION_DICT_FSST => physical == Varchar,
+        COMPRESSION_CHIMP | COMPRESSION_PATAS | COMPRESSION_ALP | COMPRESSION_ALPRD => float,
+        COMPRESSION_ROARING => matches!(physical, Bit | Bool),
+        COMPRESSION_EMPTY => physical == Bit,
+        _ => false,
     }
 }
 

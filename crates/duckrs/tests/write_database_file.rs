@@ -1125,3 +1125,93 @@ fn update_and_alter_read_only_their_columns() {
     assert!(rows(&mut c, loaded).is_empty());
     assert_eq!(rows(&mut c, sums), expected);
 }
+
+#[test]
+fn filters_on_shredded_paths_are_the_same() {
+    let file = path("path_filters.db");
+    {
+        let db = Database::open(&file, false).unwrap();
+        let mut c = db.connect().unwrap();
+        run(&mut c, "SET variant_minimum_shredding_size = 0");
+        run(
+            &mut c,
+            "CREATE TABLE v AS SELECT {'x': i, 'y': i * 100, 's': 'k' || i}::VARIANT v, i FROM range(400000) r(i)",
+        );
+        run(
+            &mut c,
+            "CREATE TABLE m AS SELECT CASE WHEN i % 3 = 0 THEN {'x': i}::VARIANT WHEN i % 3 = 1 THEN {'y': i}::VARIANT \
+             ELSE NULL END v, i FROM range(400000) r(i)",
+        );
+    }
+    let db = Database::open(&file, true).unwrap();
+    let mut c = db.connect().unwrap();
+    for query in [
+        "SELECT count(*), sum(i) FROM v WHERE v.x::BIGINT = 5",
+        "SELECT count(*), sum(i) FROM v WHERE v.x::BIGINT BETWEEN 300000 AND 300010",
+        "SELECT count(*) FROM v WHERE v.y::BIGINT > 39999000 AND v.x::BIGINT < 399995",
+        "SELECT count(*) FROM v WHERE v.x::DOUBLE < 3.5",
+        "SELECT count(*) FROM v WHERE v.s::VARCHAR = 'k7'",
+        "SELECT i, v.y::BIGINT FROM v WHERE v.x::BIGINT IN (3, 399998) ORDER BY i",
+        "SELECT count(*), sum(i) FROM m WHERE v.x::BIGINT > 399000",
+        "SELECT count(*) FROM m WHERE v.y::BIGINT = 7",
+    ] {
+        let pushed = rows(&mut c, query);
+        run(&mut c, "SET disabled_optimizers = 'unused_columns'");
+        let whole = rows(&mut c, query);
+        run(&mut c, "SET disabled_optimizers = ''");
+        assert_eq!(pushed, whole, "{query}");
+    }
+}
+
+/// `USING COMPRESSION`: a checkpoint stores a column only with its method, through a log, an ADD COLUMN and a
+/// reopening.
+#[test]
+fn columns_keep_their_compression() {
+    let file = path("using_compression.db");
+    let methods = "SELECT column_name, compression FROM pragma_storage_info('t') WHERE segment_type NOT IN \
+                   ('VALIDITY', 'INTEGER[]') GROUP BY ALL ORDER BY ALL";
+    {
+        let db = Database::open(&file, false).unwrap();
+        let mut c = db.connect().unwrap();
+        run(&mut c, "PRAGMA disable_checkpoint_on_shutdown");
+        run(
+            &mut c,
+            "CREATE TABLE t (a INTEGER USING COMPRESSION UNCOMPRESSED, b BIGINT USING COMPRESSION RLE, \
+             s VARCHAR USING COMPRESSION ZSTD, l INTEGER[] USING COMPRESSION BITPACKING)",
+        );
+        run(
+            &mut c,
+            "INSERT INTO t SELECT i // 1000, i, 'v' || (i % 4), [i % 4] FROM range(50000) r(i)",
+        );
+        run(
+            &mut c,
+            "ALTER TABLE t ADD COLUMN d INTEGER USING COMPRESSION UNCOMPRESSED DEFAULT 42",
+        );
+    }
+    let db = Database::open(&file, false).unwrap();
+    let mut c = db.connect().unwrap();
+    run(&mut c, "CHECKPOINT");
+    assert_eq!(
+        rows(&mut c, methods),
+        // a column of one value is a constant, whatever its method, as in C++
+        ["a|Uncompressed", "b|RLE", "d|Constant", "l|BitPacking", "s|ZSTD"]
+    );
+    assert_eq!(
+        rows(&mut c, "SELECT sql FROM duckdb_tables() WHERE table_name = 't'"),
+        [
+            "CREATE TABLE t(a INTEGER USING COMPRESSION Uncompressed, b BIGINT USING COMPRESSION RLE, s VARCHAR USING \
+          COMPRESSION ZSTD, l INTEGER[] USING COMPRESSION BitPacking, d INTEGER DEFAULT(42) USING COMPRESSION \
+          Uncompressed);"
+        ]
+    );
+    refused(
+        &mut c,
+        "CREATE TABLE u (x VARCHAR USING COMPRESSION RLE)",
+        "Can't compress column \"x\" with type 'VARCHAR' (physical: VARCHAR) using compression type 'RLE'",
+    );
+    refused(
+        &mut c,
+        "CREATE TABLE u (x VARCHAR USING COMPRESSION Dictionary)",
+        "that type is deprecated and only has decompress support",
+    );
+}

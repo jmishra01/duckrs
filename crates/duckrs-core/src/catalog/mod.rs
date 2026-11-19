@@ -101,6 +101,9 @@ pub struct ColumnDefinition {
     pub default_text: Option<String>,
     /// What `COMMENT ON COLUMN` said.
     pub comment: Option<String>,
+    /// The `CompressionType` of `USING COMPRESSION`, if it says one: a checkpoint stores the column with only
+    /// that method, or UNCOMPRESSED where it can't.
+    pub compression: Option<u8>,
 }
 
 /// A generated column: not stored, only an expression over the other columns.
@@ -133,6 +136,7 @@ impl ColumnDefinition {
             not_null: false,
             default_text: None,
             comment: None,
+            compression: None,
         }
     }
 }

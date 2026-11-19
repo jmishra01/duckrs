@@ -228,7 +228,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
     `length` of lists all as long is a `constant_or_null`, `list_concat`, `flatten`, list constants and ARRAY to
     LIST casts give their lengths, and joins, cross products and UNNEST drop the totals of strings and lists
     (`ResetAdditiveStatistics`)
-  - [ ] per-column `USING COMPRESSION`
+  - [x] per-column `USING COMPRESSION`: CREATE TABLE refuses methods the file's storage version has no more or not
+    yet and those that can't store the column's type (`VerifyCompressionType`), ADD COLUMN keeps one unchecked,
+    the catalog, the log and `sql` keep it, and a checkpoint stores the column, its validity and children with
+    only that method and UNCOMPRESSED in place of `force_compression` (`ColumnCheckpointInfo::GetCompressionType`)
   - [x] `read_duckdb` and the replacement scan of `.db` files; `enable_view_dependencies` (DROP ... CASCADE,
     refused DROP and ALTER, CREATE OR REPLACE of a view that reads itself)
   - [ ] `vector_type` (~20 files) and `duckdb_memory` (~17) report engine internals duckrs does not model

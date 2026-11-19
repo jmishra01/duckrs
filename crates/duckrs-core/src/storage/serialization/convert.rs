@@ -943,7 +943,10 @@ pub fn column(stored: g::ColumnDefinition) -> Result<(ast::ColumnDefinition, Opt
             column_type: Some(CastType::Resolved(stored.type_)),
             generated,
             default_value,
-            compression: None,
+            compression: u8::try_from(stored.compression_type)
+                .ok()
+                .filter(|compression| *compression != 0)
+                .map(crate::storage::compression::storage_name),
         },
         physical,
     ))

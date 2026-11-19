@@ -361,6 +361,10 @@ impl Binder<'_> {
         let mut definition = ColumnDefinition::new(column.name.clone(), type_binder.bind_type(ty)?);
         // `CheckTypeIsSupported`
         self.catalog.check_column_type(&definition.ty)?;
+        // `AddColumnInfo` keeps the compression, unchecked
+        definition.compression = column
+            .compression
+            .and_then(crate::storage::compression::compression_of_name);
         if let Some(default) = &column.default_value {
             definition.default_value = Some(self.bind_default(default, &definition.ty)?);
             definition.default_text = Some(default.to_string());
