@@ -670,7 +670,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
   1.53× (none above 3×: Q21 2.7×; Q02 0.5×, Q08 0.95×), from 12.7× at the start of item 47.
   SF10, both engines on the file C++ wrote: about 1.3× (1.27× and 1.37× in two runs under heavy load from other work, in which Q18 and Q14 read above 3×; Q09 is down to 1.2–1.9× from 2.5×; Q11 0.5×, Q15 0.7×, Q22 0.7×), which passes the gate on a machine that was busy with other work; measure again on a quiet one before ticking this. duckrs
   had no way to load SF10 itself, as an append kept its rows in memory (more than 2 GiB failed); appends now write
-  their full row groups to blocks as they fill (an INSERT of 80M rows takes 90MB), but loading SF10 isn't tried yet
+  their full row groups to blocks as they fill (an INSERT of 80M rows takes 90MB). duckrs now loads SF10 into its
+  own file (COPY of the `.tbl` files: lineitem 559s, orders 53s, the rest under 20s each; at most 1.44GB resident;
+  2.78GB of file against C++'s 2.79GB), and all 22 queries on that file match `answers/sf10` (11.8s in all). The
+  load is slow next to C++, and where lineitem's 559s goes isn't profiled yet
 
 ## Phase 14: Extensions (not started)
 

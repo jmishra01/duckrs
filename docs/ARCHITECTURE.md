@@ -919,10 +919,12 @@ cargo run --release -p benchmark --features reference -- --engine=both --threads
 cargo bench -p duckrs --bench kernels
 ```
 
-Larger scale factors go through `--sf N`. duckrs cannot load TPC-H SF10 itself (an append keeps the rows of
-its table in memory), so SF10 is measured on the file C++ writes: run the reference engine once
-(`--engine=reference --sf 10`), copy `duckdb_benchmark_data/reference/tpch_sf10.duckdb` to
-`duckdb_benchmark_data/duckrs/`, then `--engine=both --sf 10`. There are no SF10 answers to check.
+Larger scale factors go through `--sf N`. The benchmark measures SF10 on the file C++ writes: run the reference
+engine once (`--engine=reference --sf 10`), copy `duckdb_benchmark_data/reference/tpch_sf10.duckdb` to
+`duckdb_benchmark_data/duckrs/`, then `--engine=both --sf 10`. duckrs can load SF10 into a file of its own too
+(CREATE TABLE and `COPY ... FROM` the `.tbl` files, about 11 minutes, under 1.5GB at the most, as appends write
+their full row groups to blocks as they fill), and `TPCH_DATABASE=<file> cargo run --release -p duckrs --example
+tpch -- - ../duckdb/extension/tpch/dbgen 10` checks the 22 queries on it against `answers/sf10`.
 
 ## Testing
 
