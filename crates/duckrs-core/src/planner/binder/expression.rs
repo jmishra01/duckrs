@@ -2403,6 +2403,13 @@ impl Binder<'_> {
                             _ => found.push((score, name)),
                         }
                     }
+                    // `CMUtils::Bind`: they are in the catalog in C++, for (de)serialization only
+                    let lower = function.name.name.to_ascii_lowercase();
+                    if lower.starts_with("__internal_compress_") || lower.starts_with("__internal_decompress_") {
+                        return Err(binder_error(
+                            "Compressed materialization functions are for internal use only!".to_string(),
+                        ));
+                    }
                     let mut suggestions: Vec<String> = found.into_iter().map(|(_, name)| name).collect();
                     suggestions.sort();
                     let hint = if suggestions.is_empty() {

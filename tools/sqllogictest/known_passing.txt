@@ -496,6 +496,7 @@ test/optimizer/common_subplan_projection_map.test
 test/optimizer/compare_blob.test
 test/optimizer/comparison_simplification.test
 test/optimizer/comparison_simplification_narrowing_casts.test
+test/optimizer/compressed_materialization_grouping_sets.test
 test/optimizer/compressed_materialization_many_aggregates.test
 test/optimizer/conjunction_simplification.test
 test/optimizer/constant_argument_errors.test
@@ -3471,6 +3472,7 @@ test/sql/select/test_select_qualified_view.test
 test/sql/serialization/function_argument_names.test
 test/sql/serialization/logical_operator_serialization.test
 test/sql/setops/ambiguous_order_by.test
+test/sql/setops/compression_expression_collation.test
 test/sql/setops/except_intersect_collation.test
 test/sql/setops/projection_expression_collation.test
 test/sql/setops/setops_pushdown.test

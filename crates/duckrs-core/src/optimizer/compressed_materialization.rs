@@ -13,8 +13,12 @@
 //! runs after it, on the statistics it found, at the same point of the optimizer, and rebinds what
 //! is above each operator it compressed as `RebindAncestors` does.
 //!
-//! Ported so far: integral columns of ORDER BY and of the groups of an aggregate. Not yet: strings,
-//! DISTINCT, the build side of joins, geometry and variant columns.
+//! A VARCHAR shorter than an integral type is that integer, its bytes from the most significant one
+//! down and its length in the least significant one: `__internal_compress_string_uinteger(s)`,
+//! and `__internal_decompress_string(c)` above.
+//!
+//! Ported so far: integral and VARCHAR columns of ORDER BY and of the groups of an aggregate. Not
+//! yet: DISTINCT, the build side of joins, geometry and variant columns.
 
 use super::common_subplan::{max_table_index, visit_bindings};
 use super::statistics::StatisticsMap;
@@ -50,6 +54,8 @@ enum Compression {
     Cast,
     /// `__internal_compress_integral_*` of the offset from `min`
     Offset(Value),
+    /// `__internal_compress_string_*`
+    String,
 }
 
 /// `CompressExpression`.
@@ -196,7 +202,8 @@ impl Pass<'_> {
         for (i, (&binding, ty)) in bindings.iter().zip(&types).enumerate() {
             let input = BoundExpr::column_ref(binding, ty.clone(), "");
             let stats = can[i].then(|| self.statistics.get(binding));
-            match stats.as_ref().and_then(|s| integral_compress(input.clone(), s)) {
+            let compress = |s: &ColumnStatistics| integral_compress(input.clone(), s).or_else(|| string_compress(input.clone(), s));
+            match stats.as_ref().and_then(compress) {
                 Some(c) => {
                     compressed.push(Some((c.how, stats.expect("some"))));
                     expressions.push(c.expression);
@@ -402,9 +409,128 @@ fn integral_compress(input: BoundExpr, stats: &ColumnStatistics) -> Option<Compr
     })
 }
 
+/// `GetStringCompress`: the smallest integral type longer than the longest string
+/// (`GetStringCompressInfo`); with strings of at most one byte below 255, a `UTINYINT` of the length
+/// plus that byte (`CreateStringCompressStats`, `MiniStringCompress`).
+fn string_compress(input: BoundExpr, stats: &ColumnStatistics) -> Option<Compressed> {
+    if input.return_type.id() != LogicalTypeId::Varchar || input.return_type.collation().is_some() {
+        return None;
+    }
+    let mut target = if !stats.can_be_valid {
+        LogicalType::UTINYINT
+    } else {
+        let max_length = stats.strings.as_ref()?.max_length?;
+        [
+            LogicalType::UTINYINT,
+            LogicalType::USMALLINT,
+            LogicalType::UINTEGER,
+            LogicalType::UBIGINT,
+            LogicalType::UHUGEINT,
+        ]
+        .into_iter()
+        .find(|t| (max_length as usize) < t.physical_type().size())?
+    };
+    if target.id() == LogicalTypeId::USmallInt
+        && let Some((_, max)) = stats.strings.as_ref().and_then(|s| s.bounds.as_ref())
+    {
+        let max_byte = max.first().copied().unwrap_or(0);
+        if max_byte < u8::MAX {
+            target = LogicalType::UTINYINT;
+        }
+    }
+    let callback: Callback = match target.id() {
+        LogicalTypeId::UTinyInt => compress_mini_string,
+        LogicalTypeId::USmallInt => compress_string::<u16>,
+        LogicalTypeId::UInteger => compress_string::<u32>,
+        LogicalTypeId::UBigInt => compress_string::<u64>,
+        _ => compress_string::<u128>,
+    };
+    let name = format!("__internal_compress_string_{}", type_name(&target));
+    Some(Compressed {
+        expression: crate::function::nested::bound_function(&name, vec![input], target, callback),
+        how: Compression::String,
+    })
+}
+
+/// An unsigned integer a string compresses into.
+trait Packed: NativeType {
+    const SIZE: usize;
+    fn from_u128(v: u128) -> Self;
+    fn to_u128(self) -> u128;
+}
+
+macro_rules! packed {
+    ($($t:ty),*) => {$(
+        impl Packed for $t {
+            const SIZE: usize = size_of::<$t>();
+            fn from_u128(v: u128) -> Self {
+                v as $t
+            }
+            fn to_u128(self) -> u128 {
+                self as u128
+            }
+        }
+    )*};
+}
+packed!(u8, u16, u32, u64, u128);
+
+/// `StringCompress`: the bytes from the most significant byte down, the length in the lowest.
+fn compress_string<R: Packed>(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    executor::unary_str::<R>(args.column(0), result, args.len(), |bytes| {
+        let mut value: u128 = 0;
+        for i in 0..R::SIZE - 1 {
+            value = (value << 8) | u128::from(bytes.get(i).copied().unwrap_or(0));
+        }
+        R::from_u128((value << 8) | bytes.len() as u128)
+    });
+    Ok(())
+}
+
+/// `MiniStringCompress`: the length plus the byte of a string of at most one.
+fn compress_mini_string(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    executor::unary_str::<u8>(args.column(0), result, args.len(), |bytes| {
+        (bytes.len() as u8).wrapping_add(bytes.first().copied().unwrap_or(0))
+    });
+    Ok(())
+}
+
+/// `StringDecompress`.
+fn decompress_string<C: Packed>(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    executor::unary_to_str::<C>(args.column(0), result, args.len(), |packed, out| {
+        let value = packed.to_u128();
+        if C::SIZE == 1 {
+            // `MiniStringDecompress`
+            if value != 0 {
+                out.push((value - 1) as u8);
+            }
+            return;
+        }
+        let length = (value & 0xff) as usize;
+        for i in 0..length {
+            out.push((value >> (8 * (C::SIZE - 1 - i))) as u8);
+        }
+    });
+    Ok(())
+}
+
 /// `CreateRestoreExpression`.
 fn restore(input: BoundExpr, how: &Compression, original: &LogicalType) -> BoundExpr {
     match how {
+        Compression::String => {
+            let callback: Callback = match input.return_type.id() {
+                LogicalTypeId::UTinyInt => decompress_string::<u8>,
+                LogicalTypeId::USmallInt => decompress_string::<u16>,
+                LogicalTypeId::UInteger => decompress_string::<u32>,
+                LogicalTypeId::UBigInt => decompress_string::<u64>,
+                _ => decompress_string::<u128>,
+            };
+            crate::function::nested::bound_function(
+                "__internal_decompress_string",
+                vec![input],
+                original.clone(),
+                callback,
+            )
+        }
         Compression::Cast => input.cast_to(original, false),
         Compression::Offset(min) => {
             let callback = decompress_callback(&input.return_type, original).expect("a compressed type");
