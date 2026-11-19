@@ -265,10 +265,10 @@ fn flatten_in(expr: &BoundExpr, left: &mut LogicalOperator, next_table_index: &m
     else {
         return Err(Unsupported);
     };
+    // uncorrelated, it runs once, volatile or not
     let BoundSubquery {
         kind: SubqueryKind::Any(ComparisonOp::Equal),
         raw: Some(raw),
-        volatile: false,
         row,
         ..
     } = subquery.as_ref()
@@ -387,6 +387,9 @@ fn flatten_subquery(expr: &BoundExpr, left: &mut LogicalOperator, next_table_ind
         && correlated.is_empty()
     {
         return flatten_scalar(expr, raw, *error_on_multiple_rows, left, next_table_index);
+    }
+    if correlated.is_empty() {
+        return flatten_in(expr, left, next_table_index);
     }
     let BoundSubquery {
         kind,

@@ -46,6 +46,7 @@ pub mod or_range_merge;
 pub mod reorder_filter;
 mod late_materialization;
 mod scalar_aggregate_merger;
+mod self_join_aggregate;
 mod topn_window_elimination;
 mod window_join_pushdown;
 mod window_self_join;
@@ -91,6 +92,8 @@ pub struct OptimizerOptions {
     pub join_filter_pushdown: bool,
     pub cte_filter_pusher: bool,
     /// `SCALAR_AGGREGATE_MERGE`
+    /// `SELF_JOIN_AGGREGATE`
+    pub self_join_aggregate: bool,
     pub scalar_aggregate_merge: bool,
     /// `WINDOW_SELF_JOIN`
     pub window_self_join: bool,
@@ -153,6 +156,7 @@ impl Default for OptimizerOptions {
             aggregate_reuse: true,
             join_filter_pushdown: true,
             cte_filter_pusher: true,
+            self_join_aggregate: true,
             scalar_aggregate_merge: true,
             window_self_join: true,
             window_join_pushdown: true,
@@ -208,6 +212,7 @@ impl OptimizerOptions {
             aggregate_reuse: false,
             join_filter_pushdown: false,
             cte_filter_pusher: false,
+            self_join_aggregate: false,
             scalar_aggregate_merge: false,
             window_self_join: false,
             window_join_pushdown: false,
@@ -262,6 +267,7 @@ impl OptimizerOptions {
             aggregate_reuse: !off("aggregate_reuse"),
             join_filter_pushdown: !off("join_filter_pushdown"),
             cte_filter_pusher: !off("cte_filter_pusher"),
+            self_join_aggregate: !off("self_join_aggregate"),
             scalar_aggregate_merge: !off("scalar_aggregate_merge"),
             window_self_join: !off("window_self_join"),
             window_join_pushdown: !off("window_join_pushdown"),
@@ -313,6 +319,10 @@ pub fn optimize_timed(
     // `CTE_INLINING` runs here too, so that what is inlined goes through the filter pushdown
     if options.cte_inlining {
         plan = run("cte_inlining", plan, &mut cte_inlining::inline);
+    }
+    // before the filter pushdown, which would move the join's conditions into the scans
+    if options.self_join_aggregate {
+        plan = run("self_join_aggregate", plan, &mut self_join_aggregate::optimize);
     }
     if options.scalar_aggregate_merge {
         let threshold = options.scalar_aggregate_merge_threshold;

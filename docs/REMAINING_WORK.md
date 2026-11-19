@@ -227,7 +227,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] its late-materialization variant: a payload of several columns of one table fetched by rowid, through
     projections, filters and joins on equal columns
   - [ ] projections between the filter and the window that compute something
-  - [ ] passes not ported: self-join aggregate, compressed materialization, partitioned execution, list comprehension rewrite, enum IN simplification (C++ keeps IN
+  - [x] self-join aggregate (TPC-DS q95's `ws_wh` as `GROUP BY keys HAVING min(x) <> max(x)`); volatile
+    uncorrelated IN subqueries are MARK joins too
+  - [ ] `duckdb_types()` and the other system functions as `LogicalGet`s in EXPLAIN (`self_join_aggregate`)
+  - [ ] passes not ported: compressed materialization, partitioned execution, list comprehension rewrite, enum IN simplification (C++ keeps IN
     lists as IN), the auxiliary `e(b) op e(c)` filters of window pushdown, uncorrelated EXISTS as a cross product
 - [ ] 19. TPC-H 22/22 and TPC-DS 99/99 correct
   - [x] with `tools/tpch` and `tools/tpcds` building dbgen and dsdgen from the C++ checkout, the examples get
