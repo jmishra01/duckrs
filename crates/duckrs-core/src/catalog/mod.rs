@@ -198,6 +198,23 @@ pub trait TableSource: std::fmt::Debug + Send + Sync {
     fn segments(&self, include_info: bool, loaded_only: bool) -> Result<Vec<SegmentInfo>>;
 }
 
+/// What writes the row groups of an append to blocks of their own ahead of a checkpoint (`OptimisticDataWriter`): of
+/// a table, rows, the position among them of the first to write and its id. Nothing where the database doesn't.
+pub trait AheadWriter: Send + Sync + std::fmt::Debug {
+    fn write(
+        &self,
+        table: &TableCatalogEntry,
+        rows: &ColumnDataCollection,
+        first: usize,
+        first_id: u64,
+        final_flush: bool,
+    ) -> Result<Vec<crate::storage::writer::WrittenGroup>>;
+}
+
+/// Where the [`AheadWriter`] of a database is, which its schemas and tables share; empty in memory and in the copies
+/// of a transaction.
+pub type AheadSlot = Arc<RwLock<Option<Arc<dyn AheadWriter>>>>;
+
 /// A row of `pragma_storage_info`.
 #[derive(Debug, Clone)]
 pub struct SegmentInfo {
@@ -410,9 +427,10 @@ pub struct TableCatalogEntry {
     /// The ALTERs that made this entry of one the log knows, oldest first, which the log says as such
     /// (`WriteAlter`): empty when it has to make the table again.
     pub alters: Mutex<Vec<LoggedAlter>>,
-    /// Row groups of rows of the table in memory that a commit wrote to blocks ahead of a checkpoint
-    /// (`OptimisticDataWriter`), which a checkpoint keeps; they go once the rows change but by appends.
-    written: Mutex<Vec<Arc<crate::storage::writer::WrittenGroup>>>,
+    /// that of its database, set where the schema it is in has one
+    ahead: RwLock<Option<AheadSlot>>,
+    /// the blocks an append is filling, open until its commit (`PartialBlockManager` of `APPEND_TO_TABLE`)
+    pub append_blocks: Mutex<crate::storage::writer::AppendBlocks>,
     /// made by CREATE TABLE AS, whose columns depend on no type (`BindCreateTableInfo` registers
     /// the types of the columns only when there is no query)
     pub from_query: std::sync::atomic::AtomicBool,
@@ -845,7 +863,8 @@ impl TableCatalogEntry {
             unloaded_deletes: std::sync::atomic::AtomicBool::new(false),
             comment: Mutex::new(None),
             alters: Mutex::default(),
-            written: Mutex::default(),
+            ahead: RwLock::default(),
+            append_blocks: Mutex::default(),
         }
     }
 
@@ -854,14 +873,47 @@ impl TableCatalogEntry {
     /// How many rows there are, which takes no reading.
     pub fn row_count(&self) -> usize {
         match &*self.source.read() {
-            Some(source) => source.row_count(),
+            Some(source) => source.row_count() + self.storage.read().len(),
             None => self.storage.read().len(),
         }
     }
 
-    /// Where the rows are, if they are still in a file.
+    /// Where the rows are, if they are still in a file: then `storage` holds those appended after them, if any,
+    /// which are the last part of the source this gives.
     pub fn source(&self) -> Option<Arc<dyn TableSource>> {
-        self.source.read().clone()
+        let source = self.source.read().clone()?;
+        let storage = self.storage.read();
+        if storage.is_empty() {
+            return Some(source);
+        }
+        let mut parts = crate::storage::appended::AppendedTable::parts_of(&source);
+        parts.push(crate::storage::appended::AppendedPart::Memory(Arc::new(
+            storage.clone(),
+        )));
+        let ids = self.row_ids(source.row_count() + storage.len());
+        let ids = (*ids).clone();
+        let appended = crate::storage::appended::AppendedTable::new(parts, ids, self.types(), self.row_group_size());
+        Some(Arc::new(appended))
+    }
+
+    /// How many of its rows are in memory.
+    pub fn rows_in_memory(&self) -> usize {
+        self.storage.read().len()
+    }
+
+    /// The rows of the table in its source, without those appended after them in memory.
+    pub fn source_rows(&self) -> usize {
+        self.source.read().as_ref().map_or(0, |source| source.row_count())
+    }
+
+    /// Whether rows can be appended to a table in a file without reading those: nothing that checks the rows
+    /// appended against the others (a key or an index) needs them in memory.
+    pub(crate) fn appends_after_source(&self) -> bool {
+        self.indexes.read().is_empty()
+            && !self
+                .constraints
+                .iter()
+                .any(|c| matches!(c, TableConstraint::Unique { .. } | TableConstraint::ForeignKey(_)))
     }
 
     /// Leaves the rows in a file until something needs them all.
@@ -871,7 +923,6 @@ impl TableCatalogEntry {
     }
 
     pub fn set_source(&self, source: Arc<dyn TableSource>) {
-        self.forget_written();
         self.set_row_ids(source.row_ids());
         let variants: Vec<usize> = (0..self.columns.len())
             .filter(|&c| self.columns[c].ty.id() == LogicalTypeId::Variant)
@@ -902,7 +953,6 @@ impl TableCatalogEntry {
     /// Of a table an UPDATE or an ALTER made of one in a file: its rows are still there, but for the columns that
     /// `source` has in memory. What the last checkpoint wrote stays what it was.
     pub fn keep_in_file(&self, source: Arc<dyn TableSource>) {
-        self.forget_written();
         self.set_row_ids(source.row_ids());
         *self.write_loaded_storage() = ColumnDataCollection::new(self.types());
         *self.read_from.write() = None;
@@ -941,7 +991,6 @@ impl TableCatalogEntry {
     /// A checkpoint put the rows in a file: what is in memory of them goes.
     pub fn leave_in_file(&self, source: Arc<dyn TableSource>) {
         self.unloaded_deletes.store(false, std::sync::atomic::Ordering::Relaxed);
-        self.forget_written();
         let types = self.types();
         let ids = source.row_ids();
         let old = self.row_ids(self.row_count());
@@ -963,7 +1012,11 @@ impl TableCatalogEntry {
         }
         let mut source = self.source.write();
         if let Some(rows) = source.as_ref() {
-            *self.storage.write() = rows.read_all()?;
+            let mut loaded = rows.read_all()?;
+            let mut storage = self.storage.write();
+            // the rows appended after those in the file
+            loaded.append_collection(&storage);
+            *storage = loaded;
             *self.read_from.write() = source.take();
         }
         Ok(())
@@ -982,6 +1035,11 @@ impl TableCatalogEntry {
             Arc::make_mut(&mut ids).fill(count);
         }
         ids.clone()
+    }
+
+    /// The row groups its rows are in that a checkpoint keeps as such, without giving rows ids.
+    pub fn stored_groups(&self) -> Vec<(u64, usize)> {
+        self.row_ids.lock().stored_groups().to_vec()
     }
 
     pub fn set_row_ids(&self, ids: RowIds) {
@@ -1044,7 +1102,6 @@ impl TableCatalogEntry {
 
     /// Replaces rows that were in a file, which the caller has read.
     pub fn set_rows(&self, rows: ColumnDataCollection) {
-        self.forget_written();
         self.rows_rewritten();
         *self.source.write() = None;
         *self.storage.write() = rows;
@@ -1054,58 +1111,100 @@ impl TableCatalogEntry {
     /// Whoever writes to `storage` comes through here, so that nothing goes on using statistics of
     /// other rows.
     pub fn write_storage(&self) -> Result<parking_lot::RwLockWriteGuard<'_, ColumnDataCollection>> {
-        self.forget_written();
         self.load_rows()?;
         Ok(self.write_loaded_storage())
     }
 
-    /// `write_storage` for what only adds rows at the end, which leaves the row groups written ahead as they are.
+    /// `write_storage` for what only adds rows at the end. Rows in a file stay there and the new ones come after
+    /// them in memory, unless something checks those against all the others.
     pub fn append_storage(&self) -> Result<parking_lot::RwLockWriteGuard<'_, ColumnDataCollection>> {
-        self.load_rows()?;
+        if !self.appends_after_source() {
+            self.load_rows()?;
+        }
+        let first_new = self.row_count();
         let storage = self.write_loaded_storage();
-        self.rows_appended(storage.len());
+        self.rows_appended(first_new);
         Ok(storage)
     }
 
-    /// The row groups of the table that a commit wrote ahead of a checkpoint.
-    pub fn written_groups(&self) -> Vec<Arc<crate::storage::writer::WrittenGroup>> {
-        self.written.lock().clone()
+    /// The rows of the table are now `source`, which a commit made of them, writing those it appended to blocks.
+    pub fn set_appended(&self, source: Arc<dyn TableSource>) {
+        self.set_row_ids(source.row_ids());
+        *self.storage.write() = ColumnDataCollection::new(self.types());
+        *self.source.write() = Some(source);
     }
 
-    /// Row groups a commit wrote of rows at the end: a checkpoint keeps them as row groups of their own.
-    pub fn add_written_groups(&self, groups: Vec<Arc<crate::storage::writer::WrittenGroup>>) {
-        let bounds: Vec<(u64, usize)> = groups.iter().map(|group| (group.row_start, group.rows)).collect();
-        {
-            let mut ids = self.row_ids.lock();
-            let ids = Arc::make_mut(&mut ids);
-            let mut stored = ids.stored_groups().to_vec();
-            stored.extend(bounds);
-            *ids = ids.clone().with_stored_groups(stored);
-        }
-        self.written.lock().extend(groups);
+    /// [`Self::write_full_row_groups`] of `WRITE_BUFFER_ROW_GROUP_COUNT` row groups, with the writer of the table's database.
+    pub fn write_ahead_when_full(&self) -> Result<()> {
+        let slot = self.ahead.read().clone();
+        let Some(writer) = slot.and_then(|slot| slot.read().clone()) else {
+            return Ok(());
+        };
+        self.write_full_row_groups(
+            crate::storage::writer::WRITE_BUFFER_ROW_GROUP_COUNT,
+            &|table, rows, first, id| writer.write(table, rows, first, id, false),
+        )
     }
 
-    /// The rows changed other than by appends: what was written of them ahead is not them any more.
-    pub fn forget_written(&self) {
-        let mut written = self.written.lock();
-        if written.is_empty() {
-            return;
+    /// `OptimisticDataWriter::WriteNewRowGroup` during an append: once the rows appended to the table in memory have
+    /// `count` row groups full and more rows after them, those row groups go to blocks and out of memory.
+    /// `write` writes them, given the rows, the position of the first and its id.
+    pub fn write_full_row_groups(
+        &self,
+        count: usize,
+        write: &dyn Fn(
+            &TableCatalogEntry,
+            &ColumnDataCollection,
+            usize,
+            u64,
+        ) -> Result<Vec<crate::storage::writer::WrittenGroup>>,
+    ) -> Result<()> {
+        use crate::storage::appended::{AppendedPart, AppendedTable, collection_between};
+        if !self.appends_after_source() {
+            return Ok(());
         }
-        written.clear();
-        drop(written);
-        // their row groups aren't row groups of their own any more either
-        let mut ids = self.row_ids.lock();
-        let ids = Arc::make_mut(&mut ids);
-        let stored: Vec<(u64, usize)> = match self.checkpointed().and_then(|source| {
-            source
-                .as_any()
-                .downcast_ref::<crate::storage::table_data::DiskTable>()
-                .map(|disk| crate::catalog::TableSource::row_ids(disk).stored_groups().to_vec())
-        }) {
-            Some(stored) => stored,
+        let group_rows = self.row_group_size();
+        let total = self.row_count();
+        let in_source = self.source_rows();
+        // rows the log has, which a commit has to write as rows, stay
+        let logged = self.log.lock().logged.len();
+        let first = in_source.max(logged);
+        if total <= first + count * group_rows || (self.source.read().is_none() && logged > 0) {
+            return Ok(());
+        }
+        let ids = self.row_ids(total);
+        let first_id = ids.id(first);
+        if ids.id(first + count * group_rows - 1) - first_id != (count * group_rows - 1) as u64 {
+            return Ok(());
+        }
+        // the source before the rows in memory, as everything that takes both does
+        let mut current = self.source.write();
+        let mut storage = self.storage.write();
+        // another thread of the append wrote them meanwhile
+        if current.as_ref().map_or(0, |source| source.row_count()) != in_source || in_source + storage.len() < total {
+            return Ok(());
+        }
+        let offset = first - in_source;
+        let flushed = collection_between(&storage, offset, offset + count * group_rows);
+        let groups = write(self, &flushed, 0, first_id)?;
+        if groups.is_empty() {
+            return Ok(());
+        }
+        let mut parts = match current.clone() {
+            Some(source) => AppendedTable::parts_of(&source),
             None => Vec::new(),
         };
-        *ids = ids.clone().with_stored_groups(stored);
+        if offset > 0 {
+            parts.push(AppendedPart::Memory(Arc::new(collection_between(&storage, 0, offset))));
+        }
+        parts.extend(groups.into_iter().map(|group| AppendedPart::Written(Arc::new(group))));
+        let rest = collection_between(&storage, offset + count * group_rows, storage.len());
+        let mut kept_ids = (*ids).clone();
+        kept_ids.truncate(first + count * group_rows);
+        let source = AppendedTable::new(parts, kept_ids, self.types(), group_rows);
+        *storage = rest;
+        *current = Some(Arc::new(source));
+        Ok(())
     }
 
     /// All rows are durable as they are, in a file or in a log that was replayed.
@@ -1160,7 +1259,6 @@ impl TableCatalogEntry {
     /// Whoever calls `write_storage` says what became of the rows, for what is known of them to
     /// stay: the rows at these positions changed, and only their values.
     pub fn rows_updated_in_place(&self, positions: impl IntoIterator<Item = usize>) {
-        self.forget_written();
         let mut statistics = self.statistics.lock();
         statistics.unreported = false;
         let positions: Vec<usize> = positions.into_iter().collect();
@@ -1264,8 +1362,48 @@ impl TableCatalogEntry {
 
     /// Drops the rows from `rows` on, which a statement that failed added.
     pub fn truncate(&self, rows: usize) {
-        // rows that are still in a file weren't added to
-        if self.source.read().is_some() {
+        // rows in a file stay; what the statement wrote to blocks of its own goes, and its rows in memory
+        let source = self.source.read().clone();
+        if let Some(source) = source {
+            if let Some(buffer) = crate::storage::appended::AppendedTable::parts_of(&source)
+                .iter()
+                .find_map(|part| match part {
+                    crate::storage::appended::AppendedPart::Written(group) => Some(group.buffer()),
+                    _ => None,
+                })
+            {
+                self.append_blocks.lock().clear(&buffer);
+            }
+            let in_source = source.row_count();
+            if rows < in_source {
+                use crate::storage::appended::{AppendedPart, AppendedTable};
+                let mut kept = Vec::new();
+                let mut end = 0;
+                for part in AppendedTable::parts_of(&source) {
+                    let part_rows = match &part {
+                        AppendedPart::Source(source) => source.row_count(),
+                        AppendedPart::Written(written) => written.rows,
+                        AppendedPart::Memory(memory) => memory.len(),
+                    };
+                    if end + part_rows > rows {
+                        break;
+                    }
+                    end += part_rows;
+                    kept.push(part);
+                }
+                let mut ids = (*self.row_ids(self.row_count())).clone();
+                ids.truncate(end);
+                let source: Arc<dyn TableSource> = match kept.as_slice() {
+                    [AppendedPart::Source(source)] => source.clone(),
+                    _ => Arc::new(AppendedTable::new(kept, ids, self.types(), self.row_group_size())),
+                };
+                *self.source.write() = Some(source);
+                *self.storage.write() = ColumnDataCollection::new(self.types());
+            } else {
+                self.storage.write().truncate(rows - in_source);
+            }
+            Arc::make_mut(&mut self.row_ids.lock()).truncate(rows);
+            self.statistics.lock().forget();
             return;
         }
         self.rows_rewritten();
@@ -1544,6 +1682,7 @@ pub struct SchemaCatalogEntry {
     triggers: RwLock<BTreeMap<String, Arc<TriggerCatalogEntry>>>,
     /// the rows of a row group of the tables of its database (`ROW_GROUP_SIZE`), shared with the catalog
     row_group_rows: Arc<std::sync::atomic::AtomicUsize>,
+    ahead: AheadSlot,
 }
 
 /// A type of CREATE TYPE, and its comment.
@@ -1587,12 +1726,23 @@ impl SchemaCatalogEntry {
 
     /// The schema at `path`, nested in the one before it if there is one.
     fn at_path(path: Vec<String>) -> Self {
-        Self::at_path_in(path, Arc::new(std::sync::atomic::AtomicUsize::new(ROW_GROUP_ROWS)), TEMP_SCHEMA)
+        Self::at_path_in(
+            path,
+            Arc::new(std::sync::atomic::AtomicUsize::new(ROW_GROUP_ROWS)),
+            AheadSlot::default(),
+            TEMP_SCHEMA,
+        )
     }
 
-    fn at_path_in(path: Vec<String>, row_group_rows: Arc<std::sync::atomic::AtomicUsize>, catalog: &str) -> Self {
+    fn at_path_in(
+        path: Vec<String>,
+        row_group_rows: Arc<std::sync::atomic::AtomicUsize>,
+        ahead: AheadSlot,
+        catalog: &str,
+    ) -> Self {
         Self {
             row_group_rows,
+            ahead,
             catalog: catalog.to_string(),
             name: path.last().cloned().unwrap_or_default(),
             path,
@@ -1624,9 +1774,24 @@ impl SchemaCatalogEntry {
         (self.path.len() > 1).then(|| schema_key(&self.path[..self.path.len() - 1]))
     }
 
+    /// What writes the appends of its database ahead of a checkpoint, if it does.
+    pub(crate) fn ahead_writer(&self) -> Option<Arc<dyn AheadWriter>> {
+        self.ahead.read().clone()
+    }
+
+    /// The rows of a row group of its tables.
+    pub(crate) fn row_group_size(&self) -> usize {
+        self.row_group_rows.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// An empty schema at the same place.
     pub(crate) fn empty_like(&self) -> Self {
-        Self::at_path_in(self.path.clone(), self.row_group_rows.clone(), &self.catalog)
+        Self::at_path_in(
+            self.path.clone(),
+            self.row_group_rows.clone(),
+            AheadSlot::default(),
+            &self.catalog,
+        )
     }
 
     /// `DuckSchemaEntry::CreateType`.
@@ -1912,6 +2077,7 @@ impl SchemaCatalogEntry {
             self.row_group_rows.load(std::sync::atomic::Ordering::Relaxed),
             std::sync::atomic::Ordering::Relaxed,
         );
+        *table.ahead.write() = Some(self.ahead.clone());
         let table = Arc::new(table);
         Self::register_foreign_keys(&tables, &table);
         tables.insert(key(name), TableOrView::Table(table.clone()));
@@ -2403,6 +2569,8 @@ pub struct Catalog {
     storage_version: RwLock<Option<duckrs_common::serializer::StorageVersion>>,
     /// `ROW_GROUP_SIZE`: the rows of a row group of its tables, which its schemas share
     pub(crate) row_group_rows: Arc<std::sync::atomic::AtomicUsize>,
+    /// what writes appends ahead of a checkpoint, of a database in a file
+    ahead: AheadSlot,
 }
 
 thread_local! {
@@ -2566,8 +2734,9 @@ impl Catalog {
             for entry in tables.values() {
                 if let TableOrView::Table(table) = entry {
                     // a table that is still in a file comes back as it is, without reading it
+                    // the source as it is, and the rows appended after it in memory
                     let rows = table.storage.read().clone();
-                    let source = table.source();
+                    let source = table.source.read().clone();
                     let indexes = table.indexes.read().clone();
                     table_rows.push(TableRows {
                         table: table.clone(),
@@ -2639,16 +2808,32 @@ impl Catalog {
             forked: false,
             storage_version: RwLock::new(None),
             row_group_rows: Arc::new(std::sync::atomic::AtomicUsize::new(ROW_GROUP_ROWS)),
+            ahead: AheadSlot::default(),
         };
         for name in [DEFAULT_SCHEMA, TEMP_SCHEMA] {
-            let schema =
-                SchemaCatalogEntry::at_path_in(vec![name.to_string()], catalog.row_group_rows.clone(), &catalog.name);
+            // temporary tables aren't in the file
+            let ahead = if name == TEMP_SCHEMA {
+                AheadSlot::default()
+            } else {
+                catalog.ahead.clone()
+            };
+            let schema = SchemaCatalogEntry::at_path_in(
+                vec![name.to_string()],
+                catalog.row_group_rows.clone(),
+                ahead,
+                &catalog.name,
+            );
             catalog.schemas.write().insert(key(name), Arc::new(schema));
         }
         catalog
     }
 
     /// `ROW_GROUP_SIZE` of the database: the tables created from now on have row groups of this many rows.
+    /// What writes the appends of the database ahead of a checkpoint.
+    pub fn set_ahead_writer(&self, writer: Arc<dyn AheadWriter>) {
+        *self.ahead.write() = Some(writer);
+    }
+
     pub fn set_row_group_rows(&self, rows: usize) {
         self.row_group_rows.store(rows, std::sync::atomic::Ordering::Relaxed);
     }
@@ -2694,6 +2879,7 @@ impl Catalog {
             Arc::new(SchemaCatalogEntry::at_path_in(
                 path.to_vec(),
                 self.row_group_rows.clone(),
+                self.ahead.clone(),
                 &self.name,
             )),
         );

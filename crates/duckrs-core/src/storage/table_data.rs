@@ -108,7 +108,10 @@ fn not_ported_column(ty: &LogicalType) -> Error {
 }
 
 /// `PersistentColumnData::Deserialize`, of a column or (with no `ty`) of its validity.
-fn read_persistent_column(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>) -> Result<PersistentColumn> {
+pub(super) fn read_persistent_column(
+    d: &mut BinaryDeserializer<'_>,
+    ty: Option<&LogicalType>,
+) -> Result<PersistentColumn> {
     d.read_object_value(|d| {
         // a GEOMETRY without `GeometryPersistentColumnData` is of the spatial extension's format
         let spatial = ty.map(LogicalType::id) == Some(LogicalTypeId::Geometry) && !d.has_property(99)?;
@@ -533,7 +536,7 @@ fn scan_column(buffer: &BufferManager, column: &PersistentColumn, ty: &LogicalTy
 
 /// [`scan_column`] of a column of the table itself, which may come out as a dictionary vector (the
 /// children of nested columns are filled in place, so they stay flat).
-fn scan_table_column(
+pub(super) fn scan_table_column(
     buffer: &BufferManager,
     column: &PersistentColumn,
     ty: &LogicalType,
@@ -728,6 +731,68 @@ fn read_deletes(
         }
     }
     Ok(deleted)
+}
+
+/// `pragma_storage_info` of a column of a row group: its segments, and those of its validity and children.
+pub(super) fn column_segments(
+    buffer: Option<&BufferManager>,
+    result: &mut Vec<SegmentInfo>,
+    stored: &PersistentColumn,
+    group: u64,
+    column: usize,
+    path: &[usize],
+    ty: Option<&LogicalType>,
+) -> Result<()> {
+    let type_name = ty.map_or_else(|| "VALIDITY".to_string(), ToString::to_string);
+    let mut start = 0;
+    let text = path.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
+    for (index, pointer) in stored.pointers.iter().enumerate() {
+        result.push(SegmentInfo {
+            row_group: group,
+            column,
+            path: format!("[{text}]"),
+            segment: index as u64,
+            segment_type: type_name.clone(),
+            start,
+            count: pointer.tuple_count as u64,
+            compression: storage_name(pointer.compression),
+            block_id: pointer.block_id,
+            block_offset: pointer.offset as u64,
+            info: match buffer {
+                Some(buffer) if pointer.block_id >= 0 => {
+                    let handle = segment(buffer, pointer)?;
+                    super::compression::segment_info(
+                        pointer.compression,
+                        &handle[pointer.offset..],
+                        pointer.tuple_count,
+                    )?
+                }
+                _ => None,
+            },
+        });
+        start += pointer.tuple_count as u64;
+    }
+    if let Some(validity) = &stored.validity {
+        let mut child = path.to_vec();
+        child.push(0);
+        column_segments(buffer, result, validity, group, column, &child, None)?;
+    }
+    for (index, inner) in stored.children.iter().enumerate() {
+        let mut child = path.to_vec();
+        child.push(index + 1);
+        // a VARIANT's are what it is stored as, unshredded and shredded
+        let unshredded = duckrs_common::variant::unshredded_type();
+        let name = match ty.map(LogicalType::id) {
+            Some(LogicalTypeId::Variant) if index == 0 => Some(&unshredded),
+            Some(LogicalTypeId::Variant) => stored.shredded_type.as_ref(),
+            _ => match ty.map(LogicalType::physical_type) {
+                Some(PhysicalType::Struct) => ty.map(|ty| &ty.struct_children()[index].1),
+                _ => ty.and_then(LogicalType::child_type),
+            },
+        };
+        column_segments(buffer, result, inner, group, column, &child, name)?;
+    }
+    Ok(())
 }
 
 /// The rows of a table in a file. They stay there, and are read a group and a column at a time.
@@ -931,7 +996,10 @@ fn bound(ty: &LogicalType, bytes: Option<&[u8; 16]>) -> Result<Option<Value>> {
 }
 
 /// What a file's statistics of a column of type `ty` say, with its children's and a VARIANT's shredded part's.
-fn column_statistics(stored: &super::statistics::BaseStatistics, ty: &LogicalType) -> Result<ColumnStatistics> {
+pub(super) fn column_statistics(
+    stored: &super::statistics::BaseStatistics,
+    ty: &LogicalType,
+) -> Result<ColumnStatistics> {
     let child_types: Vec<LogicalType> = match ty.id() {
         LogicalTypeId::List | LogicalTypeId::Array => ty.child_type().cloned().into_iter().collect(),
         LogicalTypeId::Struct => ty.struct_children().iter().map(|(_, ty)| ty.clone()).collect(),
@@ -1254,66 +1322,7 @@ impl TableSource for DiskTable {
         Some(self.persistent_column(group, column).ok()?.shredded_type)
     }
     fn segments(&self, include_info: bool, loaded_only: bool) -> Result<Vec<SegmentInfo>> {
-        fn add(
-            buffer: Option<&BufferManager>,
-            result: &mut Vec<SegmentInfo>,
-            stored: &PersistentColumn,
-            group: u64,
-            column: usize,
-            path: &[usize],
-            ty: Option<&LogicalType>,
-        ) -> Result<()> {
-            let type_name = ty.map_or_else(|| "VALIDITY".to_string(), ToString::to_string);
-            let mut start = 0;
-            let text = path.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
-            for (index, pointer) in stored.pointers.iter().enumerate() {
-                result.push(SegmentInfo {
-                    row_group: group,
-                    column,
-                    path: format!("[{text}]"),
-                    segment: index as u64,
-                    segment_type: type_name.clone(),
-                    start,
-                    count: pointer.tuple_count as u64,
-                    compression: storage_name(pointer.compression),
-                    block_id: pointer.block_id,
-                    block_offset: pointer.offset as u64,
-                    info: match buffer {
-                        Some(buffer) if pointer.block_id >= 0 => {
-                            let handle = segment(buffer, pointer)?;
-                            super::compression::segment_info(
-                                pointer.compression,
-                                &handle[pointer.offset..],
-                                pointer.tuple_count,
-                            )?
-                        }
-                        _ => None,
-                    },
-                });
-                start += pointer.tuple_count as u64;
-            }
-            if let Some(validity) = &stored.validity {
-                let mut child = path.to_vec();
-                child.push(0);
-                add(buffer, result, validity, group, column, &child, None)?;
-            }
-            for (index, inner) in stored.children.iter().enumerate() {
-                let mut child = path.to_vec();
-                child.push(index + 1);
-                // a VARIANT's are what it is stored as, unshredded and shredded
-                let unshredded = duckrs_common::variant::unshredded_type();
-                let name = match ty.map(LogicalType::id) {
-                    Some(LogicalTypeId::Variant) if index == 0 => Some(&unshredded),
-                    Some(LogicalTypeId::Variant) => stored.shredded_type.as_ref(),
-                    _ => match ty.map(LogicalType::physical_type) {
-                        Some(PhysicalType::Struct) => ty.map(|ty| &ty.struct_children()[index].1),
-                        _ => ty.and_then(LogicalType::child_type),
-                    },
-                };
-                add(buffer, result, inner, group, column, &child, name)?;
-            }
-            Ok(())
-        }
+        let add = column_segments;
         let mut result = Vec::new();
         let buffer = include_info.then_some(&*self.buffer);
         for group in 0..self.table.row_groups.len() {
@@ -1331,73 +1340,80 @@ impl TableSource for DiskTable {
     }
 
     fn zones(&self, column: usize) -> Result<Vec<ColumnZone>> {
-        let mut zones = Vec::with_capacity(self.table.row_groups.len());
-        for group in 0..self.table.row_groups.len() {
-            let stored = self.persistent_column(group, column)?;
-            // nulls are in the validity column: what its statistics say, if there is one
-            let (has_null, has_valid) = match &stored.validity {
-                Some(validity) => (
-                    validity.pointers.iter().any(|p| p.statistics.has_null),
-                    validity.pointers.iter().any(|p| p.statistics.has_no_null),
-                ),
-                None => (true, true),
-            };
-            let mut zone = ColumnZone {
-                has_null,
-                ..ColumnZone::default()
-            };
-            // only NULLs: there are no bounds to know
-            if !has_valid {
-                zones.push(zone);
-                continue;
-            }
-            let varchar = self.table.columns[column].ty.id() == LogicalTypeId::Varchar;
-            let mut lengths_known = varchar;
-            for pointer in &stored.pointers {
-                // the lengths of the strings, while every segment has them
-                match pointer.statistics.strings.as_ref().and_then(|s| Some((s.min_length.unwrap_or(0), s.max_length?, s.has_unicode))) {
-                    Some((low, high, unicode)) if lengths_known => {
-                        let (old_low, old_high) = zone.lengths.unwrap_or((low, high));
-                        zone.lengths = Some((old_low.min(low), old_high.max(high)));
-                        zone.has_unicode |= unicode;
-                    }
-                    _ => {
-                        lengths_known = false;
-                        zone.lengths = None;
-                    }
-                }
-                let (min, max) = if varchar {
-                    string_bounds(pointer.statistics.strings.as_ref())
-                } else {
-                    (
-                        bound(&self.table.columns[column].ty, pointer.statistics.min.as_ref())?,
-                        bound(&self.table.columns[column].ty, pointer.statistics.max.as_ref())?,
-                    )
-                };
-                let (Some(min), Some(max)) = (min, max) else {
-                    zone.unknown = true;
-                    break;
-                };
-                if zone
-                    .min
-                    .as_ref()
-                    .is_none_or(|old| compare_values(ComparisonOp::LessThan, &min, old) == Some(true))
-                {
-                    zone.min = Some(min);
-                }
-                if zone
-                    .max
-                    .as_ref()
-                    .is_none_or(|old| compare_values(ComparisonOp::GreaterThan, &max, old) == Some(true))
-                {
-                    zone.max = Some(max);
-                }
-            }
-            zone.unknown |= zone.min.is_none();
-            zones.push(zone);
-        }
-        Ok(zones)
+        let ty = &self.table.columns[column].ty;
+        (0..self.table.row_groups.len())
+            .map(|group| column_zone(&self.persistent_column(group, column)?, ty))
+            .collect()
     }
+}
+
+/// What the statistics of the segments of a stored column say of its values in a row group.
+pub(super) fn column_zone(stored: &PersistentColumn, ty: &LogicalType) -> Result<ColumnZone> {
+    // nulls are in the validity column: what its statistics say, if there is one
+    let (has_null, has_valid) = match &stored.validity {
+        Some(validity) => (
+            validity.pointers.iter().any(|p| p.statistics.has_null),
+            validity.pointers.iter().any(|p| p.statistics.has_no_null),
+        ),
+        None => (true, true),
+    };
+    let mut zone = ColumnZone {
+        has_null,
+        ..ColumnZone::default()
+    };
+    // only NULLs: there are no bounds to know
+    if !has_valid {
+        return Ok(zone);
+    }
+    let varchar = ty.id() == LogicalTypeId::Varchar;
+    let mut lengths_known = varchar;
+    for pointer in &stored.pointers {
+        // the lengths of the strings, while every segment has them
+        match pointer
+            .statistics
+            .strings
+            .as_ref()
+            .and_then(|s| Some((s.min_length.unwrap_or(0), s.max_length?, s.has_unicode)))
+        {
+            Some((low, high, unicode)) if lengths_known => {
+                let (old_low, old_high) = zone.lengths.unwrap_or((low, high));
+                zone.lengths = Some((old_low.min(low), old_high.max(high)));
+                zone.has_unicode |= unicode;
+            }
+            _ => {
+                lengths_known = false;
+                zone.lengths = None;
+            }
+        }
+        let (min, max) = if varchar {
+            string_bounds(pointer.statistics.strings.as_ref())
+        } else {
+            (
+                bound(ty, pointer.statistics.min.as_ref())?,
+                bound(ty, pointer.statistics.max.as_ref())?,
+            )
+        };
+        let (Some(min), Some(max)) = (min, max) else {
+            zone.unknown = true;
+            break;
+        };
+        if zone
+            .min
+            .as_ref()
+            .is_none_or(|old| compare_values(ComparisonOp::LessThan, &min, old) == Some(true))
+        {
+            zone.min = Some(min);
+        }
+        if zone
+            .max
+            .as_ref()
+            .is_none_or(|old| compare_values(ComparisonOp::GreaterThan, &max, old) == Some(true))
+        {
+            zone.max = Some(max);
+        }
+    }
+    zone.unknown |= zone.min.is_none();
+    Ok(zone)
 }
 
 /// Bounds of the strings of a segment, from what its statistics keep of them: a truncated minimum is still below
@@ -1437,9 +1453,25 @@ fn string_bounds(bounds: Option<&super::statistics::StringBounds>) -> (Option<Va
 
 /// `PersistentRowGroupData`: rows that a large insert wrote to the file ahead of its commit.
 pub(super) struct PersistentRowGroup {
-    types: Vec<LogicalType>,
-    columns: Vec<PersistentColumn>,
-    count: u64,
+    pub(super) types: Vec<LogicalType>,
+    pub(super) columns: Vec<PersistentColumn>,
+    pub(super) count: u64,
+}
+
+/// The blocks a column's segments are in, its validity's and its children's too.
+pub(super) fn column_blocks(column: &PersistentColumn, blocks: &mut Vec<u64>) {
+    for pointer in &column.pointers {
+        if pointer.block_id >= 0 {
+            blocks.push(pointer.block_id as u64);
+        }
+        blocks.extend(pointer.overflow_blocks.iter().filter(|b| **b >= 0).map(|b| *b as u64));
+    }
+    if let Some(validity) = &column.validity {
+        column_blocks(validity, blocks);
+    }
+    for child in &column.children {
+        column_blocks(child, blocks);
+    }
 }
 
 /// `PersistentCollectionData::Deserialize`.

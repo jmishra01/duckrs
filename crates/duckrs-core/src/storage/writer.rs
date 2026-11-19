@@ -99,8 +99,32 @@ const STRING_BLOCK_LIMIT: usize = 4096;
 const STRING_HEADER_SIZE: usize = 8;
 const BIG_STRING_MARKER_SIZE: usize = 12;
 const SUB_BLOCK_HEADER_SIZE: usize = 8;
-/// Where the ids of partial blocks start that have none yet (see `Writer::append`).
-const PROVISIONAL_BLOCK: u64 = 1 << 62;
+use super::buffer_manager::PROVISIONAL_BLOCK;
+/// The next provisional id of a block an append fills.
+static NEXT_PROVISIONAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// A block segments go into: its id, its bytes, and how much of it they fill.
+type PartialBlock = (u64, Arc<parking_lot::Mutex<Vec<u8>>>, usize);
+
+/// `PartialBlockManager` of an append (`APPEND_TO_TABLE`): the blocks its row groups fill, which stay open between the
+/// row groups it writes until its commit flushes them (`FinalFlush`).
+#[derive(Debug, Default)]
+pub struct AppendBlocks {
+    partial: std::collections::BTreeMap<(usize, u64), PartialBlock>,
+    count: u64,
+}
+
+impl AppendBlocks {
+    /// `Rollback`: the blocks still open go; nothing was written of them.
+    pub fn clear(&mut self, buffer: &BufferManager) {
+        let ids: Vec<u64> = self.partial.values().map(|(id, _, _)| *id).collect();
+        buffer.drop_provisional(&ids);
+        self.partial.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.partial.is_empty()
+    }
+}
 const METADATA_BLOCK_COUNT: usize = 64;
 /// `CompressionType::COMPRESSION_AUTO`.
 const COMPRESSION_AUTO: u64 = 0;
@@ -1286,12 +1310,14 @@ struct Writer<'a> {
     /// The block that segments go into now, with how much of it they fill.
     /// `PartialBlockManager::partially_filled_blocks`: blocks segments still go into, by the room they have left
     /// (and then in the order they came, as a multimap has them), with their bytes and how much they fill.
-    partial: std::collections::BTreeMap<(usize, u64), (u64, Vec<u8>, usize)>,
+    partial: std::collections::BTreeMap<(usize, u64), PartialBlock>,
     partial_count: u64,
     /// `PartialBlockType::APPEND_TO_TABLE`: rows written ahead of a commit, whose blocks get their ids as they are
     /// flushed (`PartialBlock::Flush`); until then a partial block has an id of its own, which this maps.
     append: bool,
     provisional: HashMap<u64, u64>,
+    /// Of the table being written, the row groups an append wrote to blocks (`OptimisticDataWriter`).
+    written: Vec<std::sync::Arc<WrittenGroup>>,
     /// Sub-blocks that were put aside for the free list (`GetFreeListBlocks`).
     reserved: VecDeque<(u64, usize)>,
     tables: MetaStream,
@@ -1500,6 +1526,21 @@ fn matching_columns(
         same.push(equal.then_some(at));
     }
     Ok((same_deletes, same))
+}
+
+/// Whether the rows of `left` are the first of `ids`, with the same ids.
+fn ids_are_prefix(left: &RowIds, ids: &RowIds) -> bool {
+    if left.len() > ids.len() {
+        return false;
+    }
+    let mut position = 0;
+    for (first, count) in left.ranges() {
+        if ids.id(position) != first || ids.id(position + count - 1) != first + count as u64 - 1 {
+            return false;
+        }
+        position += count;
+    }
+    true
 }
 
 /// Whether the rows of `group` of `disk` that are left are those `kept` says.
@@ -1759,6 +1800,7 @@ impl<'a> Writer<'a> {
             partial_count: 0,
             append: false,
             provisional: HashMap::new(),
+            written: Vec::new(),
             reserved: VecDeque::new(),
             tables: MetaStream::default(),
             force_compression: options.force_compression.to_lowercase(),
@@ -1801,15 +1843,19 @@ impl<'a> Writer<'a> {
     }
 
     /// `PartialBlock::Flush`: ahead of a commit, this is when the block gets its id.
-    fn flush_partial(&mut self, block: u64, data: &[u8]) -> Result<()> {
-        let block = if self.append {
+    fn flush_partial(&mut self, block: u64, data: &parking_lot::Mutex<Vec<u8>>) -> Result<()> {
+        let id = if self.append {
             let id = self.allocate_block();
             self.provisional.insert(block, id);
             id
         } else {
             block
         };
-        self.buffer.block_manager().write_block(block, data)
+        self.buffer.block_manager().write_block(id, &data.lock())?;
+        if self.append {
+            self.buffer.flushed_provisional(block, id);
+        }
+        Ok(())
     }
 
     /// `PartialBlockManager::Write` of a segment: into the fullest block that has room for it, unless it is too
@@ -1823,16 +1869,23 @@ impl<'a> Writer<'a> {
         } else {
             None
         };
-        let (block, mut buffer, used) = match taken {
+        let (block, buffer, used) = match taken {
             Some(partial) => partial,
             None if self.append => {
-                self.partial_count += 1;
-                (PROVISIONAL_BLOCK + self.partial_count, vec![0; self.block_size], 0)
+                let id = PROVISIONAL_BLOCK + NEXT_PROVISIONAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let buffer = Arc::new(parking_lot::Mutex::new(vec![0; self.block_size]));
+                // what is in it is read from memory until it is written
+                self.buffer.open_provisional(id, buffer.clone());
+                (id, buffer, 0)
             }
-            None => (self.allocate_block(), vec![0; self.block_size], 0),
+            None => (
+                self.allocate_block(),
+                Arc::new(parking_lot::Mutex::new(vec![0; self.block_size])),
+                0,
+            ),
         };
         let at = used;
-        buffer[at..at + data.len()].copy_from_slice(data);
+        buffer.lock()[at..at + data.len()].copy_from_slice(data);
         let used = (at + data.len()).next_multiple_of(8);
         *self.segments_in_block.entry(block).or_default() += 1;
         // `RetainOrFlush`
@@ -2915,7 +2968,7 @@ impl<'a> Writer<'a> {
             // rows written ahead of the commit are in their blocks already (`ColumnData::HasChanges`)
             let out = match written {
                 Some(columns) => {
-                    let out = columns[column].clone();
+                    let out = resolved(&columns[column], self.buffer);
                     self.keep_written_blocks(&out);
                     out
                 }
@@ -3144,12 +3197,18 @@ impl<'a> Writer<'a> {
         }
         // a row group a commit wrote ahead, whose rows are all still there: its columns stay in their blocks, and
         // only their metadata is written (`OptimisticDataWriter`)
-        if indexes.is_empty() && !group.merged && group.live == group.rows {
-            let written = table
-                .written_groups()
-                .into_iter()
-                .find(|written| written.row_start == group.row_start && written.rows == group.rows);
+        if indexes.is_empty() && !group.merged {
+            let written = self
+                .written
+                .iter()
+                .find(|written| written.row_start == group.row_start && written.rows == group.rows)
+                .cloned();
             if let Some(written) = written {
+                // the rows a DELETE took are deletes of the row group (`RowVersionManager::Checkpoint`)
+                let kept: Vec<bool> = (0..group.rows)
+                    .map(|offset| ids.position(group.row_start + offset as u64).is_some())
+                    .collect();
+                let deletes = Deletes::Write(kept.iter().any(|kept| !kept).then(|| deletes_of(&kept)));
                 self.group_loaded.push(vec![true; types.len()]);
                 let parts = types.iter().map(|_| Vec::new()).collect();
                 let reused = vec![None; types.len()];
@@ -3158,7 +3217,7 @@ impl<'a> Writer<'a> {
                     parts,
                     group.file_start,
                     group.rows,
-                    Deletes::Write(None),
+                    deletes,
                     statistics,
                     reused,
                     Some(&written.columns),
@@ -3300,13 +3359,44 @@ impl<'a> Writer<'a> {
         self.group_loaded.clear();
         // the rows are still those of the file, as a layer over its table or that table itself
         // (that a DELETE took rows of too)
-        self.in_file = match (table.source(), disk) {
+        // of rows appended after those of the file, those the file has (`RowGroupCollection::MergeStorage`)
+        // also under a DELETE, which leaves the columns as they are
+        let appended = table.source().and_then(|source| {
+            if let Some(appended) = source.as_any().downcast_ref::<super::appended::AppendedTable>() {
+                return Some(appended.clone());
+            }
+            let layered = source.as_any().downcast_ref::<super::layered::LayeredTable>()?;
+            let identity = layered
+                .layers()
+                .iter()
+                .enumerate()
+                .all(|(at, layer)| matches!(layer, super::layered::Layer::Base(column) if *column == at));
+            identity
+                .then(|| {
+                    layered
+                        .base()
+                        .as_any()
+                        .downcast_ref::<super::appended::AppendedTable>()
+                        .cloned()
+                })
+                .flatten()
+        });
+        self.written = appended
+            .as_ref()
+            .map(|appended| appended.written_groups().into_iter().map(|(_, group)| group).collect())
+            .unwrap_or_default();
+        let in_file_source = match &appended {
+            Some(appended) => appended.base().cloned(),
+            None => table.source(),
+        };
+        self.in_file = match (in_file_source, disk) {
             (Some(source), Some(disk)) if self.metadata_reuse => {
                 let layered = super::layered::LayeredTable::of(&source, types.clone());
                 let left = crate::catalog::TableSource::row_ids(&layered);
+                // its rows are the first of the table, with the same ids
+                let prefix = appended.is_some() && ids_are_prefix(&left, &ids);
                 let same = std::ptr::addr_eq(Arc::as_ptr(layered.base()), disk as *const _)
-                    && left.next() == ids.next()
-                    && left.ranges().eq(ids.ranges());
+                    && (prefix || (left.next() == ids.next() && left.ranges().eq(ids.ranges())));
                 same.then_some(layered)
             }
             _ => None,
@@ -3611,31 +3701,192 @@ fn serializer(version: StorageVersion) -> BinarySerializer {
 
 /// A row group a large insert wrote to blocks ahead of its commit (`OptimisticDataWriter`): where its columns are,
 /// which a checkpoint keeps, writing only their metadata.
-#[derive(Debug)]
 pub struct WrittenGroup {
     /// the id of its first row
     pub row_start: u64,
     pub rows: usize,
     columns: Vec<ColumnOut>,
+    /// the columns as a reader of the file sees them, to read them back from their blocks
+    persistent: Vec<super::table_data::PersistentColumn>,
+    types: Vec<LogicalType>,
+    buffer: std::sync::Arc<BufferManager>,
+}
+
+impl std::fmt::Debug for WrittenGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WrittenGroup")
+            .field("row_start", &self.row_start)
+            .field("rows", &self.rows)
+            .finish()
+    }
+}
+
+impl WrittenGroup {
+    fn new(
+        row_start: u64,
+        rows: usize,
+        columns: Vec<ColumnOut>,
+        types: Vec<LogicalType>,
+        version: StorageVersion,
+        buffer: std::sync::Arc<BufferManager>,
+    ) -> Result<Self> {
+        let mut persistent = Vec::with_capacity(columns.len());
+        for (column, ty) in columns.iter().zip(&types) {
+            let mut s = serializer(version);
+            s.write_object_value(|s| write_column(s, column, Some(ty), 0));
+            let bytes = s.into_bytes();
+            let mut d = duckrs_common::serializer::BinaryDeserializer::new(&bytes);
+            persistent.push(super::table_data::read_persistent_column(&mut d, Some(ty))?);
+        }
+        Ok(Self {
+            row_start,
+            rows,
+            columns,
+            persistent,
+            types,
+            buffer,
+        })
+    }
+
+    /// A row group a log of C++ says is in blocks (`ROW_GROUP_DATA`); `None` where its columns are of a kind the
+    /// writer doesn't write as they are (a GEOMETRY of the spatial extension's format).
+    pub(super) fn from_persistent(
+        row_start: u64,
+        rows: usize,
+        columns: &[super::table_data::PersistentColumn],
+        types: Vec<LogicalType>,
+        version: StorageVersion,
+        buffer: std::sync::Arc<BufferManager>,
+    ) -> Result<Option<Self>> {
+        fn out_of(column: &super::table_data::PersistentColumn, ty: Option<&LogicalType>) -> Option<ColumnOut> {
+            if column.spatial {
+                return None;
+            }
+            let segments = column
+                .pointers
+                .iter()
+                .map(|pointer| SegmentOut {
+                    tuple_count: pointer.tuple_count,
+                    block_id: pointer.block_id,
+                    offset: pointer.offset as u32,
+                    compression: pointer.compression,
+                    stats: segment_stats(&pointer.statistics),
+                    overflow_blocks: pointer.overflow_blocks.clone(),
+                })
+                .collect();
+            let validity = match &column.validity {
+                Some(validity) => Some(Box::new(out_of(validity, None)?)),
+                None => None,
+            };
+            let child_types = match ty {
+                Some(ty) if ty.id() == LogicalTypeId::Variant => {
+                    let mut types = vec![duckrs_common::variant::unshredded_type()];
+                    types.extend(column.shredded_type.clone());
+                    types
+                }
+                Some(ty) => child_types(ty),
+                None => Vec::new(),
+            };
+            if column.children.len() != child_types.len() {
+                return None;
+            }
+            let children = column
+                .children
+                .iter()
+                .zip(&child_types)
+                .map(|(child, ty)| out_of(child, Some(ty)))
+                .collect::<Option<Vec<_>>>()?;
+            let stats = match ty {
+                Some(ty) => stored_stats(column, ty),
+                None => {
+                    let mut stats = Stats::of_validity(&[]);
+                    for pointer in &column.pointers {
+                        stats.has_null |= pointer.statistics.has_null;
+                        stats.has_no_null |= pointer.statistics.has_no_null;
+                    }
+                    stats
+                }
+            };
+            Some(ColumnOut {
+                segments,
+                validity,
+                children,
+                stats,
+                shredded_type: column.shredded_type.clone(),
+            })
+        }
+        let mut outs = Vec::with_capacity(columns.len());
+        for (column, ty) in columns.iter().zip(&types) {
+            match out_of(column, Some(ty)) {
+                Some(out) => outs.push(out),
+                None => return Ok(None),
+            }
+        }
+        Self::new(row_start, rows, outs, types, version, buffer).map(Some)
+    }
+
+    /// A column of the group, read from its blocks.
+    pub fn read_column(&self, column: usize) -> Result<Vector> {
+        super::table_data::scan_table_column(&self.buffer, &self.persistent[column], &self.types[column], self.rows)
+    }
+
+    pub fn buffer(&self) -> std::sync::Arc<BufferManager> {
+        self.buffer.clone()
+    }
+
+    /// `pragma_storage_info` of its columns, as row group `group`.
+    pub(super) fn segments(
+        &self,
+        buffer: Option<&BufferManager>,
+        group: u64,
+    ) -> Result<Vec<crate::catalog::SegmentInfo>> {
+        let mut result = Vec::new();
+        for (column, ty) in self.types.iter().enumerate() {
+            super::table_data::column_segments(
+                buffer,
+                &mut result,
+                &self.persistent[column],
+                group,
+                column,
+                &[column],
+                Some(ty),
+            )?;
+        }
+        for segment in &mut result {
+            if segment.block_id >= 0 {
+                segment.block_id = self.buffer.resolve(segment.block_id as u64) as i64;
+            }
+        }
+        Ok(result)
+    }
+
+    /// What its columns say of their values, per column (`ColumnZone`).
+    pub(super) fn zone(&self, column: usize) -> Result<crate::catalog::ColumnZone> {
+        super::table_data::column_zone(&self.persistent[column], &self.types[column])
+    }
 }
 
 /// `WRITE_BUFFER_ROW_GROUP_COUNT`: the row groups written together, a column of all of them at a time.
-const WRITE_BUFFER_ROW_GROUP_COUNT: usize = 5;
+pub const WRITE_BUFFER_ROW_GROUP_COUNT: usize = 5;
 
 /// `OptimisticDataWriter::WriteNewRowGroup` and `WriteUnflushedRowGroups` of the rows of `table` from position
 /// `first` on, the first of which has id `first_id`: in row groups of the table's size, `WRITE_BUFFER_ROW_GROUP_COUNT`
 /// at a time, into blocks that get their ids as they fill (`PartialBlockType::APPEND_TO_TABLE`).
 pub fn write_ahead(
-    buffer: &BufferManager,
+    buffer: &std::sync::Arc<BufferManager>,
     catalog: &Catalog,
     table: &TableCatalogEntry,
     rows: &ColumnDataCollection,
     first: usize,
     first_id: u64,
     options: CheckpointOptions,
+    blocks: &mut AppendBlocks,
+    final_flush: bool,
 ) -> Result<Vec<WrittenGroup>> {
     let mut writer = Writer::new(buffer, catalog, String::new(), options);
     writer.append = true;
+    writer.partial = std::mem::take(&mut blocks.partial);
+    writer.partial_count = blocks.count;
     let size = table.row_group_size();
     let total = rows.len();
     let types = table.types();
@@ -3677,35 +3928,63 @@ pub fn write_ahead(
             }
         }
         for (&(start, end), columns) in batch.iter().zip(columns) {
-            groups.push(WrittenGroup {
-                row_start: first_id + (start - first) as u64,
-                rows: end - start,
-                columns,
-            });
+            groups.push((first_id + (start - first) as u64, end - start, columns));
         }
     }
-    // `FinalFlush`, and the blocks the segments are in, now that they have ids
-    writer.flush_open_block()?;
-    let provisional = std::mem::take(&mut writer.provisional);
-    fn patch(column: &mut ColumnOut, provisional: &HashMap<u64, u64>) {
+    // `FinalFlush` at the commit; until then the blocks that aren't full stay open for the next row groups
+    if final_flush {
+        writer.flush_open_block()?;
+    }
+    blocks.partial = std::mem::take(&mut writer.partial);
+    blocks.count = writer.partial_count;
+    let version = writer.version;
+    groups
+        .into_iter()
+        .map(|(row_start, rows, columns)| {
+            WrittenGroup::new(row_start, rows, columns, types.clone(), version, buffer.clone())
+        })
+        .collect()
+}
+
+/// `TableStatistics` of row groups written ahead of a checkpoint: the statistics of their columns merged, as a
+/// checkpoint writes those of a table and a reader of the file sees them.
+pub fn written_statistics(groups: &[std::sync::Arc<WrittenGroup>]) -> Option<Vec<crate::catalog::ColumnStatistics>> {
+    let first = groups.first()?;
+    let mut result = Vec::with_capacity(first.types.len());
+    for (column, ty) in first.types.iter().enumerate() {
+        let mut merged = first.columns[column].stats.clone();
+        for group in &groups[1..] {
+            merged.merge(&group.columns[column].stats, ty);
+        }
+        let mut s = serializer(StorageVersion::V2_1_0);
+        true.write_value(&mut s);
+        s.write_object_value(|s| s.write_object(100, "statistics", |s| write_stats(s, Some(ty), &merged)));
+        let bytes = s.into_bytes();
+        let mut d = duckrs_common::serializer::BinaryDeserializer::new(&bytes);
+        let stored = super::statistics::read_column_statistics(&mut d, ty).ok()??;
+        result.push(super::table_data::column_statistics(&stored, ty).ok()?);
+    }
+    Some(result)
+}
+
+/// A column with the blocks of the file its segments are in, those an append filled having ids by now.
+fn resolved(column: &ColumnOut, buffer: &BufferManager) -> ColumnOut {
+    let mut column = column.clone();
+    fn patch(column: &mut ColumnOut, buffer: &BufferManager) {
         for segment in &mut column.segments {
-            if let Some(&block) = provisional.get(&(segment.block_id as u64)) {
-                segment.block_id = block as i64;
+            if segment.block_id >= 0 {
+                segment.block_id = buffer.resolve(segment.block_id as u64) as i64;
             }
         }
         if let Some(validity) = &mut column.validity {
-            patch(validity, provisional);
+            patch(validity, buffer);
         }
         for child in &mut column.children {
-            patch(child, provisional);
+            patch(child, buffer);
         }
     }
-    for group in &mut groups {
-        for column in &mut group.columns {
-            patch(column, &provisional);
-        }
-    }
-    Ok(groups)
+    patch(&mut column, buffer);
+    column
 }
 
 /// `PersistentCollectionData::Serialize` of row groups written ahead of a commit, for a log (`WriteRowGroupData`).
@@ -3716,7 +3995,8 @@ pub fn write_row_group_data(s: &mut BinarySerializer, types: &[LogicalType], gro
             s.write_object_value(|s| {
                 s.write_property(100, "types", &types.to_vec());
                 s.write_list(101, "columns", group.columns.len(), |s, column| {
-                    s.write_object_value(|s| write_column(s, &group.columns[column], Some(&types[column]), 0));
+                    let out = resolved(&group.columns[column], &group.buffer);
+                    s.write_object_value(|s| write_column(s, &out, Some(&types[column]), 0));
                 });
                 s.write_property(102, "start", &group.row_start);
                 s.write_property(103, "count", &(group.rows as u64));

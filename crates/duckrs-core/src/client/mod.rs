@@ -105,6 +105,30 @@ pub struct AttachOptions {
     pub vacuum_rebuild_indexes: Option<u64>,
     /// Those of the database that it is attached to, as a log is replayed with them.
     settings: Option<Arc<RwLock<SettingValues>>>,
+    /// Whoever opens it sets what writes appends ahead, once it is done changing it.
+    no_write_ahead: bool,
+}
+
+/// `OptimisticDataWriter` of a database in a file: row groups of appends go to blocks of their own, as the settings say.
+#[derive(Debug)]
+struct FileAheadWriter {
+    db: std::sync::Weak<DatabaseInstance>,
+}
+
+impl crate::catalog::AheadWriter for FileAheadWriter {
+    fn write(
+        &self,
+        table: &crate::catalog::TableCatalogEntry,
+        rows: &duckrs_common::column_data::ColumnDataCollection,
+        first: usize,
+        first_id: u64,
+        final_flush: bool,
+    ) -> Result<Vec<storage::writer::WrittenGroup>> {
+        let Some(db) = self.db.upgrade() else {
+            return Ok(Vec::new());
+        };
+        db.write_ahead(table, rows, first, first_id, final_flush)
+    }
 }
 
 /// What a checkpoint writes a file with, from the settings: `CheckpointOptions` borrow from it.
@@ -216,6 +240,7 @@ impl DatabaseInstance {
             no_wal_writes: false,
             vacuum_rebuild_indexes: None,
             settings: None,
+            no_write_ahead: false,
         };
         Self::open_with(path, &options)
     }
@@ -240,6 +265,7 @@ impl DatabaseInstance {
             no_wal_writes: false,
             vacuum_rebuild_indexes: None,
             settings: None,
+            no_write_ahead: false,
         };
         Self::open_with(path, &options)
     }
@@ -397,7 +423,20 @@ impl DatabaseInstance {
                 db.file_access = Some(FileAccess::WritesNotPorted);
             }
         }
-        Ok(Arc::new(db))
+        let db = Arc::new(db);
+        // what holds on to it, once whoever opened it is done with it (`ATTACH` names it first)
+        if !options.no_write_ahead {
+            Self::write_ahead_with(&db);
+        }
+        Ok(db)
+    }
+
+    /// Appends of a database in a file go to blocks of their own ahead of a checkpoint (`OptimisticDataWriter`).
+    fn write_ahead_with(db: &Arc<DatabaseInstance>) {
+        if db.file.is_some() && db.file_access.is_none() {
+            db.catalog
+                .set_ahead_writer(Arc::new(FileAheadWriter { db: Arc::downgrade(db) }));
+        }
     }
 
     /// Makes a commit durable, in the log of the file, and checkpoints if the log has grown past
@@ -419,22 +458,12 @@ impl DatabaseInstance {
             return Ok(());
         }
         // `OptimisticDataWriter`: large appends go to blocks of their own ahead of a checkpoint
-        let settings = self.checkpoint_settings(file)?;
-        let write_ahead = |table: &crate::catalog::TableCatalogEntry,
-                           rows: &duckrs_common::column_data::ColumnDataCollection,
-                           first: usize,
-                           first_id: u64| {
-            storage::writer::write_ahead(
-                &file.buffer,
-                &self.catalog,
-                table,
-                rows,
-                first,
-                first_id,
-                settings.options(""),
-            )
-        };
-        let ahead: Option<storage::log_writer::WriteAhead> = settings.optimistic_write.then_some(&write_ahead);
+        let write_ahead =
+            |table: &crate::catalog::TableCatalogEntry,
+             rows: &duckrs_common::column_data::ColumnDataCollection,
+             first: usize,
+             first_id: u64| self.write_ahead(table, rows, first, first_id, true);
+        let ahead: Option<storage::log_writer::WriteAhead> = Some(&write_ahead);
         if !log.commit(
             &file.path,
             &self.catalog,
@@ -506,6 +535,41 @@ impl DatabaseInstance {
         for database in self.attached.read().values() {
             database.invalidate(reason);
         }
+    }
+
+    /// `OptimisticDataWriter::FlushToDisk`: rows of `table` from position `first` on, whose first has id `first_id`, to
+    /// blocks of their own; nothing where `enable_optimistic_write` is off or the database can't be written.
+    fn write_ahead(
+        &self,
+        table: &crate::catalog::TableCatalogEntry,
+        rows: &duckrs_common::column_data::ColumnDataCollection,
+        first: usize,
+        first_id: u64,
+        final_flush: bool,
+    ) -> Result<Vec<storage::writer::WrittenGroup>> {
+        let Some(file) = self
+            .file
+            .as_ref()
+            .filter(|file| self.file_access.is_none() && !file.no_wal_writes)
+        else {
+            return Ok(Vec::new());
+        };
+        let settings = self.checkpoint_settings(file)?;
+        let mut blocks = table.append_blocks.lock();
+        if !settings.optimistic_write && blocks.is_empty() {
+            return Ok(Vec::new());
+        }
+        storage::writer::write_ahead(
+            &file.buffer,
+            &self.catalog,
+            table,
+            rows,
+            first,
+            first_id,
+            settings.options(""),
+            &mut blocks,
+            final_flush,
+        )
     }
 
     /// The settings a checkpoint writes the file with, which a commit writing rows ahead of it uses too.
@@ -2739,11 +2803,13 @@ impl ClientContext {
             Arc::new(database)
         } else {
             options.settings = Some(self.home.settings.clone());
+            options.no_write_ahead = true;
             let mut opened = DatabaseInstance::open_with(Path::new(&path), &options)?;
             let Some(database) = Arc::get_mut(&mut opened) else {
                 return Err(Error::new(ErrorKind::Internal, "a new database is in use"));
             };
             database.name.clone_from(&name);
+            DatabaseInstance::write_ahead_with(&opened);
             opened
         };
         database.catalog.set_database_list(self.database_list());

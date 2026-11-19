@@ -1297,3 +1297,43 @@ fn large_appends_are_written_ahead() {
     let after: Vec<String> = rows(&mut c, blocks);
     assert!(kept.iter().all(|block| after.contains(block)), "{kept:?} {after:?}");
 }
+
+/// `OptimisticDataWriter::WriteNewRowGroup`: an append writes its full row groups to blocks as it goes and keeps only
+/// the rest in memory; a statement that fails after that leaves the table as it was.
+#[test]
+fn appends_write_row_groups_as_they_fill() {
+    let file = path("written_as_they_fill.db");
+    let sums = "SELECT count(*), sum(a), sum(hash(s)) FROM t";
+    let expected = {
+        let db = Database::open_in_memory().unwrap();
+        let mut c = db.connect().unwrap();
+        run(
+            &mut c,
+            "CREATE TABLE t AS SELECT i a, 'v' || (i % 977) s FROM range(1000000) r(i)",
+        );
+        run(&mut c, "INSERT INTO t SELECT i, 'w' || i FROM range(700000) r(i)");
+        rows(&mut c, sums)
+    };
+    {
+        let db = Database::open(&file, false).unwrap();
+        let mut c = db.connect().unwrap();
+        run(&mut c, "PRAGMA disable_checkpoint_on_shutdown");
+        run(
+            &mut c,
+            "CREATE TABLE t AS SELECT i a, 'v' || (i % 977) s FROM range(1000000) r(i)",
+        );
+        // fails at its last rows, when most of them are in blocks
+        let failed = c.query(
+            "INSERT INTO t SELECT i, CASE WHEN i = 690000 THEN error('late') ELSE 'w' || i END FROM range(700000) r(i)",
+        );
+        assert!(failed.is_err());
+        assert_eq!(rows(&mut c, "SELECT count(*) FROM t"), ["1000000"]);
+        run(&mut c, "INSERT INTO t SELECT i, 'w' || i FROM range(700000) r(i)");
+        assert_eq!(rows(&mut c, sums), expected);
+    }
+    let db = Database::open(&file, false).unwrap();
+    let mut c = db.connect().unwrap();
+    assert_eq!(rows(&mut c, sums), expected);
+    run(&mut c, "CHECKPOINT");
+    assert_eq!(rows(&mut c, sums), expected);
+}

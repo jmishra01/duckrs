@@ -1102,7 +1102,71 @@ impl<'a> Replay<'a> {
         if chunk.types() != table.types() {
             return Err(corrupt("a log inserts rows of other types"));
         }
-        table.write_storage()?.append(chunk);
+        table.append_storage()?.append(chunk);
+        Ok(())
+    }
+
+    /// `ReplayRowGroupData`: row groups an append wrote to blocks ahead of a checkpoint stay there
+    /// (`RowGroupCollection::MergeStorage`, `MarkBlockAsUsed`), after the rows of the table, where those are in its
+    /// file or there are none in memory; others are read into memory, as rows.
+    fn row_groups(&mut self, row_groups: Vec<table_data::PersistentRowGroup>) -> Result<()> {
+        use super::appended::{AppendedPart, AppendedTable};
+        self.current_table()?;
+        let (schema, name) = self.current.clone().expect("the table above");
+        let table = self.catalog.get_table(Some(&schema), &name)?;
+        let version = self.buffer.block_manager().storage_version()?;
+        let keep = table.rows_in_memory() == 0 && table.appends_after_source();
+        let mut kept = Vec::new();
+        let mut rest = Vec::new();
+        for row_group in row_groups {
+            let rows = row_group.count as usize;
+            let group = if keep && rest.is_empty() && row_group.types == table.types() {
+                let row_start = self.current_table()?.next_row_id;
+                super::writer::WrittenGroup::from_persistent(
+                    row_start,
+                    rows,
+                    &row_group.columns,
+                    row_group.types.clone(),
+                    version,
+                    self.buffer.clone(),
+                )?
+            } else {
+                None
+            };
+            match group {
+                Some(group) => {
+                    let mut blocks = Vec::new();
+                    for column in &row_group.columns {
+                        table_data::column_blocks(column, &mut blocks);
+                    }
+                    for block in blocks {
+                        self.buffer.block_manager().mark_used(block);
+                    }
+                    self.current_table()?.add_rows(rows);
+                    kept.push(Arc::new(group));
+                }
+                None => rest.push(row_group),
+            }
+        }
+        if !kept.is_empty() {
+            let mut parts = match table.source() {
+                Some(source) => AppendedTable::parts_of(&source),
+                None => Vec::new(),
+            };
+            parts.extend(kept.into_iter().map(AppendedPart::Written));
+            let live = self.current_table()?;
+            let ids = crate::catalog::RowIds::of_list(&live.row_ids, live.next_row_id);
+            table.set_appended(Arc::new(AppendedTable::new(
+                parts,
+                ids,
+                table.types(),
+                table.row_group_size(),
+            )));
+        }
+        for row_group in &rest {
+            let chunk = table_data::scan_row_group(&self.buffer, row_group)?;
+            self.append(&chunk)?;
+        }
         Ok(())
     }
 
@@ -1135,13 +1199,7 @@ impl<'a> Replay<'a> {
                 Ok(())
             }
             Record::Insert(chunk) => self.append(&chunk),
-            Record::RowGroups(row_groups) => {
-                for row_group in &row_groups {
-                    let chunk = table_data::scan_row_group(&self.buffer, row_group)?;
-                    self.append(&chunk)?;
-                }
-                Ok(())
-            }
+            Record::RowGroups(row_groups) => self.row_groups(row_groups),
             Record::Delete(chunk) => {
                 let table = self.current_table()?;
                 for row in 0..chunk.len() {
@@ -1251,11 +1309,16 @@ fn settle(table: &TableCatalogEntry, live: &LiveTable) -> Result<()> {
         .filter(|position| !live.deleted.contains(position))
         .map(|position| live.row_ids[position])
         .collect();
-    table.set_row_ids(RowIds::of_list(&ids, live.next_row_id));
+    // the row groups of the file and those in blocks of their own stay row groups of their own
+    let stored = table.stored_groups();
+    let left = RowIds::of_list(&ids, live.next_row_id).with_stored_groups(stored.clone());
     if live.deleted.is_empty() && live.updates.is_empty() {
+        table.set_row_ids(left);
         table.reset_log();
         return Ok(());
     }
+    // the ids of all the rows, deleted ones too, as long as the table has them
+    table.set_row_ids(RowIds::of_list(&live.row_ids, live.next_row_id).with_stored_groups(stored));
     // deletes of rows still in the file only say which are left, as a DELETE does
     if let (true, Some(source)) = (live.updates.is_empty(), table.source())
         && crate::execution::physical::delete_leaves_in_file(table)
@@ -1296,6 +1359,7 @@ fn settle(table: &TableCatalogEntry, live: &LiveTable) -> Result<()> {
     }
     *storage = result;
     drop(storage);
+    table.set_row_ids(left);
     table.reset_log();
     Ok(())
 }

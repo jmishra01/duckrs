@@ -1163,7 +1163,7 @@ fn append_text(table: &TableCatalogEntry, rows: &[Vec<Option<String>>]) -> Resul
     table
         .append_storage()?
         .append(&DataChunk::from_columns(columns, rows.len()));
-    Ok(())
+    table.write_ahead_when_full()
 }
 
 /// The start of `text`, at most `limit` bytes that stay valid UTF-8.

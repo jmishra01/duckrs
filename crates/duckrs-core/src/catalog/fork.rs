@@ -113,7 +113,6 @@ impl TableCatalogEntry {
 
     /// Rows that changed in place. A transaction brings them along when it commits.
     pub fn rows_updated(&self, positions: impl IntoIterator<Item = usize>, columns: &[usize], count: usize) {
-        self.forget_written();
         if let Some(origin) = &self.origin {
             origin.updated_columns.lock().extend(columns);
             return;
@@ -137,7 +136,6 @@ impl TableCatalogEntry {
     /// end gets its id when something asks for it.
     pub fn rows_moved(&self, removed: &[usize], count: usize) {
         self.unloaded_deletes.store(false, std::sync::atomic::Ordering::Relaxed);
-        self.forget_written();
         let ids = self.row_ids(count);
         let group_rows = self.row_group_size();
         self.statistics.lock().rows_removed(removed, group_rows);
@@ -282,7 +280,7 @@ impl TableCatalogEntry {
             self.from_query.load(std::sync::atomic::Ordering::Relaxed),
             std::sync::atomic::Ordering::Relaxed,
         );
-        *table.source.write() = self.source();
+        *table.source.write() = self.source.read().clone();
         table.set_checkpointed_columns(self.checkpointed(), self.checkpointed_columns());
         {
             // what is known of the rows stays known, other than how often they changed

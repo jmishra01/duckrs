@@ -4472,8 +4472,10 @@ impl PhysicalOperator for PhysicalInsert {
         let first_new_row = *self.first_new_row.lock().get_or_insert(storage.len());
         constraints::verify_append(&self.table, &storage, &row, first_new_row)?;
         storage.append(&row);
-        check_buffered(&storage)?;
         drop(storage);
+        // `LocalStorage::Append`: full row groups go to blocks, and out of memory
+        self.table.write_ahead_when_full()?;
+        check_buffered_rows(&self.table.types(), self.table.rows_in_memory())?;
         *self.inserted.lock() += chunk.len() as u64;
         if self.returning {
             self.output.lock().append(&row);
@@ -4525,6 +4527,51 @@ pub struct PhysicalCreateTableAs {
     pub on_conflict: OnCreateConflict,
     pub children: Vec<Box<dyn PhysicalOperator>>,
     pub data: Mutex<ColumnDataCollection>,
+    /// The row groups of `data` written to blocks as they filled (`OptimisticDataWriter`), out of memory, with the
+    /// table they were written for, which takes their blocks.
+    pub written: Mutex<
+        Option<(
+            Arc<TableCatalogEntry>,
+            Vec<Arc<crate::storage::writer::WrittenGroup>>,
+            usize,
+        )>,
+    >,
+}
+
+impl PhysicalCreateTableAs {
+    /// `WriteNewRowGroup`: once `data` has `WRITE_BUFFER_ROW_GROUP_COUNT` full row groups and more, they go to blocks.
+    fn write_full_row_groups(&self, data: &mut ColumnDataCollection) -> Result<()> {
+        let Some(writer) = self.schema.ahead_writer() else {
+            return Ok(());
+        };
+        let mut written = self.written.lock();
+        let (table, groups, rows) = written.get_or_insert_with(|| {
+            // the table as it will be, which only says how its rows are written
+            let table = TableCatalogEntry::new(
+                self.schema.name.clone(),
+                self.table_name.clone(),
+                self.columns.clone(),
+                ColumnDataCollection::new(data.types().to_vec()),
+                Vec::new(),
+            );
+            table
+                .row_group_rows
+                .store(self.schema.row_group_size(), std::sync::atomic::Ordering::Relaxed);
+            (Arc::new(table), Vec::new(), 0)
+        });
+        let count = crate::storage::writer::WRITE_BUFFER_ROW_GROUP_COUNT * table.row_group_size();
+        while data.len() > count {
+            let full = crate::storage::appended::collection_between(data, 0, count);
+            let new = writer.write(table, &full, 0, *rows as u64, false)?;
+            if new.is_empty() {
+                return Ok(());
+            }
+            groups.extend(new.into_iter().map(Arc::new));
+            *rows += count;
+            *data = crate::storage::appended::collection_between(data, count, data.len());
+        }
+        Ok(())
+    }
 }
 
 impl PhysicalOperator for PhysicalCreateTableAs {
@@ -4550,6 +4597,7 @@ impl PhysicalOperator for PhysicalCreateTableAs {
         }
         let mut data = self.data.lock();
         data.append(&DataChunk::from_columns(columns, chunk.len()));
+        self.write_full_row_groups(&mut data)?;
         check_buffered(&data)
     }
     fn finalize(&self) -> Result<()> {
@@ -4560,8 +4608,21 @@ impl PhysicalOperator for PhysicalCreateTableAs {
             Vec::new(),
             self.on_conflict,
         )?;
+        let written = self.written.lock().clone();
         if let Some(table) = table {
             table.from_query.store(true, std::sync::atomic::Ordering::Relaxed);
+            // the row groups written so far are its first rows, and the blocks still open its own
+            if let Some((scratch, groups, rows)) = written.filter(|(_, groups, _)| !groups.is_empty()) {
+                let ids = crate::catalog::RowIds::of_ranges([(0, rows)], rows as u64);
+                let parts = groups
+                    .into_iter()
+                    .map(crate::storage::appended::AppendedPart::Written)
+                    .collect();
+                let source =
+                    crate::storage::appended::AppendedTable::new(parts, ids, table.types(), table.row_group_size());
+                table.set_appended(Arc::new(source));
+                *table.append_blocks.lock() = std::mem::take(&mut *scratch.append_blocks.lock());
+            }
             let data = self.data.lock();
             let mut storage = table.append_storage()?;
             for chunk in data.chunks() {
@@ -4583,7 +4644,8 @@ impl PhysicalOperator for PhysicalCreateTableAs {
         }
         *done = true;
         let mut chunk = DataChunk::new(&self.types);
-        chunk.append_row(&[Value::bigint(self.data.lock().len() as i64)])?;
+        let flushed = self.written.lock().as_ref().map_or(0, |(_, _, rows)| *rows);
+        chunk.append_row(&[Value::bigint((self.data.lock().len() + flushed) as i64)])?;
         Ok(Some(chunk))
     }
 }

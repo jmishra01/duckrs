@@ -342,6 +342,21 @@ impl SingleFileBlockManager {
         state.multi_use_blocks = multi_use_blocks;
     }
 
+    /// `MarkBlockAsUsed`: a block a log says holds rows is no longer free, and the file has at least the blocks up
+    /// to it.
+    pub fn mark_used(&self, block: u64) {
+        let mut state = self.state.lock();
+        while state.header.block_count < block {
+            let free = state.header.block_count;
+            state.free_list.insert(free);
+            state.header.block_count += 1;
+        }
+        if state.header.block_count == block {
+            state.header.block_count += 1;
+        }
+        state.free_list.remove(&block);
+    }
+
     /// `GetFreeBlockId`: the lowest free block, or one past the others, which is used from now on.
     pub fn allocate_free_block(&self) -> u64 {
         let mut state = self.state.lock();

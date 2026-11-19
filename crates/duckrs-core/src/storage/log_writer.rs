@@ -445,7 +445,8 @@ fn log_rows(records: &mut Records, name: &Key, table: &TableCatalogEntry, ahead:
         .iter()
         .any(|c| table.columns[*c].ty.physical_type() == PhysicalType::Struct);
     // rows still in a file, of which nothing is new, need only the columns that were updated
-    let in_file = table.source().filter(|_| !nested && first_new >= count);
+    // rows in a file, with those appended after them, are read where they are
+    let in_file = table.source().filter(|_| !nested);
     let storage = match &in_file {
         Some(_) => None,
         None => Some(table.rows()?),
@@ -490,53 +491,128 @@ fn log_rows(records: &mut Records, name: &Key, table: &TableCatalogEntry, ahead:
         replayed.remove(&gone);
         first_new
     };
-    // `LocalStorage::Flush`: a bulk append, of at least a row group, goes to blocks of its own, which the log points
-    // to (`WriteRowGroupData`)
-    let mut first_written = first_written;
-    if let (Some(ahead), Some(rows), false) = (ahead, &storage, nested) {
-        let new = count.saturating_sub(first_written);
-        let consecutive = new > 0 && ids.id(count - 1) - ids.id(first_written) == (new - 1) as u64;
-        if new >= table.row_group_size() && consecutive {
-            let groups: Vec<Arc<super::writer::WrittenGroup>> =
-                ahead(table, rows, first_written, ids.id(first_written))?
-                    .into_iter()
-                    .map(Arc::new)
-                    .collect();
-            if !groups.is_empty() {
-                let types = table.types();
-                records.entry(wal_type::ROW_GROUP_DATA, |s| {
-                    super::writer::write_row_group_data(s, &types, &groups)
-                });
-                table.add_written_groups(groups);
-                first_written = count;
+    if first_written < count {
+        let source = match (&in_file, &storage) {
+            (Some(source), _) => source.clone(),
+            (None, Some(rows)) => {
+                let parts = vec![super::appended::AppendedPart::Memory(Arc::new((**rows).clone()))];
+                let appended =
+                    super::appended::AppendedTable::new(parts, (*ids).clone(), table.types(), table.row_group_size());
+                Arc::new(appended) as Arc<dyn crate::catalog::TableSource>
             }
-        }
-    }
-    let mut row = first_written / STANDARD_VECTOR_SIZE * STANDARD_VECTOR_SIZE;
-    let chunks = storage
-        .as_ref()
-        .map(|rows| rows.chunks().skip(first_written / STANDARD_VECTOR_SIZE));
-    for chunk in chunks.into_iter().flatten() {
-        let skip = first_written.saturating_sub(row);
-        let mut chunk = chunk.clone();
-        let count = chunk.len();
-        row += count;
-        if skip >= count {
-            continue;
-        }
-        if skip > 0 {
-            let selection = SelectionVector::from_vec((skip as u32..count as u32).collect());
-            chunk.slice(&selection, count - skip);
-        }
-        let mut result = Ok(());
-        records.entry(wal_type::INSERT_TUPLE, |s| result = write_chunk(s, &chunk));
-        result?;
+            (None, None) => unreachable!("the rows are read where they aren't in a file"),
+        };
+        drop(storage);
+        log_new_rows(records, table, &source, &ids, first_written, count, ahead)?;
     }
     replayed.fill(count);
     log.replayed = Arc::new(replayed);
     log.logged = ids;
     log.updated.clear();
     log.updated_columns.clear();
+    Ok(())
+}
+
+/// `DataTable::WriteToLog` of the rows of `table` from `first` on, of `source`, which has all its rows: row groups an
+/// append wrote to blocks go in as where they are (`WriteRowGroupData`), and so do the rows in memory after them where
+/// the append is a bulk one, of at least a row group (`LocalStorage::Flush`), which a commit writes to blocks now;
+/// other rows go in as rows. The table keeps its rows where the log says they are.
+fn log_new_rows(
+    records: &mut Records,
+    table: &TableCatalogEntry,
+    source: &Arc<dyn crate::catalog::TableSource>,
+    ids: &RowIds,
+    first: usize,
+    count: usize,
+    ahead: Option<WriteAhead>,
+) -> Result<()> {
+    use super::appended::{AppendedPart, AppendedTable, collection_between};
+    let types = table.types();
+    // the parts in front of the new rows stay; of those after, the row groups in blocks and the rows in memory
+    let mut kept = Vec::new();
+    let mut written = Vec::new();
+    let mut pending = ColumnDataCollection::new(types.clone());
+    let mut position = 0;
+    for part in AppendedTable::parts_of(source) {
+        let rows = match &part {
+            AppendedPart::Source(source) => source.row_count(),
+            AppendedPart::Written(group) => group.rows,
+            AppendedPart::Memory(memory) => memory.len(),
+        };
+        let end = position + rows;
+        if end <= first {
+            kept.push(part);
+        } else {
+            match part {
+                AppendedPart::Written(group) if position >= first && pending.is_empty() => written.push(group),
+                AppendedPart::Memory(memory) => {
+                    let from = first.saturating_sub(position);
+                    if from > 0 {
+                        kept.push(AppendedPart::Memory(Arc::new(collection_between(&memory, 0, from))));
+                    }
+                    pending.append_collection(&collection_between(&memory, from, memory.len()));
+                }
+                // new rows in a file or behind rows in memory: as rows, which the table has in memory then
+                part => {
+                    let rows = match &part {
+                        AppendedPart::Source(source) => source.read_all()?,
+                        AppendedPart::Written(group) => {
+                            let one = AppendedTable::new(
+                                vec![AppendedPart::Written(group.clone())],
+                                RowIds::of_ranges([(group.row_start, group.rows)], group.row_start + group.rows as u64),
+                                types.clone(),
+                                table.row_group_size(),
+                            );
+                            crate::catalog::TableSource::read_all(&one)?
+                        }
+                        AppendedPart::Memory(_) => unreachable!("handled above"),
+                    };
+                    let from = first.saturating_sub(position);
+                    if from > 0 {
+                        kept.push(AppendedPart::Memory(Arc::new(collection_between(&rows, 0, from))));
+                    }
+                    pending.append_collection(&collection_between(&rows, from, rows.len()));
+                }
+            }
+        }
+        position = end;
+    }
+    let first_pending = first + written.iter().map(|group| group.rows).sum::<usize>();
+    let bulk = count - first >= table.row_group_size();
+    let consecutive =
+        pending.is_empty() || ids.id(count - 1) - ids.id(first_pending) == (count - 1 - first_pending) as u64;
+    if let (true, true, Some(ahead)) = (bulk, consecutive, ahead)
+        && !pending.is_empty()
+    {
+        let groups = ahead(table, &pending, 0, ids.id(first_pending))?;
+        if !groups.is_empty() {
+            written.extend(groups.into_iter().map(Arc::new));
+            pending = ColumnDataCollection::new(types.clone());
+        }
+    }
+    // `FlushBlocks`: the blocks the append left open are written by now, so that the log can say where its row groups are
+    if let (false, Some(ahead)) = (written.is_empty(), ahead) {
+        ahead(table, &ColumnDataCollection::new(types.clone()), 0, 0)?;
+    }
+    if !written.is_empty() {
+        records.entry(wal_type::ROW_GROUP_DATA, |s| {
+            super::writer::write_row_group_data(s, &types, &written)
+        });
+    }
+    for chunk in pending.chunks() {
+        let mut result = Ok(());
+        records.entry(wal_type::INSERT_TUPLE, |s| result = write_chunk(s, chunk));
+        result?;
+    }
+    // where the rows are now: the row groups in blocks are kept out of memory
+    if !written.is_empty() {
+        kept.extend(written.into_iter().map(AppendedPart::Written));
+        if !pending.is_empty() {
+            kept.push(AppendedPart::Memory(Arc::new(pending)));
+        }
+        let appended = AppendedTable::new(kept, ids.clone(), types, table.row_group_size());
+        table.set_appended(Arc::new(appended));
+    }
     Ok(())
 }
 
@@ -1060,7 +1136,9 @@ impl WriteAheadLog {
 
     /// All of `catalog` is in the file now, and the log file is gone.
     pub fn checkpointed(&mut self, catalog: &Catalog) {
-        *self = Self::new(catalog);
+        // the file is in the version it was
+        let version = self.version;
+        *self = Self::new(catalog).with_version(version);
     }
 }
 

@@ -163,14 +163,17 @@ Each item gives the number of failing files in `test/` that it should fix, where
     `GetFreeListBlocks` does; an unchanged table keeps its metadata whole (`WriteUnchangedTable`); deletes in
     a writer of their own and kept when they didn't change, as `ValidityMask::Write` packs them; segments into
     the fullest partly filled block they fit (`PartialBlockManager`)
-  - [x] large appends written ahead of a checkpoint (`OptimisticDataWriter`): a commit of at least a row group of
-    new rows writes them in row groups of their own, five at a time a column at a time, into blocks that get
-    their ids as they fill (`APPEND_TO_TABLE`), logs where they are (`ROW_GROUP_DATA`) and not the rows, and
-    a checkpoint keeps the blocks and writes their metadata; `enable_optimistic_write` turns it off. The rows
-    are written at the commit rather than as the statement fills each row group, and stay in memory too, so
-    an append still takes the memory of its rows; a log of C++'s row groups is replayed into memory
-  - [ ] row groups written while an append goes on, and dropped from memory, which loading TPC-H SF10 needs;
-    the row groups of a C++ log kept in their blocks on replay
+  - [x] large appends written ahead of a checkpoint (`OptimisticDataWriter`): an INSERT, COPY or CREATE TABLE AS
+    writes its row groups to blocks as they fill, five at a time a column at a time, into blocks that get their
+    ids as they fill and stay open between those writes until the commit (`APPEND_TO_TABLE`), and keeps only
+    the rest in memory; the commit writes the rest of a bulk append the same way and logs where its row groups
+    are (`ROW_GROUP_DATA`). A table is then its rows in the file, those row groups and rows in memory, one after
+    another (`AppendedTable`), read where they are; an append to a table in a file doesn't read its rows. A
+    checkpoint keeps the row groups' blocks, under a DELETE too, and a replay keeps those of a log of C++ in
+    theirs (`MarkBlockAsUsed`). An append of 80M rows takes 90MB rather than refusing to keep more than 2 GiB.
+    `enable_optimistic_write` turns it off. Not for tables with a key or an index, nor in an explicit
+    transaction, whose appends go in at the commit
+  - [ ] a one-row VARCHAR column: C++ stores it as DICT_FSST, duckrs uncompressed
   - [x] the ART layouts of files before v2.0.0, in checkpoints and the WAL: from v1.2.0 the current nodes with
     the 264-byte `Node256Leaf` (`GetNode256LeafSegmentSize`), before it `ART::TransformToDeprecated` (chains of
     `Leaf` of 4 row ids, 15-byte prefixes, 6 allocators); the `storage_version` option is the file's
@@ -666,8 +669,8 @@ Each item gives the number of failing files in `test/` that it should fix, where
   prints the gate after `--engine=both`. On TPC-H SF1 (8 threads, all 22 answers correct) duckrs is at
   1.53× (none above 3×: Q21 2.7×; Q02 0.5×, Q08 0.95×), from 12.7× at the start of item 47.
   SF10, both engines on the file C++ wrote: about 1.3× (1.27× and 1.37× in two runs under heavy load from other work, in which Q18 and Q14 read above 3×; Q09 is down to 1.2–1.9× from 2.5×; Q11 0.5×, Q15 0.7×, Q22 0.7×), which passes the gate on a machine that was busy with other work; measure again on a quiet one before ticking this. duckrs
-  cannot load SF10 itself: an append keeps the rows of its table in memory (more than 2 GiB fails), where
-  C++ writes full row groups to blocks as they fill (optimistic writes)
+  had no way to load SF10 itself, as an append kept its rows in memory (more than 2 GiB failed); appends now write
+  their full row groups to blocks as they fill (an INSERT of 80M rows takes 90MB), but loading SF10 isn't tried yet
 
 ## Phase 14: Extensions (not started)
 

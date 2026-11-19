@@ -369,6 +369,7 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
                 on_conflict,
                 children,
                 data: Mutex::new(duckrs_common::column_data::ColumnDataCollection::new(types_of_columns)),
+                written: Mutex::default(),
             })
         }
         LogicalOperatorKind::EmptyResult { .. } => Box::new(PhysicalEmptyResult { types }),

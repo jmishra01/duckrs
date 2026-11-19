@@ -16,6 +16,20 @@ pub struct BufferManager {
     blocks: Arc<SingleFileBlockManager>,
     memory_limit: usize,
     state: Mutex<State>,
+    /// Blocks an append fills ahead of a checkpoint that have no id of the file yet (`PartialBlock` of
+    /// `APPEND_TO_TABLE`), by the provisional id their segments have, and those that got one since.
+    provisional: Mutex<HashMap<u64, Provisional>>,
+}
+
+/// Where the ids of blocks start that have none of the file yet.
+pub const PROVISIONAL_BLOCK: u64 = 1 << 62;
+
+#[derive(Debug, Clone)]
+pub enum Provisional {
+    /// still filling, in memory
+    Open(Arc<Mutex<Vec<u8>>>),
+    /// written to the file as this block
+    Flushed(u64),
 }
 
 #[derive(Debug, Default)]
@@ -38,6 +52,37 @@ impl BufferManager {
             blocks,
             memory_limit,
             state: Mutex::default(),
+            provisional: Mutex::default(),
+        }
+    }
+
+    /// A block an append is filling, which segments in it are read from until it is written.
+    pub fn open_provisional(&self, id: u64, bytes: Arc<Mutex<Vec<u8>>>) {
+        self.provisional.lock().insert(id, Provisional::Open(bytes));
+    }
+
+    /// The block `id` is now block `block` of the file.
+    pub fn flushed_provisional(&self, id: u64, block: u64) {
+        self.provisional.lock().insert(id, Provisional::Flushed(block));
+    }
+
+    /// The blocks of an append that went: nothing reads them any more.
+    pub fn drop_provisional(&self, ids: &[u64]) {
+        let mut provisional = self.provisional.lock();
+        for id in ids {
+            provisional.remove(id);
+        }
+    }
+
+    /// The block of the file that `id` is, where it is one an append wrote; `id` itself otherwise or while it isn't
+    /// written yet.
+    pub fn resolve(&self, id: u64) -> u64 {
+        if id < PROVISIONAL_BLOCK {
+            return id;
+        }
+        match self.provisional.lock().get(&id) {
+            Some(Provisional::Flushed(block)) => *block,
+            _ => id,
         }
     }
 
@@ -59,6 +104,14 @@ impl BufferManager {
 
     /// `Pin`: what the block holds.
     pub fn pin(&self, block_id: u64) -> Result<Arc<Vec<u8>>> {
+        if block_id >= PROVISIONAL_BLOCK {
+            let found = self.provisional.lock().get(&block_id).cloned();
+            match found {
+                Some(Provisional::Open(bytes)) => return Ok(Arc::new(bytes.lock().clone())),
+                Some(Provisional::Flushed(block)) => return self.pin(block),
+                None => {}
+            }
+        }
         let mut state = self.state.lock();
         state.clock += 1;
         let clock = state.clock;
