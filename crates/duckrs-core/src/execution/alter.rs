@@ -220,7 +220,8 @@ fn layered_alter(
     if alter.retyped.is_some() && !dense {
         return Ok(None);
     }
-    let (base, old_layers) = LayeredTable::parts(&source, before.len());
+    let layered = LayeredTable::of(&source, before.to_vec());
+    let old_layers = layered.layers().to_vec();
     let mut layers = Vec::with_capacity(projection.len());
     for (index, (expression, ty)) in projection.iter().zip(&types).enumerate() {
         if let BoundExprKind::Reference(at) = expression.kind
@@ -259,5 +260,5 @@ fn layered_alter(
             from: None,
         });
     }
-    Ok(Some(Arc::new(LayeredTable::new(base, layers, types))))
+    Ok(Some(Arc::new(layered.with_columns(layers, types))))
 }

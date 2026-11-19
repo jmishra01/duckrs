@@ -4065,6 +4065,15 @@ impl PhysicalOperator for PhysicalDelete {
         let count = self.table.row_count();
         let positions = row_positions(&self.table, self.row_ids.lock().iter().copied(), count);
         self.table.claim_rows(positions.iter().copied(), count, false)?;
+        if self.delete_in_file(&positions, count) {
+            *self.output.lock() = changed_rows_output(
+                &self.types,
+                ColumnDataCollection::new(self.table.types()),
+                positions.len() as u64,
+                false,
+            );
+            return Ok(());
+        }
         let mut storage = self.table.write_storage()?;
         let mut kept = ColumnDataCollection::new(storage.types().to_vec());
         let mut deleted = ColumnDataCollection::new(storage.types().to_vec());
@@ -4126,6 +4135,39 @@ impl PhysicalOperator for PhysicalDelete {
     }
 }
 
+impl PhysicalDelete {
+    /// `DataTable::Delete` of a table in a file: the rows go from its version info, and nothing is read. `false`
+    /// where the rows have to be in memory: for the keys and indexes that have them, a foreign key that references
+    /// them, or RETURNING.
+    fn delete_in_file(&self, positions: &HashSet<usize>, count: usize) -> bool {
+        let table = &self.table;
+        let Some(source) = table.source() else {
+            return false;
+        };
+        if self.returning || !delete_leaves_in_file(table) {
+            return false;
+        }
+        let mut removed: Vec<usize> = positions.iter().copied().collect();
+        removed.sort_unstable();
+        let mut layered = crate::storage::layered::LayeredTable::of(&source, table.types());
+        layered.delete(&removed);
+        table.rows_moved(&removed, count);
+        table.keep_in_file(Arc::new(layered));
+        *table.unique_keys.lock() = None;
+        true
+    }
+}
+
+/// Whether rows of a table in a file can go without reading them: nothing keeps their keys.
+pub(crate) fn delete_leaves_in_file(table: &TableCatalogEntry) -> bool {
+    table.indexes.read().is_empty()
+        && table.referenced_by.lock().is_empty()
+        && !table
+            .constraints
+            .iter()
+            .any(|c| matches!(c, TableConstraint::Unique { .. }))
+}
+
 /// `PhysicalUpdate`: gathers the new values (sink), and writes them at the end.
 #[derive(Debug)]
 pub struct PhysicalUpdate {
@@ -4177,41 +4219,35 @@ impl PhysicalUpdate {
         if self.returning || checks || !table.referenced_by.lock().is_empty() {
             return Ok(false);
         }
-        let types = table.types();
-        let (base, mut layers) = LayeredTable::parts(&source, types.len());
-        // where each group starts among the rows
-        let mut starts = Vec::with_capacity(source.group_count() + 1);
-        let mut start = 0;
-        for group in 0..source.group_count() {
-            starts.push(start);
-            start += source.group_rows(group);
-        }
-        starts.push(start);
-        let mut by_group: Vec<Vec<(usize, &Vec<Value>)>> = vec![Vec::new(); source.group_count()];
+        let mut layered = LayeredTable::of(&source, table.types());
+        let mut by_group: Vec<Vec<(usize, &Vec<Value>)>> = vec![Vec::new(); layered.group_count()];
+        let locate = layered.locator();
         for (&position, values) in updates {
-            let group = starts.partition_point(|start| *start <= position) - 1;
-            by_group[group].push((position - starts[group], values));
+            let (group, row) = locate(position);
+            by_group[group].push((row, values));
         }
         for (at, &column) in self.columns.iter().enumerate() {
-            let (mut groups, from) = match &layers[column] {
-                Layer::Base(from) => (vec![None; source.group_count()], Some(*from)),
+            let (mut groups, from) = match &layered.layers()[column] {
+                Layer::Base(from) => (vec![None; layered.group_count()], Some(*from)),
                 Layer::Memory { groups, from } => ((**groups).clone(), *from),
             };
             for (group, rows) in by_group.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
-                let mut vector = LayeredTable::column_of(&*base, &layers[column], group)?;
-                let count = source.group_rows(group);
-                vector.flatten(count);
+                let mut vector = layered.column(column, group)?;
+                vector.flatten(layered.group_rows(group));
                 for (row, values) in rows {
                     vector.set_value(*row, &values[at])?;
                 }
                 groups[group] = Some(vector);
             }
-            layers[column] = Layer::Memory {
-                groups: Arc::new(groups),
-                from,
-            };
+            layered.set_layer(
+                column,
+                Layer::Memory {
+                    groups: Arc::new(groups),
+                    from,
+                },
+            );
         }
-        table.keep_in_file(Arc::new(LayeredTable::new(base, layers, types)));
+        table.keep_in_file(Arc::new(layered));
         Ok(true)
     }
 }

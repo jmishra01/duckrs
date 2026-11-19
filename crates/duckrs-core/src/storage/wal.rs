@@ -921,14 +921,14 @@ impl<'a> Replay<'a> {
                 .disk
                 .get(&table_key)
                 .ok_or_else(|| corrupt("a log names a table that does not exist"))?;
-            let mut row_ids = Vec::new();
-            let rows = disk.read_rows(Some(&mut row_ids))?;
+            // the rows stay in the file until what the log does needs them: an INSERT or an UPDATE reads them, a
+            // DELETE doesn't
+            let ids = crate::catalog::TableSource::row_ids(&**disk);
             let live = LiveTable {
-                row_ids,
+                row_ids: (0..ids.len()).map(|position| ids.id(position)).collect(),
                 next_row_id: disk.next_row_id(),
                 ..LiveTable::default()
             };
-            self.catalog.get_table(Some(&name.0), &name.1)?.set_rows(rows);
             self.tables.insert(table_key.clone(), live);
         }
         Ok(self.tables.get_mut(&table_key).expect("just ensured"))
@@ -1253,6 +1253,19 @@ fn settle(table: &TableCatalogEntry, live: &LiveTable) -> Result<()> {
         .collect();
     table.set_row_ids(RowIds::of_list(&ids, live.next_row_id));
     if live.deleted.is_empty() && live.updates.is_empty() {
+        table.reset_log();
+        return Ok(());
+    }
+    // deletes of rows still in the file only say which are left, as a DELETE does
+    if let (true, Some(source)) = (live.updates.is_empty(), table.source())
+        && crate::execution::physical::delete_leaves_in_file(table)
+        && source.row_count() == live.row_ids.len()
+    {
+        let mut removed: Vec<usize> = live.deleted.iter().copied().collect();
+        removed.sort_unstable();
+        let mut layered = super::layered::LayeredTable::of(&source, table.types());
+        layered.delete(&removed);
+        table.keep_in_file(Arc::new(layered));
         table.reset_log();
         return Ok(());
     }

@@ -1215,3 +1215,44 @@ fn columns_keep_their_compression() {
         "that type is deprecated and only has decompress support",
     );
 }
+
+/// `DataTable::Delete` of a table in a file: the rows go from its version info, through a checkpoint and a log,
+/// and only the columns of the WHERE are read.
+#[test]
+fn delete_reads_only_its_filter() {
+    let file = path("lazy_delete.db");
+    let create = "CREATE TABLE t AS SELECT i c0, i * 2 c1, i::VARCHAR c2 FROM range(300000) r(i)";
+    {
+        let db = Database::open(&file, false).unwrap();
+        let mut c = db.connect().unwrap();
+        run(&mut c, create);
+    }
+    let loaded = "SELECT DISTINCT column_name FROM pragma_storage_info('t', loaded_segments_only = true) ORDER BY 1";
+    let sums = "SELECT count(*), sum(c0), sum(c1), max(c2) FROM t";
+    let expected = {
+        let db = Database::open_in_memory().unwrap();
+        let mut c = db.connect().unwrap();
+        run(&mut c, create);
+        run(&mut c, "DELETE FROM t WHERE c0 % 3 = 0");
+        run(&mut c, "DELETE FROM t WHERE c0 > 290000");
+        rows(&mut c, sums)
+    };
+    {
+        let db = Database::open(&file, false).unwrap();
+        let mut c = db.connect().unwrap();
+        run(&mut c, "DELETE FROM t WHERE c0 % 3 = 0");
+        assert_eq!(rows(&mut c, loaded), ["c0"]);
+        // a checkpoint keeps the columns and writes which rows are left
+        run(&mut c, "CHECKPOINT");
+        assert_eq!(rows(&mut c, loaded), ["c0"]);
+        // in the log only
+        run(&mut c, "PRAGMA disable_checkpoint_on_shutdown");
+        run(&mut c, "DELETE FROM t WHERE c0 > 290000");
+    }
+    let db = Database::open(&file, false).unwrap();
+    let mut c = db.connect().unwrap();
+    assert!(rows(&mut c, loaded).is_empty());
+    run(&mut c, "CHECKPOINT");
+    assert!(rows(&mut c, loaded).is_empty());
+    assert_eq!(rows(&mut c, sums), expected);
+}

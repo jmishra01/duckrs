@@ -1256,7 +1256,7 @@ struct Writer<'a> {
     /// Of the table being written: whether its rows are those of its last checkpoint as they were, so that its
     /// row groups are kept without reading them (`RowGroup::HasChanges`), and which columns of each of those
     /// were loaded (`RowGroup::is_loaded`).
-    in_file: Option<(Arc<dyn crate::catalog::TableSource>, Vec<super::layered::Layer>)>,
+    in_file: Option<super::layered::LayeredTable>,
     stored_loaded: Vec<Vec<bool>>,
     /// Which columns of each row group written of the table are loaded: all of one that was written, and of
     /// one that was kept, those that were.
@@ -2850,11 +2850,10 @@ impl<'a> Writer<'a> {
         };
         // the rows are those the file has: of the columns, those still there stay, unread, and those an UPDATE or
         // an ALTER changed are written from memory
-        if let (Some((source, layers)), true, Some((disk, stored_group))) =
-            (self.in_file.clone(), indexes.is_empty(), stored)
-        {
+        if let (Some(source), true, Some((disk, stored_group))) = (self.in_file.clone(), indexes.is_empty(), stored) {
             use super::layered::Layer;
-            let same: Vec<Option<usize>> = layers
+            let same: Vec<Option<usize>> = source
+                .layers()
                 .iter()
                 .map(|layer| match layer {
                     Layer::Base(column) => Some(*column),
@@ -2866,9 +2865,17 @@ impl<'a> Writer<'a> {
             let unchanged = identity && (self.per_column_writes || !kept_group.per_column);
             let partly = !unchanged && self.per_column_writes && kept_group.per_column;
             if unchanged || partly {
-                let mut kept = vec![disk.alive_rows(stored_group).is_none(); group.rows];
-                for &row in disk.alive_rows(stored_group).unwrap_or_default() {
-                    kept[row as usize] = true;
+                // the rows of the group that are left: of those the file has, those a DELETE didn't take
+                let stored_rows: Vec<u32> = match disk.alive_rows(stored_group) {
+                    Some(alive) => alive.to_vec(),
+                    None => (0..group.rows as u32).collect(),
+                };
+                let mut kept = vec![false; group.rows];
+                match source.alive_rows(stored_group) {
+                    Some(left) => left
+                        .iter()
+                        .for_each(|row| kept[stored_rows[*row as usize] as usize] = true),
+                    None => stored_rows.iter().for_each(|row| kept[*row as usize] = true),
                 }
                 let deletes = (kept.iter().any(|kept| !kept)).then(|| deletes_of(&kept));
                 let mut parts: Vec<Vec<Part>> = types.iter().map(|_| Vec::new()).collect();
@@ -2876,7 +2883,9 @@ impl<'a> Writer<'a> {
                     if keep.is_some() {
                         continue;
                     }
-                    let live = source.read_group(stored_group, &[column])?.column(0).clone();
+                    let live = crate::catalog::TableSource::read_group(&source, stored_group, &[column])?
+                        .column(0)
+                        .clone();
                     let values = with_deleted(live, &kept, &types[column])?;
                     for first in (0..group.rows).step_by(STANDARD_VECTOR_SIZE) {
                         let count = STANDARD_VECTOR_SIZE.min(group.rows - first);
@@ -3025,14 +3034,15 @@ impl<'a> Writer<'a> {
             .unwrap_or_default();
         self.group_loaded.clear();
         // the rows are still those of the file, as a layer over its table or that table itself
+        // (that a DELETE took rows of too)
         self.in_file = match (table.source(), disk) {
             (Some(source), Some(disk)) if self.metadata_reuse => {
-                let (base, layers) = super::layered::LayeredTable::parts(&source, types.len());
-                let stored = crate::catalog::TableSource::row_ids(disk);
-                let same = std::ptr::addr_eq(Arc::as_ptr(&base), disk as *const _)
-                    && stored.next() == ids.next()
-                    && stored.ranges().eq(ids.ranges());
-                same.then_some((source, layers))
+                let layered = super::layered::LayeredTable::of(&source, types.clone());
+                let left = crate::catalog::TableSource::row_ids(&layered);
+                let same = std::ptr::addr_eq(Arc::as_ptr(layered.base()), disk as *const _)
+                    && left.next() == ids.next()
+                    && left.ranges().eq(ids.ranges());
+                same.then_some(layered)
             }
             _ => None,
         };

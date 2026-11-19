@@ -219,6 +219,11 @@ Each item gives the number of failing files in `test/` that it should fix, where
     compute the column they make; a commit takes the table's columns as they are, the log reads only the updated
     columns, and a checkpoint writes the columns in memory and keeps the others unread. An UPDATE with RETURNING,
     of a table with a CHECK or that a foreign key references, and an ALTER that checks the rows read the table.
+  - [x] DELETE of a table in a file (`DataTable::Delete`): the rows go from which rows of each row group are left,
+    and nothing but the columns of the WHERE is read; a later UPDATE or ALTER keeps that, a commit and the log
+    take the ids, a replay of deletes leaves the rows in the file too, and a checkpoint keeps the columns and
+    writes the deletes. A DELETE with RETURNING, of a table with a key or an index, or that a foreign key
+    references reads the table.
     columns, `read_duckdb` (8)
   - [x] string statistics for `stats()`: a minimum length too long to keep is left out, a checkpoint leaves a table the
     statistics it computed until the file is opened again (a file before v2.0.0 keeps 8 bytes of a string bound),
