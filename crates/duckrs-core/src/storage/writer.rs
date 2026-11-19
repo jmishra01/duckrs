@@ -99,6 +99,8 @@ const STRING_BLOCK_LIMIT: usize = 4096;
 const STRING_HEADER_SIZE: usize = 8;
 const BIG_STRING_MARKER_SIZE: usize = 12;
 const SUB_BLOCK_HEADER_SIZE: usize = 8;
+/// Where the ids of partial blocks start that have none yet (see `Writer::append`).
+const PROVISIONAL_BLOCK: u64 = 1 << 62;
 const METADATA_BLOCK_COUNT: usize = 64;
 /// `CompressionType::COMPRESSION_AUTO`.
 const COMPRESSION_AUTO: u64 = 0;
@@ -749,6 +751,7 @@ fn write_stats(s: &mut BinarySerializer, ty: Option<&LogicalType>, stats: &Stats
 }
 
 /// `DataPointer`.
+#[derive(Debug, Clone)]
 struct SegmentOut {
     tuple_count: usize,
     block_id: i64,
@@ -760,6 +763,7 @@ struct SegmentOut {
 }
 
 /// `PersistentColumnData`.
+#[derive(Debug, Clone)]
 struct ColumnOut {
     segments: Vec<SegmentOut>,
     validity: Option<Box<ColumnOut>>,
@@ -1284,6 +1288,10 @@ struct Writer<'a> {
     /// (and then in the order they came, as a multimap has them), with their bytes and how much they fill.
     partial: std::collections::BTreeMap<(usize, u64), (u64, Vec<u8>, usize)>,
     partial_count: u64,
+    /// `PartialBlockType::APPEND_TO_TABLE`: rows written ahead of a commit, whose blocks get their ids as they are
+    /// flushed (`PartialBlock::Flush`); until then a partial block has an id of its own, which this maps.
+    append: bool,
+    provisional: HashMap<u64, u64>,
     /// Sub-blocks that were put aside for the free list (`GetFreeListBlocks`).
     reserved: VecDeque<(u64, usize)>,
     tables: MetaStream,
@@ -1420,6 +1428,12 @@ fn plan_groups(ids: &RowIds, size: usize, vacuum_tasks: usize, dense: bool, keep
     };
     let mut end = 0;
     for &(row_start, rows) in ids.stored_groups() {
+        // rows in front of row groups a commit wrote ahead are new ones of their own
+        while end < row_start {
+            let rows = (row_start - end).min(size as u64);
+            add(end, rows as usize);
+            end += rows;
+        }
         add(row_start, rows);
         end = row_start + rows as u64;
     }
@@ -1743,6 +1757,8 @@ impl<'a> Writer<'a> {
             segments_in_block: HashMap::new(),
             partial: std::collections::BTreeMap::new(),
             partial_count: 0,
+            append: false,
+            provisional: HashMap::new(),
             reserved: VecDeque::new(),
             tables: MetaStream::default(),
             force_compression: options.force_compression.to_lowercase(),
@@ -1763,8 +1779,11 @@ impl<'a> Writer<'a> {
         }
     }
 
-    /// `GetFreeBlockIdForCheckpoint`: never one that the last checkpoint needs.
+    /// `GetFreeBlockIdForCheckpoint`: never one that the last checkpoint needs. Ahead of a commit, `GetFreeBlockId`.
     fn allocate_block(&mut self) -> u64 {
+        if self.append {
+            return self.buffer.block_manager().allocate_free_block();
+        }
         let block = self.free.pop_first().unwrap_or_else(|| {
             self.next_block += 1;
             self.next_block - 1
@@ -1776,9 +1795,21 @@ impl<'a> Writer<'a> {
     /// `FlushPartialBlocks`.
     fn flush_open_block(&mut self) -> Result<()> {
         for (_, (block, data, _)) in std::mem::take(&mut self.partial) {
-            self.buffer.block_manager().write_block(block, &data)?;
+            self.flush_partial(block, &data)?;
         }
         Ok(())
+    }
+
+    /// `PartialBlock::Flush`: ahead of a commit, this is when the block gets its id.
+    fn flush_partial(&mut self, block: u64, data: &[u8]) -> Result<()> {
+        let block = if self.append {
+            let id = self.allocate_block();
+            self.provisional.insert(block, id);
+            id
+        } else {
+            block
+        };
+        self.buffer.block_manager().write_block(block, data)
     }
 
     /// `PartialBlockManager::Write` of a segment: into the fullest block that has room for it, unless it is too
@@ -1794,6 +1825,10 @@ impl<'a> Writer<'a> {
         };
         let (block, mut buffer, used) = match taken {
             Some(partial) => partial,
+            None if self.append => {
+                self.partial_count += 1;
+                (PROVISIONAL_BLOCK + self.partial_count, vec![0; self.block_size], 0)
+            }
             None => (self.allocate_block(), vec![0; self.block_size], 0),
         };
         let at = used;
@@ -1803,7 +1838,7 @@ impl<'a> Writer<'a> {
         // `RetainOrFlush`
         let available = self.block_size - used;
         if available < min_reusable_space {
-            self.buffer.block_manager().write_block(block, &buffer)?;
+            self.flush_partial(block, &buffer)?;
         } else {
             self.partial_count += 1;
             self.partial
@@ -2814,6 +2849,46 @@ impl<'a> Writer<'a> {
         })
     }
 
+    /// `ColumnData::Checkpoint` of the rows of a column of a row group.
+    fn encode_column(&mut self, table: &TableCatalogEntry, column: usize, parts: &[Part]) -> Result<ColumnOut> {
+        let ty = &table.columns[column].ty;
+        self.log_column = (format!("{}.{}", table.schema, table.name), column);
+        // `ColumnCheckpointInfo::GetCompressionType`: the method of the column, its validity and children
+        // too, in place of `force_compression`; one that none of them has leaves them all to choose
+        let forced = table.columns[column]
+            .compression
+            .map(|compression| compression_setting_name(compression).to_string());
+        let setting = forced.map(|forced| std::mem::replace(&mut self.force_compression, forced));
+        let out = self.write_column_data(ty, parts);
+        if let Some(setting) = setting {
+            self.force_compression = setting;
+        }
+        out
+    }
+
+    /// The blocks of a column written ahead of a commit, which the checkpoint keeps.
+    fn keep_written_blocks(&mut self, column: &ColumnOut) {
+        for segment in &column.segments {
+            if segment.block_id >= 0 {
+                self.used.insert(segment.block_id as u64);
+                *self.segments_in_block.entry(segment.block_id as u64).or_default() += 1;
+            }
+            self.used.extend(
+                segment
+                    .overflow_blocks
+                    .iter()
+                    .filter(|block| **block >= 0)
+                    .map(|block| *block as u64),
+            );
+        }
+        if let Some(validity) = &column.validity {
+            self.keep_written_blocks(validity);
+        }
+        for child in &column.children {
+            self.keep_written_blocks(child);
+        }
+    }
+
     /// `RowGroup::WriteToDisk`.
     fn write_row_group(
         &mut self,
@@ -2824,6 +2899,7 @@ impl<'a> Writer<'a> {
         deletes: Deletes,
         statistics: &mut [Option<Stats>],
         reused: Vec<Option<(MetaBlockPointer, Vec<u64>)>>,
+        written: Option<&[ColumnOut]>,
     ) -> Result<Vec<u8>> {
         let mut tables = std::mem::take(&mut self.tables);
         let mut pointers = Vec::with_capacity(parts.len());
@@ -2836,18 +2912,15 @@ impl<'a> Writer<'a> {
                 continue;
             }
             let ty = &table.columns[column].ty;
-            self.log_column = (format!("{}.{}", table.schema, table.name), column);
-            // `ColumnCheckpointInfo::GetCompressionType`: the method of the column, its validity and children
-            // too, in place of `force_compression`; one that none of them has leaves them all to choose
-            let forced = table.columns[column]
-                .compression
-                .map(|compression| compression_setting_name(compression).to_string());
-            let setting = forced.map(|forced| std::mem::replace(&mut self.force_compression, forced));
-            let out = self.write_column_data(ty, parts);
-            if let Some(setting) = setting {
-                self.force_compression = setting;
-            }
-            let out = out?;
+            // rows written ahead of the commit are in their blocks already (`ColumnData::HasChanges`)
+            let out = match written {
+                Some(columns) => {
+                    let out = columns[column].clone();
+                    self.keep_written_blocks(&out);
+                    out
+                }
+                None => self.encode_column(table, column, parts)?,
+            };
             match &mut statistics[column] {
                 Some(stats) => stats.merge(&out.stats, ty),
                 empty => *empty = Some(out.stats.clone()),
@@ -3056,9 +3129,41 @@ impl<'a> Writer<'a> {
                 let reused = self.keep_columns(stored_group, &kept_group, &same, &types, statistics)?;
                 // `RowGroupWriteAction::REUSE_EXISTING_ROW_GROUP_METADATA`, deletes and all
                 let whole = unchanged && matches!(deletes, Deletes::Keep(_));
-                let written =
-                    self.write_row_group(table, parts, group.file_start, group.rows, deletes, statistics, reused)?;
+                let written = self.write_row_group(
+                    table,
+                    parts,
+                    group.file_start,
+                    group.rows,
+                    deletes,
+                    statistics,
+                    reused,
+                    None,
+                )?;
                 return Ok((written, group.file_start as usize + group.rows, whole));
+            }
+        }
+        // a row group a commit wrote ahead, whose rows are all still there: its columns stay in their blocks, and
+        // only their metadata is written (`OptimisticDataWriter`)
+        if indexes.is_empty() && !group.merged && group.live == group.rows {
+            let written = table
+                .written_groups()
+                .into_iter()
+                .find(|written| written.row_start == group.row_start && written.rows == group.rows);
+            if let Some(written) = written {
+                self.group_loaded.push(vec![true; types.len()]);
+                let parts = types.iter().map(|_| Vec::new()).collect();
+                let reused = vec![None; types.len()];
+                let bytes = self.write_row_group(
+                    table,
+                    parts,
+                    group.file_start,
+                    group.rows,
+                    Deletes::Write(None),
+                    statistics,
+                    reused,
+                    Some(&written.columns),
+                )?;
+                return Ok((bytes, group.file_start as usize + group.rows, false));
             }
         }
         let mut live_chunks = Vec::new();
@@ -3155,7 +3260,16 @@ impl<'a> Writer<'a> {
         if !kept_any {
             self.group_loaded.push(vec![true; types.len()]);
         }
-        let written = self.write_row_group(table, parts, group.file_start, group.rows, deletes, statistics, reused)?;
+        let written = self.write_row_group(
+            table,
+            parts,
+            group.file_start,
+            group.rows,
+            deletes,
+            statistics,
+            reused,
+            None,
+        )?;
         Ok((written, group.file_start as usize + group.rows, whole))
     }
 
@@ -3493,6 +3607,122 @@ fn serializer(version: StorageVersion) -> BinarySerializer {
         target: version,
         ..Default::default()
     })
+}
+
+/// A row group a large insert wrote to blocks ahead of its commit (`OptimisticDataWriter`): where its columns are,
+/// which a checkpoint keeps, writing only their metadata.
+#[derive(Debug)]
+pub struct WrittenGroup {
+    /// the id of its first row
+    pub row_start: u64,
+    pub rows: usize,
+    columns: Vec<ColumnOut>,
+}
+
+/// `WRITE_BUFFER_ROW_GROUP_COUNT`: the row groups written together, a column of all of them at a time.
+const WRITE_BUFFER_ROW_GROUP_COUNT: usize = 5;
+
+/// `OptimisticDataWriter::WriteNewRowGroup` and `WriteUnflushedRowGroups` of the rows of `table` from position
+/// `first` on, the first of which has id `first_id`: in row groups of the table's size, `WRITE_BUFFER_ROW_GROUP_COUNT`
+/// at a time, into blocks that get their ids as they fill (`PartialBlockType::APPEND_TO_TABLE`).
+pub fn write_ahead(
+    buffer: &BufferManager,
+    catalog: &Catalog,
+    table: &TableCatalogEntry,
+    rows: &ColumnDataCollection,
+    first: usize,
+    first_id: u64,
+    options: CheckpointOptions,
+) -> Result<Vec<WrittenGroup>> {
+    let mut writer = Writer::new(buffer, catalog, String::new(), options);
+    writer.append = true;
+    let size = table.row_group_size();
+    let total = rows.len();
+    let types = table.types();
+    // the parts of each column of the row group of rows [start, end)
+    let parts_of = |start: usize, end: usize| -> Vec<Vec<Part>> {
+        let mut parts: Vec<Vec<Part>> = types.iter().map(|_| Vec::new()).collect();
+        let mut chunk_index = start / STANDARD_VECTOR_SIZE;
+        while chunk_index * STANDARD_VECTOR_SIZE < end {
+            let chunk = rows.chunk(chunk_index);
+            let chunk_start = chunk_index * STANDARD_VECTOR_SIZE;
+            let from = start.saturating_sub(chunk_start);
+            let to = (end - chunk_start).min(chunk.len());
+            let mut piece = chunk.clone();
+            if from > 0 || to < chunk.len() {
+                piece.slice(
+                    &SelectionVector::from_vec((from as u32..to as u32).collect()),
+                    to - from,
+                );
+            }
+            for (column, parts) in parts.iter_mut().enumerate() {
+                parts.push(Part::new(piece.column(column), to - from));
+            }
+            chunk_index += 1;
+        }
+        parts
+    };
+    let bounds: Vec<(usize, usize)> = (first..total)
+        .step_by(size)
+        .map(|start| (start, (start + size).min(total)))
+        .collect();
+    let mut groups = Vec::with_capacity(bounds.len());
+    for batch in bounds.chunks(WRITE_BUFFER_ROW_GROUP_COUNT) {
+        let parts: Vec<Vec<Vec<Part>>> = batch.iter().map(|&(start, end)| parts_of(start, end)).collect();
+        let mut columns: Vec<Vec<ColumnOut>> = batch.iter().map(|_| Vec::with_capacity(types.len())).collect();
+        // `RowGroup::WriteToDisk`: a column of all the row groups, then the next
+        for column in 0..types.len() {
+            for (group, parts) in parts.iter().enumerate() {
+                columns[group].push(writer.encode_column(table, column, &parts[column])?);
+            }
+        }
+        for (&(start, end), columns) in batch.iter().zip(columns) {
+            groups.push(WrittenGroup {
+                row_start: first_id + (start - first) as u64,
+                rows: end - start,
+                columns,
+            });
+        }
+    }
+    // `FinalFlush`, and the blocks the segments are in, now that they have ids
+    writer.flush_open_block()?;
+    let provisional = std::mem::take(&mut writer.provisional);
+    fn patch(column: &mut ColumnOut, provisional: &HashMap<u64, u64>) {
+        for segment in &mut column.segments {
+            if let Some(&block) = provisional.get(&(segment.block_id as u64)) {
+                segment.block_id = block as i64;
+            }
+        }
+        if let Some(validity) = &mut column.validity {
+            patch(validity, provisional);
+        }
+        for child in &mut column.children {
+            patch(child, provisional);
+        }
+    }
+    for group in &mut groups {
+        for column in &mut group.columns {
+            patch(column, &provisional);
+        }
+    }
+    Ok(groups)
+}
+
+/// `PersistentCollectionData::Serialize` of row groups written ahead of a commit, for a log (`WriteRowGroupData`).
+pub fn write_row_group_data(s: &mut BinarySerializer, types: &[LogicalType], groups: &[std::sync::Arc<WrittenGroup>]) {
+    s.write_object(101, "row_group_data", |s| {
+        s.write_list(100, "row_groups", groups.len(), |s, at| {
+            let group = &groups[at];
+            s.write_object_value(|s| {
+                s.write_property(100, "types", &types.to_vec());
+                s.write_list(101, "columns", group.columns.len(), |s, column| {
+                    s.write_object_value(|s| write_column(s, &group.columns[column], Some(&types[column]), 0));
+                });
+                s.write_property(102, "start", &group.row_start);
+                s.write_property(103, "count", &(group.rows as u64));
+            });
+        });
+    });
 }
 
 pub fn write_checkpoint(

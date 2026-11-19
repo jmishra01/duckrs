@@ -417,7 +417,12 @@ fn log_update(
 }
 
 /// What changed of the rows of a table, in records.
-fn log_rows(records: &mut Records, name: &Key, table: &TableCatalogEntry) -> Result<()> {
+/// What writes the rows of a large append to blocks ahead of a checkpoint (`OptimisticDataWriter`): of a table, its
+/// rows in memory, the position of the first new one and its id.
+pub type WriteAhead<'a> =
+    &'a dyn Fn(&TableCatalogEntry, &ColumnDataCollection, usize, u64) -> Result<Vec<super::writer::WrittenGroup>>;
+
+fn log_rows(records: &mut Records, name: &Key, table: &TableCatalogEntry, ahead: Option<WriteAhead>) -> Result<()> {
     let mut log = table.log.lock();
     let count = table.row_count();
     let ids = table.row_ids(count);
@@ -485,6 +490,28 @@ fn log_rows(records: &mut Records, name: &Key, table: &TableCatalogEntry) -> Res
         replayed.remove(&gone);
         first_new
     };
+    // `LocalStorage::Flush`: a bulk append, of at least a row group, goes to blocks of its own, which the log points
+    // to (`WriteRowGroupData`)
+    let mut first_written = first_written;
+    if let (Some(ahead), Some(rows), false) = (ahead, &storage, nested) {
+        let new = count.saturating_sub(first_written);
+        let consecutive = new > 0 && ids.id(count - 1) - ids.id(first_written) == (new - 1) as u64;
+        if new >= table.row_group_size() && consecutive {
+            let groups: Vec<Arc<super::writer::WrittenGroup>> =
+                ahead(table, rows, first_written, ids.id(first_written))?
+                    .into_iter()
+                    .map(Arc::new)
+                    .collect();
+            if !groups.is_empty() {
+                let types = table.types();
+                records.entry(wal_type::ROW_GROUP_DATA, |s| {
+                    super::writer::write_row_group_data(s, &types, &groups)
+                });
+                table.add_written_groups(groups);
+                first_written = count;
+            }
+        }
+    }
     let mut row = first_written / STANDARD_VECTOR_SIZE * STANDARD_VECTOR_SIZE;
     let chunks = storage
         .as_ref()
@@ -741,7 +768,14 @@ impl WriteAheadLog {
     }
 
     /// What differs from what is durable, in records. Drops go first, as a name can come back.
-    fn differences(&self, catalog: &Catalog, name: &str, current: &Durable, block_size: usize) -> Result<Records> {
+    fn differences(
+        &self,
+        catalog: &Catalog,
+        name: &str,
+        current: &Durable,
+        block_size: usize,
+        ahead: Option<WriteAhead>,
+    ) -> Result<Records> {
         let mut records = Records(Vec::new(), self.version, 0);
         let schema_of = |key: &Key| -> Result<Arc<SchemaCatalogEntry>> { catalog.schema_for(Some(&key.0)) };
         let gone = |old_same: bool, new_exists: bool| !new_exists || !old_same;
@@ -916,7 +950,7 @@ impl WriteAheadLog {
                 };
                 records.entry(wal_type::CREATE_TABLE, |s| entry.write_members(s));
             }
-            log_rows(&mut records, original, table)?;
+            log_rows(&mut records, original, table, ahead)?;
             table.alters.lock().clear();
         }
         for (k, (original, table, index)) in &current.indexes {
@@ -969,11 +1003,12 @@ impl WriteAheadLog {
         identifier: &[u8; DB_IDENTIFIER_LEN],
         iteration: u64,
         block_size: usize,
+        ahead: Option<WriteAhead>,
     ) -> Result<bool> {
         let current = Durable::of(catalog);
         self.check_storable(catalog, name, &current)?;
         let mut records = crate::execution::profiler::time_metric("storage.commit_local_storage_latency", || {
-            self.differences(catalog, name, &current, block_size)
+            self.differences(catalog, name, &current, block_size, ahead)
         })?;
         self.durable = current;
         if records.0.is_empty() {

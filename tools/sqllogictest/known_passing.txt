@@ -3985,6 +3985,7 @@ test/sql/storage/optimistic_write/optimistic_write_commit_failure.test
 test/sql/storage/optimistic_write/optimistic_write_cyclic_scan_single_thread.test
 test/sql/storage/optimistic_write/optimistic_write_delete.test
 test/sql/storage/optimistic_write/optimistic_write_large_strings.test
+test/sql/storage/optimistic_write/optimistic_write_not_trigger_checkpoint.test
 test/sql/storage/optimistic_write/optimistic_write_temp_table.test
 test/sql/storage/optimistic_write/optimistic_write_unique_index_wal_replay.test
 test/sql/storage/optimistic_write/optimistic_write_unique_index_wal_replay_desync.test

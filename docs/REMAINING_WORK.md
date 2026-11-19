@@ -163,8 +163,14 @@ Each item gives the number of failing files in `test/` that it should fix, where
     `GetFreeListBlocks` does; an unchanged table keeps its metadata whole (`WriteUnchangedTable`); deletes in
     a writer of their own and kept when they didn't change, as `ValidityMask::Write` packs them; segments into
     the fullest partly filled block they fit (`PartialBlockManager`)
-  - [ ] large inserts written ahead of the commit (`OptimisticDataWriter`): C++ puts the full row groups of a
-    big INSERT or CREATE TABLE AS in blocks before the checkpoint, so its data starts at lower block ids
+  - [x] large appends written ahead of a checkpoint (`OptimisticDataWriter`): a commit of at least a row group of
+    new rows writes them in row groups of their own, five at a time a column at a time, into blocks that get
+    their ids as they fill (`APPEND_TO_TABLE`), logs where they are (`ROW_GROUP_DATA`) and not the rows, and
+    a checkpoint keeps the blocks and writes their metadata; `enable_optimistic_write` turns it off. The rows
+    are written at the commit rather than as the statement fills each row group, and stay in memory too, so
+    an append still takes the memory of its rows; a log of C++'s row groups is replayed into memory
+  - [ ] row groups written while an append goes on, and dropped from memory, which loading TPC-H SF10 needs;
+    the row groups of a C++ log kept in their blocks on replay
   - [x] the ART layouts of files before v2.0.0, in checkpoints and the WAL: from v1.2.0 the current nodes with
     the 264-byte `Node256Leaf` (`GetNode256LeafSegmentSize`), before it `ART::TransformToDeprecated` (chains of
     `Leaf` of 4 row ids, 15-byte prefixes, 6 allocators); the `storage_version` option is the file's

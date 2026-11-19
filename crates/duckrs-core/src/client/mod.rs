@@ -107,6 +107,44 @@ pub struct AttachOptions {
     settings: Option<Arc<RwLock<SettingValues>>>,
 }
 
+/// What a checkpoint writes a file with, from the settings: `CheckpointOptions` borrow from it.
+struct CheckpointSettings {
+    vacuum_rebuild_indexes: u64,
+    metadata_reuse: bool,
+    force_column_metadata_reuse: bool,
+    /// `enable_optimistic_write`
+    optimistic_write: bool,
+    variant_minimum_shredding_size: i64,
+    force_variant_shredding: Option<LogicalType>,
+    zstd_min_string_length: usize,
+    storage_version: duckrs_common::serializer::StorageVersion,
+    keep_free_blocks: bool,
+    force: String,
+    bitpacking_mode: String,
+    row_group_size: u64,
+    vacuum_tasks: usize,
+}
+
+impl CheckpointSettings {
+    fn options<'a>(&'a self, abort: &'a str) -> storage::writer::CheckpointOptions<'a> {
+        storage::writer::CheckpointOptions {
+            vacuum_rebuild_indexes: self.vacuum_rebuild_indexes,
+            metadata_reuse: self.metadata_reuse,
+            force_column_metadata_reuse: self.force_column_metadata_reuse,
+            variant_minimum_shredding_size: self.variant_minimum_shredding_size,
+            force_variant_shredding: self.force_variant_shredding.as_ref(),
+            zstd_min_string_length: self.zstd_min_string_length,
+            storage_version: self.storage_version,
+            keep_free_blocks: self.keep_free_blocks,
+            force_compression: &self.force,
+            bitpacking_mode: &self.bitpacking_mode,
+            row_group_size: self.row_group_size,
+            vacuum_tasks: self.vacuum_tasks,
+            abort,
+        }
+    }
+}
+
 /// Where a checkpoint goes, and the log of what happened since the last one.
 #[derive(Debug)]
 struct DatabaseFile {
@@ -380,6 +418,23 @@ impl DatabaseInstance {
             self.changed.store(true, AtomicOrdering::SeqCst);
             return Ok(());
         }
+        // `OptimisticDataWriter`: large appends go to blocks of their own ahead of a checkpoint
+        let settings = self.checkpoint_settings(file)?;
+        let write_ahead = |table: &crate::catalog::TableCatalogEntry,
+                           rows: &duckrs_common::column_data::ColumnDataCollection,
+                           first: usize,
+                           first_id: u64| {
+            storage::writer::write_ahead(
+                &file.buffer,
+                &self.catalog,
+                table,
+                rows,
+                first,
+                first_id,
+                settings.options(""),
+            )
+        };
+        let ahead: Option<storage::log_writer::WriteAhead> = settings.optimistic_write.then_some(&write_ahead);
         if !log.commit(
             &file.path,
             &self.catalog,
@@ -387,6 +442,7 @@ impl DatabaseInstance {
             &identifier,
             blocks.header().iteration,
             blocks.block_size(),
+            ahead,
         )? {
             return Ok(());
         }
@@ -452,25 +508,8 @@ impl DatabaseInstance {
         }
     }
 
-    /// `abort` is `debug_checkpoint_abort`, which belongs to the session that asked.
-    fn write_checkpoint_with(&self, abort: &str) -> Result<()> {
-        crate::execution::profiler::time_metric("storage.checkpoint_latency", || self.write_checkpoint_timed(abort))
-    }
-
-    fn write_checkpoint_timed(&self, abort: &str) -> Result<()> {
-        let Some(file) = self.file.as_ref().filter(|_| self.file_access.is_none()) else {
-            return Ok(());
-        };
-        if !self.changed.swap(false, AtomicOrdering::SeqCst) {
-            return Ok(());
-        }
-        let mut log = file.log.lock();
-        let mut marked = None;
-        let log_ref = &mut *log;
-        let mut mark = |root: storage::metadata::MetaBlockPointer| {
-            marked = Some(log_ref.mark_checkpoint(&file.path, root)?);
-            Ok(())
-        };
+    /// The settings a checkpoint writes the file with, which a commit writing rows ahead of it uses too.
+    fn checkpoint_settings(&self, file: &DatabaseFile) -> Result<CheckpointSettings> {
         let force = settings::current_value("force_compression", &self.settings.read(), &SettingValues::default());
         let force = force.and_then(|value| value.try_to_string().ok()).unwrap_or_default();
         let vacuum_tasks =
@@ -529,21 +568,53 @@ impl DatabaseInstance {
                     .is_ok_and(|text| text.eq_ignore_ascii_case("true"))
             })
         };
-        let options = storage::writer::CheckpointOptions {
+        Ok(CheckpointSettings {
             vacuum_rebuild_indexes,
             metadata_reuse: setting("experimental_metadata_reuse"),
             force_column_metadata_reuse: setting("force_column_metadata_reuse"),
+            optimistic_write: settings::current_value(
+                "enable_optimistic_write",
+                &self.settings.read(),
+                &SettingValues::default(),
+            )
+            .is_none_or(|value| {
+                !value
+                    .try_to_string()
+                    .is_ok_and(|text| text.eq_ignore_ascii_case("false"))
+            }),
             variant_minimum_shredding_size,
-            force_variant_shredding: force_variant_shredding.as_ref(),
+            force_variant_shredding,
             zstd_min_string_length,
             storage_version: file.storage_version,
             keep_free_blocks: self.catalog.has_forks(),
-            force_compression: &force,
-            bitpacking_mode: &bitpacking_mode,
+            force,
+            bitpacking_mode,
             row_group_size: file.row_group_size,
             vacuum_tasks: if self.catalog.has_forks() { 0 } else { vacuum_tasks },
-            abort,
+        })
+    }
+
+    /// `abort` is `debug_checkpoint_abort`, which belongs to the session that asked.
+    fn write_checkpoint_with(&self, abort: &str) -> Result<()> {
+        crate::execution::profiler::time_metric("storage.checkpoint_latency", || self.write_checkpoint_timed(abort))
+    }
+
+    fn write_checkpoint_timed(&self, abort: &str) -> Result<()> {
+        let Some(file) = self.file.as_ref().filter(|_| self.file_access.is_none()) else {
+            return Ok(());
         };
+        if !self.changed.swap(false, AtomicOrdering::SeqCst) {
+            return Ok(());
+        }
+        let mut log = file.log.lock();
+        let mut marked = None;
+        let log_ref = &mut *log;
+        let mut mark = |root: storage::metadata::MetaBlockPointer| {
+            marked = Some(log_ref.mark_checkpoint(&file.path, root)?);
+            Ok(())
+        };
+        let settings = self.checkpoint_settings(file)?;
+        let options = settings.options(abort);
         let result =
             storage::writer::write_checkpoint(&file.path, &file.buffer, &self.catalog, &file.name, options, &mut mark);
         match result {

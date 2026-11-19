@@ -94,7 +94,10 @@ const QUERIES: &[&str] = &[
     "SELECT 'c'::mood",
     "SELECT count(*), count(n), min(w), max(w), min(n), max(n), count(DISTINCT w), count(DISTINCT n), min(e), max(e) FROM words",
     "SELECT w, n, e FROM words LIMIT 4 OFFSET 122879",
-    "SELECT count(*), sum(d), sum(f), sum(irregular), sum(root), count(odd), count(*) FILTER (WHERE isnan(odd)), \
+    // the sums of values that aren't round are only as exact as the order a scan adds them in, which depends on
+    // whether the rows are in memory or in a file: the hash of each value says they all came back
+    "SELECT count(*), sum(d), sum(f), round(sum(irregular), 12), round(sum(root), 6), sum(hash(irregular, root)), \
+     count(odd), count(*) FILTER (WHERE isnan(odd)), \
      count(*) FILTER (WHERE isinf(odd)), count(*) FILTER (WHERE odd = 0 AND signbit(odd)) FROM decimals",
     "SELECT d, f, irregular, root, odd FROM decimals WHERE d = 1.23 ORDER BY root LIMIT 3",
     "SELECT count(few), count(rare), count(many), count(most), sum(few), sum(rare), sum(many), sum(most) FROM nulls",
@@ -1255,4 +1258,42 @@ fn delete_reads_only_its_filter() {
     run(&mut c, "CHECKPOINT");
     assert!(rows(&mut c, loaded).is_empty());
     assert_eq!(rows(&mut c, sums), expected);
+}
+
+/// `OptimisticDataWriter`: a commit of at least a row group of new rows writes them to blocks of their own, which the
+/// log points to rather than holding the rows, and which a checkpoint keeps.
+#[test]
+fn large_appends_are_written_ahead() {
+    let file = path("written_ahead.db");
+    let create = "CREATE TABLE t AS SELECT i, i::VARCHAR s FROM range(300000) r(i)";
+    let sums = "SELECT count(*), sum(i), max(s), sum(hash(s)) FROM t";
+    let blocks = "SELECT block_id, block_offset FROM pragma_storage_info('t') WHERE block_id >= 0 ORDER BY ALL";
+    let expected = {
+        let db = Database::open_in_memory().unwrap();
+        let mut c = db.connect().unwrap();
+        run(&mut c, create);
+        rows(&mut c, sums)
+    };
+    let mut log = file.clone().into_os_string();
+    log.push(".wal");
+    {
+        let db = Database::open(&file, false).unwrap();
+        let mut c = db.connect().unwrap();
+        run(&mut c, "PRAGMA disable_checkpoint_on_shutdown");
+        run(&mut c, create);
+        assert_eq!(rows(&mut c, sums), expected);
+    }
+    // the rows are in blocks; the log only says where
+    assert!(std::fs::metadata(&log).unwrap().len() < 16 * 1024);
+    let db = Database::open(&file, false).unwrap();
+    let mut c = db.connect().unwrap();
+    assert_eq!(rows(&mut c, sums), expected);
+    run(&mut c, "CHECKPOINT");
+    let kept = rows(&mut c, blocks);
+    assert_eq!(rows(&mut c, sums), expected);
+    // an append of fewer rows than a row group goes in the log as rows
+    run(&mut c, "INSERT INTO t VALUES (-1, 'x')");
+    run(&mut c, "CHECKPOINT");
+    let after: Vec<String> = rows(&mut c, blocks);
+    assert!(kept.iter().all(|block| after.contains(block)), "{kept:?} {after:?}");
 }

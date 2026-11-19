@@ -342,6 +342,18 @@ impl SingleFileBlockManager {
         state.multi_use_blocks = multi_use_blocks;
     }
 
+    /// `GetFreeBlockId`: the lowest free block, or one past the others, which is used from now on.
+    pub fn allocate_free_block(&self) -> u64 {
+        let mut state = self.state.lock();
+        match state.free_list.pop_first() {
+            Some(block) => block,
+            None => {
+                state.header.block_count += 1;
+                state.header.block_count - 1
+            }
+        }
+    }
+
     /// The metadata blocks and the free sub-blocks of each, as a mask.
     pub fn metadata_blocks(&self) -> std::collections::BTreeMap<u64, u64> {
         self.state.lock().metadata_blocks.clone()

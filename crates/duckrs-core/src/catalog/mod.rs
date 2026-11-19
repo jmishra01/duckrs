@@ -410,6 +410,9 @@ pub struct TableCatalogEntry {
     /// The ALTERs that made this entry of one the log knows, oldest first, which the log says as such
     /// (`WriteAlter`): empty when it has to make the table again.
     pub alters: Mutex<Vec<LoggedAlter>>,
+    /// Row groups of rows of the table in memory that a commit wrote to blocks ahead of a checkpoint
+    /// (`OptimisticDataWriter`), which a checkpoint keeps; they go once the rows change but by appends.
+    written: Mutex<Vec<Arc<crate::storage::writer::WrittenGroup>>>,
     /// made by CREATE TABLE AS, whose columns depend on no type (`BindCreateTableInfo` registers
     /// the types of the columns only when there is no query)
     pub from_query: std::sync::atomic::AtomicBool,
@@ -842,6 +845,7 @@ impl TableCatalogEntry {
             unloaded_deletes: std::sync::atomic::AtomicBool::new(false),
             comment: Mutex::new(None),
             alters: Mutex::default(),
+            written: Mutex::default(),
         }
     }
 
@@ -867,6 +871,7 @@ impl TableCatalogEntry {
     }
 
     pub fn set_source(&self, source: Arc<dyn TableSource>) {
+        self.forget_written();
         self.set_row_ids(source.row_ids());
         let variants: Vec<usize> = (0..self.columns.len())
             .filter(|&c| self.columns[c].ty.id() == LogicalTypeId::Variant)
@@ -897,6 +902,7 @@ impl TableCatalogEntry {
     /// Of a table an UPDATE or an ALTER made of one in a file: its rows are still there, but for the columns that
     /// `source` has in memory. What the last checkpoint wrote stays what it was.
     pub fn keep_in_file(&self, source: Arc<dyn TableSource>) {
+        self.forget_written();
         self.set_row_ids(source.row_ids());
         *self.write_loaded_storage() = ColumnDataCollection::new(self.types());
         *self.read_from.write() = None;
@@ -935,6 +941,7 @@ impl TableCatalogEntry {
     /// A checkpoint put the rows in a file: what is in memory of them goes.
     pub fn leave_in_file(&self, source: Arc<dyn TableSource>) {
         self.unloaded_deletes.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.forget_written();
         let types = self.types();
         let ids = source.row_ids();
         let old = self.row_ids(self.row_count());
@@ -1037,6 +1044,7 @@ impl TableCatalogEntry {
 
     /// Replaces rows that were in a file, which the caller has read.
     pub fn set_rows(&self, rows: ColumnDataCollection) {
+        self.forget_written();
         self.rows_rewritten();
         *self.source.write() = None;
         *self.storage.write() = rows;
@@ -1046,15 +1054,58 @@ impl TableCatalogEntry {
     /// Whoever writes to `storage` comes through here, so that nothing goes on using statistics of
     /// other rows.
     pub fn write_storage(&self) -> Result<parking_lot::RwLockWriteGuard<'_, ColumnDataCollection>> {
+        self.forget_written();
         self.load_rows()?;
         Ok(self.write_loaded_storage())
     }
 
-    /// `write_storage` for what only adds rows at the end.
+    /// `write_storage` for what only adds rows at the end, which leaves the row groups written ahead as they are.
     pub fn append_storage(&self) -> Result<parking_lot::RwLockWriteGuard<'_, ColumnDataCollection>> {
-        let storage = self.write_storage()?;
+        self.load_rows()?;
+        let storage = self.write_loaded_storage();
         self.rows_appended(storage.len());
         Ok(storage)
+    }
+
+    /// The row groups of the table that a commit wrote ahead of a checkpoint.
+    pub fn written_groups(&self) -> Vec<Arc<crate::storage::writer::WrittenGroup>> {
+        self.written.lock().clone()
+    }
+
+    /// Row groups a commit wrote of rows at the end: a checkpoint keeps them as row groups of their own.
+    pub fn add_written_groups(&self, groups: Vec<Arc<crate::storage::writer::WrittenGroup>>) {
+        let bounds: Vec<(u64, usize)> = groups.iter().map(|group| (group.row_start, group.rows)).collect();
+        {
+            let mut ids = self.row_ids.lock();
+            let ids = Arc::make_mut(&mut ids);
+            let mut stored = ids.stored_groups().to_vec();
+            stored.extend(bounds);
+            *ids = ids.clone().with_stored_groups(stored);
+        }
+        self.written.lock().extend(groups);
+    }
+
+    /// The rows changed other than by appends: what was written of them ahead is not them any more.
+    pub fn forget_written(&self) {
+        let mut written = self.written.lock();
+        if written.is_empty() {
+            return;
+        }
+        written.clear();
+        drop(written);
+        // their row groups aren't row groups of their own any more either
+        let mut ids = self.row_ids.lock();
+        let ids = Arc::make_mut(&mut ids);
+        let stored: Vec<(u64, usize)> = match self.checkpointed().and_then(|source| {
+            source
+                .as_any()
+                .downcast_ref::<crate::storage::table_data::DiskTable>()
+                .map(|disk| crate::catalog::TableSource::row_ids(disk).stored_groups().to_vec())
+        }) {
+            Some(stored) => stored,
+            None => Vec::new(),
+        };
+        *ids = ids.clone().with_stored_groups(stored);
     }
 
     /// All rows are durable as they are, in a file or in a log that was replayed.
@@ -1109,6 +1160,7 @@ impl TableCatalogEntry {
     /// Whoever calls `write_storage` says what became of the rows, for what is known of them to
     /// stay: the rows at these positions changed, and only their values.
     pub fn rows_updated_in_place(&self, positions: impl IntoIterator<Item = usize>) {
+        self.forget_written();
         let mut statistics = self.statistics.lock();
         statistics.unreported = false;
         let positions: Vec<usize> = positions.into_iter().collect();
