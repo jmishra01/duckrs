@@ -2446,6 +2446,14 @@ impl Exporter<'_> {
                 children,
                 is_operator,
             } => {
+                // `TryExportCompressedMaterialization`: SQL has the values as they were, without the
+                // optimizer's compression, so a compress or decompress function is its input
+                if (function.name.starts_with("__internal_compress_")
+                    || function.name.starts_with("__internal_decompress_"))
+                    && let Some(input) = children.first()
+                {
+                    return self.expr(scope, input);
+                }
                 if let Some(expr) = self.extract_call(scope, &function.name, children)? {
                     return Ok(expr);
                 }

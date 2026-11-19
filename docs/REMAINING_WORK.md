@@ -230,7 +230,11 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] self-join aggregate (TPC-DS q95's `ws_wh` as `GROUP BY keys HAVING min(x) <> max(x)`); volatile
     uncorrelated IN subqueries are MARK joins too
   - [ ] `duckdb_types()` and the other system functions as `LogicalGet`s in EXPLAIN (`self_join_aggregate`)
-  - [ ] passes not ported: compressed materialization, partitioned execution, list comprehension rewrite, enum IN simplification (C++ keeps IN
+  - [x] compressed materialization, stage 1: integral columns of ORDER BY and of aggregate groups, as a cast
+    where the values fit and as `__internal_compress_integral_*` of their offset otherwise
+  - [ ] compressed materialization of strings, DISTINCT, join build sides, grouping sets, geometry and variant;
+    `__internal_*` functions in the catalog with their binder error
+  - [ ] passes not ported: partitioned execution, list comprehension rewrite, enum IN simplification (C++ keeps IN
     lists as IN), the auxiliary `e(b) op e(c)` filters of window pushdown, uncorrelated EXISTS as a cross product
 - [ ] 19. TPC-H 22/22 and TPC-DS 99/99 correct
   - [x] with `tools/tpch` and `tools/tpcds` building dbgen and dsdgen from the C++ checkout, the examples get

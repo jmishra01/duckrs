@@ -45,6 +45,7 @@ pub mod monotone_preimage;
 pub mod or_range_merge;
 pub mod reorder_filter;
 mod late_materialization;
+mod compressed_materialization;
 mod scalar_aggregate_merger;
 mod self_join_aggregate;
 mod topn_window_elimination;
@@ -101,6 +102,8 @@ pub struct OptimizerOptions {
     pub window_join_pushdown: bool,
     /// `LATE_MATERIALIZATION`
     pub late_materialization: bool,
+    /// `COMPRESSED_MATERIALIZATION`
+    pub compressed_materialization: bool,
     /// `TOP_N_WINDOW_ELIMINATION`
     pub topn_window_elimination: bool,
     /// `late_materialization_max_rows` and `preserve_insertion_order`
@@ -161,6 +164,7 @@ impl Default for OptimizerOptions {
             window_self_join: true,
             window_join_pushdown: true,
             late_materialization: true,
+            compressed_materialization: true,
             topn_window_elimination: true,
             late_materialization_options: late_materialization::LateMaterializationOptions {
                 max_rows: 50,
@@ -217,6 +221,7 @@ impl OptimizerOptions {
             window_self_join: false,
             window_join_pushdown: false,
             late_materialization: false,
+            compressed_materialization: false,
             topn_window_elimination: false,
             late_materialization_options: late_materialization::LateMaterializationOptions {
                 max_rows: 50,
@@ -272,6 +277,7 @@ impl OptimizerOptions {
             window_self_join: !off("window_self_join"),
             window_join_pushdown: !off("window_join_pushdown"),
             late_materialization: !off("late_materialization"),
+            compressed_materialization: !off("compressed_materialization"),
             topn_window_elimination: !off("top_n_window_elimination"),
             late_materialization_options: late_materialization::LateMaterializationOptions {
                 max_rows: 50,
@@ -450,6 +456,16 @@ pub fn optimize_timed(
                 plan
             });
         }
+    }
+    // `COMPRESSED_MATERIALIZATION`, which C++ runs as part of the statistics propagation that follows
+    if options.compressed_materialization
+        && options.statistics_propagation
+        && let Some(statistics_map) = statistics_map.as_mut()
+    {
+        plan = run("compressed_materialization", plan, &mut |mut plan| {
+            compressed_materialization::compress(&mut plan, statistics_map);
+            plan
+        });
     }
     // `PROJECTION_PLACEMENT` runs where the statistics have been propagated, once the unused columns are gone
     if options.projection_placement

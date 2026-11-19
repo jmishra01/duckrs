@@ -1165,6 +1165,23 @@ fn rebind(stats: &RelationStats, from: &[ColumnBinding], to: &[ColumnBinding]) -
 }
 
 /// `GetChildColumnBinding`: the first column an expression reads, unless it is volatile.
+/// A cast of a column between integral types, or a compression of it (`CompressedMaterialization`),
+/// which gives different values for different values.
+fn keeps_values_apart(expr: &BoundExpr) -> bool {
+    match &expr.kind {
+        BoundExprKind::Cast { child, try_cast: false } => {
+            matches!(child.kind, BoundExprKind::ColumnRef { .. })
+                && child.return_type.is_integral()
+                && expr.return_type.is_integral()
+        }
+        BoundExprKind::Function { function, children, .. } => {
+            (function.name.starts_with("__internal_compress_") || function.name.starts_with("__internal_decompress_"))
+                && children.first().is_some_and(|c| matches!(c.kind, BoundExprKind::ColumnRef { .. }))
+        }
+        _ => false,
+    }
+}
+
 fn child_column_binding(expr: &BoundExpr) -> Option<ColumnBinding> {
     match &expr.kind {
         BoundExprKind::ColumnRef { binding, depth: 0 } => Some(*binding),
@@ -1446,7 +1463,7 @@ impl JoinOrderOptimizer {
                     } else if let Some(source) = child_column_binding(expr) {
                         let source_column = child.column(&source);
                         let mut column = source_column.plain();
-                        if matches!(expr.kind, BoundExprKind::ColumnRef { .. }) {
+                        if matches!(expr.kind, BoundExprKind::ColumnRef { .. }) || keeps_values_apart(expr) {
                             column.evidence = source_column.evidence;
                         }
                         column
@@ -1859,9 +1876,14 @@ impl JoinOrderOptimizer {
                 let bindings = op.children[0].column_bindings();
                 let mapped: Option<Vec<usize>> = positions
                     .iter()
-                    .map(|&at| match &expressions.get(at)?.kind {
-                        BoundExprKind::ColumnRef { binding, depth: 0 } => bindings.iter().position(|b| b == binding),
-                        _ => None,
+                    .map(|&at| {
+                        let expr = expressions.get(at)?;
+                        // through the compression of a column too
+                        let column = if keeps_values_apart(expr) { &expr.children()[0] } else { expr };
+                        match &column.kind {
+                            BoundExprKind::ColumnRef { binding, depth: 0 } => bindings.iter().position(|b| b == binding),
+                            _ => None,
+                        }
                     })
                     .collect();
                 let Some(mapped) = mapped else {
