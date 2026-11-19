@@ -1952,6 +1952,26 @@ impl StatisticsPropagator {
         let mut right_is_empty = false;
         // the filters the ranges of the keys after the join make for each side (`CreateFilterFromJoinStats`)
         let mut range_filters: [Vec<BoundExpr>; 2] = [Vec::new(), Vec::new()];
+        // `SimplifyDistinctComparison` with `ComparisonContext::JOIN`: a join rejects the NULL pairs too,
+        // so with one side without NULLs `IS NOT DISTINCT FROM` is `=`
+        for condition in conditions.iter_mut() {
+            if !matches!(condition.comparison, ComparisonOp::NotDistinctFrom | ComparisonOp::DistinctFrom) {
+                continue;
+            }
+            let nested = |e: &BoundExpr| {
+                matches!(e.return_type.id(), LogicalTypeId::Union | LogicalTypeId::Tuple)
+            };
+            if nested(&condition.left) || nested(&condition.right) {
+                continue;
+            }
+            let left_not_null = !self.expression(&mut condition.left.clone(), false).can_be_null;
+            let right_not_null = !self.expression(&mut condition.right.clone(), false).can_be_null;
+            condition.comparison = match condition.comparison {
+                ComparisonOp::NotDistinctFrom if left_not_null || right_not_null => ComparisonOp::Equal,
+                ComparisonOp::DistinctFrom if left_not_null && right_not_null => ComparisonOp::NotEqual,
+                other => other,
+            };
+        }
         for condition in conditions.iter_mut().filter(|c| !c.null_safe()) {
             let left = self.expression(&mut condition.left, false);
             let right = self.expression(&mut condition.right, false);

@@ -497,6 +497,7 @@ test/optimizer/compare_blob.test
 test/optimizer/comparison_simplification.test
 test/optimizer/comparison_simplification_narrowing_casts.test
 test/optimizer/compressed_materialization_grouping_sets.test
+test/optimizer/compressed_materialization_join_nulls.test
 test/optimizer/compressed_materialization_many_aggregates.test
 test/optimizer/conjunction_simplification.test
 test/optimizer/constant_argument_errors.test
@@ -612,6 +613,7 @@ test/optimizer/pushdown/pushdown_after_statistics.test
 test/optimizer/pushdown/pushdown_in_to_parquet.test
 test/optimizer/pushdown/pushdown_unnest_into_cte.test
 test/optimizer/pushdown/pushdown_window_decreasing_partition.test
+test/optimizer/pushdown/semi_anti_join_implied_filters.test
 test/optimizer/pushdown/starts_with_pushdown.test
 test/optimizer/pushdown/test_pushdown_cte_group_by_all.test
 test/optimizer/pushdown/timestamp_to_date_infinity_pushdown.test
@@ -2769,6 +2771,7 @@ test/sql/join/iejoin/test_iejoin_null_keys.test
 test/sql/join/iejoin/test_iejoin_overlaps.test
 test/sql/join/iejoin/test_iejoin_predicate.test
 test/sql/join/iejoin/test_iesemijoin.test
+test/sql/join/inner/distinctness_statistics_filter.test
 test/sql/join/inner/empty_tinyint_column.test
 test/sql/join/inner/equality_join_limits.test
 test/sql/join/inner/join_cache.test
@@ -2812,6 +2815,7 @@ test/sql/join/mark/group_reconstruction_limits.test
 test/sql/join/mark/hash_nested_operator_semantics.test
 test/sql/join/mark/residual_predicate.test
 test/sql/join/mark/residual_vector_reuse.test
+test/sql/join/mark/test_null_safe_semi_uncommitted_stats.test
 test/sql/join/mark/tuple_inequality.test
 test/sql/join/mark/tuple_value_semantics.test
 test/sql/join/nearest/nearest_basic.test

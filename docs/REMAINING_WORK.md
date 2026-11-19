@@ -230,10 +230,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] self-join aggregate (TPC-DS q95's `ws_wh` as `GROUP BY keys HAVING min(x) <> max(x)`); volatile
     uncorrelated IN subqueries are MARK joins too
   - [ ] `duckdb_types()` and the other system functions as `LogicalGet`s in EXPLAIN (`self_join_aggregate`)
-  - [x] compressed materialization, stages 1-2: integral and VARCHAR columns of ORDER BY and of aggregate
-    groups (casts, `__internal_compress_integral_*`, `__internal_compress_string_*`); calling them is the
-    binder error C++ gives
-  - [ ] compressed materialization of DISTINCT, join build sides, geometry and variant
+  - [x] compressed materialization, stages 1-3: integral and VARCHAR columns of ORDER BY, DISTINCT, aggregate
+    groups and the build side and single key pair of comparison joins (casts, `__internal_compress_integral_*`,
+    `__internal_compress_string_*`); calling them is the binder error C++ gives
+  - [ ] compressed materialization of geometry and variant columns
   - [ ] `stats()` of a VARCHAR read from several parquet files with `union_by_name` (NULL here)
   - [ ] passes not ported: partitioned execution, list comprehension rewrite, enum IN simplification (C++ keeps IN
     lists as IN), the auxiliary `e(b) op e(c)` filters of window pushdown, uncorrelated EXISTS as a cross product

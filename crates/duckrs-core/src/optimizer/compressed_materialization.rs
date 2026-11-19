@@ -17,8 +17,8 @@
 //! down and its length in the least significant one: `__internal_compress_string_uinteger(s)`,
 //! and `__internal_decompress_string(c)` above.
 //!
-//! Ported so far: integral and VARCHAR columns of ORDER BY and of the groups of an aggregate. Not
-//! yet: DISTINCT, the build side of joins, geometry and variant columns.
+//! Ported: integral and VARCHAR columns of ORDER BY, DISTINCT, the groups of an aggregate and the
+//! build side and keys of a comparison join. Not yet: geometry and variant columns.
 
 use super::common_subplan::{max_table_index, visit_bindings};
 use super::statistics::StatisticsMap;
@@ -121,6 +121,9 @@ impl Pass<'_> {
         let new = match op.kind {
             K::Order { .. } => self.compress_order(op),
             K::Aggregate { .. } => self.compress_aggregate(op),
+            K::Distinct { .. } => self.compress_distinct(op),
+            // a MARK join's right side keeps its bindings while it changes type
+            K::Join { .. } => self.compress_comparison_join(op),
             _ => HashMap::new(),
         };
         changed.extend(new);
@@ -141,7 +144,7 @@ impl Pass<'_> {
         }
         let child = &op.children[0];
         let can: Vec<bool> = child.column_bindings().iter().map(|b| !referenced.contains(b)).collect();
-        self.create_projections(op, &can)
+        self.create_projections(op, &[can], &HashMap::new())
     }
 
     /// `CompressAggregate`: the columns that are only groups.
@@ -189,83 +192,101 @@ impl Pass<'_> {
             .iter()
             .map(|b| group_bindings.contains(b) && !referenced.contains(b))
             .collect();
-        self.create_projections(op, &can)
+        self.create_projections(op, &[can], &HashMap::new())
     }
 
-    /// `CreateProjections`: a compressing projection below `op` and a restoring one above it, if
-    /// a column compresses.
-    fn create_projections(&mut self, op: &mut LogicalOperator, can: &[bool]) -> HashMap<ColumnBinding, ColumnBinding> {
-        let child = &op.children[0];
-        let (bindings, types) = (child.column_bindings(), child.types());
-        let mut compressed: Vec<Option<(Compression, ColumnStatistics)>> = Vec::new();
-        let mut expressions = Vec::new();
-        for (i, (&binding, ty)) in bindings.iter().zip(&types).enumerate() {
-            let input = BoundExpr::column_ref(binding, ty.clone(), "");
-            let stats = can[i].then(|| self.statistics.get(binding));
-            let compress = |s: &ColumnStatistics| integral_compress(input.clone(), s).or_else(|| string_compress(input.clone(), s));
-            match stats.as_ref().and_then(compress) {
-                Some(c) => {
-                    compressed.push(Some((c.how, stats.expect("some"))));
-                    expressions.push(c.expression);
-                }
-                None => {
-                    compressed.push(None);
-                    expressions.push(input);
-                }
-            }
-        }
-        if compressed.iter().all(Option::is_none) {
-            return HashMap::new();
-        }
-        // what the operator outputs, which what is above reads
+    /// `CreateProjections`: a compressing projection below each child of `op` that has a column to
+    /// compress, and a restoring one above it. `can[c][i]`: column `i` of child `c` may be
+    /// compressed; `overrides` are the statistics to compress a column by in place of its own.
+    fn create_projections(
+        &mut self,
+        op: &mut LogicalOperator,
+        can: &[Vec<bool>],
+        overrides: &HashMap<ColumnBinding, ColumnStatistics>,
+    ) -> HashMap<ColumnBinding, ColumnBinding> {
+        // per child: its compressing projection's index, and how each column is compressed
+        let mut children: Vec<Option<(usize, Vec<Option<Compression>>, Vec<LogicalType>)>> = Vec::new();
         let outputs_before = op.column_bindings();
-        // below: the child's columns, compressed
-        let compress_index = self.take();
-        let compressed_types: Vec<LogicalType> = expressions.iter().map(|e| e.return_type.clone()).collect();
-        let child = op.children.pop().expect("one child");
-        op.children.push(LogicalOperator::new(
-            K::Projection {
-                table_index: compress_index,
-                expressions,
-            },
-            vec![child],
-        ));
-        let below: HashMap<ColumnBinding, (ColumnBinding, LogicalType)> = bindings
-            .iter()
-            .enumerate()
-            .map(|(i, b)| (*b, (ColumnBinding::new(compress_index, i), compressed_types[i].clone())))
-            .collect();
-        // the operator reads the compressed columns, with their types
-        replace(&mut op.kind, &below, true);
-        // which of its outputs are compressed columns: an ORDER BY's are its input's, an
-        // aggregate's groups the columns they read
-        let outputs = op.column_bindings();
-        let output_types = op.types();
-        let mut restore_of: HashMap<ColumnBinding, (Compression, LogicalType)> = HashMap::new();
-        match &op.kind {
-            K::Order { .. } => {
-                for (i, c) in compressed.iter().enumerate() {
-                    if let Some((how, _)) = c {
-                        restore_of.insert(ColumnBinding::new(compress_index, i), (how.clone(), types[i].clone()));
+        let mut below: HashMap<ColumnBinding, (ColumnBinding, LogicalType)> = HashMap::new();
+        for (c, child_can) in can.iter().enumerate() {
+            let child = &op.children[c];
+            let (bindings, types) = (child.column_bindings(), child.types());
+            let mut how = Vec::new();
+            let mut expressions = Vec::new();
+            for (i, (&binding, ty)) in bindings.iter().zip(&types).enumerate() {
+                let input = BoundExpr::column_ref(binding, ty.clone(), "");
+                let stats = child_can[i]
+                    .then(|| overrides.get(&binding).cloned().unwrap_or_else(|| self.statistics.get(binding)));
+                let compress = |s: &ColumnStatistics| {
+                    integral_compress(input.clone(), s).or_else(|| string_compress(input.clone(), s))
+                };
+                match stats.as_ref().and_then(compress) {
+                    Some(compressed) => {
+                        how.push(Some(compressed.how));
+                        expressions.push(compressed.expression);
+                    }
+                    None => {
+                        how.push(None);
+                        expressions.push(input);
                     }
                 }
             }
+            if how.iter().all(Option::is_none) {
+                children.push(None);
+                continue;
+            }
+            let index = self.take();
+            for (i, (b, e)) in bindings.iter().zip(&expressions).enumerate() {
+                below.insert(*b, (ColumnBinding::new(index, i), e.return_type.clone()));
+            }
+            let input = std::mem::replace(&mut op.children[c], LogicalOperator::new(K::CrossProduct, Vec::new()));
+            op.children[c] = LogicalOperator::new(
+                K::Projection {
+                    table_index: index,
+                    expressions,
+                },
+                vec![input],
+            );
+            children.push(Some((index, how, types)));
+        }
+        if children.iter().all(Option::is_none) {
+            return HashMap::new();
+        }
+        // the operator reads the compressed columns, with their types
+        replace(&mut op.kind, &below, true);
+        // which of its outputs are compressed columns: those of an ORDER BY, a DISTINCT and a join
+        // are their inputs', an aggregate's groups the columns they read
+        let outputs = op.column_bindings();
+        let output_types = op.types();
+        let mut restore_of: HashMap<ColumnBinding, (Compression, LogicalType)> = HashMap::new();
+        let compressed_column = |binding: ColumnBinding| {
+            children.iter().flatten().find(|(index, ..)| *index == binding.table_index).and_then(
+                |(_, how, types)| {
+                    how[binding.column_index]
+                        .clone()
+                        .map(|h| (h, types[binding.column_index].clone()))
+                },
+            )
+        };
+        match &op.kind {
             K::Aggregate {
                 group_index, groups, ..
             } => {
                 for (g, group) in groups.iter().enumerate() {
                     if let BoundExprKind::ColumnRef { binding, depth: 0 } = group.kind
-                        && binding.table_index == compress_index
-                        && let Some((how, _)) = &compressed[binding.column_index]
+                        && let Some(restore) = compressed_column(binding)
                     {
-                        restore_of.insert(
-                            ColumnBinding::new(*group_index, g),
-                            (how.clone(), types[binding.column_index].clone()),
-                        );
+                        restore_of.insert(ColumnBinding::new(*group_index, g), restore);
                     }
                 }
             }
-            _ => unreachable!(),
+            _ => {
+                for binding in &outputs {
+                    if let Some(restore) = compressed_column(*binding) {
+                        restore_of.insert(*binding, restore);
+                    }
+                }
+            }
         }
         // above: the operator's columns as they were
         let decompress_index = self.take();
@@ -297,6 +318,113 @@ impl Pass<'_> {
         }
         changed
     }
+
+    /// `CompressDistinct`: every column passes through, so every one it does not deduplicate on
+    /// by an expression can be compressed.
+    fn compress_distinct(&mut self, op: &mut LogicalOperator) -> HashMap<ColumnBinding, ColumnBinding> {
+        let K::Distinct { targets, .. } = &op.kind else {
+            unreachable!()
+        };
+        let mut referenced = HashSet::new();
+        for target in targets {
+            if !matches!(target.kind, BoundExprKind::ColumnRef { depth: 0, .. }) {
+                collect(target, &mut referenced);
+            }
+        }
+        let can = vec![op.children[0].column_bindings().iter().map(|b| !referenced.contains(b)).collect()];
+        self.create_projections(op, &can, &HashMap::new())
+    }
+
+    /// `CompressComparisonJoin`: the columns of the build side that only pass through, and the keys
+    /// of a join on one pair of columns, both compressed by their merged statistics so that they
+    /// still compare. The probe side streams, so its other columns stay.
+    fn compress_comparison_join(&mut self, op: &mut LogicalOperator) -> HashMap<ColumnBinding, ColumnBinding> {
+        let K::Join {
+            conditions, predicate, ..
+        } = &op.kind
+        else {
+            unreachable!()
+        };
+        // release builds only compress large build sides that the join does not multiply much
+        let build = super::join_order::estimated_cardinality(&op.children[1]);
+        if build < JOIN_BUILD_CARDINALITY_THRESHOLD {
+            return HashMap::new();
+        }
+        if op.children[1].types().len() < JOIN_BUILD_COLUMN_COUNT_THRESHOLD {
+            let joined = super::join_order::estimated_cardinality(op);
+            if joined as f64 / build as f64 > JOIN_CARDINALITY_RATIO_THRESHOLD {
+                return HashMap::new();
+            }
+        }
+        let mut referenced = HashSet::new();
+        if let Some(predicate) = predicate {
+            collect(predicate, &mut referenced);
+        }
+        let mut probe_keys = HashSet::new();
+        let mut overrides = HashMap::new();
+        for condition in conditions {
+            if conditions.len() == 1
+                && let (
+                    BoundExprKind::ColumnRef { binding: l, depth: 0 },
+                    BoundExprKind::ColumnRef { binding: r, depth: 0 },
+                ) = (&condition.left.kind, &condition.right.kind)
+                && !referenced.contains(l)
+                && !referenced.contains(r)
+            {
+                // both by the same statistics, or the comparisons fail
+                let (left, right) = (self.statistics.get(*l), self.statistics.get(*r));
+                let merged = merge(&left, &right);
+                let compresses = integral_compress(condition.left.clone(), &merged)
+                    .or_else(|| string_compress(condition.left.clone(), &merged))
+                    .is_some();
+                if compresses && condition.left.return_type == condition.right.return_type {
+                    overrides.insert(*l, merged.clone());
+                    overrides.insert(*r, merged);
+                    probe_keys.insert(*l);
+                    continue;
+                }
+            }
+            collect(&condition.left, &mut referenced);
+            collect(&condition.right, &mut referenced);
+        }
+        let probe: Vec<bool> = op.children[0].column_bindings().iter().map(|b| probe_keys.contains(b)).collect();
+        let build: Vec<bool> = op.children[1].column_bindings().iter().map(|b| !referenced.contains(b)).collect();
+        self.create_projections(op, &[probe, build], &overrides)
+    }
+}
+
+/// `JOIN_BUILD_CARDINALITY_THRESHOLD`, `JOIN_BUILD_COLUMN_COUNT_THRESHOLD` and
+/// `JOIN_CARDINALITY_RATIO_THRESHOLD` (release builds).
+const JOIN_BUILD_CARDINALITY_THRESHOLD: u64 = 1_048_576;
+const JOIN_BUILD_COLUMN_COUNT_THRESHOLD: usize = 20;
+const JOIN_CARDINALITY_RATIO_THRESHOLD: f64 = 8.0;
+
+/// `BaseStatistics::Merge`: what holds of the values of both.
+fn merge(a: &ColumnStatistics, b: &ColumnStatistics) -> ColumnStatistics {
+    use crate::optimizer::statistics::compare_values;
+    use duckrs_parser::ast::ComparisonOp;
+    let pick = |x: &Option<Value>, y: &Option<Value>, op: ComparisonOp, valid_x: bool, valid_y: bool| match (x, y) {
+        // a side without values does not bound the other
+        _ if !valid_x => y.clone(),
+        _ if !valid_y => x.clone(),
+        (Some(x), Some(y)) => Some(if compare_values(op, x, y) == Some(true) { x.clone() } else { y.clone() }),
+        _ => None,
+    };
+    let mut merged = a.clone();
+    merged.min = pick(&a.min, &b.min, ComparisonOp::LessThanOrEqual, a.can_be_valid, b.can_be_valid);
+    merged.max = pick(&a.max, &b.max, ComparisonOp::GreaterThanOrEqual, a.can_be_valid, b.can_be_valid);
+    merged.can_be_null = a.can_be_null || b.can_be_null;
+    merged.can_be_valid = a.can_be_valid || b.can_be_valid;
+    merged.strings = match (&a.strings, &b.strings) {
+        (Some(x), Some(y)) => {
+            let mut s = x.clone();
+            s.max_length = x.max_length.zip(y.max_length).map(|(p, q)| p.max(q));
+            s.bounds = None;
+            Some(s)
+        }
+        _ => None,
+    };
+    merged
 }
 
 /// `GetSameWidthIntegralType`.
