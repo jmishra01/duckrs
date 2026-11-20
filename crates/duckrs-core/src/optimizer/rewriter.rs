@@ -76,12 +76,23 @@ pub(crate) fn split_conjuncts(expr: BoundExpr, result: &mut Vec<BoundExpr>) {
 /// `ExpressionRewriter::ApplyRules`. `in_filter` says the expression is the root of a filter,
 /// where NULL has the same effect as false.
 pub(crate) fn rewrite_expression(expr: &mut BoundExpr, in_filter: bool) {
+    rewrite_with(expr, in_filter, true);
+}
+
+/// [`rewrite_expression`] for a filter after the pushdown, without `ConstantFoldingRule` and
+/// `MonotonePreimageRule`: C++ applies the rules once before it, so the auxiliary `e(b) op e(c)`
+/// filters of windows stay as the pushdown makes them.
+pub(crate) fn rewrite_pushed_filter(expr: &mut BoundExpr) {
+    rewrite_with(expr, true, false);
+}
+
+fn rewrite_with(expr: &mut BoundExpr, in_filter: bool, preimage: bool) {
     for _ in 0..MAX_ROUNDS {
         for child in expr.children_mut() {
-            rewrite_expression(child, false);
+            rewrite_with(child, false, preimage);
         }
         let alias = expr.alias.clone();
-        if !apply_rules(expr, in_filter) {
+        if !apply_rules(expr, in_filter, preimage) {
             return;
         }
         if !alias.is_empty() {
@@ -90,8 +101,8 @@ pub(crate) fn rewrite_expression(expr: &mut BoundExpr, in_filter: bool) {
     }
 }
 
-fn apply_rules(expr: &mut BoundExpr, in_filter: bool) -> bool {
-    constant_folding(expr)
+fn apply_rules(expr: &mut BoundExpr, in_filter: bool, preimage: bool) -> bool {
+    (preimage && constant_folding(expr))
         || equal_or_null_simplification(expr, in_filter)
         || date_part_simplification(expr)
         || date_trunc_simplification(expr)
@@ -109,7 +120,7 @@ fn apply_rules(expr: &mut BoundExpr, in_filter: bool) -> bool {
         || least_greatest_simplification(expr)
         || not_constant_or_null_simplification(expr)
         || move_constants(expr)
-        || super::monotone_preimage::monotone_preimage(expr, in_filter)
+        || (preimage && super::monotone_preimage::monotone_preimage(expr, in_filter))
         || case_simplification(expr)
         || conjunction_simplification(expr, in_filter)
         || super::or_range_merge::or_range_merge(expr)

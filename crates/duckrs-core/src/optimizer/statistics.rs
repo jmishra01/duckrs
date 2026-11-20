@@ -815,6 +815,8 @@ struct StatisticsPropagator {
     filter_bindings_changed: bool,
     /// the plan writes (`HasSideEffects`): its statistics may not see the rows it adds, NULLs among them
     side_effects: bool,
+    /// the filter being propagated is on a scan, where it becomes a table filter
+    filter_on_scan: bool,
     /// `cte_stats_map`: the statistics of the columns of each materialized CTE's definition
     ctes: HashMap<usize, Vec<Stats>>,
     /// the most rows each materialized CTE's definition has
@@ -1016,8 +1018,13 @@ impl StatisticsPropagator {
             *expr = BoundExpr::constant(Value::null(LogicalType::BOOLEAN)).with_alias(alias);
             return unknown();
         }
-        if empty(&left_stats) || empty(&right_stats) {
-            if in_filter {
+        // `ExpressionFilter::CheckStatistics` of a table filter on the column; elsewhere there is no
+        // minimum and maximum to decide by
+        let bare_empty = |stats: &Stats, side: &BoundExpr| {
+            empty(stats) && matches!(side.kind, BoundExprKind::ColumnRef { depth: 0, .. })
+        };
+        if bare_empty(&left_stats, left) || bare_empty(&right_stats, right) {
+            if in_filter && self.filter_on_scan {
                 let alias = expr.alias.clone();
                 *expr = BoundExpr::constant(Value::boolean(false)).with_alias(alias);
             }
@@ -1919,8 +1926,11 @@ impl StatisticsPropagator {
             unreachable!()
         };
         let mut kept = Vec::with_capacity(expressions.len());
+        let on_scan = matches!(op.children[0].kind, K::Get { .. });
         for mut expr in std::mem::take(expressions) {
+            let outer = std::mem::replace(&mut self.filter_on_scan, on_scan);
             self.handle_filter(&mut expr);
+            self.filter_on_scan = outer;
             // `constant_or_null(false, x)` is false or NULL, which a filter does not let through
             let never = matches!(&expr.kind, BoundExprKind::Function { function, children, .. }
                 if function.name == "constant_or_null"
@@ -2074,7 +2084,7 @@ impl StatisticsPropagator {
     fn handle_filter(&mut self, expr: &mut BoundExpr) {
         let before = self.filter_simplification.then(|| filter_bindings(expr));
         self.expression(expr, true);
-        rewrite_expression(expr, true);
+        super::rewriter::rewrite_pushed_filter(expr);
         if let Some(before) = before {
             simplify_filter(expr);
             self.filter_bindings_changed |= before != filter_bindings(expr);

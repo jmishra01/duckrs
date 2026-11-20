@@ -15,6 +15,7 @@ use super::rewriter::{
 };
 use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, ColumnBinding, WindowFunction};
 use crate::planner::logical::{JoinCondition, LogicalOperator, LogicalOperatorKind};
+use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
 use duckrs_parser::ast::{ComparisonOp, JoinType};
 use std::collections::{BTreeSet, HashMap};
@@ -83,6 +84,55 @@ fn join_side(tables: &BTreeSet<usize>, left: &BTreeSet<usize>, right: &BTreeSet<
     } else {
         JoinSide::Both
     }
+}
+
+/// `CreateAuxiliaryFilter`: for a filter `b op c` of a constant `c`, `e(b) op' e(c)` of the partition
+/// `e(b)` if `e` keeps the order of its argument, with `op'` not strict where `e` is not.
+fn auxiliary_filter(partition: &BoundExpr, filter: &BoundExpr) -> Option<BoundExpr> {
+    let BoundExprKind::Comparison { op, left, right } = &filter.kind else {
+        return None;
+    };
+    let (constant, free, op) = if left.is_foldable() {
+        (left, right, crate::optimizer::statistics::flip(*op))
+    } else if right.is_foldable() {
+        (right, left, *op)
+    } else {
+        return None;
+    };
+    let BoundExprKind::Function { function, children, .. } = &partition.kind else {
+        return None;
+    };
+    if !expressions_equal(free, &children[0]) {
+        return None;
+    }
+    // `ArgProperties`: increasing, and strictly so for these
+    let strict = matches!(function.name.as_str(), "make_date" | "make_timestamp" | "make_timestamp_ns" | "+");
+    if !strict && crate::execution::zone_map::unary_monotonicity(&function.name) != Some(true) {
+        return None;
+    }
+    let op = match op {
+        ComparisonOp::NotEqual | ComparisonOp::DistinctFrom | ComparisonOp::Equal | ComparisonOp::NotDistinctFrom => {
+            if !strict {
+                return None;
+            }
+            op
+        }
+        ComparisonOp::LessThan if !strict => ComparisonOp::LessThanOrEqual,
+        ComparisonOp::GreaterThan if !strict => ComparisonOp::GreaterThanOrEqual,
+        other => other,
+    };
+    let mut of_constant = partition.clone();
+    if let BoundExprKind::Function { children, .. } = &mut of_constant.kind {
+        children[0] = (**constant).clone();
+    }
+    Some(BoundExpr::new(
+        BoundExprKind::Comparison {
+            op,
+            left: Box::new(partition.clone()),
+            right: Box::new(of_constant),
+        },
+        LogicalType::BOOLEAN,
+    ))
 }
 
 /// `FilterPushdown::Filter`.
@@ -354,19 +404,31 @@ impl FilterPushdown {
 
     /// `FilterPushdown::PushdownWindow`: a filter on columns that partition every window holds
     /// for all rows of a partition or none, and so does one that compares a partition of every
-    /// window with constants when the windows are rankings without arguments.
-    ///
-    /// Not ported: the auxiliary filters `e(b) op e(c)` that a filter `b op c` gives for an
-    /// order-preserving partition `e(b)`.
+    /// window with constants when the windows are rankings without arguments. A filter `b op c` of
+    /// a constant `c` and an order-preserving partition `e(b)` of every window leaves a weaker copy
+    /// `e(b) op' e(c)` below (`CreateAuxiliaryFilter`), and stays.
     fn pushdown_window(mut self, mut op: LogicalOperator) -> LogicalOperator {
         let LogicalOperatorKind::Window { windows, .. } = &op.kind else {
             unreachable!()
         };
         let mut partition_bindings: Vec<BTreeSet<ColumnBinding>> = Vec::new();
+        // the partitions `e(b)` of one argument, with how often windows have them
+        let mut partition_functions: Vec<(BoundExpr, usize)> = Vec::new();
         for window in windows {
             // all windows need partitions
             if window.partitions.is_empty() {
                 return self.finish_pushdown(op);
+            }
+            for partition in &window.partitions {
+                if let BoundExprKind::Function { children, .. } = &partition.kind
+                    && children.len() == 1
+                    && !partition.is_volatile()
+                {
+                    match partition_functions.iter_mut().find(|(p, _)| expressions_equal(p, partition)) {
+                        Some((_, count)) => *count += 1,
+                        None => partition_functions.push((partition.clone(), 1)),
+                    }
+                }
             }
             partition_bindings.push(
                 window
@@ -427,9 +489,18 @@ impl FilterPushdown {
                 .all(|set| columns.iter().all(|b| set.contains(b)));
             if (on_partitions || (only_ranks && compares_partitions(&f.filter))) && !f.filter.is_volatile() {
                 below.filters.push(f);
-            } else {
-                remaining.push(f);
+                continue;
             }
+            for (partition, count) in &partition_functions {
+                // a partition of every window
+                if *count != partition_bindings.len() {
+                    continue;
+                }
+                if let Some(auxiliary) = auxiliary_filter(partition, &f.filter) {
+                    below.filters.push(Filter::new(auxiliary));
+                }
+            }
+            remaining.push(f);
         }
         let child = op.children.remove(0);
         op.children.push(below.rewrite(child));

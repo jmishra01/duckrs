@@ -618,6 +618,7 @@ test/optimizer/pushdown/pushdown_after_statistics.test
 test/optimizer/pushdown/pushdown_in_to_parquet.test
 test/optimizer/pushdown/pushdown_unnest_into_cte.test
 test/optimizer/pushdown/pushdown_window_decreasing_partition.test
+test/optimizer/pushdown/pushdown_window_partition_filter.test
 test/optimizer/pushdown/semi_anti_join_implied_filters.test
 test/optimizer/pushdown/starts_with_pushdown.test
 test/optimizer/pushdown/test_pushdown_cte_group_by_all.test
