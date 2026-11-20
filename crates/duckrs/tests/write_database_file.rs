@@ -1337,3 +1337,70 @@ fn appends_write_row_groups_as_they_fill() {
     run(&mut c, "CHECKPOINT");
     assert_eq!(rows(&mut c, sums), expected);
 }
+
+/// A CSV file of `rows` rows after a header, of more than the 8MB a thread scans: a bad value at row `bad`, and
+/// with `quoted`, values in quotes with newlines in them.
+fn big_csv(name: &str, rows: usize, bad: Option<usize>, quoted: bool) -> PathBuf {
+    use std::fmt::Write;
+    let file = path(name);
+    let mut text = String::from("id,price,note,day\n");
+    for row in 0..rows {
+        let price = if Some(row) == bad {
+            "oops".to_string()
+        } else {
+            format!("{}.{:02}", row % 9973, row % 100)
+        };
+        let note = if quoted && row % 1000 == 7 {
+            format!("\"line {row}\nand the next, of it\"")
+        } else {
+            format!("note number {row} of the file with some words after it")
+        };
+        writeln!(
+            text,
+            "{row},{price},{note},1995-{:02}-{:02}",
+            row % 12 + 1,
+            row % 28 + 1
+        )
+        .unwrap();
+    }
+    std::fs::write(&file, text).unwrap();
+    file
+}
+
+/// `COPY` of `csv` into a new table of a new file with `threads`: what comes of it, and the rows in their order.
+fn copied(name: &str, csv: &PathBuf, threads: usize) -> Result<Vec<String>, String> {
+    let file = path(name);
+    let db = Database::open(&file, false).unwrap();
+    let mut c = db.connect().unwrap();
+    run(&mut c, &format!("SET threads = {threads}"));
+    run(
+        &mut c,
+        "CREATE TABLE t (id BIGINT, price DECIMAL(15,2), note VARCHAR, day DATE)",
+    );
+    c.query(&format!("COPY t FROM '{}' (HEADER)", csv.display()))
+        .map_err(|error| error.to_string())?;
+    Ok(rows(
+        &mut c,
+        "SELECT count(*), sum(price), sum(hash(rowid, id, price, note, day)), max(rowid) FROM t",
+    ))
+}
+
+#[test]
+fn csv_loads_on_threads_as_on_one() {
+    let csv = big_csv("threads.csv", 400_000, None, false);
+    assert!(std::fs::metadata(&csv).unwrap().len() > 16 << 20);
+    let one = copied("threads_1.db", &csv, 1).unwrap();
+    assert_eq!(copied("threads_8.db", &csv, 8).unwrap(), one);
+    assert_eq!(one[0].split('|').next(), Some("400000"));
+    // quotes in the file: on one thread, as a part could start in a value
+    let quoted = big_csv("quoted.csv", 400_000, None, true);
+    assert_eq!(
+        copied("quoted_8.db", &quoted, 8).unwrap(),
+        copied("quoted_1.db", &quoted, 1).unwrap()
+    );
+    // an error in a part after the first is the one the scan on one thread finds, with its line
+    let bad = big_csv("bad.csv", 400_000, Some(350_000), false);
+    let error = copied("bad_1.db", &bad, 1).unwrap_err();
+    assert!(error.contains("Line: 350002"), "{error}");
+    assert_eq!(copied("bad_8.db", &bad, 8).unwrap_err(), error);
+}

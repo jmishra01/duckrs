@@ -64,6 +64,9 @@ pub fn rows_between(rows: &ColumnDataCollection, start: usize, end: usize, colum
 
 /// Rows `start..end` of `rows` as a collection of their own.
 pub fn collection_between(rows: &ColumnDataCollection, start: usize, end: usize) -> ColumnDataCollection {
+    if let Some(shared) = rows.shared_range(start, end) {
+        return shared;
+    }
     let mut result = ColumnDataCollection::new(rows.types().to_vec());
     let columns: Vec<usize> = (0..rows.types().len()).collect();
     let mut at = start;

@@ -1341,7 +1341,23 @@ struct Writer<'a> {
     abort: String,
     /// what the file is written in
     version: StorageVersion,
+    /// While a column is encoded on a thread of its own: what it would place and log, in order, for the writer of
+    /// the file to place and log after the columns before it (see [`Deferred`]).
+    deferred: Option<Deferred>,
 }
+
+/// What a column's encoding would do to the file, held back: the segments it places, in order, and the lines it
+/// logs. One that needs a block of its own (overflow strings, segments over several pages) is `failed`, and is
+/// encoded again on the writer of the file.
+#[derive(Debug, Default)]
+struct Deferred {
+    placed: Vec<Vec<u8>>,
+    logs: parking_lot::Mutex<Vec<String>>,
+    failed: bool,
+}
+
+/// Where a deferred segment says it is until it is placed: `DEFERRED_BLOCK` plus its index in `Deferred::placed`.
+const DEFERRED_BLOCK: i64 = 1 << 61;
 
 /// A row group that a table is written as. Its rows have the ids from `row_start` on, and those
 /// with no row are deleted, as there are no gaps in a row group.
@@ -1818,11 +1834,16 @@ impl<'a> Writer<'a> {
             written_pages: None,
             abort: options.abort.to_string(),
             version: options.storage_version,
+            deferred: None,
         }
     }
 
     /// `GetFreeBlockIdForCheckpoint`: never one that the last checkpoint needs. Ahead of a commit, `GetFreeBlockId`.
     fn allocate_block(&mut self) -> u64 {
+        if let Some(deferred) = &mut self.deferred {
+            deferred.failed = true;
+            return 0;
+        }
         if self.append {
             return self.buffer.block_manager().allocate_free_block();
         }
@@ -1832,6 +1853,14 @@ impl<'a> Writer<'a> {
         });
         self.used.insert(block);
         block
+    }
+
+    /// A block of a segment's own, which a deferred encoding doesn't write: it has `failed`, and is encoded again.
+    fn write_data_block(&self, block: u64, data: &[u8]) -> Result<()> {
+        if self.deferred.is_some() {
+            return Ok(());
+        }
+        self.buffer.block_manager().write_block(block, data)
     }
 
     /// `FlushPartialBlocks`.
@@ -1861,6 +1890,10 @@ impl<'a> Writer<'a> {
     /// `PartialBlockManager::Write` of a segment: into the fullest block that has room for it, unless it is too
     /// large to share one, or else a new block; a block keeps taking segments while a fifth of it is free.
     fn place(&mut self, data: &[u8]) -> Result<(i64, u32)> {
+        if let Some(deferred) = &mut self.deferred {
+            deferred.placed.push(data.to_vec());
+            return Ok((DEFERRED_BLOCK + deferred.placed.len() as i64 - 1, 0));
+        }
         let max_partial_size = self.block_size / 5 * 4;
         let min_reusable_space = self.block_size - max_partial_size;
         let taken = if data.len() <= max_partial_size {
@@ -2036,10 +2069,14 @@ impl<'a> Writer<'a> {
     /// `DUCKDB_LOG_TRACE` of `DetectBestCompressionMethod`: the method chosen for a column, and its score.
     fn log_choice(&self, compression: u8, ty: &str, score: usize) {
         let (table, column) = &self.log_column;
-        crate::logging::log_database_trace(&format!(
+        let line = format!(
             "ColumnDataCheckpointer FinalAnalyze({}) result for {table}.{column}({ty}): {score}",
             compression_enum_name(compression)
-        ));
+        );
+        match &self.deferred {
+            Some(deferred) => deferred.logs.lock().push(line),
+            None => crate::logging::log_database_trace(&line),
+        }
     }
 
     /// `ColumnDataCheckpointer::DetectBestCompressionMethod`: the methods that can store the type, in
@@ -2313,13 +2350,11 @@ impl<'a> Writer<'a> {
                 // what goes on to other pages starts the block of its segment
                 let block = self.allocate_block();
                 *self.segments_in_block.entry(block).or_default() += 1;
-                self.buffer.block_manager().write_block(block, &pages[0].1)?;
+                self.write_data_block(block, &pages[0].1)?;
                 (block as i64, 0)
             };
             for (id, page) in pages.iter().skip(1) {
-                self.buffer
-                    .block_manager()
-                    .write_block(id.expect("an extra page"), page)?;
+                self.write_data_block(id.expect("an extra page"), page)?;
             }
             segments.push(SegmentOut {
                 tuple_count: rows,
@@ -2543,7 +2578,7 @@ impl<'a> Writer<'a> {
             let (block_id, offset) = self.place(&segment)?;
             let overflow_blocks = overflow.iter().map(|(block, _, _)| *block as i64).collect();
             for (block, data, _) in overflow {
-                self.buffer.block_manager().write_block(block, &data)?;
+                self.write_data_block(block, &data)?;
             }
             segments.push(SegmentOut {
                 tuple_count: row - start,
@@ -2917,6 +2952,34 @@ impl<'a> Writer<'a> {
             self.force_compression = setting;
         }
         out
+    }
+
+    /// A column [`encode_deferred`] encoded, with its segments placed now and its lines logged, as encoding it here
+    /// would have.
+    fn place_deferred(&mut self, mut out: ColumnOut, held: Deferred) -> Result<ColumnOut> {
+        for line in held.logs.into_inner() {
+            crate::logging::log_database_trace(&line);
+        }
+        let placed = held
+            .placed
+            .iter()
+            .map(|data| self.place(data))
+            .collect::<Result<Vec<_>>>()?;
+        fn patch(column: &mut ColumnOut, placed: &[(i64, u32)]) {
+            for segment in &mut column.segments {
+                if (DEFERRED_BLOCK..DEFERRED_BLOCK + placed.len() as i64).contains(&segment.block_id) {
+                    (segment.block_id, segment.offset) = placed[(segment.block_id - DEFERRED_BLOCK) as usize];
+                }
+            }
+            if let Some(validity) = &mut column.validity {
+                patch(validity, placed);
+            }
+            for child in &mut column.children {
+                patch(child, placed);
+            }
+        }
+        patch(&mut out, &placed);
+        Ok(out)
     }
 
     /// The blocks of a column written ahead of a commit, which the checkpoint keeps.
@@ -3921,11 +3984,18 @@ pub fn write_ahead(
     for batch in bounds.chunks(WRITE_BUFFER_ROW_GROUP_COUNT) {
         let parts: Vec<Vec<Vec<Part>>> = batch.iter().map(|&(start, end)| parts_of(start, end)).collect();
         let mut columns: Vec<Vec<ColumnOut>> = batch.iter().map(|_| Vec::with_capacity(types.len())).collect();
-        // `RowGroup::WriteToDisk`: a column of all the row groups, then the next
-        for column in 0..types.len() {
-            for (group, parts) in parts.iter().enumerate() {
-                columns[group].push(writer.encode_column(table, column, &parts[column])?);
-            }
+        // `RowGroup::WriteToDisk`: a column of all the row groups, then the next. The columns are encoded on
+        // threads at once, and placed in that order after.
+        let tasks: Vec<(usize, usize)> = (0..types.len())
+            .flat_map(|column| (0..batch.len()).map(move |group| (column, group)))
+            .collect();
+        let mut deferred = encode_deferred(buffer, catalog, table, options, &parts, &tasks);
+        for (index, &(column, group)) in tasks.iter().enumerate() {
+            let out = match deferred.get_mut(index).and_then(Option::take) {
+                Some((out, held)) if !held.failed => writer.place_deferred(out, held)?,
+                _ => writer.encode_column(table, column, &parts[group][column])?,
+            };
+            columns[group].push(out);
         }
         for (&(start, end), columns) in batch.iter().zip(columns) {
             groups.push((first_id + (start - first) as u64, end - start, columns));
@@ -3944,6 +4014,46 @@ pub fn write_ahead(
             WrittenGroup::new(row_start, rows, columns, types.clone(), version, buffer.clone())
         })
         .collect()
+}
+
+/// The columns `tasks` (a column and a row group of `parts` each) encoded on threads at once, each with what it
+/// would place held back: `None` of one whose encoding failed. Empty if there is one thread, which encodes them on
+/// the writer of the file.
+fn encode_deferred(
+    buffer: &BufferManager,
+    catalog: &Catalog,
+    table: &TableCatalogEntry,
+    options: CheckpointOptions,
+    parts: &[Vec<Vec<Part>>],
+    tasks: &[(usize, usize)],
+) -> Vec<Option<(ColumnOut, Deferred)>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let threads = crate::execution::temporary::current().threads().min(tasks.len());
+    if threads < 2 {
+        return Vec::new();
+    }
+    let results: Vec<parking_lot::Mutex<Option<(ColumnOut, Deferred)>>> =
+        tasks.iter().map(|_| parking_lot::Mutex::new(None)).collect();
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                let mut writer = Writer::new(buffer, catalog, String::new(), options);
+                writer.append = true;
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&(column, group)) = tasks.get(index) else {
+                        break;
+                    };
+                    writer.deferred = Some(Deferred::default());
+                    let out = writer.encode_column(table, column, &parts[group][column]);
+                    let held = writer.deferred.take().expect("just set");
+                    *results[index].lock() = out.ok().map(|out| (out, held));
+                }
+            });
+        }
+    });
+    results.into_iter().map(parking_lot::Mutex::into_inner).collect()
 }
 
 /// `TableStatistics` of row groups written ahead of a checkpoint: the statistics of their columns merged, as a

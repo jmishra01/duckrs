@@ -674,6 +674,7 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
                 pending,
                 output,
                 table,
+                batches: Default::default(),
             })
         }
         LogicalOperatorKind::CreateTable {
@@ -797,6 +798,7 @@ impl Pipeline<'_> {
                     }
                     Ok(())
                 })?;
+                self.sink.batch_done_local(&mut local, index)?;
             }
             self.sink.combine_local_input(self.input, local)
         };

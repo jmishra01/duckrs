@@ -163,6 +163,10 @@ pub trait PhysicalOperator: fmt::Debug + Send + Sync {
     fn combine_local(&self, _local: LocalSinkState) -> Result<()> {
         unreachable!("{} is not a parallel sink", self.name())
     }
+    /// The thread of `local` sank all of morsel `batch` (`PhysicalOperator::NextBatch`), which may have had no rows.
+    fn batch_done_local(&self, _local: &mut LocalSinkState, _batch: usize) -> Result<()> {
+        Ok(())
+    }
     /// [`Self::parallel_sink`] for one of the inputs of a sink with several (a delim join).
     fn parallel_sink_input(&self, _input: usize) -> bool {
         self.sink_children().len() == 1 && self.parallel_sink()
@@ -1116,6 +1120,20 @@ impl PhysicalOperator for PhysicalCsvScan {
     fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
         let state = state.downcast_mut().expect("csv scan state");
         super::csv::scan_chunk(&self.scan, state)
+    }
+    fn parallel_source(&self) -> Option<(SharedSourceState, usize)> {
+        let morsels = super::csv::parallel_morsels(&self.scan)?;
+        let count = morsels.len();
+        Some((Box::new(morsels), count))
+    }
+    fn parallel_chunks(
+        &self,
+        state: &SharedSourceState,
+        index: usize,
+        emit: &mut dyn FnMut(DataChunk) -> Result<()>,
+    ) -> Result<()> {
+        let morsels: &super::csv::CsvMorsels = state.downcast_ref().expect("csv morsels");
+        super::csv::scan_morsel(&self.scan, morsels, index, emit)
     }
 }
 
@@ -4434,6 +4452,74 @@ pub struct PhysicalInsert {
     pub pending: Mutex<ColumnDataCollection>,
     /// With `returning`, the rows to return.
     pub output: Mutex<ColumnDataCollection>,
+    /// The morsels of a parallel input, until they are appended in their order.
+    pub batches: InsertBatches,
+}
+
+/// `PhysicalBatchInsert`: of a parallel input, the morsels that threads sank and that wait for the ones before them
+/// (the next to append, and those after it), and who appends them. They are appended in order, each as the `INSERT`
+/// of one thread would, so that the rows and what is checked of them are those of one thread; the row groups that
+/// they fill are encoded on threads at once (`write_ahead`).
+#[derive(Debug, Default)]
+pub struct InsertBatches {
+    waiting: Mutex<Waiting>,
+    appending: Mutex<()>,
+}
+
+/// The next morsel to append, and the morsels by their index.
+type Waiting = (usize, std::collections::BTreeMap<usize, Vec<DataChunk>>);
+
+/// Morsels that wait for one before them, past which the thread with one more waits for its turn to append.
+const WAITING_BATCHES: usize = 8;
+
+/// Whether `op` streams the rows of a CSV scan.
+fn reads_csv(mut op: &dyn PhysicalOperator) -> bool {
+    while !op.is_source() {
+        match op.children().first() {
+            Some(child) if !op.is_sink() => op = child.as_ref(),
+            _ => return false,
+        }
+    }
+    op.name() == "READ_CSV"
+}
+
+impl PhysicalInsert {
+    /// The morsels that are next, appended in order; `wait` for another thread that appends them now, or leave
+    /// them to it.
+    fn append_waiting(&self, wait: bool) -> Result<()> {
+        loop {
+            let appending = if wait {
+                self.batches.appending.lock()
+            } else {
+                match self.batches.appending.try_lock() {
+                    Some(appending) => appending,
+                    None => return Ok(()),
+                }
+            };
+            loop {
+                let chunks = {
+                    let mut waiting = self.batches.waiting.lock();
+                    let next = waiting.0;
+                    match waiting.1.remove(&next) {
+                        Some(chunks) => {
+                            waiting.0 += 1;
+                            chunks
+                        }
+                        None => break,
+                    }
+                };
+                for chunk in &chunks {
+                    self.sink(chunk)?;
+                }
+            }
+            drop(appending);
+            // the next may have come while this thread appended, and its thread left it to this one
+            let waiting = self.batches.waiting.lock();
+            if !waiting.1.contains_key(&waiting.0) {
+                return Ok(());
+            }
+        }
+    }
 }
 
 impl PhysicalOperator for PhysicalInsert {
@@ -4482,7 +4568,31 @@ impl PhysicalOperator for PhysicalInsert {
         }
         Ok(())
     }
+    fn parallel_sink(&self) -> bool {
+        reads_csv(self.children[0].as_ref())
+    }
+    fn local_sink_state(&self) -> LocalSinkState {
+        Box::new(Vec::<DataChunk>::new())
+    }
+    fn sink_local(&self, local: &mut LocalSinkState, _batch: usize, chunk: &DataChunk) -> Result<()> {
+        let local: &mut Vec<DataChunk> = local.downcast_mut().expect("insert local state");
+        local.push(chunk.clone());
+        Ok(())
+    }
+    fn batch_done_local(&self, local: &mut LocalSinkState, batch: usize) -> Result<()> {
+        let local: &mut Vec<DataChunk> = local.downcast_mut().expect("insert local state");
+        let waiting = {
+            let mut waiting = self.batches.waiting.lock();
+            waiting.1.insert(batch, std::mem::take(local));
+            waiting.1.len()
+        };
+        self.append_waiting(waiting > WAITING_BATCHES)
+    }
+    fn combine_local(&self, _local: LocalSinkState) -> Result<()> {
+        Ok(())
+    }
     fn finalize(&self) -> Result<()> {
+        self.append_waiting(true)?;
         if let Some(action) = &self.on_conflict {
             let (count, rows) = upsert(&self.table, action, &self.pending.lock(), self.returning)?;
             *self.inserted.lock() = count;

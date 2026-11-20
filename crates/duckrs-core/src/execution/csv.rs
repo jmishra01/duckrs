@@ -1,8 +1,9 @@
 // Ported from duckdb/src/execution/operator/csv_scanner/ and duckdb/src/common/csv_writer.cpp
 // @ rust-port-baseline
 //
-//! Reading and writing CSV. A file is read whole and one thread scans it, a row at a time, through
-//! C++'s state machine (`csv_state_machine`). The sniffer is in `csv_sniffer`.
+//! Reading and writing CSV. A file is read whole and scanned a row at a time through C++'s state machine
+//! (`csv_state_machine`): by one thread, or by threads at once in parts where no quote can be across them
+//! ([`parallel_morsels`]). The sniffer is in `csv_sniffer`.
 
 use super::csv_sniffer::{Parsing, can_cast, line_size_error, numeric_text, sniff};
 pub use super::csv_state_machine::Dialect;
@@ -468,6 +469,133 @@ fn sniff_next_file(scan: &CsvScanData, file: &CsvFile, data: &[u8]) -> Result<Cs
     })
 }
 
+/// `CSVIterator::ROWS_PER_THREAD`: a thread scans as many bytes of a file as this many lines of the longest size
+/// (`BytesPerThread`).
+const ROWS_PER_THREAD: usize = 4;
+
+/// The parts of a file that threads scan at once (`CSVBoundary`): each starts where a line does, after a `\n`.
+#[derive(Debug)]
+pub struct CsvMorsels {
+    data: Vec<u8>,
+    starts: Vec<usize>,
+}
+
+impl CsvMorsels {
+    pub fn len(&self) -> usize {
+        self.starts.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.starts.is_empty()
+    }
+}
+
+/// The parts of the scan's file for threads, if it is one they can scan at once and gives each more than one.
+///
+/// C++ starts each part at what looks like the start of a line (`StringValueScanner::SetStart`), which a newline in
+/// a quoted value can fool. Here a part starts after a `\n` only where none can be in a value: the file has no
+/// quote or escape in it, so that each part scans to the rows scanning the whole file does. A scan of more than
+/// one file, of rejects, or of what one is ignoring, is a scan on one thread.
+pub fn parallel_morsels(scan: &CsvScanData) -> Option<CsvMorsels> {
+    let [file] = scan.files.as_slice() else {
+        return None;
+    };
+    let options = &scan.options;
+    if scan.filename
+        || !scan.hive.is_empty()
+        // the virtual columns come after the file's, and number its rows from its start
+        || !(scan.virtual_columns.is_empty()
+            || scan.projection.as_ref().is_some_and(|columns| columns.iter().all(|&c| c < scan.types.len())))
+        || scan.rejects.is_some()
+        || options.ignore_errors
+        || matches!(file.dialect.new_line, NewLine::SingleR)
+    {
+        return None;
+    }
+    let bytes_per_thread = options.maximum_line_size().saturating_mul(ROWS_PER_THREAD).max(1);
+    let mut first = scan.first_data.lock().expect("not poisoned");
+    let data = first.as_ref()?;
+    if data.len() < 2 * bytes_per_thread {
+        return None;
+    }
+    let bom = if data.starts_with(&[0xef, 0xbb, 0xbf]) { 3 } else { 0 };
+    let machine = Machine::new(file.dialect.clone(), bom);
+    let rows = usize::from(file.header) + file.skip;
+    let begin = skip_rows(data, &machine.dialect, &machine.transitions(), bom, rows);
+    let rest = &data[begin.min(data.len())..];
+    if [file.dialect.quote, file.dialect.escape]
+        .into_iter()
+        .flatten()
+        .any(|byte| memchr::memchr(byte, rest).is_some())
+    {
+        return None;
+    }
+    let mut starts = vec![begin];
+    let mut at = begin + bytes_per_thread;
+    while at < data.len() {
+        let Some(newline) = memchr::memchr(b'\n', &data[at..]) else {
+            break;
+        };
+        let start = at + newline + 1;
+        if start >= data.len() {
+            break;
+        }
+        starts.push(start);
+        at = start + bytes_per_thread;
+    }
+    if starts.len() < 2 {
+        return None;
+    }
+    let data = first.take().expect("just read");
+    Some(CsvMorsels { data, starts })
+}
+
+/// The rows of part `index` of `morsels`, typed, in order. If they have an error, it is the one the scan of the
+/// whole file on one thread finds first: the part has no line numbers of the file, and an earlier part may fail too.
+pub fn scan_morsel(
+    scan: &CsvScanData,
+    morsels: &CsvMorsels,
+    index: usize,
+    emit: &mut dyn FnMut(DataChunk) -> Result<()>,
+) -> Result<()> {
+    let file = &scan.files[0];
+    let start = morsels.starts[index];
+    let end = morsels.starts.get(index + 1).copied().unwrap_or(morsels.data.len());
+    let data = &morsels.data[start..end];
+    let mut state = CsvScanState {
+        scanner: Some(ValueScanner::new(Machine::new(file.dialect.clone(), 0))),
+        ..CsvScanState::default()
+    };
+    loop {
+        match read_rows(data, scan, file, &mut state) {
+            Ok(Some(chunk)) => emit(project(scan, chunk))?,
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                // the whole file again, read from it, as the parts took what sniffing read
+                let mut whole = CsvScanState::default();
+                loop {
+                    match scan_chunk(scan, &mut whole) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => return Err(error),
+                        Err(first) => return Err(first),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The columns of `chunk` that the scan outputs: of a part of a file, none of them virtual.
+fn project(scan: &CsvScanData, chunk: DataChunk) -> DataChunk {
+    match &scan.projection {
+        Some(columns) => {
+            let count = chunk.len();
+            DataChunk::from_columns(columns.iter().map(|&c| chunk.column(c).clone()).collect(), count)
+        }
+        None => chunk,
+    }
+}
+
 /// The next rows of the scan, typed. `None` when all files are done.
 pub fn scan_chunk(scan: &CsvScanData, state: &mut CsvScanState) -> Result<Option<DataChunk>> {
     let Some(chunk) = scan_file_chunk(scan, state)? else {
@@ -481,13 +609,7 @@ pub fn scan_chunk(scan: &CsvScanData, state: &mut CsvScanState) -> Result<Option
         state.file,
         &mut state.virtual_rows,
     )?;
-    Ok(Some(match &scan.projection {
-        Some(columns) => {
-            let count = chunk.len();
-            DataChunk::from_columns(columns.iter().map(|&c| chunk.column(c).clone()).collect(), count)
-        }
-        None => chunk,
-    }))
+    Ok(Some(project(scan, chunk)))
 }
 
 fn scan_file_chunk(scan: &CsvScanData, state: &mut CsvScanState) -> Result<Option<DataChunk>> {
