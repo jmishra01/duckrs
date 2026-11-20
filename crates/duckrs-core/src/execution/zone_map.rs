@@ -346,7 +346,7 @@ fn compute_nested_zones(table: &TableCatalogEntry, column: usize, element: &Logi
 }
 
 /// `compute_zones`, once per state of the rows.
-fn zones_of(table: &TableCatalogEntry, column: usize) -> Arc<Vec<ColumnZone>> {
+pub(crate) fn zones_of(table: &TableCatalogEntry, column: usize) -> Arc<Vec<ColumnZone>> {
     let groups = row_group_count(table, table.row_count());
     let (version, known) = {
         let mut cached = table.statistics.lock();

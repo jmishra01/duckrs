@@ -585,6 +585,7 @@ test/optimizer/ordered_aggregate.test
 test/optimizer/outer_join_simplification_anti_on_filter.test
 test/optimizer/partial_aggregate_pushdown.test
 test/optimizer/partition_stats_prepared.test
+test/optimizer/partitioned_execution_coverage.test
 test/optimizer/perfect_ht.test
 test/optimizer/prefer_final_projected_columns_on_probe_side.test
 test/optimizer/projection_placement_results.test

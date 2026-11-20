@@ -1182,6 +1182,7 @@ impl ClientContext {
             options.approximate_join_order_threshold = threshold;
         }
         options.force_no_cross_product = self.setting_text("debug_force_no_cross_product") == "true";
+        options.threads = self.thread_count();
         if let Ok(rows) = self.setting_text("late_materialization_max_rows").parse() {
             options.late_materialization_options.max_rows = rows;
         }

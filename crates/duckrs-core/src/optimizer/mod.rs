@@ -46,6 +46,7 @@ pub mod or_range_merge;
 pub mod reorder_filter;
 mod late_materialization;
 mod compressed_materialization;
+mod partitioned_execution;
 mod scalar_aggregate_merger;
 mod self_join_aggregate;
 mod topn_window_elimination;
@@ -104,6 +105,10 @@ pub struct OptimizerOptions {
     pub late_materialization: bool,
     /// `COMPRESSED_MATERIALIZATION`
     pub compressed_materialization: bool,
+    /// `PARTITIONED_EXECUTION`
+    pub partitioned_execution: bool,
+    /// `threads`, which the size of the parts of a partitioned execution depends on
+    pub threads: usize,
     /// `TOP_N_WINDOW_ELIMINATION`
     pub topn_window_elimination: bool,
     /// `late_materialization_max_rows` and `preserve_insertion_order`
@@ -165,6 +170,8 @@ impl Default for OptimizerOptions {
             window_join_pushdown: true,
             late_materialization: true,
             compressed_materialization: true,
+            partitioned_execution: true,
+            threads: 1,
             topn_window_elimination: true,
             late_materialization_options: late_materialization::LateMaterializationOptions {
                 max_rows: 50,
@@ -222,6 +229,8 @@ impl OptimizerOptions {
             window_join_pushdown: false,
             late_materialization: false,
             compressed_materialization: false,
+            partitioned_execution: false,
+            threads: 1,
             topn_window_elimination: false,
             late_materialization_options: late_materialization::LateMaterializationOptions {
                 max_rows: 50,
@@ -278,6 +287,8 @@ impl OptimizerOptions {
             window_join_pushdown: !off("window_join_pushdown"),
             late_materialization: !off("late_materialization"),
             compressed_materialization: !off("compressed_materialization"),
+            partitioned_execution: !off("partitioned_execution"),
+            threads: 1,
             topn_window_elimination: !off("top_n_window_elimination"),
             late_materialization_options: late_materialization::LateMaterializationOptions {
                 max_rows: 50,
@@ -492,6 +503,11 @@ pub fn optimize_timed(
     // cheapest filters first
     if options.reorder_filter {
         plan = run("reorder_filter", plan, &mut reorder_filter::reorder_filters);
+    }
+    // parts of a large aggregate, ORDER BY or window, by ranges of a column
+    if options.partitioned_execution {
+        let threads = options.threads;
+        plan = run("partitioned_execution", plan, &mut |plan| partitioned_execution::optimize(plan, threads));
     }
     // shared subplans run once, as materialized CTEs
     if options.common_subplan {
