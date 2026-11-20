@@ -668,10 +668,11 @@ Each item gives the number of failing files in `test/` that it should fix, where
 - [ ] 48. v1 gate: TPC-H SF10 geometric mean ≤ 1.5× C++ DuckDB, and no query slower than 3×. The runner
   prints the gate after `--engine=both`. On TPC-H SF1 (8 threads, all 22 answers correct) duckrs is at
   1.53× (none above 3×: Q21 2.7×; Q02 0.5×, Q08 0.95×), from 12.7× at the start of item 47.
-  SF10, both engines on the file C++ wrote: 1.20× on 2026-11-20 (none above 3×: Q10 1.89×, Q16 1.82×, Q14 1.74×,
-  Q18 1.56×; Q11 0.56×, Q15 0.65×, Q12 0.89×), with the machine's load average falling from 31 to 7 during the run.
-  Two earlier runs under heavier load were 1.27× and 1.37×, with Q18 and Q14 above 3× in them. The gate passes;
-  measure once more on a quiet machine before ticking this. Q10 then took 18% less: a GROUP BY writes the keys of a
+  SF10, both engines on the file C++ wrote: 1.09× on 2026-11-20 after parts 39 and 40 (none above 3×: Q06 1.66×,
+  Q16 1.65×, Q01 1.61×, Q10 1.55×; Q15 0.31×, Q11 0.53×, Q17 0.80×), with the machine's load average between 31
+  and 48. Earlier the same day: 1.20× (Q10 1.89×) with the load falling from 31 to 7, and before that 1.27× and
+  1.37× under heavier load, with Q18 and Q14 above 3× in them. The gate passes; measure once more on a quiet
+  machine before ticking this. Q10 then took 18% less: a GROUP BY writes the keys of a
   chunk's rows into one buffer and makes a key only for a new group, and threads read blocks of the file at once
   (`pread`), where they took turns. The distinct values of each column, which the join order starts from, are
   kept in the file as C++ keeps them (`DistinctStatistics`, as `HLL_V2`, and read of older files as `HLL_V1`):
