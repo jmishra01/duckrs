@@ -674,9 +674,11 @@ Each item gives the number of failing files in `test/` that it should fix, where
   own file (COPY of the `.tbl` files: lineitem 24s against C++'s 22s, the rest under 5s each; at most 710MB
   resident, where C++ takes 2.2GB; 2.78GB of file against C++'s 2.79GB), and all 22 queries on that file match
   `answers/sf10`. A CSV file larger than a buffer (32MB) is sniffed on its first buffer, unless a scan of the
-  sniffer gets to its end, and read a buffer at a time. One with no quote or escape in it is scanned on threads
-  at once, in parts of 8MB that start after a `\n`, each read of the file (C++ guesses where a part starts, which
-  a quoted newline can fool; a file with quotes is scanned on one thread here). An INSERT appends the parts in
+  sniffer gets to its end, and read a buffer at a time. It is scanned on threads at once, in parts of 8MB that
+  start after a `\n` that ends a row, each read of the file: any `\n` until the first quote or escape, then the
+  state machine runs on to the row ends (C++ guesses where a part starts, which a quoted newline can fool, and
+  stops when its guess was wrong). An 8M-row file with quoted values loads in 2.4s on 8 threads, from 10.1s on
+  one, where C++ takes 3.5s. An INSERT appends the parts in
   order; threads claim the row groups they fill, encode them with no lock held, and place them in the order of
   their rows, so the file is the one a single thread writes. An error is the one a scan of the whole file finds
 

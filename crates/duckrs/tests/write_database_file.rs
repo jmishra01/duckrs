@@ -1408,7 +1408,7 @@ fn csv_loads_on_threads_as_on_one() {
     let one = copied("threads_1.db", &csv, 1).unwrap();
     assert_eq!(copied("threads_8.db", &csv, 8).unwrap(), one);
     assert_eq!(one[0].split('|').next(), Some("400000"));
-    // quotes in the file: on one thread, as a part could start in a value
+    // quotes in the file, which a part can start after
     let quoted = big_csv("quoted.csv", 400_000, None, true);
     assert_eq!(
         copied("quoted_8.db", &quoted, 8).unwrap(),
@@ -1419,6 +1419,70 @@ fn csv_loads_on_threads_as_on_one() {
     let error = copied("bad_1.db", &bad, 1).unwrap_err();
     assert!(error.contains("Line: 350002"), "{error}");
     assert_eq!(copied("bad_8.db", &bad, 8).unwrap_err(), error);
+}
+
+/// A file with quotes in it loads on threads as on one: its parts start where rows do, though a quoted value has
+/// `\n`s, `\r\n`s, delimiters and escaped quotes in it, its first quote is far into the file, and its lines end in
+/// `\r\n`. An error after the quotes is the one the scan on one thread finds, with its line.
+#[test]
+fn quoted_csv_loads_on_threads_as_on_one() {
+    use std::fmt::Write;
+    let csv = |name: &str, end: &str, bad: Option<usize>| {
+        let file = path(name);
+        let mut text = format!("id,price,note,day{end}");
+        for row in 0..400_000usize {
+            let price = if Some(row) == bad {
+                "oops".to_string()
+            } else {
+                format!("{}.{:02}", row % 9973, row % 100)
+            };
+            let note = match row % 5 {
+                _ if row < 150_000 => format!("note number {row} of the file"),
+                0 => format!("\"said \"\"{row}\"\",{end}then\nleft\r\n\""),
+                1 => format!("\"{row}\n\n\""),
+                2 => "\"\"".to_string(),
+                _ => format!("note {row}"),
+            };
+            write!(
+                text,
+                "{row},{price},{note},1995-{:02}-{:02}{end}",
+                row % 12 + 1,
+                row % 28 + 1
+            )
+            .unwrap();
+        }
+        std::fs::write(&file, text).unwrap();
+        file
+    };
+    for end in ["\n", "\r\n"] {
+        let name = if end == "\n" { "lf" } else { "crlf" };
+        let quoted = csv(&format!("quotes_{name}.csv"), end, None);
+        // the sniffer's rows have no quote in them
+        let copy = |file: &PathBuf| format!("COPY f.t FROM '{}' (HEADER, QUOTE '\"')", file.display());
+        let one = loaded(&format!("quotes_{name}_1.db"), &copy(&quoted), 1).unwrap();
+        assert_eq!(
+            loaded(&format!("quotes_{name}_8.db"), &copy(&quoted), 8).unwrap(),
+            one,
+            "{name}"
+        );
+        assert_eq!(one[0].split('|').next(), Some("400000"));
+        // read in buffers of 160000 bytes, in parts of 40000: the first quote is in a buffer after the last part's
+        // start, from which the state machine runs on
+        let read = format!(
+            "INSERT INTO f.t SELECT * FROM read_csv('{}', header = true, quote = '\"', buffer_size = 160000, \
+             max_line_size = 10000, columns = {{'id': 'BIGINT', 'price': 'DECIMAL(15,2)', 'note': 'VARCHAR', 'day': 'DATE'}})",
+            quoted.display()
+        );
+        for threads in [1, 8] {
+            let streamed = loaded(&format!("quotes_{name}_parts_{threads}.db"), &read, threads).unwrap();
+            assert_eq!(streamed[..3], one[..3], "{name} in buffers on {threads} threads");
+        }
+    }
+    let bad = csv("quotes_bad.csv", "\n", Some(350_000));
+    let copy = format!("COPY f.t FROM '{}' (HEADER, QUOTE '\"')", bad.display());
+    let error = loaded("quotes_bad_1.db", &copy, 1).unwrap_err();
+    assert!(error.contains("oops"), "{error}");
+    assert_eq!(loaded("quotes_bad_8.db", &copy, 8).unwrap_err(), error);
 }
 
 /// A file read a buffer at a time, on one thread and in parts, gives what it does read whole: in buffers of 160000

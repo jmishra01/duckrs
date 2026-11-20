@@ -384,8 +384,7 @@ Floating point sums over large tables can differ in their last digits between ru
 in another order, which SQL allows, and so do the matches of a key in the build side of a join, as threads add their
 rows in the order they finish. The piecewise merge, IE and nested loop joins are that join with another lookup, so they
 probe on threads too, with the build side sorted once instead of the sorted runs of both sides that C++ merges. Not
-ported: cross products, AsOf and the other special joins on threads, sort and window on threads, parallel CSV and
-`InterruptState`.
+ported: cross products, AsOf and the other special joins on threads, sort and window on threads, and `InterruptState`.
 
 ### Spilling
 
@@ -789,7 +788,8 @@ tests read; `test_vector_types`; COLLATE; and VARIANT columns in database files.
 
 ## Phase 11
 
-CSV is in, on one thread: C++'s state machine and sniffer are ported, its buffers and parallel scan are not.
+CSV is in: C++'s state machine and sniffer are ported, and a file is read a buffer at a time and scanned on threads
+in parts that start where its rows do.
 Parquet is in as the plan's v1, through the `parquet` crate. JSON has a first slice. EXPORT and IMPORT have not started.
 
 - **Files** (`execution::file_system`): globbing with `*`, `?`, `[...]` and `**`, and reading a whole
@@ -798,7 +798,9 @@ Parquet is in as the plan's v1, through the `parquet` crate. JSON has a first sl
 - **The state machine** (`execution::csv_state_machine`) is C++'s transition table, byte by byte: quotes,
   escapes, comments, multi-byte delimiters, strict mode and all three newlines. `Machine::process` is
   `BaseScanner::Process` over a `Sink`, so `ColumnCountScanner`, `SkipScanner` and `ValueScanner` get the same
-  events in the same order as in C++. A file is in memory whole, so there are no boundaries between buffers.
+  events in the same order as in C++. A file larger than a buffer (32MB) is read a buffer at a time; a
+  part for a thread starts after a `\n` that ends a row, which the state machine finds once a quote or escape is
+  in the file.
 - **The sniffer** (`execution::csv_sniffer`) follows `CSVSniffer` step by step: the search space of dialects and
   `AnalyzeDialectCandidate`, refinement over `sample_size` rows, date and timestamp formats, type candidates and
   how they fall back, header detection, `normalize_names`. Its error messages are C++'s.

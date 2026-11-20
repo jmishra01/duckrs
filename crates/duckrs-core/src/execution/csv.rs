@@ -3,7 +3,7 @@
 //
 //! Reading and writing CSV. A file is scanned a row at a time through C++'s state machine (`csv_state_machine`):
 //! read whole, or one larger than a buffer a buffer at a time ([`Stream`]); by one thread, or by threads at once in
-//! parts where no quote can be across them ([`parallel_morsels`]). The sniffer is in `csv_sniffer`.
+//! parts that start where its rows do ([`parallel_morsels`]). The sniffer is in `csv_sniffer`.
 
 use super::csv_sniffer::{Parsing, can_cast, line_size_error, numeric_text, sniff};
 pub use super::csv_state_machine::Dialect;
@@ -577,8 +577,9 @@ impl CsvMorsels {
 /// The parts of the scan's file for threads, if it is one they can scan at once and gives each more than one.
 ///
 /// C++ starts each part at what looks like the start of a line (`StringValueScanner::SetStart`), which a newline in
-/// a quoted value can fool. Here a part starts after a `\n` only where none can be in a value: the file has no
-/// quote or escape in it, so that each part scans to the rows scanning the whole file does. A scan of more than
+/// a quoted value can fool. Here a part starts after a `\n` that ends a row: in a file with no quote or escape in
+/// it, any `\n`; after the first one, the state machine runs on from the last part's start to the row ends past
+/// each next one ([`RowEnds`]). Each part then scans to the rows scanning the whole file does. A scan of more than
 /// one file, of rejects, or of what one is ignoring, is a scan on one thread.
 pub fn parallel_morsels(scan: &CsvScanData) -> Option<CsvMorsels> {
     let [file] = scan.files.as_slice() else {
@@ -627,28 +628,59 @@ pub fn parallel_morsels(scan: &CsvScanData) -> Option<CsvMorsels> {
     let mut starts = vec![begin];
     let mut at = begin + bytes_per_thread;
     let (mut offset, mut data) = (0, head);
+    let quotes: Vec<u8> = [file.dialect.quote, file.dialect.escape]
+        .into_iter()
+        .flatten()
+        .collect();
+    // the state machine, from where it runs on
+    let mut exact: Option<(Machine, usize)> = None;
     loop {
-        let from = if offset == 0 { begin } else { 0 };
-        if [file.dialect.quote, file.dialect.escape]
-            .into_iter()
-            .flatten()
-            .any(|byte| memchr::memchr(byte, &data[from.min(data.len())..]).is_some())
-        {
-            return None;
-        }
-        // the next start in this buffer, or past it
-        while at < offset + data.len() {
-            let Some(newline) = memchr::memchr(b'\n', &data[at - offset..]) else {
-                at = offset + data.len();
-                break;
-            };
-            let start = at + newline + 1;
-            if start >= size {
-                at = size;
-                break;
+        if exact.is_none() {
+            let from = if offset == 0 { begin } else { 0 };
+            if quotes
+                .iter()
+                .any(|&byte| memchr::memchr(byte, &data[from.min(data.len())..]).is_some())
+            {
+                // a row starts at the last part's start: from it on, a value can hold a `\n`
+                let last = *starts.last().expect("one part");
+                if last < offset {
+                    (offset, data) = (last, read(last)?);
+                }
+                let machine = Machine::with_transitions(file.dialect.clone(), machine.transitions(), 0);
+                exact = Some((machine, last - offset));
             }
-            starts.push(start);
-            at = start + bytes_per_thread;
+        }
+        if let Some((machine, from)) = &mut exact {
+            machine.position = std::mem::take(from);
+            let mut ends = RowEnds {
+                offset,
+                next: at,
+                size,
+                bytes_per_thread,
+                carry_on: file.dialect.new_line == NewLine::CarryOn,
+                starts: &mut starts,
+                invalid: false,
+            };
+            machine.process(&data, &mut ends);
+            if ends.invalid {
+                return None;
+            }
+            at = ends.next;
+        } else {
+            // the next start in this buffer, or past it
+            while at < offset + data.len() {
+                let Some(newline) = memchr::memchr(b'\n', &data[at - offset..]) else {
+                    at = offset + data.len();
+                    break;
+                };
+                let start = at + newline + 1;
+                if start >= size {
+                    at = size;
+                    break;
+                }
+                starts.push(start);
+                at = start + bytes_per_thread;
+            }
         }
         offset += data.len();
         if offset >= size || data.is_empty() {
@@ -668,6 +700,63 @@ pub fn parallel_morsels(scan: &CsvScanData) -> Option<CsvMorsels> {
         starts,
         end: size,
     })
+}
+
+/// Where parts start in a file the state machine runs over a buffer at a time: after the `\n` of the first row end
+/// at or past where the next part can start. A row that ends with a `\r\n` across buffers is passed over.
+struct RowEnds<'a> {
+    /// where the buffer is in the file
+    offset: usize,
+    next: usize,
+    size: usize,
+    bytes_per_thread: usize,
+    /// a `\r\n` ends a row, not a `\r` and an empty line
+    carry_on: bool,
+    starts: &'a mut Vec<usize>,
+    invalid: bool,
+}
+
+impl RowEnds<'_> {
+    /// A row ended at the byte at `position`.
+    fn ended(&mut self, data: &[u8], position: usize) {
+        let after = match data[position] {
+            b'\n' => position + 1,
+            b'\r' if self.carry_on && data.get(position + 1) == Some(&b'\n') => position + 2,
+            _ => return,
+        };
+        let start = self.offset + after;
+        if start >= self.next && start < self.size {
+            self.starts.push(start);
+            self.next = start + self.bytes_per_thread;
+        }
+    }
+}
+
+impl super::csv_state_machine::Sink for RowEnds<'_> {
+    fn add_value(&mut self, _machine: &Machine, _data: &[u8], _position: usize) {}
+
+    fn add_row(&mut self, _machine: &Machine, data: &[u8], position: usize) -> bool {
+        self.ended(data, position);
+        false
+    }
+
+    fn empty_line(&mut self, _machine: &Machine, _position: usize) -> bool {
+        false
+    }
+
+    fn invalid_state(&mut self) {
+        self.invalid = true;
+    }
+
+    fn is_comment_set(&self) -> bool {
+        false
+    }
+
+    fn set_comment(&mut self, _machine: &Machine, _position: usize) {}
+
+    fn unset_comment(&mut self, _machine: &Machine, _data: &[u8], _position: usize) -> bool {
+        false
+    }
 }
 
 /// The rows of part `index` of `morsels`, typed, in order. If they have an error, it is the one the scan of the
