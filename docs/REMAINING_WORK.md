@@ -668,12 +668,13 @@ Each item gives the number of failing files in `test/` that it should fix, where
 - [ ] 48. v1 gate: TPC-H SF10 geometric mean ≤ 1.5× C++ DuckDB, and no query slower than 3×. The runner
   prints the gate after `--engine=both`. On TPC-H SF1 (8 threads, all 22 answers correct) duckrs is at
   1.53× (none above 3×: Q21 2.7×; Q02 0.5×, Q08 0.95×), from 12.7× at the start of item 47.
-  SF10, both engines on the file C++ wrote: 0.89× on 2026-11-20 after part 42, all 22 answers correct (none
-  above 3×: Q10 1.97×, Q18 1.72×, Q16 1.55×, Q01 1.48×; 14 of the 22 faster than C++, Q15 0.31×, Q06 0.52×,
-  Q11 0.54×), with the machine's load average falling from 43 to 14 during the run. Earlier the same day: 1.09×
-  after parts 39 and 40 (Q06 1.66×, Q10 1.55×), 1.20× (Q10 1.89×), and before that 1.27× and 1.37× under
-  heavier load, with Q18 and Q14 above 3× in them. The gate passes; measure once more on a quiet machine before
-  ticking this. Q10 then took 18% less: a GROUP BY writes the keys of a
+  SF10, both engines on the file C++ wrote: 0.67× on 2026-11-20 after part 44, all 22 answers correct (none
+  above 3×: Q01 1.38×, Q10 1.31×, Q18 1.31×; 19 of the 22 faster than C++, Q15 0.18×, Q11 0.32×, Q17 0.36×),
+  with the machine's load average rising from 45 to 157 during the run, which slowed C++ more than duckrs (its
+  Q15 took 2.1s, from 0.68s): this one says least of all. Earlier the same day: 0.89× after part 42 (Q10 1.97×)
+  with the load falling from 43 to 14, 1.09× after parts 39 and 40, 1.20×, and before that 1.27× and 1.37×
+  under heavier load, with Q18 and Q14 above 3× in them. The gate passes; measure once more on a quiet machine
+  before ticking this. Q10 then took 18% less: a GROUP BY writes the keys of a
   chunk's rows into one buffer and makes a key only for a new group, and threads read blocks of the file at once
   (`pread`), where they took turns. The distinct values of each column, which the join order starts from, are
   kept in the file as C++ keeps them (`DistinctStatistics`, as `HLL_V2`, and read of older files as `HLL_V1`):
