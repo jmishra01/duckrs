@@ -1372,6 +1372,12 @@ fn batch_chunk(
         for row in 0..count {
             vector.set_value(row, &array_value(array, row, file_type)?)?;
         }
+        // a VARIANT the file has shredded into a `typed_value` reads as a SHREDDED_VECTOR
+        if file_type.id() == LogicalTypeId::Variant
+            && array.as_struct_opt().is_some_and(|group| group.column_by_name("typed_value").is_some())
+        {
+            vector.set_shredded();
+        }
         if file_type == ty {
             columns.push(vector);
         } else if file_type.id() == LogicalTypeId::Varchar && ty.id() == LogicalTypeId::Blob {

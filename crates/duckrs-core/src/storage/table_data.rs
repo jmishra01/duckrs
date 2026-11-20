@@ -1088,6 +1088,11 @@ impl TableSource for DiskTable {
             .collect()
     }
 
+    fn variant_group_shredded(&self, group: usize, column: usize) -> bool {
+        self.table.columns[column].ty.id() == LogicalTypeId::Variant
+            && self.persistent_column(group, column).is_ok_and(|stored| stored.shredded.is_some())
+    }
+
     fn all_variant_shredding(&self, columns: &[usize]) -> HashMap<(u64, usize, usize), Option<LogicalType>> {
         let mut result = HashMap::new();
         for (index, group) in self.table.row_groups.iter().enumerate() {

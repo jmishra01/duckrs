@@ -70,6 +70,8 @@ enum Repr {
 pub struct Vector {
     ty: LogicalType,
     repr: Repr,
+    /// a VARIANT a scan read from shredded storage, which `vector_type` tells as `SHREDDED_VECTOR`
+    shredded: bool,
 }
 
 impl Flat {
@@ -134,6 +136,7 @@ impl Vector {
         Self {
             ty,
             repr: Repr::Flat(flat),
+            shredded: false,
         }
     }
 
@@ -162,11 +165,22 @@ impl Vector {
         Ok(Self {
             ty,
             repr: Repr::Sequence { start, increment },
+            shredded: false,
         })
     }
 
     pub fn logical_type(&self) -> &LogicalType {
         &self.ty
+    }
+
+    /// Marks a flat VARIANT as read from shredded storage (`VectorType::SHREDDED_VECTOR`).
+    pub fn set_shredded(&mut self) {
+        self.shredded = true;
+    }
+
+    /// Whether this is a flat VARIANT a scan read from shredded storage.
+    pub fn is_shredded(&self) -> bool {
+        self.shredded && matches!(self.repr, Repr::Flat(_))
     }
 
     pub fn physical_type(&self) -> PhysicalType {
@@ -364,6 +378,7 @@ impl Vector {
                     start: first.wrapping_add(increment.wrapping_mul(start as i64)),
                     increment: *increment,
                 },
+                shredded: false,
             },
             Repr::Dictionary { sel, child } => Vector {
                 ty: self.ty.clone(),
@@ -371,6 +386,7 @@ impl Vector {
                     sel: SelectionVector::from_vec((start..start + count).map(|i| sel.get(i) as u32).collect()),
                     child: child.clone(),
                 },
+                shredded: false,
             },
             Repr::Flat(_)
                 if !matches!(

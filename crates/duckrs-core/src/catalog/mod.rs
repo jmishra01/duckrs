@@ -181,6 +181,10 @@ pub trait TableSource: std::fmt::Debug + Send + Sync {
     fn variant_field(&self, _group: usize, _column: usize, _keys: &[String]) -> Result<Option<Vector>> {
         Ok(None)
     }
+    /// Whether row group `group` stores the VARIANT `column` shredded.
+    fn variant_group_shredded(&self, _group: usize, _column: usize) -> bool {
+        false
+    }
     /// [`Self::variant_shredding`] of each row group and each of `columns`.
     fn all_variant_shredding(&self, _columns: &[usize]) -> HashMap<(u64, usize, usize), Option<LogicalType>> {
         HashMap::new()

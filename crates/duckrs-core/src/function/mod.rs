@@ -342,7 +342,9 @@ fn stats_function() -> ScalarFunctionSet {
 fn vector_type_function() -> ScalarFunctionSet {
     fn run(args: &DataChunk, result: &mut Vector) -> Result<()> {
         use duckrs_common::vector::VectorType;
-        let name = match args.columns()[0].vector_type() {
+        let argument = &args.columns()[0];
+        let name = match argument.vector_type() {
+            VectorType::Flat if argument.is_shredded() => "SHREDDED_VECTOR",
             VectorType::Flat => "FLAT_VECTOR",
             VectorType::Constant => "CONSTANT_VECTOR",
             VectorType::Dictionary => "DICTIONARY_VECTOR",

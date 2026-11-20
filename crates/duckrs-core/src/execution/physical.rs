@@ -238,6 +238,8 @@ struct TableScanState {
     /// row group of the last chunk
     fields: Vec<usize>,
     field_group: Option<(usize, Vec<(usize, Vector)>)>,
+    /// whether the chunks of the cursor are those of the file's row groups, in order
+    group_aligned: bool,
 }
 
 /// What a scan reads of a file. `column_ids` lists all columns for the filter and the projection to
@@ -298,7 +300,38 @@ impl PhysicalTableScan {
 
     /// The filter, then the columns it may be the only one to read, of a chunk that was scanned.
     fn finish_chunk(&self, result: DataChunk) -> Result<Option<DataChunk>> {
-        self.finish_chunk_with(result, &[])
+        self.finish_chunk_with(result, &[], None)
+    }
+
+    /// The VARIANT columns of a chunk of the columns at `positions` that row group `group` of `source` stores
+    /// shredded, marked as such (`SHREDDED_VECTOR`).
+    fn mark_shredded(
+        &self,
+        positions: &[usize],
+        mut chunk: DataChunk,
+        group: Option<(&dyn TableSource, usize)>,
+    ) -> DataChunk {
+        let Some((source, group)) = group else {
+            return chunk;
+        };
+        for (at, &position) in positions.iter().enumerate() {
+            let column = self.column_ids[position];
+            let pushed = self.extracts.get(position).is_some_and(Option::is_some);
+            // a VARIANT a row group gives is flat, as `ColumnData::Select` gives it, and shredded if stored so
+            if !pushed
+                && self.table.columns.get(column).is_some_and(|c| c.ty.id() == duckrs_common::types::LogicalTypeId::Variant)
+            {
+                let rows = chunk.len();
+                let vector = &mut chunk.columns_mut()[at];
+                if vector.vector_type() == duckrs_common::vector::VectorType::Dictionary {
+                    vector.flatten(rows);
+                }
+                if source.variant_group_shredded(group, column) {
+                    vector.set_shredded();
+                }
+            }
+        }
+        chunk
     }
 
     /// The VARIANT fields at `positions` of row group `group` of `rows` rows, computed: read from the typed
@@ -336,7 +369,12 @@ impl PhysicalTableScan {
     }
 
     /// [`Self::finish_chunk`] of a chunk whose positions `done` have their fields already.
-    fn finish_chunk_with(&self, mut result: DataChunk, done: &[usize]) -> Result<Option<DataChunk>> {
+    fn finish_chunk_with(
+        &self,
+        mut result: DataChunk,
+        done: &[usize],
+        group: Option<(&dyn TableSource, usize)>,
+    ) -> Result<Option<DataChunk>> {
         // the filter reads what it scans, so the columns go after that and before the slice
         let mut selected = None;
         if let Some(filter) = &self.filter {
@@ -359,7 +397,8 @@ impl PhysicalTableScan {
         if let Some((sel, matched)) = selected {
             result.slice(&sel, matched);
         }
-        Ok(Some(self.extract_fields(&positions, result, done)?))
+        let result = self.extract_fields(&positions, result, done)?;
+        Ok(Some(self.mark_shredded(&positions, result, group)))
     }
 
     /// The fields pushed into the scan, of the columns they are of, in a chunk of the columns at `positions`.
@@ -629,7 +668,8 @@ impl PhysicalTableScan {
                 .iter()
                 .map(|&position| fetched[position].as_ref().expect("fetched above").range(start, count))
                 .collect();
-            emit(self.extract_fields(&output, DataChunk::from_columns(columns, count), &fields)?)?;
+            let chunk = self.extract_fields(&output, DataChunk::from_columns(columns, count), &fields)?;
+            emit(self.mark_shredded(&output, chunk, Some((source, group))))?;
         }
         Ok(())
     }
@@ -733,7 +773,7 @@ impl PhysicalOperator for PhysicalTableScan {
             if count < chunk.len() {
                 result.slice(&SelectionVector::from_vec((0..count as u32).collect()), count);
             }
-            if let Some(result) = self.finish_chunk_with(result, &state.fields)? {
+            if let Some(result) = self.finish_chunk_with(result, &state.fields, Some((&*state.source, index)))? {
                 emit(result)?;
             }
         }
@@ -773,15 +813,13 @@ impl PhysicalOperator for PhysicalTableScan {
         let source = self.table.source();
         // the VARIANT fields are read by row group, where the chunks are those of the file's groups
         let group_rows = self.table.row_group_size();
-        let fields = match &source {
-            Some(source)
-                if self.filter.is_none()
-                    && group_rows.is_multiple_of(STANDARD_VECTOR_SIZE)
-                    && TableCursor::is_aligned(&**source, group_rows) =>
-            {
-                self.variant_fields()
-            }
-            _ => Vec::new(),
+        let group_aligned = source.as_ref().is_some_and(|source| {
+            group_rows.is_multiple_of(STANDARD_VECTOR_SIZE) && TableCursor::is_aligned(&**source, group_rows)
+        });
+        let fields = if group_aligned && self.filter.is_none() {
+            self.variant_fields()
+        } else {
+            Vec::new()
         };
         let cursor = source.clone().map(|source| {
             let (read, types, columns) = self.file_columns_without(&fields);
@@ -818,6 +856,7 @@ impl PhysicalOperator for PhysicalTableScan {
             sampling,
             fields,
             field_group: None,
+            group_aligned,
         })
     }
     fn dynamic_filters(&self) -> Option<String> {
@@ -872,6 +911,7 @@ impl PhysicalOperator for PhysicalTableScan {
             sampling,
             fields,
             field_group,
+            group_aligned,
         } = state.downcast_mut().expect("table scan state");
         if let Some(rows) = &self.index_rows {
             return self.next_index_chunk(rows, next_index_row);
@@ -973,7 +1013,11 @@ impl PhysicalOperator for PhysicalTableScan {
             } else if count < chunk.len() {
                 result.slice(&SelectionVector::from_vec((0..count as u32).collect()), count);
             }
-            match self.finish_chunk_with(result, fields)? {
+            let source = cursor.as_ref().and_then(|_| self.table.source()).filter(|_| *group_aligned);
+            let group = source
+                .as_ref()
+                .map(|source| (&**source, index / self.table.chunks_per_row_group()));
+            match self.finish_chunk_with(result, fields, group)? {
                 Some(result) => return Ok(Some(result)),
                 None => continue,
             }
