@@ -35,7 +35,7 @@ struct Uses {
     paths: Vec<Path>,
 }
 
-pub fn push_down(plan: &mut LogicalOperator) {
+pub fn push_down(plan: &mut LogicalOperator, statistics: Option<&mut super::statistics::StatisticsMap>) {
     if !supported(plan) {
         return;
     }
@@ -67,6 +67,27 @@ pub fn push_down(plan: &mut LogicalOperator) {
     }
     add_positions(plan, &candidates, &mut pushed);
     rewrite_plan(plan, &pushed);
+    // `WritePushdownExtractColumns` keeps the statistics: the fields have those of their extracts
+    if let Some(statistics) = statistics {
+        for (binding, paths) in &pushed {
+            let column_type = &candidates[binding];
+            for (path, at) in paths {
+                let Some(extract) = path_extract(column_type, path) else {
+                    continue;
+                };
+                let mut expression = extract.expression;
+                expression.walk_mut(&mut |e| {
+                    if matches!(e.kind, BoundExprKind::Reference(0)) {
+                        e.kind = BoundExprKind::ColumnRef {
+                            binding: *binding,
+                            depth: 0,
+                        };
+                    }
+                });
+                statistics.set_expression(ColumnBinding::new(binding.table_index, *at), &expression);
+            }
+        }
+    }
 }
 
 /// Whether `prefix` is a path without a cast that `path` goes on from.

@@ -165,7 +165,8 @@ Each item gives the number of failing files in `test/` that it should fix, where
     extracts (and casts of them) are columns of the scan (`s.y.z` in EXPLAIN), also in SQL export
   - [x] reading a pushed field of a VARIANT by keys from the typed part of the row groups that have it there,
     in parallel, serial and filtered scans of a file (7-10x faster over 1M rows)
-  - [ ] the statistics of the pushed fields; `SHREDDED_VECTOR` scans; the statistics of the unshredded part are written as unknown;
+  - [x] the statistics of the pushed fields, those of their extracts, for compressed materialization
+  - [ ] `SHREDDED_VECTOR` scans; the statistics of the unshredded part are written as unknown;
     stats of the rows a delete took
   - [ ] shredded GEOMETRY columns, Patas and Chimp segments (8), `read_duckdb` (8)
   - [ ] string and list-length statistics for `stats()` (~10 files), per-column `USING COMPRESSION`

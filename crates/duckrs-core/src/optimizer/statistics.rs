@@ -774,6 +774,13 @@ impl StatisticsMap {
         self.0.lookup(binding)
     }
 
+    /// `target` has the values of `expr`, of bindings this knows the statistics of.
+    pub fn set_expression(&mut self, target: ColumnBinding, expr: &BoundExpr) {
+        let stats = self.0.expression(&mut expr.clone(), false);
+        self.0.aliases.remove(&target);
+        self.0.stats.insert(target, stats);
+    }
+
     /// `CopyStatistics`: `target` has the values of `source`.
     pub fn copy(&mut self, source: ColumnBinding, target: ColumnBinding) {
         if source != target {

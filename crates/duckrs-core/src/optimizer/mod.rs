@@ -471,7 +471,7 @@ pub fn optimize_timed(
         }
         // the pushdown extract of `RemoveUnusedColumns`, once the scans say which of their columns they output
         plan = run("unused_columns", plan, &mut |mut plan| {
-            extract_pushdown::push_down(&mut plan);
+            extract_pushdown::push_down(&mut plan, statistics_map.as_mut());
             plan
         });
     }
