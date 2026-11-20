@@ -1076,6 +1076,63 @@ impl DiskTable {
     /// [`TableSource::fetch_rows`] of a fixed-width column of a group without deletes: the rows read
     /// from their segments, those that can be read on their own (constant, uncompressed, bit-packed)
     /// without decoding the others. `None` for what this does not cover.
+    /// Rows `rows` of a VARCHAR column of DICT_FSST segments, each decoded from its entry; `None` of another column.
+    fn fetch_string_rows(&self, group: usize, column: usize, rows: &[u32]) -> Result<Option<Vector>> {
+        let ty = &self.table.columns[column].ty;
+        if ty.id() != LogicalTypeId::Varchar || self.alive[group].is_some() {
+            return Ok(None);
+        }
+        let stored = self.persistent_column(group, column)?;
+        if !dictionary_column(&stored) {
+            return Ok(None);
+        }
+        let group_rows = self.table.row_groups[group].tuple_count as usize;
+        check_rows(&stored, group_rows)?;
+        let mut strings = StringRows::with_capacity(rows.len());
+        let mut null = Vec::with_capacity(rows.len());
+        let (mut start, mut at) = (0usize, 0usize);
+        let mut local = Vec::new();
+        for pointer in &stored.pointers {
+            let count = pointer.tuple_count;
+            local.clear();
+            while at < rows.len() && (rows[at] as usize) < start + count {
+                local.push(rows[at] - start as u32);
+                at += 1;
+            }
+            if !local.is_empty() {
+                let handle = segment(&self.buffer, pointer)?;
+                null.extend(decode_dict_fsst_rows(
+                    &handle[pointer.offset..],
+                    count,
+                    &local,
+                    &mut strings,
+                )?);
+            }
+            start += count;
+        }
+        if at < rows.len() {
+            return Err(corrupt("a row past the rows of a column"));
+        }
+        let validity = stored
+            .validity
+            .as_ref()
+            .ok_or_else(|| corrupt("a column has no validity"))?;
+        if validity.pointers.iter().any(|p| p.statistics.has_null) {
+            let valid = scan_validity_column(&self.buffer, validity, group_rows)?;
+            for (position, &row) in rows.iter().enumerate() {
+                null[position] |= !valid[row as usize];
+            }
+        }
+        let mut vector = Vector::new(ty.clone(), rows.len().max(1));
+        vector.set_strs(strings.iter());
+        for (position, &null) in null.iter().enumerate() {
+            if null {
+                vector.set_null(position, true);
+            }
+        }
+        Ok(Some(vector))
+    }
+
     fn fetch_fixed_rows(&self, group: usize, column: usize, rows: &[u32]) -> Result<Option<Vector>> {
         let ty = &self.table.columns[column].ty;
         let physical = ty.physical_type();
@@ -1155,6 +1212,12 @@ impl TableSource for DiskTable {
         let group_rows = self.table.row_groups[group].tuple_count as usize;
         if rows.len() * 4 <= group_rows
             && let Some(vector) = self.fetch_fixed_rows(group, column, rows)?
+        {
+            return Ok(vector);
+        }
+        // strings: those of the rows wanted, rather than all of the dictionary's and an entry per row
+        if rows.len() * 2 <= group_rows
+            && let Some(vector) = self.fetch_string_rows(group, column, rows)?
         {
             return Ok(vector);
         }

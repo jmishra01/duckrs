@@ -1433,9 +1433,8 @@ pub fn scan_dict_fsst(segment: &[u8], count: usize, out: &mut StringRows, nulls:
     Ok(())
 }
 
-/// A DICT_FSST segment as its dictionary and, per row, the entry it has (0 is NULL): what a scan
-/// turns into a dictionary vector (`DictFSSTCompressionStorage::StringScan` emits one too).
-pub fn decode_dict_fsst(segment: &[u8], count: usize) -> Result<(StringRows, Vec<u32>)> {
+/// The header, symbol table, lengths and indices of a DICT_FSST segment, checked as C++ checks them.
+fn parse_dict_fsst(segment: &[u8], count: usize) -> Result<DictFsst<'_>> {
     const HEADER_SIZE: usize = 16;
     const DICTIONARY: u8 = 0;
     const DICT_FSST: u8 = 1;
@@ -1492,30 +1491,97 @@ pub fn decode_dict_fsst(segment: &[u8], count: usize) -> Result<(StringRows, Vec
     } else {
         None
     };
-    let mut strings = StringRows::with_capacity(dict_count.min(1 << 16));
+    // where each entry ends; one past the dictionary fails when it is read, as it does in C++
+    let mut ends = Vec::with_capacity(lengths.len());
     let mut offset = 0usize;
     for &length in &lengths {
-        let length = length as usize;
-        let entry = offset
-            .checked_add(length)
-            .and_then(|end| dictionary.get(offset..end))
+        offset = offset.saturating_add(length as usize);
+        ends.push(offset);
+    }
+    let indices: Option<Vec<u32>> =
+        (mode != FSST_ONLY).then(|| indices.into_iter().map(|index| index as u32).collect());
+    Ok(DictFsst {
+        dictionary,
+        ends,
+        decoder,
+        indices,
+    })
+}
+
+/// A DICT_FSST segment, read as far as its entries: where each ends in the dictionary, and per row its entry
+/// (`None` of `FSST_ONLY`, where row `i` has entry `i + 1`).
+struct DictFsst<'a> {
+    dictionary: &'a [u8],
+    ends: Vec<usize>,
+    decoder: Option<FsstDecoder>,
+    indices: Option<Vec<u32>>,
+}
+
+impl DictFsst<'_> {
+    fn entry(&self, index: usize, out: &mut StringRows) -> Result<()> {
+        let start = if index == 0 { 0 } else { self.ends[index - 1] };
+        let entry = self
+            .dictionary
+            .get(start..self.ends[index])
             .ok_or_else(|| corrupted("Corrupted DICT_FSST segment: string lengths exceed the dictionary size"))?;
-        offset += length;
-        match &decoder {
-            Some(decoder) => strings.push_with(|out| decoder.decompress_into(entry, out))?,
-            None => strings.push(entry),
+        match &self.decoder {
+            Some(decoder) => out.push_with(|out| decoder.decompress_into(entry, out)),
+            None => {
+                out.push(entry);
+                Ok(())
+            }
         }
     }
-    if mode == FSST_ONLY {
-        return Ok((strings, (1..=count as u32).collect()));
+
+    /// The entry of row `row`, which must be one of the dictionary.
+    fn index_of(&self, row: usize) -> Result<u32> {
+        let index = match &self.indices {
+            Some(indices) => indices[row],
+            None => row as u32 + 1,
+        };
+        if index as usize >= self.ends.len() {
+            return Err(corrupted(
+                "Corrupted DICT_FSST segment: dictionary index is out of range",
+            ));
+        }
+        Ok(index)
     }
-    let indices: Vec<u32> = indices.into_iter().map(|index| index as u32).collect();
+}
+
+/// `DictFSSTCompressionState` read back: the entries of the dictionary, and per row its entry (0 the empty string
+/// a NULL has).
+pub fn decode_dict_fsst(segment: &[u8], count: usize) -> Result<(StringRows, Vec<u32>)> {
+    let parsed = parse_dict_fsst(segment, count)?;
+    let mut strings = StringRows::with_capacity(parsed.ends.len().min(1 << 16));
+    for index in 0..parsed.ends.len() {
+        parsed.entry(index, &mut strings)?;
+    }
+    let indices = match parsed.indices {
+        Some(indices) => indices,
+        None => return Ok((strings, (1..=count as u32).collect())),
+    };
     if indices.iter().any(|&index| index as usize >= strings.len()) {
         return Err(corrupted(
             "Corrupted DICT_FSST segment: dictionary index is out of range",
         ));
     }
     Ok((strings, indices))
+}
+
+/// The strings of rows `rows` of a DICT_FSST segment of `count` rows, onto `out`, each entry decoded for each row
+/// that has it; per row, whether it has entry 0, which a NULL has.
+pub fn decode_dict_fsst_rows(segment: &[u8], count: usize, rows: &[u32], out: &mut StringRows) -> Result<Vec<bool>> {
+    let parsed = parse_dict_fsst(segment, count)?;
+    let mut empty = Vec::with_capacity(rows.len());
+    for &row in rows {
+        if row as usize >= count {
+            return Err(corrupt("a row past the rows of a column"));
+        }
+        let index = parsed.index_of(row as usize)?;
+        empty.push(index == 0);
+        parsed.entry(index as usize, out)?;
+    }
+    Ok(empty)
 }
 
 #[cfg(test)]

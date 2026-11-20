@@ -686,8 +686,10 @@ columns that its projection and filter refer to, through the buffer manager, whi
 `memory_limit` (80% of the machine's memory by default), as each query sets it, and reads them with
 `pread` on threads at once. The metadata of a column of a row group is read once and kept. A filter
 of comparisons of an integer column with constants is a range of its values, which a loop over them
-keeps (C++'s `ConstantFilter`), and conjuncts of the same columns are one pass. Metadata is read at
-open, as are deletes, as the number of rows has to be known. Decoding is what fails on damage or ZSTD, so those errors come from the
+keeps (C++'s `ConstantFilter`), and conjuncts of the same columns are one pass. Of the rows a filter
+kept, at most a quarter of a group's are fetched one by one from bitpacked integers, and at most half
+from DICT_FSST strings, each decoded from its entry. Metadata is read at open, as are deletes, as the
+number of rows has to be known. Decoding is what fails on damage or ZSTD, so those errors come from the
 query that reads the rows and not from opening the file; bad metadata still fails the open.
 
 `storage` of a table is private, so what wants all rows goes through `rows` and `write_storage`,

@@ -1585,6 +1585,38 @@ fn ranges_of_constants_filter_as_comparisons_do() {
     }
 }
 
+/// The strings of a few rows of a row group that a filtered scan of a file fetches are each decoded from their
+/// entry of the dictionary: they are what a scan of all the rows reads, for few and for many distinct strings,
+/// empty ones and NULLs, and for few and for many rows of each group.
+#[test]
+fn strings_of_some_rows_read_as_all_rows_do() {
+    let file = path("strings.db");
+    let db = Database::open_in_memory().unwrap();
+    let mut c = db.connect().unwrap();
+    run(
+        &mut c,
+        &format!("ATTACH '{}' AS f (ROW_GROUP_SIZE 16384)", file.display()),
+    );
+    run(
+        &mut c,
+        "CREATE TABLE f.t AS SELECT i, CASE i % 7 WHEN 0 THEN NULL WHEN 1 THEN '' ELSE ['R', 'A', 'N'][i % 3 + 1] \
+         END AS low, CASE WHEN i % 11 = 0 THEN NULL ELSE 'customer ' || i || ' furiously pending deposits ' || \
+         (i * 7919 % 1000) END AS high FROM range(100000) t(i)",
+    );
+    run(&mut c, "CHECKPOINT f");
+    // a copy in memory, of a scan of all the rows
+    run(&mut c, "CREATE TABLE m AS SELECT * FROM f.t");
+    for filter in ["i % 97 = 3", "i BETWEEN 1000 AND 1200", "i % 3 = 0", "i % 5 < 2", "low = 'R'"] {
+        let sql = |table: &str| {
+            format!(
+                "SELECT count(*), count(low), count(high), sum(hash(i, low, high)), max(high) FROM {table} WHERE \
+                 {filter}"
+            )
+        };
+        assert_eq!(rows(&mut c, &sql("f.t")), rows(&mut c, &sql("m")), "{filter}");
+    }
+}
+
 /// A file read a buffer at a time, on one thread and in parts, gives what it does read whole: in buffers of 160000
 /// bytes and parts of 40000 (four lines of at most 10000), rows and quoted values with newlines in them go across
 /// many of each. The sniffer reads its 2048 rows of the first buffer.

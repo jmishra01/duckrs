@@ -312,6 +312,22 @@ impl Keys {
         }
     }
 
+    /// The rows of `values` that can match a key, onto `kept`.
+    fn keep<T: Copy + Into<i64>>(&self, values: &[T], kept: &mut Vec<u32>) {
+        let (min, max) = (self.min, self.max);
+        for (row, &value) in values.iter().enumerate() {
+            let value: i64 = value.into();
+            if value < min || value > max {
+                continue;
+            }
+            let h = hash(value);
+            let bits = block_bits(h);
+            if self.blocks[self.block(h)] & bits == bits {
+                kept.push(row as u32);
+            }
+        }
+    }
+
     #[inline]
     fn may_contain(&self, value: i64) -> bool {
         if value < self.min || value > self.max {

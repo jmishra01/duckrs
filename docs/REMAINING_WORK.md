@@ -680,7 +680,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
   the first query of a file at SF10 took 16–27s counting them from all the rows, and takes under a second. Q06
   then took 0.35s warm against C++'s 0.09s: the blocks of a file stay in memory up to `memory_limit` (C++'s
   buffer pool) where 256 MiB of them did, a scan keeps the metadata of the columns it read, and comparisons of
-  an integer column with constants are a range of its values; warm Q06 takes 0.06s against C++'s 0.05s. duckrs
+  an integer column with constants are a range of its values; warm Q06 takes 0.06s against C++'s 0.05s. Q10
+  then took 3.3s of CPU warm where C++ takes 1.0s: the keys of a GROUP BY are written a column at a time, a join
+  filter loops over a flat column, and the strings of the few rows of a group a filtered scan wants are decoded
+  each from its entry, where all of the group's were; that takes 20% of the CPU off (2.6s). duckrs
   had no way to load SF10 itself, as an append kept its rows in memory (more than 2 GiB failed); appends now write
   their full row groups to blocks as they fill (an INSERT of 80M rows takes 90MB). duckrs now loads SF10 into its
   own file (COPY of the `.tbl` files: lineitem 24s against C++'s 22s, the rest under 5s each; at most 710MB

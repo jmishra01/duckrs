@@ -251,6 +251,53 @@ fn row_keys_are_sort_keys() {
         Value::null(LogicalType::VARCHAR),
         Value::varchar("x".repeat(100)),
     ]);
+    // each type written a column at a time, and one that is encoded row by row
+    let more = [
+        values(vec![
+            Value::boolean(true),
+            Value::null(LogicalType::BOOLEAN),
+            Value::boolean(false),
+        ]),
+        values(vec![
+            Value::tinyint(-128),
+            Value::tinyint(127),
+            Value::null(LogicalType::TINYINT),
+        ]),
+        values(vec![
+            Value::smallint(-2),
+            Value::null(LogicalType::SMALLINT),
+            Value::smallint(300),
+        ]),
+        values(vec![
+            Value::hugeint(i128::MIN),
+            Value::hugeint(-1),
+            Value::hugeint(1 << 100),
+        ]),
+        values(vec![
+            Value::utinyint(0),
+            Value::utinyint(255),
+            Value::null(LogicalType::UTINYINT),
+        ]),
+        values(vec![Value::ubigint(u64::MAX), Value::ubigint(7), Value::ubigint(0)]),
+        values(vec![Value::float(-0.0), Value::float(f32::NAN), Value::float(-1.5)]),
+        values(vec![
+            Value::list(LogicalType::INTEGER, vec![Value::integer(1), Value::integer(2)]).unwrap(),
+            Value::null(LogicalType::list(LogicalType::INTEGER)),
+            Value::list(LogicalType::INTEGER, vec![]).unwrap(),
+        ]),
+    ];
+    for column in &more {
+        assert_eq!(
+            row_key_bytes(std::slice::from_ref(column), 3),
+            sort_key_bytes(std::slice::from_ref(column), 3)
+        );
+    }
+    let mixed: Vec<Vector> = more
+        .iter()
+        .cloned()
+        .chain([strings.clone(), integers.clone()])
+        .collect();
+    assert_eq!(row_key_bytes(&mixed, 3), sort_key_bytes(&mixed, 3));
     for columns in [
         vec![integers.clone()],
         vec![bigints.clone(), integers.clone()],
