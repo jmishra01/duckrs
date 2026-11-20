@@ -140,12 +140,127 @@ impl VariantStatsOut {
     fn merge(&mut self, other: &Self) {
         *self = match (std::mem::replace(self, Self::Inconsistent), other) {
             (Self::NotShredded, Self::NotShredded) => Self::NotShredded,
-            (Self::Shredded(ty, mut stats), Self::Shredded(other_ty, other_stats)) if ty == *other_ty => {
-                stats.merge(other_stats, &ty);
-                Self::Shredded(ty, stats)
+            (Self::Shredded(ty, stats), Self::Shredded(other_ty, other_stats)) => {
+                match merge_shredding(&ty, &stats, other_ty, other_stats) {
+                    Some((ty, stats)) => Self::Shredded(ty, stats),
+                    None => Self::Inconsistent,
+                }
             }
             _ => Self::Inconsistent,
         };
+    }
+}
+
+/// The type of the values of a level of a typed part, its statistics, and those of its untyped part.
+fn split_shredding<'t>(ty: &LogicalType, tree: &'t StatsTree) -> (LogicalType, &'t StatsTree, Option<&'t StatsTree>) {
+    if ty.id() != LogicalTypeId::Struct || tree.children.is_empty() {
+        return (ty.clone(), tree, None);
+    }
+    let fields = ty.struct_children();
+    (fields[0].1.clone(), &tree.children[0], tree.children.get(1).filter(|_| fields.len() > 1))
+}
+
+/// `WrapTypedValue`.
+fn wrap_shredding(typed_type: LogicalType, typed: StatsTree, untyped: Option<StatsTree>) -> (LogicalType, StatsTree) {
+    if untyped.is_none() && !typed_type.is_nested() {
+        return (typed_type, typed);
+    }
+    let mut fields = vec![("typed_value".to_string(), typed_type)];
+    let mut stats = typed.stats.clone();
+    stats.bounds = None;
+    stats.strings = None;
+    stats.geometry = None;
+    let mut children = vec![typed];
+    if let Some(untyped) = untyped {
+        fields.push(("untyped_value_index".to_string(), LogicalType::UINTEGER));
+        children.push(untyped);
+    }
+    (LogicalType::struct_type(fields), StatsTree { stats, children })
+}
+
+/// `VariantStats::MergeShredding`: the typed part two row groups have in common, the fields of objects that
+/// both have with the same type, and its statistics; `None` if there is none.
+fn merge_shredding(
+    ty: &LogicalType,
+    tree: &StatsTree,
+    other_ty: &LogicalType,
+    other: &StatsTree,
+) -> Option<(LogicalType, StatsTree)> {
+    let (typed_type, typed, untyped) = split_shredding(ty, tree);
+    let (other_typed_type, other_typed, other_untyped) = split_shredding(other_ty, other);
+    let untyped = match (untyped, other_untyped) {
+        (Some(a), Some(b)) => {
+            let mut merged = a.clone();
+            merged.merge(b, &LogicalType::UINTEGER);
+            Some(merged)
+        }
+        (a, b) => a.or(b).cloned(),
+    };
+    let validity = |a: &StatsTree, b: &StatsTree| {
+        let mut stats = Stats::of_validity(&[]);
+        stats.has_null = a.stats.has_null || b.stats.has_null;
+        stats.has_no_null = a.stats.has_no_null || b.stats.has_no_null;
+        stats
+    };
+    match typed_type.id() {
+        LogicalTypeId::Struct => {
+            if other_typed_type.id() != LogicalTypeId::Struct {
+                return None;
+            }
+            let other_fields = other_typed_type.struct_children();
+            let mut fields = Vec::new();
+            let mut children = Vec::new();
+            for (at, (name, field)) in typed_type.struct_children().iter().enumerate() {
+                let Some(other_at) = other_fields.iter().position(|(other_name, _)| other_name == name) else {
+                    continue;
+                };
+                let other_field = &other_fields[other_at].1;
+                if other_field.id() != field.id() {
+                    continue;
+                }
+                let (Some(child), Some(other_child)) = (typed.children.get(at), other_typed.children.get(other_at))
+                else {
+                    continue;
+                };
+                if let Some((merged_type, merged)) = merge_shredding(field, child, other_field, other_child) {
+                    fields.push((name.clone(), merged_type));
+                    children.push(merged);
+                }
+            }
+            if fields.is_empty() {
+                return None;
+            }
+            let typed = StatsTree {
+                stats: validity(typed, other_typed),
+                children,
+            };
+            Some(wrap_shredding(LogicalType::struct_type(fields), typed, untyped))
+        }
+        LogicalTypeId::List => {
+            if other_typed_type.id() != LogicalTypeId::List {
+                return None;
+            }
+            let (element, other_element) = (typed.children.first()?, other_typed.children.first()?);
+            let (element_type, merged) = merge_shredding(
+                typed_type.child_type()?,
+                element,
+                other_typed_type.child_type()?,
+                other_element,
+            )?;
+            let typed = StatsTree {
+                stats: validity(typed, other_typed),
+                children: vec![merged],
+            };
+            Some(wrap_shredding(LogicalType::list(element_type), typed, untyped))
+        }
+        _ => {
+            if typed_type != other_typed_type {
+                return None;
+            }
+            let mut merged = typed.clone();
+            merged.merge(other_typed, &typed_type);
+            Some(wrap_shredding(typed_type, merged, untyped))
+        }
     }
 }
 
@@ -1137,6 +1252,13 @@ struct Writer<'a> {
     version: StorageVersion,
     variant_minimum_shredding_size: i64,
     force_variant_shredding: Option<LogicalType>,
+    /// the row group being written as it is stored, if it is one that is
+    stored_group: Option<(u64, usize)>,
+    /// of the VARIANT column being written, how it is stored shredded: a row group whose VARIANT data has no
+    /// changes keeps it (`VariantColumnData::Checkpoint` of no `HasAnyChanges`)
+    stored_shredding: Option<Option<LogicalType>>,
+    /// how the VARIANT columns of the table being written are shredded, for the table to keep
+    written_shredding: HashMap<(u64, usize, usize), Option<LogicalType>>,
 }
 
 /// A row group that a table is written as. Its rows have the ids from `row_start` on, and those
@@ -1331,6 +1453,9 @@ impl<'a> Writer<'a> {
             version: options.storage_version,
             variant_minimum_shredding_size: options.variant_minimum_shredding_size,
             force_variant_shredding: options.force_variant_shredding.cloned(),
+            stored_group: None,
+            stored_shredding: None,
+            written_shredding: HashMap::new(),
         }
     }
 
@@ -2221,7 +2346,9 @@ impl<'a> Writer<'a> {
             }
         }
         let minimum = self.variant_minimum_shredding_size;
-        let shredded_type = if rows > 0 && minimum != -1 && rows as u64 >= minimum.max(0) as u64 {
+        let shredded_type = if let Some(stored) = self.stored_shredding.take() {
+            stored
+        } else if rows > 0 && minimum != -1 && rows as u64 >= minimum.max(0) as u64 {
             self.force_variant_shredding.clone().or_else(|| {
                 let mut stats = shredding::ShreddingStats::default();
                 stats.update(nodes.iter().map(Option::as_ref));
@@ -2282,7 +2409,21 @@ impl<'a> Writer<'a> {
         for (column, parts) in parts.iter().enumerate() {
             let ty = &table.columns[column].ty;
             self.log_column = (format!("{}.{}", table.schema, table.name), column);
+            self.stored_shredding = match (ty.id(), self.stored_group) {
+                (LogicalTypeId::Variant, Some((row_start, rows))) => {
+                    let written = table.variant_shredding.lock().get(&(row_start, rows, column)).cloned();
+                    written.or_else(|| table.stored()?.variant_shredding(row_start, rows, column))
+                }
+                _ => None,
+            };
             let out = self.write_column_data(ty, parts)?;
+            if ty.id() == LogicalTypeId::Variant {
+                let shredded = match out.stats.variant.as_deref() {
+                    Some(VariantStatsOut::Shredded(shredded, _)) => Some(shredded.clone()),
+                    _ => None,
+                };
+                self.written_shredding.insert((row_start, rows, column), shredded);
+            }
             match &mut statistics[column] {
                 Some(stats) => stats.merge(&out.stats, ty.physical_type()),
                 empty => *empty = Some(out.stats.clone()),
@@ -2380,6 +2521,8 @@ impl<'a> Writer<'a> {
             }
         }
         let deletes = (kept.iter().any(|kept| !kept)).then(|| deletes_of(&kept));
+        // VARIANT columns can't be updated: a row group that is as it is stored has the same VARIANT data
+        self.stored_group = (!group.merged).then_some((group.row_start, group.rows));
         let written = self.write_row_group(
             table,
             parts,
@@ -2402,6 +2545,7 @@ impl<'a> Writer<'a> {
         let columns: Vec<usize> = (0..types.len()).collect();
         let total = table.row_count();
         let ids = table.row_ids(total);
+        self.written_shredding.clear();
         let cursor = table
             .source()
             .map(|source| TableCursor::new(source, columns.clone(), types.clone(), table.row_group_size()));
@@ -2440,6 +2584,7 @@ impl<'a> Writer<'a> {
             self.write_metadata(&mut tables, row_group);
         }
         self.tables = tables;
+        *table.variant_shredding.lock() = std::mem::take(&mut self.written_shredding);
         Ok((pointer, stored_rows, next_row_id))
     }
 

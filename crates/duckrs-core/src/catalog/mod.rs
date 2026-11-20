@@ -171,6 +171,15 @@ pub trait TableSource: std::fmt::Debug + Send + Sync {
     /// `pragma_storage_info`: the segments, in the order that C++ lists them. Reading what fills
     /// `segment_info` takes their blocks, so that is only done on request.
     fn segments(&self, include_info: bool) -> Result<Vec<SegmentInfo>>;
+    /// Of the row group from `row_start` with `rows` rows as it is stored, how a VARIANT column of it is shredded:
+    /// the type of its typed part, or `None` when it is not; `None` when there is no such row group.
+    fn variant_shredding(&self, _row_start: u64, _rows: usize, _column: usize) -> Option<Option<LogicalType>> {
+        None
+    }
+    /// [`Self::variant_shredding`] of each row group and each of `columns`.
+    fn all_variant_shredding(&self, _columns: &[usize]) -> HashMap<(u64, usize, usize), Option<LogicalType>> {
+        HashMap::new()
+    }
 }
 
 /// A row of `pragma_storage_info`.
@@ -338,6 +347,9 @@ pub struct TableCatalogEntry {
     source: RwLock<Option<Arc<dyn TableSource>>>,
     /// Where they still are too if they were only read from there, for what looks at the file.
     read_from: RwLock<Option<Arc<dyn TableSource>>>,
+    /// How the last checkpoint shredded the VARIANT columns of the row groups it wrote, by the row group's first
+    /// row id, its rows and the column: the type of the typed part, or `None` when not shredded.
+    pub variant_shredding: Mutex<HashMap<(u64, usize, usize), Option<LogicalType>>>,
     /// Beyond the NOT NULLs, which are in `columns`.
     pub constraints: Vec<TableConstraint>,
     /// What the write-ahead log knows of the rows.
@@ -473,6 +485,16 @@ pub struct ColumnStatistics {
     /// of a LIST or ARRAY its element's (`ListStats` / `ArrayStats`), of a STRUCT each field's
     /// (`StructStats`); empty when not known
     pub children: Vec<ColumnStatistics>,
+    /// of a VARIANT, how it is shredded (`VariantStats`); `None` when not known (`INCONSISTENT`)
+    pub variant: Option<Box<VariantStatistics>>,
+}
+
+/// `VariantStatsShreddingState`, with the type of the typed part of a shredded VARIANT and its statistics.
+#[derive(Debug, Clone)]
+pub enum VariantStatistics {
+    NotShredded,
+    Shredded(LogicalType, ColumnStatistics),
+    Inconsistent,
 }
 
 /// `StringStatsData`: what is known of the strings of a column besides their bounds.
@@ -663,6 +685,7 @@ impl TableCatalogEntry {
             storage: RwLock::new(rows),
             source: RwLock::default(),
             read_from: RwLock::default(),
+            variant_shredding: Mutex::default(),
             log: Mutex::default(),
             constraints,
             referenced_by: Mutex::default(),
@@ -704,6 +727,12 @@ impl TableCatalogEntry {
 
     pub fn set_source(&self, source: Arc<dyn TableSource>) {
         self.set_row_ids(source.row_ids());
+        let variants: Vec<usize> = (0..self.columns.len())
+            .filter(|&c| self.columns[c].ty.id() == LogicalTypeId::Variant)
+            .collect();
+        if !variants.is_empty() {
+            *self.variant_shredding.lock() = source.all_variant_shredding(&variants);
+        }
         *self.source.write() = Some(source);
     }
 

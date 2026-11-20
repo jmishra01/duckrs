@@ -764,6 +764,7 @@ test/parquet/variant/variant_multiple_files.test
 test/parquet/variant/variant_nanos_tz.test
 test/parquet/variant/variant_partially_shredded.test
 test/parquet/variant/variant_short_string_boundary.test
+test/parquet/variant/variant_shred_unsigned_types.test
 test/parquet/variant/variant_shredded.test
 test/parquet/variant/variant_shredded_nested.test
 test/parquet/variant/variant_shredding_column_names.test
@@ -4005,8 +4006,11 @@ test/sql/storage/types/variant/variant_shredding_empty_keys.test
 test/sql/storage/types/variant/variant_shredding_inconsistent.test
 test/sql/storage/types/variant/variant_shredding_omit_untyped.test
 test/sql/storage/types/variant/variant_shredding_small.test
+test/sql/storage/types/variant/variant_stats_case_sensitive_merge.test
+test/sql/storage/types/variant/variant_stats_merge_fast.test
 test/sql/storage/types/variant/variant_storage_version.test
 test/sql/storage/types/variant/variant_struct_field_subquery.test
+test/sql/storage/types/variant/variant_validity_stats.test
 test/sql/storage/unicode_filename.test
 test/sql/storage/unzip.test
 test/sql/storage/update/dictionary_reset_updates.test
@@ -4816,6 +4820,7 @@ test/sql/types/variant/try_cast_nested_list_writer.test
 test/sql/types/variant/variant_binary_duplicate_keys.test
 test/sql/types/variant/variant_cast_parameter_stats.test
 test/sql/types/variant/variant_cast_parent_path_order.test
+test/sql/types/variant/variant_cast_stats.test
 test/sql/types/variant/variant_cast_stats_json.test
 test/sql/types/variant/variant_cast_type_null.test
 test/sql/types/variant/variant_casts.test

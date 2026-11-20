@@ -30,8 +30,9 @@ use std::sync::Arc;
 
 type Stats = ColumnStatistics;
 
-fn unknown() -> Stats {
+pub(super) fn unknown() -> Stats {
     Stats {
+        variant: None,
         min: None,
         max: None,
         can_be_null: true,
@@ -60,12 +61,23 @@ fn compute_statistics(table: &Arc<TableCatalogEntry>, positions: Option<Vec<usiz
         && let Some(mut statistics) = table.source().and_then(|source| source.column_statistics())
     {
         add_geometry_statistics(table, None, &mut statistics)?;
+        mark_variants(table, &mut statistics);
         return Some(statistics);
     }
     let mut statistics = compute_ordered_statistics(table, positions.clone())?;
     add_geometry_statistics(table, positions.clone(), &mut statistics)?;
     add_nested_statistics(table, positions, &mut statistics)?;
+    mark_variants(table, &mut statistics);
     Some(statistics)
+}
+
+/// `VariantStats::MarkAsNotShredded`: the VARIANT columns that no checkpoint shredded.
+fn mark_variants(table: &Arc<TableCatalogEntry>, statistics: &mut [Stats]) {
+    for (column, stats) in table.columns.iter().zip(statistics.iter_mut()) {
+        if column.ty.id() == LogicalTypeId::Variant && stats.variant.is_none() {
+            stats.variant = Some(Box::new(crate::catalog::VariantStatistics::NotShredded));
+        }
+    }
 }
 
 /// The statistics of the LIST, ARRAY and STRUCT columns, with their children's, from their values.
@@ -328,6 +340,7 @@ fn compute_ordered_statistics(table: &Arc<TableCatalogEntry>, positions: Option<
             usable.then_some(value)
         };
         statistics.push(Stats {
+            variant: None,
             min: count_at.checked_sub(2).and_then(bound),
             max: count_at.checked_sub(1).and_then(bound),
             can_be_null: valid < total,
@@ -541,6 +554,7 @@ fn union(a: Stats, b: Stats) -> Stats {
         _ => (smaller(a.min, b.min), larger(a.max, b.max)),
     };
     Stats {
+        variant: None,
         min,
         max,
         can_be_null: a.can_be_null || b.can_be_null,
@@ -632,6 +646,7 @@ fn value_stats(value: &Value, ty: &LogicalType) -> Stats {
             };
             let bound = has_ordered_statistics(ty).then(|| value.clone());
             Stats {
+                variant: None,
                 min: bound.clone(),
                 max: bound,
                 can_be_null: false,
@@ -842,6 +857,7 @@ impl StatisticsPropagator {
     fn expression(&mut self, expr: &mut BoundExpr, in_filter: bool) -> Stats {
         match &mut expr.kind {
             BoundExprKind::Constant(value) if value.is_null() => Stats {
+                variant: None,
                 min: None,
                 max: None,
                 can_be_null: true,
@@ -874,6 +890,7 @@ impl StatisticsPropagator {
                 };
                 let value = has_ordered_statistics(&expr.return_type).then(|| value.clone());
                 Stats {
+                    variant: None,
                     min: value.clone(),
                     max: value,
                     can_be_null: false,
@@ -1125,8 +1142,19 @@ impl StatisticsPropagator {
         // `FunctionNullHandling::SPECIAL_HANDLING`: a TRY_CAST gives NULL of what doesn't convert
         let try_cast = *try_cast;
         let mut stats = self.expression(child, false);
+        // `StatisticsPropagateToVariant`: what is shredded are the values, a TRY_CAST makes the VARIANT NULL
+        if target.id() == LogicalTypeId::Variant {
+            let mut result =
+                super::variant_statistics::cast_to_variant(&child.return_type, &stats).unwrap_or_else(unknown);
+            result.can_be_null |= try_cast;
+            return result;
+        }
         if try_cast {
             stats.can_be_null = true;
+        }
+        // `StatisticsPropagateVariant`
+        if child.return_type.id() == LogicalTypeId::Variant {
+            return super::variant_statistics::cast_from_variant(&stats, &target).unwrap_or_else(unknown);
         }
         // `CastStatistics::CanPropagate`: of numbers to numbers, by their physical types, DECIMAL
         // too; a DATE or a TIMESTAMP, whose -infinity sorts above its smallest values, is left out
@@ -1378,6 +1406,7 @@ impl StatisticsPropagator {
             }
             let (min, max) = if least { (loose, anchored) } else { (anchored, loose) };
             return Stats {
+                variant: None,
                 min,
                 max,
                 can_be_null: !has_nonnull,
@@ -1418,6 +1447,14 @@ impl StatisticsPropagator {
                     children: vec![child],
                     ..unknown()
                 };
+            }
+            "variant_extract" if children.len() == 2 && children[0].return_type.id() == LogicalTypeId::Variant => {
+                if let BoundExprKind::Constant(key) = &children[1].kind
+                    && let Some(result) = super::variant_statistics::extract(&stats[0], key)
+                {
+                    return result;
+                }
+                return unknown();
             }
             "struct_extract" if children.len() == 2 && children[0].return_type.id() == LogicalTypeId::Struct => {
                 let position = match &children[1].kind {
@@ -1460,7 +1497,9 @@ impl StatisticsPropagator {
             let argument = children[0].return_type.clone();
             // `DistinctStatistics` of a table's column: only what a column of it is has them
             let mut argument_stats = stats[0].clone();
+            // a VARIANT column has no `DistinctStatistics`
             if let BoundExprKind::ColumnRef { binding, depth: 0 } = &children[0].kind
+                && argument.id() != LogicalTypeId::Variant
                 && let Some((table, column)) = self.sources.get(&self.base_of(*binding)).cloned()
             {
                 argument_stats.distinct = table_distinct_counts(&table)
@@ -1530,6 +1569,7 @@ impl StatisticsPropagator {
                 return unknown();
             };
             return Stats {
+                variant: None,
                 min: Some(min),
                 max: Some(max),
                 can_be_null: stats[0].can_be_null || stats[1].can_be_null,
@@ -1616,6 +1656,7 @@ impl StatisticsPropagator {
                 (0, negated_low.max(high))
             };
             return Stats {
+                variant: None,
                 min: int_value(min),
                 max: int_value(max),
                 can_be_null: child.can_be_null,
@@ -1676,6 +1717,7 @@ impl StatisticsPropagator {
                 return unknown();
             };
             return Stats {
+                variant: None,
                 min: int_value(min),
                 max: int_value(max),
                 can_be_null,
@@ -2732,6 +2774,7 @@ impl StatisticsPropagator {
             crate::execution::expression_executor::try_evaluate_scalar(&value)
         };
         Some(Stats {
+            variant: None,
             min: cast(min),
             max: cast(max),
             can_be_null: true,
@@ -2757,8 +2800,12 @@ fn stats_struct(stats: &Stats, ty: &LogicalType) -> Option<Value> {
 }
 
 /// `BaseStatistics::ToStruct`, as a STRUCT value.
-fn stats_fields(stats: &Stats, ty: &LogicalType) -> Option<Value> {
+pub(super) fn stats_fields(stats: &Stats, ty: &LogicalType) -> Option<Value> {
     let mut fields = Vec::new();
+    // `VariantStats::ToStruct`
+    if ty.id() == LogicalTypeId::Variant {
+        fields.extend(super::variant_statistics::variant_fields(stats));
+    }
     // `ListStats::ToStruct` / `ArrayStats::ToStruct` / `StructStats::ToStruct`: the children's
     let child = |at: usize, child_type: &LogicalType| -> Option<Value> {
         let unknown_child = unknown();
@@ -2978,6 +3025,7 @@ fn monotone_bounds(
         return None;
     }
     Some(Stats {
+        variant: None,
         min: Some(out_low),
         max: Some(out_high),
         can_be_null,
@@ -3094,6 +3142,7 @@ fn date_part_stats(name: &str, child: &Stats, child_type: &LogicalType, return_t
         return None;
     }
     Some(Stats {
+        variant: None,
         min: Some(low),
         max: Some(high),
         can_be_null: child.can_be_null,

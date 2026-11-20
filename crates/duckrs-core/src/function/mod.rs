@@ -295,7 +295,11 @@ pub fn stats_supported(ty: &LogicalType) -> bool {
         _ => {
             matches!(
                 ty.id(),
-                LogicalTypeId::SqlNull | LogicalTypeId::Geometry | LogicalTypeId::Varchar | LogicalTypeId::Blob
+                LogicalTypeId::SqlNull
+                    | LogicalTypeId::Geometry
+                    | LogicalTypeId::Varchar
+                    | LogicalTypeId::Blob
+                    | LogicalTypeId::Variant
             ) || crate::optimizer::statistics::has_ordered_statistics(ty)
         }
     }

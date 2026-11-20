@@ -38,6 +38,7 @@ mod remove_redundant_order;
 pub mod rewriter;
 pub mod scan_filters;
 pub mod statistics;
+mod variant_statistics;
 pub mod top_n;
 pub mod row_number_rewriter;
 pub mod type_pushdown;

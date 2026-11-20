@@ -19,6 +19,7 @@ use duckrs_common::vector::{DataChunk, SelectionVector, Vector};
 use duckrs_common::{Error, Result};
 use duckrs_parser::ast::ComparisonOp;
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const STANDARD_VECTOR_SIZE: usize = 2048;
@@ -757,6 +758,73 @@ impl DiskTable {
     }
 }
 
+/// The bound of a value of `ty` in its little-endian bytes.
+fn bound_of(ty: &LogicalType, bytes: Option<&[u8; 16]>) -> Result<Option<Value>> {
+    let width = fixed_width(ty.physical_type());
+    let (Some(bytes), Some(width)) = (bytes, width.filter(|_| has_ordered_statistics(ty))) else {
+        return Ok(None);
+    };
+    let mut vector = Vector::new(ty.clone(), 1);
+    fill_vector(&mut vector, &bytes[..width])?;
+    Ok(Some(vector.get_value(0)))
+}
+
+/// What the statistics of a file say about a column of `ty`, with those of what is in it. Bounds with the
+/// minimum above the maximum, as those of no values, are none (`NumericStats::HasMinMax`).
+fn column_statistics_of(stored: &BaseStatistics, ty: &LogicalType) -> Option<ColumnStatistics> {
+    let mut min = bound_of(ty, stored.min.as_ref()).ok()?;
+    let mut max = bound_of(ty, stored.max.as_ref()).ok()?;
+    if let (Some(a), Some(b)) = (&min, &max)
+        && compare_values(ComparisonOp::GreaterThan, a, b) == Some(true)
+    {
+        (min, max) = (None, None);
+    }
+    let child_types: Vec<&LogicalType> = match ty.physical_type() {
+        PhysicalType::Struct if ty.id() != LogicalTypeId::Variant => {
+            ty.struct_children().iter().map(|(_, ty)| ty).collect()
+        }
+        PhysicalType::List | PhysicalType::Array => ty.child_type().into_iter().collect(),
+        _ => Vec::new(),
+    };
+    let children = if child_types.len() == stored.children.len() {
+        child_types
+            .iter()
+            .zip(&stored.children)
+            .map(|(ty, stored)| column_statistics_of(stored, ty))
+            .collect::<Option<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+    let variant = match &stored.variant {
+        _ if ty.id() != LogicalTypeId::Variant => None,
+        Some(variant) => Some(Box::new(match (variant.state, &variant.shredded) {
+            (2, Some((shredded, stats))) => {
+                crate::catalog::VariantStatistics::Shredded(shredded.clone(), column_statistics_of(stats, shredded)?)
+            }
+            (1, _) => crate::catalog::VariantStatistics::NotShredded,
+            _ => crate::catalog::VariantStatistics::Inconsistent,
+        })),
+        None => None,
+    };
+    Some(ColumnStatistics {
+        variant,
+        min,
+        max,
+        can_be_null: stored.has_null,
+        can_be_valid: stored.has_no_null,
+        geometry: stored.geometry,
+        strings: stored.strings.as_ref().map(|strings| crate::catalog::StringStatistics {
+            bounds: strings.bounds_known.then(|| (strings.min.clone(), strings.max.clone())),
+            has_unicode: strings.has_unicode,
+            min_length: strings.min_length,
+            max_length: strings.max_length,
+            total_length: strings.total_length,
+        }),
+        distinct: None,
+        children,
+    })
+}
+
 impl DiskTable {
     /// [`TableSource::fetch_rows`] of a fixed-width column of a group without deletes: the rows read
     /// from their segments, those that can be read on their own (constant, uncompressed, bit-packed)
@@ -912,37 +980,44 @@ impl TableSource for DiskTable {
         let statistics = self.table.column_statistics.iter().enumerate();
         statistics
             .map(|(column, stored)| {
-                let unknown = ColumnStatistics {
-                    min: None,
-                    max: None,
-                    can_be_null: true,
-                    can_be_valid: true,
-                    geometry: None,
-                    strings: None,
-                    distinct: None,
-                    children: Vec::new(),
-                };
-                let Some(stored) = stored else {
-                    return Some(unknown);
-                };
-                Some(ColumnStatistics {
-                    min: self.bound(column, stored.min.as_ref()).ok()?,
-                    max: self.bound(column, stored.max.as_ref()).ok()?,
-                    can_be_null: stored.has_null,
-                    can_be_valid: stored.has_no_null,
-                    geometry: stored.geometry,
-                    strings: stored.strings.as_ref().map(|strings| crate::catalog::StringStatistics {
-                        bounds: Some((strings.min.clone(), strings.max.clone())),
-                        has_unicode: strings.has_unicode,
-                        min_length: strings.min_length,
-                        max_length: strings.max_length,
-                        total_length: strings.total_length,
+                let ty = &self.table.columns[column].ty;
+                match stored {
+                    Some(stored) => column_statistics_of(stored, ty),
+                    None => Some(ColumnStatistics {
+                        variant: None,
+                        min: None,
+                        max: None,
+                        can_be_null: true,
+                        can_be_valid: true,
+                        geometry: None,
+                        strings: None,
+                        distinct: None,
+                        children: Vec::new(),
                     }),
-                    distinct: None,
-                    children: Vec::new(),
-                })
+                }
             })
             .collect()
+    }
+
+    fn all_variant_shredding(&self, columns: &[usize]) -> HashMap<(u64, usize, usize), Option<LogicalType>> {
+        let mut result = HashMap::new();
+        for (index, group) in self.table.row_groups.iter().enumerate() {
+            for &column in columns {
+                if let Ok(stored) = self.persistent_column(index, column) {
+                    result.insert((group.row_start, group.tuple_count as usize, column), stored.shredded);
+                }
+            }
+        }
+        result
+    }
+
+    fn variant_shredding(&self, row_start: u64, rows: usize, column: usize) -> Option<Option<LogicalType>> {
+        let group = self
+            .table
+            .row_groups
+            .iter()
+            .position(|group| group.row_start == row_start && group.tuple_count as usize == rows)?;
+        Some(self.persistent_column(group, column).ok()?.shredded)
     }
 
     fn segments(&self, include_info: bool) -> Result<Vec<SegmentInfo>> {
@@ -1091,7 +1166,7 @@ impl TableSource for DiskTable {
 /// all of them, and a truncated maximum is raised to above all strings it is a prefix of (`StringStats::CheckZonemap`
 /// compares the prefixes instead).
 fn string_bounds(bounds: Option<&super::statistics::StringBounds>) -> (Option<Value>, Option<Value>) {
-    let Some(bounds) = bounds else {
+    let Some(bounds) = bounds.filter(|bounds| bounds.bounds_known) else {
         return (None, None);
     };
     // what of a truncated bound is UTF-8, cut where a character was split
