@@ -673,8 +673,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
   Two earlier runs under heavier load were 1.27× and 1.37×, with Q18 and Q14 above 3× in them. The gate passes;
   measure once more on a quiet machine before ticking this. Q10 then took 18% less: a GROUP BY writes the keys of a
   chunk's rows into one buffer and makes a key only for a new group, and threads read blocks of the file at once
-  (`pread`), where they took turns. Not yet like C++: the first query of a table counts the distinct values of
-  each of its columns from all its rows (C++ keeps them in the file), which takes 27s at SF10. duckrs
+  (`pread`), where they took turns. The distinct values of each column, which the join order starts from, are
+  kept in the file as C++ keeps them (`DistinctStatistics`, as `HLL_V2`, and read of older files as `HLL_V1`):
+  the first query of a file at SF10 took 16–27s counting them from all the rows, and takes under a second. duckrs
   had no way to load SF10 itself, as an append kept its rows in memory (more than 2 GiB failed); appends now write
   their full row groups to blocks as they fill (an INSERT of 80M rows takes 90MB). duckrs now loads SF10 into its
   own file (COPY of the `.tbl` files: lineitem 24s against C++'s 22s, the rest under 5s each; at most 710MB

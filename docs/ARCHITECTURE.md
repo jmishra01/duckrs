@@ -578,6 +578,13 @@ leave them as they are, and new values are added by reading only rows that are n
 (`rows_removed`, `rows_appended`, `rows_updated_in_place`), and what nobody reports counts as all of
 them. Zones stay for the row groups before the first row that changed.
 
+**Distinct values** of a column (`optimizer::distinct_statistics::DistinctState`) are C++'s `DistinctStatistics`: a
+HyperLogLog of a sample of each appended chunk, with how many rows it saw. A file keeps them per column, which
+`TableSource::distinct_states` reads (`HLL_V2`, or `HLL_V1` converted as `HLLV1::ToNew` does); a row group
+written ahead counts its own as it is encoded, rows in memory are counted from their chunks, and the parts of a
+table merge. A checkpoint writes them for files from v1.2.0 on. Where a part does not have them (a file without
+them, or row groups replayed from a log), they are counted from all the rows, as before.
+
 **Temporary objects** are a connection's: each has a schema of its own, which `Catalog::get_schema`
 finds through a thread local for as long as a statement of that connection runs (`SessionTemp`).
 

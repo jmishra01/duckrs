@@ -1197,6 +1197,26 @@ impl TableSource for DiskTable {
         self.read_rows(None)
     }
 
+    fn distinct_states(&self) -> Option<Vec<Option<crate::optimizer::distinct_statistics::DistinctState>>> {
+        use crate::optimizer::distinct_statistics::type_is_supported;
+        if self.table.column_statistics.len() != self.table.columns.len() {
+            return None;
+        }
+        self.table
+            .column_statistics
+            .iter()
+            .zip(&self.table.columns)
+            .map(|(stored, column)| {
+                let state = stored.as_ref().and_then(|stored| stored.distinct.clone());
+                match state {
+                    Some(state) => Some(Some(state)),
+                    None if type_is_supported(&column.ty) => None,
+                    None => Some(None),
+                }
+            })
+            .collect()
+    }
+
     fn column_statistics(&self) -> Option<Vec<ColumnStatistics>> {
         if self.table.column_statistics.len() != self.table.columns.len() {
             return None;

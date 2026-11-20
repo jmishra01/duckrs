@@ -458,9 +458,17 @@ pub(super) fn table_statistics(table: &Arc<TableCatalogEntry>) -> Option<Arc<Vec
 /// The distinct values of each column of `table`, as C++'s statistics count them
 /// ([`super::distinct_statistics`]).
 fn compute_distinct_counts(table: &Arc<TableCatalogEntry>) -> Option<TableDistinctCounts> {
-    let columns = (0..table.columns.len())
-        .map(|column| super::distinct_statistics::table_column_distinct(table, column))
-        .collect();
+    // a file keeps them, as C++ does, and counting them again would read all of the table
+    let stored = table.distinct_states();
+    let columns = match stored {
+        Some(states) => states
+            .iter()
+            .map(|state| state.as_ref().map(|state| state.count()))
+            .collect(),
+        None => (0..table.columns.len())
+            .map(|column| super::distinct_statistics::table_column_distinct(table, column))
+            .collect(),
+    };
     Some(TableDistinctCounts {
         rows: table.row_count() as u64,
         columns,

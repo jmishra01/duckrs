@@ -38,6 +38,8 @@ pub struct BaseStatistics {
     pub children: Vec<BaseStatistics>,
     /// of a LIST, the lengths of its lists, as files from v2.1.0 have them
     pub lists: Option<crate::catalog::ListLengths>,
+    /// of a table's column, its `DistinctStatistics`, if the file has them in a form that is read
+    pub distinct: Option<crate::optimizer::distinct_statistics::DistinctState>,
 }
 
 fn numeric_value(d: &mut BinaryDeserializer<'_>, physical: PhysicalType) -> Result<Option<[u8; 16]>> {
@@ -216,6 +218,7 @@ pub fn read_statistics(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>)
             variant_shredded: nested.variant_shredded,
             children: nested.children,
             lists: nested.lists,
+            distinct: None,
         })
     })
 }
@@ -337,28 +340,39 @@ fn read_type_stats(
 }
 
 /// `HyperLogLog::Deserialize`, whose registers nothing uses yet.
-struct HyperLogLog;
+/// `HyperLogLog::Deserialize`: the registers, as they are of `HLL_V2`, and of `HLL_V1` as `HLLV1::ToNew` makes
+/// them; `None` of what is neither.
+struct HyperLogLog(Option<Vec<u8>>);
+
+use crate::optimizer::distinct_statistics::{HLL_V1, HLL_V2, registers_of_v1};
 
 impl Deserialize for HyperLogLog {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(|d| {
-            d.read_property::<u8>(100, "type")?;
-            d.read_property::<RawBytes>(101, "data")?;
-            Ok(Self)
+            let storage = d.read_property::<u8>(100, "type")?;
+            let data = d.read_property::<RawBytes>(101, "data")?;
+            Ok(Self(match storage {
+                HLL_V2 => Some(data.0),
+                HLL_V1 => registers_of_v1(&data.0),
+                _ => None,
+            }))
         })
     }
 }
 
 /// `DistinctStatistics::Deserialize`.
-struct DistinctStatistics;
+struct DistinctStatistics(Option<crate::optimizer::distinct_statistics::DistinctState>);
 
 impl Deserialize for DistinctStatistics {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(|d| {
-            d.read_property_with_default::<u64>(100, "sample_count")?;
-            d.read_property_with_default::<u64>(101, "total_count")?;
-            d.read_optional_property::<Option<HyperLogLog>>(102, "log")?;
-            Ok(Self)
+            let sample_count = d.read_property_with_default::<u64>(100, "sample_count")?;
+            let total_count = d.read_property_with_default::<u64>(101, "total_count")?;
+            let log = d.read_optional_property::<Option<HyperLogLog>>(102, "log")?.flatten();
+            let state = log.and_then(|log| log.0).and_then(|registers| {
+                crate::optimizer::distinct_statistics::DistinctState::stored(&registers, sample_count, total_count)
+            });
+            Ok(Self(state))
         })
     }
 }
@@ -369,8 +383,11 @@ pub fn read_column_statistics(d: &mut BinaryDeserializer<'_>, ty: &LogicalType) 
         return Ok(None);
     }
     d.read_object_value(|d| {
-        let statistics = d.read_object_field(100, "statistics", |d| read_statistics(d, Some(ty)))?;
-        d.read_optional_property::<Option<DistinctStatistics>>(101, "distinct")?;
+        let mut statistics = d.read_object_field(100, "statistics", |d| read_statistics(d, Some(ty)))?;
+        statistics.distinct = d
+            .read_optional_property::<Option<DistinctStatistics>>(101, "distinct")?
+            .flatten()
+            .and_then(|distinct| distinct.0);
         Ok(Some(statistics))
     })
 }
@@ -492,4 +509,29 @@ fn skip_data_chunk(d: &mut BinaryDeserializer<'_>) -> Result<()> {
         d.read_object_value(|d| skip_vector(d, ty))
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use duckrs_common::serializer::{BinarySerializer, SerializationOptions};
+
+    #[test]
+    fn distinct_statistics_read_back_as_written() {
+        use crate::optimizer::distinct_statistics::DistinctState;
+        let mut state = DistinctState::default();
+        let mut vector = duckrs_common::vector::Vector::new(LogicalType::BIGINT, 2048);
+        vector.prepare_flat(2048);
+        for (row, value) in vector.data_mut::<i64>().iter_mut().enumerate() {
+            *value = (row % 300) as i64;
+        }
+        assert!(state.update(&LogicalType::BIGINT, &vector, 2048));
+        let mut s = BinarySerializer::new(SerializationOptions::default());
+        s.write_object_value(|s| state.write(s));
+        let bytes = s.into_bytes();
+        let mut d = BinaryDeserializer::new(&bytes);
+        let read = DistinctStatistics::read_value(&mut d).unwrap().0.unwrap();
+        assert_eq!(read.count(), state.count());
+        assert!(read.count() > 0);
+    }
 }

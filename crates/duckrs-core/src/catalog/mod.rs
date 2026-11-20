@@ -172,6 +172,11 @@ pub trait TableSource: std::fmt::Debug + Send + Sync {
     fn read_all(&self) -> Result<ColumnDataCollection>;
     /// What the file says about the values of the table's columns, without reading them.
     fn column_statistics(&self) -> Option<Vec<ColumnStatistics>>;
+    /// The `DistinctStatistics` of each column that the file has, without reading the rows: `None` if there is
+    /// a column of a type that has them and they are not known.
+    fn distinct_states(&self) -> Option<Vec<Option<crate::optimizer::distinct_statistics::DistinctState>>> {
+        None
+    }
     /// What the file says about a column per group, without reading its values.
     fn zones(&self, column: usize) -> Result<Vec<ColumnZone>>;
     /// Of the row group from `row_start` with `rows` rows as it is stored, how a VARIANT column of it is shredded:
@@ -927,6 +932,24 @@ impl TableCatalogEntry {
         let ids = (*ids).clone();
         let appended = crate::storage::appended::AppendedTable::new(parts, ids, self.types(), self.row_group_size());
         Some(Arc::new(appended))
+    }
+
+    /// The `DistinctStatistics` of each column, as C++ keeps them while rows are appended: those of the file and
+    /// of the row groups written ahead, merged with those of the rows in memory. `None` if those of a part are not
+    /// known (a file that does not have them), and then they come from the rows.
+    pub fn distinct_states(&self) -> Option<Vec<Option<crate::optimizer::distinct_statistics::DistinctState>>> {
+        use crate::optimizer::distinct_statistics::rows_distinct;
+        if let Some(source) = self.source() {
+            return source.distinct_states();
+        }
+        let storage = self.storage.read();
+        Some(
+            self.columns
+                .iter()
+                .enumerate()
+                .map(|(column, definition)| rows_distinct(&storage, column, &definition.ty))
+                .collect(),
+        )
     }
 
     /// How many of its rows are in memory.

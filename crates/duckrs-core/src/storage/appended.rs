@@ -245,6 +245,36 @@ impl TableSource for AppendedTable {
         super::writer::written_statistics(&groups)
     }
 
+    fn distinct_states(&self) -> Option<Vec<Option<crate::optimizer::distinct_statistics::DistinctState>>> {
+        use crate::optimizer::distinct_statistics::{DistinctState, rows_distinct};
+        // `Merge` of each part's: the file's, then those of the rows appended in memory
+        let mut result: Option<Vec<Option<DistinctState>>> = None;
+        for part in &self.parts {
+            let states: Vec<Option<DistinctState>> = match part {
+                AppendedPart::Source(source) => source.distinct_states()?,
+                AppendedPart::Memory(rows) => (0..self.types.len())
+                    .map(|column| rows_distinct(rows, column, &self.types[column]))
+                    .collect(),
+                AppendedPart::Written(group) => group.distinct()?,
+            };
+            result = Some(match result {
+                None => states,
+                Some(merged) => merged
+                    .into_iter()
+                    .zip(states)
+                    .map(|(a, b)| match (a, b) {
+                        (Some(mut a), Some(b)) => {
+                            a.merge(&b);
+                            Some(a)
+                        }
+                        (a, b) => a.or(b),
+                    })
+                    .collect(),
+            });
+        }
+        result
+    }
+
     fn zones(&self, column: usize) -> Result<Vec<ColumnZone>> {
         let unknown = || ColumnZone {
             unknown: true,

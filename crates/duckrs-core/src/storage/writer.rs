@@ -34,6 +34,7 @@ use crate::catalog::{
     Catalog, IndexCatalogEntry, MacroCatalogEntry, RowIds, SchemaCatalogEntry, SequenceCatalogEntry, TEMP_SCHEMA,
     TableCatalogEntry, TableConstraint, TableCursor, ViewCatalogEntry,
 };
+use crate::optimizer::distinct_statistics::{DistinctState, type_is_supported};
 use crate::planner::binder::Binder;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::serializer::StorageVersion;
@@ -3471,6 +3472,11 @@ impl<'a> Writer<'a> {
             at: None,
         };
         let mut statistics: Vec<Option<Stats>> = vec![None; types.len()];
+        // `ColumnStatistics::distinct_stats`, which only files of v1.2.0 on keep (`HLL_V2`)
+        let distinct = (self.version >= StorageVersion::V1_2_0)
+            .then(|| table.distinct_states())
+            .flatten()
+            .unwrap_or_default();
         let mut row_groups = Vec::new();
         let size = self.chunks_per_row_group * STANDARD_VECTOR_SIZE;
         let (mut stored_rows, mut next_row_id) = (0u64, 0u64);
@@ -3530,6 +3536,9 @@ impl<'a> Writer<'a> {
                 let stats = statistics[column].clone().unwrap_or_else(Stats::unknown);
                 s.write_object_value(|s| {
                     s.write_object(100, "statistics", |s| write_stats(s, Some(&types[column]), &stats));
+                    if let Some(Some(state)) = distinct.get(column) {
+                        s.write_nullable_object(101, "distinct", |s| state.write(s));
+                    }
                 });
             });
         });
@@ -3774,6 +3783,8 @@ pub struct WrittenGroup {
     persistent: Vec<super::table_data::PersistentColumn>,
     types: Vec<LogicalType>,
     buffer: std::sync::Arc<BufferManager>,
+    /// the `DistinctStatistics` of each column, if it was counted as its rows were appended; empty if not
+    distinct: Vec<Option<DistinctState>>,
 }
 
 impl std::fmt::Debug for WrittenGroup {
@@ -3786,6 +3797,11 @@ impl std::fmt::Debug for WrittenGroup {
 }
 
 impl WrittenGroup {
+    /// The `DistinctStatistics` of its columns, if they were counted as its rows were appended.
+    pub fn distinct(&self) -> Option<Vec<Option<DistinctState>>> {
+        (self.distinct.len() == self.types.len()).then(|| self.distinct.clone())
+    }
+
     fn new(
         row_start: u64,
         rows: usize,
@@ -3809,6 +3825,7 @@ impl WrittenGroup {
             persistent,
             types,
             buffer,
+            distinct: Vec::new(),
         })
     }
 
@@ -3967,6 +3984,8 @@ struct EncodedBatch {
     parts: Vec<Vec<Vec<Part>>>,
     tasks: Vec<(usize, usize)>,
     deferred: Vec<Option<(ColumnOut, Deferred)>>,
+    /// per row group, the `DistinctStatistics` of each column, as appending its rows updates them in C++
+    distinct: Vec<Vec<Option<DistinctState>>>,
 }
 
 /// The encoding of [`write_ahead`], each column of each row group on a thread of its own where there are threads.
@@ -4017,15 +4036,35 @@ pub fn encode_ahead(
                 .flat_map(|column| (0..batch.len()).map(move |group| (column, group)))
                 .collect();
             let deferred = encode_deferred(buffer, catalog, table, options, &parts, &tasks);
+            let distinct = parts.iter().map(|group| parts_distinct(group, &types)).collect();
             EncodedBatch {
                 bounds: batch.to_vec(),
                 parts,
                 tasks,
                 deferred,
+                distinct,
             }
         })
         .collect();
     EncodedAhead { first, batches }
+}
+
+/// The `DistinctStatistics` of each column of a row group, from its parts.
+fn parts_distinct(parts: &[Vec<Part>], types: &[LogicalType]) -> Vec<Option<DistinctState>> {
+    parts
+        .iter()
+        .zip(types)
+        .map(|(parts, ty)| {
+            if !type_is_supported(ty) {
+                return None;
+            }
+            let mut state = DistinctState::default();
+            parts
+                .iter()
+                .all(|part| state.update(ty, &part.vector, part.count))
+                .then_some(state)
+        })
+        .collect()
 }
 
 /// The placing of [`write_ahead`]: the columns of `encoded` placed in their order, those that couldn't be encoded
@@ -4057,8 +4096,8 @@ pub fn place_ahead(
             };
             columns[group].push(out);
         }
-        for (&(start, end), columns) in batch.bounds.iter().zip(columns) {
-            groups.push((first_id + (start - first) as u64, end - start, columns));
+        for ((&(start, end), columns), distinct) in batch.bounds.iter().zip(columns).zip(batch.distinct) {
+            groups.push((first_id + (start - first) as u64, end - start, columns, distinct));
         }
     }
     // `FinalFlush` at the commit; until then the blocks that aren't full stay open for the next row groups
@@ -4070,8 +4109,10 @@ pub fn place_ahead(
     let version = writer.version;
     groups
         .into_iter()
-        .map(|(row_start, rows, columns)| {
-            WrittenGroup::new(row_start, rows, columns, types.clone(), version, buffer.clone())
+        .map(|(row_start, rows, columns, distinct)| {
+            let mut group = WrittenGroup::new(row_start, rows, columns, types.clone(), version, buffer.clone())?;
+            group.distinct = distinct;
+            Ok(group)
         })
         .collect()
 }

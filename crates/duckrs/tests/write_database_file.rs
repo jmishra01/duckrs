@@ -1485,6 +1485,55 @@ fn quoted_csv_loads_on_threads_as_on_one() {
     assert_eq!(loaded("quotes_bad_8.db", &copy, 8).unwrap_err(), error);
 }
 
+/// The distinct values of a column, which the join order's estimates start from, are kept in the file as C++ keeps
+/// them (`DistinctStatistics`): read back, they give the estimates the rows gave before the checkpoint, and those of
+/// the same rows in memory, without counting them again. The rows of one table stay in memory until the checkpoint,
+/// those of the other are written ahead in row groups as they are inserted.
+#[test]
+fn distinct_counts_are_kept_in_the_file() {
+    let file = path("distinct.db");
+    let query = "EXPLAIN SELECT * FROM a, b WHERE a.k = b.k AND b.v = 'v3'";
+    let create = |c: &mut Connection| {
+        run(c, "CREATE TABLE a (k BIGINT, v VARCHAR)");
+        run(c, "CREATE TABLE b (k BIGINT, v VARCHAR)");
+        run(c, "INSERT INTO a SELECT i % 997, 'v' || (i % 31) FROM range(3000) t(i)");
+        run(
+            c,
+            "INSERT INTO b SELECT i % 50000, 'v' || (i % 7) FROM range(300000) t(i)",
+        );
+    };
+    let estimates = |c: &mut Connection| -> Vec<String> {
+        rows(c, query)
+            .iter()
+            .flat_map(|row| {
+                row.split('~')
+                    .skip(1)
+                    .map(|part| part.split(' ').next().unwrap_or("").to_string())
+            })
+            .collect::<Vec<_>>()
+    };
+    let memory = Database::open_in_memory().unwrap();
+    let mut m = memory.connect().unwrap();
+    create(&mut m);
+    let in_memory = estimates(&mut m);
+    assert!(!in_memory.is_empty());
+    let db = Database::open_in_memory().unwrap();
+    let mut c = db.connect().unwrap();
+    run(
+        &mut c,
+        &format!("ATTACH '{}' AS f (ROW_GROUP_SIZE 16384)", file.display()),
+    );
+    run(&mut c, "USE f");
+    create(&mut c);
+    assert_eq!(estimates(&mut c), in_memory, "before the checkpoint");
+    run(&mut c, "CHECKPOINT f");
+    run(&mut c, "USE memory");
+    run(&mut c, "DETACH f");
+    run(&mut c, &format!("ATTACH '{}' AS f", file.display()));
+    run(&mut c, "USE f");
+    assert_eq!(estimates(&mut c), in_memory, "read from the file");
+}
+
 /// A file read a buffer at a time, on one thread and in parts, gives what it does read whole: in buffers of 160000
 /// bytes and parts of 40000 (four lines of at most 10000), rows and quoted values with newlines in them go across
 /// many of each. The sniffer reads its 2048 rows of the first buffer.
