@@ -195,13 +195,15 @@ fn cast_can_fail(source: &LogicalType, target: &LogicalType) -> bool {
     source_signed || source_size >= target_size
 }
 
-/// `PushdownJoinFilterExpressionInternal`: the output column under integer casts, with the casts
-/// from the column outward and whether each was a TRY_CAST.
+/// `PushdownJoinFilterExpressionInternal`: the output column under integer casts, also of a VARIANT to an
+/// integer (`IsJoinFilterPushdownVariantIntegralCast`), with the casts from the column outward and whether
+/// each was a TRY_CAST.
 fn peel_casts(expr: &BoundExpr) -> Option<(usize, Vec<(LogicalType, bool)>)> {
     match &expr.kind {
         BoundExprKind::Reference(column) => Some((*column, Vec::new())),
         BoundExprKind::Cast { child, try_cast }
-            if integral(&child.return_type).is_some() && integral(&expr.return_type).is_some() =>
+            if (integral(&child.return_type).is_some() || child.return_type.id() == LogicalTypeId::Variant)
+                && integral(&expr.return_type).is_some() =>
         {
             let (column, mut casts) = peel_casts(child)?;
             casts.push((expr.return_type.clone(), *try_cast));

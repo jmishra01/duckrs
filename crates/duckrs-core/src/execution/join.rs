@@ -1508,7 +1508,13 @@ impl PhysicalOperator for PhysicalJoin {
                     BoundExprKind::Reference(column) => {
                         filter.set(finished.data.column(column), finished.count, complete)
                     }
-                    _ => filter.set(&Vector::constant(&Value::boolean(true)), 0, false),
+                    // a key that is computed, of the build rows (`CAST(b AS INTEGER)`), which computing again
+                    // must not change
+                    _ if condition.right.is_volatile() => filter.set(&Vector::constant(&Value::boolean(true)), 0, false),
+                    _ => match crate::execution::expression_executor::execute(&condition.right, &finished.data) {
+                        Ok(keys) => filter.set(&keys, finished.count, complete),
+                        Err(_) => filter.set(&Vector::constant(&Value::boolean(true)), 0, false),
+                    },
                 }
             }
         }

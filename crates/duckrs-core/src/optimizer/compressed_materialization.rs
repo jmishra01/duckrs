@@ -61,6 +61,8 @@ enum Compression {
     String,
     /// `__internal_compress_geometry_point`
     GeometryPoint,
+    /// a cast of a fully shredded VARIANT to the type it is shredded on, compressed further or not
+    Variant(LogicalType, Option<Box<Compression>>),
 }
 
 /// `CompressExpression`.
@@ -197,7 +199,69 @@ impl Pass<'_> {
             .iter()
             .map(|b| group_bindings.contains(b) && !referenced.contains(b))
             .collect();
-        self.create_projections(op, &[can], &HashMap::new())
+        // a VARIANT the binder wrapped in `variant_comparator` is compressed where it is grouped by
+        // (`GetVariantWrapperStats`), and the comparator restored above
+        let mut in_place: Vec<(usize, Compression, BoundExpr)> = Vec::new();
+        if let K::Aggregate { groups, .. } = &mut op.kind {
+            for (g, group) in groups.iter_mut().enumerate() {
+                let Some(binding) = variant_wrapper_column(group) else {
+                    continue;
+                };
+                let stats = self.statistics.get(binding);
+                let BoundExprKind::Function { children, .. } = &group.kind else {
+                    unreachable!("a wrapper")
+                };
+                if let Some(compressed) = variant_compress(children[0].clone(), &stats) {
+                    let wrapper = std::mem::replace(group, compressed.expression);
+                    in_place.push((g, compressed.how, wrapper));
+                }
+            }
+        }
+        let mut changed = self.create_projections(op, &[can], &HashMap::new());
+        if in_place.is_empty() {
+            return changed;
+        }
+        let restore_wrapped = |input: BoundExpr, how: &Compression, wrapper: &BoundExpr| {
+            let mut wrapper = wrapper.clone();
+            if let BoundExprKind::Function { children, .. } = &mut wrapper.kind {
+                children[0] = restore(input, how, &children[0].return_type.clone());
+            }
+            wrapper
+        };
+        if changed.is_empty() {
+            // nothing else was compressed: a projection above restores the groups
+            let outputs = op.column_bindings();
+            let types = op.types();
+            let index = self.take();
+            let expressions = outputs
+                .iter()
+                .zip(&types)
+                .enumerate()
+                .map(|(at, (binding, ty))| {
+                    let input = BoundExpr::column_ref(*binding, ty.clone(), "");
+                    match in_place.iter().find(|(g, ..)| *g == at) {
+                        Some((_, how, wrapper)) => restore_wrapped(input, how, wrapper),
+                        None => input,
+                    }
+                })
+                .collect();
+            let aggregate = std::mem::replace(op, LogicalOperator::new(K::CrossProduct, Vec::new()));
+            *op = LogicalOperator::new(K::Projection { table_index: index, expressions }, vec![aggregate]);
+            for (at, before) in outputs.iter().enumerate() {
+                let after = ColumnBinding::new(index, at);
+                self.statistics.copy(*before, after);
+                changed.insert(*before, after);
+            }
+            return changed;
+        }
+        // the restoring projection the other groups have restores these too
+        if let K::Projection { expressions, .. } = &mut op.kind {
+            for (g, how, wrapper) in &in_place {
+                let input = expressions[*g].clone();
+                expressions[*g] = restore_wrapped(input, how, wrapper);
+            }
+        }
+        changed
     }
 
     /// `CreateProjections`: a compressing projection below each child of `op` that has a column to
@@ -226,6 +290,7 @@ impl Pass<'_> {
                     integral_compress(input.clone(), s)
                         .or_else(|| string_compress(input.clone(), s))
                         .or_else(|| geometry_compress(input.clone(), s))
+                        .or_else(|| variant_compress(input.clone(), s))
                 };
                 match stats.as_ref().and_then(compress) {
                     Some(compressed) => {
@@ -346,24 +411,60 @@ impl Pass<'_> {
     /// of a join on one pair of columns, both compressed by their merged statistics so that they
     /// still compare. The probe side streams, so its other columns stay.
     fn compress_comparison_join(&mut self, op: &mut LogicalOperator) -> HashMap<ColumnBinding, ColumnBinding> {
+        // `TryCompressVariantComparisonJoinKey`: a join of two VARIANTs fully shredded on integral types
+        // compares them as integers of a type both fit in
+        let has_variant = op.children.iter().any(|c| c.types().iter().any(|t| t.id() == LogicalTypeId::Variant));
+        let mut lowered = HashSet::new();
+        if let K::Join { conditions, .. } = &mut op.kind
+            && conditions.len() == 1
+            && matches!(
+                conditions[0].comparison,
+                duckrs_parser::ast::ComparisonOp::Equal | duckrs_parser::ast::ComparisonOp::NotDistinctFrom
+            )
+        {
+            let condition = &mut conditions[0];
+            let key = |expr: &BoundExpr, statistics: &mut StatisticsMap| {
+                let binding = variant_wrapper_column(expr)?;
+                let (shredded, _) = super::variant_statistics::compress_info(&statistics.get(binding))?;
+                shredded.is_integral().then_some((binding, shredded))
+            };
+            if let (Some((l, left)), Some((r, right))) =
+                (key(&condition.left, self.statistics), key(&condition.right, self.statistics))
+                && let Some(target) = crate::function::combine_types::try_max_logical_type(&left, &right)
+                && target.is_integral()
+            {
+                let cast = |expr: &BoundExpr, shredded: &LogicalType| {
+                    let BoundExprKind::Function { children, .. } = &expr.kind else {
+                        unreachable!("a wrapper")
+                    };
+                    let cast = children[0].clone().cast_to(shredded, false);
+                    if *shredded == target { cast } else { cast.cast_to(&target, false) }
+                };
+                condition.left = cast(&condition.left, &left);
+                condition.right = cast(&condition.right, &right);
+                lowered.insert(l);
+                lowered.insert(r);
+            }
+        }
         let K::Join {
             conditions, predicate, ..
         } = &op.kind
         else {
             unreachable!()
         };
-        // release builds only compress large build sides that the join does not multiply much
+        // release builds only compress large build sides that the join does not multiply much, unless
+        // VARIANTs are joined
         let build = super::join_order::estimated_cardinality(&op.children[1]);
-        if build < JOIN_BUILD_CARDINALITY_THRESHOLD {
+        if !has_variant && build < JOIN_BUILD_CARDINALITY_THRESHOLD {
             return HashMap::new();
         }
-        if op.children[1].types().len() < JOIN_BUILD_COLUMN_COUNT_THRESHOLD {
+        if !has_variant && op.children[1].types().len() < JOIN_BUILD_COLUMN_COUNT_THRESHOLD {
             let joined = super::join_order::estimated_cardinality(op);
             if joined as f64 / build as f64 > JOIN_CARDINALITY_RATIO_THRESHOLD {
                 return HashMap::new();
             }
         }
-        let mut referenced = HashSet::new();
+        let mut referenced = lowered;
         if let Some(predicate) = predicate {
             collect(predicate, &mut referenced);
         }
@@ -490,6 +591,11 @@ fn integral_value(ty: &LogicalType, v: i128) -> Value {
 /// `GetIntegralCompress`: the narrowest type the range of the values fits, as a cast where the
 /// values themselves fit it (`GetIntegralCastType`), as their offset from the minimum otherwise.
 fn integral_compress(input: BoundExpr, stats: &ColumnStatistics) -> Option<Compressed> {
+    integral_compress_with(input, stats, false)
+}
+
+/// [`integral_compress`], with `offset_only` always of the offset (`CreateIntegralFunctionCompress`).
+fn integral_compress_with(input: BoundExpr, stats: &ColumnStatistics, offset_only: bool) -> Option<Compressed> {
     let ty = input.return_type.clone();
     if !ty.is_integral() {
         return None;
@@ -521,7 +627,7 @@ fn integral_compress(input: BoundExpr, stats: &ColumnStatistics) -> Option<Compr
     let preferred = same_width(offset_size, is_signed(&ty))?;
     let alternate = same_width(offset_size, !is_signed(&ty))?;
     for target in [preferred, alternate] {
-        if fits(&target) {
+        if !offset_only && fits(&target) {
             return Some(Compressed {
                 expression: input.cast_to(&target, false),
                 how: Compression::Cast,
@@ -541,6 +647,47 @@ fn integral_compress(input: BoundExpr, stats: &ColumnStatistics) -> Option<Compr
     Some(Compressed {
         expression,
         how: Compression::Offset(min),
+    })
+}
+
+/// `TryGetVariantWrapperColumnRef`: the VARIANT column of `variant_comparator(v)` or `variant_normalize(v)`.
+fn variant_wrapper_column(expr: &BoundExpr) -> Option<ColumnBinding> {
+    let BoundExprKind::Function { function, children, .. } = &expr.kind else {
+        return None;
+    };
+    if !matches!(function.name.as_str(), "variant_comparator" | "variant_normalize") || children.len() != 1 {
+        return None;
+    }
+    match &children[0].kind {
+        BoundExprKind::ColumnRef { binding, depth: 0 } if children[0].return_type.id() == LogicalTypeId::Variant => {
+            Some(*binding)
+        }
+        _ => None,
+    }
+}
+
+/// `GetVariantCompress`: a VARIANT fully shredded on a primitive type as a value of that type, which is
+/// compressed further where its statistics allow.
+fn variant_compress(input: BoundExpr, stats: &ColumnStatistics) -> Option<Compressed> {
+    if input.return_type.id() != LogicalTypeId::Variant {
+        return None;
+    }
+    let (shredded, typed) = super::variant_statistics::compress_info(stats)?;
+    let cast = input.cast_to(&shredded, false);
+    let further = if shredded.is_integral() {
+        integral_compress_with(cast.clone(), &typed, true)
+    } else {
+        string_compress(cast.clone(), &typed)
+    };
+    Some(match further {
+        Some(compressed) => Compressed {
+            expression: compressed.expression,
+            how: Compression::Variant(shredded, Some(Box::new(compressed.how))),
+        },
+        None => Compressed {
+            expression: cast,
+            how: Compression::Variant(shredded, None),
+        },
     })
 }
 
@@ -711,6 +858,14 @@ fn decompress_geometry_point(args: &DataChunk, result: &mut Vector) -> Result<()
 /// `CreateRestoreExpression`.
 fn restore(input: BoundExpr, how: &Compression, original: &LogicalType) -> BoundExpr {
     match how {
+        // `GetVariantDecompress`: to the shredded type, then the VARIANT
+        Compression::Variant(shredded, further) => {
+            let input = match further {
+                Some(how) => restore(input, how, shredded),
+                None => input,
+            };
+            input.cast_to(original, false)
+        }
         Compression::GeometryPoint => crate::function::nested::bound_function(
             "__internal_decompress_geometry_point",
             vec![input],

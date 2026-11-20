@@ -199,6 +199,52 @@ pub(super) fn cast_from_variant(stats: &Stats, target: &LogicalType) -> Option<S
     Some(result)
 }
 
+/// `GetVariantCompressInfo`: of a VARIANT fully shredded on a primitive type whose equal values are the same
+/// VARIANT, that type, and the statistics of the values cast to it (NULL where the VARIANT is).
+pub(super) fn compress_info(stats: &Stats) -> Option<(LogicalType, Stats)> {
+    let Some(VariantStatistics::Shredded(ty, shredded)) = stats.variant.as_deref() else {
+        return None;
+    };
+    let structured = structured_type(ty);
+    if structured.is_nested() || !fully_shredded(ty, shredded) {
+        return None;
+    }
+    use LogicalTypeId::*;
+    // FLOAT and DOUBLE (-0.0 = 0.0) and INTERVAL ('1 month' = '30 days') have equal values that differ
+    if !matches!(
+        structured.id(),
+        Boolean
+            | TinyInt
+            | SmallInt
+            | Integer
+            | BigInt
+            | HugeInt
+            | UTinyInt
+            | USmallInt
+            | UInteger
+            | UBigInt
+            | UHugeInt
+            | Decimal
+            | Varchar
+            | Blob
+            | Date
+            | Time
+            | TimeNs
+            | TimestampSec
+            | TimestampMs
+            | Timestamp
+            | TimestampNs
+            | TimestampTz
+            | TimestampTzNs
+            | Uuid
+    ) {
+        return None;
+    }
+    let (_, mut typed_stats) = typed(ty, shredded);
+    typed_stats.can_be_null |= stats.can_be_null;
+    Some((structured, typed_stats))
+}
+
 /// `VariantExtractPropagateStats`: the statistics of a field (`key`) or an element (`index`) of a VARIANT.
 pub(super) fn extract(stats: &Stats, key: &Value) -> Option<Stats> {
     let Some(VariantStatistics::Shredded(ty, shredded)) = stats.variant.as_deref() else {

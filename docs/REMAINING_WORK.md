@@ -164,8 +164,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] pushdown extract into table and parquet scans: fields of STRUCT and VARIANT columns read only through
     extracts (and casts of them) are columns of the scan (`s.y.z` in EXPLAIN), also in SQL export
   - [ ] reading a pushed field from the typed part of fully shredded row
-    groups (the scan unshreds the value and extracts it); the statistics of the pushed fields for compressed
-    materialization; `SHREDDED_VECTOR` scans; the statistics of the unshredded part are written as unknown;
+    groups (the scan unshreds the value and extracts it); the statistics of the pushed fields; `SHREDDED_VECTOR` scans; the statistics of the unshredded part are written as unknown;
     stats of the rows a delete took
   - [ ] shredded GEOMETRY columns, Patas and Chimp segments (8), `read_duckdb` (8)
   - [ ] string and list-length statistics for `stats()` (~10 files), per-column `USING COMPRESSION`
@@ -247,7 +246,8 @@ Each item gives the number of failing files in `test/` that it should fix, where
     groups and the build side and single key pair of comparison joins (casts, `__internal_compress_integral_*`,
     `__internal_compress_string_*`); calling them is the binder error C++ gives
   - [x] compressed materialization of POINT-XY GEOMETRY columns (`__internal_compress_geometry_point`)
-  - [ ] compressed materialization of VARIANT columns: needs the shredded statistics in the optimizer
+  - [x] compressed materialization of VARIANT columns fully shredded on a primitive type: cast to it and
+    compressed further, also as grouped by (`variant_comparator`); joins of them compare the integers
   - [ ] `stats()` of a VARCHAR read from several parquet files with `union_by_name` (NULL here)
   - [x] partitioned execution: a large aggregate, ORDER BY or window over a table as a UNION ALL of parts by
     ranges of a column, cut where the row groups' zones overlap little
