@@ -113,6 +113,19 @@ fn collect_candidates(op: &LogicalOperator, candidates: &mut HashMap<ColumnBindi
             }
         }
     }
+    // a scan of parquet files: the columns of the files, which the operators above read
+    if let K::ParquetScan { table_index, scan } = &op.kind
+        && scan.extracts.is_empty()
+        && let Some(projected) = &scan.projected
+    {
+        for (position, ty) in scan.types.iter().enumerate() {
+            if projected.get(position).copied().unwrap_or(false)
+                && matches!(ty.id(), LogicalTypeId::Struct | LogicalTypeId::Variant)
+            {
+                candidates.insert(ColumnBinding::new(*table_index, position), ty.clone());
+            }
+        }
+    }
     for child in &op.children {
         collect_candidates(child, candidates);
     }
@@ -132,7 +145,7 @@ fn reading_expressions(op: &mut LogicalOperator) -> Vec<&mut BoundExpr> {
     };
     let mut result = match &op.kind {
         // the filters of a scan read the column itself, which stays
-        K::Get { .. } => Vec::new(),
+        K::Get { .. } | K::ParquetScan { .. } => Vec::new(),
         _ => op.expressions_mut(),
     };
     // SAFETY: the conditions are fields of the operator apart from those `expressions_mut` gives
@@ -288,6 +301,33 @@ fn add_positions(
                 projection.push(*at);
             }
             projection.retain(|&p| p != position);
+        }
+    }
+    if let K::ParquetScan { table_index, scan } = &mut op.kind {
+        let table_index = *table_index;
+        let scan = Arc::make_mut(scan);
+        for position in 0..scan.types.len() {
+            let binding = ColumnBinding::new(table_index, position);
+            let Some(paths) = pushed.get_mut(&binding) else {
+                continue;
+            };
+            let column_type = &candidates[&binding];
+            let built: Option<Vec<(BoundExpr, Vec<String>)>> =
+                paths.iter().map(|(path, _)| path_expression(column_type, path)).collect();
+            let Some(built) = built else {
+                pushed.remove(&binding);
+                continue;
+            };
+            for ((expression, names), (_, at)) in built.into_iter().zip(paths.iter_mut()) {
+                *at = scan.output_types().len();
+                scan.extracts.push((position, Arc::new(PushedExtract { names, expression })));
+                if let Some(projected) = &mut scan.projected {
+                    projected.push(true);
+                }
+            }
+            if let Some(projected) = &mut scan.projected {
+                projected[position] = false;
+            }
         }
     }
     for child in &mut op.children {

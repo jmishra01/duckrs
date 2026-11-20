@@ -503,15 +503,29 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             }
             names.extend(scan.hive.iter().map(|(name, _)| name.clone()));
             names.extend(scan.virtual_columns.iter().map(|c| c.name().to_string()));
-            let positions: Vec<usize> = (0..names.len())
-                .filter(|at| {
-                    scan.projected
-                        .as_ref()
-                        .is_none_or(|p| p.get(*at).copied().unwrap_or(true))
-                })
+            let base_count = names.len();
+            // a pushed field by its path, `column.a.b`, where its column is
+            for (base, extract) in &scan.extracts {
+                names.push(format!("{}.{}", names[*base], extract.names.join(".")));
+            }
+            let is_projected =
+                |at: usize| scan.projected.as_ref().is_none_or(|p| p.get(at).copied().unwrap_or(true));
+            let positions: Vec<usize> = (0..base_count)
+                .filter(|&at| is_projected(at) || scan.extracts.iter().any(|(base, _)| *base == at))
                 .collect();
             // `column_ids` are in the order the binder read the columns
-            let projected = scan.column_order.arrange(&positions).into_iter().map(|at| names[at].clone());
+            let mut order = Vec::new();
+            for at in scan.column_order.arrange(&positions) {
+                if is_projected(at) {
+                    order.push(at);
+                }
+                for (i, (base, _)) in scan.extracts.iter().enumerate() {
+                    if *base == at && is_projected(base_count + i) {
+                        order.push(base_count + i);
+                    }
+                }
+            }
+            let projected = order.into_iter().map(|at| names[at].clone());
             info.extend(entry("Projections", lines(projected)));
             if !scan.filters.is_empty() {
                 info.extend(entry("Filters", lines(scan.filters.iter().map(filter_text))));

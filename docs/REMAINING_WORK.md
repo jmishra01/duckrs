@@ -161,9 +161,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] `stats()` of a VARIANT: its shredding state and the statistics of the typed part, from files, through
     casts to and from VARIANT and `variant_extract`; row groups merge their typed parts (`MergeShredding`), and
     one a checkpoint leaves as it is keeps how it was shredded
-  - [x] pushdown extract into table scans: fields of STRUCT and VARIANT columns read only through extracts
-    (and casts of them) are columns of the scan (`s.y.z` in EXPLAIN), also in SQL export
-  - [ ] pushdown extract into parquet scans; reading a pushed field from the typed part of fully shredded row
+  - [x] pushdown extract into table and parquet scans: fields of STRUCT and VARIANT columns read only through
+    extracts (and casts of them) are columns of the scan (`s.y.z` in EXPLAIN), also in SQL export
+  - [ ] reading a pushed field from the typed part of fully shredded row
     groups (the scan unshreds the value and extracts it); the statistics of the pushed fields for compressed
     materialization; `SHREDDED_VECTOR` scans; the statistics of the unshredded part are written as unknown;
     stats of the rows a delete took

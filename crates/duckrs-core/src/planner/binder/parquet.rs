@@ -370,6 +370,7 @@ impl Binder<'_> {
             file_filters: String::new(),
             column_order: self.column_order(table_index),
             total_files: None,
+            extracts: Vec::new(),
         };
         Ok(LogicalOperator::new(
             LogicalOperatorKind::ParquetScan {

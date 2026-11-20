@@ -1517,6 +1517,22 @@ impl Exporter<'_> {
                 .columns
                 .insert(ColumnBinding::new(table_index, position), (column.clone(), ty));
         }
+        // a pushed field is the extract of its column
+        for (base, extract) in &scan.extracts {
+            let binding = ColumnBinding::new(table_index, *base);
+            let mut expression = extract.expression.clone();
+            expression.walk_mut(&mut |e| {
+                if matches!(e.kind, BoundExprKind::Reference(0)) {
+                    e.kind = BoundExprKind::ColumnRef { binding, depth: 0 };
+                }
+            });
+            let ty = expression.return_type.clone();
+            let column = Column::plain(self.expr(&scope, &expression)?);
+            scope
+                .columns
+                .insert(ColumnBinding::new(table_index, columns.len()), (column.clone(), ty));
+            columns.push(column);
+        }
         let mut select = Select::new(from, columns);
         for filter in &scan.filters {
             select.filters.push(self.expr(&scope, filter)?);

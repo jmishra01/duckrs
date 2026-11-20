@@ -74,6 +74,9 @@ pub struct ParquetScanData {
     pub column_order: crate::execution::multi_file::ColumnOrder,
     /// `ExtraOperatorInfo::total_files`: how many files there were before that
     pub total_files: Option<usize>,
+    /// the fields of columns pushed into the scan (`IsPushdownExtract`): the output column they are of, and
+    /// what gives them; they are output columns after all others
+    pub extracts: Vec<(usize, Arc<crate::planner::logical::PushedExtract>)>,
 }
 
 impl ParquetScanData {
@@ -123,6 +126,7 @@ impl ParquetScanData {
         }
         types.extend(self.hive.iter().map(|(_, ty)| ty.clone()));
         types.extend(crate::execution::multi_file::virtual_types(&self.virtual_columns));
+        types.extend(self.extracts.iter().map(|(_, e)| e.expression.return_type.clone()));
         types
     }
 }
@@ -1523,6 +1527,15 @@ impl PhysicalOperator for PhysicalParquetScan {
                             if matched != chunk.len() {
                                 chunk.slice(&sel, matched);
                             }
+                        }
+                        // the pushed fields, of the columns they are of
+                        if !self.scan.extracts.is_empty() {
+                            let mut columns: Vec<_> = (0..chunk.column_count()).map(|c| chunk.column(c).clone()).collect();
+                            for (base, extract) in &self.scan.extracts {
+                                let input = DataChunk::from_columns(vec![chunk.column(*base).clone()], chunk.len());
+                                columns.push(crate::execution::expression_executor::execute(&extract.expression, &input)?);
+                            }
+                            chunk = DataChunk::from_columns(columns, chunk.len());
                         }
                         return Ok(Some(chunk));
                     }

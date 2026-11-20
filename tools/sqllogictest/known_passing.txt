@@ -3110,6 +3110,7 @@ test/sql/optimizer/narrowing_cast_not_invertible.test
 test/sql/optimizer/not_conjunction_simplification.test
 test/sql/optimizer/nullable_row_group_pruning.test
 test/sql/optimizer/or_null_simplification.test
+test/sql/optimizer/plan/plan_struct_projection_pushdown.test
 test/sql/optimizer/plan/test_anti_join_empty_child.test
 test/sql/optimizer/plan/test_anti_join_projection_map.test
 test/sql/optimizer/plan/test_disable_build_side_probe_side.test
@@ -3168,6 +3169,7 @@ test/sql/optimizer/topn_window_elimination_nullable_order.test
 test/sql/optimizer/topn_window_set_elimination.test
 test/sql/optimizer/try_struct_extract_cast.test
 test/sql/optimizer/upper_lower_zonemap_pruning.test
+test/sql/optimizer/variant_json_cast_pushdown.test
 test/sql/optimizer/window_self_join_optimizer_csv.test
 test/sql/optimizer/yearweek_negative_iso_year.test
 test/sql/order/hugeint_order_by_extremes.test
@@ -3582,6 +3584,7 @@ test/sql/sql_export/plain_scope_results.test
 test/sql/sql_export/plan_reconstruction_coverage.test
 test/sql/sql_export/pruned_offset.test
 test/sql/sql_export/pure_values_input.test
+test/sql/sql_export/pushed_column_paths.test
 test/sql/sql_export/range_folded_offset.test
 test/sql/sql_export/range_origin_inputs.test
 test/sql/sql_export/regex_range_filter_export.test
