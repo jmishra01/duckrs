@@ -163,17 +163,27 @@ fn required_size(count: usize, width: u32) -> usize {
 /// `PackBuffer`: `width` bits of each value, after one another from the lowest bit, in groups of
 /// 32 values (the last one filled up with zeros).
 fn pack(values: &[u128], width: u32) -> Vec<u8> {
+    let size = required_size(values.len(), width);
     let width = width as usize;
-    let mut packed = vec![0u8; required_size(values.len(), width as u32)];
+    if width == 0 {
+        return vec![0u8; size];
+    }
+    let mask = if width >= 128 { u128::MAX } else { (1u128 << width) - 1 };
+    // the bits of each value in turn from the lowest, a word at a time: a value spans up to three words
+    let mut words = vec![0u64; (values.len() * width).div_ceil(64) + 2];
     for (row, value) in values.iter().enumerate() {
-        let start = row * width;
-        for bit in 0..width {
-            if value >> bit & 1 != 0 {
-                let at = start + bit;
-                packed[at / 8] |= 1 << (at % 8);
-            }
+        let value = value & mask;
+        let (word, offset) = ((row * width) / 64, (row * width) % 64);
+        let low = value << offset;
+        words[word] |= low as u64;
+        words[word + 1] |= (low >> 64) as u64;
+        if offset > 0 {
+            words[word + 2] |= (value >> (128 - offset)) as u64;
         }
     }
+    let mut packed: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    packed.truncate(size);
+    packed.resize(size, 0);
     packed
 }
 
@@ -404,5 +414,35 @@ mod tests {
         assert_eq!(BIGINT.minimum_bit_width(1u128 << 56, false), 64);
         assert_eq!(BIGINT.minimum_bit_width(255, false), 8);
         assert_eq!(BIGINT.minimum_bit_width(255, true), 9);
+    }
+
+    /// The packing a word at a time sets the bits that setting them one at a time does.
+    #[test]
+    fn pack_matches_bit_by_bit() {
+        let bit_by_bit = |values: &[u128], width: u32| {
+            let mut packed = vec![0u8; required_size(values.len(), width)];
+            for (row, value) in values.iter().enumerate() {
+                for bit in 0..width as usize {
+                    if value >> bit & 1 != 0 {
+                        let at = row * width as usize + bit;
+                        packed[at / 8] |= 1 << (at % 8);
+                    }
+                }
+            }
+            packed
+        };
+        let mut seed = 0x9e37_79b9_7f4a_7c15u128;
+        for width in [0, 1, 3, 7, 8, 13, 31, 32, 33, 63, 64, 65, 100, 127, 128] {
+            for count in [1, 31, 32, 33, 100, 2048] {
+                let values: Vec<u128> = (0..count)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(0x2545_f491_4f6c_dd1d).wrapping_add(1);
+                        seed ^ (seed << 64)
+                    })
+                    .collect();
+                let message = format!("width {width}, {count} values");
+                assert_eq!(pack(&values, width), bit_by_bit(&values, width), "{message}");
+            }
+        }
     }
 }

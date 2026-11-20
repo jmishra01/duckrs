@@ -10,7 +10,7 @@
 //! the same; a dictionary that FSST encodes can be estimated a little differently from C++.
 
 use super::fsst::SymbolTable;
-use std::collections::HashSet;
+use hashbrown::HashSet;
 
 /// `DictFSSTCompression::STRING_SIZE_LIMIT`.
 const STRING_SIZE_LIMIT: usize = 16384;

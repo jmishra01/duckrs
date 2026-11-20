@@ -343,19 +343,19 @@ pub fn is_null(field: &Field<'_>, options: &CsvReadOptions, dialect: &Dialect) -
 fn varchar_vector(fields: &[Option<&Field<'_>>], options: &CsvReadOptions, dialect: &Dialect) -> Result<Vector> {
     let mut result = Vector::new(LogicalType::VARCHAR, fields.len());
     for (i, field) in fields.iter().enumerate() {
-        let value = match field {
+        match field {
             Some(field) if !is_null(field, options, dialect) => {
-                let text = std::str::from_utf8(&field.text).map_err(|_| {
-                    Error::new(
+                // most fields are ASCII, which is quicker to tell than UTF-8 in general
+                if !field.text.is_ascii() && std::str::from_utf8(&field.text).is_err() {
+                    return Err(Error::new(
                         ErrorKind::InvalidInput,
                         "Invalid unicode (byte sequence mismatch) detected in CSV file",
-                    )
-                })?;
-                Value::varchar(text)
+                    ));
+                }
+                result.set_str(i, &field.text);
             }
-            _ => Value::null(LogicalType::VARCHAR),
-        };
-        result.set_value(i, &value)?;
+            _ => result.set_null(i, true),
+        }
     }
     Ok(result)
 }

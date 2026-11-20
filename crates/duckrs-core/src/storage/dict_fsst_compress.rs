@@ -8,7 +8,7 @@
 
 use super::encode::{Encoded, pack};
 use super::fsst::SymbolTable;
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 /// `sizeof(dict_fsst_compression_header_t)`.
 const HEADER_SIZE: usize = 16;
