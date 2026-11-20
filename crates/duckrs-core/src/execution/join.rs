@@ -812,12 +812,13 @@ impl PhysicalJoin {
         Ok(())
     }
 
-    /// Adds `chunk` to the build rows in memory.
+    /// Adds `chunk` to the build rows in memory. Its strings stay where they are, in the buffers of the chunk,
+    /// which the build columns keep: copying them is what the threads would take turns at.
     fn append_rows(build: &mut JoinBuild, chunk: &DataChunk, keys: Vec<BuildKey>) {
         let offset = build.count;
         let sel = SelectionVector::from_vec((0..chunk.len() as u32).collect());
         for (target, source) in build.columns.iter_mut().zip(chunk.columns()) {
-            target.copy_from(source, &sel, chunk.len(), offset, StringCopy::Deep);
+            target.copy_from(source, &sel, chunk.len(), offset, StringCopy::Reference);
         }
         build.count += chunk.len();
         for (row, key) in keys.into_iter().enumerate() {

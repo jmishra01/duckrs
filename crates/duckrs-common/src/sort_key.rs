@@ -657,6 +657,32 @@ fn sort_keys_of(columns: &[(&Vector, OrderModifiers)], count: usize, raw_interva
         .collect())
 }
 
+/// The rows of `columns` whose key of [`create_sort_keys`] sorts before `bound`, each key written into the same
+/// buffer in turn rather than one of its own.
+pub fn rows_sorting_before(columns: &[(&Vector, OrderModifiers)], count: usize, bound: &[u8]) -> Result<Vec<u32>> {
+    let prepared = columns
+        .iter()
+        .map(|(v, m)| {
+            Ok((
+                KeyColumn::new_with(v, count, *m, false)?,
+                m.order == OrderType::Descending,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut key = Vec::new();
+    let mut rows = Vec::new();
+    for row in 0..count {
+        key.clear();
+        for (column, flip) in &prepared {
+            column.encode(row, *flip, &mut key);
+        }
+        if key.as_slice() < bound {
+            rows.push(row as u32);
+        }
+    }
+    Ok(rows)
+}
+
 /// The row order of `chunk` under the given ORDER BY columns, as a selection. Ties keep their
 /// input order.
 pub fn sort_chunk(chunk: &DataChunk, orders: &[(usize, OrderModifiers)]) -> Result<SelectionVector> {

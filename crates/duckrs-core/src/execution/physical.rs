@@ -2651,13 +2651,12 @@ impl PhysicalOperator for PhysicalOrder {
         let mut boundary = self.boundary.lock();
         let mut rows = std::borrow::Cow::Borrowed(chunk);
         if let Some(bound) = boundary.as_ref() {
-            let keys = self.sort_keys(chunk)?;
-            let selected: Vec<u32> = keys
+            let columns: Vec<(&Vector, OrderModifiers)> = self
+                .orders
                 .iter()
-                .enumerate()
-                .filter(|(_, key)| key.as_slice() < bound.as_slice())
-                .map(|(row, _)| row as u32)
+                .map(|&(column, m)| (chunk.column(column), m))
                 .collect();
+            let selected = duckrs_common::sort_key::rows_sorting_before(&columns, chunk.len(), bound)?;
             if selected.is_empty() {
                 return Ok(());
             }
