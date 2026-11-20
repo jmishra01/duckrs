@@ -779,6 +779,7 @@ name = "duckrs-common"
 version = "0.0.1"
 dependencies = [
  "criterion",
+ "hashbrown",
  "parking_lot",
  "proptest",
 ]

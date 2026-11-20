@@ -26,8 +26,8 @@ use crate::planner::logical::{BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, COLUMN
 use crate::storage::log_writer::can_serialize;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::{
-    NullOrder, OrderModifiers, OrderType, RowKey, RowKeyMap, RowKeySet, create_row_keys, create_sort_keys,
-    sort_collection,
+    NullOrder, OrderModifiers, OrderType, RowKey, RowKeyMap, RowKeySet, create_row_key_buffer, create_row_keys,
+    create_sort_keys, sort_collection,
 };
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::{Value, ValueData};
@@ -3379,16 +3379,22 @@ impl PhysicalAggregate {
         if let Some(ids) = self.find_dictionary_groups(set, vectors, &columns, count, state)? {
             return Ok(ids);
         }
-        let keys = create_row_keys(&columns, count)?;
+        // the keys of the rows in one buffer: a row of a group there already makes no key of its own
+        let keys = create_row_key_buffer(&columns, count)?;
         let mut new_rows = Vec::new();
-        let mut ids = Vec::with_capacity(keys.len());
-        for (row, key) in keys.into_iter().enumerate() {
-            let next = state.group_count;
-            let id = *state.group_ids.entry(key).or_insert(next);
-            if id == next {
-                state.group_count += 1;
-                new_rows.push(row as u32);
-            }
+        let mut ids = Vec::with_capacity(count);
+        for row in 0..count {
+            let key = keys.get(row);
+            let id = match state.group_ids.get(&key) {
+                Some(&id) => id,
+                None => {
+                    let id = state.group_count;
+                    state.group_ids.insert(RowKey::from_bytes(key.0), id);
+                    state.group_count += 1;
+                    new_rows.push(row as u32);
+                    id
+                }
+            };
             ids.push(id);
         }
         if !new_rows.is_empty() {

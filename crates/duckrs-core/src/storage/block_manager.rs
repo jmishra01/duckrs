@@ -199,6 +199,8 @@ fn verify_block_alloc_size(size: u64) -> Result<()> {
 pub struct SingleFileBlockManager {
     path: PathBuf,
     file: Mutex<File>,
+    /// the file again, which threads read blocks of at once, each at its place (`pread`)
+    reader: File,
     main_header: MainHeader,
     /// what the main header says of the version now, after `rewrite_main_header`
     main_version: std::sync::atomic::AtomicU64,
@@ -249,9 +251,11 @@ impl SingleFileBlockManager {
         let h2 = DatabaseHeader::read(&buffer[BLOCK_HEADER_SIZE..])?;
         let (active_header, header) = if h1.iteration > h2.iteration { (0, h1) } else { (1, h2) };
         verify_block_alloc_size(header.block_alloc_size)?;
+        let reader = file.try_clone().map_err(|e| io_error(path, e))?;
         Ok(Self {
             path: path.to_path_buf(),
             file: Mutex::new(file),
+            reader,
             main_version: std::sync::atomic::AtomicU64::new(main_header.version_number),
             main_header,
             state: Mutex::new(State {
@@ -408,10 +412,44 @@ impl SingleFileBlockManager {
     /// `Read`: the block without its checksum, which is verified.
     pub fn read_block(&self, block_id: u64) -> Result<Vec<u8>> {
         let location = self.location(block_id)?;
-        let mut buffer = vec![0; self.block_alloc_size()];
-        read_checked(&mut self.file.lock(), &self.path, location, &mut buffer)?;
-        buffer.drain(..BLOCK_HEADER_SIZE);
+        let mut sum = [0; BLOCK_HEADER_SIZE];
+        let mut buffer = vec![0; self.block_alloc_size() - BLOCK_HEADER_SIZE];
+        self.read_at(location, &mut sum)?;
+        self.read_at(location + BLOCK_HEADER_SIZE as u64, &mut buffer)?;
+        let (stored, computed) = (u64::from_le_bytes(sum), checksum(&buffer));
+        if stored != computed {
+            return Err(corrupt(format!(
+                "computed checksum {computed} does not match stored checksum {stored} in block at location {location}"
+            )));
+        }
         Ok(buffer)
+    }
+
+    /// The bytes of the file at `location`, read with no lock held.
+    #[cfg(unix)]
+    fn read_at(&self, location: u64, buffer: &mut [u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        crate::execution::profiler::track_read(buffer.len());
+        self.reader
+            .read_exact_at(buffer, location)
+            .map_err(|e| self.read_error(e, location))
+    }
+
+    #[cfg(not(unix))]
+    fn read_at(&self, location: u64, buffer: &mut [u8]) -> Result<()> {
+        let mut file = self.file.lock();
+        file.seek(SeekFrom::Start(location))
+            .map_err(|e| io_error(&self.path, e))?;
+        crate::execution::profiler::track_read(buffer.len());
+        file.read_exact(buffer).map_err(|e| self.read_error(e, location))
+    }
+
+    fn read_error(&self, error: std::io::Error, location: u64) -> Error {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            corrupt(format!("the file ends before the block at location {location}"))
+        } else {
+            io_error(&self.path, error)
+        }
     }
 
     /// `Write`: `data` is what a block holds. The block must be in the current header's count or

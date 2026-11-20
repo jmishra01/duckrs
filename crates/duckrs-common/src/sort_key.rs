@@ -315,34 +315,24 @@ pub enum RowKey {
 }
 
 impl RowKey {
-    const EMPTY: Self = Self::Inline {
-        len: 0,
-        bytes: [0; INLINE_KEY_SIZE],
-    };
+    /// The key of these bytes: in here if they fit in [`INLINE_KEY_SIZE`], so that a key has one form.
+    pub fn from_bytes(new: &[u8]) -> Self {
+        if new.len() <= INLINE_KEY_SIZE {
+            let mut bytes = [0; INLINE_KEY_SIZE];
+            bytes[..new.len()].copy_from_slice(new);
+            Self::Inline {
+                len: new.len() as u8,
+                bytes,
+            }
+        } else {
+            Self::Heap(new.to_vec())
+        }
+    }
 
     pub fn as_bytes(&self) -> &[u8] {
         match self {
             Self::Inline { len, bytes } => &bytes[..*len as usize],
             Self::Heap(bytes) => bytes,
-        }
-    }
-
-    fn append(&mut self, new: &[u8]) {
-        match self {
-            Self::Inline { len, bytes } => {
-                let end = *len as usize + new.len();
-                if end <= INLINE_KEY_SIZE {
-                    bytes[*len as usize..end].copy_from_slice(new);
-                    *len = end as u8;
-                } else {
-                    // room for the columns still to come, so that they do not each move the key
-                    let mut heap = Vec::with_capacity((end + end / 2).max(64));
-                    heap.extend_from_slice(&bytes[..*len as usize]);
-                    heap.extend_from_slice(new);
-                    *self = Self::Heap(heap);
-                }
-            }
-            Self::Heap(bytes) => bytes.extend_from_slice(new),
         }
     }
 }
@@ -398,54 +388,74 @@ impl std::hash::Hasher for KeyHasher {
     }
 }
 
-/// A map from row keys.
-pub type RowKeyMap<V> = std::collections::HashMap<RowKey, V, std::hash::BuildHasherDefault<KeyHasher>>;
+/// A map from row keys, which can be looked up by the bytes of a key ([`KeyBytes`]).
+pub type RowKeyMap<V> = hashbrown::HashMap<RowKey, V, std::hash::BuildHasherDefault<KeyHasher>>;
 /// A set of row keys.
-pub type RowKeySet = std::collections::HashSet<RowKey, std::hash::BuildHasherDefault<KeyHasher>>;
+pub type RowKeySet = hashbrown::HashSet<RowKey, std::hash::BuildHasherDefault<KeyHasher>>;
 
-impl KeyColumn {
-    /// Appends the key of each row to `keys`: `encode`, but a column at a time.
-    fn append_to(&self, keys: &mut [RowKey]) {
-        macro_rules! fixed {
-            ($t:ty, $encode:expr) => {{
-                let data = self.format.data::<$t>();
-                let encode = $encode;
-                let valid_byte = [self.valid_byte];
-                for (row, key) in keys.iter_mut().enumerate() {
-                    let idx = self.format.sel.get(row);
-                    if self.format.validity.is_valid(idx) {
-                        key.append(&valid_byte);
-                        key.append(&encode(data[idx]));
-                    } else {
-                        key.append(&[self.null_byte]);
-                    }
-                }
-            }};
-        }
-        match self.physical {
-            PhysicalType::Int32 => fixed!(i32, |v: i32| (v as u32 ^ (1 << 31)).to_be_bytes()),
-            PhysicalType::Int64 => fixed!(i64, |v: i64| (v as u64 ^ (1 << 63)).to_be_bytes()),
-            PhysicalType::UInt32 => fixed!(u32, |v: u32| v.to_be_bytes()),
-            PhysicalType::Double => fixed!(f64, |v: f64| encode_double(v).to_be_bytes()),
-            _ => {
-                let mut scratch = Vec::new();
-                for (row, key) in keys.iter_mut().enumerate() {
-                    scratch.clear();
-                    self.encode(row, false, &mut scratch);
-                    key.append(&scratch);
-                }
-            }
-        }
+/// The bytes of a row key, which find it in a [`RowKeyMap`] without a [`RowKey`] made of them.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyBytes<'a>(pub &'a [u8]);
+
+impl std::hash::Hash for KeyBytes<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // as `RowKey` hashes
+        state.write(self.0);
     }
+}
+
+impl hashbrown::Equivalent<RowKey> for KeyBytes<'_> {
+    fn equivalent(&self, key: &RowKey) -> bool {
+        self.0 == key.as_bytes()
+    }
+}
+
+/// The keys of [`create_row_keys`] for the rows of a chunk, one after another in one buffer.
+#[derive(Debug, Default)]
+pub struct RowKeyBuffer {
+    bytes: Vec<u8>,
+    ends: Vec<usize>,
+}
+
+impl RowKeyBuffer {
+    pub fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    /// The key of row `row`.
+    pub fn get(&self, row: usize) -> KeyBytes<'_> {
+        let start = if row == 0 { 0 } else { self.ends[row - 1] };
+        KeyBytes(&self.bytes[start..self.ends[row]])
+    }
+}
+
+/// [`create_row_keys`] into one buffer: a row's key is written at once, with no key of its own.
+pub fn create_row_key_buffer(columns: &[&Vector], count: usize) -> Result<RowKeyBuffer> {
+    let columns = columns
+        .iter()
+        .map(|column| KeyColumn::new(column, count, OrderModifiers::ASC_NULLS_LAST))
+        .collect::<Result<Vec<_>>>()?;
+    let mut buffer = RowKeyBuffer {
+        bytes: Vec::with_capacity(count * (columns.len() * 9).max(1)),
+        ends: Vec::with_capacity(count),
+    };
+    for row in 0..count {
+        for column in &columns {
+            column.encode(row, false, &mut buffer.bytes);
+        }
+        buffer.ends.push(buffer.bytes.len());
+    }
+    Ok(buffer)
 }
 
 /// A key per row, in the bytes of [`create_sort_keys`] for ascending columns with NULLs last.
 pub fn create_row_keys(columns: &[&Vector], count: usize) -> Result<Vec<RowKey>> {
-    let mut keys = vec![RowKey::EMPTY; count];
-    for column in columns {
-        KeyColumn::new(column, count, OrderModifiers::ASC_NULLS_LAST)?.append_to(&mut keys);
-    }
-    Ok(keys)
+    let buffer = create_row_key_buffer(columns, count)?;
+    Ok((0..count).map(|row| RowKey::from_bytes(buffer.get(row).0)).collect())
 }
 
 /// `Radix::EncodeFloat`: an order-preserving u32 (NaN largest, -0.0 == 0.0).

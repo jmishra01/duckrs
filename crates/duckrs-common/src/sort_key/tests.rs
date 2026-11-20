@@ -209,7 +209,14 @@ fn sorts_a_collection() {
 fn row_key_bytes(columns: &[Vector], count: usize) -> Vec<Vec<u8>> {
     let references: Vec<&Vector> = columns.iter().collect();
     let keys = create_row_keys(&references, count).unwrap();
-    keys.iter().map(|key| key.as_bytes().to_vec()).collect()
+    let bytes: Vec<Vec<u8>> = keys.iter().map(|key| key.as_bytes().to_vec()).collect();
+    // the keys in one buffer are those keys
+    let buffer = create_row_key_buffer(&references, count).unwrap();
+    assert_eq!(buffer.len(), count);
+    for (row, key) in bytes.iter().enumerate() {
+        assert_eq!(buffer.get(row).0, &key[..]);
+    }
+    bytes
 }
 
 fn sort_key_bytes(columns: &[Vector], count: usize) -> Vec<Vec<u8>> {
@@ -270,30 +277,31 @@ fn row_keys_are_sort_keys() {
 fn row_keys_compare_by_their_bytes() {
     use std::hash::{BuildHasher, BuildHasherDefault};
     let hash = |key: &RowKey| BuildHasherDefault::<KeyHasher>::default().hash_one(key);
-    let of = |length: usize| {
-        let mut key = RowKey::EMPTY;
-        key.append(&vec![7; length]);
-        key
-    };
+    let of = |length: usize| RowKey::from_bytes(&vec![7; length]);
     for length in [0, 1, 8, 29, 30, 31, 100] {
         assert_eq!(of(length).as_bytes().len(), length);
         assert_eq!(of(length), of(length));
         assert_eq!(hash(&of(length)), hash(&of(length)));
     }
     assert_ne!(of(30), of(31));
-    // a key that grows past the inline size equals one that was never inline
-    let mut grown = of(25);
-    grown.append(&[7; 10]);
-    assert!(matches!(grown, RowKey::Heap(_)));
-    assert_eq!(grown, of(35));
-    assert_eq!(hash(&grown), hash(&of(35)));
+    // a key is in here up to the inline size, and past it on the heap
+    assert!(matches!(of(30), RowKey::Inline { .. }));
+    assert!(matches!(of(31), RowKey::Heap(_)));
+    // the bytes of a key find it in a map, as the key does
+    let map: RowKeyMap<usize> = [0, 1, 30, 31, 100]
+        .into_iter()
+        .map(|length| (of(length), length))
+        .collect();
+    for length in [0, 1, 30, 31, 100] {
+        assert_eq!(map.get(&KeyBytes(&vec![7; length])), Some(&length));
+    }
+    assert_eq!(map.get(&KeyBytes(&[7; 2])), None);
     // integers that differ in any byte spread over the low bits, which the table reads
     let low_bits: std::collections::HashSet<u64> = (0u64..1024)
         .map(|i| {
-            let mut key = RowKey::EMPTY;
-            key.append(&[1]);
-            key.append(&i.to_be_bytes());
-            hash(&key) & 0xFFFF
+            let mut bytes = vec![1];
+            bytes.extend_from_slice(&i.to_be_bytes());
+            hash(&RowKey::from_bytes(&bytes)) & 0xFFFF
         })
         .collect();
     assert!(low_bits.len() > 1000, "{}", low_bits.len());
