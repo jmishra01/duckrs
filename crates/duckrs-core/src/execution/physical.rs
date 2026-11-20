@@ -234,6 +234,10 @@ struct TableScanState {
     filtered: Option<(usize, Vec<usize>, std::collections::VecDeque<DataChunk>)>,
     /// `ScanSamplingInfo`: the scan's random engine, and the phase of a sample of rows
     sampling: Option<(super::random_engine::RandomEngine, f64)>,
+    /// the positions of the VARIANT fields the cursor does not read (`variant_field`), and those of the
+    /// row group of the last chunk
+    fields: Vec<usize>,
+    field_group: Option<(usize, Vec<(usize, Vector)>)>,
 }
 
 /// What a scan reads of a file. `column_ids` lists all columns for the filter and the projection to
@@ -295,6 +299,40 @@ impl PhysicalTableScan {
     /// The filter, then the columns it may be the only one to read, of a chunk that was scanned.
     fn finish_chunk(&self, result: DataChunk) -> Result<Option<DataChunk>> {
         self.finish_chunk_with(result, &[])
+    }
+
+    /// The VARIANT fields at `positions` of row group `group` of `rows` rows, computed: read from the typed
+    /// part, or from the column where some value is not there.
+    fn group_fields(
+        &self,
+        source: &dyn TableSource,
+        group: usize,
+        positions: &[usize],
+        rows: usize,
+    ) -> Result<Vec<(usize, Vector)>> {
+        let mut fields = Vec::with_capacity(positions.len());
+        for &position in positions {
+            let extract = self.extracts[position].as_ref().expect("a pushed field");
+            let (keys, rest) = extract.variant_path.as_ref().expect("a field by keys");
+            let column = self.column_ids[position];
+            let (expression, input) = match source.variant_field(group, column, keys)? {
+                Some(field) => (rest, field),
+                None => (&extract.expression, source.read_group(group, &[column])?.column(0).clone()),
+            };
+            let chunk = DataChunk::from_columns(vec![input], rows);
+            fields.push((position, crate::execution::expression_executor::execute(expression, &chunk)?));
+        }
+        Ok(fields)
+    }
+
+    /// The positions of the scan's outputs that are VARIANT fields by keys, which can be read for themselves.
+    fn variant_fields(&self) -> Vec<usize> {
+        (0..self.column_ids.len())
+            .filter(|&p| {
+                self.extracts.get(p).is_some_and(|e| e.as_ref().is_some_and(|e| e.variant_path.is_some()))
+                    && self.projection.as_ref().is_some_and(|projection| projection.contains(&p))
+            })
+            .collect()
     }
 
     /// [`Self::finish_chunk`] of a chunk whose positions `done` have their fields already.
@@ -435,12 +473,7 @@ impl PhysicalTableScan {
         let starts = group_starts(&*source);
         let ids = self.table.row_ids(rows);
         // the fields of VARIANTs by keys, which can be read from the typed part
-        let fields: Vec<usize> = (0..self.column_ids.len())
-            .filter(|&p| {
-                self.extracts.get(p).is_some_and(|e| e.as_ref().is_some_and(|e| e.variant_path.is_some()))
-                    && self.projection.as_ref().is_some_and(|projection| projection.contains(&p))
-            })
-            .collect();
+        let fields = self.variant_fields();
         let (read, types, columns) = self.file_columns_without(&fields);
         let scan = FileScan {
             cursor: TableCursor::new(source.clone(), read.clone(), types.clone(), group_rows),
@@ -579,6 +612,12 @@ impl PhysicalTableScan {
             Some(positions) => positions.clone(),
             None => (0..self.column_ids.len()).collect(),
         };
+        // the VARIANT fields of the rows left, of the row group's
+        let fields: Vec<usize> = self.variant_fields().into_iter().filter(|&p| fetched[p].is_none()).collect();
+        for (position, mut field) in self.group_fields(source, group, &fields, group_rows)? {
+            field.slice(&SelectionVector::from_vec(selection.clone()), selection.len());
+            fetched[position] = Some(field);
+        }
         for &position in &output {
             if fetched[position].is_none() {
                 fetched[position] = Some(fetch(position, &selection)?);
@@ -590,7 +629,7 @@ impl PhysicalTableScan {
                 .iter()
                 .map(|&position| fetched[position].as_ref().expect("fetched above").range(start, count))
                 .collect();
-            emit(self.extract_fields(&output, DataChunk::from_columns(columns, count), &[])?)?;
+            emit(self.extract_fields(&output, DataChunk::from_columns(columns, count), &fields)?)?;
         }
         Ok(())
     }
@@ -679,20 +718,7 @@ impl PhysicalOperator for PhysicalTableScan {
         }
         let mut group = ColumnDataCollection::new(state.types.clone());
         group.append_shared(&state.source.read_group(index, &state.read)?);
-        // the VARIANT fields: from the typed part, or from the column where some value is not there
-        let mut fields = Vec::with_capacity(state.fields.len());
-        for &position in &state.fields {
-            let extract = self.extracts[position].as_ref().expect("a pushed field");
-            let (keys, rest) = extract.variant_path.as_ref().expect("a field by keys");
-            let column = self.column_ids[position];
-            let (expression, input) = match state.source.variant_field(index, column, keys)? {
-                Some(field) => (rest, field),
-                None => (&extract.expression, state.source.read_group(index, &[column])?.column(0).clone()),
-            };
-            let rows = group.len();
-            let chunk = DataChunk::from_columns(vec![input], rows);
-            fields.push((position, crate::execution::expression_executor::execute(expression, &chunk)?));
-        }
+        let fields = self.group_fields(&*state.source, index, &state.fields, group.len())?;
         for (local, chunk) in group.chunks().enumerate() {
             let first_row = group_start + local * STANDARD_VECTOR_SIZE;
             let count = chunk.len().min(state.rows.saturating_sub(first_row));
@@ -745,7 +771,25 @@ impl PhysicalOperator for PhysicalTableScan {
         let remaining = self.table.row_count();
         let groups = groups_to_scan(&self.table, &self.column_ids, self.prune.as_ref(), remaining);
         let source = self.table.source();
-        let cursor = source.clone().map(|source| self.file_scan(source));
+        // the VARIANT fields are read by row group, where the chunks are those of the file's groups
+        let group_rows = self.table.row_group_size();
+        let fields = match &source {
+            Some(source)
+                if self.filter.is_none()
+                    && group_rows.is_multiple_of(STANDARD_VECTOR_SIZE)
+                    && TableCursor::is_aligned(&**source, group_rows) =>
+            {
+                self.variant_fields()
+            }
+            _ => Vec::new(),
+        };
+        let cursor = source.clone().map(|source| {
+            let (read, types, columns) = self.file_columns_without(&fields);
+            FileScan {
+                cursor: TableCursor::new(source, read, types, self.table.row_group_size()),
+                columns,
+            }
+        });
         let ids = self.table.row_ids(remaining);
         // a filter on a table in its file is applied while its row groups are read
         let filtered = source
@@ -772,6 +816,8 @@ impl PhysicalOperator for PhysicalTableScan {
             next_index_row: 0,
             filtered,
             sampling,
+            fields,
+            field_group: None,
         })
     }
     fn dynamic_filters(&self) -> Option<String> {
@@ -824,6 +870,8 @@ impl PhysicalOperator for PhysicalTableScan {
             next_index_row,
             filtered,
             sampling,
+            fields,
+            field_group,
         } = state.downcast_mut().expect("table scan state");
         if let Some(rows) = &self.index_rows {
             return self.next_index_chunk(rows, next_index_row);
@@ -903,7 +951,21 @@ impl PhysicalOperator for PhysicalTableScan {
             };
             let count = chunk.len().min(*remaining);
             *remaining -= count;
-            let columns = self.scan_columns(&chunk, ids, first_row, cursor.as_ref())?;
+            let mut columns = self.scan_columns(&chunk, ids, first_row, cursor.as_ref())?;
+            if !fields.is_empty() {
+                let per_group = self.table.chunks_per_row_group();
+                let group = index / per_group;
+                if field_group.as_ref().is_none_or(|(at, _)| *at != group) {
+                    let source = self.table.source().expect("a scan of a file");
+                    let rows = source.group_rows(group);
+                    *field_group = Some((group, self.group_fields(&*source, group, fields, rows)?));
+                }
+                let (_, group_fields) = field_group.as_ref().expect("just set");
+                let local = (index % per_group) * STANDARD_VECTOR_SIZE;
+                for (position, field) in group_fields {
+                    columns[*position] = field.range(local, chunk.len());
+                }
+            }
             let mut result = DataChunk::from_columns(columns, chunk.len());
             if let Some(selected) = sample_selection {
                 let kept = selected.len();
@@ -911,7 +973,7 @@ impl PhysicalOperator for PhysicalTableScan {
             } else if count < chunk.len() {
                 result.slice(&SelectionVector::from_vec((0..count as u32).collect()), count);
             }
-            match self.finish_chunk(result)? {
+            match self.finish_chunk_with(result, fields)? {
                 Some(result) => return Ok(Some(result)),
                 None => continue,
             }
