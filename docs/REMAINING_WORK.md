@@ -257,8 +257,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
     ranges of a column, cut where the row groups' zones overlap little
   - [x] list comprehension rewrite: a list comprehension whose result reads no field of the filter's struct
     becomes `list_transform(list_filter(l, f), r)`
-  - [ ] passes not ported: enum IN simplification (C++ keeps IN
-    lists as IN), the auxiliary `e(b) op e(c)` filters of window pushdown, uncorrelated EXISTS as a cross product
+  - [x] enum IN simplification (`InEnumSimplificationRule`, `EnumCompareSimplificationRule`), of the IN lists
+    the binder spells out as comparisons too; `constant_or_null` is not folded by statistics in a statement with
+    side effects, side-effecting CTEs included
+  - [ ] passes not ported: C++ keeps IN lists as IN, the auxiliary `e(b) op e(c)` filters of window pushdown, uncorrelated EXISTS as a cross product
 - [ ] 19. TPC-H 22/22 and TPC-DS 99/99 correct
   - [x] with `tools/tpch` and `tools/tpcds` building dbgen and dsdgen from the C++ checkout, the examples get
     TPC-H 22/22 at SF 0.01 and 0.1, TPC-DS 99/99 at SF 0.01

@@ -737,12 +737,18 @@ fn has_unique_tables(op: &LogicalOperator, seen: &mut HashSet<usize>) -> bool {
 
 /// Runs the pass over a plan, and gives what it found out of the columns of the plan
 /// (`GetStatisticsMap`), if it ran.
-pub fn propagate_statistics(plan: &mut LogicalOperator, perfect_ht_threshold: u64) -> Option<StatisticsMap> {
+/// `side_effects`: the statement writes elsewhere, as its side-effecting CTEs, which the plan does not show.
+pub fn propagate_statistics(
+    plan: &mut LogicalOperator,
+    perfect_ht_threshold: u64,
+    side_effects: bool,
+) -> Option<StatisticsMap> {
     if !has_unique_tables(plan, &mut HashSet::new()) {
         return None;
     }
     let mut propagator = StatisticsPropagator {
         perfect_ht_threshold,
+        side_effects: side_effects || super::cte_inlining::has_side_effects(plan),
         ..Default::default()
     };
     propagator.visit(plan);
@@ -753,12 +759,13 @@ pub fn propagate_statistics(plan: &mut LogicalOperator, perfect_ht_threshold: u6
 /// are ordered: it also takes the branches out of filters that statistics tell cannot be true, and
 /// leaves the joins' range filters and the choice of aggregates for the full pass. Gives whether a
 /// filter now reads other tables than before (`FilterBindingsChanged`).
-pub fn simplify_filters(plan: &mut LogicalOperator) -> bool {
+pub fn simplify_filters(plan: &mut LogicalOperator, side_effects: bool) -> bool {
     if !has_unique_tables(plan, &mut HashSet::new()) {
         return false;
     }
     let mut propagator = StatisticsPropagator {
         filter_simplification: true,
+        side_effects: side_effects || super::cte_inlining::has_side_effects(plan),
         ..Default::default()
     };
     propagator.visit(plan);
@@ -806,6 +813,8 @@ struct StatisticsPropagator {
     filter_simplification: bool,
     /// `filter_bindings_changed`
     filter_bindings_changed: bool,
+    /// the plan writes (`HasSideEffects`): its statistics may not see the rows it adds, NULLs among them
+    side_effects: bool,
     /// `cte_stats_map`: the statistics of the columns of each materialized CTE's definition
     ctes: HashMap<usize, Vec<Stats>>,
     /// the most rows each materialized CTE's definition has
@@ -1622,7 +1631,8 @@ impl StatisticsPropagator {
             }
             return result;
         }
-        if function.name == "constant_or_null" && stats[1..].iter().all(|s| !s.can_be_null) {
+        // `ConstantOrNullSimplification`: folding drops the NULL check, which a plan that adds rows can't
+        if function.name == "constant_or_null" && !self.side_effects && stats[1..].iter().all(|s| !s.can_be_null) {
             let alias = expr.alias.clone();
             let value = children.swap_remove(0);
             *expr = value.with_alias(alias);
@@ -1932,8 +1942,9 @@ impl StatisticsPropagator {
             }
         }
         simplify_constant_or_null(&mut kept);
-        // as a table filter (which a filter that can fail keeps it from becoming)
-        if !kept.iter().any(crate::optimizer::rewriter::can_throw) {
+        // as a table filter (which a filter that can fail keeps it from becoming), where the statistics then
+        // tell it is always true: not in a plan that adds rows, which they don't see
+        if !self.side_effects && !kept.iter().any(crate::optimizer::rewriter::can_throw) {
             kept = kept.into_iter().map(|expr| true_or_null_as_not_null(expr, &op.children[0])).collect();
         }
         // `x != a AND x != b ...` that leaves no value of an integer column's range (a NOT IN list

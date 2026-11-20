@@ -149,7 +149,10 @@ impl ClientContext {
             let result = trigger_scope::with_scope(Some(scope_with(&tables)), || self.run_statement(&statement))?;
             tables.push(table_of(name, cte, result.names, result.types, result.collection));
         }
-        trigger_scope::with_scope(Some(scope_with(&tables)), || self.run_statement(rest))
+        let before = std::mem::replace(&mut self.after_dml_ctes, true);
+        let result = trigger_scope::with_scope(Some(scope_with(&tables)), || self.run_statement(rest));
+        self.after_dml_ctes = before;
+        result
     }
 
     /// `prepare_statement` of a query with side-effecting CTEs: each body binds, its rows a table
@@ -197,8 +200,10 @@ impl ClientContext {
             tables.push(table_of(name, cte, names, types, rows));
             bodies.push((name.clone(), trees));
         }
-        let (mut trees, names, types) =
-            trigger_scope::with_scope(Some(scope_with(&tables)), || self.explain_trees(rest, analyze))?;
+        let before = std::mem::replace(&mut self.after_dml_ctes, true);
+        let explained = trigger_scope::with_scope(Some(scope_with(&tables)), || self.explain_trees(rest, analyze));
+        self.after_dml_ctes = before;
+        let (mut trees, names, types) = explained?;
         for (name, body) in bodies.into_iter().rev() {
             let [logical, optimized, physical] = body;
             let [rest_logical, rest_optimized, rest_physical] = trees;

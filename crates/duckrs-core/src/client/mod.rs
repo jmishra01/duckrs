@@ -884,6 +884,8 @@ pub struct ClientContext {
     home: Arc<DatabaseInstance>,
     /// identifies the connection among the database's connections
     id: u64,
+    /// the statement ran side-effecting CTEs before what is planned now, which its statistics don't see
+    after_dml_ctes: bool,
     /// the transaction BEGIN started (`TransactionContext`); without one, each statement is its
     /// own (auto-commit)
     transaction: Option<ActiveTransaction>,
@@ -1032,6 +1034,7 @@ impl ClientContext {
             home: db.clone(),
             db,
             id,
+            after_dml_ctes: false,
             transaction: None,
             settings: SettingValues::default(),
             prepared_statements: HashMap::new(),
@@ -1207,6 +1210,7 @@ impl ClientContext {
         }
         options.force_no_cross_product = self.setting_text("debug_force_no_cross_product") == "true";
         options.threads = self.thread_count();
+        options.side_effects = self.after_dml_ctes;
         if let Ok(rows) = self.setting_text("late_materialization_max_rows").parse() {
             options.late_materialization_options.max_rows = rows;
         }

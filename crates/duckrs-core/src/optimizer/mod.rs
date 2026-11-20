@@ -111,6 +111,8 @@ pub struct OptimizerOptions {
     pub partitioned_execution: bool,
     /// `threads`, which the size of the parts of a partitioned execution depends on
     pub threads: usize,
+    /// the statement runs side-effecting CTEs before this plan (`HasSideEffects` of the whole of it)
+    pub side_effects: bool,
     /// `TOP_N_WINDOW_ELIMINATION`
     pub topn_window_elimination: bool,
     /// `late_materialization_max_rows` and `preserve_insertion_order`
@@ -174,6 +176,7 @@ impl Default for OptimizerOptions {
             compressed_materialization: true,
             partitioned_execution: true,
             threads: 1,
+            side_effects: false,
             topn_window_elimination: true,
             late_materialization_options: late_materialization::LateMaterializationOptions {
                 max_rows: 50,
@@ -233,6 +236,7 @@ impl OptimizerOptions {
             compressed_materialization: false,
             partitioned_execution: false,
             threads: 1,
+            side_effects: false,
             topn_window_elimination: false,
             late_materialization_options: late_materialization::LateMaterializationOptions {
                 max_rows: 50,
@@ -291,6 +295,7 @@ impl OptimizerOptions {
             compressed_materialization: !off("compressed_materialization"),
             partitioned_execution: !off("partitioned_execution"),
             threads: 1,
+            side_effects: false,
             topn_window_elimination: !off("top_n_window_elimination"),
             late_materialization_options: late_materialization::LateMaterializationOptions {
                 max_rows: 50,
@@ -366,7 +371,7 @@ pub fn optimize_timed(
     if options.filter_pushdown && options.statistics_propagation && filter_statistics_applies(&plan) {
         let mut changed = false;
         plan = run("statistics_propagation", plan, &mut |mut plan| {
-            changed = statistics::simplify_filters(&mut plan);
+            changed = statistics::simplify_filters(&mut plan, options.side_effects);
             plan
         });
         if changed {
@@ -438,7 +443,7 @@ pub fn optimize_timed(
     let mut statistics_map = None;
     if options.statistics_propagation {
         plan = run("statistics_propagation", plan, &mut |mut plan| {
-            statistics_map = statistics::propagate_statistics(&mut plan, options.perfect_ht_threshold);
+            statistics_map = statistics::propagate_statistics(&mut plan, options.perfect_ht_threshold, options.side_effects);
             plan
         });
     }

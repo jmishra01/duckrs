@@ -87,7 +87,7 @@ fn has_reference_below_delim_join(op: &LogicalOperator, cte: usize, below: bool)
 }
 
 /// `LogicalOperator::HasSideEffects`.
-fn has_side_effects(op: &LogicalOperator) -> bool {
+pub(crate) fn has_side_effects(op: &LogicalOperator) -> bool {
     matches!(
         op.kind,
         K::Insert { .. }

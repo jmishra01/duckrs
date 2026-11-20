@@ -121,6 +121,210 @@ fn apply_rules(expr: &mut BoundExpr, in_filter: bool) -> bool {
         || (in_filter && predicate_factoring(expr))
         || list_comprehension_rewrite(expr)
         || contains_to_in_clause(expr)
+        || enum_compare_simplification(expr)
+        || enum_in_simplification(expr)
+        || enum_full_domain(expr)
+}
+
+/// The ENUM of `CAST(e AS VARCHAR)`, or of an ENUM itself (`GetEnumInProbe`).
+fn enum_probe(expr: &BoundExpr) -> Option<&BoundExpr> {
+    if expr.return_type.id() == LogicalTypeId::Enum {
+        return Some(expr);
+    }
+    match &expr.kind {
+        BoundExprKind::Cast { child, try_cast: false }
+            if expr.return_type.id() == LogicalTypeId::Varchar && child.return_type.id() == LogicalTypeId::Enum =>
+        {
+            Some(child)
+        }
+        _ => None,
+    }
+}
+
+/// The ENUM of `ty` that is `value`, by its text, if it is one.
+fn enum_constant(ty: &LogicalType, value: &Value) -> Option<Value> {
+    let text = value.try_to_string().ok()?;
+    let position = ty.enum_values().iter().position(|v| *v == text)?;
+    Some(Value::enum_value(ty, position))
+}
+
+/// `EnumCompareSimplificationRule`: `CAST(e AS VARCHAR) op 'x'` compares the ENUM with the ENUM `'x'`; a
+/// string outside of its values is equal to none of them.
+fn enum_compare_simplification(expr: &mut BoundExpr) -> bool {
+    let BoundExprKind::Comparison { op, left, right } = &expr.kind else {
+        return false;
+    };
+    let op = *op;
+    if !matches!(
+        op,
+        ComparisonOp::Equal | ComparisonOp::NotEqual | ComparisonOp::DistinctFrom | ComparisonOp::NotDistinctFrom
+    ) {
+        return false;
+    }
+    let cast_left = matches!(left.kind, BoundExprKind::Cast { .. });
+    let (cast, constant) = if cast_left { (left, right) } else { (right, left) };
+    let BoundExprKind::Cast { child, try_cast: false } = &cast.kind else {
+        return false;
+    };
+    if cast.return_type.id() != LogicalTypeId::Varchar || child.return_type.id() != LogicalTypeId::Enum {
+        return false;
+    }
+    let BoundExprKind::Constant(value) = &constant.kind else {
+        return false;
+    };
+    if constant.return_type.id() != LogicalTypeId::Varchar {
+        return false;
+    }
+    let probe = (**child).clone();
+    let ty = probe.return_type.clone();
+    let enum_value = if value.is_null() {
+        Some(Value::null(ty.clone()))
+    } else {
+        enum_constant(&ty, value)
+    };
+    *expr = match enum_value {
+        Some(enum_value) => {
+            let enum_value = BoundExpr::constant(enum_value);
+            let (left, right) = if cast_left { (probe, enum_value) } else { (enum_value, probe) };
+            BoundExpr::new(
+                BoundExprKind::Comparison {
+                    op,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                LogicalType::BOOLEAN,
+            )
+        }
+        None => match op {
+            ComparisonOp::Equal => crate::function::constant_or_null(vec![BoundExpr::constant(Value::boolean(false)), probe]),
+            ComparisonOp::NotEqual => crate::function::constant_or_null(vec![BoundExpr::constant(Value::boolean(true)), probe]),
+            ComparisonOp::NotDistinctFrom => BoundExpr::constant(Value::boolean(false)),
+            _ => BoundExpr::constant(Value::boolean(true)),
+        },
+    };
+    true
+}
+
+/// `InEnumSimplificationRule`: `e IN (...)` of an ENUM (or `CAST(e AS VARCHAR)`) and strings or ENUMs is of the
+/// ENUM's values among them; all of them make it a constant, none too.
+fn enum_in_simplification(expr: &mut BoundExpr) -> bool {
+    let BoundExprKind::Operator { op, children } = &expr.kind else {
+        return false;
+    };
+    let in_clause = match op {
+        BoundOperator::In => true,
+        BoundOperator::NotIn => false,
+        _ => return false,
+    };
+    let Some(probe) = enum_probe(&children[0]) else {
+        return false;
+    };
+    // nothing to do for an ENUM already compared with its own values
+    let cast_probe = !std::ptr::eq(probe, &children[0]);
+    let ty = probe.return_type.clone();
+    let mut list = vec![probe.clone()];
+    let mut matched = std::collections::BTreeSet::new();
+    let mut changed = cast_probe;
+    for child in &children[1..] {
+        let BoundExprKind::Constant(value) = &child.kind else {
+            return false;
+        };
+        if value.is_null() {
+            list.push(BoundExpr::constant(Value::null(ty.clone())));
+            continue;
+        }
+        if !matches!(value.logical_type().id(), LogicalTypeId::Varchar | LogicalTypeId::Enum) {
+            return false;
+        }
+        match enum_constant(&ty, value) {
+            Some(enum_value) => {
+                if value.logical_type() != &ty {
+                    changed = true;
+                }
+                if let Some(position) = ty.enum_values().iter().position(|v| Some(v.as_str()) == value.try_to_string().ok().as_deref()) {
+                    matched.insert(position);
+                }
+                list.push(BoundExpr::constant(enum_value));
+            }
+            // not one of its values: compares with none
+            None => changed = true,
+        }
+    }
+    let probe = list[0].clone();
+    if matched.len() == ty.enum_values().len() {
+        *expr = crate::function::constant_or_null(vec![BoundExpr::constant(Value::boolean(in_clause)), probe]);
+        return true;
+    }
+    if list.len() == 1 {
+        *expr = crate::function::constant_or_null(vec![BoundExpr::constant(Value::boolean(!in_clause)), probe]);
+        return true;
+    }
+    if !changed {
+        return false;
+    }
+    let BoundExprKind::Operator { children, .. } = &mut expr.kind else {
+        unreachable!()
+    };
+    *children = list;
+    true
+}
+
+/// `InEnumSimplificationRule` of an IN list the binder spelled out: `e = a OR e = b ...` (`e != a AND ...` of
+/// NOT IN) over all of an ENUM's values is a constant, NULL where `e` is.
+fn enum_full_domain(expr: &mut BoundExpr) -> bool {
+    let BoundExprKind::Conjunction { and, children } = &expr.kind else {
+        return false;
+    };
+    let and = *and;
+    let wanted = if and { ComparisonOp::NotEqual } else { ComparisonOp::Equal };
+    let mut probe: Option<&BoundExpr> = None;
+    let mut matched = std::collections::BTreeSet::new();
+    for child in children {
+        // `constant_or_null(c, e)` of a value it has none of: of no consequence here
+        if let BoundExprKind::Function { function, children: args, .. } = &child.kind
+            && function.name == "constant_or_null"
+            && args.len() == 2
+            && matches!(&args[0].kind, BoundExprKind::Constant(v) if *v == Value::boolean(and))
+        {
+            if probe.is_some_and(|p| !expressions_equal(p, &args[1])) {
+                return false;
+            }
+            probe = Some(&args[1]);
+            continue;
+        }
+        let BoundExprKind::Comparison { op, left, right } = &child.kind else {
+            return false;
+        };
+        if *op != wanted {
+            return false;
+        }
+        let (side, constant) = match (&left.kind, &right.kind) {
+            (_, BoundExprKind::Constant(value)) => (&**left, value),
+            (BoundExprKind::Constant(value), _) => (&**right, value),
+            _ => return false,
+        };
+        if side.return_type.id() != LogicalTypeId::Enum || probe.is_some_and(|p| !expressions_equal(p, side)) {
+            return false;
+        }
+        probe = Some(side);
+        if constant.is_null() {
+            continue;
+        }
+        let Some(position) = constant.try_to_string().ok().and_then(|t| side.return_type.enum_values().iter().position(|v| *v == t))
+        else {
+            return false;
+        };
+        matched.insert(position);
+    }
+    let Some(probe) = probe else {
+        return false;
+    };
+    if probe.return_type.id() != LogicalTypeId::Enum || matched.len() != probe.return_type.enum_values().len() {
+        return false;
+    }
+    let probe = probe.clone();
+    *expr = crate::function::constant_or_null(vec![BoundExpr::constant(Value::boolean(!and)), probe]);
+    true
 }
 
 /// `MatchesStructFieldProjection`: `struct_extract` of the lambda's element, the field `name`; with
