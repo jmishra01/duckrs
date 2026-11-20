@@ -36,11 +36,13 @@ use duckrs_common::vector::{DataChunk, Vector};
 use std::collections::{HashMap, HashSet};
 
 /// `CompressedMaterialization::Compress` over the plan.
-pub fn compress(plan: &mut LogicalOperator, statistics: &mut StatisticsMap) {
+pub fn compress(plan: &mut LogicalOperator, statistics: &mut StatisticsMap, perfect_ht_threshold: u64) {
     let mut next = max_table_index(plan) + 1;
     let mut pass = Pass {
         statistics,
         next: &mut next,
+        ranges: HashMap::new(),
+        perfect_ht_threshold,
     };
     pass.visit(plan);
 }
@@ -48,6 +50,10 @@ pub fn compress(plan: &mut LogicalOperator, statistics: &mut StatisticsMap) {
 struct Pass<'a> {
     statistics: &'a mut StatisticsMap,
     next: &'a mut usize,
+    /// the range of each compressed column a compressing projection outputs, where it is known
+    ranges: HashMap<ColumnBinding, (i128, i128)>,
+    /// `perfect_ht_threshold`
+    perfect_ht_threshold: u64,
 }
 
 /// How a column was compressed (`CompressedMaterializationType`).
@@ -69,6 +75,9 @@ enum Compression {
 struct Compressed {
     expression: BoundExpr,
     how: Compression,
+    /// the smallest and largest value of the compressed column, where its statistics tell (the `stats` of C++'s
+    /// `CompressExpression`), for the perfect hash aggregate of its groups
+    range: Option<(i128, i128)>,
 }
 
 fn replace(kind: &mut K, map: &HashMap<ColumnBinding, (ColumnBinding, LogicalType)>, set_type: bool) {
@@ -218,6 +227,9 @@ impl Pass<'_> {
             }
         }
         let mut changed = self.create_projections(op, &[can], &HashMap::new());
+        if !changed.is_empty() {
+            self.update_perfect_hash(op);
+        }
         if in_place.is_empty() {
             return changed;
         }
@@ -264,6 +276,71 @@ impl Pass<'_> {
         changed
     }
 
+    /// `UpdateAggregateStats`, and with it `CanUsePerfectHashAggregate`: compressed groups have the ranges of
+    /// their compressed values, which can be small enough for a perfect hash table where the columns they
+    /// compress (strings, wide integers) were not. `op` is the aggregate, or the restoring projection above it.
+    fn update_perfect_hash(&mut self, op: &mut LogicalOperator) {
+        let aggregate = match op.kind {
+            K::Aggregate { .. } => op,
+            K::Projection { .. } => &mut op.children[0],
+            _ => return,
+        };
+        let K::Aggregate {
+            groups,
+            aggregates,
+            perfect_hash,
+            ..
+        } = &mut aggregate.kind
+        else {
+            return;
+        };
+        if *perfect_hash || groups.is_empty() || aggregates.iter().any(|a| a.distinct) {
+            return;
+        }
+        let mut total = 0;
+        for group in groups.iter() {
+            let Some(bits) = self.perfect_hash_bits(group) else {
+                return;
+            };
+            total += bits;
+        }
+        *perfect_hash = total <= self.perfect_ht_threshold;
+    }
+
+    /// The bits a group takes in a perfect hash table (`RequiredBitsForValue` of its range, plus one for NULL and
+    /// one to count from one), as the statistics propagation works them out.
+    fn perfect_hash_bits(&mut self, group: &BoundExpr) -> Option<u64> {
+        use duckrs_common::types::PhysicalType::*;
+        let BoundExprKind::ColumnRef { binding, depth: 0 } = group.kind else {
+            return None;
+        };
+        let ty = &group.return_type;
+        let physical = ty.physical_type();
+        if !matches!(
+            physical,
+            Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64
+        ) {
+            return None;
+        }
+        let known = self.ranges.get(&binding).copied().or_else(|| {
+            let stats = self.statistics.get(binding);
+            stats.min.as_ref()?.as_i128().zip(stats.max.as_ref()?.as_i128())
+        });
+        let (min, max) = match known {
+            Some(range) => range,
+            None if matches!(physical, Int8 | Int16 | UInt8 | UInt16) => bounds(ty)?,
+            None => return None,
+        };
+        if max < min {
+            return None;
+        }
+        let range = u64::try_from(max - min).ok()?;
+        if range >= i32::MAX as u64 {
+            return None;
+        }
+        Some(u64::from(64 - (range + 2).leading_zeros()))
+    }
+
     /// `CreateProjections`: a compressing projection below each child of `op` that has a column to
     /// compress, and a restoring one above it. `can[c][i]`: column `i` of child `c` may be
     /// compressed; `overrides` are the statistics to compress a column by in place of its own.
@@ -282,6 +359,7 @@ impl Pass<'_> {
             let (bindings, types) = (child.column_bindings(), child.types());
             let mut how = Vec::new();
             let mut expressions = Vec::new();
+            let mut ranges = Vec::new();
             for (i, (&binding, ty)) in bindings.iter().zip(&types).enumerate() {
                 let input = BoundExpr::column_ref(binding, ty.clone(), "");
                 let stats = child_can[i]
@@ -296,10 +374,12 @@ impl Pass<'_> {
                     Some(compressed) => {
                         how.push(Some(compressed.how));
                         expressions.push(compressed.expression);
+                        ranges.push(compressed.range);
                     }
                     None => {
                         how.push(None);
                         expressions.push(input);
+                        ranges.push(None);
                     }
                 }
             }
@@ -308,6 +388,11 @@ impl Pass<'_> {
                 continue;
             }
             let index = self.take();
+            for (i, range) in ranges.into_iter().enumerate() {
+                if let Some(range) = range {
+                    self.ranges.insert(ColumnBinding::new(index, i), range);
+                }
+            }
             for (i, (b, e)) in bindings.iter().zip(&expressions).enumerate() {
                 below.insert(*b, (ColumnBinding::new(index, i), e.return_type.clone()));
             }
@@ -631,6 +716,7 @@ fn integral_compress_with(input: BoundExpr, stats: &ColumnStatistics, offset_onl
             return Some(Compressed {
                 expression: input.cast_to(&target, false),
                 how: Compression::Cast,
+                range: (!all_null).then_some((min, max)),
             });
         }
     }
@@ -647,6 +733,7 @@ fn integral_compress_with(input: BoundExpr, stats: &ColumnStatistics, offset_onl
     Some(Compressed {
         expression,
         how: Compression::Offset(min),
+        range: (!all_null).then_some((0, i128::from(range))),
     })
 }
 
@@ -683,10 +770,12 @@ fn variant_compress(input: BoundExpr, stats: &ColumnStatistics) -> Option<Compre
         Some(compressed) => Compressed {
             expression: compressed.expression,
             how: Compression::Variant(shredded, Some(Box::new(compressed.how))),
+            range: compressed.range,
         },
         None => Compressed {
             expression: cast,
             how: Compression::Variant(shredded, None),
+            range: None,
         },
     })
 }
@@ -727,10 +816,22 @@ fn string_compress(input: BoundExpr, stats: &ColumnStatistics) -> Option<Compres
         LogicalTypeId::UBigInt => compress_string::<u64>,
         _ => compress_string::<u128>,
     };
+    // `CreateStringCompressStats`: a string of at most one byte is its length plus that byte, so the values lie
+    // between the first byte of the smallest string and one more than that of the largest
+    let range = (target.id() == LogicalTypeId::UTinyInt && stats.can_be_valid)
+        .then(|| stats.strings.as_ref()?.bounds.as_ref())
+        .flatten()
+        .map(|(min, max)| {
+            (
+                i128::from(min.first().copied().unwrap_or(0)),
+                i128::from(max.first().copied().unwrap_or(0)) + 1,
+            )
+        });
     let name = format!("__internal_compress_string_{}", type_name(&target));
     Some(Compressed {
         expression: crate::function::nested::bound_function(&name, vec![input], target, callback),
         how: Compression::String,
+        range,
     })
 }
 
@@ -815,6 +916,7 @@ fn geometry_compress(input: BoundExpr, stats: &ColumnStatistics) -> Option<Compr
             compress_geometry_point,
         ),
         how: Compression::GeometryPoint,
+        range: None,
     })
 }
 

@@ -9,6 +9,7 @@
 
 pub mod build_side;
 mod aggregate_rewriter;
+mod common_aggregate;
 mod common_subplan;
 mod cte_inlining;
 mod join_elimination;
@@ -486,7 +487,7 @@ pub fn optimize_timed(
         && let Some(statistics_map) = statistics_map.as_mut()
     {
         plan = run("compressed_materialization", plan, &mut |mut plan| {
-            compressed_materialization::compress(&mut plan, statistics_map);
+            compressed_materialization::compress(&mut plan, statistics_map, options.perfect_ht_threshold);
             plan
         });
     }
@@ -506,6 +507,13 @@ pub fn optimize_timed(
             if topn_window_elimination::optimize(&mut plan) && unused {
                 unused_columns::remove_unused_columns(&mut plan);
             }
+            plan
+        });
+    }
+    // `COMMON_AGGREGATE`: once the statistics made `count(x)` of columns without NULLs `count_star()`
+    if options.common_aggregate {
+        plan = run("common_aggregate", plan, &mut |mut plan| {
+            common_aggregate::optimize(&mut plan);
             plan
         });
     }
