@@ -240,7 +240,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] `stats()` of a VARCHAR read from several parquet files with `union_by_name` (NULL here)
   - [x] partitioned execution: a large aggregate, ORDER BY or window over a table as a UNION ALL of parts by
     ranges of a column, cut where the row groups' zones overlap little
-  - [ ] passes not ported: list comprehension rewrite, enum IN simplification (C++ keeps IN
+  - [x] list comprehension rewrite: a list comprehension whose result reads no field of the filter's struct
+    becomes `list_transform(list_filter(l, f), r)`
+  - [ ] passes not ported: enum IN simplification (C++ keeps IN
     lists as IN), the auxiliary `e(b) op e(c)` filters of window pushdown, uncorrelated EXISTS as a cross product
 - [ ] 19. TPC-H 22/22 and TPC-DS 99/99 correct
   - [x] with `tools/tpch` and `tools/tpcds` building dbgen and dsdgen from the C++ checkout, the examples get

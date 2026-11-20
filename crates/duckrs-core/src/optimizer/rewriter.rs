@@ -119,7 +119,127 @@ fn apply_rules(expr: &mut BoundExpr, in_filter: bool) -> bool {
         || not_conjunction_simplification(expr)
         || join_dependent_filter(expr, in_filter)
         || (in_filter && predicate_factoring(expr))
+        || list_comprehension_rewrite(expr)
         || contains_to_in_clause(expr)
+}
+
+/// `MatchesStructFieldProjection`: `struct_extract` of the lambda's element, the field `name`; with
+/// `boolean_cast`, under one cast to BOOLEAN too.
+fn extracts_field(expr: &BoundExpr, name: &str, boolean_cast: bool) -> bool {
+    let mut base = expr;
+    if boolean_cast
+        && let BoundExprKind::Cast { child, try_cast: false } = &base.kind
+        && base.return_type == LogicalType::BOOLEAN
+    {
+        base = child;
+    }
+    let BoundExprKind::Function { function, children, .. } = &base.kind else {
+        return false;
+    };
+    let [element, field] = children.as_slice() else {
+        return false;
+    };
+    if function.name != "struct_extract" || !matches!(element.kind, BoundExprKind::Reference(0)) {
+        return false;
+    }
+    let BoundExprKind::Constant(field) = &field.kind else {
+        return false;
+    };
+    let fields = element.return_type.struct_children();
+    match field.logical_type().id() {
+        LogicalTypeId::Varchar => field.try_to_string().is_ok_and(|f| f == name),
+        _ => field
+            .as_i128()
+            .and_then(|at| fields.get(usize::try_from(at).ok()?))
+            .is_some_and(|(field, _)| field == name),
+    }
+}
+
+/// `ListComprehensionRewriteRule`: `[r FOR x IN l IF f]` binds to `list_apply(list_filter(list_apply(l,
+/// lambda x: struct_pack(filter := f, result := r)), lambda s: s.filter), lambda s: s.result)`; where `r`
+/// does not read the index it is `list_apply(list_filter(l, lambda x: f), lambda x: r)`, which builds
+/// no structs.
+fn list_comprehension_rewrite(expr: &mut BoundExpr) -> bool {
+    use crate::planner::expression::LambdaKind;
+    let BoundExprKind::ListLambda {
+        kind: LambdaKind::Transform,
+        list: filtered,
+        captures: root_captures,
+        body: root_body,
+        ..
+    } = &expr.kind
+    else {
+        return false;
+    };
+    let BoundExprKind::ListLambda {
+        kind: LambdaKind::Filter,
+        list: inner,
+        captures: filter_captures,
+        body: filter_body,
+        ..
+    } = &filtered.kind
+    else {
+        return false;
+    };
+    if !root_captures.is_empty()
+        || !filter_captures.is_empty()
+        || !extracts_field(filter_body, "filter", true)
+        || !extracts_field(root_body, "result", false)
+    {
+        return false;
+    }
+    let BoundExprKind::ListLambda {
+        kind: LambdaKind::Transform,
+        list,
+        captures,
+        body: inner_body,
+        ..
+    } = &inner.kind
+    else {
+        return false;
+    };
+    let BoundExprKind::Function { function, children, .. } = &inner_body.kind else {
+        return false;
+    };
+    if function.name != "struct_pack" {
+        return false;
+    }
+    let fields = inner_body.return_type.struct_children();
+    let field = |name: &str| fields.iter().position(|(n, _)| n == name).and_then(|at| children.get(at));
+    let (Some(filter), Some(result)) = (field("filter"), field("result")) else {
+        return false;
+    };
+    // the index, which the rewritten apply does not have
+    let mut reads_index = false;
+    result.clone().walk_mut(&mut |e| reads_index |= matches!(e.kind, BoundExprKind::Reference(1)));
+    if reads_index || result.is_volatile() {
+        return false;
+    }
+    let filter = filter.clone().cast_to(&LogicalType::BOOLEAN, false);
+    let result = result.clone();
+    let new_filter = BoundExpr::new(
+        BoundExprKind::ListLambda {
+            kind: LambdaKind::Filter,
+            list: list.clone(),
+            initial: None,
+            captures: captures.clone(),
+            body: Box::new(filter),
+        },
+        list.return_type.clone(),
+    );
+    let return_type = LogicalType::list(result.return_type.clone());
+    *expr = BoundExpr::new(
+        BoundExprKind::ListLambda {
+            kind: LambdaKind::Transform,
+            list: Box::new(new_filter),
+            initial: None,
+            captures: captures.clone(),
+            body: Box::new(result),
+        },
+        return_type,
+    )
+    .with_alias(expr.alias.clone());
+    true
 }
 
 /// `GetSingleColumnBinding`: the one column a non-volatile expression reads.

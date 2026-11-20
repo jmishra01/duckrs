@@ -585,6 +585,45 @@ impl fmt::Display for BoundExpr {
                 write!(f, " ELSE {else_expr} END")
             }
             BoundExprKind::Subquery { .. } => f.write_str("SUBQUERY"),
+            // `BoundFunctionExpression::ToString` of a lambda function: the list, the lambda with the
+            // names of its parameters, and the initial value
+            BoundExprKind::ListLambda {
+                kind,
+                list,
+                initial,
+                body,
+                ..
+            } => {
+                let name = match kind {
+                    LambdaKind::Transform => "list_apply",
+                    LambdaKind::Filter => "list_filter",
+                    LambdaKind::Reduce => "list_reduce",
+                };
+                let mut names: Vec<String> = Vec::new();
+                let slots = if *kind == LambdaKind::Reduce { 3 } else { 2 };
+                for slot in 0..slots {
+                    let mut found = None;
+                    body.clone().walk_mut(&mut |e| {
+                        if let BoundExprKind::Reference(at) = e.kind
+                            && at == slot
+                            && found.is_none()
+                            && !e.alias.is_empty()
+                        {
+                            found = Some(e.alias.clone());
+                        }
+                    });
+                    match found {
+                        Some(name) => names.push(name),
+                        None if slot == 0 => names.push("x".to_string()),
+                        None => break,
+                    }
+                }
+                write!(f, "{name}({list}, lambda {}: {body}", names.join(", "))?;
+                if let Some(initial) = initial {
+                    write!(f, ", {initial}")?;
+                }
+                f.write_str(")")
+            }
             _ => write!(f, "{:?}", self.kind),
         }
     }
