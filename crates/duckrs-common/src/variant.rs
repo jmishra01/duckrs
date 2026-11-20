@@ -458,6 +458,7 @@ mod physical_type {
     pub const DECIMAL: u8 = 15;
     pub const OBJECT: u8 = 29;
     pub const ARRAY: u8 = 30;
+    pub const GEOMETRY: u8 = 33;
 }
 
 /// The scalar types of `VariantLogicalType`, by their tag; `None` where the tag is no plain scalar.
@@ -780,67 +781,123 @@ impl VariantNode {
 
     /// The row of [`unshredded_type`] that DuckDB stores this value as. A NULL at the top is a NULL row.
     pub fn to_unshredded(&self) -> Result<Value> {
-        let ty = unshredded_type();
         if *self == Self::Null {
-            return Ok(Value::null(ty));
+            return Ok(Value::null(unshredded_type()));
         }
-        let mut keys = std::collections::BTreeSet::new();
-        self.collect_keys(&mut keys);
-        let mut physical = Physical {
-            keys: keys.into_iter().collect(),
-            ..Physical::default()
-        };
-        physical.emit(self)?;
-        let fields = ty.struct_children();
-        let child_of = |at: usize| fields[at].1.child_type().cloned().expect("a list");
-        let keys = Value::list(
-            LogicalType::VARCHAR,
-            physical.keys.iter().map(|k| Value::varchar(k.as_str())).collect(),
-        )?;
-        let children_type = child_of(1);
-        let children = physical
-            .children
-            .iter()
-            .map(|(key, value)| {
-                Value::new(
-                    children_type.clone(),
-                    ValueData::Struct(vec![
-                        key.map_or_else(|| Value::null(LogicalType::UINTEGER), Value::uinteger),
-                        Value::uinteger(*value),
-                    ]),
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let values_type = child_of(2);
-        let values = physical
-            .values
-            .iter()
-            .map(|(tag, offset)| {
-                Value::new(
-                    values_type.clone(),
-                    ValueData::Struct(vec![Value::utinyint(*tag), Value::uinteger(*offset)]),
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Value::new(
-            ty,
-            ValueData::Struct(vec![
-                keys,
-                Value::list(children_type, children)?,
-                Value::list(values_type, values)?,
-                Value::blob(physical.data.as_slice()),
-            ]),
-        )
+        Ok(unshredded_row(&[self])?.0)
     }
 
     /// A row of [`unshredded_type`] back as a value; a NULL row is a NULL.
     pub fn from_unshredded(row: &Value) -> Result<Self> {
+        match UnshreddedRow::parse(row)? {
+            Some(row) if !row.physical.values.is_empty() => row.node(0),
+            _ => Ok(Self::Null),
+        }
+    }
+
+    /// `VariantLogicalType`: the tag DuckDB stores the value with.
+    pub fn type_code(&self) -> u8 {
+        match self {
+            Self::Null => physical_type::NULL,
+            Self::Object(_) => physical_type::OBJECT,
+            Self::Array(_) => physical_type::ARRAY,
+            Self::Scalar(value) => match value.logical_type().id() {
+                LogicalTypeId::Boolean if *value == Value::boolean(true) => physical_type::BOOL_TRUE,
+                LogicalTypeId::Boolean => physical_type::BOOL_FALSE,
+                LogicalTypeId::Decimal => physical_type::DECIMAL,
+                LogicalTypeId::Geometry => physical_type::GEOMETRY,
+                id => tag_of_scalar_type(id).unwrap_or(physical_type::NULL),
+            },
+        }
+    }
+
+    /// How many entries of the `values` list the value takes: one for it and each value inside.
+    pub fn value_count(&self) -> u32 {
+        match self {
+            Self::Object(entries) => 1 + entries.iter().map(|(_, child)| child.value_count()).sum::<u32>(),
+            Self::Array(items) => 1 + items.iter().map(VariantNode::value_count).sum::<u32>(),
+            _ => 1,
+        }
+    }
+}
+
+/// The row of [`unshredded_type`] holding several values one after the other (`VariantNormalizer`), as the
+/// leftovers of a shredded row are stored, and where in `values` each of them starts. No values is a NULL row.
+pub fn unshredded_row(roots: &[&VariantNode]) -> Result<(Value, Vec<u32>)> {
+    let ty = unshredded_type();
+    if roots.is_empty() {
+        return Ok((Value::null(ty), Vec::new()));
+    }
+    let mut keys = std::collections::BTreeSet::new();
+    for root in roots {
+        root.collect_keys(&mut keys);
+    }
+    let mut physical = Physical {
+        keys: keys.into_iter().collect(),
+        ..Physical::default()
+    };
+    let mut starts = Vec::with_capacity(roots.len());
+    for root in roots {
+        starts.push(physical.emit(root)?);
+    }
+    let fields = ty.struct_children();
+    let child_of = |at: usize| fields[at].1.child_type().cloned().expect("a list");
+    let keys = Value::list(
+        LogicalType::VARCHAR,
+        physical.keys.iter().map(|k| Value::varchar(k.as_str())).collect(),
+    )?;
+    let children_type = child_of(1);
+    let children = physical
+        .children
+        .iter()
+        .map(|(key, value)| {
+            Value::new(
+                children_type.clone(),
+                ValueData::Struct(vec![
+                    key.map_or_else(|| Value::null(LogicalType::UINTEGER), Value::uinteger),
+                    Value::uinteger(*value),
+                ]),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let values_type = child_of(2);
+    let values = physical
+        .values
+        .iter()
+        .map(|(tag, offset)| {
+            Value::new(
+                values_type.clone(),
+                ValueData::Struct(vec![Value::utinyint(*tag), Value::uinteger(*offset)]),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let row = Value::new(
+        ty,
+        ValueData::Struct(vec![
+            keys,
+            Value::list(children_type, children)?,
+            Value::list(values_type, values)?,
+            Value::blob(physical.data.as_slice()),
+        ]),
+    )?;
+    Ok((row, starts))
+}
+
+/// A row of [`unshredded_type`], decoded, whose values can be read from any of their entries.
+pub struct UnshreddedRow {
+    physical: Physical,
+}
+
+impl UnshreddedRow {
+    /// `None` for a NULL row.
+    pub fn parse(row: &Value) -> Result<Option<Self>> {
         let ValueData::Struct(fields) = row.data() else {
-            return Ok(Self::Null);
+            return Ok(None);
         };
         let list = |at: usize| -> Result<&[Value]> {
             match fields.get(at).map(Value::data) {
                 Some(ValueData::List(items)) => Ok(items),
+                Some(ValueData::Null) => Ok(&[]),
                 _ => Err(corrupt_variant()),
             }
         };
@@ -863,10 +920,12 @@ impl VariantNode {
                 _ => Vec::new(),
             },
         };
-        if physical.values.is_empty() {
-            return Ok(Self::Null);
-        }
-        physical.node(0, 0)
+        Ok(Some(Self { physical }))
+    }
+
+    /// The value whose entry of `values` is `index`.
+    pub fn node(&self, index: u32) -> Result<VariantNode> {
+        self.physical.node(index, 0)
     }
 }
 

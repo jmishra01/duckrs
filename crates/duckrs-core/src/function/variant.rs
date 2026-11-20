@@ -291,7 +291,8 @@ fn extract_child(node: VariantNode, key: &Value) -> Option<VariantNode> {
     match (&mut node, key.data()) {
         (VariantNode::Object(children), ValueData::Bytes(key)) => {
             let key = String::from_utf8_lossy(key);
-            let at = children.iter().position(|(k, _)| k.eq_ignore_ascii_case(&key))?;
+            // object keys are case-sensitive
+            let at = children.iter().position(|(k, _)| *k == key)?;
             Some(children.swap_remove(at).1)
         }
         (VariantNode::Array(items), _) => {

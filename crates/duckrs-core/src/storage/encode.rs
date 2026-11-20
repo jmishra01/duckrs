@@ -37,7 +37,8 @@ pub fn fill_nulls(data: &mut [u8], width: usize, valid: &[bool]) {
 /// `RLECompressState`: values, then how often each repeats.
 pub fn encode_rle(data: &[u8], width: usize, block_size: usize) -> Vec<Encoded> {
     const MAX_RUN: usize = u16::MAX as usize;
-    let max_entries = (block_size - HEADER_SIZE) / (width + 2);
+    // `GetMaxRLECount`: a multiple of 8
+    let max_entries = (block_size - HEADER_SIZE) / (width + 2) / 8 * 8;
     let mut segments = Vec::new();
     let mut values: Vec<u8> = Vec::new();
     let mut counts: Vec<u8> = Vec::new();
@@ -46,9 +47,12 @@ pub fn encode_rle(data: &[u8], width: usize, block_size: usize) -> Vec<Encoded> 
         if *rows == 0 {
             return;
         }
-        let mut segment = Vec::with_capacity(HEADER_SIZE + values.len() + counts.len());
-        segment.extend_from_slice(&((HEADER_SIZE + values.len()) as u64).to_le_bytes());
+        // `FlushSegment`: the counts start aligned, as C++ reads them in place
+        let counts_at = (HEADER_SIZE + values.len()).next_multiple_of(8);
+        let mut segment = Vec::with_capacity(counts_at + counts.len());
+        segment.extend_from_slice(&(counts_at as u64).to_le_bytes());
         segment.extend_from_slice(values);
+        segment.resize(counts_at, 0);
         segment.extend_from_slice(counts);
         segments.push((segment, *rows));
         values.clear();

@@ -74,8 +74,11 @@ fn read_data_pointer(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>) -
 pub(super) struct PersistentColumn {
     pointers: Vec<DataPointer>,
     validity: Option<Box<PersistentColumn>>,
-    /// Of a LIST or ARRAY, one; of a STRUCT, its fields.
+    /// Of a LIST or ARRAY, one; of a STRUCT, its fields; of a VARIANT, its unshredded values and, if it is
+    /// shredded, their typed part.
     children: Vec<PersistentColumn>,
+    /// Of a shredded VARIANT, the type of its typed part (`VariantPersistentColumnData`).
+    shredded: Option<LogicalType>,
 }
 
 fn not_ported_column(ty: &LogicalType) -> Error {
@@ -90,7 +93,11 @@ fn read_persistent_column(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalTyp
     d.read_object_value(|d| {
         // `GeometryPersistentColumnData`: a GEOMETRY stored as WKB reads as the strings it is
         if ty.map(LogicalType::id) == Some(LogicalTypeId::Geometry) && d.has_property(99)? {
+            // a `unique_ptr`: whether there is one, then it
             let storage_type = d.read_object_field(99, "extra_data", |d| {
+                if !bool::read_value(d)? {
+                    return Ok(None);
+                }
                 d.read_object_value(|d| {
                     d.read_optional_property::<u8>(100, "type")?;
                     d.read_optional_property::<u8>(101, "storage_type")
@@ -107,13 +114,25 @@ fn read_persistent_column(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalTyp
                 "reading a GEOMETRY column of the spatial extension from a database file is not yet ported to duckrs",
             ));
         }
-        if d.has_property(99)? {
-            return Err(Error::not_implemented(match ty.map(LogicalType::id) {
-                Some(LogicalTypeId::Variant) => {
-                    "reading a shredded VARIANT column from a database file is not yet ported to duckrs"
+        // `VariantPersistentColumnData`: the type the typed part of a shredded VARIANT is stored as
+        let mut shredded = None;
+        if ty.map(LogicalType::id) == Some(LogicalTypeId::Variant) && d.has_property(99)? {
+            shredded = d.read_object_field(99, "extra_data", |d| {
+                if !bool::read_value(d)? {
+                    return Ok(None);
                 }
-                _ => "reading extra column data from a database file is not yet ported to duckrs",
-            }));
+                d.read_object_value(|d| {
+                    const VARIANT: u8 = 1;
+                    if d.read_optional_property::<u8>(100, "type")? != Some(VARIANT) {
+                        return Err(corrupt("VARIANT column data has extra data of another type"));
+                    }
+                    d.read_optional_property::<LogicalType>(101, "storage_type")
+                })
+            })?;
+        } else if d.has_property(99)? {
+            return Err(Error::not_implemented(
+                "reading extra column data from a database file is not yet ported to duckrs",
+            ));
         }
         let pointers = if d.has_property(100)? {
             d.read_list(100, "data_pointers", |d| read_data_pointer(d, ty))?
@@ -125,16 +144,22 @@ fn read_persistent_column(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalTyp
                 pointers,
                 validity: None,
                 children: Vec::new(),
+                shredded: None,
             });
         };
         let validity = d.read_object_field(101, "validity", |d| read_persistent_column(d, None))?;
         if ty.id() == LogicalTypeId::Variant {
             let unshredded = duckrs_common::variant::unshredded_type();
-            let child = d.read_object_field(102, "unshredded", |d| read_persistent_column(d, Some(&unshredded)))?;
+            let mut children =
+                vec![d.read_object_field(102, "unshredded", |d| read_persistent_column(d, Some(&unshredded)))?];
+            if let Some(shredded) = &shredded {
+                children.push(d.read_object_field(103, "shredded", |d| read_persistent_column(d, Some(shredded)))?);
+            }
             return Ok(PersistentColumn {
                 pointers,
                 validity: Some(Box::new(validity)),
-                children: vec![child],
+                children,
+                shredded,
             });
         }
         let children = match ty.physical_type() {
@@ -155,6 +180,7 @@ fn read_persistent_column(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalTyp
             pointers,
             validity: Some(Box::new(validity)),
             children,
+            shredded: None,
         })
     })
 }
@@ -494,13 +520,30 @@ fn scan_column_as(
             .first()
             .ok_or_else(|| corrupt("a VARIANT column has no data"))?;
         let stored = scan_column(buffer, child, &unshredded, rows)?;
+        // `UnshredVariantData`: the typed part of the values, with what is left of them
+        let typed = match (&column.shredded, column.children.get(1)) {
+            (Some(shredded), Some(typed)) => Some((shredded, scan_column(buffer, typed, shredded, rows)?)),
+            _ => None,
+        };
         let mut vector = Vector::new(ty.clone(), rows);
         for (row, &valid) in valid.iter().enumerate() {
             if !valid {
                 vector.set_null(row, true);
                 continue;
             }
-            let node = duckrs_common::variant::VariantNode::from_unshredded(&stored.get_value(row))?;
+            let node = match &typed {
+                Some((shredded, typed)) => {
+                    let unshredded = stored.get_value(row);
+                    match duckrs_common::variant_shredding::unshred_row(&unshredded, &typed.get_value(row), shredded)? {
+                        Some(node) => node,
+                        None => {
+                            vector.set_null(row, true);
+                            continue;
+                        }
+                    }
+                }
+                None => duckrs_common::variant::VariantNode::from_unshredded(&stored.get_value(row))?,
+            };
             vector.set_value(row, &Value::new(ty.clone(), ValueData::Bytes(node.encode()))?)?;
         }
         return Ok(vector);
@@ -949,8 +992,13 @@ impl TableSource for DiskTable {
             for (index, inner) in stored.children.iter().enumerate() {
                 let mut child = path.to_vec();
                 child.push(index + 1);
-                let name = match ty.map(LogicalType::physical_type) {
-                    Some(PhysicalType::Struct) => ty.map(|ty| &ty.struct_children()[index].1),
+                let unshredded = duckrs_common::variant::unshredded_type();
+                let name = match ty.map(LogicalType::id) {
+                    Some(LogicalTypeId::Variant) if index == 0 => Some(&unshredded),
+                    Some(LogicalTypeId::Variant) => stored.shredded.as_ref(),
+                    _ if ty.map(LogicalType::physical_type) == Some(PhysicalType::Struct) => {
+                        ty.map(|ty| &ty.struct_children()[index].1)
+                    }
                     _ => ty.and_then(LogicalType::child_type),
                 };
                 add(buffer, result, inner, group, column, &child, name)?;

@@ -155,7 +155,12 @@ Each item gives the number of failing files in `test/` that it should fix, where
     `Leaf` of 4 row ids, 15-byte prefixes, 6 allocators); the `storage_version` option is the file's
   - [ ] dense row id rewriting of files before v2.0.0 (`rowid_gaps/old_storage_*`): row groups stay as they are
   - [x] unshredded VARIANT columns, in the file and the WAL
-  - [ ] shredded VARIANT columns (~20 files), shredded GEOMETRY columns, Patas and Chimp segments (8), `read_duckdb` (8)
+  - [x] shredded VARIANT columns: read from files C++ writes, and written at a checkpoint by
+    `variant_minimum_shredding_size` and `force_variant_shredding`, with the type inferred as C++ does (object fields
+    in name order where C++ has its hash order) and the statistics of the typed part
+  - [ ] `stats()` of a VARIANT, and the shredded statistics in the optimizer (pushdown of extracts into the typed
+    part, `SHREDDED_VECTOR` scans); the statistics of the unshredded part are written as unknown
+  - [ ] shredded GEOMETRY columns, Patas and Chimp segments (8), `read_duckdb` (8)
   - [ ] string and list-length statistics for `stats()` (~10 files), per-column `USING COMPRESSION`
   - [x] `read_duckdb` and the replacement scan of `.db` files; `enable_view_dependencies` (DROP ... CASCADE,
     refused DROP and ALTER, CREATE OR REPLACE of a view that reads itself)
@@ -235,8 +240,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
     groups and the build side and single key pair of comparison joins (casts, `__internal_compress_integral_*`,
     `__internal_compress_string_*`); calling them is the binder error C++ gives
   - [x] compressed materialization of POINT-XY GEOMETRY columns (`__internal_compress_geometry_point`)
-  - [ ] compressed materialization of VARIANT columns: needs shredded VARIANT columns read from a database file
-    (not yet ported in storage) and their shredded statistics
+  - [ ] compressed materialization of VARIANT columns: needs the shredded statistics in the optimizer
   - [ ] `stats()` of a VARCHAR read from several parquet files with `union_by_name` (NULL here)
   - [x] partitioned execution: a large aggregate, ORDER BY or window over a table as a UNION ALL of parts by
     ranges of a column, cut where the row groups' zones overlap little

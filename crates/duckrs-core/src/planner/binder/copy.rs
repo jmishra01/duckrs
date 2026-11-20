@@ -175,6 +175,11 @@ struct CsvArguments {
 }
 
 impl Binder<'_> {
+    /// The type that `name` spells (`UnboundType::TryParseAndDefaultBind`).
+    pub(crate) fn type_from_name(&mut self, name: &str) -> Result<LogicalType> {
+        self.csv_type(name)
+    }
+
     /// The type that `name` spells, resolved as a cast to it would be.
     pub(super) fn csv_type(&mut self, name: &str) -> Result<LogicalType> {
         if name.eq_ignore_ascii_case("null") {

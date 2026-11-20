@@ -464,7 +464,31 @@ impl DatabaseInstance {
         )
         .and_then(|value| value.as_i128())
         .map_or(4096, |length| length as usize);
+        let variant_minimum_shredding_size = settings::current_value(
+            "variant_minimum_shredding_size",
+            &self.settings.read(),
+            &SettingValues::default(),
+        )
+        .and_then(|value| value.as_i128())
+        .map_or(30000, |size| size as i64);
+        // `ForceVariantShredding::SetGlobal`: the type, each level of which can also hold what does not fit it
+        let force_variant_shredding = settings::current_value(
+            "debug_force_variant_shredding",
+            &self.settings.read(),
+            &SettingValues::default(),
+        )
+        .and_then(|value| value.try_to_string().ok())
+        .filter(|name| !name.is_empty());
+        let force_variant_shredding = match force_variant_shredding {
+            Some(name) => {
+                let ty = crate::planner::binder::Binder::new(&self.catalog).type_from_name(&name)?;
+                Some(duckrs_common::variant_shredding::forced_shredding_type(&ty))
+            }
+            None => None,
+        };
         let options = storage::writer::CheckpointOptions {
+            variant_minimum_shredding_size,
+            force_variant_shredding: force_variant_shredding.as_ref(),
             zstd_min_string_length,
             storage_version: file.storage_version,
             keep_free_blocks: self.catalog.has_forks(),

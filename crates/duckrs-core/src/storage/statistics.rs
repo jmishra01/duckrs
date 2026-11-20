@@ -196,14 +196,15 @@ fn read_type_stats(
         return Ok(None);
     };
     if ty.id() == LogicalTypeId::Variant {
+        // `VariantStats::Deserialize`: the statistics of the unshredded values and, if shredded, of the typed part
+        const SHREDDED: u8 = 2;
         let state: u8 = d.read_property(200, "shredding_state")?;
-        if state != 1 {
-            return Err(Error::not_implemented(
-                "reading a shredded VARIANT column from a database file is not yet ported to duckrs",
-            ));
-        }
         let unshredded = duckrs_common::variant::unshredded_type();
         d.read_object_field(225, "unshredded_stats", |d| read_statistics(d, Some(&unshredded)))?;
+        if state == SHREDDED {
+            let shredded: LogicalType = d.read_property(230, "shredded_type")?;
+            d.read_object_field(235, "shredded_stats", |d| read_statistics(d, Some(&shredded)))?;
+        }
         return Ok(None);
     }
     // `GeometryStats::Deserialize`: the string stats of files of the spatial extension, or the extent,
