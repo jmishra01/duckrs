@@ -1,8 +1,8 @@
 //! A small version of duckdb/src/storage/standard_buffer_manager.cpp @ rust-port-baseline.
 //!
-//! Keeps blocks read from a file in memory up to a limit, and evicts the least recently used one
-//! that nobody holds. A pinned block is an `Arc`, so a block in use stays valid and stays here
-//! however far over the limit that goes, as it does in C++ only until `memory_limit` throws.
+//! Keeps blocks read from a file in memory up to a limit, `memory_limit` as a query sets it, and evicts
+//! those least recently used that nobody holds. A pinned block is an `Arc`, so a block in use stays valid
+//! and stays here however far over the limit that goes, as it does in C++ only until `memory_limit` throws.
 //! Temporary files and spilling come with Phase 8's out-of-core operators.
 
 use super::block_manager::SingleFileBlockManager;
@@ -14,7 +14,7 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct BufferManager {
     blocks: Arc<SingleFileBlockManager>,
-    memory_limit: usize,
+    memory_limit: std::sync::atomic::AtomicUsize,
     state: Mutex<State>,
     /// Blocks an append fills ahead of a checkpoint that have no id of the file yet (`PartialBlock` of
     /// `APPEND_TO_TABLE`), by the provisional id their segments have, and those that got one since.
@@ -50,9 +50,17 @@ impl BufferManager {
     pub fn new(blocks: Arc<SingleFileBlockManager>, memory_limit: usize) -> Self {
         Self {
             blocks,
-            memory_limit,
+            memory_limit: std::sync::atomic::AtomicUsize::new(memory_limit),
             state: Mutex::default(),
             provisional: Mutex::default(),
+        }
+    }
+
+    /// What the blocks in memory may take from now on: those over it that nobody holds go.
+    pub fn set_memory_limit(&self, bytes: usize) {
+        let old = self.memory_limit.swap(bytes, std::sync::atomic::Ordering::Relaxed);
+        if bytes < old {
+            Self::evict(&mut self.state.lock(), bytes);
         }
     }
 
@@ -135,20 +143,29 @@ impl BufferManager {
             // somebody else read it in the meantime
             state.used -= previous.block.len();
         }
-        Self::evict(&mut state, self.memory_limit);
+        Self::evict(&mut state, self.memory_limit.load(std::sync::atomic::Ordering::Relaxed));
         Ok(block)
     }
 
+    /// Over `limit`, the blocks nobody holds go, least recently used first, until a tenth of the limit is free, so
+    /// that the next blocks read don't each look through all of them again.
     fn evict(state: &mut State, limit: usize) {
-        while state.used > limit {
-            let victim = state
-                .cached
-                .iter()
-                .filter(|(_, cached)| Arc::strong_count(&cached.block) == 1)
-                .min_by_key(|(_, cached)| cached.last_use)
-                .map(|(&id, _)| id);
-            let Some(victim) = victim else { return };
-            let cached = state.cached.remove(&victim).expect("just found");
+        if state.used <= limit {
+            return;
+        }
+        let target = limit - limit / 10;
+        let mut victims: Vec<(u64, u64)> = state
+            .cached
+            .iter()
+            .filter(|(_, cached)| Arc::strong_count(&cached.block) == 1)
+            .map(|(&id, cached)| (cached.last_use, id))
+            .collect();
+        victims.sort_unstable();
+        for (_, id) in victims {
+            if state.used <= target {
+                break;
+            }
+            let cached = state.cached.remove(&id).expect("just found");
             state.used -= cached.block.len();
         }
     }

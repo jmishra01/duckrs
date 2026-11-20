@@ -4032,6 +4032,8 @@ impl ClientContext {
         }
         let memory = self.query_memory()?;
         memory.set_threads(threads);
+        // the blocks of the files in memory take what `memory_limit` gives, as C++'s buffer pool does
+        self.db.set_block_memory(memory.limit());
         // an auto-commit statement is a transaction of its own, which starts now
         memory.set_transaction_start(
             self.transaction
@@ -4204,6 +4206,20 @@ fn on_create_conflict(conflict: AstConflict) -> OnCreateConflict {
         AstConflict::Error => OnCreateConflict::Error,
         AstConflict::Ignore => OnCreateConflict::Ignore,
         AstConflict::Replace => OnCreateConflict::Replace,
+    }
+}
+
+impl DatabaseInstance {
+    /// The limit of the blocks in memory of its file and of the files attached to it.
+    fn set_block_memory(&self, bytes: usize) {
+        if let Some(file) = &self.file {
+            file.buffer.set_memory_limit(bytes);
+        }
+        for attached in self.attached.read().values() {
+            if let Some(file) = &attached.file {
+                file.buffer.set_memory_limit(bytes);
+            }
+        }
     }
 }
 

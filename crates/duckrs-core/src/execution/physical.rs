@@ -594,6 +594,29 @@ impl PhysicalTableScan {
             _ => 2,
         };
         conjuncts.sort_by_key(|(conjunct, positions)| (positions.len(), cost(conjunct, positions)));
+        // those of the same columns that follow each other are one pass over their rows, each seeing the rows the
+        // ones before it kept (`SelectAnd`), as they would one after another
+        let mut merged: Vec<(std::borrow::Cow<'_, BoundExpr>, Vec<usize>)> = Vec::with_capacity(conjuncts.len());
+        for (conjunct, positions) in conjuncts {
+            match merged.last_mut() {
+                Some((last, last_positions)) if *last_positions == positions => {
+                    let mut children = match &last.kind {
+                        BoundExprKind::Conjunction { and: true, children }
+                            if matches!(last, std::borrow::Cow::Owned(_)) =>
+                        {
+                            children.clone()
+                        }
+                        _ => vec![last.as_ref().clone()],
+                    };
+                    children.push(conjunct.clone());
+                    *last = std::borrow::Cow::Owned(BoundExpr::new(
+                        BoundExprKind::Conjunction { and: true, children },
+                        LogicalType::BOOLEAN,
+                    ));
+                }
+                _ => merged.push((std::borrow::Cow::Borrowed(conjunct), positions)),
+            }
+        }
         let type_of = |position: usize| -> LogicalType {
             match self.column_ids[position] {
                 COLUMN_IDENTIFIER_ROW_ID | COLUMN_IDENTIFIER_ROW_NUMBER => LogicalType::BIGINT,
@@ -621,19 +644,42 @@ impl PhysicalTableScan {
         let unread: Vec<Vector> = (0..self.column_ids.len())
             .map(|position| Vector::constant_null(type_of(position)))
             .collect();
-        for (conjunct, positions) in conjuncts {
-            for &position in &positions {
+        for (conjunct, positions) in &merged {
+            for &position in positions {
                 if fetched[position].is_none() {
                     fetched[position] = Some(fetch(position, &selection)?);
+                }
+            }
+            // comparisons of a column of integers with constants: the values it has are a range, which a loop over
+            // them keeps (C++'s `ConstantFilter` in the scan)
+            let range = match positions.as_slice() {
+                [position] => constant_range(conjunct, *position),
+                _ => None,
+            };
+            if let (Some(range), [position]) = (range, positions.as_slice()) {
+                let vector = fetched[*position].as_ref().expect("fetched above");
+                if let Some(kept) = select_range(vector, selection.len(), range) {
+                    if kept.len() < selection.len() {
+                        let keep = SelectionVector::from_vec(kept.clone());
+                        for vector in fetched.iter_mut().flatten() {
+                            vector.slice(&keep, kept.len());
+                        }
+                        selection = kept.iter().map(|&k| selection[k as usize]).collect();
+                    }
+                    if selection.is_empty() {
+                        return Ok(());
+                    }
+                    continue;
                 }
             }
             let mut kept: Vec<u32> = Vec::with_capacity(selection.len());
             for start in (0..selection.len()).step_by(STANDARD_VECTOR_SIZE) {
                 let count = STANDARD_VECTOR_SIZE.min(selection.len() - start);
+                // the columns the conjunct reads, and in place of the others what stands for them
                 let columns = (0..self.column_ids.len())
                     .map(|position| match &fetched[position] {
-                        Some(vector) => vector.range(start, count),
-                        None => unread[position].clone(),
+                        Some(vector) if positions.contains(&position) => vector.range(start, count),
+                        _ => unread[position].clone(),
                     })
                     .collect();
                 let chunk = DataChunk::from_columns(columns, count);
@@ -677,6 +723,115 @@ impl PhysicalTableScan {
         }
         Ok(())
     }
+}
+
+/// The values of the column at `position` that `conjunct` keeps, as an inclusive range, if it is only comparisons
+/// of the column, of a type held as an integer, with constants that are not NULL (`<`, `<=`, `>`, `>=`, `=` and
+/// BETWEEN, joined by AND). `None` of anything else, which is evaluated as it is.
+fn constant_range(conjunct: &BoundExpr, position: usize) -> Option<(i64, i64)> {
+    fn integer(value: &Value) -> Option<i64> {
+        match value.data() {
+            ValueData::Int8(v) => Some(i64::from(*v)),
+            ValueData::Int16(v) => Some(i64::from(*v)),
+            ValueData::Int32(v) => Some(i64::from(*v)),
+            ValueData::Int64(v) => Some(*v),
+            _ => None,
+        }
+    }
+    fn column_of(expr: &BoundExpr, position: usize) -> bool {
+        matches!(expr.kind, BoundExprKind::Reference(p) if p == position)
+            && matches!(
+                expr.return_type.physical_type(),
+                duckrs_common::types::PhysicalType::Int8
+                    | duckrs_common::types::PhysicalType::Int16
+                    | duckrs_common::types::PhysicalType::Int32
+                    | duckrs_common::types::PhysicalType::Int64
+            )
+    }
+    fn constant_of(expr: &BoundExpr, column: &BoundExpr) -> Option<i64> {
+        match &expr.kind {
+            BoundExprKind::Constant(value) if expr.return_type == column.return_type => integer(value),
+            _ => None,
+        }
+    }
+    fn narrow(expr: &BoundExpr, position: usize, range: &mut (i64, i64)) -> Option<()> {
+        use duckrs_parser::ast::ComparisonOp as Op;
+        if let BoundExprKind::Conjunction { and: true, children } = &expr.kind {
+            // each child narrows the same range
+            return children.iter().try_for_each(|child| narrow(child, position, range));
+        }
+        let (lower, upper) = (&mut range.0, &mut range.1);
+        match &expr.kind {
+            BoundExprKind::Between {
+                input,
+                lower: low,
+                upper: high,
+            } if column_of(input, position) => {
+                *lower = (*lower).max(constant_of(low, input)?);
+                *upper = (*upper).min(constant_of(high, input)?);
+                Some(())
+            }
+            BoundExprKind::Comparison { op, left, right } => {
+                let (op, value) = if column_of(left, position) {
+                    (*op, constant_of(right, left)?)
+                } else if column_of(right, position) {
+                    let flipped = match op {
+                        Op::LessThan => Op::GreaterThan,
+                        Op::GreaterThan => Op::LessThan,
+                        Op::LessThanOrEqual => Op::GreaterThanOrEqual,
+                        Op::GreaterThanOrEqual => Op::LessThanOrEqual,
+                        other => *other,
+                    };
+                    (flipped, constant_of(left, right)?)
+                } else {
+                    return None;
+                };
+                match op {
+                    Op::Equal => {
+                        *lower = (*lower).max(value);
+                        *upper = (*upper).min(value);
+                    }
+                    Op::LessThan => *upper = (*upper).min(value.checked_sub(1)?),
+                    Op::LessThanOrEqual => *upper = (*upper).min(value),
+                    Op::GreaterThan => *lower = (*lower).max(value.checked_add(1)?),
+                    Op::GreaterThanOrEqual => *lower = (*lower).max(value),
+                    _ => return None,
+                }
+                Some(())
+            }
+            _ => None,
+        }
+    }
+    let mut range = (i64::MIN, i64::MAX);
+    narrow(conjunct, position, &mut range)?;
+    Some(range)
+}
+
+/// The rows of the first `count` of `vector` whose values are in `lower..=upper`, if it holds integers.
+fn select_range(vector: &Vector, count: usize, (lower, upper): (i64, i64)) -> Option<Vec<u32>> {
+    let unified = vector.to_unified(count);
+    let mut kept = Vec::with_capacity(count);
+    macro_rules! keep {
+        ($t:ty) => {{
+            let data = unified.data::<$t>();
+            for row in 0..count {
+                let index = unified.sel.get(row);
+                let value = i64::from(data[index]);
+                if value >= lower && value <= upper && unified.validity.is_valid(index) {
+                    kept.push(row as u32);
+                }
+            }
+        }};
+    }
+    use duckrs_common::types::PhysicalType;
+    match vector.logical_type().physical_type() {
+        PhysicalType::Int8 => keep!(i8),
+        PhysicalType::Int16 => keep!(i16),
+        PhysicalType::Int32 => keep!(i32),
+        PhysicalType::Int64 => keep!(i64),
+        _ => return None,
+    }
+    Some(kept)
 }
 
 /// What the threads of a [`PhysicalTableScan`] of a table in its file share.

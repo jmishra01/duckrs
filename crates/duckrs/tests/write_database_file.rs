@@ -1534,6 +1534,57 @@ fn distinct_counts_are_kept_in_the_file() {
     assert_eq!(estimates(&mut c), in_memory, "read from the file");
 }
 
+/// Comparisons of a column of integers with constants that a scan of a file evaluates as a range of the values
+/// keep what the same comparisons keep evaluated as expressions (`+ 0` makes them those): of each width of
+/// integer, DATE and DECIMAL, with NULLs, BETWEEN, a constant on the left, equality, a range that is empty and
+/// bounds at the ends of BIGINT.
+#[test]
+fn ranges_of_constants_filter_as_comparisons_do() {
+    let file = path("ranges.db");
+    let db = Database::open_in_memory().unwrap();
+    let mut c = db.connect().unwrap();
+    run(
+        &mut c,
+        &format!("ATTACH '{}' AS f (ROW_GROUP_SIZE 16384)", file.display()),
+    );
+    run(
+        &mut c,
+        "CREATE TABLE f.t AS SELECT i, (i % 200 - 100)::TINYINT AS a, (i % 30000)::SMALLINT AS b, \
+         (i * 7 % 100000)::INTEGER AS c, CASE WHEN i % 13 = 0 THEN NULL ELSE i * 1000003 - 50000000000 END AS d, \
+         DATE '1990-01-01' + (i % 4000)::INTEGER AS e, (i % 1000 / 100)::DECIMAL(15,2) AS g \
+         FROM range(100000) t(i)",
+    );
+    run(&mut c, "CHECKPOINT f");
+    for filter in [
+        "a < -50",
+        "a >= 90 AND a <= 99",
+        "b BETWEEN 100 AND 2000",
+        "1000 < b AND b < 1100",
+        "c = 70007",
+        "c > 99990 AND c < 5",
+        "d >= 0 AND d < 10000000000",
+        "d < -9223372036854775808",
+        "d > 9223372036854775807",
+        "d <= 9223372036854775807",
+        "e >= DATE '1994-01-01' AND e < DATE '1995-01-01'",
+        "g BETWEEN 0.05 AND 7.00",
+        "g = 3.00 AND c < 50000",
+    ] {
+        let as_expressions = filter
+            .replace("a ", "(a + 0) ")
+            .replace("b ", "(b + 0) ")
+            .replace("c ", "(c + 0) ")
+            .replace("d ", "(d + 0) ")
+            .replace("e ", "(e + 0) ")
+            .replace("g ", "(g + 0) ");
+        let mut count = |filter: &str| -> Vec<String> {
+            let sql = format!("SELECT count(*), sum(i), min(d), max(d) FROM f.t WHERE {filter}");
+            rows(&mut c, &sql)
+        };
+        assert_eq!(count(filter), count(&as_expressions), "{filter}");
+    }
+}
+
 /// A file read a buffer at a time, on one thread and in parts, gives what it does read whole: in buffers of 160000
 /// bytes and parts of 40000 (four lines of at most 10000), rows and quoted values with newlines in them go across
 /// many of each. The sniffer reads its 2048 rows of the first buffer.

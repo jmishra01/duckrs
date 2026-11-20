@@ -682,9 +682,12 @@ file with `fsync`, but it can't lose what the operating system holds, as a power
 
 **Tables in place** (`DiskTable`, `TableCursor`): rows stay in the file, and `TableSource` is how the
 engine reaches them without knowing about files. A scan decodes the row group it is at, only the
-columns that its projection and filter refer to, through the buffer manager, which keeps 256 MiB of
-blocks whatever `memory_limit` says for now. Metadata is read at open, as are deletes, as the number
-of rows has to be known. Decoding is what fails on damage or ZSTD, so those errors come from the
+columns that its projection and filter refer to, through the buffer manager, which keeps blocks up to
+`memory_limit` (80% of the machine's memory by default), as each query sets it, and reads them with
+`pread` on threads at once. The metadata of a column of a row group is read once and kept. A filter
+of comparisons of an integer column with constants is a range of its values, which a loop over them
+keeps (C++'s `ConstantFilter`), and conjuncts of the same columns are one pass. Metadata is read at
+open, as are deletes, as the number of rows has to be known. Decoding is what fails on damage or ZSTD, so those errors come from the
 query that reads the rows and not from opening the file; bad metadata still fails the open.
 
 `storage` of a table is private, so what wants all rows goes through `rows` and `write_storage`,

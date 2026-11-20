@@ -31,9 +31,6 @@ use duckrs_common::{Error, ErrorKind, Result};
 use std::path::Path;
 use std::sync::Arc;
 
-/// The blocks of a file that stay in memory. Rows stay in the file, and a scan decodes one row group
-/// at a time, so this is what bounds the memory that a large file takes.
-const BUFFER_MEMORY: usize = 256 << 20;
 
 /// Whether there is a database in the file: a new database starts as a missing or empty file.
 /// `DBPathAndType::CheckMagicBytes`: a file that is not a DuckDB (or SQLite) database but that one of
@@ -69,7 +66,11 @@ pub fn is_database_file(path: &Path) -> bool {
 /// log committed since. The tables stay in the file, which is what the result reads them through.
 pub fn load_database(path: &Path, catalog: &Catalog, read_only: bool) -> Result<Arc<BufferManager>> {
     let blocks = Arc::new(SingleFileBlockManager::open(path, read_only)?);
-    let buffer = Arc::new(BufferManager::new(blocks, BUFFER_MEMORY));
+    // until a query sets it from `memory_limit`, its default (`DBConfig::SetDefaultMaxMemory`)
+    let buffer = Arc::new(BufferManager::new(
+        blocks,
+        crate::execution::temporary::default_memory_limit(),
+    ));
     use crate::execution::profiler::{add_counter, time_metric};
     metadata::load_free_list(&buffer)?;
     let records = time_metric("storage.attach_replay_wal_latency", || wal::read_records(path, &buffer))?;

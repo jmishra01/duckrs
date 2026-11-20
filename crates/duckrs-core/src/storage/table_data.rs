@@ -808,6 +808,19 @@ pub struct DiskTable {
     /// Per group, which columns were read (`RowGroup::is_loaded`): the metadata of a column is only
     /// read once something needs the column.
     loaded: Vec<Box<[AtomicBool]>>,
+    /// Per group, the metadata of each column once it was read (`RowGroup::columns`), which scans of each part of
+    /// the group share
+    columns: Vec<Box<[ReadColumn]>>,
+}
+
+/// The metadata of a column of a row group, once it was read.
+#[derive(Default)]
+struct ReadColumn(std::sync::OnceLock<Arc<PersistentColumn>>);
+
+impl std::fmt::Debug for ReadColumn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.get().is_some() { "read" } else { "unread" })
+    }
 }
 
 impl DiskTable {
@@ -842,6 +855,9 @@ impl DiskTable {
         let loaded = (0..table.row_groups.len())
             .map(|_| (0..columns).map(|_| AtomicBool::new(false)).collect())
             .collect();
+        let read = (0..table.row_groups.len())
+            .map(|_| (0..columns).map(|_| ReadColumn::default()).collect())
+            .collect();
         Ok(Self {
             buffer,
             table,
@@ -849,6 +865,7 @@ impl DiskTable {
             alive,
             rows: count,
             loaded,
+            columns: read,
         })
     }
 
@@ -957,12 +974,19 @@ impl DiskTable {
     }
 
     /// `RowGroup::LoadColumn`: what the file has of a column of a group, which loads it.
-    fn persistent_column(&self, group: usize, column: usize) -> Result<PersistentColumn> {
+    fn persistent_column(&self, group: usize, column: usize) -> Result<Arc<PersistentColumn>> {
         self.loaded[group][column].store(true, Ordering::Relaxed);
+        let cell = &self.columns[group][column].0;
+        if let Some(read) = cell.get() {
+            return Ok(read.clone());
+        }
         let pointer = self.table.row_groups[group].data_pointers[column];
-        let mut chains = self.chains.lock();
-        let mut d = BinaryDeserializer::new(chains.at(&self.buffer, pointer)?);
-        read_persistent_column(&mut d, Some(&self.table.columns[column].ty))
+        let read = {
+            let mut chains = self.chains.lock();
+            let mut d = BinaryDeserializer::new(chains.at(&self.buffer, pointer)?);
+            Arc::new(read_persistent_column(&mut d, Some(&self.table.columns[column].ty))?)
+        };
+        Ok(cell.get_or_init(|| read).clone())
     }
 
     /// All rows, with the id of each if the caller wants them.
@@ -1329,7 +1353,7 @@ impl TableSource for DiskTable {
         for (index, group) in self.table.row_groups.iter().enumerate() {
             for &column in columns {
                 if let Ok(stored) = self.persistent_column(index, column) {
-                    result.insert((group.row_start, group.tuple_count as usize, column), stored.shredded_type);
+                    result.insert((group.row_start, group.tuple_count as usize, column), stored.shredded_type.clone());
                 }
             }
         }
@@ -1341,7 +1365,7 @@ impl TableSource for DiskTable {
             .row_groups
             .iter()
             .position(|group| group.row_start == row_start && group.tuple_count as usize == rows)?;
-        Some(self.persistent_column(group, column).ok()?.shredded_type)
+        Some(self.persistent_column(group, column).ok()?.shredded_type.clone())
     }
     fn segments(&self, include_info: bool, loaded_only: bool) -> Result<Vec<SegmentInfo>> {
         let add = column_segments;
@@ -1364,7 +1388,7 @@ impl TableSource for DiskTable {
     fn zones(&self, column: usize) -> Result<Vec<ColumnZone>> {
         let ty = &self.table.columns[column].ty;
         (0..self.table.row_groups.len())
-            .map(|group| column_zone(&self.persistent_column(group, column)?, ty))
+            .map(|group| column_zone(&*self.persistent_column(group, column)?, ty))
             .collect()
     }
 }

@@ -676,7 +676,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
   chunk's rows into one buffer and makes a key only for a new group, and threads read blocks of the file at once
   (`pread`), where they took turns. The distinct values of each column, which the join order starts from, are
   kept in the file as C++ keeps them (`DistinctStatistics`, as `HLL_V2`, and read of older files as `HLL_V1`):
-  the first query of a file at SF10 took 16–27s counting them from all the rows, and takes under a second. duckrs
+  the first query of a file at SF10 took 16–27s counting them from all the rows, and takes under a second. Q06
+  then took 0.35s warm against C++'s 0.09s: the blocks of a file stay in memory up to `memory_limit` (C++'s
+  buffer pool) where 256 MiB of them did, a scan keeps the metadata of the columns it read, and comparisons of
+  an integer column with constants are a range of its values; warm Q06 takes 0.06s against C++'s 0.05s. duckrs
   had no way to load SF10 itself, as an append kept its rows in memory (more than 2 GiB failed); appends now write
   their full row groups to blocks as they fill (an INSERT of 80M rows takes 90MB). duckrs now loads SF10 into its
   own file (COPY of the `.tbl` files: lineitem 24s against C++'s 22s, the rest under 5s each; at most 710MB
