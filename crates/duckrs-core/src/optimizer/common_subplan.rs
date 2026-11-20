@@ -647,7 +647,9 @@ impl Finder {
                 projection,
                 ..
             } => {
+                // a scan of only the row id is one of no column (`GetAnyColumn`), which only counts rows
                 let rowid = match projection {
+                    Some(positions) if positions.len() == 1 => false,
                     Some(positions) => positions.iter().any(|&p| column_ids[p] == COLUMN_IDENTIFIER_ROW_ID),
                     None => column_ids.contains(&COLUMN_IDENTIFIER_ROW_ID),
                 };

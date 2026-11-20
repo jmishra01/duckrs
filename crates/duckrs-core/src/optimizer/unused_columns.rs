@@ -62,9 +62,17 @@ fn visit(op: &mut LogicalOperator, by_position: bool, used: &mut HashSet<ColumnB
     {
         let read = (0..column_ids.len()).filter(|&column| used.contains(&ColumnBinding::new(*table_index, column)));
         let mut read: Vec<usize> = read.collect();
-        // a chunk without columns would have no rows to count
+        // `GetAnyColumn`: a chunk without columns would have no rows to count, and the row id costs nothing to read
         if read.is_empty() {
-            read.push(0);
+            let row_id = crate::planner::logical::COLUMN_IDENTIFIER_ROW_ID;
+            let position = match column_ids.iter().position(|&c| c == row_id) {
+                Some(position) => position,
+                None => {
+                    column_ids.push(row_id);
+                    column_ids.len() - 1
+                }
+            };
+            read.push(position);
         }
         *projection = Some(read);
     }

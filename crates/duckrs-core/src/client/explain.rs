@@ -470,11 +470,19 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
                 Some(Some(extract)) => format!("{}.{}", name(&column_ids[p]), extract.names.join(".")),
                 _ => name(&column_ids[p]),
             };
-            let projected: Vec<String> = match projection {
-                Some(positions) => positions.iter().map(|&p| name_at(p)).collect(),
-                None => (0..column_ids.len()).map(name_at).collect(),
+            // the row id is no column of the table, which C++ does not list
+            let positions: Vec<usize> = match projection {
+                Some(positions) => positions.clone(),
+                None => (0..column_ids.len()).collect(),
             };
-            info.extend(entry("Projections", lines(projected)));
+            let projected: Vec<String> = positions
+                .into_iter()
+                .filter(|&p| column_ids[p] != crate::planner::logical::COLUMN_IDENTIFIER_ROW_ID)
+                .map(name_at)
+                .collect();
+            if !projected.is_empty() {
+                info.extend(entry("Projections", lines(projected)));
+            }
             if !filter_text.is_empty() {
                 info.extend(entry("Filters", filter_text));
             }

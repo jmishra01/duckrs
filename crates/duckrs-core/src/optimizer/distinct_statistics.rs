@@ -164,10 +164,12 @@ fn samples(integral: bool) -> &'static [usize] {
 
 /// `DistinctStatistics::TypeIsSupported`.
 pub fn type_is_supported(ty: &LogicalType) -> bool {
-    !matches!(
-        ty.physical_type(),
-        PhysicalType::List | PhysicalType::Struct | PhysicalType::Array | PhysicalType::Bit | PhysicalType::Bool
-    )
+    // a VARIANT is a STRUCT in C++
+    ty.id() != duckrs_common::types::LogicalTypeId::Variant
+        && !matches!(
+            ty.physical_type(),
+            PhysicalType::List | PhysicalType::Struct | PhysicalType::Array | PhysicalType::Bit | PhysicalType::Bool
+        )
 }
 
 /// The distinct values of column `column` of `table` as C++'s statistics would count them, from
