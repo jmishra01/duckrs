@@ -10,7 +10,10 @@
 use super::rewriter::{can_throw, contains_barrier, split_conjuncts};
 use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind as K};
+use crate::planner::expression::BoundOperator;
+use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
+use duckrs_parser::ast::ComparisonOp;
 
 /// The columns of the expression, in the query around the plan too, with `outer` for those.
 fn columns_of(expr: &BoundExpr, columns: &mut Vec<ColumnBinding>, outer: &mut bool) {
@@ -99,6 +102,163 @@ fn prefix_bounds(expr: &BoundExpr) -> Option<[BoundExpr; 2]> {
     ])
 }
 
+/// What `FilterCombiner` puts into a scan for a filter.
+enum TablePushdown {
+    /// `PUSHED_DOWN_FULLY`: these filters in place of it
+    Fully(Vec<BoundExpr>),
+    /// `PUSHED_DOWN_PARTIALLY`: an optional filter for the zone maps, and the filter stays
+    Optional(BoundExpr),
+    None,
+}
+
+fn compare(op: ComparisonOp, column: &BoundExpr, value: Value) -> BoundExpr {
+    BoundExpr::new(
+        BoundExprKind::Comparison {
+            op,
+            left: Box::new(column.clone()),
+            right: Box::new(BoundExpr::constant(value)),
+        },
+        LogicalType::BOOLEAN,
+    )
+}
+
+/// `TryPushdownDenseInFilter`: consecutive integers as `col >= min AND col <= max`.
+fn dense_range(column: &BoundExpr, values: &[Value]) -> Option<Vec<BoundExpr>> {
+    let mut numbers = Vec::with_capacity(values.len());
+    for value in values {
+        let ty = value.logical_type();
+        if !ty.is_integral() || ty == &LogicalType::UHUGEINT {
+            return None;
+        }
+        numbers.push((value.as_i128()?, value));
+    }
+    numbers.sort_by_key(|(n, _)| *n);
+    if numbers.is_empty() || !numbers.windows(2).all(|pair| pair[1].0.checked_sub(pair[0].0) == Some(1)) {
+        return None;
+    }
+    let min = numbers[0].1.clone();
+    let max = numbers[numbers.len() - 1].1.clone();
+    Some(vec![
+        compare(ComparisonOp::GreaterThanOrEqual, column, min),
+        compare(ComparisonOp::LessThanOrEqual, column, max),
+    ])
+}
+
+fn in_list(column: &BoundExpr, values: Vec<Value>) -> BoundExpr {
+    let children = std::iter::once(column.clone())
+        .chain(values.into_iter().map(BoundExpr::constant))
+        .collect();
+    BoundExpr::new(
+        BoundExprKind::Operator {
+            op: BoundOperator::In,
+            children,
+        },
+        LogicalType::BOOLEAN,
+    )
+}
+
+/// `TryPushdownInFilter` and `TryPushdownOrClause`.
+fn table_pushdown(expr: &BoundExpr) -> TablePushdown {
+    match &expr.kind {
+        BoundExprKind::Operator {
+            op: BoundOperator::In,
+            children,
+        } => {
+            if !matches!(children[0].kind, BoundExprKind::ColumnRef { depth: 0, .. }) {
+                return TablePushdown::None;
+            }
+            let mut values = Vec::with_capacity(children.len() - 1);
+            for child in &children[1..] {
+                match &child.kind {
+                    BoundExprKind::Constant(value) if !value.is_null() => values.push(value.clone()),
+                    _ => return TablePushdown::None,
+                }
+            }
+            if values.len() == 1 {
+                let value = values.pop().expect("one value");
+                return TablePushdown::Fully(vec![compare(ComparisonOp::Equal, &children[0], value)]);
+            }
+            if let Some(range) = dense_range(&children[0], &values) {
+                return TablePushdown::Fully(range);
+            }
+            TablePushdown::Optional(expr.clone())
+        }
+        BoundExprKind::Conjunction { and: false, children } if !children.is_empty() => {
+            let mut column: Option<&BoundExpr> = None;
+            let mut equalities = Vec::new();
+            let mut only_equalities = true;
+            let mut parts = Vec::new();
+            for child in children {
+                let BoundExprKind::Comparison { op, left, right } = &child.kind else {
+                    return TablePushdown::None;
+                };
+                let (col, value, op) = match (&left.kind, &right.kind) {
+                    (BoundExprKind::ColumnRef { depth: 0, .. }, BoundExprKind::Constant(v)) => (&**left, v, *op),
+                    (BoundExprKind::Constant(v), BoundExprKind::ColumnRef { depth: 0, .. }) => {
+                        (&**right, v, super::statistics::flip(*op))
+                    }
+                    _ => return TablePushdown::None,
+                };
+                let binding = |e: &BoundExpr| match &e.kind {
+                    BoundExprKind::ColumnRef { binding, .. } => Some(*binding),
+                    _ => None,
+                };
+                match column {
+                    None => column = Some(col),
+                    Some(first) if binding(first) == binding(col) => {}
+                    Some(_) => return TablePushdown::None,
+                }
+                only_equalities &= op == ComparisonOp::Equal;
+                if value.is_null() {
+                    match op {
+                        ComparisonOp::DistinctFrom | ComparisonOp::NotDistinctFrom => {
+                            let null_op = if op == ComparisonOp::DistinctFrom {
+                                BoundOperator::IsNotNull
+                            } else {
+                                BoundOperator::IsNull
+                            };
+                            parts.push(BoundExpr::new(
+                                BoundExprKind::Operator {
+                                    op: null_op,
+                                    children: vec![col.clone()],
+                                },
+                                LogicalType::BOOLEAN,
+                            ));
+                        }
+                        // `x = NULL` in an OR passes no row
+                        _ => {}
+                    }
+                    continue;
+                }
+                if op == ComparisonOp::Equal {
+                    equalities.push(value.clone());
+                }
+                parts.push(compare(op, col, value.clone()));
+            }
+            let column = column.expect("an OR has children");
+            if only_equalities && !equalities.is_empty() {
+                if let Some(range) = dense_range(column, &equalities) {
+                    return TablePushdown::Fully(range);
+                }
+                return TablePushdown::Optional(in_list(column, equalities));
+            }
+            let optional = match parts.len() {
+                0 => return TablePushdown::None,
+                1 => parts.pop().expect("one part"),
+                _ => BoundExpr::new(
+                    BoundExprKind::Conjunction {
+                        and: false,
+                        children: parts,
+                    },
+                    LogicalType::BOOLEAN,
+                ),
+            };
+            TablePushdown::Optional(optional)
+        }
+        _ => TablePushdown::None,
+    }
+}
+
 /// Moves the filters directly on scans into them.
 pub fn push_into_scans(op: &mut LogicalOperator) {
     for child in &mut op.children {
@@ -144,19 +304,39 @@ pub fn push_into_scans(op: &mut LogicalOperator) {
     for expr in std::mem::take(expressions) {
         split_conjuncts(expr, &mut conjuncts);
     }
-    let filters = match &mut op.children[0].kind {
-        K::Get { filters, .. } => filters,
+    let (filters, mut optional) = match &mut op.children[0].kind {
+        K::Get {
+            filters,
+            optional_filters,
+            ..
+        } => (filters, Some(optional_filters)),
         // `MultiFileFunction` has `filter_pushdown`; these run as the file is read
         K::ParquetScan { scan: data, .. } => {
             let data = std::sync::Arc::make_mut(data);
             prune_files(data, &scan, &mut conjuncts);
-            &mut data.filters
+            (&mut data.filters, None)
         }
         _ => unreachable!("checked above"),
     };
     let (barred, conjuncts): (Vec<BoundExpr>, Vec<BoundExpr>) = conjuncts.into_iter().partition(contains_barrier);
+    // what went into the scan only as an optional filter, which stays here as well
+    let mut partial = Vec::new();
     for conjunct in conjuncts {
         if can_move_into_scan(&conjunct, &scan) {
+            if let Some(optional) = optional.as_deref_mut() {
+                match table_pushdown(&conjunct) {
+                    TablePushdown::Fully(pushed) => {
+                        filters.extend(pushed);
+                        continue;
+                    }
+                    TablePushdown::Optional(pushed) => {
+                        optional.push(pushed);
+                        partial.push(conjunct);
+                        continue;
+                    }
+                    TablePushdown::None => {}
+                }
+            }
             if let Some(bounds) = prefix_bounds(&conjunct) {
                 filters.extend(bounds);
                 continue;
@@ -170,6 +350,7 @@ pub fn push_into_scans(op: &mut LogicalOperator) {
     // no other filter it would run ahead of
     if let [only] = expressions.as_slice()
         && barred.is_empty()
+        && partial.is_empty()
         && can_move_ignoring_errors(only, &scan)
     {
         let only = expressions.pop().expect("one filter");
@@ -184,12 +365,13 @@ pub fn push_into_scans(op: &mut LogicalOperator) {
         let mut outer = false;
         columns_of(&conjunct, &mut columns, &mut outer);
         let one_column = !columns.is_empty() && columns.iter().all(|c| *c == columns[0]) && scan.contains(&columns[0]);
-        if expressions.is_empty() && one_column && !outer && !conjunct.is_volatile() {
+        if expressions.is_empty() && partial.is_empty() && one_column && !outer && !conjunct.is_volatile() {
             filters.push(conjunct);
         } else {
             expressions.push(conjunct);
         }
     }
+    expressions.splice(0..0, partial);
     // `TryCreateMultiColumnExpressionFilter`: a filter on several columns of a table stays, and a copy tells the
     // scan which row groups none of its rows pass in
     if let K::Get { zone_filters, .. } = &mut op.children[0].kind {

@@ -1929,6 +1929,29 @@ impl StatisticsPropagator {
                 *op = empty_result(op);
                 return;
             }
+            // `ExpressionFilter::CheckStatistics` of the IN lists `PushdownGet` put into the scan
+            if matches!(op.children[0].kind, K::Get { .. }) {
+                match self.check_in_list(&expr) {
+                    Some(InListResult::Never) => {
+                        *op = empty_result(op);
+                        return;
+                    }
+                    Some(InListResult::Always) => continue,
+                    Some(InListResult::TrueOrNull(column)) => {
+                        let not_null = BoundExpr::new(
+                            BoundExprKind::Operator {
+                                op: BoundOperator::IsNotNull,
+                                children: vec![column],
+                            },
+                            LogicalType::BOOLEAN,
+                        );
+                        self.update_from_filter(&not_null);
+                        kept.push(not_null);
+                        continue;
+                    }
+                    None => {}
+                }
+            }
             match fold_boolean(&expr) {
                 Some(Some(true)) => {}
                 Some(_) => {
@@ -1987,6 +2010,63 @@ impl StatisticsPropagator {
             *op = op.children.remove(0);
         } else {
             *expressions = kept;
+        }
+    }
+
+    /// `CheckInOperatorStatistics` and `CheckNotOperatorStatistics`, for `col IN (...)` and
+    /// `NOT (col IN (...))` of constants.
+    fn check_in_list(&mut self, expr: &BoundExpr) -> Option<InListResult> {
+        let (list, negated) = match &expr.kind {
+            BoundExprKind::Operator {
+                op: BoundOperator::Not,
+                children,
+            } if children.len() == 1 => (&children[0], true),
+            _ => (expr, false),
+        };
+        let BoundExprKind::Operator {
+            op: BoundOperator::In,
+            children,
+        } = &list.kind
+        else {
+            return None;
+        };
+        if children.len() < 2 {
+            return None;
+        }
+        // `NOT (x IN (NULL))` is never true
+        if negated && children.len() == 2 && matches!(&children[1].kind, BoundExprKind::Constant(v) if v.is_null()) {
+            return Some(InListResult::Never);
+        }
+        let BoundExprKind::ColumnRef { binding, depth: 0 } = &children[0].kind else {
+            return None;
+        };
+        let mut values = Vec::with_capacity(children.len() - 1);
+        for child in &children[1..] {
+            let BoundExprKind::Constant(value) = &child.kind else {
+                return None;
+            };
+            if !value.is_null() {
+                values.push(value.clone());
+            }
+        }
+        let stats = self.lookup(*binding);
+        let result = if values.is_empty() || !stats.can_be_valid {
+            InListResult::Never
+        } else {
+            match in_zonemap(&stats, &values) {
+                Some(true) if stats.can_be_null => InListResult::TrueOrNull(children[0].clone()),
+                Some(true) => InListResult::Always,
+                Some(false) => InListResult::Never,
+                None => return None,
+            }
+        };
+        if !negated {
+            return Some(result);
+        }
+        // a list matching every row makes NOT match none; one matching none may be NULL, which NOT keeps
+        match result {
+            InListResult::Always | InListResult::TrueOrNull(_) => Some(InListResult::Never),
+            InListResult::Never => None,
         }
     }
 
@@ -2658,6 +2738,66 @@ fn simplify_constant_or_null(expressions: &mut Vec<BoundExpr>) {
 /// `PropagateStatistics(LogicalGet)` of a `FILTER_TRUE_OR_NULL` table filter: `constant_or_null(true, ...)`
 /// of one column of a scan, and constants that are not NULL, is NULL just when the column is, and
 /// filters as `column IS NOT NULL` (`IsNullOnlyForNullColumn`).
+/// `FilterPropagateResult` of an IN list.
+enum InListResult {
+    Always,
+    /// true for the values, NULL for NULL: `col IS NOT NULL`
+    TrueOrNull(BoundExpr),
+    Never,
+}
+
+/// `CheckZonemapAgainstConstants` with `=` and `NumericStats::ConstantsCoverRange`: whether a value of the
+/// range is always (`Some(true)`) or never (`Some(false)`) among the constants.
+fn in_zonemap(stats: &Stats, values: &[Value]) -> Option<bool> {
+    let (Some(min), Some(max)) = (stats.min.as_ref(), stats.max.as_ref()) else {
+        return None;
+    };
+    let ty = min.logical_type();
+    let numeric = ty.is_numeric() || ty.id() == LogicalTypeId::Boolean || ty.id() == LogicalTypeId::Interval;
+    if !numeric && stats.strings.is_none() {
+        return None;
+    }
+    if !numeric && ty.id() != LogicalTypeId::Varchar {
+        return None;
+    }
+    let outside = |v: &Value| {
+        compare_values(ComparisonOp::LessThan, v, min) == Some(true)
+            || compare_values(ComparisonOp::GreaterThan, v, max) == Some(true)
+    };
+    if values.iter().all(outside) {
+        return Some(false);
+    }
+    if compare_values(ComparisonOp::Equal, min, max) == Some(true)
+        && values.iter().any(|v| compare_values(ComparisonOp::Equal, v, min) == Some(true))
+    {
+        return Some(true);
+    }
+    // an integral column whose whole [min, max] range is listed
+    if ty.is_integral() && ty != &LogicalType::UHUGEINT {
+        let (low, high) = (min.as_i128()?, max.as_i128()?);
+        let range = high.checked_sub(low)?;
+        if range >= values.len() as i128 {
+            return None;
+        }
+        let mut inside = Vec::new();
+        for value in values {
+            if value.logical_type() != ty {
+                return None;
+            }
+            let v = value.as_i128()?;
+            if (low..=high).contains(&v) {
+                inside.push(v);
+            }
+        }
+        inside.sort_unstable();
+        inside.dedup();
+        if inside.first() == Some(&low) && inside.last() == Some(&high) && inside.len() as i128 == range + 1 {
+            return Some(true);
+        }
+    }
+    None
+}
+
 fn true_or_null_as_not_null(expr: BoundExpr, child: &LogicalOperator) -> BoundExpr {
     let BoundExprKind::Function { function, children, .. } = &expr.kind else {
         return expr;

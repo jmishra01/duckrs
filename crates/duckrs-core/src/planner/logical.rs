@@ -851,8 +851,15 @@ impl LogicalOperator {
             }
             LogicalOperatorKind::MarkJoin { predicate, .. } => predicate.iter_mut().collect(),
             LogicalOperatorKind::Get {
-                filters, zone_filters, ..
-            } => filters.iter_mut().chain(zone_filters.iter_mut()).collect(),
+                filters,
+                zone_filters,
+                optional_filters,
+                ..
+            } => filters
+                .iter_mut()
+                .chain(zone_filters.iter_mut())
+                .chain(optional_filters.iter_mut())
+                .collect(),
             LogicalOperatorKind::ParquetScan { scan, .. } => {
                 std::sync::Arc::make_mut(scan).filters.iter_mut().collect()
             }

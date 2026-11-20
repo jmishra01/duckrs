@@ -79,6 +79,29 @@ fn probe_of(key: &BoundExpr, conjuncts: &[BoundExpr]) -> Option<Probe> {
             }
             continue;
         }
+        // the optional filter of `col IN (...)`
+        if let BoundExprKind::Operator {
+            op: crate::planner::expression::BoundOperator::In,
+            children,
+        } = &conjunct.kind
+        {
+            let values: Option<Vec<Value>> = (same_expression(&children[0], key))
+                .then(|| {
+                    children[1..]
+                        .iter()
+                        .map(|child| match &child.kind {
+                            BoundExprKind::Constant(value) if !value.is_null() => Some(value.clone()),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .flatten();
+            match values {
+                Some(values) => probe.points.extend(values),
+                None => unused = true,
+            }
+            continue;
+        }
         // the rewriter leaves a list of values as ORs of equalities
         if let BoundExprKind::Conjunction { and: false, children } = &conjunct.kind {
             let values: Option<Vec<Value>> = children
@@ -236,13 +259,26 @@ pub fn plan_index_scans(op: &mut LogicalOperator, options: &OptimizerOptions) {
         table,
         column_ids,
         filters,
+        optional_filters,
         index_rows: rows,
         sample: None,
         ..
     } = &mut op.kind
-        && !filters.is_empty()
     {
-        *rows = index_rows(table, column_ids, filters, options).map(Arc::new);
+        // `TableScanInitGlobal` looks into the optional filters for an IN list
+        let mut all = filters.clone();
+        all.extend(optional_filters.iter().filter(|f| {
+            matches!(
+                f.kind,
+                BoundExprKind::Operator {
+                    op: crate::planner::expression::BoundOperator::In,
+                    ..
+                }
+            )
+        }).cloned());
+        if !all.is_empty() {
+            *rows = index_rows(table, column_ids, &all, options).map(Arc::new);
+        }
     }
     if let K::Join {
         join_type: JoinType::Inner | JoinType::Semi,

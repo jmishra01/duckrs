@@ -1050,6 +1050,24 @@ impl Group<'_> {
                     Some(max) => max.data() == &duckrs_common::value::ValueData::Bool(false),
                 })
             }
+            // an IN list as its comparisons
+            BoundExprKind::Operator {
+                op: op @ (BoundOperator::In | BoundOperator::NotIn),
+                children,
+            } if children.len() > 1 => {
+                self.never_true(&crate::planner::expression::in_as_comparisons(*op == BoundOperator::NotIn, children))
+            }
+            BoundExprKind::Operator {
+                op: BoundOperator::Not,
+                children,
+            } if children.len() == 1
+                && matches!(&children[0].kind, BoundExprKind::Operator { op: BoundOperator::In, children } if children.len() > 1) =>
+            {
+                let BoundExprKind::Operator { children, .. } = &children[0].kind else {
+                    unreachable!("checked")
+                };
+                self.never_true(&crate::planner::expression::in_as_comparisons(true, children))
+            }
             // `NOT prefix(s, 'ab')`: every string of the group starts with it (a NULL gives NULL)
             BoundExprKind::Operator {
                 op: BoundOperator::Not,

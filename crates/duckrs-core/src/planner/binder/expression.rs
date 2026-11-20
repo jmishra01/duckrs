@@ -3570,7 +3570,8 @@ impl Binder<'_> {
         Ok((bound, max_type))
     }
 
-    /// `x IN (a, b)` as `x = a OR x = b`, which has its three-valued logic.
+    /// `x IN (a, b)`, which stays an IN through the filter pushdown; `InClauseRewriter` spells out
+    /// the short lists left after it.
     fn bind_in(&mut self, children: &[Expr], negated: bool) -> Result<BoundExpr> {
         let name = if negated { "NOT IN" } else { "IN" };
         let (bound, max_type) = self.resolve_coalesce_type(children, Some(name))?;
@@ -3579,22 +3580,15 @@ impl Binder<'_> {
             .into_iter()
             .map(|child| self.collate(child, &max_type))
             .collect::<Result<Vec<_>>>()?;
-        // `InClauseRewriter::HasRewritableInClause`: a list it turns into a MARK join stays an IN,
-        // which it spells out otherwise
-        let rewritable = bound.len() >= crate::optimizer::in_clause_rewriter::IN_CLAUSE_REWRITE_THRESHOLD
-            && bound[1..].iter().all(BoundExpr::is_foldable);
-        if rewritable {
-            let op = if negated {
-                BoundOperator::NotIn
-            } else {
-                BoundOperator::In
-            };
-            return Ok(BoundExpr::new(
-                BoundExprKind::Operator { op, children: bound },
-                LogicalType::BOOLEAN,
-            ));
-        }
-        Ok(crate::planner::expression::in_as_comparisons(negated, &bound))
+        let op = if negated {
+            BoundOperator::NotIn
+        } else {
+            BoundOperator::In
+        };
+        Ok(BoundExpr::new(
+            BoundExprKind::Operator { op, children: bound },
+            LogicalType::BOOLEAN,
+        ))
     }
 }
 

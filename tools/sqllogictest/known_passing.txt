@@ -507,6 +507,7 @@ test/optimizer/constant_argument_errors_case.test
 test/optimizer/constant_argument_errors_like_regex.test
 test/optimizer/constant_folding.test
 test/optimizer/constant_order_normalization.test
+test/optimizer/contains_to_in_clause.test
 test/optimizer/csv_pushdown.test
 test/optimizer/cte_inlining.test
 test/optimizer/cte_statistics_propagation.test
@@ -2144,10 +2145,12 @@ test/sql/filter/test_expression_executor_select.test
 test/sql/filter/test_illegal_filters.test
 test/sql/filter/test_like_null.test
 test/sql/filter/test_obsolete_filters.test
+test/sql/filter/test_or_pushdown.test
 test/sql/filter/test_throwing_filter_pushdown.test
 test/sql/filter/test_transitive_filters.test
 test/sql/filter/test_try_filter_doesnt_mutate_columns.test
 test/sql/filter/test_variant_filter.test
+test/sql/filter/test_zonemap_disjunctions.test
 test/sql/filter/test_zonemap_segment.test
 test/sql/filter/transitive_filter_bounds.test
 test/sql/function/array/array_and_map.test
@@ -2399,6 +2402,7 @@ test/sql/function/operator/test_bitwise_ops.test
 test/sql/function/operator/test_bitwise_ops_types.test
 test/sql/function/operator/test_comparison.test
 test/sql/function/operator/test_comparison_function_call_types.test
+test/sql/function/operator/test_conjunction.test
 test/sql/function/operator/test_conjunction_nulls.test
 test/sql/function/operator/test_date_arithmetic.test
 test/sql/function/operator/test_division_by_zero.test
@@ -3126,6 +3130,7 @@ test/sql/optimizer/narrowing_cast_not_invertible.test
 test/sql/optimizer/not_conjunction_simplification.test
 test/sql/optimizer/nullable_row_group_pruning.test
 test/sql/optimizer/or_null_simplification.test
+test/sql/optimizer/plan/dense_or_filter_pushdown.test
 test/sql/optimizer/plan/plan_struct_projection_pushdown.test
 test/sql/optimizer/plan/test_anti_join_empty_child.test
 test/sql/optimizer/plan/test_anti_join_projection_map.test

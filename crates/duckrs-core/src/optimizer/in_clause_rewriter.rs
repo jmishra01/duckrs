@@ -52,7 +52,30 @@ struct Rewriter<'a> {
 /// own, so that one more column of `op` does not change what the parent puts out.
 fn visit_operator(op: &mut LogicalOperator, next_table_index: &mut usize, binds: bool) {
     let mut hidden = None;
+    // `PushdownGet` puts `NOT (col IN (...))` into the scan as it is, which stays an IN there
+    let mut kept_in_scan = Vec::new();
     if matches!(op.kind, K::Filter { .. } | K::Projection { .. }) && op.expressions_mut().iter().any(|e| has_in(e)) {
+        if let K::Filter { expressions } = &op.kind
+            && matches!(op.children[0].kind, K::Get { .. })
+        {
+            let scan = op.children[0].column_bindings();
+            kept_in_scan = expressions.iter().map(|e| is_scan_not_in(e, &scan)).collect();
+            // and `col IN (...)` there as an optional filter, as well as here; the shorter lists
+            // `push_into_scans` sees as the ORs [`lower_remaining`] makes of them
+            let optional: Vec<BoundExpr> = expressions
+                .iter()
+                .filter(|e| {
+                    matches!(&e.kind, BoundExprKind::Operator { op: BoundOperator::In, children }
+                        if children.len() >= IN_CLAUSE_REWRITE_THRESHOLD)
+                        && is_constant_column_in(e, &scan)
+                        && !is_dense_column_in(e)
+                })
+                .cloned()
+                .collect();
+            if let K::Get { optional_filters, .. } = &mut op.children[0].kind {
+                optional_filters.extend(optional);
+            }
+        }
         let child = std::mem::replace(&mut op.children[0], LogicalOperator::new(K::CrossProduct, Vec::new()));
         let scan = matches!(op.kind, K::Filter { .. }).then_some(&child).filter(|c| matches!(c.kind, K::Get { .. }));
         // `PushdownGet` had put a dense list of integers into the scan as a range, and the list of
@@ -72,7 +95,7 @@ fn visit_operator(op: &mut LogicalOperator, next_table_index: &mut usize, binds:
             joined: false,
         };
         for (at, expr) in op.expressions_mut().into_iter().enumerate() {
-            if keep.get(at).copied().unwrap_or(false) {
+            if keep.get(at).copied().unwrap_or(false) || kept_in_scan.get(at).copied().unwrap_or(false) {
                 continue;
             }
             rewriter.visit(expr);
@@ -80,7 +103,7 @@ fn visit_operator(op: &mut LogicalOperator, next_table_index: &mut usize, binds:
         hidden = rewriter.joined.then_some(child_bindings);
         op.children[0] = rewriter.root;
     }
-    lower_remaining(op);
+    lower_remaining(op, &kept_in_scan);
     let own_binds = matches!(op.kind, K::Projection { .. } | K::Aggregate { .. });
     for child in &mut op.children {
         visit_operator(child, next_table_index, own_binds);
@@ -97,6 +120,53 @@ fn visit_operator(op: &mut LogicalOperator, next_table_index: &mut usize, binds:
         let filter = std::mem::replace(op, LogicalOperator::new(K::CrossProduct, Vec::new()));
         *op = LogicalOperator::new(K::ColumnSelect { keep }, vec![filter]);
     }
+}
+
+/// `col IN (c1, ...)` of non-NULL constants on a column of the scan.
+fn is_constant_column_in(expr: &BoundExpr, scan: &[ColumnBinding]) -> bool {
+    let BoundExprKind::Operator {
+        op: BoundOperator::In,
+        children,
+    } = &expr.kind
+    else {
+        return false;
+    };
+    matches!(&children[0].kind, BoundExprKind::ColumnRef { binding, depth: 0 } if scan.contains(binding))
+        && children[1..]
+            .iter()
+            .all(|c| matches!(&c.kind, BoundExprKind::Constant(v) if !v.is_null()))
+}
+
+/// `NOT (col IN (...))` (or `col NOT IN (...)`) of one column of the scan, which `TryPushdownGenericExpression` moves into it.
+fn is_scan_not_in(expr: &BoundExpr, scan: &[ColumnBinding]) -> bool {
+    let list = match &expr.kind {
+        BoundExprKind::Operator {
+            op: BoundOperator::Not,
+            children,
+        } => &children[0],
+        _ => expr,
+    };
+    let BoundExprKind::Operator { op, children } = &list.kind else {
+        return false;
+    };
+    if !(*op == BoundOperator::NotIn || (*op == BoundOperator::In && !std::ptr::eq(list, expr))) {
+        return false;
+    }
+    fn columns_of(expr: &BoundExpr, columns: &mut Vec<(ColumnBinding, usize)>) {
+        if let BoundExprKind::ColumnRef { binding, depth } = &expr.kind {
+            columns.push((*binding, *depth));
+        }
+        for child in expr.children() {
+            columns_of(child, columns);
+        }
+    }
+    let mut columns = Vec::new();
+    columns_of(expr, &mut columns);
+    matches!(children[0].kind, BoundExprKind::ColumnRef { .. })
+        && !columns.is_empty()
+        && columns.iter().all(|c| c.1 == 0 && c.0 == columns[0].0 && scan.contains(&c.0))
+        && !expr.is_volatile()
+        && !super::rewriter::can_throw(expr)
 }
 
 /// `col IN (c1, ...)` of non-NULL constants on a column of the scan that a key of one column indexes.
@@ -131,7 +201,11 @@ fn has_in(expr: &BoundExpr) -> bool {
 }
 
 /// The INs that stay, as their ORs, simplified the way the rewriter would have.
-fn lower_remaining(op: &mut LogicalOperator) {
+fn lower_remaining(op: &mut LogicalOperator, kept: &[bool]) {
+    // the filters of a scan are its table filters, which the rewriter does not see
+    if matches!(op.kind, K::Get { .. }) {
+        return;
+    }
     let is_filter = matches!(op.kind, K::Filter { .. });
     let lower = |expr: &mut BoundExpr, in_filter: bool| {
         if !has_in(expr) {
@@ -147,8 +221,10 @@ fn lower_remaining(op: &mut LogicalOperator) {
         });
         rewrite_expression(expr, in_filter);
     };
-    for expr in op.expressions_mut() {
-        lower(expr, is_filter);
+    for (at, expr) in op.expressions_mut().into_iter().enumerate() {
+        if !kept.get(at).copied().unwrap_or(false) {
+            lower(expr, is_filter);
+        }
     }
     if let K::Join { conditions, .. } | K::DelimJoin { conditions, .. } | K::MarkJoin { conditions, .. } = &mut op.kind
     {
