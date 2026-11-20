@@ -506,8 +506,17 @@ fn is_avg(kind: AggregateKind) -> bool {
 /// `AggregateStateSerialization::SerializeStates`: a state as a value of its layout
 /// ([`state_layout`]); an unset optional state is NULL, and so is an empty list.
 fn state_to_value(kind: AggregateKind, state: &AggregateState, ty: &LogicalType) -> Result<Value> {
+    state_to_value_of(kind, state, ty, &ty.state_layout())
+}
+
+/// [`state_to_value`] with the layout of `ty` worked out already, for many states of one type.
+fn state_to_value_of(
+    kind: AggregateKind,
+    state: &AggregateState,
+    ty: &LogicalType,
+    layout: &LogicalType,
+) -> Result<Value> {
     use AggregateState as S;
-    let layout = ty.state_layout();
     let value = match state {
         S::Count(n) => Value::bigint(*n),
         S::Integer { sum, count } if is_avg(kind) => {
@@ -522,7 +531,7 @@ fn state_to_value(kind: AggregateKind, state: &AggregateState, ty: &LogicalType)
             ("value".into(), Value::double(*sum)),
         ]),
         S::Integer { count: 0, .. } | S::Double { count: 0, .. } => Value::null(layout.clone()),
-        S::Integer { sum, .. } => integer_of(*sum, &layout)?,
+        S::Integer { sum, .. } => integer_of(*sum, layout)?,
         S::Double { sum, .. } => Value::double(*sum),
         S::Extreme(Some(extreme)) => extreme.1.clone(),
         // any_value skips NULLs, so its state is still unset after one
@@ -538,7 +547,7 @@ fn state_to_value(kind: AggregateKind, state: &AggregateState, ty: &LogicalType)
             AggregateKind::Holistic(super::holistic::Holistic::Sorted) => {
                 Value::new(layout.clone(), ValueData::List(rows.clone()))?
             }
-            AggregateKind::Holistic(holistic) => super::holistic_states::from_rows(holistic, rows, &layout)?,
+            AggregateKind::Holistic(holistic) => super::holistic_states::from_rows(holistic, rows, layout)?,
             _ => return Err(state_failure()),
         },
         S::Exported(value) => Value::clone(value),
@@ -566,6 +575,11 @@ fn integer_of(value: i128, ty: &LogicalType) -> Result<Value> {
 /// `AggregateStateSerialization::DeserializeStates`: the state a value of its layout holds. A
 /// NULL state, and a NULL field, leave the empty state as it is.
 fn value_to_state(kind: AggregateKind, value: &Value, ty: &LogicalType) -> Result<AggregateState> {
+    value_to_state_of(kind, value, &ty.state_layout())
+}
+
+/// [`value_to_state`] with the layout of the state type worked out already, for many values of one type.
+fn value_to_state_of(kind: AggregateKind, value: &Value, layout: &LogicalType) -> Result<AggregateState> {
     use AggregateKind::*;
     use AggregateState as S;
     let mut state = kind.initial_state();
@@ -573,7 +587,7 @@ fn value_to_state(kind: AggregateKind, value: &Value, ty: &LogicalType) -> Resul
         return Ok(state);
     }
     // the value of the state, as a value of its layout rather than of the state type
-    let value = &Value::new(ty.state_layout(), value.data().clone())?;
+    let value = &Value::new(layout.clone(), value.data().clone())?;
     if let Holistic(_) = kind {
         return Ok(S::Exported(Box::new(value.clone())));
     }
@@ -822,22 +836,55 @@ pub fn write_state(kind: AggregateKind, state: &AggregateState, ty: &LogicalType
 
 /// `finalize`: the result of the aggregate from a state.
 pub fn finalize_state(value: &Value, ty: &LogicalType) -> Result<Value> {
-    if !ty.aggregate_state_orders().is_empty() {
-        return finalize_sorted(value, ty);
+    StateFinalizer::new(ty).finalize(value)
+}
+
+/// [`finalize_state`] for the values of one state type, as `finalize(state)` takes them a vector at a time: the
+/// aggregate the type names and the layout of its states are found once, when the first value needs them.
+pub struct StateFinalizer<'a> {
+    ty: &'a LogicalType,
+    /// the aggregate, its result type and the layout of its states
+    resolved: std::cell::OnceCell<(Arc<AggregateFunction>, LogicalType, LogicalType)>,
+}
+
+impl<'a> StateFinalizer<'a> {
+    pub fn new(ty: &'a LogicalType) -> Self {
+        Self {
+            ty,
+            resolved: std::cell::OnceCell::new(),
+        }
     }
-    let (.., arguments, _) = ty.aggregate_state_info().ok_or_else(state_failure)?;
-    let (function, result) = resolve_state(ty)?;
-    if value.is_null() {
-        return Ok(Value::null(result));
+
+    pub fn finalize(&self, value: &Value) -> Result<Value> {
+        let ty = self.ty;
+        if !ty.aggregate_state_orders().is_empty() {
+            return finalize_sorted(value, ty);
+        }
+        let (.., arguments, _) = ty.aggregate_state_info().ok_or_else(state_failure)?;
+        let (function, result, layout) = match self.resolved.get() {
+            Some(resolved) => resolved,
+            None => {
+                let (function, result) = resolve_state(ty)?;
+                self.resolved.get_or_init(|| (function, result, ty.state_layout()))
+            }
+        };
+        if value.is_null() {
+            return Ok(Value::null(result.clone()));
+        }
+        // a state of C++'s layout of an aggregate duckrs computes from its rows, with what its arguments were bound to
+        if let AggregateKind::Holistic(holistic) = function.kind
+            && ty.is_aggregate_state()
+        {
+            let layout = Value::new(layout.clone(), value.data().clone())?;
+            return super::holistic_states::finalize(holistic, &layout, result, ty.aggregate_state_constants());
+        }
+        let state = if ty.is_aggregate_state() {
+            value_to_state_of(function.kind, value, layout)?
+        } else {
+            read_state(function.kind, value, ty)?
+        };
+        function.finalize(&state, result, arguments.first())
     }
-    // a state of C++'s layout of an aggregate duckrs computes from its rows, with what its arguments were bound to
-    if let AggregateKind::Holistic(holistic) = function.kind
-        && ty.is_aggregate_state()
-    {
-        let layout = Value::new(ty.state_layout(), value.data().clone())?;
-        return super::holistic_states::finalize(holistic, &layout, &result, ty.aggregate_state_constants());
-    }
-    function.finalize(&read_state(function.kind, value, ty)?, &result, arguments.first())
 }
 
 /// `SortedAggregateFunction::Finalize` of an exported state: the buffered rows sorted by their keys, then given to
@@ -1727,6 +1774,28 @@ impl AggregateFunction {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// [`finalize`](Self::finalize) of each of `states`, stored in `column` from its first row on. An exported
+    /// state's layout is worked out once for all of them, rather than once for each state.
+    pub fn finalize_into(
+        &self,
+        states: &[AggregateState],
+        return_type: &LogicalType,
+        input: Option<&LogicalType>,
+        column: &mut Vector,
+    ) -> Result<()> {
+        if self.export.is_some() && return_type.is_aggregate_state() {
+            let layout = return_type.state_layout();
+            for (row, state) in states.iter().enumerate() {
+                column.set_value(row, &state_to_value_of(self.kind, state, return_type, &layout)?)?;
+            }
+            return Ok(());
+        }
+        for (row, state) in states.iter().enumerate() {
+            column.set_value(row, &self.finalize(state, return_type, input)?)?;
         }
         Ok(())
     }

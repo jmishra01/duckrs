@@ -1670,7 +1670,8 @@ fn from_binary(args: &DataChunk, result: &mut Vector) -> Result<()> {
 
 fn state_finalize(args: &DataChunk, result: &mut Vector) -> Result<()> {
     let ty = args.column(0).logical_type().clone();
-    row_wise(args, result, |row| super::aggregates::finalize_state(&row[0], &ty))
+    let finalizer = super::aggregates::StateFinalizer::new(&ty);
+    row_wise(args, result, |row| finalizer.finalize(&row[0]))
 }
 
 fn state_combine(args: &DataChunk, result: &mut Vector) -> Result<()> {

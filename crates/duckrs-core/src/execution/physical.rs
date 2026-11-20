@@ -3506,10 +3506,12 @@ impl PhysicalAggregate {
                 .map(|(aggregate, states)| {
                     let mut column = Vector::new(aggregate.return_type.clone(), count);
                     let input = aggregate.children.first().map(|c| &c.return_type);
-                    for (row, state) in states[group..group + count].iter().enumerate() {
-                        let value = aggregate.function.finalize(state, &aggregate.return_type, input)?;
-                        column.set_value(row, &value)?;
-                    }
+                    aggregate.function.finalize_into(
+                        &states[group..group + count],
+                        &aggregate.return_type,
+                        input,
+                        &mut column,
+                    )?;
                     Ok(column)
                 })
                 .collect()
