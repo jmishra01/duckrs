@@ -408,7 +408,7 @@ fn equals(a: &BoundExpr, b: &BoundExpr) -> bool {
     a.return_type == b.return_type && unnamed(a) == unnamed(b)
 }
 
-fn aggregate_equals(a: &BoundAggregate, b: &BoundAggregate) -> bool {
+pub(super) fn aggregate_equals(a: &BoundAggregate, b: &BoundAggregate) -> bool {
     a.function.name == b.function.name
         && a.return_type == b.return_type
         && a.distinct == b.distinct
