@@ -30,6 +30,9 @@ pub struct PushedExtract {
     pub names: Vec<String>,
     /// what gives it from the column, which is `Reference(0)` in it
     pub expression: crate::planner::expression::BoundExpr,
+    /// of a field of a VARIANT by keys, those keys and what gives it from the field (at `Reference(0)`): the
+    /// cast, if any, which a scan that reads the field from the typed part applies
+    pub variant_path: Option<(Vec<String>, crate::planner::expression::BoundExpr)>,
 }
 
 #[derive(Debug, Clone)]

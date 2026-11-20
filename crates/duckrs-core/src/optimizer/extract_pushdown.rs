@@ -243,6 +243,36 @@ fn gather(
 
 /// `ConstructStructExtractFromPath`: the expression that gives the field from the column at `Reference(0)`.
 fn path_expression(column_type: &LogicalType, path: &Path) -> Option<(BoundExpr, Vec<String>)> {
+    path_extract(column_type, path).map(|extract| (extract.expression, extract.names))
+}
+
+/// The [`PushedExtract`] of `path`, with the keys of a path into a VARIANT.
+fn path_extract(column_type: &LogicalType, path: &Path) -> Option<PushedExtract> {
+    let (expression, names) = path_expression_of(column_type, path)?;
+    let keys: Option<Vec<String>> = path
+        .steps
+        .iter()
+        .map(|step| match step {
+            Step::Key(key) => Some(key.clone()),
+            Step::Field(_) => None,
+        })
+        .collect();
+    let variant_path = keys.filter(|_| column_type.id() == LogicalTypeId::Variant).map(|keys| {
+        let field = BoundExpr::new(BoundExprKind::Reference(0), column_type.clone());
+        let rest = match &path.cast {
+            Some(cast) => field.cast_to(cast, false),
+            None => field,
+        };
+        (keys, rest)
+    });
+    Some(PushedExtract {
+        names,
+        expression,
+        variant_path,
+    })
+}
+
+fn path_expression_of(column_type: &LogicalType, path: &Path) -> Option<(BoundExpr, Vec<String>)> {
     let mut expr = BoundExpr::new(BoundExprKind::Reference(0), column_type.clone());
     let mut names = Vec::with_capacity(path.steps.len());
     for step in &path.steps {
@@ -287,17 +317,17 @@ fn add_positions(
             };
             let column_type = &candidates[&binding];
             // all of them, or none: a path that can't be rebuilt keeps the column as it is
-            let built: Option<Vec<(BoundExpr, Vec<String>)>> =
-                paths.iter().map(|(path, _)| path_expression(column_type, path)).collect();
+            let built: Option<Vec<PushedExtract>> =
+                paths.iter().map(|(path, _)| path_extract(column_type, path)).collect();
             let Some(built) = built else {
                 pushed.remove(&binding);
                 continue;
             };
             extracts.resize(column_ids.len(), None);
-            for ((expression, names), (_, at)) in built.into_iter().zip(paths.iter_mut()) {
+            for (extract, (_, at)) in built.into_iter().zip(paths.iter_mut()) {
                 *at = column_ids.len();
                 column_ids.push(column_ids[position]);
-                extracts.push(Some(Arc::new(PushedExtract { names, expression })));
+                extracts.push(Some(Arc::new(extract)));
                 projection.push(*at);
             }
             projection.retain(|&p| p != position);
@@ -320,7 +350,12 @@ fn add_positions(
             };
             for ((expression, names), (_, at)) in built.into_iter().zip(paths.iter_mut()) {
                 *at = scan.output_types().len();
-                scan.extracts.push((position, Arc::new(PushedExtract { names, expression })));
+                let extract = PushedExtract {
+                    names,
+                    expression,
+                    variant_path: None,
+                };
+                scan.extracts.push((position, Arc::new(extract)));
                 if let Some(projected) = &mut scan.projected {
                     projected.push(true);
                 }

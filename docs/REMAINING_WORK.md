@@ -163,8 +163,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
     one a checkpoint leaves as it is keeps how it was shredded
   - [x] pushdown extract into table and parquet scans: fields of STRUCT and VARIANT columns read only through
     extracts (and casts of them) are columns of the scan (`s.y.z` in EXPLAIN), also in SQL export
-  - [ ] reading a pushed field from the typed part of fully shredded row
-    groups (the scan unshreds the value and extracts it); the statistics of the pushed fields; `SHREDDED_VECTOR` scans; the statistics of the unshredded part are written as unknown;
+  - [x] reading a pushed field of a VARIANT by keys from the typed part of the row groups that have it there,
+    in parallel scans of a file (7x faster for `sum(v.a::BIGINT)` of 1M rows)
+  - [ ] the same in serial and filtered scans; `count(*)` of a table reads its first column, a VARIANT in full;
+    the statistics of the pushed fields; `SHREDDED_VECTOR` scans; the statistics of the unshredded part are written as unknown;
     stats of the rows a delete took
   - [ ] shredded GEOMETRY columns, Patas and Chimp segments (8), `read_duckdb` (8)
   - [ ] string and list-length statistics for `stats()` (~10 files), per-column `USING COMPRESSION`

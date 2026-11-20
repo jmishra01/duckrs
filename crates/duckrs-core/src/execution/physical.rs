@@ -293,7 +293,12 @@ impl PhysicalTableScan {
     }
 
     /// The filter, then the columns it may be the only one to read, of a chunk that was scanned.
-    fn finish_chunk(&self, mut result: DataChunk) -> Result<Option<DataChunk>> {
+    fn finish_chunk(&self, result: DataChunk) -> Result<Option<DataChunk>> {
+        self.finish_chunk_with(result, &[])
+    }
+
+    /// [`Self::finish_chunk`] of a chunk whose positions `done` have their fields already.
+    fn finish_chunk_with(&self, mut result: DataChunk, done: &[usize]) -> Result<Option<DataChunk>> {
         // the filter reads what it scans, so the columns go after that and before the slice
         let mut selected = None;
         if let Some(filter) = &self.filter {
@@ -316,11 +321,11 @@ impl PhysicalTableScan {
         if let Some((sel, matched)) = selected {
             result.slice(&sel, matched);
         }
-        Ok(Some(self.extract_fields(&positions, result)?))
+        Ok(Some(self.extract_fields(&positions, result, done)?))
     }
 
     /// The fields pushed into the scan, of the columns they are of, in a chunk of the columns at `positions`.
-    fn extract_fields(&self, positions: &[usize], result: DataChunk) -> Result<DataChunk> {
+    fn extract_fields(&self, positions: &[usize], result: DataChunk, done: &[usize]) -> Result<DataChunk> {
         if self.extracts.iter().all(Option::is_none) {
             return Ok(result);
         }
@@ -328,7 +333,7 @@ impl PhysicalTableScan {
         for (at, &position) in positions.iter().enumerate() {
             let column = result.column(at).clone();
             columns.push(match self.extracts.get(position) {
-                Some(Some(extract)) => {
+                Some(Some(extract)) if !done.contains(&position) => {
                     let input = DataChunk::from_columns(vec![column], result.len());
                     crate::execution::expression_executor::execute(&extract.expression, &input)?
                 }
@@ -374,9 +379,15 @@ impl PhysicalTableScan {
     /// chunk of them has it (or a vector that nothing reads).
     #[allow(clippy::type_complexity, reason = "the three parts of a FileScan")]
     fn file_columns(&self) -> (Vec<usize>, Vec<LogicalType>, Vec<Result<usize, Vector>>) {
+        self.file_columns_without(&[])
+    }
+
+    /// [`Self::file_columns`], with the positions `skip` read some other way.
+    #[allow(clippy::type_complexity, reason = "the three parts of a FileScan")]
+    fn file_columns_without(&self, skip: &[usize]) -> (Vec<usize>, Vec<LogicalType>, Vec<Result<usize, Vector>>) {
         let mut used = vec![self.projection.is_none(); self.column_ids.len()];
         for &position in self.projection.iter().flatten() {
-            used[position] = true;
+            used[position] = !skip.contains(&position);
         }
         if let Some(filter) = &self.filter {
             filter.clone().walk_mut(&mut |e| {
@@ -423,7 +434,14 @@ impl PhysicalTableScan {
         };
         let starts = group_starts(&*source);
         let ids = self.table.row_ids(rows);
-        let (read, types, columns) = self.file_columns();
+        // the fields of VARIANTs by keys, which can be read from the typed part
+        let fields: Vec<usize> = (0..self.column_ids.len())
+            .filter(|&p| {
+                self.extracts.get(p).is_some_and(|e| e.as_ref().is_some_and(|e| e.variant_path.is_some()))
+                    && self.projection.as_ref().is_some_and(|projection| projection.contains(&p))
+            })
+            .collect();
+        let (read, types, columns) = self.file_columns_without(&fields);
         let scan = FileScan {
             cursor: TableCursor::new(source.clone(), read.clone(), types.clone(), group_rows),
             columns,
@@ -438,6 +456,7 @@ impl PhysicalTableScan {
                 rows,
                 groups: wanted,
                 starts,
+                fields,
             }),
             groups,
         ))
@@ -571,7 +590,7 @@ impl PhysicalTableScan {
                 .iter()
                 .map(|&position| fetched[position].as_ref().expect("fetched above").range(start, count))
                 .collect();
-            emit(self.extract_fields(&output, DataChunk::from_columns(columns, count))?)?;
+            emit(self.extract_fields(&output, DataChunk::from_columns(columns, count), &[])?)?;
         }
         Ok(())
     }
@@ -590,6 +609,8 @@ struct ParallelFileScan {
     groups: Vec<bool>,
     /// the first row of each group of the file
     starts: Vec<usize>,
+    /// the positions of fields of VARIANTs that are read for themselves (`variant_field`)
+    fields: Vec<usize>,
 }
 
 /// The first row of each group of a source: groups of a file written on threads need not be full.
@@ -658,18 +679,35 @@ impl PhysicalOperator for PhysicalTableScan {
         }
         let mut group = ColumnDataCollection::new(state.types.clone());
         group.append_shared(&state.source.read_group(index, &state.read)?);
+        // the VARIANT fields: from the typed part, or from the column where some value is not there
+        let mut fields = Vec::with_capacity(state.fields.len());
+        for &position in &state.fields {
+            let extract = self.extracts[position].as_ref().expect("a pushed field");
+            let (keys, rest) = extract.variant_path.as_ref().expect("a field by keys");
+            let column = self.column_ids[position];
+            let (expression, input) = match state.source.variant_field(index, column, keys)? {
+                Some(field) => (rest, field),
+                None => (&extract.expression, state.source.read_group(index, &[column])?.column(0).clone()),
+            };
+            let rows = group.len();
+            let chunk = DataChunk::from_columns(vec![input], rows);
+            fields.push((position, crate::execution::expression_executor::execute(expression, &chunk)?));
+        }
         for (local, chunk) in group.chunks().enumerate() {
             let first_row = group_start + local * STANDARD_VECTOR_SIZE;
             let count = chunk.len().min(state.rows.saturating_sub(first_row));
             if count == 0 {
                 break;
             }
-            let columns = self.scan_columns(chunk, &state.ids, first_row, Some(&state.scan))?;
+            let mut columns = self.scan_columns(chunk, &state.ids, first_row, Some(&state.scan))?;
+            for (position, field) in &fields {
+                columns[*position] = field.range(local * STANDARD_VECTOR_SIZE, chunk.len());
+            }
             let mut result = DataChunk::from_columns(columns, chunk.len());
             if count < chunk.len() {
                 result.slice(&SelectionVector::from_vec((0..count as u32).collect()), count);
             }
-            if let Some(result) = self.finish_chunk(result)? {
+            if let Some(result) = self.finish_chunk_with(result, &state.fields)? {
                 emit(result)?;
             }
         }

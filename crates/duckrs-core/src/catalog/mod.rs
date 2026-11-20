@@ -176,6 +176,11 @@ pub trait TableSource: std::fmt::Debug + Send + Sync {
     fn variant_shredding(&self, _row_start: u64, _rows: usize, _column: usize) -> Option<Option<LogicalType>> {
         None
     }
+    /// Of a row group, the field at `keys` of the VARIANT `column`, as `variant_extract` gives it, read from the
+    /// typed part where every value of it is there (`PushdownShreddedFieldExtract`); `None` where it is not.
+    fn variant_field(&self, _group: usize, _column: usize, _keys: &[String]) -> Result<Option<Vector>> {
+        Ok(None)
+    }
     /// [`Self::variant_shredding`] of each row group and each of `columns`.
     fn all_variant_shredding(&self, _columns: &[usize]) -> HashMap<(u64, usize, usize), Option<LogicalType>> {
         HashMap::new()

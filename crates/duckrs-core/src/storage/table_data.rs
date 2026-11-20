@@ -947,6 +947,95 @@ impl TableSource for DiskTable {
         }
     }
 
+    fn variant_field(&self, group: usize, column: usize, keys: &[String]) -> Result<Option<Vector>> {
+        use duckrs_common::variant::VariantNode;
+        let ty = &self.table.columns[column].ty;
+        if ty.id() != LogicalTypeId::Variant || keys.is_empty() {
+            return Ok(None);
+        }
+        let rows = self.table.row_groups[group].tuple_count as usize;
+        let stored = self.persistent_column(group, column)?;
+        let (Some(mut level_type), Some(mut level)) = (stored.shredded.clone(), stored.children.get(1)) else {
+            return Ok(None);
+        };
+        let validity = |column: &PersistentColumn| -> Result<Vec<bool>> {
+            match &column.validity {
+                Some(validity) => scan_validity_column(&self.buffer, validity, rows),
+                None => Ok(vec![true; rows]),
+            }
+        };
+        // a row is NULL where the VARIANT is, or the root of its typed part
+        let mut present = validity(&stored)?;
+        for (row, valid) in validity(level)?.into_iter().enumerate() {
+            present[row] &= valid;
+        }
+        // each key: of an object, which its typed part holds as a STRUCT; a value that is no object has no field
+        for key in keys {
+            let fields = level_type.struct_children();
+            let (typed_type, typed) = match (fields.first(), level.children.first()) {
+                (Some((_, typed_type)), Some(typed)) if typed_type.id() == LogicalTypeId::Struct => (typed_type, typed),
+                _ => return Ok(None),
+            };
+            let Some(at) = typed_type.struct_children().iter().position(|(name, _)| name == key) else {
+                return Ok(None);
+            };
+            for (row, valid) in validity(typed)?.into_iter().enumerate() {
+                present[row] &= valid;
+            }
+            let Some(field) = typed.children.get(at) else {
+                return Ok(None);
+            };
+            level_type = typed_type.struct_children()[at].1.clone();
+            level = field;
+        }
+        // the field: a primitive, or one that is NULL (a VARIANT NULL) or missing where it has no typed value
+        let (leaf_type, leaf, untyped) = if level_type.id() == LogicalTypeId::Struct {
+            let fields = level_type.struct_children();
+            let (Some((_, typed_type)), Some(typed)) = (fields.first(), level.children.first()) else {
+                return Ok(None);
+            };
+            let untyped = match (fields.get(1), level.children.get(1)) {
+                (Some(_), Some(untyped)) => Some(scan_column(&self.buffer, untyped, &LogicalType::UINTEGER, rows)?),
+                _ => None,
+            };
+            (typed_type.clone(), typed, untyped)
+        } else {
+            (level_type.clone(), level, None)
+        };
+        if leaf_type.is_nested() {
+            return Ok(None);
+        }
+        let values = scan_column(&self.buffer, leaf, &leaf_type, rows)?;
+        let variant = LogicalType::new(LogicalTypeId::Variant);
+        let mut result = Vector::new(variant.clone(), rows.max(1));
+        for row in 0..rows {
+            if !present[row] {
+                result.set_null(row, true);
+                continue;
+            }
+            let value = values.get_value(row);
+            if value.is_null() {
+                // a VARIANT NULL, or missing from its object: either is NULL, as `variant_extract` gives it
+                match untyped.as_ref().map(|u| u.get_value(row)) {
+                    Some(index) if !index.is_null() && index.as_i128() != Some(0) => {
+                        // what is left of the value, which only the unshredded part has
+                        return Ok(None);
+                    }
+                    _ => {
+                        result.set_null(row, true);
+                        continue;
+                    }
+                }
+            }
+            let node = VariantNode::Scalar(value);
+            result.set_value(row, &Value::new(variant.clone(), ValueData::Bytes(node.encode()))?)?;
+        }
+        if let Some(alive) = &self.alive[group] {
+            result.slice(&SelectionVector::from_vec(alive.clone()), alive.len());
+        }
+        Ok(Some(result))
+    }
+
     fn read_group(&self, group: usize, columns: &[usize]) -> Result<DataChunk> {
         let rows = self.table.row_groups[group].tuple_count as usize;
         let mut vectors = Vec::with_capacity(columns.len());
