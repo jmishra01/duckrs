@@ -254,8 +254,68 @@ fn flatten_scalar(
     Ok(output.with_alias(expr.alias.clone()))
 }
 
-/// `PlanUncorrelatedSubquery` for `x IN (...)`, the case that gains from a join: the other kinds
-/// run once as they are. A MARK join puts whether a right row equals `x` next to each left row.
+/// `PlanUncorrelatedSubquery` for EXISTS: a cross product with `count_star() = 1` of its first row
+/// (`LIMIT 1`), which is one row of either TRUE or FALSE.
+fn flatten_exists(
+    expr: &BoundExpr,
+    raw: &LogicalOperator,
+    left: &mut LogicalOperator,
+    next_table_index: &mut usize,
+) -> Flat<BoundExpr> {
+    let left_bindings = left.column_bindings();
+    if raw.column_bindings().iter().any(|b| left_bindings.contains(b)) {
+        return Err(Unsupported);
+    }
+    let limit = LogicalOperator::new(
+        K::Limit {
+            limit: Some(1),
+            offset: 0,
+            failure: None,
+        },
+        vec![raw.clone()],
+    );
+    let count_star = BuiltinFunctions::get().aggregate("count_star").ok_or(Unsupported)?;
+    let count_star = bind_aggregate_function(count_star, Vec::new(), None, false).map_err(|_| Unsupported)?;
+    let count_type = count_star.return_type.clone();
+    let aggregate_index = take_index(next_table_index);
+    let aggregate = LogicalOperator::new(
+        K::Aggregate {
+            group_index: take_index(next_table_index),
+            aggregate_index,
+            groupings_index: take_index(next_table_index),
+            groups: Vec::new(),
+            aggregates: vec![count_star],
+            grouping_sets: Vec::new(),
+            grouping_functions: Vec::new(),
+            perfect_hash: false,
+            domain_cap: None,
+        },
+        vec![limit],
+    );
+    let comparison = BoundExpr::new(
+        BoundExprKind::Comparison {
+            op: ComparisonOp::Equal,
+            left: Box::new(BoundExpr::column_ref(ColumnBinding::new(aggregate_index, 0), count_type, "")),
+            right: Box::new(BoundExpr::constant(Value::bigint(1))),
+        },
+        LogicalType::BOOLEAN,
+    );
+    let projection_index = take_index(next_table_index);
+    let right = LogicalOperator::new(
+        K::Projection {
+            table_index: projection_index,
+            expressions: vec![comparison],
+        },
+        vec![aggregate],
+    );
+    let outer = std::mem::replace(left, LogicalOperator::new(K::CrossProduct, Vec::new()));
+    *left = LogicalOperator::new(K::CrossProduct, vec![outer, right]);
+    let output = BoundExpr::column_ref(ColumnBinding::new(projection_index, 0), LogicalType::BOOLEAN, "");
+    Ok(output.with_alias(expr.alias.clone()))
+}
+
+/// `PlanUncorrelatedSubquery` for `x IN (...)`, the case that gains from a join; the other ANY
+/// comparisons run once as they are. A MARK join puts whether a right row equals `x` next to each left row.
 fn flatten_in(expr: &BoundExpr, left: &mut LogicalOperator, next_table_index: &mut usize) -> Flat<BoundExpr> {
     let BoundExprKind::Subquery {
         subquery,
@@ -387,6 +447,15 @@ fn flatten_subquery(expr: &BoundExpr, left: &mut LogicalOperator, next_table_ind
         && correlated.is_empty()
     {
         return flatten_scalar(expr, raw, *error_on_multiple_rows, left, next_table_index);
+    }
+    if let BoundSubquery {
+        kind: SubqueryKind::Exists,
+        raw: Some(raw),
+        ..
+    } = subquery.as_ref()
+        && correlated.is_empty()
+    {
+        return flatten_exists(expr, raw, left, next_table_index);
     }
     if correlated.is_empty() {
         return flatten_in(expr, left, next_table_index);

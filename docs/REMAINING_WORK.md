@@ -262,7 +262,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
     side effects, side-effecting CTEs included
   - [x] IN lists kept as IN through filter pushdown (dense ranges, optional IN and OR filters on scans, index
     scans and zone maps of them); the auxiliary `e(b) op e(c)` filters of window pushdown
-  - [ ] passes not ported: uncorrelated EXISTS as a cross product
+  - [x] uncorrelated EXISTS as a cross product with `count_star() = 1` of its `LIMIT 1`
 - [ ] 19. TPC-H 22/22 and TPC-DS 99/99 correct
   - [x] with `tools/tpch` and `tools/tpcds` building dbgen and dsdgen from the C++ checkout, the examples get
     TPC-H 22/22 at SF 0.01 and 0.1, TPC-DS 99/99 at SF 0.01
