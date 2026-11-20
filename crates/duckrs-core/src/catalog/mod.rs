@@ -501,6 +501,8 @@ pub struct ColumnStatistics {
 /// `VariantStatsShreddingState`, with the type of the typed part of a shredded VARIANT and its statistics.
 #[derive(Debug, Clone)]
 pub enum VariantStatistics {
+    /// what a checkpoint that shredded nothing leaves
+    Uninitialized,
     NotShredded,
     Shredded(LogicalType, ColumnStatistics),
     Inconsistent,

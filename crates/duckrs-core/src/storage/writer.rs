@@ -119,19 +119,23 @@ struct Stats {
     strings: Option<StringStatsOut>,
     /// of a VARIANT column: how it is shredded
     variant: Option<Box<VariantStatsOut>>,
+    /// of a VARIANT column, the statistics of what is stored unshredded (`unshredded_stats`)
+    unshredded: Option<Box<StatsTree>>,
 }
 
 /// `VariantStatsData`: whether a VARIANT column is shredded, and if so the type of its typed part and the
 /// statistics of that.
 #[derive(Debug, Clone)]
 enum VariantStatsOut {
-    NotShredded,
+    /// a row group the checkpoint did not shred (`VariantColumnCheckpointState::GetStatistics` leaves it so),
+    /// which says nothing of how the others are
+    Uninitialized,
     Shredded(LogicalType, StatsTree),
     /// row groups that are shredded differently
     Inconsistent,
 }
 
-const NOT_SHREDDED: u8 = 1;
+const UNINITIALIZED: u8 = 0;
 const SHREDDED: u8 = 2;
 const INCONSISTENT: u8 = 3;
 
@@ -139,7 +143,8 @@ impl VariantStatsOut {
     /// `VariantStats::Merge`.
     fn merge(&mut self, other: &Self) {
         *self = match (std::mem::replace(self, Self::Inconsistent), other) {
-            (Self::NotShredded, Self::NotShredded) => Self::NotShredded,
+            (Self::Uninitialized, other) => other.clone(),
+            (this, Self::Uninitialized) => this,
             (Self::Shredded(ty, stats), Self::Shredded(other_ty, other_stats)) => {
                 match merge_shredding(&ty, &stats, other_ty, other_stats) {
                     Some((ty, stats)) => Self::Shredded(ty, stats),
@@ -377,6 +382,7 @@ impl Stats {
             geometry: None,
             strings: None,
             variant: None,
+            unshredded: None,
         }
     }
 
@@ -388,12 +394,20 @@ impl Stats {
             geometry: None,
             strings: None,
             variant: None,
+            unshredded: None,
         }
     }
 
     fn merge(&mut self, other: &Self, physical: PhysicalType) {
         self.has_null |= other.has_null;
         self.has_no_null |= other.has_no_null;
+        self.unshredded = match (self.unshredded.take(), &other.unshredded) {
+            (Some(mut a), Some(b)) => {
+                a.merge(b, &duckrs_common::variant::unshredded_type());
+                Some(a)
+            }
+            (a, b) => a.or_else(|| b.clone()),
+        };
         self.variant = match (self.variant.take(), &other.variant) {
             (Some(mut a), Some(b)) => {
                 a.merge(b);
@@ -700,12 +714,13 @@ fn write_stats(s: &mut BinarySerializer, ty: Option<&LogicalType>, stats: &Stats
             let state = match stats.variant.as_deref() {
                 Some(VariantStatsOut::Shredded(..)) => SHREDDED,
                 Some(VariantStatsOut::Inconsistent) => INCONSISTENT,
-                _ => NOT_SHREDDED,
+                _ => UNINITIALIZED,
             };
             s.write_property(200, "shredding_state", &state);
             let unshredded = duckrs_common::variant::unshredded_type();
-            s.write_object(225, "unshredded_stats", |s| {
-                write_stats(s, Some(&unshredded), &Stats::unknown())
+            s.write_object(225, "unshredded_stats", |s| match stats.unshredded.as_deref() {
+                Some(tree) => write_stats_tree(s, &unshredded, tree),
+                None => write_stats(s, Some(&unshredded), &Stats::unknown()),
             });
             if let Some(VariantStatsOut::Shredded(shredded, tree)) = stats.variant.as_deref() {
                 s.write_property(230, "shredded_type", shredded);
@@ -1343,7 +1358,8 @@ fn vacuum_groups(groups: Vec<PlannedGroup>, size: usize, tasks: usize, only_full
 /// went, and new ones of `size` for what came after them.
 /// `dense`: the file can't say that row ids have gaps (`CanPersistRowIdGaps`, before v2.0.0), so row groups
 /// without rows stay, and only those that keep all their rows come together.
-fn plan_groups(ids: &RowIds, size: usize, vacuum_tasks: usize, dense: bool) -> Vec<PlannedGroup> {
+/// `stable_ids`: indexes need the rows to keep their ids.
+fn plan_groups(ids: &RowIds, size: usize, vacuum_tasks: usize, dense: bool, stable_ids: bool) -> Vec<PlannedGroup> {
     let mut groups: Vec<PlannedGroup> = Vec::new();
     let mut add = |row_start: u64, rows: usize| {
         let first_position = ids.first_from(row_start);
@@ -1368,6 +1384,37 @@ fn plan_groups(ids: &RowIds, size: usize, vacuum_tasks: usize, dense: bool) -> V
         let rows = (ids.next() - end).min(size as u64);
         add(end, rows as usize);
         end += rows;
+    }
+    // `InitializeVacuumState` of a file that can't say that row ids have gaps: a row group whose rows all went is
+    // dropped where the rows after it can take new ids (`SetRowIdsChanged`), or else only at the end
+    if dense && (stable_ids || vacuum_tasks == 0) {
+        while groups.last().is_some_and(|group| group.live == 0) {
+            groups.pop();
+        }
+    } else if dense && groups.iter().any(|group| group.live == 0) {
+        let mut next = groups.first().map_or(0, |group| group.row_start);
+        let mut shifted = false;
+        let mut kept = Vec::with_capacity(groups.len());
+        for group in groups {
+            if group.live == 0 {
+                shifted = true;
+                continue;
+            }
+            if shifted || group.row_start != next {
+                kept.push(PlannedGroup {
+                    row_start: next,
+                    rows: group.live,
+                    first_position: group.first_position,
+                    live: group.live,
+                    merged: true,
+                });
+                next += group.live as u64;
+            } else {
+                next = group.row_start + group.rows as u64;
+                kept.push(group);
+            }
+        }
+        groups = kept;
     }
     vacuum_groups(groups, size, vacuum_tasks, dense)
 }
@@ -2368,7 +2415,8 @@ impl<'a> Writer<'a> {
                 }
             }
             let child = self.write_column_data(&unshredded, &[Part::new(&stored, rows)])?;
-            stats.variant = Some(Box::new(VariantStatsOut::NotShredded));
+            stats.variant = Some(Box::new(VariantStatsOut::Uninitialized));
+            stats.unshredded = Some(Box::new(StatsTree::of(&child)));
             return Ok(ColumnOut {
                 segments: Vec::new(),
                 validity: Some(validity),
@@ -2386,6 +2434,7 @@ impl<'a> Writer<'a> {
         let child = self.write_column_data(&unshredded, &[Part::new(&stored, rows)])?;
         let typed = self.write_column_data(&shredded_type, &[Part::new(&typed, rows)])?;
         stats.variant = Some(Box::new(VariantStatsOut::Shredded(shredded_type, StatsTree::of(&typed))));
+        stats.unshredded = Some(Box::new(StatsTree::of(&child)));
         Ok(ColumnOut {
             segments: Vec::new(),
             validity: Some(validity),
@@ -2560,7 +2609,7 @@ impl<'a> Writer<'a> {
         let size = self.chunks_per_row_group * STANDARD_VECTOR_SIZE;
         let (mut stored_rows, mut next_row_id) = (0u64, 0u64);
         let dense = self.version < StorageVersion::V2_0_0;
-        for group in plan_groups(&ids, size, self.vacuum_tasks, dense) {
+        for group in plan_groups(&ids, size, self.vacuum_tasks, dense, !indexes.is_empty()) {
             let (written, end) = self.write_group(table, &group, &ids, &mut rows, indexes, &mut statistics)?;
             row_groups.push(written);
             stored_rows += group.rows as u64;

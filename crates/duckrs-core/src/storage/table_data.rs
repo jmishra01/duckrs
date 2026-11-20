@@ -801,6 +801,7 @@ fn column_statistics_of(stored: &BaseStatistics, ty: &LogicalType) -> Option<Col
             (2, Some((shredded, stats))) => {
                 crate::catalog::VariantStatistics::Shredded(shredded.clone(), column_statistics_of(stats, shredded)?)
             }
+            (0, _) => crate::catalog::VariantStatistics::Uninitialized,
             (1, _) => crate::catalog::VariantStatistics::NotShredded,
             _ => crate::catalog::VariantStatistics::Inconsistent,
         })),

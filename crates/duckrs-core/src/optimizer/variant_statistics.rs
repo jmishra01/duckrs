@@ -74,6 +74,7 @@ fn shredded_struct(ty: &LogicalType, stats: &Stats, fully: bool) -> Option<Value
 /// `VariantStats::ToStruct`: the shredding state, and of the typed part what is fully shredded and what not.
 pub(super) fn variant_fields(stats: &Stats) -> Vec<(String, Value)> {
     let state = match stats.variant.as_deref() {
+        Some(VariantStatistics::Uninitialized) => "UNINITIALIZED",
         Some(VariantStatistics::NotShredded) => "NOT_SHREDDED",
         Some(VariantStatistics::Shredded(..)) => "SHREDDED",
         _ => "INCONSISTENT",
