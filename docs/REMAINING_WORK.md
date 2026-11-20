@@ -671,14 +671,14 @@ Each item gives the number of failing files in `test/` that it should fix, where
   SF10, both engines on the file C++ wrote: about 1.3× (1.27× and 1.37× in two runs under heavy load from other work, in which Q18 and Q14 read above 3×; Q09 is down to 1.2–1.9× from 2.5×; Q11 0.5×, Q15 0.7×, Q22 0.7×), which passes the gate on a machine that was busy with other work; measure again on a quiet one before ticking this. duckrs
   had no way to load SF10 itself, as an append kept its rows in memory (more than 2 GiB failed); appends now write
   their full row groups to blocks as they fill (an INSERT of 80M rows takes 90MB). duckrs now loads SF10 into its
-  own file (COPY of the `.tbl` files: lineitem 41–70s against C++'s 22s, the rest under 11s each; at most 1.5GB
-  resident; 2.78GB of file against C++'s 2.79GB), and all 22 queries on that file match `answers/sf10`. A CSV
-  file with no quote or escape in it is scanned on threads at once, in parts of 8MB that start after a `\n` (C++
-  guesses where a part starts, which a quoted newline can fool; a file with quotes is scanned on one thread here).
-  An INSERT appends the parts in order; threads claim the row groups they fill, encode them with no lock held,
-  and place them in the order of their rows, so the file is the one a single thread writes. Still to do: the
-  sniffer reads all of the file into memory (7.7GB for SF10 lineitem) and the scan works on that, where C++
-  reads buffers of 32MB
+  own file (COPY of the `.tbl` files: lineitem 24s against C++'s 22s, the rest under 5s each; at most 710MB
+  resident, where C++ takes 2.2GB; 2.78GB of file against C++'s 2.79GB), and all 22 queries on that file match
+  `answers/sf10`. A CSV file larger than a buffer (32MB) is sniffed on its first buffer, unless a scan of the
+  sniffer gets to its end, and read a buffer at a time. One with no quote or escape in it is scanned on threads
+  at once, in parts of 8MB that start after a `\n`, each read of the file (C++ guesses where a part starts, which
+  a quoted newline can fool; a file with quotes is scanned on one thread here). An INSERT appends the parts in
+  order; threads claim the row groups they fill, encode them with no lock held, and place them in the order of
+  their rows, so the file is the one a single thread writes. An error is the one a scan of the whole file finds
 
 ## Phase 14: Extensions (not started)
 

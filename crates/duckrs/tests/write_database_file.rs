@@ -1371,6 +1371,11 @@ fn big_csv(name: &str, rows: usize, bad: Option<usize>, quoted: bool) -> PathBuf
 /// several of `WRITE_BUFFER_ROW_GROUP_COUNT` that are written ahead: what comes of it, the rows in their order, and
 /// where the segments of the row groups are, before and after a checkpoint.
 fn copied(name: &str, csv: &PathBuf, threads: usize) -> Result<Vec<String>, String> {
+    loaded(name, &format!("COPY f.t FROM '{}' (HEADER)", csv.display()), threads)
+}
+
+/// [`copied`] with `load`, which fills `f.t`.
+fn loaded(name: &str, load: &str, threads: usize) -> Result<Vec<String>, String> {
     let file = path(name);
     let db = Database::open_in_memory().unwrap();
     let mut c = db.connect().unwrap();
@@ -1383,8 +1388,7 @@ fn copied(name: &str, csv: &PathBuf, threads: usize) -> Result<Vec<String>, Stri
         &mut c,
         "CREATE TABLE f.t (id BIGINT, price DECIMAL(15,2), note VARCHAR, day DATE)",
     );
-    c.query(&format!("COPY f.t FROM '{}' (HEADER)", csv.display()))
-        .map_err(|error| error.to_string())?;
+    c.query(load).map_err(|error| error.to_string())?;
     let layout = "SELECT count(*), count(DISTINCT row_group_id), sum(hash(row_group_id, column_id, segment_id, \
                   block_id, block_offset, compression)) FROM pragma_storage_info('f.t')";
     let mut result = rows(
@@ -1415,4 +1419,35 @@ fn csv_loads_on_threads_as_on_one() {
     let error = copied("bad_1.db", &bad, 1).unwrap_err();
     assert!(error.contains("Line: 350002"), "{error}");
     assert_eq!(copied("bad_8.db", &bad, 8).unwrap_err(), error);
+}
+
+/// A file read a buffer at a time, on one thread and in parts, gives what it does read whole: in buffers of 160000
+/// bytes and parts of 40000 (four lines of at most 10000), rows and quoted values with newlines in them go across
+/// many of each. The sniffer reads its 2048 rows of the first buffer.
+#[test]
+fn csv_read_in_buffers_as_whole() {
+    let read = |csv: &PathBuf, line: &str| {
+        format!(
+            "INSERT INTO f.t SELECT * FROM read_csv('{}', header = true, sample_size = 100{line}, columns = {{'id': \
+             'BIGINT', 'price': 'DECIMAL(15,2)', 'note': 'VARCHAR', 'day': 'DATE'}})",
+            csv.display()
+        )
+    };
+    for (name, quoted, bad) in [
+        ("plain", false, None),
+        ("quotes", true, None),
+        ("error", false, Some(90_000)),
+    ] {
+        let csv = big_csv(&format!("buffers_{name}.csv"), 100_000, bad, quoted);
+        // smaller than a buffer of the usual size, so read whole
+        let whole = loaded(&format!("buffers_{name}_whole.db"), &read(&csv, ""), 1);
+        for threads in [1, 8] {
+            let streamed = loaded(
+                &format!("buffers_{name}_{threads}.db"),
+                &read(&csv, ", buffer_size = 160000, max_line_size = 10000"),
+                threads,
+            );
+            assert_eq!(streamed, whole, "{name} on {threads} threads");
+        }
+    }
 }

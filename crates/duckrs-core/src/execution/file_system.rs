@@ -249,6 +249,35 @@ pub fn check_compression(path: &str, compression: Compression) -> Result<()> {
 }
 
 /// All of a file, decompressed.
+/// `CSVBuffer::CSV_BUFFER_SIZE` as the reader options size it: `ROWS_PER_BUFFER` lines of the longest size. A file
+/// larger than this is read a buffer at a time where it can be.
+pub const BUFFER_ROWS: usize = 16;
+
+/// The size of the file at `path` if it is read as it is, with nothing to decompress: one that can be read a part
+/// at a time.
+pub fn plain_file_size(path: &str, compression: Compression) -> Option<u64> {
+    if check_compression(path, compression).is_err() || compression.for_path(path) != Compression::Uncompressed {
+        return None;
+    }
+    let metadata = std::fs::metadata(expand_path(path)).ok()?;
+    metadata.is_file().then_some(metadata.len())
+}
+
+/// Bytes `start..start + len` of the file at `path`, or as many of them as it has.
+pub fn read_range(path: &str, start: u64, len: usize) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file =
+        std::fs::File::open(expand_path(path)).map_err(|e| io_error(format!("Cannot open file \"{path}\": {e}")))?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(|e| io_error(format!("Cannot read file \"{path}\": {e}")))?;
+    let mut data = Vec::with_capacity(len);
+    file.take(len as u64)
+        .read_to_end(&mut data)
+        .map_err(|e| io_error(format!("Cannot read file \"{path}\": {e}")))?;
+    crate::execution::profiler::track_read(data.len());
+    Ok(data)
+}
+
 pub fn read_file(path: &str, compression: Compression) -> Result<Vec<u8>> {
     check_compression(path, compression)?;
     let expanded = expand_path(path);

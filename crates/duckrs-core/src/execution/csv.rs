@@ -1,9 +1,9 @@
 // Ported from duckdb/src/execution/operator/csv_scanner/ and duckdb/src/common/csv_writer.cpp
 // @ rust-port-baseline
 //
-//! Reading and writing CSV. A file is read whole and scanned a row at a time through C++'s state machine
-//! (`csv_state_machine`): by one thread, or by threads at once in parts where no quote can be across them
-//! ([`parallel_morsels`]). The sniffer is in `csv_sniffer`.
+//! Reading and writing CSV. A file is scanned a row at a time through C++'s state machine (`csv_state_machine`):
+//! read whole, or one larger than a buffer a buffer at a time ([`Stream`]); by one thread, or by threads at once in
+//! parts where no quote can be across them ([`parallel_morsels`]). The sniffer is in `csv_sniffer`.
 
 use super::csv_sniffer::{Parsing, can_cast, line_size_error, numeric_text, sniff};
 pub use super::csv_state_machine::Dialect;
@@ -378,6 +378,61 @@ pub struct CsvScanState {
     rejects: Vec<Reject>,
     flushed: bool,
     virtual_rows: crate::execution::multi_file::VirtualRows,
+    /// of a file read a buffer at a time, where `data` is in it
+    stream: Option<Stream>,
+    /// every file is read whole, for the error the scan of it finds first
+    whole: bool,
+}
+
+/// A file read a buffer at a time (`CSVBufferManager`): the scan has the bytes of it from `base` on.
+#[derive(Debug)]
+struct Stream {
+    path: String,
+    base: u64,
+    size: u64,
+    buffer: usize,
+    /// a row is scanned with at least this many bytes after its start, or the end of the file: twice the longest
+    /// line, so that a line longer than that is one, and an error
+    margin: usize,
+}
+
+impl Stream {
+    fn at_end(&self, data: &[u8]) -> bool {
+        self.base + data.len() as u64 >= self.size
+    }
+}
+
+/// Of a stream, the bytes after where the scanner is topped up from the file, those before it dropped, once fewer
+/// than its margin are left (or with `force`, if any are left to read).
+fn refill(stream: &mut Stream, data: &mut Arc<Vec<u8>>, scanner: &mut ValueScanner, force: bool) -> Result<()> {
+    if stream.at_end(data) || (!force && data.len() - scanner.machine.position >= stream.margin) {
+        return Ok(());
+    }
+    let cut = scanner.earliest();
+    let more = super::file_system::read_range(&stream.path, stream.base + data.len() as u64, stream.buffer)?;
+    let mut next = Vec::with_capacity(data.len() - cut + more.len());
+    next.extend_from_slice(&data[cut..]);
+    next.extend_from_slice(&more);
+    scanner.rebase(cut);
+    stream.base += cut as u64;
+    *data = Arc::new(next);
+    Ok(())
+}
+
+/// The error a scan of all the files, each read whole, finds first: that of a scan of parts or buffers of them,
+/// whose lines and positions are those of the whole file. `error` if, after all, it finds none.
+fn first_error(scan: &CsvScanData, error: Error) -> Error {
+    let mut whole = CsvScanState {
+        whole: true,
+        ..CsvScanState::default()
+    };
+    loop {
+        match scan_chunk(scan, &mut whole) {
+            Ok(Some(_)) => {}
+            Ok(None) => return error,
+            Err(first) => return first,
+        }
+    }
 }
 
 /// `CSVFileScan`: a file after the first, as sniffing it finds it, with its columns found by name.
@@ -469,6 +524,27 @@ fn sniff_next_file(scan: &CsvScanData, file: &CsvFile, data: &[u8]) -> Result<Cs
     })
 }
 
+/// `buffer_size_option` of the options (`CSVReaderOptions::Verify`): what a buffer of a file holds, `ROWS_PER_BUFFER`
+/// lines of the default longest size, or of a longer one the user set.
+pub fn buffer_size(options: &CsvReadOptions) -> usize {
+    const MAX_LINE_SIZE_DEFAULT: usize = 2_000_000;
+    options.buffer_size.unwrap_or_else(|| {
+        let line = options.max_line_size.filter(|line| *line > MAX_LINE_SIZE_DEFAULT);
+        super::file_system::BUFFER_ROWS.saturating_mul(line.unwrap_or(MAX_LINE_SIZE_DEFAULT))
+    })
+}
+
+/// The size of the file at `path`, if it is larger than a buffer and is read as it is: one that is read a buffer at
+/// a time.
+pub fn streamed_size(path: &str, options: &CsvReadOptions) -> Option<u64> {
+    let encoding = options.encoding.as_deref().unwrap_or("utf-8").to_lowercase();
+    if !matches!(encoding.as_str(), "utf-8" | "utf8") {
+        return None;
+    }
+    let size = super::file_system::plain_file_size(path, options.compression)?;
+    (size > buffer_size(options) as u64).then_some(size)
+}
+
 /// `CSVIterator::ROWS_PER_THREAD`: a thread scans as many bytes of a file as this many lines of the longest size
 /// (`BytesPerThread`).
 const ROWS_PER_THREAD: usize = 4;
@@ -476,8 +552,16 @@ const ROWS_PER_THREAD: usize = 4;
 /// The parts of a file that threads scan at once (`CSVBoundary`): each starts where a line does, after a `\n`.
 #[derive(Debug)]
 pub struct CsvMorsels {
-    data: Arc<Vec<u8>>,
+    data: MorselData,
     starts: Vec<usize>,
+    end: usize,
+}
+
+/// Where the parts of a file are: in what sniffing read of it, or in the file, which each part reads of.
+#[derive(Debug)]
+enum MorselData {
+    Memory(Arc<Vec<u8>>),
+    File(String),
 }
 
 impl CsvMorsels {
@@ -514,40 +598,76 @@ pub fn parallel_morsels(scan: &CsvScanData) -> Option<CsvMorsels> {
     }
     let bytes_per_thread = options.maximum_line_size().saturating_mul(ROWS_PER_THREAD).max(1);
     let mut first = scan.first_data.lock().expect("not poisoned");
-    let data = first.as_ref()?;
-    if data.len() < 2 * bytes_per_thread {
+    let in_memory = first.as_ref().map(|data| data.len() as u64);
+    let size = match in_memory {
+        Some(size) => size,
+        None => streamed_size(&file.path, options)?,
+    } as usize;
+    if size < 2 * bytes_per_thread {
         return None;
     }
-    let bom = if data.starts_with(&[0xef, 0xbb, 0xbf]) { 3 } else { 0 };
+    // the file a buffer at a time, as the scan of it would read it: in what sniffing read, or from the file
+    let buffer = buffer_size(options).max(1);
+    let read = |at: usize| -> Option<Arc<Vec<u8>>> {
+        match first.as_ref() {
+            Some(data) => (at == 0).then(|| Arc::clone(data)),
+            None => super::file_system::read_range(&file.path, at as u64, buffer)
+                .ok()
+                .map(Arc::new),
+        }
+    };
+    let head = read(0)?;
+    let bom = if head.starts_with(&[0xef, 0xbb, 0xbf]) { 3 } else { 0 };
     let machine = Machine::new(file.dialect.clone(), bom);
     let rows = usize::from(file.header) + file.skip;
-    let begin = skip_rows(data, &machine.dialect, &machine.transitions(), bom, rows);
-    let rest = &data[begin.min(data.len())..];
-    if [file.dialect.quote, file.dialect.escape]
-        .into_iter()
-        .flatten()
-        .any(|byte| memchr::memchr(byte, rest).is_some())
-    {
+    let begin = skip_rows(&head, &machine.dialect, &machine.transitions(), bom, rows);
+    if begin + bytes_per_thread > head.len() {
         return None;
     }
     let mut starts = vec![begin];
     let mut at = begin + bytes_per_thread;
-    while at < data.len() {
-        let Some(newline) = memchr::memchr(b'\n', &data[at..]) else {
-            break;
-        };
-        let start = at + newline + 1;
-        if start >= data.len() {
+    let (mut offset, mut data) = (0, head);
+    loop {
+        let from = if offset == 0 { begin } else { 0 };
+        if [file.dialect.quote, file.dialect.escape]
+            .into_iter()
+            .flatten()
+            .any(|byte| memchr::memchr(byte, &data[from.min(data.len())..]).is_some())
+        {
+            return None;
+        }
+        // the next start in this buffer, or past it
+        while at < offset + data.len() {
+            let Some(newline) = memchr::memchr(b'\n', &data[at - offset..]) else {
+                at = offset + data.len();
+                break;
+            };
+            let start = at + newline + 1;
+            if start >= size {
+                at = size;
+                break;
+            }
+            starts.push(start);
+            at = start + bytes_per_thread;
+        }
+        offset += data.len();
+        if offset >= size || data.is_empty() {
             break;
         }
-        starts.push(start);
-        at = start + bytes_per_thread;
+        data = read(offset)?;
     }
     if starts.len() < 2 {
         return None;
     }
-    let data = first.take().expect("just read");
-    Some(CsvMorsels { data, starts })
+    let data = match first.take() {
+        Some(data) => MorselData::Memory(data),
+        None => MorselData::File(file.path.clone()),
+    };
+    Some(CsvMorsels {
+        data,
+        starts,
+        end: size,
+    })
 }
 
 /// The rows of part `index` of `morsels`, typed, in order. If they have an error, it is the one the scan of the
@@ -560,27 +680,25 @@ pub fn scan_morsel(
 ) -> Result<()> {
     let file = &scan.files[0];
     let start = morsels.starts[index];
-    let end = morsels.starts.get(index + 1).copied().unwrap_or(morsels.data.len());
-    let data = &morsels.data[start..end];
+    let end = morsels.starts.get(index + 1).copied().unwrap_or(morsels.end);
+    let read;
+    let data: &[u8] = match &morsels.data {
+        MorselData::Memory(data) => &data[start..end],
+        MorselData::File(path) => {
+            read = super::file_system::read_range(path, start as u64, end - start)?;
+            &read
+        }
+    };
     let mut state = CsvScanState {
         scanner: Some(ValueScanner::new(Machine::new(file.dialect.clone(), 0))),
         ..CsvScanState::default()
     };
     loop {
-        match read_rows(data, scan, file, &mut state) {
+        match read_rows(data, scan, file, &mut state, None) {
             Ok(Some(chunk)) => emit(project(scan, chunk))?,
             Ok(None) => return Ok(()),
-            Err(error) => {
-                // the whole file again, read from it, as the parts took what sniffing read
-                let mut whole = CsvScanState::default();
-                loop {
-                    match scan_chunk(scan, &mut whole) {
-                        Ok(Some(_)) => {}
-                        Ok(None) => return Err(error),
-                        Err(first) => return Err(first),
-                    }
-                }
-            }
+            // the whole file again, read from it, as the parts took what sniffing read
+            Err(error) => return Err(first_error(scan, error)),
         }
     }
 }
@@ -624,9 +742,30 @@ fn scan_file_chunk(scan: &CsvScanData, state: &mut CsvScanState) -> Result<Optio
             } else {
                 None
             };
-            let data = match cached {
-                Some(data) => data,
-                None => Arc::new(read_csv_file(&file.path, &scan.options)?),
+            // a file larger than a buffer is read a buffer at a time, unless what the scan reports of rows it
+            // drops says where in the file they are
+            let streamed = (!state.whole
+                && cached.is_none()
+                && scan.rejects.is_none()
+                && !scan.options.ignore_errors
+                && !(state.file > 0 && scan.options.auto_detect && !scan.union_by_name))
+                .then(|| streamed_size(&file.path, &scan.options))
+                .flatten();
+            state.stream = None;
+            let data = match (cached, streamed) {
+                (Some(data), _) if !state.whole => data,
+                (_, Some(size)) => {
+                    let buffer = buffer_size(&scan.options);
+                    state.stream = Some(Stream {
+                        path: file.path.clone(),
+                        base: 0,
+                        size,
+                        buffer,
+                        margin: scan.options.maximum_line_size().saturating_mul(2),
+                    });
+                    Arc::new(super::file_system::read_range(&file.path, 0, buffer)?)
+                }
+                _ => Arc::new(read_csv_file(&file.path, &scan.options)?),
             };
             let bom = if data.starts_with(&[0xef, 0xbb, 0xbf]) { 3 } else { 0 };
             state.current = if state.file > 0 && scan.options.auto_detect && !scan.union_by_name {
@@ -638,22 +777,58 @@ fn scan_file_chunk(scan: &CsvScanData, state: &mut CsvScanState) -> Result<Optio
             let machine = Machine::new(file.dialect.clone(), bom);
             let rows = usize::from(file.header) + file.skip;
             let begin = skip_rows(&data, &machine.dialect, &machine.transitions(), bom, rows);
+            // rows to skip past the first buffer: the file is read whole
+            if state
+                .stream
+                .as_ref()
+                .is_some_and(|stream| !stream.at_end(&data) && begin + stream.margin > data.len())
+            {
+                state.stream = None;
+                state.whole = true;
+                let result = scan_file_chunk(scan, state);
+                state.whole = false;
+                return result;
+            }
             state.line = count_lines(&data[..begin]);
             let mut machine = machine;
             machine.position = begin;
             state.scanner = Some(ValueScanner::new(machine));
             state.data = Some(data);
         }
-        let data = state.data.take().expect("just set");
+        let mut data = state.data.take().expect("just set");
         let current = state.current.take();
-        let result = read_rows(&data, scan, current.as_ref().unwrap_or(file), state)?;
+        let mut stream = state.stream.take();
+        if let Some(stream) = &mut stream {
+            refill(stream, &mut data, state.scanner.as_mut().expect("a scanner"), false)?;
+        }
+        let margin = stream
+            .as_ref()
+            .filter(|stream| !stream.at_end(&data))
+            .map(|stream| stream.margin);
+        let result = match read_rows(&data, scan, current.as_ref().unwrap_or(file), state, margin) {
+            Ok(result) => result,
+            Err(error) if stream.is_some() => return Err(first_error(scan, error)),
+            Err(error) => return Err(error),
+        };
         match result {
             Some(chunk) => {
                 state.data = Some(data);
                 state.current = current;
+                state.stream = stream;
                 return Ok(Some(chunk));
             }
-            None => state.file += 1,
+            // the rest of the file, past the buffer
+            None if stream.as_ref().is_some_and(|stream| !stream.at_end(&data)) => {
+                let mut stream = stream.expect("just checked");
+                refill(&mut stream, &mut data, state.scanner.as_mut().expect("a scanner"), true)?;
+                state.data = Some(data);
+                state.current = current;
+                state.stream = Some(stream);
+            }
+            None => {
+                state.file += 1;
+                state.stream = None;
+            }
         }
     }
 }
@@ -809,7 +984,15 @@ fn bad_line(
     Ok(())
 }
 
-fn read_rows(data: &[u8], scan: &CsvScanData, file: &CsvFile, state: &mut CsvScanState) -> Result<Option<DataChunk>> {
+/// The next rows of `data`, typed; `None` past its last. With a `margin`, a row starts only with that many bytes of
+/// `data` after it, as `data` is a buffer of a file that goes on.
+fn read_rows(
+    data: &[u8],
+    scan: &CsvScanData,
+    file: &CsvFile,
+    state: &mut CsvScanState,
+    margin: Option<usize>,
+) -> Result<Option<DataChunk>> {
     let ignore = scan.options.ignore_errors;
     let padding = scan.options.null_padding;
     let strict = file.dialect.strict;
@@ -821,6 +1004,9 @@ fn read_rows(data: &[u8], scan: &CsvScanData, file: &CsvFile, state: &mut CsvSca
         while rows.len() < CHUNK_ROWS {
             let scanner = state.scanner.as_mut().expect("a scan has a scanner");
             let before = scanner.machine.position;
+            if margin.is_some_and(|margin| data.len() - before < margin) {
+                break;
+            }
             let row = match scanner.next(data) {
                 None => break,
                 Some(Scanned::Row(row)) => row,
