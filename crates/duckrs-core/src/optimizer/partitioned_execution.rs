@@ -327,9 +327,13 @@ fn visit(op: &mut LogicalOperator, threads: usize, next: &mut usize, replacement
     if columns.is_empty() {
         return;
     }
-    let K::Get { table, .. } = &get.kind else {
+    let K::Get { table, extracts, .. } = &get.kind else {
         unreachable!()
     };
+    // a position that outputs a field of a column has no zones of its own
+    if extracts.iter().any(Option::is_some) {
+        return;
+    }
     let table = table.clone();
     let rows = table.row_count();
     // `PartitionedExecutionHandleGlobalStats`: of the whole table, a column without NULL whose

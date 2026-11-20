@@ -2601,6 +2601,7 @@ impl Binder<'_> {
                         optional_filters: Vec::new(),
                         index_rows: None,
                         sample: None,
+                        extracts: Vec::new(),
                     },
                     vec![],
                 ))

@@ -23,6 +23,15 @@ pub const COLUMN_IDENTIFIER_ROW_ID: usize = usize::MAX;
 /// (`COLUMN_IDENTIFIER_ROW_NUMBER`): the place of a row among the rows of the table, from 1.
 pub const COLUMN_IDENTIFIER_ROW_NUMBER: usize = usize::MAX - 1;
 
+/// A field of a STRUCT or VARIANT column that a scan outputs in place of the column, cast or not.
+#[derive(Debug, Clone)]
+pub struct PushedExtract {
+    /// the names along the path, as `column.a.b` shows it
+    pub names: Vec<String>,
+    /// what gives it from the column, which is `Reference(0)` in it
+    pub expression: crate::planner::expression::BoundExpr,
+}
+
 #[derive(Debug, Clone)]
 pub enum LogicalOperatorKind {
     /// `LogicalGet` of a table: scans `column_ids` (indexes into the table's columns).
@@ -46,6 +55,9 @@ pub enum LogicalOperatorKind {
         index_rows: Option<Arc<Vec<usize>>>,
         /// `extra_info.sample_options`: a SYSTEM sample the scan takes (`SamplingPushdown`)
         sample: Option<TableSample>,
+        /// Per position of `column_ids` (or empty for none), a field of the column that the scan outputs in
+        /// its place (`ColumnIndex::IsPushdownExtract`).
+        extracts: Vec<Option<Arc<PushedExtract>>>,
     },
     /// The `range` and `generate_series` table functions: `count` integers from `start`.
     Range {
@@ -533,18 +545,22 @@ impl LogicalOperator {
                 table,
                 column_ids,
                 projection,
+                extracts,
                 ..
             } => {
-                let type_of = |&i: &usize| {
-                    if i == COLUMN_IDENTIFIER_ROW_ID || i == COLUMN_IDENTIFIER_ROW_NUMBER {
+                let type_of = |p: usize| {
+                    let i = column_ids[p];
+                    if let Some(Some(extract)) = extracts.get(p) {
+                        extract.expression.return_type.clone()
+                    } else if i == COLUMN_IDENTIFIER_ROW_ID || i == COLUMN_IDENTIFIER_ROW_NUMBER {
                         LogicalType::BIGINT
                     } else {
                         table.columns[i].ty.clone()
                     }
                 };
                 match projection {
-                    Some(positions) => positions.iter().map(|&p| type_of(&column_ids[p])).collect(),
-                    None => column_ids.iter().map(type_of).collect(),
+                    Some(positions) => positions.iter().map(|&p| type_of(p)).collect(),
+                    None => (0..column_ids.len()).map(type_of).collect(),
                 }
             }
             LogicalOperatorKind::ColumnSelect { keep } => {

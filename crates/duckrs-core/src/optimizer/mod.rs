@@ -55,6 +55,7 @@ mod window_join_pushdown;
 mod window_self_join;
 pub mod unnest_rewriter;
 pub mod unused_columns;
+mod extract_pushdown;
 
 use crate::planner::expression::{BoundExpr, BoundExprKind};
 use crate::planner::logical::LogicalOperator;
@@ -468,6 +469,11 @@ pub fn optimize_timed(
                 plan
             });
         }
+        // the pushdown extract of `RemoveUnusedColumns`, once the scans say which of their columns they output
+        plan = run("unused_columns", plan, &mut |mut plan| {
+            extract_pushdown::push_down(&mut plan);
+            plan
+        });
     }
     // `COMPRESSED_MATERIALIZATION`, which C++ runs as part of the statistics propagation that follows
     if options.compressed_materialization

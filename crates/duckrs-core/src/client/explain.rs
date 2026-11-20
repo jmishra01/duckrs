@@ -414,6 +414,7 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             optional_filters,
             projection,
             sample,
+            extracts,
             ..
         } => {
             // `PhysicalTableScan::GetFilterInfo`: a filter of a column by the column's name
@@ -464,9 +465,14 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
                 let name = table.columns.get(column).map(|c| c.name.as_str());
                 name.unwrap_or("rowid").to_string()
             };
+            // a pushed field by its path, `column.a.b`
+            let name_at = |p: usize| match extracts.get(p) {
+                Some(Some(extract)) => format!("{}.{}", name(&column_ids[p]), extract.names.join(".")),
+                _ => name(&column_ids[p]),
+            };
             let projected: Vec<String> = match projection {
-                Some(positions) => positions.iter().map(|&p| name(&column_ids[p])).collect(),
-                None => column_ids.iter().map(name).collect(),
+                Some(positions) => positions.iter().map(|&p| name_at(p)).collect(),
+                None => (0..column_ids.len()).map(name_at).collect(),
             };
             info.extend(entry("Projections", lines(projected)));
             if !filter_text.is_empty() {

@@ -222,10 +222,14 @@ fn plain_scan(op: &LogicalOperator) -> Option<Scan> {
         projection,
         index_rows,
         sample,
+        extracts,
     } = &op.kind
     else {
         return None;
     };
+    if extracts.iter().any(Option::is_some) {
+        return None;
+    }
     if !op.children.is_empty()
         || !filters.is_empty()
         || !zone_filters.is_empty()

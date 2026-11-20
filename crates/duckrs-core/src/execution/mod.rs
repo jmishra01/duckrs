@@ -252,6 +252,7 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             projection,
             index_rows,
             sample,
+            extracts,
             ..
         } => {
             let all: Vec<_> = filters
@@ -269,6 +270,7 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
                 prune: (!all.is_empty()).then(|| crate::optimizer::conjunction_of(all)),
                 index_rows,
                 sample,
+                extracts,
             })
         }
         LogicalOperatorKind::CsvScan { scan, .. } => Box::new(PhysicalCsvScan { types, scan }),

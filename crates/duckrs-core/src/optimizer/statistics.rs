@@ -104,6 +104,7 @@ fn add_nested_statistics(
             projection: None,
             index_rows: positions.map(Arc::new),
             sample: None,
+            extracts: Vec::new(),
         },
         Vec::new(),
     );
@@ -227,6 +228,7 @@ fn add_geometry_statistics(
             projection: None,
             index_rows: positions.map(Arc::new),
             sample: None,
+            extracts: Vec::new(),
         },
         Vec::new(),
     );
@@ -293,6 +295,7 @@ fn compute_ordered_statistics(table: &Arc<TableCatalogEntry>, positions: Option<
             projection: None,
             index_rows: positions.map(Arc::new),
             sample: None,
+            extracts: Vec::new(),
         },
         Vec::new(),
     );

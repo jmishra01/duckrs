@@ -772,8 +772,9 @@ impl Exporter<'_> {
                 filters,
                 projection,
                 table_index,
+                extracts,
                 ..
-            } => self.get(table, *table_index, column_ids, filters, projection.as_deref())?,
+            } => self.get(table, *table_index, column_ids, filters, projection.as_deref(), extracts)?,
             Op::Range {
                 start,
                 increment,
@@ -1375,6 +1376,7 @@ impl Exporter<'_> {
         column_ids: &[usize],
         filters: &[BoundExpr],
         projection: Option<&[usize]>,
+        extracts: &[Option<std::sync::Arc<super::logical::PushedExtract>>],
     ) -> Res<Body> {
         let alias = self.alias();
         let mut qualification = Vec::new();
@@ -1430,11 +1432,33 @@ impl Exporter<'_> {
                 .columns
                 .insert(ColumnBinding::new(table_index, position), (column_of(id), type_of(id)));
         }
+        // a pushed field is the extract of its column
+        for (position, extract) in extracts.iter().enumerate() {
+            let Some(extract) = extract else { continue };
+            let base = ColumnBinding::new(table_index, usize::MAX - position);
+            let id = column_ids[position];
+            scope.columns.insert(base, (column_of(id), type_of(id)));
+            let mut expression = extract.expression.clone();
+            expression.walk_mut(&mut |e| {
+                if matches!(e.kind, BoundExprKind::Reference(0)) {
+                    e.kind = BoundExprKind::ColumnRef { binding: base, depth: 0 };
+                }
+            });
+            let ty = expression.return_type.clone();
+            let column = Column::plain(self.expr(&scope, &expression)?);
+            scope.columns.insert(ColumnBinding::new(table_index, position), (column, ty));
+        }
         let positions: Vec<usize> = match projection {
             Some(p) => p.to_vec(),
             None => (0..column_ids.len()).collect(),
         };
-        let columns = positions.iter().map(|&p| column_of(column_ids[p])).collect();
+        let mut columns = Vec::with_capacity(positions.len());
+        for &p in &positions {
+            columns.push(match extracts.get(p) {
+                Some(Some(_)) => scope.columns[&ColumnBinding::new(table_index, p)].0.clone(),
+                _ => column_of(column_ids[p]),
+            });
+        }
         let mut select = Select::new(from, columns);
         for filter in filters {
             select.filters.push(self.expr(&scope, filter)?);

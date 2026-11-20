@@ -1428,10 +1428,23 @@ impl CommonJoinFilters {
         let mut varying = group.differing_scan;
         for (at, (left, right)) in primary.scans.iter().zip(&other.scans).enumerate() {
             let (left, right) = (node(plan, left), node(plan, right));
-            let (K::Get { column_ids: a, .. }, K::Get { column_ids: b, .. }) = (&left.kind, &right.kind) else {
+            let (
+                K::Get {
+                    column_ids: a,
+                    extracts: a_extracts,
+                    ..
+                },
+                K::Get {
+                    column_ids: b,
+                    extracts: b_extracts,
+                    ..
+                },
+            ) = (&left.kind, &right.kind)
+            else {
                 return false;
             };
-            if a != b {
+            // the fields a scan outputs of a column are not compared
+            if a != b || a_extracts.iter().chain(b_extracts).any(Option::is_some) {
                 return false;
             }
             if filters_text(left) == filters_text(right) {

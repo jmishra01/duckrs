@@ -260,6 +260,8 @@ pub struct PhysicalTableScan {
     pub index_rows: Option<Arc<Vec<usize>>>,
     /// a SYSTEM sample of the vectors or rows the scan reads
     pub sample: Option<crate::planner::logical::TableSample>,
+    /// per position of `column_ids`, the field of the column it outputs in its place, if any
+    pub extracts: Vec<Option<Arc<crate::planner::logical::PushedExtract>>>,
 }
 
 impl PhysicalTableScan {
@@ -303,14 +305,37 @@ impl PhysicalTableScan {
                 selected = Some((sel, matched));
             }
         }
-        if let Some(positions) = &self.projection {
+        let positions: Vec<usize> = match &self.projection {
+            Some(positions) => positions.clone(),
+            None => (0..result.column_count()).collect(),
+        };
+        if self.projection.is_some() {
             let columns = positions.iter().map(|&p| result.column(p).clone()).collect();
             result = DataChunk::from_columns(columns, result.len());
         }
         if let Some((sel, matched)) = selected {
             result.slice(&sel, matched);
         }
-        Ok(Some(result))
+        Ok(Some(self.extract_fields(&positions, result)?))
+    }
+
+    /// The fields pushed into the scan, of the columns they are of, in a chunk of the columns at `positions`.
+    fn extract_fields(&self, positions: &[usize], result: DataChunk) -> Result<DataChunk> {
+        if self.extracts.iter().all(Option::is_none) {
+            return Ok(result);
+        }
+        let mut columns = Vec::with_capacity(positions.len());
+        for (at, &position) in positions.iter().enumerate() {
+            let column = result.column(at).clone();
+            columns.push(match self.extracts.get(position) {
+                Some(Some(extract)) => {
+                    let input = DataChunk::from_columns(vec![column], result.len());
+                    crate::execution::expression_executor::execute(&extract.expression, &input)?
+                }
+                _ => column,
+            });
+        }
+        Ok(DataChunk::from_columns(columns, result.len()))
     }
 
     /// The next rows of an index scan that have any left after the filter: those of one chunk.
@@ -546,7 +571,7 @@ impl PhysicalTableScan {
                 .iter()
                 .map(|&position| fetched[position].as_ref().expect("fetched above").range(start, count))
                 .collect();
-            emit(DataChunk::from_columns(columns, count))?;
+            emit(self.extract_fields(&output, DataChunk::from_columns(columns, count))?)?;
         }
         Ok(())
     }

@@ -161,8 +161,12 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] `stats()` of a VARIANT: its shredding state and the statistics of the typed part, from files, through
     casts to and from VARIANT and `variant_extract`; row groups merge their typed parts (`MergeShredding`), and
     one a checkpoint leaves as it is keeps how it was shredded
-  - [ ] the shredded statistics in the optimizer (pushdown of extracts into the typed part, `SHREDDED_VECTOR`
-    scans); the statistics of the unshredded part are written as unknown; stats of the rows a delete took
+  - [x] pushdown extract into table scans: fields of STRUCT and VARIANT columns read only through extracts
+    (and casts of them) are columns of the scan (`s.y.z` in EXPLAIN), also in SQL export
+  - [ ] pushdown extract into parquet scans; reading a pushed field from the typed part of fully shredded row
+    groups (the scan unshreds the value and extracts it); the statistics of the pushed fields for compressed
+    materialization; `SHREDDED_VECTOR` scans; the statistics of the unshredded part are written as unknown;
+    stats of the rows a delete took
   - [ ] shredded GEOMETRY columns, Patas and Chimp segments (8), `read_duckdb` (8)
   - [ ] string and list-length statistics for `stats()` (~10 files), per-column `USING COMPRESSION`
   - [x] `read_duckdb` and the replacement scan of `.db` files; `enable_view_dependencies` (DROP ... CASCADE,

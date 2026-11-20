@@ -376,7 +376,7 @@ pub fn is_variant_function(name: &str) -> bool {
 }
 
 /// `variant_extract(child, key)`, which is what `child.key` and `child[key]` bind to.
-pub(super) fn bind_extract(child: BoundExpr, key: BoundExpr) -> Result<BoundExpr> {
+pub(crate) fn bind_extract(child: BoundExpr, key: BoundExpr) -> Result<BoundExpr> {
     // a foldable key (`1::UINTEGER`) is a constant
     let key = if key.is_foldable() && !matches!(key.kind, BoundExprKind::Constant(_)) {
         BoundExpr::constant(crate::execution::expression_executor::evaluate_scalar(&key)?)

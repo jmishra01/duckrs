@@ -568,6 +568,13 @@ fn bind_union_extract(child: BoundExpr, key: &BoundExpr) -> Result<BoundExpr> {
     ))
 }
 
+/// `struct_extract` of the field at `index` of a STRUCT.
+pub(crate) fn struct_extract_at_index(child: BoundExpr, index: usize) -> Option<BoundExpr> {
+    let member = child.return_type.struct_children().get(index)?.1.clone();
+    let index = BoundExpr::constant(Value::bigint(index as i64));
+    Some(bound_function("struct_extract", vec![child, index], member, struct_extract))
+}
+
 /// `StructExtractResolveTypes` with a constant key.
 fn bind_struct_extract(child: BoundExpr, key: BoundExpr) -> Result<BoundExpr> {
     bind_struct_extract_with(child, key, false)
