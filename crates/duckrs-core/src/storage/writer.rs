@@ -1256,6 +1256,7 @@ pub(super) fn parents_first<'a>(tables: impl IntoIterator<Item = &'a Arc<TableCa
 }
 
 /// A piece of a column: a flat vector and how many rows it has.
+#[derive(Debug)]
 struct Part {
     vector: Vector,
     count: usize,
@@ -3946,10 +3947,37 @@ pub fn write_ahead(
     blocks: &mut AppendBlocks,
     final_flush: bool,
 ) -> Result<Vec<WrittenGroup>> {
-    let mut writer = Writer::new(buffer, catalog, String::new(), options);
-    writer.append = true;
-    writer.partial = std::mem::take(&mut blocks.partial);
-    writer.partial_count = blocks.count;
+    let encoded = encode_ahead(buffer, catalog, table, rows, first, options);
+    place_ahead(buffer, catalog, table, encoded, first_id, options, blocks, final_flush)
+}
+
+/// The row groups of [`write_ahead`] encoded, with what they place held back, for [`place_ahead`] to place: which
+/// needs no lock, so that threads encode row groups at once and place them in their order after.
+#[derive(Debug)]
+pub struct EncodedAhead {
+    first: usize,
+    batches: Vec<EncodedBatch>,
+}
+
+/// `WRITE_BUFFER_ROW_GROUP_COUNT` row groups of an [`EncodedAhead`]: their rows, the parts of each of their columns,
+/// and of each column of each (`tasks`), what encoding it on a thread of its own gave.
+#[derive(Debug)]
+struct EncodedBatch {
+    bounds: Vec<(usize, usize)>,
+    parts: Vec<Vec<Vec<Part>>>,
+    tasks: Vec<(usize, usize)>,
+    deferred: Vec<Option<(ColumnOut, Deferred)>>,
+}
+
+/// The encoding of [`write_ahead`], each column of each row group on a thread of its own where there are threads.
+pub fn encode_ahead(
+    buffer: &BufferManager,
+    catalog: &Catalog,
+    table: &TableCatalogEntry,
+    rows: &ColumnDataCollection,
+    first: usize,
+    options: CheckpointOptions,
+) -> EncodedAhead {
     let size = table.row_group_size();
     let total = rows.len();
     let types = table.types();
@@ -3980,24 +4008,56 @@ pub fn write_ahead(
         .step_by(size)
         .map(|start| (start, (start + size).min(total)))
         .collect();
-    let mut groups = Vec::with_capacity(bounds.len());
-    for batch in bounds.chunks(WRITE_BUFFER_ROW_GROUP_COUNT) {
-        let parts: Vec<Vec<Vec<Part>>> = batch.iter().map(|&(start, end)| parts_of(start, end)).collect();
-        let mut columns: Vec<Vec<ColumnOut>> = batch.iter().map(|_| Vec::with_capacity(types.len())).collect();
-        // `RowGroup::WriteToDisk`: a column of all the row groups, then the next. The columns are encoded on
-        // threads at once, and placed in that order after.
-        let tasks: Vec<(usize, usize)> = (0..types.len())
-            .flat_map(|column| (0..batch.len()).map(move |group| (column, group)))
-            .collect();
-        let mut deferred = encode_deferred(buffer, catalog, table, options, &parts, &tasks);
-        for (index, &(column, group)) in tasks.iter().enumerate() {
-            let out = match deferred.get_mut(index).and_then(Option::take) {
+    let batches = bounds
+        .chunks(WRITE_BUFFER_ROW_GROUP_COUNT)
+        .map(|batch| {
+            let parts: Vec<Vec<Vec<Part>>> = batch.iter().map(|&(start, end)| parts_of(start, end)).collect();
+            // `RowGroup::WriteToDisk`: a column of all the row groups, then the next
+            let tasks: Vec<(usize, usize)> = (0..types.len())
+                .flat_map(|column| (0..batch.len()).map(move |group| (column, group)))
+                .collect();
+            let deferred = encode_deferred(buffer, catalog, table, options, &parts, &tasks);
+            EncodedBatch {
+                bounds: batch.to_vec(),
+                parts,
+                tasks,
+                deferred,
+            }
+        })
+        .collect();
+    EncodedAhead { first, batches }
+}
+
+/// The placing of [`write_ahead`]: the columns of `encoded` placed in their order, those that couldn't be encoded
+/// apart encoded here. The rows have ids from `first_id` on.
+#[allow(clippy::too_many_arguments)] // those of `write_ahead`
+pub fn place_ahead(
+    buffer: &std::sync::Arc<BufferManager>,
+    catalog: &Catalog,
+    table: &TableCatalogEntry,
+    encoded: EncodedAhead,
+    first_id: u64,
+    options: CheckpointOptions,
+    blocks: &mut AppendBlocks,
+    final_flush: bool,
+) -> Result<Vec<WrittenGroup>> {
+    let mut writer = Writer::new(buffer, catalog, String::new(), options);
+    writer.append = true;
+    writer.partial = std::mem::take(&mut blocks.partial);
+    writer.partial_count = blocks.count;
+    let types = table.types();
+    let first = encoded.first;
+    let mut groups = Vec::new();
+    for mut batch in encoded.batches {
+        let mut columns: Vec<Vec<ColumnOut>> = batch.bounds.iter().map(|_| Vec::with_capacity(types.len())).collect();
+        for (index, &(column, group)) in batch.tasks.iter().enumerate() {
+            let out = match batch.deferred.get_mut(index).and_then(Option::take) {
                 Some((out, held)) if !held.failed => writer.place_deferred(out, held)?,
-                _ => writer.encode_column(table, column, &parts[group][column])?,
+                _ => writer.encode_column(table, column, &batch.parts[group][column])?,
             };
             columns[group].push(out);
         }
-        for (&(start, end), columns) in batch.iter().zip(columns) {
+        for (&(start, end), columns) in batch.bounds.iter().zip(columns) {
             groups.push((first_id + (start - first) as u64, end - start, columns));
         }
     }

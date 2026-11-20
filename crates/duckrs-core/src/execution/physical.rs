@@ -4484,6 +4484,53 @@ fn reads_csv(mut op: &dyn PhysicalOperator) -> bool {
 }
 
 impl PhysicalInsert {
+    /// `PhysicalInsert::Sink` of one chunk: its rows appended to the table, and with `write_ahead`, the row groups
+    /// they fill written to blocks; threads that append at once write them after (`write_claimed`).
+    fn append(&self, chunk: &DataChunk, write_ahead: bool) -> Result<()> {
+        // ResolveDefaults: each table column from its input column, or its default
+        let columns = self
+            .table
+            .columns
+            .iter()
+            .zip(&self.column_index_map)
+            .map(|(column, source)| match (source, &column.default_value) {
+                (Some(i), _) => Ok(chunk.column(*i).clone()),
+                (None, Some(default)) => execute(default, chunk),
+                (None, None) => Ok(Vector::constant_null(column.ty.clone())),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let row = DataChunk::from_columns(columns, chunk.len());
+        if self.on_conflict.is_some() {
+            self.pending.lock().append(&row);
+            return Ok(());
+        }
+        constraints::verify_not_null(&self.table, &row)?;
+        let mut storage = self.table.append_storage()?;
+        let first_new_row = *self.first_new_row.lock().get_or_insert(storage.len());
+        constraints::verify_append(&self.table, &storage, &row, first_new_row)?;
+        storage.append(&row);
+        drop(storage);
+        // `LocalStorage::Append`: full row groups go to blocks, and out of memory
+        if write_ahead {
+            self.table.write_ahead_when_full()?;
+        }
+        check_buffered_rows(&self.table.types(), self.table.rows_in_memory())?;
+        *self.inserted.lock() += chunk.len() as u64;
+        if self.returning {
+            self.output.lock().append(&row);
+        }
+        Ok(())
+    }
+
+    /// The row groups that threads appended in full, each claimed by one thread, encoded on it, and placed in order.
+    fn write_claimed(&self) -> Result<()> {
+        while self
+            .table
+            .write_claimed_row_groups(crate::storage::writer::WRITE_BUFFER_ROW_GROUP_COUNT)?
+        {}
+        Ok(())
+    }
+
     /// The morsels that are next, appended in order; `wait` for another thread that appends them now, or leave
     /// them to it.
     fn append_waiting(&self, wait: bool) -> Result<()> {
@@ -4509,7 +4556,7 @@ impl PhysicalInsert {
                     }
                 };
                 for chunk in &chunks {
-                    self.sink(chunk)?;
+                    self.append(chunk, false)?;
                 }
             }
             drop(appending);
@@ -4536,37 +4583,7 @@ impl PhysicalOperator for PhysicalInsert {
         true
     }
     fn sink(&self, chunk: &DataChunk) -> Result<()> {
-        // ResolveDefaults: each table column from its input column, or its default
-        let columns = self
-            .table
-            .columns
-            .iter()
-            .zip(&self.column_index_map)
-            .map(|(column, source)| match (source, &column.default_value) {
-                (Some(i), _) => Ok(chunk.column(*i).clone()),
-                (None, Some(default)) => execute(default, chunk),
-                (None, None) => Ok(Vector::constant_null(column.ty.clone())),
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let row = DataChunk::from_columns(columns, chunk.len());
-        if self.on_conflict.is_some() {
-            self.pending.lock().append(&row);
-            return Ok(());
-        }
-        constraints::verify_not_null(&self.table, &row)?;
-        let mut storage = self.table.append_storage()?;
-        let first_new_row = *self.first_new_row.lock().get_or_insert(storage.len());
-        constraints::verify_append(&self.table, &storage, &row, first_new_row)?;
-        storage.append(&row);
-        drop(storage);
-        // `LocalStorage::Append`: full row groups go to blocks, and out of memory
-        self.table.write_ahead_when_full()?;
-        check_buffered_rows(&self.table.types(), self.table.rows_in_memory())?;
-        *self.inserted.lock() += chunk.len() as u64;
-        if self.returning {
-            self.output.lock().append(&row);
-        }
-        Ok(())
+        self.append(chunk, true)
     }
     fn parallel_sink(&self) -> bool {
         reads_csv(self.children[0].as_ref())
@@ -4586,13 +4603,16 @@ impl PhysicalOperator for PhysicalInsert {
             waiting.1.insert(batch, std::mem::take(local));
             waiting.1.len()
         };
-        self.append_waiting(waiting > WAITING_BATCHES)
+        self.append_waiting(waiting > WAITING_BATCHES)?;
+        self.write_claimed()
     }
     fn combine_local(&self, _local: LocalSinkState) -> Result<()> {
         Ok(())
     }
     fn finalize(&self) -> Result<()> {
         self.append_waiting(true)?;
+        self.write_claimed()?;
+        self.table.end_claims();
         if let Some(action) = &self.on_conflict {
             let (count, rows) = upsert(&self.table, action, &self.pending.lock(), self.returning)?;
             *self.inserted.lock() = count;

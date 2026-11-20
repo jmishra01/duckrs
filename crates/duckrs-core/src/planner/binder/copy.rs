@@ -978,7 +978,7 @@ impl Binder<'_> {
             names,
             types,
             filename: arguments.filename.is_some(),
-            first_data: std::sync::Mutex::new(Some(first_data)),
+            first_data: std::sync::Mutex::new(Some(std::sync::Arc::new(first_data))),
             projection: None,
             column_order: self.column_order(table_index),
             file_filters: String::new(),

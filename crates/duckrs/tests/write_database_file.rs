@@ -1367,22 +1367,34 @@ fn big_csv(name: &str, rows: usize, bad: Option<usize>, quoted: bool) -> PathBuf
     file
 }
 
-/// `COPY` of `csv` into a new table of a new file with `threads`: what comes of it, and the rows in their order.
+/// `COPY` of `csv` into a new table of a new file with `threads`, in row groups of 16384 rows, so that the rows fill
+/// several of `WRITE_BUFFER_ROW_GROUP_COUNT` that are written ahead: what comes of it, the rows in their order, and
+/// where the segments of the row groups are, before and after a checkpoint.
 fn copied(name: &str, csv: &PathBuf, threads: usize) -> Result<Vec<String>, String> {
     let file = path(name);
-    let db = Database::open(&file, false).unwrap();
+    let db = Database::open_in_memory().unwrap();
     let mut c = db.connect().unwrap();
     run(&mut c, &format!("SET threads = {threads}"));
     run(
         &mut c,
-        "CREATE TABLE t (id BIGINT, price DECIMAL(15,2), note VARCHAR, day DATE)",
+        &format!("ATTACH '{}' AS f (ROW_GROUP_SIZE 16384)", file.display()),
     );
-    c.query(&format!("COPY t FROM '{}' (HEADER)", csv.display()))
-        .map_err(|error| error.to_string())?;
-    Ok(rows(
+    run(
         &mut c,
-        "SELECT count(*), sum(price), sum(hash(rowid, id, price, note, day)), max(rowid) FROM t",
-    ))
+        "CREATE TABLE f.t (id BIGINT, price DECIMAL(15,2), note VARCHAR, day DATE)",
+    );
+    c.query(&format!("COPY f.t FROM '{}' (HEADER)", csv.display()))
+        .map_err(|error| error.to_string())?;
+    let layout = "SELECT count(*), count(DISTINCT row_group_id), sum(hash(row_group_id, column_id, segment_id, \
+                  block_id, block_offset, compression)) FROM pragma_storage_info('f.t')";
+    let mut result = rows(
+        &mut c,
+        "SELECT count(*), sum(price), sum(hash(rowid, id, price, note, day)), max(rowid) FROM f.t",
+    );
+    result.extend(rows(&mut c, layout));
+    run(&mut c, "CHECKPOINT f");
+    result.extend(rows(&mut c, layout));
+    Ok(result)
 }
 
 #[test]

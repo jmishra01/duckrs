@@ -129,6 +129,29 @@ impl crate::catalog::AheadWriter for FileAheadWriter {
         };
         db.write_ahead(table, rows, first, first_id, final_flush)
     }
+
+    fn encode(
+        &self,
+        table: &crate::catalog::TableCatalogEntry,
+        rows: &duckrs_common::column_data::ColumnDataCollection,
+    ) -> Result<Option<storage::writer::EncodedAhead>> {
+        let Some(db) = self.db.upgrade() else {
+            return Ok(None);
+        };
+        db.encode_ahead(table, rows)
+    }
+
+    fn place(
+        &self,
+        table: &crate::catalog::TableCatalogEntry,
+        encoded: storage::writer::EncodedAhead,
+        first_id: u64,
+    ) -> Result<Vec<storage::writer::WrittenGroup>> {
+        let Some(db) = self.db.upgrade() else {
+            return Ok(Vec::new());
+        };
+        db.place_ahead(table, encoded, first_id)
+    }
 }
 
 /// What a checkpoint writes a file with, from the settings: `CheckpointOptions` borrow from it.
@@ -569,6 +592,52 @@ impl DatabaseInstance {
             settings.options(""),
             &mut blocks,
             final_flush,
+        )
+    }
+
+    /// The encoding of [`Self::write_ahead`] of all of `rows`, with no lock held: `None` where nothing is written.
+    fn encode_ahead(
+        &self,
+        table: &crate::catalog::TableCatalogEntry,
+        rows: &duckrs_common::column_data::ColumnDataCollection,
+    ) -> Result<Option<storage::writer::EncodedAhead>> {
+        let Some(file) = self
+            .file
+            .as_ref()
+            .filter(|file| self.file_access.is_none() && !file.no_wal_writes)
+        else {
+            return Ok(None);
+        };
+        let settings = self.checkpoint_settings(file)?;
+        if !settings.optimistic_write && table.append_blocks.lock().is_empty() {
+            return Ok(None);
+        }
+        let options = settings.options("");
+        let encoded = storage::writer::encode_ahead(&file.buffer, &self.catalog, table, rows, 0, options);
+        Ok(Some(encoded))
+    }
+
+    /// The placing of [`Self::write_ahead`], of what [`Self::encode_ahead`] encoded.
+    fn place_ahead(
+        &self,
+        table: &crate::catalog::TableCatalogEntry,
+        encoded: storage::writer::EncodedAhead,
+        first_id: u64,
+    ) -> Result<Vec<storage::writer::WrittenGroup>> {
+        let Some(file) = self.file.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let settings = self.checkpoint_settings(file)?;
+        let mut blocks = table.append_blocks.lock();
+        storage::writer::place_ahead(
+            &file.buffer,
+            &self.catalog,
+            table,
+            encoded,
+            first_id,
+            settings.options(""),
+            &mut blocks,
+            false,
         )
     }
 

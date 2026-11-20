@@ -671,16 +671,14 @@ Each item gives the number of failing files in `test/` that it should fix, where
   SF10, both engines on the file C++ wrote: about 1.3× (1.27× and 1.37× in two runs under heavy load from other work, in which Q18 and Q14 read above 3×; Q09 is down to 1.2–1.9× from 2.5×; Q11 0.5×, Q15 0.7×, Q22 0.7×), which passes the gate on a machine that was busy with other work; measure again on a quiet one before ticking this. duckrs
   had no way to load SF10 itself, as an append kept its rows in memory (more than 2 GiB failed); appends now write
   their full row groups to blocks as they fill (an INSERT of 80M rows takes 90MB). duckrs now loads SF10 into its
-  own file (COPY of the `.tbl` files: lineitem 121s, orders 8s, the rest under 5s each; at most 2.2GB resident;
-  2.78GB of file against C++'s 2.79GB), and all 22 queries on that file match `answers/sf10`. A CSV file with no
-  quote or escape in it is scanned on threads at once, in parts of 8MB that start after a `\n` (C++ guesses where a
-  part starts, which a quoted newline can fool; a file with quotes is scanned on one thread here); an INSERT appends
-  the parts in order, and the columns of the row groups they fill are encoded on threads at once and placed in
-  order, so the file is the one a single thread writes. SF1 lineitem takes 6.9s against C++'s 4.4s. Still to do:
-  the sniffer reads all of the file into memory (7.7GB for SF10 lineitem), and the scan works on that, where C++
-  reads buffers of 32MB. And the append that keeps the order runs one thread at a time, with the rest waiting
-  on it: SF10 lineitem keeps about two of eight threads busy (228s of CPU in 121s), where C++ appends on every
-  thread (`PhysicalBatchInsert` with row groups per thread)
+  own file (COPY of the `.tbl` files: lineitem 41–70s against C++'s 22s, the rest under 11s each; at most 1.5GB
+  resident; 2.78GB of file against C++'s 2.79GB), and all 22 queries on that file match `answers/sf10`. A CSV
+  file with no quote or escape in it is scanned on threads at once, in parts of 8MB that start after a `\n` (C++
+  guesses where a part starts, which a quoted newline can fool; a file with quotes is scanned on one thread here).
+  An INSERT appends the parts in order; threads claim the row groups they fill, encode them with no lock held,
+  and place them in the order of their rows, so the file is the one a single thread writes. Still to do: the
+  sniffer reads all of the file into memory (7.7GB for SF10 lineitem) and the scan works on that, where C++
+  reads buffers of 32MB
 
 ## Phase 14: Extensions (not started)
 

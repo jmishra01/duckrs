@@ -249,7 +249,7 @@ pub struct CsvScanData {
     pub rejects: Option<CsvRejects>,
     /// the bytes of the first file that sniffing read, for the first scan (the CSV reader keeps
     /// the handle it sniffed with)
-    pub first_data: std::sync::Mutex<Option<Vec<u8>>>,
+    pub first_data: std::sync::Mutex<Option<Arc<Vec<u8>>>>,
     /// the columns of `output_types` the scan outputs, in order (`column_ids`); `None` for all.
     /// The others are not converted, so their values cannot fail.
     pub projection: Option<Vec<usize>>,
@@ -370,7 +370,7 @@ pub fn new_line_identifier(dialect: &Dialect) -> &'static str {
 #[derive(Debug, Default)]
 pub struct CsvScanState {
     file: usize,
-    data: Option<Vec<u8>>,
+    data: Option<Arc<Vec<u8>>>,
     scanner: Option<ValueScanner>,
     /// the file being read, if sniffing it found other than the first
     current: Option<CsvFile>,
@@ -476,7 +476,7 @@ const ROWS_PER_THREAD: usize = 4;
 /// The parts of a file that threads scan at once (`CSVBoundary`): each starts where a line does, after a `\n`.
 #[derive(Debug)]
 pub struct CsvMorsels {
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>,
     starts: Vec<usize>,
 }
 
@@ -626,7 +626,7 @@ fn scan_file_chunk(scan: &CsvScanData, state: &mut CsvScanState) -> Result<Optio
             };
             let data = match cached {
                 Some(data) => data,
-                None => read_csv_file(&file.path, &scan.options)?,
+                None => Arc::new(read_csv_file(&file.path, &scan.options)?),
             };
             let bom = if data.starts_with(&[0xef, 0xbb, 0xbf]) { 3 } else { 0 };
             state.current = if state.file > 0 && scan.options.auto_detect && !scan.union_by_name {

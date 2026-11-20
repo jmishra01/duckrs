@@ -85,6 +85,7 @@ pub(super) fn clone_scan(scan: &CsvScanData) -> CsvScanData {
         filename: scan.filename,
         virtual_columns: scan.virtual_columns.clone(),
         rejects: scan.rejects.clone(),
+        // the bytes sniffing read are shared, not copied: they can be all of a large file
         first_data: std::sync::Mutex::new(scan.first_data.lock().map(|data| data.clone()).unwrap_or(None)),
         projection: scan.projection.clone(),
         column_order: scan.column_order.clone(),

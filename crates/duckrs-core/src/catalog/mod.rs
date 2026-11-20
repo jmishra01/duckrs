@@ -209,6 +209,36 @@ pub trait AheadWriter: Send + Sync + std::fmt::Debug {
         first_id: u64,
         final_flush: bool,
     ) -> Result<Vec<crate::storage::writer::WrittenGroup>>;
+    /// [`Self::write`] in two: the encoding, which threads do at once, and the placing, in order after; `None` where
+    /// nothing is written ahead.
+    fn encode(
+        &self,
+        table: &TableCatalogEntry,
+        rows: &ColumnDataCollection,
+    ) -> Result<Option<crate::storage::writer::EncodedAhead>>;
+    fn place(
+        &self,
+        table: &TableCatalogEntry,
+        encoded: crate::storage::writer::EncodedAhead,
+        first_id: u64,
+    ) -> Result<Vec<crate::storage::writer::WrittenGroup>>;
+}
+
+/// `OptimisticDataWriter` of each thread of an append: the row groups that threads claimed to write ahead, up to
+/// where, and the turns that place them in the order of their rows, each after the one before it.
+#[derive(Debug, Default)]
+struct AheadClaims {
+    state: Mutex<ClaimState>,
+    placed: parking_lot::Condvar,
+}
+
+#[derive(Debug, Default)]
+struct ClaimState {
+    /// the rows up to here are claimed
+    claimed: usize,
+    next_turn: u64,
+    /// the turn that places now
+    placing: u64,
 }
 
 /// Where the [`AheadWriter`] of a database is, which its schemas and tables share; empty in memory and in the copies
@@ -431,6 +461,8 @@ pub struct TableCatalogEntry {
     ahead: RwLock<Option<AheadSlot>>,
     /// the blocks an append is filling, open until its commit (`PartialBlockManager` of `APPEND_TO_TABLE`)
     pub append_blocks: Mutex<crate::storage::writer::AppendBlocks>,
+    /// the row groups that threads of an append write ahead at once
+    ahead_claims: AheadClaims,
     /// made by CREATE TABLE AS, whose columns depend on no type (`BindCreateTableInfo` registers
     /// the types of the columns only when there is no query)
     pub from_query: std::sync::atomic::AtomicBool,
@@ -865,6 +897,7 @@ impl TableCatalogEntry {
             alters: Mutex::default(),
             ahead: RwLock::default(),
             append_blocks: Mutex::default(),
+            ahead_claims: AheadClaims::default(),
         }
     }
 
@@ -1205,6 +1238,104 @@ impl TableCatalogEntry {
         *storage = rest;
         *current = Some(Arc::new(source));
         Ok(())
+    }
+
+    /// [`Self::write_full_row_groups`] of `count` row groups, for threads that append at once: the rows are claimed,
+    /// encoded with no lock held, and placed in the order of their rows, so that the blocks are those one thread
+    /// writes. Whether there were rows to claim.
+    pub fn write_claimed_row_groups(&self, count: usize) -> Result<bool> {
+        use crate::storage::appended::{AppendedPart, AppendedTable, collection_between};
+        let slot = self.ahead.read().clone();
+        let Some(writer) = slot.and_then(|slot| slot.read().clone()) else {
+            return Ok(false);
+        };
+        if !self.appends_after_source() {
+            return Ok(false);
+        }
+        let flushed = count * self.row_group_size();
+        let (turn, first, rows) = {
+            let mut claims = self.ahead_claims.state.lock();
+            let total = self.row_count();
+            let logged = self.log.lock().logged.len();
+            // a statement that failed may have left its claims past the rows that stayed
+            if claims.claimed > total {
+                claims.claimed = 0;
+            }
+            let first = self.source_rows().max(logged).max(claims.claimed);
+            if total <= first + flushed || (self.source.read().is_none() && logged > 0) {
+                return Ok(false);
+            }
+            let ids = self.row_ids(total);
+            if ids.id(first + flushed - 1) - ids.id(first) != (flushed - 1) as u64 {
+                return Ok(false);
+            }
+            let current = self.source.read();
+            let storage = self.storage.read();
+            let in_source = current.as_ref().map_or(0, |source| source.row_count());
+            if first < in_source || in_source + storage.len() < first + flushed {
+                return Ok(false);
+            }
+            let rows = collection_between(&storage, first - in_source, first - in_source + flushed);
+            claims.claimed = first + flushed;
+            claims.next_turn += 1;
+            (claims.next_turn - 1, first, rows)
+        };
+        let encoded = writer.encode(self, &rows);
+        drop(rows);
+        // the turns of the claims before this one first, and the next after this one even where it fails
+        {
+            let mut claims = self.ahead_claims.state.lock();
+            while claims.placing != turn {
+                self.ahead_claims.placed.wait(&mut claims);
+            }
+        }
+        let placed = (|| -> Result<()> {
+            let Some(encoded) = encoded? else {
+                return Ok(());
+            };
+            let ids = self.row_ids(self.row_count());
+            let first_id = ids.id(first);
+            let mut current = self.source.write();
+            let mut storage = self.storage.write();
+            let in_source = current.as_ref().map_or(0, |source| source.row_count());
+            // rows before these, that a claim left in memory, stay there
+            if first < in_source || in_source + storage.len() < first + flushed {
+                return Ok(());
+            }
+            let offset = first - in_source;
+            let groups = writer.place(self, encoded, first_id)?;
+            if groups.is_empty() {
+                return Ok(());
+            }
+            let mut parts = match current.clone() {
+                Some(source) => AppendedTable::parts_of(&source),
+                None => Vec::new(),
+            };
+            if offset > 0 {
+                parts.push(AppendedPart::Memory(Arc::new(collection_between(&storage, 0, offset))));
+            }
+            parts.extend(groups.into_iter().map(|group| AppendedPart::Written(Arc::new(group))));
+            let rest = collection_between(&storage, offset + flushed, storage.len());
+            let mut kept_ids = (*ids).clone();
+            kept_ids.truncate(first + flushed);
+            let source = AppendedTable::new(parts, kept_ids, self.types(), self.row_group_size());
+            *storage = rest;
+            *current = Some(Arc::new(source));
+            Ok(())
+        })();
+        let mut claims = self.ahead_claims.state.lock();
+        claims.placing += 1;
+        self.ahead_claims.placed.notify_all();
+        placed.map(|()| true)
+    }
+
+    /// The end of an append whose threads claimed row groups: all are placed, and the next starts over.
+    pub fn end_claims(&self) {
+        let mut claims = self.ahead_claims.state.lock();
+        while claims.placing != claims.next_turn {
+            self.ahead_claims.placed.wait(&mut claims);
+        }
+        claims.claimed = 0;
     }
 
     /// All rows are durable as they are, in a file or in a log that was replayed.
