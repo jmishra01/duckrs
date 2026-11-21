@@ -67,6 +67,12 @@ impl GroupTable {
         self.rows.is_empty()
     }
 
+    /// What it takes of memory (`GetSizeInBytes`): its rows and their strings, the entries, and per group its row
+    /// pointer and hash.
+    pub fn size_in_bytes(&self) -> usize {
+        self.data.size_in_bytes() + (self.entries.len() + 2 * self.rows.len()) * std::mem::size_of::<u64>()
+    }
+
     /// The hash of the groups of each row of `groups` (`VectorOperations::Hash` and `CombineHash`).
     pub fn hash(groups: &DataChunk) -> Result<Vec<u64>> {
         let count = groups.len();

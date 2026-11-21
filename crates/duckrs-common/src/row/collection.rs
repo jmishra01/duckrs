@@ -128,6 +128,13 @@ impl TupleDataCollection {
         self.count == 0
     }
 
+    /// The bytes of its blocks and of its strings (`SizeInBytes`), for memory accounting: the values of its LIST
+    /// and ARRAY columns are not counted.
+    pub fn size_in_bytes(&self) -> usize {
+        let blocks: usize = self.blocks.iter().map(|block| block.len() * 8).sum();
+        blocks + self.strings.allocated()
+    }
+
     /// Reserves space for one row and returns its address; the row's bytes are zeroed.
     fn allocate_row(&mut self) -> RowPtr {
         if self.blocks.is_empty() || self.rows_in_last == self.rows_per_block {

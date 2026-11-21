@@ -1,8 +1,16 @@
 # GROUP BY hash table rewrite (plan)
 
-Status: steps 1 to 3 done (parts 48 and 49). The plain GROUP BY finds its groups in a `GroupTable` and merges
-threads' tables by partition; spilling and the other paths still go by keys, which a state gets from its table
-when one of them needs them (`AggregateSinkState::into_keys`). Steps 4 and 5 are left.
+Status: steps 1 to 4 done (parts 48, 49 and 51). The plain GROUP BY finds its groups in a `GroupTable`, merges
+threads' tables by partition, and spills by the hash of its groups, so its states keep their tables throughout.
+The aggregates with keys (DISTINCT, ORDER BY, grouping sets, VARIANT and BIT groups) are as they were. Step 5 is
+left: `into_keys` is reached only by a key state now, and can go with the rest of what no path uses.
+
+Step 4: whether an aggregate spills by hash or by key is decided once for it (`spills_by_hash`), as the rows it
+spills and the groups that join them must go to the same partitions. The rows of groups a full state doesn't
+hold are found by `GroupTable::find`, and go to the partition of their hash mixed with the level
+(`SpillTarget::partition_of_hash`). `take_partitions` and `merge_groups` move groups between tables
+(`absorb`). A table's state counts what its table grew by (`GroupTable::size_in_bytes`) and its states, where
+the estimate of the values and two keys per group counted 1.4 (Q10) to 4.3 (Q18) times what the table holds.
 
 Measured after step 3 on SF10, 8 threads, against part 46: Q18 1.49s to 1.07s (CPU 9.6s to 6.3s), Q10 0.40s
 to 0.37s (CPU 7% less), Q13 4% less, Q01 the same. Step 2 alone was slower (Q10 15% more CPU), as the values

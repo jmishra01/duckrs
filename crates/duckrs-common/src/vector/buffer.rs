@@ -64,6 +64,11 @@ pub struct StringBuffer {
 }
 
 impl StringBuffer {
+    /// Bytes its strings took so far, for memory accounting.
+    pub fn allocated(&self) -> usize {
+        self.heap.allocated()
+    }
+
     /// Copies `bytes` into this buffer. The result stays readable while the buffer is alive.
     pub fn add(&self, bytes: &[u8]) -> StringT {
         self.heap.add(bytes)
