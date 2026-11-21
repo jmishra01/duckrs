@@ -340,15 +340,27 @@ pub(super) fn table_pushdown(expr: &BoundExpr) -> TablePushdown {
 
 /// Moves the filters directly on scans into them.
 pub fn push_into_scans(op: &mut LogicalOperator) {
+    push_into(op, false);
+}
+
+/// [`push_into_scans`] of the filters on scans of tables only, whose table filters statistics then check.
+pub fn push_into_table_scans(op: &mut LogicalOperator) {
+    push_into(op, true);
+}
+
+fn push_into(op: &mut LogicalOperator, tables_only: bool) {
     for child in &mut op.children {
-        push_into_scans(child);
+        push_into(child, tables_only);
     }
     if let K::LateralJoin { right, .. } = &mut op.kind {
-        push_into_scans(right);
+        push_into(right, tables_only);
     }
     let K::Filter { expressions } = &mut op.kind else {
         return;
     };
+    if tables_only && !matches!(op.children[0].kind, K::Get { .. }) {
+        return;
+    }
     // `MultiFileFunction` has no `filter_pushdown` for CSV and JSON, only `pushdown_complex_filter`, which
     // leaves out files
     if matches!(op.children[0].kind, K::CsvScan { .. } | K::JsonScan { .. }) {
@@ -397,10 +409,36 @@ pub fn push_into_scans(op: &mut LogicalOperator) {
         }
         _ => unreachable!("checked above"),
     };
+    // a column with an optional filter already has its filter above the scan: the one statistics rewrote there
+    // stays (it went into the scan partly when the filters were pushed before statistics)
+    let optionally_pushed: Vec<ColumnBinding> = optional
+        .as_deref()
+        .map(|optional| {
+            optional
+                .iter()
+                .filter_map(|filter| {
+                    let mut columns = Vec::new();
+                    let mut outer = false;
+                    columns_of(filter, &mut columns, &mut outer);
+                    columns.first().copied().filter(|c| !outer && columns.iter().all(|other| other == c))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let kept_above = |conjunct: &BoundExpr| {
+        let mut columns = Vec::new();
+        let mut outer = false;
+        columns_of(conjunct, &mut columns, &mut outer);
+        columns.first().is_some_and(|c| columns.iter().all(|other| other == c) && optionally_pushed.contains(c))
+    };
     let (barred, conjuncts): (Vec<BoundExpr>, Vec<BoundExpr>) = conjuncts.into_iter().partition(contains_barrier);
     // what went into the scan only as an optional filter, which stays here as well
     let mut partial = Vec::new();
     for conjunct in conjuncts {
+        if kept_above(&conjunct) && matches!(table_pushdown(&conjunct), TablePushdown::None) {
+            partial.push(conjunct);
+            continue;
+        }
         if can_move_into_scan(&conjunct, &scan) {
             match (table_pushdown(&conjunct), optional.as_deref_mut()) {
                 (TablePushdown::Fully(pushed), _) => {
@@ -408,7 +446,10 @@ pub fn push_into_scans(op: &mut LogicalOperator) {
                     continue;
                 }
                 (TablePushdown::Optional(pushed), Some(optional)) => {
-                    optional.push(pushed);
+                    // the scan may have it from when the filters went in before statistics
+                    if !optional.iter().any(|o| super::rewriter::expressions_equal(o, &pushed)) {
+                        optional.push(pushed);
+                    }
                     partial.push(conjunct);
                     continue;
                 }

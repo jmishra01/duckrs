@@ -1732,6 +1732,10 @@ impl StatisticsPropagator {
         if function.name == "constant_or_null"
             && !self.side_effects
             && stats[1..].iter().all(|s| !s.can_be_null && s.can_be_valid)
+            // `NotNullExpressionAnalyzer::IsNotNull` knows columns, not what is computed of them
+            && children[1..]
+                .iter()
+                .all(|c| matches!(c.kind, BoundExprKind::ColumnRef { .. } | BoundExprKind::Constant(_)))
         {
             let alias = expr.alias.clone();
             let value = children.swap_remove(0);
@@ -2014,6 +2018,56 @@ impl StatisticsPropagator {
     }
 
     /// `PropagateStatistics(LogicalFilter)`.
+    /// `PropagateStatistics(LogicalGet)`: the table filters of a scan against the statistics of its columns, as
+    /// a filter on the scan would be (`ExpressionFilter::CheckStatistics`): one that is always true goes, one that
+    /// is never true makes the result empty, and the others narrow the statistics.
+    fn table_filters(&mut self, op: &mut LogicalOperator) {
+        if self.filter_simplification {
+            return;
+        }
+        // an optional filter that statistics tell is always true goes; it narrows nothing, as it may be wider
+        // than the filter it came from
+        if let K::Get { optional_filters, .. } = &op.kind
+            && !optional_filters.is_empty()
+        {
+            let mut kept = Vec::new();
+            for optional in optional_filters.clone() {
+                let mut probe = optional.clone();
+                let outer = std::mem::replace(&mut self.filter_on_scan, true);
+                let saved = self.stats.clone();
+                self.handle_filter(&mut probe);
+                self.stats = saved;
+                self.filter_on_scan = outer;
+                if fold_boolean(&probe) != Some(Some(true)) {
+                    kept.push(optional);
+                }
+            }
+            if let K::Get { optional_filters, .. } = &mut op.kind {
+                *optional_filters = kept;
+            }
+        }
+        let K::Get { filters, .. } = &mut op.kind else {
+            return;
+        };
+        if filters.is_empty() {
+            return;
+        }
+        let expressions = std::mem::take(filters);
+        let scan = std::mem::replace(op, LogicalOperator::new(K::CrossProduct, Vec::new()));
+        let mut filter = LogicalOperator::new(K::Filter { expressions }, vec![scan]);
+        self.filter(&mut filter);
+        *op = match filter.kind {
+            K::Filter { expressions } => {
+                let mut scan = filter.children.remove(0);
+                if let K::Get { filters, .. } = &mut scan.kind {
+                    *filters = expressions;
+                }
+                scan
+            }
+            _ => filter,
+        };
+    }
+
     fn filter(&mut self, op: &mut LogicalOperator) {
         let K::Filter { expressions } = &mut op.kind else {
             unreachable!()
@@ -2453,6 +2507,7 @@ impl StatisticsPropagator {
                         self.sources.insert(binding, (table.clone(), *column));
                     }
                 }
+                self.table_filters(op);
             }
             K::ParquetScan { table_index, scan } => {
                 for (column, stats) in crate::execution::parquet::scan_statistics(scan).into_iter().enumerate() {

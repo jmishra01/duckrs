@@ -514,6 +514,7 @@ test/optimizer/contains_to_in_clause.test
 test/optimizer/csv_pushdown.test
 test/optimizer/cte_inlining.test
 test/optimizer/cte_statistics_propagation.test
+test/optimizer/date_trunc_simplification.test
 test/optimizer/deliminator_nullability.test
 test/optimizer/disjunctive_join_rewriter_exclusions.test
 test/optimizer/disjunctive_join_rewriter_expansion.test
@@ -632,6 +633,7 @@ test/optimizer/pushdown/pushdown_window_partition_filter.test
 test/optimizer/pushdown/semi_anti_join_implied_filters.test
 test/optimizer/pushdown/starts_with_pushdown.test
 test/optimizer/pushdown/table_filter_pushdown.test
+test/optimizer/pushdown/test_constant_or_null_pushdown.test
 test/optimizer/pushdown/test_pushdown_cte_group_by_all.test
 test/optimizer/pushdown/timestamp_to_date_infinity_pushdown.test
 test/optimizer/pushdown/type_pushdown_projection_index.test

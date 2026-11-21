@@ -203,8 +203,12 @@ Each item gives the number of failing files in `test/` that it should fix, where
     it is always true (`JoinCondition`); `nextval('s')` shown as C++ shows it
   - [ ] `ScalarFnPushdown`: `strlen`/`octet_length` of a Parquet column read by the scan (`scalar_function_pushdown`,
     its LIMIT variant)
-  - [ ] filters into scans before statistics, as C++ does, so the scan keeps the filter as it was and statistics
-    rewrite only the one above (`table_or_pushdown`, `test_constant_or_null_pushdown`, `date_trunc_simplification`)
+  - [x] filters into table scans before statistics, as C++ does, so the scan keeps the filter as it was and
+    statistics rewrite only the one above; statistics check the scan's table filters, optional ones too
+    (`PropagateStatistics(LogicalGet)`); `constant_or_null` folds only of columns and constants
+    (`NotNullExpressionAnalyzer`)
+  - [ ] the same for Parquet scans, whose filters statistics do not check yet; EXPLAIN ANALYZE row counts
+    (`table_or_pushdown`)
   - [ ] the order of a join's conditions where an inequality comes before IS DISTINCT FROM (`issue_17042`)
   - [ ] filters through the row numbers of EXCEPT ALL / INTERSECT ALL on a collation key
     (`pushdown_window_partition_expression`); dynamic filters of blockwise NL joins (`join_filter_pushdown_any_join`)
@@ -259,8 +263,6 @@ Each item gives the number of failing files in `test/` that it should fix, where
     join's predicate become MARK joins; `EXPLAIN (FORMAT yaml)`; scan filters of a column as one conjunction
   - [ ] struct fields pushed into a scan through a view's projection (`unused_columns/deliver_child_columns`)
   - [ ] the ORDER BY of DISTINCT ON inside the DISTINCT, so its keys can be dropped (`remove_redundant_order_keys`)
-  - [ ] an OR whose NULL check statistics remove is a table filter in full, as C++ pushes it before statistics
-    (`date_trunc_simplification` IS DISTINCT FROM)
   - [x] the values aggregates keep for their rows count toward `memory_limit` with the bytes of their strings,
     BLOBs and BITs (`bitagg_memory_limit`)
   - [ ] EXPLAIN shapes: join-dependent filters, projection placement, filter pullup join order, recursive CTE join

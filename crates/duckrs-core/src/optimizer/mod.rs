@@ -453,6 +453,11 @@ pub fn optimize_timed(
     if options.redundant_order_keys {
         plan = run("redundant_order_keys", plan, &mut redundant_order_keys::remove);
     }
+    // `PushdownGet` has put the filters into the scans by the time statistics see them, as table filters that
+    // statistics check while the copies of what went in partly stay above
+    if options.filter_pushdown && options.statistics_propagation {
+        scan_filters::push_into_table_scans(&mut plan);
+    }
     let mut statistics_map = None;
     if options.statistics_propagation {
         plan = run("statistics_propagation", plan, &mut |mut plan| {
