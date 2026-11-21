@@ -241,6 +241,30 @@ where
         let (lu, ru) = (left.to_unified(count), right.to_unified(count));
         let (a, b) = (lu.data::<A>(), ru.data::<B>());
         let out = result.data_mut::<R>();
+        // no NULL on either side: a loop for the kind of selection of each, with no check of a row's validity
+        if lu.validity.all_valid() && ru.validity.all_valid() {
+            use crate::vector::SelectionVector::{Explicit, Identity, Zero};
+            macro_rules! each {
+                ($left:expr, $right:expr) => {{
+                    for (i, slot) in out.iter_mut().enumerate().take(count) {
+                        match f(a[$left(i)], b[$right(i)])? {
+                            Some(r) => *slot = r,
+                            None => nulls.push(i),
+                        }
+                    }
+                }};
+            }
+            match (&lu.sel, &ru.sel) {
+                (Explicit(x), Explicit(y)) => each!(|i: usize| x[i] as usize, |i: usize| y[i] as usize),
+                (Explicit(x), Identity) => each!(|i: usize| x[i] as usize, |i: usize| i),
+                (Identity, Explicit(y)) => each!(|i: usize| i, |i: usize| y[i] as usize),
+                (Explicit(x), Zero) => each!(|i: usize| x[i] as usize, |_| 0),
+                (Zero, Explicit(y)) => each!(|_| 0, |i: usize| y[i] as usize),
+                (left, right) => each!(|i: usize| left.get(i), |i: usize| right.get(i)),
+            }
+            nulls.into_iter().for_each(|i| result.set_null(i, true));
+            return Ok(());
+        }
         for (i, slot) in out.iter_mut().enumerate().take(count) {
             let (li, ri) = (lu.sel.get(i), ru.sel.get(i));
             if !lu.validity.is_valid(li) || !ru.validity.is_valid(ri) {

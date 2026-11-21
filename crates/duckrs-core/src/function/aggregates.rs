@@ -12,7 +12,7 @@ use duckrs_common::serializer::{BinaryDeserializer, BinarySerializer, Serializat
 use duckrs_common::sort_key::{NullOrder, OrderModifiers, OrderType, create_sort_keys};
 use duckrs_common::types::{LogicalType, LogicalTypeId, NativeType, PhysicalType, bignum};
 use duckrs_common::value::{Value, ValueData};
-use duckrs_common::vector::Vector;
+use duckrs_common::vector::{SelectionVector, Vector};
 use duckrs_common::{Error, ErrorKind, Result};
 use std::fmt;
 use std::sync::Arc;
@@ -1556,6 +1556,9 @@ fn to_aggregate_state(args: &duckrs_common::vector::DataChunk, result: &mut Vect
     })
 }
 
+/// Groups up to this many have their sums of a chunk in arrays of their own, which go into their states at once.
+const LOCAL_SUM_GROUPS: usize = 1024;
+
 fn add_integers<T: NativeType + Into<i128>>(
     input: &Vector,
     count: usize,
@@ -1564,6 +1567,86 @@ fn add_integers<T: NativeType + Into<i128>>(
 ) -> Result<()> {
     let u = input.to_unified(count);
     let data = u.data::<T>();
+    // few groups: a sum and a count per group in a loop of its own, then into the states; where an addition
+    // overflows, the rows go into the states one by one after all, for the error of the one that does
+    if states.len() <= LOCAL_SUM_GROUPS && rows.len() >= states.len() {
+        let mut sums = vec![0i128; states.len()];
+        let mut seen = vec![0u64; states.len()];
+        let mut overflow = false;
+        // a sum of values of 64 bits or fewer can't overflow 128 bits; one of 128-bit values can
+        let narrow = std::mem::size_of::<T>() <= std::mem::size_of::<i64>();
+        if narrow && u.validity.all_valid() {
+            // rows in turn go to one of `BANKS` sums and counts of their group, so that an addition doesn't wait for
+            // the one of the row before, which is often of the same group
+            const BANKS: usize = 4;
+            let groups = states.len();
+            let mut bank_sums = vec![0i128; BANKS * groups];
+            let mut bank_seen = vec![0u64; BANKS * groups];
+            match &u.sel {
+                SelectionVector::Identity => {
+                    for &(row, group) in rows {
+                        let slot = (row & (BANKS - 1)) * groups + group;
+                        bank_sums[slot] += data[row].into();
+                        bank_seen[slot] += 1;
+                    }
+                }
+                sel => {
+                    for &(row, group) in rows {
+                        let slot = (row & (BANKS - 1)) * groups + group;
+                        bank_sums[slot] += data[sel.get(row)].into();
+                        bank_seen[slot] += 1;
+                    }
+                }
+            }
+            for group in 0..groups {
+                for bank in 0..BANKS {
+                    sums[group] += bank_sums[bank * groups + group];
+                    seen[group] += bank_seen[bank * groups + group];
+                }
+            }
+        } else {
+            for &(row, group) in rows {
+                let index = u.sel.get(row);
+                if !u.validity.is_valid(index) {
+                    continue;
+                }
+                let value: i128 = data[index].into();
+                match sums[group].checked_add(value) {
+                    Some(sum) => sums[group] = sum,
+                    None => {
+                        overflow = true;
+                        break;
+                    }
+                }
+                seen[group] += 1;
+            }
+        }
+        let mut totals = Vec::with_capacity(states.len());
+        if !overflow {
+            for (group, state) in states.iter().enumerate() {
+                let AggregateState::Integer { sum, .. } = state else {
+                    unreachable!("an integer state");
+                };
+                match sum.checked_add(sums[group]) {
+                    Some(total) => totals.push(total),
+                    None => {
+                        overflow = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !overflow {
+            for ((state, total), added) in states.iter_mut().zip(totals).zip(seen) {
+                let AggregateState::Integer { sum, count: rows_seen } = state else {
+                    unreachable!("an integer state");
+                };
+                *sum = total;
+                *rows_seen += added;
+            }
+            return Ok(());
+        }
+    }
     for &(row, group) in rows {
         let index = u.sel.get(row);
         if !u.validity.is_valid(index) {
@@ -1850,3 +1933,4 @@ impl AggregateFunction {
         })
     }
 }
+
