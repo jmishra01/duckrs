@@ -1474,8 +1474,10 @@ fn cast_error(
 pub struct PhysicalParquetScan {
     pub types: Vec<LogicalType>,
     pub scan: Arc<ParquetScanData>,
-    /// the conjunction of the scan's filters
+    /// the conjunction of the scan's filters, which each row passes
     pub filter: Option<crate::planner::expression::BoundExpr>,
+    /// the conjunction of those and the optional filters, which only skip row groups
+    pub prune: Option<crate::planner::expression::BoundExpr>,
 }
 
 impl PhysicalOperator for PhysicalParquetScan {
@@ -1492,14 +1494,14 @@ impl PhysicalOperator for PhysicalParquetScan {
         Box::new(ParquetScanState::default())
     }
     fn row_groups_scanned(&self) -> Option<(usize, usize)> {
-        self.filter.as_ref()?;
+        self.prune.as_ref()?;
         let (mut scanned, mut total) = (0, 0);
         for path in &self.scan.files {
             let (metadata, _) = read_metadata(path).ok()?;
             let groups = metadata.num_row_groups();
             total += groups;
             scanned +=
-                row_groups_to_scan(&self.scan, self.filter.as_ref(), &metadata, path).map_or(groups, |g| g.len());
+                row_groups_to_scan(&self.scan, self.prune.as_ref(), &metadata, path).map_or(groups, |g| g.len());
         }
         (total > 0).then_some((scanned, total))
     }
@@ -1510,7 +1512,7 @@ impl PhysicalOperator for PhysicalParquetScan {
                 return Ok(None);
             };
             if state.reader.is_none() {
-                open_file(&self.scan, self.filter.as_ref(), state, path)?;
+                open_file(&self.scan, self.prune.as_ref(), state, path)?;
             }
             let reader = state.reader.as_mut().expect("just opened");
             match guarded(path, || Ok(reader.next()))? {
