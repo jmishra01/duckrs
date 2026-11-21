@@ -247,8 +247,8 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] the ORDER BY of DISTINCT ON inside the DISTINCT, so its keys can be dropped (`remove_redundant_order_keys`)
   - [ ] an OR whose NULL check statistics remove is a table filter in full, as C++ pushes it before statistics
     (`date_trunc_simplification` IS DISTINCT FROM)
-  - [ ] holistic aggregate states (`bit_and` of BIT) count toward `memory_limit` (`bitagg_memory_limit` passed only
-    while its unused aggregates were computed)
+  - [x] the values aggregates keep for their rows count toward `memory_limit` with the bytes of their strings,
+    BLOBs and BITs (`bitagg_memory_limit`)
   - [ ] EXPLAIN shapes: join-dependent filters, projection placement, filter pullup join order, recursive CTE join
     order, zone maps of ORs over joins, grouping sets of the common aggregate
   - [ ] `duckdb_extensions()`, named table function arguments (`materialized_cte_column_count`)

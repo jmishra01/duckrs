@@ -3126,6 +3126,27 @@ impl PhysicalAggregate {
             * (std::mem::size_of::<Value>() + 16)
     }
 
+    /// What the aggregates that keep their rows' values take for `rows` rows of `inputs`: a value
+    /// each, and the bytes of a string or BLOB (or BIT) past what a value holds inline.
+    fn bytes_of(&self, inputs: &[AggregateInput], rows: usize) -> usize {
+        let mut bytes = rows * self.bytes_per_row();
+        for (aggregate, input) in self.aggregates.iter().zip(inputs) {
+            let keeps = aggregate.distinct || !aggregate.order_by.is_empty() || !aggregate.function.kind.is_order_independent();
+            let Some(vector) = input.input.as_ref().filter(|_| keeps) else {
+                continue;
+            };
+            if vector.logical_type().physical_type() != duckrs_common::types::PhysicalType::Varchar {
+                continue;
+            }
+            let count = |row: usize| vector.str_at(row).map_or(0, <[u8]>::len);
+            bytes += match &input.filtered {
+                Some(filtered) => filtered.iter().map(|&row| count(row)).sum::<usize>(),
+                None => (0..rows).map(count).sum::<usize>(),
+            };
+        }
+        bytes
+    }
+
     /// Sinks `chunk` into `states`. Past the memory limit, the rows of groups the state does not
     /// have go to `target` instead.
     fn sink_chunk(
@@ -3174,7 +3195,7 @@ impl PhysicalAggregate {
         self.sink_into(&known, &inputs, states)?;
         let state = &mut states[0];
         if !state.full {
-            state.bytes += known.len() * self.bytes_per_row();
+            state.bytes += self.bytes_of(&inputs.1, known.len());
             let more = state.bytes.saturating_sub(state.reserved);
             if temporary::current().try_reserve(more) {
                 state.reserved += more;
