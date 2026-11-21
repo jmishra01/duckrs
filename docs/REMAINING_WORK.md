@@ -668,9 +668,11 @@ Each item gives the number of failing files in `test/` that it should fix, where
 - [ ] 48. v1 gate: TPC-H SF10 geometric mean ≤ 1.5× C++ DuckDB, and no query slower than 3×. The runner
   prints the gate after `--engine=both`. On TPC-H SF1 (8 threads, all 22 answers correct) duckrs is at
   1.53× (none above 3×: Q21 2.7×; Q02 0.5×, Q08 0.95×), from 12.7× at the start of item 47.
-  SF10, both engines on the file C++ wrote: 0.68× on 2026-11-21 after part 52, the GROUP BY rewrite done, all 22
-  answers correct (none above 3×: Q01 1.49×, Q09 1.10×; 19 of the 22 faster than C++, Q10 0.97×, Q18 0.73×, Q15
-  0.17×), with the machine's load average rising from 18 to 58 during the run. Earlier that day: 0.71× after part
+  SF10, both engines on the file C++ wrote: 0.63× on 2026-11-21 after part 60, all 22 answers correct (none above
+  3×: Q22 1.44×, Q16 1.07×, Q10 1.06×; 19 of the 22 faster than C++, Q01 0.73×, Q06 0.27×, Q15 0.22×), with the
+  load average rising from 10 to 32 during the run, which slowed C++'s Q01 to 0.85s from its usual 0.5s. Before
+  that, 0.68× after part 52, the GROUP BY rewrite done (none above 3×: Q01 1.49×, Q09 1.10×; Q10 0.97×, Q18 0.73×,
+  Q15 0.17×), with the machine's load average rising from 18 to 58 during the run. Earlier that day: 0.71× after part
   49 (Q18 1.14×) under a load of 20 to 53, which slowed C++ well past its usual times. On 2026-11-20: 0.67× after part 44 (Q10 1.31×) under a load rising from 45 to 157,
   which says least of all, 0.89× after part 42 (Q10 1.97×)
   with the load falling from 43 to 14, 1.09× after parts 39 and 40, 1.20×, and before that 1.27× and 1.37×
@@ -694,7 +696,14 @@ Each item gives the number of failing files in `test/` that it should fix, where
   sum over few groups adds a chunk into four banks of sums per group, so that an addition doesn't wait for the
   one of the row before, and a binary operation over dictionaries without NULLs loops by the kind of selection
   of each side: 3.5s. A range of a dictionary is a window on its selection rather than a copy of its indices,
-  and sums take the banks too where a column has a validity mask without NULLs: 3.4s. duckrs
+  and sums take the banks too where a column has a validity mask without NULLs: 3.4s. Bit-packed values unpack
+  32 at a time by code for their width, DICT_FSST indices straight into `u32`s, and a filter's rows of a
+  dictionary are a gather: 3.15s. An expression that an aggregate or a projection computes twice is computed once
+  below it (`CommonSubExpressionOptimizer`): 2.8s. The loops of arithmetic inline their operation, with overflow
+  errors made apart, and `count_star` counts each group's rows apart: 2.7s. A range filter on a flat column keeps
+  its rows without a branch, a group's selection is no longer gathered through while it is all the group's rows,
+  and fixed-width columns decode into their vectors' memory: 2.5s, and a filtered count over lineitem takes 0.22s
+  of CPU from 0.54s. duckrs
   had no way to load SF10 itself, as an append kept its rows in memory (more than 2 GiB failed); appends now write
   their full row groups to blocks as they fill (an INSERT of 80M rows takes 90MB). duckrs now loads SF10 into its
   own file (COPY of the `.tbl` files: lineitem 24s against C++'s 22s, the rest under 5s each; at most 710MB
