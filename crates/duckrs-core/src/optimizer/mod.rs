@@ -108,6 +108,8 @@ pub struct OptimizerOptions {
     pub late_materialization: bool,
     /// `COMPRESSED_MATERIALIZATION`
     pub compressed_materialization: bool,
+    /// `BUILD_SIDE_PROBE_SIDE`
+    pub build_side_probe_side: bool,
     /// `PARTITIONED_EXECUTION`
     pub partitioned_execution: bool,
     /// `threads`, which the size of the parts of a partitioned execution depends on
@@ -175,6 +177,7 @@ impl Default for OptimizerOptions {
             window_join_pushdown: true,
             late_materialization: true,
             compressed_materialization: true,
+            build_side_probe_side: true,
             partitioned_execution: true,
             threads: 1,
             side_effects: false,
@@ -235,6 +238,7 @@ impl OptimizerOptions {
             window_join_pushdown: false,
             late_materialization: false,
             compressed_materialization: false,
+            build_side_probe_side: false,
             partitioned_execution: false,
             threads: 1,
             side_effects: false,
@@ -294,6 +298,7 @@ impl OptimizerOptions {
             window_join_pushdown: !off("window_join_pushdown"),
             late_materialization: !off("late_materialization"),
             compressed_materialization: !off("compressed_materialization"),
+            build_side_probe_side: !off("build_side_probe_side"),
             partitioned_execution: !off("partitioned_execution"),
             threads: 1,
             side_effects: false,
@@ -425,8 +430,14 @@ pub fn optimize_timed(
         plan = run("outer_join_simplification", plan, &mut outer_join_simplification::simplify);
     }
     if options.join_order {
-        build_side::choose_build_sides(&mut plan, options.range_joins.prefer_range_joins);
-        join_order::configure(options.approximate_join_order_threshold, options.force_no_cross_product);
+        if options.build_side_probe_side {
+            build_side::choose_build_sides(&mut plan, options.range_joins.prefer_range_joins);
+        }
+        join_order::configure(
+            options.approximate_join_order_threshold,
+            options.force_no_cross_product,
+            options.build_side_probe_side,
+        );
         plan = run("join_order", plan, &mut join_order::reorder_joins);
     }
     if options.aggregate_reuse {
@@ -517,7 +528,7 @@ pub fn optimize_timed(
             plan
         });
     }
-    if options.join_order && options.unused_columns {
+    if options.join_order && options.unused_columns && options.build_side_probe_side {
         build_side::choose_by_width(&mut plan);
     }
     // cheapest filters first

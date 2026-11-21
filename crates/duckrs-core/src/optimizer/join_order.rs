@@ -35,14 +35,17 @@ thread_local! {
     static APPROXIMATE_THRESHOLD: std::cell::Cell<usize> = const { std::cell::Cell::new(12) };
     /// `debug_force_no_cross_product`
     static FORCE_NO_CROSS_PRODUCT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// whether `build_side_probe_side` runs, which picks the sides of SEMI and ANTI joins again
+    static BUILD_SIDES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     /// what the join order refused, for the client to raise
     static ERROR: std::cell::RefCell<Option<duckrs_common::Error>> = const { std::cell::RefCell::new(None) };
 }
 
 /// The settings of the join order for the plans optimized from here on.
-pub fn configure(approximate_threshold: usize, force_no_cross_product: bool) {
+pub fn configure(approximate_threshold: usize, force_no_cross_product: bool, build_sides: bool) {
     APPROXIMATE_THRESHOLD.with(|t| t.set(approximate_threshold));
     FORCE_NO_CROSS_PRODUCT.with(|f| f.set(force_no_cross_product));
+    BUILD_SIDES.with(|b| b.set(build_sides));
 }
 
 /// The error the last join order ran into (`PlanEnumerator::SolveJoinOrder` throws).
@@ -2156,7 +2159,9 @@ impl JoinOrderOptimizer {
         let relation = self.optimize(op, false);
         semis.reverse();
         let mut plan = self.stack_semis(relation, semis);
-        super::build_side::choose_build_sides(&mut plan, false);
+        if BUILD_SIDES.with(|b| b.get()) {
+            super::build_side::choose_build_sides(&mut plan, false);
+        }
         plan
     }
 
