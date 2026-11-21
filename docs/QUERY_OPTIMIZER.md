@@ -1447,6 +1447,88 @@ Ungrouped Aggregate sum(l_extendedprice * (1.00 - l_discount))   ~1
 - **209 → 42**: Parts that pass the combined part filters, and parts that pass a whole branch. On the lineitem side, 21,136 line items are shipped by air and delivered in person, and 12,635 of them have a quantity of 30 or less.
 - **0.010 s**: Q19 with the optimizer on, median of 11 warm runs, with a load average of about 35. Without filter_pushdown it was 0.006 s, as described above.
 
+## TPC-H Q20, with the optimizer off and on
+
+Q20 lists the Canadian suppliers that have a surplus of some forest part: more in stock than half of what they shipped of it in 1994. It nests three subqueries: two `IN` lists, one inside the other, and a correlated scalar subquery on two keys. So it shows `IN (subquery)` becoming a semi join, a correlation on two columns, and a `LIKE` that becomes a range a scan can use. The plans are from `phase-55-build-side-flip` at `0b13e01`, the build-side change merged into phase-55 as `1ff6f10`, on the same SF0.1 data.
+
+```
+SELECT s_name, s_address
+FROM supplier, nation
+WHERE s_suppkey IN (
+        SELECT ps_suppkey FROM partsupp
+        WHERE ps_partkey IN (SELECT p_partkey FROM part WHERE p_name LIKE 'forest%')
+          AND ps_availqty > (SELECT 0.5 * sum(l_quantity) FROM lineitem
+                             WHERE l_partkey = ps_partkey
+                               AND l_suppkey = ps_suppkey
+                               AND l_shipdate >= CAST('1994-01-01' AS date)
+                               AND l_shipdate <  CAST('1995-01-01' AS date)))
+  AND s_nationkey = n_nationkey
+  AND n_name = 'CANADA'
+ORDER BY s_name;
+```
+
+**Optimizer off: PRAGMA disable_optimizer**
+
+```
+Order By s_name                                             ~1,000
+└ Filter  #mark AND s_nationkey = n_nationkey AND n_name = 'CANADA'
+  └ Hash Join  MARK  s_suppkey = ps_suppkey                 ~25,000
+    ├ Cross Product  supplier × nation  (all columns)   ~25,000
+    └ Filter  #mark AND ps_availqty > 0.5 * sum       ~16,000
+      └ Left Delim Join  SINGLE  (ps_partkey, ps_suppkey)   ~80,000
+        ├ Hash Join  MARK  ps_partkey = p_partkey
+        │ ├ Seq Scan partsupp  (all 5 columns)
+        │ └ Filter  p_name ~~ 'forest%'
+        │   └ Seq Scan part  (all 9 columns)
+        └ Projection 0.5 * sum, ps_partkey, ps_suppkey
+          └ Hash Join  (ps_partkey, ps_suppkey) IS NOT DISTINCT FROM (the outer keys)
+            └ Hash Group By ps_partkey, ps_suppkey, sum(l_quantity)
+              └ Filter  l_partkey = ps_partkey AND l_suppkey = ps_suppkey AND (dates)
+                └ Cross Product  lineitem × outer keys   ~20,520,944,668
+```
+
+> The planner has already turned both `IN (subquery)` conditions into MARK joins and the correlated subquery into a Delim Join, as in Q4, Q16 and Q17.
+
+**Optimizer on: default settings**
+
+```
+Order By s_name                                             ~7
+└ Projection s_name, s_address
+  └ Hash Join  RIGHT_SEMI  ps_suppkey = s_suppkey        ~7
+    ├ Projection ps_suppkey                                 ~3,200
+    │ └ Filter  CAST(ps_availqty AS DECIMAL(38,3)) > 0.5 * sum   ~3,200
+    │   └ Left Delim Join  (ps_partkey, ps_suppkey) IS NOT DISTINCT FROM (…)   ~16,000
+    │     ├ Hash Join  SEMI  ps_partkey = p_partkey       ~16,000
+    │     │ ├ Seq Scan partsupp  [ps_partkey, ps_suppkey, ps_availqty]   ~80,000
+    │     │ └ Seq Scan part  [p_partkey]                 ~4,000
+    │     │     Filters: p_name >= 'forest', p_name < 'foresu'
+    │     └ Projection 0.5 * sum, ps_partkey, ps_suppkey
+    │       └ Hash Group By ps_partkey, ps_suppkey, sum(l_quantity)
+    │         └ Hash Join  l_partkey = ps_partkey AND l_suppkey = ps_suppkey   ~44,752
+    │           ├ Seq Scan lineitem  [l_partkey, l_suppkey, l_quantity]   ~120,114
+    │           │   Filters: l_shipdate >= '1994-01-01', l_shipdate < '1995-01-01'
+    │           └ Delim Scan  (the outer key pairs)              ~13,904
+    └ Hash Join  s_nationkey = n_nationkey              ~38
+      ├ Seq Scan supplier  [s_suppkey, s_name, s_address, s_nationkey]   ~1,000
+      └ Seq Scan nation  [n_nationkey]  Filters: n_name = 'CANADA'
+```
+
+> The first child of each hash join probes and the second child is the build side. duckrs's EXPLAIN labels the Delim Scan as a CTE Scan without an index.
+
+### What each pass changed
+
+1. **filter_pushdown** made both MARK joins with a filter on their marker into SEMI joins: keep each row that has a match. It moved the Canada filter into the nation scan and the 1994 range into the lineitem scan, and turned the cross products into hash joins.
+2. **The LIKE became a range.** `p_name LIKE 'forest%'` is first rewritten as `prefix(p_name, 'forest')`, as in Q14. Then filter pushdown, when it moves that test into the part scan, turns it into the range `p_name >= 'forest' AND p_name < 'foresu'`: exactly the strings that start with "forest". A range on the column is a scan filter that zone maps can use. With `SET disabled_optimizers = 'filter_pushdown'` the plan keeps `prefix()`.
+3. **The correlated subquery runs only for the forest parts' suppliers.** Its key is the pair `(ps_partkey, ps_suppkey)`, so the Delim Scan holds the distinct pairs left after the forest semi join, and the lineitem join uses both columns as its hash key. deliminator also removed the join of the grouped sums with the outer pairs and made the Delim Join a plain LEFT join, as in Q17.
+4. **build_side_probe_side** made the top join a RIGHT_SEMI join: the 37 Canadian suppliers (~38 estimated) build, and the partsupp rows that pass probe, so each supplier is kept once however many of its parts qualify.
+5. **unused_columns** cut partsupp to 3 of its 5 columns, part to 1 of 9, lineitem to 3 of 16 and supplier to 4 of 7.
+
+> DuckDB 1.5.6 makes the same plan, with the same LIKE range, semi joins and RIGHT_SEMI top join. As in Q17, it keeps an extra RIGHT join above the subquery's GROUP BY and packs the two group keys into 2-byte integers, which duckrs doesn't.
+
+- **9 rows**: Canadian suppliers with a surplus of a forest part, the same as DuckDB. The first are Supplier#000000157 and Supplier#000000197.
+- **190 → 760 → 521**: Forest parts, their partsupp rows, and the rows with more in stock than half of 1994's shipments. The estimates were ~4,000, ~16,000 and ~3,200.
+- **0.007 s**: Q20 with the optimizer on, median of 11 warm runs, with a load average of about 3. With `join_filter_pushdown` off it was 0.009 s (0.008–0.014 s): without the runtime filters, the lineitem scan can't drop line items of other parts before its join. Switching off expression_rewriter made no clear difference (0.007 s).
+
 ## Every pass, what it does and why it's faster
 
 Each pass is marked **new** (added in Stage 3), **changed** (existed and was extended) or **existing** (existed already and was not changed). Its switch is the name to use in `disabled_optimizers`.
