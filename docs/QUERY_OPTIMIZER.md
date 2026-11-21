@@ -960,7 +960,7 @@ Projection __internal_decompress_string(l_shipmode), high_line_count, low_line_c
 
 ## TPC-H Q13, with the optimizer off and on
 
-Q13 counts how many customers have 0, 1, 2, … orders, leaving out orders whose comment mentions special requests. It is the only walkthrough with an outer join, and its filter sits in the `ON` clause, not in WHERE. It shows which filters may move below an outer join, and how the build side of one is chosen. The optimized plan is from `phase-55-build-side-flip` at `0b13e01`, the change merged into phase-55 as `1ff6f10` that lets duckrs swap the sides of a LEFT join; the unoptimized plan is the same in every build. Same SF0.1 data.
+Q13 counts how many customers have 0, 1, 2, … orders, leaving out orders whose comment mentions special requests. It is the only walkthrough with an outer join, and its filter sits in the `ON` clause, not in WHERE. It shows which filters may move below an outer join, and how the build side of one is chosen. The optimized plan is from `phase-55-build-side-flip` at `0b13e01`, the change merged into phase-55 as `1ff6f10` that lets duckrs swap the sides of a LEFT join, and is the same at the phase-55 tip `34ed290`; the unoptimized plan is the same in every build. Same SF0.1 data.
 
 ```
 SELECT c_count, count(*) AS custdist
@@ -1015,12 +1015,12 @@ Order By custdist DESC, c_count DESC                        ~14,035
 ### Compared with DuckDB 1.5.6
 
 1. **The plan now matches DuckDB's.** Both build on the 15,000 customers and let the filtered orders probe, with the comment filter in the orders scan. Before `1ff6f10`, duckrs's build side pass only swapped SEMI and ANTI joins, so it built a hash table of all 148,467 filtered orders, about ten times larger. C++ `BuildProbeSideOptimizer` swaps every join type that has an inverse (`HasInverseJoinType`), LEFT and RIGHT among them, and duckrs now does the same.
-2. **But in duckrs the swapped plan is slower.** With the swap Q13 took 0.056 s, and with `build_side_probe_side` switched off, building on orders again, 0.042 s (medians of 15 interleaved runs, load average about 20). CPU time was 0.035 s against 0.030 s. The smaller hash table should win, so the cost is most likely in how duckrs runs a RIGHT join, which also has to find the build rows no probe matched, rather than in the plan. I haven't profiled it. The session that made the change measured about 7% at a lower load.
+2. **The swapped plan was slower at first, and isn't any more.** Right after the swap was merged, Q13 took 0.056 s with it and 0.042 s with `build_side_probe_side` switched off. The cause was in execution, not in the plan: according to the session that fixed it, the GROUP BY above the join merged the groups of its serial pipeline with those of the threads one at a time. `f40d03c` merges them by partition instead. On a build of the phase-55 tip with that fix (`34ed290`), Q13 takes 0.035 s with the swap and 0.036 s without it, medians of 15 interleaved runs; CPU time is 0.031 s against 0.028 s. The load average was about 70, so the two are best read as even at this size. The session that made the fix measured the swapped plan at SF1 as faster: 0.133 s against 0.142 s for the LEFT join.
 3. **The estimates are rough in both.** The comment filter is estimated at 20% of orders (~30,000) where 99% pass (148,467). duckrs estimates ~14,035 customer groups and DuckDB ~11,711; there are 15,000, one per customer.
 
 - **5,000**: Customers with no qualifying orders: the largest group of the result, c_count 0. The next ones are 9 orders (659 customers), 10 (658) and 11 (643).
 - **148,467**: Orders out of 150,000 that pass the comment filter. Since nearly all pass, the 15,000 customers are the right side to build on.
-- **0.056 s**: Q13 with the default settings after the swap, against 0.042 s with the swap switched off. The runs overlap (0.028–0.072 s and 0.033–0.071 s), but CPU time is higher with the swap too.
+- **0.035 s**: Q13 with the default settings on `34ed290`, which has both the swap and the GROUP BY fix, against 0.036 s with the swap switched off. Before the fix it was 0.056 s against 0.042 s.
 
 ## TPC-H Q14, with the optimizer off and on
 
