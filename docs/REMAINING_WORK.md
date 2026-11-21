@@ -195,8 +195,11 @@ Each item gives the number of failing files in `test/` that it should fix, where
 
 - [ ] 14. Filter pushdown and pullup (`optimizer/pushdown`: 19 failing, 55.8% pass)
   - [x] OR range merge, monotone preimage, filter reordering (`ExpressionHeuristics`), BETWEEN of a column as two comparisons
+  - [x] a filter that can throw stays above the projection of an inlined CTE: `position`/`instr`/`strpos` and a
+    string `a[i]` with a constant index cannot throw, as in C++ (`test_no_pushdown_cast_into_cte`)
   - [ ] scalar functions pushed into Parquet scans, a filter on the right of a SEMI join through a subquery's
-    projection, CTE inlining after filter pushdown as in C++ (`test_no_pushdown_cast_into_cte`)
+    projection
+  - [ ] `can_throw` as C++ has it: only the functions C++ marks `SetFallible` (duckrs lists those that can't)
 - [ ] 15. Statistics propagation (`optimizer/statistics`: 4 failing, 91.8% pass)
   - [x] row groups of the database's `ROW_GROUP_SIZE`; zone maps through CASE, COALESCE, greatest/least,
     arithmetic with constants, month/quarter, prefix, left, sign, two-column comparisons
@@ -269,7 +272,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] `dbgen` / `dsdgen` as table functions in duckrs, so the corpus's tpch and tpcds tests run
 - [x] 20. Verification mode: run each query with the optimizer on and off and compare the results
   (`sqllogictest --diff-against unoptimized --diff-out <file>`); over `optimizer`, `join`, `subquery` and
-  `aggregate` it finds `complex_top_n` (105 rows against 102) and `test_no_pushdown_cast_into_cte`
+  `aggregate` it found `complex_top_n` (105 rows against 102) and `test_no_pushdown_cast_into_cte`, both fixed
 
 ## Phase 6: SQL surface
 

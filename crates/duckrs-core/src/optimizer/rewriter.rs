@@ -1623,6 +1623,10 @@ pub(crate) fn expressions_equal(a: &BoundExpr, b: &BoundExpr) -> bool {
 /// expression that can fail only stays where it is.
 const INFALLIBLE_FUNCTIONS: &[&str] = &[
     "constant_or_null",
+    // `InstrFun` and its aliases are not `SetFallible`
+    "instr",
+    "position",
+    "strpos",
     "~~",
     "!~~",
     "~~*",
@@ -1684,10 +1688,16 @@ pub(crate) fn can_throw(expr: &BoundExpr) -> bool {
                     .iter()
                     .all(|c| matches!(c.return_type.id(), LogicalTypeId::Float | LogicalTypeId::Double));
             // `ListExtractFunction`: an index past the end is NULL
-            let list_extract = matches!(function.name.as_str(), "list_extract" | "array_extract" | "list_element")
-                && children.first().is_some_and(|c| c.return_type.id() == LogicalTypeId::List);
+            let extract = matches!(function.name.as_str(), "list_extract" | "array_extract" | "list_element");
+            let list_extract = extract && children.first().is_some_and(|c| c.return_type.id() == LogicalTypeId::List);
+            // `StringExtractBind`: a constant index in substring's range cannot fail
+            let string_extract = extract
+                && children.len() == 2
+                && children[0].return_type.id() == LogicalTypeId::Varchar
+                && offset_in_range(&children[1], None);
             !floating
                 && !list_extract
+                && !string_extract
                 && !function.cannot_error
                 && !substring_in_range(&function.name, children)
                 && !INFALLIBLE_FUNCTIONS.contains(&function.name.as_str())
@@ -1702,6 +1712,12 @@ fn substring_in_range(name: &str, children: &[BoundExpr]) -> bool {
     if !matches!(name, "substring" | "substr" | "substring_grapheme") || !(2..=3).contains(&children.len()) {
         return false;
     }
+    offset_in_range(&children[1], children.get(2))
+}
+
+/// `SubstringInSupportedRange` of a constant offset and length; a missing length (`StringExtractBind`
+/// has 1, a substring without one runs to the end) is in the range.
+fn offset_in_range(offset: &BoundExpr, length: Option<&BoundExpr>) -> bool {
     let constant = |expr: &BoundExpr| -> Option<i128> {
         let folded = match &expr.kind {
             BoundExprKind::Constant(_) => expr.clone(),
@@ -1715,8 +1731,8 @@ fn substring_in_range(name: &str, children: &[BoundExpr]) -> bool {
     };
     const UPPER: i128 = u32::MAX as i128;
     const LOWER: i128 = -UPPER - 1;
-    let offset = constant(&children[1]);
-    let length = match children.get(2) {
+    let offset = constant(offset);
+    let length = match length {
         Some(length) => constant(length),
         None => Some(UPPER),
     };

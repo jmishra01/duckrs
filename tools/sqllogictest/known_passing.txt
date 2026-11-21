@@ -3177,6 +3177,7 @@ test/sql/optimizer/test_common_subplan_table_filters.test
 test/sql/optimizer/test_duplicate_groups_optimizer.test
 test/sql/optimizer/test_glob_row_group_pruning.test
 test/sql/optimizer/test_in_rewrite_rule.test
+test/sql/optimizer/test_no_pushdown_cast_into_cte.test
 test/sql/optimizer/test_not_comparison_simplification.test
 test/sql/optimizer/test_rollup_column_pruning.test
 test/sql/optimizer/test_rowid_pruning.test
