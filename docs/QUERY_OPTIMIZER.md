@@ -1529,6 +1529,94 @@ Order By s_name                                             ~7
 - **190 → 760 → 521**: Forest parts, their partsupp rows, and the rows with more in stock than half of 1994's shipments. The estimates were ~4,000, ~16,000 and ~3,200.
 - **0.007 s**: Q20 with the optimizer on, median of 11 warm runs, with a load average of about 3. With `join_filter_pushdown` off it was 0.009 s (0.008–0.014 s): without the runtime filters, the lineitem scan can't drop line items of other parts before its join. Switching off expression_rewriter made no clear difference (0.007 s).
 
+## TPC-H Q21, with the optimizer off and on
+
+Q21 counts, for each Saudi supplier, the orders where it was the only supplier to deliver late: the order had another supplier (`EXISTS`), and no other supplier was late too (`NOT EXISTS`). Both subqueries correlate on two columns, one of them with `<>`, and lineitem is read three times. It shows how far the deliminator gets with a correlation that isn't an equality. The plans are from the same build as Q20 (`0b13e01`) and the same SF0.1 data.
+
+```
+SELECT s_name, count(*) AS numwait
+FROM supplier, lineitem l1, orders, nation
+WHERE s_suppkey = l1.l_suppkey
+  AND o_orderkey = l1.l_orderkey
+  AND o_orderstatus = 'F'
+  AND l1.l_receiptdate > l1.l_commitdate
+  AND EXISTS (SELECT * FROM lineitem l2
+              WHERE l2.l_orderkey = l1.l_orderkey
+                AND l2.l_suppkey <> l1.l_suppkey)
+  AND NOT EXISTS (SELECT * FROM lineitem l3
+                  WHERE l3.l_orderkey = l1.l_orderkey
+                    AND l3.l_suppkey <> l1.l_suppkey
+                    AND l3.l_receiptdate > l3.l_commitdate)
+  AND s_nationkey = n_nationkey
+  AND n_name = 'SAUDI ARABIA'
+GROUP BY s_name
+ORDER BY numwait DESC, s_name
+LIMIT 100;
+```
+
+**Optimizer off: PRAGMA disable_optimizer**
+
+```
+Top N 100 BY numwait DESC, s_name                           ~100
+└ Hash Group By s_name, count_star()                        ~855
+  └ Filter  (7 conditions) AND #mark1 AND NOT #mark2
+    └ Left Delim Join  MARK  (l_orderkey, l_suppkey)    ~2.25 × 10^15
+      ├ Left Delim Join  MARK  (l_orderkey, l_suppkey)
+      │ ├ Cross Product × 3  supplier × lineitem × orders × nation  (all columns)
+      │ └ Filter  l2.l_orderkey = l_orderkey AND l2.l_suppkey != l_suppkey
+      │   └ Cross Product  lineitem l2 × outer key pairs   ~179,577,634,292
+      └ Filter  l3 conditions
+        └ Cross Product  lineitem l3 × outer key pairs   ~179,577,634,292
+```
+
+> The planner has already flattened each subquery into a Delim Join with a MARK, as in Q4 and Q20. Both use the pair `(l_orderkey, l_suppkey)` of the outer line item.
+
+**Optimizer on: default settings**
+
+```
+Top N 100 BY numwait DESC, s_name                           ~25
+└ Hash Group By s_name, count_star()                        ~25
+  └ Filter  NOT #mark                                       ~37
+    └ Left Delim Join  MARK  (l_orderkey, l_suppkey)         ~188   ← the NOT EXISTS
+      ├ Hash Join  RIGHT_SEMI  l2.l_orderkey = l_orderkey     ← the EXISTS
+      │     AND l2.l_suppkey IS DISTINCT FROM l_suppkey        ~188
+      │ ├ Seq Scan lineitem l2  [l_orderkey, l_suppkey]    ~600,572
+      │ └ Hash Join  o_orderkey = l_orderkey              ~940
+      │   ├ Seq Scan orders  [o_orderkey]  Filters: o_orderstatus = 'F'   ~75,000
+      │   └ Hash Join  l_suppkey = s_suppkey              ~3,749
+      │     ├ Filter  l_receiptdate > l_commitdate
+      │     │ └ Seq Scan lineitem l1  [l_orderkey, l_suppkey, l_commitdate, l_receiptdate]
+      │     └ Hash Join  s_nationkey = n_nationkey        ~38
+      │       ├ Seq Scan supplier  [s_suppkey, s_name, s_nationkey]
+      │       └ Seq Scan nation  [n_nationkey]  Filters: n_name = 'SAUDI ARABIA'
+      └ Projection NULL::BIGINT, … (16 NULL columns), l_orderkey, l_suppkey
+        └ Hash Join  l3.l_orderkey = l_orderkey AND l3.l_suppkey != l_suppkey   ~37
+          ├ Filter  l_receiptdate > l_commitdate
+          │ └ Seq Scan lineitem l3  [l_orderkey, l_suppkey, l_commitdate, l_receiptdate]
+          └ Delim Scan  (the outer key pairs)               ~188
+```
+
+> The first child of each hash join probes and the second child is the build side. duckrs's EXPLAIN labels the Delim Scan as a CTE Scan without an index.
+
+### What each pass changed
+
+1. **filter_pushdown** turned the cross products into hash joins, put the order status and nation name into their scans, and left the two-column comparisons `l_receiptdate > l_commitdate` in Filters on top of the l1 and l3 scans.
+2. **join_order** starts from the 47 Saudi suppliers (~38 estimated), joins their late line items, then the finished orders. All 75,000 finished orders probe a table of those line items.
+3. **deliminator removed the EXISTS's Delim Join.** The subquery only checks for another line item of the same order with a different supplier, so it is the same as a semi join of l2 with the outer rows on `l_orderkey = l_orderkey AND l_suppkey IS DISTINCT FROM l_suppkey`. The inequality becomes a second join condition. With the outer rows as the smaller side, it became a RIGHT_SEMI join that all 600,572 rows of l2 probe.
+4. **The NOT EXISTS keeps its Delim Join.** Its subquery has its own filter on l3, so it still runs once over the distinct outer key pairs (Delim Scan), joined with the late line items of l3 on the order key, with `!=` on the supplier as a second condition. A MARK on the Delim Join and a `NOT #mark` filter keep the outer rows without a match.
+5. **unused_columns** cut each lineitem scan to 2 or 4 of its 16 columns, orders to 1 of 9 and supplier to 3 of 7.
+
+### Where duckrs differs from DuckDB 1.5.6
+
+1. **duckrs removes one Delim Join that DuckDB keeps.** DuckDB 1.5.6 keeps both: a RIGHT Delim Join for the EXISTS, which joins l2 to the distinct key pairs and groups them, and a LEFT Delim Join for the NOT EXISTS. duckrs turns the EXISTS into one hash join with the inequality as a join condition.
+2. **DuckDB's NOT EXISTS is an ANTI join; duckrs's is a MARK and a filter.** Same rows, but duckrs builds a marker column and then filters on it. For a NOT EXISTS correlated only by equality, as in `orders WHERE NOT EXISTS (… l_orderkey = o_orderkey …)`, duckrs does make an ANTI join, so it is the Delim Join with the inequality that stays a MARK.
+3. **The NOT EXISTS side carries 16 NULL columns,** from its `SELECT *`, as in Q4.
+4. **The estimates differ.** duckrs estimates ~188 outer rows and ~25 groups; DuckDB ~377 and ~71. In fact 8,590 late line items of Saudi suppliers are in finished orders, and the result has 47 suppliers.
+
+- **47 rows**: Saudi suppliers with at least one order they alone delivered late, 465 such line items in all, the same as DuckDB. Suppliers 445 and 825 lead with 16 each.
+- **0.051 s**: Q21 with the optimizer on, median of 11 warm runs, with a load average of about 13. With `deliminator` off it was 0.065 s, and with `join_filter_pushdown` off 0.061 s. The runs overlap (0.036–0.103 s in all), so these are rough.
+- **3 reads**: lineitem is scanned three times, once for the outer rows and once for each subquery. DuckDB scans it three times too.
+
 ## Every pass, what it does and why it's faster
 
 Each pass is marked **new** (added in Stage 3), **changed** (existed and was extended) or **existing** (existed already and was not changed). Its switch is the name to use in `disabled_optimizers`.
