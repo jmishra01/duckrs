@@ -10,7 +10,7 @@ use duckrs_common::value::Value;
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::sort_key::{NullOrder, OrderModifiers, OrderType, create_sort_keys};
-use duckrs_common::vector::Vector;
+use duckrs_common::vector::{SelectionVector, Vector};
 use duckrs_parser::ast::JoinType;
 use std::fmt;
 use std::sync::OnceLock;
@@ -152,6 +152,38 @@ fn keys_of(vector: &Vector, count: usize) -> Vec<Option<Key>> {
             })
         })
         .collect()
+}
+
+/// The rows of the smallest and the largest key of `count` rows of `vector`, NULLs left out.
+fn extreme_rows(vector: &Vector, count: usize) -> Option<(usize, usize)> {
+    let mut ends: Option<(usize, usize)> = None;
+    if supported(vector.logical_type()) {
+        let mut bounds = (i64::MAX, i64::MIN);
+        for_each_value(vector, count, |row, value| {
+            if let Some(value) = value {
+                let (low, high) = ends.get_or_insert((row, row));
+                if value < bounds.0 {
+                    (bounds.0, *low) = (value, row);
+                }
+                if value > bounds.1 {
+                    (bounds.1, *high) = (value, row);
+                }
+            }
+        });
+        return ends;
+    }
+    let orders = create_sort_keys(&[(vector, ASCENDING)], count).ok()?;
+    let unified = vector.to_unified(count);
+    for (row, order) in orders.iter().enumerate().filter(|&(row, _)| unified.is_valid(row)) {
+        let (low, high) = ends.get_or_insert((row, row));
+        if order < &orders[*low] {
+            *low = row;
+        }
+        if order > &orders[*high] {
+            *high = row;
+        }
+    }
+    ends
 }
 
 /// The name of the column an expression of a scan's column reads.
@@ -366,6 +398,18 @@ impl JoinFilter {
     fn finalize_filters(&self, keys: &Vector, count: usize) -> Option<Published> {
         if count > MAX_KEYS {
             return None;
+        }
+        if count > self.in_threshold {
+            // `FinalizeMinMax`: too many keys for an IN list, so only the smallest and largest
+            let (low, high) = extreme_rows(keys, count)?;
+            let mut ends = keys.clone();
+            ends.slice(&SelectionVector::from_vec(vec![low as u32, high as u32]), 2);
+            let mut ends = keys_of(&ends, 2).into_iter();
+            let (min, max) = (ends.next()??, ends.next()??);
+            if min.order == max.order {
+                return Some(Published::Single(min));
+            }
+            return Some(Published::Range(min, max));
         }
         let mut values: Vec<Key> = keys_of(keys, count).into_iter().flatten().collect();
         values.sort_by(|a, b| a.order.cmp(&b.order));
