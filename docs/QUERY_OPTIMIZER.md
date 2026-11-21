@@ -958,6 +958,69 @@ Projection __internal_decompress_string(l_shipmode), high_line_count, low_line_c
 
 > DuckDB 1.5.6 makes the same plan: the same derived filters, the optional IN filter in the scan, and lineitem as the build side.
 
+## TPC-H Q13, with the optimizer off and on
+
+Q13 counts how many customers have 0, 1, 2, … orders, leaving out orders whose comment mentions special requests. It is the only walkthrough with an outer join, and its filter sits in the `ON` clause, not in WHERE. It shows which filters may move below an outer join, and a gap in how duckrs picks the build side of one. The plans are from the same build as Q11 (`1ed6cc1`) and the same SF0.1 data.
+
+```
+SELECT c_count, count(*) AS custdist
+FROM (SELECT c_custkey, count(o_orderkey)
+      FROM customer
+      LEFT OUTER JOIN orders ON c_custkey = o_custkey
+                            AND o_comment NOT LIKE '%special%requests%'
+      GROUP BY c_custkey) AS c_orders (c_custkey, c_count)
+GROUP BY c_count
+ORDER BY custdist DESC, c_count DESC;
+```
+
+**Optimizer off: PRAGMA disable_optimizer**
+
+```
+Order By custdist DESC, c_count DESC                        ~14,035
+└ Hash Group By c_count, count_star()                       ~14,035
+  └ Hash Group By c_custkey, count(o_orderkey)              ~14,035
+    └ Hash Join  LEFT  c_custkey = o_custkey
+                       AND o_comment !~~ '%special%requests%'   ~32,062
+      ├ Seq Scan customer  (all 8 columns)            ~15,000
+      └ Seq Scan orders    (all 9 columns)            ~150,000
+```
+
+> Unlike the other queries, the unoptimized plan already has a hash join: the planner makes one for an explicit `JOIN … ON` with an equality, so the join passes have less to do here than for tables listed in FROM.
+
+**Optimizer on: default settings**
+
+```
+Order By custdist DESC, c_count DESC                        ~14,035
+└ Hash Group By c_count, count_star()                       ~14,035
+  └ Projection NULL::BIGINT, count
+    └ Projection CAST(c_custkey AS BIGINT), count
+      └ Hash Group By c_custkey, count(o_orderkey)          ~14,035
+        └ Projection CAST(c_custkey AS SMALLINT), o_orderkey, o_custkey   ~32,062
+          └ Hash Join  LEFT  c_custkey = o_custkey           ~32,062
+            ├ Seq Scan customer  [c_custkey]              ~15,000
+            └ Seq Scan orders  [o_orderkey, o_custkey]    ← builds, ~30,000 estimated, 148,467 in fact
+                Filters: o_comment !~~ '%special%requests%'
+```
+
+> The first child of the hash join probes and the second child is the build side.
+
+### What each pass changed
+
+1. **filter_pushdown** moved the comment condition out of the join and into the orders scan. That is only allowed because it is in the `ON` clause and reads only the right side of a LEFT join: an order it drops simply doesn't match, and its customer still appears with a count of 0, as the query asks. The same condition in WHERE would have to stay above the join, since there it would also drop the customers without orders.
+2. **unused_columns** cut customer to 1 of its 8 columns and orders to 2 of 9 (plus `o_comment`, read inside the scan for its filter). The outer GROUP BY doesn't read `c_custkey` after the inner one, so the plan passes a constant `NULL` in its place.
+3. **compressed_materialization** narrows `c_custkey` to a SMALLINT for the inner GROUP BY, as DuckDB does (it uses a 2-byte unsigned integer with an offset).
+4. **join_order** has nothing to reorder: an outer join can't be moved, and there are only two tables.
+
+### Where duckrs differs from DuckDB 1.5.6
+
+1. **duckrs builds the hash table on orders, DuckDB on customer.** DuckDB turns the LEFT join into a RIGHT join with the sides swapped, so the 15,000 customers build and the filtered orders probe. duckrs's `build_side` pass only swaps SEMI and ANTI joins (`optimizer/build_side.rs`, `choose`), so a LEFT join always builds its right side, here all 148,467 orders that pass the filter. That is a hash table about ten times larger than DuckDB's. C++ `BuildProbeSideOptimizer` swaps every join type that has an inverse (`HasInverseJoinType`), LEFT and RIGHT among them.
+2. **Writing the join as a RIGHT join doesn't help.** With `orders RIGHT OUTER JOIN customer`, duckrs does build on customer, but then the comment condition stays in the join instead of moving into the orders scan.
+3. **The estimates are rough in both.** The comment filter is estimated at 20% of orders (~30,000) where 99% pass (148,467). duckrs estimates ~14,035 customer groups and DuckDB ~11,711; there are 15,000, one per customer.
+
+- **5,000**: Customers with no qualifying orders: the largest group of the result, c_count 0. The next ones are 9 orders (659 customers), 10 (658) and 11 (643).
+- **148,467**: Orders out of 150,000 that pass the comment filter. Since nearly all pass, the side to build on should have been decided by the 15,000 customers.
+- **Not measured**: The machine's load average was above 55 during these runs, and Q13's times ranged from 0.021 s to 0.159 s, too noisy to compare the build sides or the passes.
+
 ## TPC-H Q14, with the optimizer off and on
 
 Q14 works out what share of one month's revenue came from promotional parts. It is Q6 with one join added: lineitem filtered to September 1995, joined to part, and a `LIKE` inside the aggregate. The plans are from the same build as Q6 (`3bdaec9`) and the same SF0.1 data.
