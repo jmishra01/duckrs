@@ -959,3 +959,5 @@ pub fn execute_plan_with(root: &dyn PhysicalOperator, threads: usize) -> Result<
     }
     Ok(())
 }
+
+pub(crate) use duckrs_common::prefetch;

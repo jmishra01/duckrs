@@ -316,17 +316,25 @@ impl Keys {
     fn keep<T: Copy + Into<i64>>(&self, values: &[T], kept: &mut Vec<u32>) {
         let (min, max) = (self.min, self.max);
         // every row is written, and the count moves past those that can match: no branch per row
+        // a window's blocks are asked for first, so that their reads from memory overlap
+        const WINDOW: usize = 64;
         let start = kept.len();
         kept.resize(start + values.len(), 0);
         let mut matched = start;
-        for (row, &value) in values.iter().enumerate() {
-            let value: i64 = value.into();
-            let h = hash(value);
-            let bits = block_bits(h);
-            let in_range = value >= min && value <= max;
-            let block = self.blocks[self.block(h)];
-            kept[matched] = row as u32;
-            matched += usize::from(in_range & (block & bits == bits));
+        let mut hashes = [0u64; WINDOW];
+        for (window, values) in values.chunks(WINDOW).enumerate() {
+            for (h, &value) in hashes.iter_mut().zip(values) {
+                *h = hash(value.into());
+                super::prefetch(&self.blocks[self.block(*h)]);
+            }
+            for (i, (&value, &h)) in values.iter().zip(&hashes).enumerate() {
+                let value: i64 = value.into();
+                let bits = block_bits(h);
+                let in_range = value >= min && value <= max;
+                let block = self.blocks[self.block(h)];
+                kept[matched] = (window * WINDOW + i) as u32;
+                matched += usize::from(in_range & (block & bits == bits));
+            }
         }
         kept.truncate(matched);
     }

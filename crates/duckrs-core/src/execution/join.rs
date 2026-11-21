@@ -340,24 +340,6 @@ fn partition_of_hash(hash: u64) -> usize {
 }
 
 /// The hash of a key, which picks both its partition and its slot in the partition's table.
-/// Asks for the memory of `value` to be brought into the cache, without waiting for it (a prefetch never faults).
-#[inline(always)]
-fn prefetch<T>(value: &T) {
-    let address = std::ptr::from_ref(value);
-    #[cfg(target_arch = "aarch64")]
-    // SAFETY: `prfm` only hints at a read of a valid address; it reads no register and writes no memory
-    unsafe {
-        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) address, options(nostack, readonly, preserves_flags));
-    }
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: a prefetch only hints at a read; it never faults
-    unsafe {
-        std::arch::x86_64::_mm_prefetch(address.cast::<i8>(), std::arch::x86_64::_MM_HINT_T0);
-    }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    let _ = address;
-}
-
 fn key_hash(key: &RowKey) -> u64 {
     let mut hasher = KeyHasher::default();
     key.hash(&mut hasher);
@@ -536,7 +518,7 @@ impl FinishedBuild {
                     let partition = &self.partitions[if self.partitioned { partition_of_hash(hash) } else { 0 }];
                     // every candidate is fetched and none taken, so this only reads the table
                     partition.table.find(hash, |&group| {
-                        prefetch(&partition.keys[group as usize]);
+                        super::prefetch(&partition.keys[group as usize]);
                         false
                     });
                 }
