@@ -424,6 +424,79 @@ Projection __internal_decompress_string(nation), o_year, sum_profit
 - **Not run**: The plan with the optimizer off. Its cross product of six tables is about 3.6 × 10^27 rows.
 - **2 keys**: The one join where lineitem meets partsupp, part and supplier. The query never wrote that join; the equal-column sets made it possible.
 
+## TPC-H Q10, with the optimizer off and on
+
+Q10 finds the 20 customers who lost the most revenue to returned items in one quarter. It joins four tables and groups by seven customer columns, so it shows a pass the other walkthroughs don't: **partial_aggregate_pushdown**, which sums the line items before the join that adds the customer columns. The plans are from the same build as Q6 (`3bdaec9`) and the same SF0.1 data.
+
+```
+SELECT c_custkey, c_name,
+       sum(l_extendedprice * (1 - l_discount)) AS revenue,
+       c_acctbal, n_name, c_address, c_phone, c_comment
+FROM customer, orders, lineitem, nation
+WHERE c_custkey = o_custkey
+  AND l_orderkey = o_orderkey
+  AND o_orderdate >= CAST('1993-10-01' AS date)
+  AND o_orderdate <  CAST('1994-01-01' AS date)
+  AND l_returnflag = 'R'
+  AND c_nationkey = n_nationkey
+GROUP BY c_custkey, c_name, c_acctbal, c_phone, n_name, c_address, c_comment
+ORDER BY revenue DESC
+LIMIT 20;
+```
+
+**Optimizer off: PRAGMA disable_optimizer**
+
+```
+Top N 20 BY revenue DESC                                    ~20
+└ Projection ...
+  └ Hash Group By c_custkey, c_name, ..., c_comment, sum(...)   ~6.8 × 10^15
+    └ Filter (6 conditions)                       ~6.8 × 10^15
+      └ Cross Product                           ~3.4 × 10^16
+        ├ Cross Product                         ~1.35 × 10^15
+        │ ├ Cross Product  customer × orders     ~2,250,000,000
+        │ └ Seq Scan lineitem  (all 16 columns)       ~600,572
+        └ Seq Scan nation  (all 4 columns)            ~25
+```
+
+**Optimizer on: default settings**
+
+```
+Top N 20 BY revenue DESC                                    ~20
+└ Projection ..., finalize(state) AS revenue
+  └ Projection CAST(c_custkey AS BIGINT), ..., __internal_decompress_string(c_phone), (n_name)
+    └ Hash Group By c_custkey, c_name, c_acctbal, c_phone, n_name, c_address, c_comment
+                    combine_aggr(state)                ~10,329
+      └ Projection CAST(c_custkey AS SMALLINT), __internal_compress_string_uhugeint(c_phone), (n_name), ...
+        └ Hash Join  o_custkey = c_custkey              ~10,329
+          ├ Hash Group By o_custkey                     ~10,052
+          │   sum(l_extendedprice * (1.00 - l_discount))  (exports its state)
+          │ └ Hash Join  l_orderkey = o_orderkey          ~20,085
+          │   ├ Seq Scan lineitem  [l_orderkey, l_extendedprice, l_discount]   ~200,191
+          │   │   Filters: l_returnflag = 'R'
+          │   └ Seq Scan orders  [o_orderkey, o_custkey]      ~30,000
+          │       Filters: o_orderdate >= '1993-10-01', o_orderdate < '1994-01-01'
+          └ Hash Join  c_nationkey = n_nationkey          ~14,423
+            ├ Seq Scan customer  [c_custkey, c_name, c_address, c_nationkey, c_phone, c_acctbal, c_comment]
+            │   Filters: c_custkey <= 14999                 ~15,000
+            └ Seq Scan nation  [n_nationkey, n_name]        ~25
+```
+
+> The first child of each hash join probes and the second child is the build side. The plan is shortened: the optimized EXPLAIN also has projections that only cast or reorder columns.
+
+### What each pass changed
+
+1. **filter_pushdown** sent the return flag into the lineitem scan and the quarter into the orders scan, and turned the three cross products into hash joins on the three join conditions.
+2. **join_order** joins lineitem with the filtered orders first (orders builds). customer is joined to nation on its own (nation builds, 25 rows), and that result is the build side for the last join. DuckDB 1.5.6 orders it differently: lineitem probes a join of orders with customer and nation.
+3. **partial_aggregate_pushdown** saw that the sum reads lineitem only and that `c_custkey = o_custkey` fixes the customer. So it groups the lineitem ⋈ orders rows by `o_custkey` first and exports the sum's state. The GROUP BY above the customer join only combines those states (`combine_aggr`), and `finalize` turns them into the revenue. The customer join then sees one row per customer (3,767) instead of one per line item (11,439). This is a port of C++ `partial_aggregate_pushdown.cpp` from the baseline source, which is newer than DuckDB 1.5.6. 1.5.6 doesn't push the aggregate.
+4. **statistics_propagation** added `c_custkey <= 14999` to the customer scan, as in Q3, Q5 and Q18.
+5. **compressed_materialization** narrows three of the seven grouping keys: `c_custkey` to a SMALLINT (it is at most 14,999), and the short strings `c_phone` and `n_name` to 16-byte integers. They're unpacked after the GROUP BY. `c_name`, `c_address` and `c_comment` are too long to pack.
+6. **unused_columns** cut lineitem to 3 of its 16 columns and orders to 2 of 9. customer keeps 7 of its 8 columns, since the query returns most of them.
+7. **top_n** keeps 20 of the 3,767 customers in a heap instead of sorting them all.
+
+- **0.045 s**: Q10 with the optimizer on, median of 15 warm runs. Customer 8242 (ETHIOPIA) comes first, with 622,786.73 of lost revenue.
+- **11,439 → 3,767**: Line items that are returned and in the quarter (out of 148,301 returned and 5,677 orders), and the customers they belong to. The estimates were ~20,085 and ~10,052.
+- **No clear gain**: Switching off partial_aggregate_pushdown, compressed_materialization or both gave medians of 0.037–0.042 s. The machine's load average was 24–30, and CPU time went the other way, so these differences are noise. At SF0.1 the customer join is too small for pushing the aggregate below it to show: it saves a join over about 7,700 rows and adds a second GROUP BY.
+
 ## TPC-H Q14, with the optimizer off and on
 
 Q14 works out what share of one month's revenue came from promotional parts. It is Q6 with one join added: lineitem filtered to September 1995, joined to part, and a `LIKE` inside the aggregate. The plans are from the same build as Q6 (`3bdaec9`) and the same SF0.1 data.
