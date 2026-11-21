@@ -3227,7 +3227,15 @@ pub(super) fn stats_fields(stats: &Stats, ty: &LogicalType) -> Option<Value> {
     }
     // `StringStats::ToStruct`
     if matches!(ty.id(), LogicalTypeId::Varchar | LogicalTypeId::Blob) {
-        let strings = stats.strings.as_ref()?;
+        // `StringStats::CreateUnknown` where nothing is known: maybe unicode, no bounds or lengths
+        let unknown_strings = crate::catalog::StringStatistics {
+            bounds: None,
+            has_unicode: true,
+            min_length: None,
+            max_length: None,
+            total_length: None,
+        };
+        let strings = stats.strings.as_ref().unwrap_or(&unknown_strings);
         if let Some((min, max)) = &strings.bounds {
             // `Blob::ToString`
             let text = |bytes: &[u8]| Value::varchar(duckrs_common::string_cast::format_blob(bytes));
