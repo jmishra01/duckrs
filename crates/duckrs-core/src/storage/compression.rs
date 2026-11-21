@@ -229,12 +229,77 @@ fn packed_size(count: usize, width: usize) -> usize {
 fn unpack(data: &[u8], count: usize, width: usize, what: &str) -> Result<Vec<u128>> {
     bytes(data, 0, packed_size(count, width), what)?;
     if width <= 57 {
-        let mask = if width == 0 { 0 } else { u64::MAX >> (64 - width) };
-        return Ok((0..count)
-            .map(|i| u128::from(load_bits(data, i * width, mask)))
-            .collect());
+        let mut values = Vec::with_capacity(count);
+        unpack_groups(data, count, width, |group| {
+            values.extend(group.iter().map(|&value| u128::from(value)))
+        });
+        return Ok(values);
     }
     Ok((0..count).map(|i| read_bits(data, i * width, width)).collect())
+}
+
+/// [`unpack`] of values of at most 32 bits, as `u32`s.
+fn unpack_u32(data: &[u8], count: usize, width: usize, what: &str) -> Result<Vec<u32>> {
+    debug_assert!(width <= 32);
+    bytes(data, 0, packed_size(count, width), what)?;
+    let mut values = Vec::with_capacity(count);
+    unpack_groups(data, count, width, |group| {
+        values.extend(group.iter().map(|&value| value as u32))
+    });
+    Ok(values)
+}
+
+/// The most bits [`unpack_groups`] takes: a value and the bits before it in its first byte fit one `u64`.
+const MAX_GROUP_WIDTH: usize = 57;
+
+/// Calls `each` with `count` packed values of `width` bits (at most [`MAX_GROUP_WIDTH`]), 32 at a time and
+/// fewer the last time, each group unpacked by code for its width (`BitpackingPrimitives::UnPackBlock`).
+/// `data` must hold the [`packed_size`] of `count` values.
+fn unpack_groups(data: &[u8], count: usize, width: usize, mut each: impl FnMut(&[u64])) {
+    macro_rules! widths {
+        ($($width:literal)*) => {
+            match width {
+                $($width => unpack_groups_of::<$width>(data, count, &mut each),)*
+                _ => unreachable!("a bit width past {MAX_GROUP_WIDTH}"),
+            }
+        };
+    }
+    widths!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37
+        38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57)
+}
+
+fn unpack_groups_of<const W: usize>(data: &[u8], count: usize, each: &mut impl FnMut(&[u64])) {
+    // a group's values read 8 bytes from their first one, up to 8 bytes past the group: the last groups
+    // read a copy with room for that
+    let group_bytes = ALGORITHM_GROUP_SIZE * W / 8;
+    let mut padded = [0u8; ALGORITHM_GROUP_SIZE * MAX_GROUP_WIDTH / 8 + 8];
+    let mut values = [0u64; ALGORITHM_GROUP_SIZE];
+    for start in (0..count).step_by(ALGORITHM_GROUP_SIZE) {
+        let at = start / ALGORITHM_GROUP_SIZE * group_bytes;
+        let group = match data.get(at..at + group_bytes + 8) {
+            Some(group) => group,
+            None => {
+                let available = &data[at..at + group_bytes];
+                padded[..group_bytes].copy_from_slice(available);
+                &padded[..group_bytes + 8]
+            }
+        };
+        unpack_32::<W>(group, &mut values);
+        each(&values[..ALGORITHM_GROUP_SIZE.min(count - start)]);
+    }
+}
+
+/// The 32 values of `W` bits at the start of `group`, which has 8 bytes past them.
+#[inline(always)]
+fn unpack_32<const W: usize>(group: &[u8], values: &mut [u64; ALGORITHM_GROUP_SIZE]) {
+    // one check here, so that the constant offsets below need none
+    assert!(group.len() >= ALGORITHM_GROUP_SIZE * W / 8 + 8);
+    let mask = if W == 0 { 0 } else { u64::MAX >> (64 - W) };
+    for (i, value) in values.iter_mut().enumerate() {
+        let bit = i * W;
+        let word = u64::from_le_bytes(group[bit / 8..bit / 8 + 8].try_into().expect("8 bytes"));
+        *value = (word >> (bit % 8)) & mask;
+    }
 }
 
 /// The bits from `bit` on that `mask` keeps (at most 57 of them): one load of the 8 bytes there.
@@ -253,8 +318,7 @@ fn load_bits(data: &[u8], bit: usize, mask: u64) -> u64 {
 }
 
 /// [`unpack`] of values of at most 57 bits into values of at most 8 bytes, with the frame (and for
-/// DELTA_FOR the running sum) added: each value is read with one unaligned load of the 8 bytes at its
-/// first byte, and written at its width.
+/// DELTA_FOR the running sum) added, written at their width 32 at a time.
 #[allow(clippy::too_many_arguments, reason = "the parts of a FOR group")]
 fn unpack_narrow(
     packed: &[u8],
@@ -266,25 +330,22 @@ fn unpack_narrow(
     width: usize,
     out: &mut Vec<u8>,
 ) {
-    let mask = if packed_width == 0 {
-        0
-    } else {
-        u64::MAX >> (64 - packed_width)
-    };
-    let start = out.len();
-    out.resize(start + rows * width, 0);
-    let target = &mut out[start..];
-    let load = |bit: usize| -> u64 { load_bits(packed, bit, mask) };
+    out.reserve(rows * width);
     macro_rules! write_all {
         ($ty:ty) => {{
-            for (row, slot) in target.chunks_exact_mut(std::mem::size_of::<$ty>()).enumerate() {
-                let mut value = load(row * packed_width).wrapping_add(frame);
-                if delta {
-                    carry = value.wrapping_add(carry);
-                    value = carry;
+            const SIZE: usize = std::mem::size_of::<$ty>();
+            let mut written = [0u8; ALGORITHM_GROUP_SIZE * SIZE];
+            unpack_groups(packed, rows, packed_width, |values| {
+                for (slot, &value) in written.chunks_exact_mut(SIZE).zip(values) {
+                    let mut value = value.wrapping_add(frame);
+                    if delta {
+                        carry = value.wrapping_add(carry);
+                        value = carry;
+                    }
+                    slot.copy_from_slice(&(value as $ty).to_le_bytes());
                 }
-                slot.copy_from_slice(&(value as $ty).to_le_bytes());
-            }
+                out.extend_from_slice(&written[..values.len() * SIZE]);
+            });
         }};
     }
     match width {
@@ -1472,14 +1533,12 @@ fn parse_dict_fsst(segment: &[u8], count: usize) -> Result<DictFsst<'_>> {
     let table = bytes(segment, position, table_size, what)?;
     position = align(position + table_size, 8);
     let packed = bytes(segment, position, packed_size(dict_count, lengths_width), what)?;
-    let lengths = unpack(packed, dict_count, lengths_width, what)?;
+    let lengths = unpack_u32(packed, dict_count, lengths_width, what)?;
     position = align(position + packed.len(), 8);
     let packed = bytes(segment, position, packed_size(count, indices_width), what)?;
-    let indices = if mode == FSST_ONLY {
-        Vec::new()
-    } else {
-        unpack(packed, count, indices_width, what)?
-    };
+    let indices = (mode != FSST_ONLY)
+        .then(|| unpack_u32(packed, count, indices_width, what))
+        .transpose()?;
 
     if lengths[0] != 0 {
         return Err(corrupted(
@@ -1498,8 +1557,6 @@ fn parse_dict_fsst(segment: &[u8], count: usize) -> Result<DictFsst<'_>> {
         offset = offset.saturating_add(length as usize);
         ends.push(offset);
     }
-    let indices: Option<Vec<u32>> =
-        (mode != FSST_ONLY).then(|| indices.into_iter().map(|index| index as u32).collect());
     Ok(DictFsst {
         dictionary,
         ends,
@@ -1587,6 +1644,21 @@ pub fn decode_dict_fsst_rows(segment: &[u8], count: usize, rows: &[u32], out: &m
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn groups_unpack_as_bits_read_one_by_one() {
+        // bytes that aren't a pattern of any width, and counts that end inside a group and on one
+        let data: Vec<u8> = (0..4096u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        for width in 0..=MAX_GROUP_WIDTH {
+            for count in [0, 1, 31, 32, 33, 100] {
+                let packed = &data[..packed_size(count, width)];
+                let mut unpacked = Vec::new();
+                unpack_groups(packed, count, width, |group| unpacked.extend_from_slice(group));
+                let expected: Vec<u64> = (0..count).map(|i| read_bits(packed, i * width, width) as u64).collect();
+                assert_eq!(unpacked, expected, "{count} values of {width} bits");
+            }
+        }
+    }
 
     fn fsst_segment(dict_end: u32, width: u32, table_offset: u32) -> Vec<u8> {
         let mut segment = vec![0; 256];

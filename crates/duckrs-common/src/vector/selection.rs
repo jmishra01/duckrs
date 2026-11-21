@@ -94,7 +94,13 @@ impl SelectionVector {
             (Self::Identity, _) => inner.clone(),
             (Self::Zero, _) => Self::Zero,
             (_, Self::Identity) => self.clone(),
-            _ => Self::from_vec((0..count).map(|i| self.get(inner.get(i)) as u32).collect()),
+            _ => match (self.indices(), inner.indices()) {
+                // the common case, a filter's rows of a dictionary: a gather
+                (Some(outer), Some(inner)) => {
+                    Self::from_vec(inner[..count].iter().map(|&row| outer[row as usize]).collect())
+                }
+                _ => Self::from_vec((0..count).map(|i| self.get(inner.get(i)) as u32).collect()),
+            },
         }
     }
 }
