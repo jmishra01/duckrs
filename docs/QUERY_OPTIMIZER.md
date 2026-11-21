@@ -960,7 +960,7 @@ Projection __internal_decompress_string(l_shipmode), high_line_count, low_line_c
 
 ## TPC-H Q13, with the optimizer off and on
 
-Q13 counts how many customers have 0, 1, 2, … orders, leaving out orders whose comment mentions special requests. It is the only walkthrough with an outer join, and its filter sits in the `ON` clause, not in WHERE. It shows which filters may move below an outer join, and a gap in how duckrs picks the build side of one. The plans are from the same build as Q11 (`1ed6cc1`) and the same SF0.1 data.
+Q13 counts how many customers have 0, 1, 2, … orders, leaving out orders whose comment mentions special requests. It is the only walkthrough with an outer join, and its filter sits in the `ON` clause, not in WHERE. It shows which filters may move below an outer join, and how the build side of one is chosen. The optimized plan is from `phase-55-build-side-flip` at `0b13e01`, the change merged into phase-55 as `1ff6f10` that lets duckrs swap the sides of a LEFT join; the unoptimized plan is the same in every build. Same SF0.1 data.
 
 ```
 SELECT c_count, count(*) AS custdist
@@ -996,10 +996,10 @@ Order By custdist DESC, c_count DESC                        ~14,035
     └ Projection CAST(c_custkey AS BIGINT), count
       └ Hash Group By c_custkey, count(o_orderkey)          ~14,035
         └ Projection CAST(c_custkey AS SMALLINT), o_orderkey, o_custkey   ~32,062
-          └ Hash Join  LEFT  c_custkey = o_custkey           ~32,062
-            ├ Seq Scan customer  [c_custkey]              ~15,000
-            └ Seq Scan orders  [o_orderkey, o_custkey]    ← builds, ~30,000 estimated, 148,467 in fact
-                Filters: o_comment !~~ '%special%requests%'
+          └ Hash Join  RIGHT  o_custkey = c_custkey         ~32,062
+            ├ Seq Scan orders  [o_orderkey, o_custkey]    ~30,000 (148,467 in fact)
+            │   Filters: o_comment !~~ '%special%requests%'
+            └ Seq Scan customer  [c_custkey]   ← builds   ~15,000
 ```
 
 > The first child of the hash join probes and the second child is the build side.
@@ -1010,16 +1010,17 @@ Order By custdist DESC, c_count DESC                        ~14,035
 2. **unused_columns** cut customer to 1 of its 8 columns and orders to 2 of 9 (plus `o_comment`, read inside the scan for its filter). The outer GROUP BY doesn't read `c_custkey` after the inner one, so the plan passes a constant `NULL` in its place.
 3. **compressed_materialization** narrows `c_custkey` to a SMALLINT for the inner GROUP BY, as DuckDB does (it uses a 2-byte unsigned integer with an offset).
 4. **join_order** has nothing to reorder: an outer join can't be moved, and there are only two tables.
+5. **build_side_probe_side** turned `customer LEFT JOIN orders` into `orders RIGHT JOIN customer`, the same join with the sides swapped, because customer (~15,000 rows) is the smaller side to build. In a RIGHT join the build side is the one kept whole: a customer no order found still comes out once, with NULLs for the order columns, so its count is 0. With `SET disabled_optimizers = 'build_side_probe_side'` the plan stays a LEFT join that builds on the filtered orders.
 
-### Where duckrs differs from DuckDB 1.5.6
+### Compared with DuckDB 1.5.6
 
-1. **duckrs builds the hash table on orders, DuckDB on customer.** DuckDB turns the LEFT join into a RIGHT join with the sides swapped, so the 15,000 customers build and the filtered orders probe. duckrs's `build_side` pass only swaps SEMI and ANTI joins (`optimizer/build_side.rs`, `choose`), so a LEFT join always builds its right side, here all 148,467 orders that pass the filter. That is a hash table about ten times larger than DuckDB's. C++ `BuildProbeSideOptimizer` swaps every join type that has an inverse (`HasInverseJoinType`), LEFT and RIGHT among them.
-2. **Writing the join as a RIGHT join doesn't help.** With `orders RIGHT OUTER JOIN customer`, duckrs does build on customer, but then the comment condition stays in the join instead of moving into the orders scan.
+1. **The plan now matches DuckDB's.** Both build on the 15,000 customers and let the filtered orders probe, with the comment filter in the orders scan. Before `1ff6f10`, duckrs's build side pass only swapped SEMI and ANTI joins, so it built a hash table of all 148,467 filtered orders, about ten times larger. C++ `BuildProbeSideOptimizer` swaps every join type that has an inverse (`HasInverseJoinType`), LEFT and RIGHT among them, and duckrs now does the same.
+2. **But in duckrs the swapped plan is slower.** With the swap Q13 took 0.056 s, and with `build_side_probe_side` switched off, building on orders again, 0.042 s (medians of 15 interleaved runs, load average about 20). CPU time was 0.035 s against 0.030 s. The smaller hash table should win, so the cost is most likely in how duckrs runs a RIGHT join, which also has to find the build rows no probe matched, rather than in the plan. I haven't profiled it. The session that made the change measured about 7% at a lower load.
 3. **The estimates are rough in both.** The comment filter is estimated at 20% of orders (~30,000) where 99% pass (148,467). duckrs estimates ~14,035 customer groups and DuckDB ~11,711; there are 15,000, one per customer.
 
 - **5,000**: Customers with no qualifying orders: the largest group of the result, c_count 0. The next ones are 9 orders (659 customers), 10 (658) and 11 (643).
-- **148,467**: Orders out of 150,000 that pass the comment filter. Since nearly all pass, the side to build on should have been decided by the 15,000 customers.
-- **Not measured**: The machine's load average was above 55 during these runs, and Q13's times ranged from 0.021 s to 0.159 s, too noisy to compare the build sides or the passes.
+- **148,467**: Orders out of 150,000 that pass the comment filter. Since nearly all pass, the 15,000 customers are the right side to build on.
+- **0.056 s**: Q13 with the default settings after the swap, against 0.042 s with the swap switched off. The runs overlap (0.028–0.072 s and 0.033–0.071 s), but CPU time is higher with the swap too.
 
 ## TPC-H Q14, with the optimizer off and on
 
@@ -1375,6 +1376,76 @@ Top N 100 BY o_totalprice DESC, o_orderdate ASC             ~100
 > **Cause:** the plan is right; the cost is in how duckrs writes out exported aggregate states. Grouping lineitem by order takes 0.024 s as a plain `sum`, 0.056 s when it exports its states, and 0.085 s when `finalize` then reads them back. In a profile, 81% of the busy CPU time is in the hash aggregate's output loop (`PhysicalAggregate::set_output`), which handles the 150,000 groups one row at a time. For each row, `write_state` calls `LogicalType::state_layout()`, which copies the whole state type and then frees it. `Vector::set_value` then compares the value's type with the column's type, and that comparison formats the state's constants into strings twice (`StateInfo::constants_key`). Any plan with exported states pays this cost, which also includes partial aggregate pushdown and grouping sets.
 
 > **Fixed, merged into phase-55-optimizer-rewriters (081d0b9):** the output loop now works out the state layout once per column, comparing two types that share their info returns at once, constants are only formatted when there are some, and `finalize()` looks up its aggregate once per vector. Measured against a clean build of the same commit: Q18 with reuse goes from 0.089 s to 0.048 s, and the GROUP BY that exports states from 0.054 s to 0.029 s, about the cost of a plain one. Q18 without reuse stays at 0.020 s, so the reuse plan is still slower. What's left is the row-at-a-time `finalize` of 150,000 states in the HAVING filter.
+
+## TPC-H Q19, with the optimizer off and on
+
+Q19 sums the discounted revenue of three kinds of part shipped by air and delivered in person. Its whole WHERE clause is one OR of three branches, and every branch repeats the join condition. So none of its conditions can be pushed as they are written, and the work is to get filters for each table out of the OR. duckrs gets more out of it than DuckDB 1.5.6, but runs slower for it. The plans are from the same build as Q17 (`1ed6cc1`) and the same SF0.1 data.
+
+```
+SELECT sum(l_extendedprice * (1 - l_discount)) AS revenue
+FROM lineitem, part
+WHERE (p_partkey = l_partkey AND p_brand = 'Brand#12'
+       AND p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG')
+       AND l_quantity >= 1 AND l_quantity <= 1 + 10 AND p_size BETWEEN 1 AND 5
+       AND l_shipmode IN ('AIR', 'AIR REG') AND l_shipinstruct = 'DELIVER IN PERSON')
+   OR (p_partkey = l_partkey AND p_brand = 'Brand#23'
+       AND p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK')
+       AND l_quantity >= 10 AND l_quantity <= 10 + 10 AND p_size BETWEEN 1 AND 10
+       AND l_shipmode IN ('AIR', 'AIR REG') AND l_shipinstruct = 'DELIVER IN PERSON')
+   OR (p_partkey = l_partkey AND p_brand = 'Brand#34'
+       AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG')
+       AND l_quantity >= 20 AND l_quantity <= 20 + 10 AND p_size BETWEEN 1 AND 15
+       AND l_shipmode IN ('AIR', 'AIR REG') AND l_shipinstruct = 'DELIVER IN PERSON');
+```
+
+**Optimizer off: PRAGMA disable_optimizer**
+
+```
+Ungrouped Aggregate sum(l_extendedprice * (1 - l_discount))   ~1
+└ Filter  (branch 1) OR (branch 2) OR (branch 3)
+  └ Cross Product                                     ~12,011,440,000
+    ├ Seq Scan lineitem  (all 16 columns)               ~600,572
+    └ Seq Scan part      (all 9 columns)                ~20,000
+```
+
+**Optimizer on: default settings**
+
+```
+Ungrouped Aggregate sum(l_extendedprice * (1.00 - l_discount))   ~1
+└ Hash Join  l_partkey = p_partkey                    ~1
+      AND (l_quantity <= 20.00 OR l_quantity >= 20.00)
+      AND (the three branches, without the conditions taken out)
+  ├ Filter  l_quantity <= 20.00 OR l_quantity >= 20.00          ~4,804
+  │ └ Filter  l_shipmode = 'AIR' OR l_shipmode = 'AIR REG'     ~24,022
+  │   └ Seq Scan lineitem  [l_partkey, l_quantity, l_extendedprice, l_discount, l_shipmode]   ~120,114
+  │       Filters: l_quantity <= 30.00, l_shipinstruct = 'DELIVER IN PERSON',
+  │                optional: l_shipmode IN ('AIR', 'AIR REG')
+  └ Filter  (brand is one of 3) AND (container is one of 12) AND (the part side of each branch)   ~160
+    └ Filter  the part side of each branch                    ~800
+      └ Seq Scan part  [p_partkey, p_brand, p_size, p_container]   ~4,000
+          Filters: p_size <= 15, container is one of 12, brand is one of 3,
+                   p_size <= 15, container is one of 12, brand is one of 3  (again)
+```
+
+> The first child of the hash join probes and the second child is the build side. The long OR expressions are shortened here. The repeated part filters and the quantity condition that removes nothing are described under the differences from DuckDB.
+
+### What each pass changed
+
+1. **Conditions common to all three branches come out of the OR.** `p_partkey = l_partkey`, the ship mode and the ship instruction appear in every branch, so they hold for every row that passes. The optimizer takes them out (this happens even with filter_pushdown switched off), which gives the hash join its key and gives the lineitem scan two filters. DuckDB does this too.
+2. **Then each branch's conditions on one table are combined across the branches.** Every passing part has one of the 3 brands, one of the 12 containers, and a size of at most 15 (the largest of the three upper bounds). Every passing line item has a quantity from 1 to 30, the union of the three ranges. These go into the two scans, and only the parts that could pass any branch (209 of 20,000) reach the join. The full branches are still checked in the join, since the conditions taken out don't pair each part with the right quantity range.
+3. **statistics_propagation** dropped the lower bounds: `p_size >= 1` and `l_quantity >= 1` always hold, since 1 is the smallest size and quantity in the data. Only `p_size <= 15` and `l_quantity <= 30.00` are left.
+4. **unused_columns** cut lineitem to 5 of its 16 columns (plus `l_shipinstruct`, read inside the scan for its filter) and part to 4 of 9.
+
+### Where duckrs differs from DuckDB 1.5.6
+
+1. **duckrs derives more filters.** DuckDB 1.5.6 takes out only the conditions common to all three branches. Its part scan has no filter and sends all 20,000 parts to the join, and its lineitem scan has no quantity filter. duckrs is ported from the baseline C++ source, which is newer than 1.5.6; I haven't checked whether that source derives the same filters.
+2. **The part scan has each derived filter twice**, and the Filter above it repeats them once more inside its first condition. This looks like the same kind of repetition as the nation filter in Q7.
+3. **A useless condition on quantity.** The plan checks `l_quantity <= 20.00 OR l_quantity >= 20.00` in a Filter over lineitem and again in the join. It holds for every quantity that isn't NULL, and quantity is NOT NULL, so it removes nothing. It looks like a leftover of combining the quantity bounds of the three branches; I haven't traced where it is made.
+4. **And it's slower for it.** With `SET disabled_optimizers = 'filter_pushdown'`, Q19 took 0.006 s against 0.010 s with the default settings, in all 11 runs (0.006–0.007 s against 0.010 s). The same derived conditions still exist then, but once each, in one Filter above each scan instead of as scan filters with copies. So the scan filters and the repeated conditions cost more here than they save. I haven't measured which of them costs the most.
+
+- **168,597.29**: The result, the same as DuckDB's.
+- **209 → 42**: Parts that pass the combined part filters, and parts that pass a whole branch. On the lineitem side, 21,136 line items are shipped by air and delivered in person, and 12,635 of them have a quantity of 30 or less.
+- **0.010 s**: Q19 with the optimizer on, median of 11 warm runs, with a load average of about 35. Without filter_pushdown it was 0.006 s, as described above.
 
 ## Every pass, what it does and why it's faster
 
