@@ -135,6 +135,7 @@ impl TableCatalogEntry {
     /// The rows at the positions in `removed`, of `count`, in order, went away. What is added at the
     /// end gets its id when something asks for it.
     pub fn rows_moved(&self, removed: &[usize], count: usize) {
+        self.unloaded_deletes.store(false, std::sync::atomic::Ordering::Relaxed);
         let ids = self.row_ids(count);
         let group_rows = self.row_group_size();
         self.statistics.lock().rows_removed(removed, group_rows);
@@ -153,6 +154,19 @@ impl TableCatalogEntry {
         let mut left = (*ids).clone();
         left.remove(removed);
         *self.row_ids.lock() = Arc::new(left);
+    }
+
+    /// Whether this is the table of a transaction that changed it (`HasUncommittedChanges`): deleted or
+    /// updated rows, or added some.
+    pub fn has_uncommitted_changes(&self) -> bool {
+        let Some(origin) = &self.origin else {
+            return false;
+        };
+        if !origin.claimed.lock().is_empty() || !origin.updated_columns.lock().is_empty() {
+            return true;
+        }
+        let rows = self.row_count();
+        rows != origin.rows || self.row_ids(rows).first_from(MAX_ROW_ID) < rows
     }
 
     /// Whether a transaction other than the one of this table has updated rows it hasn't committed.

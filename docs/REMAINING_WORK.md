@@ -237,8 +237,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
 - [ ] 17. Column lifetime, unused columns, TopN, expression rewriter (small dirs under `test/optimizer`)
   - [x] `CastCanThrow` of nested, DECIMAL and timestamp casts; `x * 0` and `x // 0` (`ArithmeticSimplificationRule`);
     `prefix` decided by statistics only in a one-column filter on a scan; empty statistics fold no `constant_or_null`
-  - [ ] count/min/max from row group statistics (`TryExecuteAggregates`: `eager_aggregate_execution`, its parquet
-    variant, `partial_aggregate_precomputation`, `partition_stats_exactness`)
+  - [x] count/min/max from row group statistics (`TryExecuteAggregates`), of tables and single Parquet files, with
+    the row groups a scan filter is never or always true for; counts not exact with uncommitted changes or deletes
+    the file had at open, bounds not with any delete (partial precomputation is off at the baseline too)
   - [x] windows and aggregates whose outputs nothing reads are removed, volatile projections too
     (`ClearUnusedExpressions`); a LIMIT above fewer rows than it lets through (`PropagateStatistics(LogicalLimit)`,
     with the row bounds of `range` and Parquet row groups); `ArrayGenericFoldStats`; large INs of an inner

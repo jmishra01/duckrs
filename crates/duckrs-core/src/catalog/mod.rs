@@ -390,6 +390,9 @@ pub struct TableCatalogEntry {
     /// made by CREATE TABLE AS, whose columns depend on no type (`BindCreateTableInfo` registers
     /// the types of the columns only when there is no query)
     pub from_query: std::sync::atomic::AtomicBool,
+    /// `HasUnloadedDeletes`: the file had deleted rows when the database was opened, which nothing of this
+    /// process has loaded since (by deleting rows or checkpointing)
+    pub unloaded_deletes: std::sync::atomic::AtomicBool,
 }
 
 /// The statistics of a table's columns, if they are up to date. Working them out takes a scan, and
@@ -711,6 +714,7 @@ impl TableCatalogEntry {
             versions: Arc::default(),
             row_group_rows: std::sync::atomic::AtomicUsize::new(ROW_GROUP_ROWS),
             from_query: std::sync::atomic::AtomicBool::new(false),
+            unloaded_deletes: std::sync::atomic::AtomicBool::new(false),
             comment: Mutex::new(None),
         }
     }
@@ -767,6 +771,7 @@ impl TableCatalogEntry {
 
     /// A checkpoint put the rows in a file: what is in memory of them goes.
     pub fn leave_in_file(&self, source: Arc<dyn TableSource>) {
+        self.unloaded_deletes.store(false, std::sync::atomic::Ordering::Relaxed);
         let types = self.types();
         let ids = source.row_ids();
         let old = self.row_ids(self.row_count());

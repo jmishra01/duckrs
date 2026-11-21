@@ -2499,6 +2499,35 @@ fn statistics_text(stats: &Statistics) -> (Option<String>, Option<String>, Optio
     )
 }
 
+/// `ParquetReader::GetPartitionStats` of the one file of a scan: per row group, its rows, the zone of each column
+/// of the file, and whether all the columns' bounds are exact (`ParquetPartitionRowGroup::MinMaxIsExact`).
+pub fn partition_statistics(scan: &ParquetScanData) -> Option<Vec<(u64, Vec<Option<crate::catalog::ColumnZone>>, bool)>> {
+    let [file] = scan.files.as_slice() else {
+        return None;
+    };
+    let (metadata, _) = read_metadata(file).ok()?;
+    let leaves: Vec<Option<usize>> = (0..scan.names.len())
+        .map(|column| statistics_leaf(scan, &metadata, column))
+        .collect();
+    let groups = metadata
+        .row_groups()
+        .iter()
+        .map(|group| {
+            let zones = leaves
+                .iter()
+                .enumerate()
+                .map(|(at, leaf)| group_zone(scan, &metadata, group, (*leaf)?, at).filter(|z| !z.unknown))
+                .collect();
+            let exact = leaves.iter().all(|leaf| {
+                leaf.and_then(|leaf| group.column(leaf).statistics())
+                    .is_some_and(|s| s.min_is_exact() && s.max_is_exact())
+            });
+            (group.num_rows().max(0) as u64, zones, exact)
+        })
+        .collect();
+    Some(groups)
+}
+
 /// `MultiFileFunction::MultiFileCardinality`'s `max_cardinality`: the rows of the row groups of each
 /// file it opened (`ReadSingleParquetFileCardinality`; the footer's total is not what the scan
 /// reads), which is the one file, or all of them with `union_by_name`.

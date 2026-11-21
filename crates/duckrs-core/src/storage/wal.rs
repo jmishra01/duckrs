@@ -801,6 +801,12 @@ impl<'a> Replay<'a> {
             .expect("OnCreateConflict::Error fails or creates");
         *entry.comment.lock() = comment;
         entry.set_source(disk.clone());
+        // the deleted rows of the file are known only by scanning it
+        let ids = crate::catalog::TableSource::row_ids(&*disk);
+        let stored: usize = ids.stored_groups().iter().map(|&(_, rows)| rows).sum();
+        entry
+            .unloaded_deletes
+            .store(stored > ids.len(), std::sync::atomic::Ordering::Relaxed);
         entry.reset_log();
         self.disk.insert(table_key, disk);
         Ok(())

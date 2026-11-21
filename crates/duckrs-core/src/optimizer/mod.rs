@@ -12,6 +12,7 @@ mod aggregate_rewriter;
 mod common_aggregate;
 mod common_subplan;
 mod cte_inlining;
+mod eager_aggregate;
 mod join_elimination;
 mod outer_join_simplification;
 mod projection_pullup;

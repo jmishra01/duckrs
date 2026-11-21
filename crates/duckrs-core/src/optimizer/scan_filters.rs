@@ -103,7 +103,7 @@ fn prefix_bounds(expr: &BoundExpr) -> Option<[BoundExpr; 2]> {
 }
 
 /// What `FilterCombiner` puts into a scan for a filter.
-enum TablePushdown {
+pub(super) enum TablePushdown {
     /// `PUSHED_DOWN_FULLY`: these filters in place of it
     Fully(Vec<BoundExpr>),
     /// `PUSHED_DOWN_PARTIALLY`: an optional filter for the zone maps, and the filter stays
@@ -158,7 +158,7 @@ fn in_list(column: &BoundExpr, values: Vec<Value>) -> BoundExpr {
 }
 
 /// `TryPushdownInFilter` and `TryPushdownOrClause`.
-fn table_pushdown(expr: &BoundExpr) -> TablePushdown {
+pub(super) fn table_pushdown(expr: &BoundExpr) -> TablePushdown {
     match &expr.kind {
         BoundExprKind::Operator {
             op: BoundOperator::In,

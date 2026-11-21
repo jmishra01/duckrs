@@ -2434,6 +2434,13 @@ impl StatisticsPropagator {
                         no_overflow.push(index);
                     }
                 }
+                // `TryExecuteAggregates`: count_star, min and max from the statistics of the row groups
+                if !self.filter_simplification
+                    && let Some(result) = super::eager_aggregate::try_execute(op)
+                {
+                    *op = result;
+                    return;
+                }
                 // `SumPropagateStats`: a sum of INTEGER or BIGINT that fits in an int64 needs no wider state
                 if let K::Aggregate { aggregates, .. } = &mut op.kind {
                     for index in no_overflow {
