@@ -1224,6 +1224,77 @@ Projection __internal_decompress_string(p_brand), p_type, CAST(p_size AS INTEGER
 - **1**: Supplier with a customer complaint at SF0.1, against an estimate of ~200. The NOT IN removes its partsupp rows.
 - **Not measured**: The load average was above 120 during these runs. Q16 took 0.018–0.069 s with the default settings and 0.013–0.053 s with in_clause off, too noisy to say what the gap costs.
 
+## TPC-H Q17, with the optimizer off and on
+
+Q17 works out how much yearly revenue would be lost without the small orders of one kind of part: line items whose quantity is under 20% of that part's average. The average comes from a correlated subquery over lineitem, so the query reads lineitem twice, and the trick is making the second read cover only the parts the first one keeps. The plans are from the same build as Q16 (`1ed6cc1`) and the same SF0.1 data.
+
+```
+SELECT sum(l_extendedprice) / 7.0 AS avg_yearly
+FROM lineitem, part
+WHERE p_partkey = l_partkey
+  AND p_brand = 'Brand#23'
+  AND p_container = 'MED BOX'
+  AND l_quantity < (SELECT 0.2 * avg(l_quantity)
+                    FROM lineitem
+                    WHERE l_partkey = p_partkey);
+```
+
+**Optimizer off: PRAGMA disable_optimizer**
+
+```
+Projection CAST(sum AS DOUBLE) / CAST(7.0 AS DOUBLE)        ~1
+└ Ungrouped Aggregate sum(l_extendedprice)
+  └ Filter  p_partkey = l_partkey AND (3 more)        ~324,633,514
+    └ Left Delim Join  SINGLE  p_partkey IS NOT DISTINCT FROM p_partkey   ~12,011,440,000
+      ├ Cross Product  lineitem × part  (all columns)   ~12,011,440,000
+      └ Projection 0.2 * avg, p_partkey
+        └ Hash Join  p_partkey IS NOT DISTINCT FROM p_partkey
+          ├ CTE Scan  (the distinct outer p_partkey values)
+          └ Hash Group By p_partkey, avg(l_quantity)
+            └ Filter  l_partkey = p_partkey          ~1,983,088,744
+              └ Cross Product  lineitem (all columns) × outer p_partkey values   ~9,915,443,720
+```
+
+> As in Q2 and Q4, the planner has already flattened the subquery into a Delim Join before any pass runs: the subquery is computed for the distinct outer `p_partkey` values and joined back.
+
+**Optimizer on: default settings**
+
+```
+Projection CAST(sum AS DOUBLE) / 7.0                        ~1
+└ Ungrouped Aggregate sum(l_extendedprice)
+  └ Filter  CAST(l_quantity AS DOUBLE) < 0.2 * avg         ~3,482
+    └ Left Delim Join  p_partkey IS NOT DISTINCT FROM p_partkey   ~17,413
+      ├ Hash Join  l_partkey = p_partkey               ~17,413
+      │ ├ Seq Scan lineitem  [l_partkey, l_quantity, l_extendedprice]   ~600,572
+      │ └ Seq Scan part  [p_partkey]                      ~541
+      │     Filters: p_brand = 'Brand#23', p_container = 'MED BOX'
+      └ Projection 0.2 * avg, p_partkey
+        └ Hash Group By p_partkey, avg(l_quantity)
+          └ Hash Join  l_partkey = p_partkey             ~17,348
+            ├ Seq Scan lineitem  [l_partkey, l_quantity]   ~600,572
+            └ Delim Scan  (the outer p_partkey values)      ~539
+```
+
+> The first child of each hash join probes and the second child is the build side. duckrs's EXPLAIN labels the Delim Scan as a CTE Scan without an index.
+
+### What each pass changed
+
+1. **filter_pushdown** turned both cross products into hash joins and put the brand and container filters into the part scan. Only 18 parts pass them (~541 estimated).
+2. **The subquery only runs for those parts.** Its lineitem scan joins the Delim Scan, the distinct `p_partkey` values of the outer side, so the average is computed for 18 parts, not all 20,000. Both lineitem scans read all 600,572 rows, but in each one only the 555 line items of those parts go on.
+3. **deliminator** can't remove the Delim Join, since the outer rows need each part's average. It removes the join of the subquery's grouped result with the outer keys (the Hash Join on `IS NOT DISTINCT FROM` in the unoptimized plan), as in Q2: the GROUP BY already gives one row per key. Since that guarantees at most one match per part, it also turns the Delim Join from SINGLE, which checks for more than one match, into a plain LEFT join.
+4. **join_filter_pushdown** doesn't show in EXPLAIN. At run time each hash join hands its lineitem scan the range and a Bloom filter of the part keys it built, so line items of other parts can be dropped in the scan.
+5. **unused_columns** cut the outer lineitem scan to 3 of its 16 columns, the subquery's to 2, and part to 1 of 9.
+
+### Where duckrs differs from DuckDB 1.5.6
+
+1. **DuckDB's plan has more operators.** It uses a RIGHT Delim Join and keeps a RIGHT hash join on `IS NOT DISTINCT FROM` above the subquery's GROUP BY, with a dummy scan. duckrs has one Delim Join and no join above the GROUP BY.
+2. **DuckDB packs the subquery's group key.** It narrows `p_partkey` to a 2-byte integer for the subquery's GROUP BY. duckrs groups on the full BIGINT, as in Q2.
+3. **The subquery estimates differ widely.** DuckDB estimates ~349,097 rows into the subquery's GROUP BY and ~174,548 groups; duckrs ~17,348 and ~1. In fact 555 line items make 18 groups.
+
+- **23,512.75**: The result, the same as DuckDB's: 43 of the 555 line items of those 18 parts are under 20% of their part's average.
+- **0.012 s**: Q17 with the optimizer on, median of 11 warm runs (0.007–0.019 s). With deliminator switched off it was 0.013 s.
+- **0.020 s**: Q17 with `SET disabled_optimizers = 'join_filter_pushdown'` (0.014–0.025 s). The load average was about 70, so the ranges overlap, but the medians suggest the runtime filters on the two lineitem scans pay here.
+
 ## TPC-H Q18, with the optimizer off and on
 
 Q18 finds the 100 largest orders whose line items add up to a quantity over 300. Unlike Q5 and Q9, it has an `IN` subquery, and both the subquery and the outer query compute `sum(l_quantity)` per order. The setup is the same: the duckrs Stage 3 release build and TPC-H SF0.1 data.
