@@ -209,6 +209,70 @@ Top N 10 BY revenue DESC, o_orderdate ASC                   ~10
 - **Not run**: The plan with the optimizer off. Its cross product of the three tables is estimated at 1.35 × 10^15 rows.
 - **0.011 s**: Q3 with `SET disabled_optimizers = 'join_filter_pushdown'`. The runtime join filters that hash joins pass to their probe scans don't appear in EXPLAIN, and at this size they barely change the time.
 
+## TPC-H Q4, with the optimizer off and on
+
+Q4 counts the orders of one quarter that had at least one late line item, by priority. It is the only walkthrough with a correlated subquery: an `EXISTS` that reads `o_orderkey` from the outer query. It shows how a subquery that would run once per order becomes a single join. The plans are from the same build as Q7 and Q8 (`1ed6cc1`) and the same SF0.1 data.
+
+```
+SELECT o_orderpriority, count(*) AS order_count
+FROM orders
+WHERE o_orderdate >= CAST('1993-07-01' AS date)
+  AND o_orderdate <  CAST('1993-10-01' AS date)
+  AND EXISTS (SELECT * FROM lineitem
+              WHERE l_orderkey = o_orderkey
+                AND l_commitdate < l_receiptdate)
+GROUP BY o_orderpriority
+ORDER BY o_orderpriority;
+```
+
+**Optimizer off: PRAGMA disable_optimizer**
+
+```
+Order By o_orderpriority                                    ~5
+└ Hash Group By o_orderpriority, count_star()               ~5
+  └ Filter  o_orderdate (2 conditions) AND #mark         ~30,000
+    └ Left Delim Join  MARK  o_orderkey IS NOT DISTINCT FROM o_orderkey   ~150,000
+      ├ Seq Scan orders  (all 9 columns)                 ~150,000
+      └ Filter  l_orderkey = o_orderkey AND l_commitdate < l_receiptdate   ~18,017,160,000
+        └ Cross Product                           ~90,085,800,000
+          ├ Seq Scan lineitem  (all 16 columns)         ~600,572
+          └ CTE Scan  (the distinct o_orderkey values of orders)   ~150,000
+```
+
+> The planner flattens the subquery before any optimizer pass runs, as DuckDB's does. The **Delim Join** collects the distinct outer keys (`o_orderkey`), the subquery is joined to them, and a MARK join tells each order whether it found a match. With the optimizer off, that inner join is still a cross product.
+
+**Optimizer on: default settings**
+
+```
+Projection ...                                              ~5
+└ Order By o_orderpriority                                  ~5
+  └ Hash Group By o_orderpriority, count_star()             ~5
+    └ Hash Join  RIGHT_SEMI  o_orderkey = o_orderkey     ~6,000
+      ├ Projection NULL::BIGINT, NULL::BIGINT, ... (16 NULL columns), o_orderkey   ~120,114
+      │ └ Filter  l_commitdate < l_receiptdate          ~120,114
+      │   └ Seq Scan lineitem  [l_orderkey, l_commitdate, l_receiptdate]   ~600,572
+      └ Seq Scan orders  [o_orderkey, o_orderpriority]     ~30,000
+          Filters: o_orderdate >= '1993-07-01', o_orderdate < '1993-10-01'
+```
+
+> The first child of the hash join probes and the second child is the build side. In a RIGHT_SEMI join the build side is the one kept: an order goes on once any line item finds it in the hash table. EXPLAIN prints the condition as `o_orderkey = o_orderkey`: on the lineitem side, the key is the subquery's copy of the outer `o_orderkey`, which equals `l_orderkey`.
+
+### What each pass changed
+
+1. **deliminator** removed the Delim Join. Joining the subquery to the distinct order keys only to join the result back to orders is the same as joining lineitem to orders directly, since `l_orderkey = o_orderkey` is a plain equality. So the CTE scan of distinct keys disappears, and the MARK join with a filter on its marker becomes a SEMI join: keep each order with at least one match.
+2. **filter_pushdown** moved the date range into the orders scan, and the `l_commitdate < l_receiptdate` condition into a Filter right on top of the lineitem scan. A comparison of two columns can't become a scan filter.
+3. **build_side_probe_side** builds the hash table on the filtered orders (~30,000 estimated, 5,552 in fact) and lets the late line items (379,809 of 600,572) probe it, which makes it a RIGHT_SEMI join.
+4. **unused_columns** cut orders to 2 of its 9 columns and the lineitem scan to 3 of 16.
+
+### Where duckrs differs from DuckDB 1.5.6
+
+1. **DuckDB 1.5.6 keeps the Delim Join.** Its plan still collects the distinct order keys (~27,171), joins the late line items to them, and then does a RIGHT_SEMI join with orders on `IS NOT DISTINCT FROM`. duckrs's plan has one join where 1.5.6 has three operators.
+2. **The lineitem side still carries 16 NULL columns.** `SELECT *` in the subquery asked for all 16 lineitem columns. unused_columns stops the scan from reading them, but a projection still puts out a constant NULL for each of them, next to the key it joins on. DuckDB's projection there has only the key. Constant vectors cost almost nothing to make, so this is untidy rather than slow.
+
+- **0.007 s**: Q4 with the optimizer on, median of 11 warm runs, with a load average of about 12. It returns 5 rows, from 989 orders for 4-NOT SPECIFIED to 1,077 for 5-LOW: 5,093 of the quarter's 5,552 orders had a late line item.
+- **0.014 s**: Q4 with `SET disabled_optimizers = 'deliminator'`, the median of 11 runs that ranged from 0.008 s to 0.038 s. With the Delim Join kept, the plan builds the distinct key list, joins lineitem to it, and then MARK-joins orders.
+- **0.010 s**: Q4 with `SET disabled_optimizers = 'join_filter_pushdown'` (0.008–0.014 s). With this load the overlap with the optimized runs is too large to call it a clear gain.
+
 ## TPC-H Q5, with the optimizer off and on
 
 Q5 joins six tables to find the revenue of each Asian nation in 1994. These are real `EXPLAIN` plans from a duckrs release build of the Stage 3 branch, run on TPC-H scale factor 0.1 data (lineitem has 600,572 rows). The plans are redrawn as text trees from the CLI's boxes. Row counts with `~` are the optimizer's estimates, not counted rows.
