@@ -2499,6 +2499,22 @@ fn statistics_text(stats: &Statistics) -> (Option<String>, Option<String>, Optio
     )
 }
 
+/// `MultiFileFunction::MultiFileCardinality`'s `max_cardinality`: the rows of the row groups of each
+/// file it opened (`ReadSingleParquetFileCardinality`; the footer's total is not what the scan
+/// reads), which is the one file, or all of them with `union_by_name`.
+pub fn scan_max_cardinality(scan: &ParquetScanData) -> Option<u64> {
+    if scan.files.is_empty() || (scan.files.len() > 1 && !scan.union_by_name) {
+        return None;
+    }
+    scan.files.iter().try_fold(0u64, |total, file| {
+        let (metadata, _) = read_metadata(file).ok()?;
+        metadata
+            .row_groups()
+            .iter()
+            .try_fold(total, |total, group| total.checked_add(u64::try_from(group.num_rows()).ok()?))
+    })
+}
+
 /// `ParquetMultiFileInfo::GetCardinality`: the rows of the one file, or of the first for each file, at least 1000
 /// (there are no file sizes to tell more by).
 pub fn scan_cardinality(scan: &ParquetScanData) -> Option<u64> {

@@ -24,6 +24,10 @@ fn visit(op: &mut LogicalOperator) {
     for child in &mut op.children {
         visit(child);
     }
+    // the filters of a scan are its table filters, which are not expressions of an operator in C++
+    if matches!(op.kind, K::Get { .. } | K::ParquetScan { .. } | K::CsvScan { .. } | K::JsonScan { .. }) {
+        return;
+    }
     for expr in op.expressions_mut() {
         reorder_conjunctions(expr);
     }

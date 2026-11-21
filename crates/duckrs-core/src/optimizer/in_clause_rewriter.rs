@@ -51,6 +51,20 @@ struct Rewriter<'a> {
 /// `binds` says the parent reads the columns of `op` by their bindings and puts out columns of its
 /// own, so that one more column of `op` does not change what the parent puts out.
 fn visit_operator(op: &mut LogicalOperator, next_table_index: &mut usize, binds: bool) {
+    // what duckrs keeps as the predicate of an inner join is a filter above it in C++, where the
+    // rewriter finds its IN lists
+    if let K::Join {
+        join_type: duckrs_parser::ast::JoinType::Inner,
+        predicate: predicate @ Some(_),
+        ..
+    } = &mut op.kind
+        && predicate.as_ref().is_some_and(has_rewritable_in)
+    {
+        let mut expressions = Vec::new();
+        super::rewriter::split_conjuncts(predicate.take().expect("a predicate"), &mut expressions);
+        let join = std::mem::replace(op, LogicalOperator::new(K::CrossProduct, Vec::new()));
+        *op = LogicalOperator::new(K::Filter { expressions }, vec![join]);
+    }
     let mut hidden = None;
     // `PushdownGet` puts `NOT (col IN (...))` into the scan as it is, which stays an IN there
     let mut kept_in_scan = Vec::new();
@@ -196,6 +210,15 @@ fn is_indexed_column_in(expr: &BoundExpr, scan: &LogicalOperator) -> bool {
             .any(|key| key.columns.as_slice() == [column] && key.expressions.is_none())
 }
 
+/// An IN that becomes a join: of enough values, all constants.
+fn has_rewritable_in(expr: &BoundExpr) -> bool {
+    let own = matches!(&expr.kind, BoundExprKind::Operator { op, children }
+        if op.is_in()
+            && children.len() >= IN_CLAUSE_REWRITE_THRESHOLD
+            && children[1..].iter().all(BoundExpr::is_foldable));
+    own || expr.children().into_iter().any(has_rewritable_in)
+}
+
 fn has_in(expr: &BoundExpr) -> bool {
     matches!(&expr.kind, BoundExprKind::Operator { op, .. } if op.is_in()) || expr.children().into_iter().any(has_in)
 }
@@ -212,8 +235,10 @@ fn lower_remaining(op: &mut LogicalOperator, kept: &[bool]) {
             return;
         }
         expr.walk_mut(&mut |e| {
+            // a volatile input runs once for the IN, and would run once per value in the ORs
             if let BoundExprKind::Operator { op, children } = &e.kind
                 && op.is_in()
+                && !children[0].is_volatile()
             {
                 let alias = e.alias.clone();
                 *e = in_as_comparisons(*op == BoundOperator::NotIn, children).with_alias(alias);

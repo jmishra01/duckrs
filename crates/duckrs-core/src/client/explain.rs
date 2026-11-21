@@ -146,11 +146,42 @@ fn aggregate_text(aggregate: &BoundAggregate) -> String {
 /// comparisons (`FilterCombiner::GenerateTableScanFilters`), in one conjunction.
 fn scan_filter_lines(filters: &[BoundExpr]) -> String {
     use crate::planner::expression::BoundExprKind as E;
-    lines(filters.iter().map(|filter| match &filter.kind {
+    let text = |filter: &BoundExpr| match &filter.kind {
         E::Between { input, lower, upper } if matches!(input.kind, E::ColumnRef { .. }) => {
             format!("({input} >= {lower}) AND ({input} <= {upper})")
         }
         _ => filter_text(filter),
+    };
+    // `TableFilterSet`: one filter per column, the filters of a column a conjunction of them
+    let column = |filter: &BoundExpr| {
+        let mut columns = std::collections::BTreeSet::new();
+        filter.clone().walk_mut(&mut |e| {
+            if let E::ColumnRef { binding, depth: 0 } = &e.kind {
+                columns.insert(*binding);
+            }
+        });
+        (columns.len() == 1).then(|| columns.into_iter().next()).flatten()
+    };
+    // an OR among them keeps its parentheses; the same filter twice is pushed once
+    let part = |filter: &BoundExpr| match &filter.kind {
+        E::Conjunction { and: false, .. } => format!("({})", text(filter)),
+        _ => text(filter),
+    };
+    let mut groups: Vec<(Option<crate::planner::expression::ColumnBinding>, Vec<&BoundExpr>)> = Vec::new();
+    for filter in filters {
+        let key = column(filter);
+        match groups.iter_mut().find(|(k, _)| key.is_some() && *k == key) {
+            Some((_, members)) => {
+                if !members.iter().any(|m| part(m) == part(filter)) {
+                    members.push(filter);
+                }
+            }
+            None => groups.push((key, vec![filter])),
+        }
+    }
+    lines(groups.into_iter().map(|(_, members)| match members.as_slice() {
+        [only] => text(only),
+        _ => members.iter().map(|m| part(m)).collect::<Vec<_>>().join(" AND "),
     }))
 }
 
@@ -706,6 +737,13 @@ fn recursive_scan(table: &std::sync::Arc<parking_lot::Mutex<duckrs_common::colum
 }
 
 /// The tree of a physical plan, and the logical plan it came from if they have the same shape.
+/// Whether a physical operator is the one a logical operator becomes, by the names EXPLAIN gives them.
+fn physical_matches(op: &dyn PhysicalOperator, logical: &LogicalOperator) -> bool {
+    let physical = op.name();
+    let logical = logical_name(logical);
+    physical == logical || (matches!(physical, "TABLE_SCAN" | "SEQ_SCAN") && matches!(logical, "SEQ_GET" | "TABLE_SCAN" | "SEQ_SCAN" | "GET"))
+}
+
 pub(super) fn physical_tree(
     op: &dyn PhysicalOperator,
     logical: Option<&LogicalOperator>,
@@ -842,15 +880,32 @@ pub(super) fn physical_tree(
             children: vec![physical_tree(children[0].as_ref(), Some(window), estimate, analyze)],
         };
     }
+    // a projection the physical plan adds where the logical plan has none (the keys of an ORDER BY
+    // over a scan's columns, say): its own references, above what the logical operator becomes
+    if let Some(l) = logical
+        && op.name() == "PROJECTION"
+        && children.len() == 1
+        && !matches!(l.kind, K::Projection { .. } | K::ColumnSelect { .. })
+        && children[0].name() != "PROJECTION"
+        && physical_matches(children[0].as_ref(), l)
+    {
+        let references = (0..op.types().len()).map(|i| format!("#{i}"));
+        return ExplainNode {
+            name: op.name().to_string(),
+            info: vec![("Projections".to_string(), lines(references))],
+            estimate: estimate.map(|e| e.cardinality),
+            children: vec![physical_tree(children[0].as_ref(), logical, estimate, analyze)],
+        };
+    }
     let logical = logical.filter(|l| l.children.len() == children.len());
     let estimate = estimate.filter(|e| e.children.len() == children.len());
     if op.name() == "COLUMN_SELECT" {
-        return physical_tree(
-            children[0].as_ref(),
-            logical.map(|l| &l.children[0]),
-            estimate.map(|e| &e.children[0]),
-            analyze,
-        );
+        // the column select of a logical one, or one the physical plan adds above the operator
+        let selected = logical.filter(|l| matches!(l.kind, K::ColumnSelect { .. }));
+        return match selected {
+            Some(l) => physical_tree(children[0].as_ref(), Some(&l.children[0]), estimate.map(|e| &e.children[0]), analyze),
+            None => physical_tree(children[0].as_ref(), logical, estimate, analyze),
+        };
     }
     let name = match logical.map(|l| &l.kind) {
         Some(K::Get { .. }) => "SEQ_SCAN".to_string(),
@@ -1015,6 +1070,44 @@ fn render_json_node(node: &ExplainNode, depth: usize, out: &mut String) {
     out.push('}');
 }
 
+/// `YAMLTreeRenderer::RenderRecursive`.
+fn render_yaml_node(node: &ExplainNode, indent: usize, out: &mut String) {
+    out.push_str(&" ".repeat(indent));
+    out.push_str("- name: ");
+    json_string(&node.name, out);
+    out.push('\n');
+    let indent = indent + 2;
+    let estimate = node
+        .estimate
+        .map(|e| ("Estimated Cardinality".to_string(), e.to_string()));
+    for (key, value) in node.info.iter().chain(estimate.iter()) {
+        out.push_str(&" ".repeat(indent));
+        json_string(if key.is_empty() { "Details" } else { key }, out);
+        out.push(':');
+        let split: Vec<&str> = value.split('\n').collect();
+        if split.len() > 1 {
+            out.push('\n');
+            for line in split {
+                out.push_str(&" ".repeat(indent + 2));
+                out.push_str("- ");
+                json_string(line, out);
+                out.push('\n');
+            }
+        } else {
+            out.push(' ');
+            json_string(value, out);
+            out.push('\n');
+        }
+    }
+    if !node.children.is_empty() {
+        out.push_str(&" ".repeat(indent));
+        out.push_str("children: \n");
+        for child in &node.children {
+            render_yaml_node(child, indent + 2, out);
+        }
+    }
+}
+
 /// How EXPLAIN shows a plan: `format` is that of the statement, and `upper` is `operator_casing`.
 pub(super) fn render(node: &ExplainNode, format: &str, upper: bool) -> String {
     let mut out = String::new();
@@ -1022,6 +1115,8 @@ pub(super) fn render(node: &ExplainNode, format: &str, upper: bool) -> String {
         out.push_str("[\n");
         render_json_node(node, 1, &mut out);
         out.push_str("\n]");
+    } else if format == "yaml" {
+        render_yaml_node(node, 0, &mut out);
     } else {
         let config = TextTreeConfig {
             upper_case: upper,

@@ -1296,6 +1296,31 @@ impl StatisticsPropagator {
                 };
             }
         }
+        // `ArrayGenericFoldStats`: NULL where an array is, and no error where no element is NULL
+        if matches!(
+            function.name.as_str(),
+            "array_distance"
+                | "array_inner_product"
+                | "array_dot_product"
+                | "array_negative_inner_product"
+                | "array_negative_dot_product"
+                | "array_cosine_similarity"
+                | "array_cosine_distance"
+        ) && let [left, right] = stats.as_slice()
+            && children.iter().all(|c| c.return_type.id() == LogicalTypeId::Array)
+        {
+            let elements_valid = [left, right]
+                .iter()
+                .all(|s| s.children.first().is_some_and(|element| !element.can_be_null));
+            if elements_valid {
+                *function = Arc::new(function.infallible());
+            }
+            return Stats {
+                can_be_null: left.can_be_null || right.can_be_null,
+                can_be_valid: left.can_be_valid && right.can_be_valid,
+                ..unknown()
+            };
+        }
         // a function that gives NULL for NULL, of an argument that is only NULL, is only NULL
         if matches!(
             function.name.as_str(),
@@ -2296,6 +2321,17 @@ impl StatisticsPropagator {
                 self.cte_rows.insert(*table_index, rows);
             }
         }
+        // `PropagateStatistics(LogicalLimit)`: a limit above fewer rows than it lets through does nothing
+        if let K::Limit {
+            limit: Some(limit),
+            offset: 0,
+            failure: None,
+        } = &op.kind
+            && self.max_rows(&op.children[0]).is_some_and(|rows| rows < *limit)
+        {
+            *op = op.children.remove(0);
+            return;
+        }
         // `PropagateStatistics(LogicalCTERef)`
         if let K::CteRef {
             table_index, cte_index, ..
@@ -2890,6 +2926,9 @@ fn integer_range(ty: &LogicalType) -> Option<(i128, i128)> {
 fn max_cardinality(op: &LogicalOperator) -> Option<u64> {
     match &op.kind {
         K::Get { table, .. } => Some(table.row_count() as u64),
+        // `RangeCardinality`
+        K::Range { count, .. } => Some(*count),
+        K::ParquetScan { scan, .. } => crate::execution::parquet::scan_max_cardinality(scan),
         K::Filter { .. } | K::Projection { .. } => op.children.first().and_then(max_cardinality),
         _ => None,
     }

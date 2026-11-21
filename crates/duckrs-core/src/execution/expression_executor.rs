@@ -1008,6 +1008,22 @@ pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
             op: BoundOperator::HasError,
             children,
         } => execute_has_error(&children[0], input),
+        // a volatile input is evaluated once, and compared from a column of its own
+        BoundExprKind::Operator {
+            op: op @ (BoundOperator::In | BoundOperator::NotIn),
+            children,
+        } if children[0].is_volatile() => {
+            let probe = execute(&children[0], input)?;
+            let mut columns = input.columns().to_vec();
+            columns.push(probe);
+            let extended = DataChunk::from_columns(columns, input.len());
+            let mut lowered = children.clone();
+            lowered[0] = BoundExpr::new(BoundExprKind::Reference(input.column_count()), children[0].return_type.clone());
+            execute(
+                &crate::planner::expression::in_as_comparisons(*op == BoundOperator::NotIn, &lowered),
+                &extended,
+            )
+        }
         BoundExprKind::Operator {
             op: op @ (BoundOperator::In | BoundOperator::NotIn),
             children,

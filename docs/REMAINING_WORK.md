@@ -239,14 +239,19 @@ Each item gives the number of failing files in `test/` that it should fix, where
     `prefix` decided by statistics only in a one-column filter on a scan; empty statistics fold no `constant_or_null`
   - [ ] count/min/max from row group statistics (`TryExecuteAggregates`: `eager_aggregate_execution`, its parquet
     variant, `partial_aggregate_precomputation`, `partition_stats_exactness`)
-  - [ ] a window none of whose outputs are read is removed (`unused_window_columns`); child columns through views
-    (`unused_columns/deliver_child_columns`)
-  - [ ] EXPLAIN shapes: ANY joins folded to cross products, IN rewrites under ORs into MARK joins, date_trunc
-    filters as ranges, join-dependent filters, LIMIT above exact bounds, projection placement, filter pullup
-    join order, recursive CTE join order, redundant ORDER BY keys with COLLATE, zone maps of ORs over joins,
-    grouping sets of the common aggregate
-  - [ ] `duckdb_extensions()`, named table function arguments (`materialized_cte_column_count`), an unnest rewrite
-    of a LIST constant (`unnest_rewriter_issue_14542`)
+  - [x] windows and aggregates whose outputs nothing reads are removed, volatile projections too
+    (`ClearUnusedExpressions`); a LIMIT above fewer rows than it lets through (`PropagateStatistics(LogicalLimit)`,
+    with the row bounds of `range` and Parquet row groups); `ArrayGenericFoldStats`; large INs of an inner
+    join's predicate become MARK joins; `EXPLAIN (FORMAT yaml)`; scan filters of a column as one conjunction
+  - [ ] struct fields pushed into a scan through a view's projection (`unused_columns/deliver_child_columns`)
+  - [ ] the ORDER BY of DISTINCT ON inside the DISTINCT, so its keys can be dropped (`remove_redundant_order_keys`)
+  - [ ] an OR whose NULL check statistics remove is a table filter in full, as C++ pushes it before statistics
+    (`date_trunc_simplification` IS DISTINCT FROM)
+  - [ ] holistic aggregate states (`bit_and` of BIT) count toward `memory_limit` (`bitagg_memory_limit` passed only
+    while its unused aggregates were computed)
+  - [ ] EXPLAIN shapes: join-dependent filters, projection placement, filter pullup join order, recursive CTE join
+    order, zone maps of ORs over joins, grouping sets of the common aggregate
+  - [ ] `duckdb_extensions()`, named table function arguments (`materialized_cte_column_count`)
 - [ ] 18. Optimizer-dependent SQL tests (`sql/optimizer`: 62 failing, 63.7% pass)
   - [x] uncorrelated scalar subqueries planned as cross products (`PlanUncorrelatedSubquery`), with first() and
     the multiple-rows check where they may not return one row

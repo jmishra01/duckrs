@@ -485,6 +485,7 @@ test/issues/rigger/timestamp_overflow.test
 test/issues/rigger/zonemap_column_out_of_range.test
 test/ldbc/ldbc-empty.test
 test/optimizer/aggregate_reuse.test
+test/optimizer/any_join_condition_pruning.test
 test/optimizer/arithmetic_simplification.test
 test/optimizer/avg_rewrite_profitability.test
 test/optimizer/case_simplification.test
@@ -526,6 +527,7 @@ test/optimizer/filter_pushdown/filter_pushdown_into_subquery.test
 test/optimizer/filter_pushdown/like_prefix_boundary.test
 test/optimizer/grouping_expression_simplification.test
 test/optimizer/grouping_sets_optimizer.test
+test/optimizer/in_clause_rewriter_join.test
 test/optimizer/index_optimizer.test
 test/optimizer/instr_prefix_null_needle.test
 test/optimizer/issue_12181.test
@@ -587,6 +589,7 @@ test/optimizer/not_in_null.test
 test/optimizer/optimize_unsigned_vs_signed_ints.test
 test/optimizer/ordered_aggregate.test
 test/optimizer/outer_join_simplification_anti_on_filter.test
+test/optimizer/parquet_cardinality_bounds.test
 test/optimizer/partial_aggregate_pushdown.test
 test/optimizer/partition_stats_prepared.test
 test/optimizer/partitioned_execution_coverage.test
@@ -702,8 +705,10 @@ test/optimizer/topn_window_elimination_group_stats.test
 test/optimizer/topn_window_elimination_nearest_setop.test
 test/optimizer/transitive_filters.test
 test/optimizer/union_exclude.test
+test/optimizer/unnest_rewriter_issue_14542.test
 test/optimizer/unused_columns/cte_unused_columns.test
 test/optimizer/unused_columns/distinct_on_projection_pushdown.test
+test/optimizer/unused_window_columns.test
 test/optimizer/using_optimizer.test
 test/parquet/concatenated_gzip_members.test
 test/parquet/constant_dictionary_vector_parquet.test
@@ -2165,6 +2170,7 @@ test/sql/function/array/array_cosine_similarity_extreme.test
 test/sql/function/array/array_cross_product.test
 test/sql/function/array/array_distance.test
 test/sql/function/array/array_flatten.test
+test/sql/function/array/array_inner_product.test
 test/sql/function/array/array_length.test
 test/sql/function/array/array_list_functions.test
 test/sql/function/array/array_size_mismatch_argument.test
@@ -3516,6 +3522,7 @@ test/sql/serialization/logical_operator_serialization.test
 test/sql/setops/ambiguous_order_by.test
 test/sql/setops/compression_expression_collation.test
 test/sql/setops/except_intersect_collation.test
+test/sql/setops/except_intersect_filter_equal_values.test
 test/sql/setops/projection_expression_collation.test
 test/sql/setops/setops_pushdown.test
 test/sql/setops/test_except.test

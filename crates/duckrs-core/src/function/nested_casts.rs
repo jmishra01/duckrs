@@ -88,9 +88,17 @@ fn string_to_nested(input: &[u8], target: &LogicalType, mode: CastMode) -> Resul
         LogicalTypeId::List | LogicalTypeId::Array => {
             let child = target.child_type().expect("a child type");
             let parts = split_list(input).ok_or_else(error)?;
+            // a child type with an alias (JSON) casts as the type it is of: the items are of the alias
             let items = parts
                 .into_iter()
-                .map(|p| cast_value(&varchar_part(p), child, mode))
+                .map(|p| {
+                    let item = cast_value(&varchar_part(p), child, mode)?;
+                    if item.logical_type() != child && item.logical_type().id() == child.id() {
+                        item.reinterpret(child)
+                    } else {
+                        Ok(item)
+                    }
+                })
                 .collect::<Result<Vec<_>>>()?;
             if let Some(size) = target.array_size().filter(|_| target.id() == LogicalTypeId::Array)
                 && items.len() != size as usize
