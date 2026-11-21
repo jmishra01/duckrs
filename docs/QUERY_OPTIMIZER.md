@@ -810,6 +810,86 @@ Top N 20 BY revenue DESC                                    ~20
 - **11,439 → 3,767**: Line items that are returned and in the quarter (out of 148,301 returned and 5,677 orders), and the customers they belong to. The estimates were ~20,085 and ~10,052.
 - **No clear gain**: Switching off partial_aggregate_pushdown, compressed_materialization or both gave medians of 0.037–0.042 s. The machine's load average was 24–30, and CPU time went the other way, so these differences are noise. At SF0.1 the customer join is too small for pushing the aggregate below it to show: it saves a join over about 7,700 rows and adds a second GROUP BY.
 
+## TPC-H Q11, with the optimizer off and on
+
+Q11 lists the parts that make up more than 0.01% of the value of German suppliers' stock. The threshold comes from an uncorrelated scalar subquery in the HAVING clause, which repeats the outer query's joins. So it shows **common_subplan** again, and how a comparison with a one-row subquery becomes a join. The plans are from the same build as Q2 (`1ed6cc1`) and the same SF0.1 data.
+
+```
+SELECT ps_partkey, sum(ps_supplycost * ps_availqty) AS value
+FROM partsupp, supplier, nation
+WHERE ps_suppkey = s_suppkey
+  AND s_nationkey = n_nationkey
+  AND n_name = 'GERMANY'
+GROUP BY ps_partkey
+HAVING sum(ps_supplycost * ps_availqty) >
+       (SELECT sum(ps_supplycost * ps_availqty) * 0.0001000000
+        FROM partsupp, supplier, nation
+        WHERE ps_suppkey = s_suppkey
+          AND s_nationkey = n_nationkey
+          AND n_name = 'GERMANY')
+ORDER BY value DESC;
+```
+
+**Optimizer off: PRAGMA disable_optimizer**
+
+```
+Order By value DESC                                         ~6,833
+└ Projection ps_partkey, value
+  └ Filter  sum > threshold                          ~6,833
+    └ Cross Product  (each group × the one threshold row)   ~34,169
+      ├ Hash Group By ps_partkey, sum(ps_supplycost * ps_availqty)   ~34,169
+      │ └ Filter (3 conditions)                     ~80,000,000
+      │   └ Cross Product × 2  partsupp × supplier × nation   ~2,000,000,000
+      └ Ungrouped Aggregate  sum(...) * 0.0001
+        └ Filter (3 conditions)
+          └ Cross Product × 2  partsupp × supplier × nation   ~2,000,000,000
+```
+
+**Optimizer on: default settings**
+
+```
+Projection CAST(ps_partkey AS BIGINT), value              ~1,241
+└ Order By value DESC
+  └ Projection CAST(ps_partkey AS SMALLINT), value
+    └ ...
+      └ CTE __common_subplan_1
+        ├ Hash Join  s_nationkey = n_nationkey   ← German suppliers, computed once   ~38
+        │ ├ Seq Scan supplier  [s_suppkey, s_nationkey]     ~1,000
+        │ └ Seq Scan nation  [n_nationkey]  Filters: n_name = 'GERMANY'
+        └ Nested Loop Join  CAST(sum AS DECIMAL(38,12)) > threshold   ~1,241
+          ├ Hash Group By ps_partkey, sum(ps_supplycost * ps_availqty)   ~2,483
+          │ └ Projection CAST(ps_partkey AS SMALLINT), ...
+          │   └ Hash Join  ps_suppkey = s_suppkey          ~2,483
+          │     ├ Seq Scan partsupp  [ps_partkey, ps_suppkey, ps_availqty, ps_supplycost]   ~80,000
+          │     └ CTE Scan __common_subplan_1            ~38
+          └ Projection sum * 0.0001000000                   ~1
+            └ Ungrouped Aggregate sum(ps_supplycost * ps_availqty)
+              └ Hash Join  ps_suppkey = s_suppkey          ~2,483
+                ├ Seq Scan partsupp  [ps_suppkey, ps_availqty, ps_supplycost]   ~80,000
+                └ CTE Scan __common_subplan_1            ~38
+```
+
+> The first child of each hash join probes and the second child is the build side. The "..." stands for three projections that only reorder and cast columns.
+
+### What each pass changed
+
+1. **filter_pushdown** turned the two cross products in each half into hash joins and moved `n_name = 'GERMANY'` into the nation scans.
+2. **common_subplan** found that both halves join supplier to nation for Germany. It computes that once, as the CTE `__common_subplan_1` (50 suppliers, ~38 estimated), and both halves build their partsupp join on it.
+3. **join_order** builds each partsupp join on the German suppliers. All 80,000 partsupp rows probe it, and 4,000 go on.
+4. **The HAVING comparison became a join condition.** The subquery returns exactly one row, so the plan pairs it with every group in a Nested Loop Join whose condition is the comparison. That replaces the cross product and the Filter above it. A hash join can't take `>`, and with one row on one side a nested loop is the cheapest join anyway.
+5. **compressed_materialization** narrows `ps_partkey` to a SMALLINT for the GROUP BY and the ORDER BY. It is at most 20,000, which fits.
+6. **unused_columns** cut partsupp to 4 of its 5 columns in the outer half and to 3 in the subquery, which doesn't need the part key.
+
+### Where duckrs differs from DuckDB 1.5.6
+
+1. **DuckDB shares a larger piece and reads partsupp once.** Its common subplan is the whole join of partsupp with the German suppliers (~2,483 rows), which both the GROUP BY and the threshold read. duckrs shares only the German suppliers and scans and joins partsupp in each half. This is the same difference as in Q2.
+2. **DuckDB checks the subquery's row count.** It wraps the threshold in a check that raises an error if the subquery returns more than one row. An ungrouped aggregate always returns one row, so this can't happen here; duckrs leaves the check out.
+3. **The estimates differ widely.** duckrs estimates ~1,241 result rows and DuckDB ~17. In fact there are 2,541 of the 3,716 groups.
+
+- **0.008 s**: Q11 with the optimizer on, median of 11 warm runs, with a load average of about 4. It returns 2,541 parts, led by part 12098 with a stock value of 16,227,681.21.
+- **About the same**: With `common_subplan`, `compressed_materialization` or `join_order` switched off, the medians were all 0.007 s. Sharing a join of 1,000 suppliers with one nation saves too little to show. Without join_order, all 80,000 partsupp rows are joined to supplier first and Germany is filtered after (and no CTE is shared), but with only three small tables that still costs nothing measurable here.
+- **4,000**: partsupp rows of German suppliers, against an estimate of ~2,483. Sharing that whole join, as DuckDB does, would save a second scan of all 80,000 partsupp rows.
+
 ## TPC-H Q12, with the optimizer off and on
 
 Q12 counts the late line items shipped by mail or ship in 1994, split by order priority. Its WHERE clause chains three dates (`l_shipdate < l_commitdate < l_receiptdate`) and has a short `IN` list, which shows two things the other walkthroughs don't: filters derived from other filters, and filters a scan can only use partly. The plans are from a release build of `phase-55-optimizer-rewriters` at `1ed6cc1`, on the same SF0.1 data.
