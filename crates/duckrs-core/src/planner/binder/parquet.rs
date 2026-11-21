@@ -109,6 +109,7 @@ impl Binder<'_> {
         let mut utf8_validation = crate::execution::parquet::Utf8Validation::Strict;
         let mut schema_value = None;
         let mut allow_empty = false;
+        let mut files_for_stats = 0;
         let (mut copy_names, mut copy_types): (Option<Vec<String>>, Option<Vec<LogicalType>>) = (None, None);
         for argument in &args {
             let value = self.constant_argument(&argument.expr)?;
@@ -151,6 +152,12 @@ impl Binder<'_> {
                     utf8_validation = crate::execution::parquet::Utf8Validation::parse(&value.try_to_string()?)?;
                 }
                 "allow_empty" => allow_empty = is_true(&value, &option)?,
+                "maximum_files_for_stats" => {
+                    files_for_stats = crate::execution::parquet::cast_value(&value, &LogicalType::UBIGINT)?
+                        .as_i128()
+                        .and_then(|n| usize::try_from(n).ok())
+                        .unwrap_or(0);
+                }
                 "explicit_cardinality" | "can_have_nan" => {}
                 "schema" => schema_value = Some(value),
                 // what COPY ... FROM passes on of the table it loads into
@@ -374,6 +381,7 @@ impl Binder<'_> {
             extracts: Vec::new(),
             byte_lengths: Vec::new(),
             output: None,
+            files_for_stats,
         };
         Ok(LogicalOperator::new(
             LogicalOperatorKind::ParquetScan {

@@ -1801,6 +1801,7 @@ test/sql/copy/parquet/multi_file/multi_file_filter_integer_types.test
 test/sql/copy/parquet/multi_file/multi_file_filter_mixed.test
 test/sql/copy/parquet/multi_file/multi_file_filter_struct.test
 test/sql/copy/parquet/multi_file_conversion_error.test
+test/sql/copy/parquet/multi_file_max_files_for_stats.test
 test/sql/copy/parquet/page_index/page_index_write.test
 test/sql/copy/parquet/parallel_parquet_glob.test
 test/sql/copy/parquet/parquet2.test

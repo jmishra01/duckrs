@@ -86,8 +86,12 @@ Each item gives the number of failing files in `test/` that it should fix, where
     errors; multi-file cast errors as C++; VARCHAR read as BLOB by its bytes (`union_by_name`)
   - [x] `allow_empty`; `schema` turns off hive detection; hive columns that are file columns aren't cast from it;
     unknown COPY options of Parquet and CSV with C++'s suggestions; signed zeros apart in dictionaries
-  - [ ] INT96 out of range (the crate wraps), `timestamp_ns` saturation, legacy `ConvertedType` 24, `stats()` of
-    VARCHAR, recursive `UNNEST` of structs (`metadata_full`), `WITH ORDINALITY`
+  - [ ] INT96 out of range (the crate wraps), `timestamp_ns` saturation, legacy `ConvertedType` 24, recursive
+    `UNNEST` of structs (`metadata_full`), `WITH ORDINALITY`
+  - [x] `stats()` of Parquet VARCHAR / BLOB columns: string statistics from the footers (exact bounds, a constant's
+    lengths), unknown ones where none; JSON the file marks as such keeps them under a repairing `utf8_validation`
+  - [ ] float statistics of Parquet columns by `nan_count` and `can_have_nan` (`parquet_stats_function`,
+    `parquet_nan_setting`)
   - [x] `parquet_metadata` stats in the column's DuckDB type (decimals, UUID, TIMETZ, INT96, blobs; NULL for infinities and out-of-range values)
   - [x] `int96_as` (`timestamp` by default, `timestamp_ns`, `struct`)
   - [x] the native Parquet writer (`execution/parquet_writer`): DuckDB's encodings, dictionaries, pages, statistics, bloom filters and footer, written with our own Thrift; TIMETZ as TIME in UTC
@@ -298,7 +302,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] compressed materialization of POINT-XY GEOMETRY columns (`__internal_compress_geometry_point`)
   - [x] compressed materialization of VARIANT columns fully shredded on a primitive type: cast to it and
     compressed further, also as grouped by (`variant_comparator`); joins of them compare the integers
-  - [ ] `stats()` of a VARCHAR read from several parquet files with `union_by_name` (NULL here)
+  - [x] `stats()` of a VARCHAR read from several parquet files with `union_by_name`: the statistics and row
+    counts of several files only when the bind opens them all (`union_by_name`, `maximum_files_for_stats`), empty
+    files skipped; with a `schema`, of a column it names that the file stores as the same type
   - [x] partitioned execution: a large aggregate, ORDER BY or window over a table as a UNION ALL of parts by
     ranges of a column, cut where the row groups' zones overlap little
   - [x] list comprehension rewrite: a list comprehension whose result reads no field of the filter's struct
