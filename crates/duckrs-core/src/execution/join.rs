@@ -39,10 +39,9 @@ use super::physical::{
     parallel_expression,
 };
 use super::temporary::{PartitionedSpill, SpillFile, current, estimated_bytes};
-use crate::planner::expression::{BoundExpr, BoundExprKind};
 use crate::optimizer::range_joins::{range_order, reorder_conditions};
+use crate::planner::expression::{BoundExpr, BoundExprKind};
 use crate::planner::logical::{JoinAlgorithm, JoinCondition};
-use duckrs_parser::ast::ComparisonOp;
 use crate::storage::log_writer::can_serialize;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::{KeyHasher, RowKey, create_row_keys};
@@ -50,6 +49,7 @@ use duckrs_common::types::LogicalType;
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, SelectionVector, StringCopy, Vector};
 use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
+use duckrs_parser::ast::ComparisonOp;
 use duckrs_parser::ast::JoinType;
 use parking_lot::Mutex;
 use std::hash::{Hash, Hasher};
@@ -214,7 +214,12 @@ fn compare_keys(op: ComparisonOp, left: &[u8], right: &[u8]) -> bool {
 
 /// The positions `0..len`, whose keys `key(i)` ascend, with `left op key(i)`: a suffix for `<`
 /// and `<=`, a prefix for `>` and `>=`.
-fn matching_run<'a>(len: usize, key: impl Fn(usize) -> &'a [u8], op: ComparisonOp, left: &[u8]) -> std::ops::Range<usize> {
+fn matching_run<'a>(
+    len: usize,
+    key: impl Fn(usize) -> &'a [u8],
+    op: ComparisonOp,
+    left: &[u8],
+) -> std::ops::Range<usize> {
     let point = |pred: &dyn Fn(&[u8]) -> bool| {
         let (mut low, mut high) = (0, len);
         while low < high {
@@ -1113,12 +1118,17 @@ impl PhysicalJoin {
                 return Ok((result, OperatorResult::NeedMoreInput));
             }
             let count = left.len();
-            let mut columns = Self::rows_of(input, left.clone()).columns().to_vec();
-            columns.extend_from_slice(Self::rows_of(data, right.clone()).columns());
-            let mut pairs = DataChunk::from_columns(columns, count);
+            // the pairs' rows, which a join that only marks its rows needs for a predicate only
+            let pairs_of = || {
+                let mut columns = Self::rows_of(input, left.clone()).columns().to_vec();
+                columns.extend_from_slice(Self::rows_of(data, right.clone()).columns());
+                DataChunk::from_columns(columns, count)
+            };
+            let mut pairs = (emit_pairs || self.predicate.is_some()).then(pairs_of);
             let matches = match &self.predicate {
                 Some(predicate) if self.join_type == JoinType::Mark => {
-                    let result = super::expression_executor::as_join_condition(|| execute(predicate, &pairs))?;
+                    let pairs = pairs.as_ref().expect("made for the predicate");
+                    let result = super::expression_executor::as_join_condition(|| execute(predicate, pairs))?;
                     let mut selected = Vec::new();
                     for (row, left) in left.iter().enumerate() {
                         match result.get_value(row).data() {
@@ -1131,7 +1141,8 @@ impl PhysicalJoin {
                     Some((SelectionVector::from_vec(selected), matched))
                 }
                 Some(predicate) => {
-                    let (sel, matched) = super::expression_executor::as_join_condition(|| select(predicate, &pairs))?;
+                    let pairs = pairs.as_ref().expect("made for the predicate");
+                    let (sel, matched) = super::expression_executor::as_join_condition(|| select(predicate, pairs))?;
                     (matched != count).then_some((sel, matched))
                 }
                 None => None,
@@ -1167,6 +1178,7 @@ impl PhysicalJoin {
             if !emit_pairs {
                 continue;
             }
+            let mut pairs = pairs.take().expect("made for the pairs to emit");
             if let Some((sel, matched)) = matches {
                 pairs.slice(&sel, matched);
             }
@@ -1387,15 +1399,14 @@ impl PhysicalJoin {
                 let count = input.len();
                 let mut mark = Vector::new(LogicalType::BOOLEAN, count.max(1));
                 mark.prepare_flat(count.max(1));
-                for (row, (found, null)) in found.iter().zip(&probe.nulls).enumerate() {
-                    let value = if *found {
-                        Value::boolean(true)
-                    } else if *null {
-                        Value::null(LogicalType::BOOLEAN)
-                    } else {
-                        Value::boolean(false)
-                    };
-                    mark.set_value(row, &value)?;
+                // a row that found a match is true, one that compared with a NULL NULL, the others false
+                for (slot, &found) in mark.data_mut::<bool>().iter_mut().zip(found.iter()) {
+                    *slot = found;
+                }
+                for (row, (&found, &null)) in found.iter().zip(&probe.nulls).enumerate() {
+                    if !found && null {
+                        mark.set_null(row, true);
+                    }
                 }
                 let mut columns = input.columns().to_vec();
                 columns.push(mark);
@@ -1457,7 +1468,10 @@ impl PhysicalOperator for PhysicalJoin {
         self.append(&mut self.build.lock(), chunk, keys, false)
     }
     fn parallel_sink(&self) -> bool {
-        self.conditions.iter().chain(&self.range).all(|c| parallel_expression(&c.right))
+        self.conditions
+            .iter()
+            .chain(&self.range)
+            .all(|c| parallel_expression(&c.right))
     }
     fn local_sink_state(&self) -> LocalSinkState {
         self.builders.fetch_add(1, Ordering::Relaxed);
@@ -1524,7 +1538,10 @@ impl PhysicalOperator for PhysicalJoin {
             .map_err(|_| Error::new(ErrorKind::Internal, "a join build side was finished twice"))
     }
     fn parallel_operator(&self) -> bool {
-        self.conditions.iter().chain(&self.range).all(|c| parallel_expression(&c.left))
+        self.conditions
+            .iter()
+            .chain(&self.range)
+            .all(|c| parallel_expression(&c.left))
             && self.predicate.as_ref().is_none_or(parallel_expression)
     }
     fn operator_state(&self) -> OperatorState {

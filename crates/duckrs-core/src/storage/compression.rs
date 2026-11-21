@@ -1670,6 +1670,32 @@ pub fn decode_dict_fsst(segment: &[u8], count: usize) -> Result<(StringRows, Vec
     Ok((strings, indices))
 }
 
+/// [`decode_dict_fsst`] with the entries but entry 0 (the empty string a NULL has) onto `entries`: per row where in
+/// `entries` its entry went, or 0 for a NULL (whose entry 0 of `entries` must stand for).
+pub fn decode_dict_fsst_onto(segment: &[u8], count: usize, entries: &mut StringRows) -> Result<Vec<u32>> {
+    let parsed = parse_dict_fsst(segment, count)?;
+    let dict_count = parsed.ends.len();
+    let base = entries.len() as u32;
+    for index in 1..dict_count {
+        parsed.entry(index, entries)?;
+    }
+    let shift = |index: u32| if index == 0 { 0 } else { base + index - 1 };
+    match parsed.indices {
+        Some(mut indices) => {
+            if indices.iter().any(|&index| index as usize >= dict_count) {
+                return Err(corrupted(
+                    "Corrupted DICT_FSST segment: dictionary index is out of range",
+                ));
+            }
+            for index in &mut indices {
+                *index = shift(*index);
+            }
+            Ok(indices)
+        }
+        None => Ok((1..=count as u32).map(shift).collect()),
+    }
+}
+
 /// The strings of rows `rows` of a DICT_FSST segment of `count` rows, onto `out`, each entry decoded for each row
 /// that has it; per row, whether it has entry 0, which a NULL has.
 pub fn decode_dict_fsst_rows(segment: &[u8], count: usize, rows: &[u32], out: &mut StringRows) -> Result<Vec<bool>> {

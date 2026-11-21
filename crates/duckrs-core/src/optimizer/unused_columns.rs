@@ -245,6 +245,20 @@ fn visit(op: &mut LogicalOperator, by_position: bool, used: &mut HashSet<ColumnB
             });
         }
     }
+    // a column select hides columns of its child (the markers of the IN clause rewriter): it keeps no more than is
+    // read of it, and its child gives what it keeps
+    if let K::ColumnSelect { keep } = &mut op.kind {
+        if !by_position {
+            let read: Vec<ColumnBinding> = keep.iter().copied().filter(|binding| used.contains(binding)).collect();
+            // a chunk without columns would have no rows to count
+            if !read.is_empty() {
+                *keep = read;
+            } else {
+                keep.truncate(1);
+            }
+        }
+        used.extend(keep.iter().copied());
+    }
     for expr in op.expressions_mut() {
         collect_columns(expr, used);
     }
@@ -267,7 +281,8 @@ fn visit(op: &mut LogicalOperator, by_position: bool, used: &mut HashSet<ColumnB
         | K::MarkJoin { .. }
         | K::Window { .. }
         | K::Unnest { .. }
-        | K::SecureView { .. } => by_position,
+        | K::SecureView { .. }
+        | K::ColumnSelect { .. } => by_position,
         _ => true,
     };
     // `ColumnLifetimeAnalyzer`: the operators with projection maps, which copy the rows of their children:

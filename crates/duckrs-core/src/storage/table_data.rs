@@ -397,17 +397,9 @@ fn scan_dictionary_column(
     let mut selection: Vec<u32> = Vec::with_capacity(rows);
     for pointer in &column.pointers {
         let handle = segment(buffer, pointer)?;
-        let (strings, indices) = decode_dict_fsst(&handle[pointer.offset..], pointer.tuple_count)?;
-        // entry i of the segment (i > 0) is entry base + i here; 0 stays the NULL
-        let base = entries.len() as u32 - 1;
-        for string in strings.iter().skip(1) {
-            entries.push(string);
-        }
-        selection.extend(
-            indices
-                .into_iter()
-                .map(|index| if index == 0 { 0 } else { base + index }),
-        );
+        // entry i of the segment (i > 0) goes after the entries so far; 0 stays the NULL
+        let indices = decode_dict_fsst_onto(&handle[pointer.offset..], pointer.tuple_count, &mut entries)?;
+        selection.extend(indices);
     }
     if selection.len() != rows {
         return Err(corrupt("the segments of a string column do not have its rows"));
