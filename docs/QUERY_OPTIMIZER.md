@@ -341,6 +341,89 @@ Ungrouped Aggregate sum(l_extendedprice * l_discount)       ~1
 
 > The first run after the load took 0.088 s every time, as in Q5: it includes working out the table statistics the first time a plan reads them. The timings above leave it out.
 
+## TPC-H Q7, with the optimizer off and on
+
+Q7 sums the trade between two nations, France and Germany, in each direction, for 1995 and 1996. It joins six tables, nation twice, and its key condition is an OR that spans both copies of nation. That shows how the optimizer gets a filter for each table out of a condition that reads two of them. The plans are from a release build of `phase-55-optimizer-rewriters` at `1ed6cc1`, on the same SF0.1 data.
+
+```
+SELECT supp_nation, cust_nation, l_year, sum(volume) AS revenue
+FROM (SELECT n1.n_name AS supp_nation, n2.n_name AS cust_nation,
+             extract(year FROM l_shipdate) AS l_year,
+             l_extendedprice * (1 - l_discount) AS volume
+      FROM supplier, lineitem, orders, customer, nation n1, nation n2
+      WHERE s_suppkey = l_suppkey
+        AND o_orderkey = l_orderkey
+        AND c_custkey = o_custkey
+        AND s_nationkey = n1.n_nationkey
+        AND c_nationkey = n2.n_nationkey
+        AND ((n1.n_name = 'FRANCE' AND n2.n_name = 'GERMANY')
+          OR (n1.n_name = 'GERMANY' AND n2.n_name = 'FRANCE'))
+        AND l_shipdate BETWEEN CAST('1995-01-01' AS date)
+                           AND CAST('1996-12-31' AS date)) AS shipping
+GROUP BY supp_nation, cust_nation, l_year
+ORDER BY supp_nation, cust_nation, l_year;
+```
+
+**Optimizer off: PRAGMA disable_optimizer**
+
+```
+Order By supp_nation, cust_nation, l_year                   ~9,183
+└ Hash Group By supp_nation, cust_nation, l_year, sum(volume)   ~9,183
+  └ Projection ...                       ~18,446,744,073,709,551,615
+    └ Filter (7 conditions)                ~18,446,744,073,709,551,615
+      └ Cross Product × 5  supplier × lineitem × orders × customer × nation × nation
+          (all columns of every table)
+```
+
+**Optimizer on: default settings**
+
+```
+Projection __internal_decompress_string(supp_nation), (cust_nation), l_year, revenue   ~1
+└ Order By supp_nation, cust_nation, l_year
+  └ Projection __internal_compress_string_uhugeint(...) (both nations)
+    └ Hash Group By supp_nation, cust_nation, year(l_shipdate), sum(...)   ~1
+      └ Projection ..., __internal_compress_string_uhugeint(n1.n_name), (n2.n_name)   ~15
+        └ Hash Join  o_custkey = c_custkey               ~15
+              AND (n1 IN (FRANCE, GERMANY)) AND (n2 IN (GERMANY, FRANCE))
+              AND ((n1 = FRANCE AND n2 = GERMANY) OR (n1 = GERMANY AND n2 = FRANCE))
+          ├ Hash Join  o_orderkey = l_orderkey            ~1,881
+          │ ├ Seq Scan orders  [o_orderkey, o_custkey]       ~150,000
+          │ └ Hash Join  l_suppkey = s_suppkey            ~3,749
+          │   ├ Seq Scan lineitem  [l_orderkey, l_suppkey, l_extendedprice, l_discount, l_shipdate]
+          │   │   Filters: l_shipdate >= '1995-01-01' AND l_shipdate <= '1996-12-31'   ~120,114
+          │   └ Hash Join  s_nationkey = n1.n_nationkey     ~38
+          │     ├ Seq Scan supplier  [s_suppkey, s_nationkey]   ~1,000
+          │     └ Filter  n_name = 'FRANCE' OR n_name = 'GERMANY'
+          │       └ Filter  (same OR), (same OR)
+          │         └ Seq Scan nation n1  Filters: optional: n_name IN ('FRANCE', 'GERMANY') (twice)
+          └ Hash Join  c_nationkey = n2.n_nationkey       ~2,884
+            ├ Seq Scan customer  [c_custkey, c_nationkey]   Filters: c_custkey <= 14999
+            └ Filter  n_name = 'GERMANY' OR n_name = 'FRANCE'
+              └ Seq Scan nation n2  Filters: optional: n_name IN ('GERMANY', 'FRANCE')
+```
+
+> The first child of each hash join probes and the second child is the build side. The repeated n1 filters, the extra IN conditions in the last join and its ~15 row estimate are where duckrs differs from DuckDB 1.5.6, described below.
+
+### What each pass changed
+
+1. **filter_pushdown** turned the five cross products into hash joins on the five key conditions and moved the ship date range into the lineitem scan.
+2. **Filters for each nation from the OR.** The condition `(n1 = FRANCE AND n2 = GERMANY) OR (n1 = GERMANY AND n2 = FRANCE)` reads both copies of nation, so it can only be checked once both are joined. But each branch of the OR names a nation for n1, so every row that passes has n1 as FRANCE or GERMANY, and the same goes for n2. Filter pushdown adds those two conditions and pushes each one to its own nation scan, where it cuts nation from 25 rows to 2. The full OR still runs above the last join to pair them up correctly.
+3. **join_order** starts from the two filtered nations. Suppliers of France and Germany (~38 estimated) are the build side for the 1995–96 line items, and their join (~3,749) is the build side for orders. Customers of the two nations (~2,884) are joined on their own and are the build side of the last join.
+4. **statistics_propagation** added `c_custkey <= 14999` to the customer scan, as in Q3, Q5, Q10 and Q18.
+5. **compressed_materialization** packs the two nation names into 16-byte integers for the GROUP BY and the ORDER BY.
+6. **unused_columns** cut every table down to the columns the joins and the sum need: lineitem to 5 of 16, orders, customer and supplier to 2 each.
+
+### Where duckrs differs from DuckDB 1.5.6
+
+1. **The n1 filter is there three times.** The supplier side of nation has one Filter on another, with the same OR three times, and the optional IN filter twice in its scan. DuckDB has each once. With `SET disabled_optimizers = 'expression_rewriter'` duckrs has it once too, so the copies come from how the rewriter and the pushdown work together. On 25 rows of nation it costs nothing measurable, but the copies also feed the estimates.
+2. **The last join keeps the derived conditions.** duckrs checks the two IN conditions again in the last join, next to the full OR. DuckDB checks only the full OR, in a Filter above the join.
+3. **The estimates are much too low.** duckrs estimates the last join at ~15 rows and the GROUP BY at ~1. In fact 643 rows reach the GROUP BY, and they make 4 groups. DuckDB estimates ~4,187. The French and German line items are 15,631 rows, where duckrs estimates ~3,749 and DuckDB ~18,749. The repeated nation filters are a likely cause, since each copy that is counted as a separate condition lowers the estimate again. I haven't confirmed that. Here the low estimate doesn't change the plan, since both engines pick the same join order.
+4. **l_year isn't packed.** DuckDB packs `year(l_shipdate)` into one byte, as `__internal_compress_integral_utinyint(l_year, 1992)`. duckrs groups on the full integer.
+
+- **4 rows**: The result: France to Germany and Germany to France, for 1995 and 1996. Germany's sales to France in 1995 are the largest, 6,232,818.70.
+- **643**: Rows that reach the GROUP BY, out of 1,270 line items whose supplier and customer are both French or German. The full OR drops the half where both are from the same nation.
+- **Not measured**: The machine's load average was above 70 during these runs, and Q7's times ranged from 0.018 s to 0.141 s, too noisy to compare the passes.
+
 ## TPC-H Q9, with the optimizer off and on
 
 Q9 works out the profit on "green" parts per nation and year. It also joins six tables, but its filter is a `LIKE` on part names, and partsupp joins lineitem on two keys at once. The setup is the same as for Q5: the duckrs Stage 3 release build and TPC-H SF0.1 data.
