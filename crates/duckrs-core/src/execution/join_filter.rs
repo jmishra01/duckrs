@@ -315,17 +315,20 @@ impl Keys {
     /// The rows of `values` that can match a key, onto `kept`.
     fn keep<T: Copy + Into<i64>>(&self, values: &[T], kept: &mut Vec<u32>) {
         let (min, max) = (self.min, self.max);
+        // every row is written, and the count moves past those that can match: no branch per row
+        let start = kept.len();
+        kept.resize(start + values.len(), 0);
+        let mut matched = start;
         for (row, &value) in values.iter().enumerate() {
             let value: i64 = value.into();
-            if value < min || value > max {
-                continue;
-            }
             let h = hash(value);
             let bits = block_bits(h);
-            if self.blocks[self.block(h)] & bits == bits {
-                kept.push(row as u32);
-            }
+            let in_range = value >= min && value <= max;
+            let block = self.blocks[self.block(h)];
+            kept[matched] = row as u32;
+            matched += usize::from(in_range & (block & bits == bits));
         }
+        kept.truncate(matched);
     }
 
     #[inline]

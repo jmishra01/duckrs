@@ -340,6 +340,24 @@ fn partition_of_hash(hash: u64) -> usize {
 }
 
 /// The hash of a key, which picks both its partition and its slot in the partition's table.
+/// Asks for the memory of `value` to be brought into the cache, without waiting for it (a prefetch never faults).
+#[inline(always)]
+fn prefetch<T>(value: &T) {
+    let address = std::ptr::from_ref(value);
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: `prfm` only hints at a read of a valid address; it reads no register and writes no memory
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) address, options(nostack, readonly, preserves_flags));
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch only hints at a read; it never faults
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(address.cast::<i8>(), std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = address;
+}
+
 fn key_hash(key: &RowKey) -> u64 {
     let mut hasher = KeyHasher::default();
     key.hash(&mut hasher);
@@ -495,12 +513,41 @@ struct FinishedBuild {
 impl FinishedBuild {
     /// The partition and the group of `key`, if a build row has it.
     fn find(&self, key: &RowKey) -> Option<(usize, usize)> {
+        self.find_hashed(key_hash(key), key)
+    }
+
+    fn find_hashed(&self, hash: u64, key: &RowKey) -> Option<(usize, usize)> {
         // the hash picks the partition and the slot in its table both
-        let hash = key_hash(key);
         let partition = if self.partitioned { partition_of_hash(hash) } else { 0 };
         self.partitions[partition]
             .group(hash, key)
             .map(|group| (partition, group))
+    }
+
+    /// [`Self::find`] of each key, a window of them at a time: the keys of a window's candidate groups are
+    /// fetched for all of its rows first, so that their reads from memory overlap rather than wait one by one.
+    fn find_all(&self, keys: &[Option<RowKey>]) -> Vec<Option<(usize, usize)>> {
+        const WINDOW: usize = 32;
+        let hashes: Vec<u64> = keys.iter().map(|key| key.as_ref().map_or(0, key_hash)).collect();
+        let mut groups = Vec::with_capacity(keys.len());
+        for (keys, hashes) in keys.chunks(WINDOW).zip(hashes.chunks(WINDOW)) {
+            for (key, &hash) in keys.iter().zip(hashes) {
+                if key.is_some() {
+                    let partition = &self.partitions[if self.partitioned { partition_of_hash(hash) } else { 0 }];
+                    // every candidate is fetched and none taken, so this only reads the table
+                    partition.table.find(hash, |&group| {
+                        prefetch(&partition.keys[group as usize]);
+                        false
+                    });
+                }
+            }
+            groups.extend(
+                keys.iter()
+                    .zip(hashes)
+                    .map(|(key, &hash)| key.as_ref().and_then(|key| self.find_hashed(hash, key))),
+            );
+        }
+        groups
     }
 
     fn set_matched(&self, row: u32) {
@@ -1073,9 +1120,7 @@ impl PhysicalJoin {
                             *null = key.is_none() || build.has_null_key;
                         }
                     }
-                    keys.iter()
-                        .map(|key| key.as_ref().and_then(|key| build.find(key)))
-                        .collect()
+                    build.find_all(&keys)
                 };
                 let count = kept.as_ref().map_or(input.len(), DataChunk::len);
                 let range_keys = if self.range.is_empty() {
